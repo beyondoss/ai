@@ -10,10 +10,13 @@
 mod common;
 
 use std::io::{BufRead, BufReader, Write};
-use std::process::{Child, ChildStdin};
+use std::process::ChildStdin;
 use std::time::Duration;
 
-use common::{read_until_response, serve_cmd, spawn_model_server, turn_text, turn_tool_use};
+use common::{
+    ChildGuard, SpawnGuarded, read_until_response, serve_cmd, spawn_model_server, turn_text,
+    turn_tool_use,
+};
 use serde_json::{Value, json};
 
 const BIN: &str = env!("CARGO_BIN_EXE_beyond-ai-agent");
@@ -40,7 +43,7 @@ fn get_todos(stdin: &mut ChildStdin, stdout: &mut impl BufRead) -> Value {
     resp["data"]["todos"].clone()
 }
 
-fn kill(mut child: Child) {
+fn kill(mut child: ChildGuard) {
     let _ = child.kill();
     let _ = child.wait();
 }
@@ -59,7 +62,7 @@ fn get_todos_is_null_before_the_model_has_made_a_plan() {
     let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
     let (base, _bodies) = spawn_model_server(vec![]);
 
-    let mut child = serve_cmd(BIN, &base, &session_file).spawn().unwrap();
+    let mut child = serve_cmd(BIN, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
@@ -80,7 +83,7 @@ fn get_todos_reads_the_last_call_out_of_the_live_transcript_when_idle() {
         turn_text("planned"),
     ]);
 
-    let mut child = serve_cmd(BIN, &base, &session_file).spawn().unwrap();
+    let mut child = serve_cmd(BIN, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
@@ -118,7 +121,7 @@ fn get_todos_answers_from_the_live_mirror_while_a_run_is_still_in_flight() {
         turn_text("done"),
     ]);
 
-    let mut child = serve_cmd(BIN, &base, &session_file).spawn().unwrap();
+    let mut child = serve_cmd(BIN, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
@@ -167,8 +170,7 @@ fn a_compaction_carries_the_plan_into_the_summary_and_get_todos_still_finds_it()
     let mut child = serve_cmd(BIN, &base, &session_file)
         // Force an aggressive cut so a short test session actually compacts.
         .args(["--compaction-keep-recent-tokens", "1"])
-        .spawn()
-        .unwrap();
+        .spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
@@ -223,8 +225,7 @@ fn the_plan_survives_a_serve_restart_past_a_compaction() {
         ]);
         let mut child = serve_cmd(BIN, &base, &session_file)
             .args(["--compaction-keep-recent-tokens", "1"])
-            .spawn()
-            .unwrap();
+            .spawn_guarded();
         let mut stdin = child.stdin.take().unwrap();
         let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
@@ -241,7 +242,7 @@ fn the_plan_survives_a_serve_restart_past_a_compaction() {
 
     // A brand-new process, resuming the same session file. Nothing is read from memory.
     let (base2, _b2) = spawn_model_server(vec![]);
-    let mut child = serve_cmd(BIN, &base2, &session_file).spawn().unwrap();
+    let mut child = serve_cmd(BIN, &base2, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
 

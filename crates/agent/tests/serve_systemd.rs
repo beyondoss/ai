@@ -8,10 +8,11 @@
 mod common;
 
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 
 use common::{
-    ISOLATED_HOME, spawn_model_server, turn_text, ws_connect_uds, ws_read_until_response, ws_send,
+    ChildGuard, ISOLATED_HOME, SpawnGuarded, spawn_model_server, turn_text, ws_connect_uds,
+    ws_read_until_response, ws_send,
 };
 use serde_json::json;
 
@@ -58,7 +59,7 @@ fn serve_adopts_a_systemd_activated_socket() {
 
     // `systemd-socket-activate -l <sock> <agent> serve ...` — note: NO --listen/--listen-uds; the agent
     // must pick up the fd from LISTEN_FDS. The activator binds `sock` and execs the agent with it.
-    let mut child: Child = Command::new(&activator)
+    let mut child: ChildGuard = Command::new(&activator)
         .arg("-l")
         .arg(&sock)
         .arg(env!("CARGO_BIN_EXE_beyond-ai-agent"))
@@ -75,8 +76,7 @@ fn serve_adopts_a_systemd_activated_socket() {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::inherit())
-        .spawn()
-        .expect("spawn systemd-socket-activate");
+        .spawn_guarded();
 
     wait_for_uds(&sock);
 

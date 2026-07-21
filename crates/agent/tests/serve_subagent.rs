@@ -6,7 +6,7 @@ mod common;
 
 use std::io::{BufReader, Write};
 
-use common::{read_until_response, spawn_model_server, turn_text, turn_tool_use};
+use common::{SpawnGuarded, read_until_response, spawn_model_server, turn_text, turn_tool_use};
 use serde_json::{Value, json};
 
 fn write_scout(dir: &std::path::Path) {
@@ -42,8 +42,7 @@ fn serve_runs_a_subagent_and_streams_its_progress() {
         .arg("--trust-project")
         .current_dir(dir.path())
         .stderr(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
+        .spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
@@ -121,8 +120,7 @@ fn reload_makes_a_newly_added_agent_delegable_without_a_restart() {
         .arg("--trust-project")
         .current_dir(dir.path())
         .stderr(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
+        .spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
 

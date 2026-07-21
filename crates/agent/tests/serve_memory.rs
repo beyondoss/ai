@@ -7,10 +7,12 @@ mod common;
 
 use std::io::{BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{ChildStdin, Command, Stdio};
 use std::sync::{Arc, Mutex};
 
-use common::{read_until_response, spawn_model_server, turn_text, turn_tool_use};
+use common::{
+    ChildGuard, SpawnGuarded, read_until_response, spawn_model_server, turn_text, turn_tool_use,
+};
 use serde_json::{Value, json};
 
 const BIN: &str = env!("CARGO_BIN_EXE_beyond-ai-agent");
@@ -24,7 +26,7 @@ fn send(stdin: &mut ChildStdin, cmd: Value) {
     stdin.flush().unwrap();
 }
 
-fn kill(mut child: Child) {
+fn kill(mut child: ChildGuard) {
     let _ = child.kill();
     let _ = child.wait();
 }
@@ -80,9 +82,7 @@ fn one_prompt(
     extra: &[&str],
     message: &str,
 ) -> (Vec<String>, Vec<Value>) {
-    let mut child = serve_mem_cmd(base, session_file, home, work, extra)
-        .spawn()
-        .unwrap();
+    let mut child = serve_mem_cmd(base, session_file, home, work, extra).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
     send(&mut stdin, json!({ "type": "prompt", "message": message }));
@@ -121,9 +121,8 @@ fn persists_across_a_restart_then_injects_the_index_and_recalls() {
         ),
         turn_text("saved"),
     ]);
-    let mut child = serve_mem_cmd(&base_a, &session_a, home.path(), work.path(), &[])
-        .spawn()
-        .unwrap();
+    let mut child =
+        serve_mem_cmd(&base_a, &session_a, home.path(), work.path(), &[]).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
     send(
@@ -201,9 +200,7 @@ fn a_memory_written_mid_session_refreshes_the_injected_index_on_the_next_rebuild
         turn_text("ok"),
     ]);
 
-    let mut child = serve_mem_cmd(&base, &session, home.path(), work.path(), &[])
-        .spawn()
-        .unwrap();
+    let mut child = serve_mem_cmd(&base, &session, home.path(), work.path(), &[]).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
 

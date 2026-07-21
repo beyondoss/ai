@@ -10,16 +10,16 @@
 
 mod common;
 
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 
 use common::{
-    ISOLATED_HOME, free_port, spawn_model_server, turn_text, wait_for_port, ws_connect,
-    ws_read_until_response, ws_send,
+    ChildGuard, ISOLATED_HOME, SpawnGuarded, free_port, spawn_model_server, turn_text,
+    wait_for_port, ws_connect, ws_read_until_response, ws_send,
 };
 use serde_json::json;
 
 /// Spawn a `serve --listen` child with a shared upstream client in `--upstream-http2 <mode>`.
-fn serve_ws_child_shared(base: &str, session_dir: &str, port: u16, http2_mode: &str) -> Child {
+fn serve_ws_child_shared(base: &str, session_dir: &str, port: u16, http2_mode: &str) -> ChildGuard {
     Command::new(env!("CARGO_BIN_EXE_beyond-ai-agent"))
         .args([
             "serve",
@@ -40,8 +40,7 @@ fn serve_ws_child_shared(base: &str, session_dir: &str, port: u16, http2_mode: &
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn serve --listen --upstream-http2")
+        .spawn_guarded()
 }
 
 /// Two distinct sessions, driven concurrently through the one shared `--upstream-http2 auto` client,

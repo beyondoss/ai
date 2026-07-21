@@ -14,7 +14,7 @@ use std::io::{BufRead, BufReader, Read as _};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
-use common::{run_cmd, spawn_model_server, sse};
+use common::{SpawnGuarded, run_cmd, spawn_model_server, sse};
 use serde_json::json;
 
 /// An SSE turn whose single text delta is large enough (`len` bytes) that writing its rendered NDJSON
@@ -74,8 +74,7 @@ fn run_json_mode_exits_cleanly_instead_of_panicking_when_stdout_is_closed_early(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+        .spawn_guarded();
 
     // Read exactly the leading `{"kind":"session",...}` header line — proving the write path up to
     // (and including) that line still works normally — then close our end, simulating `head -1`
@@ -124,8 +123,7 @@ fn run_text_mode_exits_cleanly_instead_of_panicking_when_stdout_is_closed_early(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+        .spawn_guarded();
 
     // Text mode has no leading header line — read a small, bounded prefix of the streamed text (well
     // under the 64KiB pipe buffer) so we know the child has started writing, then close our end.

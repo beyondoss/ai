@@ -7,17 +7,17 @@
 
 mod common;
 
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 
 use common::{
-    ISOLATED_HOME, free_port, spawn_model_server, turn_text, wait_for_port, ws_connect,
-    ws_read_until_response, ws_send,
+    ChildGuard, ISOLATED_HOME, SpawnGuarded, free_port, spawn_model_server, turn_text,
+    wait_for_port, ws_connect, ws_read_until_response, ws_send,
 };
 use serde_json::{Value, json};
 
 /// Spawn a `serve --listen 127.0.0.1:<port>` child against `base` (the mock gateway), persisting
 /// per-session files under `session_dir`.
-fn serve_ws_child(base: &str, session_dir: &str, port: u16) -> Child {
+fn serve_ws_child(base: &str, session_dir: &str, port: u16) -> ChildGuard {
     Command::new(env!("CARGO_BIN_EXE_beyond-ai-agent"))
         .args([
             "serve",
@@ -36,8 +36,7 @@ fn serve_ws_child(base: &str, session_dir: &str, port: u16) -> Child {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn serve --listen")
+        .spawn_guarded()
 }
 
 /// Prompt a fresh session `id` to completion so it persists under the daemon's `--session-dir`, then

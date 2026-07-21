@@ -7,7 +7,8 @@ use std::io::{BufReader, Write};
 use std::process::{Command, Stdio};
 
 use common::{
-    ISOLATED_HOME, read_until_response, serve_cmd, spawn_model_server, turn_text, turn_tool_use,
+    ISOLATED_HOME, SpawnGuarded, read_until_response, serve_cmd, spawn_model_server, turn_text,
+    turn_tool_use,
 };
 use serde_json::{Value, json};
 
@@ -41,7 +42,7 @@ fn serve_switches_model_and_thinking_at_runtime() {
     let (base, _bodies) = spawn_model_server(vec![]);
 
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
-    let mut child = serve_cmd(bin, &base, &session_file).spawn().unwrap();
+    let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
@@ -140,7 +141,7 @@ fn serve_cycle_model_advances_and_wraps() {
     let (base, _bodies) = spawn_model_server(vec![]);
 
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
-    let mut child = serve_cmd(bin, &base, &session_file).spawn().unwrap();
+    let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
@@ -199,7 +200,7 @@ fn serve_set_model_and_cycle_model_responses_carry_capability_info() {
     let (base, _bodies) = spawn_model_server(vec![]);
 
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
-    let mut child = serve_cmd(bin, &base, &session_file).spawn().unwrap();
+    let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
@@ -247,7 +248,7 @@ fn serve_set_model_colon_suffix_resolves_the_id_and_sets_reasoning_effort() {
     let (base, _bodies) = spawn_model_server(vec![]);
 
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
-    let mut child = serve_cmd(bin, &base, &session_file).spawn().unwrap();
+    let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
@@ -301,8 +302,7 @@ fn serve_cycle_model_scoped_by_the_models_flag_cycles_only_the_scope_but_lists_t
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
+        .spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
@@ -381,8 +381,7 @@ fn serve_models_flag_expands_a_glob_against_the_known_catalog() {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
+        .spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
@@ -451,8 +450,7 @@ fn serve_models_flag_pattern_level_suffix_pins_that_models_thinking_level_on_cyc
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
+        .spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
@@ -518,8 +516,7 @@ fn serve_models_flag_rejects_an_invalid_thinking_level_suffix_as_part_of_the_lit
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
+        .spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
@@ -542,7 +539,7 @@ fn serve_cycle_thinking_level_advances_through_the_ladder_and_wraps() {
     let (base, _bodies) = spawn_model_server(vec![]);
 
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
-    let mut child = serve_cmd(bin, &base, &session_file).spawn().unwrap();
+    let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
@@ -584,7 +581,7 @@ fn serve_set_reasoning_effort_sets_the_portable_level_directly() {
     let (base, _bodies) = spawn_model_server(vec![]);
 
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
-    let mut child = serve_cmd(bin, &base, &session_file).spawn().unwrap();
+    let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
@@ -647,7 +644,7 @@ fn serve_set_reasoning_effort_wins_over_a_stale_set_thinking_override() {
     let (base, _bodies) = spawn_model_server(vec![]);
 
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
-    let mut child = serve_cmd(bin, &base, &session_file).spawn().unwrap();
+    let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
@@ -693,9 +690,7 @@ fn serve_starts_clamped_not_off_for_a_model_that_cannot_disable_reasoning() {
     let (base, _bodies) = spawn_model_server(vec![]);
 
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
-    let mut child = serve_cmd_with_model(bin, &base, &session_file, "gpt-5-codex")
-        .spawn()
-        .unwrap();
+    let mut child = serve_cmd_with_model(bin, &base, &session_file, "gpt-5-codex").spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
@@ -727,9 +722,8 @@ fn serve_model_flag_off_suffix_starts_with_reasoning_off_not_the_medium_default(
     let (base, _bodies) = spawn_model_server(vec![]);
 
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
-    let mut child = serve_cmd_with_model(bin, &base, &session_file, "claude-haiku-4-5:off")
-        .spawn()
-        .unwrap();
+    let mut child =
+        serve_cmd_with_model(bin, &base, &session_file, "claude-haiku-4-5:off").spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
@@ -761,7 +755,7 @@ fn serve_set_model_reclamps_off_when_switching_onto_a_non_disableable_model() {
     // `set_reasoning_effort` so this test still exercises what it's actually about: `set_model`
     // re-clamping a stored *illegal* level (`Off`, on a model that can't disable reasoning) up to the
     // new model's own floor, not silently carrying it across the switch.
-    let mut child = serve_cmd(bin, &base, &session_file).spawn().unwrap();
+    let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
@@ -818,9 +812,7 @@ fn serve_cycle_thinking_level_never_gets_stuck_for_a_model_without_xhigh_or_off(
     let (base, _bodies) = spawn_model_server(vec![]);
 
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
-    let mut child = serve_cmd_with_model(bin, &base, &session_file, "gpt-5-codex")
-        .spawn()
-        .unwrap();
+    let mut child = serve_cmd_with_model(bin, &base, &session_file, "gpt-5-codex").spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
@@ -858,7 +850,7 @@ fn serve_switch_model_retargets_the_next_turn_of_an_in_flight_prompt() {
     let (base, bodies) = spawn_model_server(vec![turn1, turn_text("done")]);
 
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
-    let mut child = serve_cmd(bin, &base, &session_file).spawn().unwrap();
+    let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
@@ -917,7 +909,7 @@ fn serve_switch_model_while_idle_is_a_no_op_pointing_at_set_model() {
     let (base, bodies) = spawn_model_server(vec![]);
 
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
-    let mut child = serve_cmd(bin, &base, &session_file).spawn().unwrap();
+    let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
@@ -953,8 +945,7 @@ fn serve_max_tokens_flag_reaches_the_wire_request_and_survives_a_model_switch() 
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
     let mut child = serve_cmd(bin, &base, &session_file)
         .args(["--max-tokens", "777"])
-        .spawn()
-        .unwrap();
+        .spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
 

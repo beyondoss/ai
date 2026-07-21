@@ -12,14 +12,14 @@ use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 use common::{
-    ISOLATED_HOME, free_port, spawn_model_server, turn_text, turn_tool_use, wait_for_port,
-    ws_connect, ws_next_frame, ws_read_until_response, ws_send,
+    ChildGuard, ISOLATED_HOME, SpawnGuarded, free_port, spawn_model_server, turn_text,
+    turn_tool_use, wait_for_port, ws_connect, ws_next_frame, ws_read_until_response, ws_send,
 };
 use serde_json::json;
 
 /// Spawn a `serve --listen 127.0.0.1:<port>` child against `base` (the mock gateway), persisting
 /// per-session files under `session_dir`. In `--listen` mode stdio is unused, so null it.
-fn serve_ws_child(base: &str, session_dir: &str, port: u16) -> Child {
+fn serve_ws_child(base: &str, session_dir: &str, port: u16) -> ChildGuard {
     Command::new(env!("CARGO_BIN_EXE_beyond-ai-agent"))
         .args([
             "serve",
@@ -38,8 +38,7 @@ fn serve_ws_child(base: &str, session_dir: &str, port: u16) -> Child {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn serve --listen")
+        .spawn_guarded()
 }
 
 /// (i) DoD: a full session over the socket — `get_state` answers with a `session_id`, and a `prompt`

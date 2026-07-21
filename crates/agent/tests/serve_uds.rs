@@ -10,19 +10,19 @@
 mod common;
 
 use std::os::unix::fs::PermissionsExt;
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use common::{
-    ISOLATED_HOME, free_port, spawn_model_server, turn_text, wait_for_port, ws_connect,
-    ws_connect_uds, ws_read_until_response, ws_send,
+    ChildGuard, ISOLATED_HOME, SpawnGuarded, free_port, spawn_model_server, turn_text,
+    wait_for_port, ws_connect, ws_connect_uds, ws_read_until_response, ws_send,
 };
 use serde_json::json;
 
 /// Spawn `serve --listen-uds <sock>` (and optionally `--listen <tcp>`) against `base` (the mock
 /// gateway), persisting per-session files under `session_dir`. In listener mode stdio is unused, so
 /// null it.
-fn serve_uds_child(base: &str, session_dir: &str, sock: &str, tcp: Option<u16>) -> Child {
+fn serve_uds_child(base: &str, session_dir: &str, sock: &str, tcp: Option<u16>) -> ChildGuard {
     let mut c = Command::new(env!("CARGO_BIN_EXE_beyond-ai-agent"));
     c.args([
         "serve",
@@ -44,8 +44,7 @@ fn serve_uds_child(base: &str, session_dir: &str, sock: &str, tcp: Option<u16>) 
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn serve --listen-uds")
+        .spawn_guarded()
 }
 
 /// Block until the UDS at `path` accepts a connection, or panic after ~5s. The socket *file* appearing

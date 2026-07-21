@@ -15,7 +15,7 @@ mod common;
 use std::process::{Command, Stdio};
 
 use common::{
-    DEV_PUBKEY_B64, DEV_TOKEN, free_port, gateway_bin, spawn_model_server, turn_text,
+    DEV_PUBKEY_B64, DEV_TOKEN, SpawnGuarded, free_port, gateway_bin, spawn_model_server, turn_text,
     turn_tool_use, wait_for_port,
 };
 use serde_json::json;
@@ -56,8 +56,7 @@ fn agent_through_real_gateway_to_mock_upstream() {
         .env("AI_LOG", "warn")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn gateway");
+        .spawn_guarded();
     wait_for_port(gw_port);
 
     // Drive the agent through the gateway.

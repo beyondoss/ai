@@ -9,7 +9,7 @@ mod common;
 use std::io::{BufReader, Write};
 use std::process::Command;
 
-use common::{read_until_response, serve_cmd};
+use common::{SpawnGuarded, read_until_response, serve_cmd};
 use serde_json::{Value, json};
 
 /// A bogus, never-actually-contacted gateway URL — every test here only exercises the auth-store
@@ -40,9 +40,7 @@ fn auth_status_with_nothing_stored_reports_every_provider_logged_out() {
     let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
 
-    let mut child = serve_cmd_with_real_home(bin, &session_file, home.path())
-        .spawn()
-        .unwrap();
+    let mut child = serve_cmd_with_real_home(bin, &session_file, home.path()).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
@@ -73,9 +71,7 @@ fn auth_status_for_a_single_provider_reports_logged_in_when_a_non_expired_creden
     let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
 
-    let mut child = serve_cmd_with_real_home(bin, &session_file, home.path())
-        .spawn()
-        .unwrap();
+    let mut child = serve_cmd_with_real_home(bin, &session_file, home.path()).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
@@ -103,9 +99,7 @@ fn auth_status_for_an_unknown_provider_is_a_clean_error_not_a_crash() {
     let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
 
-    let mut child = serve_cmd_with_real_home(bin, &session_file, home.path())
-        .spawn()
-        .unwrap();
+    let mut child = serve_cmd_with_real_home(bin, &session_file, home.path()).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
@@ -141,9 +135,7 @@ fn logout_removes_a_stored_credential_and_is_idempotent() {
     let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
 
-    let mut child = serve_cmd_with_real_home(bin, &session_file, home.path())
-        .spawn()
-        .unwrap();
+    let mut child = serve_cmd_with_real_home(bin, &session_file, home.path()).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
@@ -185,9 +177,7 @@ fn login_acks_then_a_second_concurrent_login_is_rejected_then_abort_login_cancel
     let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
 
-    let mut child = serve_cmd_with_real_home(bin, &session_file, home.path())
-        .spawn()
-        .unwrap();
+    let mut child = serve_cmd_with_real_home(bin, &session_file, home.path()).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
@@ -215,11 +205,14 @@ fn login_acks_then_a_second_concurrent_login_is_rejected_then_abort_login_cancel
     )
     .unwrap();
     stdin.flush().unwrap();
-    let frames = read_until_response(&mut stdout, "login");
-    let rejection = frames
-        .iter()
-        .find(|v| v["type"] == "response" && v["id"] == "2")
-        .unwrap();
+    // Wait for id 2's response *specifically*, not merely the next `login` response. Two responses
+    // for command `login` are in flight here: id 1's own terminal result and id 2's rejection.
+    // `read_until_response` stops at whichever arrives first, so on a host where the first login
+    // resolves quickly — CI, where there is no network for it to sit waiting on, unlike a dev box
+    // where it stays pending — it returned id 1's frame and the `find` for id 2 unwrapped `None`.
+    // Same class of ordering assumption (and same fix) as the `abort_login` race handled below.
+    let rejection =
+        read_one_frame_matching(&mut stdout, |v| v["type"] == "response" && v["id"] == "2");
     assert_eq!(rejection["success"], false);
     assert!(
         rejection["error"]

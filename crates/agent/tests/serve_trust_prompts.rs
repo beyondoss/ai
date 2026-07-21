@@ -6,7 +6,7 @@ mod common;
 use std::io::{BufReader, Read, Write};
 use std::process::{Command, Stdio};
 
-use common::{read_until_response, serve_cmd, spawn_model_server, turn_text};
+use common::{SpawnGuarded, read_until_response, serve_cmd, spawn_model_server, turn_text};
 use serde_json::json;
 
 #[test]
@@ -21,7 +21,7 @@ fn serve_injects_project_instructions_into_system_prompt() {
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
     let mut cmd = serve_cmd(bin, &base, &session_file);
     cmd.current_dir(dir.path()); // CLAUDE.md is discovered relative to cwd
-    let mut child = cmd.spawn().unwrap();
+    let mut child = cmd.spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
@@ -52,7 +52,7 @@ fn serve_caches_the_static_system_prompt_until_reload() {
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
     let mut cmd = serve_cmd(bin, &base, &session_file);
     cmd.current_dir(dir.path());
-    let mut child = cmd.spawn().unwrap();
+    let mut child = cmd.spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
@@ -128,7 +128,7 @@ fn serve_gates_skills_and_prompts_on_project_trust() {
         let (base, _bodies) = spawn_model_server(vec![turn_text("ok")]);
         let mut cmd = serve_cmd(bin, &base, &session_file);
         cmd.current_dir(dir.path()).env("HOME", home.path());
-        let mut child = cmd.spawn().unwrap();
+        let mut child = cmd.spawn_guarded();
         let mut stdin = child.stdin.take().unwrap();
         let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
@@ -168,7 +168,7 @@ fn serve_gates_skills_and_prompts_on_project_trust() {
         cmd.arg("--trust-project")
             .current_dir(dir.path())
             .env("HOME", home.path());
-        let mut child = cmd.spawn().unwrap();
+        let mut child = cmd.spawn_guarded();
         let mut stdin = child.stdin.take().unwrap();
         let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
@@ -226,7 +226,7 @@ fn serve_force_untrusted_overrides_a_persisted_trust_grant() {
         let session_file = dir.path().join("s1.jsonl").to_string_lossy().into_owned();
         let mut cmd = serve_cmd(bin, &base, &session_file);
         cmd.current_dir(dir.path()).env("HOME", home.path());
-        let mut child = cmd.spawn().unwrap();
+        let mut child = cmd.spawn_guarded();
         let mut stdin = child.stdin.take().unwrap();
         let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
@@ -256,7 +256,7 @@ fn serve_force_untrusted_overrides_a_persisted_trust_grant() {
         cmd.arg("--force-untrusted")
             .current_dir(dir.path())
             .env("HOME", home.path());
-        let mut child = cmd.spawn().unwrap();
+        let mut child = cmd.spawn_guarded();
         let mut stdin = child.stdin.take().unwrap();
         let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
@@ -306,7 +306,7 @@ fn serve_untrusted_project_still_advertises_and_invokes_a_user_global_skill() {
     let mut cmd = serve_cmd(bin, &base, &session_file);
     // No --trust-project: the project is untrusted.
     cmd.current_dir(dir.path()).env("HOME", home.path());
-    let mut child = cmd.spawn().unwrap();
+    let mut child = cmd.spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
@@ -369,7 +369,7 @@ fn serve_get_commands_reports_a_cross_root_skill_collision() {
     cmd.arg("--trust-project")
         .current_dir(dir.path())
         .env("HOME", home.path());
-    let mut child = cmd.spawn().unwrap();
+    let mut child = cmd.spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
@@ -449,7 +449,7 @@ fn serve_get_commands_reports_scope_and_path_per_entry() {
     cmd.arg("--trust-project")
         .current_dir(dir.path())
         .env("HOME", home.path());
-    let mut child = cmd.spawn().unwrap();
+    let mut child = cmd.spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
@@ -510,7 +510,7 @@ fn serve_get_commands_reports_the_prompt_templates_own_description_not_its_argum
     cmd.arg("--trust-project")
         .current_dir(dir.path())
         .env("HOME", home.path());
-    let mut child = cmd.spawn().unwrap();
+    let mut child = cmd.spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
@@ -553,7 +553,7 @@ fn serve_warns_on_stderr_when_an_untrusted_projects_gated_resources_are_skipped(
     let mut cmd = serve_cmd(bin, &base, &session_file);
     cmd.current_dir(dir.path());
     cmd.stderr(Stdio::piped());
-    let mut child = cmd.spawn().unwrap();
+    let mut child = cmd.spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
 

@@ -8,7 +8,7 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use common::{
-    read_until_response, run_cmd, serve_cmd, spawn_model_server, sse, turn_text,
+    SpawnGuarded, read_until_response, run_cmd, serve_cmd, spawn_model_server, sse, turn_text,
     turn_text_responses, turn_tool_use,
 };
 use serde_json::json;
@@ -781,8 +781,7 @@ fn serve_binary_reasoning_effort_off_flag_starts_with_reasoning_off_not_the_medi
     // `--reasoning-effort off` on top of `serve_cmd`'s own args, never a second `--model`.
     let mut child = serve_cmd(bin, &base, &session_file)
         .args(["--reasoning-effort", "off"])
-        .spawn()
-        .expect("spawn binary");
+        .spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
 

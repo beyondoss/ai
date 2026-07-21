@@ -6,7 +6,8 @@ mod common;
 use std::io::{BufRead, BufReader, Write};
 
 use common::{
-    read_until_response, serve_cmd, spawn_model_server, turn_refusal, turn_text, turn_tool_use,
+    SpawnGuarded, read_until_response, serve_cmd, spawn_model_server, turn_refusal, turn_text,
+    turn_tool_use,
 };
 use serde_json::{Value, json};
 
@@ -31,7 +32,7 @@ fn serve_follow_up_steers_an_in_flight_run() {
     ]);
 
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
-    let mut child = serve_cmd(bin, &base, &session_file).spawn().unwrap();
+    let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
@@ -95,7 +96,7 @@ fn serve_stop_after_turn_ends_the_run_after_the_current_tool_call_completes() {
     ]);
 
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
-    let mut child = serve_cmd(bin, &base, &session_file).spawn().unwrap();
+    let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
@@ -163,7 +164,7 @@ fn serve_stop_after_turn_is_a_no_op_ack_when_idle() {
     ]);
 
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
-    let mut child = serve_cmd(bin, &base, &session_file).spawn().unwrap();
+    let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
@@ -205,7 +206,7 @@ fn serve_prompt_ack_arrives_before_the_first_event_frame() {
     let (base, _bodies) = spawn_model_server(vec![turn_text("done")]);
 
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
-    let mut child = serve_cmd(bin, &base, &session_file).spawn().unwrap();
+    let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
@@ -258,7 +259,7 @@ fn serve_busy_prompt_with_streaming_behavior_is_accepted_not_rejected() {
     ]);
 
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
-    let mut child = serve_cmd(bin, &base, &session_file).spawn().unwrap();
+    let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
@@ -342,7 +343,7 @@ fn serve_follow_up_queued_while_idle_is_picked_up_by_next_prompt() {
     ]);
 
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
-    let mut child = serve_cmd(bin, &base, &session_file).spawn().unwrap();
+    let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
@@ -408,7 +409,7 @@ fn serve_follow_up_expands_a_skill_invocation_while_idle() {
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
     let mut cmd = serve_cmd(bin, &base, &session_file);
     cmd.arg("--trust-project").current_dir(dir.path());
-    let mut child = cmd.spawn().unwrap();
+    let mut child = cmd.spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
@@ -481,7 +482,7 @@ fn serve_mid_run_steer_expands_a_skill_invocation() {
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
     let mut cmd = serve_cmd(bin, &base, &session_file);
     cmd.arg("--trust-project").current_dir(dir.path());
-    let mut child = cmd.spawn().unwrap();
+    let mut child = cmd.spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
@@ -530,7 +531,7 @@ fn serve_follow_up_carries_image_attachments_to_the_model() {
         spawn_model_server(vec![turn_text("first answer"), turn_text("saw the image")]);
 
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
-    let mut child = serve_cmd(bin, &base, &session_file).spawn().unwrap();
+    let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
@@ -594,7 +595,7 @@ fn serve_no_skills_prevents_discovery_and_leaves_an_invocation_unexpanded() {
     let mut cmd = serve_cmd(bin, &base, &session_file);
     cmd.args(["--trust-project", "--no-skills"])
         .current_dir(dir.path());
-    let mut child = cmd.spawn().unwrap();
+    let mut child = cmd.spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
@@ -647,7 +648,7 @@ fn serve_no_prompt_templates_prevents_discovery_and_leaves_an_invocation_unexpan
     let mut cmd = serve_cmd(bin, &base, &session_file);
     cmd.args(["--trust-project", "--no-prompt-templates"])
         .current_dir(dir.path());
-    let mut child = cmd.spawn().unwrap();
+    let mut child = cmd.spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
@@ -704,7 +705,7 @@ fn serve_default_queue_mode_drains_queued_follow_ups_one_at_a_time() {
     ]);
 
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
-    let mut child = serve_cmd(bin, &base, &session_file).spawn().unwrap();
+    let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
@@ -758,7 +759,7 @@ fn serve_set_queue_mode_all_folds_queued_follow_ups_into_one_injection() {
         spawn_model_server(vec![turn_text("first answer"), turn_text("answered both")]);
 
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
-    let mut child = serve_cmd(bin, &base, &session_file).spawn().unwrap();
+    let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
@@ -813,7 +814,7 @@ fn serve_steering_mode_and_follow_up_mode_are_independent_rpc_settings() {
     let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
     let (base, _bodies) = spawn_model_server(vec![]);
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
-    let mut child = serve_cmd(bin, &base, &session_file).spawn().unwrap();
+    let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
@@ -882,7 +883,7 @@ fn serve_refusal_ends_the_run_without_draining_steering() {
     ]);
 
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
-    let mut child = serve_cmd(bin, &base, &session_file).spawn().unwrap();
+    let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
@@ -966,7 +967,7 @@ fn serve_abort_cancels_an_in_flight_prompt() {
     let (base, _bodies) = spawn_model_server(vec![turn1]);
 
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
-    let mut child = serve_cmd(bin, &base, &session_file).spawn().unwrap();
+    let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
@@ -1024,7 +1025,7 @@ fn serve_bare_prompt_while_busy_is_rejected_not_queued() {
     let (base, _bodies) = spawn_model_server(vec![turn1, turn_text("done")]);
 
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
-    let mut child = serve_cmd(bin, &base, &session_file).spawn().unwrap();
+    let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
 

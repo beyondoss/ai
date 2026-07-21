@@ -9,12 +9,12 @@
 mod common;
 
 use std::io::{BufRead, BufReader, Write};
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{ChildStdin, Command, Stdio};
 use std::time::Duration;
 
 use common::{
-    ISOLATED_HOME, free_port, read_until_response, spawn_model_server, turn_text, turn_tool_use,
-    wait_for_port, ws_connect, ws_next_frame, ws_send,
+    ChildGuard, ISOLATED_HOME, SpawnGuarded, free_port, read_until_response, spawn_model_server,
+    turn_text, turn_tool_use, wait_for_port, ws_connect, ws_next_frame, ws_send,
 };
 use serde_json::{Value, json};
 
@@ -23,7 +23,7 @@ const BIN: &str = env!("CARGO_BIN_EXE_beyond-ai-agent");
 // ---- harness ---------------------------------------------------------------------------------------
 
 /// A stdio `serve` child with an approval gate installed.
-fn serve_approving(base: &str, session_file: &str, extra: &[&str]) -> Child {
+fn serve_approving(base: &str, session_file: &str, extra: &[&str]) -> ChildGuard {
     Command::new(BIN)
         .args([
             "serve",
@@ -41,8 +41,7 @@ fn serve_approving(base: &str, session_file: &str, extra: &[&str]) -> Child {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn serve")
+        .spawn_guarded()
 }
 
 fn send(stdin: &mut ChildStdin, cmd: Value) {
@@ -81,7 +80,7 @@ fn approve(stdin: &mut ChildStdin, request_id: &str, decision: &str, scope: &str
     );
 }
 
-fn kill(mut child: Child) {
+fn kill(mut child: ChildGuard) {
     let _ = child.kill();
     let _ = child.wait();
 }
@@ -588,7 +587,7 @@ fn two_gated_calls_in_one_turn_are_asked_about_one_at_a_time() {
 
 // ---- multi-attach, over the real WebSocket transport ------------------------------------------------
 
-fn serve_ws_approving(base: &str, session_dir: &str, port: u16, extra: &[&str]) -> Child {
+fn serve_ws_approving(base: &str, session_dir: &str, port: u16, extra: &[&str]) -> ChildGuard {
     Command::new(BIN)
         .args([
             "serve",
@@ -608,8 +607,7 @@ fn serve_ws_approving(base: &str, session_dir: &str, port: u16, extra: &[&str]) 
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn serve --listen")
+        .spawn_guarded()
 }
 
 /// A WebSocket client that *buffers* frames it wasn't looking for.

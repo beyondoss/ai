@@ -14,7 +14,9 @@ mod common;
 use std::io::{BufReader, Write};
 use std::process::{Command, Stdio};
 
-use common::{read_until_response, spawn_model_server, turn_text, turn_text_responses};
+use common::{
+    SpawnGuarded, read_until_response, spawn_model_server, turn_text, turn_text_responses,
+};
 use serde_json::json;
 
 fn write_auth_json(home: &std::path::Path, body: &str) {
@@ -84,8 +86,7 @@ fn set_model_across_oauth_providers_rederives_credential_and_routing() {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
+        .spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
 

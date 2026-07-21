@@ -9,7 +9,7 @@ mod common;
 
 use std::io::{BufReader, Write};
 
-use common::{read_until_response, serve_cmd, spawn_model_server, turn_text};
+use common::{SpawnGuarded, read_until_response, serve_cmd, spawn_model_server, turn_text};
 use serde_json::json;
 
 /// A tiny valid PNG (standard base64), reused verbatim as the RPC `images[].data` field — doesn't need
@@ -34,8 +34,7 @@ fn serve_rpc_prompt_pushed_image_is_downgraded_at_the_wire_when_block_images_is_
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
     let mut child = serve_cmd(bin, &base, &session_file)
         .args(["--block-images"])
-        .spawn()
-        .unwrap();
+        .spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
@@ -88,7 +87,7 @@ fn serve_persisted_image_is_downgraded_on_resend_once_block_images_is_toggled_on
 
     // First process: no `--block-images` — the image is ingested and persisted as-is.
     {
-        let mut child = serve_cmd(bin, &base, &session_file).spawn().unwrap();
+        let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
         let mut stdin = child.stdin.take().unwrap();
         let mut stdout = BufReader::new(child.stdout.take().unwrap());
         writeln!(
@@ -124,8 +123,7 @@ fn serve_persisted_image_is_downgraded_on_resend_once_block_images_is_toggled_on
     {
         let mut child = serve_cmd(bin, &base, &session_file)
             .args(["--block-images"])
-            .spawn()
-            .unwrap();
+            .spawn_guarded();
         let mut stdin = child.stdin.take().unwrap();
         let mut stdout = BufReader::new(child.stdout.take().unwrap());
         writeln!(
@@ -169,7 +167,7 @@ fn serve_set_block_images_toggles_and_rejects_a_non_boolean() {
     let (base, _bodies) = spawn_model_server(vec![]);
 
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
-    let mut child = serve_cmd(bin, &base, &session_file).spawn().unwrap();
+    let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
@@ -222,7 +220,7 @@ fn serve_set_block_images_true_downgrades_a_persisted_image_mid_session_without_
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
 
     // No `--block-images` — the image is ingested and sent to the wire as-is.
-    let mut child = serve_cmd(bin, &base, &session_file).spawn().unwrap();
+    let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
     writeln!(
