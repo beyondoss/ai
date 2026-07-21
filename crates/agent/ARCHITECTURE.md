@@ -1427,8 +1427,13 @@ and `serve`'s own `bash`/`abort_bash` RPC commands reuse `RealRunner` directly, 
   genuine truncation, not an in-flight boundary. The combined text is run through output hygiene — ANSI/OSC escape
   stripping and C0 control-char sanitizing so terminal/binary noise can't corrupt the model's context —
   before either an `(no output)` placeholder (success, genuinely silent) or an appended status line
-  (`"Command exited with code N"` / `"Command timed out after Ns"` / `"Command cancelled"`, all but the
-  success case with no placeholder glued in front). A timeout and a cancellation both route through the
+  (`"Command exited with code N"` / `"Command was killed by SIGKILL (9) …"` / `"Command timed out after Ns"` /
+  `"Command cancelled"`, all but the success case with no placeholder glued in front). Only an exit code of
+  literally `0` is success: `ExitStatus::code()` is `None` for a signal-terminated process, so `ExecResult`
+  carries the signal alongside the code (`exec::exit_signal`, Unix-only) and `bash` reports it as a failure
+  naming the signal. Previously that `None` shared an arm with `Some(0)` and an OOM-killed build, a SIGSEGV,
+  or a SIGTERM'd server all reported **success** to the model — silently, with `(no output)` standing in for
+  the output the command never got to produce. A timeout and a cancellation both route through the
   same `GroupKillGuard`, so a backgrounded grandchild process can't outlive either. Cancellation is
   cooperative, not just an external `Drop`: `exec` races the runner future against the call's own
   `ToolProgress::cancelled()` (the same `CancellationToken` a caller like `serve`'s `abort_bash` trips),

@@ -969,6 +969,15 @@ impl StreamDecoder for Decoder {
         if parsed.usage.as_ref().is_some_and(|u| !u.is_null()) {
             return None;
         }
+        // The turn's content is frozen once `finish_reason` has landed — see `push`'s own guard for
+        // why (a gateway replaying what it already streamed). This lane needs the check independently:
+        // a replayed *text* chunk carries no `tool_calls` and no non-null `finish_reason`, so it is
+        // exactly the steady-state shape this fast path matches, and it would otherwise append the
+        // answer to itself without `push` ever being consulted. Placed below the usage check above so a
+        // trailing `include_usage` chunk still falls through to `push`'s accounting, same as ever.
+        if self.saw_finish {
+            return Some(Vec::new());
+        }
         // Exactly one choice, matching the single-choice assumption `push` itself already makes
         // (`choices.get(0)`) — zero choices is the trailing usage-only chunk (handled above/by the
         // slow path), more than one is outside what this harness ever requests.
@@ -1053,6 +1062,29 @@ impl StreamDecoder for Decoder {
                 .and_then(Value::as_u64)
                 .map_or(0, super::saturating_u32);
             out.push(StreamEvent::Usage(self.usage));
+        }
+
+        // Everything below this point is *content* for the turn — reasoning, text, tool calls, and the
+        // `finish_reason` that closes them. Once `finish_reason` has already landed, the turn's content
+        // is complete by definition, so a later chunk carrying more of it is not new content: it's a
+        // gateway/aggregator replaying what it just streamed (observed: the assembled `tool_calls` array
+        // resent verbatim after the terminal chunk). Replaying it is actively harmful rather than merely
+        // redundant, because `close_tools` has already drained `open_tools` while `next_tool_index` keeps
+        // counting — so a replayed call matches nothing, opens at a *fresh* index, and reaches the
+        // session as a second `tool_use` block carrying the same wire `id`. Nothing downstream dedupes
+        // by id (`Agent::run_events_steered` collects straight from `Message::tool_uses()`), so that
+        // second block is dispatched and physically executed a second time.
+        //
+        // Deliberately placed *below* the usage block above, not at the top of `push`: OpenAI's own
+        // `stream_options.include_usage` (set unconditionally in `build_body`) delivers the turn's real
+        // token usage in a trailing `choices: []` chunk that arrives *after* `finish_reason` by design.
+        // That chunk must keep being accepted — only content is frozen here, not accounting.
+        //
+        // The `finish_reason` arm below stays behind this guard too: a replayed terminal chunk would
+        // otherwise re-run `close_text_or_thinking`/`close_tools` and emit a second `ContentBlockStop`
+        // for blocks already closed.
+        if self.saw_finish {
+            return out;
         }
 
         let Some(choice) = choice else {
@@ -2163,6 +2195,107 @@ data: [DONE]
                 },
             ]
         );
+    }
+
+    #[test]
+    fn a_tool_calls_array_replayed_after_finish_reason_does_not_open_a_second_call() {
+        // Found live: a gateway/aggregator that streams tool-call deltas *and then* replays the
+        // assembled `tool_calls` array in a well-formed chunk after the terminal one. Nothing stops
+        // decoding at `finish_reason` (`run_turn_once` reads until the byte stream ends, and
+        // `push_sse_line` consults `is_terminal()` only to tolerate *non-JSON* trailing noise), so that
+        // replay used to reach `push` as ordinary content. `close_tools` had already drained
+        // `open_tools` while `next_tool_index` kept counting, so the replayed call matched no open call,
+        // opened at a fresh index, and became a *second* `tool_use` block carrying the same wire `id` —
+        // which `Agent::run_events_steered` then dispatched and physically executed a second time
+        // (nothing downstream dedupes by id). The user-visible symptom was a tool running twice, with
+        // both runs succeeding.
+        const REPLAY_AFTER_FINISH: &str = r#"
+data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_42","type":"function","function":{"name":"bash","arguments":""}}]},"finish_reason":null}]}
+
+data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"command\":\"ls\"}"}}]},"finish_reason":null}]}
+
+data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}
+
+data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_42","type":"function","function":{"name":"bash","arguments":"{\"command\":\"ls\"}"}}]}}]}
+
+data: [DONE]
+"#;
+        let mut dec = Decoder::default();
+        let events = decode_sse(&mut dec, REPLAY_AFTER_FINISH).unwrap();
+        assert_eq!(
+            events,
+            vec![
+                StreamEvent::MessageStart,
+                StreamEvent::ToolUseStart {
+                    index: 0,
+                    id: "call_42".into(),
+                    name: "bash".into(),
+                },
+                StreamEvent::InputJsonDelta {
+                    index: 0,
+                    partial_json: "{\"command\":\"ls\"}".into(),
+                },
+                StreamEvent::ContentBlockStop { index: 0 },
+                StreamEvent::MessageStop {
+                    stop_reason: StopReason::ToolUse
+                },
+            ],
+            "the replayed call must be ignored outright — one wire call, one `tool_use` block"
+        );
+    }
+
+    #[test]
+    fn text_replayed_after_finish_reason_is_ignored_too() {
+        // Same guard, non-tool shape: a replayed content chunk must not append the answer to itself.
+        const REPLAY_AFTER_FINISH: &str = r#"
+data: {"choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":null}]}
+
+data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+data: {"choices":[{"index":0,"delta":{"content":"hi"}}]}
+
+data: [DONE]
+"#;
+        let mut dec = Decoder::default();
+        let events = decode_sse(&mut dec, REPLAY_AFTER_FINISH).unwrap();
+        let text: String = events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::TextDelta { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, "hi", "the replayed text must not be appended twice");
+    }
+
+    #[test]
+    fn the_trailing_usage_only_chunk_after_finish_reason_is_still_accepted() {
+        // The post-terminal content guard must NOT swallow this: `build_body` sets
+        // `stream_options.include_usage`, whose whole contract is that the turn's real token usage
+        // arrives in a `choices: []` chunk *after* `finish_reason`. Only content is frozen at the
+        // terminal event, not accounting — placing the guard above the usage block would silently zero
+        // out every OpenAI-dialect turn's usage (and with it compaction's own pressure signal).
+        const USAGE_AFTER_FINISH: &str = r#"
+data: {"choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":null}]}
+
+data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+data: {"choices":[],"usage":{"prompt_tokens":11,"completion_tokens":3}}
+
+data: [DONE]
+"#;
+        let mut dec = Decoder::default();
+        let events = decode_sse(&mut dec, USAGE_AFTER_FINISH).unwrap();
+        let usage = events
+            .iter()
+            .rev()
+            .find_map(|e| match e {
+                StreamEvent::Usage(u) => Some(*u),
+                _ => None,
+            })
+            .expect("the trailing usage chunk must still produce a Usage event");
+        assert_eq!(usage.input_tokens, 11);
+        assert_eq!(usage.output_tokens, 3);
     }
 
     #[test]

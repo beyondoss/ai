@@ -1858,22 +1858,37 @@ impl Agent {
                 cancelled_mid_dispatch = true;
                 break;
             }
+            // Every arm that resolves a call without running it must still emit that call's `ToolEnd`
+            // before moving on. `ToolStart` was already emitted for this whole batch, up front, by
+            // `run_events_steered` (see this function's own doc comment on why this path deliberately
+            // emits none of its own) — so a gate-resolved call that returns here without an end leaves
+            // any client pairing the two events with a tool that started and never finished, hung
+            // forever in the UI even though the run moved on and the model got its error result.
             if let Some(raw) = malformed.get(id) {
-                results[i] = Some((
-                    format!(
-                        "tool call arguments were not valid JSON and could not be parsed: {raw}"
-                    ),
-                    Vec::new(),
-                    true,
-                    false,
-                ));
+                let message = format!(
+                    "tool call arguments were not valid JSON and could not be parsed: {raw}"
+                );
+                sink(AgentEvent::ToolEnd {
+                    id: id.clone(),
+                    name: name.clone(),
+                    result: message.clone(),
+                    is_error: true,
+                });
+                results[i] = Some((message, Vec::new(), true, false));
                 continue;
             }
             // Pi-parity fix: same "look up the tool first" fix as the default gate loop above (see its
             // own doc comment for the pi `agent-loop.ts` citation) — an unregistered tool name resolves
             // straight to the "unknown tool" error result, before coercion or `before_tool_call` run.
             let Some(tool) = tools.get(name) else {
-                results[i] = Some((format!("unknown tool: {name}"), Vec::new(), true, false));
+                let message = format!("unknown tool: {name}");
+                sink(AgentEvent::ToolEnd {
+                    id: id.clone(),
+                    name: name.clone(),
+                    result: message.clone(),
+                    is_error: true,
+                });
+                results[i] = Some((message, Vec::new(), true, false));
                 continue;
             };
             // Same pi-parity coercion as the default gate loop, run *before* `before_tool_call` (matches
@@ -1898,12 +1913,14 @@ impl Agent {
                 Err(panic_msg) => Some(panic_msg),
             };
             if let Some(reason) = blocked {
-                results[i] = Some((
-                    format!("tool call blocked: {reason}"),
-                    Vec::new(),
-                    true,
-                    false,
-                ));
+                let message = format!("tool call blocked: {reason}");
+                sink(AgentEvent::ToolEnd {
+                    id: id.clone(),
+                    name: name.clone(),
+                    result: message.clone(),
+                    is_error: true,
+                });
+                results[i] = Some((message, Vec::new(), true, false));
                 continue;
             }
             // Same Task #3 fix as the default gate loop: re-check cancellation after the hook
@@ -5173,6 +5190,86 @@ mod tests {
             end_order,
             vec!["f".to_string(), "s".to_string()],
             "ToolEnd must stream in actual finish order (fast, then slow), not call order: {end_order:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn every_tool_start_gets_a_tool_end_on_the_interleaved_path_even_when_gate_resolved() {
+        // `run_tool_calls_interleaved`'s three gate-resolution arms (malformed streamed arguments, an
+        // unregistered tool name, a `before_tool_call` block) each produced a result and `continue`d
+        // without ever emitting that call's `ToolEnd` — while `ToolStart` had already gone out for the
+        // whole batch up front. Any client pairing the two saw the call start and never finish.
+        // Exercised through the unknown-tool arm, with a `Sequential` tool in the same batch because a
+        // single sequential-requesting call is what reroutes the *entire* batch onto this path.
+        struct SequentialTool;
+        #[async_trait]
+        impl Tool for SequentialTool {
+            fn name(&self) -> &str {
+                "seq"
+            }
+            fn description(&self) -> &str {
+                "runs on the interleaved path"
+            }
+            fn input_schema(&self) -> Value {
+                json!({ "type": "object" })
+            }
+            fn execution_mode(&self) -> Option<crate::tool::ToolExecutionMode> {
+                Some(crate::tool::ToolExecutionMode::Sequential)
+            }
+            async fn run(
+                &self,
+                _: Value,
+            ) -> std::result::Result<crate::tool::ToolOutput, crate::error::ToolError> {
+                Ok("seq-done".into())
+            }
+        }
+
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(SequentialTool));
+
+        let calls = vec![
+            StreamEvent::MessageStart,
+            StreamEvent::ToolUseStart {
+                index: 0,
+                id: "ok".into(),
+                name: "seq".into(),
+            },
+            StreamEvent::ContentBlockStop { index: 0 },
+            StreamEvent::ToolUseStart {
+                index: 0,
+                id: "nope".into(),
+                name: "does_not_exist".into(),
+            },
+            StreamEvent::ContentBlockStop { index: 0 },
+            StreamEvent::MessageStop {
+                stop_reason: StopReason::ToolUse,
+            },
+        ];
+        let (agent, _mock) = agent_with(vec![calls, turn::text("done")], tools);
+        let mut session = Session::new();
+        session.user("go");
+
+        let mut started: Vec<String> = Vec::new();
+        let mut ended: Vec<String> = Vec::new();
+        agent
+            .run_events(&mut session, |ev| match ev {
+                AgentEvent::ToolStart { id, .. } => started.push(id),
+                AgentEvent::ToolEnd { id, .. } => ended.push(id),
+                _ => {}
+            })
+            .await
+            .unwrap();
+
+        started.sort();
+        ended.sort();
+        assert_eq!(
+            started,
+            vec!["nope".to_string(), "ok".to_string()],
+            "both calls must be announced"
+        );
+        assert_eq!(
+            ended, started,
+            "every announced call must also report an end — the unknown-tool call included"
         );
     }
 
