@@ -3743,6 +3743,48 @@ pub(crate) async fn serve_session(
                     // to swap `persistence` out from under it.
                     while checkpoint_rx.try_recv().is_ok() {}
 
+                    // Whether this attempt is about to be retried. Decided *here*, before the persist
+                    // below, and reused verbatim as the retry arm's own guard — the two must not be
+                    // able to disagree, because the closing error record has to be dropped on the same
+                    // side of the persist in memory as it is on disk.
+                    let will_retry = matches!(&attempt_result, Err(e)
+                        if current_auto_retry
+                            && stdin_open
+                            && !cancel.is_cancelled()
+                            && retry_attempt < run_retry_policy.max_retries
+                            && crate::retry::is_retryable_whole_run(e));
+
+                    // The failed attempt's closing error record (`run_events_steered` always pushes one
+                    // on an `Err`-ending run) must not survive into the retry — this is the *same* run
+                    // resuming from scratch, not a client's own fresh prompt, so it has to be genuinely
+                    // invisible in the transcript rather than stacked under the retry's real response.
+                    //
+                    // Popped *before* the persist below, not after it. `SessionStore::append_new` is
+                    // keyed on a count (`messages.len() <= self.persisted` skips, and each append sets
+                    // `persisted = messages.len()`), so it has no way to notice the message list got
+                    // *shorter*: persisting N+1 messages and then shrinking to N desynced the two for
+                    // the rest of the session. The retry re-produced the assistant message, `len` was
+                    // back to N+1, the append early-returned, and that message was silently **never
+                    // written** — with the following `tool_result` then chaining onto the error record's
+                    // node instead. Nothing reconciles a shrink (`rewrite` is only reachable via
+                    // compaction/fork/branch), and the existing e2e coverage missed it entirely by
+                    // asserting against the live in-memory transcript rather than a reload.
+                    //
+                    // Kept rather than dropped: if the retry is cancelled during its backoff below, this
+                    // run ends here after all, and the record has to go back — it is the only thing
+                    // keeping the session's role alternation valid for whatever prompt comes next (see
+                    // `a_prompt_after_a_failed_run_does_not_double_push_a_user_turn` in `agent_core`;
+                    // there is no guard against a double-pushed `user` turn anywhere else).
+                    let mut withheld_error_record = None;
+                    if will_retry {
+                        withheld_error_record = session
+                            .messages
+                            .last()
+                            .filter(|m| m.error_message.is_some())
+                            .cloned();
+                        session.pop_error_record();
+                    }
+
                     // Persist whatever this attempt produced (even a failed one may have committed a tool
                     // round-trip or two before the error) before deciding whether to retry.
                     let compacted_tokens_before = match tokens_before.load(Ordering::Relaxed) {
@@ -3758,13 +3800,7 @@ pub(crate) async fn serve_session(
                     }
 
                     match &attempt_result {
-                        Err(e)
-                            if current_auto_retry
-                                && stdin_open
-                                && !cancel.is_cancelled()
-                                && retry_attempt < run_retry_policy.max_retries
-                                && crate::retry::is_retryable_whole_run(e) =>
-                        {
+                        Err(e) if will_retry => {
                             retry_attempt += 1;
                             let delay = run_retry_policy.backoff(retry_attempt);
                             let _ = out_tx.send(auto_retry_frame(
@@ -3843,6 +3879,23 @@ pub(crate) async fn serve_session(
                                 }
                             }
                             if retry_cancelled {
+                                // No retry after all — this run ends on the attempt that just failed,
+                                // so the closing error record withheld above has to go back, in memory
+                                // *and* on disk. Without it the session's last message is the user's own
+                                // unanswered prompt, and the next `prompt` would stack a second
+                                // consecutive `user` turn, a shape no dialect accepts. A plain append
+                                // (never a compacted rewrite): any compaction this attempt performed was
+                                // already written by the persist above, and this only adds one message
+                                // on top of it.
+                                if let Some(record) = withheld_error_record.take() {
+                                    session.push(record);
+                                    let (p, r) =
+                                        persist_blocking(persistence, session.clone(), None).await;
+                                    persistence = p;
+                                    if let Err(e) = r {
+                                        persist_error = Some(e.to_string());
+                                    }
+                                }
                                 let _ = out_tx.send(auto_retry_end_frame(
                                     id.clone(),
                                     false,
@@ -3851,12 +3904,6 @@ pub(crate) async fn serve_session(
                                 ));
                                 break 'retry attempt_result;
                             }
-                            // The failed attempt's closing error record (`run_events_steered` always
-                            // persists one on an `Err`-ending run — see `Message::error`'s doc comment)
-                            // must not survive into the retry: this is the *same* run resuming from
-                            // scratch, not a client's own fresh prompt, so it needs to be genuinely
-                            // invisible in the transcript, not stacked under the retry's real response.
-                            session.pop_error_record();
                             continue 'retry;
                         }
                         _ => {

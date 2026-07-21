@@ -791,7 +791,16 @@ The harness layers several capabilities over the bare tools + loop:
   disconnect or an explicit `abort` (redundant with `is_retryable_whole_run` already excluding
   `Error::Cancelled` transitively, but checked explicitly too). Each attempt persists whatever it
   produced (even a failed one may have committed a
-  tool round-trip before erroring) before deciding whether to retry, and emits an unsolicited
+  tool round-trip before erroring) before deciding whether to retry — but the retry decision is made
+  _first_, and when a retry is coming the attempt's closing error record is withheld from that persist
+  and held aside, because `SessionStore::append_new` is keyed on a message **count** and so cannot
+  observe the list getting shorter. Persisting the record and only then popping it in memory desynced
+  the two permanently: the retry re-produced the assistant message, `len` was back to what had already
+  been persisted, the append early-returned, and the recovered turn was never written at all — with the
+  following `tool_result` chaining onto the error record's node instead. If the retry is then cancelled
+  during its backoff, the withheld record is pushed back and re-persisted (a plain append), since it is
+  the only thing keeping role alternation valid for the next `prompt`. Each attempt also emits an
+  unsolicited
   `auto_retry_start` frame (matching pi's own wire discriminator — this crate previously emitted a bare
   `auto_retry`) just before its backoff sleep so a client can distinguish "still working, retrying
   a hiccup" from silence. The backoff sleep _is_ raced — against `abort`/`abort_retry`/shutdown, via a

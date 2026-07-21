@@ -793,6 +793,89 @@ fn serve_auto_retries_a_whole_run_after_mid_stream_retry_is_exhausted() {
 }
 
 #[test]
+fn serve_persists_the_retried_attempts_assistant_message_not_only_in_memory() {
+    // Regression: `serve` persisted the failed attempt — closing error record and all — and only
+    // *then* popped that record from `session` in memory, without telling `Persistence`.
+    // `SessionStore::append_new` is keyed on a count (`messages.len() <= self.persisted` skips, and
+    // each append sets `persisted = messages.len()`), so it cannot observe the list getting shorter:
+    // the retry re-produced the assistant message, `len` was back to what had already been persisted,
+    // the append early-returned, and the recovered turn was **never written to disk**.
+    //
+    // Every existing whole-run-retry test misses this by asserting against the live in-memory
+    // transcript via `get_messages` on the *same* process. This one reloads the session file in a
+    // second `serve` — the real `SessionStore::open` path, which rebuilds the transcript by walking
+    // parent pointers from the resolved tip — so an unwritten message actually shows up as missing.
+    let truncated = "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n";
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
+    let (base, _bodies) = spawn_model_server(vec![
+        truncated.to_string(),
+        truncated.to_string(),
+        truncated.to_string(),
+        truncated.to_string(),
+        turn_text("recovered"),
+    ]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let mut child = serve_cmd(bin, &base, &session_file).spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    writeln!(stdin, "{}", json!({ "type": "prompt", "message": "hi" })).unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "prompt");
+    assert_eq!(
+        frames.last().unwrap()["success"],
+        true,
+        "the retried attempt must succeed: {frames:#?}"
+    );
+
+    // In-memory view — what the old tests already covered, kept here so a regression is unambiguously
+    // about *persistence* rather than the run itself.
+    writeln!(stdin, "{}", json!({ "type": "get_messages" })).unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "get_messages");
+    let in_memory = frames.last().unwrap()["data"]["messages"].clone();
+    assert!(
+        in_memory.to_string().contains("recovered"),
+        "in-memory transcript lost the recovered turn: {in_memory}"
+    );
+
+    drop(stdin);
+    child.wait().unwrap();
+
+    // Reload the very same session file in a fresh process and ask again.
+    let mut child = serve_cmd(bin, &base, &session_file).spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    writeln!(stdin, "{}", json!({ "type": "get_messages" })).unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "get_messages");
+    let reloaded = frames.last().unwrap()["data"]["messages"].clone();
+    let dump = reloaded.to_string();
+
+    assert!(
+        dump.contains("recovered"),
+        "the retried attempt's assistant message never reached disk — reloaded transcript is \
+         {dump}, in-memory was {in_memory}"
+    );
+    assert_eq!(
+        reloaded, in_memory,
+        "the reloaded transcript must match what the live session held"
+    );
+    // The withheld error record must not have been resurrected by the reload either: a retry that
+    // succeeded leaves exactly the user turn and the recovered assistant turn.
+    assert_eq!(
+        reloaded.as_array().unwrap().len(),
+        2,
+        "expected [user, assistant(recovered)] on disk, got: {dump}"
+    );
+
+    drop(stdin);
+    child.wait().unwrap();
+}
+
+#[test]
 fn serve_whole_run_retry_recovery_attempt_can_itself_dispatch_tool_calls() {
     // B-L3 pi-parity test gap (fixed): every existing whole-run-retry test recovers into a plain text
     // turn. Nothing proved the retried attempt can continue normally into a *tool-dispatch* turn — a
@@ -1010,6 +1093,41 @@ fn serve_abort_retry_interrupts_a_pending_whole_run_retry_backoff() {
     assert_eq!(auto_retry_end_frames[0]["success"], false);
     assert_eq!(auto_retry_end_frames[0]["attempt"], 1);
     assert_eq!(auto_retry_end_frames[0]["final_error"], "retry cancelled");
+
+    // The closing error record is withheld from the persist as soon as a retry is decided on (so the
+    // store's message count can't desync — see the withholding site in `serve.rs`), which means a
+    // retry cancelled during its backoff has to put it *back*, in memory and on disk. It is the only
+    // thing keeping role alternation valid: without it the session's last message is the user's own
+    // unanswered prompt, and the next `prompt` stacks a second consecutive `user` turn.
+    writeln!(stdin, "{}", json!({ "type": "get_messages" })).unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "get_messages");
+    let in_memory = frames.last().unwrap()["data"]["messages"].clone();
+    let last = in_memory.as_array().unwrap().last().unwrap();
+    assert_eq!(
+        last["role"], "assistant",
+        "a cancelled retry must still close the session on an assistant record: {in_memory}"
+    );
+    assert!(
+        last.get("error_message").is_some(),
+        "that closing record is the failed attempt's error record: {in_memory}"
+    );
+
+    drop(stdin);
+    child.wait().unwrap();
+
+    // And it must survive a reload, not just live in memory.
+    let mut child = serve_cmd(bin, &base, &session_file).spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    writeln!(stdin, "{}", json!({ "type": "get_messages" })).unwrap();
+    stdin.flush().unwrap();
+    let frames = read_until_response(&mut stdout, "get_messages");
+    let reloaded = frames.last().unwrap()["data"]["messages"].clone();
+    assert_eq!(
+        reloaded, in_memory,
+        "the restored error record must have reached disk too"
+    );
 
     drop(stdin);
     child.wait().unwrap();
