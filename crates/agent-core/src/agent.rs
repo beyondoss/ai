@@ -1529,9 +1529,25 @@ impl Agent {
                         let (prog_tx, mut prog_rx) =
                             futures::channel::mpsc::unbounded::<crate::tool::ToolUpdate>();
                         let prog_tx = &prog_tx;
+                        // Results ride their own channel, published per *call* rather than per group.
+                        // A group runs its calls serially and used to hand back one `Vec` at the end,
+                        // which meant cancellation — which drops the group future wherever it happens to
+                        // be — took every already-finished call's result down with it, and
+                        // `repair_cancelled_dispatch` then wrote "cancelled: tool call aborted before it
+                        // finished" over a tool that had genuinely run to completion. Its side effects
+                        // were already on disk and its `ToolEnd` had already reached the client, so the
+                        // transcript ended up contradicting both: on resume the model reads "cancelled",
+                        // believes the edit never landed, and applies it a second time.
+                        //
+                        // Sent, not returned, for the same reason `ToolUpdate::End` already is: once a
+                        // call's result exists it must not depend on anything else finishing to survive.
+                        let (res_tx, mut res_rx) =
+                            futures::channel::mpsc::unbounded::<(usize, ToolCallResult)>();
+                        let res_tx = &res_tx;
                         let group_runs = groups.into_values().map(|(target, indices)| {
                             let calls = &calls;
                             let prog_tx = prog_tx.clone();
+                            let res_tx = res_tx.clone();
                             let cancel = cancel_ref.clone();
                             let write_locks = this.write_locks.clone();
                             let outcomes = outcomes.clone();
@@ -1554,7 +1570,6 @@ impl Agent {
                                     }
                                     None => None,
                                 };
-                                let mut out = Vec::with_capacity(indices.len());
                                 for i in indices {
                                     let (id, name, input) = &calls[i];
                                     // Per call: (text, images, is_error, terminate). Hooks rewrite the *text*
@@ -1651,9 +1666,8 @@ impl Agent {
                                             is_error: result.2,
                                         })
                                         .ok();
-                                    out.push((i, result));
+                                    res_tx.unbounded_send((i, result)).ok();
                                 }
-                                out
                             }
                         });
                         // Bound how many groups run at once. `buffer_unordered` is safe here because each
@@ -1670,10 +1684,10 @@ impl Agent {
                         // Race the whole execution phase against cancellation: a tripped token drops `drain`,
                         // which drops every in-flight tool future — aborting a hung `bash` (its
                         // `kill_on_drop` child dies) and any other long-running tool — and returns promptly
-                        // instead of waiting them all out. The block scopes `drain`'s `&mut results` borrow so
-                        // the transcript below can consume them; `cancelled_mid_dispatch` is only *acted on*
-                        // after the block ends and that borrow is fully released (repairing the transcript
-                        // needs to move `results` out).
+                        // instead of waiting them all out. `drain` deliberately doesn't touch `results` at
+                        // all: results are harvested from `res_rx` *after* the race resolves, so the same
+                        // harvest serves both outcomes and a cancelled dispatch keeps everything that had
+                        // already completed (the channel outlives the dropped futures).
                         let concurrency = if self.sequential_tools || exclusive_turn {
                             1
                         } else {
@@ -1695,11 +1709,7 @@ impl Agent {
                                         }
                                     }
                                     group = group_stream.next() => match group {
-                                        Some(group) => {
-                                            for (i, result) in group {
-                                                results[i] = Some(result);
-                                            }
-                                        }
+                                        Some(()) => {}
                                         None => break,
                                     }
                                 }
@@ -1710,9 +1720,20 @@ impl Agent {
                             }
                         };
                         let cancelled = cancel.cancelled();
-                        futures::pin_mut!(drain, cancelled);
-                        if let Either::Right(((), _)) = select(drain, cancelled).await {
-                            cancelled_mid_dispatch = true;
+                        {
+                            futures::pin_mut!(drain, cancelled);
+                            if let Either::Right(((), _)) = select(drain, cancelled).await {
+                                cancelled_mid_dispatch = true;
+                            }
+                        }
+                        // Harvest every result that was published before this point — on both paths.
+                        // On the cancelled one that's precisely the set of calls that really did finish,
+                        // which is what keeps their genuine outcome (and its side effects) in the
+                        // transcript instead of a blanket "aborted before it finished". Slots still
+                        // `None` after this are the calls that truly never completed, exactly what
+                        // `repair_cancelled_dispatch` is for.
+                        while let Ok((i, result)) = res_rx.try_recv() {
+                            results[i] = Some(result);
                         }
                     }
                     (results, cancelled_mid_dispatch)
@@ -5877,6 +5898,121 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelling_mid_group_keeps_the_results_of_calls_that_already_finished() {
+        // Regression: calls sharing a `write_target` land in one group and run sequentially inside it,
+        // but the group only *yielded* its results (`out`) once its whole loop finished. Cancellation
+        // drops that future mid-loop, so every already-completed call's result in that group was
+        // discarded — and `repair_cancelled_dispatch` then synthesized "cancelled: tool call aborted
+        // before it finished" for a tool that had genuinely run to completion, with its side effects
+        // already on disk and its `ToolEnd` already emitted to the client.
+        //
+        // That is a transcript that actively lies about the filesystem: on resume the model reads
+        // "cancelled", believes the edit never landed, and applies it a second time.
+        struct GroupedTool {
+            cancel: CancellationToken,
+        }
+        #[async_trait]
+        impl Tool for GroupedTool {
+            fn name(&self) -> &str {
+                "edit"
+            }
+            fn description(&self) -> &str {
+                "two calls on one path share a group"
+            }
+            fn input_schema(&self) -> Value {
+                json!({ "type": "object" })
+            }
+            fn write_target(&self, input: &Value) -> Option<String> {
+                input
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            }
+            async fn run(
+                &self,
+                input: Value,
+            ) -> std::result::Result<crate::tool::ToolOutput, crate::error::ToolError> {
+                // The second call in the group cancels the run and then never returns, standing in for
+                // any long call the user interrupts. Deterministic: the first call is already fully
+                // complete (its result pushed) before this one can possibly start, because a group runs
+                // its calls strictly in order.
+                if input.get("last").and_then(Value::as_bool) == Some(true) {
+                    self.cancel.cancel();
+                    std::future::pending::<()>().await;
+                }
+                Ok("first edit applied".into())
+            }
+        }
+
+        let cancel = CancellationToken::new();
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(GroupedTool {
+            cancel: cancel.clone(),
+        }));
+
+        // Both calls name the same path, so they share one group and run sequentially within it.
+        let two_calls = vec![
+            StreamEvent::MessageStart,
+            StreamEvent::ToolUseStart {
+                index: 0,
+                id: "a".into(),
+                name: "edit".into(),
+            },
+            StreamEvent::InputJsonDelta {
+                index: 0,
+                partial_json: r#"{"path":"f.rs"}"#.into(),
+            },
+            StreamEvent::ContentBlockStop { index: 0 },
+            StreamEvent::ToolUseStart {
+                index: 0,
+                id: "b".into(),
+                name: "edit".into(),
+            },
+            StreamEvent::InputJsonDelta {
+                index: 0,
+                partial_json: r#"{"path":"f.rs","last":true}"#.into(),
+            },
+            StreamEvent::ContentBlockStop { index: 0 },
+            StreamEvent::MessageStop {
+                stop_reason: StopReason::ToolUse,
+            },
+        ];
+        let (agent, _mock) = agent_with(vec![two_calls, turn::text("done")], tools);
+        let mut session = Session::new();
+        session.user("go");
+        let err = agent
+            .run_events_cancellable(&mut session, |_| {}, cancel)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Cancelled), "got: {err:?}");
+
+        let results = session
+            .messages
+            .last()
+            .expect("a repaired tool_results turn must close the session");
+        let first = results
+            .content
+            .iter()
+            .find_map(|b| match b {
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    is_error,
+                    ..
+                } if tool_use_id == "a" => Some((content.clone(), *is_error)),
+                _ => None,
+            })
+            .expect("call `a` must have a tool_result");
+        assert_eq!(
+            first,
+            ("first edit applied".to_string(), false),
+            "the call that actually completed must keep its real result, not be rewritten as \
+             cancelled: {:?}",
+            results.content
+        );
+    }
+
+    #[tokio::test]
     async fn cancelling_a_write_holds_its_lock_until_the_in_flight_blocking_write_lands() {
         // Regression: a guarded tool (one reporting a `write_target`) whose actual write runs on a
         // `spawn_blocking` thread — the `edit` tool — must not release its registry write-lock the

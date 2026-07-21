@@ -26,7 +26,15 @@ builder on `Agent` or `ModelRequest`, and each is exercised by unit tests):
   the first byte, without depending on `async_stream`'s laziness as an implementation detail. Cancelling
   mid-tool-dispatch still leaves the session resumable: any call with no result yet is synthesized as an
   error `tool_result` (`repair_cancelled_dispatch`) rather than leaving an orphaned `tool_use` block with
-  no matching result.
+  no matching result. "No result yet" means genuinely unfinished, not merely un-joined: each call
+  publishes its own result on an mpsc channel the instant that result exists, and the harvest into
+  `results` happens _after_ the cancellation race resolves, so it serves both outcomes. Results used to
+  be returned per _group_ — one `Vec` handed back only once the group's whole serial run finished —
+  which meant cancellation dropped the group future along with every already-completed call's result in
+  it, and the synthesized "cancelled: tool call aborted before it finished" then overwrote the real
+  outcome of a tool that had run to completion. Its writes were already on disk and its `ToolEnd` had
+  already reached the client, so the transcript contradicted both, and a resuming model would redo the
+  work it was told never happened.
 - **Steering** — `run_events_steered(.., steering)` drains a `Steering` handle's _two_ lanes:
   _follow-ups_ (`push`) injected as fresh user turns at each would-stop boundary, and _steers_
   (`push_steer`) folded onto the in-flight tool-results turn mid-run — so a client can either queue the
