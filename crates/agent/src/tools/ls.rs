@@ -98,7 +98,7 @@ impl Tool for Ls {
 
     async fn run(&self, input: Value) -> Result<ToolOutput, ToolError> {
         let path = input.get("path").and_then(Value::as_str).unwrap_or(".");
-        let path = &super::resolve_against(&self.root, path);
+        let path = super::resolve_against(&self.root, path);
         let all = input.get("all").and_then(Value::as_bool).unwrap_or(false);
         let limit = input
             .get("limit")
@@ -106,7 +106,15 @@ impl Tool for Ls {
             .map(|n| n as usize)
             .unwrap_or(DEFAULT_LIMIT);
 
-        // Sort by the bare name, not the display string (which gets a trailing `/` for directories) —
+        // `read_dir` plus a `metadata` stat for every entry are blocking syscalls; on a wide directory
+        // (thousands of entries) that is real, unbounded work that would pin the `current_thread`
+        // runtime a `serve` session runs on — the `tool_reactor_stall` tests assert it must not, the
+        // same way `read`/`edit`/`write`/`exec` already run their filesystem I/O off the reactor. Hand
+        // the whole synchronous listing (read_dir + per-entry stat + sort + render) to `spawn_blocking`.
+        tokio::task::spawn_blocking(move || -> Result<ToolOutput, ToolError> {
+            let path = path.as_str();
+
+            // Sort by the bare name, not the display string (which gets a trailing `/` for directories) —
         // comparing display strings inverts order for sibling names sharing a prefix (e.g. "src" vs
         // "src-old": '-' sorts below '/' byte-wise, so "src-old/" would sort before "src/"). The
         // display suffix is appended only after sorting, matching the reference agent's own two-step
@@ -266,6 +274,9 @@ impl Tool for Ls {
             out.push_str(&super::output::marker(notices.join(". ")));
         }
         Ok(out.into())
+        })
+        .await
+        .map_err(|e| ToolError::Execution(format!("ls: background task failed: {e}")))?
     }
 }
 
