@@ -73,9 +73,17 @@ fn read_rss_kb() -> (u64, u64) {
     let mut rss = 0;
     for line in status.lines() {
         if let Some(v) = line.strip_prefix("VmHWM:") {
-            hwm = v.split_whitespace().next().and_then(|n| n.parse().ok()).unwrap_or(0);
+            hwm = v
+                .split_whitespace()
+                .next()
+                .and_then(|n| n.parse().ok())
+                .unwrap_or(0);
         } else if let Some(v) = line.strip_prefix("VmRSS:") {
-            rss = v.split_whitespace().next().and_then(|n| n.parse().ok()).unwrap_or(0);
+            rss = v
+                .split_whitespace()
+                .next()
+                .and_then(|n| n.parse().ok())
+                .unwrap_or(0);
         }
     }
     (hwm, rss)
@@ -92,7 +100,10 @@ fn percentile(sorted: &[u128], p: f64) -> u128 {
 fn main() {
     let mut args = std::env::args().skip(1);
     let n: usize = args.next().and_then(|a| a.parse().ok()).unwrap_or(64);
-    let waves: usize = args.next().and_then(|a| a.parse().ok()).unwrap_or(DEFAULT_WAVES);
+    let waves: usize = args
+        .next()
+        .and_then(|a| a.parse().ok())
+        .unwrap_or(DEFAULT_WAVES);
 
     // Two rendezvous points shared by main + all N workers:
     //  `start` releases everyone into a wave together;
