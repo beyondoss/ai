@@ -2,33 +2,91 @@ name: CI
 on:
   pull_request:
     branches: [main]
+# A newer push to the same PR cancels the superseded run — no pile-ups (which is how a single wedged
+# runner blocked everything), faster feedback, fewer wasted runner-minutes.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 env:
   CARGO_TERM_COLOR: always
   # Belt-and-suspenders: the panic-surface + `unused_must_use` denies live in `[lints]` (Cargo.toml)
   # so they bind locally too, but escalate *every* warning to an error in CI in case a lint isn't
   # expressible there (build scripts, future targets).
   RUSTFLAGS: -D warnings
+  # Incremental compilation buys nothing on a clean CI runner (every build starts cold) and only
+  # bloats the restored cache — off is the CI-recommended default.
+  CARGO_INCREMENTAL: "0"
+# The four checks below run on separate runners *in parallel*, so wall-clock is ~the slowest one
+# (the release build) instead of the sum of all of them, and one hung/slow check can no longer
+# starve the others of their signal. `Check` is the single required gate that fans them back in.
 jobs:
-  check:
-    name: Check
+  # Formatting compiles none of the project, so it returns in well under a minute — kept separate so
+  # a formatting nit fails fast without waiting behind a compile.
+  fmt:
+    name: fmt
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
       - uses: jdx/mise-action@v4
-      # Belt-and-suspenders: a restored mise tool cache can hand back a rust toolchain without the
-      # components mise.toml requests (rustfmt/clippy) even though mise itself reports everything
-      # installed — dprint's `rustfmt --edition 2024` exec command then fails with "rustfmt is not
-      # installed for the toolchain". `rustup component add` is idempotent (a no-op if already
-      # present), so this is always safe to run, cache hit or not.
-      - run: rustup component add rustfmt clippy
-      - uses: Swatinem/rust-cache@v2
-      # Formatting: dprint (config/json/etc) + rustfmt.
+      # A restored mise tool cache can hand back a rust toolchain without the rustfmt component even
+      # though mise reports it installed; dprint's `rustfmt --edition 2024` then fails. `rustup
+      # component add` is idempotent, so it's safe on a cache hit.
+      - run: rustup component add rustfmt
       - run: mise check:fmt
       - run: cargo fmt --all --check
-      # Lints: clippy `-D warnings` across all targets. With `[lints.clippy]` denying the panic
-      # surface (unwrap/expect/panic/todo/unimplemented), a new `.unwrap()` in production code
-      # fails the build here.
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v4
+      - run: rustup component add clippy
+      - uses: Swatinem/rust-cache@v2
+      # clippy `-D warnings` across all targets; `[lints.clippy]` denies the panic surface
+      # (unwrap/expect/panic/todo/unimplemented), so a new `.unwrap()` in production code fails here.
       - run: mise check:rs
-      - run: mise test:unit:rs
-      - run: mise test:integration:rs
+  # Unit + integration tests via nextest: it runs the whole suite in parallel across the runner's
+  # cores, and — crucially — its per-test `slow-timeout` (see .config/nextest.toml) TERMINATES and
+  # *names* a test that hangs, so a deadlock fails the job in a couple of minutes with the culprit
+  # identified instead of wedging it until GitHub's 6-hour ceiling. `timeout-minutes` is the backstop.
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v4
+      - uses: Swatinem/rust-cache@v2
+      # Prebuilt binary in seconds — no compiling nextest from source.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+      - run: cargo nextest run --workspace --profile ci
+  # The release build is the long pole; running it alongside the others (not after them) is most of
+  # the wall-clock win.
+  build:
+    name: build (release)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v4
+      - uses: Swatinem/rust-cache@v2
       - run: mise build:rs:release
+  # Single required status check. Branch protection can require just `Check`; it stays green only if
+  # every parallel job above did. Cheap (no build), and keeps the required-check name stable.
+  Check:
+    name: Check
+    runs-on: ubuntu-latest
+    needs: [fmt, clippy, test, build]
+    if: always()
+    steps:
+      - name: Gate on all checks
+        run: |
+          echo "fmt=${{ needs.fmt.result }} clippy=${{ needs.clippy.result }} test=${{ needs.test.result }} build=${{ needs.build.result }}"
+          [ "${{ needs.fmt.result }}" = "success" ] \
+            && [ "${{ needs.clippy.result }}" = "success" ] \
+            && [ "${{ needs.test.result }}" = "success" ] \
+            && [ "${{ needs.build.result }}" = "success" ]
