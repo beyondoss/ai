@@ -276,6 +276,14 @@ revision at which the seed was complete and calls `watch_prefix_from` to resume 
 persisted across reconnects, so a NATS blip resumes from the last-seen point instead of re-scanning
 the entire keyspace.
 
+**Revision 0 is not a resume point.** A seed scan that finds no `blackhole.*` entries yields
+revision 0, and slipstream treats a cursor as resumable only when `rev > 0` — at 0 it falls back to
+exactly the `watch_prefix`/`DeliverPolicy::New` this design exists to avoid. So an empty deny-set is
+deliberately treated as *unseeded* (`is_resumable`), and the next connect rescans rather than
+marking itself seeded and never looking again. Without that, a gateway that booted against an empty
+bucket would attach with `New` for the life of the process and silently never pick up the first
+deny written while it was starting.
+
 ### Why BYO token validity is never checked
 
 Checking a BYO token requires a round-trip to the provider. The provider does that check anyway and
@@ -442,7 +450,7 @@ Secret-bearing fields (`pool_keys`, `nats_creds`) are held as `Secret<T>` — st
 | Failure                                                            | What Actually Happens                                                                                                                                                          | Recovery                                                                                                                                                                  |
 | ------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | NATS unreachable at boot                                           | Deny-set starts empty (fail-open). Auth still works — keys from config.                                                                                                        | Watcher reconnects; seeds from NATS or disk snapshot on connect.                                                                                                          |
-| NATS disconnects mid-run                                           | Last-known deny-set stays active. New deny entries not applied until reconnect.                                                                                                | Watcher reconnects (1s→30s exponential backoff, reset on success) and resumes from saved revision — no re-scan.                                                           |
+| NATS disconnects mid-run                                           | Last-known deny-set stays active. New deny entries not applied until reconnect.                                                                                                | Watcher reconnects (1s→30s exponential backoff, reset only after a watch that ran ≥30s — *connecting* is not success, or a reachable NATS with a broken watch loops at 1 Hz forever) and resumes from the saved revision. Rescans instead when the seed found no entries, since revision 0 is not resumable — see above. |
 | NATS history compacted past snapshot cursor                        | `CursorExpired` → full re-scan from current NATS state.                                                                                                                        | After re-scan, new cursor set; delta watch resumes normally.                                                                                                              |
 | Virtual key tampered or forged                                     | Ed25519 verify fails → falls through to BYO treatment. No billing event. No error reveals which part failed.                                                                   | Billing miss detectable downstream; no security boundary breach.                                                                                                          |
 | `signing_keys` absent (typo'd/missing SSM)                         | Default: warn + BYO-only (silently drops all managed billing + deny-set). With `require_signing_keys=true`: hard boot failure.                                                 | Set `require_signing_keys=true` on managed deployments so the mis-deploy fails fast and visibly at boot.                                                                  |
