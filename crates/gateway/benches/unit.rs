@@ -138,6 +138,38 @@ mod ratelimit {
     }
 }
 
+mod circuit_breaker {
+    use super::*;
+    use beyond_ai::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
+    use std::time::Duration;
+
+    /// Production shape: the windowed policy `config.rs` always builds, with the default threshold.
+    fn breaker() -> CircuitBreaker {
+        CircuitBreaker::new(CircuitBreakerConfig::windowed(20, Duration::from_secs(10)))
+    }
+
+    /// The per-provider gate charged on **every** request (`proxy::request_filter`), measured on the
+    /// state it is in ~100% of the time: CLOSED. One acquire load + an unpack + a branch — no CAS, no
+    /// clock read, 0 allocs. A regression here (a clock call or a write creeping onto the closed
+    /// path) shows up as ns/iter climbing off single digits.
+    #[divan::bench]
+    fn allow_closed(bencher: Bencher) {
+        let cb = breaker();
+        bencher.bench(|| black_box(&cb).allow());
+    }
+
+    /// Charged on every successful upstream response (`proxy::logging`). The early return for a
+    /// healthy CLOSED breaker keeps this a single load with **no write**, so a hot provider's breaker
+    /// cache line stays Shared across every worker instead of ping-ponging Modified once per
+    /// response. It must therefore cost about the same as `allow_closed`; if it ever measures like a
+    /// CAS, the early return has been lost.
+    #[divan::bench]
+    fn record_success_healthy(bencher: Bencher) {
+        let cb = breaker();
+        bencher.bench(|| black_box(&cb).record_success());
+    }
+}
+
 mod usage {
     use super::*;
     use beyond_ai::usage::{self, Usage};
