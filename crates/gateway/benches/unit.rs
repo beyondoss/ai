@@ -198,6 +198,76 @@ mod usage {
     fn anthropic_stream() -> Option<Usage> {
         usage::anthropic_stream(black_box(ANT_SSE))
     }
+
+    // --- realistic tail sizes -------------------------------------------------------------------
+    //
+    // The four benches above run on 100-200 byte fixtures: two `data:` lines. `proxy::logging`
+    // actually hands these parsers a bounded tail of up to `USAGE_TAIL_CAP` (64 KiB) — ~450 lines on
+    // a real stream. That gap is why a full JSON parse of every line, and a scalar byte-at-a-time
+    // line split, both went unnoticed: at two lines neither is measurable. Size is the variable that
+    // matters here, so sweep it, exactly as the `peek` module below already does.
+
+    /// A realistic OpenAI chat stream of ~`bytes` with the usage chunk on the penultimate line
+    /// (where OpenAI actually puts it), then `[DONE]`.
+    fn openai_sse_tail(bytes: usize) -> Vec<u8> {
+        let mut s = String::with_capacity(bytes + 256);
+        while s.len() < bytes {
+            s.push_str("data: {\"id\":\"chatcmpl-x\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4o-2024-08-06\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\" tok\"}}]}\n\n");
+        }
+        s.push_str("data: {\"id\":\"chatcmpl-x\",\"choices\":[],\"usage\":{\"prompt_tokens\":5000,\"completion_tokens\":2500}}\n\n");
+        s.push_str("data: [DONE]\n\n");
+        s.into_bytes()
+    }
+
+    /// A realistic Anthropic stream of ~`bytes`: `message_start` (input + cache tokens), a long run
+    /// of `content_block_delta`, then the terminal `message_delta` (output tokens).
+    fn anthropic_sse_tail(bytes: usize) -> Vec<u8> {
+        let mut s = String::with_capacity(bytes + 256);
+        s.push_str("event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":5000,\"output_tokens\":1,\"cache_read_input_tokens\":4000}}}\n\n");
+        while s.len() < bytes {
+            s.push_str("event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\" tok\"}}\n\n");
+        }
+        s.push_str("event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":2500}}\n\n");
+        s.into_bytes()
+    }
+
+    /// Reverse scan + `memmem` pre-filter: the answer is on the penultimate line, so cost should be
+    /// ~flat in tail size. If this starts scaling with the argument, the early return is gone.
+    #[divan::bench(args = [4 * 1024, 64 * 1024])]
+    fn openai_stream_tail(bencher: Bencher, bytes: usize) {
+        let sse = openai_sse_tail(bytes);
+        bencher
+            .counter(BytesCount::of_slice(&sse))
+            .bench(|| usage::openai_stream(black_box(&sse)));
+    }
+
+    /// Genuinely a full pass (input tokens are at the head, output at the tail), so this *does*
+    /// scale with size — but only over the `memchr` line split and the substring pre-filter, not a
+    /// JSON parse per line. The alloc columns should stay at zero.
+    #[divan::bench(args = [4 * 1024, 64 * 1024])]
+    fn anthropic_stream_tail(bencher: Bencher, bytes: usize) {
+        let sse = anthropic_sse_tail(bytes);
+        bencher
+            .counter(BytesCount::of_slice(&sse))
+            .bench(|| usage::anthropic_stream(black_box(&sse)));
+    }
+
+    /// The worst case for the reverse scan: a well-formed stream that never carries usage, so it
+    /// cannot stop early and must walk the whole tail. Guards the claim that the pre-filter, not the
+    /// early return, is what keeps this cheap.
+    #[divan::bench(args = [4 * 1024, 64 * 1024])]
+    fn openai_stream_tail_no_usage(bencher: Bencher, bytes: usize) {
+        let mut sse = openai_sse_tail(bytes);
+        // Drop the usage chunk + [DONE], leaving only content deltas.
+        let cut = sse
+            .windows(7)
+            .position(|w| w == b"\"usage\"")
+            .expect("fixture carries a usage chunk");
+        sse.truncate(cut);
+        bencher
+            .counter(BytesCount::of_slice(&sse))
+            .bench(|| usage::openai_stream(black_box(&sse)));
+    }
 }
 
 mod peek {
