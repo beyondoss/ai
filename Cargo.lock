@@ -367,6 +367,7 @@ dependencies = [
  "prometheus",
  "rcgen",
  "reqwest",
+ "rustc-hash",
  "rustls",
  "serde",
  "serde_json",

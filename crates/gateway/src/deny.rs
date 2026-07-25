@@ -11,6 +11,28 @@
 //! (sticky). This struct only reflects current membership.
 
 use std::collections::HashMap;
+use std::hash::BuildHasherDefault;
+
+/// The deny map's hasher. **Deliberately not** std's `RandomState` (SipHash-1-3).
+///
+/// HashDoS resistance exists to stop an attacker from *choosing* keys that collide. Here the key is
+/// `identity.tenant_id`, which only ever comes out of `keyring.verify(raw_key)` — an Ed25519
+/// signature check over a token minted by the control plane, which holds the only signing key. And
+/// the ordering is load-bearing: `proxy::request_filter` verifies **first** and only then looks the
+/// tenant up (`proxy.rs`, step 5), so an unforgeable id is the *only* thing that ever reaches this
+/// map. An attacker cannot pick their tenant id, cannot enumerate ids to farm collisions, and never
+/// gets an unverified id into the table at all — so SipHash's collision resistance buys nothing and
+/// costs ~4x on a lookup that runs on **every managed request**.
+///
+/// Measured on the dev host (`benches/unit.rs`, `deny::reason_*`, 1M entries): SipHash 6.21 ns vs
+/// Fx 1.49 ns single-threaded; 13.44 ns vs 3.40 ns at 16 threads (the gateway is many-core, so the
+/// contended number is the one that matters).
+///
+/// **Do not "fix" this back to `RandomState`** without first breaking the property above — i.e. not
+/// unless some path starts inserting or looking up a tenant id that a caller supplied and we did not
+/// verify. If that ever happens, the hasher is the *second* thing to fix; the unverified id is the
+/// first.
+type DenyHasher = BuildHasherDefault<rustc_hash::FxHasher>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DenyReason {
@@ -35,12 +57,20 @@ impl DenyReason {
 
 #[derive(Debug, Default, Clone)]
 pub struct DenySet {
-    denied: HashMap<u64, DenyReason>,
+    denied: HashMap<u64, DenyReason, DenyHasher>,
 }
 
 impl DenySet {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Pre-size for a known entry count — for the seed/rescan path, which knows how many entries it
+    /// is about to insert and would otherwise rehash the whole table a dozen times on the way up.
+    pub fn with_capacity(n: usize) -> Self {
+        Self {
+            denied: HashMap::with_capacity_and_hasher(n, DenyHasher::default()),
+        }
     }
 
     /// Default-allow: absence from the set = allowed. This is the safe-for-availability default —
@@ -70,6 +100,9 @@ impl DenySet {
     }
 }
 
+/// The seed/rescan constructor (`store_watch::denyset_from_entries` builds the whole set with
+/// `.collect()`). The hasher is an implementation detail of `DenySet`, deliberately not a type
+/// parameter, so this signature — and every call site — is unaffected by the choice above.
 impl FromIterator<(u64, DenyReason)> for DenySet {
     fn from_iter<I: IntoIterator<Item = (u64, DenyReason)>>(iter: I) -> Self {
         Self {
