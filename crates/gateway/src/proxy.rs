@@ -178,6 +178,12 @@ impl AiProxy {
     /// not *which request* — this is what an oncall greps when a `deny_fraud`/`rate_limit` spike
     /// shows on the dashboard) and echoes the `request_id` in a response header so a client report
     /// quoting that id lands on this line.
+    ///
+    /// **Call it through [`Self::reject_boxed`], never `.await` it directly.** `#[async_trait]`
+    /// heap-boxes `request_filter`'s future once per request, and this future — 1 136 bytes of it,
+    /// measured with `-Zprint-type-sizes` — gets inlined into that state machine at every call site.
+    /// Awaiting it inline therefore made *every* request, including every successful one, allocate
+    /// room for a rejection it was never going to take.
     async fn reject(
         session: &mut Session,
         request_id: &str,
@@ -196,6 +202,25 @@ impl AiProxy {
         session.write_response_header(Box::new(resp), false).await?;
         session.write_response_body(Some(body), true).await?;
         Ok(true)
+    }
+
+    /// [`Self::reject`] behind its own allocation, so its state machine is *not* inlined into
+    /// `request_filter`'s.
+    ///
+    /// `request_filter` returns an `#[async_trait]` future that pingora heap-boxes once per request.
+    /// With `reject` awaited inline at eight call sites, the largest of them dominated that future:
+    /// 1 264 bytes total, of which 1 136 was the reject state machine (`-Zprint-type-sizes`) — for
+    /// comparison every other filter's future is 32 bytes and `upstream_peer`'s is 152. A request
+    /// that is never rejected still paid for it, because the box has to be big enough for the widest
+    /// variant. Boxing here moves that cost onto the requests that actually reject.
+    async fn reject_boxed(
+        session: &mut Session,
+        request_id: &str,
+        status: u16,
+        typ: &str,
+        msg: &str,
+    ) -> Result<bool> {
+        Box::pin(Self::reject(session, request_id, status, typ, msg)).await
     }
 }
 
@@ -396,7 +421,7 @@ impl ProxyHttp for AiProxy {
             }
         };
         let Some(provider) = provider_opt else {
-            return Self::reject(
+            return Self::reject_boxed(
                 session,
                 &request_id,
                 404,
@@ -410,7 +435,7 @@ impl ProxyHttp for AiProxy {
 
         // 2. Extract the presented key — a managed virtual key (`bai_…`) or a raw BYO provider token.
         let Some(raw_key) = extract_virtual_key(session.req_header()) else {
-            return Self::reject(
+            return Self::reject_boxed(
                 session,
                 &request_id,
                 401,
@@ -435,7 +460,7 @@ impl ProxyHttp for AiProxy {
                     .rejections_total
                     .with_label_values(&[reason.label()])
                     .inc();
-                return Self::reject(
+                return Self::reject_boxed(
                     session,
                     &request_id,
                     429,
@@ -455,7 +480,7 @@ impl ProxyHttp for AiProxy {
             .and_then(|v| v.parse::<usize>().ok());
         if let Some(len) = declared_len {
             if len > MAX_REQUEST_BODY {
-                return Self::reject(
+                return Self::reject_boxed(
                     session,
                     &request_id,
                     413,
@@ -476,7 +501,7 @@ impl ProxyHttp for AiProxy {
                     .rejections_total
                     .with_label_values(&["auth"])
                     .inc();
-                return Self::reject(
+                return Self::reject_boxed(
                     session,
                     &request_id,
                     401,
@@ -502,7 +527,7 @@ impl ProxyHttp for AiProxy {
                     .rejections_total
                     .with_label_values(&[label])
                     .inc();
-                return Self::reject(
+                return Self::reject_boxed(
                     session,
                     &request_id,
                     reason.http_status(),
@@ -514,7 +539,7 @@ impl ProxyHttp for AiProxy {
             // The actual `Bearer …`/`x-api-key` value is precomputed in the provider registry and
             // applied in `upstream_request_filter`; here we only confirm a pool key exists.
             if provider.pool_auth_value.is_none() {
-                return Self::reject(
+                return Self::reject_boxed(
                     session,
                     &request_id,
                     503,
@@ -548,7 +573,7 @@ impl ProxyHttp for AiProxy {
                     .rejections_total
                     .with_label_values(&["circuit_open"])
                     .inc();
-                return Self::reject(
+                return Self::reject_boxed(
                     session,
                     &request_id,
                     503,
