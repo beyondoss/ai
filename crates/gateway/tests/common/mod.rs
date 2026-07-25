@@ -183,6 +183,7 @@ pub enum Mode {
 
 #[derive(Default, Clone)]
 pub struct Captured {
+    /// The forwarded path **including** any query string, exactly as the upstream received it.
     pub path: String,
     pub authorization: Option<String>,
     pub x_api_key: Option<String>,
@@ -259,7 +260,16 @@ async fn mock_handle(
 ) -> Result<Response<Full<Bytes>>, std::convert::Infallible> {
     hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let version = req.version();
-    let path = req.uri().path().to_string();
+    // Path **and query**. Recording only `uri.path()` meant the harness was structurally blind to the
+    // query string: no test could tell whether the gateway forwarded `?api-version=…` (which Azure
+    // OpenAI requires on every call), dropped it, or mangled it. Existing assertions compare against
+    // query-less paths and are unaffected.
+    let path = req
+        .uri()
+        .path_and_query()
+        .map(|pq| pq.as_str())
+        .unwrap_or_else(|| req.uri().path())
+        .to_string();
     // Pull the headers we record before consuming the body (which moves `req`).
     let (authorization, x_api_key, host) = {
         let h = req.headers();

@@ -390,6 +390,59 @@ async fn streaming_relays_sse_and_meters_usage() {
 }
 
 #[tokio::test]
+async fn streaming_injects_usage_option_when_the_path_carries_a_query_string() {
+    // Azure OpenAI requires `?api-version=…` on every call. `is_streamable_path` matches by suffix,
+    // so when the eligibility check was run against the *forwarded path plus query* it returned
+    // false for a genuine chat/completions request — managed Azure streams skipped the
+    // `stream_options.include_usage` splice, OpenAI therefore emitted no usage chunk, and every one
+    // of those requests billed zero tokens with nothing logged to say so.
+    //
+    // The unit test on `is_streamable_path` pins the helper's behaviour; this pins the wiring, which
+    // is where the bug actually lived. Asserting on the *forwarded body* is the only thing that
+    // proves the splice ran — the mock returns a usage chunk unconditionally, so metrics can't.
+    let nats = Nats::start().await;
+    let (pubkey, sk) = test_keypair(3);
+    let mock = MockUpstream::start(Mode::Sse).await;
+    let gw = Gateway::start(nats.port, &mock.authority(), &b64(&pubkey)).await;
+
+    let vkey = mint(
+        &VirtualKey {
+            tenant_id: 7,
+            vpc_id: 1,
+        },
+        1,
+        &sk,
+    );
+    let client = reqwest::Client::new();
+    let body = r#"{"model":"gpt-4o","stream":true,"messages":[{"role":"user","content":"hi"}]}"#;
+    let path = "/openai/v1/chat/completions?api-version=2024-10-21";
+
+    {
+        let (c, u, k) = (client.clone(), gw.url(), vkey.clone());
+        wait_for_status(200, move || {
+            let (c, u, k) = (c.clone(), u.clone(), k.clone());
+            async move { post_path_status(&c, &u, path, &k, body.to_string()).await }
+        })
+        .await;
+    }
+
+    let cap = mock.captured().expect("mock received a request");
+    let needle = br#""stream_options":{"include_usage":true}"#;
+    assert!(
+        cap.body.windows(needle.len()).any(|w| w == needle),
+        "a query string must not suppress stream_options injection; forwarded body was: {}",
+        String::from_utf8_lossy(&cap.body)
+    );
+    // The query must still reach the upstream untouched — stripping it would break Azure just as
+    // thoroughly as skipping the injection did.
+    assert!(
+        cap.path.contains("api-version=2024-10-21"),
+        "the query string must be forwarded verbatim; got path: {}",
+        cap.path
+    );
+}
+
+#[tokio::test]
 async fn blackhole_denies_then_restores() {
     let nats = Nats::start().await;
     let (pubkey, sk) = test_keypair(2);

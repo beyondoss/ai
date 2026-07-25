@@ -293,6 +293,13 @@ fn bare_default_provider_name(path: &str) -> Option<&'static str> {
 /// `response.completed` event, streaming or not), so splicing this chat-completions-only fragment into
 /// a Responses body would inject a field the API doesn't recognize. Embeddings and everything else
 /// never stream, so there's nothing to meter there either.
+///
+/// **Pass the path only — never a path with a query string.** The match is by suffix, so a trailing
+/// `?api-version=2024-10-21` makes it return `false` for a path that plainly *is* chat/completions.
+/// Azure OpenAI requires that parameter on every call, so testing this against a path+query silently
+/// disabled injection for all managed Azure streams: no `stream_options.include_usage`, therefore no
+/// usage chunk from OpenAI, therefore a zero-token billing row. The caller computes this in
+/// `request_filter` *before* appending the query for exactly that reason.
 fn is_streamable_path(forward_path: &str) -> bool {
     forward_path.ends_with("/chat/completions")
 }
@@ -338,7 +345,12 @@ impl ProxyHttp for AiProxy {
         // else → unknown provider (404). We resolve before auth (an unknown route is cheap) and
         // compute owned values inside the block so the session borrow ends before any `&mut session`
         // reject below.
-        let (provider_opt, forward_path) = {
+        // `forward_streamable` is computed here, on the forwarded **path**, deliberately *before* the
+        // query string is appended: `is_streamable_path` matches by suffix, so testing it against a
+        // path+query would fail for every provider that requires a query parameter — Azure OpenAI
+        // mandates `?api-version=…`, so its managed streams would silently skip `stream_options`
+        // injection, emit no usage chunk, and bill zero tokens.
+        let (provider_opt, forward_path, forward_streamable) = {
             let uri = &session.req_header().uri;
             let path = uri.path();
             let query = uri.query();
@@ -351,15 +363,17 @@ impl ProxyHttp for AiProxy {
             if let Some(p) = self.state.provider(first) {
                 // Provider-prefixed: strip the leading `/{first}` segment, forward the remainder.
                 let rest = &path[1 + first.len()..];
-                (
-                    Some(p.clone()),
-                    with_query(if rest.is_empty() { "/" } else { rest }),
-                )
+                let rest = if rest.is_empty() { "/" } else { rest };
+                (Some(p.clone()), with_query(rest), is_streamable_path(rest))
             } else if let Some(name) = bare_default_provider_name(path) {
                 // Bare default: dialect picks the provider; forward the path unchanged.
-                (self.state.provider(name).cloned(), with_query(path))
+                (
+                    self.state.provider(name).cloned(),
+                    with_query(path),
+                    is_streamable_path(path),
+                )
             } else {
-                (None, String::new())
+                (None, String::new(), false)
             }
         };
         let Some(provider) = provider_opt else {
@@ -499,8 +513,7 @@ impl ProxyHttp for AiProxy {
         // (handled in `request_body_filter`). Scoped tight: managed only (BYO stays pure
         // passthrough), OpenAI dialect only, streaming-capable paths only — so everything else still
         // streams through untouched. Checked on the forwarded path (suffix), so it's prefix-agnostic.
-        let inject_eligible =
-            managed && dialect == Dialect::OpenAi && is_streamable_path(&forward_path);
+        let inject_eligible = managed && dialect == Dialect::OpenAi && forward_streamable;
 
         // Circuit breaker (per provider, all traffic — a down provider is down regardless of whose
         // key is used). Checked here, after every other rejection, so claiming a half-open probe
@@ -1202,6 +1215,27 @@ mod tests {
         assert!(!is_streamable_path("/v1/embeddings"));
         assert!(!is_streamable_path("/v1/messages"));
         assert!(!is_streamable_path("/v1/models"));
+    }
+
+    #[test]
+    fn is_streamable_path_must_be_given_the_path_without_the_query() {
+        // The suffix match cannot see past a query string. This locks in *why* `request_filter`
+        // computes `forward_streamable` before appending the query: Azure OpenAI requires
+        // `?api-version=…` on every request, and testing the path+query here returned `false` for a
+        // genuine chat/completions call — so managed Azure streams skipped `stream_options`
+        // injection, got no usage chunk back, and billed zero tokens with nothing logged.
+        assert!(
+            !is_streamable_path("/v1/chat/completions?api-version=2024-10-21"),
+            "a query string defeats the suffix match — callers must strip it first"
+        );
+        assert!(!is_streamable_path(
+            "/openai/deployments/gpt4o/chat/completions?api-version=2024-10-21"
+        ));
+        // ...and the same paths, query stripped, are correctly streamable.
+        assert!(is_streamable_path("/v1/chat/completions"));
+        assert!(is_streamable_path(
+            "/openai/deployments/gpt4o/chat/completions"
+        ));
     }
 
     #[test]
