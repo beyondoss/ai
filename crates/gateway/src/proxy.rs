@@ -427,11 +427,15 @@ fn is_streamable_path(forward_path: &str) -> bool {
     forward_path.ends_with("/chat/completions")
 }
 
-/// Splice `stream_options.include_usage` into a buffered OpenAI chat body when it streams without it
-/// (see `peek::plan_stream_usage_injection`); otherwise return it unchanged. This is what guarantees
-/// a usage chunk — hence a billable token count — from a stock client that never set the option.
-fn maybe_inject_stream_usage(body: Vec<u8>) -> Vec<u8> {
-    match peek::plan_stream_usage_injection(&body) {
+/// Splice `stream_options.include_usage` into a buffered OpenAI chat body at `at`, or return it
+/// unchanged when there is nothing to inject. This is what guarantees a usage chunk — hence a
+/// billable token count — from a stock client that never set the option.
+///
+/// Takes the offset rather than computing it: the caller already walked the body once for both the
+/// model and this plan (see `peek::scan_buffered`), and re-deriving it here would restore the second
+/// traversal that walk exists to remove.
+fn apply_stream_usage_injection(body: Vec<u8>, at: Option<usize>) -> Vec<u8> {
+    match at {
         Some(at) => {
             const FRAG: &[u8] = br#""stream_options":{"include_usage":true},"#;
             let mut out = Vec::with_capacity(body.len() + FRAG.len());
@@ -866,22 +870,35 @@ impl ProxyHttp for AiProxy {
                 self.state.metrics.rejection(Rejection::BodyTooLarge).inc();
                 return Err(pingora_core::Error::new_str("request body exceeds limit"));
             }
-            if rc.managed {
-                rc.model_scanner.feed(chunk);
-            }
             // Eligible requests are buffered so we can splice the root object before any byte reaches
             // the upstream (injection inserts near the front, so we can't have forwarded it already).
+            // When we're buffering anyway, the incremental scan is skipped entirely and both answers
+            // come from one walk of the finished buffer below — the body was previously traversed
+            // twice, once here for `model` and once by the injection planner, over the same bytes
+            // with the same depth/string/escape bookkeeping.
             if rc.inject_eligible {
                 rc.req_buf.extend_from_slice(chunk);
+            } else if rc.managed {
+                rc.model_scanner.feed(chunk);
             }
         }
 
         if rc.inject_eligible {
             if end_of_stream {
+                // One structural walk for both answers (see `peek::scan_buffered`).
+                let buf = std::mem::take(&mut rc.req_buf);
+                let scan = peek::scan_buffered(&buf);
+                if rc.model.is_empty() {
+                    if let Some(m) = scan.model {
+                        rc.model = sanitize_model(m).into_owned();
+                    }
+                }
                 // Emit the whole (possibly rewritten) body in one shot; `transfer-encoding: chunked`
                 // (set in `upstream_request_filter`) makes the changed length fine.
-                let buf = std::mem::take(&mut rc.req_buf);
-                *body = Some(Bytes::from(maybe_inject_stream_usage(buf)));
+                *body = Some(Bytes::from(apply_stream_usage_injection(
+                    buf,
+                    scan.inject_at,
+                )));
             } else {
                 // Withhold — the bytes are buffered above; nothing goes upstream until end-of-stream.
                 // Use an *empty* chunk, not `None`: pingora derives end-of-body as
@@ -893,7 +910,9 @@ impl ProxyHttp for AiProxy {
             }
         }
 
-        if end_of_stream && rc.managed && rc.model.is_empty() {
+        // The streamed (non-buffered) path; the buffered one resolved `model` above from its single
+        // fused walk, and its scanner was never fed.
+        if end_of_stream && rc.managed && !rc.inject_eligible && rc.model.is_empty() {
             if let Some(m) = rc.model_scanner.take_model() {
                 rc.model = sanitize_model(m).into_owned();
             }

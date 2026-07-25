@@ -621,6 +621,36 @@ mod peek {
             .counter(BytesCount::of_slice(&body))
             .bench(|| plan_stream_usage_injection(black_box(&body)));
     }
+
+    use beyond_ai::peek::scan_buffered;
+
+    /// What a managed OpenAI chat request used to cost: the body walked once by `ModelScanner`
+    /// chunk-by-chunk for the root `model`, then walked end-to-end *again* by the injection planner
+    /// for root `stream`/`stream_options`. Same traversal, same bytes, different needles.
+    #[divan::bench(args = [4 * 1024, 64 * 1024, 512 * 1024])]
+    fn buffered_two_walks(bencher: Bencher, padding: usize) {
+        let body = streaming_body(padding);
+        bencher.counter(BytesCount::of_slice(&body)).bench(|| {
+            let mut scanner = ModelScanner::new();
+            for chunk in black_box(&body).chunks(8 * 1024) {
+                scanner.feed(chunk);
+            }
+            (
+                scanner.take_model(),
+                plan_stream_usage_injection(black_box(&body)),
+            )
+        });
+    }
+
+    /// The same two answers from one pass. Cross-checked for equivalence against both originals in
+    /// `peek::tests::fused_scan_matches_the_two_walks_it_replaces`.
+    #[divan::bench(args = [4 * 1024, 64 * 1024, 512 * 1024])]
+    fn buffered_fused_walk(bencher: Bencher, padding: usize) {
+        let body = streaming_body(padding);
+        bencher
+            .counter(BytesCount::of_slice(&body))
+            .bench(|| scan_buffered(black_box(&body)));
+    }
 }
 
 mod store_watch {

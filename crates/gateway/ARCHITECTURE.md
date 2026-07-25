@@ -64,10 +64,12 @@ Client (stock OpenAI/Anthropic SDK)
   │  OpenRouter + managed only: dashboard-attribution headers (HTTP-Referer, X-OpenRouter-*)
   │
   ▼  request_body_filter (proxy.rs)  — body streamed through, never buffered
-  │  Feed chunks → ModelScanner (peek.rs) — extract root-level `model`, O(1) mem
   │  Enforce running size cap (chunked-safe) ──────────────────── 413
-  │  Injection-eligible (managed OpenAI chat/responses + stream):
-  │    buffer full body → inject stream_options.include_usage → re-frame chunked
+  │  Managed + streamed: feed chunks → ModelScanner (peek.rs), root-level `model`, O(1) mem
+  │    (BYO skips it — `model` is only ever read on the managed billing path)
+  │  Injection-eligible (managed + OpenAI dialect + path suffix /chat/completions):
+  │    buffer full body → ONE fused walk (peek::scan_buffered) yielding both `model` and the
+  │    splice offset → inject stream_options.include_usage → re-frame chunked
   │
   ▼  Provider upstream  (OpenAI / Anthropic / Groq / DeepSeek / …)
   │
@@ -77,8 +79,11 @@ Client (stock OpenAI/Anthropic SDK)
   │  Set x-beyond-request-id header
   │
   ▼  response_body_filter (proxy.rs)  — response relayed chunk-by-chunk, never buffered
-  │  Feed chunks → ModelScanner over response head → extract billed model
-  │  Append to bounded 64KB tail (compact drain(..half) if tail > 128KB)
+  │  Managed only: feed chunks → ModelScanner::for_response → billed model
+  │    (accepts Anthropic's nested message.model, so it stops in the first chunk for both dialects)
+  │  Append to bounded 64KB tail (copy_within compaction once tail > 128KB)
+  │  Anthropic SSE only: also keep a bounded 8KB head — message_start carries input + cache
+  │    tokens and would otherwise be compacted out of the tail
   │
   ▼  logging (proxy.rs)
      Parse usage from tail (by dialect + streaming flag)
