@@ -81,23 +81,41 @@ pub struct ScopedMcpCredentialStore {
 #[async_trait::async_trait]
 impl CredentialStore for ScopedMcpCredentialStore {
     async fn load(&self) -> Result<Option<StoredCredentials>, AuthError> {
-        Ok(read_store_file(&self.path)
-            .0
-            .get(&self.server_name)
-            .cloned())
+        // `read_store_file` is synchronous `fs` I/O; keep it off the tokio worker (same fix
+        // `auth_credential_source.rs` applies for `AuthStore`) so it can't stall the reactor.
+        let path = self.path.clone();
+        let server_name = self.server_name.clone();
+        tokio::task::spawn_blocking(move || read_store_file(&path).0.get(&server_name).cloned())
+            .await
+            .map_err(|e| AuthError::InternalError(e.to_string()))
     }
 
     async fn save(&self, credentials: StoredCredentials) -> Result<(), AuthError> {
-        mutate_locked(&self.path, |store| {
-            store.0.insert(self.server_name.clone(), credentials);
+        // `mutate_locked` holds a cross-process file lock and can `std::thread::sleep` up to
+        // `LOCK_TIMEOUT` under contention — never on a tokio worker; hand it to `spawn_blocking`.
+        let path = self.path.clone();
+        let server_name = self.server_name.clone();
+        tokio::task::spawn_blocking(move || {
+            mutate_locked(&path, |store| {
+                store.0.insert(server_name, credentials);
+            })
         })
+        .await
+        .map_err(|e| AuthError::InternalError(e.to_string()))?
         .map_err(|e| AuthError::InternalError(e.to_string()))
     }
 
     async fn clear(&self) -> Result<(), AuthError> {
-        mutate_locked(&self.path, |store| {
-            store.0.remove(&self.server_name);
+        // Same blocking-under-lock concern as `save` — run off the reactor.
+        let path = self.path.clone();
+        let server_name = self.server_name.clone();
+        tokio::task::spawn_blocking(move || {
+            mutate_locked(&path, |store| {
+                store.0.remove(&server_name);
+            })
         })
+        .await
+        .map_err(|e| AuthError::InternalError(e.to_string()))?
         .map_err(|e| AuthError::InternalError(e.to_string()))
     }
 }

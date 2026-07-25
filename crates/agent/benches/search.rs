@@ -21,7 +21,8 @@ use std::process::Command;
 use std::sync::OnceLock;
 
 use agent_core::Tool;
-use beyond_ai_agent::tools::{edit, find, grep, ls, read};
+use beyond_ai_agent::tools::exec::{CommandRunner, RealRunner};
+use beyond_ai_agent::tools::{edit, find, grep, ls, output, read};
 use divan::Bencher;
 use globset::Glob;
 use tempfile::TempDir;
@@ -305,6 +306,59 @@ fn edit_run_exact_unicode(bencher: Bencher) {
             })))
             .unwrap();
         black_box(out.text.len());
+    });
+}
+
+/// `OutputAccumulator::snapshot` on a still-running (unfinished) command whose rolling tail is
+/// saturated at `2 × max_bytes` — the ~100 ms live progress tick `bash` emits. `snapshot_text` used to
+/// decode the *whole* tail before `truncate_tail` discarded the front half; now a live tick decodes
+/// only the trailing window. On-thread with `persist_if_truncated = false`, so there's no temp-file
+/// I/O — the alloc columns are purely the decode + truncate cost. Watch alloc bytes drop by ~half.
+#[divan::bench]
+fn snapshot_live_tick(bencher: Bencher) {
+    let mut acc = output::OutputAccumulator::new();
+    // Well past the rolling cap so the tail is saturated and `truncate_tail` really does drop the
+    // front. Appended in a few big chunks (not per-line) to keep setup's spill writes cheap.
+    let mut block: Vec<u8> = Vec::with_capacity(40 * 1024);
+    while block.len() < 40 * 1024 {
+        block.extend_from_slice(b"some ordinary line of streamed command output goes here\n");
+    }
+    for _ in 0..8 {
+        acc.append(&block); // ~320 KiB total, tail saturates at 2 × 50 KiB
+    }
+    bencher.bench_local(|| {
+        let snap = acc.snapshot(false); // unfinished → live-tick windowed decode
+        black_box(snap.content.len());
+    });
+}
+
+/// A streaming `bash`-style command emitting well past the ≤256 KiB head/tail capture window, with a
+/// no-op live sink. The streaming path now skips the discarded `Capture` + `from_utf8_lossy` entirely,
+/// so the alloc columns should shed the head/tail buffers and the two output strings. Time is
+/// subprocess-spawn dominated (noisy); the alloc delta is the signal, not ns/iter.
+#[divan::bench(sample_count = 20)]
+fn exec_stream_capture(bencher: Bencher) {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let runner = RealRunner;
+    let sink: &(dyn Fn(&[u8]) + Send + Sync) = &|_chunk: &[u8]| {};
+    let args = [
+        "-c".to_string(),
+        "head -c 400000 /dev/zero | tr '\\0' a".to_string(),
+    ];
+    bencher.bench_local(|| {
+        let res = rt
+            .block_on(runner.run_streaming(
+                "sh",
+                &args,
+                None,
+                std::time::Duration::from_secs(30),
+                sink,
+            ))
+            .unwrap();
+        black_box(res.stdout.len());
     });
 }
 

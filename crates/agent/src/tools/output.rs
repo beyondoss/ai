@@ -512,13 +512,36 @@ impl OutputAccumulator {
     /// whole tail — including any genuinely truncated/invalid trailing bytes — goes through the
     /// same lossy fallback as before.
     fn snapshot_text(&self) -> String {
-        let decodable = if self.finished {
-            &self.tail[..]
+        let end = if self.finished {
+            self.tail.len()
         } else {
-            let held_back = incomplete_utf8_suffix_len(&self.tail);
-            &self.tail[..self.tail.len() - held_back]
+            self.tail.len() - incomplete_utf8_suffix_len(&self.tail)
         };
-        let s = String::from_utf8_lossy(decodable).into_owned();
+
+        // Live-tick fast path. `truncate_tail` (this string's only consumer, in `snapshot`) keeps at
+        // most the trailing `max_bytes` bytes, so decoding the entire rolling tail (up to
+        // `2 × max_bytes`) on every throttled progress tick only to discard the front is wasted work.
+        // Decode just a trailing window when it provably yields the byte-identical `truncate_tail`
+        // result: the window must (a) start immediately after a `'\n'` — a line (hence char) boundary,
+        // so no partial leading line is decoded and the leading-partial-line drop below would be a
+        // no-op anyway — and (b) hold strictly more than `max_bytes` bytes, which guarantees both this
+        // window *and* the full tail take `truncate_tail`'s truncating branch (never its whole-content
+        // early return) and collect the identical trailing lines. The final snapshot (`finished`)
+        // always takes the full path below, so end-of-stream decoding and the leading-partial-line
+        // handling stay exactly as before.
+        if !self.finished {
+            let want = self.max_bytes.saturating_add(1);
+            if end > want {
+                // A `'\n'` at index `< end - want` gives a window of `> want > max_bytes` bytes that
+                // starts at a line boundary. `rposition` scans backward and stops at the first hit, so
+                // this is a short scan (about one line) in the common case, no allocation.
+                if let Some(nl) = self.tail[..end - want].iter().rposition(|&b| b == b'\n') {
+                    return String::from_utf8_lossy(&self.tail[nl + 1..end]).into_owned();
+                }
+            }
+        }
+
+        let s = String::from_utf8_lossy(&self.tail[..end]).into_owned();
         if self.tail_starts_at_line_boundary {
             return s;
         }
