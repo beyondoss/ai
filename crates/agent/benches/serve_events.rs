@@ -15,6 +15,7 @@
 use std::hint::black_box;
 
 use agent_core::{AgentEvent, StreamEvent};
+use bytes::Bytes;
 use divan::Bencher;
 use serde::Serialize;
 use serde_json::{Map, Value, json};
@@ -86,5 +87,72 @@ fn direct_string(bencher: Bencher, which: &str) {
         })
         .unwrap();
         black_box(line.len());
+    });
+}
+
+/// The already-serialized event line `event_frame` hands to an `OutFrame::Raw` — the `{type,event}`
+/// envelope as its final text.
+fn frame_line(which: &str) -> String {
+    #[derive(Serialize)]
+    struct EventFrame<'a> {
+        r#type: &'static str,
+        event: &'a AgentEvent,
+    }
+    serde_json::to_string(&EventFrame {
+        r#type: "event",
+        event: &event(which),
+    })
+    .unwrap()
+}
+
+// ── `OutFanout::broadcast`'s per-event clone cost: `Raw(String)` (before) vs `Raw(Bytes)` (after) ──
+//
+// `broadcast` clones the frame once for the in-flight-turn recording, then once per *extra* attached
+// sink (the single-sink case moves, so it clones zero times for the sink). `serve.rs`'s real
+// `OutFanout` is private and unreachable from a bench target, so — exactly as the serialize-strategy
+// benches above do — this replicates its clone pattern against the same serialized line. With
+// `String` each clone is a full heap allocation + `memcpy` of the line; with `Bytes` it is a refcount
+// bump. divan's `AllocProfiler` reports the alloc-count gap directly. `1sink` = recording only (1
+// clone); `3sink` = recording + 3 sinks (4 clones).
+
+#[divan::bench(args = ["small_delta", "large_tool_end"])]
+fn fanout_string_1sink(bencher: Bencher, which: &str) {
+    let line = frame_line(which);
+    bencher.bench_local(|| {
+        let rec = black_box(line.clone());
+        black_box(&rec);
+    });
+}
+
+#[divan::bench(args = ["small_delta", "large_tool_end"])]
+fn fanout_bytes_1sink(bencher: Bencher, which: &str) {
+    let line = Bytes::from(frame_line(which));
+    bencher.bench_local(|| {
+        let rec = black_box(line.clone());
+        black_box(&rec);
+    });
+}
+
+#[divan::bench(args = ["small_delta", "large_tool_end"])]
+fn fanout_string_3sink(bencher: Bencher, which: &str) {
+    let line = frame_line(which);
+    bencher.bench_local(|| {
+        let rec = line.clone();
+        let s1 = line.clone();
+        let s2 = line.clone();
+        let s3 = line.clone();
+        black_box((&rec, &s1, &s2, &s3));
+    });
+}
+
+#[divan::bench(args = ["small_delta", "large_tool_end"])]
+fn fanout_bytes_3sink(bencher: Bencher, which: &str) {
+    let line = Bytes::from(frame_line(which));
+    bencher.bench_local(|| {
+        let rec = line.clone();
+        let s1 = line.clone();
+        let s2 = line.clone();
+        let s3 = line.clone();
+        black_box((&rec, &s1, &s2, &s3));
     });
 }

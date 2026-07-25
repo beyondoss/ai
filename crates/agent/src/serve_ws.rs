@@ -47,9 +47,9 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::mpsc;
 use tokio::time::{Duration, MissedTickBehavior};
 use tokio_tungstenite::WebSocketStream;
-use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
+use tokio_tungstenite::tungstenite::{Message, Utf8Bytes};
 use tokio_util::sync::CancellationToken;
 
 use crate::serve::{
@@ -284,8 +284,13 @@ impl Supervisor {
                     // A closed `conn_rx` means this connection's sink was removed (teardown) — stop.
                     frame = conn_rx.recv() => match frame {
                         Some(frame) => if let Some(line) = frame_to_line(frame) {
-                            if sink.send(Message::Text(line.into())).await.is_err() {
-                                break;
+                            // `line` is already valid UTF-8 (built from a `String`); `try_from` only
+                            // re-validates — no copy — to hand the same `Bytes` to a text frame.
+                            match Utf8Bytes::try_from(line) {
+                                Ok(text) => if sink.send(Message::Text(text)).await.is_err() {
+                                    break;
+                                },
+                                Err(e) => eprintln!("serve: non-utf8 output frame skipped: {e}"),
                             }
                         },
                         None => break,

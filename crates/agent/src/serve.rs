@@ -378,6 +378,8 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use crate::approval::{ApprovalDecision, ApprovalError, ApprovalScope};
 
+use bytes::Bytes;
+
 use agent_core::{
     Agent, AgentEvent, AgentHooks, CancellationToken, GatewayClient, Session, StopReason,
     StreamEvent, ToolUpdate,
@@ -1935,13 +1937,18 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
     lock_ignoring_poison(&out_conn).add(crate::serve::OutSink::Unbounded(conn_tx));
     let stdout_task = tokio::spawn(async move {
         let mut out = tokio::io::stdout();
+        // Reused across frames: the `Bytes` line plus its `\n` terminator, assembled once so the frame
+        // still goes out as a single write. The one small copy here (a single local sink) is well worth
+        // the full per-event line clone the fan-out path no longer pays now that `Raw` is `Bytes`.
+        let mut scratch: Vec<u8> = Vec::new();
         while let Some(frame) = conn_rx.recv().await {
-            let Some(mut line) = frame_to_line(frame) else {
+            let Some(line) = frame_to_line(frame) else {
                 continue;
             };
-            // The frame's bytes and its terminator go out as one write.
-            line.push('\n');
-            if let Err(e) = write_frame(&mut out, &line).await {
+            scratch.clear();
+            scratch.extend_from_slice(&line);
+            scratch.push(b'\n');
+            if let Err(e) = write_frame(&mut out, &scratch).await {
                 eprintln!("serve: stdout write failed, shutting down writer: {e}");
                 break;
             }
@@ -7797,10 +7804,14 @@ impl crate::oauth::LoginCallbacks for ServeLoginCallbacks {
 /// `String` instead, serialized straight from the `AgentEvent` in one pass — see its doc comment for
 /// why going through `Value` first would cost a second full serialize on the hottest path this process
 /// has.
+/// `Raw` carries its already-serialized line as [`bytes::Bytes`], not `String`, so the two clones the
+/// per-event fan-out path makes — the in-flight-turn recording ([`OutFanout::broadcast`]) and one per
+/// extra attached sink — are refcount bumps rather than a full heap copy of the line. `event_frame`
+/// still builds a `String` and hands its buffer over with a zero-copy `Bytes::from`.
 #[derive(Clone)]
 pub(crate) enum OutFrame {
     Value(Value),
-    Raw(String),
+    Raw(Bytes),
 }
 
 impl From<Value> for OutFrame {
@@ -8125,15 +8136,17 @@ fn messages_payload(
     Ok(json!({ "messages": messages, "leaf_id": msg_ids.last() }))
 }
 
-/// Serialize one [`OutFrame`] to its final JSON line (no trailing newline). `Raw` (the hot
-/// `event`-frame path) is already the final text; only `Value` pays a `serde_json::to_string`. Returns
-/// `None` only if a frame we built ourselves fails to serialize — a bug, skipped rather than tearing
-/// down the stream. Shared by both transports so stdio and WebSocket emit byte-identical frame text.
-pub(crate) fn frame_to_line(frame: OutFrame) -> Option<String> {
+/// Serialize one [`OutFrame`] to its final JSON line (no trailing newline), as [`bytes::Bytes`]. `Raw`
+/// (the hot `event`-frame path) is already the final text and moves out with no copy; only `Value` pays
+/// a `serde_json::to_string`. Returns `None` only if a frame we built ourselves fails to serialize — a
+/// bug, skipped rather than tearing down the stream. Shared by both transports so stdio and WebSocket
+/// emit byte-identical frame text; each converts the `Bytes` to its own wire form at the socket edge
+/// (a validation-only `Utf8Bytes` for WebSocket, a buffered `\n`-terminated write for stdio).
+pub(crate) fn frame_to_line(frame: OutFrame) -> Option<Bytes> {
     match frame {
         OutFrame::Raw(line) => Some(line),
         OutFrame::Value(v) => match serde_json::to_string(&v) {
-            Ok(line) => Some(line),
+            Ok(line) => Some(Bytes::from(line)),
             Err(e) => {
                 eprintln!("serve: failed to serialize output frame: {e}");
                 None
@@ -8352,14 +8365,16 @@ fn event_frame(ev: AgentEvent) -> Option<OutFrame> {
     })
     .inspect_err(|e| eprintln!("serve: failed to serialize agent event: {e}"))
     .ok()?;
-    Some(OutFrame::Raw(line))
+    // Hand the freshly-built `String`'s buffer to `Bytes` by move — no copy — so every downstream
+    // clone (turn recording, each extra sink) is a refcount bump.
+    Some(OutFrame::Raw(Bytes::from(line)))
 }
 
 /// Write one newline-delimited frame to stdout and flush it.
 /// `line` must already carry its own trailing `\n` — folded into the one caller's buffer rather than a
 /// second `write_all` here, so a frame goes out as a single write instead of two.
-async fn write_frame(out: &mut tokio::io::Stdout, line: &str) -> std::io::Result<()> {
-    out.write_all(line.as_bytes()).await?;
+async fn write_frame(out: &mut tokio::io::Stdout, line: &[u8]) -> std::io::Result<()> {
+    out.write_all(line).await?;
     out.flush().await
 }
 
