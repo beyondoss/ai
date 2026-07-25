@@ -651,6 +651,49 @@ mod peek {
             .counter(BytesCount::of_slice(&body))
             .bench(|| scan_buffered(black_box(&body)));
     }
+
+    const FRAG: &[u8] = br#""stream_options":{"include_usage":true},"#;
+
+    // Both splice rows measure **accumulate + inject**, which is what a buffered request actually
+    // costs end to end. Timing the injection alone would be misleading in either direction: the old
+    // form's cost is dominated by its second allocation (and that buffer's page faults), which only
+    // shows up next to an accumulation that had to happen regardless.
+
+    /// As it was: `req_buf` sized to the body, then a *second* buffer of `len + FRAG` allocated and
+    /// every byte copied across.
+    #[divan::bench(args = [4 * 1024, 64 * 1024, 1024 * 1024])]
+    fn splice_copying(bencher: Bencher, padding: usize) {
+        let body = streaming_body(padding);
+        let at = 1usize;
+        bencher.counter(BytesCount::of_slice(&body)).bench(|| {
+            let b = black_box(&body);
+            let mut buf = Vec::with_capacity(b.len());
+            buf.extend_from_slice(b);
+            let mut out = Vec::with_capacity(buf.len() + FRAG.len());
+            out.extend_from_slice(&buf[..at]);
+            out.extend_from_slice(FRAG);
+            out.extend_from_slice(&buf[at..]);
+            out
+        });
+    }
+
+    /// As it is now: `req_buf` sized with the fragment's worth of headroom up front, so the splice
+    /// shifts the tail right in place and the whole path is one allocation.
+    #[divan::bench(args = [4 * 1024, 64 * 1024, 1024 * 1024])]
+    fn splice_in_place(bencher: Bencher, padding: usize) {
+        let body = streaming_body(padding);
+        let at = 1usize;
+        bencher.counter(BytesCount::of_slice(&body)).bench(|| {
+            let b = black_box(&body);
+            let mut buf = Vec::with_capacity(b.len() + FRAG.len());
+            buf.extend_from_slice(b);
+            let old = buf.len();
+            buf.resize(old + FRAG.len(), 0);
+            buf.copy_within(at..old, at + FRAG.len());
+            buf[at..at + FRAG.len()].copy_from_slice(FRAG);
+            buf
+        });
+    }
 }
 
 mod store_watch {
