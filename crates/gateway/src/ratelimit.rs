@@ -79,15 +79,70 @@ use pingora_limits::estimator::Estimator;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-/// Count-min sketch dimensions for the per-credential tier. The estimator can only *over*estimate a
-/// key's rate (never under — so the cap always holds); the additive error is bounded by
-/// `(e / SLOTS) × N`, where `N` is total req/s across *all* credentials on the node. Sized for a
-/// single high-volume node: at `SLOTS = 65536` that error stays ≤ ~5 even at ~100k req/s aggregate —
-/// far under the per-credential ceiling, so a legitimate caller near its limit isn't false-throttled.
-/// `HASHES = 5` sets the tail confidence (≈ `e^-5` ≈ 0.7% of checks may exceed that bound; the
-/// estimate is the min over the 5 rows). Memory is `2 × HASHES × SLOTS × 8 B` ≈ **5 MB, fixed**
-/// regardless of credential cardinality (no per-key entry, no GC). To resize: `SLOTS ≈ e × peak_N /
-/// tolerable_error`.
+/// Count-min sketch dimensions for the per-credential tier.
+///
+/// ## Accuracy: where 65536 comes from
+///
+/// The sketch can only *over*estimate a key's rate, never under, so the cap always holds and the
+/// single failure mode is **false throttling** — an innocent caller whose counter was inflated by
+/// other people's traffic colliding into its slots. Two numbers bound that:
+///
+/// - the guarantee is `Pr[error > e·N / SLOTS] < e^-HASHES`, i.e. an additive error of at most
+///   `e·N/SLOTS` on all but ≈ 0.7% of checks at `HASHES = 5`;
+/// - typical error is far lower — one row carries ≈ `N/SLOTS` of foreign mass and the estimate is
+///   the *min* over `HASHES` independently-hashed rows.
+///
+/// `N` is **not** the node's request rate. It is the rate that reaches *this sketch*, which is
+/// smaller, and asymmetrically so:
+///
+/// - BYO contributes at most `byo_rate_limit_rps` (default 1000), because `check_at` returns on the
+///   global BYO ceiling **before** it touches the sketch. An unbounded junk-token flood is already
+///   shed a tier earlier and never lands here.
+/// - Managed traffic is the unbounded term. It is exempt from tier 2 by design, and a flood of
+///   forged `bai_…` strings is charged here in full — it is only rejected later, at verify.
+///
+/// So `peak_N` ≈ the peak *managed* rps a single node can accept. **Assume 100k rps.** A flood of
+/// distinct forged keys cannot outrun the node's Ed25519 verify throughput (22.9 µs/verify measured
+/// — `bench unit -- key::verify` — so ≈ 44k/s/core); a same-key flood is rejected here before verify
+/// and is bounded instead by L7 parsing. 100k sits between those and far above any plausible
+/// legitimate volume.
+///
+/// The error must stay small against the ceiling it could push a caller over — and that ceiling is
+/// `config.rate_limit_rps`, **default 100 rps**, not an abstract large number. (The original sizing
+/// said "far under the per-credential ceiling" without naming it; against 100, "≤ 5" is 5%, which
+/// is the actual claim being made.) Budgeting 5%:
+///
+/// ```text
+/// SLOTS ≥ e × peak_N / tolerable_error = 2.718 × 100_000 / 5 = 54_366  →  65_536
+/// ```
+///
+/// To re-derive: `SLOTS ≈ e × peak_N / (0.05 × rate_limit_rps)`, rounded up to a power of two. Note
+/// it is a function of the *ratio* — raise `rate_limit_rps` to 1000 and 8192 slots would do.
+///
+/// ## Cost: the side the original sizing never accounted for
+///
+/// Memory is `2 × HASHES × SLOTS × 8 B` = **5.24 MB, fixed** regardless of credential cardinality
+/// (no per-key entry, no GC), of which 2.62 MB is live and touched at `HASHES` pseudo-random
+/// offsets per request. Measured against `SLOTS = 8192` at the same `HASHES`, on a 16-thread Zen
+/// box (1 MB L2/core, 16 MB shared L3), medians over three runs:
+///
+/// ```text
+///                              SLOTS = 8192   SLOTS = 65536
+///   check, 1 thread               47.0 ns        55.2 ns      +8.2 ns (+17%)
+///   check, 16 threads             87.4 ns        87.6 ns      no measurable difference
+///   window rotation                4.7 µs        40.7 µs      8.7×
+/// ```
+///
+/// The per-request cache cost is real but small, and it *disappears* under concurrency: 2.62 MB is
+/// L3-resident here and the `HASHES` loads issue in parallel, so the latency hides behind
+/// throughput. That will not hold on a node with a smaller or busier L3 — re-measure, don't assume.
+///
+/// What the width actually costs is paid at the **rotation**: 8× the slots is 8× the zeroing walk,
+/// and that walk runs inline on one unlucky request thread (see `WindowedRate::rotate`). At 1 Hz
+/// against 100k rps that is one request in ~100k — a p99.999 tail term, not a throughput one. Given
+/// the accuracy argument above needs the width and the throughput argument does not object, the
+/// width stays. If that tail ever matters more than the accuracy does, shrink `SLOTS` *and* raise
+/// `rate_limit_rps` together: as the formula shows, they are one knob, not two.
 const SLOTS: usize = 65536;
 const HASHES: usize = 5;
 
