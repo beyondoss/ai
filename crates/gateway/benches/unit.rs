@@ -397,6 +397,51 @@ mod peek {
         });
     }
 
+    /// The **response**-side scan (`proxy::response_body_filter`), fed the relayed stream chunk by
+    /// chunk to recover the model the provider actually billed under.
+    ///
+    /// Two very different shapes, which is the whole point of benching it:
+    ///
+    /// - `openai`: the first SSE chunk carries a root-level `model`, so the scanner sets `done` and
+    ///   every later chunk short-circuits. Flat in stream size — this is the design working.
+    /// - `anthropic`: the model is nested at `message.model` inside `message_start`, i.e. depth 2,
+    ///   so a root-only scanner never matches, never sets `done`, and byte-walks the *entire*
+    ///   stream to return `None`. Linear in stream size, for nothing.
+    ///
+    /// Both are now skipped outright for BYO traffic, whose extracted model is never read.
+    #[divan::bench(args = [64 * 1024, 1024 * 1024])]
+    fn scan_response_stream(bencher: Bencher, bytes: usize) {
+        let openai = {
+            let mut s = String::from(
+                "data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4o-2024-08-06\",\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n",
+            );
+            while s.len() < bytes {
+                s.push_str("data: {\"id\":\"c\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\" tok\"}}]}\n\n");
+            }
+            s.into_bytes()
+        };
+        let anthropic = {
+            let mut s = String::from(
+                "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":5000}}}\n\n",
+            );
+            while s.len() < bytes {
+                s.push_str("event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\" tok\"}}\n\n");
+            }
+            s.into_bytes()
+        };
+        // Fed in 8 KiB chunks, the way pingora hands the relay to `response_body_filter`.
+        let scan = |body: &[u8]| {
+            let mut scanner = ModelScanner::new();
+            for chunk in body.chunks(8 * 1024) {
+                scanner.feed(chunk);
+            }
+            scanner.take_model()
+        };
+        bencher
+            .counter(BytesCount::of_slice(&openai))
+            .bench(|| (scan(black_box(&openai)), scan(black_box(&anthropic))));
+    }
+
     use beyond_ai::peek::plan_stream_usage_injection;
 
     /// A streaming body whose large `content` value precedes the root `stream` field — the worst

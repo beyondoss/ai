@@ -33,6 +33,14 @@ const MANAGED_BODY: &str = r#"{"model":"gpt-4o","messages":[{"role":"user","cont
 /// unchanged, no verify/deny/swap). The mock upstream accepts any token.
 const BYO_KEY: &str = "sk-byo-provider-token-1234567890";
 
+/// A realistically-sized chat body (~64 KiB of message content, `model` last so a structural scan
+/// must walk the whole thing). `MANAGED_BODY` is 60 bytes, which makes every body-proportional cost
+/// in the request path invisible — the same blind spot that hid the response-side findings.
+fn large_body() -> String {
+    let content = "x".repeat(64 * 1024);
+    format!(r#"{{"messages":[{{"role":"user","content":"{content}"}}],"model":"gpt-4o"}}"#)
+}
+
 /// Concurrency level for the throughput group — enough in-flight requests to expose per-request
 /// overhead and connection-pool behavior without saturating a laptop.
 const CONCURRENCY: u64 = 32;
@@ -120,6 +128,22 @@ async fn managed_roundtrip(s: &Stack) {
     let _ = resp.bytes().await.expect("body");
 }
 
+/// One round-trip with an arbitrary key and body, so a bench can vary either. `key` decides the
+/// path: a `bai_…` virtual key is managed, anything else is BYO.
+async fn roundtrip_with(s: &Stack, key: &str, body: &str) {
+    let resp = s
+        .client
+        .post(format!("{}/v1/chat/completions", s.url))
+        .header("authorization", format!("Bearer {key}"))
+        .header("content-type", "application/json")
+        .body(body.to_string())
+        .send()
+        .await
+        .expect("request");
+    debug_assert_eq!(resp.status().as_u16(), 200);
+    let _ = resp.bytes().await.expect("body");
+}
+
 /// One **BYO** round-trip: a non-`bai_` token, passed straight through — no key verify, no deny-set
 /// check, no key swap. Isolates the passthrough path's overhead from the managed path's auth work.
 async fn byo_roundtrip(s: &Stack) {
@@ -180,6 +204,25 @@ fn bench_e2e(c: &mut Criterion) {
     });
     group.bench_function("reject_missing_key_latency", |b| {
         b.to_async(&rt).iter(|| reject_roundtrip(&stack));
+    });
+
+    // The same two paths at a realistic body size, since `MANAGED_BODY` is 60 bytes and hides every
+    // body-proportional cost in the request path.
+    //
+    // Do not read a managed-vs-BYO gap out of these two rows: measured at 64 KiB they land inside
+    // each other's confidence intervals (120.2 µs vs 124.2 µs), because a loopback round-trip is
+    // dominated by HTTP and syscall time and swamps a few microseconds of body scanning. The
+    // per-request scan cost is isolated properly by `peek::scan_model_last` /
+    // `peek::scan_response_stream` in the unit bench; these exist to catch a *gross* regression in
+    // the whole path at a size the suite otherwise never exercises.
+    let big = large_body();
+    group.bench_function("managed_large_body_latency", |b| {
+        b.to_async(&rt)
+            .iter(|| roundtrip_with(&stack, &stack.vkey, &big));
+    });
+    group.bench_function("byo_large_body_latency", |b| {
+        b.to_async(&rt)
+            .iter(|| roundtrip_with(&stack, BYO_KEY, &big));
     });
 
     // Throughput: CONCURRENCY requests in flight per iteration. `Throughput::Elements` makes

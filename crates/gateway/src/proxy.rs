@@ -759,7 +759,11 @@ impl ProxyHttp for AiProxy {
             return Ok(());
         };
         // Feed the body through the structural scanner as it passes (never withheld, never
-        // buffered) to extract the exact root-level `model`. Body framing is untouched.
+        // buffered) to extract the exact root-level `model` — but only for **managed** traffic,
+        // which is the only path that reads it. `rc.model` is used at exactly two places, both
+        // inside the `if rc.managed` block in `logging` (the billing-log fallback and
+        // `requested_model`). Scanning it for BYO meant walking the whole request body — a
+        // structural, depth- and escape-aware pass — to produce a value guaranteed to be discarded.
         if let Some(chunk) = body.as_ref() {
             // Enforce the body cap on the *streamed* size too: the up-front `Content-Length` check in
             // `request_filter` can't see a chunked-encoded body (no declared length). We don't buffer
@@ -775,7 +779,9 @@ impl ProxyHttp for AiProxy {
                     .inc();
                 return Err(pingora_core::Error::new_str("request body exceeds limit"));
             }
-            rc.model_scanner.feed(chunk);
+            if rc.managed {
+                rc.model_scanner.feed(chunk);
+            }
             // Eligible requests are buffered so we can splice the root object before any byte reaches
             // the upstream (injection inserts near the front, so we can't have forwarded it already).
             if rc.inject_eligible {
@@ -800,7 +806,7 @@ impl ProxyHttp for AiProxy {
             }
         }
 
-        if end_of_stream && rc.model.is_empty() {
+        if end_of_stream && rc.managed && rc.model.is_empty() {
             if let Some(m) = rc.model_scanner.take_model() {
                 rc.model = sanitize_model(m).into_owned();
             }
@@ -876,7 +882,15 @@ impl ProxyHttp for AiProxy {
             // scanner stops at the first root `model`, so this is O(1) and cheap (it finds the model
             // in the first chunk and ignores the rest). Kept separate from the tail because the model
             // is at the start of the response while the usage event is at the end.
-            rc.resp_model_scanner.feed(chunk);
+            //
+            // Managed only, for the same reason as the request-side scanner: the extracted value is
+            // read at exactly one place, inside the `if rc.managed` block in `logging`. A BYO
+            // request has no Beyond identity and emits no billing row, so scanning its response was
+            // pure waste — and *unbounded* waste on any response with no root-level `model`, since
+            // the scanner never reaches its `done` short-circuit and walks every byte.
+            if rc.managed {
+                rc.resp_model_scanner.feed(chunk);
+            }
 
             // Anthropic SSE only: keep a bounded head so `message_start`'s input + cache token
             // counts survive the tail's compaction. Bounded by `USAGE_HEAD_CAP` and satisfied
