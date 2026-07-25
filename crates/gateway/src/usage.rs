@@ -196,6 +196,34 @@ impl From<AnthropicUsage> for Usage {
     }
 }
 
+/// Recover a `usage` block from a body that did **not** parse as a whole JSON document.
+///
+/// `proxy::logging` is handed a bounded *tail* of the response, so a non-streaming body larger than
+/// `USAGE_TAIL_CAP` arrives front-truncated: it begins mid-value, `serde_json` fails at byte 0, and
+/// the request meters as zero. That is not an edge case — an OpenAI embeddings response puts its
+/// `usage` after the `data` array, and a batch of eight 3072-dimension vectors is ~249 KB, so every
+/// batched embeddings call was billing zero tokens.
+///
+/// The bytes we need are present, just not as a standalone document: both wire formats put `usage`
+/// last. So anchor on the **last** `"usage"` in the buffer and deserialize the single value that
+/// follows, letting `serde_json` stop at the end of that object and ignore the trailing bytes.
+///
+/// Only ever called after the whole-body parse has already failed, which is what keeps the heuristic
+/// safe: a well-formed body never reaches it, so a `"usage"` appearing inside generated content can
+/// only mislead us on a body that was going to meter zero anyway. The `rfind` is what makes even
+/// that unlikely — content precedes `usage` in both formats, so the last occurrence is the real one.
+fn recover_trailing_usage<T: serde::de::DeserializeOwned>(body: &[u8]) -> Option<T> {
+    const KEY: &[u8] = br#""usage""#;
+    let at = memchr::memmem::rfind(body, KEY)?;
+    let rest = &body[at + KEY.len()..];
+    // Step over the `:` separating the key from its value (JSON permits whitespace either side).
+    let colon = memchr::memchr(b':', rest)?;
+    let mut de = serde_json::Deserializer::from_slice(&rest[colon + 1..]);
+    // Deliberately no `de.end()`: the value is followed by the rest of the object, and requiring EOF
+    // is precisely what the whole-document parse already failed on.
+    T::deserialize(&mut de).ok()
+}
+
 /// OpenAI non-streaming: top-level `usage`. `None` (absent/`null`, or a dialect mismatch — see
 /// `OpenAiUsage::looks_anthropic_shaped`) ⇒ no usage to meter.
 pub fn openai_body(body: &[u8]) -> Option<Usage> {
@@ -203,7 +231,11 @@ pub fn openai_body(body: &[u8]) -> Option<Usage> {
     struct Body {
         usage: Option<OpenAiUsage>,
     }
-    let usage = serde_json::from_slice::<Body>(body).ok()?.usage?;
+    let usage = match serde_json::from_slice::<Body>(body) {
+        Ok(b) => b.usage?,
+        // Front-truncated tail of an oversized body — see `recover_trailing_usage`.
+        Err(_) => recover_trailing_usage::<OpenAiUsage>(body)?,
+    };
     if usage.looks_anthropic_shaped() {
         return None;
     }
@@ -217,7 +249,10 @@ pub fn anthropic_body(body: &[u8]) -> Option<Usage> {
     struct Body {
         usage: Option<AnthropicUsage>,
     }
-    let u = serde_json::from_slice::<Body>(body).ok()?.usage?;
+    let u = match serde_json::from_slice::<Body>(body) {
+        Ok(b) => b.usage?,
+        Err(_) => recover_trailing_usage::<AnthropicUsage>(body)?,
+    };
     if u.looks_openai_shaped() {
         return None;
     }
@@ -471,6 +506,91 @@ mod tests {
         );
     }
 
+    /// An OpenAI embeddings response: a big `data` array of float vectors, then `model`, then
+    /// `usage` — the real wire shape, and the one that overflows the 64 KiB tail.
+    fn embeddings_body(vectors: usize, dims: usize) -> Vec<u8> {
+        let vec_json = (0..dims)
+            .map(|i| format!("{}", 0.0123456 + i as f64 * 1e-7))
+            .collect::<Vec<_>>()
+            .join(",");
+        let items = (0..vectors)
+            .map(|i| format!(r#"{{"object":"embedding","index":{i},"embedding":[{vec_json}]}}"#))
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(
+            r#"{{"object":"list","data":[{items}],"model":"text-embedding-3-large","usage":{{"prompt_tokens":812,"total_tokens":812}}}}"#
+        )
+        .into_bytes()
+    }
+
+    /// What `proxy::logging` actually passes the parser: the last `USAGE_TAIL_CAP` bytes.
+    fn tail_of(body: &[u8]) -> &[u8] {
+        const USAGE_TAIL_CAP: usize = 64 * 1024;
+        &body[body.len().saturating_sub(USAGE_TAIL_CAP)..]
+    }
+
+    #[test]
+    fn oversized_non_streaming_body_still_meters_from_the_truncated_tail() {
+        // A body larger than the tail cap reaches the parser front-truncated, so `from_slice` fails
+        // at byte 0 and the request metered zero — while tripping `usage_parse_errors_total`, so it
+        // looked like a provider wire change rather than our own truncation. OpenAI embeddings hit
+        // this routinely: `usage` sits after the `data` array, and eight 3072-dim vectors is ~249 KB.
+        let small = embeddings_body(1, 3072);
+        assert!(small.len() < 64 * 1024, "control case must fit in the tail");
+        assert_eq!(openai_body(tail_of(&small)).unwrap().input_tokens, 812);
+
+        for (vectors, dims) in [(8, 3072), (32, 3072)] {
+            let body = embeddings_body(vectors, dims);
+            assert!(body.len() > 64 * 1024);
+            let from_tail = openai_body(tail_of(&body)).unwrap_or_else(|| {
+                panic!("{vectors}x{dims} body ({} B) metered nothing", body.len())
+            });
+            assert_eq!(from_tail.input_tokens, 812);
+            // ...and matches what the untruncated body would have reported.
+            assert_eq!(from_tail, openai_body(&body).unwrap());
+        }
+    }
+
+    #[test]
+    fn oversized_anthropic_body_recovers_cache_tokens_from_the_tail() {
+        // Same shape on the Anthropic wire: a long `content` array, then `usage` last. Cache tokens
+        // are the largest line item in a cached agent workload, so silently zeroing them is the
+        // expensive half of this bug.
+        let text = "x".repeat(120 * 1024);
+        let body = format!(
+            r#"{{"id":"msg_1","type":"message","role":"assistant","model":"claude-opus-4-8","content":[{{"type":"text","text":"{text}"}}],"usage":{{"input_tokens":5000,"output_tokens":2500,"cache_read_input_tokens":4000,"cache_creation_input_tokens":100}}}}"#
+        )
+        .into_bytes();
+        assert!(body.len() > 64 * 1024);
+        let u = anthropic_body(tail_of(&body)).expect("must meter from a truncated tail");
+        assert_eq!(
+            (
+                u.input_tokens,
+                u.output_tokens,
+                u.cache_read_tokens,
+                u.cache_write_tokens
+            ),
+            (5000, 2500, 4000, 100)
+        );
+    }
+
+    #[test]
+    fn recovery_does_not_fire_on_a_body_that_parses() {
+        // The anchored recovery is only reachable once the whole-document parse has failed, which is
+        // what keeps it safe. A well-formed body must take the normal path — including the cases
+        // that deliberately return `None` (absent usage, dialect mismatch), which recovery must not
+        // resurrect into a bogus reading.
+        assert!(openai_body(br#"{"choices":[{"message":{"content":"hi"}}]}"#).is_none());
+        assert!(
+            openai_body(br#"{"usage":{"input_tokens":100,"output_tokens":50}}"#).is_none(),
+            "an Anthropic-shaped usage must stay a dialect mismatch, not be recovered"
+        );
+        assert!(anthropic_body(br#"{"usage":null}"#).is_none());
+        // Still genuinely unparseable ⇒ still nothing to meter.
+        assert!(openai_body(b"not json at all").is_none());
+        assert!(openai_body(b"{ broken").is_none());
+    }
+
     #[test]
     fn openai_reverse_scan_selects_the_same_line_as_a_forward_scan() {
         // `openai_stream` scans backwards and returns at the first hit; the contract it replaced was
@@ -492,7 +612,8 @@ mod tests {
         assert_eq!((u.input_tokens, u.output_tokens), (3, 4));
 
         // An explicit `"usage":null` deserializes to `None` and must also fall through.
-        let null_last = b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":6}}\n\n\
+        let null_last =
+            b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":6}}\n\n\
                           data: {\"choices\":[],\"usage\":null}\n\n";
         let u = openai_stream(null_last).unwrap();
         assert_eq!((u.input_tokens, u.output_tokens), (7, 6));
@@ -518,7 +639,8 @@ mod tests {
 
         // ...and a stream that genuinely never carries usage still meters nothing rather than
         // picking up a content line that merely mentions the word.
-        let only_the_word = b"data: {\"choices\":[{\"delta\":{\"content\":\"usage usage usage\"}}]}\n\n\
+        let only_the_word =
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"usage usage usage\"}}]}\n\n\
                               data: [DONE]\n\n";
         assert!(openai_stream(only_the_word).is_none());
 

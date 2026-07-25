@@ -252,6 +252,45 @@ mod usage {
             .bench(|| usage::anthropic_stream(black_box(&sse)));
     }
 
+    /// An OpenAI embeddings response: a large `data` array, then `model`, then `usage` last.
+    fn embeddings_body(vectors: usize, dims: usize) -> Vec<u8> {
+        let vec_json = (0..dims)
+            .map(|i| format!("{}", 0.0123456 + i as f64 * 1e-7))
+            .collect::<Vec<_>>()
+            .join(",");
+        let items = (0..vectors)
+            .map(|i| format!(r#"{{"object":"embedding","index":{i},"embedding":[{vec_json}]}}"#))
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(
+            r#"{{"object":"list","data":[{items}],"model":"text-embedding-3-large","usage":{{"prompt_tokens":812,"total_tokens":812}}}}"#
+        )
+        .into_bytes()
+    }
+
+    /// A non-streaming body that *fits* in the tail: the ordinary path, a full document parse that
+    /// structurally skips everything before `usage`. Kept as the baseline for the row below.
+    #[divan::bench]
+    fn openai_body_whole(bencher: Bencher) {
+        let body = embeddings_body(1, 3072);
+        bencher
+            .counter(BytesCount::of_slice(&body))
+            .bench(|| usage::openai_body(black_box(&body)));
+    }
+
+    /// The same shape *oversized*, sliced to the 64 KiB tail `proxy::logging` actually passes — so
+    /// the buffer starts mid-value and the whole-document parse fails. This used to meter nothing at
+    /// all; it now recovers from the trailing `usage`, and does so faster than parsing a whole body,
+    /// because the anchored parse skips straight to the object instead of walking the array.
+    #[divan::bench]
+    fn openai_body_truncated_tail(bencher: Bencher) {
+        let body = embeddings_body(8, 3072);
+        let tail = &body[body.len() - 64 * 1024..];
+        bencher
+            .counter(BytesCount::of_slice(tail))
+            .bench(|| usage::openai_body(black_box(tail)));
+    }
+
     /// The worst case for the reverse scan: a well-formed stream that never carries usage, so it
     /// cannot stop early and must walk the whole tail. Guards the claim that the pre-filter, not the
     /// early return, is what keeps this cheap.
