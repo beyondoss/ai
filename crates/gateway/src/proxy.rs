@@ -568,7 +568,10 @@ impl ProxyHttp for AiProxy {
             managed,
             model: String::new(),
             model_scanner: peek::ModelScanner::new(),
-            resp_model_scanner: peek::ModelScanner::new(),
+            // `for_response`, not `new`: a response may carry the model nested under `message`
+            // (Anthropic's `message_start`), and a root-only scanner would neither find it nor ever
+            // stop looking. See `ModelScanner::for_response`.
+            resp_model_scanner: peek::ModelScanner::for_response(),
             streaming: false,
             inject_eligible,
             // Only the inject-eligible path ever buffers the request body (to splice

@@ -431,7 +431,7 @@ mod peek {
         };
         // Fed in 8 KiB chunks, the way pingora hands the relay to `response_body_filter`.
         let scan = |body: &[u8]| {
-            let mut scanner = ModelScanner::new();
+            let mut scanner = ModelScanner::for_response();
             for chunk in body.chunks(8 * 1024) {
                 scanner.feed(chunk);
             }
