@@ -176,6 +176,24 @@ mod route {
     // that still runs. Kept because the cost is entirely in the allocation, which is invisible
     // end-to-end (a loopback round-trip is ~120 µs) but shows plainly in the alloc columns.
 
+    /// The two header values a managed request sets on every upstream request: the pool key and
+    /// `Host`. Both are fixed at boot, but `insert_header(name, &str)` re-validates and re-copies
+    /// the bytes into a fresh `Bytes` each time.
+    #[divan::bench]
+    fn header_value_from_str(bencher: Bencher) {
+        let auth = "Bearer sk-proj-0123456789abcdef0123456789abcdef0123456789abcdef";
+        bencher.bench(|| http::HeaderValue::from_str(black_box(auth)).unwrap());
+    }
+
+    /// Cloning the boot-built value instead: a `Bytes` refcount bump, no allocation.
+    #[divan::bench]
+    fn header_value_clone(bencher: Bencher) {
+        let auth = "Bearer sk-proj-0123456789abcdef0123456789abcdef0123456789abcdef";
+        let pre = http::HeaderValue::from_str(auth).unwrap();
+        let _ = pre.clone(); // force the one-time promotion to a shared representation
+        bencher.bench(|| black_box(&pre).clone());
+    }
+
     /// What the bare-default route used to build, with no query string.
     #[divan::bench]
     fn forward_path_rebuilt_no_query() -> String {

@@ -821,12 +821,26 @@ impl ProxyHttp for AiProxy {
                 for header in STATIC_KEY_HEADERS {
                     upstream_request.remove_header(header);
                 }
-                upstream_request.insert_header(rc.provider.auth.header(), av.expose())?;
+                // Clone the boot-built `HeaderValue` (a refcount bump) rather than re-validating and
+                // re-copying the key out of a `&str` on every managed request. The `&str` path is
+                // kept as a fallback for a key that isn't a legal header value, which could never
+                // have worked anyway — see `Provider::pool_auth_header`.
+                match &rc.provider.pool_auth_header {
+                    Some(hv) => {
+                        upstream_request.insert_header(rc.provider.auth.header(), hv.clone())?
+                    }
+                    None => {
+                        upstream_request.insert_header(rc.provider.auth.header(), av.expose())?
+                    }
+                }
             }
         }
 
-        // Point Host at the upstream.
-        upstream_request.insert_header("host", rc.provider.host.as_str())?;
+        // Point Host at the upstream. Same precomputed-value trick as the pool key above.
+        match &rc.provider.host_header {
+            Some(hv) => upstream_request.insert_header("host", hv.clone())?,
+            None => upstream_request.insert_header("host", rc.provider.host.as_str())?,
+        }
 
         // Dashboard-attribution headers (OpenRouter, managed traffic only — Task #22, see
         // `apply_provider_attribution`).

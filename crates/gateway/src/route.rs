@@ -77,6 +77,25 @@ pub struct Provider {
     /// configured for this provider ⇒ managed requests to it are rejected (503). Kept in `Secret`
     /// for the redacting-`Debug` + zeroize-on-drop hygiene of the underlying key.
     pub pool_auth_value: Option<Secret>,
+    /// `pool_auth_value` as a ready-to-insert [`http::HeaderValue`].
+    ///
+    /// `insert_header(name, &str)` runs `HeaderValue::from_str`, which validates the bytes and
+    /// copies them into a fresh `Bytes` — a heap allocation per managed request for a value fixed at
+    /// boot. Cloning a `HeaderValue` is a refcount bump instead. Same for [`Self::host_header`].
+    ///
+    /// `None` only if the configured key isn't a legal header value (a stray newline, say), which no
+    /// key that could ever have worked would be — `insert_header` would have rejected it per
+    /// request. The caller falls back to the string form so that stays true rather than becoming a
+    /// silent 503.
+    ///
+    /// Hygiene note: a `HeaderValue` is not zeroized on drop, so this is one long-lived plaintext
+    /// copy of the pool key. That is a net *improvement* — `secret.rs` already concedes the key is
+    /// "copied into Pingora's request headers we don't own", and previously that copy was made and
+    /// freed thousands of times a second, scattering key bytes across the heap. The `Secret` is kept
+    /// for the redacting `Debug`.
+    pub pool_auth_header: Option<http::HeaderValue>,
+    /// `host` as a ready-to-insert `HeaderValue` — see [`Self::pool_auth_header`].
+    pub host_header: Option<http::HeaderValue>,
     /// Per-provider metric handles, resolved once here so the response path bumps a direct
     /// counter/histogram instead of a string-keyed label lookup per response.
     pub metrics: ProviderMetrics,
@@ -105,6 +124,10 @@ impl Provider {
             .unwrap_or(&authority)
             .to_string();
         let pool_auth_value = pool_key.map(|k| Secret::new(auth.format(k)));
+        let pool_auth_header = pool_auth_value
+            .as_ref()
+            .and_then(|s| http::HeaderValue::from_str(s.expose()).ok());
+        let host_header = http::HeaderValue::from_str(&host).ok();
         Provider {
             name: name.to_string(),
             authority,
@@ -112,6 +135,8 @@ impl Provider {
             dialect,
             auth,
             pool_auth_value,
+            pool_auth_header,
+            host_header,
             metrics,
             breaker,
         }
@@ -176,6 +201,69 @@ mod tests {
             None,
         );
         assert!(a.pool_auth_value.is_none());
+    }
+
+    #[test]
+    fn precomputed_header_values_match_the_string_form() {
+        // The per-request insert now clones these instead of re-validating and re-copying the
+        // string. They must be byte-identical to what `insert_header(name, &str)` would have built,
+        // or a managed request goes upstream with a different `Host` or a different pool key.
+        for (authority, scheme, key) in [
+            ("api.openai.com:443", AuthScheme::Bearer, "sk-test"),
+            ("api.anthropic.com:443", AuthScheme::XApiKey, "sk-ant-test"),
+            (
+                "my-resource.openai.azure.com:443",
+                AuthScheme::ApiKey,
+                "azure-secret",
+            ),
+        ] {
+            let p = Provider::resolve(
+                "p",
+                authority.to_string(),
+                Dialect::OpenAi,
+                scheme,
+                Some(key),
+                ProviderMetrics::disconnected(),
+                None,
+            );
+            assert_eq!(
+                p.host_header.as_ref().expect("host is header-safe"),
+                &http::HeaderValue::from_str(&p.host).unwrap()
+            );
+            let av = p.pool_auth_value.as_ref().expect("pool key configured");
+            assert_eq!(
+                p.pool_auth_header.as_ref().expect("key is header-safe"),
+                &http::HeaderValue::from_str(av.expose()).unwrap()
+            );
+        }
+
+        // No pool key ⇒ no precomputed auth header either (and the 503 path is unchanged).
+        let none = Provider::resolve(
+            "p",
+            "h:443".to_string(),
+            Dialect::OpenAi,
+            AuthScheme::Bearer,
+            None,
+            ProviderMetrics::disconnected(),
+            None,
+        );
+        assert!(none.pool_auth_value.is_none());
+        assert!(none.pool_auth_header.is_none());
+
+        // A key that is not a legal header value precomputes to `None`, so the caller falls back to
+        // the string form and gets the same per-request error it always did — rather than this
+        // quietly turning into a 503.
+        let bad = Provider::resolve(
+            "p",
+            "h:443".to_string(),
+            Dialect::OpenAi,
+            AuthScheme::XApiKey,
+            Some("has\nnewline"),
+            ProviderMetrics::disconnected(),
+            None,
+        );
+        assert!(bad.pool_auth_value.is_some());
+        assert!(bad.pool_auth_header.is_none());
     }
 
     #[test]
