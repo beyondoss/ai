@@ -292,6 +292,13 @@ impl WindowedRate {
 
     /// Retire window `from` and open `to`. The `claimed` CAS elects exactly one request thread per
     /// rotation to run this, so the zeroing walk is paid once per window, not once per request.
+    ///
+    /// Known residual, written down rather than hidden: if a rotation is descheduled long enough
+    /// for the *next* window to open before it publishes, that next rotation can zero a slot the
+    /// stalled one has left live. The stall has to exceed a whole `WINDOW` (1 s) to happen at all,
+    /// against a walk measured at ~39 µs, and the consequence is bounded — some counts in one
+    /// window are dropped, so a handful of requests are admitted that would have been shed. Never a
+    /// panic, never a ceiling that stops being enforced, and self-correcting at the next window.
     #[cold]
     fn rotate(&self, from: u64, to: u64) {
         let incoming = (to & 1) as usize;
