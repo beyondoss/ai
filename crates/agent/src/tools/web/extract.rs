@@ -5,6 +5,7 @@
 //! token-cheap table. Output is header-once TSV-style rows with a trailing "N rows (M empty)" note —
 //! ax's "never silent" principle, rendered as text since a tool has no stderr the model sees.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 
 use agent_core::ToolError;
@@ -45,11 +46,44 @@ fn parse_selector(sel: &str) -> Result<Selector, ToolError> {
 
 /// The visible text of an element, whitespace-collapsed to one line.
 fn text_of(el: &ElementRef) -> String {
-    collapse_ws(&el.text().collect::<String>())
+    // Fold every text fragment through one whitespace-collapsing writer — a single output
+    // allocation, no intermediate concatenation.
+    let mut out = String::new();
+    let mut pending = false;
+    for frag in el.text() {
+        push_collapsed(&mut out, &mut pending, frag);
+    }
+    out
 }
 
 fn collapse_ws(s: &str) -> String {
-    s.split_whitespace().collect::<Vec<_>>().join(" ")
+    let mut out = String::new();
+    let mut pending = false;
+    push_collapsed(&mut out, &mut pending, s);
+    out
+}
+
+/// Append `s`'s characters to `out`, collapsing internal whitespace runs to a single space and
+/// trimming leading/trailing whitespace. `pending` carries "saw whitespace, awaiting the next token
+/// character" across calls, so folding several fragments collapses exactly as if they had been
+/// concatenated first (a boundary with no whitespace joins into one token; a whitespace-only
+/// fragment between two tokens still yields a single space).
+fn push_collapsed(out: &mut String, pending: &mut bool, s: &str) {
+    for ch in s.chars() {
+        if ch.is_whitespace() {
+            // Only arm a space once we've emitted a token — leading whitespace is dropped, and a
+            // deferred space never lands at the end because it's flushed only before a token char.
+            if !out.is_empty() {
+                *pending = true;
+            }
+        } else {
+            if *pending {
+                out.push(' ');
+                *pending = false;
+            }
+            out.push(ch);
+        }
+    }
 }
 
 // ---- outline -------------------------------------------------------------------------------------
@@ -67,8 +101,7 @@ fn outline(doc: &Html) -> String {
         let mut key = v.name().to_string();
         // Include up to two classes — enough to distinguish `div.card` from `div.footer` without the
         // long utility-class soup some pages carry.
-        let classes: Vec<&str> = v.classes().take(2).collect();
-        for c in classes {
+        for c in v.classes().take(2) {
             key.push('.');
             key.push_str(c);
         }
@@ -107,7 +140,7 @@ fn locate(doc: &Html, input: &Value) -> Result<String, ToolError> {
         // Direct text of this element only (not descendants), collapsed.
         let direct: String = el
             .children()
-            .filter_map(|c| c.value().as_text().map(|t| t.to_string()))
+            .filter_map(|c| c.value().as_text().map(|t| &**t))
             .collect();
         if collapse_ws(&direct).to_lowercase().contains(&needle_lc) {
             let v = el.value();
@@ -323,11 +356,12 @@ fn render_rows(
     out.push_str(&columns.join("\t"));
     out.push('\n');
     for row in rows {
-        let line: Vec<String> = columns
-            .iter()
-            .map(|c| clean_cell(row.get(c).map(String::as_str).unwrap_or("")))
-            .collect();
-        out.push_str(&line.join("\t"));
+        for (i, c) in columns.iter().enumerate() {
+            if i > 0 {
+                out.push('\t');
+            }
+            out.push_str(&clean_cell(row.get(c).map(String::as_str).unwrap_or("")));
+        }
         out.push('\n');
     }
 
@@ -347,8 +381,12 @@ fn render_rows(
     out
 }
 
-fn clean_cell(s: &str) -> String {
-    s.replace(['\t', '\n', '\r'], " ")
+fn clean_cell(s: &str) -> Cow<'_, str> {
+    if s.contains(['\t', '\n', '\r']) {
+        Cow::Owned(s.replace(['\t', '\n', '\r'], " "))
+    } else {
+        Cow::Borrowed(s)
+    }
 }
 
 #[cfg(test)]

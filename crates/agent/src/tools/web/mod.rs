@@ -304,17 +304,21 @@ fn parse_request(input: &Value) -> Result<Request, ToolError> {
 
 /// Render the `fetch` report — ax's `{status, ok, ms, headers, body}` shape, as readable text.
 fn render_fetch(f: &Fetched) -> String {
+    use std::fmt::Write;
     let mut out = String::new();
-    out.push_str(&format!(
-        "{} {} — {}ms\n",
+    // `write!` into the buffer directly — no throwaway `format!` allocation per line/header. Writing
+    // to a `String` is infallible, so the `Result` is deliberately ignored.
+    let _ = writeln!(
+        out,
+        "{} {} — {}ms",
         f.status.as_u16(),
         f.status.canonical_reason().unwrap_or(""),
         f.elapsed.as_millis()
-    ));
-    out.push_str(&format!("url: {}\n", f.final_url));
+    );
+    let _ = writeln!(out, "url: {}", f.final_url);
     out.push_str("headers:\n");
     for (k, v) in f.headers.iter() {
-        out.push_str(&format!("  {}: {}\n", k, v.to_str().unwrap_or("<binary>")));
+        let _ = writeln!(out, "  {}: {}", k, v.to_str().unwrap_or("<binary>"));
     }
     out.push('\n');
     let body = f.text();

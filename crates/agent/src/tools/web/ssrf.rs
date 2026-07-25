@@ -86,8 +86,11 @@ impl EgressPolicy {
     }
 
     fn host_allowed(&self, host: &str) -> bool {
-        let host = host.to_ascii_lowercase();
-        self.allow_hosts.contains(&host)
+        // `allow_hosts` is already lowercased at construction, so an ASCII-case-insensitive compare
+        // matches without allocating a lowercased copy of `host` per check.
+        self.allow_hosts
+            .iter()
+            .any(|h| h.eq_ignore_ascii_case(host))
     }
 
     /// Whether `addr` is safe to connect to for a request to `host`, given this policy.
@@ -200,18 +203,22 @@ pub fn validate_url(url: &reqwest::Url, policy: &EgressPolicy) -> Result<(), Blo
 /// resolved address is blocked. Installed via `ClientBuilder::dns_resolver`, so it runs for the initial
 /// connection and every redirect hop reqwest makes.
 pub struct SsrfResolver {
-    policy: EgressPolicy,
+    /// Held behind an `Arc` so each `resolve` clones a pointer into the async task, not the whole
+    /// `EgressPolicy` (which owns a `Vec<String>` of allow-hosts).
+    policy: Arc<EgressPolicy>,
 }
 
 impl SsrfResolver {
     pub fn new(policy: EgressPolicy) -> Arc<Self> {
-        Arc::new(Self { policy })
+        Arc::new(Self {
+            policy: Arc::new(policy),
+        })
     }
 }
 
 impl Resolve for SsrfResolver {
     fn resolve(&self, name: Name) -> Resolving {
-        let policy = self.policy.clone();
+        let policy = Arc::clone(&self.policy);
         let host = name.as_str().to_string();
         Box::pin(async move {
             let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host.as_str(), 0))
