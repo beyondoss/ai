@@ -233,10 +233,17 @@ mod deny {
 mod ratelimit {
     use super::*;
     use beyond_ai::ratelimit::RateLimit;
+    use std::cell::Cell;
+    use std::sync::LazyLock;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// Guardrail charged on **every request before verify** (`proxy::request_filter`). Managed: a
     /// seeded hash of the raw credential + the per-credential sketch `observe` (the BYO global tier is
     /// skipped). Fixed memory regardless of key cardinality, so this must be flat and low-alloc.
+    ///
+    /// Single-threaded, one credential: everything the sketch touches stays in L1. That is the *best*
+    /// case and it is deliberately kept — it isolates hashing + the arithmetic from the memory system.
+    /// It cannot see contention, cache misses, or the window reset; `flood_*` below covers those.
     #[divan::bench]
     fn check_managed(bencher: Bencher) {
         let rl = RateLimit::new(1_000_000, 1_000_000).expect("enabled");
@@ -245,12 +252,72 @@ mod ratelimit {
     }
 
     /// A longer BYO provider token — exercises both tiers (global BYO bucket + per-credential sketch)
-    /// against a realistic raw token length: the full per-request BYO cost.
+    /// against a realistic raw token length: the full per-request BYO cost. Single-threaded/hot-cache,
+    /// same caveat as `check_managed`.
     #[divan::bench]
     fn check_byo(bencher: Bencher) {
         let rl = RateLimit::new(1_000_000, 1_000_000).expect("enabled");
         let token = "sk-some-byo-provider-token-of-realistic-length-abcdef0123456789";
         bencher.bench(|| rl.check(black_box(token), black_box(false)));
+    }
+
+    // --- the load-shape this guardrail actually exists for: many workers, many distinct creds ---
+
+    /// Distinct credentials in the flood corpus. Power of two so the cursor wrap is a mask. Sized to
+    /// the per-credential sketch's `SLOTS` so a run touches the *whole* counter array, not a hot
+    /// corner of it — that is what makes the sketch's cache footprint visible.
+    const FLOOD: usize = 65_536;
+
+    /// Realistic ~70-byte credentials, built once outside every timed region.
+    static CREDS: LazyLock<Vec<String>> = LazyLock::new(|| {
+        (0..FLOOD)
+            .map(|i| format!("bai_v1.1.AAAAAAAAAAAAAAAA{i:08}.signature-base64url-payload-here"))
+            .collect()
+    });
+
+    static NEXT_THREAD: AtomicUsize = AtomicUsize::new(0);
+
+    thread_local! {
+        /// Per-thread cursor into `CREDS`. Seeded to a different region per thread (odd stride, so it
+        /// is a permutation) so the threads don't march in lockstep over the same counters — and it is
+        /// thread-local rather than a shared atomic so the harness itself contributes no contention.
+        static CURSOR: Cell<usize> =
+            Cell::new(NEXT_THREAD.fetch_add(1, Ordering::Relaxed).wrapping_mul(0x9E37_79B9));
+    }
+
+    #[inline]
+    fn next_cred() -> &'static str {
+        let i = CURSOR.with(|c| {
+            let v = c.get();
+            c.set(v.wrapping_add(1));
+            v
+        });
+        &CREDS[i & (FLOOD - 1)]
+    }
+
+    /// The real shape of the load: N Pingora workers charging *distinct* credentials concurrently.
+    /// Three things this shows that the hot-cache benches structurally cannot:
+    ///
+    /// 1. **Contention** — `threads = 16` puts every worker on the same shared counters.
+    /// 2. **Cache footprint** — `FLOOD` distinct keys spread the accesses over the entire sketch, so
+    ///    the per-request cost includes the cache misses the sizing constant buys.
+    /// 3. **The window reset** — `min_time = 3` guarantees the run spans ≥ 2 window rotations, so the
+    ///    reset walk lands inside a sample. It is ~1 in a million requests, so watch the **slowest**
+    ///    column, not the median: the median is throughput, the max is the tail this costs.
+    #[divan::bench(threads = [1, 16], min_time = 3, sample_size = 100)]
+    fn check_flood_managed(bencher: Bencher) {
+        let rl = RateLimit::new(u32::MAX, u32::MAX).expect("enabled");
+        LazyLock::force(&CREDS);
+        bencher.bench(|| rl.check(black_box(next_cred()), black_box(true)));
+    }
+
+    /// Same, on the BYO path — so it charges the global BYO tier *and* the per-credential sketch. The
+    /// global tier is a single shared bucket, i.e. the most contended thing in the module.
+    #[divan::bench(threads = [1, 16], min_time = 3, sample_size = 100)]
+    fn check_flood_byo(bencher: Bencher) {
+        let rl = RateLimit::new(u32::MAX, u32::MAX).expect("enabled");
+        LazyLock::force(&CREDS);
+        bencher.bench(|| rl.check(black_box(next_cred()), black_box(false)));
     }
 }
 
