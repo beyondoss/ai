@@ -332,3 +332,97 @@ mod peek {
             .bench(|| plan_stream_usage_injection(black_box(&body)));
     }
 }
+
+mod store_watch {
+    use super::*;
+    use beyond_ai::deny::{DenyReason, DenySet};
+    use beyond_ai::store_watch::apply_batch;
+    use store::{KvEntry, KvUpdate, VersionToken};
+
+    /// A realistically-sized live deny-set. The set is O(denied), not O(tenants), so a few thousand
+    /// cut-off tenants is a busy day — but it's the *size of the map that gets copied* on every
+    /// `rcu`, which is exactly what batching is about.
+    const DENIED: u64 = 1_024;
+
+    fn populated(n: u64) -> DenySet {
+        (0..n).map(|t| (t, DenyReason::Spend)).collect()
+    }
+
+    /// A burst of `k` `Put` deltas for tenants outside the existing set (a control-plane sweep).
+    fn burst(k: usize) -> Vec<KvUpdate> {
+        (0..k)
+            .map(|i| {
+                KvUpdate::Put(KvEntry {
+                    key: format!("blackhole.{}", DENIED + i as u64),
+                    value: b"spend".to_vec(),
+                    version: VersionToken::from_u64(100 + i as u64),
+                })
+            })
+            .collect()
+    }
+
+    /// The watcher's apply step, batched: `k` deltas land under **one** `rcu` clone of the map.
+    /// The alloc column is the claim — it must stay at 1 map allocation regardless of `k`, and the
+    /// `k = 1` row must match `apply_one_at_a_time`'s (batching costs nothing in the steady state).
+    #[divan::bench(args = [1, 8, 64, 256])]
+    fn apply_batched(bencher: Bencher, k: usize) {
+        let set = populated(DENIED);
+        let updates = burst(k);
+        bencher.bench(|| apply_batch(black_box(&set), black_box(&updates)));
+    }
+
+    /// The pre-batching shape, kept as the control: one `rcu` — i.e. one full clone of the map —
+    /// per delta, which is what the watch loop used to do. O(k·N) copies against the batched
+    /// O(N + k).
+    #[divan::bench(args = [1, 8, 64, 256])]
+    fn apply_one_at_a_time(bencher: Bencher, k: usize) {
+        let set = populated(DENIED);
+        let updates = burst(k);
+        bencher.bench(|| {
+            let mut cur = apply_batch(black_box(&set), &updates[..1]);
+            for u in &updates[1..] {
+                cur = apply_batch(&cur, std::slice::from_ref(u));
+            }
+            cur
+        });
+    }
+
+    // --- cold-boot / `CursorExpired` rescan: turning a scan into snapshot `Put` records ---
+
+    fn scanned(n: usize) -> Vec<KvEntry> {
+        (0..n)
+            .map(|i| KvEntry {
+                key: format!("blackhole.{i}"),
+                value: br#"{"reason":"spend","exp":1750000000}"#.to_vec(),
+                version: VersionToken::from_u64(i as u64 + 1),
+            })
+            .collect()
+    }
+
+    /// `rebuild_snapshot` wraps each scanned entry in a `KvUpdate::Put` for `write_update`. The file
+    /// I/O is identical either way and is deliberately excluded — the only difference is whether
+    /// each entry's `String` key and `Vec<u8>` value are copied or moved, so the alloc column is the
+    /// whole story: 2 allocations per entry vs none.
+    ///
+    /// Both variants take the scan result **by value** (as the real closure does) so each pays for
+    /// dropping it; otherwise the cloning variant would look artificially cheap by leaving the
+    /// originals alive past the timed region.
+    #[divan::bench(args = [128, 4096])]
+    fn rebuild_puts_cloned(bencher: Bencher, n: usize) {
+        bencher.with_inputs(|| scanned(n)).bench_values(|entries| {
+            for e in &entries {
+                black_box(KvUpdate::Put(e.clone()));
+            }
+        });
+    }
+
+    /// The same loop consuming the `Vec` it owns (`for e in entries`) — 0 allocations.
+    #[divan::bench(args = [128, 4096])]
+    fn rebuild_puts_moved(bencher: Bencher, n: usize) {
+        bencher.with_inputs(|| scanned(n)).bench_values(|entries| {
+            for e in entries {
+                black_box(KvUpdate::Put(e));
+            }
+        });
+    }
+}

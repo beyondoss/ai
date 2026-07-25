@@ -50,6 +50,10 @@ use tracing::{error, info, warn};
 
 const BLACKHOLE_PREFIX: &str = "blackhole.";
 
+/// Depth of the channel the watch task feeds, and therefore the most deltas one `recv_many` can
+/// drain into a batch — the queue is the batch, so there's nothing to gain from a second bound.
+const WATCH_CHANNEL_CAPACITY: usize = 256;
+
 /// Compact the on-disk snapshot once it grows past this many bytes of appended deltas. The deny-set
 /// is low-churn, so this is rarely hit; it just bounds the log if a tenant flaps.
 const SNAPSHOT_COMPACT_THRESHOLD: u64 = 1024 * 1024;
@@ -241,6 +245,34 @@ fn baseline_revision(entries: &[KvEntry]) -> u64 {
         .unwrap_or(0)
 }
 
+/// Apply a batch of watched deltas to `cur`, returning the set to publish.
+///
+/// **One clone of the map per batch, not per delta.** The deny-set lives behind an `ArcSwap` and is
+/// updated by `rcu`, i.e. clone-on-write: every call here copies the whole O(N) map, so folding a
+/// K-delta burst into a single call turns O(K·N) into O(N + K). A single delta — the steady state —
+/// is exactly what it always was: one clone.
+///
+/// `pub` because `benches/unit.rs` measures this seam (batched vs one-at-a-time).
+pub fn apply_batch(cur: &DenySet, updates: &[KvUpdate]) -> DenySet {
+    let mut set = cur.clone();
+    for update in updates {
+        match update {
+            KvUpdate::Put(e) => {
+                if let Some(t) = deny::parse_key(&e.key) {
+                    set.insert(t, deny::parse_reason(&e.value));
+                }
+            }
+            // Delete/Purge = restore (explicit delete or TTL expiry).
+            KvUpdate::Delete { key, .. } | KvUpdate::Purge { key, .. } => {
+                if let Some(t) = deny::parse_key(key) {
+                    set.remove(t);
+                }
+            }
+        }
+    }
+    set
+}
+
 /// Build a `DenySet` from KV entries, dropping any whose key isn't a `blackhole.{tenant}`.
 fn denyset_from_entries<'a>(entries: impl Iterator<Item = &'a KvEntry>) -> DenySet {
     entries
@@ -272,8 +304,11 @@ async fn rebuild_snapshot(
                 Err(e) => return Err(e.into()),
             }
             let mut w = SnapshotWriter::open(&path, SNAPSHOT_COMPACT_THRESHOLD)?;
-            for e in &entries {
-                w.write_update(&KvUpdate::Put(e.clone()))?;
+            // Consume `entries` — it was moved into this closure and `write_update` only borrows,
+            // so wrapping each entry in a `Put` by value costs nothing, where cloning it copied a
+            // `String` key and a `Vec<u8>` value (2 heap allocations) per scanned entry.
+            for e in entries {
+                w.write_update(&KvUpdate::Put(e))?;
             }
             w.checkpoint(&cursor)?;
             Ok(w)
@@ -387,55 +422,58 @@ async fn watch_deny(
         warn!("store has no watcher; deny-set will not update");
         return false;
     };
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<KvUpdate>(256);
-    let w = watcher.clone();
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<KvUpdate>(WATCH_CHANNEL_CAPACITY);
     let start_cursor = cursor.clone();
+    // `watcher` is an owned `Arc` from `store.watcher()` and unused after this, so move it in.
     let watch = tokio::spawn(async move {
-        w.watch_prefix_from(BLACKHOLE_PREFIX, &start_cursor, tx)
+        watcher
+            .watch_prefix_from(BLACKHOLE_PREFIX, &start_cursor, tx)
             .await
     });
 
-    // Updates are rcu (clone-on-write); the set is tiny (O(denied)). Each applied delta also
-    // advances the in-memory cursor (so a reconnect resumes from here) and is appended to the
-    // on-disk snapshot if one is configured. We `select!` on shutdown so a quiet stream (no deltas
-    // arriving) doesn't pin the task open through teardown; `select!` can only switch at an await
-    // point — between updates — so we never abort mid-`persist_update`, leaving the snapshot intact.
+    // Deltas are applied in **batches**. `rcu` is clone-on-write over the whole map, so applying a
+    // K-delta burst one at a time is O(K·N) copies of an O(N) set — and bursts are the realistic
+    // shape here (a control-plane sweep blackholes a batch of tenants at once, and a reconnect
+    // replays everything published while we were away). `recv_many` takes whatever is already queued
+    // — bounded by the channel's own capacity, so it can't be starved by a fast producer — and the
+    // batch lands under one clone, one metric write, and one snapshot checkpoint. The steady state
+    // is unchanged: `recv_many` returns as soon as a single update is available, so one delta is
+    // still one clone with no added latency.
+    //
+    // We `select!` on shutdown so a quiet stream (no deltas arriving) doesn't pin the task open
+    // through teardown; `select!` can only switch at an await point — between batches — so we never
+    // abort mid-`persist_batch`, leaving the snapshot intact.
+    let mut batch: Vec<KvUpdate> = Vec::new();
     loop {
-        let update = tokio::select! {
+        batch.clear();
+        let received = tokio::select! {
             _ = shutdown.changed() => {
                 watch.abort();
                 return true;
             }
-            update = rx.recv() => match update {
-                Some(u) => u,
-                None => break,
-            },
+            n = rx.recv_many(&mut batch, WATCH_CHANNEL_CAPACITY) => n,
         };
+        // Zero means every sender is gone: the watch task has ended.
+        if received == 0 {
+            break;
+        }
+        // Capture the new cardinality from inside the closure rather than re-loading the `ArcSwap`
+        // afterwards: `rcu` returns the *previous* value, and taking a second guard just to count
+        // what we already hold is wasted work. The closure re-runs on contention, and the run that
+        // wins is the last one, so this ends up holding the length actually published.
+        let mut denied = 0usize;
         state.deny.rcu(|cur| {
-            let mut set = (**cur).clone();
-            match &update {
-                KvUpdate::Put(e) => {
-                    if let Some(t) = deny::parse_key(&e.key) {
-                        set.insert(t, deny::parse_reason(&e.value));
-                    }
-                }
-                // Delete/Purge = restore (explicit delete or TTL expiry).
-                KvUpdate::Delete { key, .. } | KvUpdate::Purge { key, .. } => {
-                    if let Some(t) = deny::parse_key(key) {
-                        set.remove(t);
-                    }
-                }
-            }
+            let set = apply_batch(cur, &batch);
+            denied = set.len();
             Arc::new(set)
         });
-        // Reflect the new cardinality. A lock-free load of the set we just swapped in — cheap, and
-        // the deltas are low-churn, so this is far off any hot path.
-        state
-            .metrics
-            .deny_set_size
-            .set(state.deny.load().len() as i64);
-        *cursor = WatchCursor::from_version(update.version().clone());
-        persist_update(writer, &update, cursor).await;
+        state.metrics.deny_set_size.set(denied as i64);
+        // The batch's resume point is its newest delta — that's what the checkpoint below records,
+        // and what a reconnect resumes strictly after.
+        if let Some(last) = batch.last() {
+            *cursor = WatchCursor::from_version(last.version().clone());
+        }
+        persist_batch(writer, &batch, cursor).await;
     }
 
     // The watch ended (NATS dropped, or the cursor was compacted away). Inspect why so a compacted
@@ -453,18 +491,29 @@ async fn watch_deny(
     false
 }
 
-/// Append one applied delta to the on-disk snapshot (if configured) and checkpoint the cursor.
-/// `write_update`/`checkpoint` are buffered/`write(2)` and cheap; `compact` reads+rewrites the whole
-/// file, so it's offloaded off the serving runtime when the log crosses its threshold.
-async fn persist_update(
+/// Append an applied batch to the on-disk snapshot (if configured) and checkpoint the cursor once.
+/// `write_update` is a buffered write and cheap; `checkpoint` is the call that flushes (a `write(2)`
+/// into the page cache), so checkpointing per batch rather than per delta turns a K-delta burst into
+/// one syscall instead of K — and one cursor record is all the batch needs, since it only has to say
+/// where the batch left off. `compact` reads+rewrites the whole file, so it's offloaded off the
+/// serving runtime when the log crosses its threshold.
+///
+/// Checkpointing once per batch only ever errs in the safe direction: a crash after some records
+/// reached the file but before the cursor record leaves a cursor *older* than the data, so the next
+/// boot resumes early and re-applies those deltas — idempotent, since a `Put`/`Delete` of the same
+/// key lands the same set. The dangerous direction (a cursor ahead of its data, which would skip
+/// deltas) can't happen: the checkpoint is written last.
+async fn persist_batch(
     writer: &mut Option<SnapshotWriter>,
-    update: &KvUpdate,
+    updates: &[KvUpdate],
     cursor: &WatchCursor,
 ) {
     let needs_compact = match writer.as_mut() {
         Some(w) => {
-            if let Err(e) = w.write_update(update) {
-                warn!(error = %e, "snapshot write failed");
+            for update in updates {
+                if let Err(e) = w.write_update(update) {
+                    warn!(error = %e, "snapshot write failed");
+                }
             }
             match w.checkpoint(cursor) {
                 Ok(b) => b,
@@ -542,6 +591,46 @@ mod tests {
         let set = denyset_from_entries([].iter());
         assert!(set.is_empty());
         assert!(!set.is_denied(42)); // default-allow on a cold/empty scan
+    }
+
+    #[test]
+    fn apply_batch_matches_one_at_a_time() {
+        // Batching is a performance change only: a batch must land exactly the set that applying
+        // its deltas one `rcu` at a time would have. Ordering inside the batch is what makes this
+        // non-trivial — a Put followed by a Delete of the same tenant must end deleted, and the
+        // reverse must end denied.
+        let updates = vec![
+            KvUpdate::Put(entry("blackhole.1", b"spend")),
+            KvUpdate::Put(entry("blackhole.2", b"fraud")),
+            // Re-Put of a live tenant: the newer reason wins.
+            KvUpdate::Put(entry("blackhole.1", b"fraud")),
+            // Delete after Put (TTL expiry on a spend hold) → restored.
+            KvUpdate::Delete {
+                key: "blackhole.2".to_string(),
+                version: VersionToken::from_u64(4),
+            },
+            // Purge of a tenant that was never denied → no-op, not an insert.
+            KvUpdate::Purge {
+                key: "blackhole.9".to_string(),
+                version: VersionToken::from_u64(5),
+            },
+            // Foreign key in the stream must not corrupt the set.
+            KvUpdate::Put(entry("signkey.1", b"spend")),
+        ];
+
+        let batched = apply_batch(&DenySet::new(), &updates);
+        let mut sequential = DenySet::new();
+        for u in &updates {
+            sequential = apply_batch(&sequential, std::slice::from_ref(u));
+        }
+
+        assert_eq!(batched.len(), sequential.len());
+        assert_eq!(batched.len(), 1, "only tenant 1 survives the batch");
+        assert_eq!(batched.reason(1), Some(DenyReason::Fraud)); // last Put wins
+        assert_eq!(sequential.reason(1), Some(DenyReason::Fraud));
+        assert!(!batched.is_denied(2)); // deleted
+        assert!(!batched.is_denied(9)); // purge of an absent tenant
+        assert!(!batched.is_denied(0)); // `signkey.1` never became tenant 0
     }
 
     #[test]
