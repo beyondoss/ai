@@ -176,6 +176,10 @@ pub enum Mode {
     /// OpenAI-shaped SSE stream with >128 KiB of content *before* the usage chunk — forces the
     /// proxy's response-tail compaction path.
     SseLarge,
+    /// Anthropic-shaped SSE stream long enough to push `message_start` out of the retained tail.
+    /// The input and cache token counts live on that first event, so this is the only fixture that
+    /// can prove the proxy still meters them — see [`anthropic_sse_large`].
+    AnthropicSseLarge,
     /// Always reply with this HTTP status and a small JSON error body — for circuit-breaker tests
     /// (5xx trips the breaker; 4xx/429 do not).
     Status(u16),
@@ -216,7 +220,40 @@ fn large_sse() -> String {
     )
 }
 
-/// The canned `(content-type, body)` for a mode. `SseLarge` allocates; the rest are static.
+/// Input + cache tokens the [`Mode::AnthropicSseLarge`] fixture reports on `message_start`. Asserted
+/// by the e2e test, which is the only thing that can prove they survived the tail compaction.
+pub const ANTHROPIC_LARGE_INPUT_TOKENS: u64 = 5000;
+pub const ANTHROPIC_LARGE_CACHE_READ_TOKENS: u64 = 4000;
+pub const ANTHROPIC_LARGE_OUTPUT_TOKENS: u64 = 2500;
+
+/// A realistic Anthropic SSE stream: `message_start` carrying input + cache tokens, then enough
+/// `content_block_delta` events to exceed `2 × USAGE_TAIL_CAP`, then the terminal `message_delta`
+/// carrying the output count.
+///
+/// The shape matters. Anthropic splits the usage facts across the **first** and **last** events, so
+/// a tail-only tap keeps the output count and silently drops input and cache — the fixture is built
+/// to be long enough for exactly that to happen (~600 KiB, i.e. a routine 2500-token reply, since
+/// Anthropic spends ~110 bytes of framing per delta).
+fn anthropic_sse_large() -> String {
+    let mut s = format!(
+        "event: message_start\n\
+         data: {{\"type\":\"message_start\",\"message\":{{\"id\":\"msg_mock\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-opus-4-8\",\"content\":[],\"usage\":{{\"input_tokens\":{ANTHROPIC_LARGE_INPUT_TOKENS},\"output_tokens\":1,\"cache_read_input_tokens\":{ANTHROPIC_LARGE_CACHE_READ_TOKENS},\"cache_creation_input_tokens\":100}}}}}}\n\n"
+    );
+    while s.len() < 600 * 1024 {
+        s.push_str(
+            "event: content_block_delta\n\
+             data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\" token\"}}\n\n",
+        );
+    }
+    s.push_str(&format!(
+        "event: message_delta\n\
+         data: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"end_turn\"}},\"usage\":{{\"output_tokens\":{ANTHROPIC_LARGE_OUTPUT_TOKENS}}}}}\n\n\
+         event: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n"
+    ));
+    s
+}
+
+/// The canned `(content-type, body)` for a mode. The `*Large` modes allocate; the rest are static.
 fn canned_body(mode: Mode) -> (&'static str, Bytes) {
     match mode {
         Mode::Json => (
@@ -232,6 +269,7 @@ fn canned_body(mode: Mode) -> (&'static str, Bytes) {
             Bytes::from_static(CANNED_ANTHROPIC_JSON.as_bytes()),
         ),
         Mode::SseLarge => ("text/event-stream", Bytes::from(large_sse())),
+        Mode::AnthropicSseLarge => ("text/event-stream", Bytes::from(anthropic_sse_large())),
         // The status is applied by `mock_handle`; the body is a stock error shape.
         Mode::Status(_) => (
             "application/json",

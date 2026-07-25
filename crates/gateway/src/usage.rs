@@ -376,12 +376,29 @@ pub fn openai_stream(sse: &[u8]) -> Option<Usage> {
     None
 }
 
+/// Anthropic streaming over a single contiguous buffer. See [`anthropic_stream_parts`], which this
+/// delegates to — the proxy uses that form because the facts it needs live at *both* ends of the
+/// stream and it only retains the two ends.
+pub fn anthropic_stream(sse: &[u8]) -> Option<Usage> {
+    anthropic_stream_parts(&[sse])
+}
+
 /// Anthropic streaming: input + cache tokens arrive in `message_start.message.usage`; output (and
 /// reasoning/thinking tokens) accumulate in `message_delta.usage` (last delta is the cumulative
 /// total). A `usage` block that looks OpenAI-shaped (dialect mismatch — see
 /// `AnthropicUsage::looks_openai_shaped`) is skipped entirely: if every line is mismatched, `saw_any`
 /// stays `false` and the function returns `None`.
-pub fn anthropic_stream(sse: &[u8]) -> Option<Usage> {
+///
+/// Takes **parts** because those two facts sit at opposite ends of the stream and the proxy retains
+/// only a bounded head and a bounded tail (a whole stream can be megabytes). `message_start` is the
+/// first event, so it is in the head; the final `message_delta` is in the tail. Passing a single
+/// buffer — which is what a tail-only tap amounted to — silently zeroed `input_tokens` and both
+/// cache counters for any stream longer than the tail, without even tripping the parse-error
+/// counter, because `saw_any` still went true off the `message_delta`.
+///
+/// Parts are scanned in order and may safely overlap: every field is *assigned*, never accumulated,
+/// so a short response whose head and tail cover the same bytes reads the same as one that doesn't.
+pub fn anthropic_stream_parts(parts: &[&[u8]]) -> Option<Usage> {
     #[derive(Deserialize)]
     struct Message {
         usage: Option<AnthropicUsage>,
@@ -401,34 +418,36 @@ pub fn anthropic_stream(sse: &[u8]) -> Option<Usage> {
     let finder = memchr::memmem::Finder::new(b"usage");
     let mut usage = Usage::default();
     let mut saw_any = false;
-    for line in sse_lines(sse) {
-        let Some(line) = strip_sse_data(line) else {
-            continue;
-        };
-        if !might_carry_usage(&finder, line) {
-            continue;
-        }
-        let Ok(chunk) = serde_json::from_slice::<Chunk>(line) else {
-            continue;
-        };
-        if let Some(u) = chunk.message.and_then(|m| m.usage) {
-            if !u.looks_openai_shaped() {
-                usage.input_tokens = u.input_tokens;
-                usage.cache_read_tokens = u.cache_read_input_tokens;
-                usage.cache_write_tokens = u.cache_creation_input_tokens;
-                saw_any = true;
+    for part in parts {
+        for line in sse_lines(part) {
+            let Some(line) = strip_sse_data(line) else {
+                continue;
+            };
+            if !might_carry_usage(&finder, line) {
+                continue;
             }
-        }
-        if let Some(u) = chunk.usage {
-            if !u.looks_openai_shaped() {
-                // message_delta carries the running output token count.
-                if u.output_tokens > 0 {
-                    usage.output_tokens = u.output_tokens;
+            let Ok(chunk) = serde_json::from_slice::<Chunk>(line) else {
+                continue;
+            };
+            if let Some(u) = chunk.message.and_then(|m| m.usage) {
+                if !u.looks_openai_shaped() {
+                    usage.input_tokens = u.input_tokens;
+                    usage.cache_read_tokens = u.cache_read_input_tokens;
+                    usage.cache_write_tokens = u.cache_creation_input_tokens;
+                    saw_any = true;
                 }
-                if let Some(rt) = u.output_tokens_details.thinking_tokens {
-                    usage.reasoning_tokens = Some(rt);
+            }
+            if let Some(u) = chunk.usage {
+                if !u.looks_openai_shaped() {
+                    // message_delta carries the running output token count.
+                    if u.output_tokens > 0 {
+                        usage.output_tokens = u.output_tokens;
+                    }
+                    if let Some(rt) = u.output_tokens_details.thinking_tokens {
+                        usage.reasoning_tokens = Some(rt);
+                    }
+                    saw_any = true;
                 }
-                saw_any = true;
             }
         }
     }
@@ -549,6 +568,69 @@ mod tests {
             // ...and matches what the untruncated body would have reported.
             assert_eq!(from_tail, openai_body(&body).unwrap());
         }
+    }
+
+    /// A realistic Anthropic stream: `message_start` (input + cache), `n` text deltas, then the
+    /// terminal `message_delta` (output).
+    fn anthropic_sse(deltas: usize) -> Vec<u8> {
+        let mut s = String::from(
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"role\":\"assistant\",\"model\":\"claude-opus-4-8\",\"content\":[],\"usage\":{\"input_tokens\":5000,\"output_tokens\":1,\"cache_read_input_tokens\":4000,\"cache_creation_input_tokens\":100}}}\n\n",
+        );
+        for i in 0..deltas {
+            s.push_str(&format!(
+                "event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":\" token{i}\"}}}}\n\n"
+            ));
+        }
+        s.push_str("event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":2500}}\n\n");
+        s.into_bytes()
+    }
+
+    #[test]
+    fn anthropic_stream_reads_input_tokens_from_the_head_not_the_tail() {
+        // `message_start` — which carries input_tokens and BOTH cache counters — is the first event
+        // on the wire, but the proxy only retained the last 64 KiB. Past ~500 output tokens (about
+        // 62 KiB of `content_block_delta` framing) it was compacted away and those three fields
+        // billed zero, while `saw_any` still went true off the `message_delta` so nothing flagged
+        // it. Input and cache-read are the *largest* line items in a cached agent workload.
+        const HEAD: usize = 8 * 1024;
+        const TAIL: usize = 64 * 1024;
+        let expected = Usage {
+            input_tokens: 5000,
+            output_tokens: 2500,
+            cache_read_tokens: 4000,
+            cache_write_tokens: 100,
+            reasoning_tokens: None,
+        };
+
+        for deltas in [10, 500, 5000] {
+            let sse = anthropic_sse(deltas);
+            let head = &sse[..HEAD.min(sse.len())];
+            let tail = &sse[sse.len().saturating_sub(TAIL)..];
+
+            assert_eq!(
+                anthropic_stream_parts(&[head, tail]).unwrap(),
+                expected,
+                "head+tail must meter fully at {deltas} deltas ({} B)",
+                sse.len()
+            );
+            // The whole buffer, when it is small enough to keep, must agree.
+            assert_eq!(anthropic_stream(&sse).unwrap(), expected);
+        }
+
+        // ...and the tail *alone* is exactly what used to be wrong, which is what makes the head
+        // load-bearing rather than belt-and-braces.
+        let big = anthropic_sse(5000);
+        let tail_only = anthropic_stream(&big[big.len() - TAIL..]).unwrap();
+        assert_eq!(
+            (
+                tail_only.input_tokens,
+                tail_only.cache_read_tokens,
+                tail_only.cache_write_tokens
+            ),
+            (0, 0, 0),
+            "a tail-only tap is expected to lose these — that is the bug the head buffer fixes"
+        );
+        assert_eq!(tail_only.output_tokens, 2500);
     }
 
     #[test]

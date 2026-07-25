@@ -79,6 +79,20 @@ const MAX_REQUEST_BODY: usize = 100 * 1024 * 1024;
 /// / the whole non-streaming body; keeping a tail means we never buffer a long stream.
 const USAGE_TAIL_CAP: usize = 64 * 1024;
 
+/// Bounded **head** of an Anthropic SSE response, kept alongside the tail.
+///
+/// A tail alone is enough for every other shape — OpenAI puts its usage chunk at the end, and a
+/// non-streaming body carries `usage` last. Anthropic streaming is the exception: `input_tokens`
+/// and both cache counters ride on `message_start`, the *first* event, while the output count rides
+/// on the last `message_delta`. The two facts sit at opposite ends of a stream that can be
+/// megabytes long, so a tail-only tap dropped `message_start` for any response past roughly 500
+/// output tokens and billed `input_tokens = 0` — and silently, because `saw_any` still went true
+/// off the `message_delta`, so the parse never looked like an error.
+///
+/// 8 KiB is far more than needed (a `message_start` event is a few hundred bytes and is the first
+/// thing on the wire) but leaves room for a provider that emits `ping`s or other preamble first.
+const USAGE_HEAD_CAP: usize = 8 * 1024;
+
 /// Max upstream **connect** retries before surfacing the failure to the client.
 ///
 /// We retry connect failures only (the idiomatic Pingora pattern, same as edge). Retrying on a
@@ -125,6 +139,11 @@ pub struct RequestCtx {
     streaming: bool,
     /// Bounded tail of the response, for the usage tap.
     resp_tail: Vec<u8>,
+    /// Bounded head of the response — populated only for an **Anthropic SSE** response, whose input
+    /// and cache token counts arrive on the very first event and would otherwise be compacted out of
+    /// `resp_tail`. See [`USAGE_HEAD_CAP`]. Empty for every other dialect and for non-streaming
+    /// responses, which carry everything the tail already holds.
+    resp_head: Vec<u8>,
     /// Running total of request-body bytes seen, to enforce `MAX_REQUEST_BODY` even when the client
     /// uses chunked transfer encoding (no `Content-Length` to check up front).
     body_bytes_fed: usize,
@@ -569,6 +588,9 @@ impl ProxyHttp for AiProxy {
             // long stream grows it geometrically to the bounded 2×cap and compacts; that handful of
             // reallocs is lost in the network noise of a stream we're already relaying chunk by chunk.
             resp_tail: Vec::new(),
+            // Grown lazily, and only on the one path that needs it (Anthropic SSE) — see
+            // `response_body_filter`. Every other response leaves this empty and never allocates.
+            resp_head: Vec::new(),
             body_bytes_fed: 0,
             upstream_status: None,
             start,
@@ -856,6 +878,20 @@ impl ProxyHttp for AiProxy {
             // is at the start of the response while the usage event is at the end.
             rc.resp_model_scanner.feed(chunk);
 
+            // Anthropic SSE only: keep a bounded head so `message_start`'s input + cache token
+            // counts survive the tail's compaction. Bounded by `USAGE_HEAD_CAP` and satisfied
+            // within the first chunk or two, after which the length check makes this a no-op — so
+            // it costs one small allocation on the one path that needs it, and nothing anywhere
+            // else. See `USAGE_HEAD_CAP` for why only this dialect needs it.
+            if rc.streaming
+                && rc.dialect == Dialect::Anthropic
+                && rc.resp_head.len() < USAGE_HEAD_CAP
+            {
+                let want = USAGE_HEAD_CAP - rc.resp_head.len();
+                rc.resp_head
+                    .extend_from_slice(&chunk[..want.min(chunk.len())]);
+            }
+
             rc.resp_tail.extend_from_slice(chunk);
             if rc.resp_tail.len() > 2 * USAGE_TAIL_CAP {
                 let keep_from = rc.resp_tail.len() - USAGE_TAIL_CAP;
@@ -945,11 +981,14 @@ impl ProxyHttp for AiProxy {
         let tail_start = rc.resp_tail.len().saturating_sub(USAGE_TAIL_CAP);
         let tail = &rc.resp_tail[tail_start..];
 
-        // Extract usage facts from the tail (shape depends on dialect + streaming).
+        // Extract usage facts (shape depends on dialect + streaming). Every case reads the tail;
+        // Anthropic streaming *additionally* reads the head, because that's where `message_start`
+        // put the input and cache token counts. The two buffers may overlap on a short response —
+        // harmless, since every field is assigned rather than accumulated.
         let parsed = match (rc.dialect, rc.streaming) {
             (Dialect::OpenAi, true) => usage::openai_stream(tail),
             (Dialect::OpenAi, false) => usage::openai_body(tail),
-            (Dialect::Anthropic, true) => usage::anthropic_stream(tail),
+            (Dialect::Anthropic, true) => usage::anthropic_stream_parts(&[&rc.resp_head, tail]),
             (Dialect::Anthropic, false) => usage::anthropic_body(tail),
         };
         // A managed 2xx response is *expected* to carry usage; `None` there means the provider's

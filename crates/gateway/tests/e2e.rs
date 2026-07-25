@@ -777,6 +777,93 @@ async fn anthropic_dialect_swaps_key_relays_and_meters() {
 }
 
 #[tokio::test]
+async fn long_anthropic_stream_still_meters_input_and_cache_tokens() {
+    // Anthropic splits its usage facts across the FIRST event (`message_start`: input + cache) and
+    // the LAST (`message_delta`: output). The proxy retained only a bounded tail, so on any stream
+    // past ~500 output tokens `message_start` was compacted away and input + both cache counters
+    // billed zero — silently, because the parse still succeeded off the `message_delta`, so
+    // `usage_parse_errors_total` never fired either. Input and cache-read are the largest line items
+    // in a cached agent workload, so this was the expensive half of the tail-buffer design.
+    //
+    // No fixture in the suite could catch it: `Mode::SseLarge` is an *OpenAI* stream whose usage
+    // rides the terminal chunk and therefore always survived. `Mode::AnthropicSseLarge` is ~600 KiB
+    // — a routine 2500-token reply at Anthropic's ~110 bytes of framing per delta.
+    let nats = Nats::start().await;
+    let (pubkey, sk) = test_keypair(41);
+    let mock = MockUpstream::start(Mode::AnthropicSseLarge).await;
+    let gw = Gateway::builder(nats.port, &mock.authority(), &b64(&pubkey))
+        .providers(&["anthropic"])
+        .start()
+        .await;
+    let vkey = mint(
+        &VirtualKey {
+            tenant_id: 78,
+            vpc_id: 2,
+        },
+        1,
+        &sk,
+    );
+    let client = reqwest::Client::new();
+    {
+        let (c, u, k) = (client.clone(), gw.url(), vkey.clone());
+        wait_for_status(200, move || {
+            let (c, u, k) = (c.clone(), u.clone(), k.clone());
+            async move {
+                post_status_xapikey(&c, &u, "/v1/messages", &k, body_for("claude-opus-4-8")).await
+            }
+        })
+        .await;
+    }
+
+    // The stream must relay intact...
+    let resp = client
+        .post(format!("{}/v1/messages", gw.url()))
+        .header("x-api-key", &vkey)
+        .header("content-type", "application/json")
+        .body(body_for("claude-opus-4-8"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let relayed = resp.bytes().await.unwrap();
+    assert!(
+        relayed.len() > 128 * 1024,
+        "fixture must exceed 2x USAGE_TAIL_CAP for this to be a regression test; got {} B",
+        relayed.len()
+    );
+
+    // ...and every usage field must be metered, not just the one the tail happened to hold.
+    //
+    // Input and cache-read are required at 2x, since the warm-up request and the drained one both
+    // contribute: `message_start` is captured off the first chunk, so it lands even when the client
+    // never reads the body. Output is only required at 1x — the warm-up reads the status and drops
+    // the response, so that stream is cut before its terminal `message_delta` and legitimately
+    // meters no output. That asymmetry is itself the point: the head buffer is what makes the input
+    // side independent of how much of the stream the client stays around for.
+    wait_for_metric(
+        &gw,
+        "ai_tokens_total",
+        "input",
+        (ANTHROPIC_LARGE_INPUT_TOKENS * 2) as f64,
+    )
+    .await;
+    wait_for_metric(
+        &gw,
+        "ai_tokens_total",
+        "cache_read",
+        (ANTHROPIC_LARGE_CACHE_READ_TOKENS * 2) as f64,
+    )
+    .await;
+    wait_for_metric(
+        &gw,
+        "ai_tokens_total",
+        "output",
+        ANTHROPIC_LARGE_OUTPUT_TOKENS as f64,
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn missing_api_key_returns_401() {
     // A request with neither Authorization nor x-api-key takes the "missing API key" branch — a
     // different path than the malformed-key (invalid) branch the managed test exercises.
