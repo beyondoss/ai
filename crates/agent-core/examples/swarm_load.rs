@@ -17,6 +17,10 @@
 //!
 //! Usage: `swarm_load <N> [WAVES]`  (N = concurrent sessions; WAVES defaults to 5)
 
+// Load-test example, not production code: thread spawn/join and env/proc parsing use
+// `expect`/`unwrap` on setup that failing means the measurement can't run anyway.
+#![allow(clippy::expect_used, clippy::unwrap_used)]
+
 use std::hint::black_box;
 use std::sync::{Arc, Barrier};
 use std::thread;
