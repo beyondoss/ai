@@ -163,7 +163,10 @@ pub struct ModelRequest {
     /// Model identifier (e.g. `claude-opus-4-8`); the client maps it to a dialect + gateway path.
     pub model: String,
     /// Optional system prompt (kept separate from `messages` — both wire dialects treat it specially).
-    pub system: Option<String>,
+    /// An `Arc<str>`, not an owned `String`: the static system prompt never changes across a run, so
+    /// building each turn's request — and every speculative `ModelRequest::clone` on the retry/hook
+    /// paths — clones a pointer, not the (multi-KB) prompt text.
+    pub system: Option<Arc<str>>,
     /// Conversation history. An `Arc<Vec<…>>` shared with the `Session` it came from: building a
     /// request clones the pointer, not the (growing) message list.
     pub messages: Arc<Vec<Message>>,
@@ -341,8 +344,10 @@ impl ModelRequest {
         self
     }
 
-    /// Builder-style: attach a system prompt.
-    pub fn with_system(mut self, system: impl Into<String>) -> Self {
+    /// Builder-style: attach a system prompt. Accepts anything convertible into an `Arc<str>` — a
+    /// `&str`/`String` (one allocation, as before) or an existing `Arc<str>` (a pointer clone), so the
+    /// static per-run prompt can be threaded in without re-copying its text every turn.
+    pub fn with_system(mut self, system: impl Into<Arc<str>>) -> Self {
         self.system = Some(system.into());
         self
     }

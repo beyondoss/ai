@@ -427,7 +427,7 @@ pub fn build_body(req: &ModelRequest) -> Value {
     // `instructions` field (below) instead of folded into `input[0]` — every other route keeps this
     // vanilla native-OpenAI-Responses shape. See `req.is_codex`'s own doc comment.
     if !req.is_codex {
-        if let Some(system) = &req.system {
+        if let Some(system) = req.system.as_deref() {
             input.push(json!({ "role": instruction_role(&req.model, &caps), "content": system }));
         }
     }

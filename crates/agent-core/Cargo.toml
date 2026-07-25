@@ -99,6 +99,13 @@ bench-mimalloc = []
 name = "decode"
 harness = false
 
+# Per-tool-call dispatch hot path (M9/M10): `coerce_tool_arguments` over a large `write` argument, plus
+# faithful replicas of the coerced-`Value` outcome clone and the per-group registry clone the audit's
+# `[T1-F2]`/`[T1-F1]` findings target. `AllocProfiler` makes the per-call file-body copies visible.
+[[bench]]
+name = "dispatch"
+harness = false
+
 # Concurrency-scaling probe for the decode path (allocator-contention evidence gate). A separate
 # target because it must run on the *plain* system allocator — divan's `AllocProfiler` (in the sibling
 # `decode` bench) adds global atomic counters that would manufacture the contention it measures.

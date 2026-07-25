@@ -336,7 +336,7 @@ pub fn build_body(req: &ModelRequest) -> Value {
     // entry per source message, so this is a lower-bound hint, not an exact count — still avoids most
     // of the reallocations a `Vec::new()` start would otherwise pay as the common (1:1) case fills in.
     let mut messages: Vec<Value> = Vec::with_capacity(req.messages.len() + 1);
-    if let Some(system) = &req.system {
+    if let Some(system) = req.system.as_deref() {
         messages.push(json!({ "role": instruction_role, "content": system }));
     }
 

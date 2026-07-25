@@ -357,10 +357,10 @@ mod tests {
     #[async_trait]
     impl AgentHooks for InjectsHeaderNote {
         async fn before_provider_request(&self, req: &mut crate::transport::ModelRequest) {
-            req.system = Some(format!(
-                "{} [patched]",
-                req.system.clone().unwrap_or_default()
-            ));
+            // `req.system` is `Option<Arc<str>>`: build the patched String, then `.into()` it into an
+            // `Arc<str>` (borrow the old value via `as_deref` rather than cloning the Arc out).
+            req.system =
+                Some(format!("{} [patched]", req.system.as_deref().unwrap_or_default()).into());
         }
     }
 

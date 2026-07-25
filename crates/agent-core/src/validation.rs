@@ -172,24 +172,26 @@ fn coerce_object_properties(
     let props = schema.get("properties").and_then(Value::as_object);
     if let Some(props) = props {
         for (key, sub_schema) in props {
-            if let Some(v) = obj.remove(key) {
-                // A property that fails to coerce fails the *whole* call — matching AJV/pi's own
-                // all-or-nothing `validateToolArguments` (it throws on the first sub-schema mismatch, it
-                // doesn't silently null out just the offending field and let the rest through).
-                obj.insert(key.clone(), coerce_value(sub_schema, v, budget)?);
+            // `get_mut` + `Value::take` coerces each present property in place: one map lookup, no
+            // key-`String` clone, and no remove/re-insert churn — this runs on every tool dispatch.
+            // `take()` leaves a transient `Null` in the slot that the assignment immediately
+            // overwrites; on the `?` error path the whole object is discarded anyway, matching the
+            // original all-or-nothing behavior (a property that fails to coerce fails the *whole*
+            // call — as AJV/pi's `validateToolArguments` throws on the first sub-schema mismatch).
+            if let Some(slot) = obj.get_mut(key) {
+                *slot = coerce_value(sub_schema, slot.take(), budget)?;
             }
         }
     }
     if let Some(additional_schema) = schema.get("additionalProperties").filter(|v| v.is_object()) {
-        let extra_keys: Vec<String> = obj
-            .keys()
-            .filter(|k| !props.is_some_and(|p| p.contains_key(k.as_str())))
-            .cloned()
-            .collect();
-        for key in extra_keys {
-            if let Some(v) = obj.remove(&key) {
-                obj.insert(key, coerce_value(additional_schema, v, budget)?);
+        // Same in-place take semantics for every key `properties` didn't already claim — no throwaway
+        // `Vec<String>` of cloned keys, no remove/insert. Iteration order (sorted, as serde_json's
+        // `Map` is a `BTreeMap` here) is unchanged from the original remove-then-insert.
+        for (key, slot) in obj.iter_mut() {
+            if props.is_some_and(|p| p.contains_key(key.as_str())) {
+                continue;
             }
+            *slot = coerce_value(additional_schema, slot.take(), budget)?;
         }
     }
     Ok(Value::Object(obj))
