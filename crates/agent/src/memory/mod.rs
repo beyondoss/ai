@@ -144,9 +144,9 @@ impl MemPath {
         // Peel the logical root off the front, however the model spelled it.
         let remainder = if trimmed == root || trimmed == bare {
             ""
-        } else if let Some(r) = trimmed.strip_prefix(&format!("{root}/")) {
+        } else if let Some(r) = trimmed.strip_prefix(root).and_then(|r| r.strip_prefix('/')) {
             r
-        } else if let Some(r) = trimmed.strip_prefix(&format!("{bare}/")) {
+        } else if let Some(r) = trimmed.strip_prefix(bare).and_then(|r| r.strip_prefix('/')) {
             r
         } else if trimmed.starts_with('/') {
             // An absolute path that isn't under `root` — never allowed to escape the store.
@@ -192,8 +192,8 @@ impl MemPath {
             let bare = root.trim_start_matches('/');
             if trimmed == root
                 || trimmed == bare
-                || trimmed.starts_with(&format!("{root}/"))
-                || trimmed.starts_with(&format!("{bare}/"))
+                || trimmed.strip_prefix(root).is_some_and(|r| r.starts_with('/'))
+                || trimmed.strip_prefix(bare).is_some_and(|r| r.starts_with('/'))
             {
                 return Self::parse_in(trimmed, root);
             }
