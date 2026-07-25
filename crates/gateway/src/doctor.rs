@@ -148,7 +148,8 @@ async fn check_provider_dns(config: &AiConfig) -> Vec<CheckResult> {
         let (name, authority) = (name.to_string(), authority.to_string());
         lookups.spawn(async move {
             let lookup =
-                tokio::time::timeout(DNS_TIMEOUT, tokio::net::lookup_host(authority.as_str())).await;
+                tokio::time::timeout(DNS_TIMEOUT, tokio::net::lookup_host(authority.as_str()))
+                    .await;
             let res = match lookup {
                 Ok(Ok(mut addrs)) => match addrs.next() {
                     Some(addr) => pass(check_name, format!("{name} → {authority} ({addr})")),
@@ -287,7 +288,8 @@ mod tests {
             .map(|s| (s.name.to_string(), format!("zz-{}.invalid:443", s.name)))
             .collect();
         // Plus a few config-only providers, so the run covers both `CheckResult.name` branches.
-        authorities.extend((0..4).map(|i| (format!("zz-extra-{i}"), format!("zz-{i}.invalid:443"))));
+        authorities
+            .extend((0..4).map(|i| (format!("zz-extra-{i}"), format!("zz-{i}.invalid:443"))));
         let expected = authorities.len();
         let c = AiConfig {
             provider_authorities: authorities,
