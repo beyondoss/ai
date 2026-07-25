@@ -192,18 +192,16 @@ pub fn verifying_key_from_value(bytes: &[u8]) -> Option<VerifyingKey> {
         return VerifyingKey::from_bytes(&arr).ok();
     }
     let s = std::str::from_utf8(bytes).ok()?.trim();
-    for decoded in [
-        base64::engine::general_purpose::STANDARD.decode(s).ok(),
-        URL_SAFE_NO_PAD.decode(s).ok(),
-    ]
-    .into_iter()
-    .flatten()
-    {
-        if let Ok(arr) = <[u8; 32]>::try_from(decoded.as_slice()) {
-            return VerifyingKey::from_bytes(&arr).ok();
-        }
-    }
-    None
+    // Standard first, url-safe only if that didn't yield a key. Chained rather than collected into an
+    // array of both candidates: an array is built *before* it's iterated, so the url-safe decode —
+    // and its allocation — ran even when the standard one had already succeeded.
+    let key32 = |decoded: Vec<u8>| <[u8; 32]>::try_from(decoded.as_slice()).ok();
+    let arr = base64::engine::general_purpose::STANDARD
+        .decode(s)
+        .ok()
+        .and_then(key32)
+        .or_else(|| URL_SAFE_NO_PAD.decode(s).ok().and_then(key32))?;
+    VerifyingKey::from_bytes(&arr).ok()
 }
 
 /// Mint a virtual key. Lives here for tests + determinism checks and as the reference
@@ -346,6 +344,30 @@ mod tests {
         let relabeled = format!("{}.1.{}.{}", parts[0], parts[2], parts[3]);
         assert_eq!(ring.verify(&relabeled), Err(KeyError::BadSignature));
         let _ = sk1;
+    }
+
+    #[test]
+    fn verifying_key_accepts_every_stored_encoding() {
+        // The three shapes the control plane may store a `signkey.*` value in. A rejection here is a
+        // silently empty keyring — every managed token 401s — so pin all of them, plus the negatives.
+        let (_, vk) = test_keypair(9);
+        let raw = vk.to_bytes();
+        let std_b64 = base64::engine::general_purpose::STANDARD.encode(raw);
+        let url_b64 = URL_SAFE_NO_PAD.encode(raw);
+
+        assert_eq!(verifying_key_from_value(&raw), Some(vk));
+        assert_eq!(verifying_key_from_value(std_b64.as_bytes()), Some(vk));
+        assert_eq!(verifying_key_from_value(url_b64.as_bytes()), Some(vk));
+        // Surrounding whitespace (a trailing newline from a file or a KV write) is trimmed.
+        assert_eq!(
+            verifying_key_from_value(format!(" {url_b64}\n").as_bytes()),
+            Some(vk)
+        );
+
+        assert_eq!(verifying_key_from_value(b"not base64 at all"), None);
+        // Decodes fine, but isn't 32 bytes — not a key.
+        let short = base64::engine::general_purpose::STANDARD.encode([0u8; 16]);
+        assert_eq!(verifying_key_from_value(short.as_bytes()), None);
     }
 
     #[test]
