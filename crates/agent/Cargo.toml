@@ -175,6 +175,14 @@ tokio-tungstenite = { version = "0.29", default-features = false, features = ["c
 name = "search"
 harness = false
 
+# The `web` tool's extract/table row-building — M17's `HashMap<String,String>`-per-row → positional
+# `Vec<String>` change. Drives the public `Web::run` over a loopback fixture (the only public seam);
+# see the bench's module doc for what the alloc columns include and why the before/after delta is the
+# row-storage change alone.
+[[bench]]
+name = "web_extract"
+harness = false
+
 [[bench]]
 name = "serve_events"
 harness = false

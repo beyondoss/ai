@@ -247,11 +247,24 @@ fn extract(doc: &Html, input: &Value) -> Result<String, ToolError> {
     };
     let cap = max_items(input);
 
-    let mut rows: Vec<HashMap<String, String>> = Vec::new();
+    // Rows are stored *positionally*, aligned to `fields` — the field name is never cloned per row.
+    // The `where` filter is the only reason a row was ever keyed by name; give it a name→column-index
+    // map computed once (last wins on a duplicate name, matching the old per-row map whose later insert
+    // shadowed the earlier), so `Filter::matches` resolves a field with an index lookup, not a clone.
+    let filter_index: Option<(&Filter, HashMap<&str, usize>)> = filter.as_ref().map(|f| {
+        let idx = fields
+            .iter()
+            .enumerate()
+            .map(|(i, field)| (field.name.as_str(), i))
+            .collect();
+        (f, idx)
+    });
+
+    let mut rows: Vec<Vec<String>> = Vec::new();
     let mut empty_fields = 0usize;
     let mut total_matched = 0usize;
     for row_el in doc.select(&row_selector) {
-        let mut row = HashMap::new();
+        let mut values: Vec<String> = Vec::with_capacity(fields.len());
         for field in &fields {
             let value = row_el
                 .select(&field.selector)
@@ -268,18 +281,22 @@ fn extract(doc: &Html, input: &Value) -> Result<String, ToolError> {
             if value.is_empty() {
                 empty_fields += 1;
             }
-            row.insert(field.name.clone(), value);
+            values.push(value);
         }
-        if filter.as_ref().is_none_or(|f| f.matches(&row)) {
+        let passes = filter_index
+            .as_ref()
+            .is_none_or(|(f, idx)| f.matches(&|name| idx.get(name).map(|&i| values[i].as_str())));
+        if passes {
             total_matched += 1;
             if rows.len() < cap {
-                rows.push(row);
+                rows.push(values);
             }
         }
     }
 
+    let columns: Vec<&str> = fields.iter().map(|f| f.name.as_str()).collect();
     Ok(render_rows(
-        &fields.iter().map(|f| f.name.clone()).collect::<Vec<_>>(),
+        &columns,
         &rows,
         total_matched,
         empty_fields,
@@ -307,7 +324,7 @@ fn table(doc: &Html, input: &Value) -> Result<String, ToolError> {
     let td = parse_selector("td")?;
 
     let mut header: Vec<String> = Vec::new();
-    let mut rows: Vec<HashMap<String, String>> = Vec::new();
+    let mut rows: Vec<Vec<String>> = Vec::new();
     let cap = max_items(input);
     let mut total = 0usize;
 
@@ -327,18 +344,19 @@ fn table(doc: &Html, input: &Value) -> Result<String, ToolError> {
         }
         total += 1;
         if rows.len() < cap {
-            let row = header
-                .iter()
-                .cloned()
-                .zip(cells.into_iter().chain(std::iter::repeat(String::new())))
-                .collect();
+            // Store the row positionally, aligned to `header` — no header string cloned per row.
+            // `resize` pads short rows with "" and drops cells past the header width, exactly as the
+            // old `zip(cells.chain(repeat("")))` into a header-keyed map did.
+            let mut row = cells;
+            row.resize(header.len(), String::new());
             rows.push(row);
         }
     }
     if header.is_empty() {
         return Ok(format!("`{sel}` matched a table with no rows"));
     }
-    Ok(render_rows(&header, &rows, total, 0, cap))
+    let columns: Vec<&str> = header.iter().map(String::as_str).collect();
+    Ok(render_rows(&columns, &rows, total, 0, cap))
 }
 
 // ---- shared rendering ----------------------------------------------------------------------------
@@ -346,8 +364,8 @@ fn table(doc: &Html, input: &Value) -> Result<String, ToolError> {
 /// Header-once TSV, then a trailing note. Tabs/newlines in a value are spaced out so a row stays one
 /// line — the whole point is a compact, greppable table the model reads cheaply.
 fn render_rows(
-    columns: &[String],
-    rows: &[HashMap<String, String>],
+    columns: &[&str],
+    rows: &[Vec<String>],
     total_matched: usize,
     empty_fields: usize,
     cap: usize,
@@ -356,11 +374,14 @@ fn render_rows(
     out.push_str(&columns.join("\t"));
     out.push('\n');
     for row in rows {
-        for (i, c) in columns.iter().enumerate() {
+        // Rows are positional and aligned to `columns`; index by position so the cell count always
+        // matches the header even if a row were short (padded to "" — the old map lookup's behavior).
+        // Cells stream straight into `out` — no per-row `Vec`+`join`.
+        for i in 0..columns.len() {
             if i > 0 {
                 out.push('\t');
             }
-            out.push_str(&clean_cell(row.get(c).map(String::as_str).unwrap_or("")));
+            out.push_str(&clean_cell(row.get(i).map(String::as_str).unwrap_or("")));
         }
         out.push('\n');
     }

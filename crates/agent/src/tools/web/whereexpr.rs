@@ -15,8 +15,11 @@
 //! ```
 //! A bare `ident` used as a whole `cmp` (no operator) is truthy when its field value is non-empty —
 //! `where 'href'` keeps rows that have an `href`.
-
-use std::collections::HashMap;
+//!
+//! A row is not passed as a `HashMap`: [`Filter::matches`] takes a `get(field) -> Option<&str>`
+//! lookup so the caller can resolve a field name against a fixed positional row (name→index computed
+//! once) without cloning field names into a per-row map. `None` means "no such column" (a bare-field
+//! truthiness test fails); `Some("")` means the column exists but is empty.
 
 use regex::Regex;
 
@@ -40,9 +43,11 @@ impl Filter {
         Ok(Self { root })
     }
 
-    /// Whether `row` passes the filter.
-    pub fn matches(&self, row: &HashMap<String, String>) -> bool {
-        self.root.eval(row)
+    /// Whether a row passes the filter. `get(field)` resolves a field name to its value: `None` if the
+    /// row has no such column, `Some(value)` otherwise. The caller keeps the row positional and hands us
+    /// an index-based lookup — no per-row map, no field-name clones.
+    pub fn matches<'r>(&self, get: &impl Fn(&str) -> Option<&'r str>) -> bool {
+        self.root.eval(get)
     }
 }
 
@@ -76,13 +81,13 @@ enum Operand {
 }
 
 impl Expr {
-    fn eval(&self, row: &HashMap<String, String>) -> bool {
+    fn eval<'r>(&self, get: &impl Fn(&str) -> Option<&'r str>) -> bool {
         match self {
-            Expr::Or(a, b) => a.eval(row) || b.eval(row),
-            Expr::And(a, b) => a.eval(row) && b.eval(row),
-            Expr::Truthy(field) => row.get(field).is_some_and(|v| !v.is_empty()),
+            Expr::Or(a, b) => a.eval(get) || b.eval(get),
+            Expr::And(a, b) => a.eval(get) && b.eval(get),
+            Expr::Truthy(field) => get(field).is_some_and(|v| !v.is_empty()),
             Expr::Cmp { field, op, rhs } => {
-                let lhs = row.get(field).map(String::as_str).unwrap_or("");
+                let lhs = get(field).unwrap_or("");
                 match (op, rhs) {
                     (Op::Match, Operand::Regex(re)) => re.is_match(lhs),
                     // A `~` against a non-regex right-hand side never matches (a parse-time guard also
@@ -383,6 +388,8 @@ fn build_regex(pat: &str, flags: &str) -> Result<Regex, String> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
 
     fn row(pairs: &[(&str, &str)]) -> HashMap<String, String> {
@@ -393,7 +400,10 @@ mod tests {
     }
 
     fn passes(expr: &str, pairs: &[(&str, &str)]) -> bool {
-        Filter::parse(expr).unwrap().matches(&row(pairs))
+        let row = row(pairs);
+        Filter::parse(expr)
+            .unwrap()
+            .matches(&|field| row.get(field).map(String::as_str))
     }
 
     #[test]
