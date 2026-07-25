@@ -7,6 +7,7 @@
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::path_utils::resolved_path;
@@ -203,12 +204,42 @@ pub fn build_system_prompt(opts: &PromptOptions) -> String {
     s
 }
 
+/// [`build_system_prompt`] with the project-instruction files already resolved — the
+/// [`build_static_system_prompt_with_context`] counterpart, plus the per-turn dynamic footer. Used by
+/// the subagent fan-out to reuse one cwd→root walk across siblings sharing a root (T8-F9).
+pub(crate) fn build_system_prompt_with_context(
+    opts: &PromptOptions,
+    context_files: &[(String, String)],
+) -> String {
+    let mut s = build_static_system_prompt_with_context(opts, context_files);
+    s.push_str(&dynamic_footer(opts.cwd));
+    s
+}
+
 /// Everything in the system prompt except the per-turn dynamic footer (current date/cwd, see
 /// [`dynamic_footer`]): the base identity or its `SYSTEM.md` override, project instructions, and
 /// discovered skills. Walks the filesystem (project-instruction files, skill directories), so it's
 /// meant to be rebuilt only at startup and on a model/thinking-triggered `Agent` rebuild — not on every
 /// turn, unlike the cheap dynamic footer.
 pub fn build_static_system_prompt(opts: &PromptOptions) -> String {
+    let context_files = if opts.include_context_files {
+        load_context_files(opts.cwd)
+    } else {
+        Vec::new()
+    };
+    build_static_system_prompt_with_context(opts, &context_files)
+}
+
+/// [`build_static_system_prompt`] with the project-instruction files already resolved, rather than
+/// walked from `opts.cwd` here. Lets a subagent fan-out (see [`crate::tools::subagent`]) walk cwd→root
+/// ONCE and reuse the `(path, body)` result across sibling children that share a root, instead of every
+/// child re-reading the same `AGENTS.md`/`CLAUDE.md` chain (T8-F9). `opts.include_context_files` is not
+/// consulted here — the caller decides by what it passes (an empty slice renders no block, exactly as a
+/// `false` flag would); the public wrapper above preserves the flag's meaning for every other caller.
+pub(crate) fn build_static_system_prompt_with_context(
+    opts: &PromptOptions,
+    context_files: &[(String, String)],
+) -> String {
     // An explicit `--system-prompt` (`opts.base`) wins outright, exactly like `opts.append` below —
     // never even consulting the on-disk `SYSTEM.md`. Only when no explicit override was given does a
     // trusted project's on-disk `SYSTEM.md` (project `<cwd>/.claude/`, else user `~/.claude/`) get a
@@ -228,22 +259,19 @@ pub fn build_static_system_prompt(opts: &PromptOptions) -> String {
         s.push_str(&extra);
     }
 
-    if opts.include_context_files {
-        let files = load_context_files(opts.cwd);
-        if !files.is_empty() {
-            // Wrapped in an outer `<project_context>` element (matching the reference agent) so the
-            // model sees these as a distinct, labeled section rather than bare instruction blocks
-            // floating in the prompt.
-            s.push_str("\n\n<project_context>\n\n");
-            s.push_str("Project-specific instructions and guidelines:\n\n");
-            for (path, body) in files {
-                s.push_str(&format!(
-                    "<project_instructions path=\"{path}\">\n{}\n</project_instructions>\n\n",
-                    body.trim()
-                ));
-            }
-            s.push_str("</project_context>");
+    if !context_files.is_empty() {
+        // Wrapped in an outer `<project_context>` element (matching the reference agent) so the
+        // model sees these as a distinct, labeled section rather than bare instruction blocks
+        // floating in the prompt.
+        s.push_str("\n\n<project_context>\n\n");
+        s.push_str("Project-specific instructions and guidelines:\n\n");
+        for (path, body) in context_files {
+            s.push_str(&format!(
+                "<project_instructions path=\"{path}\">\n{}\n</project_instructions>\n\n",
+                body.trim()
+            ));
         }
+        s.push_str("</project_context>");
     }
 
     // pi-parity fix (M1): checking `!opts.skills.is_empty()` guards on the *unfiltered* list — a
@@ -493,7 +521,37 @@ fn today() -> String {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
-    format_local_datetime_at(secs, false)
+    // The date itself is recomputed every call (it must stay current across midnight), but the local
+    // UTC offset is process-constant in practice, so it's cached rather than re-read+re-parsed from
+    // `/etc/localtime` (or the `TZ`-named zoneinfo) on every turn — see [`cached_local_utc_offset`].
+    let local = secs + cached_local_utc_offset(secs);
+    format_civil_datetime(local, false)
+}
+
+/// The host's local UTC offset, memoized for the hot dynamic-footer path ([`today`], rebuilt before
+/// every turn). Resolving it means reading and TZif-parsing `/etc/localtime` (or the zoneinfo file the
+/// `TZ` env var names) — pure syscalls+parsing to recover a value that is constant for the life of the
+/// process barring a `TZ` change or a DST transition. The cache is keyed on the current `TZ` env value,
+/// so a process that changes `TZ` mid-run still refreshes; a DST transition mid-session is the one
+/// tolerated staleness (an at-most-one-hour skew in the *displayed* date near the boundary), the same
+/// bound the audit accepted for this per-turn recompute.
+///
+/// Deliberately NOT used by [`format_local_datetime`] (export rendering): that formats arbitrary
+/// historical `created_at` timestamps, whose correct offset genuinely depends on the timestamp (a
+/// winter session exported in summer must render with the winter offset), so it keeps resolving the
+/// per-timestamp offset directly.
+fn cached_local_utc_offset(now: i64) -> i64 {
+    static CACHE: Mutex<Option<(Option<String>, i64)>> = Mutex::new(None);
+    let tz = std::env::var("TZ").ok();
+    let mut guard = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((cached_tz, offset)) = guard.as_ref() {
+        if *cached_tz == tz {
+            return *offset;
+        }
+    }
+    let offset = local_utc_offset(now);
+    *guard = Some((tz, offset));
+    offset
 }
 
 /// Format a unix-seconds timestamp as a human-readable local date/time string, without pulling in a
@@ -679,6 +737,47 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cached_local_utc_offset_matches_the_uncached_resolution_at_the_current_time() {
+        // The cache resolves the offset for whatever `now` first populated it (keyed on `TZ`), which is
+        // sound precisely because its one hot caller, `today()`, always passes ~the current time — so a
+        // query at the current time must equal the uncached resolution at that same time. (A query at an
+        // arbitrary *historical* `now` deliberately would NOT match: that's the documented DST-tolerance
+        // trade-off, and why `format_local_datetime`'s export path resolves the offset directly instead.)
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        assert_eq!(cached_local_utc_offset(now), local_utc_offset(now));
+    }
+
+    // Micro-bench (T8-F1): run with `cargo test -p beyond-ai-agent --lib -- --ignored --nocapture
+    // offset_micro_bench` to see ns/call for the uncached disk+TZif path vs the cached path.
+    #[test]
+    #[ignore = "micro-bench, prints timings; not an assertion"]
+    fn offset_micro_bench() {
+        let now = 1_700_000_000;
+        let iters = 200_000;
+        // Warm the cache so we measure steady-state, not the first miss.
+        let _ = cached_local_utc_offset(now);
+
+        let t0 = std::time::Instant::now();
+        let mut acc = 0i64;
+        for _ in 0..iters {
+            acc = acc.wrapping_add(local_utc_offset(std::hint::black_box(now)));
+        }
+        let uncached = t0.elapsed().as_nanos() as f64 / iters as f64;
+
+        let t1 = std::time::Instant::now();
+        for _ in 0..iters {
+            acc = acc.wrapping_add(cached_local_utc_offset(std::hint::black_box(now)));
+        }
+        let cached = t1.elapsed().as_nanos() as f64 / iters as f64;
+
+        std::hint::black_box(acc);
+        println!("local_utc_offset: uncached {uncached:.1} ns/call, cached {cached:.1} ns/call");
+    }
 
     #[test]
     fn default_system_prompt_lists_every_registered_tool() {

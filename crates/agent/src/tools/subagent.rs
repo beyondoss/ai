@@ -415,6 +415,17 @@ impl Tool for Subagent {
     }
 }
 
+/// Per-dispatch setup computed once and shared across sibling children (T8-F9/F10). See
+/// [`Subagent::shared_child_setup`]. `chain` mode passes `None` and each step recomputes instead.
+struct SharedChildSetup {
+    /// The parent cwd's project-instruction files (`AGENTS.md`/`CLAUDE.md` walked cwd→root), reused by
+    /// every child sharing that cwd. A worktree child, whose root differs, walks its own.
+    context_files: Vec<(String, String)>,
+    /// The memory index snapshot read once at fan-out start — the same session-start recall every
+    /// sibling would otherwise re-read from the shared mounts.
+    memory_sections: Vec<(crate::memory::MountKind, String)>,
+}
+
 impl Subagent {
     async fn dispatch(
         &self,
@@ -526,13 +537,27 @@ impl Subagent {
         )))
     }
 
+    /// The per-dispatch setup shared across sibling children that fan out from the same cwd (T8-F9/F10):
+    /// the project-instruction files walked once from the parent cwd, and the memory index read once.
+    /// Reused by every non-worktree child instead of each re-walking the same `AGENTS.md`/`CLAUDE.md`
+    /// chain and re-reading the same `MEMORY.md`. Deliberately NOT used for a `chain`, whose sequential
+    /// steps can each mutate project memory (or the instruction files themselves) — a later step must
+    /// see those writes, so it recomputes per step.
+    async fn shared_child_setup(&self) -> SharedChildSetup {
+        SharedChildSetup {
+            context_files: crate::resources::load_context_files(&self.ctx.cwd),
+            memory_sections: crate::memory::mount_sections(&self.ctx.memory_mounts).await,
+        }
+    }
+
     async fn run_single(
         &self,
         spec: TaskSpec,
         progress: &ToolProgress,
     ) -> Result<ToolOutput, ToolError> {
         let board = Board::new(progress, std::slice::from_ref(&spec));
-        let outcome = self.run_child(&spec, 0, &board).await;
+        let shared = self.shared_child_setup().await;
+        let outcome = self.run_child(&spec, 0, &board, Some(&shared)).await;
         board.emit();
         if !outcome.ok {
             return Err(ToolError::Execution(outcome.text));
@@ -558,7 +583,9 @@ impl Subagent {
                 task: spec.task.replace("{previous}", &previous),
                 output_schema: spec.output_schema.clone(),
             };
-            let outcome = self.run_child(&resolved, index, &board).await;
+            // `None`: a chain step can mutate memory/context that a later step must observe, so each
+            // step recomputes its own setup rather than reusing a stale fan-out snapshot.
+            let outcome = self.run_child(&resolved, index, &board, None).await;
             if !outcome.ok {
                 board.emit();
                 let partials = render_parallel(&done);
@@ -596,9 +623,13 @@ impl Subagent {
         // closure form makes the borrow checker try to prove the closure general over every lifetime of
         // the borrowed `spec`, which it can't (HRTB inference fails), whereas a plain loop pushes
         // already-formed futures with concrete lifetimes.
+        // Walk the project-instruction chain and read the memory index ONCE for the whole fan-out; all
+        // siblings share the parent cwd and the same memory snapshot (T8-F9/F10). A worktree-isolated
+        // child, whose root differs, still recomputes its own context files (see `build_child_system_prompt`).
+        let shared = self.shared_child_setup().await;
         let mut futs = Vec::with_capacity(specs.len());
         for (index, spec) in specs.iter().enumerate() {
-            futs.push(self.run_child(spec, index, &board));
+            futs.push(self.run_child(spec, index, &board, Some(&shared)));
         }
         let outcomes: Vec<ChildOutcome> = futures::stream::iter(futs)
             .buffered(MAX_CONCURRENCY)
@@ -625,9 +656,15 @@ impl Subagent {
 
     /// Build and run one child to completion. Never returns `Err`: a failure is a [`ChildOutcome`] so
     /// `parallel` can report it alongside its siblings' successes.
-    async fn run_child(&self, spec: &TaskSpec, index: usize, board: &Board) -> ChildOutcome {
+    async fn run_child(
+        &self,
+        spec: &TaskSpec,
+        index: usize,
+        board: &Board,
+        shared: Option<&SharedChildSetup>,
+    ) -> ChildOutcome {
         board.update(index, |s| s.status = "running", true);
-        match self.try_run_child(spec, index, board).await {
+        match self.try_run_child(spec, index, board, shared).await {
             Ok(outcome) => {
                 let status = if outcome.ok { "done" } else { "failed" };
                 board.update(index, |s| s.status = status, true);
@@ -645,6 +682,7 @@ impl Subagent {
         spec: &TaskSpec,
         index: usize,
         board: &Board,
+        shared: Option<&SharedChildSetup>,
     ) -> Result<ChildOutcome, String> {
         let def = find_by_name(&self.ctx.agents, &spec.agent).ok_or_else(|| {
             format!(
@@ -693,9 +731,18 @@ impl Subagent {
         }
         // The current shared indices, injected into the child's prompt so it starts aware of project
         // memory *and* the parent's session scratch (the same session-start recall the parent gets), read
-        // from the shared mounts.
-        let memory_sections = crate::memory::mount_sections(&self.ctx.memory_mounts).await;
-        let system = self.build_child_system_prompt(def, &registry, &root, &memory_sections);
+        // from the shared mounts. Reused from the fan-out snapshot when one was precomputed (T8-F10);
+        // a `chain` step (`shared: None`) reads its own, since a prior step may have written memory.
+        let owned_memory_sections;
+        let memory_sections: &[(crate::memory::MountKind, String)] = match shared {
+            Some(shared) => &shared.memory_sections,
+            None => {
+                owned_memory_sections =
+                    crate::memory::mount_sections(&self.ctx.memory_mounts).await;
+                &owned_memory_sections
+            }
+        };
+        let system = self.build_child_system_prompt(def, &registry, &root, memory_sections, shared);
         let model = def
             .model
             .clone()
@@ -915,36 +962,51 @@ impl Subagent {
         registry: &ToolRegistry,
         root: &Path,
         memory_sections: &[(crate::memory::MountKind, String)],
+        shared: Option<&SharedChildSetup>,
     ) -> String {
         let default_base =
             crate::resources::default_system_prompt(registry, &self.ctx.prompt_guidelines);
         let body = def.system.trim();
-        crate::resources::build_system_prompt(&crate::resources::PromptOptions {
-            base: None,
-            default_base: &default_base,
-            append: (!body.is_empty()).then_some(body),
-            cwd: root,
-            include_context_files: true,
-            skills: &self.ctx.skills,
-            has_read: registry.get("read").is_some(),
-            has_todo: registry.get(crate::tools::todo::NAME).is_some(),
-            has_structured_output: registry
-                .get(crate::tools::structured_output::NAME)
-                .is_some(),
-            // A child carries the shared `memory` tool whenever the parent has a backend (see
-            // `build_child_registry`), so the section — guidance plus the current shared index — appears
-            // for it exactly as for the parent.
-            has_memory: registry.get(crate::tools::memory::NAME).is_some(),
-            memory_sections,
-            // A child never has `subagent` unless its definition asked for it and the depth cap allowed
-            // it; there is no point listing agents it cannot delegate to.
-            agents: if registry.get(NAME).is_some() {
-                &self.ctx.agents
-            } else {
-                &[]
+        // Reuse the fan-out's single cwd→root walk when this child shares the parent cwd (T8-F9). A
+        // worktree-isolated child's `root` is its own checkout, so the shared files (walked from — and
+        // path-labeled with — the parent cwd) don't apply; it walks its own root instead.
+        let owned_context_files;
+        let context_files: &[(String, String)] = match shared {
+            Some(shared) if root == self.ctx.cwd.as_path() => &shared.context_files,
+            _ => {
+                owned_context_files = crate::resources::load_context_files(root);
+                &owned_context_files
+            }
+        };
+        crate::resources::build_system_prompt_with_context(
+            &crate::resources::PromptOptions {
+                base: None,
+                default_base: &default_base,
+                append: (!body.is_empty()).then_some(body),
+                cwd: root,
+                include_context_files: true,
+                skills: &self.ctx.skills,
+                has_read: registry.get("read").is_some(),
+                has_todo: registry.get(crate::tools::todo::NAME).is_some(),
+                has_structured_output: registry
+                    .get(crate::tools::structured_output::NAME)
+                    .is_some(),
+                // A child carries the shared `memory` tool whenever the parent has a backend (see
+                // `build_child_registry`), so the section — guidance plus the current shared index — appears
+                // for it exactly as for the parent.
+                has_memory: registry.get(crate::tools::memory::NAME).is_some(),
+                memory_sections,
+                // A child never has `subagent` unless its definition asked for it and the depth cap allowed
+                // it; there is no point listing agents it cannot delegate to.
+                agents: if registry.get(NAME).is_some() {
+                    &self.ctx.agents
+                } else {
+                    &[]
+                },
+                project_trusted: self.ctx.project_trusted,
             },
-            project_trusted: self.ctx.project_trusted,
-        })
+            context_files,
+        )
     }
 }
 

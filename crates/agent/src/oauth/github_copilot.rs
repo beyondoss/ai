@@ -6,8 +6,8 @@
 //! credential that had one recorded some other way (e.g. hand-edited into `auth.json`) before this fix.
 
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use agent_core::client::{Credential, CredentialSource, DirectRouting, RouteOverride};
 use futures::future::join_all;
@@ -460,6 +460,14 @@ pub struct CopilotRoutedCredentialSource {
     /// construction.
     pub enterprise_url: Option<String>,
     pub path: &'static str,
+    /// Memoized `(expires_at_ms, routing)` from the last disk read (T9-F1). The proxy host in
+    /// `access` only changes when the token is refreshed, and a refresh always mints a fresh
+    /// `expires_at_ms`; so while `now < expires_at_ms` the stored token is provably unchanged and the
+    /// derived routing can be reused without re-opening+re-parsing `auth.json` on every model request
+    /// (which otherwise defeats `inner`'s own in-memory credential cache). Past that expiry `inner`
+    /// may have just refreshed, so the disk read runs again and re-keys on the new expiry.
+    #[allow(clippy::type_complexity)]
+    pub cached_routing: Mutex<Option<(i64, DirectRouting)>>,
 }
 
 impl CopilotRoutedCredentialSource {
@@ -467,13 +475,37 @@ impl CopilotRoutedCredentialSource {
     /// CURRENTLY on disk. Factored out from `credential()` so it's independently testable without
     /// needing to see inside `agent_core::client::Credential`'s deliberately opaque internals.
     fn current_routing(&self) -> DirectRouting {
-        let access = crate::auth_store::AuthStore::open(self.store_path.clone())
+        // Fast path (T9-F1): while the cached token has not yet expired, no refresh can have run, so
+        // the on-disk access token — and thus the derived routing — is unchanged. Skip the disk read.
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        {
+            let guard = self
+                .cached_routing
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some((expires_at_ms, routing)) = guard.as_ref() {
+                if now_ms < *expires_at_ms {
+                    return routing.clone();
+                }
+            }
+        }
+        // Cache empty or the cached token has expired: re-read whatever `inner`'s `credential()` just
+        // (possibly) refreshed onto disk, and re-key on its expiry.
+        let (access, expires_at_ms) = crate::auth_store::AuthStore::open(self.store_path.clone())
             .get("github-copilot")
             .and_then(|stored| match &stored.credential {
-                crate::oauth::OAuthCredential::GithubCopilot(c) => Some(c.access.clone()),
+                crate::oauth::OAuthCredential::GithubCopilot(c) => {
+                    Some((c.access.clone(), c.expires_at_ms))
+                }
                 _ => None,
+            })
+            .map_or((None, 0), |(access, expires_at_ms)| {
+                (Some(access), expires_at_ms)
             });
-        DirectRouting {
+        let routing = DirectRouting {
             route: RouteOverride::Direct {
                 base_url: base_url_from_token(access.as_deref(), self.enterprise_url.as_deref()),
                 path: self.path,
@@ -498,7 +530,12 @@ impl CopilotRoutedCredentialSource {
             // aggregator host of its own to report (see `DirectRouting::aggregator_host`'s own doc
             // comment).
             aggregator_host: None,
-        }
+        };
+        *self
+            .cached_routing
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some((expires_at_ms, routing.clone()));
+        routing
     }
 }
 
@@ -901,10 +938,20 @@ mod tests {
     }
 
     fn stored_copilot_credential(access: &str) -> crate::oauth::OAuthCredential {
+        // A far-past expiry by default, so the T9-F1 routing memoization never short-circuits and each
+        // `current_routing()` genuinely re-reads the store — the behavior every re-derivation test here
+        // relies on. The dedicated cache-hit test below supplies its own future expiry instead.
+        stored_copilot_credential_expiring(access, 0)
+    }
+
+    fn stored_copilot_credential_expiring(
+        access: &str,
+        expires_at_ms: i64,
+    ) -> crate::oauth::OAuthCredential {
         crate::oauth::OAuthCredential::GithubCopilot(GithubCopilotCredential {
             access: access.to_string(),
             refresh: "refresh-token".to_string(),
-            expires_at_ms: 4_000_000_000_000,
+            expires_at_ms,
             enterprise_url: None,
             available_model_ids: vec!["gpt-5-codex".to_string()],
         })
@@ -935,6 +982,7 @@ mod tests {
             store_path: store_path.clone(),
             enterprise_url: None,
             path: "/chat/completions",
+            cached_routing: Mutex::new(None),
         };
 
         assert_eq!(
@@ -961,6 +1009,61 @@ mod tests {
         );
     }
 
+    #[test]
+    fn copilot_routing_is_memoized_while_the_token_has_not_expired() {
+        // T9-F1: while the cached token is still valid (future expiry), a subsequent on-disk token
+        // change must NOT be re-read — the whole point is to skip the per-request `auth.json` parse.
+        // (A real proxy-pool migration only lands via a refresh, which mints a fresh `expires_at_ms`
+        // and so re-keys the cache; that path is covered by the re-derivation test above.)
+        let dir = tempfile::tempdir().unwrap();
+        let store_path = dir.path().join("auth.json");
+        let far_future = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64
+            + 3_600_000;
+        crate::auth_store::AuthStore::open(store_path.clone())
+            .set(
+                "github-copilot",
+                stored_copilot_credential_expiring(
+                    "tid=abc;proxy-ep=proxy.pool-a.githubcopilot.com;exp=123",
+                    far_future,
+                ),
+            )
+            .unwrap();
+
+        let source = CopilotRoutedCredentialSource {
+            inner: Arc::new(DummyInner),
+            store_path: store_path.clone(),
+            enterprise_url: None,
+            path: "/chat/completions",
+            cached_routing: Mutex::new(None),
+        };
+
+        assert_eq!(
+            direct_base_url(&source.current_routing()),
+            "https://api.pool-a.githubcopilot.com"
+        );
+
+        // Change the on-disk token WITHOUT changing the expiry — not a real refresh, so the cache is
+        // entitled to keep serving the still-valid routing without touching disk.
+        crate::auth_store::AuthStore::open(store_path.clone())
+            .set(
+                "github-copilot",
+                stored_copilot_credential_expiring(
+                    "tid=abc;proxy-ep=proxy.pool-b.githubcopilot.com;exp=456",
+                    far_future,
+                ),
+            )
+            .unwrap();
+
+        assert_eq!(
+            direct_base_url(&source.current_routing()),
+            "https://api.pool-a.githubcopilot.com",
+            "an unexpired cache must serve the memoized routing, not re-read auth.json"
+        );
+    }
+
     #[tokio::test]
     async fn copilot_routed_credential_source_credential_call_succeeds_end_to_end() {
         let dir = tempfile::tempdir().unwrap();
@@ -979,6 +1082,7 @@ mod tests {
             store_path,
             enterprise_url: None,
             path: "/chat/completions",
+            cached_routing: Mutex::new(None),
         };
 
         // `Credential`'s fields are private (see `agent_core::client::Credential`'s own doc comment);
