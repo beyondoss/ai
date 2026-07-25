@@ -61,16 +61,20 @@
 //!   a guardrail, so it's intentionally out of scope here. If you're here because the blunt cap hurt,
 //!   build that — don't just raise the number.
 //!
-//! Backed by pingora-limits' `Rate`: count-min-sketch estimators with **fixed memory regardless of
-//! key cardinality** (no per-credential entry, no background GC), matching the deny-set's O(denied)
-//! ethos. A sketch can *over*estimate a key's rate on hash collision but never under, so a cap is
-//! always enforced; `SLOTS` is sized wide enough that overestimation stays negligible.
+//! The per-credential tier is a pair of pingora-limits count-min-sketch `Estimator`s rotated at the
+//! window boundary (`WindowedRate`), giving **fixed memory regardless of key cardinality** — no
+//! per-credential entry, no background GC — which matches the deny-set's O(denied) ethos. A sketch
+//! can *over*estimate a key's rate on hash collision but never under, so a cap is always enforced;
+//! `SLOTS` is sized wide enough that overestimation stays negligible. `pingora_limits::rate::Rate`
+//! itself is deliberately **not** used — see the note on `WindowedRate` for the reason.
 
 // `ahash::RandomState` carries its own inherent `hash_one` (it does not need `BuildHasher` in
 // scope), which is also the specialised, faster path — see the `hasher` field's note.
 use ahash::RandomState;
+use pingora_limits::estimator::Estimator;
 use pingora_limits::rate::Rate;
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 /// Count-min sketch dimensions for the per-credential tier. The estimator can only *over*estimate a
 /// key's rate (never under — so the cap always holds); the additive error is bounded by
@@ -87,8 +91,104 @@ const HASHES: usize = 5;
 /// The rate window. Every ceiling is expressed per this interval, i.e. requests/second.
 const WINDOW: Duration = Duration::from_secs(1);
 
+/// `WINDOW` in milliseconds — the unit the window index is counted in. A `const` so `check_at`'s
+/// divide is a multiply-shift rather than a hardware `div`.
+const WINDOW_MS: u64 = WINDOW.as_millis() as u64;
+
 /// The single sketch key the global BYO tier counts everything under (one shared bucket).
 const BYO_GLOBAL_KEY: u8 = 0;
+
+/// A fixed-window event counter over a count-min sketch: "how many events has `key` been charged in
+/// the window that is currently open". Two sketches are rotated at each window boundary so the reset
+/// walk can never race an increment.
+///
+/// ## Why not `pingora_limits::rate::Rate` (READ BEFORE REVERTING)
+///
+/// `Rate::maybe_reset` computes `past_ms` as
+///
+/// ```text
+/// let now = Instant::now().duration_since(self.start).as_millis() as u64;   // (A)
+/// let last_reset = self.last_reset_time.load(Ordering::SeqCst);             // (B)
+/// let past_ms = now - last_reset;                                           // unchecked
+/// ```
+///
+/// — a subtraction of two values read at two different instants. A thread that takes its clock
+/// reading at (A) and is then descheduled, while a thread whose reading was *later* wins the reset
+/// CAS and stores that larger timestamp, resumes to find `now < last_reset` and underflows. No
+/// memory ordering fixes this: the clock read strictly precedes the atomic load, so their relative
+/// age can always be inverted. Cargo profile settings apply to dependencies and this workspace sets
+/// `[profile.release] overflow-checks = true`, so the underflow is a **panicking Pingora worker**,
+/// not a silent wrap. (`rate.rs`'s `assert!(new >= now - 1000)` on the CAS-loser path is the same
+/// hazard, unreachable today only because `WINDOW` happens to be exactly 1 s.)
+///
+/// This type keeps the same red/blue rotation but never subtracts two independently-read values.
+/// The caller turns its single `Instant` into a monotonically non-decreasing **window index** once
+/// (`RateLimit::check_at`) and rotation is decided by comparing indices, so there is nothing left to
+/// underflow — the bug is designed out rather than clamped away. Threading the index in also means
+/// the clock is read once per *request* instead of once per tier.
+struct WindowedRate {
+    /// The two sketches. The live window index's parity picks the one `observe` increments; the
+    /// other is zeroed *before* the flip, so a rotation neither exposes stale counts nor wipes
+    /// increments still in flight for the window being counted.
+    slots: [Estimator; 2],
+    /// The highest window index some thread has taken responsibility for rotating into. CAS'd, so
+    /// exactly one thread performs each rotation and the ~36 µs zeroing walk is never duplicated.
+    claimed: AtomicU64,
+    /// The window index that is *live*: `& 1` selects the slot `observe` increments. Advanced only
+    /// once the incoming slot holds zeros, with release/acquire so a thread that sees the new index
+    /// is guaranteed to see them. `fetch_max` keeps it monotonic, so a rotation descheduled past a
+    /// later one cannot drag the live slot backwards onto counts that are already being taken.
+    live: AtomicU64,
+}
+
+impl WindowedRate {
+    fn new(hashes: usize, slots: usize) -> Self {
+        Self {
+            slots: [Estimator::new(hashes, slots), Estimator::new(hashes, slots)],
+            claimed: AtomicU64::new(0),
+            live: AtomicU64::new(0),
+        }
+    }
+
+    /// Charge one event to `key` in `window`, returning the running count for that window.
+    ///
+    /// A `window` *older* than the live one — this thread's clock read lost a race — is charged to
+    /// the live window rather than reopening a closed one. Counts only ever move forward.
+    fn observe(&self, key: u64, window: u64) -> isize {
+        let claimed = self.claimed.load(Ordering::Relaxed);
+        // The overwhelmingly common case is `window == claimed`: one predictable compare, no RMW.
+        if window > claimed
+            && self
+                .claimed
+                .compare_exchange(claimed, window, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+        {
+            self.rotate(claimed, window);
+        }
+        let live = (self.live.load(Ordering::Acquire) & 1) as usize;
+        self.slots[live].incr(key, 1)
+    }
+
+    /// Retire window `from` and open `to`. The `claimed` CAS elects exactly one request thread per
+    /// rotation to run this, so the zeroing walk is paid once per window, not once per request.
+    #[cold]
+    fn rotate(&self, from: u64, to: u64) {
+        let incoming = (to & 1) as usize;
+        // Zero *before* publishing. Until `live` moves, every other thread is still charging the
+        // outgoing slot, so nothing is counting into the one being cleared and no in-flight
+        // increment can be lost. (When `to - from` is even the incoming slot *is* the outgoing one;
+        // reaching that needs two or more elapsed windows, i.e. a window that saw no traffic at
+        // all, so there is nothing there to lose either.)
+        self.slots[incoming].reset();
+        self.live.fetch_max(to, Ordering::AcqRel);
+        // Two or more windows elapsed, so the other slot is stale too. Cleared *after* publishing,
+        // both so the fresh slot goes live as early as possible and because nothing increments this
+        // one once it is no longer live.
+        if to - from >= 2 {
+            self.slots[incoming ^ 1].reset();
+        }
+    }
+}
 
 /// Why a request was throttled — carried out so the caller can label the rejection metric and an
 /// operator can tell *which* ceiling tripped (and thus which knob to tune).
@@ -121,9 +221,12 @@ impl From<Throttled> for crate::metrics::Rejection {
 
 pub struct RateLimit {
     /// `(sketch, max_per_window)` for the per-credential tier. `None` disables it.
-    per_cred: Option<(Rate, isize)>,
+    per_cred: Option<(WindowedRate, isize)>,
     /// `(sketch, max_per_window)` for the global BYO aggregate tier. `None` disables it.
     byo_global: Option<(Rate, isize)>,
+    /// Epoch the window index is measured from. Fixed at construction, so every tier counts the
+    /// same windows off one clock read per request rather than each re-reading the clock.
+    start: Instant,
     /// Process-random hash state. The raw credential is reduced to the per-credential sketch key
     /// through this, so the hash is keyed by a per-process secret. Without it the digest would be
     /// precomputable (`DefaultHasher` keys on zeros), letting an attacker craft two tokens that
@@ -156,17 +259,24 @@ impl RateLimit {
             return None;
         }
         Some(Self {
-            per_cred: (per_cred_rps != 0).then(|| {
-                (
-                    Rate::new_with_estimator_config(WINDOW, HASHES, SLOTS),
-                    per_cred_rps as isize,
-                )
-            }),
+            per_cred: (per_cred_rps != 0)
+                .then(|| (WindowedRate::new(HASHES, SLOTS), per_cred_rps as isize)),
             // One bucket, so the default estimator is plenty — no need for the wide sketch.
             byo_global: (byo_global_rps != 0).then(|| (Rate::new(WINDOW), byo_global_rps as isize)),
+            start: Instant::now(),
             // `RandomState::new()` draws fresh key material from the OS RNG per process.
             hasher: RandomState::new(),
         })
+    }
+
+    /// The index of the window `now` falls in — the only thing either tier needs from the clock.
+    ///
+    /// `saturating_duration_since`, not `-`: with `check_at` the caller supplies `now`, and a
+    /// caller that captured it before this limiter was constructed (or a test that hands one back)
+    /// must clamp to window 0, not panic under `overflow-checks`.
+    #[inline]
+    fn window_of(&self, now: Instant) -> u64 {
+        (now.saturating_duration_since(self.start).as_millis() as u64) / WINDOW_MS
     }
 
     /// Charge one request. `managed` is `true` for a verified-path (`bai_…`) credential, `false` for
@@ -180,6 +290,19 @@ impl RateLimit {
     /// present, so it's load-bearing, not decorative.
     #[must_use = "the throttle decision must be enforced — dropping it charges the request but lets it through"]
     pub fn check(&self, raw_credential: &str, managed: bool) -> Option<Throttled> {
+        self.check_at(raw_credential, managed, Instant::now())
+    }
+
+    /// `check`, with the clock supplied by the caller.
+    ///
+    /// `request_filter` already takes an `Instant::now()` at the top of every request for its
+    /// latency histogram; handing that same reading in makes the limiter's clock read free instead
+    /// of duplicating a vDSO `clock_gettime`. It is also what makes the window boundaries testable:
+    /// a test pins `now` and gets a deterministic window rather than sleeping for one.
+    #[must_use = "the throttle decision must be enforced — dropping it charges the request but lets it through"]
+    pub fn check_at(&self, raw_credential: &str, managed: bool, now: Instant) -> Option<Throttled> {
+        // One clock read, one divide, shared by both tiers.
+        let window = self.window_of(now);
         // Global BYO backstop first: BYO is unverified and upstream-bound, so this is the ceiling that
         // protects our egress IPs from a distinct-token flood. Managed traffic skips it (verified,
         // can't be forged, already bounded per-credential) so it never shares this bucket.
@@ -193,7 +316,7 @@ impl RateLimit {
         // Per-credential ceiling: a single leaked/runaway key (managed or BYO), capped before verify.
         if let Some((rate, max)) = &self.per_cred {
             let key = self.hasher.hash_one(raw_credential);
-            if rate.observe(&key, 1) > *max {
+            if rate.observe(key, window) > *max {
                 return Some(Throttled::PerCredential);
             }
         }
@@ -245,6 +368,109 @@ mod tests {
         for i in 0..10 {
             assert_eq!(rl.check(&format!("bai_v1.1.p{i}.s{i}"), true), None);
         }
+    }
+
+    /// Window rotation, pinned to an explicit clock so it is deterministic and instant: exhaust the
+    /// budget, step into the next window, get the whole budget back. The tail also covers the
+    /// two-or-more-windows-elapsed path, where *both* slots are stale and have to be cleared.
+    #[test]
+    fn per_credential_budget_is_restored_by_the_next_window() {
+        let rl = RateLimit::new(2, 0).unwrap();
+        // Taken *after* construction, so it is at or after the limiter's epoch → window 0.
+        let t0 = Instant::now();
+        let cred = "bai_v1.1.payload.sig";
+
+        assert_eq!(rl.check_at(cred, true, t0), None);
+        assert_eq!(rl.check_at(cred, true, t0), None);
+        assert_eq!(rl.check_at(cred, true, t0), Some(Throttled::PerCredential));
+
+        // Window 1: a fresh budget, and the same ceiling at the same place.
+        let t1 = t0 + WINDOW;
+        assert_eq!(rl.check_at(cred, true, t1), None);
+        assert_eq!(rl.check_at(cred, true, t1), None);
+        assert_eq!(rl.check_at(cred, true, t1), Some(Throttled::PerCredential));
+
+        // Window 6: an idle gap of more than two windows, so neither slot holds anything live.
+        let t6 = t0 + WINDOW * 6;
+        assert_eq!(rl.check_at(cred, true, t6), None);
+        assert_eq!(rl.check_at(cred, true, t6), None);
+        assert_eq!(rl.check_at(cred, true, t6), Some(Throttled::PerCredential));
+    }
+
+    /// A thread whose clock read predates a rotation must not reopen the window it closed. In
+    /// pingora's `Rate` this is the case that underflows `now - last_reset` (a worker panic under
+    /// the workspace's `overflow-checks`); here it must simply charge the live window.
+    #[test]
+    fn a_stale_clock_read_cannot_reopen_a_closed_window() {
+        let rl = RateLimit::new(2, 0).unwrap();
+        let t0 = Instant::now();
+        let t1 = t0 + WINDOW;
+        let cred = "bai_v1.1.payload.sig";
+
+        assert_eq!(rl.check_at(cred, true, t1), None); // rotates into window 1
+        // Arriving late with a window-0 reading: charged to window 1, not given a new budget.
+        assert_eq!(rl.check_at(cred, true, t0), None);
+        assert_eq!(rl.check_at(cred, true, t0), Some(Throttled::PerCredential));
+        // And the rotation state is still sane afterwards — window 2 starts clean.
+        assert_eq!(rl.check_at(cred, true, t0 + WINDOW * 2), None);
+    }
+
+    /// The concurrency regression for `WindowedRate`. Every thread walks its own skewed sequence of
+    /// window indices, so rotations are continuously raced and threads routinely arrive with a
+    /// reading older than the winner's. Against `pingora_limits::rate::Rate` this is the shape that
+    /// underflows `past_ms`; it must run clean here, and the counts must stay bounded by the
+    /// ceiling within each window (the sketch is exact for a single key).
+    #[test]
+    fn racing_rotations_with_out_of_order_clock_reads_are_safe() {
+        const THREADS: u64 = 8;
+        const STEPS: u64 = 400;
+
+        let rl = RateLimit::new(1_000_000, 0).unwrap();
+        let base = Instant::now();
+        std::thread::scope(|s| {
+            for t in 0..THREADS {
+                let rl = &rl;
+                s.spawn(move || {
+                    for i in 0..STEPS {
+                        // 400 ms of simulated time per step (so ~160 rotations), each thread offset
+                        // by a different sub-window skew — threads land on either side of a
+                        // boundary in a different order every time.
+                        let skew = (i + t * 37) % 5;
+                        let at = base + Duration::from_millis(i * 400 + skew * 150);
+                        let _ = rl.check_at("byo-token", false, at);
+                    }
+                });
+            }
+        });
+    }
+
+    /// The rotation must not lose counts under contention: with the window pinned, `THREADS × EACH`
+    /// concurrent charges against one key have to leave the sketch holding all of them.
+    #[test]
+    fn concurrent_charges_in_one_window_are_all_counted() {
+        const THREADS: usize = 8;
+        const EACH: usize = 2_000;
+
+        // Ceiling just under the total, so the last charge must be the one that trips it.
+        let rl = RateLimit::new((THREADS * EACH) as u32 - 1, 0).unwrap();
+        let now = Instant::now();
+        let cred = "bai_v1.1.payload.sig";
+        std::thread::scope(|s| {
+            for _ in 0..THREADS {
+                let rl = &rl;
+                s.spawn(move || {
+                    for _ in 0..EACH {
+                        let _ = rl.check_at(cred, true, now);
+                    }
+                });
+            }
+        });
+        // If a single increment had been dropped the running total would still be under the
+        // ceiling and this would come back `None`.
+        assert_eq!(
+            rl.check_at(cred, true, now),
+            Some(Throttled::PerCredential)
+        );
     }
 
     #[test]

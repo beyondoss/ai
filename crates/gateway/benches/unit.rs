@@ -319,6 +319,29 @@ mod ratelimit {
         LazyLock::force(&CREDS);
         bencher.bench(|| rl.check(black_box(next_cred()), black_box(false)));
     }
+
+    /// The tail the flood benches can only hint at: the cost of the *one* request per window that
+    /// wins the rotation and pays for zeroing a whole sketch inline, on its own request thread.
+    ///
+    /// `check_at` makes this measurable instead of statistical — every iteration steps the clock a
+    /// full window, so every iteration rotates. Read it as a per-rotation cost, not a per-request
+    /// one: at 1 Hz and a plausible peak of 100k rps it is one request in ~100k that pays it, i.e.
+    /// around p99.999 for the ceiling on `SLOTS`, not a throughput term.
+    #[divan::bench(sample_size = 20)]
+    fn rotate_window(bencher: Bencher) {
+        let rl = RateLimit::new(u32::MAX, 0).expect("enabled");
+        let cred = "bai_v1.1.AAAAAAAAAAAAAAAAAAAAAA.signature-base64url-payload-here";
+        let t0 = std::time::Instant::now();
+        let mut window = 0u32;
+        bencher.bench_local(|| {
+            window += 1;
+            rl.check_at(
+                black_box(cred),
+                black_box(true),
+                t0 + std::time::Duration::from_secs(1) * window,
+            )
+        });
+    }
 }
 
 mod circuit_breaker {
