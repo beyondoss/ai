@@ -25,8 +25,11 @@ use std::hint::black_box;
 use agent_core::client::LineFramer;
 use agent_core::dialect::{SseEventBuffer, decode_sse, push_sse_line};
 use agent_core::dialect::{anthropic, openai, openai_responses};
+use agent_core::message::{ContentBlock, Message, ToolDef};
+use agent_core::transport::ModelRequest;
 use divan::Bencher;
 use divan::counter::BytesCount;
+use serde_json::json;
 
 #[global_allocator]
 static ALLOC: divan::AllocProfiler = divan::AllocProfiler::system();
@@ -352,6 +355,167 @@ mod caps {
                 black_box(None),
             )
         });
+    }
+}
+
+// --- encode: dialect build_body over a synthetic multi-turn history (M6) --------------------------
+//
+// The request-encode counterpart to the decode benches above: `build_body` translates the full
+// conversation history into a provider's wire shape once per request (per attempt, per retry), so its
+// cost grows with history length — the opposite frequency class from the per-token decode path, but
+// on the same turn. Measures allocs/request + ns/request for building the body **and** serializing it
+// to bytes, exactly what the client does (`GatewayClient::stream` hands the built body to reqwest's
+// `.json(..)`, i.e. `serde_json::to_vec`). Serializing is included so the audit's "materialize a
+// `Value` tree the caller immediately serializes" round-trip is visible end to end.
+
+/// Assistant/user/tool-result round-trips in the synthetic history — ~`3 * ROUNDS` messages plus the
+/// leading system prompt, i.e. a mid-length agent transcript (36 messages here), the regime where
+/// per-message encode cost dominates the fixed request scaffolding.
+const ROUNDS: usize = 12;
+
+/// A JSON reasoning signature exactly as a dialect decoder stores it — `serde_json`'s own canonical
+/// compact form (`item.to_string()`; see `openai_responses::Decoder`). Both the Responses dialect's
+/// `Thinking` replay and the Chat Completions dialect's `reasoning_details` passthrough re-parse a
+/// value of this shape, so a realistic history must carry it.
+fn reasoning_signature(tag: usize) -> String {
+    json!({
+        "type": "reasoning",
+        "id": format!("rs_{tag}"),
+        "summary": [{ "type": "summary_text", "text": "weighing the options before answering" }],
+    })
+    .to_string()
+}
+
+/// A representative mid-length agent transcript for `model`: repeated `user → assistant(text +
+/// tool_use) → tool_result` rounds, with a signed thinking block every 4th assistant turn — enough
+/// text/tool/thinking history to exercise every per-message encode branch across all three dialects.
+///
+/// This is the **common** shape a real turn encodes: a single-model, already-clean transcript.
+/// `model_id` is stamped with `model` on every assistant turn, so the cross-dialect normalization
+/// passes (openai `normalize_cross_model_tool_id`, anthropic `normalize_cross_model_tool_ids`) hit
+/// their same-model fast path exactly as in production, rather than the exotic multi-model-fan-out
+/// path a unit test constructs. No `Text::id`/`phase` and no `ToolUse::thought_signature` (both set
+/// only by a *different* dialect on a transcript that has crossed wires) for the same reason.
+fn synthetic_history(model: &str) -> Vec<Message> {
+    let mut msgs = Vec::with_capacity(ROUNDS * 3);
+    for i in 0..ROUNDS {
+        msgs.push(Message::user(format!(
+            "Question {i}: what does the code in module_{i} do, and how could I make its hot loop faster \
+             without changing behavior?"
+        )));
+
+        let mut blocks: Vec<ContentBlock> = Vec::new();
+        if i % 4 == 0 {
+            blocks.push(ContentBlock::Thinking {
+                text: format!(
+                    "Module {i} looks allocation-heavy; let me grep for the hot path first."
+                ),
+                signature: reasoning_signature(i),
+            });
+        }
+        blocks.push(ContentBlock::text(format!(
+            "I'll start by searching module_{i} for the relevant function, then read it."
+        )));
+        blocks.push(ContentBlock::tool_use(
+            format!("call_{i}"),
+            "bash",
+            json!({ "command": format!("grep -rn 'fn hot' module_{i}/ && wc -l module_{i}/*.rs") }),
+        ));
+        let mut assistant = Message::assistant(blocks);
+        assistant.model_id = Some(model.to_string());
+        msgs.push(assistant);
+
+        msgs.push(Message::tool_result(
+            format!("call_{i}"),
+            format!(
+                "module_{i}/lib.rs:42: fn hot(x: &[u8]) -> usize\nmatched 3 lines\n\
+                 module_{i}/lib.rs 210\nmodule_{i}/util.rs 88\ntotal 298 lines"
+            ),
+            false,
+        ));
+    }
+    msgs
+}
+
+/// A `ModelRequest` over `synthetic_history()` for `model`, with a system prompt and, when `tools`,
+/// the usual tool set. The no-tools variant (`tools: false`) is the `--no-tools` follow-up shape whose
+/// `tools: []` fallback used to trigger a whole separate `has_tool_history` rescan of the history
+/// (openai [T3-F9]).
+fn encode_request(model: &str, tools: bool) -> ModelRequest {
+    let req = ModelRequest::new(model, synthetic_history(model), 4096).with_system(
+        "You are a meticulous performance engineer. Prefer the minimum effective change, keep \
+         behavior byte-identical, and measure before and after.",
+    );
+    if !tools {
+        return req;
+    }
+    req.with_tools(vec![
+        ToolDef {
+            name: "bash".into(),
+            description: "Run a shell command and return combined stdout/stderr.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": { "command": { "type": "string" } },
+                "required": ["command"],
+            }),
+        },
+        ToolDef {
+            name: "read".into(),
+            description: "Read a file from the workspace.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": { "path": { "type": "string" }, "offset": { "type": "integer" } },
+                "required": ["path"],
+            }),
+        },
+    ])
+}
+
+fn model_for(which: &str) -> &'static str {
+    match which {
+        "anthropic" => "claude-opus-4-8",
+        "openai" => "gpt-4o",
+        "responses" => "gpt-5",
+        other => panic!("unknown dialect {other}"),
+    }
+}
+
+fn build(which: &str, req: &ModelRequest) -> serde_json::Value {
+    match which {
+        "anthropic" => anthropic::build_body(black_box(req), false),
+        "openai" => openai::build_body(black_box(req)),
+        "responses" => openai_responses::build_body(black_box(req)),
+        _ => unreachable!(),
+    }
+}
+
+mod encode {
+    use super::*;
+
+    /// The `ModelRequest` → `serde_json::Value` translation alone — the tree-building pass this task's
+    /// finding cluster targets, isolated from serialization so the per-message walk savings (openai
+    /// [T3-F7]/[T3-F9], anthropic [T3-F2]) aren't drowned out by `to_vec`'s own cost. `tools=false`
+    /// exercises the `has_tool_history`/`tools: []` fallback path.
+    #[divan::bench(args = ["anthropic", "openai", "responses"])]
+    fn build_tree(bencher: Bencher, which: &str) {
+        let req = encode_request(model_for(which), true);
+        bencher.bench(|| build(which, &req));
+    }
+
+    /// Same, on the no-tools follow-up shape (`--no-tools` over a tool-carrying history) — the path
+    /// openai's [T3-F9] flag replaces a whole extra history rescan on.
+    #[divan::bench(args = ["anthropic", "openai", "responses"])]
+    fn build_tree_no_tools(bencher: Bencher, which: &str) {
+        let req = encode_request(model_for(which), false);
+        bencher.bench(|| build(which, &req));
+    }
+
+    /// Build **and serialize** to wire bytes — the whole `ModelRequest` → bytes cost the client pays
+    /// (`GatewayClient::stream` → reqwest `.json(..)` → `serde_json::to_vec`), allocs + ns per request.
+    #[divan::bench(args = ["anthropic", "openai", "responses"])]
+    fn build_and_serialize(bencher: Bencher, which: &str) {
+        let req = encode_request(model_for(which), true);
+        bencher.bench(|| serde_json::to_vec(&build(which, &req)).expect("serialize body"));
     }
 }
 

@@ -11,7 +11,7 @@ use serde_json::{Map, Value, json};
 
 use super::StreamDecoder;
 use crate::error::{Error, Result};
-use crate::message::{StopReason, StreamEvent, TokenUsage, ToolDef};
+use crate::message::{ContentBlock, StopReason, StreamEvent, TokenUsage, ToolDef};
 use crate::transport::{ModelRequest, ToolChoice};
 
 /// Anthropic's OAuth-gated (Claude Pro/Max subscription) endpoint expects to see exactly Claude Code's
@@ -143,15 +143,54 @@ pub fn build_body(req: &ModelRequest, is_oauth: bool) -> Value {
     // `run --model gpt-5 …` then `run --continue --model claude-…` 400s on
     // `messages.N.content.0.text.id: Extra inputs are not permitted`, and cross-provider model switching
     // is now an ordinary thing to do (`agent::gateway_credential`'s direct routes), not an exotic one.
+    // Each mutation pass below is a full walk of the `messages` `Value` array, and on an ordinary
+    // same-model, already-clean transcript most are provable no-ops. One cheap scan of the *typed*
+    // history (no `Value` traversal) decides which walks can be skipped outright — see [T3-F2].
+    // `prune_non_anthropic_block_fields` is deliberately left *unconditional*: it's the safety net that
+    // keeps a future non-Anthropic `ContentBlock` field structurally unreachable on the wire (see its
+    // own doc comment), so gating it on a field-specific flag would reintroduce exactly the
+    // stays-in-sync fragility it exists to remove.
+    let mut has_thinking = false;
+    let mut has_tool_use = false;
+    let mut foreign_tool_use = false;
+    let mut has_tool_result_image = false;
+    for m in req.messages.iter() {
+        let is_foreign = m.model_id.as_deref() != Some(req.model.as_str());
+        for b in &m.content {
+            match b {
+                ContentBlock::Thinking { .. } => has_thinking = true,
+                ContentBlock::ToolUse { .. } => {
+                    has_tool_use = true;
+                    foreign_tool_use |= is_foreign;
+                }
+                ContentBlock::ToolResult { images, .. } if !images.is_empty() => {
+                    has_tool_result_image = true
+                }
+                _ => {}
+            }
+        }
+    }
+
     prune_non_anthropic_block_fields(&mut messages);
-    normalize_cross_model_tool_ids(&mut messages, &req.messages, &req.model);
-    downgrade_unsigned_thinking(&mut messages);
+    // `normalize_cross_model_tool_ids` only rewrites `tool_use` ids on messages produced by a
+    // *different* model; with no foreign tool_use in history it's a full no-op walk (every message
+    // hits its own same-model `continue`, `id_remap` stays empty, the second pass is skipped).
+    if foreign_tool_use {
+        normalize_cross_model_tool_ids(&mut messages, &req.messages, &req.model);
+    }
+    if has_thinking {
+        downgrade_unsigned_thinking(&mut messages);
+    }
     // Vision is gated on *both* the model's own real support and the request's explicit
     // wire-level opt-out (`ModelRequest::block_images`) — an image is downgraded to a text
     // placeholder when either is unsupported/blocked, regardless of when/how it entered history.
+    // (`downgrade_unsupported_images` already early-returns on a vision-capable, non-blocked request —
+    // the common case — so it needs no extra history flag here.)
     downgrade_unsupported_images(&mut messages, caps.supports_vision && !req.block_images);
-    encode_tool_result_images(&mut messages);
-    if is_oauth {
+    if has_tool_result_image {
+        encode_tool_result_images(&mut messages);
+    }
+    if is_oauth && has_tool_use {
         // Replayed assistant tool_use blocks in history need the same canonical casing the live model
         // just saw advertised in `tools` below — the stored name is always our own real one (this
         // dialect's `Decoder` already reverses it back via `from_claude_code_name` at decode time), so
@@ -537,12 +576,11 @@ fn downgrade_unsigned_thinking(messages: &mut Value) {
             if obj.get("type").and_then(Value::as_str) != Some("thinking") {
                 return true;
             }
-            let text = obj
+            let raw = obj
                 .get("thinking")
                 .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string();
-            if text.trim().is_empty() {
+                .unwrap_or_default();
+            if raw.trim().is_empty() {
                 return false;
             }
             let signed = obj
@@ -552,6 +590,9 @@ fn downgrade_unsigned_thinking(messages: &mut Value) {
             if signed {
                 return true;
             }
+            // Only the (rare) downgrade branch actually needs an owned copy — a signed block, the
+            // common case, is kept verbatim without allocating a throwaway `String` for its text.
+            let text = raw.to_string();
             *block = json!({ "type": "text", "text": text });
             true
         });
