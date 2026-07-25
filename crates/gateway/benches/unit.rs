@@ -82,9 +82,25 @@ mod deny {
         deny::parse_reason(black_box(b"spend"))
     }
 
+    /// The shape the control plane actually writes (note the extra `exp` field, which must be
+    /// skipped without ever being materialized). Must be **0 allocs**: the reason deserializes as a
+    /// `Cow` borrowed straight out of the input. A non-zero alloc column here means someone
+    /// reintroduced an owning parse — on a seed/rescan this runs once per entry.
     #[divan::bench]
     fn parse_reason_json() -> beyond_ai::deny::DenyReason {
         deny::parse_reason(black_box(br#"{"reason":"fraud","exp":123}"#))
+    }
+
+    /// Same, but the reason is `\u`-escaped (`\u0066` is `f`), so it cannot be borrowed out of
+    /// the input. This is the case that forces the field to be a `Cow` and not a `&str`: a
+    /// `&str` field cannot represent an escaped string, so it would fail the parse outright and
+    /// silently degrade to `Unknown`.
+    /// Costs **2 allocs / 13 B** — serde_json's unescape scratch buffer (8 B) plus the resulting
+    /// `String` (5 B). The control plane doesn't write escapes, so this is the rare path; it is
+    /// benched to keep the borrowed case above honest about what it is avoiding.
+    #[divan::bench]
+    fn parse_reason_json_escaped() -> beyond_ai::deny::DenyReason {
+        deny::parse_reason(black_box(br#"{"reason":"\u0066raud","exp":123}"#))
     }
 
     // --- request hot path: the lookup run on EVERY managed request (`proxy::request_filter`) ---

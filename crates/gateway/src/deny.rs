@@ -117,18 +117,42 @@ pub fn parse_key(key: &str) -> Option<u64> {
     key.strip_prefix("blackhole.")?.parse().ok()
 }
 
+/// The only field of the control plane's JSON entry value we care about; everything else it writes
+/// (`exp`, …) is skipped by the parser without ever being materialized.
+///
+/// `Cow`, not `&str`: a `&str` field can only deserialize from an *unescaped* string, so a reason
+/// containing a `\`-escape would fail the whole parse and silently degrade to `Unknown`. `Cow`
+/// borrows in the common case and falls back to an owned `String` only for an escaped value.
+///
+/// Two non-obvious requirements, both load-bearing — drop either and this silently allocates again:
+///   * `#[serde(borrow)]` — without it serde uses the blanket `impl Deserialize for Cow<'_, T>`,
+///     which *always* yields `Cow::Owned`.
+///   * a **bare** `Cow`, not `Option<Cow>` — serde_derive only rewrites a field to its borrowing
+///     deserializer when the type is literally `Cow<'a, _>` (`internals::attr::is_cow`); wrapped in
+///     an `Option` the attribute still compiles but quietly falls back to the always-owned impl.
+///     `#[serde(default)]` covers the absent case instead, and `String::new()` doesn't allocate.
+#[derive(serde::Deserialize)]
+struct ReasonOnly<'a> {
+    #[serde(borrow, default)]
+    reason: std::borrow::Cow<'a, str>,
+}
+
 /// Parse the entry value into a reason. Accepts either a bare token (`spend`/`fraud`) or a JSON
 /// object `{"reason":"spend", ...}`. Anything else → `Unknown` (still denied — fail safe).
 pub fn parse_reason(value: &[u8]) -> DenyReason {
     let s = std::str::from_utf8(value).unwrap_or("").trim();
-    // The JSON branch must own its extracted reason (it's borrowed from a temporary `Value`); the
-    // bare-token branch matches the borrowed `&str` directly — no allocation on the common path.
-    let json_reason: Option<String>;
+    // Both branches are zero-alloc. JSON is what the control plane actually writes, so it is *not*
+    // the cold branch: it runs once per delta, and once per entry on a full seed/rescan — at a large
+    // deny-set, allocating here is millions of allocations per cold boot. Deserializing into a
+    // borrowed `ReasonOnly` instead of a `serde_json::Value` skips building a `Map` plus a `String`
+    // per key and per string value, and hands back a `&str` pointing into `value` itself.
+    let parsed;
     let token: &str = if s.starts_with('{') {
-        json_reason = serde_json::from_slice::<serde_json::Value>(value)
-            .ok()
-            .and_then(|v| v.get("reason").and_then(|r| r.as_str()).map(str::to_owned));
-        json_reason.as_deref().unwrap_or("")
+        // `from_str` on the trimmed `s`, not `from_slice` on the raw bytes: identical input to the
+        // parser (JSON ignores surrounding whitespace) but it skips a second UTF-8 validation of a
+        // slice we just validated.
+        parsed = serde_json::from_str::<ReasonOnly<'_>>(s).ok();
+        parsed.as_ref().map_or("", |r| &r.reason)
     } else {
         s
     };
@@ -178,6 +202,29 @@ mod tests {
             DenyReason::Spend
         );
         assert_eq!(parse_reason(b"weird"), DenyReason::Unknown);
+    }
+
+    #[test]
+    fn reason_parsing_tolerates_escapes_and_junk() {
+        // The reason arrives escaped (`\u0073` is `s`, so this decodes to "spend"). A borrowed
+        // `&str` field cannot represent an escaped string and would fail the *whole* parse, silently
+        // degrading to `Unknown`; `Cow` falls back to an owned copy for exactly this input. This is
+        // the case that dictates the field type — see `ReasonOnly`.
+        assert_eq!(
+            parse_reason(br#"{"reason":"\u0073pend"}"#),
+            DenyReason::Spend
+        );
+        // Fail-safe on every malformed shape: still denied, never an allow.
+        assert_eq!(parse_reason(br#"{"reason":123}"#), DenyReason::Unknown);
+        assert_eq!(parse_reason(br#"{"exp":123}"#), DenyReason::Unknown); // no `reason` field
+        assert_eq!(parse_reason(b"{not json"), DenyReason::Unknown);
+        assert_eq!(parse_reason(b""), DenyReason::Unknown);
+        assert_eq!(parse_reason(&[0xff, 0xfe]), DenyReason::Unknown); // invalid UTF-8
+        // Whitespace around a JSON object still reaches the JSON branch (we parse the trimmed str).
+        assert_eq!(
+            parse_reason(b"  {\"reason\":\"fraud\"}  "),
+            DenyReason::Fraud
+        );
     }
 
     #[test]
