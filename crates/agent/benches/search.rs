@@ -244,6 +244,41 @@ fn edit_run_exact_ascii(bencher: Bencher) {
     });
 }
 
+/// `edit`'s whole `run` over a **large (~4 MB) pure-LF ASCII** file — the case M11 targets. A file
+/// this size is where copying the entire body, building a 4×-file-size `Vec<u32>` offset map, and
+/// re-validating UTF-8 on every edit actually hurt (the doc cites ~73 ms on 4 MB). With no `\r` in the
+/// file the post-change path borrows the body and splices with raw offsets, skipping the copy + map +
+/// validation entirely — watch the alloc bytes and time collapse here. Includes the `fs::write` of the
+/// subject on both sides, so the delta is the CPU/alloc the edit itself no longer spends.
+#[divan::bench(sample_count = 20)]
+fn edit_run_large_lf(bencher: Bencher) {
+    const LARGE_LF_LINES: usize = 75_000; // ~4 MB at ~56 bytes/line
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("large.rs");
+    let mut src = String::with_capacity(LARGE_LF_LINES * 56);
+    for i in 0..LARGE_LF_LINES {
+        src.push_str(&format!("    let x_{i} = compute(i, {i}) + adjust();\n"));
+    }
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    let tool = edit::Edit::new(dir.path());
+    let p = path.to_str().unwrap().to_string();
+    let mut n = 0usize;
+    bencher.bench_local(|| {
+        std::fs::write(&path, &src).unwrap();
+        n += 1;
+        let out = rt
+            .block_on(tool.run(serde_json::json!({
+                "path": p,
+                "old_string": "    let x_37500 = compute(i, 37500) + adjust();",
+                "new_string": format!("    let x_37500 = compute(i, 37500) + adjust(); // {n}"),
+            })))
+            .unwrap();
+        black_box(out.text.len());
+    });
+}
+
 /// The same `run`, but over a file carrying a few non-ASCII characters, so it takes the general
 /// Unicode normalizer. Kept beside `edit_run_exact_ascii` as the guard rail: the ASCII fast path must
 /// not have *regressed* the path that still needs full NFKC.
