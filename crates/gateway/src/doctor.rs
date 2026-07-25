@@ -9,6 +9,7 @@ use crate::config::AiConfig;
 use crate::route;
 use std::collections::BTreeMap;
 use std::time::Duration;
+use tokio::task::JoinSet;
 
 pub struct CheckResult {
     pub name: &'static str,
@@ -107,56 +108,94 @@ fn check_pool_keys(config: &AiConfig) -> CheckResult {
     }
 }
 
+/// How long we wait on any one provider's DNS before calling it unreachable. Because the lookups
+/// overlap (see below), this is the *total* the doctor can spend on DNS, not the per-provider budget.
+const DNS_TIMEOUT: Duration = Duration::from_secs(3);
+
 /// Resolve every provider authority the gateway might dial (known providers + config overrides/adds),
 /// so a DNS or typo'd-authority problem shows up here rather than as a 502 on the first request. Each
 /// lookup is bounded so one black-holed host can't hang the doctor. We don't connect (no auth, no TLS
 /// handshake) — reachability of the *name* is the prerequisite; live auth is proven by the smoke test.
+///
+/// The lookups run **concurrently**. Sequentially the bound is `providers × DNS_TIMEOUT` — ~30s of
+/// nothing when DNS is black-holed, which is precisely the situation you run `doctor` in. `lookup_host`
+/// hands the blocking `getaddrinfo` to the runtime's blocking pool, so they genuinely overlap even on
+/// the current-thread runtime `main` builds, and the wall clock collapses to one timeout. Results are
+/// sorted back into provider order on the way out: the output is read by a human (and asserted in
+/// tests), so it must not depend on which lookup happened to finish first.
 async fn check_provider_dns(config: &AiConfig) -> Vec<CheckResult> {
     // Effective authority per provider name: the known default unless config overrides it, plus any
     // config-only provider. A BTreeMap dedups and keeps the output stable/ordered.
-    let mut authorities: BTreeMap<&str, String> = BTreeMap::new();
+    //
+    // `CheckResult.name` is `&'static str`: a known provider lends its static name — carried in the
+    // value straight off the registry row, so we never re-scan the registry per provider — while a
+    // config-only provider (non-'static) reports under a generic label, real name in the message.
+    let mut authorities: BTreeMap<&str, (&'static str, &str)> = BTreeMap::new();
     for spec in route::known_providers() {
-        authorities.insert(spec.name, spec.authority.to_string());
+        authorities.insert(spec.name, (spec.name, spec.authority));
     }
     for (name, authority) in &config.provider_authorities {
-        authorities.insert(name.as_str(), authority.clone());
+        authorities
+            .entry(name.as_str())
+            .and_modify(|slot| slot.1 = authority.as_str())
+            .or_insert(("provider_dns", authority.as_str()));
     }
 
-    let mut results = Vec::with_capacity(authorities.len());
-    for (name, authority) in authorities {
-        // `CheckResult.name` is `&'static str`: a known provider lends its static name; a config-only
-        // provider (non-'static) reports under a generic label, with the real name in the message.
-        let check_name: &'static str = route::known_providers()
-            .find(|s| s.name == name)
-            .map_or("provider_dns", |s| s.name);
-        let lookup = tokio::time::timeout(
-            Duration::from_secs(3),
-            tokio::net::lookup_host(authority.clone()),
-        )
-        .await;
-        let res = match lookup {
-            Ok(Ok(mut addrs)) => match addrs.next() {
-                Some(addr) => pass(check_name, format!("{name} → {authority} ({addr})")),
-                None => fail(
+    let mut lookups = JoinSet::new();
+    for (name, (check_name, authority)) in authorities {
+        // A spawned task is `'static`, so it owns its strings: one allocation per provider, which is
+        // what buys the overlap. Everything above this point stays borrowed.
+        let (name, authority) = (name.to_string(), authority.to_string());
+        lookups.spawn(async move {
+            let lookup =
+                tokio::time::timeout(DNS_TIMEOUT, tokio::net::lookup_host(authority.as_str())).await;
+            let res = match lookup {
+                Ok(Ok(mut addrs)) => match addrs.next() {
+                    Some(addr) => pass(check_name, format!("{name} → {authority} ({addr})")),
+                    None => fail(
+                        check_name,
+                        format!("{name}: {authority} resolved to no addresses"),
+                        "check the provider authority (host:port) in provider_authorities",
+                    ),
+                },
+                Ok(Err(e)) => fail(
                     check_name,
-                    format!("{name}: {authority} resolved to no addresses"),
-                    "check the provider authority (host:port) in provider_authorities",
+                    format!("{name}: {authority}: {e}"),
+                    "check the provider authority (host:port) and DNS",
                 ),
-            },
-            Ok(Err(e)) => fail(
-                check_name,
-                format!("{name}: {authority}: {e}"),
-                "check the provider authority (host:port) and DNS",
-            ),
-            Err(_) => fail(
-                check_name,
-                format!("{name}: {authority}: DNS lookup timed out (>3s)"),
-                "the upstream host may be unreachable or DNS is slow",
-            ),
-        };
-        results.push(res);
+                Err(_) => fail(
+                    check_name,
+                    format!(
+                        "{name}: {authority}: DNS lookup timed out (>{}s)",
+                        DNS_TIMEOUT.as_secs()
+                    ),
+                    "the upstream host may be unreachable or DNS is slow",
+                ),
+            };
+            (name, res)
+        });
     }
-    results
+
+    let mut results = Vec::with_capacity(lookups.len());
+    while let Some(joined) = lookups.join_next().await {
+        results.push(match joined {
+            Ok(entry) => entry,
+            // Nothing aborts the set, so a join error means the task panicked. Report it instead of
+            // silently dropping a provider — a doctor that under-reports is worse than one that says
+            // something went wrong.
+            Err(e) => (
+                String::new(),
+                fail(
+                    "provider_dns",
+                    format!("a provider DNS check did not run: {e}"),
+                    "this is a gateway bug — please report it",
+                ),
+            ),
+        });
+    }
+    // `join_next` yields in completion order; restore the provider order the BTreeMap defined.
+    results.sort_by(|(a, _), (b, _)| a.cmp(b));
+    results.into_iter().map(|(_, res)| res).collect()
 }
 
 pub fn print_results(title: &str, results: &[CheckResult]) {
@@ -222,5 +261,65 @@ mod tests {
             ..Default::default()
         };
         assert!(check_pool_keys(&c).passed);
+    }
+
+    /// Two properties of `check_provider_dns` at once:
+    ///
+    /// 1. **Order is deterministic** — the report follows provider-name order no matter which lookup
+    ///    finished first. That's the part the concurrency rewrite could break silently.
+    /// 2. **The lookups overlap** — N of them cost about one lookup, not N.
+    ///
+    /// Every authority is overridden to a `.invalid` name (RFC 2606: reserved, never resolves), so the
+    /// run is all negative lookups: no live provider DNS in a unit test, and no chance of a name whose
+    /// success path (RFC 3484 address sorting) serializes inside glibc and muddies the timing.
+    ///
+    /// (2) is measured against a baseline taken in the same test, because a negative lookup costs
+    /// anywhere from ~20ms (real resolver round trip) to microseconds (no resolver reachable — the
+    /// offline-sandbox case). Below `MIN_BASELINE` the sequential and concurrent regimes are
+    /// indistinguishable from scheduling noise, so we skip the timing claim rather than ship a flaky
+    /// assertion; (1) still runs.
+    #[tokio::test]
+    async fn provider_dns_lookups_overlap_and_report_in_order() {
+        use std::time::Instant;
+        const MIN_BASELINE: Duration = Duration::from_millis(2);
+
+        let mut authorities: HashMap<String, String> = route::known_providers()
+            .map(|s| (s.name.to_string(), format!("zz-{}.invalid:443", s.name)))
+            .collect();
+        // Plus a few config-only providers, so the run covers both `CheckResult.name` branches.
+        authorities.extend((0..4).map(|i| (format!("zz-extra-{i}"), format!("zz-{i}.invalid:443"))));
+        let expected = authorities.len();
+        let c = AiConfig {
+            provider_authorities: authorities,
+            ..Default::default()
+        };
+
+        let t = Instant::now();
+        let _ = tokio::net::lookup_host("zz-baseline.invalid:443").await;
+        let baseline = t.elapsed();
+
+        let t = Instant::now();
+        let results = check_provider_dns(&c).await;
+        let elapsed = t.elapsed();
+
+        // Every provider reported exactly once, in name order. The name leads each message, ahead of
+        // either ` →` (pass) or `:` (fail).
+        assert_eq!(results.len(), expected);
+        let names: Vec<&str> = results
+            .iter()
+            .map(|r| r.message.split([' ', ':']).next().unwrap_or_default())
+            .collect();
+        let mut sorted = names.clone();
+        sorted.sort_unstable();
+        assert_eq!(names, sorted, "doctor output must be in provider order");
+
+        if baseline >= MIN_BASELINE {
+            let sequential = baseline * expected as u32;
+            assert!(
+                elapsed < sequential / 2,
+                "{expected} lookups took {elapsed:?}; sequential would be ≈{sequential:?} \
+                 (one lookup = {baseline:?}) — they are not overlapping",
+            );
+        }
     }
 }
