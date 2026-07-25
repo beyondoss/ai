@@ -184,22 +184,30 @@ const DIFF_EXCLUDED_FIELDS: [&str; 3] = ["input", "previous_response_id", "max_o
 
 /// `body` with [`DIFF_EXCLUDED_FIELDS`] removed — pi's `requestBodyWithoutInput`, plus the
 /// `max_output_tokens` exclusion this crate's own body shape needs (see the module doc comment).
+///
+/// Clones only the *retained* fields into a fresh object rather than deep-cloning the whole body
+/// (its `input` transcript array is one of the excluded fields — cloning it just to drop it is the
+/// single biggest wasted copy on the delta path, growing with the whole conversation).
 fn body_fingerprint(body: &Value) -> Value {
-    let mut body = body.clone();
-    if let Some(obj) = body.as_object_mut() {
-        for key in DIFF_EXCLUDED_FIELDS {
-            obj.remove(key);
-        }
+    match body.as_object() {
+        Some(obj) => Value::Object(
+            obj.iter()
+                .filter(|(key, _)| !DIFF_EXCLUDED_FIELDS.contains(&key.as_str()))
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect(),
+        ),
+        None => body.clone(),
     }
-    body
 }
 
-/// `body["input"]` as a plain vec, or empty if absent/not an array (never true for a body
+/// `body["input"]` borrowed as a slice, or empty if absent/not an array (never true for a body
 /// `dialect::openai_responses::build_body` produced, but this stays total rather than assuming that).
-fn input_items(body: &Value) -> Vec<Value> {
+/// Borrowing (rather than cloning into a `Vec`) is what lets the delta path do its length/prefix
+/// checks and slice out only the new tail without ever copying the retained transcript.
+fn input_slice(body: &Value) -> &[Value] {
     body.get("input")
         .and_then(Value::as_array)
-        .cloned()
+        .map(Vec::as_slice)
         .unwrap_or_default()
 }
 
@@ -259,7 +267,7 @@ fn build_wire_body(full_body: &Value, continuation: Option<&Continuation>) -> Va
     if body_fingerprint(full_body) != continuation.fingerprint {
         return full_body.clone();
     }
-    let current_input = input_items(full_body);
+    let current_input = input_slice(full_body);
     if current_input.len() < continuation.baseline_input.len() {
         return full_body.clone();
     }
@@ -267,23 +275,32 @@ fn build_wire_body(full_body: &Value, continuation: Option<&Continuation>) -> Va
         return full_body.clone();
     }
     let delta = &current_input[continuation.baseline_input.len()..];
-    let mut trimmed = full_body.clone();
-    if let Some(obj) = trimmed.as_object_mut() {
-        obj.insert("input".to_string(), Value::Array(delta.to_vec()));
-        obj.insert(
-            "previous_response_id".to_string(),
-            Value::String(continuation.last_response_id.clone()),
-        );
-    }
-    trimmed
+    // Clone every field *except* `input` (replaced wholesale by the small delta below) rather than
+    // deep-cloning the whole body — the retained transcript in `input` is exactly what the delta
+    // path exists to avoid resending, so it must never be copied here.
+    let mut trimmed: serde_json::Map<String, Value> = full_body
+        .as_object()
+        .map(|obj| {
+            obj.iter()
+                .filter(|(key, _)| key.as_str() != "input")
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect()
+        })
+        .unwrap_or_default();
+    trimmed.insert("input".to_string(), Value::Array(delta.to_vec()));
+    trimmed.insert(
+        "previous_response_id".to_string(),
+        Value::String(continuation.last_response_id.clone()),
+    );
+    Value::Object(trimmed)
 }
 
 /// Wrap `body` (the wire body [`build_wire_body`] computed — full or delta) in the `response.create`
 /// envelope the Codex WebSocket protocol expects as the single outbound text frame per turn — pi's
 /// `socket.send(JSON.stringify({ type: "response.create", ...requestBody }))`.
-fn wire_frame(body: &Value) -> String {
+fn wire_frame(body: Value) -> String {
     let mut obj = match body {
-        Value::Object(map) => map.clone(),
+        Value::Object(map) => map,
         _ => serde_json::Map::new(),
     };
     obj.insert(
@@ -630,19 +647,21 @@ impl Receiver {
                 Ok(Some(Ok(message))) => message,
             };
 
-            let text = match message {
-                Message::Text(t) => t.as_str().to_string(),
-                Message::Binary(b) => match String::from_utf8(b.to_vec()) {
+            // Parse straight off the frame's own bytes — no intermediate owned `String` copy of
+            // every stream-event frame. A `Text` frame is already UTF-8; a `Binary` frame is
+            // validated as UTF-8 in place (a non-UTF-8 one isn't a JSON event frame — ignored rather
+            // than failing the turn, mirroring pi's own best-effort `decodeWebSocketData`).
+            let text = match &message {
+                Message::Text(t) => t.as_str(),
+                Message::Binary(b) => match std::str::from_utf8(b) {
                     Ok(s) => s,
-                    // Not a JSON event frame — ignore rather than fail the turn over it, mirroring
-                    // pi's own best-effort `decodeWebSocketData`.
                     Err(_) => continue,
                 },
                 Message::Close(_) => return self.closed_outcome(),
                 Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => continue,
             };
 
-            let value: Value = match serde_json::from_str(&text) {
+            let mut value: Value = match serde_json::from_str(text) {
                 Ok(v) => v,
                 Err(e) => {
                     return FrameOutcome::Failure {
@@ -662,13 +681,19 @@ impl Receiver {
             if let Some(id) = extract_response_id(&value) {
                 self.response_id = Some(id);
             }
-            if value.get("type").and_then(Value::as_str) == Some("response.output_item.done") {
-                if let Some(item) = value.get("item").filter(|i| is_replayable_output_item(i)) {
-                    self.harvested.push(item.clone());
-                }
-            }
+            let is_output_item_done =
+                value.get("type").and_then(Value::as_str) == Some("response.output_item.done");
 
             let mut events = self.decoder.push(&value);
+            // `value` is dropped at the end of this iteration, so move the harvested `item` out of it
+            // rather than cloning — done *after* `decoder.push` has read the frame it needs.
+            if is_output_item_done {
+                if let Some(item) = value.as_object_mut().and_then(|obj| obj.remove("item")) {
+                    if is_replayable_output_item(&item) {
+                        self.harvested.push(item);
+                    }
+                }
+            }
             if self.decoder.is_terminal() {
                 self.finished = true;
                 return match self.decoder.finish() {
@@ -775,7 +800,7 @@ async fn attempt_once(
     };
 
     let wire_body = build_wire_body(full_body, continuation.as_ref());
-    let send = socket.send(Message::text(wire_frame(&wire_body)));
+    let send = socket.send(Message::text(wire_frame(wire_body)));
     match tokio::time::timeout(SEND_TIMEOUT, send).await {
         // A peer that took the upgrade and then stopped reading our bytes is indistinguishable, from
         // here, from one that rejected them outright — and the answer to both is the same: this turn
@@ -842,7 +867,6 @@ pub(crate) async fn try_stream(
     }
 
     let fingerprint = body_fingerprint(&full_body);
-    let full_input = input_items(&full_body);
 
     let mut prefer_cache = true;
     let mut retried_connection_limit = false;
@@ -866,6 +890,16 @@ pub(crate) async fn try_stream(
                 first_events,
                 receiver,
             } => {
+                // `attempt_once` has already built and sent the wire body, so `full_body`'s own
+                // `input` array is no longer needed as-is — move it out to become this turn's replay
+                // baseline rather than cloning the whole transcript one last time.
+                let full_input = match full_body {
+                    Value::Object(mut map) => match map.remove("input") {
+                        Some(Value::Array(items)) => items,
+                        _ => Vec::new(),
+                    },
+                    _ => Vec::new(),
+                };
                 return Attempt::Started(build_event_stream(
                     cache,
                     cache_key,
@@ -907,7 +941,7 @@ fn build_event_stream(
     cache: Arc<CodexWebSocketCache>,
     cache_key: Option<String>,
     fingerprint: Value,
-    full_input: Vec<Value>,
+    mut full_input: Vec<Value>,
     first_events: Vec<StreamEvent>,
     mut receiver: Box<Receiver>,
 ) -> EventStream {
@@ -924,8 +958,10 @@ fn build_event_stream(
                 }
                 FrameOutcome::Done => {
                     if let (Some(key), Some(id)) = (cache_key.clone(), receiver.response_id.take()) {
-                        let mut baseline = full_input.clone();
-                        baseline.append(&mut receiver.harvested);
+                        // This turn's baseline is its own full input plus its harvested output items;
+                        // `full_input` is owned and never read again, so extend and move it rather
+                        // than cloning the whole transcript into a fresh `Vec`.
+                        full_input.append(&mut receiver.harvested);
                         let Receiver { socket, .. } = *receiver;
                         cache.checkin(
                             key,
@@ -934,7 +970,7 @@ fn build_event_stream(
                                 created_at: Instant::now(),
                                 continuation: Some(Continuation {
                                     fingerprint: fingerprint.clone(),
-                                    baseline_input: baseline,
+                                    baseline_input: full_input,
                                     last_response_id: id,
                                 }),
                             },
@@ -1201,7 +1237,7 @@ mod tests {
     #[test]
     fn wire_frame_wraps_the_body_in_a_response_create_envelope() {
         let body = json!({"model": "gpt-5-codex", "input": []});
-        let frame = wire_frame(&body);
+        let frame = wire_frame(body);
         let parsed: Value = serde_json::from_str(&frame).unwrap();
         assert_eq!(parsed["type"], "response.create");
         assert_eq!(parsed["model"], "gpt-5-codex");

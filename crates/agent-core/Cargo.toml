@@ -105,3 +105,12 @@ harness = false
 [[bench]]
 name = "decode_concurrent"
 harness = false
+
+# Codex WebSocket delta-transport per-turn work: the fingerprint + wire-body-build path and the
+# inbound-frame parse. `codex_websocket`'s target functions are module-private (it's a transport, not
+# a library surface), so — like `agent`'s `serve_events` bench for `serve`'s private `event_frame` —
+# this measures a faithful replica of each clone pattern (before vs after) against the public
+# `serde_json::Value` shape, honest without widening the module's API just to bench it.
+[[bench]]
+name = "codex_ws"
+harness = false
