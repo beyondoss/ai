@@ -23,7 +23,9 @@
 //! third-party extension, or a future built-in not yet taught this module) falls back to generic JSON,
 //! which reads fine for the rare case that needs it.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::io::Write as _;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -106,24 +108,27 @@ fn render_html_inner(
 ) -> String {
     let mut out = String::new();
     out.push_str("<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n");
-    out.push_str(&format!(
-        "<title>{}</title>\n",
+    let _ = writeln!(
+        out,
+        "<title>{}</title>",
         html_escape(meta.title.as_deref().unwrap_or("Session transcript"))
-    ));
+    );
     out.push_str(STYLE);
     out.push_str("</head>\n<body>\n");
     out.push_str("<header>\n");
-    out.push_str(&format!(
-        "<h1>{}</h1>\n",
+    let _ = writeln!(
+        out,
+        "<h1>{}</h1>",
         html_escape(meta.title.as_deref().unwrap_or("Session transcript"))
-    ));
-    out.push_str(&format!(
+    );
+    let _ = writeln!(
+        out,
         "<p class=\"meta\">session <code>{}</code> &middot; model <code>{}</code> &middot; {} \
-         message(s)</p>\n",
+         message(s)</p>",
         html_escape(&meta.id),
         html_escape(&meta.model),
         messages.len()
-    ));
+    );
     render_stats_section(&mut out, meta, messages, usage, events);
     out.push_str("</header>\n");
     render_system_prompt_section(&mut out, system_prompt);
@@ -251,7 +256,7 @@ fn render_events_section(out: &mut String, events: &[crate::session_store::Expor
                 )
             }
         };
-        out.push_str(&format!("<li>{line}</li>\n"));
+        let _ = writeln!(out, "<li>{line}</li>");
     }
     out.push_str("</ul>\n</section>\n");
 }
@@ -263,10 +268,11 @@ fn render_events_section(out: &mut String, events: &[crate::session_store::Expor
 /// same wording that flat list already used for this variant (`"Model changed to <code>{}</code>"`), so
 /// a reader sees identical phrasing regardless of which of the two ever renders a given switch.
 fn render_model_change(out: &mut String, model: &str) {
-    out.push_str(&format!(
-        "<div class=\"model-change\">Model changed to <code>{}</code></div>\n",
+    let _ = writeln!(
+        out,
+        "<div class=\"model-change\">Model changed to <code>{}</code></div>",
         html_escape(model)
-    ));
+    );
 }
 
 /// Render the session's system prompt as a collapsed-by-default `<details>` block — pi's own
@@ -277,10 +283,11 @@ fn render_system_prompt_section(out: &mut String, system_prompt: Option<&str>) {
     let Some(prompt) = system_prompt else {
         return;
     };
-    out.push_str(&format!(
+    let _ = write!(
+        out,
         "<details class=\"system-prompt\"><summary>System Prompt</summary>\n<pre>{}</pre>\n</details>\n",
         html_escape(prompt)
-    ));
+    );
 }
 
 /// Render the session's registered tools (name, description, and JSON-Schema parameters) as a
@@ -290,18 +297,20 @@ fn render_tools_section(out: &mut String, tools: Option<&[ToolDef]>) {
     let Some(tools) = tools.filter(|t| !t.is_empty()) else {
         return;
     };
-    out.push_str(&format!(
+    let _ = write!(
+        out,
         "<details class=\"tools-list\"><summary>Available Tools ({})</summary>\n\
          <div class=\"tools-content\">\n",
         tools.len()
-    ));
+    );
     for tool in tools {
-        out.push_str(&format!(
+        let _ = writeln!(
+            out,
             "<div class=\"tool-item\"><span class=\"tool-item-name\">{}</span> &mdash; \
-             <span class=\"tool-item-desc\">{}</span>\n",
+             <span class=\"tool-item-desc\">{}</span>",
             html_escape(&tool.name),
             html_escape(&tool.description)
-        ));
+        );
         render_tool_params(out, &tool.input_schema);
         out.push_str("</div>\n");
     }
@@ -337,17 +346,19 @@ fn render_tool_params(out: &mut String, schema: &serde_json::Value) {
         } else {
             ("tool-param-optional", "optional")
         };
-        out.push_str(&format!(
+        let _ = write!(
+            out,
             "<div class=\"tool-param\"><span class=\"tool-param-name\">{}</span> \
              <span class=\"tool-param-type\">{}</span> <span class=\"{req_class}\">{req_label}</span>",
             html_escape(name),
             html_escape(ty),
-        ));
+        );
         if let Some(desc) = prop.get("description").and_then(serde_json::Value::as_str) {
-            out.push_str(&format!(
+            let _ = write!(
+                out,
                 "<div class=\"tool-param-desc\">{}</div>",
                 html_escape(desc)
-            ));
+            );
         }
         out.push_str("</div>\n");
     }
@@ -374,12 +385,13 @@ fn render_branches_diverging_at(
         } else {
             format!("forked after message {shared}")
         };
-        out.push_str(&format!(
+        let _ = write!(
+            out,
             "<details class=\"branch\"><summary>Branch {n} &middot; {} &middot; {} message(s)\
              </summary>\n<div class=\"branch-body\">\n",
             html_escape(&note),
             branch_messages.len() - shared
-        ));
+        );
         for message in &branch_messages[*shared..] {
             render_message(out, message, index);
         }
@@ -609,12 +621,13 @@ fn render_stats_section(
 }
 
 fn push_stat(out: &mut String, label: &str, value: &str) {
-    out.push_str(&format!(
+    let _ = writeln!(
+        out,
         "<div class=\"stat\"><span class=\"stat-label\">{}</span><span class=\"stat-value\">{}</span>\
-         </div>\n",
+         </div>",
         html_escape(label),
         html_escape(value)
-    ));
+    );
 }
 
 const STYLE: &str = "<style>\n\
@@ -726,11 +739,12 @@ fn role_class(role: Role) -> &'static str {
 }
 
 fn render_message(out: &mut String, message: &Message, index: &ToolCallIndex<'_>) {
-    out.push_str(&format!(
+    let _ = write!(
+        out,
         "<div class=\"message {}\">\n<div class=\"role-label\">{}</div>\n",
         role_class(message.role),
         role_label(message.role)
-    ));
+    );
     for block in &message.content {
         render_block(out, block, index);
     }
@@ -743,10 +757,11 @@ fn render_message(out: &mut String, message: &Message, index: &ToolCallIndex<'_>
         out.push_str("<div class=\"turn-status aborted\">Aborted</div>\n");
     }
     if let Some(err) = &message.error_message {
-        out.push_str(&format!(
-            "<div class=\"turn-status error\">Error: {}</div>\n",
+        let _ = writeln!(
+            out,
+            "<div class=\"turn-status error\">Error: {}</div>",
             html_escape(err)
-        ));
+        );
     }
     out.push_str("</div>\n");
 }
@@ -778,19 +793,17 @@ fn render_block(out: &mut String, block: &ContentBlock, index: &ToolCallIndex<'_
                 match parse_skill_block(text) {
                     Some(skill) => render_skill_invocation(out, &skill),
                     None => {
-                        out.push_str(&format!(
-                            "<div class=\"text markdown\">{}</div>\n",
+                        let _ = writeln!(
+                            out,
+                            "<div class=\"text markdown\">{}</div>",
                             render_markdown(text)
-                        ));
+                        );
                     }
                 }
             }
         }
         ContentBlock::Thinking { text, .. } => {
-            out.push_str(&format!(
-                "<div class=\"thinking\">{}</div>\n",
-                html_escape(text)
-            ));
+            let _ = writeln!(out, "<div class=\"thinking\">{}</div>", html_escape(text));
         }
         ContentBlock::RedactedThinking { .. } => {
             out.push_str("<div class=\"thinking\">[redacted thinking]</div>\n");
@@ -809,9 +822,10 @@ fn render_block(out: &mut String, block: &ContentBlock, index: &ToolCallIndex<'_
                 "tool-result"
             };
             let title = if *is_error { "Error" } else { "Result" };
-            out.push_str(&format!(
-                "<div class=\"{class}\"><div class=\"tool-title\">{title}</div>\n"
-            ));
+            let _ = writeln!(
+                out,
+                "<div class=\"{class}\"><div class=\"tool-title\">{title}</div>"
+            );
             let tool_info = index.get(tool_use_id.as_str()).copied();
             render_tool_result_content(out, content, tool_info);
             for image in images {
@@ -884,10 +898,11 @@ fn render_collapsible_output(
     };
     let line_count = cleaned.lines().count();
     if line_count > threshold {
-        out.push_str(&format!(
+        let _ = write!(
+            out,
             "<details class=\"collapsible-output\"><summary>{line_count} lines (click to expand)\
              </summary>\n{body}</details>\n"
-        ));
+        );
     } else {
         out.push_str(&body);
     }
@@ -971,10 +986,14 @@ fn language_from_path(path: &str) -> Option<&'static str> {
 /// color (`bash`) already strips it at capture time, so this is cheap belt-and-suspenders for the rare
 /// case something else doesn't, not a fix for a live gap. Deliberately *not* an ANSI-to-styled-HTML
 /// converter — that's a much bigger feature, out of scope here.
-fn strip_control_chars(text: &str) -> String {
-    text.chars()
-        .filter(|&c| !matches!(c, '\u{0}'..='\u{8}' | '\u{b}'..='\u{1f}' | '\u{7f}'))
-        .collect()
+fn strip_control_chars(text: &str) -> Cow<'_, str> {
+    fn is_control_to_strip(c: char) -> bool {
+        matches!(c, '\u{0}'..='\u{8}' | '\u{b}'..='\u{1f}' | '\u{7f}')
+    }
+    if !text.chars().any(is_control_to_strip) {
+        return Cow::Borrowed(text);
+    }
+    Cow::Owned(text.chars().filter(|&c| !is_control_to_strip(c)).collect())
 }
 
 /// Dispatch a tool call to a renderer that understands its specific argument shape, falling back to
@@ -998,12 +1017,13 @@ fn render_tool_call(out: &mut String, name: &str, input: &serde_json::Value) {
 }
 
 fn render_generic_call(out: &mut String, name: &str, input: &serde_json::Value) {
-    out.push_str(&format!(
+    let _ = write!(
+        out,
         "<div class=\"tool-call\"><div class=\"tool-title\">Called <code>{}</code></div>\n\
          <pre>{}</pre></div>\n",
         html_escape(name),
         html_escape(&serde_json::to_string_pretty(input).unwrap_or_default())
-    ));
+    );
 }
 
 /// Render an `edit` call as a real diff (reusing [`diff_html`]'s `+`/`-` coloring) instead of raw
@@ -1020,9 +1040,10 @@ fn render_edit_call(out: &mut String, input: &serde_json::Value) {
         Some(p) => format!("Edited <code>{}</code>", html_escape(p)),
         None => "Edit".to_string(),
     };
-    out.push_str(&format!(
-        "<div class=\"tool-call\"><div class=\"tool-title\">{title}</div>\n"
-    ));
+    let _ = writeln!(
+        out,
+        "<div class=\"tool-call\"><div class=\"tool-title\">{title}</div>"
+    );
     for (old, new) in &edits {
         out.push_str(&diff_pair_html(old, new));
     }
@@ -1053,16 +1074,18 @@ fn diff_pair_html(old: &str, new: &str) -> String {
                 out.push('\n');
             }
             LineDiffOp::Delete(line) => {
-                out.push_str(&format!(
-                    "<span class=\"diff-del\">-{}</span>\n",
+                let _ = writeln!(
+                    out,
+                    "<span class=\"diff-del\">-{}</span>",
                     html_escape(line)
-                ));
+                );
             }
             LineDiffOp::Insert(line) => {
-                out.push_str(&format!(
-                    "<span class=\"diff-add\">+{}</span>\n",
+                let _ = writeln!(
+                    out,
+                    "<span class=\"diff-add\">+{}</span>",
                     html_escape(line)
-                ));
+                );
             }
         }
     }
@@ -1198,9 +1221,10 @@ fn render_write_call(out: &mut String, input: &serde_json::Value) {
         Some(p) => format!("Wrote <code>{}</code>", html_escape(p)),
         None => "Write".to_string(),
     };
-    out.push_str(&format!(
-        "<div class=\"tool-call\"><div class=\"tool-title\">{title}</div>\n"
-    ));
+    let _ = writeln!(
+        out,
+        "<div class=\"tool-call\"><div class=\"tool-title\">{title}</div>"
+    );
     if let Some(content) = content {
         render_tool_result_content(out, content, Some(("write", input)));
     }
@@ -1213,14 +1237,15 @@ fn render_bash_call(out: &mut String, input: &serde_json::Value) {
     let cwd = input.get("cwd").and_then(serde_json::Value::as_str);
     out.push_str("<div class=\"tool-call\"><div class=\"tool-title\">Ran a shell command");
     if let Some(cwd) = cwd {
-        out.push_str(&format!(" in <code>{}</code>", html_escape(cwd)));
+        let _ = write!(out, " in <code>{}</code>", html_escape(cwd));
     }
     out.push_str("</div>\n");
     if let Some(command) = command {
-        out.push_str(&format!(
+        let _ = write!(
+            out,
             "<pre class=\"bash-command\">$ {}</pre>",
             html_escape(command)
-        ));
+        );
     }
     out.push_str("</div>\n");
 }
@@ -1240,9 +1265,9 @@ fn render_read_call(out: &mut String, input: &serde_json::Value) {
             let mut t = format!("Read <code>{}", html_escape(p));
             if offset.is_some() || limit.is_some() {
                 let start = offset.unwrap_or(1);
-                t.push_str(&format!(":{start}"));
+                let _ = write!(t, ":{start}");
                 if let Some(limit) = limit {
-                    t.push_str(&format!("-{}", start + limit.saturating_sub(1)));
+                    let _ = write!(t, "-{}", start + limit.saturating_sub(1));
                 }
             }
             t.push_str("</code>");
@@ -1250,9 +1275,10 @@ fn render_read_call(out: &mut String, input: &serde_json::Value) {
         }
         None => "Read".to_string(),
     };
-    out.push_str(&format!(
-        "<div class=\"tool-call\"><div class=\"tool-title\">{title}</div></div>\n"
-    ));
+    let _ = writeln!(
+        out,
+        "<div class=\"tool-call\"><div class=\"tool-title\">{title}</div></div>"
+    );
 }
 
 /// Render a `grep` call: the pattern searched for, plus the path/glob narrowing it if given.
@@ -1265,14 +1291,15 @@ fn render_grep_call(out: &mut String, input: &serde_json::Value) {
         None => "Search".to_string(),
     };
     if let Some(p) = path {
-        title.push_str(&format!(" in <code>{}</code>", html_escape(p)));
+        let _ = write!(title, " in <code>{}</code>", html_escape(p));
     }
     if let Some(g) = glob {
-        title.push_str(&format!(" (glob <code>{}</code>)", html_escape(g)));
+        let _ = write!(title, " (glob <code>{}</code>)", html_escape(g));
     }
-    out.push_str(&format!(
-        "<div class=\"tool-call\"><div class=\"tool-title\">{title}</div></div>\n"
-    ));
+    let _ = writeln!(
+        out,
+        "<div class=\"tool-call\"><div class=\"tool-title\">{title}</div></div>"
+    );
 }
 
 /// Render a `find` call: the glob pattern matched, plus the search root if given.
@@ -1284,11 +1311,12 @@ fn render_find_call(out: &mut String, input: &serde_json::Value) {
         None => "Find".to_string(),
     };
     if let Some(p) = path {
-        title.push_str(&format!(" in <code>{}</code>", html_escape(p)));
+        let _ = write!(title, " in <code>{}</code>", html_escape(p));
     }
-    out.push_str(&format!(
-        "<div class=\"tool-call\"><div class=\"tool-title\">{title}</div></div>\n"
-    ));
+    let _ = writeln!(
+        out,
+        "<div class=\"tool-call\"><div class=\"tool-title\">{title}</div></div>"
+    );
 }
 
 /// Render an `ls` call: the directory listed, defaulting to `.` — matching the tool's own default —
@@ -1304,11 +1332,12 @@ fn render_ls_call(out: &mut String, input: &serde_json::Value) {
     let limit = input.get("limit").and_then(serde_json::Value::as_u64);
     let mut title = format!("Listed <code>{}</code>", html_escape(path));
     if let Some(limit) = limit {
-        title.push_str(&format!(" (limit {limit})"));
+        let _ = write!(title, " (limit {limit})");
     }
-    out.push_str(&format!(
-        "<div class=\"tool-call\"><div class=\"tool-title\">{title}</div></div>\n"
-    ));
+    let _ = writeln!(
+        out,
+        "<div class=\"tool-call\"><div class=\"tool-title\">{title}</div></div>"
+    );
 }
 
 /// Render a `fork` call (Beyond platform tool): the app forked, plus the branch name if given.
@@ -1320,11 +1349,12 @@ fn render_fork_call(out: &mut String, input: &serde_json::Value) {
         None => "Fork".to_string(),
     };
     if let Some(n) = name {
-        title.push_str(&format!(" as <code>{}</code>", html_escape(n)));
+        let _ = write!(title, " as <code>{}</code>", html_escape(n));
     }
-    out.push_str(&format!(
-        "<div class=\"tool-call\"><div class=\"tool-title\">{title}</div></div>\n"
-    ));
+    let _ = writeln!(
+        out,
+        "<div class=\"tool-call\"><div class=\"tool-title\">{title}</div></div>"
+    );
 }
 
 /// Render a `sync` call (Beyond platform tool): the directory synced, if a non-default one was given.
@@ -1334,9 +1364,10 @@ fn render_sync_call(out: &mut String, input: &serde_json::Value) {
         Some(p) => format!("Synced <code>{}</code>", html_escape(p)),
         None => "Synced the project root".to_string(),
     };
-    out.push_str(&format!(
-        "<div class=\"tool-call\"><div class=\"tool-title\">{title}</div></div>\n"
-    ));
+    let _ = writeln!(
+        out,
+        "<div class=\"tool-call\"><div class=\"tool-title\">{title}</div></div>"
+    );
 }
 
 /// Render a `logs` call (Beyond platform tool): which app's logs, plus the Lucene query if given.
@@ -1345,14 +1376,15 @@ fn render_logs_call(out: &mut String, input: &serde_json::Value) {
     let query = input.get("query").and_then(serde_json::Value::as_str);
     let mut title = "Read logs".to_string();
     if let Some(a) = app {
-        title.push_str(&format!(" for <code>{}</code>", html_escape(a)));
+        let _ = write!(title, " for <code>{}</code>", html_escape(a));
     }
     if let Some(q) = query {
-        title.push_str(&format!(" (query: <code>{}</code>)", html_escape(q)));
+        let _ = write!(title, " (query: <code>{}</code>)", html_escape(q));
     }
-    out.push_str(&format!(
-        "<div class=\"tool-call\"><div class=\"tool-title\">{title}</div></div>\n"
-    ));
+    let _ = writeln!(
+        out,
+        "<div class=\"tool-call\"><div class=\"tool-title\">{title}</div></div>"
+    );
 }
 
 /// Render `text` as HTML via CommonMark plus a few GFM extensions (strikethrough/tables/task lists) —
@@ -1488,10 +1520,7 @@ fn diff_html(content: &str) -> String {
         if class.is_empty() {
             out.push_str(&html_escape(line));
         } else {
-            out.push_str(&format!(
-                "<span class=\"{class}\">{}</span>",
-                html_escape(line)
-            ));
+            let _ = write!(out, "<span class=\"{class}\">{}</span>", html_escape(line));
         }
         out.push('\n');
     }
@@ -1595,23 +1624,25 @@ fn render_summary_marker(
             Some(n) => format!("Compacted from {} tokens", format_thousands(n)),
             None => label.to_string(),
         };
-        out.push_str(&format!(
+        let _ = write!(
+            out,
             "<details class=\"summary-marker {class} collapsible-output\">\
              <summary>{}</summary>\n{}</details>\n",
             html_escape(&summary_line),
             rendered_body
-        ));
+        );
         return;
     }
     let tokens_note = match tokens_before {
         Some(n) => format!(" &middot; Compacted from {} tokens", format_thousands(n)),
         None => String::new(),
     };
-    out.push_str(&format!(
+    let _ = write!(
+        out,
         "<div class=\"summary-marker {class}\"><div class=\"tool-title\">{}{tokens_note}</div>\n{}</div>\n",
         html_escape(label),
         rendered_body
-    ));
+    );
 }
 
 /// A parsed host-run bash command marker (`serve.rs`'s `bash` RPC command, invoked from the idle loop
@@ -1765,16 +1796,18 @@ fn render_host_bash_marker(out: &mut String, block: &HostBashBlock) {
     } else {
         "Host bash command (run outside the model's own turn)"
     };
-    out.push_str(&format!(
-        "<div class=\"{class}\"><div class=\"tool-title\">{title}</div>\n"
-    ));
+    let _ = writeln!(
+        out,
+        "<div class=\"{class}\"><div class=\"tool-title\">{title}</div>"
+    );
     if let Some(status) = &block.status {
         render_host_bash_status(out, status);
     }
-    out.push_str(&format!(
+    let _ = write!(
+        out,
         "<pre class=\"bash-command\">$ {}</pre>",
         html_escape(block.command)
-    ));
+    );
     if !block.output.is_empty() {
         render_collapsible_output(out, block.output, None, HOST_BASH_OUTPUT_LINE_THRESHOLD);
     }
@@ -1798,17 +1831,12 @@ fn render_host_bash_status(out: &mut String, status: &HostBashStatus) {
         } else {
             "bash-badge-error"
         };
-        out.push_str(&format!(
-            "<span class=\"bash-badge {class}\">Exit {code}</span>\n"
-        ));
+        let _ = writeln!(out, "<span class=\"bash-badge {class}\">Exit {code}</span>");
     }
     if status.truncated {
         out.push_str("<span class=\"bash-badge bash-badge-truncated\">Output truncated");
         if let Some(path) = &status.full_output_path {
-            out.push_str(&format!(
-                " &middot; saved to <code>{}</code>",
-                html_escape(path)
-            ));
+            let _ = write!(out, " &middot; saved to <code>{}</code>", html_escape(path));
         }
         out.push_str("</span>\n");
     }
@@ -1857,18 +1885,20 @@ fn parse_skill_block(text: &str) -> Option<SkillBlock<'_>> {
 /// trailing text when present — the two are siblings, not nested, matching pi's TUI layout
 /// (`SkillInvocationMessageComponent`/`UserMessageComponent`).
 fn render_skill_invocation(out: &mut String, skill: &SkillBlock) {
-    out.push_str(&format!(
+    let _ = write!(
+        out,
         "<div class=\"skill-invocation\"><div class=\"tool-title\">Invoked skill <code>{}</code> \
          (<code>{}</code>)</div>\n{}</div>\n",
         html_escape(skill.name),
         html_escape(skill.location),
         render_markdown(skill.content),
-    ));
+    );
     if let Some(msg) = skill.user_message.filter(|m| !m.is_empty()) {
-        out.push_str(&format!(
-            "<div class=\"text markdown\">{}</div>\n",
+        let _ = writeln!(
+            out,
+            "<div class=\"text markdown\">{}</div>",
             render_markdown(msg)
-        ));
+        );
     }
 }
 
@@ -1877,11 +1907,12 @@ fn render_image(out: &mut String, media_type: &str, data: &str) {
     // deserialized from session JSONL on disk, so a tampered file or an untrusted tool's "image" output
     // reaching here isn't guaranteed to actually be base64. Must be escaped like any other untrusted
     // attribute value, or it can break out of the `src="..."` attribute into live HTML/script.
-    out.push_str(&format!(
-        "<img class=\"attachment\" src=\"data:{};base64,{}\" alt=\"attachment\">\n",
+    let _ = writeln!(
+        out,
+        "<img class=\"attachment\" src=\"data:{};base64,{}\" alt=\"attachment\">",
         html_escape(media_type),
         html_escape(data)
-    ));
+    );
 }
 
 /// A timestamped default export filename, `session-<unix-seconds>.html`, relative to the current

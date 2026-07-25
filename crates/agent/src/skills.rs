@@ -9,7 +9,9 @@
 //! inject only their name/description/location into the system prompt — the body is read on demand (by
 //! the `read` tool) when a task matches, so skills cost almost no context until used.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -597,7 +599,7 @@ fn walk(root: &Path, out: &mut Vec<Skill>, diagnostics: &mut Vec<String>) {
     // Shallowest first: a manifest nested inside an already-accepted skill's directory is that
     // skill's own resource, not a separate skill — the original recursive walk stopped descending the
     // instant it found one, which this reproduces by rejecting anything under an accepted skill root.
-    candidates.sort_by_key(|p| p.components().count());
+    candidates.sort_by_cached_key(|p| p.components().count());
     let mut accepted_dirs: Vec<PathBuf> = Vec::new();
     for manifest in candidates {
         let Some(dir) = manifest.parent() else {
@@ -835,10 +837,10 @@ pub(crate) fn parse_frontmatter(text: &str) -> (HashMap<String, String>, String)
     // be sliced out byte-exact once the closing fence is found — `Lines` alone discards that offset.
     let mut lines = text.split_inclusive('\n');
     let Some(first) = lines.next() else {
-        return (HashMap::new(), normalize_newlines(text));
+        return (HashMap::new(), normalize_newlines(text).into_owned());
     };
     if first.trim_end_matches(['\n', '\r']) != "---" {
-        return (HashMap::new(), normalize_newlines(text));
+        return (HashMap::new(), normalize_newlines(text).into_owned());
     }
     let mut consumed = first.len();
     // The YAML block's own lines, gathered verbatim (newline-normalized) as we scan for the closing
@@ -863,11 +865,11 @@ pub(crate) fn parse_frontmatter(text: &str) -> (HashMap<String, String>, String)
         // pi-parity fix (M4): an unterminated fence is "no frontmatter", full stop — see this
         // function's doc comment. Discard whatever looked like YAML above; it was never really
         // frontmatter, just text that happened to look like it.
-        return (HashMap::new(), normalize_newlines(text));
+        return (HashMap::new(), normalize_newlines(text).into_owned());
     }
     (
         parse_yaml_block(&yaml_block),
-        normalize_newlines(text.get(consumed..).unwrap_or("")),
+        normalize_newlines(text.get(consumed..).unwrap_or("")).into_owned(),
     )
 }
 
@@ -914,8 +916,25 @@ fn yaml_scalar_to_string(value: &serde_yaml::Value) -> String {
 /// text ultimately becomes the body — previously only the line-by-line frontmatter *scanning* stripped
 /// `\r` (via `trim_end_matches(['\n', '\r'])`), leaving a literal `\r` in the body slice itself when the
 /// source file used CRLF line endings (pi-parity fix, L2).
-fn normalize_newlines(s: &str) -> String {
-    s.replace("\r\n", "\n").replace('\r', "\n")
+fn normalize_newlines(s: &str) -> Cow<'_, str> {
+    if !s.contains('\r') {
+        return Cow::Borrowed(s);
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\r' {
+            // `\r\n` and a lone `\r` both collapse to a single `\n` — a single pass, equivalent to the
+            // former `.replace("\r\n", "\n").replace('\r', "\n")` but without its two intermediate Strings.
+            if chars.peek() == Some(&'\n') {
+                chars.next();
+            }
+            out.push('\n');
+        } else {
+            out.push(c);
+        }
+    }
+    Cow::Owned(out)
 }
 
 /// Look up a discovered skill by exact name — used to resolve an explicit `/skill:name` invocation,
@@ -1021,15 +1040,17 @@ pub fn format_available(skills: &[Skill]) -> String {
     );
     for s in visible {
         out.push_str("  <skill>\n");
-        out.push_str(&format!("    <name>{}</name>\n", xml_escape(&s.name)));
-        out.push_str(&format!(
-            "    <description>{}</description>\n",
+        let _ = writeln!(out, "    <name>{}</name>", xml_escape(&s.name));
+        let _ = writeln!(
+            out,
+            "    <description>{}</description>",
             xml_escape(&s.description)
-        ));
-        out.push_str(&format!(
-            "    <location>{}</location>\n",
+        );
+        let _ = writeln!(
+            out,
+            "    <location>{}</location>",
             xml_escape(&s.path.display().to_string())
-        ));
+        );
         out.push_str("  </skill>\n");
     }
     out.push_str("</available_skills>");
@@ -1040,19 +1061,34 @@ pub fn format_available(skills: &[Skill]) -> String {
 /// XML/HTML), so there is nothing legitimate to preserve unescaped — this only ever neutralizes an
 /// attempt to break out of the surrounding tag. `pub(crate)`: the same five entities are exactly what
 /// an HTML text node needs escaped too, so `export.rs` reuses this rather than a second copy.
-pub(crate) fn xml_escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '"' => out.push_str("&quot;"),
-            '\'' => out.push_str("&apos;"),
-            _ => out.push(c),
-        }
+pub(crate) fn xml_escape(s: &str) -> Cow<'_, str> {
+    // The five escaped bytes are all ASCII, so a plain byte scan (and byte-indexed slicing below) never
+    // splits a multi-byte UTF-8 sequence — a continuation/lead byte is always >= 0x80, never one of these.
+    if !s
+        .bytes()
+        .any(|b| matches!(b, b'&' | b'<' | b'>' | b'"' | b'\''))
+    {
+        return Cow::Borrowed(s);
     }
-    out
+    let mut out = String::with_capacity(s.len());
+    let mut last = 0;
+    for (i, b) in s.bytes().enumerate() {
+        let esc = match b {
+            b'&' => "&amp;",
+            b'<' => "&lt;",
+            b'>' => "&gt;",
+            b'"' => "&quot;",
+            b'\'' => "&apos;",
+            _ => continue,
+        };
+        // Bulk-copy the unescaped run since the last escape, then the entity — far fewer pushes than one
+        // per char for the common case of long spans between escapes.
+        out.push_str(&s[last..i]);
+        out.push_str(esc);
+        last = i + 1;
+    }
+    out.push_str(&s[last..]);
+    Cow::Owned(out)
 }
 
 /// The user's home directory from the environment.
