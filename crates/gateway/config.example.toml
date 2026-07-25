@@ -4,6 +4,11 @@
 listen = "0.0.0.0:8080" # client (app) traffic; internal-only, fronted as ai.internal
 metrics_listen = "0.0.0.0:9090" # internal admin: /metrics (Prometheus), /livez, /readyz
 
+# Tokio worker threads for the proxy service. 0 ⇒ one per available core. Pingora's own default is
+# 1, which pins the entire gateway to a single core — set this explicitly to a CPU quota when the
+# container is throttled, since `available_parallelism` sees the host's cores, not the cgroup's.
+worker_threads = 0
+
 # NATS / slipstream — carries ONLY the deny-set (`blackhole.*`). Auth + keys come from this file,
 # so the gateway authenticates + serves managed traffic even if NATS is down.
 nats_url = "nats://localhost:4222"

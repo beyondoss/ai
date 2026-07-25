@@ -28,6 +28,24 @@ pub struct AiConfig {
     /// Prometheus metrics listener.
     pub metrics_listen: String,
 
+    /// Tokio worker threads for the **proxy** service — the threads that run every request filter,
+    /// the Ed25519 verify, the body scanners and the usage tap. `0` ⇒ one per available core.
+    ///
+    /// This has to be set explicitly because Pingora's `ServerConf::default()` is `threads: 1`, and
+    /// a service that leaves its own `threads` as `None` inherits it (`server/mod.rs:705` →
+    /// `Runtime::new_steal(threads, …)` → `worker_threads(1)`). Unset, the entire proxy therefore
+    /// runs on a **single** core no matter how large the box: measured at 100% of one core with the
+    /// other fifteen idle. It is applied to the proxy service alone rather than to `conf.threads`,
+    /// which would also hand the (idle) admin listener a full thread pool.
+    ///
+    /// Note this counts *async worker* threads only. Tokio names its blocking-pool threads after the
+    /// same runtime, so `ps` shows extra `Pingora HTTP Pr` threads once `lookup_host` runs — those
+    /// never execute a filter, and only per-thread CPU accounting tells them apart.
+    ///
+    /// Set it explicitly under a CPU quota: `available_parallelism` reports the host's cores, not the
+    /// cgroup's share, so an over-provisioned pool on a throttled container just adds scheduler churn.
+    pub worker_threads: usize,
+
     /// Accept HTTP/2 cleartext (h2c) on the downstream (`listen`) listener, in addition to
     /// HTTP/1.1. Backward-compatible: Pingora peeks the connection preface and serves h2c only when
     /// the client sends the H2 preface, otherwise it transparently falls back to HTTP/1.1 — so
@@ -196,6 +214,10 @@ impl Default for AiConfig {
         Self {
             listen: "0.0.0.0:8080".to_string(),
             metrics_listen: "0.0.0.0:9090".to_string(),
+            // One proxy worker per core. Pingora's own default is 1, which silently pins the whole
+            // gateway to a single core; scaling with the box is the least surprising default for an
+            // L7 proxy. Override under a CPU quota — see the field docs.
+            worker_threads: 0,
             // Accept downstream h2c by default; it's backward-compatible (h1 clients fall back
             // transparently) and lets the on-VM agent share one multiplexed connection.
             downstream_h2c: true,

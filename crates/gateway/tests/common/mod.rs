@@ -453,12 +453,23 @@ pub struct GatewayBuilder {
     /// Override the per-provider circuit-breaker threshold (failures in the window before opening).
     /// `None` ⇒ leave the gateway default; `Some(0)` disables the breaker.
     circuit_breaker_threshold: Option<u32>,
+    /// Override the proxy's tokio worker-thread count. `None` ⇒ the gateway default (one per core);
+    /// `Some(1)` reproduces Pingora's single-threaded default, which is what the scaling bench
+    /// compares against.
+    worker_threads: Option<usize>,
 }
 
 impl GatewayBuilder {
     /// Set which providers are configured. Defaults to `["openai", "fireworks"]`.
     pub fn providers(mut self, providers: &[&'static str]) -> Self {
         self.providers = providers.to_vec();
+        self
+    }
+
+    /// Pin the proxy's worker-thread count. Used by the scaling bench to stand a single-threaded
+    /// gateway (Pingora's own default) next to a per-core one.
+    pub fn worker_threads(mut self, threads: usize) -> Self {
+        self.worker_threads = Some(threads);
         self
     }
 
@@ -554,6 +565,9 @@ impl GatewayBuilder {
         if let Some(rps) = self.byo_rate_limit_rps {
             cfg.push_str(&format!("byo_rate_limit_rps = {rps}\n"));
         }
+        if let Some(threads) = self.worker_threads {
+            cfg.push_str(&format!("worker_threads = {threads}\n"));
+        }
         if let Some(threshold) = self.circuit_breaker_threshold {
             // Tight window + reset so the test trips and recovers quickly.
             cfg.push_str(&format!(
@@ -644,6 +658,7 @@ impl Gateway {
             tls_upstream: false,
             upstream_http2: None,
             circuit_breaker_threshold: None,
+            worker_threads: None,
         }
     }
 

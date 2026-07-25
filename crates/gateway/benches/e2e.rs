@@ -356,5 +356,82 @@ fn bench_concurrency(c: &mut Criterion) {
     drop(nats);
 }
 
-criterion_group!(benches, bench_e2e, bench_concurrency);
+/// Proxy worker-thread scaling: one gateway pinned to a single worker (Pingora's own
+/// `ServerConf::default()`, which is what this crate silently inherited until `worker_threads` was
+/// wired up in `main.rs`) against one sized per core. Same mock, same client transport, same config
+/// otherwise — the thread count is the only variable.
+///
+/// This is the bench that would have caught it: a service that leaves its `threads` as `None` gets
+/// `conf.threads` = 1, so *every* request filter, the Ed25519 verify, both body scanners and the
+/// usage tap ran on one core regardless of box size. Nothing in the suite measured above one
+/// connection's worth of concurrency, so a hard 1-core ceiling looked exactly like a fast gateway.
+///
+/// Read it at the high end of the sweep: at concurrency 1 the two are identical by construction
+/// (one in-flight request cannot use two cores), and the gap only opens once there is real parallel
+/// work to place.
+fn bench_worker_threads(c: &mut Criterion) {
+    let rt = Runtime::new().expect("tokio runtime");
+    let nats = rt.block_on(Nats::start());
+    let mock = rt.block_on(MockUpstream::start(Mode::Json));
+    let (pubkey, sk) = test_keypair(1);
+    let vkey = mint(
+        &VirtualKey {
+            tenant_id: 42,
+            vpc_id: 7,
+        },
+        1,
+        &sk,
+    );
+
+    // Rate limits off on both, for the same reason as `bench_concurrency`: the sweep drives one
+    // credential far past the 100 rps default, and a 429 short-circuits before the work we're
+    // measuring — it would compare reject paths, not proxy throughput.
+    let cores = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+    let gw_one = rt.block_on(
+        Gateway::builder(nats.port, &mock.authority(), &b64(&pubkey))
+            .worker_threads(1)
+            .rate_limit_rps(0)
+            .byo_rate_limit_rps(0)
+            .start(),
+    );
+    let gw_many = rt.block_on(
+        Gateway::builder(nats.port, &mock.authority(), &b64(&pubkey))
+            .worker_threads(cores)
+            .rate_limit_rps(0)
+            .byo_rate_limit_rps(0)
+            .start(),
+    );
+    let client = reqwest::Client::new();
+    let (url_one, url_many) = (gw_one.url(), gw_many.url());
+    rt.block_on(warm_and_proto(&client, &url_one, &vkey));
+    rt.block_on(warm_and_proto(&client, &url_many, &vkey));
+    eprintln!("e2e_worker_threads: comparing 1 worker vs {cores} workers");
+
+    let mut group = c.benchmark_group("e2e_worker_threads");
+    group.sample_size(10);
+    group.measurement_time(Duration::from_secs(6));
+    for &conc in SWEEP {
+        group.throughput(Throughput::Elements(conc));
+        group.bench_with_input(BenchmarkId::new("threads_1", conc), &conc, |b, &conc| {
+            b.to_async(&rt)
+                .iter(|| drive(&client, &url_one, &vkey, conc));
+        });
+        group.bench_with_input(
+            BenchmarkId::new(format!("threads_{cores}"), conc),
+            &conc,
+            |b, &conc| {
+                b.to_async(&rt)
+                    .iter(|| drive(&client, &url_many, &vkey, conc));
+            },
+        );
+    }
+    group.finish();
+
+    drop(gw_one);
+    drop(gw_many);
+    drop(mock);
+    drop(nats);
+}
+
+criterion_group!(benches, bench_e2e, bench_concurrency, bench_worker_threads);
 criterion_main!(benches);
