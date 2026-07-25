@@ -198,19 +198,6 @@ impl Tool for Ls {
                 .cmp(a_dir)
                 .then_with(|| a_key.cmp(b_key).then_with(|| a_name.cmp(b_name)))
         });
-        let mut entries: Vec<String> = entries
-            .into_iter()
-            .map(|(name, is_dir, _key)| {
-                // Built with room for the trailing `/` so a directory entry doesn't allocate a second
-                // String beyond this one.
-                let mut display = String::with_capacity(name.len() + usize::from(is_dir));
-                display.push_str(&name);
-                if is_dir {
-                    display.push('/');
-                }
-                display
-            })
-            .collect();
         if entries.is_empty() {
             return Ok("(empty directory)".into());
         }
@@ -225,7 +212,24 @@ impl Tool for Ls {
         if count_truncated {
             entries.truncate(limit);
         }
-        let mut out = entries.join("\n");
+        // Render the sorted (and truncated) entries straight into `out` — the `\n`-joined bare names,
+        // each directory suffixed with `/` — instead of collecting an intermediate `Vec<String>` of
+        // display strings and joining it. Pre-sized to the exact byte length (names + one separator or
+        // trailing `/` per entry) so the buffer never reallocates.
+        let cap = entries
+            .iter()
+            .map(|(name, _, _)| name.len() + 1)
+            .sum::<usize>();
+        let mut out = String::with_capacity(cap);
+        for (i, (name, is_dir, _key)) in entries.iter().enumerate() {
+            if i > 0 {
+                out.push('\n');
+            }
+            out.push_str(name);
+            if *is_dir {
+                out.push('/');
+            }
+        }
         if needs_marker {
             out.push('\n');
         }

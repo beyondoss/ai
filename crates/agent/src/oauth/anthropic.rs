@@ -99,13 +99,20 @@ pub async fn login(
 /// Refresh an existing credential. Anthropic's refresh request omits `scope` entirely — sending one
 /// is a real regression (pi's own tests assert its absence).
 pub async fn refresh(refresh_token: &str) -> Result<AnthropicCredential> {
-    let http = Client::new();
     let body = serde_json::json!({
         "grant_type": "refresh_token",
         "client_id": CLIENT_ID,
         "refresh_token": refresh_token,
     });
-    normalize(post_token(&http, &body).await?)
+    normalize(post_token(http(), &body).await?)
+}
+
+/// The process-wide `reqwest::Client` reused across token requests. Building one is comparatively
+/// expensive (it spins up a connection pool and TLS config), and there's no per-request state to
+/// justify a fresh client each call — the timeout and headers are all set per request below.
+fn http() -> &'static Client {
+    static CLIENT: std::sync::OnceLock<Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(Client::new)
 }
 
 async fn exchange_code(
@@ -113,7 +120,6 @@ async fn exchange_code(
     code: &str,
     state: &str,
 ) -> Result<AnthropicCredential> {
-    let http = Client::new();
     let body = serde_json::json!({
         "grant_type": "authorization_code",
         "client_id": CLIENT_ID,
@@ -122,7 +128,7 @@ async fn exchange_code(
         "redirect_uri": REDIRECT_URI,
         "code_verifier": code_verifier,
     });
-    normalize(post_token(&http, &body).await?)
+    normalize(post_token(http(), &body).await?)
 }
 
 #[derive(Deserialize)]

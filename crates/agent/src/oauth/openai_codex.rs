@@ -172,13 +172,20 @@ async fn login_via_device_code(
 /// let the caller decide (a real regression pi's own tests specifically guard against for this
 /// provider).
 pub async fn refresh(refresh_token: &str) -> Result<OpenaiCodexCredential> {
-    let http = Client::new();
     let params = [
         ("grant_type", "refresh_token"),
         ("refresh_token", refresh_token),
         ("client_id", CLIENT_ID),
     ];
-    credential_from_tokens(post_token_form(&http, &params).await?)
+    credential_from_tokens(post_token_form(http(), &params).await?)
+}
+
+/// The process-wide `reqwest::Client` reused across token requests. Building one is comparatively
+/// expensive (connection pool + TLS config) and there's no per-request state on the client to justify
+/// a fresh one each call.
+fn http() -> &'static Client {
+    static CLIENT: std::sync::OnceLock<Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(Client::new)
 }
 
 async fn exchange_code(
@@ -186,7 +193,6 @@ async fn exchange_code(
     code: &str,
     redirect_uri: &str,
 ) -> Result<OpenaiCodexCredential> {
-    let http = Client::new();
     let params = [
         ("grant_type", "authorization_code"),
         ("client_id", CLIENT_ID),
@@ -194,7 +200,7 @@ async fn exchange_code(
         ("code_verifier", code_verifier),
         ("redirect_uri", redirect_uri),
     ];
-    credential_from_tokens(post_token_form(&http, &params).await?)
+    credential_from_tokens(post_token_form(http(), &params).await?)
 }
 
 #[derive(Deserialize)]

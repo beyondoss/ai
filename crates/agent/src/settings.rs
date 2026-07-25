@@ -1127,54 +1127,71 @@ fn resolve_config_value_template(
     config: &str,
     lookup: &dyn Fn(&str) -> Option<String>,
 ) -> Option<String> {
-    let chars: Vec<char> = config.chars().collect();
+    // A single `char_indices` cursor over `config`, rather than materializing a `Vec<char>` and
+    // indexing it. `$` and the ASCII markers (`{`, `}`, `!`) are all one byte, so slicing `config`
+    // with the byte offsets the cursor yields lands on valid char boundaries; variable names are
+    // borrowed as `&str` slices instead of collected into fresh `String`s.
     let mut out = String::with_capacity(config.len());
-    let mut i = 0;
-    while i < chars.len() {
-        if chars[i] != '$' {
-            out.push(chars[i]);
-            i += 1;
+    let mut chars = config.char_indices().peekable();
+    while let Some((i, c)) = chars.next() {
+        if c != '$' {
+            out.push(c);
             continue;
         }
-        match chars.get(i + 1).copied() {
-            Some('$') => {
+        match chars.peek().copied() {
+            Some((_, '$')) => {
                 out.push('$');
-                i += 2;
+                chars.next();
             }
-            Some('!') => {
+            Some((_, '!')) => {
                 out.push('!');
-                i += 2;
+                chars.next();
             }
-            Some('{') => match chars[i + 2..].iter().position(|&c| c == '}') {
-                Some(rel) => {
-                    let end = i + 2 + rel;
-                    let name: String = chars[i + 2..end].iter().collect();
-                    if is_env_var_name(&name) {
-                        out.push_str(&lookup(&name)?);
-                    } else {
-                        out.extend(chars[i..=end].iter());
+            Some((brace_idx, '{')) => {
+                // `{` is one byte, so the name starts at the next byte.
+                let name_start = brace_idx + 1;
+                match config[name_start..].find('}') {
+                    Some(rel) => {
+                        let close = name_start + rel; // byte index of the matching `}`
+                        let name = &config[name_start..close];
+                        if is_env_var_name(name) {
+                            out.push_str(&lookup(name)?);
+                        } else {
+                            // The literal `${...}` including both braces, `$` at byte `i` through `}`.
+                            out.push_str(&config[i..=close]);
+                        }
+                        // Advance the cursor past the closing `}`.
+                        while let Some(&(idx, _)) = chars.peek() {
+                            if idx <= close {
+                                chars.next();
+                            } else {
+                                break;
+                            }
+                        }
                     }
-                    i = end + 1;
+                    None => {
+                        // No closing brace: emit a literal `$` and let the `{` be scanned normally.
+                        out.push('$');
+                    }
                 }
-                None => {
-                    out.push('$');
-                    i += 1;
+            }
+            Some((_, c1)) if c1.is_ascii_alphabetic() || c1 == '_' => {
+                // Bare `$VAR`: `$` is one byte, so the name starts at the next byte and runs while the
+                // chars stay `[A-Za-z0-9_]`.
+                let name_start = i + 1;
+                let mut name_end = name_start;
+                while let Some(&(idx, cc)) = chars.peek() {
+                    if cc.is_ascii_alphanumeric() || cc == '_' {
+                        name_end = idx + cc.len_utf8();
+                        chars.next();
+                    } else {
+                        break;
+                    }
                 }
-            },
-            Some(c) if c.is_ascii_alphabetic() || c == '_' => {
-                let start = i + 1;
-                let mut end = start;
-                while end < chars.len() && (chars[end].is_ascii_alphanumeric() || chars[end] == '_')
-                {
-                    end += 1;
-                }
-                let name: String = chars[start..end].iter().collect();
-                out.push_str(&lookup(&name)?);
-                i = end;
+                out.push_str(&lookup(&config[name_start..name_end])?);
             }
             _ => {
                 out.push('$');
-                i += 1;
             }
         }
     }
