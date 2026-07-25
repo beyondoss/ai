@@ -102,9 +102,17 @@ impl Throttled {
     /// The `ai_rejections_total{reason=…}` label. `PerCredential` keeps the original `"rate_limit"`
     /// label so existing dashboards/alerts are unbroken.
     pub fn label(self) -> &'static str {
-        match self {
-            Throttled::PerCredential => "rate_limit",
-            Throttled::ByoGlobal => "rate_limit_byo_global",
+        crate::metrics::Rejection::from(self).label()
+    }
+}
+
+impl From<Throttled> for crate::metrics::Rejection {
+    /// So the caller can bump a pre-resolved counter instead of a string-keyed label lookup — the
+    /// rate limiter is precisely the path a flood drives at full request rate.
+    fn from(t: Throttled) -> Self {
+        match t {
+            Throttled::PerCredential => crate::metrics::Rejection::RateLimit,
+            Throttled::ByoGlobal => crate::metrics::Rejection::RateLimitByoGlobal,
         }
     }
 }

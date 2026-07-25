@@ -102,6 +102,59 @@ mod admin {
     }
 }
 
+mod reject {
+    use super::*;
+    use beyond_ai::metrics::{Metrics, Rejection};
+    use beyond_ai::proxy::{REJECT_BODIES, error_body};
+    use std::sync::{Arc, OnceLock};
+
+    fn metrics() -> &'static Arc<Metrics> {
+        static M: OnceLock<Arc<Metrics>> = OnceLock::new();
+        // May already be registered by another bench module in the same process.
+        M.get_or_init(|| Metrics::new().unwrap_or_else(|_| unreachable!("registered once")))
+    }
+
+    /// The rejection response body. This is the flood path: `ratelimit`'s whole reason for existing
+    /// is that a leaked or forged credential can be shed cheaply, so it runs at full request rate
+    /// exactly when the gateway can least afford it. Must be **0 allocs** — the body is one of a
+    /// closed set of constants, returned as `Bytes::from_static`.
+    #[divan::bench]
+    fn body_precomputed() -> bytes::Bytes {
+        let (typ, msg, _) = REJECT_BODIES[2];
+        error_body(black_box(typ), black_box(msg))
+    }
+
+    /// What it replaced: a `serde_json` DOM (a `Map` plus an owned `String` per key and per string
+    /// value) serialized into a fresh `String`, for output that was always one of eight constants.
+    #[divan::bench]
+    fn body_via_serde_json() -> bytes::Bytes {
+        let (typ, msg, _) = REJECT_BODIES[2];
+        bytes::Bytes::from(
+            serde_json::json!({ "error": { "type": black_box(typ), "message": black_box(msg) } })
+                .to_string(),
+        )
+    }
+
+    /// The rejection counter, resolved once at boot: a direct `fetch_add`.
+    #[divan::bench]
+    fn counter_preresolved(bencher: Bencher) {
+        let m = metrics();
+        bencher.bench(|| m.rejection(black_box(Rejection::Auth)).inc());
+    }
+
+    /// What it replaced: an FNV hash of the label bytes, a `RwLock` read, a `HashMap` lookup, an
+    /// `Arc` clone and an `Arc` drop — per rejected request, on every worker, against one lock.
+    #[divan::bench]
+    fn counter_via_label_lookup(bencher: Bencher) {
+        let m = metrics();
+        bencher.bench(|| {
+            m.rejections_total
+                .with_label_values(&[black_box(Rejection::Auth.label())])
+                .inc()
+        });
+    }
+}
+
 mod route {
     use super::*;
     use beyond_ai::route::{Dialect, dialect_default};

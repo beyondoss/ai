@@ -40,9 +40,11 @@
 //! Anthropic client works by changing only the host. An unknown first segment is a 404. Model isn't
 //! used for routing (the body isn't read pre-connect); it's still captured from the body for usage.
 
+use crate::metrics::Rejection;
 use crate::route::{self, Dialect, Provider};
 use crate::state::{GatewayState, RequestId};
 use crate::{peek, usage};
+use arrayvec::ArrayString;
 use async_trait::async_trait;
 use bytes::Bytes;
 use pingora::http::ResponseHeader;
@@ -51,6 +53,7 @@ use pingora_core::protocols::ALPN;
 use pingora_core::upstreams::peer::HttpPeer;
 use pingora_proxy::{ProxyHttp, Session};
 use std::borrow::Cow;
+use std::fmt::Write as _;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
@@ -169,6 +172,73 @@ pub struct RequestCtx {
     request_id: RequestId,
 }
 
+/// Every `(error_type, message)` pair the gateway rejects with, paired with its wire body.
+///
+/// The set is closed: `reject` is only ever called with literals, so the response body is one of
+/// these constants and never needs building. Kept as a table rather than scattered `const`s so
+/// `reject_bodies_are_valid_json` can walk it and assert each entry parses, carries the `type` and
+/// `message` it claims, and is reachable — a hand-written JSON literal is exactly the thing that
+/// rots silently otherwise.
+pub const REJECT_BODIES: [(&str, &str, &str); 8] = [
+    (
+        "invalid_request_error",
+        "unknown provider",
+        r#"{"error":{"message":"unknown provider","type":"invalid_request_error"}}"#,
+    ),
+    (
+        "authentication_error",
+        "missing API key",
+        r#"{"error":{"message":"missing API key","type":"authentication_error"}}"#,
+    ),
+    (
+        "authentication_error",
+        "invalid API key",
+        r#"{"error":{"message":"invalid API key","type":"authentication_error"}}"#,
+    ),
+    (
+        "rate_limit_error",
+        "rate limit exceeded",
+        r#"{"error":{"message":"rate limit exceeded","type":"rate_limit_error"}}"#,
+    ),
+    (
+        "invalid_request_error",
+        "request body too large",
+        r#"{"error":{"message":"request body too large","type":"invalid_request_error"}}"#,
+    ),
+    (
+        "access_denied",
+        "tenant is over limit or suspended",
+        r#"{"error":{"message":"tenant is over limit or suspended","type":"access_denied"}}"#,
+    ),
+    (
+        "api_error",
+        "no provider key available",
+        r#"{"error":{"message":"no provider key available","type":"api_error"}}"#,
+    ),
+    (
+        "api_error",
+        "provider temporarily unavailable",
+        r#"{"error":{"message":"provider temporarily unavailable","type":"api_error"}}"#,
+    ),
+];
+
+/// The precomputed body for a `(typ, msg)` pair.
+///
+/// Falls back to building one with `serde_json` for a pair not in [`REJECT_BODIES`]. That branch is
+/// unreachable today (a test asserts every call site is covered) and exists so adding a rejection
+/// without its table entry degrades to the old allocating behaviour rather than serving a body that
+/// contradicts the `error_type` in the log line.
+/// `pub` for the bench target (`benches/unit.rs`), which measures it against the `serde_json`
+/// construction it replaced. Not part of the crate's intended surface.
+pub fn error_body(typ: &str, msg: &str) -> Bytes {
+    for (t, m, body) in REJECT_BODIES {
+        if t == typ && m == msg {
+            return Bytes::from_static(body.as_bytes());
+        }
+    }
+    Bytes::from(serde_json::json!({ "error": { "type": typ, "message": msg } }).to_string())
+}
+
 impl AiProxy {
     /// Write a small JSON error and signal `request_filter` to short-circuit. The body is built with
     /// `serde_json` (not `format!`) so a `typ`/`msg` containing `"` or `\` can never break out of the
@@ -192,12 +262,21 @@ impl AiProxy {
         msg: &str,
     ) -> Result<bool> {
         warn!(request_id, status, error_type = typ, "request rejected");
-        let body = Bytes::from(
-            serde_json::json!({ "error": { "type": typ, "message": msg } }).to_string(),
-        );
-        let mut resp = ResponseHeader::build(status, None)?;
+        // `typ` and `msg` are always a pair of literals from `RejectBody`, so the body is one of a
+        // handful of compile-time constants and `error_body` hands back a `Bytes::from_static` —
+        // no JSON DOM, no `String`, no copy. Building it with `serde_json::json!` cost 13
+        // allocations and 1 565 bytes per rejected request (measured), which is a poor trade on the
+        // one path that a flood drives at full rate. The `json!` was there so a non-literal message
+        // couldn't break out of the JSON structure; a closed set of constants gives that for free,
+        // and `reject_bodies_are_valid_json` keeps them honest.
+        let body = error_body(typ, msg);
+        // Content-length formatted into a stack buffer rather than `body.len().to_string()`: still
+        // one `HeaderValue` allocation inside pingora, but no `String` of our own.
+        let mut len_buf = ArrayString::<20>::new();
+        let _ = write!(len_buf, "{}", body.len());
+        let mut resp = ResponseHeader::build(status, Some(3))?;
         resp.insert_header("content-type", "application/json")?;
-        resp.insert_header("content-length", body.len().to_string())?;
+        resp.insert_header("content-length", len_buf.as_str())?;
         resp.insert_header(REQUEST_ID_HEADER, request_id)?;
         session.write_response_header(Box::new(resp), false).await?;
         session.write_response_body(Some(body), true).await?;
@@ -455,11 +534,7 @@ impl ProxyHttp for AiProxy {
         // over-limit path (where `raw_key` is unused afterward).
         if let Some(rl) = &self.state.rate_limit {
             if let Some(reason) = rl.check(raw_key, raw_key.starts_with("bai_")) {
-                self.state
-                    .metrics
-                    .rejections_total
-                    .with_label_values(&[reason.label()])
-                    .inc();
+                self.state.metrics.rejection(reason.into()).inc();
                 return Self::reject_boxed(
                     session,
                     &request_id,
@@ -496,11 +571,7 @@ impl ProxyHttp for AiProxy {
         // (no Beyond identity, so no deny-set and no per-tenant attribution).
         let (tenant_id, vpc_id, managed) = if raw_key.starts_with("bai_") {
             let Ok(identity) = self.state.keyring.verify(raw_key) else {
-                self.state
-                    .metrics
-                    .rejections_total
-                    .with_label_values(&["auth"])
-                    .inc();
+                self.state.metrics.rejection(Rejection::Auth).inc();
                 return Self::reject_boxed(
                     session,
                     &request_id,
@@ -518,15 +589,11 @@ impl ProxyHttp for AiProxy {
                 // otherwise spike the fraud counter and mask the real fraud signal. A `deny_unknown`
                 // label surfaces it as the deployment-coordination issue it is.
                 let label = match reason {
-                    crate::deny::DenyReason::Spend => "deny_spend",
-                    crate::deny::DenyReason::Fraud => "deny_fraud",
-                    crate::deny::DenyReason::Unknown => "deny_unknown",
+                    crate::deny::DenyReason::Spend => Rejection::DenySpend,
+                    crate::deny::DenyReason::Fraud => Rejection::DenyFraud,
+                    crate::deny::DenyReason::Unknown => Rejection::DenyUnknown,
                 };
-                self.state
-                    .metrics
-                    .rejections_total
-                    .with_label_values(&[label])
-                    .inc();
+                self.state.metrics.rejection(label).inc();
                 return Self::reject_boxed(
                     session,
                     &request_id,
@@ -568,11 +635,7 @@ impl ProxyHttp for AiProxy {
         // 429 never does (that's a healthy provider throttling — see `logging`).
         if let Some(breaker) = &provider.breaker {
             if breaker.allow().is_err() {
-                self.state
-                    .metrics
-                    .rejections_total
-                    .with_label_values(&["circuit_open"])
-                    .inc();
+                self.state.metrics.rejection(Rejection::CircuitOpen).inc();
                 return Self::reject_boxed(
                     session,
                     &request_id,
@@ -800,11 +863,7 @@ impl ProxyHttp for AiProxy {
             // and this is an abuse guard, not a normal client path.
             rc.body_bytes_fed = rc.body_bytes_fed.saturating_add(chunk.len());
             if rc.body_bytes_fed > MAX_REQUEST_BODY {
-                self.state
-                    .metrics
-                    .rejections_total
-                    .with_label_values(&["body_too_large"])
-                    .inc();
+                self.state.metrics.rejection(Rejection::BodyTooLarge).inc();
                 return Err(pingora_core::Error::new_str("request body exceeds limit"));
             }
             if rc.managed {
@@ -1296,6 +1355,89 @@ mod tests {
         assert!(!is_streamable_path("/v1/embeddings"));
         assert!(!is_streamable_path("/v1/messages"));
         assert!(!is_streamable_path("/v1/models"));
+    }
+
+    #[test]
+    fn reject_bodies_are_valid_json_and_match_their_type_and_message() {
+        // These are hand-written JSON literals standing in for what `serde_json::json!` used to
+        // build, so the thing to guard is that they still *say* what the `error_type` in the log
+        // line and the metric label claim. A drifting literal would ship a response whose `type`
+        // contradicts the reason we rejected for.
+        for (typ, msg, body) in REJECT_BODIES {
+            let v: serde_json::Value =
+                serde_json::from_str(body).unwrap_or_else(|e| panic!("{body} is not JSON: {e}"));
+            assert_eq!(v["error"]["type"], typ, "type mismatch in {body}");
+            assert_eq!(v["error"]["message"], msg, "message mismatch in {body}");
+            // ...and that it is byte-identical to what `json!` would have produced, so switching to
+            // the constant changed nothing on the wire.
+            let built = serde_json::json!({ "error": { "type": typ, "message": msg } }).to_string();
+            assert_eq!(body, built, "constant diverges from the built body");
+            // The lookup must find it rather than falling through to the allocating branch.
+            assert_eq!(error_body(typ, msg), Bytes::from_static(body.as_bytes()));
+        }
+    }
+
+    #[test]
+    fn every_reject_call_site_has_a_precomputed_body() {
+        // One table entry per call site. Adding a rejection without its entry would silently take
+        // `error_body`'s allocating fallback forever — correct on the wire, but quietly undoing the
+        // point of the table on the one path a flood drives at full rate. Counting is enough to
+        // catch it and does not depend on how the arguments happen to be formatted.
+        // Only the production half of the file — this test mentions the call form itself, and a
+        // test module that grepped its own source would count that too.
+        let src = include_str!("proxy.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("split always yields at least one part");
+        let call_sites = src.matches("Self::reject_boxed(").count();
+        assert_eq!(
+            call_sites,
+            REJECT_BODIES.len(),
+            "{call_sites} reject_boxed call sites vs {} REJECT_BODIES entries — add the missing \
+             (type, message) pair to the table",
+            REJECT_BODIES.len()
+        );
+        // Every tabulated message must also appear at a call site, catching the reverse drift (a
+        // table entry left behind after its rejection was removed). Twice: the table and the caller.
+        for (_, msg, _) in REJECT_BODIES {
+            assert!(
+                src.matches(&format!("\"{msg}\"")).count() >= 2,
+                "REJECT_BODIES entry {msg:?} has no reject_boxed call site"
+            );
+        }
+    }
+
+    #[test]
+    fn rejection_labels_round_trip_and_are_unique() {
+        use crate::metrics::Rejection;
+        use std::collections::HashSet;
+        let all = [
+            Rejection::Auth,
+            Rejection::DenySpend,
+            Rejection::DenyFraud,
+            Rejection::DenyUnknown,
+            Rejection::CircuitOpen,
+            Rejection::BodyTooLarge,
+            Rejection::RateLimit,
+            Rejection::RateLimitByoGlobal,
+        ];
+        let labels: HashSet<&str> = all.iter().map(|r| r.label()).collect();
+        assert_eq!(labels.len(), all.len(), "duplicate rejection label");
+        // The two dashboards-facing strings must not drift — existing alerts key on them.
+        assert_eq!(Rejection::RateLimit.label(), "rate_limit");
+        assert_eq!(
+            Rejection::RateLimitByoGlobal.label(),
+            "rate_limit_byo_global"
+        );
+        // `Throttled` must map onto the same two.
+        assert_eq!(
+            Rejection::from(crate::ratelimit::Throttled::PerCredential),
+            Rejection::RateLimit
+        );
+        assert_eq!(
+            Rejection::from(crate::ratelimit::Throttled::ByoGlobal),
+            Rejection::RateLimitByoGlobal
+        );
     }
 
     #[test]
