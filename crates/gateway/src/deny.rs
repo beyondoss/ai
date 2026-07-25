@@ -3,8 +3,18 @@
 //! Design (deliberate, see plan): the gateway only ever asks "is this tenant cut off?" and
 //! default-**allows** on a miss. We hold **only the exceptions** (the cut-off tenants), so memory
 //! is `O(denied)`, not `O(tenants)` — this scales to millions of tenants because `denied` stays a
-//! tiny slice (a few MB even at 1M entries; a tenant id is 8 bytes). The gateway never decides
-//! *why* a tenant is denied — the control plane writes/removes entries; we just enforce + log.
+//! tiny slice of them. The gateway never decides *why* a tenant is denied — the control plane
+//! writes/removes entries; we just enforce + log.
+//!
+//! Sizing, honestly: the stored element is the **pair** `(u64, DenyReason)` = 16 bytes (the 1-byte
+//! enum is padded out to the id's 8-byte alignment), and hashbrown rounds up to a power-of-two
+//! bucket count held at a 87.5% max load factor. So 1M denied tenants is `2^21` buckets × (16 B +
+//! 1 control byte) ≈ **34 MiB** — an order of magnitude past the "a few MB" that reasoning from the
+//! bare 8-byte id suggests. Worth stating plainly because it lands twice: `store_watch` applies
+//! each delta by rcu, *cloning the whole map* per update, so that figure is also the per-delta copy
+//! cost and both copies are live across the swap. The shape is still right (`O(denied)`, and a
+//! deny-set that large means something is very wrong upstream) — it just isn't free.
+//! `million_entry_footprint_is_tens_of_megabytes` pins the arithmetic so this claim can't rot again.
 //!
 //! TTL/auto-restore is handled by slipstream, not here: spend holds are written with a TTL to the
 //! next budget reset, so they expire into a `Del` event that removes them; fraud holds have no TTL
@@ -184,6 +194,26 @@ mod tests {
         set.remove(1);
         assert!(!set.is_denied(1)); // restored
         assert_eq!(set.len(), 1);
+    }
+
+    /// The module doc quotes a concrete footprint for a 1M-entry set, and `store_watch` clones the
+    /// whole map on every delta — so understating it hides a real per-update cost. Pin the
+    /// arithmetic to the actual allocation rather than to a comment nobody re-derives.
+    #[test]
+    fn million_entry_footprint_is_tens_of_megabytes() {
+        // The element is the pair, not the id: a 1-byte enum padded to the u64's alignment.
+        assert_eq!(std::mem::size_of::<DenyReason>(), 1);
+        assert_eq!(std::mem::size_of::<(u64, DenyReason)>(), 16);
+
+        let set = DenySet::with_capacity(1_000_000);
+        // hashbrown holds a power-of-two bucket count at a 87.5% max load factor, so the usable
+        // `capacity()` it reports is `buckets - buckets/8` — invert that to recover the real table.
+        let buckets = set.denied.capacity() * 8 / 7;
+        assert_eq!(buckets, 1 << 21, "1M entries rounds up to 2^21 buckets");
+        // One `(u64, DenyReason)` slot plus one control byte per bucket (ignoring the small
+        // fixed-size mirrored control group at the tail).
+        let bytes = buckets * std::mem::size_of::<(u64, DenyReason)>() + buckets;
+        assert_eq!(bytes, 35_651_584); // 34.0 MiB — not "a few MB"
     }
 
     #[test]
