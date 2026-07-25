@@ -15,12 +15,19 @@
 //!   and enforces immediately, even before NATS reconnects. Every applied delta is appended back to
 //!   the snapshot so the file tracks the live set.
 //!
-//! Either way the watch resumes from a **revision** (`watch_prefix_from`), never a bare
-//! `watch_prefix`: the latter uses NATS `DeliverPolicy::New` (no replay), so a deny entry written in
-//! the window between seeding and the subscription attaching would be silently lost. Resuming from
-//! the seeded revision closes that window with no gap and no double-apply (it starts strictly after
-//! the seeded revision). If the backend compacted past the cursor (`CursorExpired`), we drop back to
-//! a fresh scan, which re-establishes a valid baseline.
+//! Either way the watch *tries* to resume from a **revision** (`watch_prefix_from`) rather than a
+//! bare `watch_prefix`: the latter uses NATS `DeliverPolicy::New` (no replay), so a deny entry
+//! written in the window between seeding and the subscription attaching would be silently lost.
+//! Resuming from the seeded revision closes that window with no gap and no double-apply (it starts
+//! strictly after the seeded revision).
+//!
+//! The one seed that yields *no* resume point is an empty scan: its baseline is revision 0, and
+//! slipstream honours a cursor only when `rev > 0` — at 0 `watch_prefix_from` quietly degrades to
+//! `watch_prefix`, i.e. `DeliverPolicy::New`. We can't stop that degradation, so we refuse to treat
+//! it as seeded (see `is_resumable`): the watch runs replay-less for this connection, and the *next*
+//! connect rescans instead of latching a replay-less watch for the life of the process. Same for
+//! `CursorExpired` (the backend compacted past the cursor) — we drop back to a fresh scan, which
+//! re-establishes a valid baseline.
 //!
 //! Runs as a Pingora `BackgroundService` so the NATS client is created on the serving runtime
 //! (async-nats ties its tasks to the runtime it's built on; connecting earlier would break it).
@@ -38,6 +45,7 @@ use store::{
     Connection, KvEntry, KvError, KvStore, KvUpdate, NatsConnection, NatsConnectionConfig,
     StoreConfig, WatchCursor,
 };
+use tokio::time::Instant;
 use tracing::{error, info, warn};
 
 const BLACKHOLE_PREFIX: &str = "blackhole.";
@@ -46,10 +54,53 @@ const BLACKHOLE_PREFIX: &str = "blackhole.";
 /// is low-churn, so this is rarely hit; it just bounds the log if a tenant flaps.
 const SNAPSHOT_COMPACT_THRESHOLD: u64 = 1024 * 1024;
 
-/// Reconnect backoff bounds: start at 1s, double to a 30s ceiling. Generous enough to stop log
-/// spam during a long NATS outage, tight enough that recovery is near-immediate once it returns.
+/// Reconnect backoff bounds: start at 1s, double to a 30s ceiling. Generous enough to stop log spam
+/// during a long NATS outage, tight enough that recovery is near-immediate once it returns. The cap
+/// doubles as the "was that connection productive?" threshold — see `ReconnectBackoff`.
 const RECONNECT_BACKOFF_BASE: Duration = Duration::from_secs(1);
 const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(30);
+
+/// Reconnect backoff for the watch loop: 1s doubling to a 30s cap. A fixed 2s retry hammered the log
+/// at a constant rate through a long outage (minutes to hours), burying other signals during the very
+/// incident an oncall is reading these logs for. The gateway serves correctly on the stale set
+/// throughout — this is purely about log volume and not pointlessly spinning on a down NATS.
+///
+/// The rule that matters is *when* the delay resets. It resets only after a connection that proved
+/// **productive** — one whose watch survived at least [`RECONNECT_BACKOFF_MAX`]. Resetting on a
+/// successful `connect()` instead (which is what this used to do) is a trap: NATS happily accepts
+/// connections while the *watch* fails every single time — bucket missing, scan permission denied,
+/// store hands back no watcher, consumer-create refused. Each iteration then reset the delay to the
+/// base before `watch_deny` failed, undoing the doubling that follows, and the "backoff" pinned
+/// itself at 1s: ~86k connects (TLS handshake + JetStream KV lookup + scan) and ~86k `warn!` lines a
+/// day — exactly the log flood the backoff exists to prevent.
+///
+/// Kept as a tiny state machine so that rule is testable without a NATS server.
+struct ReconnectBackoff(Duration);
+
+impl ReconnectBackoff {
+    fn new() -> Self {
+        Self(RECONNECT_BACKOFF_BASE)
+    }
+
+    /// How long to wait before the next connect attempt.
+    fn delay(&self) -> Duration {
+        self.0
+    }
+
+    /// Double the delay, capped. Called after every attempt that didn't earn a reset.
+    fn grow(&mut self) {
+        self.0 = (self.0 * 2).min(RECONNECT_BACKOFF_MAX);
+    }
+
+    /// Credit a finished watch: a connection whose watch outlived the cap was doing real work
+    /// (streaming deltas, or idling on a healthy subscription), so its successor starts fresh.
+    /// Anything shorter is flapping, and flapping keeps backing off.
+    fn credit(&mut self, watch_ran_for: Duration) {
+        if watch_ran_for >= RECONNECT_BACKOFF_MAX {
+            self.0 = RECONNECT_BACKOFF_BASE;
+        }
+    }
+}
 
 pub struct WatcherService {
     pub state: Arc<GatewayState>,
@@ -75,10 +126,13 @@ impl BackgroundService for WatcherService {
                     info!(count = set.len(), "seeded deny-set from on-disk snapshot");
                     self.state.metrics.deny_set_size.set(set.len() as i64);
                     self.state.deny.store(Arc::new(set));
-                    // A snapshot without a saved cursor can't safely resume (a bare watch would
-                    // race), so only treat it as seeded when it carries a resume point; otherwise
-                    // fall through to a NATS scan on connect.
-                    if !snap.cursor.is_none() {
+                    // A snapshot without a *resumable* cursor can't safely resume (a bare watch
+                    // would race), so only treat it as seeded when it carries a real resume point;
+                    // otherwise fall through to a NATS scan on connect. Note this must test
+                    // `is_resumable`, not `!is_none()`: a snapshot checkpointed after an empty scan
+                    // carries revision 0, which is a *present* cursor that slipstream still can't
+                    // resume from.
+                    if is_resumable(&snap.cursor) {
                         cursor = snap.cursor;
                         seeded = true;
                     }
@@ -99,12 +153,7 @@ impl BackgroundService for WatcherService {
             }
         }
 
-        // Reconnect backoff: 1s doubling to a 30s cap, reset on every successful connect. A fixed
-        // 2s retry hammered the log at a constant rate through a long outage (minutes to hours),
-        // burying other signals during the very incident an oncall is reading these logs for. The
-        // gateway serves correctly on the stale set throughout — this is purely about log volume
-        // and not pointlessly spinning on a down NATS.
-        let mut backoff = RECONNECT_BACKOFF_BASE;
+        let mut backoff = ReconnectBackoff::new();
         loop {
             // Connect, but bail immediately if Pingora signals shutdown mid-connect (e.g. NATS is
             // down and `connect` is retrying its own backoff) rather than blocking teardown.
@@ -120,12 +169,12 @@ impl BackgroundService for WatcherService {
                     Ok(store) => store,
                     Err(e) => {
                         self.state.metrics.nats_connected.set(0);
-                        error!(error = %e, backoff_secs = backoff.as_secs(), "slipstream connect failed; retrying");
+                        error!(error = %e, backoff_secs = backoff.delay().as_secs(), "slipstream connect failed; retrying");
                         // Reconnect backoff, also interruptible by shutdown.
                         tokio::select! {
                             _ = shutdown.changed() => return,
-                            _ = tokio::time::sleep(backoff) => {
-                                backoff = (backoff * 2).min(RECONNECT_BACKOFF_MAX);
+                            _ = tokio::time::sleep(backoff.delay()) => {
+                                backoff.grow();
                                 continue;
                             }
                         }
@@ -133,9 +182,11 @@ impl BackgroundService for WatcherService {
                 },
             };
 
-            backoff = RECONNECT_BACKOFF_BASE;
             self.state.metrics.nats_connected.set(1);
             info!("slipstream connected; watching deny-set");
+            // Time the watch, not the connect: only a watch that ran long enough to be doing real
+            // work earns a backoff reset (see `ReconnectBackoff::credit`).
+            let started = Instant::now();
             // `watch_deny` returns `true` when it exited because shutdown was signaled — stop the
             // reconnect loop cleanly instead of trying to reconnect a shutting-down process.
             if watch_deny(
@@ -151,16 +202,43 @@ impl BackgroundService for WatcherService {
                 info!("shutdown signaled; deny-set watcher exiting");
                 return;
             }
+            let watched_for = started.elapsed();
+            backoff.credit(watched_for);
             self.state.metrics.nats_connected.set(0);
-            warn!("deny-set watch exited; reconnecting");
+            warn!(
+                watched_secs = watched_for.as_secs(),
+                backoff_secs = backoff.delay().as_secs(),
+                "deny-set watch exited; reconnecting"
+            );
             tokio::select! {
                 _ = shutdown.changed() => return,
-                _ = tokio::time::sleep(backoff) => {
-                    backoff = (backoff * 2).min(RECONNECT_BACKOFF_MAX);
-                }
+                _ = tokio::time::sleep(backoff.delay()) => backoff.grow(),
             }
         }
     }
+}
+
+/// Is this cursor a real resume point?
+///
+/// Only if it carries a revision **greater than zero**. slipstream's `watch_prefix_from` honours a
+/// cursor exactly when `as_u64()` yields `Some(rev)` with `rev > 0`; anything else — an unknown
+/// token, or the revision 0 an empty scan produces — silently falls back to `watch_prefix`, i.e.
+/// NATS `DeliverPolicy::New`, a watch with no replay. That fallback is invisible from here (no
+/// error, no log), so we have to make the same judgement ourselves: a cursor that isn't resumable
+/// must never latch `seeded`, because then every later reconnect re-attaches a replay-less watch and
+/// an entry written while NATS was down is never picked up again.
+fn is_resumable(cursor: &WatchCursor) -> bool {
+    cursor.as_u64().is_some_and(|rev| rev > 0)
+}
+
+/// The baseline a scan establishes: the highest KV revision among the scanned entries, which the
+/// watch then resumes strictly after. Zero when the scan found nothing — see `is_resumable`.
+fn baseline_revision(entries: &[KvEntry]) -> u64 {
+    entries
+        .iter()
+        .filter_map(|e| e.version.as_u64())
+        .max()
+        .unwrap_or(0)
 }
 
 /// Build a `DenySet` from KV entries, dropping any whose key isn't a `blackhole.{tenant}`.
@@ -252,20 +330,19 @@ async fn watch_deny(
     // Seed once, on the first connect that lacks a usable resume point (cold boot with no snapshot,
     // or after a `CursorExpired` reset). A NATS scan is a point-in-time read of the live set; the
     // highest revision among its entries is the baseline the watch resumes strictly after. An empty
-    // set ⇒ revision 0 ⇒ resume from the start of history (the deny bucket is low-churn, so a full
-    // replay is cheap and still gap-free).
+    // set ⇒ revision 0, which is *not* a resume point (see `is_resumable`) — we still watch, but we
+    // don't claim to be seeded, so the next connect scans again.
     if !*seeded {
         match store.reader().scan(BLACKHOLE_PREFIX).await {
             Ok(entries) => {
-                let baseline_rev = entries
-                    .iter()
-                    .filter_map(|e| e.version.as_u64())
-                    .max()
-                    .unwrap_or(0);
+                let baseline_rev = baseline_revision(&entries);
                 let set = denyset_from_entries(entries.iter());
                 info!(
                     count = set.len(),
                     revision = baseline_rev,
+                    // Revision 0 means the watch below runs without replay and we'll rescan on the
+                    // next connect — worth saying out loud for whoever is reading these lines.
+                    resumable = baseline_rev > 0,
                     "seeded deny-set from scan"
                 );
                 state.metrics.deny_set_size.set(set.len() as i64);
@@ -283,7 +360,15 @@ async fn watch_deny(
                             rebuild_snapshot(PathBuf::from(path), entries, cursor.clone()).await;
                     }
                 }
-                *seeded = true;
+                // Latch `seeded` only when the scan produced a cursor we can actually resume from.
+                // An empty bucket scans to revision 0, and `watch_prefix_from` degrades that to
+                // `DeliverPolicy::New` — no replay. Latching there was the bug: it left the
+                // *permanent* state "seeded, resume from 0", so every reconnect for the rest of the
+                // process attached a replay-less watch and an entry written while NATS was down was
+                // never seen. Leaving it false costs one cheap rescan per reconnect (the bucket is
+                // empty, by definition) and closes that hole; the residual gap is the narrow
+                // scan→subscribe window of *this* connection, which the next scan re-reads.
+                *seeded = is_resumable(cursor);
             }
             Err(e) => {
                 // No baseline yet — serve whatever's already in memory (fail-open) and let the
@@ -294,8 +379,10 @@ async fn watch_deny(
         }
     }
 
-    // Stream deltas, resuming from the seeded revision. Never a bare `watch_prefix` (DeliverPolicy::
-    // New) — that would drop anything written in the seed→subscribe window.
+    // Stream deltas, resuming from the seeded revision so nothing written in the seed→subscribe
+    // window is dropped. When the cursor isn't resumable (empty bucket ⇒ revision 0) slipstream
+    // degrades this to a bare `watch_prefix` / `DeliverPolicy::New`; `seeded` is false in that case,
+    // so the next connect rescans rather than living with a replay-less watch forever.
     let Some(watcher) = store.watcher() else {
         warn!("store has no watcher; deny-set will not update");
         return false;
@@ -455,5 +542,84 @@ mod tests {
         let set = denyset_from_entries([].iter());
         assert!(set.is_empty());
         assert!(!set.is_denied(42)); // default-allow on a cold/empty scan
+    }
+
+    #[test]
+    fn revision_zero_is_not_a_resume_point() {
+        // slipstream resumes a watch only when the cursor's revision is > 0 (see
+        // `NatsKvWatcher::watch_prefix_from`: `Some(rev) if rev > 0`, else it delegates to
+        // `watch_prefix` = `DeliverPolicy::New`). A revision-0 cursor is therefore *present but
+        // useless*, which is why `!cursor.is_none()` is the wrong test everywhere in this file.
+        assert!(!is_resumable(&WatchCursor::none()));
+        assert!(!is_resumable(&WatchCursor::from_u64(0)));
+        assert!(!WatchCursor::from_u64(0).is_none()); // ...and it does *not* look absent
+        assert!(is_resumable(&WatchCursor::from_u64(1)));
+        assert!(is_resumable(&WatchCursor::from_u64(u64::MAX)));
+    }
+
+    #[test]
+    fn empty_scan_yields_no_resume_point_so_we_rescan() {
+        // The seed decision in `watch_deny`: baseline = highest revision in the scan, and `seeded`
+        // is latched only if that baseline is resumable. An empty bucket ⇒ 0 ⇒ not seeded ⇒ the
+        // next connect scans again. Latching here was the bug: it pinned every future reconnect to
+        // a replay-less watch, so a `blackhole.X` written while NATS was down was never applied for
+        // the life of the process.
+        let empty = baseline_revision(&[]);
+        assert_eq!(empty, 0);
+        assert!(!is_resumable(&WatchCursor::from_u64(empty)));
+
+        // A non-empty scan does establish one — the highest revision seen, not the first or last.
+        let mut lo = entry("blackhole.1", b"spend");
+        lo.version = VersionToken::from_u64(7);
+        let mut hi = entry("blackhole.2", b"fraud");
+        hi.version = VersionToken::from_u64(9);
+        let scanned = baseline_revision(&[hi, lo]);
+        assert_eq!(scanned, 9);
+        assert!(is_resumable(&WatchCursor::from_u64(scanned)));
+    }
+
+    #[test]
+    fn backoff_doubles_to_the_cap() {
+        let mut b = ReconnectBackoff::new();
+        assert_eq!(b.delay(), RECONNECT_BACKOFF_BASE);
+        for expected in [2, 4, 8, 16, 30, 30] {
+            b.grow();
+            assert_eq!(b.delay(), Duration::from_secs(expected));
+        }
+    }
+
+    #[test]
+    fn backoff_grows_when_only_the_watch_keeps_failing() {
+        // The regression: NATS accepts the connection every time but the watch dies immediately
+        // (bucket missing, scan permission denied, no watcher, consumer-create refused). The old
+        // code reset the backoff on connect, so the doubling below was undone every iteration and
+        // the loop reconnected at the 1s base forever — ~86k connects and 86k warn lines a day.
+        let mut b = ReconnectBackoff::new();
+        for _ in 0..10 {
+            b.credit(Duration::from_millis(20)); // watch died right after connecting
+            b.grow();
+        }
+        assert_eq!(
+            b.delay(),
+            RECONNECT_BACKOFF_MAX,
+            "a connect that never yields a working watch must still back off"
+        );
+    }
+
+    #[test]
+    fn backoff_resets_only_after_a_productive_watch() {
+        let mut b = ReconnectBackoff::new();
+        for _ in 0..10 {
+            b.grow();
+        }
+        assert_eq!(b.delay(), RECONNECT_BACKOFF_MAX);
+
+        // Just short of the cap is still flapping — keep backing off.
+        b.credit(RECONNECT_BACKOFF_MAX - Duration::from_millis(1));
+        assert_eq!(b.delay(), RECONNECT_BACKOFF_MAX);
+
+        // A watch that outlived the cap was doing real work: recovery is immediate again.
+        b.credit(RECONNECT_BACKOFF_MAX);
+        assert_eq!(b.delay(), RECONNECT_BACKOFF_BASE);
     }
 }
