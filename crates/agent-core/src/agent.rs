@@ -218,7 +218,9 @@ pub struct Agent {
     /// not the definitions.
     tool_defs: Arc<[ToolDef]>,
     model: String,
-    system: Option<String>,
+    /// Stored as an `Arc<str>` so cloning it into each turn's `ModelRequest` (and every speculative
+    /// request clone on the retry/hook paths) is a pointer bump, not a copy of the multi-KB prompt.
+    system: Option<Arc<str>>,
     /// A per-turn system-prompt override, re-evaluated at the same point `system` would otherwise be
     /// read — see [`Self::with_system_fn`]. Takes priority over `system` when set (mirrors pi's
     /// function-valued `systemPrompt`, which is one field, either a string or a callback — not both
@@ -345,7 +347,7 @@ impl Agent {
 
     /// Set the system prompt.
     pub fn with_system(mut self, system: impl Into<String>) -> Self {
-        self.system = Some(system.into());
+        self.system = Some(Arc::from(system.into()));
         self
     }
 
@@ -357,7 +359,7 @@ impl Agent {
     /// whole span of a long-running call — see [`Self::with_system_fn`] for the per-turn alternative
     /// that works from inside a run already in flight.
     pub fn set_system(&mut self, system: impl Into<String>) {
-        self.system = Some(system.into());
+        self.system = Some(Arc::from(system.into()));
     }
 
     /// Install a per-turn system-prompt callback, consulted fresh at the same point [`with_system`]'s
@@ -1324,31 +1326,40 @@ impl Agent {
                     input: input.clone(),
                 });
             }
+            // Resolve each call's tool exactly once, into a parallel vec, and derive the batch-level
+            // dispatch flags and per-call write targets from that single pass — instead of the three
+            // separate `calls.iter()` passes this used to run, each re-doing a `ToolRegistry::get`
+            // (a HashMap lookup + `Arc` bump) for the same names ([T1-F8]). `current_tools` can't change
+            // mid-batch, so one snapshot per call is identical to looking each up three times.
+            let resolved: Vec<Option<Arc<dyn crate::tool::Tool>>> = calls
+                .iter()
+                .map(|(_, name, _)| current_tools.get(name))
+                .collect();
             // A call whose mutation scope can't be named (see `Tool::conservative_exclusive`, e.g. an
             // opaque `bash` command) still groups by its own `write_target` (`None`, so its own
             // `solo:` group) — grouping is unchanged — but its presence anywhere in the batch caps the
             // *group-level* concurrency below to 1, so it can't race a same-turn `edit`/`write` it has
             // no path to be grouped against.
-            let exclusive_turn = calls.iter().any(|(_, name, _)| {
-                current_tools
-                    .get(name)
-                    .is_some_and(|t| t.conservative_exclusive())
-            });
+            let exclusive_turn = resolved
+                .iter()
+                .any(|t| t.as_ref().is_some_and(|t| t.conservative_exclusive()));
             // Task #28 (pi-parity): any call naming a tool that opts into
             // `ToolExecutionMode::Sequential` routes the turn's *whole* batch through the fully-
             // interleaved gate→execute→finalize-per-call path below instead of this function's default
             // gate-the-batch-then-execute split — see `run_tool_calls_interleaved`'s own doc comment.
-            let sequential_execution_requested = calls.iter().any(|(_, name, _)| {
-                current_tools.get(name).and_then(|t| t.execution_mode())
+            let sequential_execution_requested = resolved.iter().any(|t| {
+                t.as_ref().and_then(|t| t.execution_mode())
                     == Some(crate::tool::ToolExecutionMode::Sequential)
             });
             let mut groups: HashMap<String, (Option<String>, Vec<usize>)> = HashMap::new();
-            for (i, (_, name, input)) in calls.iter().enumerate() {
-                let target = current_tools.get(name).and_then(|t| t.write_target(input));
-                let key = target
-                    .clone()
-                    .map(|path| format!("path:{path}"))
-                    .unwrap_or_else(|| format!("solo:{i}"));
+            for (i, (_, _name, input)) in calls.iter().enumerate() {
+                let target = resolved[i].as_ref().and_then(|t| t.write_target(input));
+                // Build the group key from a borrow of `target` — no `String` clone ([T1-F7]); the
+                // owned `target` then moves into the group's entry below.
+                let key = match target.as_deref() {
+                    Some(path) => format!("path:{path}"),
+                    None => format!("solo:{i}"),
+                };
                 groups
                     .entry(key)
                     .or_insert_with(|| (target, Vec::new()))
@@ -1511,7 +1522,6 @@ impl Agent {
                         }
                         outcomes[i] = Some(GateOutcome::Ready(coerced));
                     }
-                    let outcomes = Arc::new(outcomes);
 
                     // `None` until that call's group finishes (or phase 1 above resolved it directly); a slot
                     // left `None` after dispatch means cancellation aborted it before it ran, and
@@ -1544,14 +1554,32 @@ impl Agent {
                         let (res_tx, mut res_rx) =
                             futures::channel::mpsc::unbounded::<(usize, ToolCallResult)>();
                         let res_tx = &res_tx;
-                        let group_runs = groups.into_values().map(|(target, indices)| {
+                        // Partition each call's gated outcome into the single group that will execute
+                        // it — groups' index sets are disjoint and cover the whole batch — so the
+                        // coerced-arguments `Value` (a whole file body for a `write`/`edit`) is MOVED
+                        // into its group and consumed once, never deep-cloned per call out of a shared
+                        // `Arc` ([T1-F2]). Collected eagerly so the transient `&mut outcomes` borrow is
+                        // released before the group futures (which each own their slice) are built.
+                        let grouped: Vec<_> = groups
+                            .into_values()
+                            .map(|(target, indices)| {
+                                let slots: Vec<(usize, Option<GateOutcome>)> = indices
+                                    .into_iter()
+                                    .map(|i| (i, outcomes[i].take()))
+                                    .collect();
+                                (target, slots)
+                            })
+                            .collect();
+                        // One shared borrow of the registry for every group, instead of cloning the
+                        // whole `HashMap<String, Arc<dyn Tool>>` into each ([T1-F1]) — the groups only
+                        // ever look tools up by name, never mutate the registry.
+                        let current_tools = &current_tools;
+                        let group_runs = grouped.into_iter().map(|(target, slots)| {
                             let calls = &calls;
                             let prog_tx = prog_tx.clone();
                             let res_tx = res_tx.clone();
                             let cancel = cancel_ref.clone();
                             let write_locks = this.write_locks.clone();
-                            let outcomes = outcomes.clone();
-                            let current_tools = current_tools.clone();
                             async move {
                                 // Held for the group's whole serial run: extends the intra-turn grouping above
                                 // across turn and session boundaries, so a concurrently-running turn (or a
@@ -1570,14 +1598,14 @@ impl Agent {
                                     }
                                     None => None,
                                 };
-                                for i in indices {
+                                for (i, outcome) in slots {
                                     let (id, name, input) = &calls[i];
                                     // Per call: (text, images, is_error, terminate). Hooks rewrite the *text*
                                     // and error flag; images and the terminate hint pass through untouched.
                                     // The gate/coercion decision itself was already made, sequentially and in
                                     // call order, by phase 1 above — this only ever runs the tool (or replays
                                     // an already-immediate outcome) and the `after_tool_call` rewrite.
-                                    let result: ToolCallResult = match outcomes[i].clone() {
+                                    let result: ToolCallResult = match outcome {
                                         Some(GateOutcome::Immediate(result)) => result,
                                         Some(GateOutcome::Ready(coerced)) => {
                                             let progress = crate::tool::ToolProgress::new(
@@ -1760,7 +1788,7 @@ impl Agent {
                 terminate &= wants_terminate;
                 result_blocks.push(ContentBlock::ToolResult {
                     tool_use_id: id.clone(),
-                    content: cap_tool_result(content),
+                    content: cap_tool_result(content).into(),
                     is_error,
                     images,
                 });
@@ -2522,7 +2550,7 @@ impl Agent {
             .blocks
             .iter()
             .filter_map(|b| match b {
-                ContentBlock::Text { text, .. } => Some(text.as_str()),
+                ContentBlock::Text { text, .. } => Some(&**text),
                 _ => None,
             })
             .collect();
@@ -2548,7 +2576,7 @@ fn turn_text(turn: &Turn) -> String {
     turn.blocks
         .iter()
         .filter_map(|b| match b {
-            ContentBlock::Text { text, .. } => Some(text.as_str()),
+            ContentBlock::Text { text, .. } => Some(&**text),
             _ => None,
         })
         .collect()
@@ -2789,7 +2817,7 @@ fn repair_cancelled_dispatch(
             let (content, images, is_error, _) = resolve_tool_result(result);
             ContentBlock::ToolResult {
                 tool_use_id: id.clone(),
-                content,
+                content: content.into(),
                 is_error,
                 images,
             }
@@ -3283,7 +3311,9 @@ impl Accumulator {
                 self.declare(*index);
                 self.done.insert(
                     *index,
-                    Some(ContentBlock::RedactedThinking { data: data.clone() }),
+                    Some(ContentBlock::RedactedThinking {
+                        data: data.as_str().into(),
+                    }),
                 );
                 self.try_flush();
             }
@@ -3370,12 +3400,15 @@ impl Accumulator {
                     thought_signature,
                 })
             }
-            OpenBlock::Thinking(text, signature) => {
-                Some(ContentBlock::Thinking { text, signature })
-            }
-            OpenBlock::Text(text, id, phase) => {
-                (!text.is_empty()).then_some(ContentBlock::Text { text, id, phase })
-            }
+            OpenBlock::Thinking(text, signature) => Some(ContentBlock::Thinking {
+                text: text.into(),
+                signature,
+            }),
+            OpenBlock::Text(text, id, phase) => (!text.is_empty()).then(|| ContentBlock::Text {
+                text: text.into(),
+                id,
+                phase,
+            }),
         };
         self.done.insert(index, block);
         self.try_flush();
@@ -5799,8 +5832,8 @@ mod tests {
                     ..
                 },
             ) => {
-                assert_eq!((a.as_str(), ca.as_str()), ("a", "t1"));
-                assert_eq!((b.as_str(), cb.as_str()), ("b", "t2"));
+                assert_eq!((a.as_str(), ca.as_ref()), ("a", "t1"));
+                assert_eq!((b.as_str(), cb.as_ref()), ("b", "t2"));
             }
             other => panic!("expected two ordered tool_result messages, got {other:?}"),
         }
@@ -6005,7 +6038,7 @@ mod tests {
             .expect("call `a` must have a tool_result");
         assert_eq!(
             first,
-            ("first edit applied".to_string(), false),
+            ("first edit applied".into(), false),
             "the call that actually completed must keep its real result, not be rewritten as \
              cancelled: {:?}",
             results.content
@@ -6918,7 +6951,7 @@ mod tests {
                 is_error, content, ..
             } => {
                 assert!(!is_error);
-                assert_eq!(content, "seq-done");
+                assert_eq!(content.as_ref(), "seq-done");
             }
             other => {
                 panic!("expected a successful tool_result for the registered call, got {other:?}")
@@ -7035,7 +7068,7 @@ mod tests {
                 is_error, content, ..
             } => {
                 assert!(!is_error, "recovered call must not be treated as malformed");
-                assert_eq!(content, "hello wor");
+                assert_eq!(content.as_ref(), "hello wor");
             }
             other => panic!("expected a tool_result block, got {other:?}"),
         }
@@ -7518,7 +7551,7 @@ mod tests {
         assert!(
             matches!(
                 session.messages.last().map(|m| m.content.first()),
-                Some(Some(ContentBlock::Text { text, .. })) if text == "done despite the failed compaction"
+                Some(Some(ContentBlock::Text { text, .. })) if text.as_ref() == "done despite the failed compaction"
             ),
             "the run must reach the real turn, not just swallow the failure and stop: {:#?}",
             session.messages.last()
@@ -8212,8 +8245,8 @@ mod tests {
             panic!("expected the spliced summary message to be text");
         };
         assert_eq!(
-            spliced,
-            &format!(
+            spliced.as_ref(),
+            format!(
                 "{}\n\nCompacted from 12345 tokens\n\n{summary}",
                 compaction::SUMMARY_MARKER
             )
@@ -8957,14 +8990,14 @@ mod tests {
 
         match &session.messages[1].content[0] {
             ContentBlock::Thinking { text, signature } => {
-                assert_eq!(text, "reasoning…");
+                assert_eq!(text.as_ref(), "reasoning…");
                 assert_eq!(signature, "sig-xyz");
             }
             other => panic!("expected a thinking block first, got {other:?}"),
         }
         assert!(matches!(
             &session.messages[1].content[1],
-            ContentBlock::Text { text, .. } if text == "the answer"
+            ContentBlock::Text { text, .. } if text.as_ref() == "the answer"
         ));
     }
 
@@ -9004,7 +9037,8 @@ mod tests {
         match &session.messages[1].content[0] {
             ContentBlock::Thinking { text, signature } => {
                 assert_eq!(
-                    text, "partial reasoning, now complete",
+                    text.as_ref(),
+                    "partial reasoning, now complete",
                     "ThinkingFinal must replace whatever the accumulated deltas produced, not be \
                      ignored"
                 );
@@ -9241,7 +9275,7 @@ mod tests {
         assert_eq!(session.messages.len(), 4);
         assert!(matches!(
             &session.messages[2].content[0],
-            ContentBlock::Text { text, .. } if text == "now do the follow-up"
+            ContentBlock::Text { text, .. } if text.as_ref() == "now do the follow-up"
         ));
     }
 
@@ -9278,7 +9312,7 @@ mod tests {
         );
         assert!(matches!(
             &blocks[0],
-            ContentBlock::Text { text, .. } if text == "look at this"
+            ContentBlock::Text { text, .. } if text.as_ref() == "look at this"
         ));
         assert!(matches!(
             &blocks[1],
@@ -9319,7 +9353,7 @@ mod tests {
         assert!(matches!(blocks[0], ContentBlock::ToolResult { .. }));
         assert!(matches!(
             &blocks[1],
-            ContentBlock::Text { text, .. } if text == "also look at this"
+            ContentBlock::Text { text, .. } if text.as_ref() == "also look at this"
         ));
         assert!(matches!(
             &blocks[2],
@@ -9483,7 +9517,7 @@ mod tests {
         assert!(matches!(blocks[0], ContentBlock::ToolResult { .. }));
         assert!(matches!(
             &blocks[1],
-            ContentBlock::Text { text, .. } if text == "actually, also handle the edge case"
+            ContentBlock::Text { text, .. } if text.as_ref() == "actually, also handle the edge case"
         ));
     }
 
@@ -9614,7 +9648,7 @@ mod tests {
         assert!(matches!(blocks[0], ContentBlock::ToolResult { .. }));
         assert!(matches!(
             &blocks[1],
-            ContentBlock::Text { text, .. } if text == "also handle this"
+            ContentBlock::Text { text, .. } if text.as_ref() == "also handle this"
         ));
     }
 
@@ -9949,7 +9983,7 @@ mod tests {
                 .iter()
                 .any(|m| m.role == Role::User
                     && m.content.iter().any(
-                        |b| matches!(b, ContentBlock::Text { text, .. } if text == "don't lose me")
+                        |b| matches!(b, ContentBlock::Text { text, .. } if text.as_ref() == "don't lose me")
                     )),
             "the user's own prompt must already be present in the snapshot a 'crash' here would \
              leave behind: {messages_at_first_checkpoint:?}"
@@ -9987,7 +10021,7 @@ mod tests {
             .content
             .iter()
             .filter_map(|b| match b {
-                ContentBlock::Text { text, .. } => Some(text.as_str()),
+                ContentBlock::Text { text, .. } => Some(&**text),
                 _ => None,
             })
             .collect();
@@ -10164,7 +10198,7 @@ mod tests {
                 },
             ) => {
                 assert_eq!(fid, "f");
-                assert_eq!(fcontent, "fast-done");
+                assert_eq!(fcontent.as_ref(), "fast-done");
                 assert!(
                     !ferr,
                     "the call that actually finished must not be flagged an error"
@@ -10937,7 +10971,7 @@ mod tests {
             !*is_error,
             "the tool's own success must survive the panicking rewrite hook"
         );
-        assert_eq!(content, "hi", "got: {content}");
+        assert_eq!(content.as_ref(), "hi", "got: {content}");
     }
 
     #[tokio::test]
@@ -11309,7 +11343,7 @@ mod tests {
             _cancel: &CancellationToken,
         ) -> bool {
             let saw_it = tool_results.iter().any(
-                |b| matches!(b, ContentBlock::ToolResult { content, is_error, .. } if content == "pong" && !is_error),
+                |b| matches!(b, ContentBlock::ToolResult { content, is_error, .. } if content.as_ref() == "pong" && !is_error),
             );
             if saw_it {
                 self.saw_result
@@ -11406,7 +11440,7 @@ mod tests {
         ) -> Message {
             for block in &mut message.content {
                 if let ContentBlock::Text { text, .. } = block {
-                    *text = text.replace("secret-token-123", "[REDACTED]");
+                    *text = text.replace("secret-token-123", "[REDACTED]").into();
                 }
             }
             message
@@ -11432,7 +11466,7 @@ mod tests {
         let ContentBlock::Text { text, .. } = &session.messages.last().unwrap().content[0] else {
             panic!("expected a text block");
         };
-        assert_eq!(text, "here is the [REDACTED] you asked about");
+        assert_eq!(text.as_ref(), "here is the [REDACTED] you asked about");
         assert!(
             !text.contains("secret-token-123"),
             "the raw secret must not survive into the committed session: {text}"
@@ -11469,7 +11503,8 @@ mod tests {
             panic!("expected a text block");
         };
         assert_eq!(
-            text, "the real answer",
+            text.as_ref(),
+            "the real answer",
             "a panicking hook must fail open to the original, unredacted content"
         );
     }
@@ -11504,17 +11539,15 @@ mod tests {
         let ContentBlock::Text { text, .. } = &last.content[0] else {
             panic!("expected a text block");
         };
-        assert_eq!(text, "the real answer");
+        assert_eq!(text.as_ref(), "the real answer");
     }
 
     struct InjectsHeaderNote;
     #[async_trait]
     impl AgentHooks for InjectsHeaderNote {
         async fn before_provider_request(&self, req: &mut crate::transport::ModelRequest) {
-            req.system = Some(format!(
-                "{} [patched]",
-                req.system.clone().unwrap_or_default()
-            ));
+            req.system =
+                Some(format!("{} [patched]", req.system.as_deref().unwrap_or_default()).into());
         }
     }
 

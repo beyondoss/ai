@@ -272,7 +272,13 @@ pub fn is_deepseek_model(model: &str) -> bool {
 /// one on another host — see [`normalize_fireworks_p_separator`] and the MiniMax branch's own
 /// Fireworks-vs-Together disambiguation below for the two places that distinction actually matters.
 pub fn is_fireworks_model(m: &str) -> bool {
-    m.starts_with("accounts/fireworks/")
+    // Allocation-free, case-insensitive prefix check: callers on the hot path (`client.rs::stream`'s
+    // per-request host derivation, the capability chain) can pass the raw id without first cloning it
+    // into a lowercased `String` just to test this fixed lowercase prefix (finding T2-F2). Already-
+    // lowercased callers are unaffected — the prefix is ascii-lowercase, so the comparison is exact.
+    const PREFIX: &[u8] = b"accounts/fireworks/";
+    let bytes = m.as_bytes();
+    bytes.len() >= PREFIX.len() && bytes[..PREFIX.len()].eq_ignore_ascii_case(PREFIX)
 }
 
 /// Normalize Fireworks' "p"-for-"." version-separator spelling (`"glm-5p1"` → `"glm-5.1"`,
@@ -514,16 +520,29 @@ fn nvidia_caps(m: &str) -> Option<ModelCaps> {
 /// Fireworks ids [`crate::dialect::is_fireworks_anthropic_wire_model`] routes through the Anthropic
 /// dialect (pi's `fireworks.models.ts` sets `supportsCacheControlOnTools: false` on all of them).
 pub fn capabilities(model: &str) -> ModelCaps {
-    let mut caps = capabilities_impl(model);
-    if crate::dialect::is_fireworks_anthropic_wire_model(model) {
+    capabilities_lc(&model.to_ascii_lowercase())
+}
+
+/// [`capabilities`] with the id already ascii-lowercased once by the caller — the per-request
+/// capability chain (`capabilities_for_route*`) lowercases the model id exactly once at its public
+/// entry point and threads the `&str` down through every layer, rather than each layer re-lowercasing
+/// the same value into a fresh `String` (findings T2-F2, T2-F3).
+fn capabilities_lc(m: &str) -> ModelCaps {
+    let mut caps = capabilities_impl_lc(m);
+    // `is_fireworks_anthropic_wire_model` re-lowercases internally, so guard it behind the
+    // allocation-free `is_fireworks_model` prefix check (which it also requires): the overwhelming
+    // non-Fireworks common path then never touches it, and only a genuine Fireworks id pays that
+    // function's own lowercase. Logically identical to the original unconditional call, since
+    // `is_fireworks_anthropic_wire_model` already implies `is_fireworks_model`.
+    if is_fireworks_model(m) && crate::dialect::is_fireworks_anthropic_wire_model(m) {
         caps.supports_cache_control_on_tools = false;
     }
     caps
 }
 
-fn capabilities_impl(model: &str) -> ModelCaps {
+fn capabilities_impl_lc(m: &str) -> ModelCaps {
     use crate::transport::ReasoningEffort as RE;
-    let m = model.to_ascii_lowercase();
+    // `m` is already ascii-lowercased by the caller (`capabilities` / the route chain).
     // Fireworks spells its models' version separator as the letter "p", not "." (`"glm-5p1"`,
     // `"kimi-k2p6"` vs every other host's `"glm-5.1"`/`"kimi-k2.6"`) — normalized here, before
     // `family_id` extraction and every family branch below, so a Fireworks id matches the exact same
@@ -531,8 +550,10 @@ fn capabilities_impl(model: &str) -> ModelCaps {
     // "p"-spelled copy of each one. Scoped to ids carrying Fireworks' own distinctive
     // `"accounts/fireworks/"` path-shaped prefix (`is_fireworks_model`) so an unrelated id that happens
     // to contain a literal "p" between two digits for some other reason is never touched.
-    let m = if is_fireworks_model(&m) {
-        normalize_fireworks_p_separator(&m)
+    let normalized;
+    let m: &str = if is_fireworks_model(m) {
+        normalized = normalize_fireworks_p_separator(m);
+        &normalized
     } else {
         m
     };
@@ -555,7 +576,7 @@ fn capabilities_impl(model: &str) -> ModelCaps {
     // appear slug-prefixed — an unnecessary widening of what each of those branches matches.
     let family_id: &str = match m.rfind('/') {
         Some(idx) => &m[idx + 1..],
-        None => &m,
+        None => m,
     };
 
     // ---- Anthropic Claude (+ Fable, which speaks the Anthropic wire) ----
@@ -576,11 +597,7 @@ fn capabilities_impl(model: &str) -> ModelCaps {
         // doing it before family dispatch, which would corrupt an unrelated family's *meaningful* use
         // of `.` in its own version numbering (DeepSeek-V3.2, Kimi-K2.6, …).
         let is_vendor_slug = m.contains('/');
-        let base = if is_vendor_slug {
-            family_id
-        } else {
-            m.as_str()
-        };
+        let base = if is_vendor_slug { family_id } else { m };
         let is_dot_spelled = base.contains('.');
         let normalized = base.replace('.', "-");
         let m: &str = &normalized;
@@ -806,11 +823,7 @@ fn capabilities_impl(model: &str) -> ModelCaps {
         || family_id.starts_with("o4");
     if is_o_series {
         let is_vendor_slug = m.contains('/');
-        let m: &str = if is_vendor_slug {
-            family_id
-        } else {
-            m.as_str()
-        };
+        let m: &str = if is_vendor_slug { family_id } else { m };
         let caps = ModelCaps {
             context_window: 200_000,
             max_output: 100_000,
@@ -852,11 +865,7 @@ fn capabilities_impl(model: &str) -> ModelCaps {
     // prefix check below keeps working unmodified against a slug-prefixed id too.
     if m.starts_with("gpt-5") || family_id.starts_with("gpt-5") {
         let is_vendor_slug = m.contains('/');
-        let m: &str = if is_vendor_slug {
-            family_id
-        } else {
-            m.as_str()
-        };
+        let m: &str = if is_vendor_slug { family_id } else { m };
         // The narrower "-chat-latest" variants share the family name but cap at the older
         // chat-completions ceiling (128k/16384), not the reasoning-model one, and aren't uniformly
         // `reasoning_effort`-driven — treat them like a non-reasoning chat model. Two of the four
@@ -987,11 +996,7 @@ fn capabilities_impl(model: &str) -> ModelCaps {
     // comment above.
     if m.starts_with("gpt-4") || family_id.starts_with("gpt-4") {
         let is_vendor_slug = m.contains('/');
-        let m: &str = if is_vendor_slug {
-            family_id
-        } else {
-            m.as_str()
-        };
+        let m: &str = if is_vendor_slug { family_id } else { m };
         // 4.1 shipped a ~1M-token context window, a full step up from the rest of the family.
         if m.starts_with("gpt-4.1") {
             // pi-parity (models/dialects pass): OpenRouter's own vendor-slug "openai/gpt-4.1" reports a
@@ -1151,7 +1156,7 @@ fn capabilities_impl(model: &str) -> ModelCaps {
     // `supportsReasoningEffort: false` on every current id regardless of its own `reasoning: true/false`
     // flag (the same "reasons internally, no client-steerable toggle" shape this table already gives
     // xAI/Grok) — so no NVIDIA id gets a thinking/reasoning mechanism here, matching that.
-    if let Some(caps) = nvidia_caps(&m) {
+    if let Some(caps) = nvidia_caps(m) {
         return caps;
     }
 
@@ -1171,7 +1176,7 @@ fn capabilities_impl(model: &str) -> ModelCaps {
         // differently-prefixed id sharing the same bare suffix (e.g. OpenRouter's
         // `"deepseek/deepseek-r1"` is a different full string entirely), so this is a safe exact-id
         // override, not a family-level default.
-        if let Some((context_window, max_output)) = match m.as_str() {
+        if let Some((context_window, max_output)) = match m {
             "deepseek-ai/deepseek-r1" => Some((64_000, 32_768)),
             "deepseek-ai/deepseek-r1-0528" => Some((163_840, 163_840)),
             "deepseek-ai/deepseek-v3.2" => Some((163_840, 65_536)),
@@ -1253,11 +1258,7 @@ fn capabilities_impl(model: &str) -> ModelCaps {
     if m.starts_with("mimo") || family_id.starts_with("mimo") {
         // Keyed on whether `m` is slug-shaped at all — same reasoning as the MiniMax/GLM/Kimi branches.
         let is_vendor_slug = m.contains('/');
-        let k = if is_vendor_slug {
-            family_id
-        } else {
-            m.as_str()
-        };
+        let k = if is_vendor_slug { family_id } else { m };
         let (context_window, max_output, supports_vision) = if k == "mimo-v2-flash" {
             // HuggingFace's own "XiaomiMiMo/MiMo-V2-Flash" has a much smaller real `maxTokens` (4_096)
             // than the native (bare, unprefixed) id's 65_536 — an id-suffix collision `family_id`
@@ -1360,8 +1361,8 @@ fn capabilities_impl(model: &str) -> ModelCaps {
     // different, non-OpenAI-shaped API); every Mistral id is routed through the generic OpenAI Chat
     // Completions dialect instead — see `dialect::openai::build_body`'s Mistral-specific tool-call-id
     // reshaping and `reasoning_wire_override` below for the two wire-shape adjustments that gap needs.
-    if is_mistral_id(&m) {
-        let (context_window, max_output, reasoning_effort, supports_vision) = match m.as_str() {
+    if is_mistral_id(m) {
+        let (context_window, max_output, reasoning_effort, supports_vision) = match m {
             "codestral-latest" => (256_000, 4_096, false, false),
             "devstral-2512" => (262_144, 262_144, false, false),
             "devstral-latest" => (262_144, 262_144, false, false),
@@ -1431,11 +1432,7 @@ fn capabilities_impl(model: &str) -> ModelCaps {
         // Keyed on whether `m` is slug-shaped at all (not on which disjunct above matched) — same
         // reasoning as the MiniMax branch below, applied uniformly even though no current GLM org
         // slug happens to collide with the literal prefix "glm" the way MiniMax's does.
-        let g = if m.contains('/') {
-            family_id
-        } else {
-            m.as_str()
-        };
+        let g = if m.contains('/') { family_id } else { m };
         let (context_window, max_output, reasoning_effort) = if g.starts_with("glm-5.2") {
             // pi-parity Task #15: Together's and HuggingFace's own vendor-slug "zai-org/GLM-5.2"
             // (`together.models.ts:363`, `huggingface.models.ts:853`) both report a real context of
@@ -1557,11 +1554,7 @@ fn capabilities_impl(model: &str) -> ModelCaps {
     if m.starts_with("kimi") || family_id.starts_with("kimi") || m == "k2p7" {
         // Keyed on whether `m` is slug-shaped at all — same reasoning as the MiniMax/GLM branches.
         let is_vendor_slug = m.contains('/');
-        let k = if is_vendor_slug {
-            family_id
-        } else {
-            m.as_str()
-        };
+        let k = if is_vendor_slug { family_id } else { m };
         // Kimi-Coding (`api.kimi.com/coding`, pi's `kimi-coding.models.ts`) hosts three ids with a much
         // smaller real `maxTokens` (32_768) than this bucket's generic 262_144 default: its own "k2p7"
         // alias and "kimi-for-coding" (neither collides with any moonshotai-native id at all), plus
@@ -1676,11 +1669,7 @@ fn capabilities_impl(model: &str) -> ModelCaps {
     // comment above.
     if m.starts_with("grok") || family_id.starts_with("grok") {
         let is_vendor_slug = m.contains('/');
-        let g = if is_vendor_slug {
-            family_id
-        } else {
-            m.as_str()
-        };
+        let g = if is_vendor_slug { family_id } else { m };
         let (context_window, max_output, supports_vision) = if g == "grok-3" || g == "grok-3-fast" {
             (131_072, 8_192, false)
         } else if g.starts_with("grok-code-fast") {
@@ -1747,11 +1736,7 @@ fn capabilities_impl(model: &str) -> ModelCaps {
         // disjunct above matched: `m.starts_with("minimax")` is *already* (coincidentally) true for
         // "minimaxai/minimax-m3" itself, so selecting on that would silently keep matching the raw,
         // slug-prefixed `m` below instead of the real suffix `family_id` isolated it to.
-        let mm = if m.contains('/') {
-            family_id
-        } else {
-            m.as_str()
-        };
+        let mm = if m.contains('/') { family_id } else { m };
         let (context_window, max_output, supports_vision) = if mm.starts_with("minimax-m3") {
             // Fireworks' own "MiniMax-M3" (`accounts/fireworks/models/minimax-m3`) reduces to this
             // identical `family_id` suffix as Together's/HuggingFace's/native's own same-named ids —
@@ -1776,7 +1761,7 @@ fn capabilities_impl(model: &str) -> ModelCaps {
             // shares it (the established "smaller number wins" tie-break — see `nvidia_caps`'s own doc
             // comment). This `else` tuple is only still reachable for the bare native id (no vendor
             // slug at all, so `nvidia_caps`'s exact-string match never fires).
-            if is_fireworks_model(&m) {
+            if is_fireworks_model(m) {
                 (512_000, 512_000, false)
             } else {
                 (1_000_000, 128_000, true)
@@ -1896,11 +1881,7 @@ fn capabilities_impl(model: &str) -> ModelCaps {
                 supports_cache_control_on_tools: true,
             };
         }
-        let q = if m.contains('/') {
-            family_id
-        } else {
-            m.as_str()
-        };
+        let q = if m.contains('/') { family_id } else { m };
         // pi-parity pass 20 Task 1: these 6 ids are OpenRouter's own `"qwen/…"` vendor-slug entries
         // (`openrouter.models.ts`), each colliding on `family_id`'s shared suffix `q` with a Together
         // id `together_match` below already covers under a genuinely different (and, for every one of
@@ -1908,8 +1889,7 @@ fn capabilities_impl(model: &str) -> ModelCaps {
         // Together's own numbers for these same suffixes are unaffected. `openai_reasoning_format:
         // OpenRouter` (not `Together`) — OpenRouter's real `compat.thinkingFormat`, a nested
         // `reasoning:{effort}` shape, distinct from Together's own nested `reasoning:{enabled}` toggle.
-        if let Some((context_window, max_output, supports_vision, is_reasoning)) = match m.as_str()
-        {
+        if let Some((context_window, max_output, supports_vision, is_reasoning)) = match m {
             // 32_768 → 4_096: an 8x over-report (Together's own real max_output for this suffix is
             // 130_000; HuggingFace's identical vendor-slug id is 32_768 — already the shared bucket's
             // pick below — but OpenRouter's own real number is smaller still).
@@ -2458,7 +2438,7 @@ fn capabilities_impl(model: &str) -> ModelCaps {
     // `supportsReasoningEffort` override ⇒ permissive default) — only context/max_output/vision differ
     // per id.
     if m == "auto" || m == "openrouter/free" || m == "openrouter/fusion" {
-        let (context_window, max_output, supports_vision) = match m.as_str() {
+        let (context_window, max_output, supports_vision) = match m {
             "auto" => (2_000_000, 30_000, true),
             "openrouter/free" => (200_000, 4_096, true),
             _ => (1_000_000, 30_000, false),
@@ -2492,7 +2472,7 @@ fn capabilities_impl(model: &str) -> ModelCaps {
     // OpenRouter one) — distinct from the "auto"/"openrouter/free"/"openrouter/fusion" trio just above,
     // which genuinely are OpenRouter-shaped. None of the three are vision-capable (`input: ["text"]`).
     if m == "big-pickle" || m == "nemotron-3-ultra-free" || m == "north-mini-code-free" {
-        let (context_window, max_output) = match m.as_str() {
+        let (context_window, max_output) = match m {
             "big-pickle" => (200_000, 32_000),
             "nemotron-3-ultra-free" => (1_000_000, 128_000),
             _ => (256_000, 64_000),
@@ -2550,7 +2530,7 @@ fn capabilities_impl(model: &str) -> ModelCaps {
     }
 
     tracing::warn!(
-        model,
+        model = m,
         "unrecognized model id; falling back to conservative capabilities"
     );
     ModelCaps::unknown()
@@ -2608,9 +2588,15 @@ pub use providers::ProviderId as AggregatorHost;
 /// model `String`, never a `ModelRequest`, so there's no `is_codex`/`is_azure` in scope to thread
 /// through there.
 pub fn capabilities_for_route(model: &str, is_codex: bool, is_azure: bool) -> ModelCaps {
-    let mut caps = capabilities(model);
-    let m = model.to_ascii_lowercase();
-    match m.as_str() {
+    capabilities_for_route_lc(&model.to_ascii_lowercase(), is_codex, is_azure)
+}
+
+/// [`capabilities_for_route`] with the id already ascii-lowercased once by the caller — every layer of
+/// the route chain (`_with_copilot`, `_with_host`) delegates to its own `_lc` variant, so the id is
+/// lowercased exactly once per request rather than once per layer (findings T2-F2, T2-F3).
+fn capabilities_for_route_lc(m: &str, is_codex: bool, is_azure: bool) -> ModelCaps {
+    let mut caps = capabilities_lc(m);
+    match m {
         "gpt-5.3-codex-spark" if is_codex => {
             caps.max_output = 128_000;
             caps.supports_vision = false;
@@ -2633,7 +2619,7 @@ pub fn capabilities_for_route(model: &str, is_codex: bool, is_azure: bool) -> Mo
         "gpt-5.4-nano",
         "gpt-5.5",
     ];
-    if (is_codex || is_azure) && NOT_DISABLEABLE_OFF_NATIVE_ROUTE.contains(&m.as_str()) {
+    if (is_codex || is_azure) && NOT_DISABLEABLE_OFF_NATIVE_ROUTE.contains(&m) {
         caps.reasoning_disableable = false;
     }
     caps
@@ -2664,12 +2650,26 @@ pub fn capabilities_for_route_with_copilot(
     is_azure: bool,
     is_copilot: bool,
 ) -> ModelCaps {
-    let mut caps = capabilities_for_route(model, is_codex, is_azure);
+    capabilities_for_route_with_copilot_lc(
+        &model.to_ascii_lowercase(),
+        is_codex,
+        is_azure,
+        is_copilot,
+    )
+}
+
+/// [`capabilities_for_route_with_copilot`] with the id already ascii-lowercased once by the caller.
+fn capabilities_for_route_with_copilot_lc(
+    m: &str,
+    is_codex: bool,
+    is_azure: bool,
+    is_copilot: bool,
+) -> ModelCaps {
+    let mut caps = capabilities_for_route_lc(m, is_codex, is_azure);
     if !is_copilot {
         return caps;
     }
-    let m = model.to_ascii_lowercase();
-    match m.as_str() {
+    match m {
         "gpt-4.1" => {
             caps.context_window = 128_000;
             caps.max_output = 16_384;
@@ -2732,8 +2732,8 @@ pub fn capabilities_for_route_with_host(
     is_copilot: bool,
     host: Option<AggregatorHost>,
 ) -> ModelCaps {
-    let mut caps = capabilities_for_route_with_copilot(model, is_codex, is_azure, is_copilot);
     let m = model.to_ascii_lowercase();
+    let mut caps = capabilities_for_route_with_copilot_lc(&m, is_codex, is_azure, is_copilot);
     match (host, m.as_str()) {
         (Some(AggregatorHost::HuggingFace), "qwen/qwen3-235b-a22b-thinking-2507") => {
             caps.max_output = 131_072;

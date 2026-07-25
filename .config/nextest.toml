@@ -1,0 +1,19 @@
+# nextest configuration. The `ci` profile is what CI runs (`--profile ci`); `default` covers local runs.
+
+[profile.default]
+# Print a "SLOW" line once a test crosses 60s so slow tests are visible without failing anyone.
+slow-timeout = { period = "60s" }
+fail-fast = false
+
+[profile.ci]
+# The important one: after a test has been SLOW for 3 periods (60s × 3 = 180s) with no result, nextest
+# TERMINATES it and reports it as a timeout failure — by name. A deadlocked/hung test therefore fails
+# the job in ~3 minutes with the culprit identified, instead of wedging the whole run until GitHub's
+# 6-hour ceiling (which is exactly what happened before this split). 180s is comfortably above any
+# legitimate test here (the slowest are large-file reads and process-spawn tests, all seconds).
+slow-timeout = { period = "60s", terminate-after = 3 }
+# One retry absorbs a genuine one-off timing blip on a shared runner without reding the PR; a test that
+# fails (or hangs) on *every* attempt still fails, and nextest prints the retried test's name either
+# way — so a flaky hang is surfaced, not silently masked.
+retries = 1
+fail-fast = false

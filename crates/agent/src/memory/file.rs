@@ -184,6 +184,9 @@ impl FileBackend {
             Err(e) if e.kind() == ErrorKind::NotFound => return Ok(()),
             Err(e) => return Err(MemoryError::Backend(e.to_string())),
         };
+        // The base dir is invariant for this walk; resolve it once (a clone / short read lock) rather
+        // than per directory entry.
+        let base = self.dir();
         for entry in entries.flatten() {
             let name = entry.file_name();
             let name = name.to_string_lossy();
@@ -192,7 +195,7 @@ impl FileBackend {
                 continue;
             }
             let real = entry.path();
-            let Ok(logical) = real.strip_prefix(self.dir()) else {
+            let Ok(logical) = real.strip_prefix(&base) else {
                 continue;
             };
             let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
@@ -401,21 +404,24 @@ impl MemoryBackend for FileBackend {
         let dir = self.dir();
         let entries = self.listing(&dir)?;
         let mut hits = Vec::new();
+        // The logical-root prefix is the same for every entry; build it once.
+        let prefix = format!("{}/", self.root);
+        // Reused across every line of every file so the case-insensitive test allocates once, not per line.
+        let mut lower = String::new();
         for entry in entries {
             if entry.is_dir {
                 continue;
             }
             // Re-derive the real path from the logical one.
-            let rel = entry
-                .path
-                .strip_prefix(&format!("{}/", self.root))
-                .unwrap_or(&entry.path);
+            let rel = entry.path.strip_prefix(&prefix).unwrap_or(&entry.path);
             let real = dir.join(rel);
             let Ok(text) = fs::read_to_string(&real) else {
                 continue;
             };
             for (i, line) in text.lines().enumerate() {
-                if line.to_lowercase().contains(&needle) {
+                lower.clear();
+                lower.extend(line.chars().flat_map(char::to_lowercase));
+                if lower.contains(&needle) {
                     hits.push(Hit {
                         path: entry.path.clone(),
                         line: i + 1,

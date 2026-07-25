@@ -21,7 +21,9 @@ use std::process::Command;
 use std::sync::OnceLock;
 
 use agent_core::Tool;
-use beyond_ai_agent::tools::{edit, find, grep, ls, read};
+use beyond_ai_agent::session_store::{SessionMeta, search_sessions};
+use beyond_ai_agent::tools::exec::{CommandRunner, RealRunner};
+use beyond_ai_agent::tools::{edit, find, grep, ls, output, read};
 use divan::Bencher;
 use globset::Glob;
 use tempfile::TempDir;
@@ -244,6 +246,41 @@ fn edit_run_exact_ascii(bencher: Bencher) {
     });
 }
 
+/// `edit`'s whole `run` over a **large (~4 MB) pure-LF ASCII** file — the case M11 targets. A file
+/// this size is where copying the entire body, building a 4×-file-size `Vec<u32>` offset map, and
+/// re-validating UTF-8 on every edit actually hurt (the doc cites ~73 ms on 4 MB). With no `\r` in the
+/// file the post-change path borrows the body and splices with raw offsets, skipping the copy + map +
+/// validation entirely — watch the alloc bytes and time collapse here. Includes the `fs::write` of the
+/// subject on both sides, so the delta is the CPU/alloc the edit itself no longer spends.
+#[divan::bench(sample_count = 20)]
+fn edit_run_large_lf(bencher: Bencher) {
+    const LARGE_LF_LINES: usize = 75_000; // ~4 MB at ~56 bytes/line
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("large.rs");
+    let mut src = String::with_capacity(LARGE_LF_LINES * 56);
+    for i in 0..LARGE_LF_LINES {
+        src.push_str(&format!("    let x_{i} = compute(i, {i}) + adjust();\n"));
+    }
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    let tool = edit::Edit::new(dir.path());
+    let p = path.to_str().unwrap().to_string();
+    let mut n = 0usize;
+    bencher.bench_local(|| {
+        std::fs::write(&path, &src).unwrap();
+        n += 1;
+        let out = rt
+            .block_on(tool.run(serde_json::json!({
+                "path": p,
+                "old_string": "    let x_37500 = compute(i, 37500) + adjust();",
+                "new_string": format!("    let x_37500 = compute(i, 37500) + adjust(); // {n}"),
+            })))
+            .unwrap();
+        black_box(out.text.len());
+    });
+}
+
 /// The same `run`, but over a file carrying a few non-ASCII characters, so it takes the general
 /// Unicode normalizer. Kept beside `edit_run_exact_ascii` as the guard rail: the ASCII fast path must
 /// not have *regressed* the path that still needs full NFKC.
@@ -270,6 +307,59 @@ fn edit_run_exact_unicode(bencher: Bencher) {
             })))
             .unwrap();
         black_box(out.text.len());
+    });
+}
+
+/// `OutputAccumulator::snapshot` on a still-running (unfinished) command whose rolling tail is
+/// saturated at `2 × max_bytes` — the ~100 ms live progress tick `bash` emits. `snapshot_text` used to
+/// decode the *whole* tail before `truncate_tail` discarded the front half; now a live tick decodes
+/// only the trailing window. On-thread with `persist_if_truncated = false`, so there's no temp-file
+/// I/O — the alloc columns are purely the decode + truncate cost. Watch alloc bytes drop by ~half.
+#[divan::bench]
+fn snapshot_live_tick(bencher: Bencher) {
+    let mut acc = output::OutputAccumulator::new();
+    // Well past the rolling cap so the tail is saturated and `truncate_tail` really does drop the
+    // front. Appended in a few big chunks (not per-line) to keep setup's spill writes cheap.
+    let mut block: Vec<u8> = Vec::with_capacity(40 * 1024);
+    while block.len() < 40 * 1024 {
+        block.extend_from_slice(b"some ordinary line of streamed command output goes here\n");
+    }
+    for _ in 0..8 {
+        acc.append(&block); // ~320 KiB total, tail saturates at 2 × 50 KiB
+    }
+    bencher.bench_local(|| {
+        let snap = acc.snapshot(false); // unfinished → live-tick windowed decode
+        black_box(snap.content.len());
+    });
+}
+
+/// A streaming `bash`-style command emitting well past the ≤256 KiB head/tail capture window, with a
+/// no-op live sink. The streaming path now skips the discarded `Capture` + `from_utf8_lossy` entirely,
+/// so the alloc columns should shed the head/tail buffers and the two output strings. Time is
+/// subprocess-spawn dominated (noisy); the alloc delta is the signal, not ns/iter.
+#[divan::bench(sample_count = 20)]
+fn exec_stream_capture(bencher: Bencher) {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let runner = RealRunner;
+    let sink: &(dyn Fn(&[u8]) + Send + Sync) = &|_chunk: &[u8]| {};
+    let args = [
+        "-c".to_string(),
+        "head -c 400000 /dev/zero | tr '\\0' a".to_string(),
+    ];
+    bencher.bench_local(|| {
+        let res = rt
+            .block_on(runner.run_streaming(
+                "sh",
+                &args,
+                None,
+                std::time::Duration::from_secs(30),
+                sink,
+            ))
+            .unwrap();
+        black_box(res.stdout.len());
     });
 }
 
@@ -302,6 +392,55 @@ fn ls_dir(bencher: Bencher) {
             .unwrap();
         black_box(out.text.len());
     });
+}
+
+// ---------------------------------------------------------------------------------------------
+// `search_rank` (session_store): case-insensitive substring match of one query against N sessions,
+// each carrying a ~50 KB `search_text` corpus. The worst case is a query that matches *nothing*,
+// because ranking then has to scan every field of every session — including the full 50 KB
+// `search_text` — before giving up. The old code did `field.to_lowercase()` per field (a fresh
+// 50 KB allocation per session, discarded), so this bench's alloc column is the whole point: it is
+// exactly the allocate-and-throw-away that the allocation-free scan removes.
+// ---------------------------------------------------------------------------------------------
+
+const SEARCH_TEXT_BYTES: usize = 50_000;
+/// A query no field contains — forces the full scan of every session's 50 KB corpus.
+const NO_MATCH_QUERY: &str = "zqxj_never_present_needle";
+
+/// `n` sessions, each with a ~50 KB mixed-case `search_text` that does **not** contain
+/// [`NO_MATCH_QUERY`] — the realistic large-history worst case for `search_rank`.
+fn session_corpus(n: usize) -> Vec<SessionMeta> {
+    // Mixed case on purpose: the case-insensitive scan must lowercase-compare every byte, so upper
+    // case in the haystack is part of the work under test.
+    let unit = "The function threads its Result alias through the call site and re-exports IT. ";
+    let mut text = String::with_capacity(SEARCH_TEXT_BYTES + unit.len());
+    while text.len() < SEARCH_TEXT_BYTES {
+        text.push_str(unit);
+    }
+    (0..n)
+        .map(|i| {
+            let mut m = SessionMeta::new(format!("/home/user/project_{i}"), "claude-sonnet-5");
+            m.preview = Some("looking at the parser module".to_string());
+            m.search_text = text.clone();
+            m.updated_at = 1_700_000_000 + i as u64;
+            m
+        })
+        .collect()
+}
+
+/// One search query over `n` sessions. The corpus is cloned per sample via `with_inputs` (untimed),
+/// so the measured region is exactly `search_sessions` → `search_rank` × n, and the alloc columns
+/// report allocs/query + bytes/query: `n` discarded 50 KB lowercased copies before the fix, ~none
+/// after. Non-matching query = every field of every session is scanned to the end (worst case).
+#[divan::bench(args = [20, 200], sample_count = 20)]
+fn search_rank(bencher: Bencher, n: usize) {
+    let corpus = session_corpus(n);
+    bencher
+        .with_inputs(|| corpus.clone())
+        .bench_local_values(|sessions| {
+            let out = search_sessions(sessions, Some(NO_MATCH_QUERY));
+            black_box(out.len())
+        });
 }
 
 /// Our in-process find (fd's `ignore` walk). Sequential — parallelizing regressed on this tree (its

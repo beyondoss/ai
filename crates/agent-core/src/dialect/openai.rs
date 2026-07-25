@@ -15,9 +15,7 @@ use serde_json::{Map, Value, json};
 
 use super::StreamDecoder;
 use crate::error::{Error, Result};
-use crate::message::{
-    ContentBlock, ImageSource, Message, Role, StopReason, StreamEvent, TokenUsage,
-};
+use crate::message::{ContentBlock, ImageSource, Role, StopReason, StreamEvent, TokenUsage};
 use crate::transport::{ModelRequest, ToolChoice};
 
 /// Whether `model` is a Xiaomi/MiMo id — mirrors `models::capabilities`'s own `"mimo"` branch id-match
@@ -38,28 +36,6 @@ fn is_mimo_model(model: &str) -> bool {
     m.starts_with("mimo") || family_id.starts_with("mimo")
 }
 
-/// This assistant turn's reasoning text and the wire field name to replay it under, if it carried a
-/// `Thinking` block with a non-empty `signature` (the decoder only ever produces one — see
-/// `Decoder::reasoning_field`; multiple blocks would be joined, matching the reference agent). `None`
-/// when there's no thinking to replay, or its signature is empty (never captured with a field to
-/// replay it on, so nowhere safe to put it).
-fn assistant_reasoning(content: &[ContentBlock]) -> Option<(&str, String)> {
-    let mut field: Option<&str> = None;
-    let mut text = String::new();
-    for b in content {
-        if let ContentBlock::Thinking { text: t, signature } = b {
-            if field.is_none() && !signature.is_empty() {
-                field = Some(signature.as_str());
-            }
-            if !text.is_empty() {
-                text.push('\n');
-            }
-            text.push_str(t);
-        }
-    }
-    field.map(|f| (f, text))
-}
-
 /// OpenAI's `prompt_cache_key` cap — a key longer than this is rejected by the API. Shared with the
 /// Responses dialect (`super::openai_responses`), which has the identical limit.
 pub(super) const PROMPT_CACHE_KEY_MAX_LEN: usize = 64;
@@ -74,31 +50,11 @@ pub(super) fn clamp_prompt_cache_key(key: &str) -> &str {
     }
 }
 
-/// This assistant turn's OpenAI Chat Completions `reasoning_details` replay array — one entry per
-/// `ToolUse` block that carries `thought_signature` (Gemini-style opaque reasoning-continuity data;
-/// see `ContentBlock::ToolUse`'s doc comment), in content order. `None` when no tool call in this turn
-/// carries one, or every entry present fails to parse back as JSON — matches pi's own
-/// `.filter(Boolean)` after `JSON.parse` (`openai-completions.ts`): a corrupted signature is silently
-/// dropped from the replay rather than sent malformed.
-fn assistant_reasoning_details(content: &[ContentBlock]) -> Option<Vec<Value>> {
-    let details: Vec<Value> = content
-        .iter()
-        .filter_map(|b| match b {
-            ContentBlock::ToolUse {
-                thought_signature: Some(sig),
-                ..
-            } => serde_json::from_str::<Value>(sig).ok(),
-            _ => None,
-        })
-        .collect();
-    (!details.is_empty()).then_some(details)
-}
-
 fn text_of(blocks: &[ContentBlock]) -> String {
     blocks
         .iter()
         .filter_map(|b| match b {
-            ContentBlock::Text { text, .. } => Some(text.as_str()),
+            ContentBlock::Text { text, .. } => Some(&**text),
             _ => None,
         })
         .collect()
@@ -176,21 +132,6 @@ fn user_content(blocks: &[ContentBlock], supports_vision: bool) -> Option<Value>
         }
     }
     (!parts.is_empty()).then_some(Value::Array(parts))
-}
-
-/// True if any earlier turn in the conversation already carries a tool call or its result — an
-/// assistant `ToolUse` block or a `ToolResult` block (always on a `User` turn in this crate's
-/// internal shape). Matches pi's `hasToolHistory` (`openai-completions.ts`), which drives the same
-/// `tools: []` fallback below.
-fn has_tool_history(messages: &[Message]) -> bool {
-    messages.iter().any(|m| {
-        m.content.iter().any(|b| {
-            matches!(
-                b,
-                ContentBlock::ToolUse { .. } | ContentBlock::ToolResult { .. }
-            )
-        })
-    })
 }
 
 /// Mistral's real API validates `tool_call_id`/tool-call `id` strictly: exactly
@@ -336,9 +277,14 @@ pub fn build_body(req: &ModelRequest) -> Value {
     // entry per source message, so this is a lower-bound hint, not an exact count — still avoids most
     // of the reallocations a `Vec::new()` start would otherwise pay as the common (1:1) case fills in.
     let mut messages: Vec<Value> = Vec::with_capacity(req.messages.len() + 1);
-    if let Some(system) = &req.system {
+    if let Some(system) = req.system.as_deref() {
         messages.push(json!({ "role": instruction_role, "content": system }));
     }
+
+    // Tracks whether the history carries any tool call or result, set inline as tool blocks are
+    // visited below — replaces `has_tool_history`'s separate full O(history) rescan on the no-tools
+    // fallback path (see [T3-F9]).
+    let mut saw_tool_history = false;
 
     for m in req.messages.iter() {
         match m.role {
@@ -372,6 +318,7 @@ pub fn build_body(req: &ModelRequest) -> Value {
                         ..
                     } = b
                     {
+                        saw_tool_history = true;
                         // An image-only result (no text) still needs *some* string in `content` — the
                         // Chat Completions `tool` role requires a string, and pi's own
                         // `convertMessages` defaults to this exact placeholder rather than sending an
@@ -380,7 +327,7 @@ pub fn build_body(req: &ModelRequest) -> Value {
                         let tool_text: &str = if content.is_empty() && !images.is_empty() {
                             TOOL_RESULT_IMAGE_ONLY_TEXT
                         } else {
-                            content.as_str()
+                            content
                         };
                         // Defense-in-depth: if this id's paired `tool_use` was rewritten (below) because
                         // it came from a foreign model, replay the *rewritten* id here so the two still
@@ -438,19 +385,46 @@ pub fn build_body(req: &ModelRequest) -> Value {
                 }
             }
             Role::Assistant => {
-                let text = text_of(&m.content);
-                let tool_calls: Vec<Value> = m
-                    .content
-                    .iter()
-                    .filter_map(|b| match b {
-                        ContentBlock::ToolUse { id, name, input, .. } => {
-                            // Defense-in-depth: an id from a message produced by a *different* model
-                            // than `req.model` gets cross-model-normalized first (see
-                            // `normalize_cross_model_tool_id`'s own doc comment), *before* any
-                            // Mistral-specific reshaping below — the two compose correctly regardless
-                            // of order since `MistralToolCallIdNormalizer` maps consistently off
-                            // whatever string it's actually given, not the original raw id.
-                            let is_foreign = m.model_id.as_deref() != Some(req.model.as_str());
+                // One pass over the turn's blocks (was 4 separate walks — `text_of`, the `tool_calls`
+                // filter_map, `assistant_reasoning`, `assistant_reasoning_details`; see [T3-F7]).
+                // `is_foreign` is a per-message property (an id from a message produced by a *different*
+                // model than `req.model` gets cross-model-normalized first — see
+                // `normalize_cross_model_tool_id`'s own doc comment — *before* any Mistral-specific
+                // reshaping, which compose correctly regardless of order since
+                // `MistralToolCallIdNormalizer` maps consistently off whatever string it's given), so
+                // it's hoisted out of the block loop.
+                let is_foreign = m.model_id.as_deref() != Some(req.model.as_str());
+                let mut text = String::new();
+                let mut tool_calls: Vec<Value> = Vec::new();
+                // First non-empty `Thinking` signature is the wire field this turn's reasoning replays
+                // under (see `Decoder::reasoning_field`); `reasoning_text` is every `Thinking` block's
+                // text joined by '\n'. `None` when no signed thinking block is present — matching the
+                // old `assistant_reasoning` returning `None` (an empty-signature-only turn replays
+                // nothing, and falls through to the DeepSeek/MiMo backfill below).
+                let mut reasoning_field: Option<&str> = None;
+                let mut reasoning_text = String::new();
+                // One entry per `ToolUse` carrying a JSON-parseable `thought_signature`, in content
+                // order — a corrupted (non-JSON) one is silently dropped, matching pi's `.filter(Boolean)`.
+                let mut reasoning_details: Vec<Value> = Vec::new();
+                for b in &m.content {
+                    match b {
+                        ContentBlock::Text { text: t, .. } => text.push_str(t),
+                        ContentBlock::Thinking { text: t, signature } => {
+                            if reasoning_field.is_none() && !signature.is_empty() {
+                                reasoning_field = Some(signature.as_str());
+                            }
+                            if !reasoning_text.is_empty() {
+                                reasoning_text.push('\n');
+                            }
+                            reasoning_text.push_str(t);
+                        }
+                        ContentBlock::ToolUse {
+                            id,
+                            name,
+                            input,
+                            thought_signature,
+                        } => {
+                            saw_tool_history = true;
                             let normalized = if is_foreign {
                                 normalize_cross_model_tool_id(id)
                             } else {
@@ -459,18 +433,23 @@ pub fn build_body(req: &ModelRequest) -> Value {
                             if is_foreign && &normalized != id {
                                 cross_model_tool_id_remap.insert(id.clone(), normalized.clone());
                             }
-                            Some(json!({
+                            tool_calls.push(json!({
                                 "id": normalize_mistral_tool_id(&mut mistral_ids, &normalized),
                                 "type": "function",
                                 "function": {
                                     "name": name,
                                     "arguments": serde_json::to_string(input).unwrap_or_else(|_| "{}".into()),
                                 },
-                            }))
+                            }));
+                            if let Some(sig) = thought_signature {
+                                if let Ok(detail) = serde_json::from_str::<Value>(sig) {
+                                    reasoning_details.push(detail);
+                                }
+                            }
                         }
-                        _ => None,
-                    })
-                    .collect();
+                        _ => {}
+                    }
+                }
                 let mut msg = Map::new();
                 msg.insert("role".into(), json!("assistant"));
                 msg.insert(
@@ -487,8 +466,8 @@ pub fn build_body(req: &ModelRequest) -> Value {
                 // Replay a prior reasoning turn under the exact field name the decoder captured it
                 // from (see `Decoder::reasoning_field`) — different endpoints only accept it back on
                 // that one field.
-                if let Some((field, text)) = assistant_reasoning(&m.content) {
-                    msg.insert(field.to_string(), json!(text));
+                if let Some(field) = reasoning_field {
+                    msg.insert(field.to_string(), json!(reasoning_text));
                 } else if caps.reasoning_effort
                     && (crate::models::is_deepseek_model(&req.model) || is_mimo_model(&req.model))
                 {
@@ -507,8 +486,8 @@ pub fn build_body(req: &ModelRequest) -> Value {
                 // under the wire's own array shape — one entry per call that carries one, in content
                 // order, matching pi's own replay (`openai-completions.ts`'s `reasoning_details`
                 // assembly).
-                if let Some(details) = assistant_reasoning_details(&m.content) {
-                    msg.insert("reasoning_details".into(), Value::Array(details));
+                if !reasoning_details.is_empty() {
+                    msg.insert("reasoning_details".into(), Value::Array(reasoning_details));
                 }
                 messages.push(Value::Object(msg));
             }
@@ -598,7 +577,7 @@ pub fn build_body(req: &ModelRequest) -> Value {
         if caps.supports_tool_stream {
             map.insert("tool_stream".into(), json!(true));
         }
-    } else if has_tool_history(&req.messages) {
+    } else if saw_tool_history {
         // pi-parity fix: no tools are registered *this* turn (e.g. the caller toggled tools off
         // mid-session, or ran `--no-tools` on a follow-up), but the conversation already contains
         // `tool_calls`/`tool` messages from an earlier one. Anthropic (reached through an
@@ -1701,7 +1680,7 @@ mod tests {
             "gpt-4o",
             vec![Message::tool_results(vec![ContentBlock::ToolResult {
                 tool_use_id: "call_1".into(),
-                content: String::new(),
+                content: String::new().into(),
                 is_error: false,
                 images: vec![ImageSource::base64("image/png", "AAAA")],
             }])],

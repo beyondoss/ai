@@ -387,6 +387,7 @@ dependencies = [
  "base64",
  "beyond-ai-agent-core",
  "beyond-ai-providers",
+ "bytes",
  "clap",
  "divan",
  "futures",

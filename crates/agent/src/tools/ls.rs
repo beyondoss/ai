@@ -98,7 +98,7 @@ impl Tool for Ls {
 
     async fn run(&self, input: Value) -> Result<ToolOutput, ToolError> {
         let path = input.get("path").and_then(Value::as_str).unwrap_or(".");
-        let path = &super::resolve_against(&self.root, path);
+        let path = super::resolve_against(&self.root, path);
         let all = input.get("all").and_then(Value::as_bool).unwrap_or(false);
         let limit = input
             .get("limit")
@@ -106,7 +106,15 @@ impl Tool for Ls {
             .map(|n| n as usize)
             .unwrap_or(DEFAULT_LIMIT);
 
-        // Sort by the bare name, not the display string (which gets a trailing `/` for directories) —
+        // `read_dir` plus a `metadata` stat for every entry are blocking syscalls; on a wide directory
+        // (thousands of entries) that is real, unbounded work that would pin the `current_thread`
+        // runtime a `serve` session runs on — the `tool_reactor_stall` tests assert it must not, the
+        // same way `read`/`edit`/`write`/`exec` already run their filesystem I/O off the reactor. Hand
+        // the whole synchronous listing (read_dir + per-entry stat + sort + render) to `spawn_blocking`.
+        tokio::task::spawn_blocking(move || -> Result<ToolOutput, ToolError> {
+            let path = path.as_str();
+
+            // Sort by the bare name, not the display string (which gets a trailing `/` for directories) —
         // comparing display strings inverts order for sibling names sharing a prefix (e.g. "src" vs
         // "src-old": '-' sorts below '/' byte-wise, so "src-old/" would sort before "src/"). The
         // display suffix is appended only after sorting, matching the reference agent's own two-step
@@ -198,19 +206,6 @@ impl Tool for Ls {
                 .cmp(a_dir)
                 .then_with(|| a_key.cmp(b_key).then_with(|| a_name.cmp(b_name)))
         });
-        let mut entries: Vec<String> = entries
-            .into_iter()
-            .map(|(name, is_dir, _key)| {
-                // Built with room for the trailing `/` so a directory entry doesn't allocate a second
-                // String beyond this one.
-                let mut display = String::with_capacity(name.len() + usize::from(is_dir));
-                display.push_str(&name);
-                if is_dir {
-                    display.push('/');
-                }
-                display
-            })
-            .collect();
         if entries.is_empty() {
             return Ok("(empty directory)".into());
         }
@@ -225,7 +220,24 @@ impl Tool for Ls {
         if count_truncated {
             entries.truncate(limit);
         }
-        let mut out = entries.join("\n");
+        // Render the sorted (and truncated) entries straight into `out` — the `\n`-joined bare names,
+        // each directory suffixed with `/` — instead of collecting an intermediate `Vec<String>` of
+        // display strings and joining it. Pre-sized to the exact byte length (names + one separator or
+        // trailing `/` per entry) so the buffer never reallocates.
+        let cap = entries
+            .iter()
+            .map(|(name, _, _)| name.len() + 1)
+            .sum::<usize>();
+        let mut out = String::with_capacity(cap);
+        for (i, (name, is_dir, _key)) in entries.iter().enumerate() {
+            if i > 0 {
+                out.push('\n');
+            }
+            out.push_str(name);
+            if *is_dir {
+                out.push('/');
+            }
+        }
         if needs_marker {
             out.push('\n');
         }
@@ -262,6 +274,9 @@ impl Tool for Ls {
             out.push_str(&super::output::marker(notices.join(". ")));
         }
         Ok(out.into())
+        })
+        .await
+        .map_err(|e| ToolError::Execution(format!("ls: background task failed: {e}")))?
     }
 }
 

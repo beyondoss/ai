@@ -21,7 +21,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use agent_core::{Agent, GatewayClient, Session, StreamEvent, Tool};
-use beyond_ai_agent::gateway_credential::{GatewayCredential, resolve_gateway_credential};
+use beyond_ai_agent::gateway_credential::{
+    GatewayCredential, resolve_gateway_credential_and_headers,
+};
 use beyond_ai_agent::policy::ToolPolicy;
 use beyond_ai_agent::session_store::{
     SessionMeta, SessionRepo, SessionStore, canonical_cwd, default_session_dir, fork_by_arg,
@@ -98,21 +100,6 @@ fn resolve_thinking_budget_overrides(
     (!map.is_empty()).then_some(map)
 }
 
-/// The extra per-request headers a `models.json` override configures for this model id, if any (Task
-/// #11 pi-parity feature) — resolved via `settings::ModelOverride::resolved_headers` and merged onto
-/// the gateway client via `GatewayClient::with_extra_headers`. A separate lookup from
-/// `resolve_gateway_credential` (which only ever returns a bearer-token-shaped credential): `headers`
-/// is a client-level concern (merged onto every request regardless of dialect/routing), not a
-/// `CredentialSource` one, and applies independently of whether the same override also names a
-/// `base_url` — a header-only override (Azure's `api-key:` header, a custom proxy header) still routes
-/// through the gateway as usual, just with these headers merged on top.
-fn model_override_extra_headers(model: &str) -> std::collections::HashMap<String, String> {
-    beyond_ai_agent::settings::ModelOverrides::open_default()
-        .get(model)
-        .map(|over| over.resolved_headers())
-        .unwrap_or_default()
-}
-
 fn unknown_provider_error(provider: &str) -> String {
     format!(
         "unknown provider {provider:?}; expected one of: anthropic, github-copilot, openai-codex"
@@ -136,7 +123,10 @@ fn build_run_gateway_client(
     retry_max_backoff_ms: Option<u64>,
     idle_timeout_ms: Option<u64>,
 ) -> Result<GatewayClient, String> {
-    let credential = resolve_gateway_credential(raw_key, model, provider_env)?;
+    // One `models.json` parse feeds both the credential and the extra headers (T9-F3) — see
+    // `resolve_gateway_credential_and_headers`.
+    let (credential, extra_headers) =
+        resolve_gateway_credential_and_headers(raw_key, model, provider_env)?;
     let mut client = match credential {
         GatewayCredential::Static(key) => {
             GatewayClient::new(gateway.to_string(), key).map_err(|e| e.to_string())?
@@ -152,7 +142,7 @@ fn build_run_gateway_client(
             .map(std::time::Duration::from_millis)
             .unwrap_or(agent_core::client::BASE_BACKOFF),
     )
-    .with_extra_headers(model_override_extra_headers(model));
+    .with_extra_headers(extra_headers);
     if let Some(ms) = retry_max_backoff_ms {
         client = client.with_max_backoff(std::time::Duration::from_millis(ms));
     }
@@ -3440,7 +3430,10 @@ async fn run_task(
     // Captured before the shadowing below turns `key` into a resolved `GatewayCredential` — the
     // subagent factory needs the *raw* key to re-resolve for a child model (credentials are model-keyed).
     let raw_gateway_key = key.clone();
-    let key = resolve_gateway_credential(key, &model, &provider_env)?;
+    // One `models.json` parse feeds both the credential and the `with_extra_headers` call far below
+    // (T9-F3) — captured here rather than re-parsing the file a second time at the header site.
+    let (key, model_extra_headers) =
+        resolve_gateway_credential_and_headers(key, &model, &provider_env)?;
     // Task #29 (pi-parity fix): whether the operator explicitly requested a specific reasoning depth
     // for *this* invocation — an explicit `--reasoning-effort` flag, or a `--model <pattern>:<level>`
     // suffix (`model_thinking_level`, including `:off`) — as opposed to neither ever being given at
@@ -3989,8 +3982,9 @@ async fn run_task(
     )
     // Task #11 (pi-parity feature): a `models.json` override's `headers` (if any) merged onto every
     // outgoing request via the generic `with_extra_headers` mechanism — harmless (a no-op) when no
-    // override configured any, since an empty map is also `GatewayClient::new`'s own default.
-    .with_extra_headers(model_override_extra_headers(&model));
+    // override configured any, since an empty map is also `GatewayClient::new`'s own default. Resolved
+    // together with the credential above from a single `models.json` parse (T9-F3).
+    .with_extra_headers(model_extra_headers);
     // Task #30 (pi-parity feature): `with_max_backoff` previously had no CLI flag or persisted override
     // reaching it at all, unlike its two siblings (`retry_max_retries`/`retry_base_delay_ms`) above —
     // see `agent_core::client::GatewayClient::with_max_backoff`'s own doc comment.
@@ -5148,7 +5142,7 @@ mod tests {
         let decoded = image::load_from_memory(
             &base64::Engine::decode(
                 &base64::engine::general_purpose::STANDARD,
-                &out.images[0].data,
+                &*out.images[0].data,
             )
             .unwrap(),
         )

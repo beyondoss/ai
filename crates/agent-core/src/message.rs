@@ -7,6 +7,8 @@
 //! The vocabulary leans Anthropic (content blocks, `tool_use`/`tool_result`) because that's the
 //! default dialect for Claude; the OpenAI adapter folds its flatter shape into these blocks.
 
+use std::sync::Arc;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -31,7 +33,12 @@ pub enum ContentBlock {
     /// OpenAI's own docs say dropping it on replay measurably degrades those models. See
     /// `dialect::openai_responses::push_assistant_content`.
     Text {
-        text: String,
+        // `Arc<str>` (not `String`): this large immutable payload is deep-cloned by
+        // `Session::push`/`scrub`'s `Arc::make_mut` once per turn while an in-flight `ModelRequest`
+        // shares the history — as `Arc<str>` that per-message clone is a refcount bump, not a byte
+        // copy (M8/[T4-F8]). Serde `rc` keeps the derive; it still (de)serializes as a plain JSON
+        // string, so on-disk/wire format is byte-identical.
+        text: Arc<str>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -41,13 +48,16 @@ pub enum ContentBlock {
     /// the `signature` is load-bearing — Anthropic rejects a later tool turn whose prior thinking block
     /// is missing or unsigned, so the loop must replay the block verbatim (see the dialect's `build_body`).
     Thinking {
+        // `Arc<str>`: large immutable payload, deep-cloned per turn by `make_mut` — see `Text.text`.
+        // `signature` stays `String` (small, and simplest).
         #[serde(rename = "thinking")]
-        text: String,
+        text: Arc<str>,
         signature: String,
     },
     /// Encrypted thinking the provider chose not to expose in clear text. Opaque; replayed verbatim so
     /// the model keeps its reasoning continuity across turns.
-    RedactedThinking { data: String },
+    // `Arc<str>`: large immutable payload, deep-cloned per turn by `make_mut` — see `Text.text`.
+    RedactedThinking { data: Arc<str> },
     /// The model's request to invoke a tool. `input` is the (already-complete) JSON arguments
     /// object; during streaming it's assembled from `StreamEvent::InputJsonDelta` fragments.
     ToolUse {
@@ -72,7 +82,9 @@ pub enum ContentBlock {
     /// text-only result, and `skip`ped on the wire/disk so existing sessions round-trip unchanged.
     ToolResult {
         tool_use_id: String,
-        content: String,
+        // `Arc<str>`: a tool result is often a multi-KB `read`/`bash`/`grep` body — the dominant
+        // per-message payload deep-cloned per turn by `make_mut` — see `Text.text`.
+        content: Arc<str>,
         #[serde(default)]
         is_error: bool,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -86,7 +98,7 @@ pub enum ContentBlock {
 impl ContentBlock {
     /// A plain text block with no replay metadata — the common case for every dialect but OpenAI
     /// Responses (see `Text`'s doc comment).
-    pub fn text(text: impl Into<String>) -> Self {
+    pub fn text(text: impl Into<Arc<str>>) -> Self {
         ContentBlock::Text {
             text: text.into(),
             id: None,
@@ -115,12 +127,14 @@ pub struct ImageSource {
     /// MIME type, e.g. `image/png`.
     pub media_type: String,
     /// Base64-encoded image bytes.
-    pub data: String,
+    // `Arc<str>`: the single biggest immutable payload a message carries (a screenshot / `read` on an
+    // image) — deep-cloned per turn by `make_mut` — see `ContentBlock::Text.text` (M8/[T4-F8]).
+    pub data: Arc<str>,
 }
 
 impl ImageSource {
     /// A base64 image of the given media type.
-    pub fn base64(media_type: impl Into<String>, data: impl Into<String>) -> Self {
+    pub fn base64(media_type: impl Into<String>, data: impl Into<Arc<str>>) -> Self {
         Self {
             kind: "base64".into(),
             media_type: media_type.into(),
@@ -194,7 +208,7 @@ fn is_false(b: &bool) -> bool {
 
 impl Message {
     /// A user turn carrying a single text block.
-    pub fn user(text: impl Into<String>) -> Self {
+    pub fn user(text: impl Into<Arc<str>>) -> Self {
         Self {
             role: Role::User,
             content: vec![ContentBlock::text(text)],
@@ -239,9 +253,9 @@ impl Message {
 
     /// A user turn carrying text plus image attachments. The text block (if any) comes first, then
     /// one `Image` block per source — the multimodal prompt shape both wire dialects expect.
-    pub fn user_with_images(text: impl Into<String>, images: Vec<ImageSource>) -> Self {
+    pub fn user_with_images(text: impl Into<Arc<str>>, images: Vec<ImageSource>) -> Self {
         let mut content = Vec::with_capacity(images.len() + 1);
-        let text = text.into();
+        let text: Arc<str> = text.into();
         if !text.is_empty() {
             content.push(ContentBlock::text(text));
         }
@@ -262,7 +276,7 @@ impl Message {
     /// A user turn carrying one tool result (how a tool's output is returned to the model).
     pub fn tool_result(
         tool_use_id: impl Into<String>,
-        content: impl Into<String>,
+        content: impl Into<Arc<str>>,
         is_error: bool,
     ) -> Self {
         Self {
@@ -539,6 +553,39 @@ mod tests {
                 images: Vec::new(),
             }
         );
+    }
+
+    #[test]
+    fn arc_str_payloads_serialize_as_plain_json_strings_byte_identical() {
+        // The M8/[T4-F8] change made `Text.text`, `Thinking.text`, `RedactedThinking.data`,
+        // `ToolResult.content`, and `ImageSource.data` `Arc<str>` instead of `String`. An `Arc<str>`
+        // must (de)serialize as an ordinary JSON string — no `{"$serde_rc":…}` wrapper, no change to
+        // the on-disk/wire shape — so existing sessions round-trip byte-identically. This pins that:
+        // an assistant message carrying every changed payload serializes to the exact JSON an older
+        // (`String`-typed) build produced, and deserializes back unchanged.
+        let msg = Message::assistant(vec![
+            ContentBlock::text("hello"),
+            ContentBlock::Thinking {
+                text: "reasoning".into(),
+                signature: "sig".to_string(),
+            },
+            ContentBlock::RedactedThinking { data: "enc".into() },
+            ContentBlock::ToolResult {
+                tool_use_id: "tu_1".to_string(),
+                content: "result body".into(),
+                is_error: false,
+                images: vec![ImageSource::base64("image/png", "aGVsbG8=")],
+            },
+        ]);
+        let json = serde_json::to_string(&msg).unwrap();
+        // Each `Arc<str>` payload is a bare JSON string — the same bytes a `String` field emits.
+        assert_eq!(
+            json,
+            r#"{"role":"assistant","content":[{"type":"text","text":"hello"},{"type":"thinking","thinking":"reasoning","signature":"sig"},{"type":"redacted_thinking","data":"enc"},{"type":"tool_result","tool_use_id":"tu_1","content":"result body","is_error":false,"images":[{"type":"base64","media_type":"image/png","data":"aGVsbG8="}]}]}"#
+        );
+        // And a document written by an older `String`-typed build (identical shape) deserializes back.
+        let back: Message = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, msg);
     }
 
     #[test]

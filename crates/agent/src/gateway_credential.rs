@@ -264,6 +264,39 @@ pub fn resolve_gateway_credential_with_identity(
     )
 }
 
+/// Resolve `model`'s gateway credential AND its extra per-request headers from a SINGLE parse of
+/// `models.json` (T9-F2/F3). A client build needs both — the credential (which routing/auth) and any
+/// `ModelOverride::headers` merged onto every request via `GatewayClient::with_extra_headers` — and
+/// they come from the same on-disk override row. Resolving them separately — `resolve_gateway_credential`
+/// alongside a standalone `ModelOverrides::open_default().get(model).resolved_headers()` — re-opened and
+/// re-parsed `models.json` a second time microseconds later, once per client build (per subagent spawn,
+/// per `run` start). This parses it once and feeds the one `ModelOverrides` to both.
+///
+/// `auth.json` is still read fresh here (via `AuthStore::open_default`) rather than from a longer-lived
+/// snapshot: a token refresh rewrites it mid-run, and a stale snapshot would misroute — so the
+/// deduplication is deliberately scoped to the per-build `models.json` double-parse, not a
+/// process-lifetime cache of either file.
+pub fn resolve_gateway_credential_and_headers(
+    key: Option<String>,
+    model: &str,
+    env: &ProviderEnv,
+) -> Result<(GatewayCredential, std::collections::HashMap<String, String>), String> {
+    let overrides = crate::settings::ModelOverrides::open_default();
+    let (credential, _identity) = resolve_with(
+        key,
+        model,
+        env,
+        &crate::auth_store::AuthStore::open_default(),
+        crate::auth_store::default_path(),
+        &overrides,
+    )?;
+    let headers = overrides
+        .get(model)
+        .map(|over| over.resolved_headers())
+        .unwrap_or_default();
+    Ok((credential, headers))
+}
+
 /// [`resolve_gateway_credential_with_identity`] with its two `$HOME`-dependent inputs — the stored-OAuth
 /// credentials and `models.json` — passed in rather than read from disk.
 ///
@@ -652,6 +685,7 @@ fn resolve_with(
                             store_path: store_path.clone(),
                             enterprise_url: c.enterprise_url.clone(),
                             path,
+                            cached_routing: std::sync::Mutex::new(None),
                         },
                     )),
                     identity,

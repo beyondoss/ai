@@ -31,7 +31,12 @@ memchr = "2"
 # let `Dialect::for_model_via_provider` know an OpenRouter-served `anthropic/claude-…` is an *OpenAI*-wire
 # request. Same rows the gateway routes on, so the two can't disagree. Zero-dependency, in-workspace.
 providers = { package = "beyond-ai-providers", path = "../providers" }
-serde.workspace = true
+# `rc` enables `#[derive(Serialize, Deserialize)]` for the `Arc<str>` payloads on `ContentBlock` /
+# `ImageSource` (M8/[T4-F8]). An `Arc<str>` still (de)serializes as a plain JSON string — each block
+# deserializes its payload into its own allocation, so the on-disk/wire format is byte-identical; the
+# feature's only caveat (Arc *sharing* isn't preserved across (de)serialization) is irrelevant here
+# since every block owns its own payload.
+serde = { workspace = true, features = ["rc"] }
 serde_json.workspace = true
 thiserror.workspace = true
 # Was dev-only (the loop itself pulled in no executor — see the crate/`write_lock.rs` doc comments).
@@ -99,9 +104,33 @@ bench-mimalloc = []
 name = "decode"
 harness = false
 
+# Per-tool-call dispatch hot path (M9/M10): `coerce_tool_arguments` over a large `write` argument, plus
+# faithful replicas of the coerced-`Value` outcome clone and the per-group registry clone the audit's
+# `[T1-F2]`/`[T1-F1]` findings target. `AllocProfiler` makes the per-call file-body copies visible.
+[[bench]]
+name = "dispatch"
+harness = false
+
+# End-of-turn `Session::push` onto a history the in-flight `ModelRequest` still shares (M8/[T4-F8]):
+# `Arc::make_mut` deep-clones the whole history once per turn. Measures the deep-clone cost (allocs +
+# bytes + ns) before/after the large `ContentBlock` payloads become `Arc<str>`. `AllocProfiler` makes
+# the per-turn byte copies visible.
+[[bench]]
+name = "session_push"
+harness = false
+
 # Concurrency-scaling probe for the decode path (allocator-contention evidence gate). A separate
 # target because it must run on the *plain* system allocator — divan's `AllocProfiler` (in the sibling
 # `decode` bench) adds global atomic counters that would manufacture the contention it measures.
 [[bench]]
 name = "decode_concurrent"
+harness = false
+
+# Codex WebSocket delta-transport per-turn work: the fingerprint + wire-body-build path and the
+# inbound-frame parse. `codex_websocket`'s target functions are module-private (it's a transport, not
+# a library surface), so — like `agent`'s `serve_events` bench for `serve`'s private `event_frame` —
+# this measures a faithful replica of each clone pattern (before vs after) against the public
+# `serde_json::Value` shape, honest without widening the module's API just to bench it.
+[[bench]]
+name = "codex_ws"
 harness = false

@@ -194,7 +194,7 @@ async fn second_turn_on_the_same_session_sends_only_the_new_delta() {
     let history = vec![
         Message::user("hi"),
         Message::assistant(vec![ContentBlock::Text {
-            text: "hi there".to_string(),
+            text: "hi there".to_string().into(),
             id: Some("msg_1".to_string()),
             phase: None,
         }]),

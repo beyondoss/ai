@@ -320,129 +320,142 @@ impl Tool for Read {
             .unwrap_or(DEFAULT_LIMIT)
             .max(1);
 
-        // Stream the file line-by-line rather than slurping it whole: a windowed read
-        // (`offset`/`limit`) into a huge file shouldn't allocate the entire file first — we hold at
-        // most one line plus the bounded output window.
-        let file = std::fs::File::open(&path)
-            .map_err(|e| ToolError::Execution(format!("read {path}: {e}")))?;
-        let mut reader = BufReader::new(file);
+        // The whole text read — open, the streaming line loop, and the post-truncation total-line
+        // drain — is blocking file I/O plus a potentially long line-by-line scan of a large/slow
+        // file. Run it off the async runtime's worker (same pattern as the image path above and
+        // `grep`/`find`/`edit`) so a serve_ws per-session current-thread runtime isn't pinned for
+        // the read's whole duration.
+        let path_for_task = path.clone();
+        tokio::task::spawn_blocking(move || read_text_windowed(&path_for_task, offset, limit))
+            .await
+            .map_err(|e| ToolError::Execution(format!("read task failed: {e}")))?
+    }
+}
 
-        // A rough per-line estimate (line-number prefix + a typical source line), capped by the same
-        // byte ceiling the loop below enforces anyway — avoids paying for several `String`
-        // grow-and-copy steps on a large `limit` without ever over-allocating past what the output
-        // could actually reach.
-        let mut out = String::with_capacity((limit.saturating_mul(48)).min(MAX_OUTPUT_BYTES));
-        let mut lineno = 0usize;
-        let mut shown = 0usize;
-        let mut truncated = false;
-        let mut has_invalid_utf8 = false;
-        let mut line: Vec<u8> = Vec::new();
+/// The blocking text read: open `path`, stream it line-by-line into a bounded `offset`/`limit` window,
+/// and, on truncation, drain the rest to count the file's true total line count. Runs on a
+/// `spawn_blocking` worker (see the call site in [`Read::run`]) since it is synchronous file I/O plus a
+/// potentially long scan of a large/slow file — it must not run inline on an async worker thread.
+fn read_text_windowed(path: &str, offset: usize, limit: usize) -> Result<ToolOutput, ToolError> {
+    // Stream the file line-by-line rather than slurping it whole: a windowed read (`offset`/`limit`)
+    // into a huge file shouldn't allocate the entire file first — we hold at most one line plus the
+    // bounded output window.
+    let file =
+        std::fs::File::open(path).map_err(|e| ToolError::Execution(format!("read {path}: {e}")))?;
+    let mut reader = BufReader::new(file);
+
+    // A rough per-line estimate (line-number prefix + a typical source line), capped by the same byte
+    // ceiling the loop below enforces anyway — avoids paying for several `String` grow-and-copy steps
+    // on a large `limit` without ever over-allocating past what the output could actually reach.
+    let mut out = String::with_capacity((limit.saturating_mul(48)).min(MAX_OUTPUT_BYTES));
+    let mut lineno = 0usize;
+    let mut shown = 0usize;
+    let mut truncated = false;
+    let mut has_invalid_utf8 = false;
+    let mut line: Vec<u8> = Vec::new();
+    loop {
+        let (n, line_clipped) = read_line_capped(&mut reader, &mut line, MAX_LINE_BYTES)
+            .map_err(|e| ToolError::Execution(format!("read {path}: {e}")))?;
+        if n == 0 {
+            break; // EOF
+        }
+        lineno += 1;
+        if lineno < offset {
+            continue; // skipped lines are still drained, so memory stays bounded
+        }
+        // Stop before showing this line if we've hit the line limit or the byte budget; either way
+        // `lineno` is the first *un*shown line, so it's exactly the offset to continue from.
+        if shown >= limit || out.len() >= MAX_OUTPUT_BYTES {
+            truncated = true;
+            break;
+        }
+        // `read_line_capped` already stripped the trailing `\n`; strip a `\r` too. A capped line may
+        // end mid-codepoint, so decode lossily rather than erroring on the split byte.
+        let kept = line.strip_suffix(b"\r").unwrap_or(&line);
+        let text = match std::str::from_utf8(kept) {
+            Ok(s) => std::borrow::Cow::Borrowed(s),
+            Err(e) => {
+                // A clipped line can legitimately end mid-codepoint — our own cap splitting a
+                // multi-byte sequence, not a sign the file itself is non-UTF-8. Only treat it as the
+                // latter when the invalid bytes start well before the end (more than one UTF-8
+                // sequence's worth), or the line wasn't clipped at all so there's no cap-related
+                // excuse. `edit` requires strictly valid UTF-8 and will refuse a file flagged here, so
+                // the model needs to know *why* if it later can't edit it.
+                let split_by_our_clip = line_clipped && kept.len() - e.valid_up_to() <= 3;
+                if !split_by_our_clip {
+                    has_invalid_utf8 = true;
+                }
+                String::from_utf8_lossy(kept)
+            }
+        };
+        // Write straight into `out` instead of allocating a `format!` temp String per line — a
+        // windowed read of a large file did one heap allocation for every line shown. `writeln!` into a
+        // `String` can't fail, so the `Result` is discarded.
+        let _ = if line_clipped {
+            writeln!(out, "{lineno:>6}\t{text}… [line truncated]")
+        } else {
+            writeln!(out, "{lineno:>6}\t{text}")
+        };
+        shown += 1;
+    }
+
+    if lineno == 0 {
+        return Ok("(empty file)".into());
+    }
+    // An offset past the last line returns nothing useful — say so explicitly rather than handing back
+    // a blank result the model can't interpret.
+    //
+    // `lineno` (and every "N lines total" this tool reports) counts real content lines only, via
+    // `read_line_capped`'s own line-at-a-time scan — a file ending `"a\nb\nc\n"` reports 3, the same as
+    // `"a\nb\nc"` with no trailing newline. This is a deliberate divergence from pi's own `read.ts`,
+    // which counts `textContent.split("\n").length`: in JS, `"a\nb\nc\n".split("\n")` yields 4 elements
+    // (a trailing empty string for the newline), so pi reports one *more* line than the file actually
+    // has whenever it ends with a newline, but the correct count when it doesn't — an inconsistency,
+    // not a convention worth matching. Every other line-oriented tool here (`grep`, editors, `wc -l`)
+    // already treats "N lines" as "N newline-terminated-or-final content lines," so keeping that same,
+    // trailing-newline-independent count is the more correct and more consistent choice, not a parity
+    // gap.
+    if offset > lineno {
+        return Err(ToolError::InvalidInput(format!(
+            "offset {offset} is beyond end of file ({lineno} lines total)"
+        )));
+    }
+    if truncated {
+        let last = offset + shown - 1;
+        // `lineno` right now is the first not-yet-shown line — already consumed from the reader (so
+        // it's exactly the right `offset` to continue from), but not counted towards `shown` or written
+        // to `out`. Save it before the drain below overwrites `lineno` with the file's true total.
+        let continue_offset = lineno;
+        // pi's own truncation message (`read.ts`) includes the file's true total line count ("Showing
+        // lines X-Y of {totalFileLines}"); without it the model has no idea how much more content is
+        // left. We stream and stop at the truncation point by design (see this function's own doc
+        // comment on `MAX_LINE_BYTES`/streaming), so getting that total means reading the rest of the
+        // file here — but only a cheap, bounded byte scan via `read_line_capped`, the same streaming
+        // line counter already used above: no line is stored or decoded, only counted, and reusing it
+        // keeps this total consistent with `lineno`'s own "real content lines" convention (see the
+        // comment above on `offset > lineno`) rather than a raw `\n` byte count that would double-count
+        // that same trailing-newline edge case.
         loop {
-            let (n, line_clipped) = read_line_capped(&mut reader, &mut line, MAX_LINE_BYTES)
+            let (n, _clipped) = read_line_capped(&mut reader, &mut line, MAX_LINE_BYTES)
                 .map_err(|e| ToolError::Execution(format!("read {path}: {e}")))?;
             if n == 0 {
                 break; // EOF
             }
             lineno += 1;
-            if lineno < offset {
-                continue; // skipped lines are still drained, so memory stays bounded
-            }
-            // Stop before showing this line if we've hit the line limit or the byte budget; either way
-            // `lineno` is the first *un*shown line, so it's exactly the offset to continue from.
-            if shown >= limit || out.len() >= MAX_OUTPUT_BYTES {
-                truncated = true;
-                break;
-            }
-            // `read_line_capped` already stripped the trailing `\n`; strip a `\r` too. A capped line
-            // may end mid-codepoint, so decode lossily rather than erroring on the split byte.
-            let kept = line.strip_suffix(b"\r").unwrap_or(&line);
-            let text = match std::str::from_utf8(kept) {
-                Ok(s) => std::borrow::Cow::Borrowed(s),
-                Err(e) => {
-                    // A clipped line can legitimately end mid-codepoint — our own cap splitting a
-                    // multi-byte sequence, not a sign the file itself is non-UTF-8. Only treat it as
-                    // the latter when the invalid bytes start well before the end (more than one
-                    // UTF-8 sequence's worth), or the line wasn't clipped at all so there's no
-                    // cap-related excuse. `edit` requires strictly valid UTF-8 and will refuse a file
-                    // flagged here, so the model needs to know *why* if it later can't edit it.
-                    let split_by_our_clip = line_clipped && kept.len() - e.valid_up_to() <= 3;
-                    if !split_by_our_clip {
-                        has_invalid_utf8 = true;
-                    }
-                    String::from_utf8_lossy(kept)
-                }
-            };
-            // Write straight into `out` instead of allocating a `format!` temp String per line — a
-            // windowed read of a large file did one heap allocation for every line shown. `writeln!`
-            // into a `String` can't fail, so the `Result` is discarded.
-            let _ = if line_clipped {
-                writeln!(out, "{lineno:>6}\t{text}… [line truncated]")
-            } else {
-                writeln!(out, "{lineno:>6}\t{text}")
-            };
-            shown += 1;
         }
-
-        if lineno == 0 {
-            return Ok("(empty file)".into());
-        }
-        // An offset past the last line returns nothing useful — say so explicitly rather than handing
-        // back a blank result the model can't interpret.
-        //
-        // `lineno` (and every "N lines total" this tool reports) counts real content lines only, via
-        // `read_line_capped`'s own line-at-a-time scan — a file ending `"a\nb\nc\n"` reports 3, the
-        // same as `"a\nb\nc"` with no trailing newline. This is a deliberate divergence from pi's own
-        // `read.ts`, which counts `textContent.split("\n").length`: in JS, `"a\nb\nc\n".split("\n")`
-        // yields 4 elements (a trailing empty string for the newline), so pi reports one *more* line
-        // than the file actually has whenever it ends with a newline, but the correct count when it
-        // doesn't — an inconsistency, not a convention worth matching. Every other line-oriented tool
-        // here (`grep`, editors, `wc -l`) already treats "N lines" as "N newline-terminated-or-final
-        // content lines," so keeping that same, trailing-newline-independent count is the more
-        // correct and more consistent choice, not a parity gap.
-        if offset > lineno {
-            return Err(ToolError::InvalidInput(format!(
-                "offset {offset} is beyond end of file ({lineno} lines total)"
-            )));
-        }
-        if truncated {
-            let last = offset + shown - 1;
-            // `lineno` right now is the first not-yet-shown line — already consumed from the reader
-            // (so it's exactly the right `offset` to continue from), but not counted towards `shown`
-            // or written to `out`. Save it before the drain below overwrites `lineno` with the file's
-            // true total.
-            let continue_offset = lineno;
-            // pi's own truncation message (`read.ts`) includes the file's true total line count
-            // ("Showing lines X-Y of {totalFileLines}"); without it the model has no idea how much
-            // more content is left. We stream and stop at the truncation point by design (see this
-            // function's own doc comment on `MAX_LINE_BYTES`/streaming), so getting that total means
-            // reading the rest of the file here — but only a cheap, bounded byte scan via
-            // `read_line_capped`, the same streaming line counter already used above: no line is
-            // stored or decoded, only counted, and reusing it keeps this total consistent with
-            // `lineno`'s own "real content lines" convention (see the comment above on `offset >
-            // lineno`) rather than a raw `\n` byte count that would double-count that same
-            // trailing-newline edge case.
-            loop {
-                let (n, _clipped) = read_line_capped(&mut reader, &mut line, MAX_LINE_BYTES)
-                    .map_err(|e| ToolError::Execution(format!("read {path}: {e}")))?;
-                if n == 0 {
-                    break; // EOF
-                }
-                lineno += 1;
-            }
-            out.push_str(&super::output::marker(format_args!(
-                "showing lines {offset}-{last} of {lineno} total; use offset={continue_offset} to continue"
-            )));
-            out.push('\n');
-        }
-        if has_invalid_utf8 {
-            out.push_str(
-                "… (this file contains bytes that are not valid UTF-8; the text above used lossy \
-                 replacement (\u{FFFD}) for them, so it may not match the file's real bytes, and \
-                 `edit` will refuse to touch this file until that's fixed)\n",
-            );
-        }
-        Ok(out.into())
+        out.push_str(&super::output::marker(format_args!(
+            "showing lines {offset}-{last} of {lineno} total; use offset={continue_offset} to continue"
+        )));
+        out.push('\n');
     }
+    if has_invalid_utf8 {
+        out.push_str(
+            "… (this file contains bytes that are not valid UTF-8; the text above used lossy \
+             replacement (\u{FFFD}) for them, so it may not match the file's real bytes, and `edit` \
+             will refuse to touch this file until that's fixed)\n",
+        );
+    }
+    Ok(out.into())
 }
 
 /// How many leading bytes are read once for magic-byte sniffing and, for a PNG specifically, an
@@ -1555,7 +1568,7 @@ mod tests {
         assert_eq!(out.images.len(), 1);
         let decoded = image::load_from_memory(
             &base64::engine::general_purpose::STANDARD
-                .decode(&out.images[0].data)
+                .decode(&*out.images[0].data)
                 .unwrap(),
         )
         .unwrap();
@@ -1710,6 +1723,43 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn text_read_does_not_block_the_async_runtime() {
+        // The text-path analogue of `image_decode_and_resize_does_not_block_the_async_runtime`. On a
+        // `current_thread` runtime there is exactly one thread driving async tasks. If the streaming
+        // line read (open + the per-line loop + the post-truncation whole-file drain that counts the
+        // remaining lines) ran inline on the reactor instead of on `spawn_blocking`, `run`'s future
+        // would never yield and the concurrent ticker below could make *zero* progress until the read
+        // finished — deterministic, not a timing threshold.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big.txt");
+        // Far past `DEFAULT_LIMIT`, so the read returns the first window *and* drains the rest just to
+        // count the file's total lines — real, measurable blocking work.
+        let body = "line lorem ipsum dolor sit amet consectetur\n".repeat(300_000);
+        std::fs::write(&path, &body).unwrap();
+
+        let ticks = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let ticks_task = ticks.clone();
+        let ticker = tokio::spawn(async move {
+            loop {
+                ticks_task.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        });
+
+        let out = Read::default()
+            .run(json!({ "path": path.to_str().unwrap() }))
+            .await
+            .unwrap();
+        ticker.abort();
+
+        assert!(!out.text.is_empty(), "the read must still succeed");
+        assert!(
+            ticks.load(std::sync::atomic::Ordering::SeqCst) > 0,
+            "a concurrent async task must make progress while the text read is running"
+        );
+    }
+
     #[tokio::test]
     async fn small_bmp_is_converted_to_png_not_sent_as_bmp() {
         // Most vision APIs (Anthropic: png/jpeg/gif/webp only) reject BMP outright — a BMP comfortably
@@ -1738,7 +1788,7 @@ mod tests {
         );
         // The converted bytes must actually decode as a real PNG carrying the same pixels.
         let decoded = base64::engine::general_purpose::STANDARD
-            .decode(&out.images[0].data)
+            .decode(&*out.images[0].data)
             .unwrap();
         assert_eq!(
             image::guess_format(&decoded).unwrap(),
@@ -1800,7 +1850,7 @@ mod tests {
         assert_eq!(out.images.len(), 1);
         let decoded = image::load_from_memory(
             &base64::engine::general_purpose::STANDARD
-                .decode(&out.images[0].data)
+                .decode(&*out.images[0].data)
                 .unwrap(),
         )
         .unwrap();
@@ -1830,7 +1880,7 @@ mod tests {
             .unwrap();
         assert_eq!(out.images.len(), 1);
         let decoded_bytes = base64::engine::general_purpose::STANDARD
-            .decode(&out.images[0].data)
+            .decode(&*out.images[0].data)
             .unwrap();
         assert_eq!(
             decoded_bytes, png_bytes,
@@ -2191,7 +2241,7 @@ mod tests {
         );
 
         let decoded_bytes = base64::engine::general_purpose::STANDARD
-            .decode(&out.images[0].data)
+            .decode(&*out.images[0].data)
             .unwrap();
         let decoded = image::load_from_memory(&decoded_bytes).unwrap();
         assert!(

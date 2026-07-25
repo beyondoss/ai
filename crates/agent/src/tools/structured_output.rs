@@ -201,8 +201,8 @@ impl Tool for StructuredOutput {
         }
         // Last write wins. A model that calls this, does more work, then calls it again with a revised
         // answer should not be pinned to the stale one.
-        self.slot.set(input.clone());
         let rendered = serde_json::to_string_pretty(&input).unwrap_or_else(|_| input.to_string());
+        self.slot.set(input);
         Ok(ToolOutput::text(rendered).with_terminate(true))
     }
 }

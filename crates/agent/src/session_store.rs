@@ -233,11 +233,81 @@ fn search_rank(meta: &SessionMeta, query_lower: &str) -> Option<(usize, usize)> 
         &meta.search_text,
     ];
     fields.iter().enumerate().find_map(|(priority, field)| {
-        field
-            .to_lowercase()
-            .find(query_lower)
-            .map(|offset| (priority, offset))
+        find_case_insensitive(field, query_lower).map(|offset| (priority, offset))
     })
+}
+
+/// Byte offset of the first case-insensitive occurrence of `needle_lower` (already lowercased by the
+/// caller) in `haystack`, or `None` — the allocation-free replacement for
+/// `haystack.to_lowercase().find(needle_lower)`.
+///
+/// The old expression allocated a fully-lowercased copy of *every* field — including the up-to-50 KB
+/// `search_text` — for every session on every query, ran `find` on it, and threw it away. This scans
+/// in place. The common case (an all-ASCII haystack and needle, which session text and a typed query
+/// overwhelmingly are) takes a `memchr`-accelerated scan with no allocation at all. Any non-ASCII in
+/// either falls back to the exact original expression, so the match set *and* the returned byte offset
+/// stay
+/// byte-for-byte identical to before — the locale-specific corners of `str::to_lowercase` (final
+/// sigma, length-changing folds) are preserved verbatim rather than reimplemented.
+fn find_case_insensitive(haystack: &str, needle_lower: &str) -> Option<usize> {
+    if needle_lower.is_empty() {
+        // `"".find("")` is `Some(0)`; match it (the caller never passes an empty query, but keep the
+        // helper total).
+        return Some(0);
+    }
+    if haystack.is_ascii() && needle_lower.is_ascii() {
+        return find_ascii_case_insensitive(haystack, needle_lower);
+    }
+    haystack.to_lowercase().find(needle_lower)
+}
+
+/// `haystack.find(needle)` under ASCII case folding, allocation-free. `needle` is already ASCII
+/// lowercase (from the caller's one-time `to_lowercase`); both strings are known ASCII, so every byte
+/// is its own char and ASCII lowercasing never changes byte length — the returned offset therefore
+/// equals the one `haystack.to_lowercase().find(needle)` would give.
+///
+/// The shape mirrors how `str::find(&str)` itself works, so it keeps that path's speed while dropping
+/// its 50 KB allocation: skip to the next position whose byte could start a match with `str::find` on
+/// a single char — which is SIMD/`memchr`-accelerated in the standard library — trying both cases of
+/// the needle's first byte, then verify the (short) remainder there. A non-matching query, the worst
+/// case, is thus one or two vectorized passes over `search_text` and no allocation at all, rather than
+/// the scalar per-byte scan a hand-rolled loop would be.
+fn find_ascii_case_insensitive(haystack: &str, needle: &str) -> Option<usize> {
+    let hb = haystack.as_bytes();
+    let nb = needle.as_bytes();
+    if nb.len() > hb.len() {
+        return None;
+    }
+    let first_lower = nb[0] as char;
+    let first_upper = nb[0].to_ascii_uppercase() as char;
+    let mut base = 0;
+    while base + nb.len() <= hb.len() {
+        let rest = &haystack[base..];
+        // Earliest position (from `base`) whose byte is the needle's first byte in either case —
+        // `str::find(char)` reaches for `memchr` for an ASCII char, so this is a vectorized skip.
+        let cand = if first_upper == first_lower {
+            rest.find(first_lower)?
+        } else {
+            match (rest.find(first_lower), rest.find(first_upper)) {
+                (Some(a), Some(b)) => a.min(b),
+                (Some(a), None) | (None, Some(a)) => a,
+                (None, None) => return None,
+            }
+        };
+        let start = base + cand;
+        if start + nb.len() > hb.len() {
+            return None;
+        }
+        if hb[start..start + nb.len()]
+            .iter()
+            .zip(nb)
+            .all(|(h, n)| h.eq_ignore_ascii_case(n))
+        {
+            return Some(start);
+        }
+        base = start + 1;
+    }
+    None
 }
 
 /// Filter `sessions` to those matching `query` (case-insensitive substring against `title`/`id`/
@@ -3506,12 +3576,22 @@ const LISTING_INDEX_FILE: &str = ".listings.json";
 /// so an upgrade can never serve stale-shaped metadata.
 const LISTING_INDEX_VERSION: u32 = 1;
 
-#[derive(Serialize, Deserialize)]
+#[derive(Deserialize)]
 struct ListingIndex {
     version: u32,
     /// Keyed by file *name*, not full path — the index lives in the directory it describes, so the
     /// directory component is implied, and the file stays valid if the whole tree is moved.
     entries: HashMap<String, ListingIndexEntry>,
+}
+
+/// Write-side mirror of [`ListingIndex`] that **borrows** the entries map instead of owning it — so
+/// [`store_listing_index`] can serialize the index directly out of the caller's `HashMap` without
+/// cloning every (up-to-50 KB `search_text`) entry just to wrap it in a `version` field. Serialize
+/// only; the read path still deserializes the owned [`ListingIndex`].
+#[derive(Serialize)]
+struct ListingIndexRef<'a> {
+    version: u32,
+    entries: &'a HashMap<String, ListingIndexEntry>,
 }
 
 /// One file's cached listing.
@@ -3593,9 +3673,9 @@ fn load_listing_index(dir: &Path) -> HashMap<String, ListingIndexEntry> {
 /// Every error is swallowed deliberately. A read-only or unwritable session directory must still *list*;
 /// it just doesn't get to keep a cache.
 fn store_listing_index(dir: &Path, entries: &HashMap<String, ListingIndexEntry>) {
-    let idx = ListingIndex {
+    let idx = ListingIndexRef {
         version: LISTING_INDEX_VERSION,
-        entries: entries.clone(),
+        entries,
     };
     let Ok(bytes) = serde_json::to_vec(&idx) else {
         return;
@@ -3649,10 +3729,20 @@ pub(crate) fn scan_listings(
     let mut hits: Vec<SessionMeta> = Vec::new();
     let mut misses: Vec<PathBuf> = Vec::new();
     // The stamp each miss was read at, so the rebuilt index records what it was *actually* computed
-    // from. Stamping after the parse instead would race an append landing mid-scan and cache a listing
-    // against a file state it never saw.
+    // from — and so `read_listing` can reuse the mtime this scan already `stat`'d instead of
+    // re-`stat`ing the same file. Stamping after the parse instead would race an append landing
+    // mid-scan and cache a listing against a file state it never saw.
     let mut miss_stamps: HashMap<PathBuf, (u64, u128)> = HashMap::new();
-    let mut fresh: HashMap<PathBuf, HashMap<String, ListingIndexEntry>> = HashMap::new();
+    // The file names this scan actually produced a listing for, per directory — the oracle for dropping
+    // an index entry whose session file has since been deleted. Names only, never the (up-to-50 KB)
+    // meta: a cache hit reuses the entry already sitting in `indexes` rather than rebuilding it, so the
+    // warm path deep-clones each session's `search_text` exactly once (the `to_meta()` it must return),
+    // not twice as it used to (`to_meta()` *and* `ListingIndexEntry::new`).
+    let mut seen: HashMap<PathBuf, HashSet<String>> = HashMap::new();
+    // Directory index sizes as loaded, so a shrink (a deleted session, whose entry must be forgotten)
+    // is distinguishable from an unchanged scan without holding a copy of the old entries.
+    let orig_lens: HashMap<PathBuf, usize> =
+        indexes.iter().map(|(d, e)| (d.clone(), e.len())).collect();
     let mut scanned = 0usize;
 
     for p in &paths {
@@ -3666,13 +3756,12 @@ pub(crate) fn scan_listings(
         })();
         match cached {
             Some(meta) => {
-                if let (Some(dir), Some(name), Some((size, mtime_ns))) =
-                    (p.parent(), p.file_name().and_then(|n| n.to_str()), stamp)
+                if let (Some(dir), Some(name)) =
+                    (p.parent(), p.file_name().and_then(|n| n.to_str()))
                 {
-                    fresh.entry(dir.to_path_buf()).or_default().insert(
-                        name.to_string(),
-                        ListingIndexEntry::new(size, mtime_ns, &meta),
-                    );
+                    seen.entry(dir.to_path_buf())
+                        .or_default()
+                        .insert(name.to_string());
                 }
                 hits.push(meta);
                 scanned += 1;
@@ -3689,15 +3778,20 @@ pub(crate) fn scan_listings(
 
     let mut metas = hits;
     metas.reserve(misses.len());
-    for (path, meta) in scan_uncached(&misses, scanned, total, on_progress) {
+    for (path, meta) in scan_uncached(&misses, &miss_stamps, scanned, total, on_progress) {
         // Only a file we managed to stamp *before* reading can be cached — otherwise there's nothing to
-        // validate a future hit against.
+        // validate a future hit against. The stamped entry lands straight in `indexes` (owned, so the
+        // meta is moved in, not re-cloned), which *is* the index this scan will persist.
         if let (Some(dir), Some(name), Some(&(size, mtime_ns))) = (
             path.parent(),
             path.file_name().and_then(|n| n.to_str()),
             miss_stamps.get(&path),
         ) {
-            fresh.entry(dir.to_path_buf()).or_default().insert(
+            let dir = dir.to_path_buf();
+            seen.entry(dir.clone())
+                .or_default()
+                .insert(name.to_string());
+            indexes.entry(dir).or_default().insert(
                 name.to_string(),
                 ListingIndexEntry::new(size, mtime_ns, &meta),
             );
@@ -3705,15 +3799,20 @@ pub(crate) fn scan_listings(
         metas.push(meta);
     }
 
-    // Rebuilt from what this scan actually saw, so a deleted session's entry is dropped rather than
-    // accumulating forever. Only rewritten when it would differ from what's already on disk — a listing
-    // that was a pure cache hit does no I/O at all.
-    for (dir, entries) in fresh {
-        let unchanged = indexes
-            .get(&dir)
-            .is_some_and(|old| old.len() == entries.len() && misses.is_empty());
-        if !unchanged {
-            store_listing_index(&dir, &entries);
+    // Persist the index only where this scan changed it. `indexes` already holds every hit's entry
+    // untouched and every miss's freshly-built one, so all that's left is to forget entries for files
+    // this scan no longer saw (a deleted session), then write back the directories that moved. The
+    // write gate matches the old one exactly — rewrite when any file was parsed (`!misses.is_empty()`)
+    // or when a directory's entry count shrank — so a listing that was pure cache hits with nothing
+    // deleted does no write at all.
+    for (dir, names) in &seen {
+        let Some(entries) = indexes.get_mut(dir) else {
+            continue;
+        };
+        entries.retain(|name, _| names.contains(name));
+        let shrank = orig_lens.get(dir).is_some_and(|&old| old != entries.len());
+        if !misses.is_empty() || shrank {
+            store_listing_index(dir, entries);
         }
     }
     metas
@@ -3723,6 +3822,7 @@ pub(crate) fn scan_listings(
 /// already served from cache, so `on_progress` keeps counting up to `total` across both halves.
 fn scan_uncached(
     paths: &[PathBuf],
+    stamps: &HashMap<PathBuf, (u64, u128)>,
     base: usize,
     total: usize,
     on_progress: &(impl Fn(usize, usize) + Send + Sync),
@@ -3740,7 +3840,7 @@ fn scan_uncached(
             .iter()
             .enumerate()
             .filter_map(|(i, path)| {
-                let meta = read_listing(path);
+                let meta = read_listing(path, mtime_from_stamps(stamps, path));
                 on_progress(base + i + 1, total);
                 meta.map(|m| (path.clone(), m))
             })
@@ -3756,7 +3856,7 @@ fn scan_uncached(
         for chunk in paths.chunks(chunk_size) {
             scope.spawn(move || {
                 for path in chunk {
-                    if let Some(meta) = read_listing(path) {
+                    if let Some(meta) = read_listing(path, mtime_from_stamps(stamps, path)) {
                         metas_ref
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -3781,8 +3881,21 @@ fn scan_uncached(
 /// alone gives id/title/etc.; only the count and preview/search text need the scan). Returns `None` for
 /// a file that isn't a readable session (no/invalid header, or an unreadable version), matching `list`'s
 /// skip semantics.
-pub(crate) fn read_listing(path: &Path) -> Option<SessionMeta> {
-    let mtime = mtime_secs(path);
+/// Whole-second mtime derived from a `(size, mtime_ns)` stamp the caller already `stat`'d — nanos → the
+/// same floor-to-seconds `mtime_secs` computes — so [`read_listing`] can skip re-`stat`ing a file the
+/// listing scan just stamped. `None` when the file wasn't stamped, leaving the read path to `stat` it.
+fn mtime_from_stamps(stamps: &HashMap<PathBuf, (u64, u128)>, path: &Path) -> Option<u64> {
+    stamps.get(path).map(|&(_, ns)| (ns / 1_000_000_000) as u64)
+}
+
+pub(crate) fn read_listing(path: &Path, mtime: Option<u64>) -> Option<SessionMeta> {
+    // `mtime` is the file's whole-second modified time when a caller already `stat`'d it (a cache-miss
+    // scan stamps every file it parses — see [`mtime_from_stamps`]), so threading it here avoids the
+    // second `stat` `mtime_secs` would otherwise do. It's only ever consulted as the `updated_at`
+    // fallback for a legacy file with no message timestamp, so a supplied value and a fresh `stat` are
+    // interchangeable — the supplied one is if anything *more* consistent, being the state the rest of
+    // this scan was computed against. `None` falls back to a `stat` here.
+    let mtime = mtime.unwrap_or_else(|| mtime_secs(path));
     let file = File::open(path).ok()?;
     let mut reader = BufReader::new(file);
     let mut header = String::new();
@@ -3849,19 +3962,10 @@ pub(crate) fn read_listing(path: &Path) -> Option<SessionMeta> {
                 // The search corpus is broader than the preview: every user *and* assistant message's
                 // text (not just the first user turn) — matching pi's own `allMessagesText`, so a
                 // session is findable by something only the assistant said (a file path it named, an
-                // error it printed), not only by what the user typed.
-                if let Some(text) = message_search_text(&message) {
-                    if search_chars < SEARCH_TEXT_MAX_CHARS {
-                        if !search_text.is_empty() {
-                            search_text.push(' ');
-                            search_chars += 1;
-                        }
-                        let remaining = SEARCH_TEXT_MAX_CHARS - search_chars;
-                        let taken: String = text.chars().take(remaining).collect();
-                        search_chars += taken.chars().count();
-                        search_text.push_str(&taken);
-                    }
-                }
+                // error it printed), not only by what the user typed. The text-block chars go straight
+                // into the corpus up to the budget — no throwaway `Vec<&str>`+`join`, no second
+                // `taken` `String` to re-count.
+                append_message_search_text(&message, &mut search_text, &mut search_chars);
             }
             // A stray header mid-file (or a branch-navigation/summary/compaction-provenance/label/custom
             // marker) is ignored — a custom entry contributes no message text of its own, matching
@@ -3919,33 +4023,79 @@ fn first_user_text(msg: &Message) -> Option<&str> {
         return None;
     }
     msg.content.iter().find_map(|b| match b {
-        ContentBlock::Text { text, .. } => Some(text.as_str()),
+        ContentBlock::Text { text, .. } => Some(&**text),
         _ => None,
     })
 }
 
-/// Every plain-text block of a user *or* assistant message, space-joined — the broader search-corpus
+/// Append every plain-text block of a user *or* assistant message — the broader search-corpus
 /// counterpart of [`first_user_text`] (which looks only at a `User` message's first block, for the
-/// one-line preview). `None` for a tool-result-only turn or a message with no text content at all
-/// (a pure tool-call turn), same as `first_user_text`.
-fn message_search_text(msg: &Message) -> Option<String> {
-    if msg.role != Role::User && msg.role != Role::Assistant {
-        return None;
+/// one-line preview) — into `search_text`, space-separated from the prior corpus content and from each
+/// other, stopping at [`SEARCH_TEXT_MAX_CHARS`] total chars. A tool-result-only turn or a text-free
+/// turn contributes nothing, same as before.
+///
+/// This replaces the old `message_search_text` (which `join`ed the blocks into one throwaway `String`)
+/// plus the caller's `taken` (a second `String` it re-counted): the join separators and the char
+/// budget are threaded through the append, so the chars land in the corpus directly. The result is
+/// byte-identical to `join(" ")` truncated to the remaining budget — including the degenerate cases a
+/// `join` produced (a lone empty block joins to `""` and so is skipped; two-plus blocks always join to
+/// at least a separator space).
+fn append_message_search_text(msg: &Message, search_text: &mut String, search_chars: &mut usize) {
+    if (msg.role != Role::User && msg.role != Role::Assistant)
+        || *search_chars >= SEARCH_TEXT_MAX_CHARS
+    {
+        return;
     }
-    let joined = msg
-        .content
-        .iter()
-        .filter_map(|b| match b {
-            ContentBlock::Text { text, .. } => Some(text.as_str()),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join(" ");
-    if joined.is_empty() {
-        None
-    } else {
-        Some(joined)
+    let mut blocks = msg.content.iter().filter_map(|b| match b {
+        ContentBlock::Text { text, .. } => Some(&**text),
+        _ => None,
+    });
+    let Some(first) = blocks.next() else {
+        return;
+    };
+    let mut rest = blocks.peekable();
+    // `join(" ")` was empty — contributing nothing — only for a message whose single text block was
+    // itself empty; a second block always makes the join non-empty (at least a bare separator space).
+    if first.is_empty() && rest.peek().is_none() {
+        return;
     }
+    // Separate this message from the prior corpus content, exactly as the outer per-message join did.
+    if !search_text.is_empty() {
+        search_text.push(' ');
+        *search_chars += 1;
+    }
+    let mut budget = SEARCH_TEXT_MAX_CHARS - *search_chars;
+    let took = take_chars_into(search_text, first, budget);
+    *search_chars += took;
+    budget -= took;
+    for block in rest {
+        if budget == 0 {
+            break;
+        }
+        // The single inter-block separator space is itself a char of the joined text, counted against
+        // the same budget as the block chars — so truncation lands exactly where `join`+`take` did.
+        search_text.push(' ');
+        *search_chars += 1;
+        budget -= 1;
+        let took = take_chars_into(search_text, block, budget);
+        *search_chars += took;
+        budget -= took;
+    }
+}
+
+/// Append up to `budget` chars of `s` to `out`, returning how many landed — a char-bounded `push_str`,
+/// so the search corpus can be truncated to its remaining budget without first materializing the taken
+/// prefix as its own `String`.
+fn take_chars_into(out: &mut String, s: &str, budget: usize) -> usize {
+    let mut n = 0;
+    for ch in s.chars() {
+        if n == budget {
+            break;
+        }
+        out.push(ch);
+        n += 1;
+    }
+    n
 }
 
 /// A one-line, length-bounded preview: the first non-blank line of `text`, trimmed, truncated on a char
@@ -4883,7 +5033,7 @@ mod tests {
         session.user("second good message");
         store.append_new(&session.messages).unwrap();
 
-        let listed = read_listing(&path).unwrap();
+        let listed = read_listing(&path, None).unwrap();
         assert_eq!(
             listed.message_count, 2,
             "both good messages must be counted, not just the one before the corruption"
@@ -5654,7 +5804,7 @@ mod tests {
         let ContentBlock::Text { text, .. } = &restored.messages[0].content[0] else {
             panic!("expected text");
         };
-        assert_eq!(text, "one (rewritten)");
+        assert_eq!(text.as_ref(), "one (rewritten)");
 
         // No `Entry::Compaction` record at all.
         let raw = fs::read_to_string(&reopened.path).unwrap();
@@ -6420,7 +6570,7 @@ mod tests {
         let (reopened, _session) = SessionStore::open(path.clone()).unwrap();
         assert_eq!(reopened.meta().title.as_deref(), Some("Second"));
 
-        let listed = read_listing(&path).unwrap();
+        let listed = read_listing(&path, None).unwrap();
         assert_eq!(listed.title.as_deref(), Some("Second"));
     }
 
@@ -6437,7 +6587,7 @@ mod tests {
 
         let (reopened, _session) = SessionStore::open(path.clone()).unwrap();
         assert_eq!(reopened.meta().title.as_deref(), Some("hello world again"));
-        let listed = read_listing(&path).unwrap();
+        let listed = read_listing(&path, None).unwrap();
         assert_eq!(listed.title.as_deref(), Some("hello world again"));
     }
 
@@ -6456,7 +6606,7 @@ mod tests {
 
         let (reopened, _session) = SessionStore::open(path.clone()).unwrap();
         assert_eq!(reopened.meta().title, None);
-        let listed = read_listing(&path).unwrap();
+        let listed = read_listing(&path, None).unwrap();
         assert_eq!(listed.title, None);
     }
 
@@ -6943,6 +7093,38 @@ mod tests {
             vec!["newer", "older"],
             "equally-ranked matches must tiebreak by recency, newest first"
         );
+    }
+
+    #[test]
+    fn find_case_insensitive_matches_the_lowercase_find_reference() {
+        // The allocation-free matcher must be byte-for-byte indistinguishable from the expression it
+        // replaced — `haystack.to_lowercase().find(needle_lower)` — in both the match/no-match verdict
+        // and the returned byte offset, across ASCII case-mixing, leftmost-match selection, needle-
+        // longer-than-haystack, end-of-string hits, and the non-ASCII fallback.
+        let cases = [
+            ("Hello World", "world"),
+            ("Hello World", "world"), // (query pre-lowered below)
+            ("aAaAbB", "ab"),         // leftmost case-insensitive match, many false starts
+            ("abcabc", "cab"),
+            ("no match here", "xyz"),
+            ("", "x"),
+            ("x", "xx"), // needle longer than haystack
+            ("MiXeDcAsE", "mixedcase"),
+            ("ends with Z", "z"),
+            ("ZZZfooZZZ", "foo"),
+            ("café society", "society"), // non-ASCII haystack → fallback
+            ("Straße", "strasse"), // eszett does not fold to ss → must NOT match, via fallback
+            ("naïve", "naïve"),    // non-ASCII query → fallback (query lowered below)
+        ];
+        for (haystack, query) in cases {
+            let needle_lower = query.to_lowercase();
+            let expected = haystack.to_lowercase().find(&needle_lower);
+            let got = find_case_insensitive(haystack, &needle_lower);
+            assert_eq!(
+                got, expected,
+                "find_case_insensitive({haystack:?}, {needle_lower:?})"
+            );
+        }
     }
 
     #[test]
@@ -8617,8 +8799,12 @@ mod tests {
         // Case 2: target is an ancestor still on the active path (b) — c and d are abandoned.
         let abandoned = store.abandoned_by_switch(&ids[1]);
         assert_eq!(abandoned.len(), 2);
-        assert!(matches!(&abandoned[0].1.content[0], ContentBlock::Text{text, ..} if text == "c"));
-        assert!(matches!(&abandoned[1].1.content[0], ContentBlock::Text{text, ..} if text == "d"));
+        assert!(
+            matches!(&abandoned[0].1.content[0], ContentBlock::Text{text, ..} if text.as_ref() == "c")
+        );
+        assert!(
+            matches!(&abandoned[1].1.content[0], ContentBlock::Text{text, ..} if text.as_ref() == "d")
+        );
 
         // Case 3: unknown target — nothing abandoned (the switch itself will fail).
         assert!(store.abandoned_by_switch("does-not-exist").is_empty());
@@ -8635,7 +8821,9 @@ mod tests {
         // (which lives on the *other* branch, not the one currently active).
         let abandoned = store.abandoned_by_switch(&ids[3]);
         assert_eq!(abandoned.len(), 1);
-        assert!(matches!(&abandoned[0].1.content[0], ContentBlock::Text{text, ..} if text == "e"));
+        assert!(
+            matches!(&abandoned[0].1.content[0], ContentBlock::Text{text, ..} if text.as_ref() == "e")
+        );
     }
 
     #[test]
@@ -8698,8 +8886,12 @@ mod tests {
             2,
             "expected just [c, d] — the walk stops at the missing `b`"
         );
-        assert!(matches!(&orphaned[0].content[0], ContentBlock::Text{text, ..} if text == "c"));
-        assert!(matches!(&orphaned[1].content[0], ContentBlock::Text{text, ..} if text == "d"));
+        assert!(
+            matches!(&orphaned[0].content[0], ContentBlock::Text{text, ..} if text.as_ref() == "c")
+        );
+        assert!(
+            matches!(&orphaned[1].content[0], ContentBlock::Text{text, ..} if text.as_ref() == "d")
+        );
 
         // And a fresh reopen of the file reconstructs the same picture — the orphaning survives a
         // round-trip through disk, not just the in-memory state from the same process. Having
@@ -8760,7 +8952,7 @@ mod tests {
         let texts: Vec<&str> = messages
             .iter()
             .map(|m| match &m.content[0] {
-                ContentBlock::Text { text, .. } => text.as_str(),
+                ContentBlock::Text { text, .. } => text.as_ref(),
                 other => panic!("expected a text block, got {other:?}"),
             })
             .collect();
@@ -9415,10 +9607,10 @@ mod tests {
         let (_repo2, session) = SessionStore::open(store.path.clone()).unwrap();
         assert_eq!(session.messages.len(), 3);
         assert!(
-            matches!(&session.messages[1].content[0], ContentBlock::Text { text, .. } if text == "three")
+            matches!(&session.messages[1].content[0], ContentBlock::Text { text, .. } if text.as_ref() == "three")
         );
         assert!(
-            matches!(&session.messages[2].content[0], ContentBlock::Text { text, .. } if text == "four")
+            matches!(&session.messages[2].content[0], ContentBlock::Text { text, .. } if text.as_ref() == "four")
         );
     }
 }

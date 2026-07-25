@@ -386,7 +386,7 @@ pub(crate) fn repair_orphaned_tool_use(messages: &[Message]) -> std::borrow::Cow
                 ContentBlock::ToolUse { id, .. } if !answered(messages, i, id) => {
                     Some(ContentBlock::ToolResult {
                         tool_use_id: id.clone(),
-                        content: "no result recorded for this tool call".to_string(),
+                        content: "no result recorded for this tool call".into(),
                         is_error: true,
                         images: Vec::new(),
                     })
@@ -676,12 +676,16 @@ impl SseEventBuffer {
         // Real Anthropic/OpenAI traffic sends exactly one `data:` line per event (see this struct's
         // own doc comment) — `Vec<String>::join` always allocates and copies a fresh `String` even
         // for a length-1 slice, so the overwhelmingly common case would otherwise pay for a join it
-        // doesn't need. Popping the sole buffered line instead reuses its existing allocation.
-        let mut data = std::mem::take(&mut self.data);
-        let data = if data.len() == 1 {
-            data.pop().unwrap_or_default()
+        // doesn't need. Popping the sole buffered line instead reuses its existing allocation as the
+        // returned `String`. Crucially we operate on `self.data` in place (`pop`/`clear`, never
+        // `mem::take`), so its backing `Vec` allocation stays put and the *next* event reuses it —
+        // one `data:` line per event otherwise means a fresh `Vec` alloc+free on every streamed delta.
+        let data = if self.data.len() == 1 {
+            self.data.pop().unwrap_or_default()
         } else {
-            data.join("\n")
+            let joined = self.data.join("\n");
+            self.data.clear();
+            joined
         };
         let event = self.event.take();
         Some((event, data))
@@ -1410,7 +1414,7 @@ data: {"type":"message_stop"}
             ] => {
                 assert_eq!(tool_use_id, "t1");
                 assert!(*is_error);
-                assert_eq!(text, "nevermind");
+                assert_eq!(text.as_ref(), "nevermind");
             }
             other => panic!("expected [synthetic ToolResult, original Text], got {other:?}"),
         }
@@ -1478,7 +1482,7 @@ data: {"type":"message_stop"}
             ] => {
                 assert_eq!(first, "orphan", "synthetic result comes first");
                 assert_eq!(second, "answered");
-                assert_eq!(content, "ok", "the real result must be untouched");
+                assert_eq!(content.as_ref(), "ok", "the real result must be untouched");
                 assert!(!is_error);
             }
             other => panic!("expected exactly two ToolResult blocks merged, got {other:?}"),

@@ -421,7 +421,7 @@ pub fn last_assistant_text(session: &Session) -> String {
             m.content
                 .iter()
                 .filter_map(|b| match b {
-                    ContentBlock::Text { text, .. } => Some(text.as_str()),
+                    ContentBlock::Text { text, .. } => Some(&**text),
                     _ => None,
                 })
                 .collect::<String>()

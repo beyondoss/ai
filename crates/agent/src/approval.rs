@@ -197,7 +197,7 @@ impl GatedSet {
 /// the intended "don't re-ask" behavior, but it is a real property, not an accident.
 #[derive(Default)]
 pub struct SessionMemory {
-    decisions: Mutex<HashMap<(String, String), bool>>,
+    decisions: Mutex<HashMap<String, bool>>,
 }
 
 impl SessionMemory {
@@ -205,20 +205,29 @@ impl SessionMemory {
         Self::default()
     }
 
-    pub fn lookup(&self, tool: &str, scope_key: &str) -> Option<bool> {
-        self.lock()
-            .get(&(tool.to_string(), scope_key.to_string()))
-            .copied()
+    /// Probe the remembered decisions. `key` is the flattened `(tool, scope)` identity produced by
+    /// [`memory_key`]; taking the already-combined `&str` lets the probe hit `HashMap::get` without
+    /// allocating a fresh owned key on this hot path (it previously built two `String`s plus a tuple
+    /// on every lookup).
+    pub fn lookup(&self, key: &str) -> Option<bool> {
+        self.lock().get(key).copied()
     }
 
-    pub fn remember(&self, tool: &str, scope_key: &str, allow: bool) {
-        self.lock()
-            .insert((tool.to_string(), scope_key.to_string()), allow);
+    pub fn remember(&self, key: &str, allow: bool) {
+        self.lock().insert(key.to_string(), allow);
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<(String, String), bool>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, bool>> {
         self.decisions.lock().unwrap_or_else(|e| e.into_inner())
     }
+}
+
+/// The single owned key a remembered decision is stored under: the `(tool, scope_key)` identity
+/// flattened into one string with a `\0` separator — a byte neither a tool name nor a scope key can
+/// contain, so this preserves the exact `(tool, scope)` match semantics of the former tuple key while
+/// letting [`SessionMemory::lookup`] probe with a borrowed `&str`.
+fn memory_key(tool: &str, scope_key: &str) -> String {
+    format!("{tool}\0{scope_key}")
 }
 
 /// Everything the gate needs, cloned into every subagent child so the whole tree shares one gate, one
@@ -279,10 +288,27 @@ pub fn summarize(input: &Value) -> Value {
 
 fn truncate_value(value: &Value) -> Value {
     match value.as_str() {
-        Some(s) if s.chars().count() > SUMMARY_MAX_CHARS => {
-            let kept: String = s.chars().take(SUMMARY_MAX_CHARS).collect();
-            let dropped = s.chars().count() - SUMMARY_MAX_CHARS;
-            Value::String(format!("{kept}… [{dropped} more characters]"))
+        Some(s) => {
+            // One `char_indices` pass yields both the byte boundary at `SUMMARY_MAX_CHARS` chars and
+            // the total char count, replacing three separate scans (`chars().count()`,
+            // `chars().take()`, `chars().count()` again). `boundary` is `Some` iff a char exists at
+            // index `SUMMARY_MAX_CHARS` — i.e. the string is strictly longer than the cap — matching
+            // the former `chars().count() > SUMMARY_MAX_CHARS` guard exactly.
+            let mut boundary = None;
+            let mut total = 0usize;
+            for (n, (byte_idx, _)) in s.char_indices().enumerate() {
+                if n == SUMMARY_MAX_CHARS {
+                    boundary = Some(byte_idx);
+                }
+                total = n + 1;
+            }
+            match boundary {
+                Some(cut) => {
+                    let dropped = total - SUMMARY_MAX_CHARS;
+                    Value::String(format!("{}… [{dropped} more characters]", &s[..cut]))
+                }
+                None => value.clone(),
+            }
         }
         _ => value.clone(),
     }
@@ -317,7 +343,8 @@ pub async fn gated_before_tool_call(
     }
 
     let key = scope_key(name, input, policy.root());
-    match runtime.memory.lookup(name, &key) {
+    let mem_key = memory_key(name, &key);
+    match runtime.memory.lookup(&mem_key) {
         Some(true) => return None,
         Some(false) => {
             return Some(format!(
@@ -330,13 +357,13 @@ pub async fn gated_before_tool_call(
     let request = ApprovalRequest {
         tool: name.to_string(),
         summary: summarize(input),
-        scope_key: key.clone(),
+        scope_key: key,
         origin: origin.clone(),
     };
     match runtime.gate.request(request, cancel).await {
         Ok(decision) => {
             if decision.scope == ApprovalScope::Session {
-                runtime.memory.remember(name, &key, decision.allow);
+                runtime.memory.remember(&mem_key, decision.allow);
             }
             if decision.allow {
                 None
@@ -498,22 +525,22 @@ mod tests {
     #[test]
     fn session_memory_is_keyed_by_tool_and_scope() {
         let m = SessionMemory::new();
-        assert_eq!(m.lookup("bash", "cmd:ls"), None);
-        m.remember("bash", "cmd:ls", true);
-        assert_eq!(m.lookup("bash", "cmd:ls"), Some(true));
+        assert_eq!(m.lookup(&memory_key("bash", "cmd:ls")), None);
+        m.remember(&memory_key("bash", "cmd:ls"), true);
+        assert_eq!(m.lookup(&memory_key("bash", "cmd:ls")), Some(true));
         assert_eq!(
-            m.lookup("bash", "cmd:rm"),
+            m.lookup(&memory_key("bash", "cmd:rm")),
             None,
             "a different command is a different decision"
         );
         assert_eq!(
-            m.lookup("write", "cmd:ls"),
+            m.lookup(&memory_key("write", "cmd:ls")),
             None,
             "a different tool is a different decision"
         );
 
-        m.remember("bash", "cmd:rm", false);
-        assert_eq!(m.lookup("bash", "cmd:rm"), Some(false));
+        m.remember(&memory_key("bash", "cmd:rm"), false);
+        assert_eq!(m.lookup(&memory_key("bash", "cmd:rm")), Some(false));
     }
 
     // ---- the decision table -----------------------------------------------------------------------
@@ -745,7 +772,7 @@ mod tests {
         check(&ToolPolicy::new(), Some(&rt), "bash", call.clone()).await;
         check(&ToolPolicy::new(), Some(&rt), "bash", call).await;
         assert_eq!(gate.asked(), 2);
-        assert_eq!(rt.memory.lookup("bash", "cmd:ls"), None);
+        assert_eq!(rt.memory.lookup(&memory_key("bash", "cmd:ls")), None);
     }
 
     #[tokio::test]

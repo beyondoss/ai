@@ -164,6 +164,12 @@ impl RealRunner {
         // actually exited on its own; still armed on both the timeout branch and an external drop, so
         // either one reaches the whole process group.
         let mut guard = GroupKillGuard { pid: child.id() };
+        // Streaming (`bash`'s live path) hands every chunk straight to `on_chunk`'s sink, then ignores
+        // the `stdout`/`stderr`/`truncated` fields entirely (see the `Ok` arm's comment and `bash.rs`).
+        // So when streaming we skip the ≤256 KiB head/tail `Capture` *and* the final `from_utf8_lossy`
+        // allocations below — they'd only be produced to be discarded. The non-streaming `run` path
+        // (the `beyond` CLI tools) keeps full capture, since it *does* read these fields.
+        let streaming = on_chunk.is_some();
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
         // Drain both pipes *concurrently* with the wait: a child that fills one pipe's OS buffer
@@ -213,8 +219,18 @@ impl RealRunner {
                 Ok(ExecResult {
                     code: status.code(),
                     signal: exit_signal(&status),
-                    stdout: String::from_utf8_lossy(&stdout).into_owned(),
-                    stderr: String::from_utf8_lossy(&stderr).into_owned(),
+                    // Empty on the streaming path: `drain_capped` returned empty capture buffers there
+                    // (nothing to decode), and `bash` never reads these anyway.
+                    stdout: if streaming {
+                        String::new()
+                    } else {
+                        String::from_utf8_lossy(&stdout).into_owned()
+                    },
+                    stderr: if streaming {
+                        String::new()
+                    } else {
+                        String::from_utf8_lossy(&stderr).into_owned()
+                    },
                     timed_out: false,
                     truncated: out_trunc || err_trunc,
                 })
@@ -374,6 +390,11 @@ async fn drain_capped<R: AsyncRead + Unpin>(
     mut exited: watch::Receiver<bool>,
 ) -> (Vec<u8>, bool) {
     let mut cap = Capture::new(head_cap, tail_cap);
+    // When streaming, the sink already receives every chunk and the returned capture buffer is
+    // discarded by the caller — so don't accumulate it (skips ≤`head_cap`+`tail_cap` bytes of copying
+    // plus the head/tail `Vec` growth per streamed command). The non-streaming path (`on_chunk` is
+    // `None`) still fills `cap`, since its caller reads the result.
+    let capturing = on_chunk.is_none();
     if let Some(mut r) = reader {
         let mut buf = [0u8; 64 * 1024];
         while !*exited.borrow() {
@@ -386,7 +407,9 @@ async fn drain_capped<R: AsyncRead + Unpin>(
                             if let Some(sink) = on_chunk {
                                 sink(&buf[..n]);
                             }
-                            cap.push(&buf[..n]);
+                            if capturing {
+                                cap.push(&buf[..n]);
+                            }
                         }
                         // A read error (e.g. the pipe closing under us) ends capture with what we have.
                         Err(_) => return cap.finish(),
@@ -402,7 +425,9 @@ async fn drain_capped<R: AsyncRead + Unpin>(
                     if let Some(sink) = on_chunk {
                         sink(&buf[..n]);
                     }
-                    cap.push(&buf[..n]);
+                    if capturing {
+                        cap.push(&buf[..n]);
+                    }
                 }
                 Ok(Err(_)) => break,
             }
@@ -705,6 +730,9 @@ mod tests {
     async fn run_streaming_emits_chunks_reconstructing_stdout() {
         // The streaming runner must hand each output chunk to `on_chunk` as it arrives, and the
         // concatenated chunks must reconstruct the full stdout (it streams before the cap, not after).
+        // The sink *is* the output on this path — the `ExecResult::stdout`/`stderr` fields are left
+        // empty on purpose (the head/tail capture is skipped when streaming, since the only consumer,
+        // `bash`, reads the streamed chunks, never these fields — see the `exec` `Ok` arm).
         let collected = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
         let c = collected.clone();
         let sink = move |bytes: &[u8]| c.lock().unwrap().extend_from_slice(bytes);
@@ -718,7 +746,10 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(res.stdout, "hello\nworld\n");
+        assert_eq!(
+            res.stdout, "",
+            "streaming skips the discarded capture; the sink is the source of truth"
+        );
         let streamed = String::from_utf8(collected.lock().unwrap().clone()).unwrap();
         assert_eq!(
             streamed, "hello\nworld\n",

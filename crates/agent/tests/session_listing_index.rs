@@ -68,7 +68,7 @@ fn a_warm_listing_matches_a_cold_one() {
             .append_new(&[
                 Message::user(format!("question number {i}")),
                 Message::assistant(vec![agent_core::ContentBlock::Text {
-                    text: format!("answer number {i}"),
+                    text: format!("answer number {i}").into(),
                     id: None,
                     phase: None,
                 }]),

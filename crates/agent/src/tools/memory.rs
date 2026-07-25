@@ -18,6 +18,7 @@
 //! `_model_supports_vision` stamp would otherwise fail validation — so it's stripped at the top of `run`,
 //! exactly as `structured_output` does.
 
+use std::fmt::Write;
 use std::sync::Arc;
 
 use agent_core::tool::{MODEL_SUPPORTS_VISION_KEY, Tool};
@@ -136,10 +137,11 @@ fn render_listing(entries: &[Entry]) -> ToolOutput {
     }
     let mut out = String::new();
     for e in entries {
+        // Infallible: writing into a String never errors.
         if e.is_dir {
-            out.push_str(&format!("{}/\n", e.path));
+            let _ = writeln!(out, "{}/", e.path);
         } else {
-            out.push_str(&format!("{} ({} bytes)\n", e.path, e.size));
+            let _ = writeln!(out, "{} ({} bytes)", e.path, e.size);
         }
     }
     cap_listing_bytes(&mut out, "narrow with search");
@@ -153,7 +155,8 @@ fn render_hits(query: &str, hits: &[Hit]) -> ToolOutput {
     }
     let mut out = String::new();
     for h in hits {
-        out.push_str(&format!("{}:{}: {}\n", h.path, h.line, h.text));
+        // Infallible: writing into a String never errors.
+        let _ = writeln!(out, "{}:{}: {}", h.path, h.line, h.text);
     }
     cap_listing_bytes(&mut out, "narrow the query");
     out.into()

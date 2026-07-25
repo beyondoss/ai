@@ -862,7 +862,12 @@ alternation valid; **follow-ups** (`push`) are a separate lane, injected only at
 
 `Session.messages` is `Arc<Vec<Message>>`. `Session::push` mutates via `Arc::make_mut` — in place when
 the session solely owns the `Arc` (the steady state between turns), cloning only if a still-live
-`ModelRequest` snapshot holds the same pointer. `ModelRequest::messages` and `Agent::tool_defs` are
+`ModelRequest` snapshot holds the same pointer. When that clone does happen (the end-of-turn `push`
+while the turn's request still shares the history), it's cheap by construction: the large immutable
+`ContentBlock` payloads (`Text`/`Thinking` text, `RedactedThinking`/`ToolResult`/`ImageSource` bodies —
+the multi-KB tool results and base64 images) are `Arc<str>`, so `make_mut`'s per-message deep clone is a
+refcount bump per payload, not a byte copy — only the small `String` fields (ids, names, signatures) are
+actually re-allocated. `ModelRequest::messages` and `Agent::tool_defs` are
 both `Arc`-shared for the same reason: building a request clones a pointer, not a deep copy of a
 history that grows every step (an O(n²) cost over a long run otherwise) or a tool-definition list with
 embedded JSON Schemas. `tool_defs` specifically is computed once in `Agent::with_tools`, not rebuilt

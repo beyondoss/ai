@@ -2,6 +2,7 @@
 //! first, then a normalized fuzzy fallback (NFKC + unified quotes/dashes/spaces + per-line
 //! trailing-whitespace) so a model's slightly-off `old_string` still lands.
 
+use std::borrow::Cow;
 use std::cell::OnceCell;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -172,9 +173,33 @@ fn apply_edits(
         // different lines). CRLF is only reintroduced wholesale when the file is *consistently* CRLF;
         // otherwise untouched spans are spliced back in from the original bytes verbatim (via
         // `body_map`) so an edit to one line can never flip another, untouched line's ending.
-        let has_bare_lf = body.replace("\r\n", "").contains('\n');
-        let is_pure_crlf = !has_bare_lf && body.contains("\r\n");
-        let (working, body_map) = strip_crlf_with_map(body);
+        //
+        // A bare `\n` is one whose preceding byte isn't `\r` — a single scan for that (no allocation)
+        // is exactly equivalent to the old `body.replace("\r\n","").contains('\n')`, which copied the
+        // whole file just to compute this one bool: a `\n` is consumed by that `replace` iff it's the
+        // second byte of a `\r\n` pair, i.e. iff its predecessor is `\r` (and a `\r` before a `\n` can
+        // never itself be the tail of an earlier match, so `replace` always collapses it).
+        let bytes = body.as_bytes();
+        let has_bare_lf = bytes
+            .iter()
+            .enumerate()
+            .any(|(i, &c)| c == b'\n' && (i == 0 || bytes[i - 1] != b'\r'));
+        let has_cr = body.contains('\r');
+        // Exactly the old `!has_bare_lf && body.contains("\r\n")`: a lone `\r` with no following `\n`
+        // is *not* a pure-CRLF file (its replacements keep bare `\n`), so the `\r\n` check is load-
+        // bearing — but it's gated behind `has_cr` so a pure-LF file never pays for it.
+        let is_pure_crlf = !has_bare_lf && has_cr && body.contains("\r\n");
+        // Only a file that actually contains a `\r` needs the CRLF→LF copy + its offset map back to the
+        // original bytes; the common case (pure-LF source) borrows `body` verbatim and splices with raw
+        // offsets, skipping the whole-file copy, the 4×-file-size `Vec<u32>` map, and the UTF-8
+        // re-validation `strip_crlf_with_map` would otherwise pay on every single edit.
+        let (working, body_map): (Cow<str>, Option<Vec<u32>>) = if has_cr {
+            let (w, map) = strip_crlf_with_map(body);
+            (Cow::Owned(w), Some(map))
+        } else {
+            (Cow::Borrowed(body), None)
+        };
+        let working = working.as_ref();
 
         // Resolve every edit to byte ranges against the *original* text (not the running result), so
         // multi-edit semantics are order-independent and an earlier edit's output can't accidentally
@@ -188,7 +213,7 @@ fn apply_edits(
         // The *offset map* back to the original bytes, though, is only read when an edit actually falls
         // through to the fuzzy path — so it's built lazily, at most once, and not at all on the exact
         // path that virtually every call takes. See `normalize_only`.
-        let norm_working = normalize_only(&working);
+        let norm_working = normalize_only(working);
         let working_map: OnceCell<Vec<u32>> = OnceCell::new();
         let total_edits = edits.len();
         // `(start, end, replacement, edit_index)` — `edit_index` rides along purely so the overlap
@@ -196,10 +221,13 @@ fn apply_edits(
         // `edit-diff.ts`, which tracks each resolved edit's `editIndex` for exactly this).
         let mut ranges: Vec<(usize, usize, String, usize)> = Vec::new();
         for (i, (old, new)) in edits.iter().enumerate() {
-            let old = old.replace("\r\n", "\n");
-            let new = new.replace("\r\n", "\n");
+            // `old`/`new` are matched/spliced in LF space. Only allocate a normalized copy when the
+            // string actually carries a `\r\n`; the common case (a model's `old_string` is already
+            // LF-only) borrows it untouched.
+            let old = strip_crlf_cow(old);
+            let new = strip_crlf_cow(new);
             for (start, end) in find_spans(
-                &working,
+                working,
                 &norm_working,
                 &working_map,
                 &old,
@@ -209,7 +237,7 @@ fn apply_edits(
             )
             .map_err(|msg| ToolError::InvalidInput(format!("{msg} in {path}")))?
             {
-                ranges.push((start, end, new.clone(), i));
+                ranges.push((start, end, new.clone().into_owned(), i));
             }
         }
 
@@ -236,10 +264,17 @@ fn apply_edits(
         // Splice the replacements in a single pass. Untouched spans are copied from `body` (the
         // original bytes, via `body_map`), not `working`, so a mixed-line-ending file's untouched
         // lines keep their exact original ending rather than being reconstructed from LF space.
+        // Translate a `working`-space offset back to an original-`body` offset. With a `\r` present the
+        // `body_map` built above does it; on the borrowed pure-LF path `working` *is* `body`, so the
+        // offset already indexes `body` directly.
+        let orig = |off: usize| match &body_map {
+            Some(map) => map[off] as usize,
+            None => off,
+        };
         let mut out = String::with_capacity(body.len());
         let mut cursor = 0usize;
         for (start, end, new, _edit_index) in &ranges {
-            out.push_str(&body[body_map[cursor] as usize..body_map[*start] as usize]);
+            out.push_str(&body[orig(cursor)..orig(*start)]);
             if is_pure_crlf {
                 out.push_str(&new.replace('\n', "\r\n"));
             } else {
@@ -247,7 +282,7 @@ fn apply_edits(
             }
             cursor = *end;
         }
-        out.push_str(&body[body_map[cursor] as usize..]);
+        out.push_str(&body[orig(cursor)..]);
 
         if out == body {
             return Err(ToolError::InvalidInput(format!(
@@ -378,7 +413,9 @@ fn find_spans(
         .collect();
 
     // `old` still needs normalizing per call — it's small and changes on every edit, unlike `working`.
-    let norm_old = normalize_with_map(old).0;
+    // Only its normalized *text* is ever read (the ambiguity count and the fuzzy `match_indices`
+    // below); its offset map was built and immediately discarded, so use the map-less normalizer.
+    let norm_old = normalize_only(old);
 
     if !exact.is_empty() {
         // Prefer exact spans for the actual splice — preserves every byte around the match instead of
@@ -648,29 +685,44 @@ fn normalize_general<const MAP: bool>(orig: &str) -> (String, Vec<u32>) {
 /// character's other bytes.
 fn strip_crlf_with_map(body: &str) -> (String, Vec<u32>) {
     let bytes = body.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
+    // Built as a `String` from the start: every run copied in is a `body[..]` slice (valid UTF-8 by
+    // construction) and the only byte ever *dropped* is the `\r` of a `\r\n` pair — never a multi-byte
+    // character's continuation byte (those are always >= 0x80, never the single ASCII `\r`). The old
+    // path built a `Vec<u8>` and paid a whole-file `String::from_utf8` re-validation scan on the way
+    // out; copying verbatim `&str` runs skips that scan entirely while producing identical bytes.
+    let mut out = String::with_capacity(bytes.len());
     let mut map = Vec::with_capacity(bytes.len() + 1);
+    // Start of the current unbroken run of bytes to copy across verbatim.
+    let mut run_start = 0usize;
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'\r' && bytes.get(i + 1) == Some(&b'\n') {
-            out.push(b'\n');
+            // Flush the verbatim run before this pair (each byte maps to its own source offset)…
+            out.push_str(&body[run_start..i]);
+            map.extend((run_start..i).map(|j| j as u32));
+            // …then the collapsed `\n`, mapped to the `\r`'s offset (the pair's start).
+            out.push('\n');
             map.push(i as u32);
             i += 2;
+            run_start = i;
             continue;
         }
-        out.push(bytes[i]);
-        map.push(i as u32);
         i += 1;
     }
-    map.push(bytes.len() as u32);
-    (
-        // Removing lone `\r` bytes that precede a `\n` never touches a multi-byte character's
-        // continuation bytes (those are always >= 0x80, never equal to the single-byte ASCII `\r`),
-        // so `out` is still valid UTF-8 whenever `body` was.
-        #[allow(clippy::expect_used)]
-        String::from_utf8(out).expect("removing ASCII \\r bytes preserves UTF-8 validity"),
-        map,
-    )
+    out.push_str(&body[run_start..]);
+    map.extend((run_start..bytes.len()).map(|j| j as u32));
+    map.push(bytes.len() as u32); // sentinel
+    (out, map)
+}
+
+/// `body.replace("\r\n", "\n")` without the allocation when there's nothing to replace: a `\r\n`-free
+/// string (the common shape for a model's `old_string`/`new_string`) is borrowed untouched.
+fn strip_crlf_cow(s: &str) -> Cow<'_, str> {
+    if s.contains("\r\n") {
+        Cow::Owned(s.replace("\r\n", "\n"))
+    } else {
+        Cow::Borrowed(s)
+    }
 }
 
 /// Accept either the `edits` array form (pi-style) or the single old_string/new_string form. Also

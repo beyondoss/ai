@@ -1676,7 +1676,7 @@ mod tests {
                 "read",
                 json!({ "path": "a.rs" }),
             )]),
-            Message::tool_result("1", &big, false),
+            Message::tool_result("1", &*big, false),
             // A concluding assistant response — without this the prefix ends on a bare tool_result,
             // which `is_split_turn` (correctly) reads as an in-progress turn and would swap in
             // `SPLIT_TURN_INSTRUCTION` instead of the generic template this test is exercising.
@@ -1770,7 +1770,7 @@ mod tests {
     fn render_prefix_truncates_a_long_thinking_block() {
         let long = "x".repeat(THINKING_MAX_CHARS + 500);
         let messages = vec![Message::assistant(vec![ContentBlock::Thinking {
-            text: long.clone(),
+            text: long.clone().into(),
             signature: "sig".into(),
         }])];
         let rendered = render_prefix(&messages);

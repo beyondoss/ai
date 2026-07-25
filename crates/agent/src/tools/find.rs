@@ -241,7 +241,12 @@ impl Tool for Find {
         // as-is) — since `find` deliberately matches both files and directories, the model otherwise
         // has no way to tell "src/components" is a directory vs. an extension-less file without an
         // extra `ls`/`bash` call.
-        let mut out = String::new();
+        let mut out = String::with_capacity(
+            paths
+                .len()
+                .saturating_mul(64)
+                .min(super::output::MAX_LISTING_BYTES),
+        );
         for (path, is_dir) in &paths {
             let rendered = format_path(path, &root);
             if *is_dir {
