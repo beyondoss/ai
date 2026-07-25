@@ -192,8 +192,12 @@ impl MemPath {
             let bare = root.trim_start_matches('/');
             if trimmed == root
                 || trimmed == bare
-                || trimmed.strip_prefix(root).is_some_and(|r| r.starts_with('/'))
-                || trimmed.strip_prefix(bare).is_some_and(|r| r.starts_with('/'))
+                || trimmed
+                    .strip_prefix(root)
+                    .is_some_and(|r| r.starts_with('/'))
+                || trimmed
+                    .strip_prefix(bare)
+                    .is_some_and(|r| r.starts_with('/'))
             {
                 return Self::parse_in(trimmed, root);
             }
