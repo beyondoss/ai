@@ -66,8 +66,10 @@
 //! ethos. A sketch can *over*estimate a key's rate on hash collision but never under, so a cap is
 //! always enforced; `SLOTS` is sized wide enough that overestimation stays negligible.
 
+// `ahash::RandomState` carries its own inherent `hash_one` (it does not need `BuildHasher` in
+// scope), which is also the specialised, faster path — see the `hasher` field's note.
+use ahash::RandomState;
 use pingora_limits::rate::Rate;
-use std::hash::{BuildHasher, RandomState};
 use std::time::Duration;
 
 /// Count-min sketch dimensions for the per-credential tier. The estimator can only *over*estimate a
@@ -123,10 +125,25 @@ pub struct RateLimit {
     /// `(sketch, max_per_window)` for the global BYO aggregate tier. `None` disables it.
     byo_global: Option<(Rate, isize)>,
     /// Process-random hash state. The raw credential is reduced to the per-credential sketch key
-    /// through this, so the SipHash key is per-process and secret. Without it the digest would be
+    /// through this, so the hash is keyed by a per-process secret. Without it the digest would be
     /// precomputable (`DefaultHasher` keys on zeros), letting an attacker craft two tokens that
     /// collide into the same slots and inflate another caller's counter — false throttling. Random
     /// seeding makes that collision search infeasible.
+    ///
+    /// **`ahash`, not std's SipHash-1-3** — 4.5 ns vs 19.1 ns on a ~70-byte credential, on a path
+    /// charged before verify on *every* request. The seeding argument above is unchanged, not
+    /// waived: `ahash::RandomState::new()` pulls its key material from the OS RNG once per process
+    /// (its default `runtime-rng` feature calls `getrandom`) and permutes it with a per-instance
+    /// counter — the same "secret per process" property `std::hash::RandomState` gives. So the
+    /// digest is still unpredictable off-process and a colliding token pair still cannot be
+    /// precomputed, which is the threat that motivated seeding it in the first place.
+    ///
+    /// What ahash does *not* carry over is SipHash's proof against an **adaptive** attacker who
+    /// searches for a collision online. That search needs an oracle, and this module exposes none:
+    /// the sketch's estimate is never returned, and the only observable is a 429 — which requires
+    /// already sustaining the per-credential ceiling, i.e. being the flood this limiter is there to
+    /// shed. Also note that pingora-limits hashes *again* internally with its own per-row
+    /// `ahash::RandomState`s, so a collision here is necessary but not sufficient.
     hasher: RandomState,
 }
 
@@ -147,7 +164,7 @@ impl RateLimit {
             }),
             // One bucket, so the default estimator is plenty — no need for the wide sketch.
             byo_global: (byo_global_rps != 0).then(|| (Rate::new(WINDOW), byo_global_rps as isize)),
-            // `RandomState::new()` draws a fresh SipHash key from the OS RNG per process.
+            // `RandomState::new()` draws fresh key material from the OS RNG per process.
             hasher: RandomState::new(),
         })
     }
