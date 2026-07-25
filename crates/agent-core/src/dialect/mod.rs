@@ -676,12 +676,16 @@ impl SseEventBuffer {
         // Real Anthropic/OpenAI traffic sends exactly one `data:` line per event (see this struct's
         // own doc comment) — `Vec<String>::join` always allocates and copies a fresh `String` even
         // for a length-1 slice, so the overwhelmingly common case would otherwise pay for a join it
-        // doesn't need. Popping the sole buffered line instead reuses its existing allocation.
-        let mut data = std::mem::take(&mut self.data);
-        let data = if data.len() == 1 {
-            data.pop().unwrap_or_default()
+        // doesn't need. Popping the sole buffered line instead reuses its existing allocation as the
+        // returned `String`. Crucially we operate on `self.data` in place (`pop`/`clear`, never
+        // `mem::take`), so its backing `Vec` allocation stays put and the *next* event reuses it —
+        // one `data:` line per event otherwise means a fresh `Vec` alloc+free on every streamed delta.
+        let data = if self.data.len() == 1 {
+            self.data.pop().unwrap_or_default()
         } else {
-            data.join("\n")
+            let joined = self.data.join("\n");
+            self.data.clear();
+            joined
         };
         let event = self.event.take();
         Some((event, data))
