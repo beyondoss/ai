@@ -21,6 +21,7 @@ use std::process::Command;
 use std::sync::OnceLock;
 
 use agent_core::Tool;
+use beyond_ai_agent::session_store::{SessionMeta, search_sessions};
 use beyond_ai_agent::tools::exec::{CommandRunner, RealRunner};
 use beyond_ai_agent::tools::{edit, find, grep, ls, output, read};
 use divan::Bencher;
@@ -391,6 +392,55 @@ fn ls_dir(bencher: Bencher) {
             .unwrap();
         black_box(out.text.len());
     });
+}
+
+// ---------------------------------------------------------------------------------------------
+// `search_rank` (session_store): case-insensitive substring match of one query against N sessions,
+// each carrying a ~50 KB `search_text` corpus. The worst case is a query that matches *nothing*,
+// because ranking then has to scan every field of every session — including the full 50 KB
+// `search_text` — before giving up. The old code did `field.to_lowercase()` per field (a fresh
+// 50 KB allocation per session, discarded), so this bench's alloc column is the whole point: it is
+// exactly the allocate-and-throw-away that the allocation-free scan removes.
+// ---------------------------------------------------------------------------------------------
+
+const SEARCH_TEXT_BYTES: usize = 50_000;
+/// A query no field contains — forces the full scan of every session's 50 KB corpus.
+const NO_MATCH_QUERY: &str = "zqxj_never_present_needle";
+
+/// `n` sessions, each with a ~50 KB mixed-case `search_text` that does **not** contain
+/// [`NO_MATCH_QUERY`] — the realistic large-history worst case for `search_rank`.
+fn session_corpus(n: usize) -> Vec<SessionMeta> {
+    // Mixed case on purpose: the case-insensitive scan must lowercase-compare every byte, so upper
+    // case in the haystack is part of the work under test.
+    let unit = "The function threads its Result alias through the call site and re-exports IT. ";
+    let mut text = String::with_capacity(SEARCH_TEXT_BYTES + unit.len());
+    while text.len() < SEARCH_TEXT_BYTES {
+        text.push_str(unit);
+    }
+    (0..n)
+        .map(|i| {
+            let mut m = SessionMeta::new(format!("/home/user/project_{i}"), "claude-sonnet-5");
+            m.preview = Some("looking at the parser module".to_string());
+            m.search_text = text.clone();
+            m.updated_at = 1_700_000_000 + i as u64;
+            m
+        })
+        .collect()
+}
+
+/// One search query over `n` sessions. The corpus is cloned per sample via `with_inputs` (untimed),
+/// so the measured region is exactly `search_sessions` → `search_rank` × n, and the alloc columns
+/// report allocs/query + bytes/query: `n` discarded 50 KB lowercased copies before the fix, ~none
+/// after. Non-matching query = every field of every session is scanned to the end (worst case).
+#[divan::bench(args = [20, 200], sample_count = 20)]
+fn search_rank(bencher: Bencher, n: usize) {
+    let corpus = session_corpus(n);
+    bencher
+        .with_inputs(|| corpus.clone())
+        .bench_local_values(|sessions| {
+            let out = search_sessions(sessions, Some(NO_MATCH_QUERY));
+            black_box(out.len())
+        });
 }
 
 /// Our in-process find (fd's `ignore` walk). Sequential — parallelizing regressed on this tree (its
