@@ -409,7 +409,8 @@ fn synthetic_history(model: &str) -> Vec<Message> {
             blocks.push(ContentBlock::Thinking {
                 text: format!(
                     "Module {i} looks allocation-heavy; let me grep for the hot path first."
-                ),
+                )
+                .into(),
                 signature: reasoning_signature(i),
             });
         }

@@ -6880,7 +6880,7 @@ fn message_text(msg: &agent_core::Message) -> Option<String> {
         .content
         .iter()
         .filter_map(|b| match b {
-            agent_core::ContentBlock::Text { text, .. } => Some(text.as_str()),
+            agent_core::ContentBlock::Text { text, .. } => Some(&**text),
             _ => None,
         })
         .collect();
@@ -6908,7 +6908,7 @@ fn last_assistant_text(session: &Session) -> String {
             m.content
                 .iter()
                 .filter_map(|b| match b {
-                    agent_core::ContentBlock::Text { text, .. } => Some(text.as_str()),
+                    agent_core::ContentBlock::Text { text, .. } => Some(&**text),
                     _ => None,
                 })
                 .collect::<String>()

@@ -106,7 +106,7 @@ impl Session {
     }
 
     /// Seed (or continue) the conversation with a user text turn.
-    pub fn user(&mut self, text: impl Into<String>) -> &mut Self {
+    pub fn user(&mut self, text: impl Into<Arc<str>>) -> &mut Self {
         self.push(Message::user(text));
         self
     }
@@ -309,7 +309,7 @@ mod tests {
         let mut s = Session::new();
         s.push(
             Message::assistant(vec![ContentBlock::Thinking {
-                text: String::new(),
+                text: String::new().into(),
                 signature: String::new(),
             }])
             .with_model_id("claude-opus-4-8"),

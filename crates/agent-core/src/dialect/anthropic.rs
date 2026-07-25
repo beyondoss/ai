@@ -1987,7 +1987,7 @@ data: {"type":"message_stop"}
             "claude-opus-4-8",
             vec![Message::tool_results(vec![ContentBlock::ToolResult {
                 tool_use_id: "tu_1".into(),
-                content: String::new(),
+                content: String::new().into(),
                 is_error: false,
                 images: vec![ImageSource::base64("image/png", "AAAA")],
             }])],
@@ -2332,7 +2332,7 @@ data: {"type":"message_stop"}
                 Message::user("think then answer"),
                 Message::assistant(vec![
                     ContentBlock::Thinking {
-                        text: String::new(),
+                        text: String::new().into(),
                         signature: String::new(),
                     },
                     ContentBlock::text("answer"),
@@ -2366,7 +2366,7 @@ data: {"type":"message_stop"}
                 Message::user("think then answer"),
                 Message::assistant(vec![
                     ContentBlock::Thinking {
-                        text: String::new(),
+                        text: String::new().into(),
                         signature: "sig-empty".into(),
                     },
                     ContentBlock::Thinking {
@@ -3165,7 +3165,7 @@ data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use"
     fn a_transcript_that_crossed_dialects_carries_no_foreign_block_fields_to_anthropic() {
         let assistant = Message::assistant(vec![
             ContentBlock::Text {
-                text: "A".to_string(),
+                text: "A".to_string().into(),
                 // What `openai_responses` stamps on every assistant text block.
                 id: Some("msg_010ec72a89156dda".to_string()),
                 phase: Some("final".to_string()),
@@ -3203,7 +3203,7 @@ data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use"
     fn pruning_keeps_every_field_anthropic_actually_needs() {
         let assistant = Message::assistant(vec![
             ContentBlock::Thinking {
-                text: "hmm".to_string(),
+                text: "hmm".to_string().into(),
                 signature: "sig-abc".to_string(),
             },
             ContentBlock::ToolUse {
@@ -3215,7 +3215,7 @@ data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use"
         ]);
         let result = Message::tool_results(vec![ContentBlock::ToolResult {
             tool_use_id: "call_1".to_string(),
-            content: "file contents".to_string(),
+            content: "file contents".to_string().into(),
             is_error: false,
             images: Vec::new(),
         }]);

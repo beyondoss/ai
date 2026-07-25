@@ -1788,7 +1788,7 @@ impl Agent {
                 terminate &= wants_terminate;
                 result_blocks.push(ContentBlock::ToolResult {
                     tool_use_id: id.clone(),
-                    content: cap_tool_result(content),
+                    content: cap_tool_result(content).into(),
                     is_error,
                     images,
                 });
@@ -2550,7 +2550,7 @@ impl Agent {
             .blocks
             .iter()
             .filter_map(|b| match b {
-                ContentBlock::Text { text, .. } => Some(text.as_str()),
+                ContentBlock::Text { text, .. } => Some(&**text),
                 _ => None,
             })
             .collect();
@@ -2576,7 +2576,7 @@ fn turn_text(turn: &Turn) -> String {
     turn.blocks
         .iter()
         .filter_map(|b| match b {
-            ContentBlock::Text { text, .. } => Some(text.as_str()),
+            ContentBlock::Text { text, .. } => Some(&**text),
             _ => None,
         })
         .collect()
@@ -2817,7 +2817,7 @@ fn repair_cancelled_dispatch(
             let (content, images, is_error, _) = resolve_tool_result(result);
             ContentBlock::ToolResult {
                 tool_use_id: id.clone(),
-                content,
+                content: content.into(),
                 is_error,
                 images,
             }
@@ -3311,7 +3311,9 @@ impl Accumulator {
                 self.declare(*index);
                 self.done.insert(
                     *index,
-                    Some(ContentBlock::RedactedThinking { data: data.clone() }),
+                    Some(ContentBlock::RedactedThinking {
+                        data: data.as_str().into(),
+                    }),
                 );
                 self.try_flush();
             }
@@ -3398,12 +3400,15 @@ impl Accumulator {
                     thought_signature,
                 })
             }
-            OpenBlock::Thinking(text, signature) => {
-                Some(ContentBlock::Thinking { text, signature })
-            }
-            OpenBlock::Text(text, id, phase) => {
-                (!text.is_empty()).then_some(ContentBlock::Text { text, id, phase })
-            }
+            OpenBlock::Thinking(text, signature) => Some(ContentBlock::Thinking {
+                text: text.into(),
+                signature,
+            }),
+            OpenBlock::Text(text, id, phase) => (!text.is_empty()).then(|| ContentBlock::Text {
+                text: text.into(),
+                id,
+                phase,
+            }),
         };
         self.done.insert(index, block);
         self.try_flush();
@@ -5827,8 +5832,8 @@ mod tests {
                     ..
                 },
             ) => {
-                assert_eq!((a.as_str(), ca.as_str()), ("a", "t1"));
-                assert_eq!((b.as_str(), cb.as_str()), ("b", "t2"));
+                assert_eq!((a.as_str(), ca.as_ref()), ("a", "t1"));
+                assert_eq!((b.as_str(), cb.as_ref()), ("b", "t2"));
             }
             other => panic!("expected two ordered tool_result messages, got {other:?}"),
         }
@@ -6033,7 +6038,7 @@ mod tests {
             .expect("call `a` must have a tool_result");
         assert_eq!(
             first,
-            ("first edit applied".to_string(), false),
+            ("first edit applied".into(), false),
             "the call that actually completed must keep its real result, not be rewritten as \
              cancelled: {:?}",
             results.content
@@ -6946,7 +6951,7 @@ mod tests {
                 is_error, content, ..
             } => {
                 assert!(!is_error);
-                assert_eq!(content, "seq-done");
+                assert_eq!(content.as_ref(), "seq-done");
             }
             other => {
                 panic!("expected a successful tool_result for the registered call, got {other:?}")
@@ -7063,7 +7068,7 @@ mod tests {
                 is_error, content, ..
             } => {
                 assert!(!is_error, "recovered call must not be treated as malformed");
-                assert_eq!(content, "hello wor");
+                assert_eq!(content.as_ref(), "hello wor");
             }
             other => panic!("expected a tool_result block, got {other:?}"),
         }
@@ -7546,7 +7551,7 @@ mod tests {
         assert!(
             matches!(
                 session.messages.last().map(|m| m.content.first()),
-                Some(Some(ContentBlock::Text { text, .. })) if text == "done despite the failed compaction"
+                Some(Some(ContentBlock::Text { text, .. })) if text.as_ref() == "done despite the failed compaction"
             ),
             "the run must reach the real turn, not just swallow the failure and stop: {:#?}",
             session.messages.last()
@@ -8240,8 +8245,8 @@ mod tests {
             panic!("expected the spliced summary message to be text");
         };
         assert_eq!(
-            spliced,
-            &format!(
+            spliced.as_ref(),
+            format!(
                 "{}\n\nCompacted from 12345 tokens\n\n{summary}",
                 compaction::SUMMARY_MARKER
             )
@@ -8985,14 +8990,14 @@ mod tests {
 
         match &session.messages[1].content[0] {
             ContentBlock::Thinking { text, signature } => {
-                assert_eq!(text, "reasoning…");
+                assert_eq!(text.as_ref(), "reasoning…");
                 assert_eq!(signature, "sig-xyz");
             }
             other => panic!("expected a thinking block first, got {other:?}"),
         }
         assert!(matches!(
             &session.messages[1].content[1],
-            ContentBlock::Text { text, .. } if text == "the answer"
+            ContentBlock::Text { text, .. } if text.as_ref() == "the answer"
         ));
     }
 
@@ -9032,7 +9037,8 @@ mod tests {
         match &session.messages[1].content[0] {
             ContentBlock::Thinking { text, signature } => {
                 assert_eq!(
-                    text, "partial reasoning, now complete",
+                    text.as_ref(),
+                    "partial reasoning, now complete",
                     "ThinkingFinal must replace whatever the accumulated deltas produced, not be \
                      ignored"
                 );
@@ -9269,7 +9275,7 @@ mod tests {
         assert_eq!(session.messages.len(), 4);
         assert!(matches!(
             &session.messages[2].content[0],
-            ContentBlock::Text { text, .. } if text == "now do the follow-up"
+            ContentBlock::Text { text, .. } if text.as_ref() == "now do the follow-up"
         ));
     }
 
@@ -9306,7 +9312,7 @@ mod tests {
         );
         assert!(matches!(
             &blocks[0],
-            ContentBlock::Text { text, .. } if text == "look at this"
+            ContentBlock::Text { text, .. } if text.as_ref() == "look at this"
         ));
         assert!(matches!(
             &blocks[1],
@@ -9347,7 +9353,7 @@ mod tests {
         assert!(matches!(blocks[0], ContentBlock::ToolResult { .. }));
         assert!(matches!(
             &blocks[1],
-            ContentBlock::Text { text, .. } if text == "also look at this"
+            ContentBlock::Text { text, .. } if text.as_ref() == "also look at this"
         ));
         assert!(matches!(
             &blocks[2],
@@ -9511,7 +9517,7 @@ mod tests {
         assert!(matches!(blocks[0], ContentBlock::ToolResult { .. }));
         assert!(matches!(
             &blocks[1],
-            ContentBlock::Text { text, .. } if text == "actually, also handle the edge case"
+            ContentBlock::Text { text, .. } if text.as_ref() == "actually, also handle the edge case"
         ));
     }
 
@@ -9642,7 +9648,7 @@ mod tests {
         assert!(matches!(blocks[0], ContentBlock::ToolResult { .. }));
         assert!(matches!(
             &blocks[1],
-            ContentBlock::Text { text, .. } if text == "also handle this"
+            ContentBlock::Text { text, .. } if text.as_ref() == "also handle this"
         ));
     }
 
@@ -9977,7 +9983,7 @@ mod tests {
                 .iter()
                 .any(|m| m.role == Role::User
                     && m.content.iter().any(
-                        |b| matches!(b, ContentBlock::Text { text, .. } if text == "don't lose me")
+                        |b| matches!(b, ContentBlock::Text { text, .. } if text.as_ref() == "don't lose me")
                     )),
             "the user's own prompt must already be present in the snapshot a 'crash' here would \
              leave behind: {messages_at_first_checkpoint:?}"
@@ -10015,7 +10021,7 @@ mod tests {
             .content
             .iter()
             .filter_map(|b| match b {
-                ContentBlock::Text { text, .. } => Some(text.as_str()),
+                ContentBlock::Text { text, .. } => Some(&**text),
                 _ => None,
             })
             .collect();
@@ -10192,7 +10198,7 @@ mod tests {
                 },
             ) => {
                 assert_eq!(fid, "f");
-                assert_eq!(fcontent, "fast-done");
+                assert_eq!(fcontent.as_ref(), "fast-done");
                 assert!(
                     !ferr,
                     "the call that actually finished must not be flagged an error"
@@ -10965,7 +10971,7 @@ mod tests {
             !*is_error,
             "the tool's own success must survive the panicking rewrite hook"
         );
-        assert_eq!(content, "hi", "got: {content}");
+        assert_eq!(content.as_ref(), "hi", "got: {content}");
     }
 
     #[tokio::test]
@@ -11337,7 +11343,7 @@ mod tests {
             _cancel: &CancellationToken,
         ) -> bool {
             let saw_it = tool_results.iter().any(
-                |b| matches!(b, ContentBlock::ToolResult { content, is_error, .. } if content == "pong" && !is_error),
+                |b| matches!(b, ContentBlock::ToolResult { content, is_error, .. } if content.as_ref() == "pong" && !is_error),
             );
             if saw_it {
                 self.saw_result
@@ -11434,7 +11440,7 @@ mod tests {
         ) -> Message {
             for block in &mut message.content {
                 if let ContentBlock::Text { text, .. } = block {
-                    *text = text.replace("secret-token-123", "[REDACTED]");
+                    *text = text.replace("secret-token-123", "[REDACTED]").into();
                 }
             }
             message
@@ -11460,7 +11466,7 @@ mod tests {
         let ContentBlock::Text { text, .. } = &session.messages.last().unwrap().content[0] else {
             panic!("expected a text block");
         };
-        assert_eq!(text, "here is the [REDACTED] you asked about");
+        assert_eq!(text.as_ref(), "here is the [REDACTED] you asked about");
         assert!(
             !text.contains("secret-token-123"),
             "the raw secret must not survive into the committed session: {text}"
@@ -11497,7 +11503,8 @@ mod tests {
             panic!("expected a text block");
         };
         assert_eq!(
-            text, "the real answer",
+            text.as_ref(),
+            "the real answer",
             "a panicking hook must fail open to the original, unredacted content"
         );
     }
@@ -11532,7 +11539,7 @@ mod tests {
         let ContentBlock::Text { text, .. } = &last.content[0] else {
             panic!("expected a text block");
         };
-        assert_eq!(text, "the real answer");
+        assert_eq!(text.as_ref(), "the real answer");
     }
 
     struct InjectsHeaderNote;

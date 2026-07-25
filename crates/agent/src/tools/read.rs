@@ -1568,7 +1568,7 @@ mod tests {
         assert_eq!(out.images.len(), 1);
         let decoded = image::load_from_memory(
             &base64::engine::general_purpose::STANDARD
-                .decode(&out.images[0].data)
+                .decode(&*out.images[0].data)
                 .unwrap(),
         )
         .unwrap();
@@ -1788,7 +1788,7 @@ mod tests {
         );
         // The converted bytes must actually decode as a real PNG carrying the same pixels.
         let decoded = base64::engine::general_purpose::STANDARD
-            .decode(&out.images[0].data)
+            .decode(&*out.images[0].data)
             .unwrap();
         assert_eq!(
             image::guess_format(&decoded).unwrap(),
@@ -1850,7 +1850,7 @@ mod tests {
         assert_eq!(out.images.len(), 1);
         let decoded = image::load_from_memory(
             &base64::engine::general_purpose::STANDARD
-                .decode(&out.images[0].data)
+                .decode(&*out.images[0].data)
                 .unwrap(),
         )
         .unwrap();
@@ -1880,7 +1880,7 @@ mod tests {
             .unwrap();
         assert_eq!(out.images.len(), 1);
         let decoded_bytes = base64::engine::general_purpose::STANDARD
-            .decode(&out.images[0].data)
+            .decode(&*out.images[0].data)
             .unwrap();
         assert_eq!(
             decoded_bytes, png_bytes,
@@ -2241,7 +2241,7 @@ mod tests {
         );
 
         let decoded_bytes = base64::engine::general_purpose::STANDARD
-            .decode(&out.images[0].data)
+            .decode(&*out.images[0].data)
             .unwrap();
         let decoded = image::load_from_memory(&decoded_bytes).unwrap();
         assert!(

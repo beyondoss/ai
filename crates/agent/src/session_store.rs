@@ -4023,7 +4023,7 @@ fn first_user_text(msg: &Message) -> Option<&str> {
         return None;
     }
     msg.content.iter().find_map(|b| match b {
-        ContentBlock::Text { text, .. } => Some(text.as_str()),
+        ContentBlock::Text { text, .. } => Some(&**text),
         _ => None,
     })
 }
@@ -4047,7 +4047,7 @@ fn append_message_search_text(msg: &Message, search_text: &mut String, search_ch
         return;
     }
     let mut blocks = msg.content.iter().filter_map(|b| match b {
-        ContentBlock::Text { text, .. } => Some(text.as_str()),
+        ContentBlock::Text { text, .. } => Some(&**text),
         _ => None,
     });
     let Some(first) = blocks.next() else {
@@ -5804,7 +5804,7 @@ mod tests {
         let ContentBlock::Text { text, .. } = &restored.messages[0].content[0] else {
             panic!("expected text");
         };
-        assert_eq!(text, "one (rewritten)");
+        assert_eq!(text.as_ref(), "one (rewritten)");
 
         // No `Entry::Compaction` record at all.
         let raw = fs::read_to_string(&reopened.path).unwrap();
@@ -8799,8 +8799,12 @@ mod tests {
         // Case 2: target is an ancestor still on the active path (b) — c and d are abandoned.
         let abandoned = store.abandoned_by_switch(&ids[1]);
         assert_eq!(abandoned.len(), 2);
-        assert!(matches!(&abandoned[0].1.content[0], ContentBlock::Text{text, ..} if text == "c"));
-        assert!(matches!(&abandoned[1].1.content[0], ContentBlock::Text{text, ..} if text == "d"));
+        assert!(
+            matches!(&abandoned[0].1.content[0], ContentBlock::Text{text, ..} if text.as_ref() == "c")
+        );
+        assert!(
+            matches!(&abandoned[1].1.content[0], ContentBlock::Text{text, ..} if text.as_ref() == "d")
+        );
 
         // Case 3: unknown target — nothing abandoned (the switch itself will fail).
         assert!(store.abandoned_by_switch("does-not-exist").is_empty());
@@ -8817,7 +8821,9 @@ mod tests {
         // (which lives on the *other* branch, not the one currently active).
         let abandoned = store.abandoned_by_switch(&ids[3]);
         assert_eq!(abandoned.len(), 1);
-        assert!(matches!(&abandoned[0].1.content[0], ContentBlock::Text{text, ..} if text == "e"));
+        assert!(
+            matches!(&abandoned[0].1.content[0], ContentBlock::Text{text, ..} if text.as_ref() == "e")
+        );
     }
 
     #[test]
@@ -8880,8 +8886,12 @@ mod tests {
             2,
             "expected just [c, d] — the walk stops at the missing `b`"
         );
-        assert!(matches!(&orphaned[0].content[0], ContentBlock::Text{text, ..} if text == "c"));
-        assert!(matches!(&orphaned[1].content[0], ContentBlock::Text{text, ..} if text == "d"));
+        assert!(
+            matches!(&orphaned[0].content[0], ContentBlock::Text{text, ..} if text.as_ref() == "c")
+        );
+        assert!(
+            matches!(&orphaned[1].content[0], ContentBlock::Text{text, ..} if text.as_ref() == "d")
+        );
 
         // And a fresh reopen of the file reconstructs the same picture — the orphaning survives a
         // round-trip through disk, not just the in-memory state from the same process. Having
@@ -8942,7 +8952,7 @@ mod tests {
         let texts: Vec<&str> = messages
             .iter()
             .map(|m| match &m.content[0] {
-                ContentBlock::Text { text, .. } => text.as_str(),
+                ContentBlock::Text { text, .. } => text.as_ref(),
                 other => panic!("expected a text block, got {other:?}"),
             })
             .collect();
@@ -9597,10 +9607,10 @@ mod tests {
         let (_repo2, session) = SessionStore::open(store.path.clone()).unwrap();
         assert_eq!(session.messages.len(), 3);
         assert!(
-            matches!(&session.messages[1].content[0], ContentBlock::Text { text, .. } if text == "three")
+            matches!(&session.messages[1].content[0], ContentBlock::Text { text, .. } if text.as_ref() == "three")
         );
         assert!(
-            matches!(&session.messages[2].content[0], ContentBlock::Text { text, .. } if text == "four")
+            matches!(&session.messages[2].content[0], ContentBlock::Text { text, .. } if text.as_ref() == "four")
         );
     }
 }

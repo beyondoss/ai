@@ -50,7 +50,7 @@ fn text_of(blocks: &[ContentBlock]) -> String {
     blocks
         .iter()
         .filter_map(|b| match b {
-            ContentBlock::Text { text, .. } => Some(text.as_str()),
+            ContentBlock::Text { text, .. } => Some(&**text),
             _ => None,
         })
         .collect()
@@ -270,7 +270,7 @@ fn push_tool_results(input: &mut Vec<Value>, blocks: &[ContentBlock], supports_v
             let output = if images.is_empty() {
                 json!(content)
             } else if !supports_vision {
-                let mut text = content.clone();
+                let mut text = content.to_string();
                 if !text.is_empty() {
                     text.push('\n');
                 }
@@ -1632,7 +1632,7 @@ data: {"type":"response.completed","response":{"status":"completed","usage":{"in
             "gpt-4o",
             vec![Message::tool_results(vec![ContentBlock::ToolResult {
                 tool_use_id: "call_1".into(),
-                content: String::new(),
+                content: String::new().into(),
                 is_error: false,
                 images: vec![ImageSource::base64("image/png", "AAAA")],
             }])],

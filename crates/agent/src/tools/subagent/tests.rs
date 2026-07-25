@@ -69,7 +69,7 @@ fn user_text(req: &agent_core::ModelRequest) -> String {
         .filter(|m| m.role == agent_core::Role::User)
         .flat_map(|m| m.content.iter())
         .filter_map(|b| match b {
-            agent_core::ContentBlock::Text { text, .. } => Some(text.as_str()),
+            agent_core::ContentBlock::Text { text, .. } => Some(text.as_ref()),
             _ => None,
         })
         .collect::<Vec<_>>()

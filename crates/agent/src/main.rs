@@ -5142,7 +5142,7 @@ mod tests {
         let decoded = image::load_from_memory(
             &base64::Engine::decode(
                 &base64::engine::general_purpose::STANDARD,
-                &out.images[0].data,
+                &*out.images[0].data,
             )
             .unwrap(),
         )

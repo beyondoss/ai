@@ -65,7 +65,7 @@ fn turn(i: usize) -> Vec<Message> {
         Message::user(format!("please look at file number {i} and explain it")),
         Message::assistant(vec![
             ContentBlock::Text {
-                text: prose,
+                text: prose.into(),
                 id: None,
                 phase: None,
             },

@@ -386,7 +386,7 @@ pub(crate) fn repair_orphaned_tool_use(messages: &[Message]) -> std::borrow::Cow
                 ContentBlock::ToolUse { id, .. } if !answered(messages, i, id) => {
                     Some(ContentBlock::ToolResult {
                         tool_use_id: id.clone(),
-                        content: "no result recorded for this tool call".to_string(),
+                        content: "no result recorded for this tool call".into(),
                         is_error: true,
                         images: Vec::new(),
                     })
@@ -1414,7 +1414,7 @@ data: {"type":"message_stop"}
             ] => {
                 assert_eq!(tool_use_id, "t1");
                 assert!(*is_error);
-                assert_eq!(text, "nevermind");
+                assert_eq!(text.as_ref(), "nevermind");
             }
             other => panic!("expected [synthetic ToolResult, original Text], got {other:?}"),
         }
@@ -1482,7 +1482,7 @@ data: {"type":"message_stop"}
             ] => {
                 assert_eq!(first, "orphan", "synthetic result comes first");
                 assert_eq!(second, "answered");
-                assert_eq!(content, "ok", "the real result must be untouched");
+                assert_eq!(content.as_ref(), "ok", "the real result must be untouched");
                 assert!(!is_error);
             }
             other => panic!("expected exactly two ToolResult blocks merged, got {other:?}"),

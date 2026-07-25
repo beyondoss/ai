@@ -54,7 +54,7 @@ fn text_of(blocks: &[ContentBlock]) -> String {
     blocks
         .iter()
         .filter_map(|b| match b {
-            ContentBlock::Text { text, .. } => Some(text.as_str()),
+            ContentBlock::Text { text, .. } => Some(&**text),
             _ => None,
         })
         .collect()
@@ -327,7 +327,7 @@ pub fn build_body(req: &ModelRequest) -> Value {
                         let tool_text: &str = if content.is_empty() && !images.is_empty() {
                             TOOL_RESULT_IMAGE_ONLY_TEXT
                         } else {
-                            content.as_str()
+                            content
                         };
                         // Defense-in-depth: if this id's paired `tool_use` was rewritten (below) because
                         // it came from a foreign model, replay the *rewritten* id here so the two still
@@ -1680,7 +1680,7 @@ mod tests {
             "gpt-4o",
             vec![Message::tool_results(vec![ContentBlock::ToolResult {
                 tool_use_id: "call_1".into(),
-                content: String::new(),
+                content: String::new().into(),
                 is_error: false,
                 images: vec![ImageSource::base64("image/png", "AAAA")],
             }])],

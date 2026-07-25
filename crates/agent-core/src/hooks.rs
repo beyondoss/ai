@@ -408,7 +408,7 @@ mod tests {
         ) -> crate::message::Message {
             for block in &mut message.content {
                 if let crate::message::ContentBlock::Text { text, .. } = block {
-                    *text = text.replace("secret-token-123", "[REDACTED]");
+                    *text = text.replace("secret-token-123", "[REDACTED]").into();
                 }
             }
             message
@@ -427,7 +427,7 @@ mod tests {
         let crate::message::ContentBlock::Text { text, .. } = &rewritten.content[0] else {
             panic!("expected a text block");
         };
-        assert_eq!(text, "here is the [REDACTED] you asked about");
+        assert_eq!(text.as_ref(), "here is the [REDACTED] you asked about");
         assert_eq!(rewritten.role, crate::message::Role::Assistant);
     }
 
