@@ -55,6 +55,53 @@ mod key {
     }
 }
 
+mod admin {
+    use super::*;
+    use beyond_ai::admin::{AdminApp, HEALTH_OK};
+    use beyond_ai::metrics::{Metrics, ProviderMetrics};
+    use std::sync::{Arc, OnceLock};
+
+    /// Register the real metric set **and** materialise every per-provider child series, exactly as
+    /// boot does (`state::build_providers` → `ProviderMetrics::resolve`) — that cross-product is what
+    /// makes a scrape body tens of KiB from process start rather than a few KiB. `Metrics::new`
+    /// registers on the process-wide default registry, which rejects a second registration, so it is
+    /// built once behind a `OnceLock` (same shape as `state.rs`'s test fixture).
+    fn registry() -> &'static Arc<Metrics> {
+        static M: OnceLock<Arc<Metrics>> = OnceLock::new();
+        M.get_or_init(|| {
+            let m = Metrics::new().expect("register metrics once");
+            for spec in beyond_ai::route::known_providers() {
+                let pm = ProviderMetrics::resolve(&m, spec.name);
+                // Non-zero observations so the histogram buckets encode realistic values, not zeros.
+                pm.ttft_seconds.observe(0.42);
+                pm.upstream_latency_seconds.observe(3.5);
+                pm.record_response(200);
+                pm.record_response(429);
+            }
+            m
+        })
+    }
+
+    /// `/metrics`: gather the default registry and text-encode it. The `BytesCount` reports the real
+    /// encoded body size, which is the number the buffer pre-sizing has to track — a stale constant
+    /// shows up here as reallocs (bytes-copied) rather than as an obviously wrong line.
+    #[divan::bench]
+    fn scrape(bencher: Bencher) {
+        let _ = registry();
+        let len = AdminApp::metrics().body().len();
+        bencher
+            .counter(BytesCount::new(len))
+            .bench(AdminApp::metrics);
+    }
+
+    /// `/livez` (and `/readyz`): the per-probe health body. Cheap and infrequent, but it is the one
+    /// response the orchestrator hits forever, so the alloc columns are worth pinning.
+    #[divan::bench]
+    fn health(bencher: Bencher) {
+        bencher.bench(|| AdminApp::health(black_box(200), black_box(HEALTH_OK)));
+    }
+}
+
 mod route {
     use super::*;
     use beyond_ai::route::{Dialect, dialect_default};
