@@ -117,11 +117,14 @@ pub struct RequestCtx {
     /// The resolved upstream provider (authority/host + precomputed managed auth value), shared from
     /// the boot-time registry — a cheap `Arc` clone, nothing re-allocated per request.
     provider: Arc<Provider>,
-    /// The path (+ query) to send upstream: the client path with the `/{provider}` segment stripped
-    /// (provider-prefixed request) or unchanged (bare-path default). Forwarded **verbatim** — the
-    /// gateway does no per-provider path rewriting. Applied as the upstream URI in
-    /// `upstream_request_filter`.
-    forward_path: String,
+    /// The path (+ query) to send upstream, when it differs from the inbound one: the client path
+    /// with the `/{provider}` segment stripped. Forwarded **verbatim** — the gateway does no
+    /// per-provider path rewriting. Applied as the upstream URI in `upstream_request_filter`.
+    ///
+    /// `None` for the bare-path default, whose path already *is* what the upstream should see. The
+    /// distinction is in the type rather than discovered by rebuilding the path and comparing it,
+    /// so the common route allocates nothing.
+    forward_path: Option<String>,
     /// Whether this is a **managed** request (`bai_…` key → swap to the pool key). `false` for
     /// **BYO** — we leave the user's own auth header untouched (passthrough).
     managed: bool,
@@ -498,18 +501,28 @@ impl ProxyHttp for AiProxy {
             };
             if let Some(p) = self.state.provider(first) {
                 // Provider-prefixed: strip the leading `/{first}` segment, forward the remainder.
+                // `first` is non-empty here (an empty first segment matches no provider), so this
+                // always differs from the inbound path and always needs the URI rewritten.
                 let rest = &path[1 + first.len()..];
                 let rest = if rest.is_empty() { "/" } else { rest };
-                (Some(p.clone()), with_query(rest), is_streamable_path(rest))
+                (
+                    Some(p.clone()),
+                    Some(with_query(rest)),
+                    is_streamable_path(rest),
+                )
             } else if let Some(name) = bare_default_provider_name(path) {
-                // Bare default: dialect picks the provider; forward the path unchanged.
+                // Bare default: dialect picks the provider and the path is forwarded unchanged, so
+                // there is nothing to rewrite — `None`. This used to build the path back up with its
+                // query appended, hand it to `upstream_request_filter`, get compared equal against
+                // the inbound `path_and_query`, and dropped: one wasted allocation per request on
+                // the drop-in default route, three when a query string was present.
                 (
                     self.state.provider(name).cloned(),
-                    with_query(path),
+                    None,
                     is_streamable_path(path),
                 )
             } else {
-                (None, String::new(), false)
+                (None, None, false)
             }
         };
         let Some(provider) = provider_opt else {
@@ -820,17 +833,16 @@ impl ProxyHttp for AiProxy {
         apply_provider_attribution(upstream_request, rc.provider.name.as_str(), rc.managed)?;
 
         // Forward the provider-native path (computed in `request_filter`): the client path with the
-        // `/{provider}` segment stripped, or unchanged for a bare-path default. We send it verbatim —
-        // no per-provider rewriting. Only set the URI when it actually differs from the inbound path
-        // (i.e. a `/{provider}` prefix was stripped); the bare-path case needs no change, so we skip
-        // the parse + realloc. The body's framing (Content-Length / chunked) is preserved.
-        if rc.forward_path
-            != upstream_request
-                .uri
-                .path_and_query()
-                .map(|pq| pq.as_str())
-                .unwrap_or("")
-            && let Ok(uri) = rc.forward_path.parse()
+        // `/{provider}` segment stripped. Sent verbatim — no per-provider rewriting. The body's
+        // framing (Content-Length / chunked) is preserved.
+        //
+        // `None` means the bare-path default, where the path is already what the upstream should
+        // see, so there is nothing to build and nothing to parse. That used to be expressed by
+        // reconstructing the path anyway and comparing it against the inbound `path_and_query`;
+        // encoding it in the type instead skips the allocation rather than detecting it after
+        // the fact.
+        if let Some(forward_path) = &rc.forward_path
+            && let Ok(uri) = forward_path.parse()
         {
             upstream_request.set_uri(uri);
         }

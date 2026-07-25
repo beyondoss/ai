@@ -164,6 +164,40 @@ mod route {
     fn dialect_default_name(bencher: Bencher, dialect: Dialect) {
         bencher.bench(|| dialect_default(black_box(dialect)));
     }
+
+    // --- forward-path construction on the bare-default route ------------------------------------
+    //
+    // `/v1/…` with no provider prefix is the drop-in route (an OpenAI or Anthropic SDK pointed at
+    // the gateway by changing only the host), so it is the common shape. Its forwarded path is the
+    // inbound path, unchanged — `request_filter` now says so with `None` instead of rebuilding the
+    // string, handing it to `upstream_request_filter`, comparing it equal, and dropping it.
+    //
+    // These two rows are the work that no longer happens on that route, not a before/after of code
+    // that still runs. Kept because the cost is entirely in the allocation, which is invisible
+    // end-to-end (a loopback round-trip is ~120 µs) but shows plainly in the alloc columns.
+
+    /// What the bare-default route used to build, with no query string.
+    #[divan::bench]
+    fn forward_path_rebuilt_no_query() -> String {
+        let path = black_box("/v1/chat/completions");
+        let query: Option<&str> = black_box(None);
+        match query {
+            Some(q) => format!("{path}?{q}"),
+            None => path.to_string(),
+        }
+    }
+
+    /// The same, with a query string — Azure OpenAI requires `?api-version=…` on every call, so
+    /// this is not a rare shape.
+    #[divan::bench]
+    fn forward_path_rebuilt_with_query() -> String {
+        let path = black_box("/v1/chat/completions");
+        let query: Option<&str> = black_box(Some("api-version=2024-10-21"));
+        match query {
+            Some(q) => format!("{path}?{q}"),
+            None => path.to_string(),
+        }
+    }
 }
 
 mod deny {
