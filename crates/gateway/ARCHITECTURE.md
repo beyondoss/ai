@@ -199,13 +199,27 @@ Restore = explicit delete from NATS KV or TTL expiry — no gateway-side timer.
 
 ### Rate Guardrails (`ratelimit.rs`)
 
-Two fixed-memory count-min sketch tiers, checked before Ed25519 verify and before any upstream
-connection:
+Two fixed-memory tiers, checked before Ed25519 verify and before any upstream connection:
 
-| Tier                 | Key             | Bucket count | Default ceiling | Managed exempt? |
-| -------------------- | --------------- | ------------ | --------------- | --------------- |
-| Per-credential       | Hash of raw key | 5 MB sketch  | 100 req/s       | No              |
-| Global BYO aggregate | Single bucket   | 1 bucket     | 1000 req/s      | **Yes**         |
+| Tier                 | Key             | State            | Default ceiling | Managed exempt? |
+| -------------------- | --------------- | ---------------- | --------------- | --------------- |
+| Per-credential       | Hash of raw key | 5.24 MB sketch   | 100 req/s       | No              |
+| Global BYO aggregate | Single bucket   | one 64 B atomic  | 1000 req/s      | **Yes**         |
+
+Only the per-credential tier needs a sketch: its key cardinality is unbounded, so it uses a pair of
+count-min estimators (5 × 65536 counters each) rotated at the window boundary, giving fixed memory
+with no per-key entry and no GC. The `SLOTS` derivation — peak N, the false-throttle budget against
+`rate_limit_rps`, and the cache/rotation cost on the other side — is written out in full at the
+constant in `ratelimit.rs`. The global BYO tier is *one* bucket, so it is one cacheline-isolated
+`AtomicU64` packing `(window_index, count)`: exact, contention-minimal, and reset-free (opening a
+window is the same CAS as counting a request).
+
+Neither tier uses `pingora_limits::rate::Rate`. `Rate::maybe_reset` subtracts an atomically-loaded
+reset timestamp from an independently-taken clock reading, which underflows whenever the two are
+inverted by a stall — a panicking worker under the workspace's `overflow-checks`, reproduced in
+seconds under oversubscribed threads. The local `WindowedRate` keeps the same red/blue rotation but
+compares monotonic window *indices* instead, so there is nothing to underflow. Both tiers take the
+window index from one clock reading per request (`RateLimit::check_at`).
 
 The per-credential tier is keyed on the **raw presented credential** (not the verified tenant),
 which has two consequences: (1) the guard sits ahead of verify, so forged tokens are rejected
@@ -256,7 +270,8 @@ A flood of forged `bai_v1` tokens could drive unbounded crypto work if the rate 
 verify. By checking the per-credential bucket first (keyed on the raw token, no crypto), a
 forged-key flood is rejected in tens of nanoseconds per request. Legit traffic is unaffected: the
 rate guard passes through, then verify runs as normal. The unit bench (`benches/unit.rs`) asserts
-this: `key/verify` ≈ 28µs; `ratelimit::check` ≈ 43–83ns; 0 allocations for either.
+this: `key/verify` ≈ 23µs; `ratelimit::check` ≈ 39–60ns single-threaded, ≈ 88–220ns at 16 threads
+under a flood of distinct credentials; 0 allocations for either.
 
 ### Why the body injection exception exists (`managed + OpenAI + streaming`)
 
@@ -496,7 +511,7 @@ Prometheus on the default registry, exposed at `/metrics` on `metrics_listen`.
 | `peek`            | `ModelScanner` — streaming structural scan for the root-level `model`; O(1) memory                   | unit ✓         |
 | `usage`           | Token extraction (OpenAI / Anthropic, body + SSE)                                                    | unit ✓         |
 | `deny`            | Sparse deny-set, default-allow, reason → HTTP status                                                 | unit ✓         |
-| `ratelimit`       | Two-tier guardrail: per-credential + global BYO (count-min sketches, fixed memory, no GC)            | unit ✓         |
+| `ratelimit`       | Two-tier guardrail: per-credential (count-min sketch, fixed memory, no GC) + global BYO (one atomic) | unit ✓         |
 | `circuit_breaker` | Per-provider lock-free breaker (packed `AtomicU64`, windowed policy) — trips on 5xx/connect, not 429 | unit ✓ + e2e ✓ |
 | `state`           | Keyring + resolved provider registry + watched deny-set (ArcSwap) + TTL DNS cache                    | unit ✓         |
 | `store_watch`     | NATS watcher — gap-free deny-set seeding + delta watch as Pingora `BackgroundService`                | e2e ✓          |
@@ -542,18 +557,21 @@ gateway's added cost is negligible and bounded** — i.e. it never becomes the c
   beside ns/iter, no `unsafe` needed). Coverage: `key` verify/mint; `peek::ModelScanner` over
   0/4KB/256KB bodies with `model` placed last (worst case); `usage` parsers; `route`; `deny`
   (`parse_key`/`parse_reason` off-path + `reason()` on-path); `ratelimit::check` (managed tier
-  only vs. BYO which runs both tiers).
+  only vs. BYO which runs both tiers) — single-threaded/hot-cache *and* `check_flood_*`, which
+  charges 65536 distinct credentials from 1 and 16 threads over ≥ 2 window rotations, plus
+  `rotate_window`, which prices the window rotation on its own.
 
   What the alloc numbers assert:
-  | Operation           | Cost     | Allocations                  | Claim verified                |
-  | ------------------- | -------- | ---------------------------- | ----------------------------- |
-  | `key/verify`        | ~28µs    | 0                            | Stack-only Ed25519 decode     |
-  | `peek/ModelScanner` | varies   | 1 (independent of body size) | O(1) memory                   |
-  | `route`             | ~ns      | 0                            | —                             |
-  | `deny::reason`      | ~1–8ns   | 0, flat 0→1M entries         | O(1) lookup, O(denied) memory |
-  | `ratelimit::check`  | ~43–83ns | 0                            | Fixed-memory count-min        |
+  | Operation           | Cost      | Allocations                  | Claim verified                |
+  | ------------------- | --------- | ---------------------------- | ----------------------------- |
+  | `key/verify`        | ~23µs     | 0                            | Stack-only Ed25519 decode     |
+  | `peek/ModelScanner` | varies    | 1 (independent of body size) | O(1) memory                   |
+  | `route`             | ~ns       | 0                            | —                             |
+  | `deny::reason`      | ~1–8ns    | 0, flat 0→1M entries         | O(1) lookup, O(denied) memory |
+  | `ratelimit::check`  | ~39–220ns | 0                            | Fixed-memory, no per-key state |
+  | `ratelimit` rotation| ~39µs     | 0                            | Once per window, not per request |
 
-  **Headline: `key/verify` ≈ 28µs is ~350–650× every other per-request op.** This is why the rate
+  **Headline: `key/verify` ≈ 23µs is ~100–600× every other per-request op.** This is why the rate
   guardrail sits before verify in `proxy::request_filter`.
 
 - **End-to-end (`benches/e2e.rs`, `mise run bench:e2e`) — `criterion`.** Real `beyond-ai` binary
