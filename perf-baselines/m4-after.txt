@@ -1,0 +1,59 @@
+   Compiling beyond-ai-agent-core v0.1.0 (/home/jared/ai/crates/agent-core)
+    Finished `bench` profile [optimized] target(s) in 8.62s
+     Running benches/decode.rs (target/release/deps/decode-5a5edbbb72e64efb)
+Timer precision: 10 ns
+decode                   fastest       │ slowest       │ median        │ mean          │ samples │ iters
+╰─ pipeline                            │               │               │               │         │
+   ╰─ framer_and_decode                │               │               │               │         │
+      ├─ anthropic       226.8 µs      │ 277.4 µs      │ 229.6 µs      │ 230.7 µs      │ 100     │ 100
+      │                  493.9 MB/s    │ 403.9 MB/s    │ 488 MB/s      │ 485.6 MB/s    │         │
+      │                  max alloc:    │               │               │               │         │
+      │                    21          │ 21            │ 21            │ 21            │         │
+      │                    18.62 KB    │ 18.62 KB      │ 18.62 KB      │ 18.62 KB      │         │
+      │                  alloc:        │               │               │               │         │
+      │                    5053        │ 5053          │ 5053          │ 5053          │         │
+      │                    426.1 KB    │ 426.1 KB      │ 426.1 KB      │ 426.1 KB      │         │
+      │                  dealloc:      │               │               │               │         │
+      │                    5053        │ 5053          │ 5053          │ 5053          │         │
+      │                    434.2 KB    │ 434.2 KB      │ 434.2 KB      │ 434.2 KB      │         │
+      │                  grow:         │               │               │               │         │
+      │                    1           │ 1             │ 1             │ 1             │         │
+      │                    8.192 KB    │ 8.192 KB      │ 8.192 KB      │ 8.192 KB      │         │
+      │                  shrink:       │               │               │               │         │
+      │                    7           │ 7             │ 7             │ 7             │         │
+      │                    78 B        │ 78 B          │ 78 B          │ 78 B          │         │
+      ├─ openai          219.7 µs      │ 242.1 µs      │ 222.9 µs      │ 223.6 µs      │ 100     │ 100
+      │                  368.7 MB/s    │ 334.5 MB/s    │ 363.4 MB/s    │ 362.2 MB/s    │         │
+      │                  max alloc:    │               │               │               │         │
+      │                    29          │ 29            │ 29            │ 29            │         │
+      │                    20.82 KB    │ 20.82 KB      │ 20.82 KB      │ 20.82 KB      │         │
+      │                  alloc:        │               │               │               │         │
+      │                    3894        │ 3894          │ 3894          │ 3894          │         │
+      │                    565.9 KB    │ 565.9 KB      │ 565.9 KB      │ 565.9 KB      │         │
+      │                  dealloc:      │               │               │               │         │
+      │                    3894        │ 3894          │ 3894          │ 3894          │         │
+      │                    573.8 KB    │ 573.8 KB      │ 573.8 KB      │ 573.8 KB      │         │
+      │                  grow:         │               │               │               │         │
+      │                    1           │ 1             │ 1             │ 1             │         │
+      │                    8.192 KB    │ 8.192 KB      │ 8.192 KB      │ 8.192 KB      │         │
+      │                  shrink:       │               │               │               │         │
+      │                    26          │ 26            │ 26            │ 26            │         │
+      │                    209 B       │ 209 B         │ 209 B         │ 209 B         │         │
+      ╰─ responses       161.6 µs      │ 177.6 µs      │ 164 µs        │ 164.7 µs      │ 100     │ 100
+                         631.4 MB/s    │ 574.7 MB/s    │ 622.2 MB/s    │ 619.4 MB/s    │         │
+                         max alloc:    │               │               │               │         │
+                           24          │ 24            │ 24            │ 24            │         │
+                           20.44 KB    │ 20.44 KB      │ 20.44 KB      │ 20.44 KB      │         │
+                         alloc:        │               │               │               │         │
+                           3259        │ 3259          │ 3259          │ 3259          │         │
+                           249.1 KB    │ 249.1 KB      │ 249.1 KB      │ 249.1 KB      │         │
+                         dealloc:      │               │               │               │         │
+                           3259        │ 3259          │ 3259          │ 3259          │         │
+                           257.8 KB    │ 257.8 KB      │ 257.8 KB      │ 257.8 KB      │         │
+                         grow:         │               │               │               │         │
+                           7           │ 7             │ 7             │ 7             │         │
+                           8.714 KB    │ 8.714 KB      │ 8.714 KB      │ 8.714 KB      │         │
+                         shrink:       │               │               │               │         │
+                           2           │ 2             │ 2             │ 2             │         │
+                           9 B         │ 9 B           │ 9 B           │ 9 B           │         │
+

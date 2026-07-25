@@ -1,0 +1,60 @@
+   Compiling beyond-ai-agent v0.1.0 (/home/jared/ai/crates/agent)
+    Finished `bench` profile [optimized] target(s) in 1m 35s
+     Running benches/serve_events.rs (target/release/deps/serve_events-c184ed72aa0862b2)
+Timer precision: 10 ns
+serve_events          fastest       │ slowest       │ median        │ mean          │ samples │ iters
+├─ direct_string                    │               │               │               │         │
+│  ├─ large_tool_end  2.01 µs       │ 6.049 µs      │ 2.041 µs      │ 2.112 µs      │ 100     │ 100
+│  │                  max alloc:    │               │               │               │         │
+│  │                    1           │ 1             │ 1             │ 1             │         │
+│  │                    4.096 KB    │ 4.096 KB      │ 4.096 KB      │ 4.096 KB      │         │
+│  │                  alloc:        │               │               │               │         │
+│  │                    1           │ 1             │ 1             │ 1             │         │
+│  │                    128 B       │ 128 B         │ 128 B         │ 128 B         │         │
+│  │                  dealloc:      │               │               │               │         │
+│  │                    1           │ 1             │ 1             │ 1             │         │
+│  │                    4.096 KB    │ 4.096 KB      │ 4.096 KB      │ 4.096 KB      │         │
+│  │                  grow:         │               │               │               │         │
+│  │                    5           │ 5             │ 5             │ 5             │         │
+│  │                    3.968 KB    │ 3.968 KB      │ 3.968 KB      │ 3.968 KB      │         │
+│  ╰─ small_delta     108.6 ns      │ 1.381 µs      │ 118.6 ns      │ 138.8 ns      │ 100     │ 100
+│                     max alloc:    │               │               │               │         │
+│                       1           │ 1             │ 1             │ 1             │         │
+│                       256 B       │ 256 B         │ 256 B         │ 256 B         │         │
+│                     alloc:        │               │               │               │         │
+│                       1           │ 1             │ 1             │ 1             │         │
+│                       128 B       │ 128 B         │ 128 B         │ 128 B         │         │
+│                     dealloc:      │               │               │               │         │
+│                       1           │ 1             │ 1             │ 1             │         │
+│                       256 B       │ 256 B         │ 256 B         │ 256 B         │         │
+│                     grow:         │               │               │               │         │
+│                       1           │ 1             │ 1             │ 1             │         │
+│                       128 B       │ 128 B         │ 128 B         │ 128 B         │         │
+╰─ value_then_string                │               │               │               │         │
+   ├─ large_tool_end  2.289 µs      │ 4.845 µs      │ 2.369 µs      │ 2.405 µs      │ 100     │ 100
+   │                  max alloc:    │               │               │               │         │
+   │                    15          │ 15            │ 15            │ 15            │         │
+   │                    8.27 KB     │ 8.27 KB       │ 8.27 KB       │ 8.27 KB       │         │
+   │                  alloc:        │               │               │               │         │
+   │                    15          │ 15            │ 15            │ 15            │         │
+   │                    4.302 KB    │ 4.302 KB      │ 4.302 KB      │ 4.302 KB      │         │
+   │                  dealloc:      │               │               │               │         │
+   │                    15          │ 15            │ 15            │ 15            │         │
+   │                    8.27 KB     │ 8.27 KB       │ 8.27 KB       │ 8.27 KB       │         │
+   │                  grow:         │               │               │               │         │
+   │                    5           │ 5             │ 5             │ 5             │         │
+   │                    3.968 KB    │ 3.968 KB      │ 3.968 KB      │ 3.968 KB      │         │
+   ╰─ small_delta     299.6 ns      │ 1.471 µs      │ 319.6 ns      │ 338.7 ns      │ 100     │ 100
+                      max alloc:    │               │               │               │         │
+                        13          │ 13            │ 13            │ 13            │         │
+                        1.615 KB    │ 1.615 KB      │ 1.615 KB      │ 1.615 KB      │         │
+                      alloc:        │               │               │               │         │
+                        13          │ 13            │ 13            │ 13            │         │
+                        1.487 KB    │ 1.487 KB      │ 1.487 KB      │ 1.487 KB      │         │
+                      dealloc:      │               │               │               │         │
+                        13          │ 13            │ 13            │ 13            │         │
+                        1.615 KB    │ 1.615 KB      │ 1.615 KB      │ 1.615 KB      │         │
+                      grow:         │               │               │               │         │
+                        1           │ 1             │ 1             │ 1             │         │
+                        128 B       │ 128 B         │ 128 B         │ 128 B         │         │
+
