@@ -595,10 +595,7 @@ mod tests {
         });
         // If a single increment had been dropped the running total would still be under the
         // ceiling and this would come back `None`.
-        assert_eq!(
-            rl.check_at(cred, true, now),
-            Some(Throttled::PerCredential)
-        );
+        assert_eq!(rl.check_at(cred, true, now), Some(Throttled::PerCredential));
     }
 
     /// The BYO bucket rotates on the same window index as the per-credential tier, and its rotation
