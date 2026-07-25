@@ -67,12 +67,15 @@
 //! can *over*estimate a key's rate on hash collision but never under, so a cap is always enforced;
 //! `SLOTS` is sized wide enough that overestimation stays negligible. `pingora_limits::rate::Rate`
 //! itself is deliberately **not** used — see the note on `WindowedRate` for the reason.
+//!
+//! The global BYO tier is a *single* bucket, so it needs no sketch at all: it is one cacheline of
+//! atomic (`ByoCounter`) packing the window index with the count, which makes it both exact and
+//! reset-free. Only the per-credential tier, where key cardinality is unbounded, pays for a sketch.
 
 // `ahash::RandomState` carries its own inherent `hash_one` (it does not need `BuildHasher` in
 // scope), which is also the specialised, faster path — see the `hasher` field's note.
 use ahash::RandomState;
 use pingora_limits::estimator::Estimator;
-use pingora_limits::rate::Rate;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -95,8 +98,71 @@ const WINDOW: Duration = Duration::from_secs(1);
 /// divide is a multiply-shift rather than a hardware `div`.
 const WINDOW_MS: u64 = WINDOW.as_millis() as u64;
 
-/// The single sketch key the global BYO tier counts everything under (one shared bucket).
-const BYO_GLOBAL_KEY: u8 = 0;
+/// The whole state of the global BYO tier: one cacheline-isolated atomic packing
+/// `(window_index: u32) << 32 | (count: u32)`.
+///
+/// Tier 2 is a **single shared bucket**, so a count-min sketch buys it nothing — there is only one
+/// key, so there is nothing to collide with and nothing to estimate. It was nevertheless a
+/// `Rate::new`, i.e. the default 4 × 1024 estimator, which meant every BYO request paid four fully
+/// contended read-modify-writes across four cachelines, a clock read, and a share of a 64 KB
+/// two-slot reset walk — all to maintain one number that one atomic holds exactly.
+///
+/// Packing the window index *with* the count is what makes the rotation free: opening a new window
+/// is the same compare-and-swap as counting a request, so there is no reset step at all and no
+/// interval in which the count and the window it belongs to can disagree.
+#[repr(align(64))]
+struct ByoCounter {
+    /// `(window_index: u32) << 32 | (count: u32)`.
+    packed: AtomicU64,
+    /// The ceiling for this tier. Never written after construction, so sharing the line with
+    /// `packed` costs nothing — a thread that just took the line exclusive for its CAS reads the
+    /// ceiling out of the same line for free.
+    max: u32,
+}
+
+impl ByoCounter {
+    fn new(max: u32) -> Self {
+        Self {
+            packed: AtomicU64::new(0),
+            max,
+        }
+    }
+
+    /// Charge one request to `window`, returning the running count for that window.
+    ///
+    /// The window index is truncated to 32 bits. At a 1 s window counted from this limiter's
+    /// construction off a monotonic `Instant`, that is ~136 years of process uptime — unreachable
+    /// rather than merely unlikely.
+    fn observe(&self, window: u64) -> u32 {
+        let window = window as u32;
+        let mut cur = self.packed.load(Ordering::Relaxed);
+        loop {
+            let next = if window > (cur >> 32) as u32 {
+                // First request of a new window: the previous count is simply overwritten. That
+                // *is* the reset — no walk to amortise, no slot to rotate, no memory to clear.
+                (u64::from(window) << 32) | 1
+            } else {
+                // Same window — or this thread's clock read lost the race to one that already
+                // opened the next window, in which case charge the live window rather than dragging
+                // it backwards and handing out a second budget for a window that just closed.
+                // Saturating: a count that wrapped to 0 would read as "under the ceiling", so a
+                // flood big enough to overflow must stay pinned above it (and the workspace builds
+                // with `overflow-checks`, so a plain `+ 1` would be a panic).
+                (cur & !(u32::MAX as u64)) | u64::from((cur as u32).saturating_add(1))
+            };
+            // Relaxed on both sides: this counter publishes no other memory, and a single location
+            // still has a total modification order, which is all the "never move backwards"
+            // argument above needs.
+            match self
+                .packed
+                .compare_exchange_weak(cur, next, Ordering::Relaxed, Ordering::Relaxed)
+            {
+                Ok(_) => return next as u32,
+                Err(seen) => cur = seen,
+            }
+        }
+    }
+}
 
 /// A fixed-window event counter over a count-min sketch: "how many events has `key` been charged in
 /// the window that is currently open". Two sketches are rotated at each window boundary so the reset
@@ -222,8 +288,8 @@ impl From<Throttled> for crate::metrics::Rejection {
 pub struct RateLimit {
     /// `(sketch, max_per_window)` for the per-credential tier. `None` disables it.
     per_cred: Option<(WindowedRate, isize)>,
-    /// `(sketch, max_per_window)` for the global BYO aggregate tier. `None` disables it.
-    byo_global: Option<(Rate, isize)>,
+    /// The global BYO aggregate tier — one bucket, so one atomic. `None` disables it.
+    byo_global: Option<ByoCounter>,
     /// Epoch the window index is measured from. Fixed at construction, so every tier counts the
     /// same windows off one clock read per request rather than each re-reading the clock.
     start: Instant,
@@ -261,8 +327,7 @@ impl RateLimit {
         Some(Self {
             per_cred: (per_cred_rps != 0)
                 .then(|| (WindowedRate::new(HASHES, SLOTS), per_cred_rps as isize)),
-            // One bucket, so the default estimator is plenty — no need for the wide sketch.
-            byo_global: (byo_global_rps != 0).then(|| (Rate::new(WINDOW), byo_global_rps as isize)),
+            byo_global: (byo_global_rps != 0).then(|| ByoCounter::new(byo_global_rps)),
             start: Instant::now(),
             // `RandomState::new()` draws fresh key material from the OS RNG per process.
             hasher: RandomState::new(),
@@ -307,8 +372,8 @@ impl RateLimit {
         // protects our egress IPs from a distinct-token flood. Managed traffic skips it (verified,
         // can't be forged, already bounded per-credential) so it never shares this bucket.
         if !managed {
-            if let Some((rate, max)) = &self.byo_global {
-                if rate.observe(&BYO_GLOBAL_KEY, 1) > *max {
+            if let Some(byo) = &self.byo_global {
+                if byo.observe(window) > byo.max {
                     return Some(Throttled::ByoGlobal);
                 }
             }
@@ -327,6 +392,7 @@ impl RateLimit {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicUsize;
 
     #[test]
     fn both_zero_disables() {
@@ -471,6 +537,74 @@ mod tests {
             rl.check_at(cred, true, now),
             Some(Throttled::PerCredential)
         );
+    }
+
+    /// The BYO bucket rotates on the same window index as the per-credential tier, and its rotation
+    /// *is* the counting CAS — so a new window has to hand back the whole budget with no reset step
+    /// in between. The tail covers a multi-window idle gap, which for this tier is not a special
+    /// case at all (there is no second slot to go stale).
+    #[test]
+    fn byo_global_budget_is_restored_by_the_next_window() {
+        let rl = RateLimit::new(0, 2).unwrap();
+        let t0 = Instant::now();
+
+        assert_eq!(rl.check_at("byo-a", false, t0), None);
+        assert_eq!(rl.check_at("byo-b", false, t0), None);
+        assert_eq!(rl.check_at("byo-c", false, t0), Some(Throttled::ByoGlobal));
+
+        let t1 = t0 + WINDOW;
+        assert_eq!(rl.check_at("byo-d", false, t1), None);
+        assert_eq!(rl.check_at("byo-e", false, t1), None);
+        assert_eq!(rl.check_at("byo-f", false, t1), Some(Throttled::ByoGlobal));
+
+        let t9 = t0 + WINDOW * 9;
+        assert_eq!(rl.check_at("byo-g", false, t9), None);
+        assert_eq!(rl.check_at("byo-h", false, t9), None);
+        assert_eq!(rl.check_at("byo-i", false, t9), Some(Throttled::ByoGlobal));
+    }
+
+    /// Same stale-reading hazard as the per-credential tier: a thread whose clock read predates the
+    /// rotation must be charged to the live window, not reopen the closed one with a fresh budget.
+    #[test]
+    fn byo_global_stale_clock_read_cannot_reopen_a_closed_window() {
+        let rl = RateLimit::new(0, 2).unwrap();
+        let t0 = Instant::now();
+        let t1 = t0 + WINDOW;
+
+        assert_eq!(rl.check_at("byo-a", false, t1), None); // opens window 1
+        assert_eq!(rl.check_at("byo-b", false, t0), None); // late arrival, charged to window 1
+        assert_eq!(rl.check_at("byo-c", false, t0), Some(Throttled::ByoGlobal));
+        // Window 2 still opens cleanly afterwards.
+        assert_eq!(rl.check_at("byo-d", false, t0 + WINDOW * 2), None);
+    }
+
+    /// Unlike the sketch, one bucket in one atomic is *exactly* countable: with the window pinned,
+    /// `THREADS × EACH` concurrent charges against a ceiling of half that must admit exactly the
+    /// ceiling. Any lost or duplicated increment in the CAS loop moves this number.
+    #[test]
+    fn byo_global_ceiling_is_exact_under_concurrency() {
+        const THREADS: usize = 8;
+        const EACH: usize = 4_000;
+        const CEILING: u32 = (THREADS * EACH / 2) as u32;
+
+        let rl = RateLimit::new(0, CEILING).unwrap();
+        let now = Instant::now();
+        let admitted = AtomicUsize::new(0);
+        std::thread::scope(|s| {
+            for _ in 0..THREADS {
+                let (rl, admitted) = (&rl, &admitted);
+                s.spawn(move || {
+                    let mut n = 0;
+                    for _ in 0..EACH {
+                        if rl.check_at("byo-token", false, now).is_none() {
+                            n += 1;
+                        }
+                    }
+                    admitted.fetch_add(n, Ordering::Relaxed);
+                });
+            }
+        });
+        assert_eq!(admitted.load(Ordering::Relaxed), CEILING as usize);
     }
 
     #[test]
