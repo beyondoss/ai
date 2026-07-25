@@ -329,6 +329,32 @@ mod pipeline {
     }
 }
 
+// --- caps: per-request capability resolution (M14 / findings T2-F2, T2-F3) ------------------------
+
+/// The route-capabilities chain runs on every outbound request (the `client.rs::stream` betas gates),
+/// and the audit's claim is that it lowercases the model id 4+ times and rescans the family table
+/// twice. This bench calls the public resolution entry point (`capabilities_for_route_with_host`) for a
+/// representative Anthropic id and an OpenRouter-fronted vendor-slug id (exercises the `rfind('/')`
+/// family-id path) in a loop, so allocs/call and ns/call are visible before vs. after threading a
+/// lowercase-once `&str` through the chain.
+mod caps {
+    use super::*;
+    use agent_core::models::capabilities_for_route_with_host;
+
+    #[divan::bench(args = ["claude-opus-4-8", "anthropic/claude-sonnet-4-5"])]
+    fn resolve(bencher: Bencher, model: &str) {
+        bencher.bench(|| {
+            capabilities_for_route_with_host(
+                black_box(model),
+                black_box(false),
+                black_box(false),
+                black_box(false),
+                black_box(None),
+            )
+        });
+    }
+}
+
 /// A fresh decoder for the named dialect (each bench sample decodes from a clean state).
 fn new_decoder(which: &str) -> Box<dyn agent_core::dialect::StreamDecoder> {
     match which {

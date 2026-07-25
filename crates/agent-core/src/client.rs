@@ -519,7 +519,7 @@ impl ModelTransport for GatewayClient {
             .as_ref()
             .and_then(|d| d.aggregator_host)
             .or_else(|| {
-                crate::models::is_fireworks_model(&req.model.to_ascii_lowercase())
+                crate::models::is_fireworks_model(&req.model)
                     .then_some(crate::models::AggregatorHost::Fireworks)
             });
         // Pi-parity Fix 1 (Round 2): an operator-configured dialect override (`DirectRouting::
@@ -747,10 +747,16 @@ impl ModelTransport for GatewayClient {
         // and `x-client-request-id` (`openai-completions.ts`'s `compat.sendSessionAffinityHeaders`
         // branch); the Responses dialect never sends it.
         let send_x_session_affinity = dialect == Dialect::OpenAi && is_fireworks;
-        let needs_interleaved_beta = needs_interleaved_thinking_beta(&req.model);
-        let needs_fine_grained_tool_streaming_beta = !req.tools.is_empty()
-            && !crate::models::capabilities_for_route(&req.model, req.is_codex, req.is_azure)
-                .supports_eager_tool_streaming;
+        // Resolve capabilities once per request and thread the `Copy` struct to both beta gates below.
+        // `capabilities_for_route` never touches `ModelCaps::thinking`, so its `.thinking` is identical
+        // to the plain `capabilities(&req.model).thinking` the interleaved-beta gate used before —
+        // computing it here avoids a second full family-table scan (and its lowercase alloc) per
+        // request (findings T2-F2, T2-F3).
+        let route_caps =
+            crate::models::capabilities_for_route(&req.model, req.is_codex, req.is_azure);
+        let needs_interleaved_beta = needs_interleaved_thinking_beta(route_caps);
+        let needs_fine_grained_tool_streaming_beta =
+            !req.tools.is_empty() && !route_caps.supports_eager_tool_streaming;
         // Same condition already used above to decide whether to attempt the WebSocket transport at
         // all — reused here (not re-derived) so the HTTP/SSE fallback path this falls through to can
         // zstd-compress the body the same way the real Codex backend's own client does, without a
@@ -960,8 +966,14 @@ impl LineFramer {
 /// that follows it, or from consistent headers across a session's history of requests). `Adaptive`
 /// models interleave by default, so sending the opt-in for them would be a harmless no-op at best —
 /// skipped to keep the header list accurate to what the request actually needs.
-fn needs_interleaved_thinking_beta(model: &str) -> bool {
-    crate::models::capabilities(model).thinking != crate::models::ThinkingShape::Adaptive
+///
+/// Takes an already-resolved [`ModelCaps`] rather than re-resolving from the model id: the caller
+/// (`stream`) resolves capabilities once per request and threads the `Copy` struct here and to the
+/// tool-streaming gate, avoiding a second full family-table scan (findings T2-F2, T2-F3). Route
+/// overrides never touch [`ModelCaps::thinking`], so a `capabilities_for_route` result is identical
+/// here to the plain `capabilities` one this used to compute itself.
+fn needs_interleaved_thinking_beta(caps: crate::models::ModelCaps) -> bool {
+    caps.thinking != crate::models::ThinkingShape::Adaptive
 }
 
 /// Comma-joined `anthropic-beta` opt-ins for a request, or empty when neither applies — prompt
@@ -1677,10 +1689,14 @@ mod tests {
         // model's own thinking *shape* (`model.compat?.forceAdaptiveThinking !== true`) — not on
         // whether this particular turn requested thinking. `claude-sonnet-4-5` is `Budget`-shape
         // (non-Adaptive) — must get the header even with no `thinking` on this turn.
-        assert!(needs_interleaved_thinking_beta("claude-sonnet-4-5"));
+        assert!(needs_interleaved_thinking_beta(
+            crate::models::capabilities("claude-sonnet-4-5")
+        ));
         // `Adaptive`-shape models (our own default, `claude-opus-4-8`) interleave by default — sending
         // the opt-in would be a no-op, so it's skipped.
-        assert!(!needs_interleaved_thinking_beta("claude-opus-4-8"));
+        assert!(!needs_interleaved_thinking_beta(
+            crate::models::capabilities("claude-opus-4-8")
+        ));
     }
 
     #[test]
