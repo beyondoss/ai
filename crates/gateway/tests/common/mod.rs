@@ -11,7 +11,7 @@
 
 use std::io::Write;
 use std::net::TcpListener as StdTcpListener;
-use std::process::{Child, Command};
+use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -183,6 +183,10 @@ pub enum Mode {
     /// Always reply with this HTTP status and a small JSON error body — for circuit-breaker tests
     /// (5xx trips the breaker; 4xx/429 do not).
     Status(u16),
+    /// Hold the request open for this many milliseconds before answering — long enough for a client
+    /// to give up first. The only way to produce a *downstream* abort while the upstream is still
+    /// healthy, which is the distinction the breaker has to draw.
+    Slow(u64),
 }
 
 #[derive(Default, Clone)]
@@ -192,6 +196,10 @@ pub struct Captured {
     pub authorization: Option<String>,
     pub x_api_key: Option<String>,
     pub host: Option<String>,
+    /// The gateway's model-routing header. Must always be `None`: it is ours, and stripping it is
+    /// asserted rather than assumed, because a leaked internal header is the kind of thing nobody
+    /// notices until a provider starts rejecting it.
+    pub beyond_model: Option<String>,
     pub body: Vec<u8>,
 }
 
@@ -256,7 +264,8 @@ fn anthropic_sse_large() -> String {
 /// The canned `(content-type, body)` for a mode. The `*Large` modes allocate; the rest are static.
 fn canned_body(mode: Mode) -> (&'static str, Bytes) {
     match mode {
-        Mode::Json => (
+        // A slow reply is an ordinary successful one; only its timing differs.
+        Mode::Json | Mode::Slow(_) => (
             "application/json",
             Bytes::from_static(CANNED_JSON.as_bytes()),
         ),
@@ -309,10 +318,15 @@ async fn mock_handle(
         .unwrap_or_else(|| req.uri().path())
         .to_string();
     // Pull the headers we record before consuming the body (which moves `req`).
-    let (authorization, x_api_key, host) = {
+    let (authorization, x_api_key, host, beyond_model) = {
         let h = req.headers();
         let get = |k: &str| h.get(k).and_then(|v| v.to_str().ok()).map(String::from);
-        (get("authorization"), get("x-api-key"), get("host"))
+        (
+            get("authorization"),
+            get("x-api-key"),
+            get("host"),
+            get("x-beyond-model"),
+        )
     };
     let body = req
         .into_body()
@@ -325,8 +339,14 @@ async fn mock_handle(
         authorization,
         x_api_key,
         host,
+        beyond_model,
         body,
     });
+    // A slow upstream is still a *working* upstream; the point is to be slower than the client's
+    // patience, so the client hangs up first.
+    if let Mode::Slow(ms) = mode {
+        sleep(Duration::from_millis(ms)).await;
+    }
     let (ct, payload) = canned_body(mode);
     let status = match mode {
         Mode::Status(s) => s,
@@ -463,6 +483,9 @@ impl Drop for MockUpstream {
 // --- the real beyond-ai binary ----------------------------------------------
 
 pub struct Gateway {
+    /// The child's stderr, drained by a background thread. Structured JSON, one object per line —
+    /// including the `ai.usage` billing rows, which exist nowhere else.
+    log: Arc<Mutex<String>>,
     child: Child,
     pub port: u16,
     pub metrics_port: u16,
@@ -501,6 +524,10 @@ pub struct GatewayBuilder {
     /// Override the per-provider circuit-breaker threshold (failures in the window before opening).
     /// `None` ⇒ leave the gateway default; `Some(0)` disables the breaker.
     circuit_breaker_threshold: Option<u32>,
+    /// Per-provider authority overrides, for a topology with more than one upstream — a failover
+    /// test needs a live mock and a dead port at the same time, which the single `authority` cannot
+    /// express. Falls back to `authority` for any provider not named here.
+    authority_overrides: Vec<(String, String)>,
     /// Override the proxy's tokio worker-thread count. `None` ⇒ the gateway default (one per core);
     /// `Some(1)` reproduces Pingora's single-threaded default, which is what the scaling bench
     /// compares against.
@@ -512,6 +539,21 @@ impl GatewayBuilder {
     pub fn providers(mut self, providers: &[&'static str]) -> Self {
         self.providers = providers.to_vec();
         self
+    }
+
+    /// Point one provider at its own authority, instead of the shared mock. Use for model-routing
+    /// tests, where candidates must resolve to *different* upstreams — typically one live mock and
+    /// one unbound port, which refuses instantly and so makes failover deterministic and fast.
+    pub fn provider_authority(mut self, provider: &str, authority: &str) -> Self {
+        self.authority_overrides
+            .push((provider.to_string(), authority.to_string()));
+        self
+    }
+
+    /// An authority nothing is listening on: connecting gets ECONNREFUSED immediately, with no
+    /// timeout to wait out. The port is leased and dropped by `free_port`, so it is unbound.
+    pub fn dead_authority() -> String {
+        format!("127.0.0.1:{}", free_port())
     }
 
     /// Pin the proxy's worker-thread count. Used by the scaling bench to stand a single-threaded
@@ -642,7 +684,13 @@ impl GatewayBuilder {
             // Every configured provider points at the one mock upstream...
             cfg.push_str("\n[provider_authorities]\n");
             for p in &self.providers {
-                cfg.push_str(&format!("{p} = \"{}\"\n", self.authority));
+                let authority = self
+                    .authority_overrides
+                    .iter()
+                    .find(|(name, _)| name == p)
+                    .map(|(_, a)| a.as_str())
+                    .unwrap_or(&self.authority);
+                cfg.push_str(&format!("{p} = \"{authority}\"\n"));
             }
             // ...with a distinct pool key per provider so key-swap assertions can tell them apart.
             cfg.push_str("\n[pool_keys]\n");
@@ -656,21 +704,60 @@ impl GatewayBuilder {
             .write_all(cfg.as_bytes())
             .unwrap();
 
-        let child = Command::new(env!("CARGO_BIN_EXE_beyond-ai"))
+        let mut child = Command::new(env!("CARGO_BIN_EXE_beyond-ai"))
             .arg("run")
             .arg("-c")
             .arg(&config_path)
             .env(
                 "AI_LOG",
-                std::env::var("AI_LOG").unwrap_or_else(|_| "warn".into()),
+                // `info` so the `ai.usage` billing rows reach the captured log. Still overridable.
+                std::env::var("AI_LOG").unwrap_or_else(|_| "info".into()),
             )
+            // Capture the child's output instead of letting it inherit ours. Two reasons: the
+            // `ai.usage` rows are only observable this way (they are a log target, not a metric),
+            // and a child that dies on a panic otherwise takes its own diagnosis with it — a
+            // gateway crash then surfaces as a garbled assertion in whatever request raced it.
+            //
+            // **Both** streams: `init_tracing` installs `fmt::layer().json()`, whose default writer
+            // is stdout, so that is where every structured log line (including `ai.usage`) goes.
+            // Panics and pre-tracing boot failures go to stderr. Capturing only one loses half the
+            // picture, and it is not the half you would guess.
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
             .spawn()
             .expect("spawn beyond-ai");
+        let log = Arc::new(Mutex::new(String::new()));
+        let drain = |stream: Option<Box<dyn std::io::Read + Send>>| {
+            let Some(stream) = stream else { return };
+            let sink = Arc::clone(&log);
+            std::thread::spawn(move || {
+                use std::io::{BufRead, BufReader};
+                for line in BufReader::new(stream).lines().map_while(Result::ok) {
+                    if let Ok(mut buf) = sink.lock() {
+                        buf.push_str(&line);
+                        buf.push('\n');
+                    }
+                }
+            });
+        };
+        drain(
+            child
+                .stdout
+                .take()
+                .map(|s| Box::new(s) as Box<dyn std::io::Read + Send>),
+        );
+        drain(
+            child
+                .stderr
+                .take()
+                .map(|s| Box::new(s) as Box<dyn std::io::Read + Send>),
+        );
         let gw = Gateway {
             child,
             port,
             metrics_port,
             config_path,
+            log,
         };
         wait_for_port(port, "beyond-ai").await;
         // The metrics/admin listener (`/livez`, `/readyz`, `/metrics`) binds on a *separate* port from
@@ -698,6 +785,7 @@ impl Gateway {
             authority: authority.to_string(),
             signkey_b64: signkey_b64.to_string(),
             providers: vec!["openai", "fireworks"],
+            authority_overrides: Vec::new(),
             snapshot_path: None,
             real_upstreams: false,
             pool_key_overrides: Vec::new(),
@@ -712,6 +800,30 @@ impl Gateway {
 
     pub fn url(&self) -> String {
         format!("http://127.0.0.1:{}", self.port)
+    }
+
+    /// Everything the gateway has logged so far.
+    pub fn log(&self) -> String {
+        self.log.lock().map(|l| l.clone()).unwrap_or_default()
+    }
+
+    /// Wait for a log line containing every one of `needles`, and return it.
+    ///
+    /// Takes a slice rather than one string because the interesting assertions are conjunctions —
+    /// "an `ai.usage` row that names *this* provider" — and a single substring cannot express that
+    /// without depending on field order.
+    pub async fn wait_for_log_line(&self, needles: &[&str]) -> String {
+        for _ in 0..200 {
+            let log = self.log();
+            if let Some(line) = log.lines().find(|l| needles.iter().all(|n| l.contains(n))) {
+                return line.to_string();
+            }
+            sleep(Duration::from_millis(25)).await;
+        }
+        panic!(
+            "no log line matched {needles:?} within 5s; captured log was:\n{}",
+            self.log(),
+        );
     }
 
     pub async fn metrics(&self) -> String {

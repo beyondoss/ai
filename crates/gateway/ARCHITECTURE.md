@@ -20,6 +20,8 @@ published `beyond-slipstream` — clones, CI-builds, and publishes anywhere.
 | **Tenant**                                       | The billing entity from the virtual key payload (`tenant_id: u64`)                                                                                          | An org, user, or namespace — an opaque integer the gateway doesn't interpret |
 | **Dialect**                                      | A provider attribute (OpenAI-wire vs Anthropic-wire) driving usage parsing; for a bare-path request it's derived from the path to pick the default provider | The provider — a prefixed request uses its provider's dialect, not the path  |
 | **Provider**                                     | The request's **first path segment** (`/{provider}/…`); a named row in the routing table: authority, dialect, auth scheme                                   | A vendor relationship — just connection facts and auth wiring                |
+| **Model route** (`/auto/…`)                      | Reserved first segment; the provider comes from the `x-beyond-model` header via the catalog, and the gateway owns the mount prefix and rewrites the body's `model` per attempt | A dialect translator — candidates must share a wire format                   |
+| **Candidate**                                    | One `(provider, upstream model id)` a catalog row will accept, in preference order; tried on a connect failure                                              | A load-balancing pool — strictly ordered, and only entered on failure        |
 | **Deny-set**                                     | Sparse map of denied `tenant_id`s → reason; gates managed traffic; default-allow                                                                            | An allowlist or ACL — misses are allowed, not blocked                        |
 | **Tail tap**                                     | Bounded 64KB window kept from the end of the response for usage extraction                                                                                  | A buffer or copy — the response is relayed unbuffered; only the tail is kept |
 | **Snapshot**                                     | On-disk deny-set cache (entries + NATS cursor) for edge/tunnel deployments                                                                                  | Persistent store — a pure cache; delete it and the gateway re-scans NATS     |
@@ -36,6 +38,10 @@ Client (stock OpenAI/Anthropic SDK)
   │
   ▼  request_filter (proxy.rs)
   │  ├─ Route: first segment → provider row (authority, dialect, auth scheme)
+  │  │    …or `/auto` → x-beyond-model header → catalog row → ordered candidates
+  │  │      no/unknown model ──────────────────────────────────► 404
+  │  │      BYO key (managed-only route) ─────────────────────► 400
+  │  │      no candidate holds a pool key ────────────────────► 503
   │  ├─ Extract key: x-api-key / api-key / x-goog-api-key / Authorization Bearer / ?key= query param
   │  ├─ Rate guardrails (BEFORE verify — keeps forged-key floods at ns cost)
   │  │    per-credential count-min  ──────────────────────────────► 429
@@ -51,10 +57,14 @@ Client (stock OpenAI/Anthropic SDK)
   │  └─ Circuit breaker (per provider, all traffic): if OPEN ─────► 503
   │       (claims a half-open probe permit only on an actual attempt)
   │
-  ▼  upstream_peer (proxy.rs)
+  ▼  upstream_peer (proxy.rs)   — runs once per attempt, before any body byte
+  │  Reset request-body phase state (a retry replays bytes through the body filter)
+  │  Model-routed: resolve the outgoing candidate's breaker permit, then walk candidates —
+  │    skip any whose breaker is OPEN, allow() the one chosen, rebuild forward_path
+  │    from its mount; DNS failure advances to the next rather than ending the request
   │  TTL-cached DNS resolve (60s) → HttpPeer (TLS, H2 pref, timeouts)
   │  DNS fail ──────────────────────────────────────────────────── 502
-  │  TCP connect fail (retry 2×) ──────────────────────────────── 502
+  │  TCP connect fail (retry 2× same peer, or next candidate) ──── 502
   │
   ▼  upstream_request_filter (proxy.rs)
   │  Managed: remove every static-key header (authorization, x-api-key, api-key,
@@ -68,8 +78,10 @@ Client (stock OpenAI/Anthropic SDK)
   │  Managed + streamed: feed chunks → ModelScanner (peek.rs), root-level `model`, O(1) mem
   │    (BYO skips it — `model` is only ever read on the managed billing path)
   │  Injection-eligible (managed + OpenAI dialect + path suffix /chat/completions):
-  │    buffer full body → ONE fused walk (peek::scan_buffered) yielding both `model` and the
-  │    splice offset → inject stream_options.include_usage → re-frame chunked
+  │    buffer full body → ONE fused walk (peek::scan_buffered) yielding `model`, its byte
+  │    span, and the splice offset → inject stream_options.include_usage → re-frame chunked
+  │  Model-routed: same buffer, and `model` is spliced to the serving candidate's own id
+  │    (rewrite first — the injection offset precedes the value, so it cannot move)
   │
   ▼  Provider upstream  (OpenAI / Anthropic / Groq / DeepSeek / …)
   │
@@ -87,8 +99,10 @@ Client (stock OpenAI/Anthropic SDK)
   │
   ▼  logging (proxy.rs)
      Parse usage from tail (by dialect + streaming flag)
-     Emit ai.usage fact: tenant, vpc, model, requested_model, token counts + reasoning breakout (managed only)
-     Record circuit-breaker outcome (once): 5xx / connect-fail → failure; else → success (429 incl.)
+     Emit ai.usage fact: tenant, vpc, model, requested_model, routed_model, token counts +
+       reasoning breakout (managed only)
+     Record circuit-breaker outcome, only if one is still owed (breaker_pending): 5xx / upstream
+       failure → failure; else → success (429 and client aborts included)
      Decrement requests_in_flight gauge
 ```
 
@@ -131,8 +145,45 @@ to Groq and forwards `/openai/v1/chat/completions` verbatim. A bare path that is
 starts with `/v1/` (boundary-checked — `route::is_default_prefix`, not a raw string-prefix test)
 matches the dialect default (OpenAI or Anthropic based on which default is set); a lookalike like
 Google Gemini's `/v1beta/…` does **not** qualify and 404s as an unknown provider instead of being
-silently absorbed into the OpenAI default. Unknown segment → 404. Model is not known at
-peer-selection time and is never used for routing.
+silently absorbed into the OpenAI default. Unknown segment → 404.
+
+### Model routing (`/auto`, `providers::catalog`)
+
+One reserved first segment routes by **model** instead of provider: `/auto/…` takes the canonical
+model name from the `x-beyond-model` header, resolves it in the catalog to an ordered list of
+candidate providers, and tries them in order. The name is a header rather than the request body
+because the provider must be chosen before `upstream_peer` runs, which is strictly before any body
+byte is available. This arm is reached only after a provider-table miss, so `/{provider}/…` traffic
+runs exactly the code it always did; `auto` is refused as a provider name at boot so config cannot
+shadow it.
+
+Three things differ from the provider-routed path, all consequences of the client no longer naming
+the provider:
+
+- **The gateway owns the mount prefix.** Providers disagree (`/v1` OpenAI, `/openai/v1` Groq,
+  `/inference/v1` Fireworks, `/api/v1` OpenRouter, bare Anthropic), and the client cannot know which
+  one will serve. `forward_path` is rebuilt per attempt as the candidate's `base_path` + the client's
+  suffix. The contract is "point your SDK's base URL at `…/auto`".
+- **The model id is rewritten per attempt.** Providers essentially never share a string —
+  `claude-opus-4-8` at Anthropic is `anthropic/claude-opus-4-8` at OpenRouter — so the body's `model`
+  is spliced to whatever the serving candidate calls it (`peek::scan_buffered` reports the value's
+  byte span). Because the body may change length, `/auto` requests are buffered and re-framed exactly
+  as the injection path is; the two are one predicate (`RequestCtx::rewrites_body`).
+- **It is managed-only.** A BYO token belongs to one provider, so selecting among candidates would be
+  a guess and failing over would hand one vendor's key to another. BYO on `/auto` → 400.
+
+Failover is **connect-level only**: a candidate that will not connect (refused, timed out, or absent
+from DNS) is abandoned for the next one. A candidate that *answers* — including with a 5xx — is not,
+because retrying after a response head has been seen is a different mechanism with different hazards
+(see "Why status-based failover is not implemented"). Candidates whose breaker is open are skipped
+without an attempt.
+
+Catalog rows live in `providers::catalog`, shared with the agent. Every candidate in a row must
+share a wire format, enforced by a test: the gateway rewrites ids but does **not** translate between
+API shapes, so a mixed row would send an Anthropic Messages body to a Chat Completions endpoint and
+then parse the reply with the wrong dialect's usage extractor — a zero-token billing row rather than
+a visible error. A practical consequence: Anthropic is currently the only Anthropic-wire provider the
+gateway routes to, so Anthropic-wire rows have one candidate and no failover.
 
 ### Identity (`key.rs`)
 
@@ -257,12 +308,40 @@ the rate guardrails (which protect against abusive _inbound_ load):
   would convert a self-healing throttle into a self-inflicted outage. The breaker records any response
   that _arrived_ (2xx/3xx/4xx incl. 429) as a **success**; only 5xx and transport failures count
   against it.
+- **A client giving up is NOT a failure.** Pingora tags a client-side abort `ErrorSource::Downstream`,
+  and only non-`Downstream` errors count. Cancellation is routine for a coding agent (a user hits ESC
+  on a slow turn); counting those opened breakers on perfectly healthy providers, and because
+  `half_open_permits` is 1, a cancel-prone request drawn as the recovery probe reopened the breaker
+  every time — so it could not recover while users were cancelling.
 - **Applies to all traffic** (managed + BYO) — a down provider is down regardless of whose key is
   used. One breaker per provider, built at boot, shared lock-free across callers.
-- The `allow()` check is the **last** thing in `request_filter` (after every other rejection), so a
-  scarce half-open probe permit is only claimed for a request that will actually attempt the upstream;
-  the outcome is recorded exactly once in `logging`, so a permit can never leak.
 - `circuit_breaker_threshold = 0` disables it.
+
+**The permit ledger.** `RequestCtx::breaker_pending` is true **iff** exactly one `allow()` is
+outstanding against whatever `provider` currently points at. `logging` records only when it is set,
+and clears it — so one `allow()` yields exactly one `record_*`, and a scarce half-open probe permit
+can neither leak nor be resolved twice.
+
+For a provider-routed request that is the old behaviour restated: `allow()` is the last thing in
+`request_filter` (after every other rejection, so a permit corresponds to a real upstream attempt),
+and `breaker_pending` is simply `breaker.is_some()`.
+
+For a **model-routed** request the ledger is owned by `upstream_peer`, which gates each candidate as
+it is chosen and records the outgoing candidate's failure when it moves on. Three reasons it lives
+there and not in `fail_to_connect`:
+
+- `upstream_peer` is the only hook that changes `rc.provider`, which is what makes recording the
+  wrong candidate structurally impossible.
+- It is the only hook that runs on *every* attempt. Pingora's default `error_while_proxy` marks a
+  reused-connection failure retryable on its own, without consulting `fail_to_connect` at all.
+- `fail_to_connect` would double-record whenever the candidate list ran out: `retry` stays false, and
+  `logging` then also resolves the still-pending permit — tripping the breaker at half its configured
+  threshold on the last candidate, precisely where traffic lands once the primaries are sick.
+
+Candidate selection gates with `allow()`, deliberately **not** `state()`: the OPEN → HALF_OPEN
+transition happens *inside* `allow()`, so a `state()` pre-check would report `Open` past the reset
+timeout, skip a candidate `allow()` would have admitted as a probe, and leave the breaker with no way
+to ever close.
 
 ---
 
@@ -387,6 +466,30 @@ WebSocket path properly requires both a nontrivial client-side subsystem and a g
 capability that doesn't exist. Revisit if Codex's HTTP+SSE path is ever observed to hit the
 connection-limit ceiling pi's WebSocket path exists to avoid.
 
+### Why status-based failover is not implemented
+
+Connect-level failover covers a provider that will not *answer*. It does not cover one that answers
+badly — a `500`, or Anthropic's `529 overloaded` — which is arguably the more common way a provider
+degrades. That gap is deliberate, and it is not a Pingora limitation: returning `Err` with
+`set_retry(true)` from `upstream_response_filter` does re-enter the retry loop and re-invoke
+`upstream_peer`, because every response filter runs before anything is written downstream (verified
+in `pingora-proxy` 0.8's `proxy_h1.rs`/`proxy_h2.rs`; both share the path).
+
+What stops it is the **request body**. Pingora's replay buffer is `BODY_BUF_LIMIT` = 64 KiB, a
+private constant with no config knob; past it `get_retry_buffer()` returns `None` and a retry would
+send headers describing a body it then never writes, hanging the upstream until `read_timeout_secs`.
+Coding-agent requests exceed 64 KiB routinely, so status-based failover would work only for the
+traffic that needs it least, and would fail in the least debuggable way for the rest.
+
+Connect-level failover sidesteps this entirely, and not by luck: `fail_to_connect` fires from
+`proxy_to_upstream`'s connect error, *before* `enable_retry_buffering` and before a single body byte
+is read from the client — so the retry re-reads the body from the socket rather than from the
+buffer. `a_large_body_survives_a_failover_intact` pins that with a 256 KiB body.
+
+Doing status-based failover properly means owning body replay rather than borrowing Pingora's:
+buffering the request ourselves (bounded), and re-supplying it on each attempt. That is a real piece
+of work, not a flag, and it is what to build if 5xx failover is wanted.
+
 ### Why pricing is absent from the gateway
 
 The gateway emits token _facts_ (`ai.usage`): counts and model identifiers. Applying prices to
@@ -419,6 +522,11 @@ prefix requires no SDK modification.
 
 - Request body content and schema — no validation at the gateway layer
 - Model name in the request — extracted for billing facts, never validated against an allowlist
+- **Agreement between the routing header and the body's `model`** on `/auto`. The route is chosen
+  from the header before the body is ever read, so the two cannot be reconciled pre-connect. This is
+  not price-gameable — billing uses the id the provider echoes back — but the header alone selects
+  which pool key serves the request, and there is no per-tenant entitlement check on catalog rows. A
+  divergence is visible after the fact as `routed_model` ≠ `requested_model` in `ai.usage`.
 - Provider response content — relayed byte-for-byte
 - BYO token validity — forwarded as-is; the provider rejects it if invalid
 - `vpc_id` in the virtual key — decoded and emitted in billing facts, not used for access control
@@ -461,6 +569,7 @@ Secret-bearing fields (`pool_keys`, `nats_creds`) are held as `Secret<T>` — st
 | `nats_url`                      | `nats://localhost:4222`           | NATS server for the deny-set watcher. Unreachable → fail-open (deny-set stays empty or stale).                                                                                                             |
 | `nats_creds`                    | _(unset)_                         | NATS credentials file path. Required for authenticated clusters.                                                                                                                                           |
 | `listen_addr`                   | `0.0.0.0:8080`                    | Proxy listener address (client traffic).                                                                                                                                                                   |
+| `provider_authorities.auto`     | _(rejected)_                      | Reserved: `auto` is the model-routed segment, and a provider of that name would shadow it. Hard boot failure.                                                                                              |
 | `metrics_listen`                | `0.0.0.0:9090`                    | Internal admin/observability listener: `/metrics` (Prometheus scrape), `/livez`, `/readyz`. Separate from the client listener — not externally reachable.                                                  |
 
 ---
@@ -482,6 +591,10 @@ Secret-bearing fields (`pool_keys`, `nats_creds`) are held as `Secret<T>` — st
 | Provider brownout (sustained 5xx)                                  | After `circuit_breaker_threshold` 5xx/connect failures in the window, the breaker opens; requests fast-fail 503 (`circuit_open`) instead of stalling against the read timeout. | Auto: after `circuit_breaker_reset_secs` a half-open probe is admitted — success closes the breaker, failure reopens it. Per-provider, so other providers are unaffected.                                                                                                                                                |
 | Provider throttles (429 storm)                                     | Relayed to the client as 429; the client's `Retry-After` backoff applies. Does **not** trip the breaker (provider is healthy).                                                 | Backpressure via client + the rate guardrails; no gateway-side circuit action.                                                                                                                                                                                                                                           |
 | Response body > 128KB before usage chunk                           | Tail compaction fires: `drain(..half)` discards first half, keeps tail. Usage extracted from retained tail.                                                                    | No action — SSE usage is always in the final `data:` line, which always lands in the tail.                                                                                                                                                                                                                               |
+| Client cancels mid-request (ESC on a slow turn)                    | Relayed as a downstream abort. **Not** counted against the provider's breaker — pingora tags it `ErrorSource::Downstream`. Was previously recorded as a provider failure, so a burst of cancellations opened the breaker and 503'd everyone. | None. `tests/cancellation.rs` pins both halves: aborts do not open the breaker, sustained 5xx still does. |
+| Retry replays a partially-read request body                        | `upstream_peer` resets the body-phase state each attempt, so the replayed prefix replaces rather than appends. Previously it was appended, producing a duplicated JSON fragment the provider rejected with a `400` that `logging` recorded as a breaker *success*. | None — the reset is unconditional and O(1) on the first attempt. |
+| Model-routed candidate refuses the connection                      | `fail_to_connect` advances to the next candidate and pingora re-invokes `upstream_peer`; the abandoned candidate's breaker records the failure. Client sees nothing. | Automatic. `ai_candidate_failovers_total` counts it; the per-provider `ai_connect_retries_total` names the candidate left behind. |
+| Model-routed request with every candidate down                     | Each is attempted once, then the request fails with pingora's `5xx`. Each candidate's breaker records its own failure. | Fix whichever providers are down; `doctor`'s `model_catalog` check catches the *configuration* case (a row with no pool-keyed candidate) at boot. |
 | Gateway crash mid-request                                          | In-flight request drops; client receives TCP close. No partial state written.                                                                                                  | Client SDK retries. No DB writes in the request path — no cleanup needed.                                                                                                                                                                                                                                                |
 
 ---
@@ -503,6 +616,7 @@ Prometheus on the default registry, exposed at `/metrics` on `metrics_listen`.
 | `ai_deny_set_size`            | Gauge     | —                    | Current number of denied tenants                                                       |
 | `ai_nats_connected`           | Gauge     | —                    | 1 if NATS watcher is connected, 0 otherwise                                            |
 | `ai_usage_parse_errors_total` | Counter   | —                    | Managed 2xx responses with no parseable usage (emitted as a zero-token billing row)    |
+| `ai_candidate_failovers_total` | Counter  | —                    | Model-routed requests that abandoned a candidate for the next one                      |
 
 ---
 
@@ -512,7 +626,7 @@ Prometheus on the default registry, exposed at `/metrics` on `metrics_listen`.
 | ----------------- | ---------------------------------------------------------------------------------------------------- | -------------- |
 | `proxy`           | `ProxyHttp` impl — request/response pipeline (request_filter through logging)                        | e2e ✓          |
 | `key`             | `bai_v1` parse + Ed25519 verify + mint; keyring with multi-kid rotation support                      | unit ✓         |
-| `route`           | Data-driven provider table (name / authority / auth) + dialect default routing                       | unit ✓         |
+| `route`           | Data-driven provider table (name / authority / auth) + dialect default + model-route re-exports      | unit ✓         |
 | `peek`            | `ModelScanner` — streaming structural scan for the root-level `model`; O(1) memory                   | unit ✓         |
 | `usage`           | Token extraction (OpenAI / Anthropic, body + SSE)                                                    | unit ✓         |
 | `deny`            | Sparse deny-set, default-allow, reason → HTTP status                                                 | unit ✓         |
@@ -543,6 +657,17 @@ Prometheus on the default registry, exposed at `/metrics` on `metrics_listen`.
   before the usage chunk still meters), **deny-set fail-open** (kill NATS → stale set retained,
   auth still works), and **on-disk snapshot survival** (blackhole a tenant, restart with NATS down
   → the hold is still enforced from disk).
+- **Model routing (`tests/model_routing.rs`):** the `/auto` route end-to-end against two mocks with
+  different mounts, pool keys, and model ids. Covers primary routing, **failover on a refused
+  connection** (asserting the fallback's mount, its pool key, and its spelling of the model — the key
+  assertion, since forwarding the primary's key would be a credential leak rather than a failed
+  request), the breaker ledger (the abandoned candidate's breaker opens while the fallback keeps
+  serving), missing/unknown model → 404, BYO → 400, the routing header never reaching an upstream,
+  `ai.usage` naming the candidate that served, all-candidates-down, a **256 KiB body surviving a
+  failover byte-for-byte**, and provider-routed traffic being unaffected.
+- **Cancellation (`tests/cancellation.rs`):** a client that gives up must not open the provider's
+  breaker, and a genuinely broken provider still must. Verified non-vacuous — reverting the fix makes
+  the first test fail.
 - **Live smoke (`tests/smoke.rs`, `mise run test:smoke`):** the real `beyond-ai` binary against the
   **real** provider hosts over TLS, one per provider in `KNOWN_PROVIDERS`. Proves real TLS/SNI,
   the `/v1` → base-path rewrite landing on a live mount (200, not 404), and BYO auth passthrough.
