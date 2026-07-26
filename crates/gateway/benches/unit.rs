@@ -135,6 +135,36 @@ mod reject {
         )
     }
 
+    /// The four token counters for a typical OpenAI response: input and output non-zero, cache-read
+    /// zero (no cache hit), cache-write **always** zero on the OpenAI wire. Guarding on non-zero
+    /// turns two of the four contended read-modify-writes into a branch.
+    #[divan::bench]
+    fn record_tokens_guarded(bencher: Bencher) {
+        let m = metrics();
+        let usage = beyond_ai::usage::Usage {
+            input_tokens: black_box(5000),
+            output_tokens: black_box(2500),
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            reasoning_tokens: None,
+        };
+        bencher.bench(|| m.record_tokens(black_box(&usage)));
+    }
+
+    /// What it replaced: all four bumped unconditionally. `inc_by` is an unguarded `fetch_add`, so
+    /// adding zero still takes the cache line Exclusive and invalidates it on every other worker.
+    #[divan::bench]
+    fn record_tokens_unguarded(bencher: Bencher) {
+        let m = metrics();
+        let (i, o, cr, cw) = (5000u64, 2500u64, 0u64, 0u64);
+        bencher.bench(|| {
+            m.tokens_input.inc_by(black_box(i));
+            m.tokens_output.inc_by(black_box(o));
+            m.tokens_cache_read.inc_by(black_box(cr));
+            m.tokens_cache_write.inc_by(black_box(cw));
+        });
+    }
+
     /// The rejection counter, resolved once at boot: a direct `fetch_add`.
     #[divan::bench]
     fn counter_preresolved(bencher: Bencher) {

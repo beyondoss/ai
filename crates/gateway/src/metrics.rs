@@ -265,6 +265,36 @@ impl Metrics {
     pub fn rejection(&self, reason: Rejection) -> &IntCounter {
         &self.rejections[reason.as_index()]
     }
+
+    /// Add a metered response's token counts, skipping the ones that are zero.
+    ///
+    /// `prometheus`'s `IntCounter::inc_by` is an unguarded `fetch_add`, so adding zero still takes
+    /// the counter's cache line in Exclusive and invalidates it on every other worker — measured at
+    /// 150 ns under 16-thread contention, indistinguishable from adding a real value. Zeros are not
+    /// the exception here: `cache_write_tokens` is hardcoded to 0 for *both* OpenAI shapes
+    /// (`usage.rs`'s two `From<…> for Usage` impls), so at least one of the four was always a
+    /// wasted contended RMW on every OpenAI-dialect request, and on the unparseable-usage path
+    /// (`unwrap_or_default`) all four were.
+    ///
+    /// Guarding here rather than at the call site keeps the "the hot path bumps a direct handle"
+    /// invariant documented above in one place.
+    #[inline]
+    pub fn record_tokens(&self, usage: &crate::usage::Usage) {
+        // Counters are monotonic, so skipping a zero is not merely equivalent — Prometheus cannot
+        // distinguish "unchanged" from "incremented by zero" in the first place.
+        if usage.input_tokens != 0 {
+            self.tokens_input.inc_by(usage.input_tokens);
+        }
+        if usage.output_tokens != 0 {
+            self.tokens_output.inc_by(usage.output_tokens);
+        }
+        if usage.cache_read_tokens != 0 {
+            self.tokens_cache_read.inc_by(usage.cache_read_tokens);
+        }
+        if usage.cache_write_tokens != 0 {
+            self.tokens_cache_write.inc_by(usage.cache_write_tokens);
+        }
+    }
 }
 
 /// Per-provider metric handles, resolved once at boot and held on the [`Provider`](crate::route::Provider).

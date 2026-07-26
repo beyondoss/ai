@@ -1176,13 +1176,11 @@ impl ProxyHttp for AiProxy {
         let usage = parsed.unwrap_or_default();
 
         let m = &self.state.metrics;
-        // Pre-resolved fixed-label children (see `Metrics`) — no per-call `with_label_values` lookup.
-        m.tokens_input.inc_by(usage.input_tokens);
-        m.tokens_output.inc_by(usage.output_tokens);
-        // Cache tokens, too — these are in the `ai.usage` billing log below, but that ships with lag;
-        // the counter is the alerting surface for a cache-hit-rate cliff after a deploy.
-        m.tokens_cache_read.inc_by(usage.cache_read_tokens);
-        m.tokens_cache_write.inc_by(usage.cache_write_tokens);
+        // Pre-resolved fixed-label children, and zeros skipped (see `Metrics::record_tokens`). Cache
+        // tokens are counted here as well as in the `ai.usage` billing log below, because that log
+        // ships with lag — the counter is the alerting surface for a cache-hit-rate cliff after a
+        // deploy.
+        m.record_tokens(&usage);
         // Read the clock once for both consumers below. Beyond saving a vDSO call, this is a
         // correctness fix: the latency histogram and the `ai.usage` billing line used to call
         // `elapsed()` about forty lines apart, so they reported *different* durations for the same
