@@ -196,6 +196,34 @@ impl From<AnthropicUsage> for Usage {
     }
 }
 
+/// Recover a `usage` block from a body that did **not** parse as a whole JSON document.
+///
+/// `proxy::logging` is handed a bounded *tail* of the response, so a non-streaming body larger than
+/// `USAGE_TAIL_CAP` arrives front-truncated: it begins mid-value, `serde_json` fails at byte 0, and
+/// the request meters as zero. That is not an edge case — an OpenAI embeddings response puts its
+/// `usage` after the `data` array, and a batch of eight 3072-dimension vectors is ~249 KB, so every
+/// batched embeddings call was billing zero tokens.
+///
+/// The bytes we need are present, just not as a standalone document: both wire formats put `usage`
+/// last. So anchor on the **last** `"usage"` in the buffer and deserialize the single value that
+/// follows, letting `serde_json` stop at the end of that object and ignore the trailing bytes.
+///
+/// Only ever called after the whole-body parse has already failed, which is what keeps the heuristic
+/// safe: a well-formed body never reaches it, so a `"usage"` appearing inside generated content can
+/// only mislead us on a body that was going to meter zero anyway. The `rfind` is what makes even
+/// that unlikely — content precedes `usage` in both formats, so the last occurrence is the real one.
+fn recover_trailing_usage<T: serde::de::DeserializeOwned>(body: &[u8]) -> Option<T> {
+    const KEY: &[u8] = br#""usage""#;
+    let at = memchr::memmem::rfind(body, KEY)?;
+    let rest = &body[at + KEY.len()..];
+    // Step over the `:` separating the key from its value (JSON permits whitespace either side).
+    let colon = memchr::memchr(b':', rest)?;
+    let mut de = serde_json::Deserializer::from_slice(&rest[colon + 1..]);
+    // Deliberately no `de.end()`: the value is followed by the rest of the object, and requiring EOF
+    // is precisely what the whole-document parse already failed on.
+    T::deserialize(&mut de).ok()
+}
+
 /// OpenAI non-streaming: top-level `usage`. `None` (absent/`null`, or a dialect mismatch — see
 /// `OpenAiUsage::looks_anthropic_shaped`) ⇒ no usage to meter.
 pub fn openai_body(body: &[u8]) -> Option<Usage> {
@@ -203,7 +231,11 @@ pub fn openai_body(body: &[u8]) -> Option<Usage> {
     struct Body {
         usage: Option<OpenAiUsage>,
     }
-    let usage = serde_json::from_slice::<Body>(body).ok()?.usage?;
+    let usage = match serde_json::from_slice::<Body>(body) {
+        Ok(b) => b.usage?,
+        // Front-truncated tail of an oversized body — see `recover_trailing_usage`.
+        Err(_) => recover_trailing_usage::<OpenAiUsage>(body)?,
+    };
     if usage.looks_anthropic_shaped() {
         return None;
     }
@@ -217,34 +249,94 @@ pub fn anthropic_body(body: &[u8]) -> Option<Usage> {
     struct Body {
         usage: Option<AnthropicUsage>,
     }
-    let u = serde_json::from_slice::<Body>(body).ok()?.usage?;
+    let u = match serde_json::from_slice::<Body>(body) {
+        Ok(b) => b.usage?,
+        Err(_) => recover_trailing_usage::<AnthropicUsage>(body)?,
+    };
     if u.looks_openai_shaped() {
         return None;
     }
     Some(Usage::from(u))
 }
 
-/// Iterate the raw JSON payloads carried on `data:` lines of an SSE byte stream. `[DONE]` and the
-/// `data:` framing are stripped; each caller deserializes the payload into its own typed view.
-fn sse_data_lines(sse: &[u8]) -> impl Iterator<Item = &[u8]> + '_ {
-    sse.split(|&b| b == b'\n').filter_map(|line| {
-        let line = line.strip_prefix(b"data:")?;
-        // SSE strips *all* leading spaces after the field colon (not exactly one) — OpenAI/Anthropic
-        // emit `data: ` (one space), but a config-added OpenAI-wire provider that pads with more
-        // would otherwise leave whitespace in the payload and fail the JSON parse → silent zero usage.
-        // Trim the trailing end too: SSE permits CRLF line endings (RFC 8895), so splitting on `\n`
-        // leaves a trailing `\r` that would otherwise fail the JSON parse → another silent zero.
-        let line = line.trim_ascii();
-        (line != b"[DONE]").then_some(line)
-    })
+/// Strip the SSE `data:` framing from one line, yielding the raw JSON payload, or `None` if the line
+/// carries no payload we care about (a non-`data:` field, a blank separator, or the `[DONE]`
+/// sentinel).
+fn strip_sse_data(line: &[u8]) -> Option<&[u8]> {
+    let line = line.strip_prefix(b"data:")?;
+    // SSE strips *all* leading spaces after the field colon (not exactly one) — OpenAI/Anthropic
+    // emit `data: ` (one space), but a config-added OpenAI-wire provider that pads with more
+    // would otherwise leave whitespace in the payload and fail the JSON parse → silent zero usage.
+    // Trim the trailing end too: SSE permits CRLF line endings (RFC 8895), so splitting on `\n`
+    // leaves a trailing `\r` that would otherwise fail the JSON parse → another silent zero.
+    let line = line.trim_ascii();
+    (line != b"[DONE]").then_some(line)
+}
+
+/// Forward line iterator over an SSE byte stream, split on `\n` with a SIMD-accelerated scan.
+///
+/// `slice::split(|&b| b == b'\n')` compiles to `position(closure)` — a scalar, byte-at-a-time loop
+/// that LLVM does not vectorize. Over a 64 KiB tail that measured **17.6 µs vs 2.65 µs** for
+/// `memchr`, i.e. ~15 µs of pure scan waste per streaming request, before a single byte is parsed.
+///
+/// One deliberate difference from `slice::split`: a trailing `\n` yields no final empty element
+/// here. That element could never carry a payload ([`strip_sse_data`] rejects it), so every caller
+/// sees the same sequence.
+struct SseLines<'a> {
+    rest: &'a [u8],
+}
+
+fn sse_lines(sse: &[u8]) -> SseLines<'_> {
+    SseLines { rest: sse }
+}
+
+impl<'a> Iterator for SseLines<'a> {
+    type Item = &'a [u8];
+
+    fn next(&mut self) -> Option<&'a [u8]> {
+        if self.rest.is_empty() {
+            return None;
+        }
+        match memchr::memchr(b'\n', self.rest) {
+            Some(i) => {
+                let line = &self.rest[..i];
+                self.rest = &self.rest[i + 1..];
+                Some(line)
+            }
+            // Final line with no trailing newline — a tail can end mid-stream.
+            None => Some(std::mem::take(&mut self.rest)),
+        }
+    }
+}
+
+/// Iterate the raw JSON payloads carried on `data:` lines, **newest first**. Used by the dialects
+/// whose answer is "the last usage block wins", so they can stop at the first hit instead of parsing
+/// every line to overwrite the result.
+fn sse_data_lines_rev(sse: &[u8]) -> impl Iterator<Item = &[u8]> {
+    sse.rsplit(|&b| b == b'\n').filter_map(strip_sse_data)
+}
+
+/// Whether a line could possibly carry a usage block.
+///
+/// Every shape we meter — top-level `usage`, `message.usage`, `response.usage` — spells the key
+/// literally, so a line without the substring cannot deserialize one and the JSON parse is pure
+/// waste. On an Anthropic stream that is every `content_block_delta`, i.e. almost the whole tail.
+///
+/// False *negatives* would need a provider to escape the key (`"usage"`), which none does; a
+/// false *positive* (the word appearing in generated text) costs only the parse we would have done
+/// anyway, so the filter can never change the answer — only how often we pay for it.
+fn might_carry_usage(finder: &memchr::memmem::Finder<'_>, payload: &[u8]) -> bool {
+    finder.find(payload).is_some()
 }
 
 /// OpenAI streaming: chat/completions (requires `stream_options.include_usage`) carries a top-level
 /// `usage` object on the penultimate chunk; the Responses API carries it nested under
 /// `response.completed.response.usage` instead, with no top-level `usage` key at all — so both shapes
-/// are checked per line. Last one with usage wins. A top-level `usage` that looks Anthropic-shaped
-/// (dialect mismatch — see `OpenAiUsage::looks_anthropic_shaped`) is skipped, not counted: if every
-/// line is mismatched, `found` stays `None`.
+/// are checked per line. Last one with usage wins — which is why this scans the tail **backwards**
+/// and returns at the first hit rather than parsing every line to overwrite a result. A top-level
+/// `usage` that looks Anthropic-shaped (dialect mismatch — see
+/// `OpenAiUsage::looks_anthropic_shaped`) is skipped, not counted: if every line is mismatched the
+/// scan runs off the front and returns `None`.
 pub fn openai_stream(sse: &[u8]) -> Option<Usage> {
     #[derive(Deserialize)]
     struct ResponsesEnvelope {
@@ -255,19 +347,40 @@ pub fn openai_stream(sse: &[u8]) -> Option<Usage> {
         usage: Option<OpenAiUsage>,
         response: Option<ResponsesEnvelope>,
     }
-    let mut found = None;
-    for line in sse_data_lines(sse) {
+    // Scanned in **reverse**, returning at the first accepted usage. "Last accepted in forward
+    // order" and "first accepted in reverse order" select the same line by definition, so this is
+    // semantics-preserving — including the tricky cases: a trailing Anthropic-shaped `usage` is
+    // rejected in both directions and falls through to an earlier line, a trailing `"usage":null`
+    // deserializes to `None` in both and falls through, and the front-truncated first line of a
+    // 64 KiB tail is reached last here and fails `strip_prefix`/`from_slice` either way.
+    //
+    // Forward, the loop ran to completion and overwrote `found` on every hit, so on a 64 KiB tail
+    // of ~450 `data:` lines it parsed all 450 and discarded 449. Measured 80.1 µs / 261 allocations
+    // (serde_json's scratch `Vec`, one malloc+free per line whose ignored fields nest ≥2 deep —
+    // which every `choices[0].delta` chunk does) against 0.155 µs / 0 allocations for this.
+    let finder = memchr::memmem::Finder::new(b"usage");
+    for line in sse_data_lines_rev(sse) {
+        if !might_carry_usage(&finder, line) {
+            continue;
+        }
         if let Ok(chunk) = serde_json::from_slice::<Chunk>(line) {
             if let Some(u) = chunk.usage {
                 if !u.looks_anthropic_shaped() {
-                    found = Some(Usage::from(u));
+                    return Some(Usage::from(u));
                 }
             } else if let Some(u) = chunk.response.and_then(|r| r.usage) {
-                found = Some(Usage::from(u));
+                return Some(Usage::from(u));
             }
         }
     }
-    found
+    None
+}
+
+/// Anthropic streaming over a single contiguous buffer. See [`anthropic_stream_parts`], which this
+/// delegates to — the proxy uses that form because the facts it needs live at *both* ends of the
+/// stream and it only retains the two ends.
+pub fn anthropic_stream(sse: &[u8]) -> Option<Usage> {
+    anthropic_stream_parts(&[sse])
 }
 
 /// Anthropic streaming: input + cache tokens arrive in `message_start.message.usage`; output (and
@@ -275,7 +388,17 @@ pub fn openai_stream(sse: &[u8]) -> Option<Usage> {
 /// total). A `usage` block that looks OpenAI-shaped (dialect mismatch — see
 /// `AnthropicUsage::looks_openai_shaped`) is skipped entirely: if every line is mismatched, `saw_any`
 /// stays `false` and the function returns `None`.
-pub fn anthropic_stream(sse: &[u8]) -> Option<Usage> {
+///
+/// Takes **parts** because those two facts sit at opposite ends of the stream and the proxy retains
+/// only a bounded head and a bounded tail (a whole stream can be megabytes). `message_start` is the
+/// first event, so it is in the head; the final `message_delta` is in the tail. Passing a single
+/// buffer — which is what a tail-only tap amounted to — silently zeroed `input_tokens` and both
+/// cache counters for any stream longer than the tail, without even tripping the parse-error
+/// counter, because `saw_any` still went true off the `message_delta`.
+///
+/// Parts are scanned in order and may safely overlap: every field is *assigned*, never accumulated,
+/// so a short response whose head and tail cover the same bytes reads the same as one that doesn't.
+pub fn anthropic_stream_parts(parts: &[&[u8]]) -> Option<Usage> {
     #[derive(Deserialize)]
     struct Message {
         usage: Option<AnthropicUsage>,
@@ -286,30 +409,45 @@ pub fn anthropic_stream(sse: &[u8]) -> Option<Usage> {
         message: Option<Message>,
         usage: Option<AnthropicUsage>,
     }
+    // Forward, and genuinely a full pass: input/cache tokens ride on `message_start` at the head
+    // while the running output count rides on the last `message_delta`, so unlike `openai_stream`
+    // there is no single winning line to stop at. What we *can* skip is the JSON parse for every
+    // line that cannot carry a usage block at all — on an Anthropic stream that is every
+    // `content_block_delta`, which is nearly the entire tail. Measured 62.3 µs → 9.4 µs on a 64 KiB
+    // tail (the `memchr` line split accounts for ~15 µs of that; the pre-filter for the rest).
+    let finder = memchr::memmem::Finder::new(b"usage");
     let mut usage = Usage::default();
     let mut saw_any = false;
-    for line in sse_data_lines(sse) {
-        let Ok(chunk) = serde_json::from_slice::<Chunk>(line) else {
-            continue;
-        };
-        if let Some(u) = chunk.message.and_then(|m| m.usage) {
-            if !u.looks_openai_shaped() {
-                usage.input_tokens = u.input_tokens;
-                usage.cache_read_tokens = u.cache_read_input_tokens;
-                usage.cache_write_tokens = u.cache_creation_input_tokens;
-                saw_any = true;
+    for part in parts {
+        for line in sse_lines(part) {
+            let Some(line) = strip_sse_data(line) else {
+                continue;
+            };
+            if !might_carry_usage(&finder, line) {
+                continue;
             }
-        }
-        if let Some(u) = chunk.usage {
-            if !u.looks_openai_shaped() {
-                // message_delta carries the running output token count.
-                if u.output_tokens > 0 {
-                    usage.output_tokens = u.output_tokens;
+            let Ok(chunk) = serde_json::from_slice::<Chunk>(line) else {
+                continue;
+            };
+            if let Some(u) = chunk.message.and_then(|m| m.usage) {
+                if !u.looks_openai_shaped() {
+                    usage.input_tokens = u.input_tokens;
+                    usage.cache_read_tokens = u.cache_read_input_tokens;
+                    usage.cache_write_tokens = u.cache_creation_input_tokens;
+                    saw_any = true;
                 }
-                if let Some(rt) = u.output_tokens_details.thinking_tokens {
-                    usage.reasoning_tokens = Some(rt);
+            }
+            if let Some(u) = chunk.usage {
+                if !u.looks_openai_shaped() {
+                    // message_delta carries the running output token count.
+                    if u.output_tokens > 0 {
+                        usage.output_tokens = u.output_tokens;
+                    }
+                    if let Some(rt) = u.output_tokens_details.thinking_tokens {
+                        usage.reasoning_tokens = Some(rt);
+                    }
+                    saw_any = true;
                 }
-                saw_any = true;
             }
         }
     }
@@ -385,6 +523,243 @@ mod tests {
                 reasoning_tokens: None,
             }
         );
+    }
+
+    /// An OpenAI embeddings response: a big `data` array of float vectors, then `model`, then
+    /// `usage` — the real wire shape, and the one that overflows the 64 KiB tail.
+    fn embeddings_body(vectors: usize, dims: usize) -> Vec<u8> {
+        let vec_json = (0..dims)
+            .map(|i| format!("{}", 0.0123456 + i as f64 * 1e-7))
+            .collect::<Vec<_>>()
+            .join(",");
+        let items = (0..vectors)
+            .map(|i| format!(r#"{{"object":"embedding","index":{i},"embedding":[{vec_json}]}}"#))
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(
+            r#"{{"object":"list","data":[{items}],"model":"text-embedding-3-large","usage":{{"prompt_tokens":812,"total_tokens":812}}}}"#
+        )
+        .into_bytes()
+    }
+
+    /// What `proxy::logging` actually passes the parser: the last `USAGE_TAIL_CAP` bytes.
+    fn tail_of(body: &[u8]) -> &[u8] {
+        const USAGE_TAIL_CAP: usize = 64 * 1024;
+        &body[body.len().saturating_sub(USAGE_TAIL_CAP)..]
+    }
+
+    #[test]
+    fn oversized_non_streaming_body_still_meters_from_the_truncated_tail() {
+        // A body larger than the tail cap reaches the parser front-truncated, so `from_slice` fails
+        // at byte 0 and the request metered zero — while tripping `usage_parse_errors_total`, so it
+        // looked like a provider wire change rather than our own truncation. OpenAI embeddings hit
+        // this routinely: `usage` sits after the `data` array, and eight 3072-dim vectors is ~249 KB.
+        let small = embeddings_body(1, 3072);
+        assert!(small.len() < 64 * 1024, "control case must fit in the tail");
+        assert_eq!(openai_body(tail_of(&small)).unwrap().input_tokens, 812);
+
+        for (vectors, dims) in [(8, 3072), (32, 3072)] {
+            let body = embeddings_body(vectors, dims);
+            assert!(body.len() > 64 * 1024);
+            let from_tail = openai_body(tail_of(&body)).unwrap_or_else(|| {
+                panic!("{vectors}x{dims} body ({} B) metered nothing", body.len())
+            });
+            assert_eq!(from_tail.input_tokens, 812);
+            // ...and matches what the untruncated body would have reported.
+            assert_eq!(from_tail, openai_body(&body).unwrap());
+        }
+    }
+
+    /// A realistic Anthropic stream: `message_start` (input + cache), `n` text deltas, then the
+    /// terminal `message_delta` (output).
+    fn anthropic_sse(deltas: usize) -> Vec<u8> {
+        let mut s = String::from(
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"role\":\"assistant\",\"model\":\"claude-opus-4-8\",\"content\":[],\"usage\":{\"input_tokens\":5000,\"output_tokens\":1,\"cache_read_input_tokens\":4000,\"cache_creation_input_tokens\":100}}}\n\n",
+        );
+        for i in 0..deltas {
+            s.push_str(&format!(
+                "event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":\" token{i}\"}}}}\n\n"
+            ));
+        }
+        s.push_str("event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":2500}}\n\n");
+        s.into_bytes()
+    }
+
+    #[test]
+    fn anthropic_stream_reads_input_tokens_from_the_head_not_the_tail() {
+        // `message_start` — which carries input_tokens and BOTH cache counters — is the first event
+        // on the wire, but the proxy only retained the last 64 KiB. Past ~500 output tokens (about
+        // 62 KiB of `content_block_delta` framing) it was compacted away and those three fields
+        // billed zero, while `saw_any` still went true off the `message_delta` so nothing flagged
+        // it. Input and cache-read are the *largest* line items in a cached agent workload.
+        const HEAD: usize = 8 * 1024;
+        const TAIL: usize = 64 * 1024;
+        let expected = Usage {
+            input_tokens: 5000,
+            output_tokens: 2500,
+            cache_read_tokens: 4000,
+            cache_write_tokens: 100,
+            reasoning_tokens: None,
+        };
+
+        for deltas in [10, 500, 5000] {
+            let sse = anthropic_sse(deltas);
+            let head = &sse[..HEAD.min(sse.len())];
+            let tail = &sse[sse.len().saturating_sub(TAIL)..];
+
+            assert_eq!(
+                anthropic_stream_parts(&[head, tail]).unwrap(),
+                expected,
+                "head+tail must meter fully at {deltas} deltas ({} B)",
+                sse.len()
+            );
+            // The whole buffer, when it is small enough to keep, must agree.
+            assert_eq!(anthropic_stream(&sse).unwrap(), expected);
+        }
+
+        // ...and the tail *alone* is exactly what used to be wrong, which is what makes the head
+        // load-bearing rather than belt-and-braces.
+        let big = anthropic_sse(5000);
+        let tail_only = anthropic_stream(&big[big.len() - TAIL..]).unwrap();
+        assert_eq!(
+            (
+                tail_only.input_tokens,
+                tail_only.cache_read_tokens,
+                tail_only.cache_write_tokens
+            ),
+            (0, 0, 0),
+            "a tail-only tap is expected to lose these — that is the bug the head buffer fixes"
+        );
+        assert_eq!(tail_only.output_tokens, 2500);
+    }
+
+    #[test]
+    fn oversized_anthropic_body_recovers_cache_tokens_from_the_tail() {
+        // Same shape on the Anthropic wire: a long `content` array, then `usage` last. Cache tokens
+        // are the largest line item in a cached agent workload, so silently zeroing them is the
+        // expensive half of this bug.
+        let text = "x".repeat(120 * 1024);
+        let body = format!(
+            r#"{{"id":"msg_1","type":"message","role":"assistant","model":"claude-opus-4-8","content":[{{"type":"text","text":"{text}"}}],"usage":{{"input_tokens":5000,"output_tokens":2500,"cache_read_input_tokens":4000,"cache_creation_input_tokens":100}}}}"#
+        )
+        .into_bytes();
+        assert!(body.len() > 64 * 1024);
+        let u = anthropic_body(tail_of(&body)).expect("must meter from a truncated tail");
+        assert_eq!(
+            (
+                u.input_tokens,
+                u.output_tokens,
+                u.cache_read_tokens,
+                u.cache_write_tokens
+            ),
+            (5000, 2500, 4000, 100)
+        );
+    }
+
+    #[test]
+    fn recovery_does_not_fire_on_a_body_that_parses() {
+        // The anchored recovery is only reachable once the whole-document parse has failed, which is
+        // what keeps it safe. A well-formed body must take the normal path — including the cases
+        // that deliberately return `None` (absent usage, dialect mismatch), which recovery must not
+        // resurrect into a bogus reading.
+        assert!(openai_body(br#"{"choices":[{"message":{"content":"hi"}}]}"#).is_none());
+        assert!(
+            openai_body(br#"{"usage":{"input_tokens":100,"output_tokens":50}}"#).is_none(),
+            "an Anthropic-shaped usage must stay a dialect mismatch, not be recovered"
+        );
+        assert!(anthropic_body(br#"{"usage":null}"#).is_none());
+        // Still genuinely unparseable ⇒ still nothing to meter.
+        assert!(openai_body(b"not json at all").is_none());
+        assert!(openai_body(b"{ broken").is_none());
+    }
+
+    #[test]
+    fn openai_reverse_scan_selects_the_same_line_as_a_forward_scan() {
+        // `openai_stream` scans backwards and returns at the first hit; the contract it replaced was
+        // "keep going, last one with usage wins". These are the cases where the two could diverge.
+
+        // Two usage chunks: the LAST must win, exactly as the forward loop's overwrite did.
+        let two = b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":2}}\n\n\
+                    data: {\"choices\":[],\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":8}}\n\n\
+                    data: [DONE]\n\n";
+        let u = openai_stream(two).unwrap();
+        assert_eq!((u.input_tokens, u.output_tokens), (9, 8));
+
+        // A trailing Anthropic-shaped usage is rejected in both directions and must fall through to
+        // the earlier, genuinely OpenAI-shaped one — not terminate the scan.
+        let mismatched_last =
+            b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":4}}\n\n\
+              data: {\"usage\":{\"input_tokens\":100,\"output_tokens\":50}}\n\n";
+        let u = openai_stream(mismatched_last).unwrap();
+        assert_eq!((u.input_tokens, u.output_tokens), (3, 4));
+
+        // An explicit `"usage":null` deserializes to `None` and must also fall through.
+        let null_last =
+            b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":6}}\n\n\
+                          data: {\"choices\":[],\"usage\":null}\n\n";
+        let u = openai_stream(null_last).unwrap();
+        assert_eq!((u.input_tokens, u.output_tokens), (7, 6));
+
+        // A front-truncated first line (what a 64 KiB tail always starts with) is reached last by the
+        // reverse scan and must be skipped, not derail it.
+        let truncated = b"pletion.chunk\",\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n\
+                          data: {\"choices\":[],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":12}}\n\n";
+        let u = openai_stream(truncated).unwrap();
+        assert_eq!((u.input_tokens, u.output_tokens), (11, 12));
+    }
+
+    #[test]
+    fn usage_prefilter_cannot_change_the_answer() {
+        // The `memmem` pre-filter skips the JSON parse for lines that don't contain "usage". A false
+        // positive (the word in generated content) must still parse correctly and not be mistaken
+        // for a usage block...
+        let word_in_content =
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"token usage is billed\"}}]}\n\n\
+              data: {\"choices\":[],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":3}}\n\n";
+        let u = openai_stream(word_in_content).unwrap();
+        assert_eq!((u.input_tokens, u.output_tokens), (2, 3));
+
+        // ...and a stream that genuinely never carries usage still meters nothing rather than
+        // picking up a content line that merely mentions the word.
+        let only_the_word =
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"usage usage usage\"}}]}\n\n\
+                              data: [DONE]\n\n";
+        assert!(openai_stream(only_the_word).is_none());
+
+        // Same guard on the Anthropic side, which pre-filters every content_block_delta.
+        let ant = b"event: content_block_delta\n\
+                    data: {\"type\":\"content_block_delta\",\"delta\":{\"text\":\"usage\"}}\n\n\
+                    event: message_start\n\
+                    data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":20,\"output_tokens\":0}}}\n\n\
+                    event: message_delta\n\
+                    data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":15}}\n\n";
+        let u = anthropic_stream(ant).unwrap();
+        assert_eq!((u.input_tokens, u.output_tokens), (20, 15));
+    }
+
+    #[test]
+    fn sse_lines_matches_split_for_every_payload_bearing_line() {
+        // `SseLines` drops the empty element a trailing `\n` would produce; that element can never
+        // carry a payload, so the payload sequence must be identical to the old `slice::split`.
+        for body in [
+            &b"data: {\"a\":1}\n\ndata: {\"b\":2}\n\n"[..],
+            &b"data: {\"a\":1}\n\ndata: {\"b\":2}"[..], // no trailing newline (a truncated tail)
+            &b"\n\n\n"[..],
+            &b""[..],
+            &b"data: [DONE]\n"[..],
+        ] {
+            let via_split: Vec<&[u8]> = body
+                .split(|&b| b == b'\n')
+                .filter_map(strip_sse_data)
+                .collect();
+            let via_memchr: Vec<&[u8]> = sse_lines(body).filter_map(strip_sse_data).collect();
+            assert_eq!(
+                via_split,
+                via_memchr,
+                "line iteration diverged for {:?}",
+                String::from_utf8_lossy(body)
+            );
+        }
     }
 
     #[test]

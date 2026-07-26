@@ -40,9 +40,11 @@
 //! Anthropic client works by changing only the host. An unknown first segment is a 404. Model isn't
 //! used for routing (the body isn't read pre-connect); it's still captured from the body for usage.
 
+use crate::metrics::Rejection;
 use crate::route::{self, Dialect, Provider};
 use crate::state::{GatewayState, RequestId};
 use crate::{peek, usage};
+use arrayvec::ArrayString;
 use async_trait::async_trait;
 use bytes::Bytes;
 use pingora::http::ResponseHeader;
@@ -51,6 +53,7 @@ use pingora_core::protocols::ALPN;
 use pingora_core::upstreams::peer::HttpPeer;
 use pingora_proxy::{ProxyHttp, Session};
 use std::borrow::Cow;
+use std::fmt::Write as _;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
@@ -79,6 +82,87 @@ const MAX_REQUEST_BODY: usize = 100 * 1024 * 1024;
 /// / the whole non-streaming body; keeping a tail means we never buffer a long stream.
 const USAGE_TAIL_CAP: usize = 64 * 1024;
 
+/// The bounded window of response bytes kept for usage extraction.
+///
+/// Grows like a plain `Vec` while the response is small — the common case is a non-streaming body of
+/// a few hundred bytes, and reserving the full cap for that would waste an allocation on every
+/// request. Once it outgrows the cap it flips to a **ring**: a cap-sized buffer written with
+/// wraparound, so every subsequent byte is copied exactly once, with no compaction memmove and no
+/// further allocation.
+///
+/// What it replaced grew to `2 × cap` and then compacted with a `copy_within` that kept the last
+/// `cap` bytes. That is bounded, but it re-copies `cap` bytes every `cap` bytes of stream — so a
+/// long response was memmoved roughly twice over, on top of the geometric realloc chain from
+/// starting at zero capacity. Measured 1.88× the response size in memmove at steady state.
+#[derive(Default)]
+struct UsageTail {
+    buf: Vec<u8>,
+    /// Next write index. Meaningful only once `ring` is set.
+    head: usize,
+    /// Whether `buf` is a wraparound ring of exactly `USAGE_TAIL_CAP` bytes.
+    ring: bool,
+}
+
+impl UsageTail {
+    fn push(&mut self, data: &[u8]) {
+        if !self.ring {
+            self.buf.extend_from_slice(data);
+            if self.buf.len() > USAGE_TAIL_CAP {
+                // Outgrown: keep the last cap bytes in order and switch to ring mode. This is the
+                // only compaction that ever runs — from here on, writes wrap instead of shifting.
+                let start = self.buf.len() - USAGE_TAIL_CAP;
+                self.buf.copy_within(start.., 0);
+                self.buf.truncate(USAGE_TAIL_CAP);
+                self.head = 0;
+                self.ring = true;
+            }
+            return;
+        }
+        // A chunk at least as large as the whole window: only its last cap bytes can survive, and
+        // they land aligned, so the ring resets rather than wrapping.
+        if data.len() >= USAGE_TAIL_CAP {
+            self.buf
+                .copy_from_slice(&data[data.len() - USAGE_TAIL_CAP..]);
+            self.head = 0;
+            return;
+        }
+        let first = (USAGE_TAIL_CAP - self.head).min(data.len());
+        self.buf[self.head..self.head + first].copy_from_slice(&data[..first]);
+        let rest = data.len() - first;
+        if rest > 0 {
+            self.buf[..rest].copy_from_slice(&data[first..]);
+        }
+        self.head = (self.head + data.len()) % USAGE_TAIL_CAP;
+    }
+
+    /// The retained bytes, oldest first. Rotates the ring into order once, at parse time.
+    ///
+    /// Stays a ring afterwards, with `head` back at 0 — a subsequent `push` then overwrites the
+    /// oldest bytes, which is exactly right. In practice `logging` calls this once, after the body
+    /// is complete.
+    fn contiguous(&mut self) -> &[u8] {
+        if self.ring && self.head != 0 {
+            self.buf.rotate_left(self.head);
+            self.head = 0;
+        }
+        &self.buf
+    }
+}
+
+/// Bounded **head** of an Anthropic SSE response, kept alongside the tail.
+///
+/// A tail alone is enough for every other shape — OpenAI puts its usage chunk at the end, and a
+/// non-streaming body carries `usage` last. Anthropic streaming is the exception: `input_tokens`
+/// and both cache counters ride on `message_start`, the *first* event, while the output count rides
+/// on the last `message_delta`. The two facts sit at opposite ends of a stream that can be
+/// megabytes long, so a tail-only tap dropped `message_start` for any response past roughly 500
+/// output tokens and billed `input_tokens = 0` — and silently, because `saw_any` still went true
+/// off the `message_delta`, so the parse never looked like an error.
+///
+/// 8 KiB is far more than needed (a `message_start` event is a few hundred bytes and is the first
+/// thing on the wire) but leaves room for a provider that emits `ping`s or other preamble first.
+const USAGE_HEAD_CAP: usize = 8 * 1024;
+
 /// Max upstream **connect** retries before surfacing the failure to the client.
 ///
 /// We retry connect failures only (the idiomatic Pingora pattern, same as edge). Retrying on a
@@ -100,11 +184,14 @@ pub struct RequestCtx {
     /// The resolved upstream provider (authority/host + precomputed managed auth value), shared from
     /// the boot-time registry — a cheap `Arc` clone, nothing re-allocated per request.
     provider: Arc<Provider>,
-    /// The path (+ query) to send upstream: the client path with the `/{provider}` segment stripped
-    /// (provider-prefixed request) or unchanged (bare-path default). Forwarded **verbatim** — the
-    /// gateway does no per-provider path rewriting. Applied as the upstream URI in
-    /// `upstream_request_filter`.
-    forward_path: String,
+    /// The path (+ query) to send upstream, when it differs from the inbound one: the client path
+    /// with the `/{provider}` segment stripped. Forwarded **verbatim** — the gateway does no
+    /// per-provider path rewriting. Applied as the upstream URI in `upstream_request_filter`.
+    ///
+    /// `None` for the bare-path default, whose path already *is* what the upstream should see. The
+    /// distinction is in the type rather than discovered by rebuilding the path and comparing it,
+    /// so the common route allocates nothing.
+    forward_path: Option<String>,
     /// Whether this is a **managed** request (`bai_…` key → swap to the pool key). `false` for
     /// **BYO** — we leave the user's own auth header untouched (passthrough).
     managed: bool,
@@ -124,7 +211,12 @@ pub struct RequestCtx {
     /// Content-Type (we don't read the request to learn this).
     streaming: bool,
     /// Bounded tail of the response, for the usage tap.
-    resp_tail: Vec<u8>,
+    resp_tail: UsageTail,
+    /// Bounded head of the response — populated only for an **Anthropic SSE** response, whose input
+    /// and cache token counts arrive on the very first event and would otherwise be compacted out of
+    /// `resp_tail`. See [`USAGE_HEAD_CAP`]. Empty for every other dialect and for non-streaming
+    /// responses, which carry everything the tail already holds.
+    resp_head: Vec<u8>,
     /// Running total of request-body bytes seen, to enforce `MAX_REQUEST_BODY` even when the client
     /// uses chunked transfer encoding (no `Content-Length` to check up front).
     body_bytes_fed: usize,
@@ -150,6 +242,73 @@ pub struct RequestCtx {
     request_id: RequestId,
 }
 
+/// Every `(error_type, message)` pair the gateway rejects with, paired with its wire body.
+///
+/// The set is closed: `reject` is only ever called with literals, so the response body is one of
+/// these constants and never needs building. Kept as a table rather than scattered `const`s so
+/// `reject_bodies_are_valid_json` can walk it and assert each entry parses, carries the `type` and
+/// `message` it claims, and is reachable — a hand-written JSON literal is exactly the thing that
+/// rots silently otherwise.
+pub const REJECT_BODIES: [(&str, &str, &str); 8] = [
+    (
+        "invalid_request_error",
+        "unknown provider",
+        r#"{"error":{"message":"unknown provider","type":"invalid_request_error"}}"#,
+    ),
+    (
+        "authentication_error",
+        "missing API key",
+        r#"{"error":{"message":"missing API key","type":"authentication_error"}}"#,
+    ),
+    (
+        "authentication_error",
+        "invalid API key",
+        r#"{"error":{"message":"invalid API key","type":"authentication_error"}}"#,
+    ),
+    (
+        "rate_limit_error",
+        "rate limit exceeded",
+        r#"{"error":{"message":"rate limit exceeded","type":"rate_limit_error"}}"#,
+    ),
+    (
+        "invalid_request_error",
+        "request body too large",
+        r#"{"error":{"message":"request body too large","type":"invalid_request_error"}}"#,
+    ),
+    (
+        "access_denied",
+        "tenant is over limit or suspended",
+        r#"{"error":{"message":"tenant is over limit or suspended","type":"access_denied"}}"#,
+    ),
+    (
+        "api_error",
+        "no provider key available",
+        r#"{"error":{"message":"no provider key available","type":"api_error"}}"#,
+    ),
+    (
+        "api_error",
+        "provider temporarily unavailable",
+        r#"{"error":{"message":"provider temporarily unavailable","type":"api_error"}}"#,
+    ),
+];
+
+/// The precomputed body for a `(typ, msg)` pair.
+///
+/// Falls back to building one with `serde_json` for a pair not in [`REJECT_BODIES`]. That branch is
+/// unreachable today (a test asserts every call site is covered) and exists so adding a rejection
+/// without its table entry degrades to the old allocating behaviour rather than serving a body that
+/// contradicts the `error_type` in the log line.
+/// `pub` for the bench target (`benches/unit.rs`), which measures it against the `serde_json`
+/// construction it replaced. Not part of the crate's intended surface.
+pub fn error_body(typ: &str, msg: &str) -> Bytes {
+    for (t, m, body) in REJECT_BODIES {
+        if t == typ && m == msg {
+            return Bytes::from_static(body.as_bytes());
+        }
+    }
+    Bytes::from(serde_json::json!({ "error": { "type": typ, "message": msg } }).to_string())
+}
+
 impl AiProxy {
     /// Write a small JSON error and signal `request_filter` to short-circuit. The body is built with
     /// `serde_json` (not `format!`) so a `typ`/`msg` containing `"` or `\` can never break out of the
@@ -159,6 +318,12 @@ impl AiProxy {
     /// not *which request* — this is what an oncall greps when a `deny_fraud`/`rate_limit` spike
     /// shows on the dashboard) and echoes the `request_id` in a response header so a client report
     /// quoting that id lands on this line.
+    ///
+    /// **Call it through [`Self::reject_boxed`], never `.await` it directly.** `#[async_trait]`
+    /// heap-boxes `request_filter`'s future once per request, and this future — 1 136 bytes of it,
+    /// measured with `-Zprint-type-sizes` — gets inlined into that state machine at every call site.
+    /// Awaiting it inline therefore made *every* request, including every successful one, allocate
+    /// room for a rejection it was never going to take.
     async fn reject(
         session: &mut Session,
         request_id: &str,
@@ -167,16 +332,44 @@ impl AiProxy {
         msg: &str,
     ) -> Result<bool> {
         warn!(request_id, status, error_type = typ, "request rejected");
-        let body = Bytes::from(
-            serde_json::json!({ "error": { "type": typ, "message": msg } }).to_string(),
-        );
-        let mut resp = ResponseHeader::build(status, None)?;
+        // `typ` and `msg` are always a pair of literals from `RejectBody`, so the body is one of a
+        // handful of compile-time constants and `error_body` hands back a `Bytes::from_static` —
+        // no JSON DOM, no `String`, no copy. Building it with `serde_json::json!` cost 13
+        // allocations and 1 565 bytes per rejected request (measured), which is a poor trade on the
+        // one path that a flood drives at full rate. The `json!` was there so a non-literal message
+        // couldn't break out of the JSON structure; a closed set of constants gives that for free,
+        // and `reject_bodies_are_valid_json` keeps them honest.
+        let body = error_body(typ, msg);
+        // Content-length formatted into a stack buffer rather than `body.len().to_string()`: still
+        // one `HeaderValue` allocation inside pingora, but no `String` of our own.
+        let mut len_buf = ArrayString::<20>::new();
+        let _ = write!(len_buf, "{}", body.len());
+        let mut resp = ResponseHeader::build(status, Some(3))?;
         resp.insert_header("content-type", "application/json")?;
-        resp.insert_header("content-length", body.len().to_string())?;
+        resp.insert_header("content-length", len_buf.as_str())?;
         resp.insert_header(REQUEST_ID_HEADER, request_id)?;
         session.write_response_header(Box::new(resp), false).await?;
         session.write_response_body(Some(body), true).await?;
         Ok(true)
+    }
+
+    /// [`Self::reject`] behind its own allocation, so its state machine is *not* inlined into
+    /// `request_filter`'s.
+    ///
+    /// `request_filter` returns an `#[async_trait]` future that pingora heap-boxes once per request.
+    /// With `reject` awaited inline at eight call sites, the largest of them dominated that future:
+    /// 1 264 bytes total, of which 1 136 was the reject state machine (`-Zprint-type-sizes`) — for
+    /// comparison every other filter's future is 32 bytes and `upstream_peer`'s is 152. A request
+    /// that is never rejected still paid for it, because the box has to be big enough for the widest
+    /// variant. Boxing here moves that cost onto the requests that actually reject.
+    async fn reject_boxed(
+        session: &mut Session,
+        request_id: &str,
+        status: u16,
+        typ: &str,
+        msg: &str,
+    ) -> Result<bool> {
+        Box::pin(Self::reject(session, request_id, status, typ, msg)).await
     }
 }
 
@@ -293,25 +486,45 @@ fn bare_default_provider_name(path: &str) -> Option<&'static str> {
 /// `response.completed` event, streaming or not), so splicing this chat-completions-only fragment into
 /// a Responses body would inject a field the API doesn't recognize. Embeddings and everything else
 /// never stream, so there's nothing to meter there either.
+///
+/// **Pass the path only — never a path with a query string.** The match is by suffix, so a trailing
+/// `?api-version=2024-10-21` makes it return `false` for a path that plainly *is* chat/completions.
+/// Azure OpenAI requires that parameter on every call, so testing this against a path+query silently
+/// disabled injection for all managed Azure streams: no `stream_options.include_usage`, therefore no
+/// usage chunk from OpenAI, therefore a zero-token billing row. The caller computes this in
+/// `request_filter` *before* appending the query for exactly that reason.
 fn is_streamable_path(forward_path: &str) -> bool {
     forward_path.ends_with("/chat/completions")
 }
 
-/// Splice `stream_options.include_usage` into a buffered OpenAI chat body when it streams without it
-/// (see `peek::plan_stream_usage_injection`); otherwise return it unchanged. This is what guarantees
-/// a usage chunk — hence a billable token count — from a stock client that never set the option.
-fn maybe_inject_stream_usage(body: Vec<u8>) -> Vec<u8> {
-    match peek::plan_stream_usage_injection(&body) {
-        Some(at) => {
-            const FRAG: &[u8] = br#""stream_options":{"include_usage":true},"#;
-            let mut out = Vec::with_capacity(body.len() + FRAG.len());
-            out.extend_from_slice(&body[..at]);
-            out.extend_from_slice(FRAG);
-            out.extend_from_slice(&body[at..]);
-            out
-        }
-        None => body,
-    }
+/// The fragment spliced into a streaming OpenAI chat body. Always followed by a comma, since the
+/// splice point is just inside a root object that is non-empty by construction (a root `"stream"`
+/// key is what made it eligible).
+const STREAM_OPTIONS_FRAG: &[u8] = br#""stream_options":{"include_usage":true},"#;
+
+/// Splice `stream_options.include_usage` into a buffered OpenAI chat body at `at`, or return it
+/// unchanged when there is nothing to inject. This is what guarantees a usage chunk — hence a
+/// billable token count — from a stock client that never set the option.
+///
+/// Takes the offset rather than computing it: the caller already walked the body once for both the
+/// model and this plan (see `peek::scan_buffered`), and re-deriving it here would restore the second
+/// traversal that walk exists to remove.
+fn apply_stream_usage_injection(mut body: Vec<u8>, at: Option<usize>) -> Vec<u8> {
+    let Some(at) = at else { return body };
+    // Shift the tail right in place rather than copying the whole body into a second buffer.
+    // `req_buf` is pre-sized with `STREAM_OPTIONS_FRAG.len()` of headroom (see `request_filter`), so
+    // when the client declared a Content-Length this `resize` is free and the only work is moving
+    // the `body.len() - at` bytes after the splice point. The old form allocated a second buffer the
+    // size of the whole body and copied every byte into it; at 1 MB that measured 579 µs against
+    // 27.8 µs, because the second allocation dominates.
+    //
+    // Without a declared length (chunked upload) the `resize` may grow once — still a single
+    // allocation, i.e. no worse than before.
+    let old_len = body.len();
+    body.resize(old_len + STREAM_OPTIONS_FRAG.len(), 0);
+    body.copy_within(at..old_len, at + STREAM_OPTIONS_FRAG.len());
+    body[at..at + STREAM_OPTIONS_FRAG.len()].copy_from_slice(STREAM_OPTIONS_FRAG);
+    body
 }
 
 #[async_trait]
@@ -338,7 +551,12 @@ impl ProxyHttp for AiProxy {
         // else → unknown provider (404). We resolve before auth (an unknown route is cheap) and
         // compute owned values inside the block so the session borrow ends before any `&mut session`
         // reject below.
-        let (provider_opt, forward_path) = {
+        // `forward_streamable` is computed here, on the forwarded **path**, deliberately *before* the
+        // query string is appended: `is_streamable_path` matches by suffix, so testing it against a
+        // path+query would fail for every provider that requires a query parameter — Azure OpenAI
+        // mandates `?api-version=…`, so its managed streams would silently skip `stream_options`
+        // injection, emit no usage chunk, and bill zero tokens.
+        let (provider_opt, forward_path, forward_streamable) = {
             let uri = &session.req_header().uri;
             let path = uri.path();
             let query = uri.query();
@@ -350,20 +568,32 @@ impl ProxyHttp for AiProxy {
             };
             if let Some(p) = self.state.provider(first) {
                 // Provider-prefixed: strip the leading `/{first}` segment, forward the remainder.
+                // `first` is non-empty here (an empty first segment matches no provider), so this
+                // always differs from the inbound path and always needs the URI rewritten.
                 let rest = &path[1 + first.len()..];
+                let rest = if rest.is_empty() { "/" } else { rest };
                 (
                     Some(p.clone()),
-                    with_query(if rest.is_empty() { "/" } else { rest }),
+                    Some(with_query(rest)),
+                    is_streamable_path(rest),
                 )
             } else if let Some(name) = bare_default_provider_name(path) {
-                // Bare default: dialect picks the provider; forward the path unchanged.
-                (self.state.provider(name).cloned(), with_query(path))
+                // Bare default: dialect picks the provider and the path is forwarded unchanged, so
+                // there is nothing to rewrite — `None`. This used to build the path back up with its
+                // query appended, hand it to `upstream_request_filter`, get compared equal against
+                // the inbound `path_and_query`, and dropped: one wasted allocation per request on
+                // the drop-in default route, three when a query string was present.
+                (
+                    self.state.provider(name).cloned(),
+                    None,
+                    is_streamable_path(path),
+                )
             } else {
-                (None, String::new())
+                (None, None, false)
             }
         };
         let Some(provider) = provider_opt else {
-            return Self::reject(
+            return Self::reject_boxed(
                 session,
                 &request_id,
                 404,
@@ -377,7 +607,7 @@ impl ProxyHttp for AiProxy {
 
         // 2. Extract the presented key — a managed virtual key (`bai_…`) or a raw BYO provider token.
         let Some(raw_key) = extract_virtual_key(session.req_header()) else {
-            return Self::reject(
+            return Self::reject_boxed(
                 session,
                 &request_id,
                 401,
@@ -397,12 +627,8 @@ impl ProxyHttp for AiProxy {
         // over-limit path (where `raw_key` is unused afterward).
         if let Some(rl) = &self.state.rate_limit {
             if let Some(reason) = rl.check(raw_key, raw_key.starts_with("bai_")) {
-                self.state
-                    .metrics
-                    .rejections_total
-                    .with_label_values(&[reason.label()])
-                    .inc();
-                return Self::reject(
+                self.state.metrics.rejection(reason.into()).inc();
+                return Self::reject_boxed(
                     session,
                     &request_id,
                     429,
@@ -422,7 +648,7 @@ impl ProxyHttp for AiProxy {
             .and_then(|v| v.parse::<usize>().ok());
         if let Some(len) = declared_len {
             if len > MAX_REQUEST_BODY {
-                return Self::reject(
+                return Self::reject_boxed(
                     session,
                     &request_id,
                     413,
@@ -438,12 +664,8 @@ impl ProxyHttp for AiProxy {
         // (no Beyond identity, so no deny-set and no per-tenant attribution).
         let (tenant_id, vpc_id, managed) = if raw_key.starts_with("bai_") {
             let Ok(identity) = self.state.keyring.verify(raw_key) else {
-                self.state
-                    .metrics
-                    .rejections_total
-                    .with_label_values(&["auth"])
-                    .inc();
-                return Self::reject(
+                self.state.metrics.rejection(Rejection::Auth).inc();
+                return Self::reject_boxed(
                     session,
                     &request_id,
                     401,
@@ -460,16 +682,12 @@ impl ProxyHttp for AiProxy {
                 // otherwise spike the fraud counter and mask the real fraud signal. A `deny_unknown`
                 // label surfaces it as the deployment-coordination issue it is.
                 let label = match reason {
-                    crate::deny::DenyReason::Spend => "deny_spend",
-                    crate::deny::DenyReason::Fraud => "deny_fraud",
-                    crate::deny::DenyReason::Unknown => "deny_unknown",
+                    crate::deny::DenyReason::Spend => Rejection::DenySpend,
+                    crate::deny::DenyReason::Fraud => Rejection::DenyFraud,
+                    crate::deny::DenyReason::Unknown => Rejection::DenyUnknown,
                 };
-                self.state
-                    .metrics
-                    .rejections_total
-                    .with_label_values(&[label])
-                    .inc();
-                return Self::reject(
+                self.state.metrics.rejection(label).inc();
+                return Self::reject_boxed(
                     session,
                     &request_id,
                     reason.http_status(),
@@ -481,7 +699,7 @@ impl ProxyHttp for AiProxy {
             // The actual `Bearer …`/`x-api-key` value is precomputed in the provider registry and
             // applied in `upstream_request_filter`; here we only confirm a pool key exists.
             if provider.pool_auth_value.is_none() {
-                return Self::reject(
+                return Self::reject_boxed(
                     session,
                     &request_id,
                     503,
@@ -499,8 +717,7 @@ impl ProxyHttp for AiProxy {
         // (handled in `request_body_filter`). Scoped tight: managed only (BYO stays pure
         // passthrough), OpenAI dialect only, streaming-capable paths only — so everything else still
         // streams through untouched. Checked on the forwarded path (suffix), so it's prefix-agnostic.
-        let inject_eligible =
-            managed && dialect == Dialect::OpenAi && is_streamable_path(&forward_path);
+        let inject_eligible = managed && dialect == Dialect::OpenAi && forward_streamable;
 
         // Circuit breaker (per provider, all traffic — a down provider is down regardless of whose
         // key is used). Checked here, after every other rejection, so claiming a half-open probe
@@ -511,12 +728,8 @@ impl ProxyHttp for AiProxy {
         // 429 never does (that's a healthy provider throttling — see `logging`).
         if let Some(breaker) = &provider.breaker {
             if breaker.allow().is_err() {
-                self.state
-                    .metrics
-                    .rejections_total
-                    .with_label_values(&["circuit_open"])
-                    .inc();
-                return Self::reject(
+                self.state.metrics.rejection(Rejection::CircuitOpen).inc();
+                return Self::reject_boxed(
                     session,
                     &request_id,
                     503,
@@ -536,7 +749,10 @@ impl ProxyHttp for AiProxy {
             managed,
             model: String::new(),
             model_scanner: peek::ModelScanner::new(),
-            resp_model_scanner: peek::ModelScanner::new(),
+            // `for_response`, not `new`: a response may carry the model nested under `message`
+            // (Anthropic's `message_start`), and a root-only scanner would neither find it nor ever
+            // stop looking. See `ModelScanner::for_response`.
+            resp_model_scanner: peek::ModelScanner::for_response(),
             streaming: false,
             inject_eligible,
             // Only the inject-eligible path ever buffers the request body (to splice
@@ -546,8 +762,14 @@ impl ProxyHttp for AiProxy {
             // a single allocation instead of a geometric realloc chain; capped at `MAX_REQUEST_BODY`
             // so a lying header can't pre-allocate unbounded memory. Every other request leaves this
             // empty and never buffers.
+            //
+            // The `+ STREAM_OPTIONS_FRAG.len()` is headroom for the splice, which
+            // `apply_stream_usage_injection` performs *in place*: with it the injection never
+            // reallocates, so a body arrives, is spliced, and goes upstream on one allocation.
             req_buf: match (inject_eligible, declared_len) {
-                (true, Some(len)) => Vec::with_capacity(len.min(MAX_REQUEST_BODY)),
+                (true, Some(len)) => {
+                    Vec::with_capacity(len.min(MAX_REQUEST_BODY) + STREAM_OPTIONS_FRAG.len())
+                }
                 _ => Vec::new(),
             },
             // Grown lazily by the response tap (`response_body_filter`), not pre-reserved: a
@@ -555,7 +777,10 @@ impl ProxyHttp for AiProxy {
             // full 64KB cap up front would waste an allocation on every request to hold ~200B. A
             // long stream grows it geometrically to the bounded 2×cap and compacts; that handful of
             // reallocs is lost in the network noise of a stream we're already relaying chunk by chunk.
-            resp_tail: Vec::new(),
+            resp_tail: UsageTail::default(),
+            // Grown lazily, and only on the one path that needs it (Anthropic SSE) — see
+            // `response_body_filter`. Every other response leaves this empty and never allocates.
+            resp_head: Vec::new(),
             body_bytes_fed: 0,
             upstream_status: None,
             start,
@@ -663,29 +888,42 @@ impl ProxyHttp for AiProxy {
                 for header in STATIC_KEY_HEADERS {
                     upstream_request.remove_header(header);
                 }
-                upstream_request.insert_header(rc.provider.auth.header(), av.expose())?;
+                // Clone the boot-built `HeaderValue` (a refcount bump) rather than re-validating and
+                // re-copying the key out of a `&str` on every managed request. The `&str` path is
+                // kept as a fallback for a key that isn't a legal header value, which could never
+                // have worked anyway — see `Provider::pool_auth_header`.
+                match &rc.provider.pool_auth_header {
+                    Some(hv) => {
+                        upstream_request.insert_header(rc.provider.auth.header(), hv.clone())?
+                    }
+                    None => {
+                        upstream_request.insert_header(rc.provider.auth.header(), av.expose())?
+                    }
+                }
             }
         }
 
-        // Point Host at the upstream.
-        upstream_request.insert_header("host", rc.provider.host.as_str())?;
+        // Point Host at the upstream. Same precomputed-value trick as the pool key above.
+        match &rc.provider.host_header {
+            Some(hv) => upstream_request.insert_header("host", hv.clone())?,
+            None => upstream_request.insert_header("host", rc.provider.host.as_str())?,
+        }
 
         // Dashboard-attribution headers (OpenRouter, managed traffic only — Task #22, see
         // `apply_provider_attribution`).
         apply_provider_attribution(upstream_request, rc.provider.name.as_str(), rc.managed)?;
 
         // Forward the provider-native path (computed in `request_filter`): the client path with the
-        // `/{provider}` segment stripped, or unchanged for a bare-path default. We send it verbatim —
-        // no per-provider rewriting. Only set the URI when it actually differs from the inbound path
-        // (i.e. a `/{provider}` prefix was stripped); the bare-path case needs no change, so we skip
-        // the parse + realloc. The body's framing (Content-Length / chunked) is preserved.
-        if rc.forward_path
-            != upstream_request
-                .uri
-                .path_and_query()
-                .map(|pq| pq.as_str())
-                .unwrap_or("")
-            && let Ok(uri) = rc.forward_path.parse()
+        // `/{provider}` segment stripped. Sent verbatim — no per-provider rewriting. The body's
+        // framing (Content-Length / chunked) is preserved.
+        //
+        // `None` means the bare-path default, where the path is already what the upstream should
+        // see, so there is nothing to build and nothing to parse. That used to be expressed by
+        // reconstructing the path anyway and comparing it against the inbound `path_and_query`;
+        // encoding it in the type instead skips the allocation rather than detecting it after
+        // the fact.
+        if let Some(forward_path) = &rc.forward_path
+            && let Ok(uri) = forward_path.parse()
         {
             upstream_request.set_uri(uri);
         }
@@ -724,7 +962,11 @@ impl ProxyHttp for AiProxy {
             return Ok(());
         };
         // Feed the body through the structural scanner as it passes (never withheld, never
-        // buffered) to extract the exact root-level `model`. Body framing is untouched.
+        // buffered) to extract the exact root-level `model` — but only for **managed** traffic,
+        // which is the only path that reads it. `rc.model` is used at exactly two places, both
+        // inside the `if rc.managed` block in `logging` (the billing-log fallback and
+        // `requested_model`). Scanning it for BYO meant walking the whole request body — a
+        // structural, depth- and escape-aware pass — to produce a value guaranteed to be discarded.
         if let Some(chunk) = body.as_ref() {
             // Enforce the body cap on the *streamed* size too: the up-front `Content-Length` check in
             // `request_filter` can't see a chunked-encoded body (no declared length). We don't buffer
@@ -733,27 +975,38 @@ impl ProxyHttp for AiProxy {
             // and this is an abuse guard, not a normal client path.
             rc.body_bytes_fed = rc.body_bytes_fed.saturating_add(chunk.len());
             if rc.body_bytes_fed > MAX_REQUEST_BODY {
-                self.state
-                    .metrics
-                    .rejections_total
-                    .with_label_values(&["body_too_large"])
-                    .inc();
+                self.state.metrics.rejection(Rejection::BodyTooLarge).inc();
                 return Err(pingora_core::Error::new_str("request body exceeds limit"));
             }
-            rc.model_scanner.feed(chunk);
             // Eligible requests are buffered so we can splice the root object before any byte reaches
             // the upstream (injection inserts near the front, so we can't have forwarded it already).
+            // When we're buffering anyway, the incremental scan is skipped entirely and both answers
+            // come from one walk of the finished buffer below — the body was previously traversed
+            // twice, once here for `model` and once by the injection planner, over the same bytes
+            // with the same depth/string/escape bookkeeping.
             if rc.inject_eligible {
                 rc.req_buf.extend_from_slice(chunk);
+            } else if rc.managed {
+                rc.model_scanner.feed(chunk);
             }
         }
 
         if rc.inject_eligible {
             if end_of_stream {
+                // One structural walk for both answers (see `peek::scan_buffered`).
+                let buf = std::mem::take(&mut rc.req_buf);
+                let scan = peek::scan_buffered(&buf);
+                if rc.model.is_empty() {
+                    if let Some(m) = scan.model {
+                        rc.model = sanitize_model(m).into_owned();
+                    }
+                }
                 // Emit the whole (possibly rewritten) body in one shot; `transfer-encoding: chunked`
                 // (set in `upstream_request_filter`) makes the changed length fine.
-                let buf = std::mem::take(&mut rc.req_buf);
-                *body = Some(Bytes::from(maybe_inject_stream_usage(buf)));
+                *body = Some(Bytes::from(apply_stream_usage_injection(
+                    buf,
+                    scan.inject_at,
+                )));
             } else {
                 // Withhold — the bytes are buffered above; nothing goes upstream until end-of-stream.
                 // Use an *empty* chunk, not `None`: pingora derives end-of-body as
@@ -765,7 +1018,9 @@ impl ProxyHttp for AiProxy {
             }
         }
 
-        if end_of_stream && rc.model.is_empty() {
+        // The streamed (non-buffered) path; the buffered one resolved `model` above from its single
+        // fused walk, and its scanner was never fed.
+        if end_of_stream && rc.managed && !rc.inject_eligible && rc.model.is_empty() {
             if let Some(m) = rc.model_scanner.take_model() {
                 rc.model = sanitize_model(m).into_owned();
             }
@@ -841,14 +1096,31 @@ impl ProxyHttp for AiProxy {
             // scanner stops at the first root `model`, so this is O(1) and cheap (it finds the model
             // in the first chunk and ignores the rest). Kept separate from the tail because the model
             // is at the start of the response while the usage event is at the end.
-            rc.resp_model_scanner.feed(chunk);
-
-            rc.resp_tail.extend_from_slice(chunk);
-            if rc.resp_tail.len() > 2 * USAGE_TAIL_CAP {
-                let keep_from = rc.resp_tail.len() - USAGE_TAIL_CAP;
-                rc.resp_tail.copy_within(keep_from.., 0);
-                rc.resp_tail.truncate(USAGE_TAIL_CAP);
+            //
+            // Managed only, for the same reason as the request-side scanner: the extracted value is
+            // read at exactly one place, inside the `if rc.managed` block in `logging`. A BYO
+            // request has no Beyond identity and emits no billing row, so scanning its response was
+            // pure waste — and *unbounded* waste on any response with no root-level `model`, since
+            // the scanner never reaches its `done` short-circuit and walks every byte.
+            if rc.managed {
+                rc.resp_model_scanner.feed(chunk);
             }
+
+            // Anthropic SSE only: keep a bounded head so `message_start`'s input + cache token
+            // counts survive the tail's compaction. Bounded by `USAGE_HEAD_CAP` and satisfied
+            // within the first chunk or two, after which the length check makes this a no-op — so
+            // it costs one small allocation on the one path that needs it, and nothing anywhere
+            // else. See `USAGE_HEAD_CAP` for why only this dialect needs it.
+            if rc.streaming
+                && rc.dialect == Dialect::Anthropic
+                && rc.resp_head.len() < USAGE_HEAD_CAP
+            {
+                let want = USAGE_HEAD_CAP - rc.resp_head.len();
+                rc.resp_head
+                    .extend_from_slice(&chunk[..want.min(chunk.len())]);
+            }
+
+            rc.resp_tail.push(chunk);
         }
         Ok(None)
     }
@@ -927,16 +1199,18 @@ impl ProxyHttp for AiProxy {
             }
         }
 
-        // The buffer may transiently hold up to 2× the cap before compaction; the usage event is
-        // always in the last cap bytes, so slice to that bounded tail before parsing.
-        let tail_start = rc.resp_tail.len().saturating_sub(USAGE_TAIL_CAP);
-        let tail = &rc.resp_tail[tail_start..];
+        // The last `USAGE_TAIL_CAP` bytes of the response, oldest first (see `UsageTail`). Short
+        // responses are the whole body; long ones are rotated into order here, once.
+        let tail = rc.resp_tail.contiguous();
 
-        // Extract usage facts from the tail (shape depends on dialect + streaming).
+        // Extract usage facts (shape depends on dialect + streaming). Every case reads the tail;
+        // Anthropic streaming *additionally* reads the head, because that's where `message_start`
+        // put the input and cache token counts. The two buffers may overlap on a short response —
+        // harmless, since every field is assigned rather than accumulated.
         let parsed = match (rc.dialect, rc.streaming) {
             (Dialect::OpenAi, true) => usage::openai_stream(tail),
             (Dialect::OpenAi, false) => usage::openai_body(tail),
-            (Dialect::Anthropic, true) => usage::anthropic_stream(tail),
+            (Dialect::Anthropic, true) => usage::anthropic_stream_parts(&[&rc.resp_head, tail]),
             (Dialect::Anthropic, false) => usage::anthropic_body(tail),
         };
         // A managed 2xx response is *expected* to carry usage; `None` there means the provider's
@@ -963,17 +1237,20 @@ impl ProxyHttp for AiProxy {
         let usage = parsed.unwrap_or_default();
 
         let m = &self.state.metrics;
-        // Pre-resolved fixed-label children (see `Metrics`) — no per-call `with_label_values` lookup.
-        m.tokens_input.inc_by(usage.input_tokens);
-        m.tokens_output.inc_by(usage.output_tokens);
-        // Cache tokens, too — these are in the `ai.usage` billing log below, but that ships with lag;
-        // the counter is the alerting surface for a cache-hit-rate cliff after a deploy.
-        m.tokens_cache_read.inc_by(usage.cache_read_tokens);
-        m.tokens_cache_write.inc_by(usage.cache_write_tokens);
+        // Pre-resolved fixed-label children, and zeros skipped (see `Metrics::record_tokens`). Cache
+        // tokens are counted here as well as in the `ai.usage` billing log below, because that log
+        // ships with lag — the counter is the alerting surface for a cache-hit-rate cliff after a
+        // deploy.
+        m.record_tokens(&usage);
+        // Read the clock once for both consumers below. Beyond saving a vDSO call, this is a
+        // correctness fix: the latency histogram and the `ai.usage` billing line used to call
+        // `elapsed()` about forty lines apart, so they reported *different* durations for the same
+        // request and could never be reconciled against each other.
+        let elapsed = rc.start.elapsed();
         rc.provider
             .metrics
             .upstream_latency_seconds
-            .observe(rc.start.elapsed().as_secs_f64());
+            .observe(elapsed.as_secs_f64());
         // Balance the `active_streams` increment from `response_filter`. `logging` runs exactly once
         // per request (including on upstream errors / client disconnects), so a stream that opened is
         // always accounted closed here — the gauge can't leak upward.
@@ -1015,7 +1292,7 @@ impl ProxyHttp for AiProxy {
                 // model, or a provider that doesn't surface it) matters and is unrecoverable once this
                 // line ships, so it's logged as `?` (Debug) rather than collapsed to a bare `0`.
                 reasoning_tokens = ?usage.reasoning_tokens,
-                latency_ms = rc.start.elapsed().as_millis() as u64,
+                latency_ms = elapsed.as_millis() as u64,
                 "usage"
             );
         }
@@ -1202,6 +1479,210 @@ mod tests {
         assert!(!is_streamable_path("/v1/embeddings"));
         assert!(!is_streamable_path("/v1/messages"));
         assert!(!is_streamable_path("/v1/models"));
+    }
+
+    #[test]
+    fn usage_tail_retains_exactly_the_last_cap_bytes() {
+        // The ring must retain byte-for-byte what the old grow-and-compact buffer did: the whole
+        // body while it fits, the last `USAGE_TAIL_CAP` bytes once it doesn't. Getting this wrong
+        // silently truncates or misorders the usage event, which is unrecoverable once the request
+        // completes — so drive it across chunk sizes that do and don't divide the cap, and across
+        // the boundary itself.
+        let body: Vec<u8> = (0..(3 * USAGE_TAIL_CAP + 1234))
+            .map(|i| (i % 251) as u8)
+            .collect();
+
+        for chunk in [1usize, 7, 4096, 8192, USAGE_TAIL_CAP - 1, USAGE_TAIL_CAP] {
+            for total in [
+                0usize,
+                1,
+                USAGE_TAIL_CAP - 1,
+                USAGE_TAIL_CAP,
+                USAGE_TAIL_CAP + 1,
+                2 * USAGE_TAIL_CAP + 77,
+                body.len(),
+            ] {
+                let src = &body[..total];
+                let mut tail = UsageTail::default();
+                for c in src.chunks(chunk.max(1)) {
+                    tail.push(c);
+                }
+                let want = &src[src.len().saturating_sub(USAGE_TAIL_CAP)..];
+                assert_eq!(
+                    tail.contiguous(),
+                    want,
+                    "chunk={chunk} total={total}: retained window differs"
+                );
+                // Idempotent — `contiguous` must not consume or re-rotate.
+                assert_eq!(tail.contiguous(), want);
+            }
+        }
+
+        // A single chunk larger than the whole window keeps only its last cap bytes.
+        let mut tail = UsageTail::default();
+        tail.push(&body);
+        assert_eq!(tail.contiguous(), &body[body.len() - USAGE_TAIL_CAP..]);
+
+        // Memory stays bounded no matter how long the stream runs.
+        let mut tail = UsageTail::default();
+        for _ in 0..64 {
+            tail.push(&body[..USAGE_TAIL_CAP]);
+        }
+        assert_eq!(tail.contiguous().len(), USAGE_TAIL_CAP);
+    }
+
+    #[test]
+    fn in_place_splice_produces_the_same_bytes_as_a_copying_one() {
+        // The splice moved from "allocate a second buffer and copy everything" to "shift the tail
+        // right in place". The wire bytes must be identical, including when the buffer has no spare
+        // capacity (a chunked upload, where `resize` has to grow) and when it has exactly the
+        // headroom `request_filter` reserves.
+        let copying = |body: &[u8], at: usize| -> Vec<u8> {
+            let mut out = Vec::with_capacity(body.len() + STREAM_OPTIONS_FRAG.len());
+            out.extend_from_slice(&body[..at]);
+            out.extend_from_slice(STREAM_OPTIONS_FRAG);
+            out.extend_from_slice(&body[at..]);
+            out
+        };
+
+        for src in [
+            &br#"{"model":"gpt-4o","stream":true,"messages":[]}"#[..],
+            &br#"{"stream":true}"#[..],
+            &b"  {  \"stream\" : true , \"model\" : \"m1\" }"[..],
+        ] {
+            let at = peek::scan_buffered(src).inject_at.expect("streaming body");
+
+            // Exact-fit capacity, as `request_filter` pre-sizes it.
+            let mut exact = Vec::with_capacity(src.len() + STREAM_OPTIONS_FRAG.len());
+            exact.extend_from_slice(src);
+            assert_eq!(
+                apply_stream_usage_injection(exact, Some(at)),
+                copying(src, at)
+            );
+
+            // No spare capacity at all — the chunked case.
+            let tight = src.to_vec();
+            let out = apply_stream_usage_injection(tight, Some(at));
+            assert_eq!(out, copying(src, at));
+
+            // ...and the result is still valid JSON carrying the option.
+            let v: serde_json::Value = serde_json::from_slice(&out).expect("valid JSON");
+            assert_eq!(
+                v["stream_options"]["include_usage"],
+                serde_json::json!(true)
+            );
+        }
+
+        // Nothing to inject ⇒ the body is returned untouched, not grown.
+        let untouched = br#"{"model":"gpt-4o"}"#.to_vec();
+        assert_eq!(
+            apply_stream_usage_injection(untouched.clone(), None),
+            untouched
+        );
+    }
+
+    #[test]
+    fn reject_bodies_are_valid_json_and_match_their_type_and_message() {
+        // These are hand-written JSON literals standing in for what `serde_json::json!` used to
+        // build, so the thing to guard is that they still *say* what the `error_type` in the log
+        // line and the metric label claim. A drifting literal would ship a response whose `type`
+        // contradicts the reason we rejected for.
+        for (typ, msg, body) in REJECT_BODIES {
+            let v: serde_json::Value =
+                serde_json::from_str(body).unwrap_or_else(|e| panic!("{body} is not JSON: {e}"));
+            assert_eq!(v["error"]["type"], typ, "type mismatch in {body}");
+            assert_eq!(v["error"]["message"], msg, "message mismatch in {body}");
+            // ...and that it is byte-identical to what `json!` would have produced, so switching to
+            // the constant changed nothing on the wire.
+            let built = serde_json::json!({ "error": { "type": typ, "message": msg } }).to_string();
+            assert_eq!(body, built, "constant diverges from the built body");
+            // The lookup must find it rather than falling through to the allocating branch.
+            assert_eq!(error_body(typ, msg), Bytes::from_static(body.as_bytes()));
+        }
+    }
+
+    #[test]
+    fn every_reject_call_site_has_a_precomputed_body() {
+        // One table entry per call site. Adding a rejection without its entry would silently take
+        // `error_body`'s allocating fallback forever — correct on the wire, but quietly undoing the
+        // point of the table on the one path a flood drives at full rate. Counting is enough to
+        // catch it and does not depend on how the arguments happen to be formatted.
+        // Only the production half of the file — this test mentions the call form itself, and a
+        // test module that grepped its own source would count that too.
+        let src = include_str!("proxy.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("split always yields at least one part");
+        let call_sites = src.matches("Self::reject_boxed(").count();
+        assert_eq!(
+            call_sites,
+            REJECT_BODIES.len(),
+            "{call_sites} reject_boxed call sites vs {} REJECT_BODIES entries — add the missing \
+             (type, message) pair to the table",
+            REJECT_BODIES.len()
+        );
+        // Every tabulated message must also appear at a call site, catching the reverse drift (a
+        // table entry left behind after its rejection was removed). Twice: the table and the caller.
+        for (_, msg, _) in REJECT_BODIES {
+            assert!(
+                src.matches(&format!("\"{msg}\"")).count() >= 2,
+                "REJECT_BODIES entry {msg:?} has no reject_boxed call site"
+            );
+        }
+    }
+
+    #[test]
+    fn rejection_labels_round_trip_and_are_unique() {
+        use crate::metrics::Rejection;
+        use std::collections::HashSet;
+        let all = [
+            Rejection::Auth,
+            Rejection::DenySpend,
+            Rejection::DenyFraud,
+            Rejection::DenyUnknown,
+            Rejection::CircuitOpen,
+            Rejection::BodyTooLarge,
+            Rejection::RateLimit,
+            Rejection::RateLimitByoGlobal,
+        ];
+        let labels: HashSet<&str> = all.iter().map(|r| r.label()).collect();
+        assert_eq!(labels.len(), all.len(), "duplicate rejection label");
+        // The two dashboards-facing strings must not drift — existing alerts key on them.
+        assert_eq!(Rejection::RateLimit.label(), "rate_limit");
+        assert_eq!(
+            Rejection::RateLimitByoGlobal.label(),
+            "rate_limit_byo_global"
+        );
+        // `Throttled` must map onto the same two.
+        assert_eq!(
+            Rejection::from(crate::ratelimit::Throttled::PerCredential),
+            Rejection::RateLimit
+        );
+        assert_eq!(
+            Rejection::from(crate::ratelimit::Throttled::ByoGlobal),
+            Rejection::RateLimitByoGlobal
+        );
+    }
+
+    #[test]
+    fn is_streamable_path_must_be_given_the_path_without_the_query() {
+        // The suffix match cannot see past a query string. This locks in *why* `request_filter`
+        // computes `forward_streamable` before appending the query: Azure OpenAI requires
+        // `?api-version=…` on every request, and testing the path+query here returned `false` for a
+        // genuine chat/completions call — so managed Azure streams skipped `stream_options`
+        // injection, got no usage chunk back, and billed zero tokens with nothing logged.
+        assert!(
+            !is_streamable_path("/v1/chat/completions?api-version=2024-10-21"),
+            "a query string defeats the suffix match — callers must strip it first"
+        );
+        assert!(!is_streamable_path(
+            "/openai/deployments/gpt4o/chat/completions?api-version=2024-10-21"
+        ));
+        // ...and the same paths, query stripped, are correctly streamable.
+        assert!(is_streamable_path("/v1/chat/completions"));
+        assert!(is_streamable_path(
+            "/openai/deployments/gpt4o/chat/completions"
+        ));
     }
 
     #[test]

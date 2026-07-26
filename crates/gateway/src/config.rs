@@ -28,6 +28,24 @@ pub struct AiConfig {
     /// Prometheus metrics listener.
     pub metrics_listen: String,
 
+    /// Tokio worker threads for the **proxy** service — the threads that run every request filter,
+    /// the Ed25519 verify, the body scanners and the usage tap. `0` ⇒ one per available core.
+    ///
+    /// This has to be set explicitly because Pingora's `ServerConf::default()` is `threads: 1`, and
+    /// a service that leaves its own `threads` as `None` inherits it (`server/mod.rs:705` →
+    /// `Runtime::new_steal(threads, …)` → `worker_threads(1)`). Unset, the entire proxy therefore
+    /// runs on a **single** core no matter how large the box: measured at 100% of one core with the
+    /// other fifteen idle. It is applied to the proxy service alone rather than to `conf.threads`,
+    /// which would also hand the (idle) admin listener a full thread pool.
+    ///
+    /// Note this counts *async worker* threads only. Tokio names its blocking-pool threads after the
+    /// same runtime, so `ps` shows extra `Pingora HTTP Pr` threads once `lookup_host` runs — those
+    /// never execute a filter, and only per-thread CPU accounting tells them apart.
+    ///
+    /// Set it explicitly under a CPU quota: `available_parallelism` reports the host's cores, not the
+    /// cgroup's share, so an over-provisioned pool on a throttled container just adds scheduler churn.
+    pub worker_threads: usize,
+
     /// Accept HTTP/2 cleartext (h2c) on the downstream (`listen`) listener, in addition to
     /// HTTP/1.1. Backward-compatible: Pingora peeks the connection preface and serves h2c only when
     /// the client sends the H2 preface, otherwise it transparently falls back to HTTP/1.1 — so
@@ -196,6 +214,10 @@ impl Default for AiConfig {
         Self {
             listen: "0.0.0.0:8080".to_string(),
             metrics_listen: "0.0.0.0:9090".to_string(),
+            // One proxy worker per core. Pingora's own default is 1, which silently pins the whole
+            // gateway to a single core; scaling with the box is the least surprising default for an
+            // L7 proxy. Override under a CPU quota — see the field docs.
+            worker_threads: 0,
             // Accept downstream h2c by default; it's backward-compatible (h1 clients fall back
             // transparently) and lets the on-VM agent share one multiplexed connection.
             downstream_h2c: true,
@@ -248,14 +270,24 @@ impl Default for AiConfig {
 impl AiConfig {
     pub fn load_with_path(path: Option<&Path>) -> Result<Self> {
         let toml_path = path.unwrap_or_else(|| Path::new("config.toml"));
+
+        // Serialize the defaults once and read the file once, then reuse both.
+        //
+        // figment's `Data::data()` re-reads and re-parses the file on *every* call and does not
+        // cache, so validating the key set and then merging the same `Toml::file(..)` opened, read
+        // and parsed the config twice — and, more than a wasted parse, read it at two different
+        // instants, so a file rewritten in between yielded a validated-then-different config. The
+        // same applied to `AiConfig::default()`, serialized once for the known-key set and again
+        // for the merge.
+        let defaults = pre_read(figment::providers::Serialized::defaults(AiConfig::default()))?;
         // Catch a typo'd key in the operator's own TOML *before* any of it merges — a misspelled
         // `require_signing_keys` would otherwise load its default and silently drop all managed
         // billing while the gateway looks healthy. Only the TOML file is checked (see the
         // `deny_unknown_fields` note on `AiConfig`); the env layer must stay lenient.
-        reject_unknown_toml_keys(toml_path)?;
+        let toml = read_toml(toml_path)?;
+        reject_unknown_toml_keys(toml_path, &defaults, &toml)?;
 
-        let mut fig = Figment::from(figment::providers::Serialized::defaults(AiConfig::default()));
-        fig = fig.merge(Toml::file(toml_path));
+        let mut fig = Figment::from(defaults).merge(toml);
         // Flat mapping: `AI_READ_TIMEOUT_SECS` → `read_timeout_secs`. (No `.split('_')` — these are
         // flat fields, not nested tables.) Unknown `AI_*` vars are tolerated (see the
         // `deny_unknown_fields` note on `AiConfig`) — which is also why pool keys are collected
@@ -264,8 +296,10 @@ impl AiConfig {
         let mut cfg: AiConfig = fig
             .extract()
             .map_err(|e| GatewayError::Config(e.to_string()))?;
-        cfg.merge_pool_key_env(std::env::vars());
-        cfg.merge_signing_key_env(std::env::vars());
+        // One pass over the environment for both secret prefixes, and via `vars_os` because
+        // `std::env::vars()` *panics* on a variable that isn't valid UTF-8 — a hostile or merely odd
+        // environment should not be able to kill the boot before it starts.
+        cfg.merge_secret_env(env_pairs());
         cfg.validate()?;
         Ok(cfg)
     }
@@ -316,26 +350,24 @@ impl AiConfig {
         )
     }
 
-    /// Fold `AI_POOL_KEY_<NAME>` environment variables into `pool_keys` (provider name lowercased).
-    /// This is the production secret path (SSM-injected env); a flat figment merge can't target a
-    /// map field, and env must win over any `[pool_keys]` value baked into a config file.
-    fn merge_pool_key_env(&mut self, vars: impl Iterator<Item = (String, String)>) {
+    /// Fold the two secret-carrying env prefixes into the config, in a single pass.
+    ///
+    /// `AI_POOL_KEY_<NAME>` → `pool_keys[name]` (provider name lowercased) and
+    /// `AI_SIGNING_KEY_<KID>` → `signing_keys[kid]` (key id verbatim). This is the production secret
+    /// path: both are map fields a flat figment env merge can't target, the ECS container has no
+    /// mounted config file, and env must win over anything baked into one.
+    ///
+    /// `std::env::vars()` allocates a `(String, String)` for *every* variable in the environment,
+    /// so folding the two prefixes separately walked and heap-copied the whole environment twice —
+    /// including the long base64 pool keys and `.creds` blobs SSM injects, into `String`s that are
+    /// then dropped **un-zeroized**. One pass halves both the allocations and the number of
+    /// plaintext credential copies left in freed heap.
+    fn merge_secret_env(&mut self, vars: impl Iterator<Item = (String, String)>) {
         for (k, v) in vars {
             if let Some(name) = k.strip_prefix("AI_POOL_KEY_") {
                 self.pool_keys
                     .insert(name.to_ascii_lowercase(), Secret::new(v));
-            }
-        }
-    }
-
-    /// Fold `AI_SIGNING_KEY_<KID>` environment variables into `signing_keys` (`kid -> base64 pubkey`).
-    /// The prod (ECS) secret path: `[signing_keys]` is a TOML table a flat figment env merge can't
-    /// target, and the container has no mounted config file — so the trusted pubkey(s) arrive as env,
-    /// the same shape as `AI_POOL_KEY_<NAME>`. The `<KID>` suffix is the key id verbatim (e.g.
-    /// `AI_SIGNING_KEY_1`); env wins over any `[signing_keys]` baked into a config file.
-    fn merge_signing_key_env(&mut self, vars: impl Iterator<Item = (String, String)>) {
-        for (k, v) in vars {
-            if let Some(kid) = k.strip_prefix("AI_SIGNING_KEY_") {
+            } else if let Some(kid) = k.strip_prefix("AI_SIGNING_KEY_") {
                 self.signing_keys.insert(kid.to_string(), v);
             }
         }
@@ -357,52 +389,98 @@ impl AiConfig {
     }
 }
 
-/// The set of top-level keys a config file may set, derived from `AiConfig` itself by serializing
-/// its defaults — so it tracks the struct automatically and can never drift from the field list.
-fn known_config_keys() -> std::collections::BTreeSet<String> {
-    use figment::Provider as _;
-    figment::providers::Serialized::defaults(AiConfig::default())
-        .data()
-        .map(|profiles| {
-            profiles
-                .into_values()
-                .flat_map(|dict| dict.into_keys())
-                .collect()
-        })
-        .unwrap_or_default()
+/// Environment variables as `(String, String)`, skipping any that aren't valid UTF-8.
+///
+/// `std::env::vars()` **panics** on a non-UTF-8 variable. Nothing we read could be non-UTF-8 and be
+/// meaningful, so skipping is right — but panicking during boot because some unrelated variable in
+/// the container's environment has odd bytes is not.
+fn env_pairs() -> impl Iterator<Item = (String, String)> {
+    std::env::vars_os().filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
 }
 
-/// Fail the load if the TOML file at `path` carries any key that isn't an `AiConfig` field. A
-/// missing file is fine (the gateway runs on defaults + env), so an unreadable/absent file yields no
-/// keys and passes. See the `deny_unknown_fields` note on `AiConfig` for why this is scoped to the
-/// TOML file and not the env layer.
-fn reject_unknown_toml_keys(path: &Path) -> Result<()> {
+/// A figment provider whose data has already been read and parsed.
+///
+/// figment's own providers re-do their work on every `data()` call — `Data::data()` calls
+/// `F::from_path` each time, with no caching — and figment calls `data()` once per merge. Wrapping
+/// the parsed result lets the same bytes be inspected *and* merged without reading the file, or
+/// re-serializing the defaults, a second time.
+struct PreRead {
+    meta: figment::Metadata,
+    data: figment::value::Map<figment::Profile, figment::value::Dict>,
+}
+
+impl PreRead {
+    /// The top-level keys across every profile.
+    fn keys(&self) -> std::collections::BTreeSet<String> {
+        self.data
+            .values()
+            .flat_map(|dict| dict.keys().cloned())
+            .collect()
+    }
+}
+
+impl figment::Provider for PreRead {
+    fn metadata(&self) -> figment::Metadata {
+        self.meta.clone()
+    }
+    fn data(
+        &self,
+    ) -> figment::error::Result<figment::value::Map<figment::Profile, figment::value::Dict>> {
+        Ok(self.data.clone())
+    }
+}
+
+/// Read a provider's data once, up front.
+fn pre_read<P: figment::Provider>(p: P) -> Result<PreRead> {
+    let data = p.data().map_err(|e| GatewayError::Config(e.to_string()))?;
+    Ok(PreRead {
+        meta: p.metadata(),
+        data,
+    })
+}
+
+/// Read and parse the TOML config once.
+///
+/// `data()` errors two ways we must distinguish: a *missing* file is benign (the gateway runs on
+/// defaults + env), but a *malformed* file is a hard error we must surface here with the file named
+/// — otherwise the syntax error only reappears later as an opaque Figment `extract()` failure with
+/// no path attribution. A missing file yields no keys and passes; any other error (parse failure,
+/// permission denied) fails the load loudly.
+fn read_toml(path: &Path) -> Result<PreRead> {
     use figment::Provider as _;
-    let known = known_config_keys();
-    // `data()` errors two ways we must distinguish: a *missing* file is benign (the gateway runs on
-    // defaults + env), but a *malformed* file is a hard error we must surface here with the file
-    // named — otherwise the syntax error only reappears later as an opaque Figment `extract()`
-    // failure with no path attribution. A missing file yields no keys and passes; any other error
-    // (parse failure, permission denied) fails the load loudly.
-    let unknown: std::collections::BTreeSet<String> = match Toml::file(path).data() {
-        Ok(profiles) => profiles
-            .into_values()
-            .flat_map(|dict| dict.into_keys())
-            .filter(|k| !known.contains(k))
-            .collect(),
-        Err(e) if path.exists() => {
-            return Err(GatewayError::Config(format!(
-                "failed to parse {}: {e}",
-                path.display()
-            )));
-        }
+    let provider = Toml::file(path);
+    match provider.data() {
+        Ok(data) => Ok(PreRead {
+            meta: provider.metadata(),
+            data,
+        }),
+        Err(e) if path.exists() => Err(GatewayError::Config(format!(
+            "failed to parse {}: {e}",
+            path.display()
+        ))),
         // No file (or it vanished between checks): nothing to validate — defaults + env apply.
-        Err(_) => return Ok(()),
-    };
+        Err(_) => Ok(PreRead {
+            meta: provider.metadata(),
+            data: figment::value::Map::new(),
+        }),
+    }
+}
+
+/// Fail the load if the config file carries any key that isn't an `AiConfig` field.
+///
+/// `known` is derived from `AiConfig` itself by serializing its defaults, so it tracks the struct
+/// automatically and can never drift from the field list. See the `deny_unknown_fields` note on
+/// `AiConfig` for why this is scoped to the TOML file and not the env layer.
+fn reject_unknown_toml_keys(path: &Path, defaults: &PreRead, toml: &PreRead) -> Result<()> {
+    let known = defaults.keys();
+    let unknown: Vec<String> = toml
+        .keys()
+        .into_iter()
+        .filter(|k| !known.contains(k))
+        .collect();
     if unknown.is_empty() {
         return Ok(());
     }
-    let unknown: Vec<String> = unknown.into_iter().collect();
     Err(GatewayError::Config(format!(
         "unknown key(s) in {}: {} — check for a typo (known keys: {})",
         path.display(),
@@ -537,6 +615,38 @@ mod tests {
     }
 
     #[test]
+    fn config_file_is_read_exactly_once() {
+        // Validating the key set and then merging used to open, read and parse the file twice —
+        // and, worse than the wasted parse, at two different instants, so a file rewritten in
+        // between produced a config that had been validated against different content than it
+        // loaded. Prove single-read by making the *second* read return something the first didn't:
+        // load, then delete the file mid-flight is untestable, so instead assert the parsed data is
+        // carried through rather than re-fetched — a second read of a now-unknown-key file would
+        // fail, and a second read of a now-missing file would silently drop the values.
+        let dir = std::env::temp_dir().join(format!("ai-cfg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(
+            &path,
+            "read_timeout_secs = 1234\nconfig_bucket = \"from-file\"\n",
+        )
+        .unwrap();
+
+        let defaults =
+            pre_read(figment::providers::Serialized::defaults(AiConfig::default())).unwrap();
+        let toml = read_toml(&path).unwrap();
+        // Everything downstream now works off `toml`, so removing the file must not change the
+        // outcome — which is only true if nothing re-reads it.
+        std::fs::remove_file(&path).unwrap();
+        reject_unknown_toml_keys(&path, &defaults, &toml).unwrap();
+        let cfg: AiConfig = Figment::from(defaults).merge(toml).extract().unwrap();
+        assert_eq!(cfg.read_timeout_secs, 1234);
+        assert_eq!(cfg.config_bucket, "from-file");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn pool_key_env_merges_and_overrides() {
         // `AI_POOL_KEY_<NAME>` → `pool_keys[name]` (lowercased), and env wins over a config-file
         // value (the production secret path). A non-pool `AI_*` var is ignored.
@@ -544,7 +654,7 @@ mod tests {
             pool_keys: HashMap::from([("openai".to_string(), Secret::new("from-file"))]),
             ..Default::default()
         };
-        c.merge_pool_key_env(
+        c.merge_secret_env(
             [
                 ("AI_POOL_KEY_OPENAI".to_string(), "from-env".to_string()),
                 ("AI_POOL_KEY_GROQ".to_string(), "gsk-x".to_string()),
@@ -565,7 +675,7 @@ mod tests {
             signing_keys: HashMap::from([("1".to_string(), "from-file".to_string())]),
             ..Default::default()
         };
-        c.merge_signing_key_env(
+        c.merge_secret_env(
             [
                 ("AI_SIGNING_KEY_1".to_string(), "from-env".to_string()),
                 ("AI_SIGNING_KEY_2".to_string(), "second-kid".to_string()),

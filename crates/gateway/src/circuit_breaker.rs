@@ -3,7 +3,8 @@
 //! This implementation is provably race-free through:
 //! 1. Atomic words for all mutable state (no multi-variable coordination)
 //! 2. Compare-and-swap loops for all state transitions
-//! 3. Monotonic timestamps for timeout detection
+//! 3. Monotonic timestamps for timeout detection — `CLOCK_MONOTONIC`, never the wall clock, so an
+//!    NTP step can't invert a timeout decision (see `CircuitBreaker::system_clock`)
 //!
 //! # States
 //!
@@ -66,8 +67,9 @@
 //! // }
 //! ```
 
+use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// How failures are counted before opening the circuit.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -159,11 +161,13 @@ impl CircuitBreakerConfig {
 /// - Bits 62-63: State (0=closed, 1=open, 2=half-open)
 /// - Bits 48-61: Failure count (14 bits, max 16383)
 /// - Bits 32-47: Half-open permits remaining (16 bits)
-/// - Bits 0-31: Timestamp (seconds since epoch, wraps every 136 years). In OPEN it's when the
-///   circuit opened (drives the reset timeout); in CLOSED windowed mode it doubles as the current
-///   failure window's start. Because the timestamp lives in the same word, a windowed failure can
-///   reset-the-window and increment-the-count in a **single** CAS — so concurrent failures at a
-///   window boundary can never each independently reset to 1 and drop one another.
+/// - Bits 0-31: Timestamp (seconds since a process-wide **monotonic** base — see
+///   `CircuitBreaker::system_clock` — so it would take 136 years of process uptime to wrap). In
+///   OPEN it's when the circuit opened (drives the reset timeout); in CLOSED windowed mode it
+///   doubles as the current failure window's start. Because the timestamp lives in the same word, a
+///   windowed failure can reset-the-window and increment-the-count in a **single** CAS — so
+///   concurrent failures at a window boundary can never each independently reset to 1 and drop one
+///   another.
 ///
 /// This packing ensures all state transitions are atomic via single CAS operations.
 pub struct CircuitBreaker {
@@ -171,9 +175,20 @@ pub struct CircuitBreaker {
     state: AtomicU64,
     /// Configuration (immutable after construction).
     config: CircuitBreakerConfig,
-    /// Clock function for getting current time in seconds.
+    /// Clock function for getting current time in seconds. Must be non-decreasing; production uses
+    /// [`CircuitBreaker::system_clock`], tests inject a fixed or hand-stepped one. A clock that does
+    /// move backwards is still *safe* — every elapsed computation saturates at zero — it just makes
+    /// the breaker hold its current state until the clock catches back up.
     clock: fn() -> u64,
 }
+
+/// Process-wide monotonic base for [`CircuitBreaker::system_clock`].
+///
+/// Initialized once, on first use (the first breaker construction), so every packed timestamp in the
+/// counts seconds from the *same* origin and stays directly comparable across per-provider breakers.
+/// Keeping it a static (rather than an `Instant` per breaker) is what lets `clock` remain a bare
+/// `fn() -> u64`: the injection point tests rely on needs no per-instance state behind it.
+static MONOTONIC_BASE: LazyLock<Instant> = LazyLock::new(Instant::now);
 
 impl std::fmt::Debug for CircuitBreaker {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -216,13 +231,20 @@ impl CircuitBreaker {
         }
     }
 
-    /// System clock returning seconds since epoch (32-bit, wrapping).
+    /// Monotonic clock returning seconds since the process-wide [`MONOTONIC_BASE`].
+    ///
+    /// Deliberately **not** wall-clock time. `SystemTime` reads `CLOCK_REALTIME`, which is steppable:
+    /// when NTP corrects a host whose clock had drifted forward (cloud instances do step), `now`
+    /// jumps *backwards* past timestamps already packed into the state word, and both time-based
+    /// decisions invert at exactly the moment the fleet is least healthy — every open breaker is
+    /// forced half-open at once, and a windowed failure count can never accrue past 1 so the breaker
+    /// stops tripping at all. `Instant` reads `CLOCK_MONOTONIC`: the same vDSO cost, but it cannot
+    /// step or go backwards. The trade is that the 32-bit field now counts seconds since process
+    /// start rather than since the epoch — which is strictly better, since wrapping it would take
+    /// 136 years of *uptime* instead of landing on a fixed calendar date.
     #[inline]
     fn system_clock() -> u64 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() & TIMESTAMP_MASK)
-            .unwrap_or(0)
+        MONOTONIC_BASE.elapsed().as_secs() & TIMESTAMP_MASK
     }
 
     /// Get current time from the configured clock.
@@ -266,7 +288,14 @@ impl CircuitBreaker {
 
                 STATE_OPEN => {
                     let now = self.now_secs();
-                    let elapsed = now.wrapping_sub(timestamp);
+                    // `saturating_sub`, not `wrapping_sub`: `system_clock` is monotonic so
+                    // `now >= timestamp` always holds, but an injected clock must not be able to
+                    // turn a backwards step into a near-2^32 `elapsed` that trivially clears any
+                    // reset timeout and forces every open breaker half-open in lockstep. Saturating
+                    // at zero fails in the safe direction — the circuit simply stays open until the
+                    // clock genuinely advances past the timeout. Nothing is lost to the missing
+                    // wrap: the field can only wrap after 136 years of process uptime.
+                    let elapsed = now.saturating_sub(timestamp);
 
                     if elapsed >= self.config.reset_timeout.as_secs() {
                         // Timeout elapsed, try to transition to half-open
@@ -382,10 +411,14 @@ impl CircuitBreaker {
 
     /// Record failure with consecutive failure tracking.
     fn record_failure_consecutive(&self, threshold: u32) {
+        // Read the clock once, above the retry loop — the timestamp this failure stamps is the time
+        // the failure happened, not the time its CAS finally landed, and re-reading a vDSO clock on
+        // every contended retry is pure waste. Matches `record_failure_windowed`.
+        let now = self.now_secs();
+
         loop {
             let packed = self.state.load(Ordering::Acquire);
             let (state, failures, _, _) = Self::unpack(packed);
-            let now = self.now_secs();
 
             let new_packed = match state {
                 STATE_CLOSED => {
@@ -435,7 +468,14 @@ impl CircuitBreaker {
                     // `now - ts >= window` ⇒ the window this failure falls into has expired. Either
                     // way this failure starts a new window at count 1; otherwise it accrues into the
                     // current one. The anchor (window start) is carried in the timestamp field.
-                    let window_expired = failures == 0 || now.wrapping_sub(ts) >= window_secs;
+                    //
+                    // `saturating_sub` for the same reason as `allow()`: a clock that steps
+                    // backwards must read as "no time has passed", not as a wrapped ~2^32 elapsed
+                    // that would expire the window on *every* failure and pin the count at 1 — a
+                    // breaker that can never trip. Saturating keeps the anchor slightly in the
+                    // future until the clock catches up, which only ever counts more failures into
+                    // one window (fail-closed).
+                    let window_expired = failures == 0 || now.saturating_sub(ts) >= window_secs;
                     let (new_failures, anchor) = if window_expired {
                         (1, now)
                     } else {
@@ -898,6 +938,107 @@ mod tests {
 
             assert_eq!(cb.state(), CircuitState::Open);
         }
+    }
+
+    // =========================================================================
+    // Clock tests
+    // =========================================================================
+
+    #[test]
+    fn test_system_clock_is_monotonic_not_wall_clock() {
+        let first = CircuitBreaker::system_clock();
+        thread::sleep(Duration::from_millis(5));
+        let second = CircuitBreaker::system_clock();
+
+        assert!(second >= first, "monotonic clock must never go backwards");
+        // Seconds since process start, not since 1970 — a `SystemTime` reading would be ~1.7e9 and
+        // climbing. This is what makes the packed 32-bit timestamp unwrappable in practice (it needs
+        // 136 years of *uptime*) and what makes it immune to an NTP step.
+        assert!(
+            first < 60 * 60 * 24,
+            "clock must count from a process-local base, got {first}"
+        );
+    }
+
+    /// Hand-driven clock for the backward-step regressions below. Each test owns its own static so
+    /// the two can run concurrently in the same test binary without stepping on each other.
+    static BACKSTEP_OPEN_CLOCK: AtomicU64 = AtomicU64::new(0);
+    fn backstep_open_clock() -> u64 {
+        BACKSTEP_OPEN_CLOCK.load(Ordering::SeqCst)
+    }
+
+    #[test]
+    fn test_backward_clock_step_does_not_force_half_open() {
+        // Regression: `allow()` computed `now.wrapping_sub(timestamp)`. When the clock stepped
+        // backwards — routine when NTP corrects a host that had drifted forward — `now < timestamp`
+        // wrapped to a near-2^32 value that clears *any* reset timeout, so the very next request
+        // forced the breaker half-open and put traffic back on a provider that is very likely still
+        // broken. Worse, it did this to every open breaker in the process at once, right when the
+        // fleet was least able to absorb it.
+        BACKSTEP_OPEN_CLOCK.store(10_000, Ordering::SeqCst);
+        let cb = CircuitBreaker::with_clock(
+            CircuitBreakerConfig::consecutive(1).reset_timeout(Duration::from_secs(30)),
+            backstep_open_clock,
+        );
+
+        cb.record_failure();
+        assert_eq!(cb.state(), CircuitState::Open);
+
+        // NTP steps the clock one hour backwards.
+        BACKSTEP_OPEN_CLOCK.store(10_000 - 3_600, Ordering::SeqCst);
+        assert!(
+            cb.allow().is_err(),
+            "a backwards clock step must not admit traffic through an open circuit"
+        );
+        assert_eq!(
+            cb.state(),
+            CircuitState::Open,
+            "a backwards clock step must not transition the circuit to half-open"
+        );
+
+        // ...and the fix must not strand it: once the clock genuinely advances past the reset
+        // timeout, the normal half-open transition still happens.
+        BACKSTEP_OPEN_CLOCK.store(10_000 + 30, Ordering::SeqCst);
+        assert!(cb.allow().is_ok());
+        assert!(matches!(cb.state(), CircuitState::HalfOpen { .. }));
+    }
+
+    static BACKSTEP_WINDOW_CLOCK: AtomicU64 = AtomicU64::new(0);
+    fn backstep_window_clock() -> u64 {
+        BACKSTEP_WINDOW_CLOCK.load(Ordering::SeqCst)
+    }
+
+    #[test]
+    fn test_backward_clock_step_does_not_reset_failure_window() {
+        // The same wrap in `record_failure_windowed`'s `window_expired` check made every failure
+        // after a backwards step look like it landed in an expired window, so the count reset to 1
+        // each time and the breaker could never reach its threshold — it simply stopped protecting
+        // anything, silently, while the clock was behind.
+        BACKSTEP_WINDOW_CLOCK.store(10_000, Ordering::SeqCst);
+        let cb = CircuitBreaker::with_clock(
+            CircuitBreakerConfig::windowed(3, Duration::from_secs(60)),
+            backstep_window_clock,
+        );
+
+        cb.record_failure();
+        assert_eq!(cb.state(), CircuitState::Closed { failure_count: 1 });
+
+        // NTP steps the clock one hour backwards mid-window.
+        BACKSTEP_WINDOW_CLOCK.store(10_000 - 3_600, Ordering::SeqCst);
+
+        cb.record_failure();
+        assert_eq!(
+            cb.state(),
+            CircuitState::Closed { failure_count: 2 },
+            "failures must keep accruing across a backwards clock step"
+        );
+
+        cb.record_failure();
+        assert_eq!(
+            cb.state(),
+            CircuitState::Open,
+            "the breaker must still trip at its threshold while the clock is behind"
+        );
     }
 
     // =========================================================================

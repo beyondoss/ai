@@ -9,10 +9,88 @@ use prometheus::{
 };
 use std::sync::Arc;
 
+/// Why a request was rejected — the closed label set of `ai_rejections_total`.
+///
+/// An enum rather than bare `&str`s so the children can be resolved once at boot (see
+/// [`Metrics::rejection`]). This is the flood path by construction: `proxy`'s rate guardrail exists
+/// precisely so a leaked or forged credential can be shed cheaply, so it runs at full request rate
+/// exactly when the gateway is least able to afford a map lookup and a lock on every hit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Rejection {
+    /// Virtual key failed Ed25519 verification.
+    Auth,
+    /// Deny-set hit, reason "spend".
+    DenySpend,
+    /// Deny-set hit, reason "fraud".
+    DenyFraud,
+    /// Deny-set hit with a reason string this build doesn't recognize — kept distinct from
+    /// `DenyFraud` so a control-plane deploy running ahead of a gateway deploy shows up as the
+    /// deployment-coordination issue it is instead of spiking the fraud signal.
+    DenyUnknown,
+    /// Provider's circuit breaker is open.
+    CircuitOpen,
+    /// Streamed request body crossed `MAX_REQUEST_BODY`.
+    BodyTooLarge,
+    /// Per-credential rate ceiling.
+    RateLimit,
+    /// Aggregate BYO rate ceiling.
+    RateLimitByoGlobal,
+}
+
+impl Rejection {
+    /// Every variant, in `as_index` order. The array in `Metrics` is built from this, so adding a
+    /// variant without adding it here fails the exhaustive `match` in `as_index`.
+    const ALL: [Rejection; 8] = [
+        Rejection::Auth,
+        Rejection::DenySpend,
+        Rejection::DenyFraud,
+        Rejection::DenyUnknown,
+        Rejection::CircuitOpen,
+        Rejection::BodyTooLarge,
+        Rejection::RateLimit,
+        Rejection::RateLimitByoGlobal,
+    ];
+
+    /// The `reason=` label value. `RateLimit` keeps the original `"rate_limit"` string so existing
+    /// dashboards and alerts are unbroken.
+    pub fn label(self) -> &'static str {
+        match self {
+            Rejection::Auth => "auth",
+            Rejection::DenySpend => "deny_spend",
+            Rejection::DenyFraud => "deny_fraud",
+            Rejection::DenyUnknown => "deny_unknown",
+            Rejection::CircuitOpen => "circuit_open",
+            Rejection::BodyTooLarge => "body_too_large",
+            Rejection::RateLimit => "rate_limit",
+            Rejection::RateLimitByoGlobal => "rate_limit_byo_global",
+        }
+    }
+
+    fn as_index(self) -> usize {
+        match self {
+            Rejection::Auth => 0,
+            Rejection::DenySpend => 1,
+            Rejection::DenyFraud => 2,
+            Rejection::DenyUnknown => 3,
+            Rejection::CircuitOpen => 4,
+            Rejection::BodyTooLarge => 5,
+            Rejection::RateLimit => 6,
+            Rejection::RateLimitByoGlobal => 7,
+        }
+    }
+}
+
 pub struct Metrics {
     pub requests_total: IntCounter,
     /// Labeled by reason ("auth", "deny_spend", "deny_fraud") so we can see *why* we rejected.
     pub rejections_total: IntCounterVec,
+    /// The `rejections_total` children, resolved once at boot — same rationale as `tokens_*` below,
+    /// and for the same reason it matters more here: `with_label_values` is an FNV hash of the label
+    /// bytes plus a `RwLock` read, a `HashMap` lookup, an `Arc` clone and an `Arc` drop, and this
+    /// path fires at full request rate under a credential-stuffing flood. Measured 14.3 ns vs 1.3 ns
+    /// single-threaded, and 808 ns vs 151 ns with 16 threads contending the same lock.
+    /// Indexed by [`Rejection::as_index`]; read it through [`Metrics::rejection`].
+    rejections: [IntCounter; 8],
     /// Upstream responses by provider + status class ("2xx"/"4xx"/"5xx"). A provider degrading
     /// (429/5xx) is otherwise invisible until it surfaces as latency or missing usage events —
     /// this is the per-provider error-rate signal an oncall pages on.
@@ -89,6 +167,9 @@ impl Metrics {
             Opts::new("ai_rejections_total", "Requests rejected before upstream"),
             &["reason"],
         )?;
+        // Resolve all eight children up front. Also means every reason is present in a scrape from
+        // process start, so a dashboard shows an explicit 0 rather than a missing series.
+        let rejections = Rejection::ALL.map(|r| rejections_total.with_label_values(&[r.label()]));
         let upstream_responses_total = IntCounterVec::new(
             Opts::new(
                 "ai_upstream_responses_total",
@@ -159,6 +240,7 @@ impl Metrics {
         Ok(Arc::new(Self {
             requests_total,
             rejections_total,
+            rejections,
             upstream_responses_total,
             connect_retries_total,
             tokens_total,
@@ -174,6 +256,44 @@ impl Metrics {
             nats_connected,
             usage_parse_errors_total,
         }))
+    }
+
+    /// The pre-resolved `ai_rejections_total` child for `reason` — a direct `fetch_add`, with no
+    /// label hash, no registry lock, and no `Arc` churn on a path that runs at full request rate
+    /// under a flood.
+    #[inline]
+    pub fn rejection(&self, reason: Rejection) -> &IntCounter {
+        &self.rejections[reason.as_index()]
+    }
+
+    /// Add a metered response's token counts, skipping the ones that are zero.
+    ///
+    /// `prometheus`'s `IntCounter::inc_by` is an unguarded `fetch_add`, so adding zero still takes
+    /// the counter's cache line in Exclusive and invalidates it on every other worker — measured at
+    /// 150 ns under 16-thread contention, indistinguishable from adding a real value. Zeros are not
+    /// the exception here: `cache_write_tokens` is hardcoded to 0 for *both* OpenAI shapes
+    /// (`usage.rs`'s two `From<…> for Usage` impls), so at least one of the four was always a
+    /// wasted contended RMW on every OpenAI-dialect request, and on the unparseable-usage path
+    /// (`unwrap_or_default`) all four were.
+    ///
+    /// Guarding here rather than at the call site keeps the "the hot path bumps a direct handle"
+    /// invariant documented above in one place.
+    #[inline]
+    pub fn record_tokens(&self, usage: &crate::usage::Usage) {
+        // Counters are monotonic, so skipping a zero is not merely equivalent — Prometheus cannot
+        // distinguish "unchanged" from "incremented by zero" in the first place.
+        if usage.input_tokens != 0 {
+            self.tokens_input.inc_by(usage.input_tokens);
+        }
+        if usage.output_tokens != 0 {
+            self.tokens_output.inc_by(usage.output_tokens);
+        }
+        if usage.cache_read_tokens != 0 {
+            self.tokens_cache_read.inc_by(usage.cache_read_tokens);
+        }
+        if usage.cache_write_tokens != 0 {
+            self.tokens_cache_write.inc_by(usage.cache_write_tokens);
+        }
     }
 }
 

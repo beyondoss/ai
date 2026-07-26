@@ -104,6 +104,11 @@ fn main() {
     let listen = config.listen.clone();
     let metrics_listen = config.metrics_listen.clone();
     let downstream_h2c = config.downstream_h2c;
+    // `0` ⇒ one worker per core. Resolved here, before `config` moves into the gateway state.
+    let worker_threads = match config.worker_threads {
+        0 => std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get),
+        n => n,
+    };
     // Capture the shutdown knobs before `config` is moved into the gateway state below.
     let grace_period_secs = config.shutdown_grace_period_secs;
     let runtime_timeout_secs = config.shutdown_runtime_timeout_secs;
@@ -152,6 +157,13 @@ fn main() {
     }
     let mut proxy_svc = proxy_builder.build();
     proxy_svc.add_tcp(&listen);
+    // Size the proxy's worker pool. Pingora resolves a service's thread count as
+    // `service.threads().unwrap_or(conf.threads)` (`server/mod.rs`), and `ServerConf::default()` is
+    // `threads: 1` — so leaving this `None` runs every request filter, the Ed25519 verify, the body
+    // scanners and the usage tap for the whole gateway on a **single** core regardless of box size.
+    // Set on the service rather than on `conf`: `conf.threads` applies to every service, which would
+    // also give the admin listener (one scrape every 15s) a full pool of its own.
+    proxy_svc.threads = Some(worker_threads);
     server.add_service(proxy_svc);
 
     // slipstream watchers + NATS connectivity (connects on Pingora's runtime; see WatcherService).
@@ -176,6 +188,7 @@ fn main() {
     tracing::info!(
         %listen,
         %metrics_listen,
+        worker_threads,
         grace_period_secs,
         runtime_timeout_secs,
         downstream_h2c,

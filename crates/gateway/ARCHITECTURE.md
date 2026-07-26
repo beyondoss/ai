@@ -64,10 +64,12 @@ Client (stock OpenAI/Anthropic SDK)
   │  OpenRouter + managed only: dashboard-attribution headers (HTTP-Referer, X-OpenRouter-*)
   │
   ▼  request_body_filter (proxy.rs)  — body streamed through, never buffered
-  │  Feed chunks → ModelScanner (peek.rs) — extract root-level `model`, O(1) mem
   │  Enforce running size cap (chunked-safe) ──────────────────── 413
-  │  Injection-eligible (managed OpenAI chat/responses + stream):
-  │    buffer full body → inject stream_options.include_usage → re-frame chunked
+  │  Managed + streamed: feed chunks → ModelScanner (peek.rs), root-level `model`, O(1) mem
+  │    (BYO skips it — `model` is only ever read on the managed billing path)
+  │  Injection-eligible (managed + OpenAI dialect + path suffix /chat/completions):
+  │    buffer full body → ONE fused walk (peek::scan_buffered) yielding both `model` and the
+  │    splice offset → inject stream_options.include_usage → re-frame chunked
   │
   ▼  Provider upstream  (OpenAI / Anthropic / Groq / DeepSeek / …)
   │
@@ -77,8 +79,11 @@ Client (stock OpenAI/Anthropic SDK)
   │  Set x-beyond-request-id header
   │
   ▼  response_body_filter (proxy.rs)  — response relayed chunk-by-chunk, never buffered
-  │  Feed chunks → ModelScanner over response head → extract billed model
-  │  Append to bounded 64KB tail (compact drain(..half) if tail > 128KB)
+  │  Managed only: feed chunks → ModelScanner::for_response → billed model
+  │    (accepts Anthropic's nested message.model, so it stops in the first chunk for both dialects)
+  │  Append to bounded 64KB tail (copy_within compaction once tail > 128KB)
+  │  Anthropic SSE only: also keep a bounded 8KB head — message_start carries input + cache
+  │    tokens and would otherwise be compacted out of the tail
   │
   ▼  logging (proxy.rs)
      Parse usage from tail (by dialect + streaming flag)
@@ -199,13 +204,27 @@ Restore = explicit delete from NATS KV or TTL expiry — no gateway-side timer.
 
 ### Rate Guardrails (`ratelimit.rs`)
 
-Two fixed-memory count-min sketch tiers, checked before Ed25519 verify and before any upstream
-connection:
+Two fixed-memory tiers, checked before Ed25519 verify and before any upstream connection:
 
-| Tier                 | Key             | Bucket count | Default ceiling | Managed exempt? |
-| -------------------- | --------------- | ------------ | --------------- | --------------- |
-| Per-credential       | Hash of raw key | 5 MB sketch  | 100 req/s       | No              |
-| Global BYO aggregate | Single bucket   | 1 bucket     | 1000 req/s      | **Yes**         |
+| Tier                 | Key             | State           | Default ceiling | Managed exempt? |
+| -------------------- | --------------- | --------------- | --------------- | --------------- |
+| Per-credential       | Hash of raw key | 5.24 MB sketch  | 100 req/s       | No              |
+| Global BYO aggregate | Single bucket   | one 64 B atomic | 1000 req/s      | **Yes**         |
+
+Only the per-credential tier needs a sketch: its key cardinality is unbounded, so it uses a pair of
+count-min estimators (5 × 65536 counters each) rotated at the window boundary, giving fixed memory
+with no per-key entry and no GC. The `SLOTS` derivation — peak N, the false-throttle budget against
+`rate_limit_rps`, and the cache/rotation cost on the other side — is written out in full at the
+constant in `ratelimit.rs`. The global BYO tier is _one_ bucket, so it is one cacheline-isolated
+`AtomicU64` packing `(window_index, count)`: exact, contention-minimal, and reset-free (opening a
+window is the same CAS as counting a request).
+
+Neither tier uses `pingora_limits::rate::Rate`. `Rate::maybe_reset` subtracts an atomically-loaded
+reset timestamp from an independently-taken clock reading, which underflows whenever the two are
+inverted by a stall — a panicking worker under the workspace's `overflow-checks`, reproduced in
+seconds under oversubscribed threads. The local `WindowedRate` keeps the same red/blue rotation but
+compares monotonic window _indices_ instead, so there is nothing to underflow. Both tiers take the
+window index from one clock reading per request (`RateLimit::check_at`).
 
 The per-credential tier is keyed on the **raw presented credential** (not the verified tenant),
 which has two consequences: (1) the guard sits ahead of verify, so forged tokens are rejected
@@ -256,7 +275,8 @@ A flood of forged `bai_v1` tokens could drive unbounded crypto work if the rate 
 verify. By checking the per-credential bucket first (keyed on the raw token, no crypto), a
 forged-key flood is rejected in tens of nanoseconds per request. Legit traffic is unaffected: the
 rate guard passes through, then verify runs as normal. The unit bench (`benches/unit.rs`) asserts
-this: `key/verify` ≈ 28µs; `ratelimit::check` ≈ 43–83ns; 0 allocations for either.
+this: `key/verify` ≈ 23µs; `ratelimit::check` ≈ 39–60ns single-threaded, ≈ 88–220ns at 16 threads
+under a flood of distinct credentials; 0 allocations for either.
 
 ### Why the body injection exception exists (`managed + OpenAI + streaming`)
 
@@ -275,6 +295,14 @@ revision at which the seed was complete and calls `watch_prefix_from` to resume 
 — so a deny written during the gap is delivered, not silently dropped. This revision is also
 persisted across reconnects, so a NATS blip resumes from the last-seen point instead of re-scanning
 the entire keyspace.
+
+**Revision 0 is not a resume point.** A seed scan that finds no `blackhole.*` entries yields
+revision 0, and slipstream treats a cursor as resumable only when `rev > 0` — at 0 it falls back to
+exactly the `watch_prefix`/`DeliverPolicy::New` this design exists to avoid. So an empty deny-set is
+deliberately treated as _unseeded_ (`is_resumable`), and the next connect rescans rather than
+marking itself seeded and never looking again. Without that, a gateway that booted against an empty
+bucket would attach with `New` for the life of the process and silently never pick up the first
+deny written while it was starting.
 
 ### Why BYO token validity is never checked
 
@@ -439,22 +467,22 @@ Secret-bearing fields (`pool_keys`, `nats_creds`) are held as `Secret<T>` — st
 
 ## Failure Modes
 
-| Failure                                                            | What Actually Happens                                                                                                                                                          | Recovery                                                                                                                                                                  |
-| ------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| NATS unreachable at boot                                           | Deny-set starts empty (fail-open). Auth still works — keys from config.                                                                                                        | Watcher reconnects; seeds from NATS or disk snapshot on connect.                                                                                                          |
-| NATS disconnects mid-run                                           | Last-known deny-set stays active. New deny entries not applied until reconnect.                                                                                                | Watcher reconnects (1s→30s exponential backoff, reset on success) and resumes from saved revision — no re-scan.                                                           |
-| NATS history compacted past snapshot cursor                        | `CursorExpired` → full re-scan from current NATS state.                                                                                                                        | After re-scan, new cursor set; delta watch resumes normally.                                                                                                              |
-| Virtual key tampered or forged                                     | Ed25519 verify fails → falls through to BYO treatment. No billing event. No error reveals which part failed.                                                                   | Billing miss detectable downstream; no security boundary breach.                                                                                                          |
-| `signing_keys` absent (typo'd/missing SSM)                         | Default: warn + BYO-only (silently drops all managed billing + deny-set). With `require_signing_keys=true`: hard boot failure.                                                 | Set `require_signing_keys=true` on managed deployments so the mis-deploy fails fast and visibly at boot.                                                                  |
-| Pool key missing for provider                                      | Managed request returns 503 before any upstream connection.                                                                                                                    | Add `AI_POOL_KEY_<NAME>` env and redeploy.                                                                                                                                |
-| `provider_dialects`/`provider_auth_schemes` value unrecognized     | Hard boot failure (`GatewayError::Config`) naming the provider and the bad value.                                                                                              | Fix the typo — `"openai"`/`"anthropic"` and `"bearer"`/`"x-api-key"`/`"api-key"` are the only accepted values.                                                            |
-| Config-added provider's dialect misconfigured (wire doesn't match) | `usage::openai_body`/`anthropic_body` (and the stream variants) detect the other dialect's characteristic field names and return `None` instead of a zeroed `Usage`.           | `usage_parse_errors_total` fires + a `warn!` log; fix `provider_dialects.<name>` to match the vendor's actual wire.                                                       |
-| Provider DNS fails                                                 | `upstream_peer` returns error → 502 to client.                                                                                                                                 | TTL-cached DNS (60s) serves stale; poisoned-lock guard re-resolves on next request.                                                                                       |
-| Provider TCP connect fails                                         | `fail_to_connect` retries up to 2×, then returns 502. Counts as a circuit-breaker failure.                                                                                     | Client SDK retries with backoff. No HTTP-status retries (Pingora-idiomatic).                                                                                              |
-| Provider brownout (sustained 5xx)                                  | After `circuit_breaker_threshold` 5xx/connect failures in the window, the breaker opens; requests fast-fail 503 (`circuit_open`) instead of stalling against the read timeout. | Auto: after `circuit_breaker_reset_secs` a half-open probe is admitted — success closes the breaker, failure reopens it. Per-provider, so other providers are unaffected. |
-| Provider throttles (429 storm)                                     | Relayed to the client as 429; the client's `Retry-After` backoff applies. Does **not** trip the breaker (provider is healthy).                                                 | Backpressure via client + the rate guardrails; no gateway-side circuit action.                                                                                            |
-| Response body > 128KB before usage chunk                           | Tail compaction fires: `drain(..half)` discards first half, keeps tail. Usage extracted from retained tail.                                                                    | No action — SSE usage is always in the final `data:` line, which always lands in the tail.                                                                                |
-| Gateway crash mid-request                                          | In-flight request drops; client receives TCP close. No partial state written.                                                                                                  | Client SDK retries. No DB writes in the request path — no cleanup needed.                                                                                                 |
+| Failure                                                            | What Actually Happens                                                                                                                                                          | Recovery                                                                                                                                                                                                                                                                                                                 |
+| ------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| NATS unreachable at boot                                           | Deny-set starts empty (fail-open). Auth still works — keys from config.                                                                                                        | Watcher reconnects; seeds from NATS or disk snapshot on connect.                                                                                                                                                                                                                                                         |
+| NATS disconnects mid-run                                           | Last-known deny-set stays active. New deny entries not applied until reconnect.                                                                                                | Watcher reconnects (1s→30s exponential backoff, reset only after a watch that ran ≥30s — _connecting_ is not success, or a reachable NATS with a broken watch loops at 1 Hz forever) and resumes from the saved revision. Rescans instead when the seed found no entries, since revision 0 is not resumable — see above. |
+| NATS history compacted past snapshot cursor                        | `CursorExpired` → full re-scan from current NATS state.                                                                                                                        | After re-scan, new cursor set; delta watch resumes normally.                                                                                                                                                                                                                                                             |
+| Virtual key tampered or forged                                     | Ed25519 verify fails → falls through to BYO treatment. No billing event. No error reveals which part failed.                                                                   | Billing miss detectable downstream; no security boundary breach.                                                                                                                                                                                                                                                         |
+| `signing_keys` absent (typo'd/missing SSM)                         | Default: warn + BYO-only (silently drops all managed billing + deny-set). With `require_signing_keys=true`: hard boot failure.                                                 | Set `require_signing_keys=true` on managed deployments so the mis-deploy fails fast and visibly at boot.                                                                                                                                                                                                                 |
+| Pool key missing for provider                                      | Managed request returns 503 before any upstream connection.                                                                                                                    | Add `AI_POOL_KEY_<NAME>` env and redeploy.                                                                                                                                                                                                                                                                               |
+| `provider_dialects`/`provider_auth_schemes` value unrecognized     | Hard boot failure (`GatewayError::Config`) naming the provider and the bad value.                                                                                              | Fix the typo — `"openai"`/`"anthropic"` and `"bearer"`/`"x-api-key"`/`"api-key"` are the only accepted values.                                                                                                                                                                                                           |
+| Config-added provider's dialect misconfigured (wire doesn't match) | `usage::openai_body`/`anthropic_body` (and the stream variants) detect the other dialect's characteristic field names and return `None` instead of a zeroed `Usage`.           | `usage_parse_errors_total` fires + a `warn!` log; fix `provider_dialects.<name>` to match the vendor's actual wire.                                                                                                                                                                                                      |
+| Provider DNS fails                                                 | `upstream_peer` returns error → 502 to client.                                                                                                                                 | TTL-cached DNS (60s) serves stale; poisoned-lock guard re-resolves on next request.                                                                                                                                                                                                                                      |
+| Provider TCP connect fails                                         | `fail_to_connect` retries up to 2×, then returns 502. Counts as a circuit-breaker failure.                                                                                     | Client SDK retries with backoff. No HTTP-status retries (Pingora-idiomatic).                                                                                                                                                                                                                                             |
+| Provider brownout (sustained 5xx)                                  | After `circuit_breaker_threshold` 5xx/connect failures in the window, the breaker opens; requests fast-fail 503 (`circuit_open`) instead of stalling against the read timeout. | Auto: after `circuit_breaker_reset_secs` a half-open probe is admitted — success closes the breaker, failure reopens it. Per-provider, so other providers are unaffected.                                                                                                                                                |
+| Provider throttles (429 storm)                                     | Relayed to the client as 429; the client's `Retry-After` backoff applies. Does **not** trip the breaker (provider is healthy).                                                 | Backpressure via client + the rate guardrails; no gateway-side circuit action.                                                                                                                                                                                                                                           |
+| Response body > 128KB before usage chunk                           | Tail compaction fires: `drain(..half)` discards first half, keeps tail. Usage extracted from retained tail.                                                                    | No action — SSE usage is always in the final `data:` line, which always lands in the tail.                                                                                                                                                                                                                               |
+| Gateway crash mid-request                                          | In-flight request drops; client receives TCP close. No partial state written.                                                                                                  | Client SDK retries. No DB writes in the request path — no cleanup needed.                                                                                                                                                                                                                                                |
 
 ---
 
@@ -488,7 +516,7 @@ Prometheus on the default registry, exposed at `/metrics` on `metrics_listen`.
 | `peek`            | `ModelScanner` — streaming structural scan for the root-level `model`; O(1) memory                   | unit ✓         |
 | `usage`           | Token extraction (OpenAI / Anthropic, body + SSE)                                                    | unit ✓         |
 | `deny`            | Sparse deny-set, default-allow, reason → HTTP status                                                 | unit ✓         |
-| `ratelimit`       | Two-tier guardrail: per-credential + global BYO (count-min sketches, fixed memory, no GC)            | unit ✓         |
+| `ratelimit`       | Two-tier guardrail: per-credential (count-min sketch, fixed memory, no GC) + global BYO (one atomic) | unit ✓         |
 | `circuit_breaker` | Per-provider lock-free breaker (packed `AtomicU64`, windowed policy) — trips on 5xx/connect, not 429 | unit ✓ + e2e ✓ |
 | `state`           | Keyring + resolved provider registry + watched deny-set (ArcSwap) + TTL DNS cache                    | unit ✓         |
 | `store_watch`     | NATS watcher — gap-free deny-set seeding + delta watch as Pingora `BackgroundService`                | e2e ✓          |
@@ -534,18 +562,21 @@ gateway's added cost is negligible and bounded** — i.e. it never becomes the c
   beside ns/iter, no `unsafe` needed). Coverage: `key` verify/mint; `peek::ModelScanner` over
   0/4KB/256KB bodies with `model` placed last (worst case); `usage` parsers; `route`; `deny`
   (`parse_key`/`parse_reason` off-path + `reason()` on-path); `ratelimit::check` (managed tier
-  only vs. BYO which runs both tiers).
+  only vs. BYO which runs both tiers) — single-threaded/hot-cache _and_ `check_flood_*`, which
+  charges 65536 distinct credentials from 1 and 16 threads over ≥ 2 window rotations, plus
+  `rotate_window`, which prices the window rotation on its own.
 
   What the alloc numbers assert:
-  | Operation           | Cost     | Allocations                  | Claim verified                |
-  | ------------------- | -------- | ---------------------------- | ----------------------------- |
-  | `key/verify`        | ~28µs    | 0                            | Stack-only Ed25519 decode     |
-  | `peek/ModelScanner` | varies   | 1 (independent of body size) | O(1) memory                   |
-  | `route`             | ~ns      | 0                            | —                             |
-  | `deny::reason`      | ~1–8ns   | 0, flat 0→1M entries         | O(1) lookup, O(denied) memory |
-  | `ratelimit::check`  | ~43–83ns | 0                            | Fixed-memory count-min        |
+  | Operation            | Cost      | Allocations                  | Claim verified                   |
+  | -------------------- | --------- | ---------------------------- | -------------------------------- |
+  | `key/verify`         | ~23µs     | 0                            | Stack-only Ed25519 decode        |
+  | `peek/ModelScanner`  | varies    | 1 (independent of body size) | O(1) memory                      |
+  | `route`              | ~ns       | 0                            | —                                |
+  | `deny::reason`       | ~1–8ns    | 0, flat 0→1M entries         | O(1) lookup, O(denied) memory    |
+  | `ratelimit::check`   | ~39–220ns | 0                            | Fixed-memory, no per-key state   |
+  | `ratelimit` rotation | ~39µs     | 0                            | Once per window, not per request |
 
-  **Headline: `key/verify` ≈ 28µs is ~350–650× every other per-request op.** This is why the rate
+  **Headline: `key/verify` ≈ 23µs is ~100–600× every other per-request op.** This is why the rate
   guardrail sits before verify in `proxy::request_filter`.
 
 - **End-to-end (`benches/e2e.rs`, `mise run bench:e2e`) — `criterion`.** Real `beyond-ai` binary

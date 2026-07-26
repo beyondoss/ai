@@ -390,6 +390,59 @@ async fn streaming_relays_sse_and_meters_usage() {
 }
 
 #[tokio::test]
+async fn streaming_injects_usage_option_when_the_path_carries_a_query_string() {
+    // Azure OpenAI requires `?api-version=…` on every call. `is_streamable_path` matches by suffix,
+    // so when the eligibility check was run against the *forwarded path plus query* it returned
+    // false for a genuine chat/completions request — managed Azure streams skipped the
+    // `stream_options.include_usage` splice, OpenAI therefore emitted no usage chunk, and every one
+    // of those requests billed zero tokens with nothing logged to say so.
+    //
+    // The unit test on `is_streamable_path` pins the helper's behaviour; this pins the wiring, which
+    // is where the bug actually lived. Asserting on the *forwarded body* is the only thing that
+    // proves the splice ran — the mock returns a usage chunk unconditionally, so metrics can't.
+    let nats = Nats::start().await;
+    let (pubkey, sk) = test_keypair(3);
+    let mock = MockUpstream::start(Mode::Sse).await;
+    let gw = Gateway::start(nats.port, &mock.authority(), &b64(&pubkey)).await;
+
+    let vkey = mint(
+        &VirtualKey {
+            tenant_id: 7,
+            vpc_id: 1,
+        },
+        1,
+        &sk,
+    );
+    let client = reqwest::Client::new();
+    let body = r#"{"model":"gpt-4o","stream":true,"messages":[{"role":"user","content":"hi"}]}"#;
+    let path = "/openai/v1/chat/completions?api-version=2024-10-21";
+
+    {
+        let (c, u, k) = (client.clone(), gw.url(), vkey.clone());
+        wait_for_status(200, move || {
+            let (c, u, k) = (c.clone(), u.clone(), k.clone());
+            async move { post_path_status(&c, &u, path, &k, body.to_string()).await }
+        })
+        .await;
+    }
+
+    let cap = mock.captured().expect("mock received a request");
+    let needle = br#""stream_options":{"include_usage":true}"#;
+    assert!(
+        cap.body.windows(needle.len()).any(|w| w == needle),
+        "a query string must not suppress stream_options injection; forwarded body was: {}",
+        String::from_utf8_lossy(&cap.body)
+    );
+    // The query must still reach the upstream untouched — stripping it would break Azure just as
+    // thoroughly as skipping the injection did.
+    assert!(
+        cap.path.contains("api-version=2024-10-21"),
+        "the query string must be forwarded verbatim; got path: {}",
+        cap.path
+    );
+}
+
+#[tokio::test]
 async fn blackhole_denies_then_restores() {
     let nats = Nats::start().await;
     let (pubkey, sk) = test_keypair(2);
@@ -721,6 +774,93 @@ async fn anthropic_dialect_swaps_key_relays_and_meters() {
     assert_eq!(cap.authorization, None);
 
     wait_for_metric(&gw, "ai_tokens_total", "input", 13.0).await;
+}
+
+#[tokio::test]
+async fn long_anthropic_stream_still_meters_input_and_cache_tokens() {
+    // Anthropic splits its usage facts across the FIRST event (`message_start`: input + cache) and
+    // the LAST (`message_delta`: output). The proxy retained only a bounded tail, so on any stream
+    // past ~500 output tokens `message_start` was compacted away and input + both cache counters
+    // billed zero — silently, because the parse still succeeded off the `message_delta`, so
+    // `usage_parse_errors_total` never fired either. Input and cache-read are the largest line items
+    // in a cached agent workload, so this was the expensive half of the tail-buffer design.
+    //
+    // No fixture in the suite could catch it: `Mode::SseLarge` is an *OpenAI* stream whose usage
+    // rides the terminal chunk and therefore always survived. `Mode::AnthropicSseLarge` is ~600 KiB
+    // — a routine 2500-token reply at Anthropic's ~110 bytes of framing per delta.
+    let nats = Nats::start().await;
+    let (pubkey, sk) = test_keypair(41);
+    let mock = MockUpstream::start(Mode::AnthropicSseLarge).await;
+    let gw = Gateway::builder(nats.port, &mock.authority(), &b64(&pubkey))
+        .providers(&["anthropic"])
+        .start()
+        .await;
+    let vkey = mint(
+        &VirtualKey {
+            tenant_id: 78,
+            vpc_id: 2,
+        },
+        1,
+        &sk,
+    );
+    let client = reqwest::Client::new();
+    {
+        let (c, u, k) = (client.clone(), gw.url(), vkey.clone());
+        wait_for_status(200, move || {
+            let (c, u, k) = (c.clone(), u.clone(), k.clone());
+            async move {
+                post_status_xapikey(&c, &u, "/v1/messages", &k, body_for("claude-opus-4-8")).await
+            }
+        })
+        .await;
+    }
+
+    // The stream must relay intact...
+    let resp = client
+        .post(format!("{}/v1/messages", gw.url()))
+        .header("x-api-key", &vkey)
+        .header("content-type", "application/json")
+        .body(body_for("claude-opus-4-8"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let relayed = resp.bytes().await.unwrap();
+    assert!(
+        relayed.len() > 128 * 1024,
+        "fixture must exceed 2x USAGE_TAIL_CAP for this to be a regression test; got {} B",
+        relayed.len()
+    );
+
+    // ...and every usage field must be metered, not just the one the tail happened to hold.
+    //
+    // Input and cache-read are required at 2x, since the warm-up request and the drained one both
+    // contribute: `message_start` is captured off the first chunk, so it lands even when the client
+    // never reads the body. Output is only required at 1x — the warm-up reads the status and drops
+    // the response, so that stream is cut before its terminal `message_delta` and legitimately
+    // meters no output. That asymmetry is itself the point: the head buffer is what makes the input
+    // side independent of how much of the stream the client stays around for.
+    wait_for_metric(
+        &gw,
+        "ai_tokens_total",
+        "input",
+        (ANTHROPIC_LARGE_INPUT_TOKENS * 2) as f64,
+    )
+    .await;
+    wait_for_metric(
+        &gw,
+        "ai_tokens_total",
+        "cache_read",
+        (ANTHROPIC_LARGE_CACHE_READ_TOKENS * 2) as f64,
+    )
+    .await;
+    wait_for_metric(
+        &gw,
+        "ai_tokens_total",
+        "output",
+        ANTHROPIC_LARGE_OUTPUT_TOKENS as f64,
+    )
+    .await;
 }
 
 #[tokio::test]
