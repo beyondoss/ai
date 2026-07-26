@@ -20,6 +20,10 @@
 //! something new — think about whether it's really provider knowledge (host, auth, wire) as opposed to
 //! *model* knowledge (context window, thinking shape), which belongs in `agent_core::models` instead.
 
+pub mod catalog;
+
+pub use catalog::{Candidate, MAX_CANDIDATES, ModelRoute, for_model};
+
 /// Every upstream this codebase can route to, by either path. The gateway's 11 `/{name}/…` routes and
 /// the 5 BYO-only aggregator platforms (reachable only by base-URL override, no gateway-native route)
 /// are one enum because they are one *concept* — "which upstream" — and splitting them is what
@@ -54,6 +58,61 @@ pub enum ProviderId {
     OpenCodeZen,
     /// `opencode.ai/zen/go`. See [`Self::OpenCodeZen`].
     OpenCodeGo,
+}
+
+impl ProviderId {
+    /// Every variant, in [`Self::index`] order.
+    ///
+    /// Exists so a consumer can build a fixed-size array keyed by id instead of hashing a name — the
+    /// gateway's model-routed path switches providers between connect attempts and wants that lookup
+    /// to be an index, not a string compare. Also spares `every_id_has_exactly_one_row` from
+    /// hand-maintaining its own copy of the variant list.
+    pub const ALL: [ProviderId; 16] = [
+        ProviderId::OpenAi,
+        ProviderId::Anthropic,
+        ProviderId::OpenRouter,
+        ProviderId::Fireworks,
+        ProviderId::Groq,
+        ProviderId::DeepSeek,
+        ProviderId::Together,
+        ProviderId::Cerebras,
+        ProviderId::Mistral,
+        ProviderId::XAi,
+        ProviderId::OpenAiCodex,
+        ProviderId::HuggingFace,
+        ProviderId::Nvidia,
+        ProviderId::KimiCoding,
+        ProviderId::OpenCodeZen,
+        ProviderId::OpenCodeGo,
+    ];
+
+    /// How many variants there are — the width of an id-keyed array.
+    pub const COUNT: usize = Self::ALL.len();
+
+    /// A dense index in `0..COUNT`, for array-keyed lookup.
+    ///
+    /// The exhaustive `match` is the point: adding a variant fails to compile here rather than
+    /// silently landing outside an array built from [`Self::COUNT`].
+    pub fn index(self) -> usize {
+        match self {
+            ProviderId::OpenAi => 0,
+            ProviderId::Anthropic => 1,
+            ProviderId::OpenRouter => 2,
+            ProviderId::Fireworks => 3,
+            ProviderId::Groq => 4,
+            ProviderId::DeepSeek => 5,
+            ProviderId::Together => 6,
+            ProviderId::Cerebras => 7,
+            ProviderId::Mistral => 8,
+            ProviderId::XAi => 9,
+            ProviderId::OpenAiCodex => 10,
+            ProviderId::HuggingFace => 11,
+            ProviderId::Nvidia => 12,
+            ProviderId::KimiCoding => 13,
+            ProviderId::OpenCodeZen => 14,
+            ProviderId::OpenCodeGo => 15,
+        }
+    }
 }
 
 /// The provider's wire format — which API shape its endpoint speaks.
@@ -478,6 +537,34 @@ pub const PROVIDERS: &[ProviderSpec] = &[
     },
 ];
 
+impl ProviderSpec {
+    /// The path component of [`Self::base_url`] — the mount prefix this provider hangs its API under.
+    /// `""` when there is no base URL, and for Anthropic, whose base is deliberately bare.
+    ///
+    /// The gateway's `/{provider}/…` route never needs this: the client names the provider, so it
+    /// also spells the mount, and the path is forwarded verbatim. The **model-routed** (`/auto`)
+    /// route does, because there the client cannot know which provider will serve it — and the
+    /// providers do not agree (`/v1` for OpenAI, `/openai/v1` for Groq, `/inference/v1` for
+    /// Fireworks, `/api/v1` for OpenRouter). So that route strips its own segment, keeps the
+    /// remainder, and prepends whichever mount the chosen candidate uses.
+    ///
+    /// Derived rather than stored so it cannot drift from [`Self::base_url`], which is the field
+    /// anyone updating a provider actually edits.
+    pub fn base_path(&self) -> &'static str {
+        let Some(url) = self.base_url else {
+            return "";
+        };
+        let after_scheme = match url.find("://") {
+            Some(i) => &url[i + 3..],
+            None => url,
+        };
+        match after_scheme.find('/') {
+            Some(i) => &after_scheme[i..],
+            None => "",
+        }
+    }
+}
+
 /// The gateway rows — those with a `/{name}/…` route and a pool key. The BYO-only rows have no
 /// upstream the gateway would ever dial on a virtual key's behalf, so including them would mint dead
 /// providers (and dead `AI_POOL_KEY_*` env vars) at boot.
@@ -585,33 +672,86 @@ mod tests {
     /// has two. This is what lets `by_id` be infallible.
     #[test]
     fn every_id_has_exactly_one_row() {
-        let ids = [
-            ProviderId::OpenAi,
-            ProviderId::Anthropic,
-            ProviderId::OpenRouter,
-            ProviderId::Fireworks,
-            ProviderId::Groq,
-            ProviderId::DeepSeek,
-            ProviderId::Together,
-            ProviderId::Cerebras,
-            ProviderId::Mistral,
-            ProviderId::XAi,
-            ProviderId::OpenAiCodex,
-            ProviderId::HuggingFace,
-            ProviderId::Nvidia,
-            ProviderId::KimiCoding,
-            ProviderId::OpenCodeZen,
-            ProviderId::OpenCodeGo,
-        ];
         assert_eq!(
-            ids.len(),
+            ProviderId::ALL.len(),
             PROVIDERS.len(),
             "a row exists with no ProviderId"
         );
-        for id in ids {
+        for id in ProviderId::ALL {
             let rows = PROVIDERS.iter().filter(|p| p.id == id).count();
             assert_eq!(rows, 1, "{id:?} has {rows} rows, want exactly 1");
             assert_eq!(by_id(id).id, id);
+        }
+    }
+
+    /// `index` is used to key a fixed-size array, so it must be a bijection onto `0..COUNT`.
+    #[test]
+    fn provider_id_indices_are_dense_and_unique() {
+        let mut seen = [false; ProviderId::COUNT];
+        for (want, id) in ProviderId::ALL.into_iter().enumerate() {
+            let got = id.index();
+            assert_eq!(got, want, "{id:?} must sit at its position in ALL");
+            assert!(!seen[got], "{id:?} reuses index {got}");
+            seen[got] = true;
+        }
+        assert!(seen.into_iter().all(|s| s), "an index is unreachable");
+    }
+
+    /// The mount prefixes the model-routed gateway path prepends. Pinned per row because getting one
+    /// wrong sends a request to a 404 on a provider that is up.
+    #[test]
+    fn base_path_is_the_base_urls_path_component() {
+        let cases = [
+            (ProviderId::OpenAi, "/v1"),
+            // Deliberately bare: `base_url` carries no `/v1`, the endpoint path supplies it.
+            (ProviderId::Anthropic, ""),
+            (ProviderId::OpenRouter, "/api/v1"),
+            (ProviderId::Fireworks, "/inference/v1"),
+            (ProviderId::Groq, "/openai/v1"),
+            (ProviderId::DeepSeek, "/v1"),
+            (ProviderId::Together, "/v1"),
+            (ProviderId::Cerebras, "/v1"),
+            (ProviderId::Mistral, "/v1"),
+            (ProviderId::XAi, "/v1"),
+            // No direct-route base URL at all.
+            (ProviderId::OpenAiCodex, ""),
+        ];
+        for (id, want) in cases {
+            assert_eq!(
+                by_id(id).base_path(),
+                want,
+                "{id:?} base_path from base_url {:?}",
+                by_id(id).base_url,
+            );
+        }
+    }
+
+    /// `base_path` must be derivable from `base_url` for *every* row, not just the pinned ones —
+    /// a new provider gets the same treatment without anyone remembering to extend the case list.
+    #[test]
+    fn base_path_agrees_with_base_url_for_every_row() {
+        for p in PROVIDERS {
+            match p.base_url {
+                None => assert_eq!(p.base_path(), "", "{}: no base_url ⇒ no mount", p.name),
+                Some(url) => {
+                    let path = p.base_path();
+                    assert!(
+                        path.is_empty() || path.starts_with('/'),
+                        "{}: mount {path:?} must be empty or absolute",
+                        p.name,
+                    );
+                    assert!(
+                        url.ends_with(path),
+                        "{}: base_url {url:?} must end with its mount {path:?}",
+                        p.name,
+                    );
+                    assert!(
+                        !path.contains("://"),
+                        "{}: mount {path:?} still carries a scheme",
+                        p.name,
+                    );
+                }
+            }
         }
     }
 
