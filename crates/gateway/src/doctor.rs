@@ -57,9 +57,103 @@ pub async fn run_checks(config: &AiConfig) -> Vec<CheckResult> {
 
     out.push(check_signing_keys(config));
     out.push(check_pool_keys(config));
+    out.push(check_catalog_coverage(config));
     out.extend(check_provider_dns(config).await);
 
     out
+}
+
+/// Every catalog model must have at least one candidate this deployment can actually reach.
+///
+/// A model-routed request resolves its candidates at request time and drops any whose provider has
+/// no pool key. If that leaves nothing, the request 503s — and it does so identically to a model
+/// that simply isn't configured yet, which is a miserable thing to diagnose from a dashboard. The
+/// keys are deployment config, so the answer is knowable at boot: say it here instead.
+///
+/// A row with *some* candidates missing is reported but not failed: that is the normal state of a
+/// deployment that pools keys for one provider and not its alternates. It costs failover depth, not
+/// correctness, so it is worth seeing without being worth blocking on.
+fn check_catalog_coverage(config: &AiConfig) -> CheckResult {
+    let mut unreachable: Vec<&str> = Vec::new();
+    let mut degraded: Vec<&str> = Vec::new();
+
+    for route in providers::catalog::MODEL_ROUTES {
+        let usable = route
+            .candidates
+            .iter()
+            .filter(|c| {
+                config
+                    .pool_keys
+                    .contains_key(providers::by_id(c.provider).name)
+            })
+            .count();
+        if usable == 0 {
+            unreachable.push(route.model);
+        } else if usable < route.candidates.len() {
+            degraded.push(route.model);
+        }
+    }
+
+    // No pool keys at all is a pure-BYO deployment, which `check_pool_keys` already speaks to. The
+    // model-routed route is managed-only, so it is simply unused here — not misconfigured.
+    if config.pool_keys.is_empty() {
+        return pass(
+            "model_catalog",
+            "no pool keys configured — model routing is unused (it is managed-only)",
+        );
+    }
+
+    if !unreachable.is_empty() {
+        let missing: Vec<String> = unreachable
+            .iter()
+            .filter_map(|m| providers::for_model(m))
+            .flat_map(|r| r.candidates)
+            .map(|c| {
+                format!(
+                    "AI_POOL_KEY_{}",
+                    env_suffix(providers::by_id(c.provider).name)
+                )
+            })
+            .collect();
+        return fail(
+            "model_catalog",
+            format!(
+                "{} catalog model(s) have no reachable provider: {}",
+                unreachable.len(),
+                unreachable.join(", "),
+            ),
+            &format!("set one of: {}", dedup_joined(missing)),
+        );
+    }
+
+    let total = providers::catalog::MODEL_ROUTES.len();
+    if degraded.is_empty() {
+        pass(
+            "model_catalog",
+            format!("{total} model(s) routable, every candidate reachable"),
+        )
+    } else {
+        pass(
+            "model_catalog",
+            format!(
+                "{total} model(s) routable; {} with reduced failover (not every candidate has a \
+                 pool key): {}",
+                degraded.len(),
+                degraded.join(", "),
+            ),
+        )
+    }
+}
+
+/// A provider name as it appears in its `AI_POOL_KEY_*` env var (`openai-codex` → `OPENAI_CODEX`).
+fn env_suffix(provider_name: &str) -> String {
+    provider_name.to_ascii_uppercase().replace('-', "_")
+}
+
+fn dedup_joined(mut items: Vec<String>) -> String {
+    items.sort_unstable();
+    items.dedup();
+    items.join(", ")
 }
 
 /// The signing keyring is what authenticates managed traffic. An empty or invalid keyring isn't a
@@ -215,6 +309,83 @@ mod tests {
     use super::*;
     use crate::secret::Secret;
     use std::collections::HashMap;
+
+    /// The catalog seed carries at least one Anthropic-only row, so a deployment with only an
+    /// OpenAI pool key has a model it cannot serve. That must fail loudly at boot, naming the env
+    /// var to set — the request-time symptom is a 503 indistinguishable from an unconfigured model.
+    #[test]
+    fn catalog_coverage_fails_when_a_model_has_no_reachable_provider() {
+        let config = AiConfig {
+            pool_keys: HashMap::from([("openai".to_string(), Secret::new("sk-openai"))]),
+            ..Default::default()
+        };
+        let r = check_catalog_coverage(&config);
+        assert!(
+            !r.passed,
+            "an unreachable catalog model must fail: {}",
+            r.message
+        );
+        assert!(
+            r.hint
+                .as_deref()
+                .unwrap_or_default()
+                .contains("AI_POOL_KEY_ANTHROPIC"),
+            "the hint must name the missing env var, got {:?}",
+            r.hint,
+        );
+    }
+
+    /// Every candidate reachable ⇒ a clean pass, with no "reduced failover" caveat.
+    #[test]
+    fn catalog_coverage_passes_when_every_candidate_is_reachable() {
+        let config = AiConfig {
+            pool_keys: HashMap::from([
+                ("openai".to_string(), Secret::new("sk-openai")),
+                ("anthropic".to_string(), Secret::new("sk-anthropic")),
+                ("openrouter".to_string(), Secret::new("sk-openrouter")),
+            ]),
+            ..Default::default()
+        };
+        let r = check_catalog_coverage(&config);
+        assert!(r.passed, "fully-keyed deployment must pass: {}", r.message);
+        assert!(
+            !r.message.contains("reduced failover"),
+            "nothing is degraded here, got {:?}",
+            r.message,
+        );
+    }
+
+    /// A row whose primary is keyed but whose alternate is not still works — it has just lost its
+    /// failover depth. Worth reporting, not worth blocking a boot over.
+    #[test]
+    fn catalog_coverage_reports_reduced_failover_without_failing() {
+        let config = AiConfig {
+            pool_keys: HashMap::from([
+                ("openai".to_string(), Secret::new("sk-openai")),
+                ("anthropic".to_string(), Secret::new("sk-anthropic")),
+                // no openrouter key ⇒ gpt-4o-mini keeps its primary, loses its fallback
+            ]),
+            ..Default::default()
+        };
+        let r = check_catalog_coverage(&config);
+        assert!(
+            r.passed,
+            "a keyed primary is still serviceable: {}",
+            r.message
+        );
+        assert!(
+            r.message.contains("reduced failover") && r.message.contains("gpt-4o-mini"),
+            "must name the degraded model, got {:?}",
+            r.message,
+        );
+    }
+
+    /// A pure-BYO deployment does not use the managed-only model route at all.
+    #[test]
+    fn catalog_coverage_is_not_a_failure_without_pool_keys() {
+        let r = check_catalog_coverage(&AiConfig::default());
+        assert!(r.passed, "pure-BYO must not fail this check: {}", r.message);
+    }
 
     #[test]
     fn signing_keys_empty_fails() {

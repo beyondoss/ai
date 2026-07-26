@@ -78,6 +78,18 @@ fn build_providers(config: &AiConfig, metrics: &Metrics) -> Result<HashMap<Strin
             .map(crate::circuit_breaker::CircuitBreaker::new)
     };
 
+    // `/auto` is the model-routed segment (`route::AUTO_SEGMENT`). Provider lookup runs *first* in
+    // `request_filter`, so a provider registered under that name would shadow the whole feature —
+    // silently, and only for requests that were meant to be model-routed. Refuse to boot instead.
+    if let Some(authority) = config.provider_authorities.get(route::AUTO_SEGMENT) {
+        return Err(GatewayError::Config(format!(
+            "provider_authorities.{} = {authority:?} uses a reserved name: {}/… is the \
+             model-routed route, which a provider of that name would shadow",
+            route::AUTO_SEGMENT,
+            route::AUTO_SEGMENT,
+        )));
+    }
+
     let mut providers = HashMap::new();
     for spec in route::known_providers() {
         let authority = config
@@ -88,15 +100,21 @@ fn build_providers(config: &AiConfig, metrics: &Metrics) -> Result<HashMap<Strin
         let pool_key = config.pool_keys.get(spec.name).map(|s| s.expose());
         providers.insert(
             spec.name.to_string(),
-            Arc::new(Provider::resolve(
-                spec.name,
-                authority,
-                spec.wire,
-                spec.auth,
-                pool_key,
-                ProviderMetrics::resolve(metrics, spec.name),
-                breaker(),
-            )),
+            Arc::new(
+                Provider::resolve(
+                    spec.name,
+                    authority,
+                    spec.wire,
+                    spec.auth,
+                    pool_key,
+                    ProviderMetrics::resolve(metrics, spec.name),
+                    breaker(),
+                )
+                // Only a known provider has a mount: it comes from the shared table's `base_url`.
+                // A config-added provider keeps `""` (verbatim forwarding), which is what an
+                // operator handing the gateway a bare authority is asking for.
+                .with_base_path(spec.base_path()),
+            ),
         );
     }
     // Config-only providers (name not in the known set): dialect/auth scheme come from
@@ -145,6 +163,22 @@ fn build_providers(config: &AiConfig, metrics: &Metrics) -> Result<HashMap<Strin
     Ok(providers)
 }
 
+/// Index the resolved providers by [`providers::ProviderId`], for the model-routed path's
+/// per-attempt candidate lookup.
+///
+/// Built from the shared table rather than by walking the map, so the array can only ever hold a
+/// provider under its own id. A config-added provider has no id and is deliberately absent — the
+/// catalog names candidates by id, so it could never reference one.
+fn index_by_id(
+    resolved: &HashMap<String, Arc<Provider>>,
+) -> [Option<Arc<Provider>>; providers::ProviderId::COUNT] {
+    let mut by_id: [Option<Arc<Provider>>; providers::ProviderId::COUNT] = Default::default();
+    for spec in route::known_providers() {
+        by_id[spec.id.index()] = resolved.get(spec.name).cloned();
+    }
+    by_id
+}
+
 pub struct GatewayState {
     pub config: AiConfig,
     pub metrics: Arc<Metrics>,
@@ -154,6 +188,13 @@ pub struct GatewayState {
     /// Resolved providers by name (upstream authority/host + precomputed managed auth value). Built
     /// once at boot from `route::KNOWN_PROVIDERS` + config; the request path clones the `Arc`.
     providers: HashMap<String, Arc<Provider>>,
+    /// The same providers, indexed by [`providers::ProviderId`] — the model-routed path switches
+    /// candidates between connect attempts and holds ids, not names, so this makes that an array
+    /// index instead of hashing a string on a path that can run several times per request.
+    ///
+    /// `None` for an id the gateway does not route to (the BYO-only rows), which is also why a
+    /// config-added provider is absent: it has no `ProviderId`, and a catalog row can only name one.
+    by_id: [Option<Arc<Provider>>; providers::ProviderId::COUNT],
 
     /// Sparse deny-set — the ONE thing watched from NATS. Default-allow on miss; fail-open.
     pub deny: ArcSwap<DenySet>,
@@ -217,6 +258,7 @@ impl GatewayState {
         }
 
         let providers = build_providers(&config, &metrics)?;
+        let by_id = index_by_id(&providers);
         let rate_limit = RateLimit::new(config.rate_limit_rps, config.byo_rate_limit_rps);
 
         // 8 OS-random bytes as the instance token, so two gateways' request_ids never collide when
@@ -239,6 +281,7 @@ impl GatewayState {
             metrics,
             keyring,
             providers,
+            by_id,
             deny: ArcSwap::from_pointee(DenySet::new()),
             rate_limit,
             dns_cache: ArcSwap::from_pointee(HashMap::new()),
@@ -275,6 +318,12 @@ impl GatewayState {
     /// 404.
     pub fn provider(&self, name: &str) -> Option<&Arc<Provider>> {
         self.providers.get(name)
+    }
+
+    /// The resolved provider for a catalog candidate's id, or `None` if this gateway does not route
+    /// to it. One array index — the model-routed path calls this once per connect attempt.
+    pub fn provider_by_id(&self, id: providers::ProviderId) -> Option<&Arc<Provider>> {
+        self.by_id[id.index()].as_ref()
     }
 
     /// Resolve an `host:port` authority to a `SocketAddr`, cached for `DNS_TTL`. Uses
@@ -330,6 +379,67 @@ mod tests {
         static M: OnceLock<Arc<Metrics>> = OnceLock::new();
         M.get_or_init(|| Metrics::new().expect("register metrics once"))
             .clone()
+    }
+
+    /// Provider lookup runs before the model-routed segment is even considered, so registering a
+    /// provider named `auto` from config would silently disable model routing. Boot must refuse.
+    #[test]
+    fn reserved_auto_provider_name_fails_boot() {
+        let config = AiConfig {
+            provider_authorities: HashMap::from([(
+                route::AUTO_SEGMENT.to_string(),
+                "llm.internal:8443".to_string(),
+            )]),
+            ..Default::default()
+        };
+        let err = build_providers(&config, &test_metrics())
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(
+            err.contains(route::AUTO_SEGMENT) && err.contains("reserved"),
+            "boot must fail naming the reserved segment, got {err:?}",
+        );
+    }
+
+    /// The id-keyed array is what the model-routed path indexes per connect attempt. It must agree
+    /// with the by-name map for every known provider, and must have no entry for a config-only one
+    /// (which has no `ProviderId` for a catalog row to name).
+    #[test]
+    fn provider_by_id_resolves_known_rows_and_skips_config_only_ones() {
+        let config = AiConfig {
+            provider_authorities: HashMap::from([(
+                "custom".to_string(),
+                "llm.internal:8443".to_string(),
+            )]),
+            ..Default::default()
+        };
+        let resolved = build_providers(&config, &test_metrics()).unwrap();
+        let by_id = index_by_id(&resolved);
+
+        for spec in route::known_providers() {
+            let via_id = by_id[spec.id.index()].as_ref();
+            assert!(via_id.is_some(), "{} missing from the id index", spec.name);
+            assert_eq!(
+                via_id.map(|p| p.name.as_str()),
+                Some(spec.name),
+                "{} is indexed under another provider's id",
+                spec.name,
+            );
+            // The mount only comes from the shared table, and only for known rows.
+            assert_eq!(via_id.map(|p| p.base_path), Some(spec.base_path()));
+        }
+
+        assert!(
+            resolved.contains_key("custom"),
+            "config-only provider is still reachable by name",
+        );
+        let indexed = by_id.iter().flatten().count();
+        assert_eq!(
+            indexed,
+            route::known_providers().count(),
+            "the id index must hold exactly the known rows — no config-only providers",
+        );
     }
 
     #[test]

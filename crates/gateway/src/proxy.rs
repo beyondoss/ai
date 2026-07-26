@@ -1769,18 +1769,20 @@ mod tests {
     fn rejection_labels_round_trip_and_are_unique() {
         use crate::metrics::Rejection;
         use std::collections::HashSet;
-        let all = [
-            Rejection::Auth,
-            Rejection::DenySpend,
-            Rejection::DenyFraud,
-            Rejection::DenyUnknown,
-            Rejection::CircuitOpen,
-            Rejection::BodyTooLarge,
-            Rejection::RateLimit,
-            Rejection::RateLimitByoGlobal,
-        ];
+        // `Rejection::ALL` rather than a copy of the variant list: a copy silently stops covering
+        // whatever is added next, which is exactly what it happened to do.
+        let all = Rejection::ALL;
         let labels: HashSet<&str> = all.iter().map(|r| r.label()).collect();
         assert_eq!(labels.len(), all.len(), "duplicate rejection label");
+        for r in all {
+            let l = r.label();
+            assert!(!l.is_empty(), "{r:?} has an empty label");
+            assert!(
+                l.bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_'),
+                "{r:?} label {l:?} must be a lowercase snake_case Prometheus label value",
+            );
+        }
         // The two dashboards-facing strings must not drift — existing alerts key on them.
         assert_eq!(Rejection::RateLimit.label(), "rate_limit");
         assert_eq!(

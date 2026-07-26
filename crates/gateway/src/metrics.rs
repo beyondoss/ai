@@ -35,12 +35,22 @@ pub enum Rejection {
     RateLimit,
     /// Aggregate BYO rate ceiling.
     RateLimitByoGlobal,
+    /// Model-routed request whose model could not be resolved — the routing header was absent, or
+    /// named a model the catalog does not carry.
+    UnknownModel,
+    /// Model-routed request whose model resolved, but no candidate is usable: none of the providers
+    /// that serve it has a pool key configured. Distinct from `CircuitOpen`, which means the
+    /// candidates exist and are being deliberately skipped while they recover.
+    NoCandidate,
+    /// BYO key presented to the model-routed route, which is managed-only — a BYO token belongs to
+    /// one provider, so neither selecting among candidates nor failing over is meaningful for it.
+    ByoOnModelRoute,
 }
 
 impl Rejection {
     /// Every variant, in `as_index` order. The array in `Metrics` is built from this, so adding a
     /// variant without adding it here fails the exhaustive `match` in `as_index`.
-    const ALL: [Rejection; 8] = [
+    pub(crate) const ALL: [Rejection; 11] = [
         Rejection::Auth,
         Rejection::DenySpend,
         Rejection::DenyFraud,
@@ -49,6 +59,9 @@ impl Rejection {
         Rejection::BodyTooLarge,
         Rejection::RateLimit,
         Rejection::RateLimitByoGlobal,
+        Rejection::UnknownModel,
+        Rejection::NoCandidate,
+        Rejection::ByoOnModelRoute,
     ];
 
     /// The `reason=` label value. `RateLimit` keeps the original `"rate_limit"` string so existing
@@ -63,6 +76,9 @@ impl Rejection {
             Rejection::BodyTooLarge => "body_too_large",
             Rejection::RateLimit => "rate_limit",
             Rejection::RateLimitByoGlobal => "rate_limit_byo_global",
+            Rejection::UnknownModel => "unknown_model",
+            Rejection::NoCandidate => "no_candidate",
+            Rejection::ByoOnModelRoute => "byo_on_model_route",
         }
     }
 
@@ -76,6 +92,9 @@ impl Rejection {
             Rejection::BodyTooLarge => 5,
             Rejection::RateLimit => 6,
             Rejection::RateLimitByoGlobal => 7,
+            Rejection::UnknownModel => 8,
+            Rejection::NoCandidate => 9,
+            Rejection::ByoOnModelRoute => 10,
         }
     }
 }
@@ -90,7 +109,7 @@ pub struct Metrics {
     /// path fires at full request rate under a credential-stuffing flood. Measured 14.3 ns vs 1.3 ns
     /// single-threaded, and 808 ns vs 151 ns with 16 threads contending the same lock.
     /// Indexed by [`Rejection::as_index`]; read it through [`Metrics::rejection`].
-    rejections: [IntCounter; 8],
+    rejections: [IntCounter; 11],
     /// Upstream responses by provider + status class ("2xx"/"4xx"/"5xx"). A provider degrading
     /// (429/5xx) is otherwise invisible until it surfaces as latency or missing usage events —
     /// this is the per-provider error-rate signal an oncall pages on.
@@ -100,6 +119,14 @@ pub struct Metrics {
     /// per request; without this, the extra latency looks like a slow provider, not a connect
     /// problem. Pairs with a `warn!` on the same path so the dashboard spike has a log to grep.
     pub connect_retries_total: IntCounterVec,
+    /// Model-routed requests that gave up on a candidate and moved to the next one.
+    ///
+    /// Deliberately *not* folded into `connect_retries_total`: that counter means "we retried the
+    /// same provider" and existing alerts read it that way. This one means "we abandoned a provider
+    /// and something else served the request" — a success story with a hidden cost, and the number
+    /// that answers "is failover actually firing, and how often". The per-provider
+    /// `connect_retries_total` still fires alongside it, labelled with the candidate we left.
+    pub candidate_failovers_total: IntCounter,
     /// Labeled by kind: input|output|cache_read|cache_write. Cache tokens are also in the `ai.usage`
     /// billing log, but that ships with lag — the Prometheus counter is the alerting surface for
     /// "cache hit rate fell off a cliff after a deploy" (cache write ≈ 3× input, cache read ≈ 0.1×,
@@ -163,6 +190,10 @@ impl Metrics {
 
         let requests_total =
             IntCounter::with_opts(Opts::new("ai_requests_total", "Total requests handled"))?;
+        let candidate_failovers_total = IntCounter::with_opts(Opts::new(
+            "ai_candidate_failovers_total",
+            "Model-routed requests that moved to the next candidate provider",
+        ))?;
         let rejections_total = IntCounterVec::new(
             Opts::new("ai_rejections_total", "Requests rejected before upstream"),
             &["reason"],
@@ -225,6 +256,7 @@ impl Metrics {
         ))?;
 
         r.register(Box::new(requests_total.clone()))?;
+        r.register(Box::new(candidate_failovers_total.clone()))?;
         r.register(Box::new(rejections_total.clone()))?;
         r.register(Box::new(upstream_responses_total.clone()))?;
         r.register(Box::new(connect_retries_total.clone()))?;
@@ -239,6 +271,7 @@ impl Metrics {
 
         Ok(Arc::new(Self {
             requests_total,
+            candidate_failovers_total,
             rejections_total,
             rejections,
             upstream_responses_total,
