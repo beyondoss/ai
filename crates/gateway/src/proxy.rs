@@ -1952,6 +1952,127 @@ impl ProxyHttp for AiProxy {
 mod tests {
     use super::*;
 
+    use crate::metrics::ProviderMetrics;
+    use crate::route::AuthScheme;
+
+    /// A minimal `RequestCtx` for exercising the body-phase logic without a running proxy.
+    fn test_ctx(inject_eligible: bool) -> RequestCtx {
+        let provider = Provider::resolve(
+            "openai",
+            "api.openai.com:443".to_string(),
+            Dialect::OpenAi,
+            AuthScheme::Bearer,
+            Some("sk-pool"),
+            ProviderMetrics::disconnected(),
+            None,
+        );
+        RequestCtx {
+            tenant_id: 42,
+            vpc_id: 7,
+            dialect: Dialect::OpenAi,
+            provider: Arc::new(provider),
+            forward_path: None,
+            managed: true,
+            model: String::new(),
+            model_scanner: peek::ModelScanner::new(),
+            resp_model_scanner: peek::ModelScanner::for_response(),
+            streaming: false,
+            resp_tail: UsageTail::default(),
+            resp_head: Vec::new(),
+            body_bytes_fed: 0,
+            upstream_status: None,
+            inject_eligible,
+            req_buf: Vec::new(),
+            start: Instant::now(),
+            attempt: 0,
+            breaker_pending: false,
+            auto: None,
+            request_id: RequestId::new(),
+        }
+    }
+
+    /// The replay contract, exercised directly: `upstream_peer` resets the body phase before pingora
+    /// re-feeds the buffered prefix through `request_body_filter`, so attempt 2 sees the body once.
+    ///
+    /// This is the bug in miniature. Attempt 1 buffers a prefix and is cut off before end-of-stream,
+    /// so `req_buf` is never drained. Pingora then replays that prefix from byte 0. Without the
+    /// reset the two concatenate, the splice is planned against the first copy, and the upstream
+    /// gets a body with a duplicated fragment — which it rejects with a `400` that `logging` records
+    /// as a breaker *success*, so nothing surfaces it as ours.
+    ///
+    /// Covered here rather than end-to-end because reproducing it over a socket needs the upstream
+    /// to die in the window where the gateway holds a *partial* body — a timing-dependent race. The
+    /// e2e suite proves the surrounding mechanism (pingora really does retry a reused connection and
+    /// really does replay through this filter); this pins what the reset itself must guarantee.
+    #[test]
+    fn resetting_the_body_phase_makes_a_replayed_prefix_idempotent() {
+        let body =
+            br#"{"messages":[{"role":"user","content":"hi"}],"model":"gpt-4o","stream":true}"#;
+        let (prefix, rest) = body.split_at(30);
+
+        // Attempt 1: a prefix arrives, then the upstream dies before end-of-stream.
+        let mut rc = test_ctx(true);
+        rc.req_buf.extend_from_slice(prefix);
+        rc.body_bytes_fed += prefix.len();
+        assert!(
+            !rc.req_buf.is_empty(),
+            "precondition: the partial body is still held, since end_of_stream never came",
+        );
+
+        // `upstream_peer` runs before any body byte of attempt 2.
+        rc.reset_request_body_phase();
+
+        // Attempt 2: pingora replays from byte 0, then the remainder streams in.
+        rc.req_buf.extend_from_slice(prefix);
+        rc.req_buf.extend_from_slice(rest);
+
+        assert_eq!(
+            rc.req_buf, body,
+            "the retried attempt must send the body exactly once",
+        );
+        assert_eq!(
+            rc.body_bytes_fed, 0,
+            "the size guard must not double-count the replayed prefix",
+        );
+        let scan = peek::scan_buffered(&rc.req_buf);
+        assert_eq!(
+            scan.model.as_deref(),
+            Some("gpt-4o"),
+            "and the model must still be extractable — a duplicated prefix offsets the scanner's \
+             depth permanently, shipping `requested_model` empty",
+        );
+        assert!(
+            scan.inject_at.is_some(),
+            "the stream_options splice must still be planned against a well-formed root object",
+        );
+    }
+
+    /// Without the reset, the same sequence corrupts the body — so the test above is not vacuous.
+    #[test]
+    fn a_replayed_prefix_without_the_reset_corrupts_the_body() {
+        let body =
+            br#"{"messages":[{"role":"user","content":"hi"}],"model":"gpt-4o","stream":true}"#;
+        let (prefix, rest) = body.split_at(30);
+
+        let mut rc = test_ctx(true);
+        rc.req_buf.extend_from_slice(prefix);
+        rc.body_bytes_fed += prefix.len();
+        // ...no reset...
+        rc.req_buf.extend_from_slice(prefix);
+        rc.req_buf.extend_from_slice(rest);
+
+        assert_ne!(rc.req_buf, body, "the duplicated prefix must be observable");
+        assert!(
+            serde_json::from_slice::<serde_json::Value>(&rc.req_buf).is_err(),
+            "and the result is not valid JSON — this is the 400 the provider returns",
+        );
+        assert_eq!(
+            rc.body_bytes_fed,
+            prefix.len(),
+            "and the size guard has double-counted",
+        );
+    }
+
     /// `RequestCtx` is touched on every hook and, for a streaming response, once per response
     /// chunk, so its size is a real cost rather than bookkeeping. Growing it by 64 bytes to hold the
     /// model-routing fields inline produced a reproducible ~2.5% regression on the

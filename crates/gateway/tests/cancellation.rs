@@ -138,3 +138,82 @@ async fn upstream_failures_still_open_the_breaker() {
         "sustained 5xx must still open the breaker:\n{metrics}"
     );
 }
+
+/// Pingora retries a **reused-connection** failure on its own, without ever calling
+/// `fail_to_connect` — and that is the load-bearing reason the breaker ledger lives in
+/// `upstream_peer` instead.
+///
+/// Request 1 completes and its connection is pooled. Request 2 reuses it and the upstream dies on
+/// the response read, which pingora's default `error_while_proxy` marks retryable. A design that
+/// recorded breaker outcomes in `fail_to_connect` would silently miss this attempt entirely: a
+/// permit claimed and never resolved.
+///
+/// It also exercises the replay path — pingora re-feeds its buffered request body through
+/// `request_body_filter` on the retry, which is what `RequestCtx::reset_request_body_phase` exists
+/// to make idempotent.
+#[tokio::test]
+async fn a_reused_connection_failure_is_retried_and_the_body_survives() {
+    let nats = Nats::start().await;
+    let (pubkey, sk) = test_keypair(1);
+    let mock = MockUpstream::start(Mode::CloseOnRequest(2)).await;
+    let gw = Gateway::builder(nats.port, &mock.authority(), &b64(&pubkey))
+        .start()
+        .await;
+
+    let vkey = mint(
+        &VirtualKey {
+            tenant_id: 42,
+            vpc_id: 7,
+        },
+        1,
+        &sk,
+    );
+    let client = reqwest::Client::new();
+    // Streaming + managed + OpenAI chat = the inject-eligible path, which buffers the body. Well
+    // under pingora's 64 KiB replay cap, so the retry genuinely replays rather than giving up.
+    let filler = "y".repeat(8 * 1024);
+    let body = format!(
+        r#"{{"model":"gpt-4o-mini","stream":true,"messages":[{{"role":"user","content":"{filler}"}}]}}"#
+    );
+
+    let post = |b: String| {
+        let (c, u, k) = (client.clone(), gw.url(), vkey.clone());
+        async move {
+            c.post(format!("{u}/v1/chat/completions"))
+                .header("authorization", format!("Bearer {k}"))
+                .header("content-type", "application/json")
+                .body(b)
+                .send()
+                .await
+                .unwrap()
+        }
+    };
+
+    // 1: primes the connection pool.
+    assert_eq!(post(body.clone()).await.status().as_u16(), 200);
+    // 2: reuses the pooled connection, which the mock kills. Pingora must retry it for us.
+    let second = post(body.clone()).await;
+    assert_eq!(
+        second.status().as_u16(),
+        200,
+        "a reused-connection failure must be retried, not surfaced to the client",
+    );
+    assert!(
+        mock.hits() >= 3,
+        "want a third request (the retry); got {} hits",
+        mock.hits(),
+    );
+
+    // The retried attempt's body must be whole and well-formed — not the original with a replayed
+    // prefix concatenated onto it.
+    let cap = mock.captured().expect("the retry reached the upstream");
+    let received: serde_json::Value = serde_json::from_slice(&cap.body).unwrap_or_else(|e| {
+        panic!("retried body is not valid JSON ({e}) — replay was appended, not reset")
+    });
+    assert_eq!(received["model"], "gpt-4o-mini");
+    assert_eq!(received["messages"][0]["content"], filler);
+    assert_eq!(
+        received["stream_options"]["include_usage"], true,
+        "the usage injection must still be spliced exactly once on the retried attempt",
+    );
+}

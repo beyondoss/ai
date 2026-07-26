@@ -183,6 +183,14 @@ pub enum Mode {
     /// Always reply with this HTTP status and a small JSON error body — for circuit-breaker tests
     /// (5xx trips the breaker; 4xx/429 do not).
     Status(u16),
+    /// Accept the Nth request (1-based) and then kill the connection without answering it.
+    ///
+    /// The only way to produce pingora's *reused-connection* failure: request 1 completes normally
+    /// and its connection goes into the pool, request 2 reuses it and dies on the response read.
+    /// That is the retry pingora decides on by itself, via its default `error_while_proxy`, without
+    /// ever calling `fail_to_connect` — which is precisely why the gateway's breaker ledger lives in
+    /// `upstream_peer` rather than there.
+    CloseOnRequest(usize),
     /// Hold the request open for this many milliseconds before answering — long enough for a client
     /// to give up first. The only way to produce a *downstream* abort while the upstream is still
     /// healthy, which is the distinction the breaker has to draw.
@@ -264,8 +272,8 @@ fn anthropic_sse_large() -> String {
 /// The canned `(content-type, body)` for a mode. The `*Large` modes allocate; the rest are static.
 fn canned_body(mode: Mode) -> (&'static str, Bytes) {
     match mode {
-        // A slow reply is an ordinary successful one; only its timing differs.
-        Mode::Json | Mode::Slow(_) => (
+        // A slow reply, and the surviving requests of a close-on-Nth mock, are ordinary successes.
+        Mode::Json | Mode::Slow(_) | Mode::CloseOnRequest(_) => (
             "application/json",
             Bytes::from_static(CANNED_JSON.as_bytes()),
         ),
@@ -304,8 +312,13 @@ async fn mock_handle(
     cap: Arc<Mutex<Option<Captured>>>,
     hits: Arc<std::sync::atomic::AtomicUsize>,
     mode: Mode,
-) -> Result<Response<Full<Bytes>>, std::convert::Infallible> {
-    hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+) -> Result<Response<Full<Bytes>>, std::io::Error> {
+    let n = hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    // Kill the connection before touching the body, so the gateway sees the failure while awaiting
+    // the response header — the shape that yields `RetryType::ReusedOnly`.
+    if matches!(mode, Mode::CloseOnRequest(k) if k == n) {
+        return Err(std::io::Error::other("mock closing the connection"));
+    }
     let version = req.version();
     // Path **and query**. Recording only `uri.path()` meant the harness was structurally blind to the
     // query string: no test could tell whether the gateway forwarded `?api-version=…` (which Azure
