@@ -1183,10 +1183,15 @@ impl ProxyHttp for AiProxy {
         // the counter is the alerting surface for a cache-hit-rate cliff after a deploy.
         m.tokens_cache_read.inc_by(usage.cache_read_tokens);
         m.tokens_cache_write.inc_by(usage.cache_write_tokens);
+        // Read the clock once for both consumers below. Beyond saving a vDSO call, this is a
+        // correctness fix: the latency histogram and the `ai.usage` billing line used to call
+        // `elapsed()` about forty lines apart, so they reported *different* durations for the same
+        // request and could never be reconciled against each other.
+        let elapsed = rc.start.elapsed();
         rc.provider
             .metrics
             .upstream_latency_seconds
-            .observe(rc.start.elapsed().as_secs_f64());
+            .observe(elapsed.as_secs_f64());
         // Balance the `active_streams` increment from `response_filter`. `logging` runs exactly once
         // per request (including on upstream errors / client disconnects), so a stream that opened is
         // always accounted closed here — the gauge can't leak upward.
@@ -1228,7 +1233,7 @@ impl ProxyHttp for AiProxy {
                 // model, or a provider that doesn't surface it) matters and is unrecoverable once this
                 // line ships, so it's logged as `?` (Debug) rather than collapsed to a bare `0`.
                 reasoning_tokens = ?usage.reasoning_tokens,
-                latency_ms = rc.start.elapsed().as_millis() as u64,
+                latency_ms = elapsed.as_millis() as u64,
                 "usage"
             );
         }

@@ -218,6 +218,34 @@ mod route {
     }
 }
 
+mod state {
+    use super::*;
+    use beyond_ai::config::AiConfig;
+    use beyond_ai::metrics::Metrics;
+    use beyond_ai::state::GatewayState;
+    use std::sync::{Arc, OnceLock};
+
+    fn state() -> &'static Arc<GatewayState> {
+        static S: OnceLock<Arc<GatewayState>> = OnceLock::new();
+        S.get_or_init(|| {
+            static M: OnceLock<Arc<Metrics>> = OnceLock::new();
+            let m = M
+                .get_or_init(|| Metrics::new().expect("register metrics once"))
+                .clone();
+            GatewayState::new(AiConfig::default(), m).expect("build state")
+        })
+    }
+
+    /// Minted for **every** request, including every fast reject, so it is the most-executed line in
+    /// the crate. Must stay 0-alloc (an `ArrayString` on the stack) and off `core::fmt`: the
+    /// instance half is boot-constant and is copied, only the counter is rendered.
+    #[divan::bench]
+    fn next_request_id(bencher: Bencher) {
+        let s = state();
+        bencher.bench(|| black_box(s).next_request_id());
+    }
+}
+
 mod deny {
     use super::*;
     use beyond_ai::deny::{self, DenyReason, DenySet};
