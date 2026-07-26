@@ -371,6 +371,39 @@ fn bench_e2e(c: &mut Criterion) {
         });
     });
 
+    // Throughput for the shape this gateway actually carries in production: a long Anthropic
+    // stream, under concurrency. `managed_json_throughput` measures a 60-byte body and a 250-byte
+    // response, which is the cheapest possible request and so mostly measures accept/parse; this one
+    // measures the response path doing real work on many streams at once.
+    group.throughput(Throughput::Elements(CONCURRENCY));
+    group.bench_function("managed_large_anthropic_sse_throughput", |b| {
+        b.to_async(&rt).iter(|| async {
+            let mut set = JoinSet::new();
+            for _ in 0..CONCURRENCY {
+                let (client, url, vkey) = (
+                    anthropic_sse_stack.client.clone(),
+                    anthropic_sse_stack.url.clone(),
+                    anthropic_sse_stack.vkey.clone(),
+                );
+                set.spawn(async move {
+                    let resp = client
+                        .post(format!("{url}/v1/messages"))
+                        .header("x-api-key", &vkey)
+                        .header("content-type", "application/json")
+                        .body(r#"{"model":"claude-opus-4-8","messages":[]}"#)
+                        .send()
+                        .await
+                        .expect("request");
+                    assert_eq!(resp.status().as_u16(), 200);
+                    let _ = resp.bytes().await.expect("body");
+                });
+            }
+            while let Some(r) = set.join_next().await {
+                r.expect("task");
+            }
+        });
+    });
+
     group.finish();
 
     // Keep the stacks alive until every bench has run, then tear them down explicitly.
