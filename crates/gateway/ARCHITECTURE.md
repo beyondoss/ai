@@ -715,4 +715,14 @@ gateway's added cost is negligible and bounded** — i.e. it never becomes the c
   catching gross regressions (a buffering mistake, a dropped connection pool, an O(n) path added
   would move the band by far more than 20µs) and saved-baseline RPS trend via `--save-baseline`.
 
+  **Read criterion's verdict on this harness with care below ~3%.** Its p-value models within-run
+  sampling noise, not run-to-run drift, and there is plenty of the latter here. Measured directly:
+  three consecutive runs of *identical* code against one saved baseline reported +2.18% ("regressed",
+  p=0.00), +0.53% ("no change", p=0.40), and +1.90% ("regressed", p=0.00) — and the run with the
+  *highest* absolute time was the one that reported the smallest delta. So a single flagged run is a
+  prompt to re-measure, not a finding. Treat a change as real only if it reproduces across runs, and
+  ideally only with a mechanism to point at: the `ModelRouting` boxing was accepted on a +2.31% and
+  +2.80% pair *plus* a 368→432-byte struct measurement that explained why streaming was hit and
+  non-streaming was not. For anything at ns scale, use the unit bench — that is what it is for.
+
 `mise run bench` runs both.
