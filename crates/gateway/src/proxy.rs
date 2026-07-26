@@ -82,6 +82,73 @@ const MAX_REQUEST_BODY: usize = 100 * 1024 * 1024;
 /// / the whole non-streaming body; keeping a tail means we never buffer a long stream.
 const USAGE_TAIL_CAP: usize = 64 * 1024;
 
+/// The bounded window of response bytes kept for usage extraction.
+///
+/// Grows like a plain `Vec` while the response is small — the common case is a non-streaming body of
+/// a few hundred bytes, and reserving the full cap for that would waste an allocation on every
+/// request. Once it outgrows the cap it flips to a **ring**: a cap-sized buffer written with
+/// wraparound, so every subsequent byte is copied exactly once, with no compaction memmove and no
+/// further allocation.
+///
+/// What it replaced grew to `2 × cap` and then compacted with a `copy_within` that kept the last
+/// `cap` bytes. That is bounded, but it re-copies `cap` bytes every `cap` bytes of stream — so a
+/// long response was memmoved roughly twice over, on top of the geometric realloc chain from
+/// starting at zero capacity. Measured 1.88× the response size in memmove at steady state.
+#[derive(Default)]
+struct UsageTail {
+    buf: Vec<u8>,
+    /// Next write index. Meaningful only once `ring` is set.
+    head: usize,
+    /// Whether `buf` is a wraparound ring of exactly `USAGE_TAIL_CAP` bytes.
+    ring: bool,
+}
+
+impl UsageTail {
+    fn push(&mut self, data: &[u8]) {
+        if !self.ring {
+            self.buf.extend_from_slice(data);
+            if self.buf.len() > USAGE_TAIL_CAP {
+                // Outgrown: keep the last cap bytes in order and switch to ring mode. This is the
+                // only compaction that ever runs — from here on, writes wrap instead of shifting.
+                let start = self.buf.len() - USAGE_TAIL_CAP;
+                self.buf.copy_within(start.., 0);
+                self.buf.truncate(USAGE_TAIL_CAP);
+                self.head = 0;
+                self.ring = true;
+            }
+            return;
+        }
+        // A chunk at least as large as the whole window: only its last cap bytes can survive, and
+        // they land aligned, so the ring resets rather than wrapping.
+        if data.len() >= USAGE_TAIL_CAP {
+            self.buf
+                .copy_from_slice(&data[data.len() - USAGE_TAIL_CAP..]);
+            self.head = 0;
+            return;
+        }
+        let first = (USAGE_TAIL_CAP - self.head).min(data.len());
+        self.buf[self.head..self.head + first].copy_from_slice(&data[..first]);
+        let rest = data.len() - first;
+        if rest > 0 {
+            self.buf[..rest].copy_from_slice(&data[first..]);
+        }
+        self.head = (self.head + data.len()) % USAGE_TAIL_CAP;
+    }
+
+    /// The retained bytes, oldest first. Rotates the ring into order once, at parse time.
+    ///
+    /// Stays a ring afterwards, with `head` back at 0 — a subsequent `push` then overwrites the
+    /// oldest bytes, which is exactly right. In practice `logging` calls this once, after the body
+    /// is complete.
+    fn contiguous(&mut self) -> &[u8] {
+        if self.ring && self.head != 0 {
+            self.buf.rotate_left(self.head);
+            self.head = 0;
+        }
+        &self.buf
+    }
+}
+
 /// Bounded **head** of an Anthropic SSE response, kept alongside the tail.
 ///
 /// A tail alone is enough for every other shape — OpenAI puts its usage chunk at the end, and a
@@ -144,7 +211,7 @@ pub struct RequestCtx {
     /// Content-Type (we don't read the request to learn this).
     streaming: bool,
     /// Bounded tail of the response, for the usage tap.
-    resp_tail: Vec<u8>,
+    resp_tail: UsageTail,
     /// Bounded head of the response — populated only for an **Anthropic SSE** response, whose input
     /// and cache token counts arrive on the very first event and would otherwise be compacted out of
     /// `resp_tail`. See [`USAGE_HEAD_CAP`]. Empty for every other dialect and for non-streaming
@@ -710,7 +777,7 @@ impl ProxyHttp for AiProxy {
             // full 64KB cap up front would waste an allocation on every request to hold ~200B. A
             // long stream grows it geometrically to the bounded 2×cap and compacts; that handful of
             // reallocs is lost in the network noise of a stream we're already relaying chunk by chunk.
-            resp_tail: Vec::new(),
+            resp_tail: UsageTail::default(),
             // Grown lazily, and only on the one path that needs it (Anthropic SSE) — see
             // `response_body_filter`. Every other response leaves this empty and never allocates.
             resp_head: Vec::new(),
@@ -1053,12 +1120,7 @@ impl ProxyHttp for AiProxy {
                     .extend_from_slice(&chunk[..want.min(chunk.len())]);
             }
 
-            rc.resp_tail.extend_from_slice(chunk);
-            if rc.resp_tail.len() > 2 * USAGE_TAIL_CAP {
-                let keep_from = rc.resp_tail.len() - USAGE_TAIL_CAP;
-                rc.resp_tail.copy_within(keep_from.., 0);
-                rc.resp_tail.truncate(USAGE_TAIL_CAP);
-            }
+            rc.resp_tail.push(chunk);
         }
         Ok(None)
     }
@@ -1137,10 +1199,9 @@ impl ProxyHttp for AiProxy {
             }
         }
 
-        // The buffer may transiently hold up to 2× the cap before compaction; the usage event is
-        // always in the last cap bytes, so slice to that bounded tail before parsing.
-        let tail_start = rc.resp_tail.len().saturating_sub(USAGE_TAIL_CAP);
-        let tail = &rc.resp_tail[tail_start..];
+        // The last `USAGE_TAIL_CAP` bytes of the response, oldest first (see `UsageTail`). Short
+        // responses are the whole body; long ones are rotated into order here, once.
+        let tail = rc.resp_tail.contiguous();
 
         // Extract usage facts (shape depends on dialect + streaming). Every case reads the tail;
         // Anthropic streaming *additionally* reads the head, because that's where `message_start`
@@ -1418,6 +1479,56 @@ mod tests {
         assert!(!is_streamable_path("/v1/embeddings"));
         assert!(!is_streamable_path("/v1/messages"));
         assert!(!is_streamable_path("/v1/models"));
+    }
+
+    #[test]
+    fn usage_tail_retains_exactly_the_last_cap_bytes() {
+        // The ring must retain byte-for-byte what the old grow-and-compact buffer did: the whole
+        // body while it fits, the last `USAGE_TAIL_CAP` bytes once it doesn't. Getting this wrong
+        // silently truncates or misorders the usage event, which is unrecoverable once the request
+        // completes — so drive it across chunk sizes that do and don't divide the cap, and across
+        // the boundary itself.
+        let body: Vec<u8> = (0..(3 * USAGE_TAIL_CAP + 1234))
+            .map(|i| (i % 251) as u8)
+            .collect();
+
+        for chunk in [1usize, 7, 4096, 8192, USAGE_TAIL_CAP - 1, USAGE_TAIL_CAP] {
+            for total in [
+                0usize,
+                1,
+                USAGE_TAIL_CAP - 1,
+                USAGE_TAIL_CAP,
+                USAGE_TAIL_CAP + 1,
+                2 * USAGE_TAIL_CAP + 77,
+                body.len(),
+            ] {
+                let src = &body[..total];
+                let mut tail = UsageTail::default();
+                for c in src.chunks(chunk.max(1)) {
+                    tail.push(c);
+                }
+                let want = &src[src.len().saturating_sub(USAGE_TAIL_CAP)..];
+                assert_eq!(
+                    tail.contiguous(),
+                    want,
+                    "chunk={chunk} total={total}: retained window differs"
+                );
+                // Idempotent — `contiguous` must not consume or re-rotate.
+                assert_eq!(tail.contiguous(), want);
+            }
+        }
+
+        // A single chunk larger than the whole window keeps only its last cap bytes.
+        let mut tail = UsageTail::default();
+        tail.push(&body);
+        assert_eq!(tail.contiguous(), &body[body.len() - USAGE_TAIL_CAP..]);
+
+        // Memory stays bounded no matter how long the stream runs.
+        let mut tail = UsageTail::default();
+        for _ in 0..64 {
+            tail.push(&body[..USAGE_TAIL_CAP]);
+        }
+        assert_eq!(tail.contiguous().len(), USAGE_TAIL_CAP);
     }
 
     #[test]

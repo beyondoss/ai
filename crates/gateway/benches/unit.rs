@@ -248,6 +248,74 @@ mod route {
     }
 }
 
+mod resp_tail {
+    use super::*;
+
+    const CAP: usize = 64 * 1024;
+
+    /// What the response tap did: grow to `2 × CAP`, then `copy_within` the last `CAP` bytes back to
+    /// the front and truncate. Bounded, but it re-copies `CAP` bytes every `CAP` bytes of stream, so
+    /// a long response gets memmoved about twice over — plus the geometric realloc chain from
+    /// starting at zero capacity.
+    #[divan::bench(args = [64 * 1024, 512 * 1024, 4 * 1024 * 1024])]
+    fn grow_and_compact(bencher: Bencher, total: usize) {
+        let chunk = vec![b'x'; 8 * 1024];
+        let chunks = total / chunk.len();
+        bencher.counter(BytesCount::new(total)).bench(|| {
+            let mut tail: Vec<u8> = Vec::new();
+            for _ in 0..chunks {
+                tail.extend_from_slice(black_box(&chunk));
+                if tail.len() > 2 * CAP {
+                    let keep = tail.len() - CAP;
+                    tail.copy_within(keep.., 0);
+                    tail.truncate(CAP);
+                }
+            }
+            tail
+        });
+    }
+
+    /// The ring: grows normally until it outgrows `CAP`, then writes with wraparound. Every byte is
+    /// copied exactly once, there is no compaction memmove, and after the one switchover there is no
+    /// further allocation. `proxy::UsageTail` is the real implementation; this mirrors it so the two
+    /// rows are comparable (the type is private, and its behaviour is pinned by
+    /// `usage_tail_retains_exactly_the_last_cap_bytes`).
+    #[divan::bench(args = [64 * 1024, 512 * 1024, 4 * 1024 * 1024])]
+    fn ring(bencher: Bencher, total: usize) {
+        let chunk = vec![b'x'; 8 * 1024];
+        let chunks = total / chunk.len();
+        bencher.counter(BytesCount::new(total)).bench(|| {
+            let mut buf: Vec<u8> = Vec::new();
+            let (mut head, mut is_ring) = (0usize, false);
+            for _ in 0..chunks {
+                let data = black_box(&chunk);
+                if !is_ring {
+                    buf.extend_from_slice(data);
+                    if buf.len() > CAP {
+                        let start = buf.len() - CAP;
+                        buf.copy_within(start.., 0);
+                        buf.truncate(CAP);
+                        head = 0;
+                        is_ring = true;
+                    }
+                    continue;
+                }
+                let first = (CAP - head).min(data.len());
+                buf[head..head + first].copy_from_slice(&data[..first]);
+                let rest = data.len() - first;
+                if rest > 0 {
+                    buf[..rest].copy_from_slice(&data[first..]);
+                }
+                head = (head + data.len()) % CAP;
+            }
+            if is_ring {
+                buf.rotate_left(head);
+            }
+            buf
+        });
+    }
+}
+
 mod state {
     use super::*;
     use beyond_ai::config::AiConfig;
