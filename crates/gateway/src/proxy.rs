@@ -242,6 +242,45 @@ pub struct RequestCtx {
     request_id: RequestId,
 }
 
+impl RequestCtx {
+    /// Clear the state the request-body phase accumulates, so a **retried** attempt starts from the
+    /// same slate as the first one.
+    ///
+    /// Pingora replays its buffered request body through `request_body_filter` on a retry
+    /// (`proxy_h1.rs`'s `send_body_to_pipe`, and the h2 twin), so without this the replayed prefix is
+    /// *appended* to whatever the previous attempt already accumulated:
+    ///
+    /// - `req_buf` would hold the prefix twice, and `peek::scan_buffered` would then plan the splice
+    ///   against the **first** copy — handing the upstream a body with a duplicated fragment, which
+    ///   it rejects with a `400` that reads like a client error. `logging` even records that `400` as
+    ///   a breaker *success* (the provider answered), so nothing surfaces it as our fault.
+    /// - `model_scanner`'s brace depth would be permanently offset by the extra `{`, so
+    ///   `at_key_level` never matches again and the billing row ships `requested_model = ""`.
+    /// - `body_bytes_fed` would double-count the prefix against `MAX_REQUEST_BODY`.
+    ///
+    /// Called from `upstream_peer`, which pingora invokes exactly once per attempt and always before
+    /// any body byte moves — it is the first statement of `proxy_to_upstream`.
+    ///
+    /// `model` is deliberately **not** cleared: once a complete body has yielded it the value is
+    /// correct, and pingora's replay buffer is capped at 64 KiB, so a larger body could not
+    /// re-derive it on the next attempt.
+    fn reset_request_body_phase(&mut self) {
+        // The first attempt has nothing to undo, and that is the only attempt the vast majority of
+        // requests ever make — so pay one compare rather than three stores on the hot path. A zero
+        // `body_bytes_fed` is an exact witness for "no chunk was ever fed": it is incremented for
+        // every chunk that reaches `request_body_filter`, on the same branch that appends to
+        // `req_buf` and feeds `model_scanner`, so neither can hold state while it reads zero.
+        if self.body_bytes_fed == 0 {
+            return;
+        }
+        // `clear` keeps the capacity, which was pre-sized from `Content-Length` in `request_filter`
+        // and which the in-place splice relies on to stay realloc-free.
+        self.req_buf.clear();
+        self.body_bytes_fed = 0;
+        self.model_scanner = peek::ModelScanner::new();
+    }
+}
+
 /// Every `(error_type, message)` pair the gateway rejects with, paired with its wire body.
 ///
 /// The set is closed: `reject` is only ever called with literals, so the response body is one of
@@ -457,6 +496,20 @@ fn apply_provider_attribution(
         upstream_request.insert_header("X-OpenRouter-Categories", OPENROUTER_CATEGORY)?;
     }
     Ok(())
+}
+
+/// Whether an error that ended the request should count against the **provider's** circuit breaker.
+///
+/// `ErrorSource::Downstream` is the *client's* side failing — an aborted request, a broken pipe
+/// while we write the response back. Pingora tags those explicitly (`into_down()`), and they carry
+/// no information about the upstream's health, so they must not trip a breaker that exists to detect
+/// a sick provider.
+///
+/// Everything else counts: an upstream error (pingora calls `as_up()` before `fail_to_connect`), our
+/// own DNS failure returned from `upstream_peer` (which leaves the source `Unset`), or an internal
+/// fault. Each is a real failure to complete this request against this provider.
+fn is_upstream_failure(e: Option<&pingora_core::Error>) -> bool {
+    e.is_some_and(|e| !matches!(e.esource(), pingora_core::ErrorSource::Downstream))
 }
 
 fn dialect_for_path(path: &str) -> Dialect {
@@ -802,11 +855,15 @@ impl ProxyHttp for AiProxy {
         // `ctx` is set by `request_filter` for every admitted request; a missing ctx here means an
         // unadmitted request reached `upstream_peer` (a Pingora ordering change or future refactor).
         // Surface it as an error rather than panicking the worker.
-        let Some(rc) = ctx.as_ref() else {
+        let Some(rc) = ctx.as_mut() else {
             return Err(pingora_core::Error::new_str(
                 "upstream_peer reached without request context",
             ));
         };
+
+        // Pingora calls this once per attempt, always before a body byte moves, so it is the one
+        // place a retry's leftover request-body state can be cleared. No-op on the first attempt.
+        rc.reset_request_body_phase();
 
         // Resolve via the TTL cache (async, non-blocking) rather than `HttpPeer::new`'s eager
         // blocking `getaddrinfo`. SNI/Host = the configured host; TLS on for real providers (the
@@ -1192,9 +1249,19 @@ impl ProxyHttp for AiProxy {
             match rc.upstream_status {
                 Some(s) if s >= 500 => breaker.record_failure(),
                 Some(_) => breaker.record_success(),
-                None if e.is_some() => breaker.record_failure(),
-                // No response and no error ⇒ client went away before the upstream answered; don't
-                // blame the provider — record success so the probe permit resolves.
+                // No response head arrived. Blame the provider only when the failure actually came
+                // *from* upstream. Pingora tags a client-side abort `ErrorSource::Downstream` (the
+                // `into_down()` at proxy_h1.rs's downstream read/write sites), and a user hitting
+                // ESC on a slow turn says nothing about the provider's health. Counting those was a
+                // live bug: cancellation is routine for a coding agent, and
+                // `circuit_breaker_threshold` cancellations inside `circuit_breaker_window_secs`
+                // would open the breaker and 503 *everyone*. Worse, `half_open_permits` is 1, so a
+                // cancel-prone request drawn as the probe reopened it every time — the breaker could
+                // not recover while users were cancelling.
+                None if is_upstream_failure(e) => breaker.record_failure(),
+                // Client went away, or the request ended with no error at all. The provider is not
+                // implicated either way; record a success so a claimed half-open probe permit still
+                // resolves rather than being stranded.
                 None => breaker.record_success(),
             }
         }
@@ -1302,6 +1369,73 @@ impl ProxyHttp for AiProxy {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A client-side abort must not count against the provider's breaker; everything else must.
+    ///
+    /// This is the whole of the cancellation bug: `ErrorSource::Downstream` is a user hitting ESC or
+    /// a broken pipe writing the response back, and counting those opened breakers on healthy
+    /// providers. `Unset` is our own DNS failure out of `upstream_peer` and `Upstream` is a real
+    /// connect/read failure — both are genuine provider failures and must still count.
+    #[test]
+    fn only_non_downstream_errors_count_against_the_breaker() {
+        use pingora_core::{Error, ErrorSource, ErrorType};
+
+        assert!(!is_upstream_failure(None), "no error is not a failure");
+
+        let mut down = *Error::new(ErrorType::WriteError);
+        down.esource = ErrorSource::Downstream;
+        assert!(
+            !is_upstream_failure(Some(&down)),
+            "a client abort must not trip the provider's breaker",
+        );
+
+        for source in [
+            ErrorSource::Upstream,
+            ErrorSource::Internal,
+            ErrorSource::Unset,
+        ] {
+            let mut e = *Error::new(ErrorType::ConnectError);
+            e.esource = source.clone();
+            assert!(
+                is_upstream_failure(Some(&e)),
+                "{source:?} must count as a provider failure",
+            );
+        }
+    }
+
+    /// The premise behind `RequestCtx::reset_request_body_phase`: a scanner fed a duplicated body
+    /// prefix is permanently broken, because the extra `{` offsets its brace depth so the root-level
+    /// key check never matches again.
+    ///
+    /// Pingora replays its retry buffer through `request_body_filter`, so without the reset this is
+    /// exactly what the second attempt's scanner sees — and the billing row ships
+    /// `requested_model = ""`. The e2e coverage for the real replay path lives in `tests/e2e.rs`.
+    #[test]
+    fn a_replayed_body_prefix_breaks_a_scanner_that_was_not_reset() {
+        // `model` deliberately sits after `messages`, so the scanner is still mid-walk when the
+        // replayed prefix arrives — the case a short-circuit on an early `model` would hide.
+        let body = br#"{"messages":[{"role":"user","content":"hi"}],"model":"gpt-4o"}"#;
+        let (prefix, rest) = body.split_at(30);
+
+        let mut fresh = peek::ModelScanner::new();
+        fresh.feed(body);
+        assert_eq!(
+            fresh.take_model().as_deref(),
+            Some("gpt-4o"),
+            "a clean walk finds the root-level model",
+        );
+
+        let mut replayed = peek::ModelScanner::new();
+        replayed.feed(prefix);
+        replayed.feed(prefix); // pingora replays from byte 0 on the retry
+        replayed.feed(rest);
+        assert_eq!(
+            replayed.take_model(),
+            None,
+            "the duplicated prefix offsets the depth, so the root `model` is never seen — \
+             this is why upstream_peer resets the scanner every attempt",
+        );
+    }
 
     /// Build a `RequestHeader` for a given path (+ optional query) with the given headers set —
     /// mirrors the shape `session.req_header()` hands `extract_virtual_key` on the real path.
