@@ -249,32 +249,44 @@ pub struct RequestCtx {
     /// On the `/{provider}/…` path this is simply `breaker.is_some()`, set once in `request_filter`
     /// — exactly the condition `logging` used to test inline — so that path's behaviour is unchanged.
     breaker_pending: bool,
-    /// The catalog row this request routes over — `Some` only for `/auto`. `None` keeps every
-    /// provider-routed request on exactly the code it ran before model routing existed.
-    ///
-    /// `&'static`, so carrying it costs a pointer and no allocation.
-    route: Option<&'static route::ModelRoute>,
-    /// Index into `route.candidates` of the candidate currently being attempted.
-    candidate: u8,
-    /// Bit `i` ⇒ `route.candidates[i]` is *usable*: this gateway routes to that provider and has a
-    /// pool key for it. Computed once in `request_filter` so `upstream_peer` never re-derives it.
-    /// Bounded by `route::MAX_CANDIDATES`, which is why a `u8` suffices.
-    usable: u8,
-    /// The client's path (+ query) with the `/auto` segment removed. The forwarded path is this
-    /// appended to the chosen candidate's mount, rebuilt into `forward_path` on every attempt.
-    auto_suffix: Option<String>,
-    /// The canonical catalog name this request routed on — the `ai.usage` row's `routed_model`.
-    /// `&'static` (it is the catalog row's own string), and charset-validated by a catalog test, so
-    /// it needs neither an allocation nor `sanitize_model`.
-    routed_model: Option<&'static str>,
-    /// When the current attempt began. Separate from `start` (which times the whole request) so a
-    /// candidate that burned `connect_timeout_secs` before failing over does not charge that time
-    /// to the provider that actually served — which would render an outage at candidate A as a
-    /// latency regression at candidate B, inverting the point of the per-provider label.
-    attempt_start: Instant,
+    /// Model-routing state — `Some` only for `/auto`. `None` keeps every provider-routed request on
+    /// exactly the code it ran before model routing existed. See [`ModelRouting`] for why it is
+    /// boxed rather than inline.
+    auto: Option<Box<ModelRouting>>,
     /// Process-unique id for this request (`{instance}-{seq}`), echoed in the `x-beyond-request-id`
     /// response header and the `ai.usage` event so a client report ties back to a log line.
     request_id: RequestId,
+}
+
+/// State that exists only for a **model-routed** (`/auto`) request.
+///
+/// Boxed, and `None` for provider-routed traffic — which is the overwhelming majority. Held inline
+/// these fields added 64 bytes to `RequestCtx` (368 → 432), a struct that is touched on every hook
+/// and, for a streaming response, once per response chunk. That showed up as a reproducible ~2.5%
+/// regression on the `managed_sse_latency` bench, across two independent runs against the same
+/// baseline, while the non-streaming case was unaffected — the signature of a per-chunk cost, not a
+/// per-request one.
+///
+/// So the model-routed path pays one small allocation and every other request pays nothing. That is
+/// the right way round: `/auto` is opt-in, and the request it serves is about to cross a network.
+struct ModelRouting {
+    /// The catalog row this request routes over. `&'static`, so it costs a pointer.
+    route: &'static route::ModelRoute,
+    /// Index into `route.candidates` of the candidate currently being attempted.
+    candidate: u8,
+    /// Bit `i` ⇒ `route.candidates[i]` is *usable*: this gateway routes to that provider and holds a
+    /// pool key for it. Computed once in `request_filter` so `upstream_peer` never re-derives it.
+    /// Bounded by [`route::MAX_CANDIDATES`], which is why a `u8` suffices.
+    usable: u8,
+    /// The client's path (+ query) with the `/auto` segment removed. The forwarded path is this
+    /// appended to the chosen candidate's mount, rebuilt into `forward_path` on every attempt.
+    suffix: String,
+    /// When the current attempt began. Distinct from `RequestCtx::start` (which times the whole
+    /// request) so a candidate that burned `connect_timeout_secs` before failing over does not
+    /// charge that time to the provider that actually served — which would render an outage at
+    /// candidate A as a latency regression at candidate B, inverting the point of the per-provider
+    /// label.
+    attempt_start: Instant,
 }
 
 impl RequestCtx {
@@ -299,6 +311,20 @@ impl RequestCtx {
     /// `model` is deliberately **not** cleared: once a complete body has yielded it the value is
     /// correct, and pingora's replay buffer is capped at 64 KiB, so a larger body could not
     /// re-derive it on the next attempt.
+    /// When the current upstream attempt began: the per-attempt stamp for a model-routed request,
+    /// and simply the request start for everything else — where the two are always equal anyway,
+    /// so the common path stores no second `Instant`.
+    fn attempt_start(&self) -> Instant {
+        self.auto.as_ref().map_or(self.start, |a| a.attempt_start)
+    }
+
+    /// Move the candidate cursor past index `i`. No-op for a provider-routed request.
+    fn advance_candidate(&mut self, i: u8) {
+        if let Some(a) = self.auto.as_mut() {
+            a.candidate = i.saturating_add(1);
+        }
+    }
+
     /// Whether this request's body is buffered and may leave with a different length than it
     /// arrived — which is one question, not two, because the answer drives *both* the buffering in
     /// `request_body_filter` and the `Content-Length`/`transfer-encoding` re-framing in
@@ -311,7 +337,7 @@ impl RequestCtx {
     ///
     /// Both can apply to the same request, in which case both edits are made to the one buffer.
     fn rewrites_body(&self) -> bool {
-        self.inject_eligible || self.route.is_some()
+        self.inject_eligible || self.auto.is_some()
     }
 
     /// Rebuild the forwarded path for the candidate about to be attempted: its mount prefix plus the
@@ -321,11 +347,11 @@ impl RequestCtx {
     /// after the first attempt. A no-op for a provider-routed request, which has no `auto_suffix`
     /// and whose `forward_path` was settled once in `request_filter`.
     fn rebuild_forward_path(&mut self, base_path: &str) {
-        let Some(suffix) = self.auto_suffix.as_deref() else {
+        let Some(auto) = self.auto.as_ref() else {
             return;
         };
         let buf = self.forward_path.get_or_insert_with(String::new);
-        write_mounted_path(buf, base_path, suffix);
+        write_mounted_path(buf, base_path, &auto.suffix);
     }
 
     fn reset_request_body_phase(&mut self) {
@@ -1210,17 +1236,19 @@ impl ProxyHttp for AiProxy {
             start,
             attempt: 0,
             breaker_pending,
-            route: model_route,
-            // `first_usable` picked this candidate above; `upstream_peer` re-derives from here on.
-            candidate: model_route
-                .and_then(|_| first_usable(usable, 0))
-                .unwrap_or(0),
-            usable,
-            auto_suffix,
-            routed_model: model_route.map(|r| r.model),
-            // Overwritten per attempt by `upstream_peer`; seeded so the first attempt is timed even
-            // if it fails before the prologue runs.
-            attempt_start: start,
+            auto: model_route.map(|route| {
+                Box::new(ModelRouting {
+                    route,
+                    // `first_usable` picked this candidate above; `upstream_peer` re-derives it from
+                    // here on.
+                    candidate: first_usable(usable, 0).unwrap_or(0),
+                    usable,
+                    suffix: auto_suffix.unwrap_or_default(),
+                    // Overwritten per attempt by `upstream_peer`; seeded so the first attempt is
+                    // timed even if it fails before the prologue runs.
+                    attempt_start: start,
+                })
+            }),
             request_id,
         });
         // Admitted: count it in-flight. Balanced by the decrement in `logging`, which runs exactly
@@ -1255,7 +1283,7 @@ impl ProxyHttp for AiProxy {
         // the ones pingora starts without consulting `fail_to_connect` (its default
         // `error_while_proxy` marks a reused-connection failure retryable on its own). A design that
         // recorded in `fail_to_connect` would miss exactly those.
-        if let Some(row) = rc.route {
+        if let Some(row) = rc.auto.as_ref().map(|a| a.route) {
             // Reaching here with a permit outstanding means the previous attempt failed before any
             // response arrived, so the candidate we were on earned the failure. Resolve it before
             // touching anything else; `logging` then only ever sees the final candidate's permit.
@@ -1267,21 +1295,30 @@ impl ProxyHttp for AiProxy {
             }
 
             loop {
-                let Some(i) = first_usable(rc.usable, rc.candidate) else {
+                // Read the cursor out of the boxed state; `rc` stays mutably borrowable below.
+                let (usable, at) = match rc.auto.as_ref() {
+                    Some(a) => (a.usable, a.candidate),
+                    None => {
+                        return Err(pingora_core::Error::new_str("model routing state missing"));
+                    }
+                };
+                let Some(i) = first_usable(usable, at) else {
                     // Out of candidates. `Error::new` defaults `retry` to false, so the proxy loop
                     // stops here rather than spinning; `logging` finds nothing pending to record.
                     return Err(pingora_core::Error::new_str(
                         "no candidate provider available",
                     ));
                 };
-                rc.candidate = i;
+                if let Some(a) = rc.auto.as_mut() {
+                    a.candidate = i;
+                }
 
                 let candidate = row.candidates.get(usize::from(i));
                 let resolved =
                     candidate.and_then(|c| self.state.provider_by_id(c.provider).cloned());
                 let Some(p) = resolved else {
                     // Unreachable: `usable` bits are only set for candidates that resolved.
-                    rc.candidate = i.saturating_add(1);
+                    rc.advance_candidate(i);
                     continue;
                 };
 
@@ -1295,7 +1332,7 @@ impl ProxyHttp for AiProxy {
                 if let Some(b) = &p.breaker {
                     if b.allow().is_err() {
                         self.state.metrics.rejection(Rejection::CircuitOpen).inc();
-                        rc.candidate = i.saturating_add(1);
+                        rc.advance_candidate(i);
                         continue;
                     }
                 }
@@ -1307,7 +1344,9 @@ impl ProxyHttp for AiProxy {
                     Ok(addr) => {
                         // Time this attempt from here, so a candidate that burned its connect
                         // timeout does not charge that to whichever provider ends up serving.
-                        rc.attempt_start = Instant::now();
+                        if let Some(a) = rc.auto.as_mut() {
+                            a.attempt_start = Instant::now();
+                        }
                         rc.rebuild_forward_path(p.base_path);
                         return Ok(Box::new(self.build_peer(addr, &p)));
                     }
@@ -1329,7 +1368,7 @@ impl ProxyHttp for AiProxy {
                             b.record_failure();
                         }
                         rc.breaker_pending = false;
-                        rc.candidate = i.saturating_add(1);
+                        rc.advance_candidate(i);
                         continue;
                     }
                 }
@@ -1410,7 +1449,7 @@ impl ProxyHttp for AiProxy {
 
         // The routing header is ours, not the provider's. Stripped on every attempt (pingora rebuilds
         // this header from the downstream request each time, so it reappears each time).
-        if rc.route.is_some() {
+        if rc.auto.is_some() {
             upstream_request.remove_header(route::MODEL_HEADER);
         }
 
@@ -1528,9 +1567,9 @@ impl ProxyHttp for AiProxy {
                 // Done before the `stream_options` splice, and safe in that order because
                 // `inject_at` points just past the root `{` and so always precedes the model value:
                 // rewriting the value cannot move it.
-                let buf = match (rc.route, scan.model_span) {
-                    (Some(row), Some(span)) => {
-                        match row.candidates.get(usize::from(rc.candidate)) {
+                let buf = match (rc.auto.as_ref(), scan.model_span) {
+                    (Some(a), Some(span)) => {
+                        match a.route.candidates.get(usize::from(a.candidate)) {
                             Some(c) => apply_model_rewrite(buf, span, c.upstream_model.as_bytes()),
                             None => buf,
                         }
@@ -1583,7 +1622,7 @@ impl ProxyHttp for AiProxy {
             rc.provider
                 .metrics
                 .ttft_seconds
-                .observe(rc.attempt_start.elapsed().as_secs_f64());
+                .observe(rc.attempt_start().elapsed().as_secs_f64());
 
             // Per-provider response counter, bucketed by status class — the signal that a provider
             // is degrading (429/5xx) before it shows up only as latency or a missing usage event.
@@ -1684,7 +1723,7 @@ impl ProxyHttp for AiProxy {
             // `MAX_CONNECT_RETRIES` attempts per candidate would multiply the client's worst case by
             // three for no additional coverage. And it keeps the ledger trivial — exactly one
             // `allow()`, one attempt, and one `record_*` per candidate.
-            if rc.route.is_some() {
+            if let Some((usable, at)) = rc.auto.as_ref().map(|a| (a.usable, a.candidate)) {
                 // The failure itself is recorded by `upstream_peer`'s prologue, when it moves off
                 // this candidate. Recording here as well would double-count whenever there is no
                 // next candidate, since `logging` would then also resolve the still-pending permit —
@@ -1694,16 +1733,16 @@ impl ProxyHttp for AiProxy {
                 warn!(
                     request_id = %rc.request_id,
                     provider = rc.provider.name.as_str(),
-                    candidate = rc.candidate,
+                    candidate = at,
                     error = %e,
                     "upstream connect failed; trying the next candidate",
                 );
                 // Only signal a retry if there is somewhere to go. Otherwise leave `retry` false so
                 // the proxy loop stops and `logging` resolves the outstanding permit against this,
                 // the last candidate.
-                if first_usable(rc.usable, rc.candidate.saturating_add(1)).is_some() {
+                if first_usable(usable, at.saturating_add(1)).is_some() {
                     self.state.metrics.candidate_failovers_total.inc();
-                    rc.candidate = rc.candidate.saturating_add(1);
+                    rc.advance_candidate(at);
                     e.set_retry(true);
                 }
                 return e;
@@ -1870,9 +1909,11 @@ impl ProxyHttp for AiProxy {
             // Third link in the fallback chain for a model-routed request: if neither the response
             // nor the body carried an id, the catalog name we routed on is still a true statement
             // about what was asked for, and strictly better than the empty string this used to ship.
+            // Derived rather than stored: it is the catalog row's own name.
+            let routed_model = rc.auto.as_ref().map(|a| a.route.model);
             let resolved = billed.as_deref().unwrap_or(&rc.model);
             let billed_model = if resolved.is_empty() {
-                rc.routed_model.unwrap_or_default()
+                routed_model.unwrap_or_default()
             } else {
                 resolved
             };
@@ -1890,7 +1931,7 @@ impl ProxyHttp for AiProxy {
                 // decision is made from the header before the body is ever read, and a divergence is
                 // only visible here, after the fact. `&'static` from the catalog and charset-checked
                 // by a catalog test, so it needs no `sanitize_model`.
-                routed_model = rc.routed_model,
+                routed_model,
                 stream = rc.streaming,
                 input_tokens = usage.input_tokens,
                 output_tokens = usage.output_tokens,
@@ -1910,6 +1951,26 @@ impl ProxyHttp for AiProxy {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `RequestCtx` is touched on every hook and, for a streaming response, once per response
+    /// chunk, so its size is a real cost rather than bookkeeping. Growing it by 64 bytes to hold the
+    /// model-routing fields inline produced a reproducible ~2.5% regression on the
+    /// `managed_sse_latency` bench — non-streaming was unaffected, which is the signature of a
+    /// per-chunk cost. Boxing that state (see `ModelRouting`) bought it back.
+    ///
+    /// A ceiling rather than an equality: padding and field order are the compiler's business, and a
+    /// few bytes either way is not what this guards. What it guards is someone adding a `String` or
+    /// an `Instant` here without noticing that the cost is paid per chunk on every stream.
+    #[test]
+    fn request_ctx_stays_small_enough_to_be_cheap_per_chunk() {
+        let size = std::mem::size_of::<RequestCtx>();
+        assert!(
+            size <= 384,
+            "RequestCtx grew to {size} bytes (ceiling 384). It is touched once per response chunk \
+             on a stream — if the new state is only needed on one route, box it the way \
+             `ModelRouting` is rather than paying for it on every request.",
+        );
+    }
 
     /// The candidate cursor. `from` strictly increases across a request, which is what guarantees
     /// the walk terminates and that no candidate can be revisited to claim a second breaker permit.
