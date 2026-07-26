@@ -69,7 +69,15 @@ async fn start_stack_with(mode: Mode) -> Stack {
     let nats = Nats::start().await;
     let (pubkey, sk) = test_keypair(1);
     let mock = MockUpstream::start(mode).await;
-    let gw = Gateway::start(nats.port, &mock.authority(), &b64(&pubkey)).await;
+    // Rate limits OFF, both tiers. criterion drives one credential at thousands of requests per
+    // second — far past the 100 rps default — and a throttled request 429s in `request_filter`
+    // *before* the upstream, so with the ceiling in place these benches were timing the reject path
+    // and reporting it as proxy latency. `bench_concurrency` already did this; `bench_e2e` did not.
+    let gw = Gateway::builder(nats.port, &mock.authority(), &b64(&pubkey))
+        .rate_limit_rps(0)
+        .byo_rate_limit_rps(0)
+        .start()
+        .await;
     let vkey = mint(
         &VirtualKey {
             tenant_id: 42,
@@ -124,8 +132,84 @@ async fn managed_roundtrip(s: &Stack) {
         .send()
         .await
         .expect("request");
-    debug_assert_eq!(resp.status().as_u16(), 200);
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "bench measured a non-200; it is timing the wrong path"
+    );
     let _ = resp.bytes().await.expect("body");
+}
+
+/// A stack configured for the **Anthropic** dialect: the `anthropic` provider, reached at
+/// `/v1/messages` with the key in `x-api-key`. Needed because the default stack configures
+/// openai/fireworks and drives `/v1/chat/completions`, which would parse an Anthropic stream with
+/// the OpenAI parser and never touch the Anthropic-specific response path at all.
+async fn start_anthropic_stack(mode: Mode) -> Stack {
+    let nats = Nats::start().await;
+    let (pubkey, sk) = test_keypair(1);
+    let mock = MockUpstream::start(mode).await;
+    let gw = Gateway::builder(nats.port, &mock.authority(), &b64(&pubkey))
+        .providers(&["anthropic"])
+        .rate_limit_rps(0)
+        .byo_rate_limit_rps(0)
+        .start()
+        .await;
+    let vkey = mint(
+        &VirtualKey {
+            tenant_id: 42,
+            vpc_id: 7,
+        },
+        1,
+        &sk,
+    );
+    let client = reqwest::Client::new();
+    let url = gw.url();
+    {
+        let (c, u, k) = (client.clone(), url.clone(), vkey.clone());
+        wait_for_status(200, move || {
+            let (c, u, k) = (c.clone(), u.clone(), k.clone());
+            async move {
+                c.post(format!("{u}/v1/messages"))
+                    .header("x-api-key", &k)
+                    .header("content-type", "application/json")
+                    .body(r#"{"model":"claude-opus-4-8","messages":[]}"#)
+                    .send()
+                    .await
+                    .map(|r| r.status().as_u16())
+                    .unwrap_or(0)
+            }
+        })
+        .await;
+    }
+    Stack {
+        gw,
+        mock,
+        nats,
+        client,
+        vkey,
+        url,
+    }
+}
+
+/// One managed Anthropic round-trip: `/v1/messages`, key in `x-api-key`, Anthropic-dialect usage
+/// parsing over a head **and** tail window.
+async fn anthropic_roundtrip(s: &Stack) {
+    let resp = s
+        .client
+        .post(format!("{}/v1/messages", s.url))
+        .header("x-api-key", &s.vkey)
+        .header("content-type", "application/json")
+        .body(r#"{"model":"claude-opus-4-8","messages":[]}"#)
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(resp.status().as_u16(), 200);
+    let body = resp.bytes().await.expect("body");
+    assert!(
+        body.len() > 128 * 1024,
+        "expected the large stream, got {} B",
+        body.len()
+    );
 }
 
 /// One round-trip with an arbitrary key and body, so a bench can vary either. `key` decides the
@@ -140,7 +224,11 @@ async fn roundtrip_with(s: &Stack, key: &str, body: &str) {
         .send()
         .await
         .expect("request");
-    debug_assert_eq!(resp.status().as_u16(), 200);
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "bench measured a non-200; it is timing the wrong path"
+    );
     let _ = resp.bytes().await.expect("body");
 }
 
@@ -156,7 +244,11 @@ async fn byo_roundtrip(s: &Stack) {
         .send()
         .await
         .expect("request");
-    debug_assert_eq!(resp.status().as_u16(), 200);
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "bench measured a non-200; it is timing the wrong path"
+    );
     let _ = resp.bytes().await.expect("body");
 }
 
@@ -173,16 +265,30 @@ async fn reject_roundtrip(s: &Stack) {
         .send()
         .await
         .expect("request");
-    debug_assert_eq!(resp.status().as_u16(), 401);
+    assert_eq!(
+        resp.status().as_u16(),
+        401,
+        "reject bench must actually reject"
+    );
     let _ = resp.bytes().await.expect("body");
 }
 
 fn bench_e2e(c: &mut Criterion) {
     let rt = Runtime::new().expect("tokio runtime");
     let stack = rt.block_on(start_stack());
-    // A second stack whose mock streams SSE, so the response-tap (tail buffer + compaction) hot path
-    // is actually exercised — it's a near no-op for the single-shot JSON body.
+    // A second stack whose mock streams SSE. `Mode::Sse` is a *three-line* canned stream, so despite
+    // what this comment used to claim it does not exercise the response tap's bounded window at all
+    // — the tail never fills, nothing is ever evicted, and the usage parser sees two `data:` lines.
+    // It is kept as the cheap "is a stream slower than a body" datapoint; the two `*_large_sse_*`
+    // stacks below are what actually cover the tap.
     let sse_stack = rt.block_on(start_stack_with(Mode::Sse));
+    // >128 KiB OpenAI stream: fills and wraps the response tail, so the usage chunk has to survive
+    // eviction. This fixture existed but was only ever used by one integration test, never benched —
+    // which is why an O(response-size) memmove and a per-line JSON parse in the tail went unnoticed.
+    let large_sse_stack = rt.block_on(start_stack_with(Mode::SseLarge));
+    // ~600 KiB Anthropic stream: the shape that splits its usage facts across the *first* and
+    // *last* events, so it covers the head buffer as well as the tail.
+    let anthropic_sse_stack = rt.block_on(start_anthropic_stack(Mode::AnthropicSseLarge));
 
     let mut group = c.benchmark_group("e2e");
     // Real round-trips are sub-millisecond on loopback but still ~100× a micro-bench; trim the
@@ -204,6 +310,18 @@ fn bench_e2e(c: &mut Criterion) {
     });
     group.bench_function("reject_missing_key_latency", |b| {
         b.to_async(&rt).iter(|| reject_roundtrip(&stack));
+    });
+
+    // Streams large enough to actually drive the response tap: the tail wraps, the model scanner has
+    // to terminate early rather than walk the whole body, and the usage parser has to find its event
+    // in a full window. Read these against `managed_sse_latency` — the gap between a 3-line stream
+    // and these is the response path's size sensitivity, which nothing measured before.
+    group.bench_function("managed_large_sse_latency", |b| {
+        b.to_async(&rt).iter(|| managed_roundtrip(&large_sse_stack));
+    });
+    group.bench_function("managed_large_anthropic_sse_latency", |b| {
+        b.to_async(&rt)
+            .iter(|| anthropic_roundtrip(&anthropic_sse_stack));
     });
 
     // The same two paths at a realistic body size, since `MANAGED_BODY` is 60 bytes and hides every
@@ -258,6 +376,8 @@ fn bench_e2e(c: &mut Criterion) {
     // Keep the stacks alive until every bench has run, then tear them down explicitly.
     drop(stack);
     drop(sse_stack);
+    drop(large_sse_stack);
+    drop(anthropic_sse_stack);
 }
 
 /// Concurrency levels swept by `bench_concurrency`. Spans below and above hyper's default
