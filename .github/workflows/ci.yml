@@ -52,9 +52,26 @@ jobs:
   # *names* a test that hangs, so a deadlock fails the job in a couple of minutes with the culprit
   # identified instead of wedging it until GitHub's 6-hour ceiling. `timeout-minutes` is the backstop.
   test:
-    name: test
+    # Sharded across four runners with nextest's own partitioning. Two reasons, and speed is the
+    # lesser one.
+    #
+    # The real one is blast radius. This job repeatedly died at exactly 30:00 with `timeout-minutes`
+    # unenforced (25 ran to 30; a 20-minute step timeout ran to 27), a `cancelled` conclusion rather
+    # than `failure`, and — every time — no log uploaded, because GitHub uploads none for a cancelled
+    # job. One opaque red check, five runs running, with nothing to diagnose it by. Four independent
+    # jobs mean a single bad runner costs one shard while the other three still upload logs, which
+    # narrows any future culprit by elimination instead of leaving it invisible.
+    #
+    # `count:N/4` is a stable hash partition, so a given test always lands on the same shard and a
+    # shard's contents are reproducible locally with the same flag.
+    name: test (${{ matrix.partition }}/4)
     runs-on: ubuntu-latest
     timeout-minutes: 25
+    strategy:
+      # One failing shard must not cancel the others — their logs are the diagnostic.
+      fail-fast: false
+      matrix:
+        partition: [1, 2, 3, 4]
     steps:
       - uses: actions/checkout@v7
       - uses: jdx/mise-action@v4
@@ -68,7 +85,7 @@ jobs:
       # with literally nothing to diagnose it by, three runs running. A step that times out *fails*
       # instead, the job completes normally, and the log survives with nextest's per-test PASS lines
       # in it: whatever never printed is the culprit.
-      - run: cargo nextest run --workspace --profile ci
+      - run: cargo nextest run --workspace --profile ci --partition count:${{ matrix.partition }}/4
         timeout-minutes: 20
   # The release build is the long pole; running it alongside the others (not after them) is most of
   # the wall-clock win.
