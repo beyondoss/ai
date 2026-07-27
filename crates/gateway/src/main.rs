@@ -10,12 +10,13 @@
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 use beyond_ai::admin::AdminApp;
+use beyond_ai::capture_sink::CaptureSink;
 use beyond_ai::config::AiConfig;
 use beyond_ai::doctor;
 use beyond_ai::metrics::Metrics;
 use beyond_ai::proxy::AiProxy;
 use beyond_ai::state::GatewayState;
-use beyond_ai::store_watch::WatcherService;
+use beyond_ai::store_watch::{Capture, Deny, WatcherService};
 use clap::{Parser, Subcommand};
 use pingora_core::apps::HttpServerOptions;
 use pingora_core::apps::http_app::HttpServer;
@@ -27,7 +28,8 @@ use pingora_proxy::ProxyServiceBuilder;
 use std::path::Path;
 use std::process::exit;
 use tracing_subscriber::EnvFilter;
-use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::filter::filter_fn;
+use tracing_subscriber::layer::{Layer, SubscriberExt};
 use tracing_subscriber::util::SubscriberInitExt;
 
 #[derive(Parser)]
@@ -62,12 +64,47 @@ fn load_config(path: Option<&Path>) -> AiConfig {
     }
 }
 
-fn init_tracing() {
+/// The target carrying captured request/response payloads. Split onto its own writer — see below.
+const PAYLOAD_TARGET: &str = "ai.payload";
+
+fn init_tracing(metrics: &Metrics, queue_depth: usize) {
     // JSON to stdout; the `ai.usage` target carries billing facts that logfwd/OTLP ships to
     // ClickHouse. `AI_LOG` overrides the level filter.
     let filter = EnvFilter::try_from_env("AI_LOG").unwrap_or_else(|_| EnvFilter::new("info"));
+
+    // Two layers, split by target, because the two kinds of line want opposite guarantees.
+    //
+    //  * Everything else — including `ai.usage` — keeps the **blocking** stdout writer. Billing rows
+    //    must never be dropped, and at a few hundred bytes each the synchronous write is free.
+    //  * `ai.payload` gets a **bounded, lossy** queue drained by its own thread. A captured payload
+    //    is orders of magnitude larger and exists only to explain incidents, so if the log pipeline
+    //    stalls we drop payloads (counted on `ai_capture_dropped_total`) rather than let a stalled
+    //    stdout pipe backpressure the proxy. See `capture_sink`.
+    //
+    // The two filters are exact complements: every event lands in exactly one layer, so nothing is
+    // duplicated and nothing is silently swallowed.
+    // A gateway that can't spawn a thread at boot won't serve traffic either — fail visibly rather
+    // than run with payload capture silently disabled. Same eprintln+exit shape as the config and
+    // metrics failures above, which is why this isn't a `tracing` error: nothing is initialized yet.
+    let payload_sink = match CaptureSink::spawn(queue_depth, metrics.capture_dropped_total.clone())
+    {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("failed to start the capture-payload log sink: {e}");
+            exit(1);
+        }
+    };
+    let payload_layer = tracing_subscriber::fmt::layer()
+        .json()
+        .with_writer(payload_sink)
+        .with_filter(filter_fn(|meta| meta.target() == PAYLOAD_TARGET));
+    let main_layer = tracing_subscriber::fmt::layer()
+        .json()
+        .with_filter(filter_fn(|meta| meta.target() != PAYLOAD_TARGET));
+
     tracing_subscriber::registry()
-        .with(tracing_subscriber::fmt::layer().json())
+        .with(main_layer)
+        .with(payload_layer)
         .with(filter)
         .init();
 }
@@ -99,7 +136,6 @@ fn main() {
         });
     }
 
-    init_tracing();
     let config = load_config(cli.config.as_deref());
     let listen = config.listen.clone();
     let metrics_listen = config.metrics_listen.clone();
@@ -112,6 +148,7 @@ fn main() {
     // Capture the shutdown knobs before `config` is moved into the gateway state below.
     let grace_period_secs = config.shutdown_grace_period_secs;
     let runtime_timeout_secs = config.shutdown_runtime_timeout_secs;
+    let capture_queue_depth = config.capture_queue_depth;
     let metrics = match Metrics::new() {
         Ok(m) => m,
         Err(e) => {
@@ -119,6 +156,12 @@ fn main() {
             exit(1);
         }
     };
+
+    // After metrics (the payload layer owns a drop counter) and before `GatewayState::new`, which is
+    // the first thing on this path that logs through `tracing` rather than `eprintln!`. Everything
+    // above reports its own failures directly to stderr and exits, so nothing is lost by initializing
+    // here rather than at the top of `main`.
+    init_tracing(&metrics, capture_queue_depth);
     let state = match GatewayState::new(config, metrics) {
         Ok(s) => s,
         Err(e) => {
@@ -167,11 +210,15 @@ fn main() {
     server.add_service(proxy_svc);
 
     // slipstream watchers + NATS connectivity (connects on Pingora's runtime; see WatcherService).
+    // One service per watched set, each with its own connection, cursor, and reconnect loop — so a
+    // capture-set outage backs off on its own schedule and can't disturb deny enforcement.
     server.add_service(background_service(
-        "ai-watchers",
-        WatcherService {
-            state: state.clone(),
-        },
+        "ai-watch-deny",
+        WatcherService::<Deny>::new(state.clone()),
+    ));
+    server.add_service(background_service(
+        "ai-watch-capture",
+        WatcherService::<Capture>::new(state.clone()),
     ));
 
     // Metrics listener now also serves /livez + /readyz for the ECS/k8s probes. Pingora's built-in

@@ -332,6 +332,11 @@ pub struct Captured {
     /// asserted rather than assumed, because a leaked internal header is the kind of thing nobody
     /// notices until a provider starts rejecting it.
     pub beyond_model: Option<String>,
+    /// The `x-beyond-*` control headers, recorded for the same reason as `beyond_model` — they are
+    /// ours, they are meaningless upstream, and a provider that rejects unknown headers would turn
+    /// an observability opt-in into their 400. Both must always be `None` at the upstream.
+    pub beyond_metadata: Option<String>,
+    pub beyond_capture: Option<String>,
     pub body: Vec<u8>,
 }
 
@@ -452,7 +457,7 @@ async fn mock_handle(
         .unwrap_or_else(|| req.uri().path())
         .to_string();
     // Pull the headers we record before consuming the body (which moves `req`).
-    let (authorization, x_api_key, host, beyond_model) = {
+    let (authorization, x_api_key, host, beyond_model, beyond_metadata, beyond_capture) = {
         let h = req.headers();
         let get = |k: &str| h.get(k).and_then(|v| v.to_str().ok()).map(String::from);
         (
@@ -460,6 +465,8 @@ async fn mock_handle(
             get("x-api-key"),
             get("host"),
             get("x-beyond-model"),
+            get("x-beyond-metadata"),
+            get("x-beyond-capture"),
         )
     };
     let body = req
@@ -482,6 +489,8 @@ async fn mock_handle(
         x_api_key,
         host,
         beyond_model,
+        beyond_metadata,
+        beyond_capture,
         body,
     });
     // A slow upstream is still a *working* upstream; the point is to be slower than the client's
@@ -672,6 +681,10 @@ pub struct GatewayBuilder {
     /// Override the per-provider circuit-breaker threshold (failures in the window before opening).
     /// `None` ⇒ leave the gateway default; `Some(0)` disables the breaker.
     circuit_breaker_threshold: Option<u32>,
+    /// Override the per-direction payload capture cap, so truncation is testable with a small body.
+    capture_max_bytes: Option<u32>,
+    /// Override the default capture sampling (1 in N).
+    capture_default_sample_n: Option<u32>,
     /// Per-provider authority overrides, for a topology with more than one upstream — a failover
     /// test needs a live mock and a dead port at the same time, which the single `authority` cannot
     /// express. Falls back to `authority` for any provider not named here.
@@ -773,6 +786,19 @@ impl GatewayBuilder {
         self
     }
 
+    /// Per-direction capture byte cap. Set it small to exercise truncation without having to send a
+    /// 256 KiB body.
+    pub fn capture_max_bytes(mut self, bytes: u32) -> Self {
+        self.capture_max_bytes = Some(bytes);
+        self
+    }
+
+    /// Default capture sampling (1 in N) for control-plane-enabled tenants.
+    pub fn capture_default_sample_n(mut self, n: u32) -> Self {
+        self.capture_default_sample_n = Some(n);
+        self
+    }
+
     pub async fn start(self) -> Gateway {
         let port = free_port();
         let metrics_port = free_port();
@@ -805,6 +831,12 @@ impl GatewayBuilder {
         }
         if let Some(threads) = self.worker_threads {
             cfg.push_str(&format!("worker_threads = {threads}\n"));
+        }
+        if let Some(bytes) = self.capture_max_bytes {
+            cfg.push_str(&format!("capture_max_bytes = {bytes}\n"));
+        }
+        if let Some(n) = self.capture_default_sample_n {
+            cfg.push_str(&format!("capture_default_sample_n = {n}\n"));
         }
         if let Some(threshold) = self.circuit_breaker_threshold {
             // Tight window + reset so the test trips and recovers quickly.
@@ -868,11 +900,17 @@ impl GatewayBuilder {
             .env(
                 "AI_LOG",
                 // `info` so the `ai.usage` billing rows reach the captured log. Still overridable.
-                // `warn` for everything, `info` only for the billing target — the `ai.usage` rows
-                // are the reason this is captured at all. Turning the whole gateway (and pingora
-                // under it) up to `info` for every test produced far more output than any assertion
-                // reads, on a path where each line is then held in memory below.
-                std::env::var("AI_LOG").unwrap_or_else(|_| "warn,ai.usage=info".into()),
+                // `warn` for everything, `info` only for the two targets tests assert on — the
+                // `ai.usage` rows are the reason this is captured at all, and `ai.payload` carries
+                // captured request/response bodies. Turning the whole gateway (and pingora under it)
+                // up to `info` for every test produced far more output than any assertion reads, on
+                // a path where each line is then held in memory below.
+                //
+                // Note `ai.payload` needs naming here even though it has its own `tracing` layer:
+                // the layer split routes events to different *writers*, while this `EnvFilter` still
+                // gates them all. Without this the payload layer is installed and silently starved.
+                std::env::var("AI_LOG")
+                    .unwrap_or_else(|_| "warn,ai.usage=info,ai.payload=info".into()),
             )
             // Capture the child's output instead of letting it inherit ours. Two reasons: the
             // `ai.usage` rows are only observable this way (they are a log target, not a metric),
@@ -965,6 +1003,8 @@ impl Gateway {
             upstream_http2: None,
             circuit_breaker_threshold: None,
             worker_threads: None,
+            capture_max_bytes: None,
+            capture_default_sample_n: None,
         }
     }
 

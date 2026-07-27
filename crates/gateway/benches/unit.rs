@@ -408,6 +408,83 @@ mod deny {
     }
 }
 
+/// The per-request cost of the capture/control surface **when nobody is using it** — which is what
+/// almost every request pays and the only number that has to be free.
+mod capture {
+    use super::*;
+    use beyond_ai::capture::{CaptureBufs, CaptureRule, CaptureSet};
+    use beyond_ai::control::Control;
+    use pingora::http::RequestHeader;
+
+    const DEFAULTS: CaptureRule = CaptureRule {
+        sample_n: 1,
+        max_bytes: 256 * 1024,
+    };
+
+    fn populated(n: u64) -> CaptureSet {
+        (0..n).map(|t| (t, DEFAULTS)).collect()
+    }
+
+    // --- request hot path: what a request that isn't being captured pays ---
+
+    /// **The headline "capture costs nothing when off" measurement.** Sparse miss, O(1), 0-alloc
+    /// regardless of set size — same shape and same `FxHasher` as `deny::reason_miss`, so the two
+    /// rows should read alike. `n = 0` is the realistic production case (nobody capturing); the 1M
+    /// row exists so a regression to anything size-dependent shows up as divergence between them.
+    #[divan::bench(args = [0, 1_000_000])]
+    fn rule_for_miss(bencher: Bencher, n: u64) {
+        let set = populated(n);
+        bencher.bench(|| set.rule_for(black_box(n + 1)));
+    }
+
+    #[divan::bench(args = [1, 1_000_000])]
+    fn rule_for_hit(bencher: Bencher, n: u64) {
+        let set = populated(n);
+        bencher.bench(|| set.rule_for(black_box(n / 2)));
+    }
+
+    /// Parsing the control surface on a request that sent **no** `x-beyond-*` headers — the other
+    /// half of the always-paid cost. Two absent-header lookups and nothing else; must be 0-alloc.
+    #[divan::bench]
+    fn control_parse_absent(bencher: Bencher) {
+        let req = RequestHeader::build("POST", b"/v1/chat/completions", None).expect("header");
+        bencher.bench(|| Control::parse(black_box(&req)));
+    }
+
+    /// The same parse when the caller *did* send tags. Allocates (the canonical re-serialization is
+    /// the point — see `control`), so this row is here to keep that cost visible and bounded rather
+    /// than to be free.
+    #[divan::bench]
+    fn control_parse_metadata(bencher: Bencher) {
+        let mut req = RequestHeader::build("POST", b"/v1/chat/completions", None).expect("header");
+        req.insert_header(
+            "x-beyond-metadata",
+            r#"{"feature":"summarizer","org":"acme"}"#,
+        )
+        .expect("insert");
+        bencher.bench(|| Control::parse(black_box(&req)));
+    }
+
+    // --- the tap itself: what a request that IS being captured pays, per chunk ---
+
+    /// Bounded append across a body delivered in 16 KiB chunks. The `total > cap` row is the one
+    /// that matters for a long SSE stream: once the cap is reached the tap must stop copying
+    /// entirely rather than keep growing, so its cost per chunk should collapse to a length check.
+    #[divan::bench(args = [8 * 1024, 256 * 1024, 1024 * 1024])]
+    fn push_bounded(bencher: Bencher, total: usize) {
+        let chunk = vec![b'x'; 16 * 1024];
+        bencher.bench(|| {
+            let mut bufs = CaptureBufs::new(black_box(total) as u32);
+            let mut written = 0;
+            while written < 1024 * 1024 {
+                bufs.push_resp(black_box(&chunk));
+                written += chunk.len();
+            }
+            bufs
+        });
+    }
+}
+
 mod ratelimit {
     use super::*;
     use beyond_ai::ratelimit::RateLimit;

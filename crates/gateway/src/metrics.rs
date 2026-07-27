@@ -180,6 +180,30 @@ pub struct Metrics {
     /// fail-open — it serves on the last-known set when NATS is down — so staleness is otherwise
     /// silent; this is the metric to alert "deny-set has been stale for >N minutes" on.
     pub nats_connected: IntGauge,
+    /// Current capture-set cardinality (tenants with payload logging on). Sparse and normally a
+    /// handful; a number that climbs and never falls means time-boxed capture entries are being
+    /// written without a TTL, which quietly turns a debugging tool into a permanent cost.
+    pub capture_set_size: IntGauge,
+    /// NATS connectivity for the **capture-set** watcher, separate from `nats_connected`. Two
+    /// watchers with independent connections and reconnect loops need independent gauges — one
+    /// shared gauge would read "whichever reconnected last", which is precisely wrong during the
+    /// partial outage you'd be consulting it for.
+    pub capture_nats_connected: IntGauge,
+    /// Requests whose payloads were captured. The denominator for "is capture on, and how much of
+    /// the tenant's traffic is it actually seeing" after sampling is applied.
+    pub captures_total: IntCounter,
+    /// Payload bytes handed to the capture sink (request + response). This is the cost signal — it
+    /// predicts the log-pipeline and storage bill before the invoice does.
+    pub capture_bytes_total: IntCounter,
+    /// Captures dropped because the sink queue was full. **The important one.** Capture is
+    /// deliberately lossy so a stalled log sink can never backpressure the proxy, which means a
+    /// missing payload is ambiguous — was capture off for that request, or did we lose it? Without
+    /// this counter that question is unanswerable during the incident capture exists to serve.
+    pub capture_dropped_total: IntCounter,
+    /// `x-beyond-*` headers that were present but unusable (malformed JSON, oversize, unrecognized
+    /// value). These are dropped rather than rejected, so a client whose tags silently never show up
+    /// has no other signal to debug against.
+    pub control_header_errors_total: IntCounter,
     /// Managed `2xx` responses that carried no parseable usage block. Such a response still emits a
     /// zero-token `ai.usage` row, which is indistinguishable downstream from a (non-existent)
     /// legitimate zero-token generation — so a provider changing its usage wire shape would silently
@@ -277,6 +301,30 @@ impl Metrics {
             "ai_nats_connected",
             "Deny-set watcher NATS connectivity (1=connected, 0=disconnected)",
         ))?;
+        let capture_set_size = IntGauge::with_opts(Opts::new(
+            "ai_capture_set_size",
+            "Tenants with payload capture enabled",
+        ))?;
+        let capture_nats_connected = IntGauge::with_opts(Opts::new(
+            "ai_capture_nats_connected",
+            "Capture-set watcher NATS connectivity (1=connected, 0=disconnected)",
+        ))?;
+        let captures_total = IntCounter::with_opts(Opts::new(
+            "ai_captures_total",
+            "Requests whose payloads were captured",
+        ))?;
+        let capture_bytes_total = IntCounter::with_opts(Opts::new(
+            "ai_capture_bytes_total",
+            "Payload bytes handed to the capture sink (request + response)",
+        ))?;
+        let capture_dropped_total = IntCounter::with_opts(Opts::new(
+            "ai_capture_dropped_total",
+            "Captures dropped because the sink queue was full",
+        ))?;
+        let control_header_errors_total = IntCounter::with_opts(Opts::new(
+            "ai_control_header_errors_total",
+            "x-beyond-* headers present but unusable (dropped, request still served)",
+        ))?;
         let usage_parse_errors_total = IntCounter::with_opts(Opts::new(
             "ai_usage_parse_errors_total",
             "Managed 2xx responses with no parseable usage (emitted as a zero-token billing row)",
@@ -296,6 +344,12 @@ impl Metrics {
         r.register(Box::new(requests_in_flight.clone()))?;
         r.register(Box::new(deny_set_size.clone()))?;
         r.register(Box::new(nats_connected.clone()))?;
+        r.register(Box::new(capture_set_size.clone()))?;
+        r.register(Box::new(capture_nats_connected.clone()))?;
+        r.register(Box::new(captures_total.clone()))?;
+        r.register(Box::new(capture_bytes_total.clone()))?;
+        r.register(Box::new(capture_dropped_total.clone()))?;
+        r.register(Box::new(control_header_errors_total.clone()))?;
         r.register(Box::new(usage_parse_errors_total.clone()))?;
 
         Ok(Arc::new(Self {
@@ -318,6 +372,12 @@ impl Metrics {
             requests_in_flight,
             deny_set_size,
             nats_connected,
+            capture_set_size,
+            capture_nats_connected,
+            captures_total,
+            capture_bytes_total,
+            capture_dropped_total,
+            control_header_errors_total,
             usage_parse_errors_total,
         }))
     }
