@@ -504,14 +504,24 @@ buffer is `BODY_BUF_LIMIT` = 64 KiB, a private constant with no knob. Past it th
 re-sent, so the 5xx is relayed rather than attempted — a retry there would hand the next upstream
 headers describing a body it never writes, hanging it until `read_timeout_secs`.
 
-The gate is `is_body_done() && !retry_buffer_truncated()`, and the first half is load-bearing:
-truncation reports on what has been buffered _so far_, so consulting it mid-read gives a false
-negative. A provider that 5xxes fast — which is what a failing provider does — answers before a large
-body has finished streaming in, and a gate without the `is_body_done()` check waves through a retry
-that then replays a **truncated body** to the fallback. Silent corruption, strictly worse than
-relaying the error.
+The gate is `is_body_done() && !retry_buffer_truncated()`, and the first half deserves an
+explanation because it is not the obvious one. Truncation reports on what has been buffered _so
+far_, so a provider that 5xxes fast — which is what a failing provider does — answers before a large
+body has finished streaming in, and the check reads `false` only because the bytes that would
+truncate it have not arrived yet.
 
-`ai_failover_body_too_large_total` counts the requests this excludes. That number is the input to
+Retrying there would not be _unsafe_: pingora replays the buffered prefix with
+`end_of_body = is_body_done()` and the duplex loop reads the remainder straight from the socket, so
+the next candidate does receive the whole body. It would be **timing-dependent** — the same request
+fails over or does not, depending on how quickly the upstream rejected it. On a path that decides
+which vendor gets billed, a deterministic rule is worth more than the extra failovers a looser one
+would win.
+
+The cost is real: a 5xx arriving while the client is still uploading is relayed rather than retried
+even when it would have replayed fine.
+
+`ai_failover_unreplayable_total` counts every request this excludes — both the too-large bodies and
+the not-yet-known ones, since both cost the same thing: a failover declined. That number is the input to
 whether covering them is worth building, and the options are not cheap: patch `BODY_BUF_LIMIT`
 (fork, or upstream a config knob) or drive the retry ourselves via pingora's `Subrequest` API
 (`allow_spawning_subrequest` — a full inner proxy request whose downstream is a channel, so the body

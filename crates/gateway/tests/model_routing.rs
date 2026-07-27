@@ -653,9 +653,15 @@ async fn every_candidate_5xx_relays_the_last_error() {
     assert_eq!(fallback.hits(), 1, "both candidates must have been tried");
 }
 
-/// A body past pingora's 64 KiB replay buffer cannot be re-sent, so the 5xx is relayed rather than
-/// hanging the next upstream with headers describing a body that never arrives. The case is
-/// **counted**, which is the number that decides whether covering it is worth the work.
+/// A body past pingora's 64 KiB replay buffer is not provably replayable, so the 5xx is relayed
+/// rather than retried — and the case is **counted**, which is the number that decides whether
+/// covering it is worth the work.
+///
+/// Note what this does *not* claim. Retrying such a body is not unsafe: pingora would replay the
+/// buffered prefix and read the remainder from the socket. The rule exists so the decision is
+/// deterministic rather than a race against how fast the upstream rejected the request — an earlier
+/// version of this test passed or failed depending on whether the 256 KiB body had finished
+/// arriving, because both outcomes were correct behaviour under a looser gate.
 #[tokio::test]
 async fn an_unreplayable_body_relays_the_5xx_and_is_counted() {
     let nats = Nats::start().await;
@@ -694,7 +700,7 @@ async fn an_unreplayable_body_relays_the_5xx_and_is_counted() {
     );
     let metrics = gw.metrics().await;
     assert!(
-        parse_metric(&metrics, "ai_failover_body_too_large_total", "") >= 1.0,
+        parse_metric(&metrics, "ai_failover_unreplayable_total", "") >= 1.0,
         "the uncovered case must be measurable — it is what decides the next investment:\n{metrics}"
     );
 }

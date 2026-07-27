@@ -1425,26 +1425,34 @@ impl ProxyHttp for AiProxy {
         if first_usable(usable, at.saturating_add(1)).is_none() {
             return Ok(());
         }
-        // Replayability is only *knowable* once the whole downstream body has been read.
+        // Fail over only when the body is **provably** replayable: fully read, and small enough
+        // that pingora buffered all of it.
         //
-        // `retry_buffer_truncated()` reports on what has been buffered so far, so consulting it
-        // mid-read gives a false negative: a provider that 5xxes fast — which is exactly what a
-        // failing provider does — answers before a large body has finished streaming in, and the
-        // gate would wave through a retry that then replays a *truncated* body to the fallback.
-        // Silent corruption, and strictly worse than relaying the error. Caught by
-        // `an_unreplayable_body_relays_the_5xx_and_is_counted`, which saw a 200 where the fallback
-        // had been handed a partial request.
+        // `retry_buffer_truncated()` alone is not enough, and the reason is subtler than it looks.
+        // It reports on what has been buffered *so far*, so a provider that 5xxes fast — which is
+        // what a failing provider does — answers before a large body has finished streaming in, and
+        // the check reads `false` simply because the bytes that would truncate it have not arrived.
         //
-        // So: not done reading ⇒ we cannot promise a replay ⇒ do not retry.
+        // Retrying there is not *unsafe*: pingora replays the buffered prefix with
+        // `end_of_body = is_body_done()` and the duplex loop reads the remainder straight from the
+        // socket (`proxy_h1.rs`'s retry block), so the next candidate does receive the whole body.
+        // What it is, is **timing-dependent** — the same request fails over or does not depending on
+        // how quickly the upstream rejected it. For a path that decides which vendor gets billed,
+        // a deterministic rule is worth more than the extra failovers the loose one would win.
+        //
+        // The cost is real and worth naming: a 5xx that arrives while the client is still uploading
+        // is relayed rather than retried, even when it would have replayed fine. That is what
+        // `ai_failover_unreplayable_total` counts.
         let replayable =
             session.as_mut().is_body_done() && !session.as_ref().retry_buffer_truncated();
         if !replayable {
-            self.state.metrics.failover_body_too_large_total.inc();
+            self.state.metrics.failover_unreplayable_total.inc();
             warn!(
                 request_id = %rc.request_id,
                 provider = rc.provider.name.as_str(),
                 status,
-                "upstream failed but the body is too large to replay; relaying the error",
+                body_done = session.as_mut().is_body_done(),
+                "upstream failed but the request body is not provably replayable; relaying the error",
             );
             return Ok(());
         }

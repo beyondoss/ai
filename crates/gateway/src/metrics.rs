@@ -127,14 +127,17 @@ pub struct Metrics {
     /// one warn per request forever; a non-zero rate here is a client bug to go and find.
     pub model_header_body_mismatch_total: IntCounter,
     /// Model-routed requests that hit a retryable upstream status, had a candidate left to try, and
-    /// could **not** fail over because the request body exceeded pingora's replay buffer.
+    /// could **not** fail over because the request body was not provably replayable.
     ///
-    /// This is the measurement that decides whether the expensive fix is worth building. Status
-    /// failover rides pingora's own retry, whose buffer is a private 64 KiB constant; past that the
-    /// body cannot be re-sent and the 5xx goes to the client. Covering those requests means either
-    /// a pingora patch or driving the retry ourselves (see ARCHITECTURE.md), and neither is worth
-    /// starting until this counter says how often it actually bites.
-    pub failover_body_too_large_total: IntCounter,
+    /// Two ways to land here: the body exceeded pingora's 64 KiB replay buffer, or it had not
+    /// finished arriving when the upstream answered, so replayability was not yet knowable. Both are
+    /// counted together because both cost the same thing — a failover we declined to attempt.
+    ///
+    /// This is the measurement that decides whether the expensive fix is worth building. Covering
+    /// these requests means either patching pingora's private buffer limit or driving the retry
+    /// ourselves (see ARCHITECTURE.md); neither is worth starting until this counter says how often
+    /// the limit actually bites.
+    pub failover_unreplayable_total: IntCounter,
     /// Model-routed requests that gave up on a candidate and moved to the next one.
     ///
     /// Deliberately *not* folded into `connect_retries_total`: that counter means "we retried the
@@ -214,9 +217,9 @@ impl Metrics {
             "ai_model_header_body_mismatch_total",
             "Model-routed requests whose routing header and body `model` disagreed",
         ))?;
-        let failover_body_too_large_total = IntCounter::with_opts(Opts::new(
-            "ai_failover_body_too_large_total",
-            "Retryable upstream statuses that could not fail over: body exceeded the replay buffer",
+        let failover_unreplayable_total = IntCounter::with_opts(Opts::new(
+            "ai_failover_unreplayable_total",
+            "Retryable upstream statuses that could not fail over: body not provably replayable",
         ))?;
         let rejections_total = IntCounterVec::new(
             Opts::new("ai_rejections_total", "Requests rejected before upstream"),
@@ -282,7 +285,7 @@ impl Metrics {
         r.register(Box::new(requests_total.clone()))?;
         r.register(Box::new(candidate_failovers_total.clone()))?;
         r.register(Box::new(model_header_body_mismatch_total.clone()))?;
-        r.register(Box::new(failover_body_too_large_total.clone()))?;
+        r.register(Box::new(failover_unreplayable_total.clone()))?;
         r.register(Box::new(rejections_total.clone()))?;
         r.register(Box::new(upstream_responses_total.clone()))?;
         r.register(Box::new(connect_retries_total.clone()))?;
@@ -299,7 +302,7 @@ impl Metrics {
             requests_total,
             candidate_failovers_total,
             model_header_body_mismatch_total,
-            failover_body_too_large_total,
+            failover_unreplayable_total,
             rejections_total,
             rejections,
             upstream_responses_total,
