@@ -37,6 +37,24 @@ pub use providers::WireFormat as Dialect;
 /// else with an unknown first segment is a 404.
 pub const DEFAULT_PREFIX: &str = "/v1";
 
+/// The model catalog — see [`providers::catalog`]. A `/{AUTO_SEGMENT}/…` request names a *model*
+/// rather than a provider, and this resolves it to the ordered providers that can serve it.
+pub use providers::{Candidate, MAX_CANDIDATES, ModelRoute, for_model as model_route};
+
+/// The reserved first path segment for **model-routed** requests: `/auto/…` picks its provider from
+/// the catalog using the `x-beyond-model` header instead of from the path.
+///
+/// Reserved, not merely conventional: `state::build_providers` refuses to boot if config tries to
+/// register a provider under this name. Provider lookup runs first in `proxy::request_filter`, so a
+/// `provider_authorities.auto = …` entry would otherwise shadow the whole feature silently.
+pub const AUTO_SEGMENT: &str = "auto";
+
+/// The header carrying the canonical model name on the model-routed route.
+///
+/// Sits in the `x-beyond-*` namespace the gateway already owns (`x-beyond-request-id`), so it cannot
+/// collide with a header a provider defines, and is stripped before the request goes upstream.
+pub const MODEL_HEADER: &str = "x-beyond-model";
+
 /// Whether `path` is the bare-default route: exactly [`DEFAULT_PREFIX`], or `DEFAULT_PREFIX`
 /// followed by `/`. **Boundary-checked**, not a raw [`str::starts_with`] — a plain prefix check
 /// would also match Google Gemini's real path shape (`/v1beta/models/{model}:generateContent`),
@@ -146,6 +164,34 @@ impl Provider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The model-routed segment is matched only after a provider-table miss, so a provider actually
+    /// named `auto` would shadow it. `state::build_providers` rejects that from config; this covers
+    /// the other direction — someone adding an `auto` row to the shared provider table.
+    #[test]
+    fn auto_segment_is_not_a_provider_name() {
+        assert!(
+            providers::by_name(AUTO_SEGMENT).is_none(),
+            "{AUTO_SEGMENT:?} is reserved for model-routed requests and cannot also be a provider",
+        );
+    }
+
+    /// Every catalog candidate must resolve to a row this gateway actually mints a `Provider` for,
+    /// or the route silently loses a failover target at request time.
+    #[test]
+    fn every_catalog_candidate_is_a_known_provider() {
+        for route in providers::catalog::MODEL_ROUTES {
+            for c in route.candidates {
+                let spec = providers::by_id(c.provider);
+                assert!(
+                    known_providers().any(|p| p.id == c.provider),
+                    "catalog route {:?} names {}, which the gateway does not route to",
+                    route.model,
+                    spec.name,
+                );
+            }
+        }
+    }
 
     #[test]
     fn is_default_prefix_boundary_checks() {

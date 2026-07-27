@@ -29,6 +29,10 @@ use common::*;
 
 const MANAGED_BODY: &str = r#"{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}"#;
 
+/// Model-routed body. Same size as `MANAGED_BODY` so `auto_json_latency` minus
+/// `managed_json_latency` is the model route's own cost and not a payload difference.
+const AUTO_BODY: &str = r#"{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}]}"#;
+
 /// A plausible BYO provider token (anything not starting with `bai_` is BYO — passed through
 /// unchanged, no verify/deny/swap). The mock upstream accepts any token.
 const BYO_KEY: &str = "sk-byo-provider-token-1234567890";
@@ -39,6 +43,13 @@ const BYO_KEY: &str = "sk-byo-provider-token-1234567890";
 fn large_body() -> String {
     let content = "x".repeat(64 * 1024);
     format!(r#"{{"messages":[{{"role":"user","content":"{content}"}}],"model":"gpt-4o"}}"#)
+}
+
+/// The `large_body` shape on the model route: same size, `model` named as the catalog row so the
+/// rewrite path runs. This is where `/auto`'s whole-body buffering has to show up if anywhere.
+fn large_auto_body() -> String {
+    let content = "x".repeat(64 * 1024);
+    format!(r#"{{"messages":[{{"role":"user","content":"{content}"}}],"model":"gpt-4o-mini"}}"#)
 }
 
 /// Concurrency level for the throughput group — enough in-flight requests to expose per-request
@@ -117,6 +128,129 @@ async fn start_stack_with(mode: Mode) -> Stack {
         vkey,
         url,
     }
+}
+
+/// A stack wired for the **model route**: `openai` and `openrouter` both point at the mock, so the
+/// catalog's `gpt-4o-mini` row resolves and both candidates are usable.
+async fn start_auto_stack() -> Stack {
+    let nats = Nats::start().await;
+    let (pubkey, sk) = test_keypair(1);
+    let mock = MockUpstream::start(Mode::Json).await;
+    let gw = Gateway::builder(nats.port, &mock.authority(), &b64(&pubkey))
+        .providers(&["openai", "openrouter"])
+        .rate_limit_rps(0)
+        .byo_rate_limit_rps(0)
+        .start()
+        .await;
+    let vkey = mint(
+        &VirtualKey {
+            tenant_id: 42,
+            vpc_id: 7,
+        },
+        1,
+        &sk,
+    );
+    let client = reqwest::Client::new();
+    let url = gw.url();
+    {
+        let (c, u, k) = (client.clone(), url.clone(), vkey.clone());
+        wait_for_status(200, move || {
+            let (c, u, k) = (c.clone(), u.clone(), k.clone());
+            async move {
+                c.post(format!("{u}/auto/chat/completions"))
+                    .header("authorization", format!("Bearer {k}"))
+                    .header("content-type", "application/json")
+                    .header("x-beyond-model", "gpt-4o-mini")
+                    .body(AUTO_BODY)
+                    .send()
+                    .await
+                    .map(|r| r.status().as_u16())
+                    .unwrap_or(0)
+            }
+        })
+        .await;
+    }
+    Stack {
+        gw,
+        mock,
+        nats,
+        client,
+        vkey,
+        url,
+    }
+}
+
+/// A model-routed stack whose **primary candidate is dead**, so every request walks to the fallback.
+/// The delta against `auto_json_latency` is what a failover costs the client.
+async fn start_auto_failover_stack() -> Stack {
+    let nats = Nats::start().await;
+    let (pubkey, sk) = test_keypair(1);
+    let mock = MockUpstream::start(Mode::Json).await;
+    let gw = Gateway::builder(nats.port, &GatewayBuilder::dead_authority(), &b64(&pubkey))
+        .providers(&["openai", "openrouter"])
+        .provider_authority("openrouter", &mock.authority())
+        .rate_limit_rps(0)
+        .byo_rate_limit_rps(0)
+        .start()
+        .await;
+    let vkey = mint(
+        &VirtualKey {
+            tenant_id: 42,
+            vpc_id: 7,
+        },
+        1,
+        &sk,
+    );
+    let client = reqwest::Client::new();
+    let url = gw.url();
+    {
+        let (c, u, k) = (client.clone(), url.clone(), vkey.clone());
+        wait_for_status(200, move || {
+            let (c, u, k) = (c.clone(), u.clone(), k.clone());
+            async move {
+                c.post(format!("{u}/auto/chat/completions"))
+                    .header("authorization", format!("Bearer {k}"))
+                    .header("content-type", "application/json")
+                    .header("x-beyond-model", "gpt-4o-mini")
+                    .body(AUTO_BODY)
+                    .send()
+                    .await
+                    .map(|r| r.status().as_u16())
+                    .unwrap_or(0)
+            }
+        })
+        .await;
+    }
+    Stack {
+        gw,
+        mock,
+        nats,
+        client,
+        vkey,
+        url,
+    }
+}
+
+/// One model-routed round-trip. Same work as `managed_roundtrip` plus: a catalog lookup, the
+/// candidate walk, whole-body buffering, and the `model` splice. The delta against
+/// `managed_json_latency` is the price of the model route.
+async fn auto_roundtrip(s: &Stack, body: &str) {
+    let resp = s
+        .client
+        .post(format!("{}/auto/chat/completions", s.url))
+        .header("authorization", format!("Bearer {}", s.vkey))
+        .header("content-type", "application/json")
+        .header("x-beyond-model", "gpt-4o-mini")
+        .body(body.to_string())
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "bench measured a non-200; it is timing the wrong path"
+    );
+    let _ = resp.bytes().await.expect("body");
 }
 
 /// One full managed round-trip: key swap + body relay + non-streaming usage tap. Drains the
@@ -341,6 +475,28 @@ fn bench_e2e(c: &mut Criterion) {
     group.bench_function("byo_large_body_latency", |b| {
         b.to_async(&rt)
             .iter(|| roundtrip_with(&stack, BYO_KEY, &big));
+    });
+
+    // The model route. `auto_json_latency` against `managed_json_latency` isolates its fixed cost
+    // (catalog lookup, candidate walk, the `Box<ModelRouting>`); `auto_large_body_latency` against
+    // `managed_large_body_latency` isolates the part that scales with the body, which is where
+    // `/auto`'s whole-body buffering and the `model` splice live. Neither had ever been measured.
+    let auto_stack = rt.block_on(start_auto_stack());
+    let big_auto = large_auto_body();
+    group.bench_function("auto_json_latency", |b| {
+        b.to_async(&rt)
+            .iter(|| auto_roundtrip(&auto_stack, AUTO_BODY));
+    });
+    group.bench_function("auto_large_body_latency", |b| {
+        b.to_async(&rt)
+            .iter(|| auto_roundtrip(&auto_stack, &big_auto));
+    });
+    // Every request here loses its primary to a refused connection and is served by the fallback,
+    // so the delta against `auto_json_latency` is what a failover costs the client.
+    let auto_failover_stack = rt.block_on(start_auto_failover_stack());
+    group.bench_function("auto_failover_latency", |b| {
+        b.to_async(&rt)
+            .iter(|| auto_roundtrip(&auto_failover_stack, AUTO_BODY));
     });
 
     // Throughput: CONCURRENCY requests in flight per iteration. `Throughput::Elements` makes

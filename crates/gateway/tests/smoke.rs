@@ -67,7 +67,7 @@ async fn smoke_openai_wire(provider: &str, key_env: &str, model: &str, chat_path
     };
     let nats = Nats::start().await;
     let (gw, vkey) = managed_gateway(&nats, provider, &key).await;
-    let client = reqwest::Client::new();
+    let client = test_client();
 
     let body = format!(
         r#"{{"model":"{model}","max_tokens":16,"messages":[{{"role":"user","content":"Reply with the single word: ping"}}]}}"#
@@ -104,7 +104,7 @@ async fn smoke_anthropic() {
     };
     let nats = Nats::start().await;
     let (gw, vkey) = managed_gateway(&nats, "anthropic", &key).await;
-    let client = reqwest::Client::new();
+    let client = test_client();
 
     // `/anthropic/v1/messages` → provider `anthropic` (selected by the path segment, stripped to
     // `/v1/messages` upstream). The minted virtual key is presented in `x-api-key` (the Anthropic
@@ -166,7 +166,7 @@ async fn smoke_openai_responses_usage_is_metered() {
     };
     let nats = Nats::start().await;
     let (gw, vkey) = managed_gateway(&nats, "openai", &key).await;
-    let client = reqwest::Client::new();
+    let client = test_client();
 
     let before = gw.metrics().await;
     let before_output = parse_metric(&before, "ai_tokens_total", "output");
@@ -305,4 +305,173 @@ async fn smoke_xai() {
         "/xai/v1/chat/completions",
     )
     .await;
+}
+
+/// The `AI_POOL_KEY_*` env var a provider's key conventionally lives in — mirrors the shared table's
+/// `env_var`, which is what the catalog smoke below reads.
+fn provider_env_var(id: providers::ProviderId) -> Option<&'static str> {
+    providers::by_id(id).env_var
+}
+
+/// **Every catalog row, against the real providers, through the real gateway.**
+///
+/// The catalog is product data: a wrong model id or path does not fail loudly, it routes to a 404
+/// that reads like the client's fault. Unit tests can check the table's shape but not its *truth* —
+/// only the provider can say whether `anthropic/claude-opus-4.8` is still a thing. This is the test
+/// that keeps the table honest.
+///
+/// Drives each `(row, candidate)` pair individually via the model route, forcing that candidate to
+/// be the only usable one, so a green run means every entry is independently servable rather than
+/// every row merely having *one* working primary.
+///
+/// Skips any candidate whose key is absent, so a partial keyring smokes what it can.
+#[tokio::test]
+#[ignore = "hits real providers and bills tiny requests; run via `mise run test:smoke`"]
+async fn catalog_rows_are_servable() {
+    let mut checked = 0usize;
+    let mut skipped: Vec<String> = Vec::new();
+
+    for route in providers::catalog::MODEL_ROUTES {
+        for candidate in route.candidates {
+            let spec = providers::by_id(candidate.provider);
+            let Some(var) = provider_env_var(candidate.provider) else {
+                skipped.push(format!("{} ({}): no env var", route.model, spec.name));
+                continue;
+            };
+            let Some(key) = env_key(var) else {
+                skipped.push(format!("{} ({}): {var} unset", route.model, spec.name));
+                continue;
+            };
+
+            let nats = Nats::start().await;
+            // Only this candidate holds a pool key, so the gateway has nowhere else to go — a 200
+            // here is this exact (provider, path, model id) triple answering, not a fallback
+            // quietly covering for it.
+            let (gw, vkey) = managed_gateway(&nats, spec.name, &key).await;
+
+            // The body is the row's own wire. `max_tokens` is required by Anthropic and harmless to
+            // OpenAI, and 1 token keeps the bill to a fraction of a cent.
+            let body = format!(
+                r#"{{"model":"{}","max_tokens":1,"messages":[{{"role":"user","content":"hi"}}]}}"#,
+                route.model,
+            );
+            let mut req = test_client()
+                .post(format!("{}/auto/x", gw.url()))
+                .header("authorization", format!("Bearer {vkey}"))
+                .header("content-type", "application/json")
+                .header("x-beyond-model", route.model);
+            if route.wire == providers::WireFormat::Anthropic {
+                req = req.header("anthropic-version", "2023-06-01");
+            }
+            let resp = req.body(body).send().await.expect("request sent");
+            let status = resp.status().as_u16();
+            let text = resp.text().await.unwrap_or_default();
+            assert_eq!(
+                status,
+                200,
+                "catalog row {:?} → {} {} (model {:?}) returned {status}: {}",
+                route.model,
+                spec.name,
+                candidate.path,
+                candidate.upstream_model,
+                text.chars().take(300).collect::<String>(),
+            );
+            // The provider echoes the id it actually ran, which is how a silently-rewritten or
+            // aliased model shows up.
+            eprintln!(
+                "smoke[catalog]: {:<18} → {:<11} {:<24} ok",
+                route.model, spec.name, candidate.upstream_model,
+            );
+            checked += 1;
+        }
+    }
+
+    for s in &skipped {
+        eprintln!("smoke[catalog]: skipped {s}");
+    }
+    assert!(
+        checked > 0,
+        "no catalog candidate was checked — set at least one provider key",
+    );
+    eprintln!(
+        "smoke[catalog]: {checked} candidate(s) verified, {} skipped",
+        skipped.len()
+    );
+}
+
+/// **A live failover.** The primary candidate is pointed at a dead port; the fallback is the *real*
+/// provider. Proves the whole chain against something that can actually say no: catalog → candidate
+/// walk → mount → key swap in the fallback's own scheme → model-id rewrite → real 200.
+///
+/// The mocked failover tests prove the mechanism. This proves the mechanism against a provider that
+/// has its own opinions about paths, ids, and auth headers — which is where a catalog is wrong in
+/// practice.
+#[tokio::test]
+#[ignore = "hits a real provider and bills a tiny request; run via `mise run test:smoke`"]
+async fn model_route_fails_over_to_a_real_provider() {
+    let Some(key) = env_key("OPENROUTER_API_KEY") else {
+        eprintln!("smoke[failover]: OPENROUTER_API_KEY unset — skipping");
+        return;
+    };
+    // `claude-opus-4-8` is an Anthropic-wire row: Anthropic first, OpenRouter second.
+    let model = "claude-opus-4-8";
+    let nats = Nats::start().await;
+    let (pubkey, sk) = test_keypair(7);
+    let gw = Gateway::builder(nats.port, "unused", &b64(&pubkey))
+        .real_upstreams()
+        // Only OpenRouter is keyed, so Anthropic is not even a usable candidate...
+        .pool_key("openrouter", &key)
+        // ...and it is unreachable besides, so nothing can quietly serve from it.
+        .provider_authority("anthropic", &GatewayBuilder::dead_authority())
+        .start()
+        .await;
+    let vkey = mint(
+        &VirtualKey {
+            tenant_id: 1,
+            vpc_id: 1,
+        },
+        1,
+        &sk,
+    );
+
+    let resp = test_client()
+        .post(format!("{}/auto/x", gw.url()))
+        .header("authorization", format!("Bearer {vkey}"))
+        .header("content-type", "application/json")
+        .header("anthropic-version", "2023-06-01")
+        .header("x-beyond-model", model)
+        .body(format!(
+            r#"{{"model":"{model}","max_tokens":1,"messages":[{{"role":"user","content":"hi"}}]}}"#
+        ))
+        .send()
+        .await
+        .expect("request sent");
+    let status = resp.status().as_u16();
+    let text = resp.text().await.unwrap_or_default();
+    assert_eq!(
+        status,
+        200,
+        "live failover to OpenRouter returned {status}: {}",
+        text.chars().take(400).collect::<String>(),
+    );
+    // The reply is Anthropic-shaped and names OpenRouter's spelling of the model — proof the rewrite
+    // landed and the response came from the fallback, not from somewhere unexpected.
+    assert!(
+        text.contains(r#""type":"message""#),
+        "want an Anthropic Messages reply: {text}"
+    );
+    assert!(
+        text.contains("anthropic/claude-opus-4.8"),
+        "the fallback must have been asked for its own id: {text}"
+    );
+
+    // And it metered: a zero-token row here would mean the Anthropic extractor never ran.
+    let line = gw
+        .wait_for_log_line(&["ai.usage", r#""provider":"openrouter""#])
+        .await;
+    assert!(
+        !line.contains(r#""input_tokens":0"#),
+        "the live failover must still be metered: {line}"
+    );
+    eprintln!("smoke[failover]: live Anthropic→OpenRouter failover ok — {line}");
 }

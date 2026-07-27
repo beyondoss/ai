@@ -237,9 +237,133 @@ pub struct RequestCtx {
     start: Instant,
     /// Connect-retry counter (see `fail_to_connect`).
     attempt: u8,
+    /// Whether an `allow()` on `provider`'s breaker is outstanding and still owes exactly one
+    /// `record_*`.
+    ///
+    /// The ledger that keeps breaker accounting honest once a request can attempt more than one
+    /// provider. Invariant: `breaker_pending` is true **iff** there is exactly one unresolved
+    /// `allow()` against whatever `provider` currently points at. `logging` records only when it is
+    /// set, so an attempt can never be recorded twice, and a candidate switch resolves the outgoing
+    /// candidate before claiming the next one.
+    ///
+    /// On the `/{provider}/…` path this is simply `breaker.is_some()`, set once in `request_filter`
+    /// — exactly the condition `logging` used to test inline — so that path's behaviour is unchanged.
+    breaker_pending: bool,
+    /// Model-routing state — `Some` only for `/auto`. `None` keeps every provider-routed request on
+    /// exactly the code it ran before model routing existed. See [`ModelRouting`] for why it is
+    /// boxed rather than inline.
+    auto: Option<Box<ModelRouting>>,
     /// Process-unique id for this request (`{instance}-{seq}`), echoed in the `x-beyond-request-id`
     /// response header and the `ai.usage` event so a client report ties back to a log line.
     request_id: RequestId,
+}
+
+/// State that exists only for a **model-routed** (`/auto`) request.
+///
+/// Boxed, and `None` for provider-routed traffic — which is the overwhelming majority. Held inline
+/// these fields added 64 bytes to `RequestCtx` (368 → 432), a struct that is touched on every hook
+/// and, for a streaming response, once per response chunk. That showed up as a reproducible ~2.5%
+/// regression on the `managed_sse_latency` bench, across two independent runs against the same
+/// baseline, while the non-streaming case was unaffected — the signature of a per-chunk cost, not a
+/// per-request one.
+///
+/// So the model-routed path pays one small allocation and every other request pays nothing. That is
+/// the right way round: `/auto` is opt-in, and the request it serves is about to cross a network.
+struct ModelRouting {
+    /// The catalog row this request routes over. `&'static`, so it costs a pointer.
+    route: &'static route::ModelRoute,
+    /// Index into `route.candidates` of the candidate currently being attempted.
+    candidate: u8,
+    /// Bit `i` ⇒ `route.candidates[i]` is *usable*: this gateway routes to that provider and holds a
+    /// pool key for it. Computed once in `request_filter` so `upstream_peer` never re-derives it.
+    /// Bounded by [`route::MAX_CANDIDATES`], which is why a `u8` suffices.
+    usable: u8,
+    /// When the current attempt began. Distinct from `RequestCtx::start` (which times the whole
+    /// request) so a candidate that burned `connect_timeout_secs` before failing over does not
+    /// charge that time to the provider that actually served — which would render an outage at
+    /// candidate A as a latency regression at candidate B, inverting the point of the per-provider
+    /// label.
+    attempt_start: Instant,
+}
+
+impl RequestCtx {
+    /// Clear the state the request-body phase accumulates, so a **retried** attempt starts from the
+    /// same slate as the first one.
+    ///
+    /// Pingora replays its buffered request body through `request_body_filter` on a retry
+    /// (`proxy_h1.rs`'s `send_body_to_pipe`, and the h2 twin), so without this the replayed prefix is
+    /// *appended* to whatever the previous attempt already accumulated:
+    ///
+    /// - `req_buf` would hold the prefix twice, and `peek::scan_buffered` would then plan the splice
+    ///   against the **first** copy — handing the upstream a body with a duplicated fragment, which
+    ///   it rejects with a `400` that reads like a client error. `logging` even records that `400` as
+    ///   a breaker *success* (the provider answered), so nothing surfaces it as our fault.
+    /// - `model_scanner`'s brace depth would be permanently offset by the extra `{`, so
+    ///   `at_key_level` never matches again and the billing row ships `requested_model = ""`.
+    /// - `body_bytes_fed` would double-count the prefix against `MAX_REQUEST_BODY`.
+    ///
+    /// Called from `upstream_peer`, which pingora invokes exactly once per attempt and always before
+    /// any body byte moves — it is the first statement of `proxy_to_upstream`.
+    ///
+    /// `model` is deliberately **not** cleared: once a complete body has yielded it the value is
+    /// correct, and pingora's replay buffer is capped at 64 KiB, so a larger body could not
+    /// re-derive it on the next attempt.
+    /// When the current upstream attempt began: the per-attempt stamp for a model-routed request,
+    /// and simply the request start for everything else — where the two are always equal anyway,
+    /// so the common path stores no second `Instant`.
+    fn attempt_start(&self) -> Instant {
+        self.auto.as_ref().map_or(self.start, |a| a.attempt_start)
+    }
+
+    /// Move the candidate cursor past index `i`. No-op for a provider-routed request.
+    fn advance_candidate(&mut self, i: u8) {
+        if let Some(a) = self.auto.as_mut() {
+            a.candidate = i.saturating_add(1);
+        }
+    }
+
+    /// Whether this request's body is buffered and may leave with a different length than it
+    /// arrived — which is one question, not two, because the answer drives *both* the buffering in
+    /// `request_body_filter` and the `Content-Length`/`transfer-encoding` re-framing in
+    /// `upstream_request_filter`. Splitting them is how you get a body whose framing disagrees with
+    /// its bytes.
+    ///
+    /// Two reasons a body gets rewritten:
+    /// - `inject_eligible`: splicing `stream_options` into a managed OpenAI stream.
+    /// - `route`: re-spelling `model` for the candidate serving this attempt.
+    ///
+    /// Both can apply to the same request, in which case both edits are made to the one buffer.
+    fn rewrites_body(&self) -> bool {
+        self.inject_eligible || self.auto.is_some()
+    }
+
+    /// Point the forwarded path at the candidate about to be attempted.
+    ///
+    /// Taken wholesale from the catalog rather than composed from a mount and the client's suffix:
+    /// providers disagree on where an endpoint lives and the disagreement is not a prefix, so there
+    /// is no client suffix that is correct for every candidate in a row. Rewritten in place, so a
+    /// failover costs no allocation after the first attempt.
+    fn set_forward_path(&mut self, path: &str) {
+        let buf = self.forward_path.get_or_insert_with(String::new);
+        buf.clear();
+        buf.push_str(path);
+    }
+
+    fn reset_request_body_phase(&mut self) {
+        // The first attempt has nothing to undo, and that is the only attempt the vast majority of
+        // requests ever make — so pay one compare rather than three stores on the hot path. A zero
+        // `body_bytes_fed` is an exact witness for "no chunk was ever fed": it is incremented for
+        // every chunk that reaches `request_body_filter`, on the same branch that appends to
+        // `req_buf` and feeds `model_scanner`, so neither can hold state while it reads zero.
+        if self.body_bytes_fed == 0 {
+            return;
+        }
+        // `clear` keeps the capacity, which was pre-sized from `Content-Length` in `request_filter`
+        // and which the in-place splice relies on to stay realloc-free.
+        self.req_buf.clear();
+        self.body_bytes_fed = 0;
+        self.model_scanner = peek::ModelScanner::new();
+    }
 }
 
 /// Every `(error_type, message)` pair the gateway rejects with, paired with its wire body.
@@ -249,7 +373,7 @@ pub struct RequestCtx {
 /// `reject_bodies_are_valid_json` can walk it and assert each entry parses, carries the `type` and
 /// `message` it claims, and is reachable — a hand-written JSON literal is exactly the thing that
 /// rots silently otherwise.
-pub const REJECT_BODIES: [(&str, &str, &str); 8] = [
+pub const REJECT_BODIES: [(&str, &str, &str); 11] = [
     (
         "invalid_request_error",
         "unknown provider",
@@ -290,6 +414,21 @@ pub const REJECT_BODIES: [(&str, &str, &str); 8] = [
         "provider temporarily unavailable",
         r#"{"error":{"message":"provider temporarily unavailable","type":"api_error"}}"#,
     ),
+    (
+        "invalid_request_error",
+        "unknown model",
+        r#"{"error":{"message":"unknown model","type":"invalid_request_error"}}"#,
+    ),
+    (
+        "invalid_request_error",
+        "model routing requires a managed key",
+        r#"{"error":{"message":"model routing requires a managed key","type":"invalid_request_error"}}"#,
+    ),
+    (
+        "api_error",
+        "no provider available for model",
+        r#"{"error":{"message":"no provider available for model","type":"api_error"}}"#,
+    ),
 ];
 
 /// The precomputed body for a `(typ, msg)` pair.
@@ -310,6 +449,42 @@ pub fn error_body(typ: &str, msg: &str) -> Bytes {
 }
 
 impl AiProxy {
+    /// Build the upstream peer for a resolved address + provider.
+    ///
+    /// Extracted so the provider-routed path and the model-routed candidate walk cannot drift apart
+    /// on TLS, ALPN, or timeouts — a fallback candidate connected on different terms than the
+    /// primary would be a genuinely nasty thing to debug.
+    fn build_peer(&self, addr: std::net::SocketAddr, provider: &Provider) -> HttpPeer {
+        let mut peer = HttpPeer::new(addr, self.state.config.upstream_tls, provider.host.clone());
+        // Prefer HTTP/2 to the provider (config `upstream_http2`, default on), fall back to HTTP/1.1.
+        // Every provider in `KNOWN_PROVIDERS` negotiates `h2` over TLS (verified by handshake), and H2
+        // multiplexes many concurrent requests/streams over one connection — fewer sockets and TLS
+        // handshakes from our egress IPs (which also eases the egress-reputation pressure `ratelimit`
+        // guards). `H2H1` is strictly ≥ `H1` on compatibility: ALPN negotiates down to H1 for any host
+        // that doesn't offer h2, and a plaintext upstream (the mock, `upstream_tls=false`) has no ALPN
+        // at all and stays H1. The negotiated protocol is then visible per-request as
+        // `upstream_request.version` (see `upstream_request_filter`), which is what lets the
+        // body-injection path frame correctly. The knob lets an operator force all-H1 without a code
+        // redeploy, and lets the e2e bench compare the two head-to-head.
+        peer.options.alpn = if self.state.config.upstream_http2 {
+            ALPN::H2H1
+        } else {
+            ALPN::H1
+        };
+        // Cert verification is on everywhere except the bench's self-signed TLS mock (see config).
+        if !self.state.config.upstream_verify_cert {
+            peer.options.verify_cert = false;
+            peer.options.verify_hostname = false;
+        }
+        peer.options.connection_timeout =
+            Some(Duration::from_secs(self.state.config.connect_timeout_secs));
+        peer.options.read_timeout = Some(Duration::from_secs(self.state.config.read_timeout_secs));
+        peer.options.write_timeout =
+            Some(Duration::from_secs(self.state.config.write_timeout_secs));
+        peer.options.idle_timeout = Some(Duration::from_secs(self.state.config.idle_timeout_secs));
+        peer
+    }
+
     /// Write a small JSON error and signal `request_filter` to short-circuit. The body is built with
     /// `serde_json` (not `format!`) so a `typ`/`msg` containing `"` or `\` can never break out of the
     /// JSON structure — keeps this safe if a future caller passes a non-literal message.
@@ -459,6 +634,34 @@ fn apply_provider_attribution(
     Ok(())
 }
 
+/// Whether an error that ended the request should count against the **provider's** circuit breaker.
+///
+/// `ErrorSource::Downstream` is the *client's* side failing — an aborted request, a broken pipe
+/// while we write the response back. Pingora tags those explicitly (`into_down()`), and they carry
+/// no information about the upstream's health, so they must not trip a breaker that exists to detect
+/// a sick provider.
+///
+/// Everything else counts: an upstream error (pingora calls `as_up()` before `fail_to_connect`), our
+/// own DNS failure returned from `upstream_peer` (which leaves the source `Unset`), or an internal
+/// fault. Each is a real failure to complete this request against this provider.
+fn is_upstream_failure(e: Option<&pingora_core::Error>) -> bool {
+    e.is_some_and(|e| !matches!(e.esource(), pingora_core::ErrorSource::Downstream))
+}
+
+/// The lowest set bit in `usable` at or after index `from`, or `None` if there is none.
+///
+/// The candidate walk's only cursor primitive. `from` strictly increases across a request, so the
+/// walk always terminates — there is no way to revisit a candidate and claim a second breaker permit
+/// against it.
+fn first_usable(usable: u8, from: u8) -> Option<u8> {
+    if from >= route::MAX_CANDIDATES as u8 {
+        return None;
+    }
+    // Mask off everything below `from`, then take the lowest remaining bit.
+    let remaining = usable & !((1u8 << from) - 1);
+    (remaining != 0).then(|| remaining.trailing_zeros() as u8)
+}
+
 fn dialect_for_path(path: &str) -> Dialect {
     // Anthropic Messages vs OpenAI Chat Completions/Embeddings. Embeddings are OpenAI-dialect only.
     if path.starts_with("/v1/messages") {
@@ -509,6 +712,30 @@ const STREAM_OPTIONS_FRAG: &[u8] = br#""stream_options":{"include_usage":true},"
 /// Takes the offset rather than computing it: the caller already walked the body once for both the
 /// model and this plan (see `peek::scan_buffered`), and re-deriving it here would restore the second
 /// traversal that walk exists to remove.
+/// Overwrite the `model` value's bytes with the id the chosen candidate uses.
+///
+/// `span` comes from [`peek::BufferedScan::model_span`] and covers the raw value, quotes excluded.
+/// The replacement is a catalog string, so it needs no JSON escaping — the catalog charset test
+/// (`model_names_are_lowercase_and_log_safe`, plus the same shape for `upstream_model`) is what
+/// makes a raw byte copy safe here.
+///
+/// Returns the body untouched when the id already matches, which is the common case: candidate 0
+/// usually spells the model the way the catalog names it, so the primary path does no memmove at all
+/// and only a failover pays for one.
+fn apply_model_rewrite(mut body: Vec<u8>, span: (usize, usize), replacement: &[u8]) -> Vec<u8> {
+    let (start, end) = span;
+    // Defensive: a span outside the buffer would panic on the splice. Unreachable — the span is
+    // produced by the same walk over the same bytes — but this runs on every model-routed request.
+    if start > end || end > body.len() {
+        return body;
+    }
+    if body[start..end] == *replacement {
+        return body;
+    }
+    body.splice(start..end, replacement.iter().copied());
+    body
+}
+
 fn apply_stream_usage_injection(mut body: Vec<u8>, at: Option<usize>) -> Vec<u8> {
     let Some(at) = at else { return body };
     // Shift the tail right in place rather than copying the whole body into a second buffer.
@@ -525,6 +752,35 @@ fn apply_stream_usage_injection(mut body: Vec<u8>, at: Option<usize>) -> Vec<u8>
     body.copy_within(at..old_len, at + STREAM_OPTIONS_FRAG.len());
     body[at..at + STREAM_OPTIONS_FRAG.len()].copy_from_slice(STREAM_OPTIONS_FRAG);
     body
+}
+
+/// What the first path segment resolved to.
+///
+/// An enum rather than a wider tuple because the three failure shapes need *different* rejections
+/// (404 unknown provider, 404 unknown model, and — later, once identity is known — 400 for a BYO key
+/// on the managed-only model route), and a tuple of `Option`s would encode that in which fields
+/// happened to be `None`.
+enum Routed {
+    /// `/{provider}/…`, or the bare `/v1` default. The provider is named by the request.
+    Provider {
+        provider: Arc<Provider>,
+        /// `None` for the bare default, whose path already is what the upstream should see.
+        forward_path: Option<String>,
+        streamable: bool,
+    },
+    /// `/auto/…` with a routing header naming a model the catalog carries.
+    ///
+    /// Carries no path: on this route the upstream path is the *candidate's*, taken from the
+    /// catalog, because providers do not agree on where an endpoint lives and the disagreement is
+    /// not a prefix (Anthropic serves Messages at `/v1/messages`, OpenRouter at `/api/v1/messages`).
+    /// The client's own suffix is ignored — it points the SDK at `…/auto` and the row decides.
+    Model { route: &'static route::ModelRoute },
+    /// `/auto/…` with no routing header, or one naming a model we do not serve. Collapsed into one
+    /// outcome deliberately: a value we cannot match is a value we do not serve, and splitting it
+    /// would leak whether a given name is in the catalog to a caller who has not authenticated.
+    UnknownModel,
+    /// The first segment matches no provider, is not the bare default, and is not `/auto`.
+    UnknownProvider,
 }
 
 #[async_trait]
@@ -556,8 +812,9 @@ impl ProxyHttp for AiProxy {
         // path+query would fail for every provider that requires a query parameter — Azure OpenAI
         // mandates `?api-version=…`, so its managed streams would silently skip `stream_options`
         // injection, emit no usage chunk, and bill zero tokens.
-        let (provider_opt, forward_path, forward_streamable) = {
-            let uri = &session.req_header().uri;
+        let routed = {
+            let req = session.req_header();
+            let uri = &req.uri;
             let path = uri.path();
             let query = uri.query();
             // `nth(1)`: `/openai/v1/…` → "openai"; `/v1/…` → "v1"; "/" or "" → "".
@@ -572,38 +829,118 @@ impl ProxyHttp for AiProxy {
                 // always differs from the inbound path and always needs the URI rewritten.
                 let rest = &path[1 + first.len()..];
                 let rest = if rest.is_empty() { "/" } else { rest };
-                (
-                    Some(p.clone()),
-                    Some(with_query(rest)),
-                    is_streamable_path(rest),
-                )
+                Routed::Provider {
+                    provider: p.clone(),
+                    forward_path: Some(with_query(rest)),
+                    streamable: is_streamable_path(rest),
+                }
             } else if let Some(name) = bare_default_provider_name(path) {
                 // Bare default: dialect picks the provider and the path is forwarded unchanged, so
                 // there is nothing to rewrite — `None`. This used to build the path back up with its
                 // query appended, hand it to `upstream_request_filter`, get compared equal against
                 // the inbound `path_and_query`, and dropped: one wasted allocation per request on
                 // the drop-in default route, three when a query string was present.
-                (
-                    self.state.provider(name).cloned(),
-                    None,
-                    is_streamable_path(path),
-                )
+                match self.state.provider(name) {
+                    Some(p) => Routed::Provider {
+                        provider: p.clone(),
+                        forward_path: None,
+                        streamable: is_streamable_path(path),
+                    },
+                    None => Routed::UnknownProvider,
+                }
+            } else if first == route::AUTO_SEGMENT {
+                // Model-routed. Reached only after a provider-table miss, so the established routes
+                // pay nothing for this arm — and `state::build_providers` refuses to boot with a
+                // provider named `auto`, so the miss is guaranteed rather than merely likely.
+                let rest = &path[1 + first.len()..];
+                let rest = if rest.is_empty() { "/" } else { rest };
+                // Resolved to a `&'static` row inside the borrow, so nothing borrowed from the
+                // session escapes into the rejection paths below.
+                let row = req
+                    .headers
+                    .get(route::MODEL_HEADER)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(route::model_route);
+                let _ = rest;
+                match row {
+                    Some(route) => Routed::Model { route },
+                    None => Routed::UnknownModel,
+                }
             } else {
-                (None, None, false)
+                Routed::UnknownProvider
             }
         };
-        let Some(provider) = provider_opt else {
-            return Self::reject_boxed(
-                session,
-                &request_id,
-                404,
-                "invalid_request_error",
-                "unknown provider",
-            )
-            .await;
+
+        // Model routing needs identity before it can pick a provider (it is managed-only, and a
+        // candidate is only usable if we hold a pool key for it), so the catalog row is carried
+        // through the auth gates and resolved to a provider after them. `provider` below is the
+        // row's first candidate, which is also what the request will attempt first.
+        let (provider, forward_path, forward_streamable, model_route) = match routed {
+            Routed::Provider {
+                provider,
+                forward_path,
+                streamable,
+            } => (provider, forward_path, streamable, None),
+            Routed::Model { route } => {
+                // Streamability is a property of the *row*: its candidates all serve one wire at
+                // matching endpoints (a catalog invariant), so the first candidate's path answers it
+                // for all of them.
+                let streamable = route
+                    .candidates
+                    .first()
+                    .is_some_and(|c| is_streamable_path(c.path));
+                let first = route
+                    .candidates
+                    .first()
+                    .and_then(|c| self.state.provider_by_id(c.provider).cloned());
+                match first {
+                    Some(p) => (p, None, streamable, Some(route)),
+                    // Unreachable in practice: `every_catalog_candidate_is_a_known_provider` proves
+                    // every row names a provider the gateway registers. Answer rather than panic.
+                    None => {
+                        self.state.metrics.rejection(Rejection::NoCandidate).inc();
+                        return Self::reject_boxed(
+                            session,
+                            &request_id,
+                            503,
+                            "api_error",
+                            "no provider available for model",
+                        )
+                        .await;
+                    }
+                }
+            }
+            Routed::UnknownModel => {
+                self.state.metrics.rejection(Rejection::UnknownModel).inc();
+                return Self::reject_boxed(
+                    session,
+                    &request_id,
+                    404,
+                    "invalid_request_error",
+                    "unknown model",
+                )
+                .await;
+            }
+            Routed::UnknownProvider => {
+                return Self::reject_boxed(
+                    session,
+                    &request_id,
+                    404,
+                    "invalid_request_error",
+                    "unknown provider",
+                )
+                .await;
+            }
         };
-        // Dialect now comes from the resolved provider (usage parsing + injection eligibility).
-        let dialect = provider.dialect;
+        // Dialect drives usage parsing and injection eligibility.
+        //
+        // For a model-routed request it comes from the **row**, not the provider, because a provider
+        // can serve more than one wire: OpenRouter is `WireFormat::OpenAi` in the provider table and
+        // still serves genuine Anthropic Messages traffic at `/api/v1/messages`. Reading
+        // `provider.dialect` there would hand an Anthropic response to the OpenAI usage extractor,
+        // which does not error — it trips the dialect-mismatch guard and emits a **zero-token
+        // billing row**. Silent revenue loss, on the exact path that makes Claude failover possible.
+        let dialect = model_route.map_or(provider.dialect, |r| r.wire);
 
         // 2. Extract the presented key — a managed virtual key (`bai_…`) or a raw BYO provider token.
         let Some(raw_key) = extract_virtual_key(session.req_header()) else {
@@ -698,7 +1035,11 @@ impl ProxyHttp for AiProxy {
             }
             // The actual `Bearer …`/`x-api-key` value is precomputed in the provider registry and
             // applied in `upstream_request_filter`; here we only confirm a pool key exists.
-            if provider.pool_auth_value.is_none() {
+            //
+            // Skipped for a model-routed request: there a pool key is a property of each *candidate*,
+            // and the first one lacking a key is a reason to try the next, not to fail the request.
+            // The equivalent gate is the usable-candidate check below.
+            if model_route.is_none() && provider.pool_auth_value.is_none() {
                 return Self::reject_boxed(
                     session,
                     &request_id,
@@ -711,6 +1052,82 @@ impl ProxyHttp for AiProxy {
             (identity.tenant_id, identity.vpc_id, true)
         } else {
             (0, 0, false)
+        };
+
+        // Model routing is **managed-only**, and the first candidate is chosen here.
+        let (provider, usable) = match model_route {
+            None => (provider, 0u8),
+            Some(row) => {
+                // A BYO token belongs to exactly one provider. Selecting among candidates would be a
+                // guess about which — the guess the `providers` crate exists to refuse — and failing
+                // over would send the caller's key for one vendor to a different vendor, which is a
+                // credential disclosure, not a degraded experience. 400 rather than 401: their key
+                // may be perfectly valid, it is the endpoint that is wrong for it.
+                if !managed {
+                    self.state
+                        .metrics
+                        .rejection(Rejection::ByoOnModelRoute)
+                        .inc();
+                    return Self::reject_boxed(
+                        session,
+                        &request_id,
+                        400,
+                        "invalid_request_error",
+                        "model routing requires a managed key",
+                    )
+                    .await;
+                }
+                // Bit i ⇒ candidate i is registered here *and* has a pool key. Computed once; every
+                // later attempt reads this instead of re-deriving it.
+                let mut usable = 0u8;
+                for (i, c) in row
+                    .candidates
+                    .iter()
+                    .take(route::MAX_CANDIDATES)
+                    .enumerate()
+                {
+                    let keyed = self
+                        .state
+                        .provider_by_id(c.provider)
+                        .is_some_and(|p| p.pool_auth_value.is_some());
+                    if keyed {
+                        usable |= 1 << i;
+                    }
+                }
+                let Some(first) = first_usable(usable, 0) else {
+                    // Every candidate is unkeyed. Distinct from `circuit_open`, which means the
+                    // candidates exist and are being skipped while they recover — `doctor`'s
+                    // `model_catalog` check exists to catch this configuration at boot instead.
+                    self.state.metrics.rejection(Rejection::NoCandidate).inc();
+                    return Self::reject_boxed(
+                        session,
+                        &request_id,
+                        503,
+                        "api_error",
+                        "no provider key available",
+                    )
+                    .await;
+                };
+                match row
+                    .candidates
+                    .get(usize::from(first))
+                    .and_then(|c| self.state.provider_by_id(c.provider))
+                {
+                    Some(p) => (p.clone(), usable),
+                    // Unreachable: the bit is only set when `provider_by_id` resolved above.
+                    None => {
+                        self.state.metrics.rejection(Rejection::NoCandidate).inc();
+                        return Self::reject_boxed(
+                            session,
+                            &request_id,
+                            503,
+                            "api_error",
+                            "no provider key available",
+                        )
+                        .await;
+                    }
+                }
+            }
         };
 
         // Mark OpenAI managed chat/completions streams for body buffering + `stream_options` injection
@@ -726,19 +1143,31 @@ impl ProxyHttp for AiProxy {
         // When open, fast-fail 503 instead of piling the request against `read_timeout_secs` and
         // exhausting connection/in-flight slots for every provider. 5xx/connect failures trip it;
         // 429 never does (that's a healthy provider throttling — see `logging`).
-        if let Some(breaker) = &provider.breaker {
-            if breaker.allow().is_err() {
-                self.state.metrics.rejection(Rejection::CircuitOpen).inc();
-                return Self::reject_boxed(
-                    session,
-                    &request_id,
-                    503,
-                    "api_error",
-                    "provider temporarily unavailable",
-                )
-                .await;
+        //
+        // **Not** for a model-routed request: which provider it attempts is not settled until
+        // `upstream_peer` picks a candidate, and gating here would claim a permit against candidate
+        // 0 and then claim a second one against whichever candidate is actually tried. That path
+        // gates per candidate instead, at the same "last thing before the connection" position.
+        if model_route.is_none() {
+            if let Some(breaker) = &provider.breaker {
+                if breaker.allow().is_err() {
+                    self.state.metrics.rejection(Rejection::CircuitOpen).inc();
+                    return Self::reject_boxed(
+                        session,
+                        &request_id,
+                        503,
+                        "api_error",
+                        "provider temporarily unavailable",
+                    )
+                    .await;
+                }
             }
         }
+        // A permit is now outstanding against this provider (see `RequestCtx::breaker_pending`).
+        // `breaker.is_some()` is exactly the condition `logging` used to test inline before the
+        // ledger existed, so recording is unchanged for the provider-routed path. The model-routed
+        // path starts owing nothing and takes on its first permit in `upstream_peer`.
+        let breaker_pending = model_route.is_none() && provider.breaker.is_some();
 
         *ctx = Some(RequestCtx {
             tenant_id,
@@ -766,7 +1195,7 @@ impl ProxyHttp for AiProxy {
             // The `+ STREAM_OPTIONS_FRAG.len()` is headroom for the splice, which
             // `apply_stream_usage_injection` performs *in place*: with it the injection never
             // reallocates, so a body arrives, is spliced, and goes upstream on one allocation.
-            req_buf: match (inject_eligible, declared_len) {
+            req_buf: match (inject_eligible || model_route.is_some(), declared_len) {
                 (true, Some(len)) => {
                     Vec::with_capacity(len.min(MAX_REQUEST_BODY) + STREAM_OPTIONS_FRAG.len())
                 }
@@ -785,6 +1214,19 @@ impl ProxyHttp for AiProxy {
             upstream_status: None,
             start,
             attempt: 0,
+            breaker_pending,
+            auto: model_route.map(|route| {
+                Box::new(ModelRouting {
+                    route,
+                    // `first_usable` picked this candidate above; `upstream_peer` re-derives it from
+                    // here on.
+                    candidate: first_usable(usable, 0).unwrap_or(0),
+                    usable,
+                    // Overwritten per attempt by `upstream_peer`; seeded so the first attempt is
+                    // timed even if it fails before the prologue runs.
+                    attempt_start: start,
+                })
+            }),
             request_id,
         });
         // Admitted: count it in-flight. Balanced by the decrement in `logging`, which runs exactly
@@ -802,11 +1244,115 @@ impl ProxyHttp for AiProxy {
         // `ctx` is set by `request_filter` for every admitted request; a missing ctx here means an
         // unadmitted request reached `upstream_peer` (a Pingora ordering change or future refactor).
         // Surface it as an error rather than panicking the worker.
-        let Some(rc) = ctx.as_ref() else {
+        let Some(rc) = ctx.as_mut() else {
             return Err(pingora_core::Error::new_str(
                 "upstream_peer reached without request context",
             ));
         };
+
+        // Pingora calls this once per attempt, always before a body byte moves, so it is the one
+        // place a retry's leftover request-body state can be cleared. No-op on the first attempt.
+        rc.reset_request_body_phase();
+
+        // Model-routed: this hook owns the candidate walk *and* the breaker ledger.
+        //
+        // It is the only place `rc.provider` changes, which is what makes double-recording
+        // structurally impossible — and it is the only hook that runs on every attempt, including
+        // the ones pingora starts without consulting `fail_to_connect` (its default
+        // `error_while_proxy` marks a reused-connection failure retryable on its own). A design that
+        // recorded in `fail_to_connect` would miss exactly those.
+        if let Some(row) = rc.auto.as_ref().map(|a| a.route) {
+            // Reaching here with a permit outstanding means the previous attempt failed before any
+            // response arrived, so the candidate we were on earned the failure. Resolve it before
+            // touching anything else; `logging` then only ever sees the final candidate's permit.
+            if rc.breaker_pending {
+                if let Some(b) = &rc.provider.breaker {
+                    b.record_failure();
+                }
+                rc.breaker_pending = false;
+            }
+
+            loop {
+                // Read the cursor out of the boxed state; `rc` stays mutably borrowable below.
+                let (usable, at) = match rc.auto.as_ref() {
+                    Some(a) => (a.usable, a.candidate),
+                    None => {
+                        return Err(pingora_core::Error::new_str("model routing state missing"));
+                    }
+                };
+                let Some(i) = first_usable(usable, at) else {
+                    // Out of candidates. `Error::new` defaults `retry` to false, so the proxy loop
+                    // stops here rather than spinning; `logging` finds nothing pending to record.
+                    return Err(pingora_core::Error::new_str(
+                        "no candidate provider available",
+                    ));
+                };
+                if let Some(a) = rc.auto.as_mut() {
+                    a.candidate = i;
+                }
+
+                let Some(candidate) = row.candidates.get(usize::from(i)) else {
+                    rc.advance_candidate(i);
+                    continue;
+                };
+                let Some(p) = self.state.provider_by_id(candidate.provider).cloned() else {
+                    // Unreachable: `usable` bits are only set for candidates that resolved.
+                    rc.advance_candidate(i);
+                    continue;
+                };
+
+                // Gate on *this* candidate's breaker. An open one is skipped without claiming a
+                // permit and without an attempt — the entire point of holding a candidate list.
+                //
+                // Deliberately `allow()` rather than reading `state()`: the OPEN → HALF_OPEN
+                // transition happens *inside* `allow()`, so a `state()`-based pre-check would report
+                // `Open` past the reset timeout, skip a candidate that `allow()` would have admitted
+                // as a probe, and leave the breaker with no way to ever close.
+                if let Some(b) = &p.breaker {
+                    if b.allow().is_err() {
+                        self.state.metrics.rejection(Rejection::CircuitOpen).inc();
+                        rc.advance_candidate(i);
+                        continue;
+                    }
+                }
+                // A permit (if this breaker has one to give) is now outstanding against `p`.
+                rc.breaker_pending = p.breaker.is_some();
+                rc.provider = p.clone();
+
+                match self.state.resolve(&p.authority).await {
+                    Ok(addr) => {
+                        // Time this attempt from here, so a candidate that burned its connect
+                        // timeout does not charge that to whichever provider ends up serving.
+                        if let Some(a) = rc.auto.as_mut() {
+                            a.attempt_start = Instant::now();
+                        }
+                        rc.set_forward_path(candidate.path);
+                        return Ok(Box::new(self.build_peer(addr, &p)));
+                    }
+                    Err(e) => {
+                        // DNS failure is handled *here*, inside the walk, rather than by returning
+                        // an error: pingora does not call `fail_to_connect` when `upstream_peer`
+                        // itself fails (lib.rs returns early), so a returned error would end the
+                        // request instead of trying the next candidate — and a provider that has
+                        // vanished from DNS is precisely a case failover exists for.
+                        warn!(
+                            request_id = %rc.request_id,
+                            provider = p.name.as_str(),
+                            authority = p.authority.as_str(),
+                            candidate = i,
+                            error = %e,
+                            "upstream dns resolution failed; trying the next candidate",
+                        );
+                        if let Some(b) = &p.breaker {
+                            b.record_failure();
+                        }
+                        rc.breaker_pending = false;
+                        rc.advance_candidate(i);
+                        continue;
+                    }
+                }
+            }
+        }
 
         // Resolve via the TTL cache (async, non-blocking) rather than `HttpPeer::new`'s eager
         // blocking `getaddrinfo`. SNI/Host = the configured host; TLS on for real providers (the
@@ -832,38 +1378,100 @@ impl ProxyHttp for AiProxy {
                 ));
             }
         };
-        let mut peer = HttpPeer::new(
-            addr,
-            self.state.config.upstream_tls,
-            rc.provider.host.clone(),
-        );
-        // Prefer HTTP/2 to the provider (config `upstream_http2`, default on), fall back to HTTP/1.1.
-        // Every provider in `KNOWN_PROVIDERS` negotiates `h2` over TLS (verified by handshake), and H2
-        // multiplexes many concurrent requests/streams over one connection — fewer sockets and TLS
-        // handshakes from our egress IPs (which also eases the egress-reputation pressure `ratelimit`
-        // guards). `H2H1` is strictly ≥ `H1` on compatibility: ALPN negotiates down to H1 for any host
-        // that doesn't offer h2, and a plaintext upstream (the mock, `upstream_tls=false`) has no ALPN
-        // at all and stays H1. The negotiated protocol is then visible per-request as
-        // `upstream_request.version` (see `upstream_request_filter`), which is what lets the
-        // body-injection path frame correctly. The knob lets an operator force all-H1 without a code
-        // redeploy, and lets the e2e bench compare the two head-to-head.
-        peer.options.alpn = if self.state.config.upstream_http2 {
-            ALPN::H2H1
-        } else {
-            ALPN::H1
+        Ok(Box::new(self.build_peer(addr, &rc.provider)))
+    }
+
+    /// Fail over on a **5xx**, before a byte of it reaches the client.
+    ///
+    /// This hook runs strictly before anything is written downstream (`h1_response_filter` /
+    /// `h2_response_filter` both call it ahead of `write_response_tasks`), so returning a retryable
+    /// error here re-enters pingora's retry loop and `upstream_peer` picks the next candidate. That
+    /// is the only place in the response path where abandoning an answer is still possible.
+    ///
+    /// Erroring *here* rather than in `response_filter` also keeps the per-attempt state clean for
+    /// free: `response_filter` never runs for the abandoned attempt, so nothing increments
+    /// `active_streams`, observes TTFT, or sets `upstream_status`, and `response_body_filter` never
+    /// feeds the tail, head, or response model scanner. The next attempt starts from the same slate
+    /// the first one did.
+    ///
+    /// Four conditions, all necessary:
+    ///
+    /// - **Model-routed.** A provider-routed request named its provider; there is nowhere else to go.
+    /// - **5xx only.** A `429` is a healthy provider throttling our pool key — the same judgement the
+    ///   circuit breaker makes. Re-asking a *different* vendor would convert a self-healing throttle
+    ///   into spend somewhere else, and the client's `Retry-After` already owns that case.
+    /// - **A candidate is left.** Otherwise relay the 5xx: the client learns what the last provider
+    ///   actually said, which beats the synthetic error an exhausted retry loop would produce.
+    /// - **The body is replayable.** Pingora's replay buffer is a private 64 KiB constant; past it
+    ///   `get_retry_buffer` yields nothing and a retry would send headers describing a body it then
+    ///   never writes, hanging the upstream until `read_timeout_secs`. That case is counted, not
+    ///   attempted — see `ai_failover_body_too_large_total`.
+    async fn upstream_response_filter(
+        &self,
+        session: &mut Session,
+        upstream_response: &mut ResponseHeader,
+        ctx: &mut Self::CTX,
+    ) -> Result<()> {
+        let Some(rc) = ctx.as_mut() else {
+            return Ok(());
         };
-        // Cert verification is on everywhere except the bench's self-signed TLS mock (see config).
-        if !self.state.config.upstream_verify_cert {
-            peer.options.verify_cert = false;
-            peer.options.verify_hostname = false;
+        let Some((usable, at)) = rc.auto.as_ref().map(|a| (a.usable, a.candidate)) else {
+            return Ok(());
+        };
+        let status = upstream_response.status.as_u16();
+        if status < 500 {
+            return Ok(());
         }
-        peer.options.connection_timeout =
-            Some(Duration::from_secs(self.state.config.connect_timeout_secs));
-        peer.options.read_timeout = Some(Duration::from_secs(self.state.config.read_timeout_secs));
-        peer.options.write_timeout =
-            Some(Duration::from_secs(self.state.config.write_timeout_secs));
-        peer.options.idle_timeout = Some(Duration::from_secs(self.state.config.idle_timeout_secs));
-        Ok(Box::new(peer))
+        if first_usable(usable, at.saturating_add(1)).is_none() {
+            return Ok(());
+        }
+        // Fail over only when the body is **provably** replayable: fully read, and small enough
+        // that pingora buffered all of it.
+        //
+        // `retry_buffer_truncated()` alone is not enough, and the reason is subtler than it looks.
+        // It reports on what has been buffered *so far*, so a provider that 5xxes fast — which is
+        // what a failing provider does — answers before a large body has finished streaming in, and
+        // the check reads `false` simply because the bytes that would truncate it have not arrived.
+        //
+        // Retrying there is not *unsafe*: pingora replays the buffered prefix with
+        // `end_of_body = is_body_done()` and the duplex loop reads the remainder straight from the
+        // socket (`proxy_h1.rs`'s retry block), so the next candidate does receive the whole body.
+        // What it is, is **timing-dependent** — the same request fails over or does not depending on
+        // how quickly the upstream rejected it. For a path that decides which vendor gets billed,
+        // a deterministic rule is worth more than the extra failovers the loose one would win.
+        //
+        // The cost is real and worth naming: a 5xx that arrives while the client is still uploading
+        // is relayed rather than retried, even when it would have replayed fine. That is what
+        // `ai_failover_unreplayable_total` counts.
+        let replayable =
+            session.as_mut().is_body_done() && !session.as_ref().retry_buffer_truncated();
+        if !replayable {
+            self.state.metrics.failover_unreplayable_total.inc();
+            warn!(
+                request_id = %rc.request_id,
+                provider = rc.provider.name.as_str(),
+                status,
+                body_done = session.as_mut().is_body_done(),
+                "upstream failed but the request body is not provably replayable; relaying the error",
+            );
+            return Ok(());
+        }
+
+        self.state.metrics.candidate_failovers_total.inc();
+        warn!(
+            request_id = %rc.request_id,
+            provider = rc.provider.name.as_str(),
+            candidate = at,
+            status,
+            "upstream returned {status}; trying the next candidate",
+        );
+        // The outgoing candidate's breaker failure is recorded by `upstream_peer`'s prologue, which
+        // still sees `breaker_pending` set. A 5xx is a failure by the breaker's own definition, so
+        // that is the right outcome — and recording it here as well would double-count.
+        rc.advance_candidate(at);
+        let mut e = pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(status));
+        e.set_retry(true);
+        Err(e)
     }
 
     async fn upstream_request_filter(
@@ -883,11 +1491,19 @@ impl ProxyHttp for AiProxy {
         // presented its virtual key in doesn't end up with two stacked values. BYO (`!managed`):
         // leave the user's own auth header exactly as presented.
         if rc.managed {
+            // Strip **unconditionally**, before deciding whether there is a pool key to insert.
+            //
+            // These two used to sit inside the `if let Some(av)` below, which was safe only because
+            // a managed request without a pool key is rejected earlier. That is a load-bearing
+            // invariant expressed nowhere near here, and if it ever failed the consequence was not a
+            // degraded request but a *credential disclosure*: nothing removed, nothing inserted, and
+            // the caller's Ed25519 virtual key forwarded verbatim to a third-party provider. Now the
+            // worst case is an unauthenticated request the provider rejects with a 401.
+            upstream_request.remove_header("authorization");
+            for header in STATIC_KEY_HEADERS {
+                upstream_request.remove_header(header);
+            }
             if let Some(av) = &rc.provider.pool_auth_value {
-                upstream_request.remove_header("authorization");
-                for header in STATIC_KEY_HEADERS {
-                    upstream_request.remove_header(header);
-                }
                 // Clone the boot-built `HeaderValue` (a refcount bump) rather than re-validating and
                 // re-copying the key out of a `&str` on every managed request. The `&str` path is
                 // kept as a fallback for a key that isn't a legal header value, which could never
@@ -901,6 +1517,12 @@ impl ProxyHttp for AiProxy {
                     }
                 }
             }
+        }
+
+        // The routing header is ours, not the provider's. Stripped on every attempt (pingora rebuilds
+        // this header from the downstream request each time, so it reappears each time).
+        if rc.auto.is_some() {
+            upstream_request.remove_header(route::MODEL_HEADER);
         }
 
         // Point Host at the upstream. Same precomputed-value trick as the pool key above.
@@ -942,7 +1564,11 @@ impl ProxyHttp for AiProxy {
         //     connection-specific header — the `h2` crate *rejects the whole request*
         //     (`UserError::MalformedHeaders`) if it's present. So we must NOT set it; removing
         //     `content-length` is sufficient and correct.
-        if rc.inject_eligible {
+        //
+        // Keyed on `rewrites_body`, not `inject_eligible`, so the model rewrite gets the same
+        // treatment: `openai/gpt-4o-mini` is longer than `gpt-4o-mini`, and forwarding the client's
+        // original `Content-Length` alongside a longer body truncates it at the upstream.
+        if rc.rewrites_body() {
             upstream_request.remove_header("content-length");
             if upstream_request.version != http::Version::HTTP_2 {
                 upstream_request.insert_header("transfer-encoding", "chunked")?;
@@ -984,23 +1610,44 @@ impl ProxyHttp for AiProxy {
             // come from one walk of the finished buffer below — the body was previously traversed
             // twice, once here for `model` and once by the injection planner, over the same bytes
             // with the same depth/string/escape bookkeeping.
-            if rc.inject_eligible {
+            if rc.rewrites_body() {
                 rc.req_buf.extend_from_slice(chunk);
             } else if rc.managed {
                 rc.model_scanner.feed(chunk);
             }
         }
 
-        if rc.inject_eligible {
+        if rc.rewrites_body() {
             if end_of_stream {
-                // One structural walk for both answers (see `peek::scan_buffered`).
+                // One structural walk for every answer (see `peek::scan_buffered`).
                 let buf = std::mem::take(&mut rc.req_buf);
                 let scan = peek::scan_buffered(&buf);
                 if rc.model.is_empty() {
                     if let Some(m) = scan.model {
+                        // The *client's* id, captured before any rewrite below — this is what
+                        // `requested_model` means, and it stays the canonical catalog name on a
+                        // model-routed request even though the upstream is about to be told
+                        // something else.
                         rc.model = sanitize_model(m).into_owned();
                     }
                 }
+                // Model-routed: re-spell `model` as the candidate serving *this attempt* spells it.
+                // Providers essentially never agree on an id — Anthropic's `claude-opus-4-8` is
+                // OpenRouter's `anthropic/claude-opus-4-8` — so without this a failover would ask
+                // the fallback for a model it has never heard of.
+                //
+                // Done before the `stream_options` splice, and safe in that order because
+                // `inject_at` points just past the root `{` and so always precedes the model value:
+                // rewriting the value cannot move it.
+                let buf = match (rc.auto.as_ref(), scan.model_span) {
+                    (Some(a), Some(span)) => {
+                        match a.route.candidates.get(usize::from(a.candidate)) {
+                            Some(c) => apply_model_rewrite(buf, span, c.upstream_model.as_bytes()),
+                            None => buf,
+                        }
+                    }
+                    _ => buf,
+                };
                 // Emit the whole (possibly rewritten) body in one shot; `transfer-encoding: chunked`
                 // (set in `upstream_request_filter`) makes the changed length fine.
                 *body = Some(Bytes::from(apply_stream_usage_injection(
@@ -1038,10 +1685,16 @@ impl ProxyHttp for AiProxy {
             // Headers arrived ≈ time-to-first-byte. Per-provider handle resolved once at boot (see
             // `ProviderMetrics`) — first-token latency is per-provider, so an unlabeled histogram
             // can't tell you which one regressed.
+            //
+            // Timed from `attempt_start`, not `start`. They are the same instant for a request that
+            // connects first try; they differ once a candidate has been abandoned, and charging the
+            // dead candidate's `connect_timeout_secs` to the provider that actually answered would
+            // render an outage at A as a latency regression at B — inverting the one thing the
+            // per-provider label is for.
             rc.provider
                 .metrics
                 .ttft_seconds
-                .observe(rc.start.elapsed().as_secs_f64());
+                .observe(rc.attempt_start().elapsed().as_secs_f64());
 
             // Per-provider response counter, bucketed by status class — the signal that a provider
             // is degrading (429/5xx) before it shows up only as latency or a missing usage event.
@@ -1133,6 +1786,39 @@ impl ProxyHttp for AiProxy {
         mut e: Box<pingora_core::Error>,
     ) -> Box<pingora_core::Error> {
         if let Some(rc) = ctx.as_mut() {
+            // Model-routed: one attempt per candidate, in preference order.
+            //
+            // No same-peer retry here, unlike the provider-routed path below. A *different* provider
+            // is strictly a superset of retrying the same one — it recovers from the transient blip
+            // the retry exists for and from a provider that is simply down, which the retry cannot.
+            // It also bounds the dead air: each attempt can burn `connect_timeout_secs`, so
+            // `MAX_CONNECT_RETRIES` attempts per candidate would multiply the client's worst case by
+            // three for no additional coverage. And it keeps the ledger trivial — exactly one
+            // `allow()`, one attempt, and one `record_*` per candidate.
+            if let Some((usable, at)) = rc.auto.as_ref().map(|a| (a.usable, a.candidate)) {
+                // The failure itself is recorded by `upstream_peer`'s prologue, when it moves off
+                // this candidate. Recording here as well would double-count whenever there is no
+                // next candidate, since `logging` would then also resolve the still-pending permit —
+                // which would trip the breaker at half its configured threshold on the last
+                // candidate, exactly where everything lands once the primaries are sick.
+                rc.provider.metrics.connect_retries_total.inc();
+                warn!(
+                    request_id = %rc.request_id,
+                    provider = rc.provider.name.as_str(),
+                    candidate = at,
+                    error = %e,
+                    "upstream connect failed; trying the next candidate",
+                );
+                // Only signal a retry if there is somewhere to go. Otherwise leave `retry` false so
+                // the proxy loop stops and `logging` resolves the outstanding permit against this,
+                // the last candidate.
+                if first_usable(usable, at.saturating_add(1)).is_some() {
+                    self.state.metrics.candidate_failovers_total.inc();
+                    rc.advance_candidate(at);
+                    e.set_retry(true);
+                }
+                return e;
+            }
             // Retry transient connect failures a couple of times (Pingora re-invokes upstream_peer).
             if rc.attempt < MAX_CONNECT_RETRIES {
                 rc.attempt += 1;
@@ -1182,21 +1868,38 @@ impl ProxyHttp for AiProxy {
             );
         }
 
-        // Resolve the circuit-breaker outcome exactly once per admitted request (every request that
-        // claimed a permit in `request_filter` records here, so a half-open probe permit can't leak).
+        // Resolve the outstanding circuit-breaker permit, if this request still owes one.
+        //
+        // `breaker_pending` is the ledger (see `RequestCtx::breaker_pending`): it is set when a
+        // permit is claimed and cleared when it is recorded, so exactly one `record_*` lands per
+        // `allow()`. On the model-routed path a candidate switch resolves the outgoing candidate in
+        // `upstream_peer` and clears the flag there, which is what stops this from double-recording
+        // against whichever candidate happened to be current at the end.
+        //
         // Failure = the provider is *broken*: a 5xx response, or no response at all paired with an
         // upstream error (connect/read failure). Success = the provider *answered* — 2xx/3xx, and
         // deliberately **4xx/429 too**: a 429 is a healthy provider throttling our pool key, which the
         // rate limiter and the client's `Retry-After` own, NOT a reason to cut all traffic to it.
-        if let Some(breaker) = &rc.provider.breaker {
+        if let Some(breaker) = rc.provider.breaker.as_ref().filter(|_| rc.breaker_pending) {
             match rc.upstream_status {
                 Some(s) if s >= 500 => breaker.record_failure(),
                 Some(_) => breaker.record_success(),
-                None if e.is_some() => breaker.record_failure(),
-                // No response and no error ⇒ client went away before the upstream answered; don't
-                // blame the provider — record success so the probe permit resolves.
+                // No response head arrived. Blame the provider only when the failure actually came
+                // *from* upstream. Pingora tags a client-side abort `ErrorSource::Downstream` (the
+                // `into_down()` at proxy_h1.rs's downstream read/write sites), and a user hitting
+                // ESC on a slow turn says nothing about the provider's health. Counting those was a
+                // live bug: cancellation is routine for a coding agent, and
+                // `circuit_breaker_threshold` cancellations inside `circuit_breaker_window_secs`
+                // would open the breaker and 503 *everyone*. Worse, `half_open_permits` is 1, so a
+                // cancel-prone request drawn as the probe reopened it every time — the breaker could
+                // not recover while users were cancelling.
+                None if is_upstream_failure(e) => breaker.record_failure(),
+                // Client went away, or the request ended with no error at all. The provider is not
+                // implicated either way; record a success so a claimed half-open probe permit still
+                // resolves rather than being stranded.
                 None => breaker.record_success(),
             }
+            rc.breaker_pending = false;
         }
 
         // The last `USAGE_TAIL_CAP` bytes of the response, oldest first (see `UsageTail`). Short
@@ -1272,9 +1975,36 @@ impl ProxyHttp for AiProxy {
             // than the downstream price table. They're equal when the response carried no model (e.g.
             // an error body), where `model` falls back to the request alias. Both sanitized.
             let billed = rc.resp_model_scanner.take_model().map(sanitize_model);
-            // Borrow the requested model as the fallback rather than cloning it — it's still read as
-            // `requested_model` below, so a clone would be pure waste on every managed response.
-            let billed_model = billed.as_deref().unwrap_or(&rc.model);
+            // The catalog name this request routed on — `None` for a provider-routed request.
+            // Derived rather than stored: it is the catalog row's own `&'static` name.
+            let routed_model = rc.auto.as_ref().map(|a| a.route.model);
+
+            // What the client *asked for*.
+            //
+            // On the model-routed path that is the catalog name from the routing header, **not** the
+            // body's `model`. The body's value is overwritten with the serving candidate's id before
+            // the request leaves the gateway, so it runs nothing and determines nothing; reporting a
+            // discarded input as "requested" was a leftover from an earlier design that did not
+            // rewrite bodies. On the provider-routed path the body is untouched and is exactly what
+            // was asked for, so it stays the answer there.
+            let requested_model = routed_model.unwrap_or(rc.model.as_str());
+
+            // A model-routed client should send the same id in both places; nothing enforces it,
+            // because the route is chosen from the header before the body is ever read. It is
+            // harmless — the body is overwritten either way — but it means the client believes it
+            // asked for something it did not get, which is a client bug worth being able to see.
+            // Counted rather than logged per request: a client that always disagrees would otherwise
+            // produce one warn line per request forever.
+            if routed_model.is_some_and(|r| !rc.model.is_empty() && rc.model != r) {
+                self.state.metrics.model_header_body_mismatch_total.inc();
+            }
+
+            // Prefer the id the provider echoed (the pinned snapshot it actually billed); fall back
+            // to what was asked for when the response carried none — an error body, say.
+            let billed_model = billed
+                .as_deref()
+                .filter(|m| !m.is_empty())
+                .unwrap_or(requested_model);
             info!(
                 target: "ai.usage",
                 request_id = %rc.request_id,
@@ -1282,7 +2012,12 @@ impl ProxyHttp for AiProxy {
                 vpc_id = rc.vpc_id,
                 provider = rc.provider.name.as_str(),
                 model = billed_model,
-                requested_model = %rc.model,
+                requested_model,
+                // Present only for a model-routed request, so the billing row says *how* it was
+                // routed as well as what ran. Equal to `requested_model` by construction on that
+                // path; its value is marking the route, not carrying a second id. `&'static` from
+                // the catalog and charset-checked by a catalog test, so it needs no `sanitize_model`.
+                routed_model,
                 stream = rc.streaming,
                 input_tokens = usage.input_tokens,
                 output_tokens = usage.output_tokens,
@@ -1302,6 +2037,316 @@ impl ProxyHttp for AiProxy {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::metrics::ProviderMetrics;
+    use crate::route::AuthScheme;
+
+    /// A minimal `RequestCtx` for exercising the body-phase logic without a running proxy.
+    fn test_ctx(inject_eligible: bool) -> RequestCtx {
+        let provider = Provider::resolve(
+            "openai",
+            "api.openai.com:443".to_string(),
+            Dialect::OpenAi,
+            AuthScheme::Bearer,
+            Some("sk-pool"),
+            ProviderMetrics::disconnected(),
+            None,
+        );
+        RequestCtx {
+            tenant_id: 42,
+            vpc_id: 7,
+            dialect: Dialect::OpenAi,
+            provider: Arc::new(provider),
+            forward_path: None,
+            managed: true,
+            model: String::new(),
+            model_scanner: peek::ModelScanner::new(),
+            resp_model_scanner: peek::ModelScanner::for_response(),
+            streaming: false,
+            resp_tail: UsageTail::default(),
+            resp_head: Vec::new(),
+            body_bytes_fed: 0,
+            upstream_status: None,
+            inject_eligible,
+            req_buf: Vec::new(),
+            start: Instant::now(),
+            attempt: 0,
+            breaker_pending: false,
+            auto: None,
+            request_id: RequestId::new(),
+        }
+    }
+
+    /// The replay contract, exercised directly: `upstream_peer` resets the body phase before pingora
+    /// re-feeds the buffered prefix through `request_body_filter`, so attempt 2 sees the body once.
+    ///
+    /// This is the bug in miniature. Attempt 1 buffers a prefix and is cut off before end-of-stream,
+    /// so `req_buf` is never drained. Pingora then replays that prefix from byte 0. Without the
+    /// reset the two concatenate, the splice is planned against the first copy, and the upstream
+    /// gets a body with a duplicated fragment — which it rejects with a `400` that `logging` records
+    /// as a breaker *success*, so nothing surfaces it as ours.
+    ///
+    /// Covered here rather than end-to-end because reproducing it over a socket needs the upstream
+    /// to die in the window where the gateway holds a *partial* body — a timing-dependent race. The
+    /// e2e suite proves the surrounding mechanism (pingora really does retry a reused connection and
+    /// really does replay through this filter); this pins what the reset itself must guarantee.
+    #[test]
+    fn resetting_the_body_phase_makes_a_replayed_prefix_idempotent() {
+        let body =
+            br#"{"messages":[{"role":"user","content":"hi"}],"model":"gpt-4o","stream":true}"#;
+        let (prefix, rest) = body.split_at(30);
+
+        // Attempt 1: a prefix arrives, then the upstream dies before end-of-stream.
+        let mut rc = test_ctx(true);
+        rc.req_buf.extend_from_slice(prefix);
+        rc.body_bytes_fed += prefix.len();
+        assert!(
+            !rc.req_buf.is_empty(),
+            "precondition: the partial body is still held, since end_of_stream never came",
+        );
+
+        // `upstream_peer` runs before any body byte of attempt 2.
+        rc.reset_request_body_phase();
+
+        // Attempt 2: pingora replays from byte 0, then the remainder streams in.
+        rc.req_buf.extend_from_slice(prefix);
+        rc.req_buf.extend_from_slice(rest);
+
+        assert_eq!(
+            rc.req_buf, body,
+            "the retried attempt must send the body exactly once",
+        );
+        assert_eq!(
+            rc.body_bytes_fed, 0,
+            "the size guard must not double-count the replayed prefix",
+        );
+        let scan = peek::scan_buffered(&rc.req_buf);
+        assert_eq!(
+            scan.model.as_deref(),
+            Some("gpt-4o"),
+            "and the model must still be extractable — a duplicated prefix offsets the scanner's \
+             depth permanently, shipping `requested_model` empty",
+        );
+        assert!(
+            scan.inject_at.is_some(),
+            "the stream_options splice must still be planned against a well-formed root object",
+        );
+    }
+
+    /// Without the reset, the same sequence corrupts the body — so the test above is not vacuous.
+    #[test]
+    fn a_replayed_prefix_without_the_reset_corrupts_the_body() {
+        let body =
+            br#"{"messages":[{"role":"user","content":"hi"}],"model":"gpt-4o","stream":true}"#;
+        let (prefix, rest) = body.split_at(30);
+
+        let mut rc = test_ctx(true);
+        rc.req_buf.extend_from_slice(prefix);
+        rc.body_bytes_fed += prefix.len();
+        // ...no reset...
+        rc.req_buf.extend_from_slice(prefix);
+        rc.req_buf.extend_from_slice(rest);
+
+        assert_ne!(rc.req_buf, body, "the duplicated prefix must be observable");
+        assert!(
+            serde_json::from_slice::<serde_json::Value>(&rc.req_buf).is_err(),
+            "and the result is not valid JSON — this is the 400 the provider returns",
+        );
+        assert_eq!(
+            rc.body_bytes_fed,
+            prefix.len(),
+            "and the size guard has double-counted",
+        );
+    }
+
+    /// `RequestCtx` is touched on every hook and, for a streaming response, once per response
+    /// chunk, so its size is a real cost rather than bookkeeping. Growing it by 64 bytes to hold the
+    /// model-routing fields inline produced a reproducible ~2.5% regression on the
+    /// `managed_sse_latency` bench — non-streaming was unaffected, which is the signature of a
+    /// per-chunk cost. Boxing that state (see `ModelRouting`) bought it back.
+    ///
+    /// A ceiling rather than an equality: padding and field order are the compiler's business, and a
+    /// few bytes either way is not what this guards. What it guards is someone adding a `String` or
+    /// an `Instant` here without noticing that the cost is paid per chunk on every stream.
+    #[test]
+    fn request_ctx_stays_small_enough_to_be_cheap_per_chunk() {
+        let size = std::mem::size_of::<RequestCtx>();
+        assert!(
+            size <= 384,
+            "RequestCtx grew to {size} bytes (ceiling 384). It is touched once per response chunk \
+             on a stream — if the new state is only needed on one route, box it the way \
+             `ModelRouting` is rather than paying for it on every request.",
+        );
+    }
+
+    /// A model-routed request takes its dialect from the **row**, not from the provider it happens
+    /// to start on.
+    ///
+    /// Not currently distinguishable end-to-end: every catalog row's primary candidate is a provider
+    /// whose own wire already matches the row, so both derivations agree. It stops agreeing the
+    /// moment a row's primary is an OpenAI-wire provider serving the Anthropic wire — Fireworks does
+    /// exactly that for its own models — and the failure is silent: the Anthropic response meets the
+    /// OpenAI extractor, trips the dialect-mismatch guard, and bills zero tokens without erroring.
+    #[test]
+    fn a_model_route_takes_its_dialect_from_the_row_not_the_provider() {
+        // OpenRouter is `OpenAi` in the provider table but serves this row's Anthropic wire.
+        let openrouter = providers::by_id(providers::ProviderId::OpenRouter);
+        assert_eq!(openrouter.wire, Dialect::OpenAi, "premise");
+
+        let row = route::model_route("claude-opus-4-8").expect("seed row");
+        assert_eq!(row.wire, Dialect::Anthropic, "premise");
+
+        // The derivation under test, as `request_filter` performs it.
+        let from_row = Some(row).map_or(openrouter.wire, |r| r.wire);
+        assert_eq!(
+            from_row,
+            Dialect::Anthropic,
+            "the row's wire must win; taking the provider's would parse an Anthropic response with \
+             the OpenAI extractor and emit a zero-token billing row",
+        );
+
+        // ...and a provider-routed request is unaffected: no row, so the provider decides.
+        let none: Option<&route::ModelRoute> = None;
+        assert_eq!(none.map_or(openrouter.wire, |r| r.wire), Dialect::OpenAi);
+    }
+
+    /// The candidate cursor. `from` strictly increases across a request, which is what guarantees
+    /// the walk terminates and that no candidate can be revisited to claim a second breaker permit.
+    #[test]
+    fn first_usable_walks_set_bits_in_order_and_terminates() {
+        // 0b1011 ⇒ candidates 0, 1, 3.
+        assert_eq!(first_usable(0b1011, 0), Some(0));
+        assert_eq!(first_usable(0b1011, 1), Some(1));
+        assert_eq!(first_usable(0b1011, 2), Some(3));
+        assert_eq!(first_usable(0b1011, 3), Some(3));
+        assert_eq!(first_usable(0b1011, 4), None);
+
+        // Nothing usable at all — the "every candidate is unkeyed" case.
+        assert_eq!(first_usable(0, 0), None);
+
+        // Past the bitmask width, including values a `saturating_add` could park on.
+        assert_eq!(first_usable(0xFF, route::MAX_CANDIDATES as u8), None);
+        assert_eq!(first_usable(0xFF, u8::MAX), None);
+
+        // Walking a full mask visits every index exactly once, in order, then stops.
+        let mut seen = Vec::new();
+        let mut at = 0u8;
+        while let Some(i) = first_usable(0xFF, at) {
+            seen.push(i);
+            at = i.saturating_add(1);
+        }
+        assert_eq!(seen, (0..route::MAX_CANDIDATES as u8).collect::<Vec<_>>());
+    }
+
+    /// The rewrite must replace exactly the value and leave the rest of the body byte-identical,
+    /// whether the new id is longer, shorter, or the same. A body that stays valid JSON with a
+    /// subtly wrong model is the failure this guards, and nothing downstream would catch it.
+    #[test]
+    fn model_rewrite_replaces_exactly_the_value() {
+        let body = br#"{"model":"gpt-4o-mini","stream":true}"#.to_vec();
+        let span = peek::scan_buffered(&body).model_span.unwrap();
+
+        // Longer (the real failover case: OpenRouter prefixes the vendor).
+        let grown = apply_model_rewrite(body.clone(), span, b"openai/gpt-4o-mini");
+        assert_eq!(
+            std::str::from_utf8(&grown).unwrap(),
+            r#"{"model":"openai/gpt-4o-mini","stream":true}"#,
+        );
+        // Shorter.
+        let shrunk = apply_model_rewrite(body.clone(), span, b"x");
+        assert_eq!(
+            std::str::from_utf8(&shrunk).unwrap(),
+            r#"{"model":"x","stream":true}"#,
+        );
+        // Identical ⇒ untouched, and no memmove: the primary candidate's common case.
+        let same = apply_model_rewrite(body.clone(), span, b"gpt-4o-mini");
+        assert_eq!(same, body);
+
+        // Both rewrites still parse, and the result is still injectable at the same offset — the
+        // ordering invariant that lets the model rewrite run before the stream_options splice.
+        let rescanned = peek::scan_buffered(&grown);
+        assert_eq!(rescanned.model.as_deref(), Some("openai/gpt-4o-mini"));
+        assert_eq!(
+            rescanned.inject_at,
+            peek::scan_buffered(&body).inject_at,
+            "the injection offset sits before the model value, so a rewrite cannot move it",
+        );
+    }
+
+    /// An out-of-range span must be ignored rather than panicking a worker.
+    #[test]
+    fn model_rewrite_ignores_an_impossible_span() {
+        let body = br#"{"model":"a"}"#.to_vec();
+        assert_eq!(apply_model_rewrite(body.clone(), (5, 2), b"z"), body);
+        assert_eq!(apply_model_rewrite(body.clone(), (0, 999), b"z"), body);
+    }
+
+    /// A client-side abort must not count against the provider's breaker; everything else must.
+    ///
+    /// This is the whole of the cancellation bug: `ErrorSource::Downstream` is a user hitting ESC or
+    /// a broken pipe writing the response back, and counting those opened breakers on healthy
+    /// providers. `Unset` is our own DNS failure out of `upstream_peer` and `Upstream` is a real
+    /// connect/read failure — both are genuine provider failures and must still count.
+    #[test]
+    fn only_non_downstream_errors_count_against_the_breaker() {
+        use pingora_core::{Error, ErrorSource, ErrorType};
+
+        assert!(!is_upstream_failure(None), "no error is not a failure");
+
+        let mut down = *Error::new(ErrorType::WriteError);
+        down.esource = ErrorSource::Downstream;
+        assert!(
+            !is_upstream_failure(Some(&down)),
+            "a client abort must not trip the provider's breaker",
+        );
+
+        for source in [
+            ErrorSource::Upstream,
+            ErrorSource::Internal,
+            ErrorSource::Unset,
+        ] {
+            let mut e = *Error::new(ErrorType::ConnectError);
+            e.esource = source.clone();
+            assert!(
+                is_upstream_failure(Some(&e)),
+                "{source:?} must count as a provider failure",
+            );
+        }
+    }
+
+    /// The premise behind `RequestCtx::reset_request_body_phase`: a scanner fed a duplicated body
+    /// prefix is permanently broken, because the extra `{` offsets its brace depth so the root-level
+    /// key check never matches again.
+    ///
+    /// Pingora replays its retry buffer through `request_body_filter`, so without the reset this is
+    /// exactly what the second attempt's scanner sees — and the billing row ships
+    /// `requested_model = ""`. The e2e coverage for the real replay path lives in `tests/e2e.rs`.
+    #[test]
+    fn a_replayed_body_prefix_breaks_a_scanner_that_was_not_reset() {
+        // `model` deliberately sits after `messages`, so the scanner is still mid-walk when the
+        // replayed prefix arrives — the case a short-circuit on an early `model` would hide.
+        let body = br#"{"messages":[{"role":"user","content":"hi"}],"model":"gpt-4o"}"#;
+        let (prefix, rest) = body.split_at(30);
+
+        let mut fresh = peek::ModelScanner::new();
+        fresh.feed(body);
+        assert_eq!(
+            fresh.take_model().as_deref(),
+            Some("gpt-4o"),
+            "a clean walk finds the root-level model",
+        );
+
+        let mut replayed = peek::ModelScanner::new();
+        replayed.feed(prefix);
+        replayed.feed(prefix); // pingora replays from byte 0 on the retry
+        replayed.feed(rest);
+        assert_eq!(
+            replayed.take_model(),
+            None,
+            "the duplicated prefix offsets the depth, so the root `model` is never seen — \
+             this is why upstream_peer resets the scanner every attempt",
+        );
+    }
 
     /// Build a `RequestHeader` for a given path (+ optional query) with the given headers set —
     /// mirrors the shape `session.req_header()` hands `extract_virtual_key` on the real path.
@@ -1613,13 +2658,41 @@ mod tests {
             .split("#[cfg(test)]")
             .next()
             .expect("split always yields at least one part");
-        let call_sites = src.matches("Self::reject_boxed(").count();
-        assert_eq!(
-            call_sites,
+        // Pull each call site's `(type, message)` rather than counting sites. A raw count broke as
+        // soon as one message was rejected from more than one place ("no provider key available"
+        // now has a provider-routed and a model-routed caller), and relaxing it to `>=` would have
+        // stopped catching the thing it exists for: a *new* message with no table entry.
+        //
+        // The two arguments after the numeric status are the only string literals in the call, and
+        // rustfmt keeps them one per line, so scanning forward for the first two quoted literals is
+        // stable.
+        let mut sites = 0usize;
+        for (i, _) in src.match_indices("Self::reject_boxed(") {
+            sites += 1;
+            let tail = &src[i..];
+            let end = tail.find(")\n").map_or(tail.len(), |e| e + 1);
+            let literals: Vec<&str> = tail[..end]
+                .match_indices('"')
+                .collect::<Vec<_>>()
+                .chunks(2)
+                .filter_map(|c| match c {
+                    [(a, _), (b, _)] => Some(&tail[a + 1..*b]),
+                    _ => None,
+                })
+                .collect();
+            let (Some(typ), Some(msg)) = (literals.first(), literals.get(1)) else {
+                panic!("could not read (type, message) from a reject_boxed call site");
+            };
+            assert!(
+                REJECT_BODIES.iter().any(|(t, m, _)| t == typ && m == msg),
+                "reject_boxed({typ:?}, {msg:?}) has no REJECT_BODIES entry — it would take \
+                 `error_body`'s allocating fallback on every hit",
+            );
+        }
+        assert!(
+            sites >= REJECT_BODIES.len(),
+            "{sites} call sites but {} table entries — an entry has no caller",
             REJECT_BODIES.len(),
-            "{call_sites} reject_boxed call sites vs {} REJECT_BODIES entries — add the missing \
-             (type, message) pair to the table",
-            REJECT_BODIES.len()
         );
         // Every tabulated message must also appear at a call site, catching the reverse drift (a
         // table entry left behind after its rejection was removed). Twice: the table and the caller.
@@ -1635,18 +2708,20 @@ mod tests {
     fn rejection_labels_round_trip_and_are_unique() {
         use crate::metrics::Rejection;
         use std::collections::HashSet;
-        let all = [
-            Rejection::Auth,
-            Rejection::DenySpend,
-            Rejection::DenyFraud,
-            Rejection::DenyUnknown,
-            Rejection::CircuitOpen,
-            Rejection::BodyTooLarge,
-            Rejection::RateLimit,
-            Rejection::RateLimitByoGlobal,
-        ];
+        // `Rejection::ALL` rather than a copy of the variant list: a copy silently stops covering
+        // whatever is added next, which is exactly what it happened to do.
+        let all = Rejection::ALL;
         let labels: HashSet<&str> = all.iter().map(|r| r.label()).collect();
         assert_eq!(labels.len(), all.len(), "duplicate rejection label");
+        for r in all {
+            let l = r.label();
+            assert!(!l.is_empty(), "{r:?} has an empty label");
+            assert!(
+                l.bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_'),
+                "{r:?} label {l:?} must be a lowercase snake_case Prometheus label value",
+            );
+        }
         // The two dashboards-facing strings must not drift — existing alerts key on them.
         assert_eq!(Rejection::RateLimit.label(), "rate_limit");
         assert_eq!(

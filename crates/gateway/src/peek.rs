@@ -343,6 +343,14 @@ pub struct BufferedScan {
     /// Where to splice the `stream_options` fragment, as [`plan_stream_usage_injection`] would have
     /// reported it.
     pub inject_at: Option<usize>,
+    /// Byte range of the root-level `model` **value**, exclusive of its quotes — the span to
+    /// overwrite when a model-routed request has to be re-spelled for the candidate serving it.
+    ///
+    /// Raw, still-escaped bytes, unlike [`Self::model`] which is unescaped: a rewrite replaces the
+    /// span wholesale, so it wants the extent of what is actually on the wire, not the decoded
+    /// value's length. `None` whenever [`Self::model`] is `None`, and the two always describe the
+    /// same occurrence — the first root-level `model`.
+    pub model_span: Option<(usize, usize)>,
 }
 
 /// One structural walk producing both answers, for the path that already has the whole body.
@@ -373,6 +381,7 @@ pub fn scan_buffered(body: &[u8]) -> BufferedScan {
         return BufferedScan {
             model: None,
             inject_at: None,
+            model_span: None,
         };
     }
     let insert_at = i + 1;
@@ -392,6 +401,9 @@ pub fn scan_buffered(body: &[u8]) -> BufferedScan {
     let mut capturing_model = false;
     let mut model_buf: Vec<u8> = Vec::new();
     let mut model: Option<String> = None;
+    // Where the value's raw bytes begin (just past the opening quote), and the finished span.
+    let mut model_start = 0usize;
+    let mut model_span: Option<(usize, usize)> = None;
 
     let mut j = i;
     while j < n {
@@ -429,6 +441,9 @@ pub fn scan_buffered(body: &[u8]) -> BufferedScan {
                 } else if capturing_model {
                     capturing_model = false;
                     last_key_is_model = false;
+                    // `j` is the closing quote, `model_start` the byte after the opening one, so the
+                    // span covers exactly the value and neither quote.
+                    model_span = Some((model_start, j));
                     // Same non-UTF-8 fallback as `ModelScanner`: record "unknown" rather than emit a
                     // U+FFFD-corrupted model into the billing log.
                     model = Some(
@@ -453,6 +468,7 @@ pub fn scan_buffered(body: &[u8]) -> BufferedScan {
                 } else if depth == 1 && last_key_is_model && model.is_none() {
                     capturing_model = true;
                     model_buf.clear();
+                    model_start = j + 1;
                 }
                 in_string = true;
             }
@@ -484,6 +500,7 @@ pub fn scan_buffered(body: &[u8]) -> BufferedScan {
     BufferedScan {
         model,
         inject_at: (stream_true && !saw_stream_options).then_some(insert_at),
+        model_span,
     }
 }
 
@@ -501,6 +518,63 @@ mod tests {
         let mut s = ModelScanner::for_response();
         s.feed(body);
         s.take_model()
+    }
+
+    /// `model_span` must bracket exactly the value's raw bytes — neither quote, nothing else. The
+    /// model-routed path overwrites this range in place, so an off-by-one produces a body that is
+    /// still valid JSON with a subtly wrong model, which no downstream check would catch.
+    #[test]
+    fn model_span_brackets_exactly_the_value_bytes() {
+        let cases: &[&[u8]] = &[
+            br#"{"model":"gpt-4o-mini"}"#,
+            br#"{"messages":[{"role":"user","content":"hi"}],"model":"gpt-4o-mini"}"#,
+            br#"{"model":"gpt-4o-mini","stream":true}"#,
+            // A nested "model" must not be the one located.
+            br#"{"tools":[{"model":"decoy"}],"model":"gpt-4o-mini"}"#,
+            // Whitespace around the value's colon, and a leading-whitespace root.
+            b"  {\n  \"model\" : \"gpt-4o-mini\"\n}",
+        ];
+        for body in cases {
+            let scan = scan_buffered(body);
+            let span = scan.model_span;
+            assert!(
+                span.is_some(),
+                "no span for {:?}",
+                String::from_utf8_lossy(body)
+            );
+            if let Some((start, end)) = span {
+                assert_eq!(
+                    &body[start..end],
+                    b"gpt-4o-mini",
+                    "span covers the wrong bytes in {:?}",
+                    String::from_utf8_lossy(body),
+                );
+                // The bytes immediately outside the span are the delimiting quotes.
+                assert_eq!(body[start - 1], b'"', "span must start inside the quote");
+                assert_eq!(body[end], b'"', "span must end before the quote");
+            }
+            assert_eq!(scan.model.as_deref(), Some("gpt-4o-mini"));
+        }
+    }
+
+    /// No root-level model ⇒ no span. The two answers always agree about whether one was found.
+    #[test]
+    fn model_span_is_absent_exactly_when_the_model_is() {
+        let cases: &[&[u8]] = &[
+            br#"{"messages":[]}"#,
+            br#"[]"#,
+            br#"{"tools":[{"model":"nested-only"}]}"#,
+            b"",
+        ];
+        for body in cases {
+            let scan = scan_buffered(body);
+            assert_eq!(
+                scan.model.is_some(),
+                scan.model_span.is_some(),
+                "model and model_span disagree on {:?}",
+                String::from_utf8_lossy(body),
+            );
+        }
     }
 
     #[test]

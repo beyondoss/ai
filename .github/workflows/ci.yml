@@ -52,9 +52,49 @@ jobs:
   # *names* a test that hangs, so a deadlock fails the job in a couple of minutes with the culprit
   # identified instead of wedging it until GitHub's 6-hour ceiling. `timeout-minutes` is the backstop.
   test:
-    name: test
+    # Split by *area*, not by hash. Both shard the work; only this tells you where a failure lives.
+    #
+    # A hash partition (`--partition count:N/4`) did locate the problem once — three shards green in
+    # under three minutes, the fourth dead at exactly 30:00, twice in a row including a targeted
+    # re-run, so deterministic rather than a bad runner. But its contents reshuffle whenever the
+    # partition count changes, so narrowing further meant re-deriving the set each round. These
+    # groups are stable, reproducible locally with the same `-E` expression, and a red shard names
+    # the area outright.
+    #
+    # The four filters are exhaustive: 180 + 45 + 1820 + 898 = 2943, the whole suite.
+    name: test (${{ matrix.name }})
     runs-on: ubuntu-latest
     timeout-minutes: 25
+    strategy:
+      # A failing group must not cancel the others — their logs are the diagnostic.
+      fail-fast: false
+      matrix:
+        include:
+          - name: gateway-unit
+            filter: package(beyond-ai) and kind(lib)
+            extra: ""
+          - name: gateway-e2e
+            filter: package(beyond-ai) and kind(test)
+            extra: ""
+          # The agent package is split three ways rather than run whole. Two reasons, both learned
+          # the hard way: a single 1849-test job is the only shard that has ever wedged (its three
+          # siblings finish in ~90s every single time), and when it does wedge, "the agent tests" is
+          # far too coarse a result to act on. Splitting the workspace by area is what localized the
+          # failure to this package to begin with; continuing that same bisect one level down is what
+          # will localize it inside the package, and each piece is small enough to stand a materially
+          # better chance of simply passing.
+          - name: agent-lib
+            filter: package(beyond-ai-agent) and (kind(lib) or kind(bin))
+            extra: ""
+          - name: agent-serve
+            filter: package(beyond-ai-agent) and kind(test) and binary(~serve)
+            extra: ""
+          - name: agent-rest
+            filter: package(beyond-ai-agent) and kind(test) and not binary(~serve)
+            extra: ""
+          - name: core-providers
+            filter: package(beyond-ai-agent-core) or package(beyond-ai-providers)
+            extra: ""
     steps:
       - uses: actions/checkout@v7
       - uses: jdx/mise-action@v4
@@ -63,7 +103,67 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: nextest
-      - run: cargo nextest run --workspace --profile ci
+      # Two requirements that pull against each other, so this is deliberate.
+      #
+      # 1. Nothing that can be *inherited* may hold the step's stdout. GitHub captures a step through
+      #    a pipe and waits for EOF on it, so a single leaked child — a `serve` daemon that outlived
+      #    its test, reparented to init — wedges the job forever: no output, no log upload, and no
+      #    timeout of any kind fires. Not the job's `timeout-minutes`, not the step's, not even a
+      #    shell `timeout`, because `timeout` kills the command it launched, never its descendants.
+      #    That is the 30:00 death this suite kept hitting. Reproduced both ways in isolation: with a
+      #    pipe the step hangs long past `timeout` firing; with a file it returns the instant it does.
+      #
+      # 2. The step must still print as it goes. A silent step is indistinguishable from a wedged one
+      #    to anybody watching, which is its own kind of unusable.
+      #
+      # So: the test command writes to a file (inheritable, and an orphan holding it blocks nothing),
+      # and a `tail -f` we own streams that file to the step's stdout. The tail does hold the step's
+      # stdout — but it is ours to kill, so it always releases.
+      - name: test
+        run: |
+          set +e
+          LOG="$RUNNER_TEMP/nextest.log"
+          : > "$LOG"
+          tail -f "$LOG" &
+          TAIL=$!
+          # Sample resources every 20s. A single postmortem reading cannot distinguish "ran out"
+          # from "was never the problem" -- the trend can. Cheap, and written to its own file so a
+          # wedged run still leaves the history behind.
+          ( while :; do
+              printf '%s pids=%s load=%s mem_avail_mb=%s disk_avail=%s procs=%s\n' \
+                "$(date -u +%H:%M:%S)" \
+                "$(ps -eo pid= | wc -l)" \
+                "$(cut -d" " -f1 /proc/loadavg)" \
+                "$(awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo)" \
+                "$(df -Pk / | awk 'NR==2{print int($4/1048576)"G"}')" \
+                "$(pgrep -c -f 'beyond-ai' 2>/dev/null || echo 0)"
+              sleep 20
+            done ) > "$RUNNER_TEMP/samples.log" 2>&1 &
+          SAMPLER=$!
+          timeout --signal=TERM --kill-after=30s 15m \
+            cargo nextest run --workspace --profile ci ${{ matrix.extra }} -E '${{ matrix.filter }}' \
+            > "$LOG" 2>&1 </dev/null
+          status=$?
+          sleep 2                      # let the tail flush the last lines
+          kill "$TAIL" 2>/dev/null; wait "$TAIL" 2>/dev/null
+          kill "$SAMPLER" 2>/dev/null
+          # The tail is a convenience, not the record. If it dies the step would otherwise look wedged
+          # while the run is fine, so the file itself is always the source of truth at the end.
+          echo "--- last 200 lines of the log file (authoritative; the stream above can lag) ---"
+          tail -200 "$LOG"
+          echo "--- resource samples taken DURING the run ---"
+          cat "$RUNNER_TEMP/samples.log" 2>/dev/null || echo "  (none)"
+          [ $status -eq 124 ] && echo "::error::timed out after 15m — the last test above is where it stopped"
+          exit $status
+        timeout-minutes: 20
+      # Belt and braces: runs even if the step above somehow does not, and names anything still alive.
+      - name: what was left running
+        if: always()
+        run: |
+          echo "--- disk ---"; df -h / | tail -1
+          echo "--- memory ---"; free -m | head -2
+          echo "--- surviving beyond-ai processes (leaked daemons) ---"
+          ps -eo pid,etime,rss,args | grep -E "beyond-ai|nats-server" | grep -v grep || echo "  none"
   # The release build is the long pole; running it alongside the others (not after them) is most of
   # the wall-clock win.
   build:

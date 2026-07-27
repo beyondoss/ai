@@ -11,7 +11,7 @@
 
 use std::io::Write;
 use std::net::TcpListener as StdTcpListener;
-use std::process::{Child, Command};
+use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -27,36 +27,135 @@ use tokio::net::TcpListener;
 use tokio::time::{sleep, timeout};
 use tokio_rustls::TlsAcceptor;
 
-/// Hand out a TCP port no other `free_port()` call in this test binary has returned.
+/// The directory this test *run* reserves ports in, shared by every process in the run.
 ///
-/// Tests run as concurrent threads in **one** process, and closing a `bind(:0)` listener lets the OS
-/// immediately re-hand that ephemeral port to the next `bind(:0)` — so two `free_port()` calls (a
-/// gateway's `listen` + `metrics` ports, or two tests at once) can collide, and a component then
-/// fails to bind → a *different* test flakes. A process-global reservation set makes every returned
-/// port distinct within the run; binding fresh listeners on collision forces the OS off the just-used
-/// port (it can't re-hand a port still held open) so the loop makes progress.
+/// Keyed on `NEXTEST_RUN_ID` so concurrent runs never see each other's reservations and a finished
+/// run leaves nothing that shrinks the next one's pool. Falls back to the pid under plain
+/// `cargo test`, where a single process makes the in-memory set sufficient anyway.
+fn port_reservation_dir() -> Option<std::path::PathBuf> {
+    let run =
+        std::env::var("NEXTEST_RUN_ID").unwrap_or_else(|_| format!("pid-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("beyond-ai-ports-{run}"));
+    let made = std::fs::create_dir_all(&dir).ok().map(|()| dir);
+    // Sweep reservations from runs that ended (killed job, panicked harness, plain `cargo test` pid
+    // reuse). Best-effort and non-fatal: the only cost of a missed sweep is a stale directory, and
+    // the only cost of a failed removal is that it stays one round longer.
+    sweep_stale_port_dirs();
+    made
+}
+
+/// Remove `beyond-ai-ports-*` directories older than an hour, skipping this run's own.
+fn sweep_stale_port_dirs() {
+    let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
+        return;
+    };
+    let hour_ago = std::time::SystemTime::now() - Duration::from_secs(3600);
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !name.starts_with("beyond-ai-ports-") {
+            continue;
+        }
+        let stale = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .is_ok_and(|t| t < hour_ago);
+        if stale {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
+/// Hand out a TCP port no other `free_port()` call in this test **run** has returned.
 ///
-/// A residual TOCTOU window remains between returning a port and a *subprocess* (nats/gateway) binding
-/// it, vs. other OS processes — unavoidable when the bind happens in another process. In-process
-/// servers must instead bind `:0` and read the port back (see `MockUpstream`), which has no window.
+/// Two layers, because there are two ways to collide:
+///
+/// - **Within a process**, closing a `bind(:0)` listener lets the OS immediately re-hand that
+///   ephemeral port to the next `bind(:0)`, so a gateway's `listen` and `metrics` ports can come
+///   back identical. A process-global set makes every returned port distinct, and holding the
+///   colliding listeners open forces the OS onto a different port so the loop makes progress.
+/// - **Across processes**, which is the case that actually bites in CI. The comment here used to say
+///   "tests run as concurrent threads in one process" — true under `cargo test`, and false under
+///   `cargo nextest`, which CI uses and which reports `NEXTEST_EXECUTION_MODE=process-per-test`. Each
+///   test therefore had its *own* empty reservation set, so the guard coordinated nothing between
+///   them: two tests could be handed the same port inside their TOCTOU windows, and whichever
+///   subprocess bound second failed to start — surfacing as a 20s `wait_for_port` timeout in a test
+///   that had done nothing wrong. A reservation file created with `create_new` in a run-scoped
+///   directory closes that: the create is atomic, so exactly one process wins a given port.
+///
+/// The residual window — between returning a port and the *subprocess* binding it — is unavoidable
+/// when the bind happens elsewhere, but it is now only racing processes outside this test run.
+/// In-process servers should still bind `:0` and read the port back (see `MockUpstream`), which has
+/// no window at all.
 pub fn free_port() -> u16 {
     use std::collections::HashSet;
     use std::sync::OnceLock;
     static USED: OnceLock<Mutex<HashSet<u16>>> = OnceLock::new();
+    static DIR: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
     let used = USED.get_or_init(|| Mutex::new(HashSet::new()));
+    let dir = DIR.get_or_init(port_reservation_dir);
 
     let mut held = Vec::new();
     for _ in 0..1000 {
         let listener = StdTcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
-        if used.lock().unwrap_or_else(|p| p.into_inner()).insert(port) {
+        if !used.lock().unwrap_or_else(|p| p.into_inner()).insert(port) {
+            // Already handed out in this process: keep this listener open so the next bind gets a
+            // different port. The held listeners all drop at return, releasing those ports.
+            held.push(listener);
+            continue;
+        }
+        // Claim it for the whole run. `create_new` is atomic, so a concurrent test process racing
+        // for the same port loses here rather than at `bind` time in a subprocess.
+        let claimed = match dir {
+            Some(d) => std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(d.join(port.to_string()))
+                .is_ok(),
+            // No shared directory (read-only tmp, say): fall back to the in-process guard, which is
+            // what this always used to be.
+            None => true,
+        };
+        if claimed {
             return port; // `listener` drops here, freeing the port for the (sub)process to bind.
         }
-        // Already handed out: keep this listener open so the next bind gets a different port, then
-        // try again. The held listeners all drop at return, releasing those ports back to the OS.
         held.push(listener);
     }
     panic!("could not find an unused free port after 1000 attempts");
+}
+
+/// How much of a gateway's log to retain. Half is dropped when it fills, so the buffer stays within
+/// this bound while always holding the most recent lines — which is what every assertion reads.
+const LOG_CAPTURE_CAP: usize = 512 * 1024;
+
+/// A NATS port for a gateway that never touches the deny-set.
+///
+/// The deny-set is the *only* thing the gateway reads from NATS, and it fails open — an unreachable
+/// server means an empty deny-set and a retrying background watcher, which is exactly right for a
+/// test that denies nobody. Auth, pool keys and routing all come from config.
+///
+/// Worth having because the alternative is not free: `Nats::start()` spawns a real JetStream server
+/// per test, and a suite that starts twenty of them it never queries is spending a CI runner's
+/// memory and disk on nothing. Tests that *do* exercise the deny-set still use `Nats::start()`.
+pub fn unused_nats_port() -> u16 {
+    free_port()
+}
+
+/// An HTTP client that cannot hang.
+///
+/// `reqwest::Client::new()` has **no** timeout, so a request that stalls stalls the test, and under
+/// nextest that costs the per-test terminate budget (180s) plus a retry before anyone learns which
+/// test it was — and a job killed that way uploads no log at all. A bounded client turns the same
+/// stall into a named failure in seconds.
+///
+/// 30s is far above any legitimate local round-trip here (the slowest fixtures are ~600 KiB streams
+/// over loopback) while still being an order of magnitude below the harness's own patience.
+pub fn test_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .expect("build test client")
 }
 
 /// Base64 (standard) — used to put an Ed25519 public key into the gateway's `signing_keys` config.
@@ -146,20 +245,40 @@ pub async fn del_kv(nats_port: u16, key: &str) {
     open_writer(nats_port).await.delete(key).await.unwrap();
 }
 
+/// Connect to the test NATS and open the deny-set bucket, **bounded**.
+///
+/// Both steps are unbounded on their own and can wait forever rather than fail. `wait_for_port` only
+/// proves the TCP listener is accepting; JetStream may still be initialising, and creating the KV
+/// bucket then blocks until it is ready — on a fast local disk that is instant, which is exactly the
+/// kind of difference that turns into an unkillable CI job and no log. async-nats also retries
+/// reconnects indefinitely by design, so a server that dies mid-test would hang here too.
+///
+/// 20s is generous for a local JetStream that has already opened its port; the point is that the
+/// failure is named and finite rather than silent and infinite.
 async fn open_writer(nats_port: u16) -> std::sync::Arc<dyn store::KvWriter> {
     let conn = store::NatsConnection::new(store::NatsConnectionConfig {
         url: format!("nats://127.0.0.1:{nats_port}"),
         creds: None,
         creds_file: None,
     });
-    conn.connect().await.unwrap();
-    let kv = conn
-        .store_with_config(store::StoreConfig {
+    timeout(Duration::from_secs(20), conn.connect())
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "nats-server on {nats_port} accepted a connection but never completed the handshake"
+            )
+        })
+        .unwrap();
+    let kv = timeout(
+        Duration::from_secs(20),
+        conn.store_with_config(store::StoreConfig {
             name: "ai-gateway".into(),
             ..Default::default()
-        })
-        .await
-        .unwrap();
+        }),
+    )
+    .await
+    .unwrap_or_else(|_| panic!("JetStream on {nats_port} never produced the ai-gateway bucket"))
+    .unwrap();
     kv.writer().expect("bucket is writable")
 }
 
@@ -183,6 +302,23 @@ pub enum Mode {
     /// Always reply with this HTTP status and a small JSON error body — for circuit-breaker tests
     /// (5xx trips the breaker; 4xx/429 do not).
     Status(u16),
+    /// Kill any request that is **not the first on its connection**, without answering it.
+    ///
+    /// This is pingora's *reused-connection* failure, produced deterministically. Keying on
+    /// position-within-the-connection rather than a global request counter is what makes it
+    /// reliable: how many connections pingora opens, and which request lands on which, varies with
+    /// load. A global "kill request 2" fired on a *fresh* connection roughly half the time once the
+    /// suite's other tests were running alongside — and a fresh-connection failure is not retryable,
+    /// so the test failed for a reason that had nothing to do with what it was testing.
+    ///
+    /// The retry this provokes is one pingora decides on by itself, via its default
+    /// `error_while_proxy`, without ever calling `fail_to_connect` — which is precisely why the
+    /// gateway's breaker ledger lives in `upstream_peer` rather than there.
+    CloseOnReusedConnection,
+    /// Hold the request open for this many milliseconds before answering — long enough for a client
+    /// to give up first. The only way to produce a *downstream* abort while the upstream is still
+    /// healthy, which is the distinction the breaker has to draw.
+    Slow(u64),
 }
 
 #[derive(Default, Clone)]
@@ -192,6 +328,10 @@ pub struct Captured {
     pub authorization: Option<String>,
     pub x_api_key: Option<String>,
     pub host: Option<String>,
+    /// The gateway's model-routing header. Must always be `None`: it is ours, and stripping it is
+    /// asserted rather than assumed, because a leaked internal header is the kind of thing nobody
+    /// notices until a provider starts rejecting it.
+    pub beyond_model: Option<String>,
     pub body: Vec<u8>,
 }
 
@@ -256,7 +396,8 @@ fn anthropic_sse_large() -> String {
 /// The canned `(content-type, body)` for a mode. The `*Large` modes allocate; the rest are static.
 fn canned_body(mode: Mode) -> (&'static str, Bytes) {
     match mode {
-        Mode::Json => (
+        // A slow reply, and the surviving requests of a close-on-Nth mock, are ordinary successes.
+        Mode::Json | Mode::Slow(_) | Mode::CloseOnReusedConnection => (
             "application/json",
             Bytes::from_static(CANNED_JSON.as_bytes()),
         ),
@@ -295,7 +436,9 @@ async fn mock_handle(
     cap: Arc<Mutex<Option<Captured>>>,
     hits: Arc<std::sync::atomic::AtomicUsize>,
     mode: Mode,
-) -> Result<Response<Full<Bytes>>, std::convert::Infallible> {
+    // `on_conn`: how many requests this **connection** has already served. 0 ⇒ fresh connection.
+    on_conn: usize,
+) -> Result<Response<Full<Bytes>>, std::io::Error> {
     hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let version = req.version();
     // Path **and query**. Recording only `uri.path()` meant the harness was structurally blind to the
@@ -309,10 +452,15 @@ async fn mock_handle(
         .unwrap_or_else(|| req.uri().path())
         .to_string();
     // Pull the headers we record before consuming the body (which moves `req`).
-    let (authorization, x_api_key, host) = {
+    let (authorization, x_api_key, host, beyond_model) = {
         let h = req.headers();
         let get = |k: &str| h.get(k).and_then(|v| v.to_str().ok()).map(String::from);
-        (get("authorization"), get("x-api-key"), get("host"))
+        (
+            get("authorization"),
+            get("x-api-key"),
+            get("host"),
+            get("x-beyond-model"),
+        )
     };
     let body = req
         .into_body()
@@ -320,13 +468,27 @@ async fn mock_handle(
         .await
         .map(|b| b.to_bytes().to_vec())
         .unwrap_or_default();
+    // Kill only *after* the request body has been fully read. Killing on the head instead raced the
+    // gateway's body write and surfaced as `Upstream WriteError … Broken pipe`, which pingora does
+    // not retry — correctly, since it cannot know how much the upstream consumed. Draining first
+    // puts the failure squarely on the response-header read, which is the `ReusedOnly` shape this
+    // mode exists to produce.
+    if matches!(mode, Mode::CloseOnReusedConnection) && on_conn > 0 {
+        return Err(std::io::Error::other("mock closing a reused connection"));
+    }
     *cap.lock().unwrap() = Some(Captured {
         path,
         authorization,
         x_api_key,
         host,
+        beyond_model,
         body,
     });
+    // A slow upstream is still a *working* upstream; the point is to be slower than the client's
+    // patience, so the client hangs up first.
+    if let Mode::Slow(ms) = mode {
+        sleep(Duration::from_millis(ms)).await;
+    }
     let (ct, payload) = canned_body(mode);
     let status = match mode {
         Mode::Status(s) => s,
@@ -359,8 +521,12 @@ impl MockUpstream {
                 let cap = cap.clone();
                 let hit_counter = hit_counter.clone();
                 tokio::spawn(async move {
+                    // Per-connection request index: `fetch_add` returns how many this connection has
+                    // already served, so `0` means "first on a fresh connection".
+                    let on_conn = Arc::new(std::sync::atomic::AtomicUsize::new(0));
                     let svc = service_fn(move |req| {
-                        mock_handle(req, cap.clone(), hit_counter.clone(), mode)
+                        let n = on_conn.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        mock_handle(req, cap.clone(), hit_counter.clone(), mode, n)
                     });
                     let _ = hyper::server::conn::http1::Builder::new()
                         .serve_connection(io, svc)
@@ -421,8 +587,10 @@ impl MockUpstream {
                         return;
                     };
                     let io = TokioIo::new(tls_stream);
+                    let on_conn = Arc::new(std::sync::atomic::AtomicUsize::new(0));
                     let svc = service_fn(move |req| {
-                        mock_handle(req, cap.clone(), hit_counter.clone(), mode)
+                        let n = on_conn.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        mock_handle(req, cap.clone(), hit_counter.clone(), mode, n)
                     });
                     // Auto builder: serves H2 or H1 per the negotiated ALPN.
                     let _ = auto::Builder::new(TokioExecutor::new())
@@ -463,6 +631,9 @@ impl Drop for MockUpstream {
 // --- the real beyond-ai binary ----------------------------------------------
 
 pub struct Gateway {
+    /// The child's stderr, drained by a background thread. Structured JSON, one object per line —
+    /// including the `ai.usage` billing rows, which exist nowhere else.
+    log: Arc<Mutex<String>>,
     child: Child,
     pub port: u16,
     pub metrics_port: u16,
@@ -501,6 +672,10 @@ pub struct GatewayBuilder {
     /// Override the per-provider circuit-breaker threshold (failures in the window before opening).
     /// `None` ⇒ leave the gateway default; `Some(0)` disables the breaker.
     circuit_breaker_threshold: Option<u32>,
+    /// Per-provider authority overrides, for a topology with more than one upstream — a failover
+    /// test needs a live mock and a dead port at the same time, which the single `authority` cannot
+    /// express. Falls back to `authority` for any provider not named here.
+    authority_overrides: Vec<(String, String)>,
     /// Override the proxy's tokio worker-thread count. `None` ⇒ the gateway default (one per core);
     /// `Some(1)` reproduces Pingora's single-threaded default, which is what the scaling bench
     /// compares against.
@@ -512,6 +687,21 @@ impl GatewayBuilder {
     pub fn providers(mut self, providers: &[&'static str]) -> Self {
         self.providers = providers.to_vec();
         self
+    }
+
+    /// Point one provider at its own authority, instead of the shared mock. Use for model-routing
+    /// tests, where candidates must resolve to *different* upstreams — typically one live mock and
+    /// one unbound port, which refuses instantly and so makes failover deterministic and fast.
+    pub fn provider_authority(mut self, provider: &str, authority: &str) -> Self {
+        self.authority_overrides
+            .push((provider.to_string(), authority.to_string()));
+        self
+    }
+
+    /// An authority nothing is listening on: connecting gets ECONNREFUSED immediately, with no
+    /// timeout to wait out. The port is leased and dropped by `free_port`, so it is unbound.
+    pub fn dead_authority() -> String {
+        format!("127.0.0.1:{}", free_port())
     }
 
     /// Pin the proxy's worker-thread count. Used by the scaling bench to stand a single-threaded
@@ -638,11 +828,26 @@ impl GatewayBuilder {
             if !self.signkey_b64.is_empty() {
                 cfg.push_str(&format!("\n[signing_keys]\n1 = \"{}\"\n", self.signkey_b64));
             }
+            // Authority overrides still apply in real-upstream mode, so a smoke test can point one
+            // provider at a dead port while the rest stay real — which is what proves a *live*
+            // failover rather than a mocked one.
+            if !self.authority_overrides.is_empty() {
+                cfg.push_str("\n[provider_authorities]\n");
+                for (name, authority) in &self.authority_overrides {
+                    cfg.push_str(&format!("{name} = \"{authority}\"\n"));
+                }
+            }
         } else {
             // Every configured provider points at the one mock upstream...
             cfg.push_str("\n[provider_authorities]\n");
             for p in &self.providers {
-                cfg.push_str(&format!("{p} = \"{}\"\n", self.authority));
+                let authority = self
+                    .authority_overrides
+                    .iter()
+                    .find(|(name, _)| name == p)
+                    .map(|(_, a)| a.as_str())
+                    .unwrap_or(&self.authority);
+                cfg.push_str(&format!("{p} = \"{authority}\"\n"));
             }
             // ...with a distinct pool key per provider so key-swap assertions can tell them apart.
             cfg.push_str("\n[pool_keys]\n");
@@ -656,21 +861,73 @@ impl GatewayBuilder {
             .write_all(cfg.as_bytes())
             .unwrap();
 
-        let child = Command::new(env!("CARGO_BIN_EXE_beyond-ai"))
+        let mut child = Command::new(env!("CARGO_BIN_EXE_beyond-ai"))
             .arg("run")
             .arg("-c")
             .arg(&config_path)
             .env(
                 "AI_LOG",
-                std::env::var("AI_LOG").unwrap_or_else(|_| "warn".into()),
+                // `info` so the `ai.usage` billing rows reach the captured log. Still overridable.
+                // `warn` for everything, `info` only for the billing target — the `ai.usage` rows
+                // are the reason this is captured at all. Turning the whole gateway (and pingora
+                // under it) up to `info` for every test produced far more output than any assertion
+                // reads, on a path where each line is then held in memory below.
+                std::env::var("AI_LOG").unwrap_or_else(|_| "warn,ai.usage=info".into()),
             )
+            // Capture the child's output instead of letting it inherit ours. Two reasons: the
+            // `ai.usage` rows are only observable this way (they are a log target, not a metric),
+            // and a child that dies on a panic otherwise takes its own diagnosis with it — a
+            // gateway crash then surfaces as a garbled assertion in whatever request raced it.
+            //
+            // **Both** streams: `init_tracing` installs `fmt::layer().json()`, whose default writer
+            // is stdout, so that is where every structured log line (including `ai.usage`) goes.
+            // Panics and pre-tracing boot failures go to stderr. Capturing only one loses half the
+            // picture, and it is not the half you would guess.
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
             .spawn()
             .expect("spawn beyond-ai");
+        let log = Arc::new(Mutex::new(String::new()));
+        let drain = |stream: Option<Box<dyn std::io::Read + Send>>| {
+            let Some(stream) = stream else { return };
+            let sink = Arc::clone(&log);
+            std::thread::spawn(move || {
+                use std::io::{BufRead, BufReader};
+                for line in BufReader::new(stream).lines().map_while(Result::ok) {
+                    if let Ok(mut buf) = sink.lock() {
+                        // Bounded. A test binary holds one of these per gateway it starts, several
+                        // run concurrently, and a chatty or wedged gateway would otherwise grow this
+                        // without limit for the life of the test — memory pressure on a CI runner
+                        // being a spectacularly unhelpful failure, since a reaped runner uploads no
+                        // logs to explain itself. Assertions only ever read recent lines.
+                        if buf.len() > LOG_CAPTURE_CAP {
+                            let keep = buf.len() - LOG_CAPTURE_CAP / 2;
+                            buf.drain(..keep);
+                        }
+                        buf.push_str(&line);
+                        buf.push('\n');
+                    }
+                }
+            });
+        };
+        drain(
+            child
+                .stdout
+                .take()
+                .map(|s| Box::new(s) as Box<dyn std::io::Read + Send>),
+        );
+        drain(
+            child
+                .stderr
+                .take()
+                .map(|s| Box::new(s) as Box<dyn std::io::Read + Send>),
+        );
         let gw = Gateway {
             child,
             port,
             metrics_port,
             config_path,
+            log,
         };
         wait_for_port(port, "beyond-ai").await;
         // The metrics/admin listener (`/livez`, `/readyz`, `/metrics`) binds on a *separate* port from
@@ -698,6 +955,7 @@ impl Gateway {
             authority: authority.to_string(),
             signkey_b64: signkey_b64.to_string(),
             providers: vec!["openai", "fireworks"],
+            authority_overrides: Vec::new(),
             snapshot_path: None,
             real_upstreams: false,
             pool_key_overrides: Vec::new(),
@@ -712,6 +970,30 @@ impl Gateway {
 
     pub fn url(&self) -> String {
         format!("http://127.0.0.1:{}", self.port)
+    }
+
+    /// Everything the gateway has logged so far.
+    pub fn log(&self) -> String {
+        self.log.lock().map(|l| l.clone()).unwrap_or_default()
+    }
+
+    /// Wait for a log line containing every one of `needles`, and return it.
+    ///
+    /// Takes a slice rather than one string because the interesting assertions are conjunctions —
+    /// "an `ai.usage` row that names *this* provider" — and a single substring cannot express that
+    /// without depending on field order.
+    pub async fn wait_for_log_line(&self, needles: &[&str]) -> String {
+        for _ in 0..200 {
+            let log = self.log();
+            if let Some(line) = log.lines().find(|l| needles.iter().all(|n| l.contains(n))) {
+                return line.to_string();
+            }
+            sleep(Duration::from_millis(25)).await;
+        }
+        panic!(
+            "no log line matched {needles:?} within 5s; captured log was:\n{}",
+            self.log(),
+        );
     }
 
     pub async fn metrics(&self) -> String {
