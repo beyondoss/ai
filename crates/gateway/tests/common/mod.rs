@@ -709,6 +709,15 @@ impl GatewayBuilder {
             if !self.signkey_b64.is_empty() {
                 cfg.push_str(&format!("\n[signing_keys]\n1 = \"{}\"\n", self.signkey_b64));
             }
+            // Authority overrides still apply in real-upstream mode, so a smoke test can point one
+            // provider at a dead port while the rest stay real — which is what proves a *live*
+            // failover rather than a mocked one.
+            if !self.authority_overrides.is_empty() {
+                cfg.push_str("\n[provider_authorities]\n");
+                for (name, authority) in &self.authority_overrides {
+                    cfg.push_str(&format!("{name} = \"{authority}\"\n"));
+                }
+            }
         } else {
             // Every configured provider points at the one mock upstream...
             cfg.push_str("\n[provider_authorities]\n");

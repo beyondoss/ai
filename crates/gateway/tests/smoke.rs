@@ -398,3 +398,80 @@ async fn catalog_rows_are_servable() {
         skipped.len()
     );
 }
+
+/// **A live failover.** The primary candidate is pointed at a dead port; the fallback is the *real*
+/// provider. Proves the whole chain against something that can actually say no: catalog → candidate
+/// walk → mount → key swap in the fallback's own scheme → model-id rewrite → real 200.
+///
+/// The mocked failover tests prove the mechanism. This proves the mechanism against a provider that
+/// has its own opinions about paths, ids, and auth headers — which is where a catalog is wrong in
+/// practice.
+#[tokio::test]
+#[ignore = "hits a real provider and bills a tiny request; run via `mise run test:smoke`"]
+async fn model_route_fails_over_to_a_real_provider() {
+    let Some(key) = env_key("OPENROUTER_API_KEY") else {
+        eprintln!("smoke[failover]: OPENROUTER_API_KEY unset — skipping");
+        return;
+    };
+    // `claude-opus-4-8` is an Anthropic-wire row: Anthropic first, OpenRouter second.
+    let model = "claude-opus-4-8";
+    let nats = Nats::start().await;
+    let (pubkey, sk) = test_keypair(7);
+    let gw = Gateway::builder(nats.port, "unused", &b64(&pubkey))
+        .real_upstreams()
+        // Only OpenRouter is keyed, so Anthropic is not even a usable candidate...
+        .pool_key("openrouter", &key)
+        // ...and it is unreachable besides, so nothing can quietly serve from it.
+        .provider_authority("anthropic", &GatewayBuilder::dead_authority())
+        .start()
+        .await;
+    let vkey = mint(
+        &VirtualKey {
+            tenant_id: 1,
+            vpc_id: 1,
+        },
+        1,
+        &sk,
+    );
+
+    let resp = reqwest::Client::new()
+        .post(format!("{}/auto/x", gw.url()))
+        .header("authorization", format!("Bearer {vkey}"))
+        .header("content-type", "application/json")
+        .header("anthropic-version", "2023-06-01")
+        .header("x-beyond-model", model)
+        .body(format!(
+            r#"{{"model":"{model}","max_tokens":1,"messages":[{{"role":"user","content":"hi"}}]}}"#
+        ))
+        .send()
+        .await
+        .expect("request sent");
+    let status = resp.status().as_u16();
+    let text = resp.text().await.unwrap_or_default();
+    assert_eq!(
+        status,
+        200,
+        "live failover to OpenRouter returned {status}: {}",
+        text.chars().take(400).collect::<String>(),
+    );
+    // The reply is Anthropic-shaped and names OpenRouter's spelling of the model — proof the rewrite
+    // landed and the response came from the fallback, not from somewhere unexpected.
+    assert!(
+        text.contains(r#""type":"message""#),
+        "want an Anthropic Messages reply: {text}"
+    );
+    assert!(
+        text.contains("anthropic/claude-opus-4.8"),
+        "the fallback must have been asked for its own id: {text}"
+    );
+
+    // And it metered: a zero-token row here would mean the Anthropic extractor never ran.
+    let line = gw
+        .wait_for_log_line(&["ai.usage", r#""provider":"openrouter""#])
+        .await;
+    assert!(
+        !line.contains(r#""input_tokens":0"#),
+        "the live failover must still be metered: {line}"
+    );
+    eprintln!("smoke[failover]: live Anthropic→OpenRouter failover ok — {line}");
+}
