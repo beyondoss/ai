@@ -20,8 +20,8 @@ published `beyond-slipstream` — clones, CI-builds, and publishes anywhere.
 | **Tenant**                                       | The billing entity from the virtual key payload (`tenant_id: u64`)                                                                                          | An org, user, or namespace — an opaque integer the gateway doesn't interpret |
 | **Dialect**                                      | A provider attribute (OpenAI-wire vs Anthropic-wire) driving usage parsing; for a bare-path request it's derived from the path to pick the default provider | The provider — a prefixed request uses its provider's dialect, not the path  |
 | **Provider**                                     | The request's **first path segment** (`/{provider}/…`); a named row in the routing table: authority, dialect, auth scheme                                   | A vendor relationship — just connection facts and auth wiring                |
-| **Model route** (`/auto/…`)                      | Reserved first segment; the provider comes from the `x-beyond-model` header via the catalog, and the gateway owns the mount prefix and rewrites the body's `model` per attempt | A dialect translator — candidates must share a wire format                   |
-| **Candidate**                                    | One `(provider, upstream model id)` a catalog row will accept, in preference order; tried on a connect failure                                              | A load-balancing pool — strictly ordered, and only entered on failure        |
+| **Model route** (`/auto/…`)                      | Reserved first segment; provider, upstream path, and model id all come from the catalog row named by the `x-beyond-model` header, and the body's `model` is rewritten per attempt | A dialect translator — candidates must share a wire format                   |
+| **Candidate**                                    | One `(provider, upstream model id, path)` a catalog row will accept, in preference order; tried on a connect failure                                        | A load-balancing pool — strictly ordered, and only entered on failure        |
 | **Deny-set**                                     | Sparse map of denied `tenant_id`s → reason; gates managed traffic; default-allow                                                                            | An allowlist or ACL — misses are allowed, not blocked                        |
 | **Tail tap**                                     | Bounded 64KB window kept from the end of the response for usage extraction                                                                                  | A buffer or copy — the response is relayed unbuffered; only the tail is kept |
 | **Snapshot**                                     | On-disk deny-set cache (entries + NATS cursor) for edge/tunnel deployments                                                                                  | Persistent store — a pure cache; delete it and the gateway re-scans NATS     |
@@ -60,8 +60,8 @@ Client (stock OpenAI/Anthropic SDK)
   ▼  upstream_peer (proxy.rs)   — runs once per attempt, before any body byte
   │  Reset request-body phase state (a retry replays bytes through the body filter)
   │  Model-routed: resolve the outgoing candidate's breaker permit, then walk candidates —
-  │    skip any whose breaker is OPEN, allow() the one chosen, rebuild forward_path
-  │    from its mount; DNS failure advances to the next rather than ending the request
+  │    skip any whose breaker is OPEN, allow() the one chosen, set forward_path to that
+  │    candidate's own catalog path; DNS failure advances rather than ending the request
   │  TTL-cached DNS resolve (60s) → HttpPeer (TLS, H2 pref, timeouts)
   │  DNS fail ──────────────────────────────────────────────────── 502
   │  TCP connect fail (retry 2× same peer, or next candidate) ──── 502
@@ -160,12 +160,13 @@ shadow it.
 Three things differ from the provider-routed path, all consequences of the client no longer naming
 the provider:
 
-- **The gateway owns the mount prefix.** Providers disagree (`/v1` OpenAI, `/openai/v1` Groq,
-  `/inference/v1` Fireworks, `/api/v1` OpenRouter, bare Anthropic), and the client cannot know which
-  one will serve. `forward_path` is rebuilt per attempt as the candidate's `base_path` + the client's
-  suffix. The contract is "point your SDK's base URL at `…/auto`".
+- **The upstream path comes from the catalog, per candidate.** Providers disagree on where an
+  endpoint lives and the disagreement is *not* a prefix: Anthropic serves Messages at `/v1/messages`
+  from a base carrying no path, OpenRouter serves the same wire at `/api/v1/messages`. No client
+  suffix is correct for both, so each candidate states its path outright and `forward_path` is set
+  from it per attempt. The client points its SDK at `…/auto` and the row decides.
 - **The model id is rewritten per attempt.** Providers essentially never share a string —
-  `claude-opus-4-8` at Anthropic is `anthropic/claude-opus-4-8` at OpenRouter — so the body's `model`
+  `claude-opus-4-8` at Anthropic is `anthropic/claude-opus-4.8` at OpenRouter — so the body's `model`
   is spliced to whatever the serving candidate calls it (`peek::scan_buffered` reports the value's
   byte span). Because the body may change length, `/auto` requests are buffered and re-framed exactly
   as the injection path is; the two are one predicate (`RequestCtx::rewrites_body`).
@@ -182,8 +183,21 @@ Catalog rows live in `providers::catalog`, shared with the agent. Every candidat
 share a wire format, enforced by a test: the gateway rewrites ids but does **not** translate between
 API shapes, so a mixed row would send an Anthropic Messages body to a Chat Completions endpoint and
 then parse the reply with the wrong dialect's usage extractor — a zero-token billing row rather than
-a visible error. A practical consequence: Anthropic is currently the only Anthropic-wire provider the
-gateway routes to, so Anthropic-wire rows have one candidate and no failover.
+a visible error.
+
+**Wire belongs to the row, not the provider.** `ProviderSpec::wire` is one value per provider and
+that is an approximation: OpenRouter serves the OpenAI wire at `/api/v1/chat/completions` *and* a
+genuine Anthropic Messages wire at `/api/v1/messages`, and Fireworks is the same story from the other
+side (`agent_core::dialect::is_fireworks_anthropic_wire_model`). So each row declares its own `wire`,
+and `request_filter` takes the request's dialect from **the row** rather than from whichever provider
+it happens to start on. Reading the provider there fails silently in the worst way — an Anthropic
+response meets the OpenAI extractor, trips the dialect-mismatch guard, and bills zero tokens.
+
+That is what makes **Claude failover real today**: `claude-opus-4-8` routes to Anthropic first and
+falls back to OpenRouter's Messages endpoint as `anthropic/claude-opus-4.8`. OpenRouter itself fronts
+Bedrock for that traffic, so this is Bedrock-backed Claude failover with no SigV4 and no
+`application/vnd.amazon.eventstream` decoding. Every row and candidate is verified against the live
+providers by `catalog_rows_are_servable` in `tests/smoke.rs`.
 
 ### Identity (`key.rs`)
 

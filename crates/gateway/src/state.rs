@@ -100,21 +100,15 @@ fn build_providers(config: &AiConfig, metrics: &Metrics) -> Result<HashMap<Strin
         let pool_key = config.pool_keys.get(spec.name).map(|s| s.expose());
         providers.insert(
             spec.name.to_string(),
-            Arc::new(
-                Provider::resolve(
-                    spec.name,
-                    authority,
-                    spec.wire,
-                    spec.auth,
-                    pool_key,
-                    ProviderMetrics::resolve(metrics, spec.name),
-                    breaker(),
-                )
-                // Only a known provider has a mount: it comes from the shared table's `base_url`.
-                // A config-added provider keeps `""` (verbatim forwarding), which is what an
-                // operator handing the gateway a bare authority is asking for.
-                .with_base_path(spec.base_path()),
-            ),
+            Arc::new(Provider::resolve(
+                spec.name,
+                authority,
+                spec.wire,
+                spec.auth,
+                pool_key,
+                ProviderMetrics::resolve(metrics, spec.name),
+                breaker(),
+            )),
         );
     }
     // Config-only providers (name not in the known set): dialect/auth scheme come from
@@ -426,8 +420,6 @@ mod tests {
                 "{} is indexed under another provider's id",
                 spec.name,
             );
-            // The mount only comes from the shared table, and only for known rows.
-            assert_eq!(via_id.map(|p| p.base_path), Some(spec.base_path()));
         }
 
         assert!(

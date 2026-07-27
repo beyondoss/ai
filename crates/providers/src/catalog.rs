@@ -1,57 +1,74 @@
-//! The model catalog — canonical model name → the ordered providers that can serve it.
+//! The model catalog — canonical model name → the ordered upstreams that serve it.
 //!
 //! This is the inverse of [`crate::for_model_id`], and the general form of it. `for_model_id` answers
 //! "which provider serves this id *shape*, natively, when nobody said otherwise" and deliberately
 //! returns nothing for an aggregator, because `moonshotai/kimi-k2.6` is equally a Fireworks,
 //! Together and OpenRouter id and guessing between them is the mis-route this crate exists to
-//! prevent. The catalog is where that guess becomes a *decision*: a named model, and the ordered
-//! list of upstreams we are willing to serve it from.
+//! prevent. The catalog is where that guess becomes a *decision*: a named model, the wire its
+//! clients speak, and the ordered upstreams we are willing to serve it from.
 //!
-//! It carries routing facts only — which provider, and the id that provider spells it with. Model
-//! *capability* facts (context window, thinking shape) stay in `agent_core::models`; a test keeps
-//! this file from growing them.
+//! It carries routing facts only — provider, the id that provider spells it with, and the path to
+//! send it to. Model *capability* facts (context window, thinking shape) stay in
+//! `agent_core::models`; a test keeps this file from growing them.
 //!
-//! # Why every candidate in a row must share a wire format
+//! # Wire format belongs to the row, not the provider
 //!
-//! The gateway rewrites the request body's `model` field per attempt, so candidates may spell the
-//! model differently (`claude-opus-4-8` at Anthropic, `anthropic/claude-opus-4-8` at OpenRouter).
-//! What it does **not** do is translate between API shapes. A row mixing wire formats would take an
-//! Anthropic Messages body and send it to a Chat Completions endpoint — a 400 at best, and at worst
-//! a response the usage extractor parses with the wrong dialect and bills as zero tokens. So
-//! `candidates_agree_on_wire` is load-bearing, not tidiness.
+//! [`ProviderSpec::wire`](crate::ProviderSpec::wire) is a single value per provider, and that is an
+//! approximation. OpenRouter is the clearest case: it serves the **OpenAI** wire at
+//! `/api/v1/chat/completions` *and* the **Anthropic** wire at `/api/v1/messages`, and both are real
+//! — the Anthropic one returns `message_start`/`message_delta` SSE with `input_tokens`,
+//! `cache_read_input_tokens` and `output_tokens_details.thinking_tokens`, which is exactly what the
+//! gateway's Anthropic usage extractor reads. (Fireworks is the same story from the other side: see
+//! `agent_core::dialect::is_fireworks_anthropic_wire_model`.)
 //!
-//! The practical consequence, worth knowing before adding rows: **Anthropic is currently the only
-//! Anthropic-wire provider the gateway can route to**, so an Anthropic-wire row has exactly one
-//! candidate and no failover. Claude *can* be given a multi-candidate row, but only on the OpenAI
-//! wire (via OpenRouter and friends), i.e. for a client speaking Chat Completions rather than
-//! Messages. Adding a second Anthropic-wire provider is what unlocks native Claude failover.
+//! So a row declares its own [`ModelRoute::wire`] and each candidate carries the [`Candidate::path`]
+//! that serves it. Deriving the wire from the provider would have been wrong in a specifically nasty
+//! way: an Anthropic-wire response parsed by the OpenAI extractor trips the dialect-mismatch guard
+//! and emits a **zero-token billing row**, not an error.
+//!
+//! Every candidate in a row must still agree on the wire, because the gateway rewrites model ids but
+//! does **not** translate between API shapes.
 //!
 //! # Maintenance
 //!
 //! These rows are product data and they go stale — providers rename ids, deprecate models, and
-//! change what they host. The seed below is deliberately small and limited to ids verified against
-//! `crates/gateway/tests/smoke.rs` (which exercises each provider's real API) or already relied on
-//! elsewhere in the workspace. Add a row when you have checked the id at that provider, not before:
-//! a wrong entry does not fail loudly, it routes to a 404 that looks like the client's fault.
+//! change what they host. Every id and path below was verified against the live API before being
+//! added, and `catalog_rows_are_servable` (in `crates/gateway/tests/smoke.rs`) re-verifies the whole
+//! table against real providers whenever the keys are present. Add a row the same way: check it,
+//! then add it. A wrong entry does not fail loudly — it routes to a 404 that looks like the client's
+//! fault.
 
-use crate::ProviderId;
+use crate::{ProviderId, WireFormat};
 
-/// One upstream that can serve a catalog model, and the id to ask it for.
+/// One upstream that can serve a catalog model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Candidate {
     pub provider: ProviderId,
     /// The model id **as this provider spells it**. The gateway splices this into the request body's
     /// `model` field before forwarding, so it may differ from the row's canonical name and from
-    /// every other candidate's.
+    /// every other candidate's — `claude-opus-4-8` at Anthropic is `anthropic/claude-opus-4.8` at
+    /// OpenRouter, dots and all.
     pub upstream_model: &'static str,
+    /// The full upstream path for this candidate on this row's wire.
+    ///
+    /// Absolute and complete, not a suffix to be composed: providers do not agree on where an
+    /// endpoint lives, and the disagreement is not a simple prefix. Anthropic serves Messages at
+    /// `/v1/messages` from a base URL carrying no path; OpenRouter serves the same wire at
+    /// `/api/v1/messages`. There is no client-supplied suffix that is correct for both, so the
+    /// catalog states each one outright.
+    pub path: &'static str,
 }
 
-/// A canonical model name and the ordered list of upstreams that serve it.
+/// A canonical model name, the wire its clients speak, and the ordered upstreams that serve it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ModelRoute {
-    /// The value a client puts in the routing header. Lowercase and restricted to
-    /// `[a-z0-9._/-]`, which is what lets the gateway log it verbatim without sanitizing.
+    /// The value a client puts in the routing header. Lowercase and restricted to `[a-z0-9._/-]`,
+    /// which is what lets the gateway log it verbatim without sanitizing.
     pub model: &'static str,
+    /// The API shape a client of this row sends, and the shape its responses come back in. Drives
+    /// the gateway's usage extractor. Declared here rather than read off the provider — see the
+    /// module docs.
+    pub wire: WireFormat,
     /// Preference order: `[0]` is primary, the rest are failover candidates. Non-empty, at most
     /// [`MAX_CANDIDATES`], no provider repeated.
     pub candidates: &'static [Candidate],
@@ -62,36 +79,58 @@ pub struct ModelRoute {
 pub const MAX_CANDIDATES: usize = 8;
 
 /// Every routable model, **sorted by `model`** — [`for_model`] binary-searches it.
+///
+/// Each id/path pair below returned `200` from the real provider when it was added.
 pub const MODEL_ROUTES: &[ModelRoute] = &[
-    // Anthropic-wire. One candidate each: Anthropic is the only Anthropic-wire provider the gateway
-    // routes to, so there is nowhere to fail over *to* without changing the client's API shape.
+    // Claude on the Anthropic wire, with a real second source. OpenRouter's `/api/v1/messages` is a
+    // genuine Messages endpoint — and it fronts Bedrock, so this is Bedrock-backed Claude failover
+    // without a line of SigV4 or eventstream decoding.
     ModelRoute {
         model: "claude-haiku-4-5",
-        candidates: &[Candidate {
-            provider: ProviderId::Anthropic,
-            upstream_model: "claude-haiku-4-5",
-        }],
+        wire: WireFormat::Anthropic,
+        candidates: &[
+            Candidate {
+                provider: ProviderId::Anthropic,
+                upstream_model: "claude-haiku-4-5",
+                path: "/v1/messages",
+            },
+            Candidate {
+                provider: ProviderId::OpenRouter,
+                upstream_model: "anthropic/claude-haiku-4.5",
+                path: "/api/v1/messages",
+            },
+        ],
     },
     ModelRoute {
         model: "claude-opus-4-8",
-        candidates: &[Candidate {
-            provider: ProviderId::Anthropic,
-            upstream_model: "claude-opus-4-8",
-        }],
+        wire: WireFormat::Anthropic,
+        candidates: &[
+            Candidate {
+                provider: ProviderId::Anthropic,
+                upstream_model: "claude-opus-4-8",
+                path: "/v1/messages",
+            },
+            Candidate {
+                provider: ProviderId::OpenRouter,
+                upstream_model: "anthropic/claude-opus-4.8",
+                path: "/api/v1/messages",
+            },
+        ],
     },
-    // OpenAI-wire, two candidates — the shape failover is actually for. Both ids are exercised
-    // against the real providers by `smoke.rs`, and the two mounts differ (`/v1` vs `/api/v1`),
-    // which is exactly what the model-routed path's mount-prefix handling exists for.
+    // The same shape on the OpenAI wire, where the two mounts differ as well (`/v1` vs `/api/v1`).
     ModelRoute {
         model: "gpt-4o-mini",
+        wire: WireFormat::OpenAi,
         candidates: &[
             Candidate {
                 provider: ProviderId::OpenAi,
                 upstream_model: "gpt-4o-mini",
+                path: "/v1/chat/completions",
             },
             Candidate {
                 provider: ProviderId::OpenRouter,
                 upstream_model: "openai/gpt-4o-mini",
+                path: "/api/v1/chat/completions",
             },
         ],
     },
@@ -115,9 +154,18 @@ pub fn for_model(name: &str) -> Option<&'static ModelRoute> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    // Provider-table lookups the invariants check the catalog against; test-only, since the catalog
-    // itself stores ids and never resolves them.
-    use crate::{WireFormat, by_id, gateway_providers};
+    use crate::{by_id, gateway_providers};
+
+    /// The wire a path serves, inferred from its endpoint — `…/messages` is Anthropic, everything
+    /// else is OpenAI-shaped. An independent read of the same fact the row declares, which is what
+    /// lets the two be cross-checked.
+    fn wire_of_path(path: &str) -> WireFormat {
+        if path.ends_with("/messages") {
+            WireFormat::Anthropic
+        } else {
+            WireFormat::OpenAi
+        }
+    }
 
     /// The binary search in `for_model` is only correct on a sorted table, and duplicate names would
     /// make which row wins depend on where the search landed.
@@ -201,65 +249,68 @@ mod tests {
     }
 
     /// Load-bearing. The gateway rewrites the body's `model` id per attempt but does **not**
-    /// translate between API shapes, so a mixed-wire row would forward an Anthropic Messages body to
-    /// a Chat Completions endpoint — and, worse, parse the reply with the wrong dialect's usage
-    /// extractor, which yields a zero-token billing row rather than an error.
+    /// translate between API shapes, so a row whose candidates disagree on the wire would forward an
+    /// Anthropic Messages body to a Chat Completions endpoint — and, worse, parse the reply with the
+    /// wrong dialect's usage extractor, which yields a zero-token billing row rather than an error.
+    ///
+    /// Checked against each candidate's **path**, not its provider: OpenRouter serves both wires, so
+    /// the provider's own `wire` field cannot answer this.
     #[test]
-    fn candidates_agree_on_wire() {
+    fn candidate_paths_match_the_rows_declared_wire() {
         for route in MODEL_ROUTES {
-            assert!(
-                shared_wire(route.candidates).is_some(),
-                "route {:?} mixes wire formats across its candidates: {:?}",
-                route.model,
-                route
-                    .candidates
-                    .iter()
-                    .map(|c| (c.provider, by_id(c.provider).wire))
-                    .collect::<Vec<_>>(),
-            );
+            for c in route.candidates {
+                assert_eq!(
+                    wire_of_path(c.path),
+                    route.wire,
+                    "route {:?} declares {:?} but candidate {:?} points at {:?}",
+                    route.model,
+                    route.wire,
+                    c.provider,
+                    c.path,
+                );
+            }
         }
     }
 
-    /// The one wire format every candidate shares, or `None` if they disagree.
-    fn shared_wire(candidates: &[Candidate]) -> Option<WireFormat> {
-        let first = by_id(candidates.first()?.provider).wire;
-        candidates
-            .iter()
-            .all(|c| by_id(c.provider).wire == first)
-            .then_some(first)
+    #[test]
+    fn candidate_paths_are_absolute() {
+        for route in MODEL_ROUTES {
+            for c in route.candidates {
+                assert!(
+                    c.path.starts_with('/') && !c.path.contains("://"),
+                    "route {:?} candidate {:?} path {:?} must be an absolute path, not a URL",
+                    route.model,
+                    c.provider,
+                    c.path,
+                );
+            }
+        }
     }
 
-    /// `candidates_agree_on_wire` is only meaningful if it can fail. The seed table happens to
-    /// contain no mixed row, so prove the check itself rejects one — Anthropic is Anthropic-wire and
-    /// OpenRouter is OpenAI-wire, which is the exact pairing someone reaches for when adding Claude
-    /// failover without realizing it changes the client's API shape.
+    /// A candidate's path must sit under its provider's own base URL, where the provider publishes
+    /// one. Catches a path copied from the wrong row — the failure mode a 404 at request time.
     #[test]
-    fn the_wire_check_rejects_a_mixed_row() {
-        let mixed = [
-            Candidate {
-                provider: ProviderId::Anthropic,
-                upstream_model: "claude-opus-4-8",
-            },
-            Candidate {
-                provider: ProviderId::OpenRouter,
-                upstream_model: "anthropic/claude-opus-4-8",
-            },
-        ];
-        assert_eq!(
-            shared_wire(&mixed),
-            None,
-            "an Anthropic + OpenRouter row must be rejected as mixed-wire",
-        );
-        assert_eq!(
-            shared_wire(&mixed[..1]),
-            Some(WireFormat::Anthropic),
-            "a single-candidate row trivially shares its own wire",
-        );
+    fn candidate_paths_sit_under_their_providers_base() {
+        for route in MODEL_ROUTES {
+            for c in route.candidates {
+                let spec = by_id(c.provider);
+                let Some(base) = spec.base_url else { continue };
+                let mount = spec.base_path();
+                assert!(
+                    c.path.starts_with(mount),
+                    "route {:?}: {} serves from {base} (mount {mount:?}), but the candidate path is \
+                     {:?}",
+                    route.model,
+                    spec.name,
+                    c.path,
+                );
+            }
+        }
     }
 
     /// If an id is one a provider serves *natively* by shape, the candidate holding it had better be
     /// that provider. Catches `claude-opus-4-8` listed under Groq. Vendor-slug ids
-    /// (`openai/gpt-4o-mini`) resolve to no native provider and are correctly skipped.
+    /// (`anthropic/claude-opus-4.8`) resolve to no native provider and are correctly skipped.
     #[test]
     fn native_ids_are_not_misrouted() {
         for route in MODEL_ROUTES {
@@ -282,12 +333,14 @@ mod tests {
         let c = Candidate {
             provider: ProviderId::OpenAi,
             upstream_model: "gpt-4o-mini",
+            path: "/v1/chat/completions",
         };
         // Destructured exhaustively: adding a field fails to compile here, which is the prompt to
         // ask whether it is really routing knowledge.
         let Candidate {
             provider: _,
             upstream_model: _,
+            path: _,
         } = c;
     }
 
@@ -322,30 +375,42 @@ mod tests {
         }
     }
 
-    /// The failover row is the one every gateway test leans on; assert its exact shape so a careless
-    /// edit to the seed data breaks here rather than in an opaque proxy test.
+    /// `wire_of_path` is what `candidate_paths_match_the_rows_declared_wire` leans on, so prove it
+    /// discriminates rather than always answering the same thing.
     #[test]
-    fn the_openai_wire_row_offers_a_real_second_candidate() {
+    fn wire_of_path_discriminates_messages_from_chat_completions() {
+        assert_eq!(wire_of_path("/v1/messages"), WireFormat::Anthropic);
+        assert_eq!(wire_of_path("/api/v1/messages"), WireFormat::Anthropic);
+        assert_eq!(wire_of_path("/v1/chat/completions"), WireFormat::OpenAi);
+        assert_eq!(wire_of_path("/api/v1/chat/completions"), WireFormat::OpenAi);
+        assert_eq!(wire_of_path("/v1/responses"), WireFormat::OpenAi);
+    }
+
+    /// Claude has a genuine second source, and it is *not* the provider's declared wire that makes
+    /// it work. Pinned explicitly because this row is the whole point of the wire rework: OpenRouter
+    /// is an OpenAI-wire provider by `ProviderSpec`, yet serves this row's Anthropic-wire traffic.
+    #[test]
+    fn claude_fails_over_to_openrouter_on_the_anthropic_wire() {
         let want = [
             Candidate {
-                provider: ProviderId::OpenAi,
-                upstream_model: "gpt-4o-mini",
+                provider: ProviderId::Anthropic,
+                upstream_model: "claude-opus-4-8",
+                path: "/v1/messages",
             },
             Candidate {
                 provider: ProviderId::OpenRouter,
-                upstream_model: "openai/gpt-4o-mini",
+                // OpenRouter spells Claude with a vendor prefix and dots, not dashes.
+                upstream_model: "anthropic/claude-opus-4.8",
+                path: "/api/v1/messages",
             },
         ];
         assert_eq!(
-            for_model("gpt-4o-mini").map(|r| r.candidates),
-            Some(&want[..]),
-            "the seed failover row must keep its exact shape and order",
+            for_model("claude-opus-4-8").map(|r| (r.wire, r.candidates)),
+            Some((WireFormat::Anthropic, &want[..])),
+            "Claude must have a real Anthropic-wire fallback",
         );
-        // Same wire (so no translation is implied) but genuinely different mounts — this is the row
-        // that exercises the model-routed path's mount-prefix rewrite.
-        assert_eq!(by_id(ProviderId::OpenAi).wire, WireFormat::OpenAi);
+        // The point: the fallback provider's own wire disagrees with the row's, and that is fine
+        // because the row and the path are what decide.
         assert_eq!(by_id(ProviderId::OpenRouter).wire, WireFormat::OpenAi);
-        assert_eq!(by_id(ProviderId::OpenAi).base_path(), "/v1");
-        assert_eq!(by_id(ProviderId::OpenRouter).base_path(), "/api/v1");
     }
 }

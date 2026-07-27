@@ -278,9 +278,6 @@ struct ModelRouting {
     /// pool key for it. Computed once in `request_filter` so `upstream_peer` never re-derives it.
     /// Bounded by [`route::MAX_CANDIDATES`], which is why a `u8` suffices.
     usable: u8,
-    /// The client's path (+ query) with the `/auto` segment removed. The forwarded path is this
-    /// appended to the chosen candidate's mount, rebuilt into `forward_path` on every attempt.
-    suffix: String,
     /// When the current attempt began. Distinct from `RequestCtx::start` (which times the whole
     /// request) so a candidate that burned `connect_timeout_secs` before failing over does not
     /// charge that time to the provider that actually served — which would render an outage at
@@ -340,18 +337,16 @@ impl RequestCtx {
         self.inject_eligible || self.auto.is_some()
     }
 
-    /// Rebuild the forwarded path for the candidate about to be attempted: its mount prefix plus the
-    /// client's suffix.
+    /// Point the forwarded path at the candidate about to be attempted.
     ///
-    /// Only the model-routed path calls this. Rewritten in place, so a failover costs no allocation
-    /// after the first attempt. A no-op for a provider-routed request, which has no `auto_suffix`
-    /// and whose `forward_path` was settled once in `request_filter`.
-    fn rebuild_forward_path(&mut self, base_path: &str) {
-        let Some(auto) = self.auto.as_ref() else {
-            return;
-        };
+    /// Taken wholesale from the catalog rather than composed from a mount and the client's suffix:
+    /// providers disagree on where an endpoint lives and the disagreement is not a prefix, so there
+    /// is no client suffix that is correct for every candidate in a row. Rewritten in place, so a
+    /// failover costs no allocation after the first attempt.
+    fn set_forward_path(&mut self, path: &str) {
         let buf = self.forward_path.get_or_insert_with(String::new);
-        write_mounted_path(buf, base_path, &auto.suffix);
+        buf.clear();
+        buf.push_str(path);
     }
 
     fn reset_request_body_phase(&mut self) {
@@ -653,22 +648,6 @@ fn is_upstream_failure(e: Option<&pingora_core::Error>) -> bool {
     e.is_some_and(|e| !matches!(e.esource(), pingora_core::ErrorSource::Downstream))
 }
 
-/// Write the forwarded path for a model-routed attempt: the candidate's mount prefix, then the
-/// client's suffix.
-///
-/// Reuses `buf`'s allocation, so a failover re-derives the path without allocating again.
-///
-/// The contract the client sees is "point your SDK's base URL at `…/auto`": an OpenAI-wire SDK then
-/// sends `/chat/completions` and gets `/v1/chat/completions` at OpenAI or `/api/v1/chat/completions`
-/// at OpenRouter, while an Anthropic SDK sends `/v1/messages` and gets it unchanged, because
-/// Anthropic's base URL carries no mount. That asymmetry is not invented here — it is exactly the
-/// `base_url` convention already in the shared provider table.
-fn write_mounted_path(buf: &mut String, base_path: &str, suffix: &str) {
-    buf.clear();
-    buf.push_str(base_path);
-    buf.push_str(suffix);
-}
-
 /// The lowest set bit in `usable` at or after index `from`, or `None` if there is none.
 ///
 /// The candidate walk's only cursor primitive. `from` strictly increases across a request, so the
@@ -790,12 +769,12 @@ enum Routed {
         streamable: bool,
     },
     /// `/auto/…` with a routing header naming a model the catalog carries.
-    Model {
-        route: &'static route::ModelRoute,
-        /// The client path (+ query) after the `/auto` segment; the mount is prepended per attempt.
-        suffix: String,
-        streamable: bool,
-    },
+    ///
+    /// Carries no path: on this route the upstream path is the *candidate's*, taken from the
+    /// catalog, because providers do not agree on where an endpoint lives and the disagreement is
+    /// not a prefix (Anthropic serves Messages at `/v1/messages`, OpenRouter at `/api/v1/messages`).
+    /// The client's own suffix is ignored — it points the SDK at `…/auto` and the row decides.
+    Model { route: &'static route::ModelRoute },
     /// `/auto/…` with no routing header, or one naming a model we do not serve. Collapsed into one
     /// outcome deliberately: a value we cannot match is a value we do not serve, and splitting it
     /// would leak whether a given name is in the catalog to a caller who has not authenticated.
@@ -882,16 +861,9 @@ impl ProxyHttp for AiProxy {
                     .get(route::MODEL_HEADER)
                     .and_then(|v| v.to_str().ok())
                     .and_then(route::model_route);
+                let _ = rest;
                 match row {
-                    Some(route) => Routed::Model {
-                        route,
-                        suffix: with_query(rest),
-                        // Streamability is a property of the client's suffix, not of whichever mount
-                        // gets prepended: every candidate's mount is a prefix, and
-                        // `is_streamable_path` matches by suffix. Computed once here for the same
-                        // reason it is computed pre-query above.
-                        streamable: is_streamable_path(rest),
-                    },
+                    Some(route) => Routed::Model { route },
                     None => Routed::UnknownModel,
                 }
             } else {
@@ -903,26 +875,26 @@ impl ProxyHttp for AiProxy {
         // candidate is only usable if we hold a pool key for it), so the catalog row is carried
         // through the auth gates and resolved to a provider after them. `provider` below is the
         // row's first candidate, which is also what the request will attempt first.
-        let (provider, forward_path, forward_streamable, model_route, auto_suffix) = match routed {
+        let (provider, forward_path, forward_streamable, model_route) = match routed {
             Routed::Provider {
                 provider,
                 forward_path,
                 streamable,
-            } => (provider, forward_path, streamable, None, None),
-            Routed::Model {
-                route,
-                suffix,
-                streamable,
-            } => {
-                // Every candidate shares a wire (a catalog invariant), so the first one's dialect —
-                // which is all that is read before the real candidate is chosen — is the row's.
-                let first = route.candidates.first().and_then(|c| {
-                    self.state
-                        .provider_by_id(c.provider)
-                        .map(|p| (p.clone(), c.upstream_model))
-                });
+            } => (provider, forward_path, streamable, None),
+            Routed::Model { route } => {
+                // Streamability is a property of the *row*: its candidates all serve one wire at
+                // matching endpoints (a catalog invariant), so the first candidate's path answers it
+                // for all of them.
+                let streamable = route
+                    .candidates
+                    .first()
+                    .is_some_and(|c| is_streamable_path(c.path));
+                let first = route
+                    .candidates
+                    .first()
+                    .and_then(|c| self.state.provider_by_id(c.provider).cloned());
                 match first {
-                    Some((p, _)) => (p, None, streamable, Some(route), Some(suffix)),
+                    Some(p) => (p, None, streamable, Some(route)),
                     // Unreachable in practice: `every_catalog_candidate_is_a_known_provider` proves
                     // every row names a provider the gateway registers. Answer rather than panic.
                     None => {
@@ -960,8 +932,15 @@ impl ProxyHttp for AiProxy {
                 .await;
             }
         };
-        // Dialect now comes from the resolved provider (usage parsing + injection eligibility).
-        let dialect = provider.dialect;
+        // Dialect drives usage parsing and injection eligibility.
+        //
+        // For a model-routed request it comes from the **row**, not the provider, because a provider
+        // can serve more than one wire: OpenRouter is `WireFormat::OpenAi` in the provider table and
+        // still serves genuine Anthropic Messages traffic at `/api/v1/messages`. Reading
+        // `provider.dialect` there would hand an Anthropic response to the OpenAI usage extractor,
+        // which does not error — it trips the dialect-mismatch guard and emits a **zero-token
+        // billing row**. Silent revenue loss, on the exact path that makes Claude failover possible.
+        let dialect = model_route.map_or(provider.dialect, |r| r.wire);
 
         // 2. Extract the presented key — a managed virtual key (`bai_…`) or a raw BYO provider token.
         let Some(raw_key) = extract_virtual_key(session.req_header()) else {
@@ -1243,7 +1222,6 @@ impl ProxyHttp for AiProxy {
                     // here on.
                     candidate: first_usable(usable, 0).unwrap_or(0),
                     usable,
-                    suffix: auto_suffix.unwrap_or_default(),
                     // Overwritten per attempt by `upstream_peer`; seeded so the first attempt is
                     // timed even if it fails before the prologue runs.
                     attempt_start: start,
@@ -1313,10 +1291,11 @@ impl ProxyHttp for AiProxy {
                     a.candidate = i;
                 }
 
-                let candidate = row.candidates.get(usize::from(i));
-                let resolved =
-                    candidate.and_then(|c| self.state.provider_by_id(c.provider).cloned());
-                let Some(p) = resolved else {
+                let Some(candidate) = row.candidates.get(usize::from(i)) else {
+                    rc.advance_candidate(i);
+                    continue;
+                };
+                let Some(p) = self.state.provider_by_id(candidate.provider).cloned() else {
                     // Unreachable: `usable` bits are only set for candidates that resolved.
                     rc.advance_candidate(i);
                     continue;
@@ -1347,7 +1326,7 @@ impl ProxyHttp for AiProxy {
                         if let Some(a) = rc.auto.as_mut() {
                             a.attempt_start = Instant::now();
                         }
-                        rc.rebuild_forward_path(p.base_path);
+                        rc.set_forward_path(candidate.path);
                         return Ok(Box::new(self.build_peer(addr, &p)));
                     }
                     Err(e) => {
@@ -2093,6 +2072,37 @@ mod tests {
         );
     }
 
+    /// A model-routed request takes its dialect from the **row**, not from the provider it happens
+    /// to start on.
+    ///
+    /// Not currently distinguishable end-to-end: every catalog row's primary candidate is a provider
+    /// whose own wire already matches the row, so both derivations agree. It stops agreeing the
+    /// moment a row's primary is an OpenAI-wire provider serving the Anthropic wire — Fireworks does
+    /// exactly that for its own models — and the failure is silent: the Anthropic response meets the
+    /// OpenAI extractor, trips the dialect-mismatch guard, and bills zero tokens without erroring.
+    #[test]
+    fn a_model_route_takes_its_dialect_from_the_row_not_the_provider() {
+        // OpenRouter is `OpenAi` in the provider table but serves this row's Anthropic wire.
+        let openrouter = providers::by_id(providers::ProviderId::OpenRouter);
+        assert_eq!(openrouter.wire, Dialect::OpenAi, "premise");
+
+        let row = route::model_route("claude-opus-4-8").expect("seed row");
+        assert_eq!(row.wire, Dialect::Anthropic, "premise");
+
+        // The derivation under test, as `request_filter` performs it.
+        let from_row = Some(row).map_or(openrouter.wire, |r| r.wire);
+        assert_eq!(
+            from_row,
+            Dialect::Anthropic,
+            "the row's wire must win; taking the provider's would parse an Anthropic response with \
+             the OpenAI extractor and emit a zero-token billing row",
+        );
+
+        // ...and a provider-routed request is unaffected: no row, so the provider decides.
+        let none: Option<&route::ModelRoute> = None;
+        assert_eq!(none.map_or(openrouter.wire, |r| r.wire), Dialect::OpenAi);
+    }
+
     /// The candidate cursor. `from` strictly increases across a request, which is what guarantees
     /// the walk terminates and that no candidate can be revisited to claim a second breaker permit.
     #[test]
@@ -2162,43 +2172,6 @@ mod tests {
         let body = br#"{"model":"a"}"#.to_vec();
         assert_eq!(apply_model_rewrite(body.clone(), (5, 2), b"z"), body);
         assert_eq!(apply_model_rewrite(body.clone(), (0, 999), b"z"), body);
-    }
-
-    /// Mount composition for every shape in the provider table. Getting one wrong sends a request
-    /// to a 404 on a provider that is perfectly healthy.
-    #[test]
-    fn mounted_path_prepends_the_candidates_mount() {
-        let cases = [
-            // (mount, client suffix, forwarded)
-            ("/v1", "/chat/completions", "/v1/chat/completions"),
-            ("/api/v1", "/chat/completions", "/api/v1/chat/completions"),
-            (
-                "/inference/v1",
-                "/chat/completions",
-                "/inference/v1/chat/completions",
-            ),
-            (
-                "/openai/v1",
-                "/chat/completions",
-                "/openai/v1/chat/completions",
-            ),
-            // Anthropic's base carries no mount; the SDK's own `/v1/messages` is already complete.
-            ("", "/v1/messages", "/v1/messages"),
-            // A query string rides along on the suffix.
-            (
-                "/v1",
-                "/chat/completions?api-version=2024",
-                "/v1/chat/completions?api-version=2024",
-            ),
-        ];
-        let mut buf = String::new();
-        for (mount, suffix, want) in cases {
-            write_mounted_path(&mut buf, mount, suffix);
-            assert_eq!(buf, want, "mount {mount:?} + suffix {suffix:?}");
-        }
-        // Reused across attempts without growing: the same buffer served every case above.
-        write_mounted_path(&mut buf, "/v1", "/chat/completions");
-        assert_eq!(buf, "/v1/chat/completions");
     }
 
     /// A client-side abort must not count against the provider's breaker; everything else must.

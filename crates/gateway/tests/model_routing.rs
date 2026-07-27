@@ -359,3 +359,89 @@ async fn provider_routed_requests_are_unaffected() {
         "a provider-routed body must not be rewritten: {body}"
     );
 }
+
+/// Claude fails over Anthropic → OpenRouter **on the Anthropic wire**, and the usage is parsed with
+/// the Anthropic extractor even though OpenRouter is an OpenAI-wire provider in the provider table.
+///
+/// On the metering half, be clear about what this test can and cannot prove. `rc.dialect` now comes
+/// from the row's `wire`; it used to come from `provider.dialect`. For *this* row those agree, since
+/// the primary candidate is Anthropic and Anthropic is an Anthropic-wire provider — so reverting the
+/// fix leaves this test green (checked, not assumed). What it does prove is that the whole
+/// Anthropic-wire path — route, rewrite, relay, extract — meters end to end.
+///
+/// The case the fix actually guards is a row whose *primary* is an OpenAI-wire provider serving the
+/// Anthropic wire (Fireworks does exactly this for its own models). There, `provider.dialect` says
+/// `OpenAi`, the Anthropic response hits the dialect-mismatch guard, and the row bills **zero
+/// tokens** without erroring. No such row is in the catalog yet, so the derivation is pinned as a
+/// unit test in `proxy.rs` instead of contriving one here.
+#[tokio::test]
+async fn claude_fails_over_on_the_anthropic_wire_and_is_still_metered() {
+    let nats = Nats::start().await;
+    let (pubkey, sk) = test_keypair(1);
+    // The fallback answers in Anthropic shape: `usage.input_tokens`, not `usage.prompt_tokens`.
+    let fallback = MockUpstream::start(Mode::AnthropicJson).await;
+    let gw = Gateway::builder(nats.port, &GatewayBuilder::dead_authority(), &b64(&pubkey))
+        .providers(&["anthropic", "openrouter"])
+        .provider_authority("openrouter", &fallback.authority())
+        .start()
+        .await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{}/auto/v1/messages", gw.url()))
+        .header("authorization", format!("Bearer {}", vkey(&sk)))
+        .header("content-type", "application/json")
+        .header("x-beyond-model", "claude-opus-4-8")
+        .body(r#"{"model":"claude-opus-4-8","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "Anthropic is dead; OpenRouter must serve it"
+    );
+
+    let cap = fallback
+        .captured()
+        .expect("the fallback served the request");
+    // OpenRouter's Messages endpoint, which is not reachable by composing Anthropic's `/v1/messages`
+    // with any per-provider mount — the catalog states it outright.
+    assert_eq!(cap.path, "/api/v1/messages");
+    // Auth followed the candidate, and so did its *scheme*: Anthropic wants `x-api-key`, OpenRouter
+    // wants Bearer. Sending Anthropic's scheme to OpenRouter would 401.
+    assert_eq!(
+        cap.authorization.as_deref(),
+        Some("Bearer sk-openrouter-pool"),
+    );
+    assert_eq!(
+        cap.x_api_key, None,
+        "the Anthropic scheme must not leak to OpenRouter"
+    );
+    // And the model was re-spelled the way OpenRouter names it — dots, vendor-prefixed.
+    let body = String::from_utf8(cap.body).unwrap();
+    assert!(
+        body.contains(r#""model":"anthropic/claude-opus-4.8""#),
+        "the fallback must be asked for its own id: {body}"
+    );
+
+    // The billing row must carry real tokens. Zero here means the OpenAI extractor ran against an
+    // Anthropic body and the dialect-mismatch guard swallowed it.
+    let line = gw
+        .wait_for_log_line(&["ai.usage", r#""provider":"openrouter""#])
+        .await;
+    assert!(
+        line.contains(r#""input_tokens":13"#),
+        "usage must be parsed with the row's Anthropic dialect, not the provider's OpenAI one: {line}"
+    );
+    assert!(
+        line.contains(r#""routed_model":"claude-opus-4-8""#),
+        "{line}"
+    );
+
+    let metrics = gw.metrics().await;
+    assert_eq!(
+        parse_metric(&metrics, "ai_usage_parse_errors_total", ""),
+        0.0,
+        "no usage should have failed to parse:\n{metrics}"
+    );
+}

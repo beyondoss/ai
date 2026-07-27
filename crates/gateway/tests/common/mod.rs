@@ -183,14 +183,19 @@ pub enum Mode {
     /// Always reply with this HTTP status and a small JSON error body — for circuit-breaker tests
     /// (5xx trips the breaker; 4xx/429 do not).
     Status(u16),
-    /// Accept the Nth request (1-based) and then kill the connection without answering it.
+    /// Kill any request that is **not the first on its connection**, without answering it.
     ///
-    /// The only way to produce pingora's *reused-connection* failure: request 1 completes normally
-    /// and its connection goes into the pool, request 2 reuses it and dies on the response read.
-    /// That is the retry pingora decides on by itself, via its default `error_while_proxy`, without
-    /// ever calling `fail_to_connect` — which is precisely why the gateway's breaker ledger lives in
-    /// `upstream_peer` rather than there.
-    CloseOnRequest(usize),
+    /// This is pingora's *reused-connection* failure, produced deterministically. Keying on
+    /// position-within-the-connection rather than a global request counter is what makes it
+    /// reliable: how many connections pingora opens, and which request lands on which, varies with
+    /// load. A global "kill request 2" fired on a *fresh* connection roughly half the time once the
+    /// suite's other tests were running alongside — and a fresh-connection failure is not retryable,
+    /// so the test failed for a reason that had nothing to do with what it was testing.
+    ///
+    /// The retry this provokes is one pingora decides on by itself, via its default
+    /// `error_while_proxy`, without ever calling `fail_to_connect` — which is precisely why the
+    /// gateway's breaker ledger lives in `upstream_peer` rather than there.
+    CloseOnReusedConnection,
     /// Hold the request open for this many milliseconds before answering — long enough for a client
     /// to give up first. The only way to produce a *downstream* abort while the upstream is still
     /// healthy, which is the distinction the breaker has to draw.
@@ -273,7 +278,7 @@ fn anthropic_sse_large() -> String {
 fn canned_body(mode: Mode) -> (&'static str, Bytes) {
     match mode {
         // A slow reply, and the surviving requests of a close-on-Nth mock, are ordinary successes.
-        Mode::Json | Mode::Slow(_) | Mode::CloseOnRequest(_) => (
+        Mode::Json | Mode::Slow(_) | Mode::CloseOnReusedConnection => (
             "application/json",
             Bytes::from_static(CANNED_JSON.as_bytes()),
         ),
@@ -312,13 +317,10 @@ async fn mock_handle(
     cap: Arc<Mutex<Option<Captured>>>,
     hits: Arc<std::sync::atomic::AtomicUsize>,
     mode: Mode,
+    // `on_conn`: how many requests this **connection** has already served. 0 ⇒ fresh connection.
+    on_conn: usize,
 ) -> Result<Response<Full<Bytes>>, std::io::Error> {
-    let n = hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-    // Kill the connection before touching the body, so the gateway sees the failure while awaiting
-    // the response header — the shape that yields `RetryType::ReusedOnly`.
-    if matches!(mode, Mode::CloseOnRequest(k) if k == n) {
-        return Err(std::io::Error::other("mock closing the connection"));
-    }
+    hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let version = req.version();
     // Path **and query**. Recording only `uri.path()` meant the harness was structurally blind to the
     // query string: no test could tell whether the gateway forwarded `?api-version=…` (which Azure
@@ -347,6 +349,14 @@ async fn mock_handle(
         .await
         .map(|b| b.to_bytes().to_vec())
         .unwrap_or_default();
+    // Kill only *after* the request body has been fully read. Killing on the head instead raced the
+    // gateway's body write and surfaced as `Upstream WriteError … Broken pipe`, which pingora does
+    // not retry — correctly, since it cannot know how much the upstream consumed. Draining first
+    // puts the failure squarely on the response-header read, which is the `ReusedOnly` shape this
+    // mode exists to produce.
+    if matches!(mode, Mode::CloseOnReusedConnection) && on_conn > 0 {
+        return Err(std::io::Error::other("mock closing a reused connection"));
+    }
     *cap.lock().unwrap() = Some(Captured {
         path,
         authorization,
@@ -392,8 +402,12 @@ impl MockUpstream {
                 let cap = cap.clone();
                 let hit_counter = hit_counter.clone();
                 tokio::spawn(async move {
+                    // Per-connection request index: `fetch_add` returns how many this connection has
+                    // already served, so `0` means "first on a fresh connection".
+                    let on_conn = Arc::new(std::sync::atomic::AtomicUsize::new(0));
                     let svc = service_fn(move |req| {
-                        mock_handle(req, cap.clone(), hit_counter.clone(), mode)
+                        let n = on_conn.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        mock_handle(req, cap.clone(), hit_counter.clone(), mode, n)
                     });
                     let _ = hyper::server::conn::http1::Builder::new()
                         .serve_connection(io, svc)
@@ -454,8 +468,10 @@ impl MockUpstream {
                         return;
                     };
                     let io = TokioIo::new(tls_stream);
+                    let on_conn = Arc::new(std::sync::atomic::AtomicUsize::new(0));
                     let svc = service_fn(move |req| {
-                        mock_handle(req, cap.clone(), hit_counter.clone(), mode)
+                        let n = on_conn.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        mock_handle(req, cap.clone(), hit_counter.clone(), mode, n)
                     });
                     // Auto builder: serves H2 or H1 per the negotiated ALPN.
                     let _ = auto::Builder::new(TokioExecutor::new())

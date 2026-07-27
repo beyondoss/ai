@@ -121,15 +121,6 @@ pub struct Provider {
     /// breaker is disabled (`circuit_breaker_threshold == 0`). Checked before connect and fed the
     /// 5xx/connect outcome — see `proxy`. Lock-free, so the hot path reads it without contention.
     pub breaker: Option<CircuitBreaker>,
-    /// The mount prefix this provider hangs its API under (`/v1`, `/openai/v1`, `/api/v1`, `""` for
-    /// Anthropic) — see [`ProviderSpec::base_path`].
-    ///
-    /// Empty, and unread, on the `/{provider}/…` route: there the client names the provider, so it
-    /// also spells the mount, and the path is forwarded verbatim. Only the **model-routed** route
-    /// consults it, because there the client cannot know which provider will serve the request.
-    /// Empty for a config-added provider too — an operator giving the gateway a bare authority is
-    /// telling it to forward paths verbatim, exactly as today.
-    pub base_path: &'static str,
 }
 
 impl Provider {
@@ -166,18 +157,7 @@ impl Provider {
             host_header,
             metrics,
             breaker,
-            base_path: "",
         }
-    }
-
-    /// Attach the provider's mount prefix (see [`Provider::base_path`]).
-    ///
-    /// A builder rather than an eighth positional parameter: only the known-provider loop in
-    /// `state::build_providers` has a mount to give, and `resolve`'s parameter list is already long
-    /// enough that another bare `&str` between the other `&str`s would be easy to transpose.
-    pub fn with_base_path(mut self, base_path: &'static str) -> Self {
-        self.base_path = base_path;
-        self
     }
 }
 
@@ -211,21 +191,6 @@ mod tests {
                 );
             }
         }
-    }
-
-    #[test]
-    fn base_path_defaults_to_empty_and_is_set_by_the_builder() {
-        let p = Provider::resolve(
-            "openai",
-            "api.openai.com:443".into(),
-            Dialect::OpenAi,
-            AuthScheme::Bearer,
-            None,
-            ProviderMetrics::disconnected(),
-            None,
-        );
-        assert_eq!(p.base_path, "", "verbatim-forwarding default");
-        assert_eq!(p.with_base_path("/v1").base_path, "/v1");
     }
 
     #[test]

@@ -306,3 +306,95 @@ async fn smoke_xai() {
     )
     .await;
 }
+
+/// The `AI_POOL_KEY_*` env var a provider's key conventionally lives in — mirrors the shared table's
+/// `env_var`, which is what the catalog smoke below reads.
+fn provider_env_var(id: providers::ProviderId) -> Option<&'static str> {
+    providers::by_id(id).env_var
+}
+
+/// **Every catalog row, against the real providers, through the real gateway.**
+///
+/// The catalog is product data: a wrong model id or path does not fail loudly, it routes to a 404
+/// that reads like the client's fault. Unit tests can check the table's shape but not its *truth* —
+/// only the provider can say whether `anthropic/claude-opus-4.8` is still a thing. This is the test
+/// that keeps the table honest.
+///
+/// Drives each `(row, candidate)` pair individually via the model route, forcing that candidate to
+/// be the only usable one, so a green run means every entry is independently servable rather than
+/// every row merely having *one* working primary.
+///
+/// Skips any candidate whose key is absent, so a partial keyring smokes what it can.
+#[tokio::test]
+#[ignore = "hits real providers and bills tiny requests; run via `mise run test:smoke`"]
+async fn catalog_rows_are_servable() {
+    let mut checked = 0usize;
+    let mut skipped: Vec<String> = Vec::new();
+
+    for route in providers::catalog::MODEL_ROUTES {
+        for candidate in route.candidates {
+            let spec = providers::by_id(candidate.provider);
+            let Some(var) = provider_env_var(candidate.provider) else {
+                skipped.push(format!("{} ({}): no env var", route.model, spec.name));
+                continue;
+            };
+            let Some(key) = env_key(var) else {
+                skipped.push(format!("{} ({}): {var} unset", route.model, spec.name));
+                continue;
+            };
+
+            let nats = Nats::start().await;
+            // Only this candidate holds a pool key, so the gateway has nowhere else to go — a 200
+            // here is this exact (provider, path, model id) triple answering, not a fallback
+            // quietly covering for it.
+            let (gw, vkey) = managed_gateway(&nats, spec.name, &key).await;
+
+            // The body is the row's own wire. `max_tokens` is required by Anthropic and harmless to
+            // OpenAI, and 1 token keeps the bill to a fraction of a cent.
+            let body = format!(
+                r#"{{"model":"{}","max_tokens":1,"messages":[{{"role":"user","content":"hi"}}]}}"#,
+                route.model,
+            );
+            let mut req = reqwest::Client::new()
+                .post(format!("{}/auto/x", gw.url()))
+                .header("authorization", format!("Bearer {vkey}"))
+                .header("content-type", "application/json")
+                .header("x-beyond-model", route.model);
+            if route.wire == providers::WireFormat::Anthropic {
+                req = req.header("anthropic-version", "2023-06-01");
+            }
+            let resp = req.body(body).send().await.expect("request sent");
+            let status = resp.status().as_u16();
+            let text = resp.text().await.unwrap_or_default();
+            assert_eq!(
+                status,
+                200,
+                "catalog row {:?} → {} {} (model {:?}) returned {status}: {}",
+                route.model,
+                spec.name,
+                candidate.path,
+                candidate.upstream_model,
+                text.chars().take(300).collect::<String>(),
+            );
+            // The provider echoes the id it actually ran, which is how a silently-rewritten or
+            // aliased model shows up.
+            eprintln!(
+                "smoke[catalog]: {:<18} → {:<11} {:<24} ok",
+                route.model, spec.name, candidate.upstream_model,
+            );
+            checked += 1;
+        }
+    }
+
+    for s in &skipped {
+        eprintln!("smoke[catalog]: skipped {s}");
+    }
+    assert!(
+        checked > 0,
+        "no catalog candidate was checked — set at least one provider key",
+    );
+    eprintln!(
+        "smoke[catalog]: {checked} candidate(s) verified, {} skipped",
+        skipped.len()
+    );
+}
