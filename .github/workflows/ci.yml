@@ -94,26 +94,35 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: nextest
-      # Write to a **file**, never a pipe. This is the whole fix for a hang that cost a day.
+      # Two requirements that pull against each other, so this is deliberate.
       #
-      # A leaked child — a `serve` daemon that outlived its test, reparented to init — inherits the
-      # step's stdout. GitHub captures a step through a pipe and waits for EOF on it, so one orphan
-      # holding that descriptor wedges the job forever: no output, no log upload (GitHub uploads none
-      # for a job it later records as cancelled), and *no timeout of any kind fires* — not the job's
-      # `timeout-minutes`, not the step's, not even a shell `timeout`, because `timeout` kills the
-      # command it launched and not that command's descendants. Reproduced exactly: with a pipe the
-      # step hangs despite `timeout` firing; with a file redirect it returns the instant `timeout`
-      # fires and the orphan is left writing to a file nobody waits on.
+      # 1. Nothing that can be *inherited* may hold the step's stdout. GitHub captures a step through
+      #    a pipe and waits for EOF on it, so a single leaked child — a `serve` daemon that outlived
+      #    its test, reparented to init — wedges the job forever: no output, no log upload, and no
+      #    timeout of any kind fires. Not the job's `timeout-minutes`, not the step's, not even a
+      #    shell `timeout`, because `timeout` kills the command it launched, never its descendants.
+      #    That is the 30:00 death this suite kept hitting. Reproduced both ways in isolation: with a
+      #    pipe the step hangs long past `timeout` firing; with a file it returns the instant it does.
       #
-      # `</dev/null` so nothing inherits the step's stdin either.
+      # 2. The step must still print as it goes. A silent step is indistinguishable from a wedged one
+      #    to anybody watching, which is its own kind of unusable.
+      #
+      # So: the test command writes to a file (inheritable, and an orphan holding it blocks nothing),
+      # and a `tail -f` we own streams that file to the step's stdout. The tail does hold the step's
+      # stdout — but it is ours to kill, so it always releases.
       - name: test
         run: |
           set +e
+          LOG="$RUNNER_TEMP/nextest.log"
+          : > "$LOG"
+          tail -f "$LOG" &
+          TAIL=$!
           timeout --signal=TERM --kill-after=30s 15m \
             cargo nextest run --workspace --profile ci ${{ matrix.extra }} -E '${{ matrix.filter }}' \
-            > "$RUNNER_TEMP/nextest.log" 2>&1 </dev/null
+            > "$LOG" 2>&1 </dev/null
           status=$?
-          tail -300 "$RUNNER_TEMP/nextest.log"
+          sleep 2                      # let the tail flush the last lines
+          kill "$TAIL" 2>/dev/null; wait "$TAIL" 2>/dev/null
           [ $status -eq 124 ] && echo "::error::timed out after 15m — the last test above is where it stopped"
           exit $status
         timeout-minutes: 20
