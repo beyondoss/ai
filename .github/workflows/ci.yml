@@ -82,7 +82,7 @@ jobs:
             # nextest prints a test when it finishes: under parallelism the culprit is whichever
             # name never appears, which is unreadable across 1820 tests. Streaming serially, the
             # last line printed IS the test that hung.
-            extra: --no-capture
+            extra: ""
           - name: core-providers
             filter: package(beyond-ai-agent-core) or package(beyond-ai-providers)
             extra: ""
