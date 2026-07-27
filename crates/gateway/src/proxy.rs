@@ -1882,20 +1882,36 @@ impl ProxyHttp for AiProxy {
             // than the downstream price table. They're equal when the response carried no model (e.g.
             // an error body), where `model` falls back to the request alias. Both sanitized.
             let billed = rc.resp_model_scanner.take_model().map(sanitize_model);
-            // Borrow the requested model as the fallback rather than cloning it — it's still read as
-            // `requested_model` below, so a clone would be pure waste on every managed response.
-            //
-            // Third link in the fallback chain for a model-routed request: if neither the response
-            // nor the body carried an id, the catalog name we routed on is still a true statement
-            // about what was asked for, and strictly better than the empty string this used to ship.
-            // Derived rather than stored: it is the catalog row's own name.
+            // The catalog name this request routed on — `None` for a provider-routed request.
+            // Derived rather than stored: it is the catalog row's own `&'static` name.
             let routed_model = rc.auto.as_ref().map(|a| a.route.model);
-            let resolved = billed.as_deref().unwrap_or(&rc.model);
-            let billed_model = if resolved.is_empty() {
-                routed_model.unwrap_or_default()
-            } else {
-                resolved
-            };
+
+            // What the client *asked for*.
+            //
+            // On the model-routed path that is the catalog name from the routing header, **not** the
+            // body's `model`. The body's value is overwritten with the serving candidate's id before
+            // the request leaves the gateway, so it runs nothing and determines nothing; reporting a
+            // discarded input as "requested" was a leftover from an earlier design that did not
+            // rewrite bodies. On the provider-routed path the body is untouched and is exactly what
+            // was asked for, so it stays the answer there.
+            let requested_model = routed_model.unwrap_or(rc.model.as_str());
+
+            // A model-routed client should send the same id in both places; nothing enforces it,
+            // because the route is chosen from the header before the body is ever read. It is
+            // harmless — the body is overwritten either way — but it means the client believes it
+            // asked for something it did not get, which is a client bug worth being able to see.
+            // Counted rather than logged per request: a client that always disagrees would otherwise
+            // produce one warn line per request forever.
+            if routed_model.is_some_and(|r| !rc.model.is_empty() && rc.model != r) {
+                self.state.metrics.model_header_body_mismatch_total.inc();
+            }
+
+            // Prefer the id the provider echoed (the pinned snapshot it actually billed); fall back
+            // to what was asked for when the response carried none — an error body, say.
+            let billed_model = billed
+                .as_deref()
+                .filter(|m| !m.is_empty())
+                .unwrap_or(requested_model);
             info!(
                 target: "ai.usage",
                 request_id = %rc.request_id,
@@ -1903,13 +1919,11 @@ impl ProxyHttp for AiProxy {
                 vpc_id = rc.vpc_id,
                 provider = rc.provider.name.as_str(),
                 model = billed_model,
-                requested_model = %rc.model,
-                // The catalog name the request routed on — `None` (absent from the row) for a
-                // provider-routed request. Distinct from `requested_model`, which is whatever the
-                // client's *body* asked for: nothing enforces that the two agree, since the routing
-                // decision is made from the header before the body is ever read, and a divergence is
-                // only visible here, after the fact. `&'static` from the catalog and charset-checked
-                // by a catalog test, so it needs no `sanitize_model`.
+                requested_model,
+                // Present only for a model-routed request, so the billing row says *how* it was
+                // routed as well as what ran. Equal to `requested_model` by construction on that
+                // path; its value is marking the route, not carrying a second id. `&'static` from
+                // the catalog and charset-checked by a catalog test, so it needs no `sanitize_model`.
                 routed_model,
                 stream = rc.streaming,
                 input_tokens = usage.input_tokens,

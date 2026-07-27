@@ -536,11 +536,15 @@ prefix requires no SDK modification.
 
 - Request body content and schema — no validation at the gateway layer
 - Model name in the request — extracted for billing facts, never validated against an allowlist
-- **Agreement between the routing header and the body's `model`** on `/auto`. The route is chosen
-  from the header before the body is ever read, so the two cannot be reconciled pre-connect. This is
-  not price-gameable — billing uses the id the provider echoes back — but the header alone selects
-  which pool key serves the request, and there is no per-tenant entitlement check on catalog rows. A
-  divergence is visible after the fact as `routed_model` ≠ `requested_model` in `ai.usage`.
+- **The request body's `model` on `/auto`.** It is an input the gateway *overwrites* with the
+  serving candidate's id, so it determines nothing — the routing header does. A body that names a
+  different model is counted on `ai_model_header_body_mismatch_total` (a client bug worth finding)
+  and otherwise ignored; `requested_model` in `ai.usage` reports the catalog name, which is what was
+  actually asked for.
+- **Which pool key a model-routed request draws on.** The header alone selects the catalog row, and
+  there is no per-tenant entitlement check on rows — any managed tenant can route to any row. Not
+  price-gameable (billing uses the id the provider echoes back), but worth knowing before rows are
+  added whose pool keys differ in cost or contract.
 - Provider response content — relayed byte-for-byte
 - BYO token validity — forwarded as-is; the provider rejects it if invalid
 - `vpc_id` in the virtual key — decoded and emitted in billing facts, not used for access control
@@ -631,6 +635,7 @@ Prometheus on the default registry, exposed at `/metrics` on `metrics_listen`.
 | `ai_nats_connected`           | Gauge     | —                    | 1 if NATS watcher is connected, 0 otherwise                                            |
 | `ai_usage_parse_errors_total` | Counter   | —                    | Managed 2xx responses with no parseable usage (emitted as a zero-token billing row)    |
 | `ai_candidate_failovers_total` | Counter  | —                    | Model-routed requests that abandoned a candidate for the next one                      |
+| `ai_model_header_body_mismatch_total` | Counter | —             | Model-routed requests whose routing header and body `model` disagreed (client bug)     |
 
 ---
 

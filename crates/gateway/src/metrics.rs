@@ -119,6 +119,13 @@ pub struct Metrics {
     /// per request; without this, the extra latency looks like a slow provider, not a connect
     /// problem. Pairs with a `warn!` on the same path so the dashboard spike has a log to grep.
     pub connect_retries_total: IntCounterVec,
+    /// Model-routed requests whose routing header and request-body `model` named different models.
+    ///
+    /// Harmless to the request — the body's `model` is overwritten with the serving candidate's id
+    /// regardless — but it means the client believes it asked for something it did not get. A
+    /// counter rather than a log line because a client that always disagrees would otherwise emit
+    /// one warn per request forever; a non-zero rate here is a client bug to go and find.
+    pub model_header_body_mismatch_total: IntCounter,
     /// Model-routed requests that gave up on a candidate and moved to the next one.
     ///
     /// Deliberately *not* folded into `connect_retries_total`: that counter means "we retried the
@@ -194,6 +201,10 @@ impl Metrics {
             "ai_candidate_failovers_total",
             "Model-routed requests that moved to the next candidate provider",
         ))?;
+        let model_header_body_mismatch_total = IntCounter::with_opts(Opts::new(
+            "ai_model_header_body_mismatch_total",
+            "Model-routed requests whose routing header and body `model` disagreed",
+        ))?;
         let rejections_total = IntCounterVec::new(
             Opts::new("ai_rejections_total", "Requests rejected before upstream"),
             &["reason"],
@@ -257,6 +268,7 @@ impl Metrics {
 
         r.register(Box::new(requests_total.clone()))?;
         r.register(Box::new(candidate_failovers_total.clone()))?;
+        r.register(Box::new(model_header_body_mismatch_total.clone()))?;
         r.register(Box::new(rejections_total.clone()))?;
         r.register(Box::new(upstream_responses_total.clone()))?;
         r.register(Box::new(connect_retries_total.clone()))?;
@@ -272,6 +284,7 @@ impl Metrics {
         Ok(Arc::new(Self {
             requests_total,
             candidate_failovers_total,
+            model_header_body_mismatch_total,
             rejections_total,
             rejections,
             upstream_responses_total,

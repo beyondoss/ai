@@ -445,3 +445,115 @@ async fn claude_fails_over_on_the_anthropic_wire_and_is_still_metered() {
         "no usage should have failed to parse:\n{metrics}"
     );
 }
+
+/// `requested_model` on `/auto` is the catalog name from the routing header — not the body's
+/// `model`, which the gateway overwrites and which therefore determines nothing.
+///
+/// The body here deliberately names a *different* model. It runs nothing (the row's primary serves,
+/// under the row's id), so reporting it as what the client "requested" would be reporting a
+/// discarded input. The disagreement is counted so a client bug is visible.
+#[tokio::test]
+async fn requested_model_is_the_routed_name_not_the_discarded_body_value() {
+    let nats = Nats::start().await;
+    let (pubkey, sk) = test_keypair(1);
+    let primary = MockUpstream::start(Mode::Json).await;
+    let gw = Gateway::builder(nats.port, &primary.authority(), &b64(&pubkey))
+        .providers(&["openai", "openrouter"])
+        .start()
+        .await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{}/auto/chat/completions", gw.url()))
+        .header("authorization", format!("Bearer {}", vkey(&sk)))
+        .header("content-type", "application/json")
+        .header("x-beyond-model", MODEL)
+        // A body naming something else entirely.
+        .body(r#"{"model":"claude-opus-4-8","messages":[{"role":"user","content":"hi"}]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+
+    // The body's value never reached the provider: it was overwritten with the row's id.
+    let cap = primary.captured().expect("primary served the request");
+    let body = String::from_utf8(cap.body).unwrap();
+    assert!(
+        body.contains(r#""model":"gpt-4o-mini""#) && !body.contains("claude"),
+        "the body's model must be replaced by the routed candidate's id: {body}"
+    );
+
+    let line = gw
+        .wait_for_log_line(&["ai.usage", r#""provider":"openai""#])
+        .await;
+    assert!(
+        line.contains(r#""requested_model":"gpt-4o-mini""#),
+        "requested_model must be the routed catalog name: {line}"
+    );
+    assert!(
+        !line.contains("claude"),
+        "the discarded body value must not appear anywhere in the billing row: {line}"
+    );
+
+    let metrics = gw.metrics().await;
+    assert!(
+        parse_metric(&metrics, "ai_model_header_body_mismatch_total", "") >= 1.0,
+        "the disagreement must be counted so a client bug is findable:\n{metrics}"
+    );
+}
+
+/// The ordinary case: header and body agree, and nothing is counted as a mismatch.
+#[tokio::test]
+async fn agreeing_header_and_body_count_no_mismatch() {
+    let nats = Nats::start().await;
+    let (pubkey, sk) = test_keypair(1);
+    let primary = MockUpstream::start(Mode::Json).await;
+    let gw = Gateway::builder(nats.port, &primary.authority(), &b64(&pubkey))
+        .providers(&["openai", "openrouter"])
+        .start()
+        .await;
+
+    let resp = post_auto(&reqwest::Client::new(), &gw.url(), &vkey(&sk), Some(MODEL)).await;
+    assert_eq!(resp.status().as_u16(), 200);
+
+    let metrics = gw.metrics().await;
+    assert_eq!(
+        parse_metric(&metrics, "ai_model_header_body_mismatch_total", ""),
+        0.0,
+        "a well-formed request must not be counted as a mismatch:\n{metrics}"
+    );
+}
+
+/// Provider-routed traffic keeps the old meaning: the body is untouched, so the body's `model` *is*
+/// what was requested, and no `routed_model` appears at all.
+#[tokio::test]
+async fn provider_routed_requested_model_still_comes_from_the_body() {
+    let nats = Nats::start().await;
+    let (pubkey, sk) = test_keypair(1);
+    let mock = MockUpstream::start(Mode::Json).await;
+    let gw = Gateway::builder(nats.port, &mock.authority(), &b64(&pubkey))
+        .providers(&["openai", "openrouter"])
+        .start()
+        .await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{}/openai/v1/chat/completions", gw.url()))
+        .header("authorization", format!("Bearer {}", vkey(&sk)))
+        .header("content-type", "application/json")
+        .body(r#"{"model":"some-other-model","messages":[{"role":"user","content":"hi"}]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+
+    let line = gw
+        .wait_for_log_line(&["ai.usage", r#""provider":"openai""#])
+        .await;
+    assert!(
+        line.contains(r#""requested_model":"some-other-model""#),
+        "a provider-routed body is untouched, so it is what was requested: {line}"
+    );
+    assert!(
+        !line.contains("routed_model"),
+        "routed_model marks the model route and must be absent otherwise: {line}"
+    );
+}
