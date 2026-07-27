@@ -76,12 +76,21 @@ jobs:
           - name: gateway-e2e
             filter: package(beyond-ai) and kind(test)
             extra: ""
-          - name: agent
-            filter: package(beyond-ai-agent)
-            # Serial and uncaptured *for this group only*, because it is the one that hangs and
-            # nextest prints a test when it finishes: under parallelism the culprit is whichever
-            # name never appears, which is unreadable across 1820 tests. Streaming serially, the
-            # last line printed IS the test that hung.
+          # The agent package is split three ways rather than run whole. Two reasons, both learned
+          # the hard way: a single 1849-test job is the only shard that has ever wedged (its three
+          # siblings finish in ~90s every single time), and when it does wedge, "the agent tests" is
+          # far too coarse a result to act on. Splitting the workspace by area is what localized the
+          # failure to this package to begin with; continuing that same bisect one level down is what
+          # will localize it inside the package, and each piece is small enough to stand a materially
+          # better chance of simply passing.
+          - name: agent-lib
+            filter: package(beyond-ai-agent) and (kind(lib) or kind(bin))
+            extra: ""
+          - name: agent-serve
+            filter: package(beyond-ai-agent) and kind(test) and binary(~serve)
+            extra: ""
+          - name: agent-rest
+            filter: package(beyond-ai-agent) and kind(test) and not binary(~serve)
             extra: ""
           - name: core-providers
             filter: package(beyond-ai-agent-core) or package(beyond-ai-providers)
@@ -117,12 +126,33 @@ jobs:
           : > "$LOG"
           tail -f "$LOG" &
           TAIL=$!
+          # Sample resources every 20s. A single postmortem reading cannot distinguish "ran out"
+          # from "was never the problem" -- the trend can. Cheap, and written to its own file so a
+          # wedged run still leaves the history behind.
+          ( while :; do
+              printf '%s pids=%s load=%s mem_avail_mb=%s disk_avail=%s procs=%s\n' \
+                "$(date -u +%H:%M:%S)" \
+                "$(ps -eo pid= | wc -l)" \
+                "$(cut -d" " -f1 /proc/loadavg)" \
+                "$(awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo)" \
+                "$(df -Pk / | awk 'NR==2{print int($4/1048576)"G"}')" \
+                "$(pgrep -c -f 'beyond-ai' 2>/dev/null || echo 0)"
+              sleep 20
+            done ) > "$RUNNER_TEMP/samples.log" 2>&1 &
+          SAMPLER=$!
           timeout --signal=TERM --kill-after=30s 15m \
             cargo nextest run --workspace --profile ci ${{ matrix.extra }} -E '${{ matrix.filter }}' \
             > "$LOG" 2>&1 </dev/null
           status=$?
           sleep 2                      # let the tail flush the last lines
           kill "$TAIL" 2>/dev/null; wait "$TAIL" 2>/dev/null
+          kill "$SAMPLER" 2>/dev/null
+          # The tail is a convenience, not the record. If it dies the step would otherwise look wedged
+          # while the run is fine, so the file itself is always the source of truth at the end.
+          echo "--- last 200 lines of the log file (authoritative; the stream above can lag) ---"
+          tail -200 "$LOG"
+          echo "--- resource samples taken DURING the run ---"
+          cat "$RUNNER_TEMP/samples.log" 2>/dev/null || echo "  (none)"
           [ $status -eq 124 ] && echo "::error::timed out after 15m — the last test above is where it stopped"
           exit $status
         timeout-minutes: 20
