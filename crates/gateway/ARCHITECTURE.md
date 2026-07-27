@@ -68,12 +68,13 @@ Client (stock OpenAI/Anthropic SDK)
   │
   ▼  upstream_request_filter (proxy.rs)
   │  Managed: remove every static-key header (authorization, x-api-key, api-key,
-  │    x-goog-api-key) → inject pool key in the provider's own scheme
+  │    x-goog-api-key) UNCONDITIONALLY → inject pool key in the provider's own scheme
   │  BYO: leave auth header unchanged
-  │  Set Host; forward path verbatim (/{provider} prefix stripped)
+  │  Set Host; path: verbatim for /{provider} (prefix stripped), or the candidate's
+  │    own catalog path for /auto. Model-routed: strip x-beyond-model
   │  OpenRouter + managed only: dashboard-attribution headers (HTTP-Referer, X-OpenRouter-*)
   │
-  ▼  request_body_filter (proxy.rs)  — body streamed through, never buffered
+  ▼  request_body_filter (proxy.rs)  — streamed through, except where a rewrite needs the whole body
   │  Enforce running size cap (chunked-safe) ──────────────────── 413
   │  Managed + streamed: feed chunks → ModelScanner (peek.rs), root-level `model`, O(1) mem
   │    (BYO skips it — `model` is only ever read on the managed billing path)
