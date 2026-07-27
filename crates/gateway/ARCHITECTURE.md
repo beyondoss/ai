@@ -734,6 +734,23 @@ gateway's added cost is negligible and bounded** — i.e. it never becomes the c
   catching gross regressions (a buffering mistake, a dropped connection pool, an O(n) path added
   would move the band by far more than 20µs) and saved-baseline RPS trend via `--save-baseline`.
 
+  **The model route (`/auto`) costs nothing measurable.** Paired runs against the provider-routed
+  path: `managed_json` 107.85 / 108.84 / 108.68 µs vs `auto_json` 107.19 / 108.65 / 108.67 µs — a
+  mean delta of −0.3 µs, i.e. `/auto` measured marginally *faster*, which is noise. At 64 KiB the
+  two are likewise level (`managed_large_body` 155.23 µs vs `auto_large_body` 155.75 µs) **despite**
+  `/auto` buffering the whole body where the path-routed request streams it: a 64 KiB memcpy into a
+  pre-sized `Vec` disappears into the network cost, and the `model` splice is a no-op whenever the
+  candidate spells the model the way the catalog names it, which the primary candidate usually does.
+  A single first run showed `auto_json` +2.26 µs and it did not survive repetition — see the
+  paragraph below, which exists because of exactly that.
+
+  **`auto_failover_latency` (~110.6 µs, +2.5 µs) measures the mechanism, not an outage.** Its dead
+  primary is an unbound port, so the connect is refused instantly. In production a provider that has
+  gone away usually does not refuse — it hangs, and the client pays up to `connect_timeout_secs`
+  before the next candidate is tried. The candidate walk itself is microseconds; the wait is
+  whatever the failed connect costs, and that is the number to quote to anyone asking what failover
+  feels like.
+
   **Read criterion's verdict on this harness with care below ~3%.** Its p-value models within-run
   sampling noise, not run-to-run drift, and there is plenty of the latter here. Measured directly:
   three consecutive runs of *identical* code against one saved baseline reported +2.18% ("regressed",
