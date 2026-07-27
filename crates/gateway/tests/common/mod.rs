@@ -125,6 +125,10 @@ pub fn free_port() -> u16 {
     panic!("could not find an unused free port after 1000 attempts");
 }
 
+/// How much of a gateway's log to retain. Half is dropped when it fills, so the buffer stays within
+/// this bound while always holding the most recent lines — which is what every assertion reads.
+const LOG_CAPTURE_CAP: usize = 512 * 1024;
+
 /// An HTTP client that cannot hang.
 ///
 /// `reqwest::Client::new()` has **no** timeout, so a request that stalls stalls the test, and under
@@ -851,7 +855,11 @@ impl GatewayBuilder {
             .env(
                 "AI_LOG",
                 // `info` so the `ai.usage` billing rows reach the captured log. Still overridable.
-                std::env::var("AI_LOG").unwrap_or_else(|_| "info".into()),
+                // `warn` for everything, `info` only for the billing target — the `ai.usage` rows
+                // are the reason this is captured at all. Turning the whole gateway (and pingora
+                // under it) up to `info` for every test produced far more output than any assertion
+                // reads, on a path where each line is then held in memory below.
+                std::env::var("AI_LOG").unwrap_or_else(|_| "warn,ai.usage=info".into()),
             )
             // Capture the child's output instead of letting it inherit ours. Two reasons: the
             // `ai.usage` rows are only observable this way (they are a log target, not a metric),
@@ -874,6 +882,15 @@ impl GatewayBuilder {
                 use std::io::{BufRead, BufReader};
                 for line in BufReader::new(stream).lines().map_while(Result::ok) {
                     if let Ok(mut buf) = sink.lock() {
+                        // Bounded. A test binary holds one of these per gateway it starts, several
+                        // run concurrently, and a chatty or wedged gateway would otherwise grow this
+                        // without limit for the life of the test — memory pressure on a CI runner
+                        // being a spectacularly unhelpful failure, since a reaped runner uploads no
+                        // logs to explain itself. Assertions only ever read recent lines.
+                        if buf.len() > LOG_CAPTURE_CAP {
+                            let keep = buf.len() - LOG_CAPTURE_CAP / 2;
+                            buf.drain(..keep);
+                        }
                         buf.push_str(&line);
                         buf.push('\n');
                     }
