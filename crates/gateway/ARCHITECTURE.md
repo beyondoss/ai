@@ -173,11 +173,10 @@ the provider:
 - **It is managed-only.** A BYO token belongs to one provider, so selecting among candidates would be
   a guess and failing over would hand one vendor's key to another. BYO on `/auto` → 400.
 
-Failover is **connect-level only**: a candidate that will not connect (refused, timed out, or absent
-from DNS) is abandoned for the next one. A candidate that *answers* — including with a 5xx — is not,
-because retrying after a response head has been seen is a different mechanism with different hazards
-(see "Why status-based failover is not implemented"). Candidates whose breaker is open are skipped
-without an attempt.
+Failover covers both shapes: a candidate that will not **connect** (refused, timed out, or absent
+from DNS) and one that **answers with a 5xx**, provided nothing has gone downstream yet and the
+request body is still replayable. Candidates whose breaker is open are skipped without an attempt.
+See "Status-based failover, and where it stops" for the 5xx path and its one real limit.
 
 Catalog rows live in `providers::catalog`, shared with the agent. Every candidate in a row must
 share a wire format, enforced by a test: the gateway rewrites ids but does **not** translate between
@@ -480,29 +479,44 @@ WebSocket path properly requires both a nontrivial client-side subsystem and a g
 capability that doesn't exist. Revisit if Codex's HTTP+SSE path is ever observed to hit the
 connection-limit ceiling pi's WebSocket path exists to avoid.
 
-### Why status-based failover is not implemented
+### Status-based failover, and where it stops
 
-Connect-level failover covers a provider that will not *answer*. It does not cover one that answers
-badly — a `500`, or Anthropic's `529 overloaded` — which is arguably the more common way a provider
-degrades. That gap is deliberate, and it is not a Pingora limitation: returning `Err` with
-`set_retry(true)` from `upstream_response_filter` does re-enter the retry loop and re-invoke
-`upstream_peer`, because every response filter runs before anything is written downstream (verified
-in `pingora-proxy` 0.8's `proxy_h1.rs`/`proxy_h2.rs`; both share the path).
+A provider that answers badly — a `500`, or Anthropic's `529 overloaded` — is the common outage, and
+`upstream_response_filter` handles it: it runs strictly before anything is written downstream (both
+`h1_response_filter` and `h2_response_filter` call it ahead of `write_response_tasks`), so returning
+a retryable error there re-enters pingora's retry loop and `upstream_peer` picks the next candidate.
 
-What stops it is the **request body**. Pingora's replay buffer is `BODY_BUF_LIMIT` = 64 KiB, a
-private constant with no config knob; past it `get_retry_buffer()` returns `None` and a retry would
-send headers describing a body it then never writes, hanging the upstream until `read_timeout_secs`.
-Coding-agent requests exceed 64 KiB routinely, so status-based failover would work only for the
-traffic that needs it least, and would fail in the least debuggable way for the rest.
+Erroring at that hook rather than in `response_filter` keeps the per-attempt state clean for free:
+`response_filter` never runs for the abandoned attempt, so nothing increments `active_streams`,
+observes TTFT, or sets `upstream_status`, and `response_body_filter` never feeds the tail, head, or
+response model scanner. The next attempt starts from the slate the first one did.
 
-Connect-level failover sidesteps this entirely, and not by luck: `fail_to_connect` fires from
-`proxy_to_upstream`'s connect error, *before* `enable_retry_buffering` and before a single body byte
-is read from the client — so the retry re-reads the body from the socket rather than from the
-buffer. `a_large_body_survives_a_failover_intact` pins that with a 256 KiB body.
+Two deliberate non-cases:
 
-Doing status-based failover properly means owning body replay rather than borrowing Pingora's:
-buffering the request ourselves (bounded), and re-supplying it on each attempt. That is a real piece
-of work, not a flag, and it is what to build if 5xx failover is wanted.
+- **A `429` is relayed, never failed over.** It is a healthy provider throttling our pool key — the
+  same judgement the circuit breaker makes. Re-asking a different vendor converts a self-healing
+  throttle into spend somewhere else, and the client's `Retry-After` already owns it.
+- **When every candidate 5xxes, the client gets the last provider's own status**, not a synthetic
+  error. Better diagnostics than an exhausted retry loop produces.
+
+**Where it stops: bodies that cannot be replayed.** Failover rides pingora's retry, whose request
+buffer is `BODY_BUF_LIMIT` = 64 KiB, a private constant with no knob. Past it the body cannot be
+re-sent, so the 5xx is relayed rather than attempted — a retry there would hand the next upstream
+headers describing a body it never writes, hanging it until `read_timeout_secs`.
+
+The gate is `is_body_done() && !retry_buffer_truncated()`, and the first half is load-bearing:
+truncation reports on what has been buffered *so far*, so consulting it mid-read gives a false
+negative. A provider that 5xxes fast — which is what a failing provider does — answers before a large
+body has finished streaming in, and a gate without the `is_body_done()` check waves through a retry
+that then replays a **truncated body** to the fallback. Silent corruption, strictly worse than
+relaying the error.
+
+`ai_failover_body_too_large_total` counts the requests this excludes. That number is the input to
+whether covering them is worth building, and the options are not cheap: patch `BODY_BUF_LIMIT`
+(fork, or upstream a config knob) or drive the retry ourselves via pingora's `Subrequest` API
+(`allow_spawning_subrequest` — a full inner proxy request whose downstream is a channel, so the body
+comes from our buffer with no cap, at the cost of every filter re-entering on the inner request).
+Neither is worth starting before the counter says how often the limit actually bites.
 
 ### Why pricing is absent from the gateway
 
@@ -636,6 +650,7 @@ Prometheus on the default registry, exposed at `/metrics` on `metrics_listen`.
 | `ai_usage_parse_errors_total` | Counter   | —                    | Managed 2xx responses with no parseable usage (emitted as a zero-token billing row)    |
 | `ai_candidate_failovers_total` | Counter  | —                    | Model-routed requests that abandoned a candidate for the next one                      |
 | `ai_model_header_body_mismatch_total` | Counter | —             | Model-routed requests whose routing header and body `model` disagreed (client bug)     |
+| `ai_failover_body_too_large_total` | Counter | —                | 5xx that could not fail over: request body exceeded the 64 KiB replay buffer            |
 
 ---
 

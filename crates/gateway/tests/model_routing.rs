@@ -557,3 +557,144 @@ async fn provider_routed_requested_model_still_comes_from_the_body() {
         "routed_model marks the model route and must be absent otherwise: {line}"
     );
 }
+
+/// **Status-based failover.** The primary answers `500`; the client still gets a `200` from the
+/// fallback, and never sees the error.
+///
+/// This is the outage that actually happens — a provider that is up and failing, not one that
+/// refuses connections — so it is the case the whole feature exists for.
+#[tokio::test]
+async fn fails_over_when_the_primary_answers_5xx() {
+    let nats = Nats::start().await;
+    let (pubkey, sk) = test_keypair(1);
+    let primary = MockUpstream::start(Mode::Status(500)).await;
+    let fallback = MockUpstream::start(Mode::Json).await;
+    let gw = Gateway::builder(nats.port, &primary.authority(), &b64(&pubkey))
+        .providers(&["openai", "openrouter"])
+        .provider_authority("openrouter", &fallback.authority())
+        .start()
+        .await;
+
+    let resp = post_auto(&reqwest::Client::new(), &gw.url(), &vkey(&sk), Some(MODEL)).await;
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "a 5xx from the primary must be invisible to the client",
+    );
+
+    assert_eq!(primary.hits(), 1, "the primary was asked once");
+    let cap = fallback
+        .captured()
+        .expect("the fallback served the request");
+    assert_eq!(cap.path, "/api/v1/chat/completions");
+    assert_eq!(
+        cap.authorization.as_deref(),
+        Some("Bearer sk-openrouter-pool"),
+        "the key swap must follow the candidate on a status failover too",
+    );
+    let body = String::from_utf8(cap.body).unwrap();
+    assert!(body.contains(r#""model":"openai/gpt-4o-mini""#), "{body}");
+
+    let metrics = gw.metrics().await;
+    assert!(
+        parse_metric(&metrics, "ai_candidate_failovers_total", "") >= 1.0,
+        "the failover must be counted:\n{metrics}"
+    );
+}
+
+/// A `429` is a healthy provider throttling us, not a broken one. It must be relayed, not failed
+/// over — re-asking a different vendor turns a self-healing throttle into spend somewhere else.
+#[tokio::test]
+async fn a_429_is_relayed_not_failed_over() {
+    let nats = Nats::start().await;
+    let (pubkey, sk) = test_keypair(1);
+    let primary = MockUpstream::start(Mode::Status(429)).await;
+    let fallback = MockUpstream::start(Mode::Json).await;
+    let gw = Gateway::builder(nats.port, &primary.authority(), &b64(&pubkey))
+        .providers(&["openai", "openrouter"])
+        .provider_authority("openrouter", &fallback.authority())
+        .start()
+        .await;
+
+    let resp = post_auto(&reqwest::Client::new(), &gw.url(), &vkey(&sk), Some(MODEL)).await;
+    assert_eq!(
+        resp.status().as_u16(),
+        429,
+        "the throttle must reach the client"
+    );
+    assert_eq!(
+        fallback.hits(),
+        0,
+        "a throttle must not spend at another vendor"
+    );
+}
+
+/// When every candidate 5xxes, the client gets the last provider's *actual* error rather than a
+/// synthetic one — better diagnostics than an exhausted retry loop produces.
+#[tokio::test]
+async fn every_candidate_5xx_relays_the_last_error() {
+    let nats = Nats::start().await;
+    let (pubkey, sk) = test_keypair(1);
+    let primary = MockUpstream::start(Mode::Status(503)).await;
+    let fallback = MockUpstream::start(Mode::Status(503)).await;
+    let gw = Gateway::builder(nats.port, &primary.authority(), &b64(&pubkey))
+        .providers(&["openai", "openrouter"])
+        .provider_authority("openrouter", &fallback.authority())
+        .start()
+        .await;
+
+    let resp = post_auto(&reqwest::Client::new(), &gw.url(), &vkey(&sk), Some(MODEL)).await;
+    assert_eq!(
+        resp.status().as_u16(),
+        503,
+        "the last provider's own status must reach the client, not a synthetic 502",
+    );
+    assert_eq!(primary.hits(), 1);
+    assert_eq!(fallback.hits(), 1, "both candidates must have been tried");
+}
+
+/// A body past pingora's 64 KiB replay buffer cannot be re-sent, so the 5xx is relayed rather than
+/// hanging the next upstream with headers describing a body that never arrives. The case is
+/// **counted**, which is the number that decides whether covering it is worth the work.
+#[tokio::test]
+async fn an_unreplayable_body_relays_the_5xx_and_is_counted() {
+    let nats = Nats::start().await;
+    let (pubkey, sk) = test_keypair(1);
+    let primary = MockUpstream::start(Mode::Status(500)).await;
+    let fallback = MockUpstream::start(Mode::Json).await;
+    let gw = Gateway::builder(nats.port, &primary.authority(), &b64(&pubkey))
+        .providers(&["openai", "openrouter"])
+        .provider_authority("openrouter", &fallback.authority())
+        .start()
+        .await;
+
+    // 256 KiB — comfortably past BODY_BUF_LIMIT.
+    let filler = "x".repeat(256 * 1024);
+    let big =
+        format!(r#"{{"model":"{MODEL}","messages":[{{"role":"user","content":"{filler}"}}]}}"#);
+    let resp = reqwest::Client::new()
+        .post(format!("{}/auto/chat/completions", gw.url()))
+        .header("authorization", format!("Bearer {}", vkey(&sk)))
+        .header("content-type", "application/json")
+        .header("x-beyond-model", MODEL)
+        .body(big)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp.status().as_u16(),
+        500,
+        "an unreplayable body must relay the error, not attempt a retry it cannot complete",
+    );
+    assert_eq!(
+        fallback.hits(),
+        0,
+        "the fallback must not be sent headers for a body we cannot resend",
+    );
+    let metrics = gw.metrics().await;
+    assert!(
+        parse_metric(&metrics, "ai_failover_body_too_large_total", "") >= 1.0,
+        "the uncovered case must be measurable — it is what decides the next investment:\n{metrics}"
+    );
+}

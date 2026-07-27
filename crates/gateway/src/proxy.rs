@@ -1381,6 +1381,91 @@ impl ProxyHttp for AiProxy {
         Ok(Box::new(self.build_peer(addr, &rc.provider)))
     }
 
+    /// Fail over on a **5xx**, before a byte of it reaches the client.
+    ///
+    /// This hook runs strictly before anything is written downstream (`h1_response_filter` /
+    /// `h2_response_filter` both call it ahead of `write_response_tasks`), so returning a retryable
+    /// error here re-enters pingora's retry loop and `upstream_peer` picks the next candidate. That
+    /// is the only place in the response path where abandoning an answer is still possible.
+    ///
+    /// Erroring *here* rather than in `response_filter` also keeps the per-attempt state clean for
+    /// free: `response_filter` never runs for the abandoned attempt, so nothing increments
+    /// `active_streams`, observes TTFT, or sets `upstream_status`, and `response_body_filter` never
+    /// feeds the tail, head, or response model scanner. The next attempt starts from the same slate
+    /// the first one did.
+    ///
+    /// Four conditions, all necessary:
+    ///
+    /// - **Model-routed.** A provider-routed request named its provider; there is nowhere else to go.
+    /// - **5xx only.** A `429` is a healthy provider throttling our pool key — the same judgement the
+    ///   circuit breaker makes. Re-asking a *different* vendor would convert a self-healing throttle
+    ///   into spend somewhere else, and the client's `Retry-After` already owns that case.
+    /// - **A candidate is left.** Otherwise relay the 5xx: the client learns what the last provider
+    ///   actually said, which beats the synthetic error an exhausted retry loop would produce.
+    /// - **The body is replayable.** Pingora's replay buffer is a private 64 KiB constant; past it
+    ///   `get_retry_buffer` yields nothing and a retry would send headers describing a body it then
+    ///   never writes, hanging the upstream until `read_timeout_secs`. That case is counted, not
+    ///   attempted — see `ai_failover_body_too_large_total`.
+    async fn upstream_response_filter(
+        &self,
+        session: &mut Session,
+        upstream_response: &mut ResponseHeader,
+        ctx: &mut Self::CTX,
+    ) -> Result<()> {
+        let Some(rc) = ctx.as_mut() else {
+            return Ok(());
+        };
+        let Some((usable, at)) = rc.auto.as_ref().map(|a| (a.usable, a.candidate)) else {
+            return Ok(());
+        };
+        let status = upstream_response.status.as_u16();
+        if status < 500 {
+            return Ok(());
+        }
+        if first_usable(usable, at.saturating_add(1)).is_none() {
+            return Ok(());
+        }
+        // Replayability is only *knowable* once the whole downstream body has been read.
+        //
+        // `retry_buffer_truncated()` reports on what has been buffered so far, so consulting it
+        // mid-read gives a false negative: a provider that 5xxes fast — which is exactly what a
+        // failing provider does — answers before a large body has finished streaming in, and the
+        // gate would wave through a retry that then replays a *truncated* body to the fallback.
+        // Silent corruption, and strictly worse than relaying the error. Caught by
+        // `an_unreplayable_body_relays_the_5xx_and_is_counted`, which saw a 200 where the fallback
+        // had been handed a partial request.
+        //
+        // So: not done reading ⇒ we cannot promise a replay ⇒ do not retry.
+        let replayable =
+            session.as_mut().is_body_done() && !session.as_ref().retry_buffer_truncated();
+        if !replayable {
+            self.state.metrics.failover_body_too_large_total.inc();
+            warn!(
+                request_id = %rc.request_id,
+                provider = rc.provider.name.as_str(),
+                status,
+                "upstream failed but the body is too large to replay; relaying the error",
+            );
+            return Ok(());
+        }
+
+        self.state.metrics.candidate_failovers_total.inc();
+        warn!(
+            request_id = %rc.request_id,
+            provider = rc.provider.name.as_str(),
+            candidate = at,
+            status,
+            "upstream returned {status}; trying the next candidate",
+        );
+        // The outgoing candidate's breaker failure is recorded by `upstream_peer`'s prologue, which
+        // still sees `breaker_pending` set. A 5xx is a failure by the breaker's own definition, so
+        // that is the right outcome — and recording it here as well would double-count.
+        rc.advance_candidate(at);
+        let mut e = pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(status));
+        e.set_retry(true);
+        Err(e)
+    }
+
     async fn upstream_request_filter(
         &self,
         _session: &mut Session,
