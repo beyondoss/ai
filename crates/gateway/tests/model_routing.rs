@@ -698,3 +698,53 @@ async fn an_unreplayable_body_relays_the_5xx_and_is_counted() {
         "the uncovered case must be measurable — it is what decides the next investment:\n{metrics}"
     );
 }
+
+/// The ledger holds on the **status** failover path too: a candidate that answers 5xx has that
+/// failure recorded against its own breaker, while the candidate that served does not.
+///
+/// The connect-path equivalent is `records_the_failed_candidates_breaker_not_the_serving_ones`.
+/// This one matters separately because the two paths resolve the permit through different hooks —
+/// `fail_to_connect` versus `upstream_response_filter` — and only `upstream_peer`'s prologue ties
+/// them together.
+#[tokio::test]
+async fn a_5xx_candidates_breaker_opens_while_the_fallback_keeps_serving() {
+    let nats = Nats::start().await;
+    let (pubkey, sk) = test_keypair(1);
+    let primary = MockUpstream::start(Mode::Status(500)).await;
+    let fallback = MockUpstream::start(Mode::Json).await;
+    let gw = Gateway::builder(nats.port, &primary.authority(), &b64(&pubkey))
+        .providers(&["openai", "openrouter"])
+        .provider_authority("openrouter", &fallback.authority())
+        .circuit_breaker_threshold(2)
+        .start()
+        .await;
+
+    let client = reqwest::Client::new();
+    let key = vkey(&sk);
+    for i in 0..6 {
+        let resp = post_auto(&client, &gw.url(), &key, Some(MODEL)).await;
+        assert_eq!(
+            resp.status().as_u16(),
+            200,
+            "request {i}: the fallback must keep serving while the primary's breaker opens",
+        );
+    }
+
+    let metrics = gw.metrics().await;
+    // Once the primary's breaker opens, its candidate is skipped without an attempt — counted as a
+    // `circuit_open` rejection even though every client request succeeded. If the 5xx failures were
+    // not recorded against the primary, this would stay zero; if the fallback's successes were
+    // recorded against the primary instead, likewise.
+    assert!(
+        parse_metric(&metrics, "ai_rejections_total", "circuit_open") >= 1.0,
+        "the 5xx candidate's breaker must open from its own recorded failures:\n{metrics}"
+    );
+    assert_eq!(fallback.hits(), 6, "every request reached the fallback");
+    // ...and once the breaker is open the primary stops being asked at all, so it saw fewer than
+    // one request per client request.
+    assert!(
+        primary.hits() < 6,
+        "an open breaker must stop the primary being tried; it saw {} of 6",
+        primary.hits(),
+    );
+}
