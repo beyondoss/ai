@@ -67,7 +67,7 @@ async fn smoke_openai_wire(provider: &str, key_env: &str, model: &str, chat_path
     };
     let nats = Nats::start().await;
     let (gw, vkey) = managed_gateway(&nats, provider, &key).await;
-    let client = reqwest::Client::new();
+    let client = test_client();
 
     let body = format!(
         r#"{{"model":"{model}","max_tokens":16,"messages":[{{"role":"user","content":"Reply with the single word: ping"}}]}}"#
@@ -104,7 +104,7 @@ async fn smoke_anthropic() {
     };
     let nats = Nats::start().await;
     let (gw, vkey) = managed_gateway(&nats, "anthropic", &key).await;
-    let client = reqwest::Client::new();
+    let client = test_client();
 
     // `/anthropic/v1/messages` → provider `anthropic` (selected by the path segment, stripped to
     // `/v1/messages` upstream). The minted virtual key is presented in `x-api-key` (the Anthropic
@@ -166,7 +166,7 @@ async fn smoke_openai_responses_usage_is_metered() {
     };
     let nats = Nats::start().await;
     let (gw, vkey) = managed_gateway(&nats, "openai", &key).await;
-    let client = reqwest::Client::new();
+    let client = test_client();
 
     let before = gw.metrics().await;
     let before_output = parse_metric(&before, "ai_tokens_total", "output");
@@ -355,7 +355,7 @@ async fn catalog_rows_are_servable() {
                 r#"{{"model":"{}","max_tokens":1,"messages":[{{"role":"user","content":"hi"}}]}}"#,
                 route.model,
             );
-            let mut req = reqwest::Client::new()
+            let mut req = test_client()
                 .post(format!("{}/auto/x", gw.url()))
                 .header("authorization", format!("Bearer {vkey}"))
                 .header("content-type", "application/json")
@@ -434,7 +434,7 @@ async fn model_route_fails_over_to_a_real_provider() {
         &sk,
     );
 
-    let resp = reqwest::Client::new()
+    let resp = test_client()
         .post(format!("{}/auto/x", gw.url()))
         .header("authorization", format!("Bearer {vkey}"))
         .header("content-type", "application/json")

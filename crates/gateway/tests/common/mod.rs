@@ -125,6 +125,22 @@ pub fn free_port() -> u16 {
     panic!("could not find an unused free port after 1000 attempts");
 }
 
+/// An HTTP client that cannot hang.
+///
+/// `reqwest::Client::new()` has **no** timeout, so a request that stalls stalls the test, and under
+/// nextest that costs the per-test terminate budget (180s) plus a retry before anyone learns which
+/// test it was — and a job killed that way uploads no log at all. A bounded client turns the same
+/// stall into a named failure in seconds.
+///
+/// 30s is far above any legitimate local round-trip here (the slowest fixtures are ~600 KiB streams
+/// over loopback) while still being an order of magnitude below the harness's own patience.
+pub fn test_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .expect("build test client")
+}
+
 /// Base64 (standard) — used to put an Ed25519 public key into the gateway's `signing_keys` config.
 pub fn b64(bytes: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(bytes)

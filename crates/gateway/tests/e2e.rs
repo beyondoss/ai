@@ -101,7 +101,7 @@ async fn managed_swaps_key_relays_body_and_meters_usage() {
         1,
         &sk,
     );
-    let client = reqwest::Client::new();
+    let client = test_client();
 
     {
         let (c, u, k) = (client.clone(), gw.url(), vkey.clone());
@@ -162,7 +162,7 @@ async fn managed_openai_stream_relays_a_large_multichunk_body() {
         1,
         &sk,
     );
-    let client = reqwest::Client::new();
+    let client = test_client();
 
     // A streaming chat body padded well past a single read chunk (64 KiB of content) so the buffering
     // path withholds at least one non-final chunk — the exact condition the old `None` withhold broke.
@@ -194,7 +194,7 @@ async fn byo_passes_user_token_through_unchanged() {
     let mock = MockUpstream::start(Mode::Json).await;
     let gw = Gateway::start(nats.port, &mock.authority(), &b64(&pubkey)).await;
 
-    let client = reqwest::Client::new();
+    let client = test_client();
     // A raw provider token (not `bai_`) → BYO → forwarded verbatim.
     {
         let (c, u) = (client.clone(), gw.url());
@@ -227,7 +227,7 @@ async fn fireworks_path_prefix_strips_and_swaps_pool_key() {
         1,
         &sk,
     );
-    let client = reqwest::Client::new();
+    let client = test_client();
     // Fireworks is selected by the `/fireworks` path segment; the client uses its native base path
     // (`/inference/v1`). The gateway strips `/fireworks` and forwards the rest VERBATIM, and a
     // managed key swaps to the Fireworks-specific pool key.
@@ -280,7 +280,7 @@ async fn openai_prefix_matches_bare_default() {
         1,
         &sk,
     );
-    let client = reqwest::Client::new();
+    let client = test_client();
     {
         let (c, u, k) = (client.clone(), gw.url(), vkey.clone());
         wait_for_status(200, move || {
@@ -324,7 +324,7 @@ async fn unknown_provider_segment_returns_404() {
         1,
         &sk,
     );
-    let client = reqwest::Client::new();
+    let client = test_client();
     let (c, u, k) = (client.clone(), gw.url(), vkey.clone());
     wait_for_status(404, move || {
         let (c, u, k) = (c.clone(), u.clone(), k.clone());
@@ -350,7 +350,7 @@ async fn streaming_relays_sse_and_meters_usage() {
         1,
         &sk,
     );
-    let client = reqwest::Client::new();
+    let client = test_client();
     let body = r#"{"model":"gpt-4o","stream":true,"messages":[{"role":"user","content":"hi"}]}"#
         .to_string();
 
@@ -413,7 +413,7 @@ async fn streaming_injects_usage_option_when_the_path_carries_a_query_string() {
         1,
         &sk,
     );
-    let client = reqwest::Client::new();
+    let client = test_client();
     let body = r#"{"model":"gpt-4o","stream":true,"messages":[{"role":"user","content":"hi"}]}"#;
     let path = "/openai/v1/chat/completions?api-version=2024-10-21";
 
@@ -457,7 +457,7 @@ async fn blackhole_denies_then_restores() {
         1,
         &sk,
     );
-    let client = reqwest::Client::new();
+    let client = test_client();
 
     let probe = |want: u16| {
         let (c, u, k) = (client.clone(), gw.url(), vkey.clone());
@@ -494,7 +494,7 @@ async fn blackhole_fraud_returns_403() {
         1,
         &sk,
     );
-    let client = reqwest::Client::new();
+    let client = test_client();
 
     let probe = |want: u16| {
         let (c, u, k) = (client.clone(), gw.url(), vkey.clone());
@@ -526,7 +526,7 @@ async fn oversized_content_length_is_rejected_413() {
         1,
         &sk,
     );
-    let client = reqwest::Client::new();
+    let client = test_client();
 
     // Wait until the gateway is serving.
     {
@@ -566,7 +566,7 @@ async fn per_credential_rate_limit_returns_429() {
         .byo_rate_limit_rps(0)
         .start()
         .await;
-    let client = reqwest::Client::new();
+    let client = test_client();
 
     // Wait until the gateway serves, using a *different* credential so the flood token's budget is
     // untouched by readiness probing.
@@ -617,7 +617,7 @@ async fn byo_global_rate_limit_caps_distinct_tokens() {
         .byo_rate_limit_rps(3) // global BYO ceiling
         .start()
         .await;
-    let client = reqwest::Client::new();
+    let client = test_client();
 
     // Warm with a *managed* path is pointless here (managed is exempt); warm with a distinct BYO
     // token whose single hit can't itself exhaust a 3-rps bucket mid-readiness.
@@ -676,7 +676,7 @@ async fn managed_key_via_x_api_key_header_is_accepted() {
         1,
         &sk,
     );
-    let client = reqwest::Client::new();
+    let client = test_client();
     {
         let (c, u, k) = (client.clone(), gw.url(), vkey.clone());
         wait_for_status(200, move || {
@@ -708,7 +708,7 @@ async fn managed_key_for_unconfigured_provider_returns_503() {
         1,
         &sk,
     );
-    let client = reqwest::Client::new();
+    let client = test_client();
     let (c, u, k) = (client.clone(), gw.url(), vkey.clone());
     wait_for_status(503, move || {
         let (c, u, k) = (c.clone(), u.clone(), k.clone());
@@ -745,7 +745,7 @@ async fn anthropic_dialect_swaps_key_relays_and_meters() {
         1,
         &sk,
     );
-    let client = reqwest::Client::new();
+    let client = test_client();
     {
         let (c, u, k) = (client.clone(), gw.url(), vkey.clone());
         wait_for_status(200, move || {
@@ -803,7 +803,7 @@ async fn long_anthropic_stream_still_meters_input_and_cache_tokens() {
         1,
         &sk,
     );
-    let client = reqwest::Client::new();
+    let client = test_client();
     {
         let (c, u, k) = (client.clone(), gw.url(), vkey.clone());
         wait_for_status(200, move || {
@@ -871,7 +871,7 @@ async fn missing_api_key_returns_401() {
     let (pubkey, _sk) = test_keypair(25);
     let mock = MockUpstream::start(Mode::Json).await;
     let gw = Gateway::start(nats.port, &mock.authority(), &b64(&pubkey)).await;
-    let client = reqwest::Client::new();
+    let client = test_client();
 
     let (c, u) = (client.clone(), gw.url());
     wait_for_status(401, move || {
@@ -914,7 +914,7 @@ async fn deny_set_is_fail_open_when_nats_drops() {
         1,
         &sk,
     );
-    let client = reqwest::Client::new();
+    let client = test_client();
 
     let probe = |key: String, want: u16| {
         let (c, u) = (client.clone(), gw.url());
@@ -953,7 +953,7 @@ async fn streaming_tail_compaction_preserves_usage_event() {
         1,
         &sk,
     );
-    let client = reqwest::Client::new();
+    let client = test_client();
     let body = r#"{"model":"gpt-4o","stream":true,"messages":[{"role":"user","content":"hi"}]}"#
         .to_string();
 
@@ -1008,7 +1008,7 @@ async fn on_disk_snapshot_enforces_across_restart_without_nats() {
         1,
         &sk,
     );
-    let client = reqwest::Client::new();
+    let client = test_client();
 
     let probe = |gw_url: String, key: String, want: u16| {
         let c = client.clone();
@@ -1105,7 +1105,7 @@ async fn circuit_breaker_opens_on_5xx_and_sheds() {
         .circuit_breaker_threshold(3)
         .start()
         .await;
-    let client = reqwest::Client::new();
+    let client = test_client();
 
     // While closed the gateway relays the mock's 500; once the breaker trips it returns its own 503.
     // Poll until we observe the trip (each failure is recorded in `logging`, which lags the response
@@ -1140,7 +1140,7 @@ async fn circuit_breaker_does_not_trip_on_429() {
         .byo_rate_limit_rps(0)
         .start()
         .await;
-    let client = reqwest::Client::new();
+    let client = test_client();
 
     // Warm up until the gateway is serving and relaying the mock's 429 (the readiness pattern the
     // other e2e tests use — avoids racing the first request against gateway startup under load).

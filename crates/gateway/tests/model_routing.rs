@@ -64,7 +64,7 @@ async fn routes_by_model_header_to_the_primary_candidate() {
         .start()
         .await;
 
-    let client = reqwest::Client::new();
+    let client = test_client();
     let resp = post_auto(&client, &gw.url(), &vkey(&sk), Some(MODEL)).await;
     assert_eq!(resp.status().as_u16(), 200);
 
@@ -97,7 +97,7 @@ async fn fails_over_to_the_next_candidate_when_the_primary_wont_connect() {
         .start()
         .await;
 
-    let client = reqwest::Client::new();
+    let client = test_client();
     let resp = post_auto(&client, &gw.url(), &vkey(&sk), Some(MODEL)).await;
     assert_eq!(
         resp.status().as_u16(),
@@ -144,7 +144,7 @@ async fn records_the_failed_candidates_breaker_not_the_serving_ones() {
         .start()
         .await;
 
-    let client = reqwest::Client::new();
+    let client = test_client();
     let key = vkey(&sk);
     // Enough attempts to trip the dead primary's breaker several times over.
     for _ in 0..6 {
@@ -178,7 +178,7 @@ async fn a_missing_or_unknown_model_is_rejected_before_any_upstream() {
         .start()
         .await;
 
-    let client = reqwest::Client::new();
+    let client = test_client();
     let key = vkey(&sk);
 
     let no_header = post_auto(&client, &gw.url(), &key, None).await;
@@ -206,7 +206,7 @@ async fn a_byo_key_is_refused_with_400() {
         .start()
         .await;
 
-    let client = reqwest::Client::new();
+    let client = test_client();
     let resp = post_auto(
         &client,
         &gw.url(),
@@ -234,7 +234,7 @@ async fn the_usage_row_names_the_candidate_that_served() {
         .start()
         .await;
 
-    let client = reqwest::Client::new();
+    let client = test_client();
     let resp = post_auto(&client, &gw.url(), &vkey(&sk), Some(MODEL)).await;
     assert_eq!(resp.status().as_u16(), 200);
 
@@ -262,7 +262,7 @@ async fn every_candidate_down_fails_the_request() {
         .start()
         .await;
 
-    let client = reqwest::Client::new();
+    let client = test_client();
     let resp = post_auto(&client, &gw.url(), &vkey(&sk), Some(MODEL)).await;
     assert!(
         resp.status().is_server_error(),
@@ -301,7 +301,7 @@ async fn a_large_body_survives_a_failover_intact() {
         format!(r#"{{"model":"{MODEL}","messages":[{{"role":"user","content":"{filler}"}}]}}"#);
     let sent = big.len();
 
-    let resp = reqwest::Client::new()
+    let resp = test_client()
         .post(format!("{}/auto/chat/completions", gw.url()))
         .header("authorization", format!("Bearer {}", vkey(&sk)))
         .header("content-type", "application/json")
@@ -339,7 +339,7 @@ async fn provider_routed_requests_are_unaffected() {
         .start()
         .await;
 
-    let resp = reqwest::Client::new()
+    let resp = test_client()
         .post(format!("{}/openai/v1/chat/completions", gw.url()))
         .header("authorization", format!("Bearer {}", vkey(&sk)))
         .header("content-type", "application/json")
@@ -386,7 +386,7 @@ async fn claude_fails_over_on_the_anthropic_wire_and_is_still_metered() {
         .start()
         .await;
 
-    let resp = reqwest::Client::new()
+    let resp = test_client()
         .post(format!("{}/auto/v1/messages", gw.url()))
         .header("authorization", format!("Bearer {}", vkey(&sk)))
         .header("content-type", "application/json")
@@ -462,7 +462,7 @@ async fn requested_model_is_the_routed_name_not_the_discarded_body_value() {
         .start()
         .await;
 
-    let resp = reqwest::Client::new()
+    let resp = test_client()
         .post(format!("{}/auto/chat/completions", gw.url()))
         .header("authorization", format!("Bearer {}", vkey(&sk)))
         .header("content-type", "application/json")
@@ -512,7 +512,7 @@ async fn agreeing_header_and_body_count_no_mismatch() {
         .start()
         .await;
 
-    let resp = post_auto(&reqwest::Client::new(), &gw.url(), &vkey(&sk), Some(MODEL)).await;
+    let resp = post_auto(&test_client(), &gw.url(), &vkey(&sk), Some(MODEL)).await;
     assert_eq!(resp.status().as_u16(), 200);
 
     let metrics = gw.metrics().await;
@@ -535,7 +535,7 @@ async fn provider_routed_requested_model_still_comes_from_the_body() {
         .start()
         .await;
 
-    let resp = reqwest::Client::new()
+    let resp = test_client()
         .post(format!("{}/openai/v1/chat/completions", gw.url()))
         .header("authorization", format!("Bearer {}", vkey(&sk)))
         .header("content-type", "application/json")
@@ -575,7 +575,7 @@ async fn fails_over_when_the_primary_answers_5xx() {
         .start()
         .await;
 
-    let resp = post_auto(&reqwest::Client::new(), &gw.url(), &vkey(&sk), Some(MODEL)).await;
+    let resp = post_auto(&test_client(), &gw.url(), &vkey(&sk), Some(MODEL)).await;
     assert_eq!(
         resp.status().as_u16(),
         200,
@@ -616,7 +616,7 @@ async fn a_429_is_relayed_not_failed_over() {
         .start()
         .await;
 
-    let resp = post_auto(&reqwest::Client::new(), &gw.url(), &vkey(&sk), Some(MODEL)).await;
+    let resp = post_auto(&test_client(), &gw.url(), &vkey(&sk), Some(MODEL)).await;
     assert_eq!(
         resp.status().as_u16(),
         429,
@@ -643,7 +643,7 @@ async fn every_candidate_5xx_relays_the_last_error() {
         .start()
         .await;
 
-    let resp = post_auto(&reqwest::Client::new(), &gw.url(), &vkey(&sk), Some(MODEL)).await;
+    let resp = post_auto(&test_client(), &gw.url(), &vkey(&sk), Some(MODEL)).await;
     assert_eq!(
         resp.status().as_u16(),
         503,
@@ -678,7 +678,7 @@ async fn an_unreplayable_body_relays_the_5xx_and_is_counted() {
     let filler = "x".repeat(256 * 1024);
     let big =
         format!(r#"{{"model":"{MODEL}","messages":[{{"role":"user","content":"{filler}"}}]}}"#);
-    let resp = reqwest::Client::new()
+    let resp = test_client()
         .post(format!("{}/auto/chat/completions", gw.url()))
         .header("authorization", format!("Bearer {}", vkey(&sk)))
         .header("content-type", "application/json")
@@ -725,7 +725,7 @@ async fn a_5xx_candidates_breaker_opens_while_the_fallback_keeps_serving() {
         .start()
         .await;
 
-    let client = reqwest::Client::new();
+    let client = test_client();
     let key = vkey(&sk);
     for i in 0..6 {
         let resp = post_auto(&client, &gw.url(), &key, Some(MODEL)).await;
