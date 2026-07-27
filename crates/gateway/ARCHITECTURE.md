@@ -204,8 +204,13 @@ candidate is not a guaranteed independent supply of the model. It reliably cover
 are on our side of the wire: egress blocked, our Anthropic key throttled or suspended,
 `api.anthropic.com` unreachable from us, or that account rate-limited. It does not guarantee cover
 for Anthropic's own serving being down, because OpenRouter may be forwarding to the same place.
-Genuinely independent Claude capacity still means Bedrock or Vertex directly, which is the SigV4 /
-GCP-OAuth work described below.
+Making it genuinely independent turns out to be cheap, and much cheaper than the SigV4 route
+described below: OpenRouter honours a `provider` preference in the request body, and
+`{"provider":{"only":["amazon-bedrock"]}}` on `/api/v1/messages` returns a `200` served by Bedrock
+with the usage block unchanged (verified). Reaching that would mean the catalog carrying a per-
+candidate body fragment and the gateway splicing it the way it already splices `model` and
+`stream_options` — a known shape, in a place that already does this. That is the recommended path to
+real Claude redundancy, ahead of implementing Bedrock's own auth and eventstream framing.
 
 ### Identity (`key.rs`)
 

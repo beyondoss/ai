@@ -91,6 +91,11 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
     // failures that are ours: our egress blocked, our Anthropic key throttled or suspended,
     // api.anthropic.com unreachable from us. It does not guarantee cover for Anthropic's own
     // serving being down, because OpenRouter may be forwarding there too.
+    //
+    // Making it independent is cheap and not yet done: OpenRouter honours a `provider` preference in
+    // the request body, and `{"provider":{"only":["amazon-bedrock"]}}` returns a 200 from Bedrock
+    // with the usage block unchanged. That needs a per-candidate body fragment here plus a splice in
+    // the gateway — the same shape as the `model` rewrite it already performs.
     ModelRoute {
         model: "claude-haiku-4-5",
         wire: WireFormat::Anthropic,
