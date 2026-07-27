@@ -272,6 +272,53 @@ mod tests {
         }
     }
 
+    /// Every candidate in a row must serve the **same endpoint**, not merely the same wire.
+    ///
+    /// `wire_of_path` only separates Messages from everything else, so `/v1/chat/completions` and
+    /// `/v1/responses` both read as OpenAI and would pass the wire check while behaving differently:
+    /// the gateway's `stream_options.include_usage` injection is a Chat Completions construct, and
+    /// `is_streamable_path` — which decides whether to inject at all — is computed once from the
+    /// *first* candidate's path. A row mixing the two would inject into a Responses request, or skip
+    /// injection on a Chat Completions one and silently lose the usage chunk it meters from.
+    #[test]
+    fn candidates_within_a_row_share_one_endpoint() {
+        for route in MODEL_ROUTES {
+            let endpoint = |p: &str| p.rsplit_once("/v1").map_or(p, |(_, tail)| tail).to_string();
+            let Some(first) = route.candidates.first() else {
+                continue;
+            };
+            let want = endpoint(first.path);
+            for c in route.candidates {
+                assert_eq!(
+                    endpoint(c.path),
+                    want,
+                    "route {:?}: {:?} serves {:?} but {:?} serves {:?} — same wire, different \
+                     endpoint, which the injection path cannot straddle",
+                    route.model,
+                    first.provider,
+                    first.path,
+                    c.provider,
+                    c.path,
+                );
+            }
+        }
+    }
+
+    /// ...and prove that check can fail, since the seed table contains no violation to catch.
+    #[test]
+    fn the_endpoint_check_rejects_chat_completions_mixed_with_responses() {
+        let endpoint = |p: &str| p.rsplit_once("/v1").map_or(p, |(_, tail)| tail).to_string();
+        assert_eq!(
+            endpoint("/v1/chat/completions"),
+            endpoint("/api/v1/chat/completions")
+        );
+        assert_ne!(
+            endpoint("/v1/chat/completions"),
+            endpoint("/v1/responses"),
+            "the two OpenAI-wire endpoints must be distinguishable",
+        );
+    }
+
     #[test]
     fn candidate_paths_are_absolute() {
         for route in MODEL_ROUTES {
