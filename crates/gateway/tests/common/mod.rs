@@ -228,20 +228,40 @@ pub async fn del_kv(nats_port: u16, key: &str) {
     open_writer(nats_port).await.delete(key).await.unwrap();
 }
 
+/// Connect to the test NATS and open the deny-set bucket, **bounded**.
+///
+/// Both steps are unbounded on their own and can wait forever rather than fail. `wait_for_port` only
+/// proves the TCP listener is accepting; JetStream may still be initialising, and creating the KV
+/// bucket then blocks until it is ready — on a fast local disk that is instant, which is exactly the
+/// kind of difference that turns into an unkillable CI job and no log. async-nats also retries
+/// reconnects indefinitely by design, so a server that dies mid-test would hang here too.
+///
+/// 20s is generous for a local JetStream that has already opened its port; the point is that the
+/// failure is named and finite rather than silent and infinite.
 async fn open_writer(nats_port: u16) -> std::sync::Arc<dyn store::KvWriter> {
     let conn = store::NatsConnection::new(store::NatsConnectionConfig {
         url: format!("nats://127.0.0.1:{nats_port}"),
         creds: None,
         creds_file: None,
     });
-    conn.connect().await.unwrap();
-    let kv = conn
-        .store_with_config(store::StoreConfig {
+    timeout(Duration::from_secs(20), conn.connect())
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "nats-server on {nats_port} accepted a connection but never completed the handshake"
+            )
+        })
+        .unwrap();
+    let kv = timeout(
+        Duration::from_secs(20),
+        conn.store_with_config(store::StoreConfig {
             name: "ai-gateway".into(),
             ..Default::default()
-        })
-        .await
-        .unwrap();
+        }),
+    )
+    .await
+    .unwrap_or_else(|_| panic!("JetStream on {nats_port} never produced the ai-gateway bucket"))
+    .unwrap();
     kv.writer().expect("bucket is writable")
 }
 
