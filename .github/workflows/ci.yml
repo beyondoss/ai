@@ -72,12 +72,20 @@ jobs:
         include:
           - name: gateway-unit
             filter: package(beyond-ai) and kind(lib)
+            extra: ""
           - name: gateway-e2e
             filter: package(beyond-ai) and kind(test)
+            extra: ""
           - name: agent
             filter: package(beyond-ai-agent)
+            # Serial and uncaptured *for this group only*, because it is the one that hangs and
+            # nextest prints a test when it finishes: under parallelism the culprit is whichever
+            # name never appears, which is unreadable across 1820 tests. Streaming serially, the
+            # last line printed IS the test that hung.
+            extra: --no-capture
           - name: core-providers
             filter: package(beyond-ai-agent-core) or package(beyond-ai-providers)
+            extra: ""
     steps:
       - uses: actions/checkout@v7
       - uses: jdx/mise-action@v4
@@ -86,12 +94,31 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: nextest
-      # Step timeout deliberately *below* the job's. A job killed by `timeout-minutes` is recorded as
-      # cancelled, and GitHub uploads no logs for a cancelled job — which is why six consecutive
-      # hangs produced red checks with nothing to diagnose them by. A step that times out *fails*
-      # instead, so the job completes normally and the log survives.
-      - run: cargo nextest run --workspace --profile ci -E '${{ matrix.filter }}'
+      # `timeout` in the shell, not just `timeout-minutes` on the step. GitHub's own timeouts are
+      # enforced by the runner agent, so when a job wedges hard enough that the agent stops
+      # responding they do not fire at all — observed repeatedly here: a 25-minute job limit ran to
+      # 30, and a 20-minute step limit ran to 27. A job reaped that way is recorded as *cancelled*,
+      # and GitHub uploads no logs for a cancelled job, so every one of those attempts produced a red
+      # check with nothing whatsoever to diagnose it by.
+      #
+      # A shell-level timeout returns control to the step, which then fails normally, which means the
+      # job completes and its log survives. `tee` keeps a copy either way.
+      - name: test
+        run: |
+          set -o pipefail
+          timeout --signal=TERM --kill-after=30s 15m \
+            cargo nextest run --workspace --profile ci ${{ matrix.extra }} -E '${{ matrix.filter }}' \
+            2>&1 | tee "$RUNNER_TEMP/nextest.log"
         timeout-minutes: 20
+      # Runs even when the step above times out, so a hang leaves behind the one thing it never has:
+      # the name of the test that was running when everything stopped.
+      - name: last output before the end
+        if: always()
+        run: |
+          echo "--- disk ---"; df -h / "$RUNNER_TEMP" | sed -n '1,4p'
+          echo "--- memory ---"; free -m | head -3
+          echo "--- final 60 lines of nextest output ---"
+          tail -60 "$RUNNER_TEMP/nextest.log" 2>/dev/null || echo "(no output captured at all)"
   # The release build is the long pole; running it alongside the others (not after them) is most of
   # the wall-clock win.
   build:
