@@ -129,6 +129,19 @@ pub fn free_port() -> u16 {
 /// this bound while always holding the most recent lines — which is what every assertion reads.
 const LOG_CAPTURE_CAP: usize = 512 * 1024;
 
+/// A NATS port for a gateway that never touches the deny-set.
+///
+/// The deny-set is the *only* thing the gateway reads from NATS, and it fails open — an unreachable
+/// server means an empty deny-set and a retrying background watcher, which is exactly right for a
+/// test that denies nobody. Auth, pool keys and routing all come from config.
+///
+/// Worth having because the alternative is not free: `Nats::start()` spawns a real JetStream server
+/// per test, and a suite that starts twenty of them it never queries is spending a CI runner's
+/// memory and disk on nothing. Tests that *do* exercise the deny-set still use `Nats::start()`.
+pub fn unused_nats_port() -> u16 {
+    free_port()
+}
+
 /// An HTTP client that cannot hang.
 ///
 /// `reqwest::Client::new()` has **no** timeout, so a request that stalls stalls the test, and under

@@ -54,11 +54,11 @@ async fn post_auto(
 /// The primary candidate serves it: OpenAI's mount, OpenAI's pool key, OpenAI's spelling of the id.
 #[tokio::test]
 async fn routes_by_model_header_to_the_primary_candidate() {
-    let nats = Nats::start().await;
+    let nats_port = unused_nats_port();
     let (pubkey, sk) = test_keypair(1);
     let primary = MockUpstream::start(Mode::Json).await;
     let fallback = MockUpstream::start(Mode::Json).await;
-    let gw = Gateway::builder(nats.port, &primary.authority(), &b64(&pubkey))
+    let gw = Gateway::builder(nats_port, &primary.authority(), &b64(&pubkey))
         .providers(&["openai", "openrouter"])
         .provider_authority("openrouter", &fallback.authority())
         .start()
@@ -88,10 +88,10 @@ async fn routes_by_model_header_to_the_primary_candidate() {
 /// by the fallback, under the fallback's mount, key, and id.
 #[tokio::test]
 async fn fails_over_to_the_next_candidate_when_the_primary_wont_connect() {
-    let nats = Nats::start().await;
+    let nats_port = unused_nats_port();
     let (pubkey, sk) = test_keypair(1);
     let fallback = MockUpstream::start(Mode::Json).await;
-    let gw = Gateway::builder(nats.port, &GatewayBuilder::dead_authority(), &b64(&pubkey))
+    let gw = Gateway::builder(nats_port, &GatewayBuilder::dead_authority(), &b64(&pubkey))
         .providers(&["openai", "openrouter"])
         .provider_authority("openrouter", &fallback.authority())
         .start()
@@ -134,10 +134,10 @@ async fn fails_over_to_the_next_candidate_when_the_primary_wont_connect() {
 /// assertions catches both.
 #[tokio::test]
 async fn records_the_failed_candidates_breaker_not_the_serving_ones() {
-    let nats = Nats::start().await;
+    let nats_port = unused_nats_port();
     let (pubkey, sk) = test_keypair(1);
     let fallback = MockUpstream::start(Mode::Json).await;
-    let gw = Gateway::builder(nats.port, &GatewayBuilder::dead_authority(), &b64(&pubkey))
+    let gw = Gateway::builder(nats_port, &GatewayBuilder::dead_authority(), &b64(&pubkey))
         .providers(&["openai", "openrouter"])
         .provider_authority("openrouter", &fallback.authority())
         .circuit_breaker_threshold(2)
@@ -170,10 +170,10 @@ async fn records_the_failed_candidates_breaker_not_the_serving_ones() {
 /// The routing header is required, and only names the catalog serves are routable.
 #[tokio::test]
 async fn a_missing_or_unknown_model_is_rejected_before_any_upstream() {
-    let nats = Nats::start().await;
+    let nats_port = unused_nats_port();
     let (pubkey, sk) = test_keypair(1);
     let mock = MockUpstream::start(Mode::Json).await;
-    let gw = Gateway::builder(nats.port, &mock.authority(), &b64(&pubkey))
+    let gw = Gateway::builder(nats_port, &mock.authority(), &b64(&pubkey))
         .providers(&["openai", "openrouter"])
         .start()
         .await;
@@ -198,10 +198,10 @@ async fn a_missing_or_unknown_model_is_rejected_before_any_upstream() {
 /// would be a guess and failing over would hand one vendor's key to another.
 #[tokio::test]
 async fn a_byo_key_is_refused_with_400() {
-    let nats = Nats::start().await;
+    let nats_port = unused_nats_port();
     let (pubkey, _sk) = test_keypair(1);
     let mock = MockUpstream::start(Mode::Json).await;
-    let gw = Gateway::builder(nats.port, &mock.authority(), &b64(&pubkey))
+    let gw = Gateway::builder(nats_port, &mock.authority(), &b64(&pubkey))
         .providers(&["openai", "openrouter"])
         .start()
         .await;
@@ -225,10 +225,10 @@ async fn a_byo_key_is_refused_with_400() {
 /// The billing row names the provider that actually served, and carries the catalog name routed on.
 #[tokio::test]
 async fn the_usage_row_names_the_candidate_that_served() {
-    let nats = Nats::start().await;
+    let nats_port = unused_nats_port();
     let (pubkey, sk) = test_keypair(1);
     let fallback = MockUpstream::start(Mode::Json).await;
-    let gw = Gateway::builder(nats.port, &GatewayBuilder::dead_authority(), &b64(&pubkey))
+    let gw = Gateway::builder(nats_port, &GatewayBuilder::dead_authority(), &b64(&pubkey))
         .providers(&["openai", "openrouter"])
         .provider_authority("openrouter", &fallback.authority())
         .start()
@@ -254,9 +254,9 @@ async fn the_usage_row_names_the_candidate_that_served() {
 /// Every candidate down ⇒ a clean failure, and both candidates were genuinely tried.
 #[tokio::test]
 async fn every_candidate_down_fails_the_request() {
-    let nats = Nats::start().await;
+    let nats_port = unused_nats_port();
     let (pubkey, sk) = test_keypair(1);
-    let gw = Gateway::builder(nats.port, &GatewayBuilder::dead_authority(), &b64(&pubkey))
+    let gw = Gateway::builder(nats_port, &GatewayBuilder::dead_authority(), &b64(&pubkey))
         .providers(&["openai", "openrouter"])
         .provider_authority("openrouter", &GatewayBuilder::dead_authority())
         .start()
@@ -286,10 +286,10 @@ async fn every_candidate_down_fails_the_request() {
 /// read from the client, so the retry re-reads from the socket rather than from the buffer.
 #[tokio::test]
 async fn a_large_body_survives_a_failover_intact() {
-    let nats = Nats::start().await;
+    let nats_port = unused_nats_port();
     let (pubkey, sk) = test_keypair(1);
     let fallback = MockUpstream::start(Mode::Json).await;
-    let gw = Gateway::builder(nats.port, &GatewayBuilder::dead_authority(), &b64(&pubkey))
+    let gw = Gateway::builder(nats_port, &GatewayBuilder::dead_authority(), &b64(&pubkey))
         .providers(&["openai", "openrouter"])
         .provider_authority("openrouter", &fallback.authority())
         .start()
@@ -331,10 +331,10 @@ async fn a_large_body_survives_a_failover_intact() {
 /// routing header involved.
 #[tokio::test]
 async fn provider_routed_requests_are_unaffected() {
-    let nats = Nats::start().await;
+    let nats_port = unused_nats_port();
     let (pubkey, sk) = test_keypair(1);
     let mock = MockUpstream::start(Mode::Json).await;
-    let gw = Gateway::builder(nats.port, &mock.authority(), &b64(&pubkey))
+    let gw = Gateway::builder(nats_port, &mock.authority(), &b64(&pubkey))
         .providers(&["openai", "openrouter"])
         .start()
         .await;
@@ -376,11 +376,11 @@ async fn provider_routed_requests_are_unaffected() {
 /// unit test in `proxy.rs` instead of contriving one here.
 #[tokio::test]
 async fn claude_fails_over_on_the_anthropic_wire_and_is_still_metered() {
-    let nats = Nats::start().await;
+    let nats_port = unused_nats_port();
     let (pubkey, sk) = test_keypair(1);
     // The fallback answers in Anthropic shape: `usage.input_tokens`, not `usage.prompt_tokens`.
     let fallback = MockUpstream::start(Mode::AnthropicJson).await;
-    let gw = Gateway::builder(nats.port, &GatewayBuilder::dead_authority(), &b64(&pubkey))
+    let gw = Gateway::builder(nats_port, &GatewayBuilder::dead_authority(), &b64(&pubkey))
         .providers(&["anthropic", "openrouter"])
         .provider_authority("openrouter", &fallback.authority())
         .start()
@@ -454,10 +454,10 @@ async fn claude_fails_over_on_the_anthropic_wire_and_is_still_metered() {
 /// discarded input. The disagreement is counted so a client bug is visible.
 #[tokio::test]
 async fn requested_model_is_the_routed_name_not_the_discarded_body_value() {
-    let nats = Nats::start().await;
+    let nats_port = unused_nats_port();
     let (pubkey, sk) = test_keypair(1);
     let primary = MockUpstream::start(Mode::Json).await;
-    let gw = Gateway::builder(nats.port, &primary.authority(), &b64(&pubkey))
+    let gw = Gateway::builder(nats_port, &primary.authority(), &b64(&pubkey))
         .providers(&["openai", "openrouter"])
         .start()
         .await;
@@ -504,10 +504,10 @@ async fn requested_model_is_the_routed_name_not_the_discarded_body_value() {
 /// The ordinary case: header and body agree, and nothing is counted as a mismatch.
 #[tokio::test]
 async fn agreeing_header_and_body_count_no_mismatch() {
-    let nats = Nats::start().await;
+    let nats_port = unused_nats_port();
     let (pubkey, sk) = test_keypair(1);
     let primary = MockUpstream::start(Mode::Json).await;
-    let gw = Gateway::builder(nats.port, &primary.authority(), &b64(&pubkey))
+    let gw = Gateway::builder(nats_port, &primary.authority(), &b64(&pubkey))
         .providers(&["openai", "openrouter"])
         .start()
         .await;
@@ -527,10 +527,10 @@ async fn agreeing_header_and_body_count_no_mismatch() {
 /// what was requested, and no `routed_model` appears at all.
 #[tokio::test]
 async fn provider_routed_requested_model_still_comes_from_the_body() {
-    let nats = Nats::start().await;
+    let nats_port = unused_nats_port();
     let (pubkey, sk) = test_keypair(1);
     let mock = MockUpstream::start(Mode::Json).await;
-    let gw = Gateway::builder(nats.port, &mock.authority(), &b64(&pubkey))
+    let gw = Gateway::builder(nats_port, &mock.authority(), &b64(&pubkey))
         .providers(&["openai", "openrouter"])
         .start()
         .await;
@@ -565,11 +565,11 @@ async fn provider_routed_requested_model_still_comes_from_the_body() {
 /// refuses connections — so it is the case the whole feature exists for.
 #[tokio::test]
 async fn fails_over_when_the_primary_answers_5xx() {
-    let nats = Nats::start().await;
+    let nats_port = unused_nats_port();
     let (pubkey, sk) = test_keypair(1);
     let primary = MockUpstream::start(Mode::Status(500)).await;
     let fallback = MockUpstream::start(Mode::Json).await;
-    let gw = Gateway::builder(nats.port, &primary.authority(), &b64(&pubkey))
+    let gw = Gateway::builder(nats_port, &primary.authority(), &b64(&pubkey))
         .providers(&["openai", "openrouter"])
         .provider_authority("openrouter", &fallback.authority())
         .start()
@@ -606,11 +606,11 @@ async fn fails_over_when_the_primary_answers_5xx() {
 /// over — re-asking a different vendor turns a self-healing throttle into spend somewhere else.
 #[tokio::test]
 async fn a_429_is_relayed_not_failed_over() {
-    let nats = Nats::start().await;
+    let nats_port = unused_nats_port();
     let (pubkey, sk) = test_keypair(1);
     let primary = MockUpstream::start(Mode::Status(429)).await;
     let fallback = MockUpstream::start(Mode::Json).await;
-    let gw = Gateway::builder(nats.port, &primary.authority(), &b64(&pubkey))
+    let gw = Gateway::builder(nats_port, &primary.authority(), &b64(&pubkey))
         .providers(&["openai", "openrouter"])
         .provider_authority("openrouter", &fallback.authority())
         .start()
@@ -633,11 +633,11 @@ async fn a_429_is_relayed_not_failed_over() {
 /// synthetic one — better diagnostics than an exhausted retry loop produces.
 #[tokio::test]
 async fn every_candidate_5xx_relays_the_last_error() {
-    let nats = Nats::start().await;
+    let nats_port = unused_nats_port();
     let (pubkey, sk) = test_keypair(1);
     let primary = MockUpstream::start(Mode::Status(503)).await;
     let fallback = MockUpstream::start(Mode::Status(503)).await;
-    let gw = Gateway::builder(nats.port, &primary.authority(), &b64(&pubkey))
+    let gw = Gateway::builder(nats_port, &primary.authority(), &b64(&pubkey))
         .providers(&["openai", "openrouter"])
         .provider_authority("openrouter", &fallback.authority())
         .start()
@@ -664,11 +664,11 @@ async fn every_candidate_5xx_relays_the_last_error() {
 /// arriving, because both outcomes were correct behaviour under a looser gate.
 #[tokio::test]
 async fn an_unreplayable_body_relays_the_5xx_and_is_counted() {
-    let nats = Nats::start().await;
+    let nats_port = unused_nats_port();
     let (pubkey, sk) = test_keypair(1);
     let primary = MockUpstream::start(Mode::Status(500)).await;
     let fallback = MockUpstream::start(Mode::Json).await;
-    let gw = Gateway::builder(nats.port, &primary.authority(), &b64(&pubkey))
+    let gw = Gateway::builder(nats_port, &primary.authority(), &b64(&pubkey))
         .providers(&["openai", "openrouter"])
         .provider_authority("openrouter", &fallback.authority())
         .start()
@@ -714,11 +714,11 @@ async fn an_unreplayable_body_relays_the_5xx_and_is_counted() {
 /// them together.
 #[tokio::test]
 async fn a_5xx_candidates_breaker_opens_while_the_fallback_keeps_serving() {
-    let nats = Nats::start().await;
+    let nats_port = unused_nats_port();
     let (pubkey, sk) = test_keypair(1);
     let primary = MockUpstream::start(Mode::Status(500)).await;
     let fallback = MockUpstream::start(Mode::Json).await;
-    let gw = Gateway::builder(nats.port, &primary.authority(), &b64(&pubkey))
+    let gw = Gateway::builder(nats_port, &primary.authority(), &b64(&pubkey))
         .providers(&["openai", "openrouter"])
         .provider_authority("openrouter", &fallback.authority())
         .circuit_breaker_threshold(2)

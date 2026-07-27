@@ -29,12 +29,12 @@ fn body() -> String {
 /// aborts would have opened the breaker several times over and started rejecting.
 #[tokio::test]
 async fn client_cancellations_do_not_open_the_providers_breaker() {
-    let nats = Nats::start().await;
+    let nats_port = unused_nats_port();
     let (pubkey, sk) = test_keypair(1);
     // Slower than the client's patience below, so every one of those requests is abandoned
     // mid-flight — while the upstream itself stays perfectly healthy.
     let mock = MockUpstream::start(Mode::Slow(3_000)).await;
-    let gw = Gateway::builder(nats.port, &mock.authority(), &b64(&pubkey))
+    let gw = Gateway::builder(nats_port, &mock.authority(), &b64(&pubkey))
         .circuit_breaker_threshold(2)
         .start()
         .await;
@@ -105,10 +105,10 @@ async fn client_cancellations_do_not_open_the_providers_breaker() {
 /// this, "stop blaming the provider for client aborts" could be satisfied by never blaming it at all.
 #[tokio::test]
 async fn upstream_failures_still_open_the_breaker() {
-    let nats = Nats::start().await;
+    let nats_port = unused_nats_port();
     let (pubkey, sk) = test_keypair(1);
     let mock = MockUpstream::start(Mode::Status(500)).await;
-    let gw = Gateway::builder(nats.port, &mock.authority(), &b64(&pubkey))
+    let gw = Gateway::builder(nats_port, &mock.authority(), &b64(&pubkey))
         .circuit_breaker_threshold(2)
         .start()
         .await;
@@ -153,10 +153,10 @@ async fn upstream_failures_still_open_the_breaker() {
 /// request number that may well land on a fresh connection under load.
 #[tokio::test]
 async fn a_reused_connection_failure_is_retried_and_the_body_survives() {
-    let nats = Nats::start().await;
+    let nats_port = unused_nats_port();
     let (pubkey, sk) = test_keypair(1);
     let mock = MockUpstream::start(Mode::CloseOnReusedConnection).await;
-    let gw = Gateway::builder(nats.port, &mock.authority(), &b64(&pubkey))
+    let gw = Gateway::builder(nats_port, &mock.authority(), &b64(&pubkey))
         .start()
         .await;
 
