@@ -82,6 +82,35 @@ circuit_breaker_reset_secs = 30
 # `ai_rejections_total{reason="rate_limit_byo_global"}` metric.
 byo_rate_limit_rps = 1000
 
+# Optional payload capture — logging the full request/response bodies of a tenant's traffic on the
+# `ai.payload` target, so "the agent did something stupid" is answerable after the fact.
+#
+# It is OFF for every tenant until the control plane writes an `aicapture.{tenant_id}` KV entry
+# (value `{}` for defaults, or `{"sample_n":N,"max_bytes":B}` to tune). Write that entry with a TTL
+# and "capture tenant 42 for the next hour" expires itself. A caller can also opt a single request
+# in or out with the `x-beyond-capture: on|off` header, which wins over the tenant's entry.
+#
+# Nothing below turns capture on — they only bound it once something else does.
+
+# Per-direction cap on a captured body before truncation (bytes), and the default a per-tenant entry
+# overrides. Really a bound on what the LOG PIPELINE will carry: payloads ride the same logfwd/OTLP
+# path as `ai.usage`, so raising this past that path's per-record limit gets captures dropped
+# downstream where the gateway can't see it. Truncation keeps the HEAD (the system prompt) and is
+# flagged on the emitted row.
+capture_max_bytes = 262144
+
+# Default sampling for control-plane-enabled capture: keep 1 request in N. `1` captures everything,
+# which is the right default for a debugging tool aimed at one tenant at a time; raise it for a
+# tenant whose volume makes that impractical. A capture explicitly requested via `x-beyond-capture:
+# on` is NEVER sampled away.
+capture_default_sample_n = 1
+
+# Depth of the bounded queue feeding the `ai.payload` writer. When it fills, captures are DROPPED
+# (counted on `ai_capture_dropped_total`) rather than blocking — a stalled log sink must never be
+# able to backpressure the proxy. Billing rows (`ai.usage`) are unaffected: they keep the blocking,
+# lossless writer. Deeper absorbs a longer sink stall at the cost of holding more bytes in memory.
+capture_queue_depth = 1024
+
 # Optional per-provider upstream authority (host:port), BY PROVIDER NAME. For a known provider this
 # overrides its built-in default; for an unknown name it ADDS a new provider, then reachable at
 # `/{name}/…` (the provider is the first path segment of the request). Known providers (zero-config

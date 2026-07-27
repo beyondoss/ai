@@ -40,10 +40,11 @@
 //! Anthropic client works by changing only the host. An unknown first segment is a 404. Model isn't
 //! used for routing (the body isn't read pre-connect); it's still captured from the body for usage.
 
+use crate::capture::CaptureBufs;
 use crate::metrics::Rejection;
 use crate::route::{self, Dialect, Provider};
 use crate::state::{GatewayState, RequestId};
-use crate::{peek, usage};
+use crate::{control, peek, usage};
 use arrayvec::ArrayString;
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -253,9 +254,29 @@ pub struct RequestCtx {
     /// exactly the code it ran before model routing existed. See [`ModelRouting`] for why it is
     /// boxed rather than inline.
     auto: Option<Box<ModelRouting>>,
+    /// Control-surface state — `Some` only when the caller sent an `x-beyond-*` header or the tenant
+    /// is being captured. Boxed for [`ModelRouting`]'s measured reason: `RequestCtx` is touched once
+    /// per response chunk, so inline fields cost streaming latency on *every* request to buy nothing
+    /// for the overwhelming majority that use neither feature. `None` is 8 bytes and one discriminant
+    /// check per chunk.
+    control: Option<Box<RequestControl>>,
     /// Process-unique id for this request (`{instance}-{seq}`), echoed in the `x-beyond-request-id`
     /// response header and the `ai.usage` event so a client report ties back to a log line.
     request_id: RequestId,
+}
+
+/// State that exists only when a request uses the `x-beyond-*` control surface — it carried
+/// metadata, or it is being captured (by tenant rule or by header).
+///
+/// Boxed on `RequestCtx` for the same measured reason [`ModelRouting`] is: both members are dead
+/// weight on the ordinary request, and `RequestCtx` is on the per-chunk path.
+struct RequestControl {
+    /// Canonical metadata JSON from `x-beyond-metadata`, already validated and re-serialized by
+    /// [`crate::control`]. Emitted on `ai.usage` (and `ai.payload`) verbatim.
+    metadata: Option<String>,
+    /// Payload buffers — `Some` iff this request is being captured. Independent of `metadata`:
+    /// tagging is useful with capture off, which is the point of shipping them together.
+    capture: Option<CaptureBufs>,
 }
 
 /// State that exists only for a **model-routed** (`/auto`) request.
@@ -797,7 +818,7 @@ impl ProxyHttp for AiProxy {
         // One id per request, generated before any reject path so even a 400/401 carries it (in the
         // log line and the `x-beyond-request-id` header). Moved into `ctx` at the end for the
         // admitted path. Cheap: a counter bump + a short `format!` (see `next_request_id`).
-        let request_id = self.state.next_request_id();
+        let (request_id, request_seq) = self.state.next_request_id_seq();
 
         // 1. Route by the **first path segment** = provider; forward the rest of the path verbatim
         // (native passthrough — the gateway holds no per-provider mount knowledge). A path with no
@@ -1136,6 +1157,54 @@ impl ProxyHttp for AiProxy {
         // streams through untouched. Checked on the forwarded path (suffix), so it's prefix-agnostic.
         let inject_eligible = managed && dialect == Dialect::OpenAi && forward_streamable;
 
+        // Per-request control surface (`x-beyond-*`). Managed only: a BYO request carries no verified
+        // identity, so a tag on it would be an unattributable row and a capture would be storing
+        // prompts we can't attribute to an account that asked us to — the same reason `ai.usage`
+        // itself is managed-only.
+        //
+        // Nothing here can reject the request: `Control::parse` drops what it can't use and counts
+        // it. See `control`'s module docs.
+        let control = if managed {
+            let parsed = control::Control::parse(session.req_header());
+            if parsed.malformed {
+                self.state.metrics.control_header_errors_total.inc();
+            }
+
+            // Capture decision. The header wins in **both** directions over the tenant's
+            // control-plane rule (Cloudflare's `cf-aig-collect-log` semantics), and the two enablers
+            // serve different people: the control plane is the operator's, works retroactively, and
+            // needs no cooperation from a client we don't control; the header is the caller's, for
+            // per-request precision.
+            let capture = match parsed.capture {
+                // Explicit suppression always wins — "not this one, it has PII".
+                Some(false) => None,
+                // Explicitly requested, so **never sampled away**: a caller who asks to log one
+                // trace and silently gets nothing is the single outcome that makes this useless.
+                Some(true) => Some(CaptureBufs::new(self.state.capture_defaults.max_bytes)),
+                // No opinion — fall back to the tenant's rule. Sparse miss is ~1.5ns (see `deny`'s
+                // hasher rationale, which this set shares) and is what the overwhelming majority of
+                // managed requests hit.
+                None => self
+                    .state
+                    .capture
+                    .load()
+                    .rule_for(tenant_id)
+                    .filter(|rule| rule.samples(request_seq))
+                    .map(|rule| CaptureBufs::new(rule.max_bytes)),
+            };
+
+            // Allocate the box only when something is actually on. A managed request that used
+            // neither feature — nearly all of them — stays at `None`.
+            (parsed.metadata.is_some() || capture.is_some()).then(|| {
+                Box::new(RequestControl {
+                    metadata: parsed.metadata,
+                    capture,
+                })
+            })
+        } else {
+            None
+        };
+
         // Circuit breaker (per provider, all traffic — a down provider is down regardless of whose
         // key is used). Checked here, after every other rejection, so claiming a half-open probe
         // permit corresponds to an *actual* upstream attempt — and balanced by exactly one
@@ -1176,6 +1245,7 @@ impl ProxyHttp for AiProxy {
             provider,
             forward_path,
             managed,
+            control,
             model: String::new(),
             model_scanner: peek::ModelScanner::new(),
             // `for_response`, not `new`: a response may carry the model nested under `message`
@@ -1525,6 +1595,15 @@ impl ProxyHttp for AiProxy {
             upstream_request.remove_header(route::MODEL_HEADER);
         }
 
+        // Strip our own control headers. They're Beyond's namespace, meaningless to a provider, and
+        // a provider that rejects unknown headers would turn an observability opt-in into their 400.
+        // Unconditional rather than gated on `rc.control`: the parse is managed-only, so a BYO
+        // request that sent one was never read — but it must not be forwarded either, and a request
+        // whose header was *malformed* has `rc.control == None` while the header is still on the wire.
+        for header in control::CONTROL_HEADERS {
+            upstream_request.remove_header(header);
+        }
+
         // Point Host at the upstream. Same precomputed-value trick as the pool key above.
         match &rc.provider.host_header {
             Some(hv) => upstream_request.insert_header("host", hv.clone())?,
@@ -1610,6 +1689,19 @@ impl ProxyHttp for AiProxy {
             // come from one walk of the finished buffer below — the body was previously traversed
             // twice, once here for `model` and once by the injection planner, over the same bytes
             // with the same depth/string/escape bookkeeping.
+            // Capture tap. Deliberately here, on the chunk as it *arrives*, which makes the captured
+            // bytes **pre-rewrite** for free: both of the rewrites below happen at end-of-stream over
+            // the whole of `req_buf`, long after this ran. That matters twice over — a captured body
+            // showing a `stream_options` the client's SDK never sent, or a `model` re-spelled for
+            // whichever failover candidate served, sends an engineer hunting through their own code
+            // for something the gateway put there. What we capture is what the client sent.
+            //
+            // Bounded and non-withholding, exactly like the response tap: the chunk is forwarded
+            // either way, so this costs a memcpy, never latency.
+            if let Some(c) = rc.control.as_mut().and_then(|c| c.capture.as_mut()) {
+                c.push_req(chunk);
+            }
+
             if rc.rewrites_body() {
                 rc.req_buf.extend_from_slice(chunk);
             } else if rc.managed {
@@ -1774,6 +1866,15 @@ impl ProxyHttp for AiProxy {
             }
 
             rc.resp_tail.push(chunk);
+
+            // Capture tap — same passive-tap contract as the usage tail above (copy, never withhold),
+            // differing only in which end it keeps. `resp_tail` keeps the *last* 64 KB because usage
+            // rides the final event; capture keeps the *first* `max_bytes` because that's where the
+            // answer starts. On a captured Anthropic SSE response all three buffers coexist, which is
+            // fine — each is independently bounded.
+            if let Some(c) = rc.control.as_mut().and_then(|c| c.capture.as_mut()) {
+                c.push_resp(chunk);
+            }
         }
         Ok(None)
     }
@@ -2028,8 +2129,45 @@ impl ProxyHttp for AiProxy {
                 // line ships, so it's logged as `?` (Debug) rather than collapsed to a bare `0`.
                 reasoning_tokens = ?usage.reasoning_tokens,
                 latency_ms = elapsed.as_millis() as u64,
+                // Caller-supplied tags from `x-beyond-metadata`, already validated and canonically
+                // re-serialized by `control` — a JSON object, so `GROUP BY metadata['feature']`
+                // downstream answers "which feature is burning money" against the same row that
+                // carries the tokens. Absent (not `null`) when the caller sent none.
+                metadata = rc.control.as_ref().and_then(|c| c.metadata.as_deref()),
                 "usage"
             );
+
+            // Payload capture, on its own target so a stalled payload sink can never delay or drop a
+            // billing row (see `main::init_tracing`, which gives the two targets different writers).
+            // Correlated by `request_id`, which is also on the line above and in the response's
+            // `x-beyond-request-id` header — so a user quoting that id resolves straight to their
+            // conversation with no join table.
+            if let Some(cap) = rc.control.as_ref().and_then(|c| c.capture.as_ref()) {
+                m.captures_total.inc();
+                m.capture_bytes_total.inc_by(cap.bytes() as u64);
+                info!(
+                    target: "ai.payload",
+                    request_id = %rc.request_id,
+                    tenant_id = rc.tenant_id,
+                    provider = rc.provider.name.as_str(),
+                    model = billed_model,
+                    stream = rc.streaming,
+                    status = rc.upstream_status,
+                    metadata = rc.control.as_ref().and_then(|c| c.metadata.as_deref()),
+                    // What the client sent, before either body rewrite (see `request_body_filter`).
+                    request_body = cap.req_str(),
+                    response_body = cap.resp_str(),
+                    // Truncation and completeness are separate facts and both are load-bearing.
+                    // `truncated` means we hit the byte cap; `complete` means the upstream actually
+                    // finished. A capture that reads as whole when it isn't produces confident wrong
+                    // conclusions during the incident this feature exists to serve — and "the stream
+                    // died at token 400" is frequently the answer, so a partial is kept, not dropped.
+                    request_truncated = cap.req_truncated(),
+                    response_truncated = cap.resp_truncated(),
+                    complete = e.is_none(),
+                    "payload"
+                );
+            }
         }
     }
 }
@@ -2073,6 +2211,7 @@ mod tests {
             attempt: 0,
             breaker_pending: false,
             auto: None,
+            control: None,
             request_id: RequestId::new(),
         }
     }

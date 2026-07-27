@@ -5,6 +5,7 @@
 //! values) — is built once at boot from config (SSM/env), so the auth + key paths have **no runtime
 //! dependency on NATS**.
 
+use crate::capture::{CaptureRule, CaptureSet};
 use crate::config::AiConfig;
 use crate::deny::DenySet;
 use crate::error::{GatewayError, Result};
@@ -190,8 +191,15 @@ pub struct GatewayState {
     /// config-added provider is absent: it has no `ProviderId`, and a catalog row can only name one.
     by_id: [Option<Arc<Provider>>; providers::ProviderId::COUNT],
 
-    /// Sparse deny-set — the ONE thing watched from NATS. Default-allow on miss; fail-open.
+    /// Sparse deny-set — watched from NATS. Default-allow on miss; fail-open.
     pub deny: ArcSwap<DenySet>,
+
+    /// Sparse capture-set — watched from NATS under its own prefix and its own watcher. Default-off
+    /// on miss, so a NATS outage degrades to "capturing nothing", which is the correct thing to lose.
+    pub capture: ArcSwap<CaptureSet>,
+    /// Per-tenant capture defaults resolved from config once at boot, applied to any control-plane
+    /// entry that doesn't override them (and to a capture requested by header, which has no entry).
+    pub capture_defaults: CaptureRule,
 
     /// Per-key request-rate guardrail (see `ratelimit`). `None` when `rate_limit_rps == 0`. Fixed
     /// memory regardless of tenant count, so it lives in the static state with no GC.
@@ -271,12 +279,21 @@ impl GatewayState {
             }
         };
 
+        // Resolved once here rather than read per-request: these are boot config, and the capture
+        // decision runs on every managed request.
+        let capture_defaults = CaptureRule {
+            sample_n: config.capture_default_sample_n.max(1),
+            max_bytes: config.capture_max_bytes,
+        };
+
         Ok(Arc::new(Self {
             metrics,
             keyring,
             providers,
             by_id,
             deny: ArcSwap::from_pointee(DenySet::new()),
+            capture: ArcSwap::from_pointee(CaptureSet::new()),
+            capture_defaults,
             rate_limit,
             dns_cache: ArcSwap::from_pointee(HashMap::new()),
             instance_prefix: {
@@ -296,6 +313,17 @@ impl GatewayState {
     /// one `fetch_add` + a hex format into a stack buffer (no heap allocation), and needs no
     /// randomness per request.
     pub fn next_request_id(&self) -> RequestId {
+        self.next_request_id_seq().0
+    }
+
+    /// As [`Self::next_request_id`], but also returns the raw counter value behind it.
+    ///
+    /// The capture sampler needs a per-request number and this counter already is one, drawn from
+    /// the same single `fetch_add` that mints the id — so sampling costs nothing extra, and "1 in N"
+    /// is exactly 1 in N rather than a probabilistic approximation of it. Returning the pair keeps
+    /// that to one atomic; a separate `fetch_add` for sampling would both cost more and desynchronize
+    /// the two, making "why wasn't request X captured?" unanswerable from its id.
+    pub fn next_request_id_seq(&self) -> (RequestId, u64) {
         let seq = self.request_seq.fetch_add(1, Ordering::Relaxed);
         let mut id = RequestId::new();
         // The instance half is boot-constant, so it is copied rather than re-formatted; only the
@@ -304,7 +332,7 @@ impl GatewayState {
         // overflow is dropped — a truncated correlation id beats panicking a worker over one.
         let _ = id.try_push_str(&self.instance_prefix);
         push_lower_hex(&mut id, seq);
-        id
+        (id, seq)
     }
 
     /// The resolved provider for `name` (the request's first path segment, or the bare-path dialect

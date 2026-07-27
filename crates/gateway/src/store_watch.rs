@@ -1,9 +1,18 @@
-//! slipstream deny-set watcher — the gateway's **only** use of NATS.
+//! slipstream control-plane watchers — the gateway's **only** use of NATS.
 //!
-//! Seeds the deny-set at boot, then streams deltas. **Fail-open**: a NATS blip keeps the last-known
-//! set (we never clear), so an outage degrades to a stale deny-set, not "reject everything". Auth
-//! and pool/signing keys come from config, so they're unaffected by NATS being down — only
+//! Seeds a sparse per-tenant set at boot, then streams deltas. **Fail-open**: a NATS blip keeps the
+//! last-known set (we never clear), so an outage degrades to a stale set, not "reject everything".
+//! Auth and pool/signing keys come from config, so they're unaffected by NATS being down — only
 //! spend/fraud enforcement goes stale.
+//!
+//! Two sets are watched, both per-tenant and both sparse, differing only in prefix and payload: the
+//! **deny-set** (`blackhole.`, enforcement) and the **capture-set** (`aicapture.`, payload logging).
+//! The seed → watch → batch-apply → reconnect loop below is written **once**, over the [`WatchedSet`]
+//! trait, and instantiated per set. That loop carries several non-obvious correctness properties —
+//! `is_resumable`'s revision-0 trap, the scan→subscribe race, batched `rcu`, backoff crediting — and
+//! a copied second version would be a standing invitation for the two to drift apart. Each set gets
+//! its own [`WatcherService`] (hence its own NATS connection, cursor, and reconnect loop), so a
+//! capture-set problem cannot disturb deny enforcement.
 //!
 //! Seeding has two modes, chosen by `config.snapshot_path`:
 //!
@@ -32,11 +41,14 @@
 //! Runs as a Pingora `BackgroundService` so the NATS client is created on the serving runtime
 //! (async-nats ties its tasks to the runtime it's built on; connecting earlier would break it).
 
+use crate::capture::{self, CaptureSet};
 use crate::deny::{self, DenySet};
 use crate::state::GatewayState;
+use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use pingora_core::server::ShutdownWatch;
 use pingora_core::services::background::BackgroundService;
+use std::marker::PhantomData;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -47,8 +59,6 @@ use store::{
 };
 use tokio::time::Instant;
 use tracing::{error, info, warn};
-
-const BLACKHOLE_PREFIX: &str = "blackhole.";
 
 /// Depth of the channel the watch task feeds, and therefore the most deltas one `recv_many` can
 /// drain into a batch — the queue is the batch, so there's nothing to gain from a second bound.
@@ -63,6 +73,181 @@ const SNAPSHOT_COMPACT_THRESHOLD: u64 = 1024 * 1024;
 /// doubles as the "was that connection productive?" threshold — see `ReconnectBackoff`.
 const RECONNECT_BACKOFF_BASE: Duration = Duration::from_secs(1);
 const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(30);
+
+/// One watched control-plane set: which prefix it lives under, how to build it, and where to publish
+/// it. Implemented once per set ([`Deny`], and the capture-set), then driven by [`watch_set`].
+///
+/// This exists so the seed → watch → batch-apply → reconnect loop is written **once**. Every method
+/// here is a place the two sets genuinely differ; everything else about the loop — and in particular
+/// every one of its subtle correctness properties — is shared by construction rather than by two
+/// copies staying in sync.
+///
+/// Not object-safe (generic method, associated const), and deliberately so: each set is instantiated
+/// statically at boot, so there's nothing to gain from dynamic dispatch on a path this cold.
+pub trait WatchedSet: Send + Sync + 'static {
+    /// The in-memory set this watcher publishes.
+    type Set: Send + Sync + 'static;
+
+    /// KV key prefix this set is scanned and watched under.
+    const PREFIX: &'static str;
+
+    /// Noun for this watcher's log lines ("deny-set", "capture-set") — so an oncall reading a
+    /// `"…watch exited; reconnecting"` line can tell which of the two it came from.
+    const NOUN: &'static str;
+
+    /// Build the set from scanned or snapshot-loaded entries, dropping any malformed key/value.
+    ///
+    /// `state` is threaded through because a set's *values* can depend on boot config — the
+    /// capture-set resolves its per-tenant defaults from `AiConfig` — even though its keys never do.
+    /// The deny-set ignores it.
+    fn from_entries<'a>(
+        state: &GatewayState,
+        entries: impl Iterator<Item = &'a KvEntry>,
+    ) -> Self::Set;
+
+    /// Fold a batch of watched deltas into a new set. See [`apply_batch`] for why this is per-batch
+    /// rather than per-delta.
+    fn apply_batch(state: &GatewayState, cur: &Self::Set, updates: &[KvUpdate]) -> Self::Set;
+
+    /// Cardinality, for the size gauge and the seed log line.
+    fn len(set: &Self::Set) -> usize;
+
+    /// Where the live set is published for the request path to read.
+    fn slot(state: &GatewayState) -> &ArcSwap<Self::Set>;
+
+    /// Publish the current cardinality to this set's own gauge.
+    fn record_size(state: &GatewayState, len: usize);
+
+    /// Publish this watcher's NATS connectivity to its **own** gauge.
+    ///
+    /// Per-set rather than shared: two independent watchers writing one `nats_connected` gauge would
+    /// race, and the reading would mean "whichever reconnected most recently", which is exactly the
+    /// wrong answer during the partial outage you'd be looking at it for.
+    fn record_connected(state: &GatewayState, connected: bool);
+
+    /// Path to this set's on-disk snapshot, or `None` to run snapshot-less.
+    ///
+    /// The snapshot exists so *enforcement* survives a cold start before NATS reconnects. A set that
+    /// isn't enforcement (the capture-set) fails open — capture simply stays off until the first
+    /// scan lands — so it has nothing to gain from durable seeding and returns `None`, which makes
+    /// every snapshot path below inert without needing to special-case it.
+    fn snapshot_path(state: &GatewayState) -> Option<String>;
+}
+
+/// The deny-set: spend/fraud holds written by the control plane under `blackhole.{tenant}`.
+pub struct Deny;
+
+impl WatchedSet for Deny {
+    type Set = DenySet;
+
+    const PREFIX: &'static str = "blackhole.";
+    const NOUN: &'static str = "deny-set";
+
+    fn from_entries<'a>(
+        _state: &GatewayState,
+        entries: impl Iterator<Item = &'a KvEntry>,
+    ) -> DenySet {
+        denyset_from_entries(entries)
+    }
+
+    fn apply_batch(_state: &GatewayState, cur: &DenySet, updates: &[KvUpdate]) -> DenySet {
+        apply_batch(cur, updates)
+    }
+
+    fn len(set: &DenySet) -> usize {
+        set.len()
+    }
+
+    fn slot(state: &GatewayState) -> &ArcSwap<DenySet> {
+        &state.deny
+    }
+
+    fn record_size(state: &GatewayState, len: usize) {
+        state.metrics.deny_set_size.set(len as i64);
+    }
+
+    fn record_connected(state: &GatewayState, connected: bool) {
+        state.metrics.nats_connected.set(i64::from(connected));
+    }
+
+    fn snapshot_path(state: &GatewayState) -> Option<String> {
+        state.config.snapshot_path.clone()
+    }
+}
+
+/// The capture-set: payload-logging opt-ins written by the control plane under `aicapture.{tenant}`.
+pub struct Capture;
+
+impl WatchedSet for Capture {
+    type Set = CaptureSet;
+
+    const PREFIX: &'static str = "aicapture.";
+    const NOUN: &'static str = "capture-set";
+
+    fn from_entries<'a>(
+        state: &GatewayState,
+        entries: impl Iterator<Item = &'a KvEntry>,
+    ) -> CaptureSet {
+        let defaults = state.capture_defaults;
+        entries
+            .filter_map(|e| {
+                Some((
+                    capture::parse_key(&e.key)?,
+                    capture::parse_rule(&e.value, defaults),
+                ))
+            })
+            .collect()
+    }
+
+    fn apply_batch(state: &GatewayState, cur: &CaptureSet, updates: &[KvUpdate]) -> CaptureSet {
+        let defaults = state.capture_defaults;
+        let mut set = cur.clone();
+        for update in updates {
+            match update {
+                KvUpdate::Put(e) => {
+                    if let Some(t) = capture::parse_key(&e.key) {
+                        set.insert(t, capture::parse_rule(&e.value, defaults));
+                    }
+                }
+                // Delete/Purge = capture off (explicit delete, or the TTL on a time-boxed
+                // "capture tenant 42 for an hour" entry expiring).
+                KvUpdate::Delete { key, .. } | KvUpdate::Purge { key, .. } => {
+                    if let Some(t) = capture::parse_key(key) {
+                        set.remove(t);
+                    }
+                }
+            }
+        }
+        set
+    }
+
+    fn len(set: &CaptureSet) -> usize {
+        set.len()
+    }
+
+    fn slot(state: &GatewayState) -> &ArcSwap<CaptureSet> {
+        &state.capture
+    }
+
+    fn record_size(state: &GatewayState, len: usize) {
+        state.metrics.capture_set_size.set(len as i64);
+    }
+
+    fn record_connected(state: &GatewayState, connected: bool) {
+        state
+            .metrics
+            .capture_nats_connected
+            .set(i64::from(connected));
+    }
+
+    /// No snapshot. The deny-set keeps one so *enforcement* survives a cold start before NATS
+    /// reconnects; capture is not enforcement, and "captured nothing for the first few seconds after
+    /// a restart" is a non-event. Returning `None` makes every snapshot path in this module inert
+    /// for this set without a single `if` anywhere else.
+    fn snapshot_path(_state: &GatewayState) -> Option<String> {
+        None
+    }
+}
 
 /// Reconnect backoff for the watch loop: 1s doubling to a 30s cap. A fixed 2s retry hammered the log
 /// at a constant rate through a long outage (minutes to hours), burying other signals during the very
@@ -106,12 +291,27 @@ impl ReconnectBackoff {
     }
 }
 
-pub struct WatcherService {
-    pub state: Arc<GatewayState>,
+/// Drives one [`WatchedSet`] for the life of the process: seed, watch, reconnect.
+///
+/// One service per set, each with its own NATS connection and reconnect loop. The extra connection
+/// is cheap next to the isolation it buys: a capture-set scan that keeps failing backs off on its
+/// own schedule and cannot slow, stall, or reseed deny enforcement.
+pub struct WatcherService<W: WatchedSet> {
+    state: Arc<GatewayState>,
+    _set: PhantomData<W>,
+}
+
+impl<W: WatchedSet> WatcherService<W> {
+    pub fn new(state: Arc<GatewayState>) -> Self {
+        Self {
+            state,
+            _set: PhantomData,
+        }
+    }
 }
 
 #[async_trait]
-impl BackgroundService for WatcherService {
+impl<W: WatchedSet> BackgroundService for WatcherService<W> {
     async fn start(&self, mut shutdown: ShutdownWatch) {
         // Resume position + on-disk snapshot writer persist across reconnects: a NATS blip resumes
         // the watch from `cursor` instead of re-scanning, and `seeded` stays true so we don't reseed.
@@ -119,17 +319,18 @@ impl BackgroundService for WatcherService {
         let mut writer: Option<SnapshotWriter> = None;
         let mut seeded = false;
 
-        if let Some(path) = self.state.config.snapshot_path.clone() {
+        if let Some(path) = W::snapshot_path(&self.state) {
             let path = PathBuf::from(path);
             // Snapshot I/O is synchronous (whole-file read/rewrite) — offload it so we never stall
             // the serving runtime this BackgroundService shares with the proxy.
             let load_path = path.clone();
             match tokio::task::spawn_blocking(move || store::snapshot::load(&load_path)).await {
                 Ok(Ok(Some(snap))) => {
-                    let set = denyset_from_entries(snap.entries.values());
-                    info!(count = set.len(), "seeded deny-set from on-disk snapshot");
-                    self.state.metrics.deny_set_size.set(set.len() as i64);
-                    self.state.deny.store(Arc::new(set));
+                    let set = W::from_entries(&self.state, snap.entries.values());
+                    let count = W::len(&set);
+                    info!(set = W::NOUN, count, "seeded from on-disk snapshot");
+                    W::record_size(&self.state, count);
+                    W::slot(&self.state).store(Arc::new(set));
                     // A snapshot without a *resumable* cursor can't safely resume (a bare watch
                     // would race), so only treat it as seeded when it carries a real resume point;
                     // otherwise fall through to a NATS scan on connect. Note this must test
@@ -164,15 +365,16 @@ impl BackgroundService for WatcherService {
             let store = tokio::select! {
                 _ = shutdown.changed() => {
                     info!(
+                        set = W::NOUN,
                         in_flight = self.state.metrics.requests_in_flight.get(),
-                        "shutdown signaled; deny-set watcher exiting"
+                        "shutdown signaled; watcher exiting"
                     );
                     return;
                 }
                 outcome = connect(&self.state) => match outcome {
                     Ok(store) => store,
                     Err(e) => {
-                        self.state.metrics.nats_connected.set(0);
+                        W::record_connected(&self.state, false);
                         error!(error = %e, backoff_secs = backoff.delay().as_secs(), "slipstream connect failed; retrying");
                         // Reconnect backoff, also interruptible by shutdown.
                         tokio::select! {
@@ -186,14 +388,14 @@ impl BackgroundService for WatcherService {
                 },
             };
 
-            self.state.metrics.nats_connected.set(1);
-            info!("slipstream connected; watching deny-set");
+            W::record_connected(&self.state, true);
+            info!(set = W::NOUN, "slipstream connected; watching");
             // Time the watch, not the connect: only a watch that ran long enough to be doing real
             // work earns a backoff reset (see `ReconnectBackoff::credit`).
             let started = Instant::now();
-            // `watch_deny` returns `true` when it exited because shutdown was signaled — stop the
+            // `watch_set` returns `true` when it exited because shutdown was signaled — stop the
             // reconnect loop cleanly instead of trying to reconnect a shutting-down process.
-            if watch_deny(
+            if watch_set::<W>(
                 &self.state,
                 store,
                 &mut cursor,
@@ -203,16 +405,17 @@ impl BackgroundService for WatcherService {
             )
             .await
             {
-                info!("shutdown signaled; deny-set watcher exiting");
+                info!(set = W::NOUN, "shutdown signaled; watcher exiting");
                 return;
             }
             let watched_for = started.elapsed();
             backoff.credit(watched_for);
-            self.state.metrics.nats_connected.set(0);
+            W::record_connected(&self.state, false);
             warn!(
+                set = W::NOUN,
                 watched_secs = watched_for.as_secs(),
                 backoff_secs = backoff.delay().as_secs(),
-                "deny-set watch exited; reconnecting"
+                "watch exited; reconnecting"
             );
             tokio::select! {
                 _ = shutdown.changed() => return,
@@ -352,9 +555,9 @@ async fn connect(state: &GatewayState) -> crate::error::Result<Arc<dyn KvStore>>
     Ok(store)
 }
 
-/// Seed (if needed) and stream deny-set deltas until the watch ends or shutdown is signaled.
+/// Seed (if needed) and stream one set's deltas until the watch ends or shutdown is signaled.
 /// Returns `true` iff it exited because `shutdown` fired — the caller then stops reconnecting.
-async fn watch_deny(
+async fn watch_set<W: WatchedSet>(
     state: &Arc<GatewayState>,
     store: Arc<dyn KvStore>,
     cursor: &mut WatchCursor,
@@ -368,20 +571,22 @@ async fn watch_deny(
     // set ⇒ revision 0, which is *not* a resume point (see `is_resumable`) — we still watch, but we
     // don't claim to be seeded, so the next connect scans again.
     if !*seeded {
-        match store.reader().scan(BLACKHOLE_PREFIX).await {
+        match store.reader().scan(W::PREFIX).await {
             Ok(entries) => {
                 let baseline_rev = baseline_revision(&entries);
-                let set = denyset_from_entries(entries.iter());
+                let set = W::from_entries(state, entries.iter());
+                let count = W::len(&set);
                 info!(
-                    count = set.len(),
+                    set = W::NOUN,
+                    count,
                     revision = baseline_rev,
                     // Revision 0 means the watch below runs without replay and we'll rescan on the
                     // next connect — worth saying out loud for whoever is reading these lines.
                     resumable = baseline_rev > 0,
-                    "seeded deny-set from scan"
+                    "seeded from scan"
                 );
-                state.metrics.deny_set_size.set(set.len() as i64);
-                state.deny.store(Arc::new(set));
+                W::record_size(state, count);
+                W::slot(state).store(Arc::new(set));
                 *cursor = WatchCursor::from_u64(baseline_rev);
                 // Persist the freshly-scanned baseline so a later restart can skip the scan. We
                 // *rebuild* the file (not append): this path runs on a cold boot or after a
@@ -390,7 +595,7 @@ async fn watch_deny(
                 // later `load()` would replay and resurrect (wrongly re-denying a tenant). A clean
                 // rewrite from the live scan makes the on-disk state exactly match NATS.
                 if writer.is_some() {
-                    if let Some(path) = state.config.snapshot_path.clone() {
+                    if let Some(path) = W::snapshot_path(state) {
                         *writer =
                             rebuild_snapshot(PathBuf::from(path), entries, cursor.clone()).await;
                     }
@@ -408,7 +613,7 @@ async fn watch_deny(
             Err(e) => {
                 // No baseline yet — serve whatever's already in memory (fail-open) and let the
                 // reconnect loop retry the scan.
-                warn!(error = %e, "deny-set scan failed; serving current set, will retry");
+                warn!(set = W::NOUN, error = %e, "scan failed; serving current set, will retry");
                 return false;
             }
         }
@@ -419,7 +624,7 @@ async fn watch_deny(
     // degrades this to a bare `watch_prefix` / `DeliverPolicy::New`; `seeded` is false in that case,
     // so the next connect rescans rather than living with a replay-less watch forever.
     let Some(watcher) = store.watcher() else {
-        warn!("store has no watcher; deny-set will not update");
+        warn!(set = W::NOUN, "store has no watcher; set will not update");
         return false;
     };
     let (tx, mut rx) = tokio::sync::mpsc::channel::<KvUpdate>(WATCH_CHANNEL_CAPACITY);
@@ -427,7 +632,7 @@ async fn watch_deny(
     // `watcher` is an owned `Arc` from `store.watcher()` and unused after this, so move it in.
     let watch = tokio::spawn(async move {
         watcher
-            .watch_prefix_from(BLACKHOLE_PREFIX, &start_cursor, tx)
+            .watch_prefix_from(W::PREFIX, &start_cursor, tx)
             .await
     });
 
@@ -461,13 +666,13 @@ async fn watch_deny(
         // afterwards: `rcu` returns the *previous* value, and taking a second guard just to count
         // what we already hold is wasted work. The closure re-runs on contention, and the run that
         // wins is the last one, so this ends up holding the length actually published.
-        let mut denied = 0usize;
-        state.deny.rcu(|cur| {
-            let set = apply_batch(cur, &batch);
-            denied = set.len();
+        let mut count = 0usize;
+        W::slot(state).rcu(|cur| {
+            let set = W::apply_batch(state, cur, &batch);
+            count = W::len(&set);
             Arc::new(set)
         });
-        state.metrics.deny_set_size.set(denied as i64);
+        W::record_size(state, count);
         // The batch's resume point is its newest delta — that's what the checkpoint below records,
         // and what a reconnect resumes strictly after.
         if let Some(last) = batch.last() {
@@ -481,12 +686,15 @@ async fn watch_deny(
     match watch.await {
         Ok(Ok(())) => {}
         Ok(Err(KvError::CursorExpired)) => {
-            warn!("deny-set resume cursor expired (history compacted past it); will rescan");
+            warn!(
+                set = W::NOUN,
+                "resume cursor expired (history compacted past it); will rescan"
+            );
             *seeded = false;
             *cursor = WatchCursor::none();
         }
-        Ok(Err(e)) => warn!(error = %e, "deny-set watch ended"),
-        Err(e) => warn!(error = %e, "deny-set watch task panicked"),
+        Ok(Err(e)) => warn!(set = W::NOUN, error = %e, "watch ended"),
+        Err(e) => warn!(set = W::NOUN, error = %e, "watch task panicked"),
     }
     false
 }
@@ -553,6 +761,19 @@ mod tests {
             value: value.to_vec(),
             version: VersionToken::from_u64(1),
         }
+    }
+
+    /// The deny-set's prefix is what the control plane writes to; it used to be a module-level
+    /// `const` and now lives in a trait impl, one of several `WatchedSet` implementations. A typo
+    /// there fails **silently and completely**: the gateway boots, scans a prefix nothing is written
+    /// to, seeds an empty set, and cheerfully serves every denied tenant forever. Nothing else in
+    /// this file would notice. Pin the literal.
+    #[test]
+    fn deny_watches_the_blackhole_prefix() {
+        assert_eq!(Deny::PREFIX, "blackhole.");
+        // And the keys `deny::parse_key` accepts must actually live under it — the prefix and the
+        // parser are two halves of one contract, and agreeing with each other is the whole job.
+        assert_eq!(deny::parse_key(&format!("{}42", Deny::PREFIX)), Some(42));
     }
 
     #[test]

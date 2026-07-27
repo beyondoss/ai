@@ -24,6 +24,9 @@ published `beyond-slipstream` — clones, CI-builds, and publishes anywhere.
 | **Candidate**                                    | One `(provider, upstream model id, path)` a catalog row will accept, in preference order; tried on a connect failure                                                              | A load-balancing pool — strictly ordered, and only entered on failure        |
 | **Deny-set**                                     | Sparse map of denied `tenant_id`s → reason; gates managed traffic; default-allow                                                                                                  | An allowlist or ACL — misses are allowed, not blocked                        |
 | **Tail tap**                                     | Bounded 64KB window kept from the end of the response for usage extraction                                                                                                        | A buffer or copy — the response is relayed unbuffered; only the tail is kept |
+| **Capture-set**                                  | Sparse map of `tenant_id`s with payload logging on; default-**off**; watched under its own prefix by its own watcher                                                              | Retention policy — the gateway emits and forgets; the store owns TTL/erasure |
+| **Capture tap**                                  | Bounded **head**-keeping copy of each body, taken pre-rewrite; relayed bytes are untouched                                                                                        | A buffer — nothing is withheld, so it costs memcpy, never latency            |
+| **Control header** (`x-beyond-*`)                | Per-request caller input: `metadata` tags, `capture` on/off. Managed only; stripped before the upstream                                                                           | A way to fail a request — unusable values are dropped and counted, never 4xx |
 | **Snapshot**                                     | On-disk deny-set cache (entries + NATS cursor) for edge/tunnel deployments                                                                                                        | Persistent store — a pure cache; delete it and the gateway re-scans NATS     |
 | **Virtual key** (`bai_v1.{kid}.{payload}.{sig}`) | Ed25519-signed token encoding `tenant_id` + `vpc_id` (16-byte fixed payload)                                                                                                      | A session or auth token — stateless, no server-side lookup, no revocation    |
 
@@ -54,6 +57,8 @@ Client (stock OpenAI/Anthropic SDK)
   │       │                                    │
   │       │           pool key required ───────────────────────── 503
   │       └─ BYO: pass through (no verify, no deny-set, no billing)
+  │  ├─ Managed only: parse x-beyond-* control headers (never rejects; bad values counted)
+  │  │    capture decision = header (wins both ways) else capture-set rule ∧ 1-in-N sample
   │  └─ Circuit breaker (per provider, all traffic): if OPEN ─────► 503
   │       (claims a half-open probe permit only on an actual attempt)
   │
@@ -70,12 +75,15 @@ Client (stock OpenAI/Anthropic SDK)
   │  Managed: remove every static-key header (authorization, x-api-key, api-key,
   │    x-goog-api-key) UNCONDITIONALLY → inject pool key in the provider's own scheme
   │  BYO: leave auth header unchanged
+  │  Strip x-beyond-* control headers (ours; meaningless upstream)
   │  Set Host; path: verbatim for /{provider} (prefix stripped), or the candidate's
   │    own catalog path for /auto. Model-routed: strip x-beyond-model
   │  OpenRouter + managed only: dashboard-attribution headers (HTTP-Referer, X-OpenRouter-*)
   │
   ▼  request_body_filter (proxy.rs)  — streamed through, except where a rewrite needs the whole body
   │  Enforce running size cap (chunked-safe) ──────────────────── 413
+  │  Capturing: copy chunk into the head-bounded request buffer — PRE-rewrite, so the
+  │    capture is what the client sent, not what we spliced (never withheld)
   │  Managed + streamed: feed chunks → ModelScanner (peek.rs), root-level `model`, O(1) mem
   │    (BYO skips it — `model` is only ever read on the managed billing path)
   │  Injection-eligible (managed + OpenAI dialect + path suffix /chat/completions):
@@ -97,30 +105,54 @@ Client (stock OpenAI/Anthropic SDK)
   │  Append to bounded 64KB tail (copy_within compaction once tail > 128KB)
   │  Anthropic SSE only: also keep a bounded 8KB head — message_start carries input + cache
   │    tokens and would otherwise be compacted out of the tail
+  │  Capturing: copy chunk into the head-bounded response buffer (same passive-tap contract
+  │    as the usage tail; opposite end, because meaning is at the front)
   │
   ▼  logging (proxy.rs)
      Parse usage from tail (by dialect + streaming flag)
      Emit ai.usage fact: tenant, vpc, model, requested_model, routed_model, token counts +
-       reasoning breakout (managed only)
+       reasoning breakout, + x-beyond-metadata tags (managed only) → blocking stdout, lossless
+     Capturing: emit ai.payload (both bodies, truncation + completeness flags), correlated by
+       request_id → bounded queue, DROPPED on overflow so a stalled sink can't backpressure
      Record circuit-breaker outcome, only if one is still owed (breaker_pending): 5xx / upstream
        failure → failure; else → success (429 and client aborts included)
      Decrement requests_in_flight gauge
 ```
 
-### Background: Deny-Set Watcher
+### Background: Control-Plane Watchers
+
+Two sparse per-tenant sets, watched independently. The seed → watch → batch-apply → reconnect loop
+is written **once**, over the `WatchedSet` trait, and instantiated per set — that loop carries the
+non-obvious correctness properties (revision-0 resume trap, scan→subscribe race, batched `rcu`,
+backoff crediting), and a second copy would be a standing invitation for the two to drift.
 
 ```
-NATS (blackhole.* KV entries)
-  │
-  ▼  store_watch.rs (Pingora BackgroundService)
-  │  On connect: seed from disk snapshot (if snapshot_path set) or full NATS scan
-  │  Resume watch from saved revision (gap-free — no entry lost mid-connect)
-  │  Reconnect backoff: 1s → 30s exponential
-  │
-  ▼  ArcSwap<DenySet>  (state.rs)
-     Lock-free read on every managed request
-     Written only by the watcher on entry add/remove
+NATS (blackhole.* KV entries)          NATS (aicapture.* KV entries)
+  │                                      │
+  ▼  store_watch.rs::WatcherService<Deny>│  store_watch.rs::WatcherService<Capture>
+  │  (Pingora BackgroundService)         │  (its own connection, cursor, reconnect loop)
+  │  On connect: seed from disk snapshot │  On connect: seed from NATS scan only
+  │  (if snapshot_path) or NATS scan     │  (no snapshot — see below)
+  │  Resume from saved revision          │  Resume from saved revision
+  │  Reconnect backoff: 1s → 30s         │  Reconnect backoff: 1s → 30s
+  │                                      │
+  ▼  ArcSwap<DenySet>  (state.rs)        ▼  ArcSwap<CaptureSet>  (state.rs)
+     Lock-free read, every managed req      Lock-free read, every managed req
 ```
+
+**One service per set, hence one NATS connection per set.** The extra connection buys independent
+failure domains: a capture-set scan that keeps failing backs off on its own schedule and cannot
+slow, stall, or reseed deny enforcement.
+
+**Only the deny-set gets an on-disk snapshot.** The snapshot exists so _enforcement_ survives a cold
+start before NATS reconnects. Capture is not enforcement — "captured nothing for the first few
+seconds after a restart" is a non-event — so `Capture::snapshot_path` returns `None`, which makes
+every snapshot path in the module inert for that set without a single conditional elsewhere.
+
+Both sets are **fail-open and off the critical path**, which is the property that lets them live
+behind NATS at all: a deny-set outage degrades to stale enforcement, a capture-set outage degrades
+to no capture. Auth, signing keys, and pool keys deliberately stay in boot config so a NATS outage
+can never stop the gateway serving. Do not put must-have config behind a watched set.
 
 ---
 
@@ -279,6 +311,94 @@ exclusively by the NATS watcher via `ArcSwap`; reads on the hot path are lock-fr
 
 Reasons: `Spend` (→ 402), `Fraud` (→ 403), `Unknown` (→ 403, fail-safe for unrecognized values).
 Restore = explicit delete from NATS KV or TTL expiry — no gateway-side timer.
+
+### Control surface (`control.rs`) and payload capture (`capture.rs`)
+
+The `x-beyond-*` headers are the per-request control surface, parsed once in `request_filter` after
+identity is verified and stripped in `upstream_request_filter` before the request leaves.
+**Managed only** — a BYO request carries no verified `tenant_id`, so a tag on it would be an
+unattributable row, the same reason `ai.usage` is managed-only.
+
+| Header              | Value                                       | Effect                                         |
+| ------------------- | ------------------------------------------- | ---------------------------------------------- |
+| `x-beyond-metadata` | flat JSON object of scalars, ≤1KB, ≤16 keys | tags `ai.usage` + `ai.payload`                 |
+| `x-beyond-capture`  | `on` / `off`                                | enables or suppresses capture for this request |
+
+**Nothing here can fail a request.** Malformed, oversize, or unrecognized values are dropped and
+counted on `ai_control_header_errors_total`; the request proceeds as if the header were absent. An
+observability header that can 400 a customer's inference call is a worse bug than the missing
+observability — and on a proxy, the header we would be rejecting was written by _their_ SDK.
+
+**Metadata is re-serialized, never passed through.** The client's JSON is parsed, validated, and
+re-emitted from the parsed values with keys sorted. Log injection is therefore structurally
+impossible rather than filtered-for, and identical tags always render identically.
+
+Capture has **two enablers and one suppressor**, because they serve different people:
+
+| Source                       | Enable | Suppress | Serves                                                            |
+| ---------------------------- | :----: | :------: | ----------------------------------------------------------------- |
+| Control plane (`aicapture.`) |   ✓    |    —     | operator; retroactive; needs no cooperation from the client       |
+| `x-beyond-capture`           |   ✓    |    ✓     | caller; per-request precision — "log this trace" / "not this one" |
+
+The header wins in both directions. The control-plane path is the one the founding use case needs:
+when a user reports that the agent did something stupid, the request has already happened and the
+client cannot be changed. A header-only design would require the customer to ship code before we
+could help them, and would make debugging a _misbehaving_ client impossible.
+
+An explicitly requested capture is **never sampled away** — a caller who asks to log one trace and
+silently gets nothing is the single outcome that makes the feature useless. Sampling (`sample_n`)
+bounds only control-plane-enabled capture.
+
+**Enablement expiry costs zero gateway code**: the control plane writes the `aicapture.{tenant}`
+entry with a slipstream TTL, and its expiry arrives as an ordinary `Delete` delta.
+
+### Capture is a tap, not a buffer
+
+Capture copies each chunk as it passes and **never withholds a byte** — the same passive-tap
+contract as the usage tail beside it. Nothing is rewritten, so there is no added client latency,
+only bounded memcpy and memory. `tests/capture.rs` asserts byte-identical relay in both directions
+with capture on; that is the invariant that would make the feature unshippable if it broke.
+
+Two details that follow from where the taps sit:
+
+- **Head, not tail** — deliberately the inverse of `UsageTail`. Usage lives at the _end_ of a
+  response; meaning lives at the _start_ of a request. Truncating from the front would discard the
+  system prompt, which is the part that explains what the agent was told to do. Truncation is
+  flagged, because a capture that reads as complete when it isn't produces confident wrong
+  conclusions mid-incident.
+- **Pre-rewrite bytes** — the request tap runs on the chunk as it arrives, before both end-of-stream
+  rewrites (`stream_options` injection and the model-routed `model` re-spelling). Capturing a
+  `stream_options` the client's SDK never sent, or a `model` re-spelled for whichever failover
+  candidate served, sends an engineer hunting through their own code for something the gateway put
+  there.
+
+Bodies only, never headers — so no pool key or `Authorization` value can reach a capture. Partial
+captures are kept and marked (`complete: false`): `logging` runs on upstream errors and client
+disconnects too, and "the stream died at token 400" is frequently the answer.
+
+### Payload egress (`capture_sink.rs`)
+
+`ai.usage` keeps the blocking stdout writer and is **lossless** — a dropped billing row is money we
+can't account for. `ai.payload` gets a **bounded, lossy** queue drained by its own OS thread, and
+overflow drops the line rather than waiting. `init_tracing` installs the two as separate layers
+whose target filters are exact complements.
+
+The hazard this removes is real: a synchronous multi-KB write means that if the log shipper stops
+draining the stdout pipe, `write(2)` blocks and a _log sink_ is applying backpressure to the proxy.
+Observability that can stall the data plane is a worse bug than the missing observability.
+
+Drops are counted on `ai_capture_dropped_total`. That counter is what makes a missing payload
+diagnosable ("capture was on and we lost it") rather than ambiguous ("was capture even on?") —
+which is exactly the question asked during the incident capture exists to serve.
+
+**Downstream schema.** Payload rows ship on the same logfwd/OTLP path as `ai.usage` and correlate by
+`request_id`, which is also returned to the client in `x-beyond-request-id` — so a user quoting that
+id resolves straight to their conversation with no join table. Retention and deletion are the
+store's concern, not the gateway's: a `TTL captured_at + INTERVAL <n> DAY` clause on the table, and
+`ALTER TABLE ai_payload DELETE WHERE tenant_id = ?` for a tenant erasure request. The gateway emits
+and forgets. `metadata` arrives as a JSON object string; materialize it as `Map(String, String)` so
+`GROUP BY metadata['feature']` answers "which feature is burning money" against the same row that
+carries the tokens.
 
 ### Rate Guardrails (`ratelimit.rs`)
 
@@ -622,7 +742,10 @@ Secret-bearing fields (`pool_keys`, `nats_creds`) are held as `Secret<T>` — st
 | `idle_timeout_secs`             | `90`                              | Idle timeout on a pooled upstream connection before it's closed.                                                                                                                                           |
 | `shutdown_grace_period_secs`    | `600`                             | SIGTERM drain window for in-flight requests (= `read_timeout_secs` so a deploy never truncates a stream). Capped by the orchestrator's stop timeout (ECS Fargate: 120s).                                   |
 | `shutdown_runtime_timeout_secs` | `10`                              | Final runtime-teardown backstop after the drain window.                                                                                                                                                    |
-| `nats_url`                      | `nats://localhost:4222`           | NATS server for the deny-set watcher. Unreachable → fail-open (deny-set stays empty or stale).                                                                                                             |
+| `capture_max_bytes`             | `262144`                          | Per-direction cap on a captured payload before truncation; the default a per-tenant entry overrides. Really a bound on what the log pipeline will carry — raise only alongside its per-record limit.       |
+| `capture_default_sample_n`      | `1`                               | Default sampling for control-plane-enabled capture (keep 1 request in N). `1` captures every request. A capture requested via `x-beyond-capture: on` is never sampled away.                                |
+| `capture_queue_depth`           | `1024`                            | Depth of the bounded `ai.payload` sink queue. When full, captures are **dropped** (`ai_capture_dropped_total`) rather than blocking — a stalled log sink must never backpressure the data plane.           |
+| `nats_url`                      | `nats://localhost:4222`           | NATS server for both control-plane watchers. Unreachable → fail-open (deny-set stale, capture off).                                                                                                        |
 | `nats_creds`                    | _(unset)_                         | NATS credentials file path. Required for authenticated clusters.                                                                                                                                           |
 | `listen_addr`                   | `0.0.0.0:8080`                    | Proxy listener address (client traffic).                                                                                                                                                                   |
 | `provider_authorities.auto`     | _(rejected)_                      | Reserved: `auto` is the model-routed segment, and a provider of that name would shadow it. Hard boot failure.                                                                                              |
@@ -670,7 +793,13 @@ Prometheus on the default registry, exposed at `/metrics` on `metrics_listen`.
 | `ai_active_streams`                   | Gauge     | —                    | Open SSE streams                                                                       |
 | `ai_requests_in_flight`               | Gauge     | —                    | All in-flight requests (streaming + non-streaming)                                     |
 | `ai_deny_set_size`                    | Gauge     | —                    | Current number of denied tenants                                                       |
-| `ai_nats_connected`                   | Gauge     | —                    | 1 if NATS watcher is connected, 0 otherwise                                            |
+| `ai_nats_connected`                   | Gauge     | —                    | 1 if the **deny-set** watcher is connected, 0 otherwise                                |
+| `ai_capture_set_size`                 | Gauge     | —                    | Tenants with payload capture enabled (climbing and never falling ⇒ missing TTLs)       |
+| `ai_capture_nats_connected`           | Gauge     | —                    | 1 if the **capture-set** watcher is connected — separate watcher, separate connection  |
+| `ai_captures_total`                   | Counter   | —                    | Requests whose payloads were captured (post-sampling)                                  |
+| `ai_capture_bytes_total`              | Counter   | —                    | Payload bytes handed to the sink — the cost signal, ahead of the storage bill          |
+| `ai_capture_dropped_total`            | Counter   | —                    | Captures dropped on a full sink queue — distinguishes "lost it" from "capture was off" |
+| `ai_control_header_errors_total`      | Counter   | —                    | `x-beyond-*` headers present but unusable (dropped; request still served)              |
 | `ai_usage_parse_errors_total`         | Counter   | —                    | Managed 2xx responses with no parseable usage (emitted as a zero-token billing row)    |
 | `ai_candidate_failovers_total`        | Counter   | —                    | Model-routed requests that abandoned a candidate for the next one                      |
 | `ai_model_header_body_mismatch_total` | Counter   | —                    | Model-routed requests whose routing header and body `model` disagreed (client bug)     |
@@ -688,10 +817,13 @@ Prometheus on the default registry, exposed at `/metrics` on `metrics_listen`.
 | `peek`            | `ModelScanner` — streaming structural scan for the root-level `model`; O(1) memory                   | unit ✓         |
 | `usage`           | Token extraction (OpenAI / Anthropic, body + SSE)                                                    | unit ✓         |
 | `deny`            | Sparse deny-set, default-allow, reason → HTTP status                                                 | unit ✓         |
+| `capture`         | Sparse capture-set (default-off) + head-bounded `CaptureBufs` and 1-in-N sampling                    | unit ✓ + e2e ✓ |
+| `capture_sink`    | Bounded, lossy `ai.payload` writer — drops on a full queue so a stalled log sink can't backpressure  | unit ✓         |
+| `control`         | `x-beyond-*` header parse/validate; metadata canonicalized and re-serialized, never passed through   | unit ✓ + e2e ✓ |
 | `ratelimit`       | Two-tier guardrail: per-credential (count-min sketch, fixed memory, no GC) + global BYO (one atomic) | unit ✓         |
 | `circuit_breaker` | Per-provider lock-free breaker (packed `AtomicU64`, windowed policy) — trips on 5xx/connect, not 429 | unit ✓ + e2e ✓ |
-| `state`           | Keyring + resolved provider registry + watched deny-set (ArcSwap) + TTL DNS cache                    | unit ✓         |
-| `store_watch`     | NATS watcher — gap-free deny-set seeding + delta watch as Pingora `BackgroundService`                | e2e ✓          |
+| `state`           | Keyring + provider registry + watched deny-/capture-sets (ArcSwap) + TTL DNS cache                   | unit ✓         |
+| `store_watch`     | Generic `WatchedSet` driver — gap-free seeding + delta watch, instantiated per set                   | e2e ✓          |
 | `config`          | Figment config; build keyring; pool keys / authorities by provider name                              | unit ✓         |
 | `secret`          | Redacting, zeroize-on-drop `Secret<T>` newtype for pool keys and NATS creds                          | unit ✓         |
 | `admin`           | `ServeHttp` on the metrics listener: `/livez`, `/readyz`, `/metrics`                                 | e2e ✓          |

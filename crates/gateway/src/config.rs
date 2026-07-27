@@ -207,6 +207,25 @@ pub struct AiConfig {
     /// How long the breaker stays open before allowing a half-open probe request (seconds). Long enough
     /// to let a provider recover, short enough that recovery is detected promptly.
     pub circuit_breaker_reset_secs: u64,
+
+    /// Per-direction byte cap on a captured payload, before truncation. Applies to the request body
+    /// and the response body independently, and is the default a control-plane capture entry
+    /// overrides per tenant.
+    ///
+    /// This is really a bound on what the **log pipeline** will carry: a captured payload rides the
+    /// same logfwd/OTLP path as `ai.usage`, so the cap has to sit under whatever per-record limit
+    /// that path enforces. Raise it only alongside that limit, or captures will be silently dropped
+    /// downstream where this gateway can't see it happen.
+    pub capture_max_bytes: u32,
+    /// Default sampling for control-plane-enabled capture: keep 1 request in N. `1` captures every
+    /// request. Ignored for a capture explicitly requested via `x-beyond-capture: on`, which is
+    /// never sampled away.
+    pub capture_default_sample_n: u32,
+    /// Depth of the bounded queue feeding the capture sink. When it fills, captures are **dropped**
+    /// (counted on `ai_capture_dropped_total`) rather than blocking — a stalled log sink must never
+    /// be able to backpressure the data plane. Deeper absorbs longer sink stalls at the cost of
+    /// holding more payload bytes in memory.
+    pub capture_queue_depth: usize,
 }
 
 impl Default for AiConfig {
@@ -263,6 +282,18 @@ impl Default for AiConfig {
             circuit_breaker_threshold: 20,
             circuit_breaker_window_secs: 10,
             circuit_breaker_reset_secs: 30,
+            // 256 KiB per direction. Comfortably holds a large system prompt plus a long
+            // conversation — the shapes this feature exists to explain — while staying well under
+            // the per-record size a log/OTLP pipeline will carry without complaint.
+            capture_max_bytes: 256 * 1024,
+            // Capture everything for a tenant that's been switched on. Capture is a targeted
+            // debugging tool enabled for one tenant at a time, so the default that answers "what did
+            // the agent do" is *all of it*; sampling is the escape hatch for a tenant whose volume
+            // makes that impractical, set per-tenant on the control-plane entry.
+            capture_default_sample_n: 1,
+            // Absorbs a multi-second sink stall at a healthy capture rate. Past that we drop rather
+            // than block — see the field docs and `ai_capture_dropped_total`.
+            capture_queue_depth: 1024,
         }
     }
 }
