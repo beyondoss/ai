@@ -194,10 +194,18 @@ it happens to start on. Reading the provider there fails silently in the worst w
 response meets the OpenAI extractor, trips the dialect-mismatch guard, and bills zero tokens.
 
 That is what makes **Claude failover real today**: `claude-opus-4-8` routes to Anthropic first and
-falls back to OpenRouter's Messages endpoint as `anthropic/claude-opus-4.8`. OpenRouter itself fronts
-Bedrock for that traffic, so this is Bedrock-backed Claude failover with no SigV4 and no
-`application/vnd.amazon.eventstream` decoding. Every row and candidate is verified against the live
-providers by `catalog_rows_are_servable` in `tests/smoke.rs`.
+falls back to OpenRouter's Messages endpoint as `anthropic/claude-opus-4.8`. Every row and candidate
+is verified against the live providers by `catalog_rows_are_servable` in `tests/smoke.rs`, and the
+failover itself by `model_route_fails_over_to_a_real_provider`.
+
+**What that failover does and does not cover.** OpenRouter picks its own backend per request — these
+ids have been observed served from Anthropic directly _and_ from Amazon Bedrock — so the second
+candidate is not a guaranteed independent supply of the model. It reliably covers the failures that
+are on our side of the wire: egress blocked, our Anthropic key throttled or suspended,
+`api.anthropic.com` unreachable from us, or that account rate-limited. It does not guarantee cover
+for Anthropic's own serving being down, because OpenRouter may be forwarding to the same place.
+Genuinely independent Claude capacity still means Bedrock or Vertex directly, which is the SigV4 /
+GCP-OAuth work described below.
 
 ### Identity (`key.rs`)
 

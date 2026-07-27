@@ -82,9 +82,15 @@ pub const MAX_CANDIDATES: usize = 8;
 ///
 /// Each id/path pair below returned `200` from the real provider when it was added.
 pub const MODEL_ROUTES: &[ModelRoute] = &[
-    // Claude on the Anthropic wire, with a real second source. OpenRouter's `/api/v1/messages` is a
-    // genuine Messages endpoint — and it fronts Bedrock, so this is Bedrock-backed Claude failover
-    // without a line of SigV4 or eventstream decoding.
+    // Claude on the Anthropic wire, with a real second source: OpenRouter's `/api/v1/messages` is a
+    // genuine Messages endpoint, reached with a different key over a different network path.
+    //
+    // Know what this does and does not buy. OpenRouter chooses its own backend per request —
+    // observed serving these ids from both Anthropic directly and Amazon Bedrock — so the second
+    // candidate is *not* a guaranteed independent supply of the model. It reliably covers the
+    // failures that are ours: our egress blocked, our Anthropic key throttled or suspended,
+    // api.anthropic.com unreachable from us. It does not guarantee cover for Anthropic's own
+    // serving being down, because OpenRouter may be forwarding there too.
     ModelRoute {
         model: "claude-haiku-4-5",
         wire: WireFormat::Anthropic,
