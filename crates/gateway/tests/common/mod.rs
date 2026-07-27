@@ -27,33 +27,99 @@ use tokio::net::TcpListener;
 use tokio::time::{sleep, timeout};
 use tokio_rustls::TlsAcceptor;
 
-/// Hand out a TCP port no other `free_port()` call in this test binary has returned.
+/// The directory this test *run* reserves ports in, shared by every process in the run.
 ///
-/// Tests run as concurrent threads in **one** process, and closing a `bind(:0)` listener lets the OS
-/// immediately re-hand that ephemeral port to the next `bind(:0)` — so two `free_port()` calls (a
-/// gateway's `listen` + `metrics` ports, or two tests at once) can collide, and a component then
-/// fails to bind → a *different* test flakes. A process-global reservation set makes every returned
-/// port distinct within the run; binding fresh listeners on collision forces the OS off the just-used
-/// port (it can't re-hand a port still held open) so the loop makes progress.
+/// Keyed on `NEXTEST_RUN_ID` so concurrent runs never see each other's reservations and a finished
+/// run leaves nothing that shrinks the next one's pool. Falls back to the pid under plain
+/// `cargo test`, where a single process makes the in-memory set sufficient anyway.
+fn port_reservation_dir() -> Option<std::path::PathBuf> {
+    let run =
+        std::env::var("NEXTEST_RUN_ID").unwrap_or_else(|_| format!("pid-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("beyond-ai-ports-{run}"));
+    let made = std::fs::create_dir_all(&dir).ok().map(|()| dir);
+    // Sweep reservations from runs that ended (killed job, panicked harness, plain `cargo test` pid
+    // reuse). Best-effort and non-fatal: the only cost of a missed sweep is a stale directory, and
+    // the only cost of a failed removal is that it stays one round longer.
+    sweep_stale_port_dirs();
+    made
+}
+
+/// Remove `beyond-ai-ports-*` directories older than an hour, skipping this run's own.
+fn sweep_stale_port_dirs() {
+    let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
+        return;
+    };
+    let hour_ago = std::time::SystemTime::now() - Duration::from_secs(3600);
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !name.starts_with("beyond-ai-ports-") {
+            continue;
+        }
+        let stale = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .is_ok_and(|t| t < hour_ago);
+        if stale {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
+/// Hand out a TCP port no other `free_port()` call in this test **run** has returned.
 ///
-/// A residual TOCTOU window remains between returning a port and a *subprocess* (nats/gateway) binding
-/// it, vs. other OS processes — unavoidable when the bind happens in another process. In-process
-/// servers must instead bind `:0` and read the port back (see `MockUpstream`), which has no window.
+/// Two layers, because there are two ways to collide:
+///
+/// - **Within a process**, closing a `bind(:0)` listener lets the OS immediately re-hand that
+///   ephemeral port to the next `bind(:0)`, so a gateway's `listen` and `metrics` ports can come
+///   back identical. A process-global set makes every returned port distinct, and holding the
+///   colliding listeners open forces the OS onto a different port so the loop makes progress.
+/// - **Across processes**, which is the case that actually bites in CI. The comment here used to say
+///   "tests run as concurrent threads in one process" — true under `cargo test`, and false under
+///   `cargo nextest`, which CI uses and which reports `NEXTEST_EXECUTION_MODE=process-per-test`. Each
+///   test therefore had its *own* empty reservation set, so the guard coordinated nothing between
+///   them: two tests could be handed the same port inside their TOCTOU windows, and whichever
+///   subprocess bound second failed to start — surfacing as a 20s `wait_for_port` timeout in a test
+///   that had done nothing wrong. A reservation file created with `create_new` in a run-scoped
+///   directory closes that: the create is atomic, so exactly one process wins a given port.
+///
+/// The residual window — between returning a port and the *subprocess* binding it — is unavoidable
+/// when the bind happens elsewhere, but it is now only racing processes outside this test run.
+/// In-process servers should still bind `:0` and read the port back (see `MockUpstream`), which has
+/// no window at all.
 pub fn free_port() -> u16 {
     use std::collections::HashSet;
     use std::sync::OnceLock;
     static USED: OnceLock<Mutex<HashSet<u16>>> = OnceLock::new();
+    static DIR: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
     let used = USED.get_or_init(|| Mutex::new(HashSet::new()));
+    let dir = DIR.get_or_init(port_reservation_dir);
 
     let mut held = Vec::new();
     for _ in 0..1000 {
         let listener = StdTcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
-        if used.lock().unwrap_or_else(|p| p.into_inner()).insert(port) {
+        if !used.lock().unwrap_or_else(|p| p.into_inner()).insert(port) {
+            // Already handed out in this process: keep this listener open so the next bind gets a
+            // different port. The held listeners all drop at return, releasing those ports.
+            held.push(listener);
+            continue;
+        }
+        // Claim it for the whole run. `create_new` is atomic, so a concurrent test process racing
+        // for the same port loses here rather than at `bind` time in a subprocess.
+        let claimed = match dir {
+            Some(d) => std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(d.join(port.to_string()))
+                .is_ok(),
+            // No shared directory (read-only tmp, say): fall back to the in-process guard, which is
+            // what this always used to be.
+            None => true,
+        };
+        if claimed {
             return port; // `listener` drops here, freeing the port for the (sub)process to bind.
         }
-        // Already handed out: keep this listener open so the next bind gets a different port, then
-        // try again. The held listeners all drop at return, releasing those ports back to the OS.
         held.push(listener);
     }
     panic!("could not find an unused free port after 1000 attempts");

@@ -63,7 +63,13 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: nextest
+      # Step timeout deliberately *below* the job's. A job killed by `timeout-minutes` is recorded as
+      # cancelled, and GitHub uploads no logs for a cancelled job — so a hang produced a red check
+      # with literally nothing to diagnose it by, three runs running. A step that times out *fails*
+      # instead, the job completes normally, and the log survives with nextest's per-test PASS lines
+      # in it: whatever never printed is the culprit.
       - run: cargo nextest run --workspace --profile ci
+        timeout-minutes: 20
   # The release build is the long pole; running it alongside the others (not after them) is most of
   # the wall-clock win.
   build:
