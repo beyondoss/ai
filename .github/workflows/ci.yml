@@ -94,31 +94,37 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: nextest
-      # `timeout` in the shell, not just `timeout-minutes` on the step. GitHub's own timeouts are
-      # enforced by the runner agent, so when a job wedges hard enough that the agent stops
-      # responding they do not fire at all — observed repeatedly here: a 25-minute job limit ran to
-      # 30, and a 20-minute step limit ran to 27. A job reaped that way is recorded as *cancelled*,
-      # and GitHub uploads no logs for a cancelled job, so every one of those attempts produced a red
-      # check with nothing whatsoever to diagnose it by.
+      # Write to a **file**, never a pipe. This is the whole fix for a hang that cost a day.
       #
-      # A shell-level timeout returns control to the step, which then fails normally, which means the
-      # job completes and its log survives. `tee` keeps a copy either way.
+      # A leaked child — a `serve` daemon that outlived its test, reparented to init — inherits the
+      # step's stdout. GitHub captures a step through a pipe and waits for EOF on it, so one orphan
+      # holding that descriptor wedges the job forever: no output, no log upload (GitHub uploads none
+      # for a job it later records as cancelled), and *no timeout of any kind fires* — not the job's
+      # `timeout-minutes`, not the step's, not even a shell `timeout`, because `timeout` kills the
+      # command it launched and not that command's descendants. Reproduced exactly: with a pipe the
+      # step hangs despite `timeout` firing; with a file redirect it returns the instant `timeout`
+      # fires and the orphan is left writing to a file nobody waits on.
+      #
+      # `</dev/null` so nothing inherits the step's stdin either.
       - name: test
         run: |
-          set -o pipefail
+          set +e
           timeout --signal=TERM --kill-after=30s 15m \
             cargo nextest run --workspace --profile ci ${{ matrix.extra }} -E '${{ matrix.filter }}' \
-            2>&1 | tee "$RUNNER_TEMP/nextest.log"
+            > "$RUNNER_TEMP/nextest.log" 2>&1 </dev/null
+          status=$?
+          tail -300 "$RUNNER_TEMP/nextest.log"
+          [ $status -eq 124 ] && echo "::error::timed out after 15m — the last test above is where it stopped"
+          exit $status
         timeout-minutes: 20
-      # Runs even when the step above times out, so a hang leaves behind the one thing it never has:
-      # the name of the test that was running when everything stopped.
-      - name: last output before the end
+      # Belt and braces: runs even if the step above somehow does not, and names anything still alive.
+      - name: what was left running
         if: always()
         run: |
-          echo "--- disk ---"; df -h / "$RUNNER_TEMP" | sed -n '1,4p'
-          echo "--- memory ---"; free -m | head -3
-          echo "--- final 60 lines of nextest output ---"
-          tail -60 "$RUNNER_TEMP/nextest.log" 2>/dev/null || echo "(no output captured at all)"
+          echo "--- disk ---"; df -h / | tail -1
+          echo "--- memory ---"; free -m | head -2
+          echo "--- surviving beyond-ai processes (leaked daemons) ---"
+          ps -eo pid,etime,rss,args | grep -E "beyond-ai|nats-server" | grep -v grep || echo "  none"
   # The release build is the long pole; running it alongside the others (not after them) is most of
   # the wall-clock win.
   build:
