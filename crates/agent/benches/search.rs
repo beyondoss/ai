@@ -23,9 +23,10 @@ use std::sync::OnceLock;
 use agent_core::Tool;
 use beyond_ai_agent::session_store::{SessionMeta, search_sessions};
 use beyond_ai_agent::tools::exec::{CommandRunner, RealRunner};
-use beyond_ai_agent::tools::{edit, find, grep, ls, output, read};
+use beyond_ai_agent::tools::fs::FsBackend as _;
+use beyond_ai_agent::tools::fs::local::LocalFs;
+use beyond_ai_agent::tools::{edit, fs, ls, output, read};
 use divan::Bencher;
-use globset::Glob;
 use tempfile::TempDir;
 
 #[global_allocator]
@@ -74,10 +75,11 @@ fn tree() -> &'static PathBuf {
 #[divan::bench(args = [1, 0])]
 fn grep_engine(bencher: Bencher, threads: usize) {
     let root = tree();
-    let job = grep::GrepJob::new(NEEDLE, false, false, None, root.clone(), 100).unwrap();
+    let backend = LocalFs::with_threads(threads);
+    let q = fs::local::query(NEEDLE, root.clone(), 100);
     bencher.bench_local(|| {
-        let (m, _, _) = grep::search(&job, threads);
-        black_box(m.len());
+        let outcome = backend.search_blocking(&q).unwrap();
+        black_box(outcome.hits.len());
     });
 }
 
@@ -105,10 +107,11 @@ fn grep_rg_subprocess(bencher: Bencher) {
 #[divan::bench]
 fn grep_dense(bencher: Bencher) {
     let root = tree();
-    let job = grep::GrepJob::new("ordinary", false, false, None, root.clone(), 100).unwrap();
+    let backend = LocalFs::with_threads(1);
+    let q = fs::local::query("ordinary", root.clone(), 100);
     bencher.bench_local(|| {
-        let (m, _, _) = grep::search(&job, 1);
-        black_box(m.len());
+        let outcome = backend.search_blocking(&q).unwrap();
+        black_box(outcome.hits.len());
     });
 }
 
@@ -448,14 +451,19 @@ fn search_rank(bencher: Bencher, n: usize) {
 #[divan::bench]
 fn find_walk(bencher: Bencher) {
     let root = tree();
-    let job = find::FindJob::new(
-        Glob::new("*.rs").unwrap().compile_matcher(),
-        true,
-        root.clone(),
-        1000,
-    );
+    let backend = LocalFs::new();
+    let q = fs::GlobQuery {
+        pattern: "*.rs".to_string(),
+        basename_only: true,
+        case_insensitive: false,
+        root: root.clone(),
+        limit: 1000,
+    };
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
     bencher.bench_local(|| {
-        let (p, _, _) = find::search(&job);
-        black_box(p.len());
+        let outcome = rt.block_on(backend.glob(&q)).unwrap();
+        black_box(outcome.paths.len());
     });
 }

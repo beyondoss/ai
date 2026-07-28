@@ -90,6 +90,12 @@ pub struct ChildToolConfig {
     pub web_allow_private: bool,
     pub web_allow_hosts: Vec<String>,
     pub web_timeout_ms: Option<u64>,
+    /// The parent's filesystem backend, inherited so a child acts on the *same* filesystem.
+    ///
+    /// Not optional plumbing: this module's own doc comment warns that a child escaping the parent's
+    /// constraints "would then *be* the sandbox escape". A parent whose tools act inside a sandbox
+    /// spawning a child whose tools act on the host is exactly that.
+    pub fs_backend: Option<std::sync::Arc<dyn crate::tools::fs::FsBackend>>,
 }
 
 /// Everything a [`Subagent`] needs to build and run a child. Shared by `Arc` across every depth level,
@@ -928,6 +934,7 @@ impl Subagent {
             web_allow_private: self.ctx.tool_cfg.web_allow_private,
             web_allow_hosts: &self.ctx.tool_cfg.web_allow_hosts,
             web_timeout_ms: self.ctx.tool_cfg.web_timeout_ms,
+            fs_backend: self.ctx.tool_cfg.fs_backend.clone(),
         });
         let allow = self.effective_tools(def);
         super::apply_filter(&mut registry, Some(&allow), None, false);

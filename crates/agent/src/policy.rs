@@ -45,6 +45,19 @@ pub struct ToolPolicy {
     /// before `git apply` runs. `git apply` is not a tool call and never reaches `before_tool_call`, so
     /// merge-back is the only place that check can live.
     root: std::path::PathBuf,
+    /// The target's `$HOME` when the gated agent's filesystem tools act somewhere other than this
+    /// host, or `None` for the ordinary local case.
+    ///
+    /// Presence of a value is what selects lexical rather than `canonicalize`-based path resolution —
+    /// see [`crate::tools::write_key`]. That distinction is load-bearing *here specifically*: a deny
+    /// glob evaluated against a host-`canonicalize`d spelling of a path that lives on another machine
+    /// is checking a different file than the one about to be written, which is a bypass rather than a
+    /// cosmetic bug.
+    remote_home: Option<String>,
+    /// Whether the gated tools are remote at all. Separate from [`ToolPolicy::remote_home`] because a
+    /// target whose home we don't know is still remote, and collapsing the two would silently drop
+    /// such a policy back onto host resolution.
+    remote: bool,
 }
 
 impl ToolPolicy {
@@ -82,6 +95,26 @@ impl ToolPolicy {
     pub fn with_root(mut self, root: impl Into<std::path::PathBuf>) -> Self {
         self.root = root.into();
         self
+    }
+
+    /// Builder-style: police paths on another filesystem rather than this host. Must be set whenever
+    /// the gated agent's tool registry was built with a non-local [`crate::tools::fs::FsBackend`], or
+    /// the deny-list evaluates a host-resolved spelling of a path that isn't on this host.
+    pub fn with_remote(mut self, home: Option<String>) -> Self {
+        self.remote = true;
+        self.remote_home = home;
+        self
+    }
+
+    /// The world this policy resolves paths in — the same one the gated tools use.
+    pub fn world(&self) -> crate::tools::fs::PathWorld<'_> {
+        if self.remote {
+            crate::tools::fs::PathWorld::Remote {
+                home: self.remote_home.as_deref(),
+            }
+        } else {
+            crate::tools::fs::PathWorld::Local
+        }
     }
 
     /// The compiled deny-path globs, for the merge-back re-check described on [`ToolPolicy::root`].
@@ -186,10 +219,7 @@ impl AgentHooks for ToolPolicy {
             // a pattern like `--deny-path '/etc/**'` can't be sidestepped with a `./`/`..`-laden or
             // relative spelling of the same path. Resolving against a different root than the tools use
             // would check a path that is not the one about to be written.
-            let target = crate::tools::canonical_write_target(
-                &self.root,
-                &crate::tools::resolve_against(&self.root, path),
-            );
+            let target = crate::tools::write_key(&self.root, path, self.world());
             if let Some(m) = self.denied_paths.iter().find(|m| m.is_match(&target)) {
                 return Some(format!(
                     "path '{target}' is denied by policy (matches {:?})",

@@ -9,124 +9,49 @@
 
 use std::fmt::Write as _;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::OnceLock;
 
 use agent_core::tool::Tool;
 use agent_core::{ToolError, ToolOutput};
 use async_trait::async_trait;
-use globset::{GlobBuilder, GlobMatcher};
-use ignore::WalkBuilder;
 use serde_json::{Value, json};
+
+use super::fs::local::LocalFs;
+use super::fs::{FileKind, FsBackend, GlobQuery};
 
 use super::output::format_path;
 
 /// Default cap on reported paths.
 const DEFAULT_LIMIT: usize = 1000;
-/// Hard ceiling on paths collected before the walk bails — an OOM guard for huge trees. Far above any
-/// sane `limit`; when it trips, which paths survive truncation can depend on walk order (flagged).
-const HARD_CAP: usize = 10_000;
 
-#[derive(Default)]
 pub struct Find {
     /// A relative search `path` (including its `"."` default) resolves against this. Empty = the
     /// process cwd. See [`super::resolve_against`].
     root: PathBuf,
+    /// Where the walk actually happens. Defaults to the host filesystem.
+    backend: Arc<dyn FsBackend>,
+}
+
+impl Default for Find {
+    fn default() -> Self {
+        Self::new(PathBuf::new())
+    }
 }
 
 impl Find {
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
-    }
-}
-
-/// A prepared find: compiled glob, whether it matches the basename only (vs. the full path), search
-/// root, and the report cap.
-pub struct FindJob {
-    matcher: GlobMatcher,
-    basename_only: bool,
-    root: PathBuf,
-    limit: usize,
-}
-
-impl FindJob {
-    /// Assemble a job from an already-compiled glob matcher.
-    pub fn new(matcher: GlobMatcher, basename_only: bool, root: PathBuf, limit: usize) -> Self {
         Self {
-            matcher,
-            basename_only,
-            root,
-            limit,
-        }
-    }
-}
-
-/// Walk the tree and collect matching paths (paired with whether each is a directory), sorted
-/// lexicographically by path. Returns the paths, whether the result was truncated (by `limit` or the
-/// hard cap), and, when the walk hit at least one unreadable path (permission denied, a broken
-/// symlink, …), the first such error's message — matching real `fd`, which exits non-zero and reports
-/// the real error text the moment it can't read *any* path in the tree, rather than silently treating
-/// it as "not found here."
-pub fn search(job: &FindJob) -> (Vec<(PathBuf, bool)>, bool, Option<String>) {
-    let mut paths: Vec<(PathBuf, bool)> = Vec::new();
-    let mut first_error: Option<String> = None;
-    // `hidden(false)` includes dotfiles (like ripgrep --hidden); .gitignore is respected by default.
-    // `require_git(false)` keeps that respect even outside an actual git repository (e.g. a plain
-    // checkout with no `.git`, or a tree copied without its VCS metadata) — the ignore crate's default
-    // otherwise silently stops honoring `.gitignore` the moment there's no repo to find. Only applied
-    // outside a real repo, though — matching pi's own `fd` invocation (`--no-require-git` only when the
-    // root isn't inside a git repo): inside one, the default git-aware walk keeps a nested repo's own
-    // `.gitignore` from leaking parent rules across its boundary.
-    let mut builder = WalkBuilder::new(&job.root);
-    builder.hidden(false);
-    if !super::root_is_inside_git_repo(&job.root) {
-        builder.require_git(false);
-    }
-    for entry in builder.build() {
-        if paths.len() >= HARD_CAP {
-            break;
-        }
-        let entry = match entry {
-            Ok(entry) => entry,
-            // Recorded (not just skipped, the prior behavior), so an otherwise-empty result can say
-            // "couldn't fully search" instead of a confidently wrong "no files matching".
-            Err(e) => {
-                first_error.get_or_insert_with(|| e.to_string());
-                continue;
-            }
-        };
-        let path = entry.path();
-        // Skip the search root itself, but match both files *and* directories — `find "node_modules"`
-        // or any directory-name pattern would otherwise return nothing.
-        if path == job.root {
-            continue;
-        }
-        // `to_string_lossy()` returns a borrowed `Cow` for the (overwhelmingly common) valid-UTF-8
-        // path case — `.into_owned()` used to force an allocation for every walked entry regardless,
-        // not just matches. `GlobMatcher::is_match` only needs `AsRef<Path>`, which a borrowed `&str`
-        // already satisfies, so there's nothing to own here.
-        let candidate = if job.basename_only {
-            path.file_name()
-                .map(|n| n.to_string_lossy())
-                .unwrap_or(std::borrow::Cow::Borrowed(""))
-        } else {
-            path.to_string_lossy()
-        };
-        if job.matcher.is_match(&*candidate) {
-            // `entry.file_type()` is the type already cached from the directory read that produced
-            // this entry — cheaper than a fresh `stat`, and matches real `fd`'s own default of
-            // appending "/" to a directory match (pi's `find` tool post-processes `fd`'s output as-is,
-            // so this reproduces the same signal fd already provides). Missing only for stdin's own
-            // synthetic entry (`-`), which never appears in a filesystem walk — `unwrap_or(false)` is
-            // unreachable in practice, not a meaningful default choice.
-            let is_dir = entry.file_type().is_some_and(|ft| ft.is_dir());
-            paths.push((path.to_path_buf(), is_dir));
+            root: root.into(),
+            backend: Arc::new(LocalFs::new()),
         }
     }
 
-    paths.sort();
-    let truncated = paths.len() > job.limit || paths.len() >= HARD_CAP;
-    paths.truncate(job.limit);
-    (paths, truncated, first_error)
+    /// Walk somewhere other than the host filesystem. See [`super::fs`].
+    pub fn with_backend(mut self, backend: Arc<dyn FsBackend>) -> Self {
+        self.backend = backend;
+        self
+    }
 }
 
 #[async_trait]
@@ -191,12 +116,6 @@ impl Tool for Find {
         // as typed. Without this, `find` was always case-sensitive outright — `*.rs` never matched
         // `File.RS` — silently missing files pi's own `find` would return.
         let case_insensitive = !pattern.chars().any(|c| c.is_uppercase());
-        let matcher = GlobBuilder::new(&glob_src)
-            .case_insensitive(case_insensitive)
-            .build()
-            .map_err(|e| ToolError::InvalidInput(format!("bad glob: {e}")))?
-            .compile_matcher();
-
         let no_match = format!("no files matching {pattern:?}");
         let root = PathBuf::from(root);
         // `search`'s walk unconditionally skips the root entry itself (see its own doc comment on that
@@ -206,19 +125,26 @@ impl Tool for Find {
         // clearly the moment the search path isn't a directory. Checked via `metadata` (not
         // `is_dir()`) so a path that doesn't exist at all still falls through to the walk below, which
         // already reports that case via `walk_error`.
-        if let Ok(meta) = std::fs::metadata(&root) {
-            if !meta.is_dir() {
+        if let Some(meta) = self.backend.stat(&root).await? {
+            if meta.kind != FileKind::Dir {
                 return Err(ToolError::Execution(format!(
                     "Search path '{}' is not a directory.",
                     root.display()
                 )));
             }
         }
-        let job = FindJob::new(matcher, basename_only, root.clone(), limit);
-        // The walk blocks (synchronous directory reads); keep it off the async runtime.
-        let (paths, truncated, walk_error) = tokio::task::spawn_blocking(move || search(&job))
-            .await
-            .map_err(|e| ToolError::Execution(format!("find task failed: {e}")))?;
+        let outcome = self
+            .backend
+            .glob(&GlobQuery {
+                pattern: glob_src,
+                basename_only,
+                case_insensitive,
+                root: root.clone(),
+                limit,
+            })
+            .await?;
+        let (paths, truncated, walk_error) =
+            (outcome.paths, outcome.truncated, outcome.first_error);
 
         if paths.is_empty() {
             // A genuine zero-match walk and a walk that hit an unreadable path along the way both

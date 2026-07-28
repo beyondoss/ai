@@ -453,6 +453,17 @@ enum Command {
         /// The `web` tool's per-request timeout (ms). Default 30,000. `serve`'s identical flag.
         #[arg(long, env = "AI_AGENT_WEB_TIMEOUT_MS")]
         web_timeout_ms: Option<u64>,
+        /// Run the filesystem tools (`read`/`write`/`edit`/`ls`/`grep`/`find`) **inside** this
+        /// instd-managed sandbox VM instead of on this host, reached by `instd instance exec`.
+        ///
+        /// The instance must already exist and be reachable — the agent attaches, it never creates or
+        /// destroys VMs. `bash` still runs on the host in this release. See `--sandbox-sudo`.
+        #[arg(long, env = "AI_AGENT_SANDBOX")]
+        sandbox: Option<String>,
+        /// Invoke `instd` through `sudo -n` when reaching the sandbox — needed when the admin channel
+        /// requires privilege this process doesn't have. Fails rather than prompting.
+        #[arg(long, env = "AI_AGENT_SANDBOX_SUDO")]
+        sandbox_sudo: bool,
         /// Restrict the tool set to exactly these names (comma-separated), dropping everything else.
         /// Combine with `--exclude-tools` to carve one back out of the allow-list. `serve`'s identical
         /// flag/env var — a deployment convention setting this env var to sandbox an agent must apply
@@ -1494,6 +1505,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             web_allow_private,
             web_allow_host,
             web_timeout_ms,
+            sandbox,
+            sandbox_sudo,
             tools,
             exclude_tools,
             no_tools,
@@ -1558,6 +1571,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 web_allow_private,
                 web_allow_host,
                 web_timeout_ms,
+                sandbox,
+                sandbox_sudo,
                 tools,
                 exclude_tools,
                 no_tools,
@@ -3199,6 +3214,8 @@ async fn run_task(
     web_allow_private: bool,
     web_allow_host: Vec<String>,
     web_timeout_ms: Option<u64>,
+    sandbox: Option<String>,
+    sandbox_sudo: bool,
     tools_allow: Option<Vec<String>>,
     tools_exclude: Option<Vec<String>>,
     no_tools: bool,
@@ -3576,6 +3593,27 @@ async fn run_task(
         eprintln!("warning: {warning}");
     }
     timing.mark("connect mcp servers");
+    // Attaching a sandbox swaps *one* thing: where the filesystem tools' I/O lands. The tools, their
+    // names, descriptions and schemas are untouched, so the model cannot tell the difference — see
+    // `tools::fs`.
+    let fs_backend: Option<std::sync::Arc<dyn tools::fs::FsBackend>> = match &sandbox {
+        Some(id) => {
+            let mut runner = beyond_ai_agent::sandbox::InstdRunner::new(id.clone());
+            if sandbox_sudo {
+                runner = runner.with_sudo();
+            }
+            let backend =
+                tools::fs::shell::ShellFs::connect(std::sync::Arc::new(runner) as _).await;
+            // Report the rung, because the alternative is discovering it from a search that walked
+            // `target/` — see `SearchEngine::PosixGrep`.
+            eprintln!(
+                "sandbox {id}: filesystem tools run inside the VM (search engine: {:?})",
+                backend.capabilities().search_engine()
+            );
+            Some(std::sync::Arc::new(backend))
+        }
+        None => None,
+    };
     let mut registry = tools::default_registry_with_config(&tools::ToolConfig {
         bash_timeout_ms,
         bash_shell_path: bash_shell_path.as_deref(),
@@ -3585,6 +3623,7 @@ async fn run_task(
         web_timeout_ms,
         image_auto_resize,
         mcp_tools: &mcp_tools,
+        fs_backend: fs_backend.clone(),
         ..tools::ToolConfig::new()
     });
     tools::apply_filter(
@@ -3856,6 +3895,9 @@ async fn run_task(
                 web_allow_hosts: web_allow_host.clone(),
                 web_timeout_ms,
                 image_auto_resize,
+                // `run` has no non-local backend to hand down yet; when it gains one this must carry
+                // it, or a child would act on the host while its parent acts elsewhere.
+                fs_backend: None,
             },
             cwd: cwd.clone(),
             project_trusted,

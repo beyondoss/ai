@@ -1,26 +1,46 @@
 //! `write` — create or overwrite a file (creating parent directories).
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use agent_core::tool::Tool;
 use agent_core::{ToolError, ToolOutput};
 use async_trait::async_trait;
 use serde_json::{Value, json};
 
-#[derive(Default)]
+use super::fs::local::LocalFs;
+use super::fs::{FileKind, FsBackend};
+
 pub struct Write {
     /// Relative `path` arguments resolve against this. Empty = the process cwd. See
     /// [`super::resolve_against`].
     root: PathBuf,
+    /// Where the write actually lands. Defaults to the host filesystem.
+    backend: Arc<dyn FsBackend>,
+}
+
+impl Default for Write {
+    fn default() -> Self {
+        Self::new(PathBuf::new())
+    }
 }
 
 impl Write {
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        Self {
+            root: root.into(),
+            backend: Arc::new(LocalFs::new()),
+        }
+    }
+
+    /// Write somewhere other than the host filesystem. See [`super::fs`].
+    pub fn with_backend(mut self, backend: Arc<dyn FsBackend>) -> Self {
+        self.backend = backend;
+        self
     }
 
     fn resolve(&self, path: &str) -> String {
-        super::resolve_against(&self.root, path)
+        super::resolve_against_in(&self.root, path, self.backend.world())
     }
 }
 
@@ -47,8 +67,7 @@ impl Tool for Write {
         input
             .get("path")
             .and_then(Value::as_str)
-            .map(|p| self.resolve(p))
-            .map(|p| super::canonical_write_target(&self.root, &p))
+            .map(|p| super::write_key(&self.root, p, self.backend.world()))
     }
 
     async fn run(&self, input: Value) -> Result<ToolOutput, ToolError> {
@@ -61,34 +80,39 @@ impl Tool for Write {
             .get("content")
             .and_then(Value::as_str)
             .ok_or_else(|| ToolError::InvalidInput("missing `content`".into()))?;
-        // pi-parity fix (pass 20): reject a FIFO/socket/device *before* `is_writable`'s own
-        // `OpenOptions::write(true).open(path)` ever runs — opening an existing FIFO for write-only
-        // blocks until a reader connects on the other end, the same unrecoverable hang class `read.rs`
-        // was fixed for earlier (see `reject_non_regular_file`'s doc comment in `tools/mod.rs`). A bare
-        // `mkfifo x` followed by `write path=x ...` reproduced this hanging indefinitely.
-        super::reject_non_regular_file(path, "write")?;
-        // `write_atomic` replaces the file via `rename(2)`, which only consults the *containing
-        // directory's* write permission — the target file's own mode bits are never checked, so a
+
+        // One `stat` answers both pre-checks, in the order that matters.
+        //
+        // pi-parity fix (pass 20): a FIFO/socket/device must be rejected on its *kind* before anything
+        // opens it for writing — opening an existing FIFO write-only blocks until a reader connects,
+        // the same unrecoverable hang class `read.rs` was fixed for. The backend's `stat` never
+        // performs the access check on a non-regular path for exactly this reason.
+        //
+        // Then writability: `write_atomic` replaces the file via `rename(2)`, which consults only the
+        // *containing directory's* permission — the target's own mode bits are never checked, so a
         // `chmod 444` file was silently overwritten. pi's `fs.writeFile` opens the existing path
-        // directly, so the OS itself enforces the file's own write-permission bit (EACCES). Same
-        // pre-check `edit.rs` already makes: `super::is_writable` performs a real access check
-        // (open-for-write, then close without touching content) rather than inspecting mode bits,
-        // which say nothing about *this process's* actual uid/gid (pi-parity task 50).
-        if !super::is_writable(path) {
-            return Err(ToolError::Execution(format!("{path} is not writable")));
+        // directly, letting the OS enforce EACCES. `Meta::writable` is a real access check rather than
+        // an inspection of mode bits, which say nothing about this process's actual uid/gid.
+        // A missing path reports no metadata at all and is simply created below, matching
+        // `is_writable`'s own `NotFound => true`.
+        let p = std::path::Path::new(path.as_str());
+        if let Some(meta) = self.backend.stat(p).await? {
+            if meta.kind == FileKind::Other {
+                return Err(super::non_regular_file_error(path, "write"));
+            }
+            if !meta.writable {
+                return Err(ToolError::Execution(format!("{path} is not writable")));
+            }
         }
-        if let Some(parent) = std::path::Path::new(path).parent() {
+        if let Some(parent) = p.parent() {
             if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent).map_err(|e| {
-                    ToolError::Execution(format!("mkdir {}: {e}", parent.display()))
-                })?;
+                self.backend.create_dir_all(parent).await?;
             }
         }
         // Atomic temp-file + rename: an overwrite killed mid-write must not leave a half-written
         // file — the same guarantee `edit` makes (and which `serve` reattach depends on for the
         // session file). `create_dir_all` above ensures the sibling temp's directory exists.
-        super::write_atomic(path, content.as_bytes())
-            .map_err(|e| ToolError::Execution(format!("write {path}: {e}")))?;
+        self.backend.write_bytes(p, content.as_bytes()).await?;
         Ok(format!("wrote {} bytes to {path}", content.len()).into())
     }
 }
