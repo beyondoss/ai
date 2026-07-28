@@ -112,16 +112,26 @@ fn local_backend() -> Arc<dyn FsBackend> {
     Arc::new(LocalFs::new())
 }
 
-/// `ShellFs` with whatever the host has — the good rung, expected to match `LocalFs` exactly.
-async fn shell_best_backend() -> Arc<dyn FsBackend> {
+/// `ShellFs` on the **`rg` rung** — the one expected to match `LocalFs` exactly. `None` when this
+/// machine has no ripgrep.
+///
+/// Absent `rg` is handled asymmetrically on purpose. On a contributor's machine it is a skip, because
+/// the POSIX-rung tests below still carry real coverage and a wall of failures for a missing optional
+/// tool helps nobody. **In CI it is a hard failure**, because there the strict rung silently ceasing
+/// to be tested is precisely the outcome this suite exists to prevent — and that is not theoretical:
+/// GitHub's runner image ships no ripgrep, this assertion caught it, and `mise.toml` now installs it.
+async fn rg_backend() -> Option<Arc<dyn FsBackend>> {
     let backend = ShellFs::connect(Arc::new(RealRunner)).await;
-    assert_eq!(
-        backend.capabilities().search_engine(),
-        SearchEngine::Ripgrep,
-        "this host has no `rg`, so the good rung is untested here — install ripgrep to get real \
-         parity coverage rather than a silently degraded run"
+    if backend.capabilities().search_engine() == SearchEngine::Ripgrep {
+        return Some(Arc::new(backend));
+    }
+    assert!(
+        std::env::var("CI").is_err(),
+        "CI has no `rg`, so the strict parity rung would not be tested — install ripgrep on the \
+         runner (see mise.toml) rather than letting this coverage lapse"
     );
-    Arc::new(backend)
+    eprintln!("skipping the ripgrep rung: no `rg` on this machine (the POSIX rung still runs)");
+    None
 }
 
 /// `ShellFs` with `rg` forced absent — the fallback rung, exercised even on a box that has ripgrep.
@@ -155,7 +165,10 @@ async fn assert_tool_parity(tool: &str, mut input: Value, dir: &TempDir) -> Stri
         input["path"] = json!(dir.path().to_str().unwrap());
     }
     let l = run_tool(Some(local_backend()), tool, input.clone()).await;
-    let s = run_tool(Some(shell_best_backend().await), tool, input.clone()).await;
+    let Some(rg) = rg_backend().await else {
+        return l;
+    };
+    let s = run_tool(Some(rg), tool, input.clone()).await;
     assert_eq!(
         l, s,
         "{tool}: LocalFs and ShellFs disagreed.\n--- local ---\n{l}\n--- shell ---\n{s}"
@@ -370,7 +383,8 @@ async fn read_of_a_png_returns_an_identical_image_attachment() {
 
     let input = json!({ "path": png.to_str().unwrap() });
     let reg_l = registry_for(Some(local_backend()));
-    let reg_s = registry_for(Some(shell_best_backend().await));
+    let Some(rg) = rg_backend().await else { return };
+    let reg_s = registry_for(Some(rg));
     let l = tool_of(&reg_l, "read").run(input.clone()).await.unwrap();
     let s = tool_of(&reg_s, "read").run(input.clone()).await.unwrap();
 
@@ -389,7 +403,8 @@ async fn read_of_a_missing_file_errors_identically() {
     let p = dir.path().join("nope.txt");
     let input = json!({ "path": p.to_str().unwrap() });
     let l = run_tool_err(Some(local_backend()), "read", input.clone()).await;
-    let s = run_tool_err(Some(shell_best_backend().await), "read", input).await;
+    let Some(rg) = rg_backend().await else { return };
+    let s = run_tool_err(Some(rg), "read", input).await;
     for e in [&l, &s] {
         assert!(e.contains("nope.txt"), "the error must name the path: {e}");
     }
@@ -427,7 +442,8 @@ async fn ls_errors_identically_on_a_file_and_on_a_missing_path() {
     ] {
         let input = json!({ "path": path.to_str().unwrap() });
         let l = run_tool_err(Some(local_backend()), "ls", input.clone()).await;
-        let s = run_tool_err(Some(shell_best_backend().await), "ls", input).await;
+        let Some(rg) = rg_backend().await else { return };
+        let s = run_tool_err(Some(rg), "ls", input).await;
         assert_eq!(l, s, "ls error text must match for {}", path.display());
         assert!(l.contains(needle), "expected {needle:?}, got: {l}");
     }
@@ -488,7 +504,8 @@ async fn write_then_read_round_trips_identically_across_backends() {
     // test that would catch a `write` that silently mangled content on its way through base64.
     let body = "line one\nline two — with an em dash and a ünïcödé tail\n";
     let mut outs = Vec::new();
-    for backend in [local_backend(), shell_best_backend().await] {
+    let Some(rg) = rg_backend().await else { return };
+    for backend in [local_backend(), rg] {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("deep").join("nested").join("out.txt");
         let reg = registry_for(Some(backend));
@@ -518,7 +535,8 @@ async fn write_then_read_round_trips_identically_across_backends() {
 async fn write_preserves_bytes_that_are_not_valid_utf8_neighbours() {
     // Content with characters that survive base64 but would be destroyed by a naive text pipeline.
     let body = "tab\there\nnull-adjacent: \u{fffd}\nquote: \" backslash: \\ dollar: $HOME\n";
-    for backend in [local_backend(), shell_best_backend().await] {
+    let Some(rg) = rg_backend().await else { return };
+    for backend in [local_backend(), rg] {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("tricky.txt");
         let reg = registry_for(Some(backend));
@@ -537,7 +555,8 @@ async fn write_preserves_bytes_that_are_not_valid_utf8_neighbours() {
 #[tokio::test]
 async fn write_refuses_a_read_only_file_identically() {
     use std::os::unix::fs::PermissionsExt;
-    for backend in [local_backend(), shell_best_backend().await] {
+    let Some(rg) = rg_backend().await else { return };
+    for backend in [local_backend(), rg] {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("ro.txt");
         std::fs::write(&p, "original").unwrap();
@@ -559,7 +578,8 @@ async fn write_refuses_a_read_only_file_identically() {
 
 #[tokio::test]
 async fn edit_applies_identically_across_backends() {
-    for backend in [local_backend(), shell_best_backend().await] {
+    let Some(rg) = rg_backend().await else { return };
+    for backend in [local_backend(), rg] {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("src.rs");
         std::fs::write(&p, "fn main() {\n    let quick = 1;\n}\n").unwrap();
@@ -583,7 +603,8 @@ async fn edit_applies_identically_across_backends() {
 
 #[tokio::test]
 async fn edit_preserves_crlf_line_endings_across_backends() {
-    for backend in [local_backend(), shell_best_backend().await] {
+    let Some(rg) = rg_backend().await else { return };
+    for backend in [local_backend(), rg] {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("crlf.txt");
         std::fs::write(&p, "alpha\r\nbeta\r\ngamma\r\n").unwrap();
@@ -615,7 +636,8 @@ async fn edit_reports_a_missing_match_identically() {
         "new_string": "x",
     });
     let l = run_tool_err(Some(local_backend()), "edit", input.clone()).await;
-    let s = run_tool_err(Some(shell_best_backend().await), "edit", input).await;
+    let Some(rg) = rg_backend().await else { return };
+    let s = run_tool_err(Some(rg), "edit", input).await;
     assert_eq!(l, s, "edit's not-found error must be identical");
 }
 
@@ -628,7 +650,8 @@ async fn the_model_sees_a_byte_identical_toolset_whichever_backend_is_configured
     // attaching a backend changed a single byte here, every turn would cold-miss the cache *and* the
     // model would be looking at a different toolset than the one it was tuned against.
     let local = registry_for(Some(local_backend())).definitions();
-    let shell = registry_for(Some(shell_best_backend().await)).definitions();
+    let Some(rg) = rg_backend().await else { return };
+    let shell = registry_for(Some(rg)).definitions();
     let none = registry_for(None).definitions();
 
     let json = |defs: &[agent_core::ToolDef]| serde_json::to_string(defs).unwrap();
@@ -659,7 +682,8 @@ async fn the_posix_fallback_diverges_in_exactly_two_named_ways() {
     let dir = fixture();
     let input = json!({ "pattern": "NEEDLE", "path": dir.path().to_str().unwrap(), "limit": 500 });
 
-    let good = run_tool(Some(shell_best_backend().await), "grep", input.clone()).await;
+    let Some(rg) = rg_backend().await else { return };
+    let good = run_tool(Some(rg), "grep", input.clone()).await;
     let fallback = run_tool(Some(shell_posix_backend()), "grep", input.clone()).await;
 
     // 1. FALSE POSITIVES: no `.gitignore` awareness. On a real repo this is the difference between a
@@ -712,7 +736,8 @@ async fn the_posix_fallback_still_agrees_on_everything_gitignore_does_not_touch(
     let sub = dir.path().join("sub");
     let input = json!({ "pattern": "NEEDLE", "path": sub.to_str().unwrap() });
 
-    let good = run_tool(Some(shell_best_backend().await), "grep", input.clone()).await;
+    let Some(rg) = rg_backend().await else { return };
+    let good = run_tool(Some(rg), "grep", input.clone()).await;
     let fallback = run_tool(Some(shell_posix_backend()), "grep", input.clone()).await;
     assert_eq!(
         good, fallback,
@@ -735,7 +760,8 @@ async fn a_truncated_result_agrees_on_count_and_notice_if_not_on_membership() {
     let input = json!({ "pattern": "NEEDLE", "path": dir.path().to_str().unwrap(), "limit": 10 });
 
     let l = run_tool(Some(local_backend()), "grep", input.clone()).await;
-    let s = run_tool(Some(shell_best_backend().await), "grep", input.clone()).await;
+    let Some(rg) = rg_backend().await else { return };
+    let s = run_tool(Some(rg), "grep", input.clone()).await;
 
     assert_eq!(
         match_lines(&l),

@@ -281,12 +281,18 @@ async fn randomized_trees_and_queries_agree_across_backends() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(200);
 
+    // Absent `rg` is a skip locally and a hard failure in CI — see `fs_backend_parity.rs`'s
+    // `rg_backend` for why the asymmetry, and for the runner that actually tripped it.
     let shell = ShellFs::connect(Arc::new(RealRunner)).await;
-    assert_eq!(
-        shell.capabilities().search_engine(),
-        SearchEngine::Ripgrep,
-        "this host has no `rg`; the strict rung cannot be fuzzed here"
-    );
+    if shell.capabilities().search_engine() != SearchEngine::Ripgrep {
+        assert!(
+            std::env::var("CI").is_err(),
+            "CI has no `rg`, so the strict rung cannot be fuzzed — install ripgrep on the runner \
+             (see mise.toml) rather than letting this coverage lapse"
+        );
+        eprintln!("skipping the fuzz: no `rg` on this machine");
+        return;
+    }
     let shell: Arc<dyn FsBackend> = Arc::new(shell);
     let local: Arc<dyn FsBackend> = Arc::new(LocalFs::new());
 
