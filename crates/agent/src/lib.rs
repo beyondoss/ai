@@ -22,6 +22,7 @@ pub mod policy;
 pub mod prompts;
 pub mod resources;
 pub mod retry;
+pub mod sandbox;
 pub mod serve;
 pub mod serve_ws;
 pub mod session_store;

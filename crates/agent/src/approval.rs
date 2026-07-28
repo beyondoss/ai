@@ -40,6 +40,7 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 
 use crate::policy::ToolPolicy;
+use crate::tools::fs::PathWorld;
 
 /// Tools that only ever read. `GatedSet::All` still skips them: asking a human to approve a `grep` is
 /// how an approval prompt gets trained away into a reflex.
@@ -250,7 +251,16 @@ impl ApprovalRuntime {
 }
 
 /// What an "always" decision is remembered against. See the module doc for why each is what it is.
-pub fn scope_key(tool: &str, input: &Value, root: &std::path::Path) -> String {
+///
+/// `world` must be the same one the gated tools resolve paths in. A remembered "always allow
+/// `/workspace/notes.md`" is only sound if the key it was stored under names the file that will
+/// actually be written next time — and on a non-local filesystem, host `canonicalize` does not.
+pub fn scope_key(
+    tool: &str,
+    input: &Value,
+    root: &std::path::Path,
+    world: PathWorld<'_>,
+) -> String {
     match tool {
         "bash" => match input.get("command").and_then(Value::as_str) {
             // Verbatim, never a prefix.
@@ -259,12 +269,9 @@ pub fn scope_key(tool: &str, input: &Value, root: &std::path::Path) -> String {
         },
         "write" | "edit" => match input.get("path").and_then(Value::as_str) {
             Some(path) => {
-                // The same canonical form the tools themselves write to, so `./x`, `../dir/x` and a
+                // The same form the tools themselves write to, so `./x`, `../dir/x` and (locally) a
                 // symlink to `x` all resolve to one remembered decision rather than three.
-                let target = crate::tools::canonical_write_target(
-                    root,
-                    &crate::tools::resolve_against(root, path),
-                );
+                let target = crate::tools::write_key(root, path, world);
                 format!("path:{target}")
             }
             None => "path:<none>".to_string(),
@@ -342,7 +349,7 @@ pub async fn gated_before_tool_call(
         return None;
     }
 
-    let key = scope_key(name, input, policy.root());
+    let key = scope_key(name, input, policy.root(), policy.world());
     let mem_key = memory_key(name, &key);
     match runtime.memory.lookup(&mem_key) {
         Some(true) => return None,
@@ -452,7 +459,7 @@ mod tests {
 
     #[test]
     fn a_bash_scope_key_is_the_verbatim_command_not_a_prefix() {
-        let key = |c: &str| scope_key("bash", &json!({ "command": c }), &cwd());
+        let key = |c: &str| scope_key("bash", &json!({ "command": c }), &cwd(), PathWorld::Local);
         assert_eq!(key("git status"), "cmd:git status");
         assert_ne!(
             key("git status"),
@@ -468,9 +475,24 @@ mod tests {
         std::fs::write(dir.path().join("notes.md"), "x").unwrap();
         let root = dir.path();
 
-        let direct = scope_key("write", &json!({ "path": "notes.md" }), root);
-        let dotted = scope_key("write", &json!({ "path": "./notes.md" }), root);
-        let dotdot = scope_key("edit", &json!({ "path": "sub/../notes.md" }), root);
+        let direct = scope_key(
+            "write",
+            &json!({ "path": "notes.md" }),
+            root,
+            PathWorld::Local,
+        );
+        let dotted = scope_key(
+            "write",
+            &json!({ "path": "./notes.md" }),
+            root,
+            PathWorld::Local,
+        );
+        let dotdot = scope_key(
+            "edit",
+            &json!({ "path": "sub/../notes.md" }),
+            root,
+            PathWorld::Local,
+        );
         assert_eq!(direct, dotted);
         assert_eq!(
             direct, dotdot,
@@ -481,22 +503,38 @@ mod tests {
         // A different file is a different decision.
         assert_ne!(
             direct,
-            scope_key("write", &json!({ "path": "other.md" }), root)
+            scope_key(
+                "write",
+                &json!({ "path": "other.md" }),
+                root,
+                PathWorld::Local
+            )
         );
     }
 
     #[test]
     fn any_other_tool_keys_on_its_name() {
         assert_eq!(
-            scope_key("subagent", &json!({ "agent": "x" }), &cwd()),
+            scope_key(
+                "subagent",
+                &json!({ "agent": "x" }),
+                &cwd(),
+                PathWorld::Local
+            ),
             "tool:subagent"
         );
     }
 
     #[test]
     fn a_missing_argument_still_produces_a_stable_key_rather_than_panicking() {
-        assert_eq!(scope_key("bash", &json!({}), &cwd()), "cmd:<none>");
-        assert_eq!(scope_key("write", &json!({}), &cwd()), "path:<none>");
+        assert_eq!(
+            scope_key("bash", &json!({}), &cwd(), PathWorld::Local),
+            "cmd:<none>"
+        );
+        assert_eq!(
+            scope_key("write", &json!({}), &cwd(), PathWorld::Local),
+            "path:<none>"
+        );
     }
 
     // ---- summarize --------------------------------------------------------------------------------

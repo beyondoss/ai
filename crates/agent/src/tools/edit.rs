@@ -12,20 +12,43 @@ use agent_core::{ToolError, ToolOutput, WriteLockGuard};
 use async_trait::async_trait;
 use serde_json::{Value, json};
 
-#[derive(Default)]
+use super::fs::FsBackend;
+use super::fs::local::LocalFs;
+
+/// Ceiling on the file size `edit` will load. Matching requires the whole file in memory, so this
+/// bounds that; a file beyond it fails to match rather than exhausting memory.
+const MAX_EDIT_BYTES: usize = 64 * 1024 * 1024;
+
 pub struct Edit {
     /// Relative `path` arguments resolve against this. Empty = the process cwd. See
     /// [`super::resolve_against`].
     root: PathBuf,
+    /// Where the read and the write actually land. Defaults to the host filesystem.
+    backend: Arc<dyn FsBackend>,
+}
+
+impl Default for Edit {
+    fn default() -> Self {
+        Self::new(PathBuf::new())
+    }
 }
 
 impl Edit {
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        Self {
+            root: root.into(),
+            backend: Arc::new(LocalFs::new()),
+        }
+    }
+
+    /// Edit somewhere other than the host filesystem. See [`super::fs`].
+    pub fn with_backend(mut self, backend: Arc<dyn FsBackend>) -> Self {
+        self.backend = backend;
+        self
     }
 
     fn resolve(&self, path: &str) -> String {
-        super::resolve_against(&self.root, path)
+        super::resolve_against_in(&self.root, path, self.backend.world())
     }
 }
 
@@ -68,8 +91,7 @@ impl Tool for Edit {
         input
             .get("path")
             .and_then(Value::as_str)
-            .map(|p| self.resolve(p))
-            .map(|p| super::canonical_write_target(&self.root, &p))
+            .map(|p| super::write_key(&self.root, p, self.backend.world()))
     }
 
     /// Argument parsing stays on the caller's task (it's a few `Value` lookups); everything from the
@@ -124,46 +146,102 @@ impl Edit {
             ));
         }
 
-        // `write_lock` rides *into* the closure so its guard drops on this blocking thread, once
-        // `apply_edits`' `rename(2)` has landed — never before. tokio cannot cancel a running blocking
-        // task: on cancellation the `.await` below is abandoned and this future is dropped, but the
-        // closure runs to completion regardless. Were the guard held only by the dispatch future (as it
-        // was), it would release the instant that future dropped, leaving the write physically in flight
-        // with the lock already free — a second turn/session could then acquire it and interleave. Moving
-        // the guard here ties its release to the write itself. (`write` needs no such move: it mutates
-        // synchronously within its own future, which can't be preempted mid-write.)
-        match tokio::task::spawn_blocking(move || {
-            let _write_lock = write_lock;
-            apply_edits(&path, edits, replace_all)
+        // One `stat`, taken **before** the read, serves three purposes.
+        //
+        // Kind first: a FIFO/socket/device must be refused on its type before anything opens it —
+        // opening a FIFO for reading blocks until a writer connects, with no timeout and no
+        // kill-on-drop, wedging the turn from inside a blocking syscall.
+        //
+        // Then writability, so a file this process cannot write fails fast, before the fuzzy match
+        // spends real CPU (NFKC normalization plus ambiguity resolution) on it — pi's own
+        // `access(path, W_OK)` pre-check. `Meta::writable` is a real access check, not an inspection of
+        // mode bits, which say nothing about this process's actual uid/gid.
+        //
+        // Then the mtime baseline the guarded write compares against. Taking it *before* the read
+        // rather than after is deliberate and is the fail-safe direction: if a writer lands between
+        // the baseline and the read, the baseline is stale, the guard fires, and the edit is refused —
+        // a false alarm the model can retry. Taking it after would mean stale *content* paired with a
+        // fresh timestamp, so the guard would stay silent and the edit would clobber the other write.
+        let p = std::path::Path::new(path.as_str());
+        let meta = self.backend.stat(p).await?;
+        if let Some(m) = &meta {
+            if m.kind == super::fs::FileKind::Other {
+                return Err(super::non_regular_file_error(&path, "edit"));
+            }
+            if !m.writable {
+                return Err(ToolError::Execution(format!("{path} is not writable")));
+            }
+        }
+        let initial_mtime = meta.as_ref().and_then(|m| m.mtime);
+
+        let raw_bytes = self.backend.read_bytes(p, 0, MAX_EDIT_BYTES).await?;
+        let raw = String::from_utf8(raw_bytes)
+            .map_err(|_| ToolError::Execution(format!("read {path}: file is not valid UTF-8")))?;
+
+        // The match/splice work is pure CPU over an in-memory string and can run for tens of
+        // milliseconds on a multi-MB file, so it stays on a blocking worker — `serve_ws` gives each
+        // session its own `current_thread` runtime, and work done inline here would pin that session's
+        // whole executor, its event pump and its abort/steer loop included.
+        // See `tests/tool_reactor_stall.rs`, which pins this invariant.
+        let plan_path = path.clone();
+        let (content, ok) = match tokio::task::spawn_blocking(move || {
+            plan_edits(&plan_path, &raw, edits, replace_all)
         })
         .await
         {
-            Ok(result) => result,
+            Ok(result) => result?,
             // The closure returns its errors as `Err`, so a `JoinError` can only be a panic inside it.
             // Re-raise rather than dressing it up as an ordinary tool failure.
             Err(e) => std::panic::resume_unwind(e.into_panic()),
+        };
+
+        // The write runs inside a **spawned task that owns the write-lock guard**, so the guard is
+        // released only once the write has actually landed.
+        //
+        // The hazard this closes: dropping a future cancels it, but `tokio::spawn`ing one does not —
+        // a spawned task runs to completion even after its `JoinHandle` is dropped. Were the guard
+        // held by this future instead, a cancelled dispatch would drop it the instant the future was
+        // abandoned, leaving the write physically in flight with the lock already free, and a second
+        // turn or session could acquire it and interleave. This is the same invariant the previous
+        // `spawn_blocking`-with-the-guard-moved-in arrangement enforced, expressed in a way that
+        // survives the write being an `async` backend call rather than a synchronous one.
+        let backend = self.backend.clone();
+        let write_path = path.clone();
+        let handle = tokio::spawn(async move {
+            let _write_lock = write_lock;
+            backend
+                .write_if_unchanged(std::path::Path::new(&write_path), &content, initial_mtime)
+                .await
+        });
+        let unchanged = match handle.await {
+            Ok(result) => result?,
+            Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
+            Err(e) => return Err(ToolError::Execution(format!("edit task failed: {e}"))),
+        };
+        if !unchanged {
+            return Err(ToolError::Execution(format!(
+                "{path} was modified on disk after it was read; the edit was aborted to avoid \
+                 discarding that change — re-read the file and retry"
+            )));
         }
+        Ok(ok)
     }
 }
 
-/// The whole synchronous body of an `edit`: read, writability probe, match, splice, write. Lives on
-/// `spawn_blocking`, never on the reactor — see [`Edit::run`].
-fn apply_edits(
+/// The pure, synchronous heart of an `edit`: match, splice, and produce the bytes to write.
+///
+/// Deliberately does **no I/O**. Reading, the writability and kind pre-checks, and the guarded write
+/// all happen in [`Edit::run_inner`] against the backend, which is what lets the same matching logic
+/// serve a file on this host and one on a machine we're only talking to. Returns the new file contents
+/// together with the success message, so the caller does the writing.
+fn plan_edits(
     path: &str,
+    raw: &str,
     edits: Vec<(String, String)>,
     replace_all: bool,
-) -> Result<ToolOutput, ToolError> {
+) -> Result<(Vec<u8>, ToolOutput), ToolError> {
     {
-        let (raw, initial_mtime) = read_with_mtime(path)?;
-        // Fail fast on a file this process can't actually write before spending any match/diff work on
-        // it (fuzzy matching does NFKC normalization + ambiguity resolution — real CPU work, not free)
-        // — pi's own `access(path, W_OK)` pre-check. `super::is_writable` performs a real access check
-        // (open-for-write, then close without touching content) rather than inspecting the file's mode
-        // bits, which — unlike a real `access(2)` — say nothing about *this process's* actual uid/gid
-        // (see that function's own doc comment for the gap this closes: pi-parity task 50).
-        if !super::is_writable(path) {
-            return Err(ToolError::Execution(format!("{path} is not writable")));
-        }
+        let raw = raw.to_string();
         // Match in a normalized LF space with the BOM stripped, then restore the file's original
         // line endings + BOM on write. A CRLF file whose `old_string` uses `\n` (the common case)
         // would otherwise never match — a silent, unrecoverable failure.
@@ -295,87 +373,20 @@ fn apply_edits(
         } else {
             out
         };
-        write_if_unchanged(path, initial_mtime, restored.as_bytes())?;
         let applied = ranges.len();
         // No diff/patch attached, deliberately: pi computes both too, but only for its interactive
         // terminal's own rendering — the model gets this same bare confirmation there as well. See
         // ARCHITECTURE.md's "Why `edit`'s result carries no diff/patch data" for the full reasoning
         // (no reader exists today on the model, wire-protocol, or export side).
-        Ok(format!(
-            "edited {path} ({applied} replacement{})",
-            if applied == 1 { "" } else { "s" }
-        )
-        .into())
+        Ok((
+            restored.into_bytes(),
+            format!(
+                "edited {path} ({applied} replacement{})",
+                if applied == 1 { "" } else { "s" }
+            )
+            .into(),
+        ))
     }
-}
-
-/// Read `path`'s contents together with the mtime it had at that exact moment, captured from the same
-/// open file handle the read itself uses — so there's no separate stat-then-read (or read-then-stat)
-/// syscall pair that could itself race a concurrent writer. [`write_if_unchanged`] later compares
-/// against this baseline right before the final write, to catch a different process (another agent
-/// session on the same repo, an editor autosave, a formatter/build step) modifying the file during the
-/// fuzzy-match/splice work `run` does in between.
-///
-/// `None` when the platform/filesystem doesn't report a modification time at all — rare, but exactly
-/// the same "best-effort, don't fail the whole operation over one unreadable timestamp" reasoning
-/// `session_store`'s trash-listing already uses for its own `.modified()` read.
-///
-/// pi-parity fix (pass 20): rejects a FIFO/socket/device *before* the `File::open` below — opening one
-/// of those for reading blocks until a writer connects on the other end (symmetric to the pre-fix
-/// `read` tool bug: see `reject_non_regular_file`'s doc comment in `tools/mod.rs`), and this runs before
-/// `run`'s own `is_writable` pre-check is even reached, so that check alone couldn't have caught it. A
-/// bare `mkfifo x` followed by `edit path=x ...` reproduced this hanging indefinitely.
-fn read_with_mtime(path: &str) -> Result<(String, Option<std::time::SystemTime>), ToolError> {
-    use std::io::Read as _;
-    super::reject_non_regular_file(path, "edit")?;
-    let mut file =
-        std::fs::File::open(path).map_err(|e| ToolError::Execution(format!("read {path}: {e}")))?;
-    let initial_mtime = file.metadata().and_then(|m| m.modified()).ok();
-    let mut raw = String::new();
-    file.read_to_string(&mut raw)
-        .map_err(|e| ToolError::Execution(format!("read {path}: {e}")))?;
-    Ok((raw, initial_mtime))
-}
-
-/// Write `content` to `path` via [`super::write_atomic`] — but only if `path`'s mtime still matches
-/// `initial_mtime` (the baseline [`read_with_mtime`] captured when this edit's `old_string`/`new_string`
-/// work started). If it doesn't, a different process wrote to the file in the window between the read
-/// and this write; applying this edit anyway would silently discard that other write (last-writer-wins,
-/// with no signal to the model that called this tool) — so this refuses instead, surfacing a clear
-/// error the model can react to by re-reading the file and retrying.
-///
-/// Same-turn races from this agent's own overlapping tool calls are already handled elsewhere (see
-/// `write_target`/the write-lock registry that serializes calls targeting the same file) — this check
-/// is specifically for an *external* writer this agent has no other way to see coming.
-///
-/// Compares mtimes rather than content hashes: mtime is what the writability pre-check right above in
-/// `run` already reasons about via `std::fs::metadata`, and it's the same signal `auth_store`/
-/// `trust_store`/`settings`'s own stale-lock detection uses elsewhere in this codebase. `std::fs::metadata`
-/// (not `symlink_metadata`) follows a trailing symlink to the real target's metadata, matching
-/// `write_atomic`'s own symlink-following behavior (see its doc comment) — so this compares mtimes on
-/// the same resolved path `write_atomic` actually writes through, not the symlink's own (unchanging)
-/// directory-entry metadata, which would otherwise make an ordinary symlinked-dotfile edit spuriously
-/// fail this check every time.
-///
-/// `initial_mtime: None` — the initial read's own metadata call failed, or the platform doesn't report
-/// mtimes at all — skips the check entirely rather than hard-failing, the same graceful degradation the
-/// writability pre-check above already applies to its own failed metadata read.
-fn write_if_unchanged(
-    path: &str,
-    initial_mtime: Option<std::time::SystemTime>,
-    content: &[u8],
-) -> Result<(), ToolError> {
-    if let Some(initial) = initial_mtime {
-        let current = std::fs::metadata(path).and_then(|m| m.modified()).ok();
-        if current != Some(initial) {
-            return Err(ToolError::Execution(format!(
-                "{path} was modified on disk after it was read; the edit was aborted to avoid \
-                 discarding that change — re-read the file and retry"
-            )));
-        }
-    }
-    super::write_atomic(path, content)
-        .map_err(|e| ToolError::Execution(format!("write {path}: {e}")))
 }
 
 /// Byte `(start, end)` spans in `working` to replace. Tries an **exact** match first; if that finds
@@ -1424,12 +1435,24 @@ mod tests {
         // same-turn write-lock (that's `write_target`/the write-lock registry's job, exercised
         // elsewhere) — modifying the file in the window between `edit`'s read and its final write.
         // `run` itself has no pause point a test can land in mid-flight, so this drives its two
-        // internal halves (`read_with_mtime` / `write_if_unchanged`) directly, exactly the way `run`
-        // chains them, with the concurrent write injected in between.
+        // internal halves (the backend's `stat`-then-`read_bytes`, and its `write_if_unchanged`)
+        // directly, exactly the way `run` chains them, with the concurrent write injected in between.
+        let backend = LocalFs::new();
         let f = write_tmp("the quick brown fox");
         let p = f.path().to_str().unwrap();
 
-        let (raw, initial_mtime) = read_with_mtime(p).unwrap();
+        let initial_mtime = backend
+            .stat(std::path::Path::new(p))
+            .await
+            .unwrap()
+            .and_then(|m| m.mtime);
+        let raw = String::from_utf8(
+            backend
+                .read_bytes(std::path::Path::new(p), 0, MAX_EDIT_BYTES)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
         assert!(
             initial_mtime.is_some(),
             "this filesystem should report mtimes"
@@ -1448,13 +1471,14 @@ mod tests {
             .set_modified(bumped)
             .unwrap();
 
-        let err = write_if_unchanged(p, initial_mtime, restored.as_bytes()).unwrap_err();
-        match err {
-            ToolError::Execution(msg) => {
-                assert!(msg.contains("modified") && msg.contains(p), "got: {msg}")
-            }
-            other => panic!("expected Execution(\"... modified ...\"), got {other:?}"),
-        }
+        let wrote = backend
+            .write_if_unchanged(std::path::Path::new(p), restored.as_bytes(), initial_mtime)
+            .await
+            .unwrap();
+        assert!(
+            !wrote,
+            "the guard must refuse the write once the file changed underneath it"
+        );
         // The concurrent writer's content must survive untouched — silently discarding it
         // (last-writer-wins) is exactly the bug this check exists to prevent.
         assert_eq!(
@@ -1467,10 +1491,30 @@ mod tests {
     async fn write_if_unchanged_succeeds_when_the_mtime_is_unchanged() {
         // The ordinary, non-racing path: nothing touched the file between the read and the write, so
         // the mtime comparison must not spuriously reject it.
+        let backend = LocalFs::new();
         let f = write_tmp("the quick brown fox");
         let p = f.path().to_str().unwrap();
-        let (raw, initial_mtime) = read_with_mtime(p).unwrap();
-        write_if_unchanged(p, initial_mtime, raw.replace("quick", "slow").as_bytes()).unwrap();
+        let initial_mtime = backend
+            .stat(std::path::Path::new(p))
+            .await
+            .unwrap()
+            .and_then(|m| m.mtime);
+        let raw = String::from_utf8(
+            backend
+                .read_bytes(std::path::Path::new(p), 0, MAX_EDIT_BYTES)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let wrote = backend
+            .write_if_unchanged(
+                std::path::Path::new(p),
+                raw.replace("quick", "slow").as_bytes(),
+                initial_mtime,
+            )
+            .await
+            .unwrap();
+        assert!(wrote, "an unraced write must go through");
         assert_eq!(std::fs::read_to_string(p).unwrap(), "the slow brown fox");
     }
 

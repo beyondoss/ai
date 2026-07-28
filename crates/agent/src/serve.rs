@@ -6319,6 +6319,9 @@ fn build_subagent_ctx(
             web_allow_hosts: cfg.web_allow_hosts.clone(),
             web_timeout_ms: cfg.web_timeout_ms,
             image_auto_resize: cfg.image_auto_resize,
+            // `serve` has no non-local backend to hand down yet; when it gains one this must carry
+            // it, or a child would act on the host while its parent acts elsewhere.
+            fs_backend: None,
         },
         cwd: cwd.to_path_buf(),
         project_trusted,

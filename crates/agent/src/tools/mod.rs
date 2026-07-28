@@ -13,6 +13,7 @@ pub mod beyond;
 pub mod edit;
 pub mod exec;
 pub mod find;
+pub mod fs;
 pub mod grep;
 pub mod ls;
 pub mod mcp;
@@ -41,6 +42,17 @@ pub mod write;
 /// consistent with every other tool here, which surface a filesystem error at the point of actual use
 /// rather than pre-validating input that might still resolve to something real.
 pub(crate) fn normalize_path(path: &str) -> String {
+    normalize_path_with_home(path, home_dir().as_deref())
+}
+
+/// [`normalize_path`], but against a caller-supplied home rather than this process's `$HOME`.
+///
+/// Split out because `~` does not mean the same thing on every filesystem a tool might act on. When a
+/// backend's files live somewhere other than this host (see [`fs::PathWorld`]), expanding `~/notes.md`
+/// against the *host's* `$HOME` produces a path for the wrong machine's user — silently, and in a form
+/// that looks entirely plausible. [`expand_tilde`] already took `home: Option<&str>` for exactly this
+/// reason; this is the rest of the normalization chain finally doing the same.
+pub(crate) fn normalize_path_with_home(path: &str, home: Option<&str>) -> String {
     if let Some(decoded) = decode_file_url(path) {
         return decoded;
     }
@@ -55,7 +67,7 @@ pub(crate) fn normalize_path(path: &str) -> String {
             }
         })
         .collect();
-    expand_tilde(&folded, home_dir().as_deref())
+    expand_tilde(&folded, home)
 }
 
 /// Unwrap a `file://` URL argument into a plain filesystem path — pi's `normalizePath` does the same
@@ -267,6 +279,24 @@ pub(crate) fn canonical_write_target(root: &Path, path: &str) -> String {
     if let Ok(real) = std::fs::canonicalize(path) {
         return real.display().to_string();
     }
+    lexical_write_target(root, path)
+}
+
+/// The purely lexical half of [`canonical_write_target`]: fold away `.` and `..` and join a relative
+/// path onto `root`, touching no filesystem at all.
+///
+/// This is the *entire* body [`canonical_write_target`] already fell back to when `canonicalize`
+/// failed — extracted rather than rewritten, so the local behavior is byte-identical.
+///
+/// It exists as its own function because `canonicalize` is a **host** syscall, and calling it for a
+/// path that isn't on this host is worse than useless. With a sandbox mounted at the same absolute
+/// path as the working tree — the configuration we actually want, so skills and the prompt's `cwd`
+/// stay true — `canonicalize` *succeeds*, resolving the **host's** symlinks, and returns a key for a
+/// different file than the one about to be written. Getting the right answer by accident when paths
+/// differ and the wrong one in the recommended configuration is the worst possible failure mode, so
+/// the choice is made explicitly by [`write_key`] rather than left to whether a syscall happened to
+/// fail.
+pub(crate) fn lexical_write_target(root: &Path, path: &str) -> String {
     let p = std::path::Path::new(path);
     let mut normalized = if p.is_absolute() {
         PathBuf::new()
@@ -285,6 +315,33 @@ pub(crate) fn canonical_write_target(root: &Path, path: &str) -> String {
         }
     }
     normalized.display().to_string()
+}
+
+/// The one definition of "which file is this call about".
+///
+/// Three separate subsystems need to answer that question and **must** answer it identically:
+///
+/// - `write`/`edit`'s [`Tool::write_target`](agent_core::Tool::write_target), which
+///   `WriteLockRegistry` uses to serialize concurrent writes to one file;
+/// - [`ToolPolicy::before_tool_call`](crate::policy::ToolPolicy), where `--deny-path` decides whether
+///   a write is allowed at all;
+/// - [`approval::scope_key`](crate::approval::scope_key), where an "always allow" decision is
+///   remembered.
+///
+/// The latter two are security controls. Before this function each site open-coded the same
+/// `canonical_write_target(root, &resolve_against(root, path))` composition, which worked only for as
+/// long as all three copies stayed in step — and a deny-list that resolves a path differently from the
+/// tool that writes it is a bypass, not a bug. One definition, three callers, no drift.
+pub(crate) fn write_key(root: &Path, path: &str, world: fs::PathWorld<'_>) -> String {
+    let resolved = resolve_against_in(root, path, world);
+    match world {
+        // On this host, `canonicalize` is meaningful and valuable: it unifies `./x`, `../dir/x` and a
+        // symlink to `x` into one key, which is what stops a same-turn `edit(real)` + `write(alias)`
+        // from racing on one file.
+        fs::PathWorld::Local => canonical_write_target(root, &resolved),
+        // Elsewhere, it can only lie. See [`lexical_write_target`].
+        fs::PathWorld::Remote { .. } => lexical_write_target(root, &resolved),
+    }
 }
 
 /// Resolve a model-supplied `path` argument against a filesystem tool's configured `root`: normalize it
@@ -306,7 +363,17 @@ pub(crate) fn canonical_write_target(root: &Path, path: &str) -> String {
 /// offer. The guarantee is that two cooperating children fanned out in parallel don't silently stomp each
 /// other, not that a determined one is jailed.
 pub(crate) fn resolve_against(root: &Path, path: &str) -> String {
-    let normalized = normalize_path(path);
+    resolve_against_in(root, path, fs::PathWorld::Local)
+}
+
+/// [`resolve_against`], but expanding `~` against the home of whichever filesystem `world` names —
+/// this host's `$HOME` for [`fs::PathWorld::Local`], the target's for a remote one. The join itself is
+/// pure string work and identical either way; only tilde expansion is world-sensitive.
+pub(crate) fn resolve_against_in(root: &Path, path: &str, world: fs::PathWorld<'_>) -> String {
+    let normalized = match world {
+        fs::PathWorld::Local => normalize_path(path),
+        fs::PathWorld::Remote { home } => normalize_path_with_home(path, home),
+    };
     if root.as_os_str().is_empty() || Path::new(&normalized).is_absolute() {
         return normalized;
     }
@@ -345,18 +412,15 @@ pub(crate) fn resolve_against(root: &Path, path: &str) -> String {
 ///
 /// `tool` names the caller in the error message (`"read"`/`"write"`/`"edit"`) so the model sees which
 /// tool actually refused the path, not a generic one-size-fits-all wording.
-pub(crate) fn reject_non_regular_file(path: &str, tool: &str) -> Result<(), ToolError> {
-    let Ok(meta) = std::fs::metadata(path) else {
-        return Ok(());
-    };
-    let file_type = meta.file_type();
-    if file_type.is_file() || file_type.is_dir() {
-        return Ok(());
-    }
-    Err(ToolError::Execution(format!(
+/// The same refusal, phrased identically, for a caller that already has the path's
+/// [`FileKind`](fs::FileKind) from a backend `stat` and must not pay a second, host-only
+/// `std::fs::metadata` to rediscover it — which for a remote path would be answering the question
+/// about the wrong machine.
+pub(crate) fn non_regular_file_error(path: &str, tool: &str) -> ToolError {
+    ToolError::Execution(format!(
         "{path} is not a regular file (it's a FIFO, socket, or device); `{tool}` can only operate on \
          regular files"
-    )))
+    ))
 }
 
 /// Whether `path` is actually writable by *this process* — a real access check, not an inspection of
@@ -433,6 +497,14 @@ pub struct ToolConfig<'a> {
     pub web_allow_hosts: &'a [String],
     /// `--web-timeout-ms`: the `web` tool's per-request timeout (default 30 s).
     pub web_timeout_ms: Option<u64>,
+    /// Where the six filesystem tools' I/O lands.
+    ///
+    /// `None` means the host filesystem — every existing caller, and behaviorally identical to the
+    /// code before this seam existed. A `Some` backend is shared by `Arc` across all six tools and
+    /// across every registry rebuild, the same lifecycle [`ToolConfig::mcp_tools`] has and for the
+    /// same reason: the registry is rebuilt on every `set_model`, and a backend that reconnected per
+    /// rebuild would be a bug rather than a cost.
+    pub fs_backend: Option<Arc<dyn fs::FsBackend>>,
 }
 
 impl<'a> ToolConfig<'a> {
@@ -479,14 +551,28 @@ pub fn default_registry_with(
 pub fn default_registry_with_config(cfg: &ToolConfig<'_>) -> ToolRegistry {
     let root = cfg.root.as_path();
     let mut reg = ToolRegistry::new();
-    reg.register(Arc::new(
-        read::Read::new(root).with_image_auto_resize(cfg.image_auto_resize),
-    ));
-    reg.register(Arc::new(write::Write::new(root)));
-    reg.register(Arc::new(edit::Edit::new(root)));
-    reg.register(Arc::new(ls::Ls::new(root)));
-    reg.register(Arc::new(grep::Grep::new(root)));
-    reg.register(Arc::new(find::Find::new(root)));
+    // One backend, shared by all six filesystem tools — so they cannot disagree about which
+    // filesystem they are acting on, and a `read` can always see what a `write` just wrote.
+    let mut read_tool = read::Read::new(root).with_image_auto_resize(cfg.image_auto_resize);
+    let mut write_tool = write::Write::new(root);
+    let mut edit_tool = edit::Edit::new(root);
+    let mut ls_tool = ls::Ls::new(root);
+    let mut grep_tool = grep::Grep::new(root);
+    let mut find_tool = find::Find::new(root);
+    if let Some(b) = &cfg.fs_backend {
+        read_tool = read_tool.with_backend(b.clone());
+        write_tool = write_tool.with_backend(b.clone());
+        edit_tool = edit_tool.with_backend(b.clone());
+        ls_tool = ls_tool.with_backend(b.clone());
+        grep_tool = grep_tool.with_backend(b.clone());
+        find_tool = find_tool.with_backend(b.clone());
+    }
+    reg.register(Arc::new(read_tool));
+    reg.register(Arc::new(write_tool));
+    reg.register(Arc::new(edit_tool));
+    reg.register(Arc::new(ls_tool));
+    reg.register(Arc::new(grep_tool));
+    reg.register(Arc::new(find_tool));
     let mut bash = match cfg.bash_timeout_ms {
         Some(ms) => bash::Bash::real().with_default_timeout_ms(ms),
         None => bash::Bash::real(),
@@ -550,6 +636,8 @@ pub fn apply_filter(
 #[cfg(test)]
 mod tests {
     use serde_json::json;
+
+    use crate::tools::fs::FsBackend as _;
 
     use super::*;
 
@@ -1212,7 +1300,7 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn reject_non_regular_file_names_the_calling_tool_in_its_error() {
+    fn a_fifo_classifies_as_other_and_the_shared_error_names_the_calling_tool() {
         // Direct unit test for the gate `write.rs`/`edit.rs` now call before their own blocking opens
         // (pi-parity pass 20) — the async, `mkfifo`-driven regression tests in each tool's own test
         // module prove the *hang* is fixed; this proves the shared helper's error text actually names
@@ -1226,7 +1314,24 @@ mod tests {
             .expect("mkfifo must be available to run this test");
         assert!(status.success(), "mkfifo failed to create the test fixture");
 
-        let err = reject_non_regular_file(fifo_path.to_str().unwrap(), "edit").unwrap_err();
+        // The classification itself now lives in the backend's `stat`, which is what the tools branch
+        // on — so the test asserts both halves: that a FIFO is classified `Other`, and that the shared
+        // error text names the calling tool. A bare `stat` never blocks on a FIFO (only *opening* one
+        // does), so this needs no timeout wrapper.
+        let kind = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(async {
+                fs::local::LocalFs::new()
+                    .stat(&fifo_path)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .kind
+            });
+        assert_eq!(kind, fs::FileKind::Other, "a FIFO must classify as Other");
+
+        let err = non_regular_file_error(fifo_path.to_str().unwrap(), "edit");
         match err {
             ToolError::Execution(msg) => {
                 assert!(msg.contains("`edit`"), "got: {msg}");
@@ -1236,26 +1341,168 @@ mod tests {
         }
     }
 
+    /// `LocalFs::stat` is what every tool's "is this safe to open" branch reads, so its classification
+    /// of the three ordinary cases is pinned here — the coverage `reject_non_regular_file`'s own tests
+    /// used to provide before the check moved behind the backend.
+    fn stat_kind(path: &std::path::Path) -> Option<fs::FileKind> {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(async { fs::local::LocalFs::new().stat(path).await.unwrap() })
+            .map(|m| m.kind)
+    }
+
     #[test]
-    fn reject_non_regular_file_allows_a_regular_file_through() {
+    fn stat_classifies_a_regular_file_as_a_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("f.txt");
         std::fs::write(&path, "x").unwrap();
-        assert!(reject_non_regular_file(path.to_str().unwrap(), "write").is_ok());
+        assert_eq!(stat_kind(&path), Some(fs::FileKind::File));
     }
 
     #[test]
-    fn reject_non_regular_file_allows_a_missing_path_through() {
+    fn stat_reports_nothing_for_a_missing_path() {
         // A missing path is left to the caller's own real open call to produce a clearer, tool-specific
         // "not found"/"not writable" error rather than duplicating that here under different wording.
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("does-not-exist.txt");
-        assert!(reject_non_regular_file(path.to_str().unwrap(), "write").is_ok());
+        assert_eq!(stat_kind(&dir.path().join("does-not-exist.txt")), None);
     }
 
     #[test]
-    fn reject_non_regular_file_allows_a_directory_through() {
+    fn stat_classifies_a_directory_as_a_directory() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(reject_non_regular_file(dir.path().to_str().unwrap(), "write").is_ok());
+        assert_eq!(stat_kind(dir.path()), Some(fs::FileKind::Dir));
+    }
+
+    // ---- write_key ---------------------------------------------------------------------------
+    //
+    // The table below is the whole point of extracting `lexical_write_target`. Every row is a place
+    // where `canonicalize` and lexical resolution can disagree, which is exactly where a deny-list, a
+    // remembered approval, and a write lock would stop agreeing with each other if the three call
+    // sites ever drifted apart again.
+
+    use crate::tools::fs::PathWorld;
+
+    #[test]
+    fn write_key_local_still_matches_the_old_composition_exactly() {
+        // The refactor's safety net: `write_key(.., Local)` must equal the exact expression all three
+        // call sites open-coded before it existed. If this ever fails, the extraction changed behavior.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("notes.md"), "x").unwrap();
+        let root = dir.path();
+        for spelling in ["notes.md", "./notes.md", "sub/../notes.md", "notes.md"] {
+            let before = canonical_write_target(root, &resolve_against(root, spelling));
+            let after = write_key(root, spelling, PathWorld::Local);
+            assert_eq!(before, after, "spelling {spelling:?}");
+        }
+    }
+
+    #[test]
+    fn write_key_folds_equivalent_spellings_to_one_key_in_both_worlds() {
+        // `./x` and `sub/../x` are the same file however you resolve them — this must hold remotely
+        // too, or a `--deny-path` glob is sidesteppable by respelling the path.
+        let root = std::path::Path::new("/workspace");
+        for world in [PathWorld::Local, PathWorld::Remote { home: None }] {
+            let direct = write_key(root, "/workspace/notes.md", world);
+            let dotted = write_key(root, "/workspace/./notes.md", world);
+            let dotdot = write_key(root, "/workspace/sub/../notes.md", world);
+            assert_eq!(direct, dotted, "{world:?}");
+            assert_eq!(direct, dotdot, "{world:?}");
+        }
+    }
+
+    #[test]
+    fn write_key_resolves_a_relative_path_against_the_root_not_the_process_cwd() {
+        // What keeps two subagents in separate worktrees, each editing `src/lib.rs`, on two keys.
+        let a = write_key(
+            std::path::Path::new("/wt/a"),
+            "src/lib.rs",
+            PathWorld::Remote { home: None },
+        );
+        let b = write_key(
+            std::path::Path::new("/wt/b"),
+            "src/lib.rs",
+            PathWorld::Remote { home: None },
+        );
+        assert_eq!(a, "/wt/a/src/lib.rs");
+        assert_ne!(a, b, "two worktrees must not share one write-lock key");
+    }
+
+    #[test]
+    fn write_key_local_unifies_a_symlink_with_its_target_but_remote_does_not() {
+        // The single most important row. Locally, `canonicalize` collapses an alias onto the real file
+        // so a same-turn `edit(real)` + `write(alias)` serialize on one lock. Remotely the same call
+        // would resolve the *host's* symlinks for a file that isn't on this host — so it must not, and
+        // the two spellings stay distinct rather than silently naming some other machine's file.
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real.txt");
+        let alias = dir.path().join("alias.txt");
+        std::fs::write(&real, "x").unwrap();
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        let root = dir.path();
+
+        let local_real = write_key(root, real.to_str().unwrap(), PathWorld::Local);
+        let local_alias = write_key(root, alias.to_str().unwrap(), PathWorld::Local);
+        assert_eq!(
+            local_real, local_alias,
+            "locally, an alias and its target are one file and must share a key"
+        );
+
+        let remote_alias = write_key(
+            root,
+            alias.to_str().unwrap(),
+            PathWorld::Remote { home: None },
+        );
+        assert_eq!(
+            remote_alias,
+            alias.display().to_string(),
+            "a remote key must be the path as named, never a host-canonicalized rewrite"
+        );
+    }
+
+    #[test]
+    fn write_key_expands_tilde_against_the_worlds_own_home() {
+        // A leading `~` means a different user's directory on a different machine. Expanding it
+        // against this process's `$HOME` for a remote path produces an entirely plausible path for the
+        // wrong home — the kind of wrong answer that never surfaces as an error.
+        let root = std::path::Path::new("");
+        let remote = write_key(
+            root,
+            "~/notes.md",
+            PathWorld::Remote {
+                home: Some("/home/guest"),
+            },
+        );
+        assert_eq!(remote, "/home/guest/notes.md");
+    }
+
+    #[test]
+    fn write_key_leaves_tilde_alone_when_the_remote_home_is_unknown() {
+        // Guessing is worse than not expanding: an unexpanded `~` fails loudly at the real open call,
+        // while a guessed one silently reads or writes the wrong file.
+        let key = write_key(
+            std::path::Path::new(""),
+            "~/notes.md",
+            PathWorld::Remote { home: None },
+        );
+        assert!(
+            key.contains('~'),
+            "an unknown home must leave `~` untouched, got {key:?}"
+        );
+    }
+
+    #[test]
+    fn normalize_path_with_home_still_handles_file_urls_and_at_prefixes() {
+        // The world-aware entry point must not have lost the rest of the normalization chain.
+        assert_eq!(
+            normalize_path_with_home("file:///tmp/a%20b.txt", None),
+            "/tmp/a b.txt"
+        );
+        assert_eq!(normalize_path_with_home("@/tmp/x.txt", None), "/tmp/x.txt");
+        // A pasted non-breaking space folds to a plain one.
+        assert_eq!(
+            normalize_path_with_home("/tmp/a\u{a0}b.txt", None),
+            "/tmp/a b.txt"
+        );
     }
 }

@@ -6,6 +6,11 @@ cargo-binstall = "latest"
 "cargo:cross" = "latest"
 # nats-server for the e2e harness (real JetStream KV backing slipstream).
 "ubi:nats-io/nats-server" = { version = "latest", exe = "nats-server" }
+# ripgrep for the filesystem-backend parity suite. `ShellFs` has two rungs — `rg`, which matches the
+# in-process walker exactly, and a POSIX `grep` fallback with two known divergences — and only a box
+# that *has* `rg` can test the strict one. GitHub's runner image does not ship it, so without this the
+# strict rung silently stops being covered (it failed loudly instead; see `fs_backend_parity.rs`).
+"github:BurntSushi/ripgrep" = { version = "latest", exe = "rg" }
 
 [tasks."build:rs"]
 run = "cargo build"

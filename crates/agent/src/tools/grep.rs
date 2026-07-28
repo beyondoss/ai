@@ -1,362 +1,61 @@
-//! `grep` — regex search across files, gitignore-aware (ripgrep's `ignore` + `regex` crates).
+//! `grep` — regex search across files, gitignore-aware.
 //!
-//! The walk runs in parallel (ripgrep's `WalkParallel`): worker threads read and scan files
-//! concurrently — the difference between grep and ripgrep on a large tree. The walk quits as soon as
-//! `limit` matches are found (not just at the much larger hard cap — see [`search`]'s doc comment), so
-//! a low-limit query against a match-dense tree does work proportional to `limit`, not to the tree's
-//! size. Whatever was collected before quitting is sorted by `(path, line)` and truncated, so an
-//! **untruncated** result (every match found, nothing cut) is always fully deterministic; a
-//! **truncated** one returns `limit` matches from wherever the parallel walk happened to reach before
-//! quitting, not guaranteed to be the lexicographically-smallest ones — the same trade pi's own `grep`
-//! makes by killing its `rg` child the instant it has enough matches. The blocking walk runs on
-//! `spawn_blocking` so it never stalls the async runtime.
+//! This module is **parse and render only**. Building the query from the model's JSON and formatting
+//! the hits back into `path:line: text` lives here; actually walking a tree and matching lines lives
+//! behind [`FsBackend::search`](super::fs::FsBackend::search), because that is the one part of this
+//! tool that has to change when the files aren't on the host.
+//!
+//! The split is drawn where it is on purpose: everything a reader would call "grep's behavior" —
+//! the `!`-negated glob, the `limit` floor, `context`/`before`/`after`, the `path:line:` vs
+//! `path-line-` distinction, the truncation notices — is on this side of the seam and therefore
+//! cannot vary by backend. See [`super::fs`] for why line clipping and limit trimming are shared too.
 
 use std::fmt::Write as _;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::Mutex;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 use agent_core::tool::Tool;
 use agent_core::{ToolError, ToolOutput};
 use async_trait::async_trait;
-use globset::{Glob, GlobMatcher};
-use grep_regex::{RegexMatcher, RegexMatcherBuilder};
-use grep_searcher::{BinaryDetection, Searcher, SearcherBuilder, Sink, SinkContext, SinkMatch};
-use ignore::{WalkBuilder, WalkState};
 use serde_json::{Value, json};
 
+use super::fs::local::LocalFs;
+use super::fs::{FsBackend, LINE_TRUNCATED_SUFFIX, MAX_CONTEXT, MAX_LINE, SearchQuery};
 use super::output::format_path;
 
 /// Default cap on reported matches.
 const DEFAULT_LIMIT: usize = 100;
-/// Long match lines are clipped to keep output readable — a *character* count, matching pi's own
-/// `GREP_MAX_LINE_LENGTH` (`truncateLine`'s `line.length`, UTF-16 code units — effectively chars for all
-/// BMP text), not a byte count: a CJK/Cyrillic/accented-Latin line costs more bytes per character than
-/// ASCII, so byte-clipping the same cap would truncate it to far fewer visible characters for no reason.
-const MAX_LINE: usize = 500;
-/// Hard ceiling on matches collected before the walk bails — an OOM guard for pathological patterns
-/// (matching nearly every line of a huge tree). Far above any sane `limit`; when it trips, the
-/// surviving subset can depend on scheduling, which the output flags.
-const HARD_CAP: usize = 10_000;
-/// Ceiling on the `before`/`after` context window. Context lines aren't bounded by `HARD_CAP` (which
-/// counts matches), so clamp them to keep a huge `after` on a match-dense file from ballooning memory.
-const MAX_CONTEXT: usize = 100;
-/// Suffix [`clip`] appends to a line it truncates. `Tool::run` checks surviving hit text for this
-/// suffix to decide whether to append an aggregate "some lines truncated" notice (matching pi's own
-/// grep, which surfaces that as an actionable notice alongside the match-limit/byte-cap ones) — a
-/// single source of truth instead of threading a separate "was this line clipped" flag through
-/// `Hit`/`Collector` just for one summary line.
-const LINE_TRUNCATED_SUFFIX: &str = "… [truncated]";
 
-#[derive(Default)]
 pub struct Grep {
     /// A relative search `path` (including its `"."` default) resolves against this. Empty = the
     /// process cwd. See [`super::resolve_against`].
     root: PathBuf,
+    /// Where the search actually runs. Defaults to the host filesystem, so every existing caller and
+    /// test gets exactly the behavior it had before this seam existed.
+    backend: Arc<dyn FsBackend>,
+}
+
+impl Default for Grep {
+    fn default() -> Self {
+        Self::new(PathBuf::new())
+    }
 }
 
 impl Grep {
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
-    }
-}
-
-/// One reported line: its path, line number, text, and whether it is a match (vs a context line). The
-/// path is an `Arc<Path>` so a file with many matches allocates the path **once** and each hit is a
-/// refcount bump, not a fresh `PathBuf` per hit.
-type Hit = (Arc<Path>, usize, String, bool);
-
-/// A prepared grep: ripgrep's regex matcher, an optional file glob (with whether it's negated — a
-/// leading `!` in the original pattern, ripgrep-CLI-style — so `search` can invert the match test), the
-/// search root, the report cap, and how many lines of context to show around each match (`before`/
-/// `after`, like ripgrep's `-B`/`-A`/`-C`).
-pub struct GrepJob {
-    matcher: RegexMatcher,
-    glob: Option<(GlobMatcher, bool)>,
-    root: PathBuf,
-    limit: usize,
-    before: usize,
-    after: usize,
-}
-
-impl GrepJob {
-    /// Compile a job. `literal` regex-escapes the pattern (verbatim search); `ignore_case` folds case.
-    /// Returns the regex error message on a bad pattern.
-    pub fn new(
-        pattern: &str,
-        literal: bool,
-        ignore_case: bool,
-        glob: Option<(GlobMatcher, bool)>,
-        root: PathBuf,
-        limit: usize,
-    ) -> Result<Self, String> {
-        let escaped;
-        let effective = if literal {
-            escaped = regex::escape(pattern);
-            escaped.as_str()
-        } else {
-            pattern
-        };
-        let matcher = RegexMatcherBuilder::new()
-            .case_insensitive(ignore_case)
-            .line_terminator(Some(b'\n'))
-            .build(effective)
-            .map_err(|e| format!("bad regex: {e}"))?;
-        Ok(Self {
-            matcher,
-            glob,
-            root,
-            limit,
-            before: 0,
-            after: 0,
-        })
+        Self {
+            root: root.into(),
+            backend: Arc::new(LocalFs::new()),
+        }
     }
 
-    /// Show `before` lines before and `after` lines after each match (clamped to [`MAX_CONTEXT`]).
-    pub fn with_context(mut self, before: usize, after: usize) -> Self {
-        self.before = before.min(MAX_CONTEXT);
-        self.after = after.min(MAX_CONTEXT);
+    /// Search somewhere other than the host filesystem. The `Arc` is shared rather than owned because
+    /// one backend serves every tool bound to the same target, and the tool registry is rebuilt on
+    /// every model switch — a backend that reconnected per rebuild would be a bug, not a cost.
+    pub fn with_backend(mut self, backend: Arc<dyn FsBackend>) -> Self {
+        self.backend = backend;
         self
-    }
-}
-
-/// Run the parallel search. `threads == 0` lets `ignore` choose (≈ CPU count); the bench passes 1 to
-/// measure the single-threaded baseline. Returns hits sorted by `(path, line)` — each flagged as a
-/// match or a context line — whether the result was truncated (by `limit` or the hard cap), and, when
-/// the walk hit at least one unreadable path (permission denied, a broken symlink, …), the first such
-/// error's message — matching real ripgrep, which exits non-zero and reports the real error text the
-/// moment it can't read *any* path in the tree, rather than silently treating it as "not found here."
-/// `limit` and the hard cap count *matches*, not context lines.
-pub fn search(job: &GrepJob, threads: usize) -> (Vec<Hit>, bool, Option<String>) {
-    let collected: Arc<Mutex<Vec<Hit>>> = Arc::new(Mutex::new(Vec::new()));
-    let total = Arc::new(AtomicUsize::new(0));
-    let first_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
-    // The walk quits as soon as *either* threshold is crossed — `job.limit` in the common case (a
-    // low-limit query against a match-dense tree should stop almost immediately, not walk the whole
-    // tree only to throw away everything past the first `limit` matches), `HARD_CAP` as the outer
-    // ceiling when a caller passes an unusually large `limit`. Below `HARD_CAP`, "the surviving subset
-    // can depend on scheduling" (this module's own doc comment) now applies whenever a query is
-    // actually truncated, not just on a pathological hard-cap trip — an accepted trade against
-    // `should_compact`-style exhaustive correctness, matching pi's own `rg` process kill on the same
-    // threshold.
-    let stop_at = job.limit.min(HARD_CAP);
-
-    // `hidden(false)` includes dotfiles (like ripgrep --hidden); .gitignore is respected by default.
-    // `require_git(false)` keeps that respect even outside an actual git repository (e.g. a plain
-    // checkout with no `.git`, or a tree copied without its VCS metadata) — the ignore crate's default
-    // otherwise silently stops honoring `.gitignore` the moment there's no repo to find. Only applied
-    // outside a real repo, though: inside one, the default git-aware walk keeps a nested repo's own
-    // `.gitignore` from leaking parent rules across its boundary.
-    //
-    // Pi-parity note: this is a deliberate DIVERGENCE, not a match. Pi's own grep tool shells out to
-    // real `rg` with no `--no-require-git`/git-detection logic at all, so it silently stops honoring
-    // `.gitignore` outside a git repo (ripgrep's own default). That conditional-on-repo-boundary
-    // handling exists only in pi's *find* tool (`fd --no-require-git`, added only when the search root
-    // isn't inside a git repo — see this same check in `find.rs`, which correctly cites it). Beyond
-    // extends the identical policy to grep too, for consistency between the two search tools and
-    // because it's strictly more useful (a plain checkout with no `.git` still gets its `.gitignore`
-    // honored) — kept rather than narrowed to match grep.ts's behavior here.
-    let mut builder = WalkBuilder::new(&job.root);
-    builder.hidden(false);
-    if !super::root_is_inside_git_repo(&job.root) {
-        builder.require_git(false);
-    }
-    builder.threads(threads).build_parallel().run(|| {
-        let collected = Arc::clone(&collected);
-        let total = Arc::clone(&total);
-        let first_error = Arc::clone(&first_error);
-        let matcher = &job.matcher;
-        let glob = &job.glob;
-        // One `Searcher` per worker thread (it carries reusable line buffers): ripgrep's engine —
-        // byte-oriented, so non-UTF-8 files search correctly (a `BufReader::read_line` loop would
-        // error out and silently drop them); binary files quit cleanly on a NUL; large files are
-        // mmap'd; line counting is SIMD-accelerated. `before`/`after` context is built in.
-        let mut searcher = SearcherBuilder::new()
-            .line_number(true)
-            .before_context(job.before)
-            .after_context(job.after)
-            .binary_detection(BinaryDetection::quit(b'\x00'))
-            .build();
-        Box::new(move |entry| {
-            if total.load(Ordering::Relaxed) >= stop_at {
-                return WalkState::Quit;
-            }
-            let entry = match entry {
-                Ok(entry) => entry,
-                // A walk-level error (permission denied on a directory, a broken symlink, …) — the
-                // entry itself is skipped, matching the prior behavior, but recorded so an
-                // otherwise-empty result can say "couldn't fully search" instead of a confidently
-                // wrong "no matches" — matching real ripgrep, which exits non-zero the moment it
-                // can't read *any* path in the tree, real or reported here or not.
-                Err(e) => {
-                    if let Ok(mut guard) = first_error.lock() {
-                        guard.get_or_insert_with(|| e.to_string());
-                    }
-                    return WalkState::Continue;
-                }
-            };
-            if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
-                return WalkState::Continue;
-            }
-            let path = entry.path();
-            if let Some((g, negate)) = glob {
-                let matched = g.is_match(path);
-                let keep = if *negate { !matched } else { matched };
-                if !keep {
-                    return WalkState::Continue;
-                }
-            }
-            // Collect this file's hits into one local sink, then push once — one lock per matching
-            // file. An I/O error (unreadable file) skips it, like the prior behavior, but is likewise
-            // recorded for the same reason as a walk-level error above.
-            // One `Arc<Path>` allocation for this file; every hit clones the pointer (refcount
-            // bump), so a match-dense file no longer pays a `PathBuf` per hit.
-            let mut sink = Collector {
-                path: Arc::from(path),
-                hits: Vec::new(),
-                matches: 0,
-                total: Arc::clone(&total),
-                stop_at,
-            };
-            if let Err(e) = searcher.search_path(matcher, path, &mut sink) {
-                if let Ok(mut guard) = first_error.lock() {
-                    guard.get_or_insert_with(|| format!("{}: {e}", path.display()));
-                }
-                return WalkState::Continue;
-            }
-            if !sink.hits.is_empty() {
-                let matches = sink.matches;
-                if let Ok(mut guard) = collected.lock() {
-                    guard.extend(sink.hits);
-                }
-                // Only matches count toward the stop threshold (context is bounded per match).
-                if total.fetch_add(matches, Ordering::Relaxed) + matches >= stop_at {
-                    return WalkState::Quit;
-                }
-            }
-            WalkState::Continue
-        })
-    });
-
-    let mut hits = Arc::try_unwrap(collected)
-        .ok()
-        .and_then(|m| m.into_inner().ok())
-        .unwrap_or_default();
-    hits.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
-    let stopped_early = total.load(Ordering::Relaxed) >= stop_at;
-    let match_total = hits.iter().filter(|h| h.3).count();
-    let truncated = match_total > job.limit || stopped_early;
-    // Keep at most `limit` matched lines (context lines don't count toward it). Walk counting matches,
-    // cut at the match that would exceed the limit, then drop any now-dangling trailing context (the
-    // before-context of the dropped match that trailed into the kept prefix). With no context
-    // requested every hit is a match, so this reduces to a plain `truncate(limit)`.
-    if match_total > job.limit {
-        let mut seen = 0usize;
-        let mut cut = hits.len();
-        for (i, h) in hits.iter().enumerate() {
-            if h.3 {
-                seen += 1;
-                if seen > job.limit {
-                    cut = i;
-                    break;
-                }
-            }
-        }
-        hits.truncate(cut);
-        while hits.last().is_some_and(|h| !h.3) {
-            hits.pop();
-        }
-    }
-    let first_error = Arc::try_unwrap(first_error)
-        .ok()
-        .and_then(|m| m.into_inner().ok())
-        .flatten();
-    (hits, truncated, first_error)
-}
-
-/// A [`Sink`] that gathers one file's matches and context lines. `matched`/`context` are called by the
-/// searcher with byte-accurate line numbers; bytes are decoded lossily so non-UTF-8 files still yield
-/// readable, matchable text instead of being dropped.
-struct Collector {
-    path: Arc<Path>,
-    hits: Vec<Hit>,
-    matches: usize,
-    /// The walk's shared match counter and its stop threshold — so a single match-dense file (an
-    /// unignored log dump, a minified bundle) can bail out of *its own* scan the instant the running
-    /// total would cross `stop_at`, instead of always finishing the file and only re-checking the cap
-    /// between files (`search`'s per-entry closure). Without this, one such file could be fully
-    /// scanned and every hit collected before the cap logic ever saw it — an OOM/hang vector with no
-    /// adversarial input required.
-    total: Arc<AtomicUsize>,
-    stop_at: usize,
-}
-
-impl Collector {
-    /// This file's own matches so far, added to every earlier file's already-flushed count — the same
-    /// running total `search`'s per-entry closure checks between files, just readable mid-file too.
-    fn running_total(&self) -> usize {
-        self.total.load(Ordering::Relaxed) + self.matches
-    }
-}
-
-impl Sink for Collector {
-    type Error = std::io::Error;
-
-    fn matched(&mut self, _searcher: &Searcher, m: &SinkMatch<'_>) -> std::io::Result<bool> {
-        let lineno = m.line_number().map(|n| n as usize).unwrap_or(0);
-        let text = String::from_utf8_lossy(m.bytes());
-        self.hits
-            .push((self.path.clone(), lineno, clip(&trim_eol(&text)), true));
-        self.matches += 1;
-        Ok(self.running_total() < self.stop_at)
-    }
-
-    fn context(&mut self, _searcher: &Searcher, c: &SinkContext<'_>) -> std::io::Result<bool> {
-        let lineno = c.line_number().map(|n| n as usize).unwrap_or(0);
-        let text = String::from_utf8_lossy(c.bytes());
-        self.hits
-            .push((self.path.clone(), lineno, clip(&trim_eol(&text)), false));
-        Ok(self.running_total() < self.stop_at)
-    }
-}
-
-/// Strip a trailing `\n` and then a trailing `\r` (the searcher hands us the line terminator), plus —
-/// pi-parity fix — any further embedded `\r` the trailing strip doesn't reach. `grep-searcher` only
-/// splits on `\n`, so a file using old-Mac-style bare-`\r` line endings (or one with stray corrupted
-/// bytes) hands us "lines" that still carry mid-content `\r` characters; pi strips every `\r` in the
-/// line, not just a trailing one. Borrows unchanged in the overwhelming common case (no embedded `\r`
-/// at all) rather than allocating a `String` for every matched line.
-fn trim_eol(s: &str) -> std::borrow::Cow<'_, str> {
-    let s = s.strip_suffix('\n').unwrap_or(s);
-    let s = s.strip_suffix('\r').unwrap_or(s);
-    if s.contains('\r') {
-        std::borrow::Cow::Owned(s.replace('\r', ""))
-    } else {
-        std::borrow::Cow::Borrowed(s)
-    }
-}
-
-/// Clip a long line to `MAX_LINE` *characters*, not bytes — pi-parity fix: the previous byte-based cap
-/// (with a char-boundary backoff to avoid splitting a codepoint) never produced invalid UTF-8, but still
-/// truncated a non-ASCII line to far fewer visible characters than an ASCII line under the same nominal
-/// cap, unlike pi's own char-counting `truncateLine`.
-///
-/// Runs on every matched *and* every context line, so the common case (a line well under `MAX_LINE`,
-/// which is most source lines) is the one to keep cheap: `char_indices` finds the byte offset of the
-/// `MAX_LINE`-th char in one pass, and a line that doesn't reach it is returned via a single `to_string`
-/// (a memcpy) rather than rebuilt char-by-char through a `Chars` iterator + `collect`. Only a line that
-/// actually needs truncating pays for the slice + suffix, and even then as one allocation, not two.
-fn clip(line: &str) -> String {
-    match line.char_indices().nth(MAX_LINE) {
-        None => line.to_string(), // fits within the cap — nothing was truncated
-        Some((cut, _)) => {
-            let mut clipped = String::with_capacity(cut + LINE_TRUNCATED_SUFFIX.len());
-            clipped.push_str(&line[..cut]);
-            clipped.push_str(LINE_TRUNCATED_SUFFIX);
-            clipped
-        }
     }
 }
 
@@ -439,34 +138,39 @@ impl Tool for Grep {
             .and_then(Value::as_bool)
             .unwrap_or(false);
         // A leading "!" negates the glob (ripgrep-CLI-style: `rg --glob '!*.test.rs'` excludes rather
-        // than restricts). `globset::Glob` has no negation syntax of its own — a leading "!" would
-        // otherwise be matched literally, so `!*.test.rs` would confidently match nothing at all and
-        // the whole query would report zero results instead of applying the exclusion.
-        let glob = match input.get("glob").and_then(Value::as_str) {
-            Some(g) => {
-                let (negate, pattern) = match g.strip_prefix('!') {
-                    Some(rest) => (true, rest),
-                    None => (false, g),
-                };
-                Some((
-                    Glob::new(pattern)
-                        .map_err(|e| ToolError::InvalidInput(format!("bad glob: {e}")))?
-                        .compile_matcher(),
-                    negate,
-                ))
-            }
-            None => None,
-        };
+        // than restricts). The negation is stripped *here* rather than in a backend, so every backend
+        // receives the same already-decided `(pattern, negate)` pair and none of them can disagree
+        // about what a leading "!" means. `globset::Glob` has no negation syntax of its own — a
+        // leading "!" would otherwise be matched literally, so `!*.test.rs` would confidently match
+        // nothing at all and the whole query would report zero results instead of applying the
+        // exclusion.
+        let glob = input
+            .get("glob")
+            .and_then(Value::as_str)
+            .map(|g| match g.strip_prefix('!') {
+                Some(rest) => (rest.to_string(), true),
+                None => (g.to_string(), false),
+            });
 
         let no_match = format!("no matches for {pattern:?}");
         let root = PathBuf::from(root);
-        let job = GrepJob::new(pattern, literal, ignore_case, glob, root.clone(), limit)
-            .map_err(ToolError::InvalidInput)?
-            .with_context(before, after);
-        // The walk blocks (its own thread pool, synchronous reads); keep it off the async runtime.
-        let (matches, truncated, walk_error) = tokio::task::spawn_blocking(move || search(&job, 0))
-            .await
-            .map_err(|e| ToolError::Execution(format!("grep task failed: {e}")))?;
+        let query = SearchQuery {
+            pattern: pattern.to_string(),
+            literal,
+            ignore_case,
+            glob,
+            root: root.clone(),
+            limit,
+            // Clamped here so the query handed to any backend is already valid, rather than each
+            // backend being trusted to clamp a window it didn't choose.
+            before: before.min(MAX_CONTEXT),
+            after: after.min(MAX_CONTEXT),
+        };
+        // A malformed regex or glob surfaces from the backend now (it compiles them), but as the same
+        // `ToolError::InvalidInput` with the same message text it always produced.
+        let outcome = self.backend.search(&query).await?;
+        let (matches, truncated, walk_error) =
+            (outcome.hits, outcome.truncated, outcome.first_error);
 
         if matches.is_empty() {
             // A genuine zero-match walk and a walk that hit an unreadable path along the way both
@@ -489,7 +193,8 @@ impl Tool for Grep {
             (matches.len().saturating_mul(64)).min(super::output::MAX_LISTING_BYTES),
         );
         let mut lines_truncated = false;
-        for (path, line, text, is_match) in &matches {
+        for hit in &matches {
+            let (path, line, text, is_match) = (&hit.path, hit.line, &hit.text, hit.is_match);
             // Write straight into `out` instead of allocating a `format!` temp String per line — same
             // fix as `read`/`ls`'s formatting loops. Match lines use `path:line:` (ripgrep's
             // separator); context lines use `path-line-` so a reader (and the model) can tell a hit
@@ -499,7 +204,7 @@ impl Tool for Grep {
                 lines_truncated = true;
             }
             let display_path = format_path(path, &root);
-            let _ = if *is_match {
+            let _ = if is_match {
                 writeln!(out, "{display_path}:{line}: {text}")
             } else {
                 writeln!(out, "{display_path}-{line}- {text}")
@@ -548,98 +253,6 @@ impl Tool for Grep {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn trim_eol_strips_trailing_newline_and_carriage_return() {
-        assert_eq!(trim_eol("hello\r\n"), "hello");
-        assert_eq!(trim_eol("hello\n"), "hello");
-        assert_eq!(trim_eol("hello"), "hello");
-    }
-
-    #[test]
-    fn trim_eol_strips_an_embedded_carriage_return_not_just_a_trailing_one() {
-        // pi-parity fix (L6): `grep-searcher` only splits on `\n`, so a file using old-Mac-style bare
-        // `\r` line endings hands us "lines" that still carry mid-content `\r` characters after the
-        // trailing strip — pi strips every `\r` in the line, not just a trailing one.
-        assert_eq!(trim_eol("first\rsecond\rthird\n"), "firstsecondthird");
-    }
-
-    #[test]
-    fn trim_eol_borrows_when_there_is_nothing_to_strip() {
-        // Not a behavior a caller can observe directly, but worth pinning: the common case (no
-        // embedded `\r`) must not allocate.
-        assert!(matches!(
-            trim_eol("plain line"),
-            std::borrow::Cow::Borrowed(_)
-        ));
-        assert!(matches!(
-            trim_eol("first\rsecond"),
-            std::borrow::Cow::Owned(_)
-        ));
-    }
-
-    #[test]
-    fn clip_leaves_a_short_line_untouched() {
-        assert_eq!(clip("short line"), "short line");
-    }
-
-    #[test]
-    fn clip_truncates_an_ascii_line_at_exactly_max_line_characters() {
-        let line = "a".repeat(MAX_LINE + 50);
-        let clipped = clip(&line);
-        assert_eq!(
-            clipped,
-            format!("{}{LINE_TRUNCATED_SUFFIX}", "a".repeat(MAX_LINE))
-        );
-    }
-
-    #[test]
-    fn clip_counts_characters_not_bytes_for_non_ascii_text() {
-        // Pi-parity fix: the previous byte-based cap truncated a non-ASCII line to far fewer visible
-        // characters than an equivalent-length ASCII line under the same nominal `MAX_LINE` — pi's own
-        // `truncateLine` counts characters (`line.length`, UTF-16 code units), not bytes. A 3-byte-per-
-        // character CJK line at exactly `MAX_LINE` characters (so ~3x `MAX_LINE` bytes) must survive
-        // whole, not get chopped down to a third of its characters.
-        let line = "漢".repeat(MAX_LINE);
-        assert!(
-            line.len() > MAX_LINE * 2,
-            "sanity: this line must be well over MAX_LINE bytes"
-        );
-        let clipped = clip(&line);
-        assert_eq!(
-            clipped, line,
-            "exactly MAX_LINE characters must not be truncated, even though it's far more than \
-             MAX_LINE bytes"
-        );
-
-        // One character over the cap must truncate to exactly MAX_LINE characters, not MAX_LINE bytes'
-        // worth (which would be roughly a third as many characters for 3-byte-per-char text).
-        let over = "漢".repeat(MAX_LINE + 1);
-        let clipped_over = clip(&over);
-        assert_eq!(
-            clipped_over,
-            format!("{}{LINE_TRUNCATED_SUFFIX}", "漢".repeat(MAX_LINE))
-        );
-    }
-
-    #[test]
-    fn clip_never_splits_a_multi_byte_character_even_though_it_counts_characters_now() {
-        // A mixed-width line where the cut point (character MAX_LINE) falls squarely on a real
-        // character boundary already (since we now count whole characters, not bytes) — this can never
-        // regress into slicing mid-codepoint the way the old byte-index-with-boundary-backoff version
-        // theoretically could if miscounted.
-        let line = format!("{}{}", "a".repeat(MAX_LINE - 1), "漢漢漢");
-        let clipped = clip(&line);
-        assert!(clipped.is_char_boundary(clipped.len() - LINE_TRUNCATED_SUFFIX.len()));
-        assert_eq!(
-            clipped,
-            format!(
-                "{}{}{LINE_TRUNCATED_SUFFIX}",
-                "a".repeat(MAX_LINE - 1),
-                "漢"
-            )
-        );
-    }
 
     #[tokio::test]
     async fn literal_mode_searches_verbatim() {
@@ -1185,40 +798,6 @@ mod tests {
         assert_eq!(
             match_lines, 3,
             "at most `limit` matches must be reported: {out}"
-        );
-    }
-
-    #[test]
-    fn collector_stops_scanning_a_single_file_once_the_cap_is_reached() {
-        // Regression: `matched`/`context` must signal the searcher to stop mid-file the instant the
-        // running total would cross `stop_at`, not just rely on `search`'s per-entry closure
-        // re-checking the cap *between* files — see `Collector::running_total`'s doc comment. Before
-        // this fix, a single match-dense file (an unignored log dump, a minified bundle) was always
-        // scanned to completion regardless of the cap, an OOM/hang vector needing no adversarial input.
-        let matcher = RegexMatcherBuilder::new()
-            .line_terminator(Some(b'\n'))
-            .build("needle")
-            .unwrap();
-        let mut searcher = SearcherBuilder::new().line_number(true).build();
-        let total = Arc::new(AtomicUsize::new(0));
-        let mut sink = Collector {
-            path: Arc::from(Path::new("f.txt")),
-            hits: Vec::new(),
-            matches: 0,
-            total: Arc::clone(&total),
-            stop_at: 3,
-        };
-        // 1,000 matching lines — if the searcher scanned the whole thing, `sink.hits.len()` would be
-        // 1,000; it must instead stop the moment the 3rd match is recorded.
-        let haystack = "needle\n".repeat(1_000);
-        searcher
-            .search_slice(&matcher, haystack.as_bytes(), &mut sink)
-            .unwrap();
-        assert_eq!(
-            sink.hits.len(),
-            3,
-            "a match-dense file must stop being scanned once the cap is crossed, not run to \
-             completion"
         );
     }
 

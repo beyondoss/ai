@@ -2,6 +2,9 @@
 
 use std::fmt::Write as _;
 use std::io::{BufRead, BufReader};
+
+use super::fs::local::LocalFs;
+use super::fs::{FileKind, FsBackend};
 use std::sync::OnceLock;
 
 use agent_core::message::ImageSource;
@@ -68,6 +71,8 @@ pub struct Read {
     /// Relative `path` arguments resolve against this. Empty = the process cwd. See
     /// [`super::resolve_against`].
     root: std::path::PathBuf,
+    /// Where the bytes actually come from. Defaults to the host filesystem.
+    backend: std::sync::Arc<dyn FsBackend>,
 }
 
 impl Default for Read {
@@ -75,6 +80,7 @@ impl Default for Read {
         Self {
             image_auto_resize: true,
             root: std::path::PathBuf::new(),
+            backend: std::sync::Arc::new(LocalFs::new()),
         }
     }
 }
@@ -91,6 +97,12 @@ impl Read {
     /// Builder-style: gate the resize/downscale path on `enabled` — see the field's own doc comment.
     pub fn with_image_auto_resize(mut self, enabled: bool) -> Self {
         self.image_auto_resize = enabled;
+        self
+    }
+
+    /// Read from somewhere other than the host filesystem. See [`super::fs`].
+    pub fn with_backend(mut self, backend: std::sync::Arc<dyn FsBackend>) -> Self {
+        self.backend = backend;
         self
     }
 }
@@ -122,25 +134,46 @@ impl Read {
 /// agent already runs with the operator's own ambient privileges, and `bash` is an unrestricted shell
 /// tool in the same tool set), so there is no privilege boundary here for a symlink swap to cross: an
 /// attacker who can win that race can already just name the target path directly.
-fn resolve_read_path(path: &str) -> String {
+///
+/// Existence is probed through the **backend**, not `std::path::Path::exists`: the whole point of the
+/// fallback is to find which spelling of a name is really on disk, and asking this host about a file
+/// that lives somewhere else would answer confidently about the wrong machine.
+///
+/// Returns the resolved spelling **together with the metadata that proved it exists**, so the caller
+/// doesn't immediately re-stat the same path. On a remote filesystem every stat is a round trip, and
+/// this one has already been paid for.
+async fn resolve_read_path(
+    backend: &dyn FsBackend,
+    path: &str,
+) -> (String, Option<crate::tools::fs::Meta>) {
     use unicode_normalization::UnicodeNormalization;
 
-    if std::path::Path::new(path).exists() {
-        return path.to_string();
+    async fn probe(backend: &dyn FsBackend, p: &str) -> Option<crate::tools::fs::Meta> {
+        backend.stat(std::path::Path::new(p)).await.ok().flatten()
+    }
+
+    if let Some(meta) = probe(backend, path).await {
+        return (path.to_string(), Some(meta));
     }
     let nfd: String = path.nfd().collect();
-    if nfd != path && std::path::Path::new(&nfd).exists() {
-        return nfd;
+    if nfd != path {
+        if let Some(meta) = probe(backend, &nfd).await {
+            return (nfd, Some(meta));
+        }
     }
     let curly = path.replace('\'', "\u{2019}");
-    if curly != path && std::path::Path::new(&curly).exists() {
-        return curly;
+    if curly != path {
+        if let Some(meta) = probe(backend, &curly).await {
+            return (curly, Some(meta));
+        }
     }
     let nfd_curly = nfd.replace('\'', "\u{2019}");
-    if nfd_curly != path && std::path::Path::new(&nfd_curly).exists() {
-        return nfd_curly;
+    if nfd_curly != path {
+        if let Some(meta) = probe(backend, &nfd_curly).await {
+            return (nfd_curly, Some(meta));
+        }
     }
-    path.to_string()
+    (path.to_string(), None)
 }
 
 /// Read one line into `buf` (without the trailing newline), keeping at most `cap` bytes; bytes beyond
@@ -227,8 +260,21 @@ impl Tool for Read {
             .get("path")
             .and_then(Value::as_str)
             .ok_or_else(|| ToolError::InvalidInput("missing `path`".into()))?;
-        let path = resolve_read_path(&super::resolve_against(&self.root, path));
-        super::reject_non_regular_file(&path, "read")?;
+        let backend = self.backend.as_ref();
+        let (path, meta) = resolve_read_path(
+            backend,
+            &super::resolve_against_in(&self.root, path, backend.world()),
+        )
+        .await;
+        // Refuse a FIFO/socket/device on its kind before anything opens it — opening a FIFO for
+        // reading blocks until a writer connects, with no timeout and no kill-on-drop. Reuses the
+        // metadata the path resolution above already fetched rather than paying a second round trip
+        // to ask the same question.
+        if let Some(meta) = &meta {
+            if meta.kind == FileKind::Other {
+                return Err(super::non_regular_file_error(&path, "read"));
+            }
+        }
 
         // Whether the active model can accept image input at all. `agent_core::tool::Tool::run` takes
         // only a bare `Value` — unlike pi's `execute(..., ctx)`, there's no separate model-capability
@@ -254,7 +300,11 @@ impl Tool for Read {
         // An *animated* PNG is deliberately excluded from image handling entirely, extension fallback
         // included — see `Sniff::AnimatedPng`'s doc comment — so it falls all the way through to the
         // ordinary text path below, the same route a corrupt/non-image file named `.png` takes.
-        let sniff = sniff_image_format(&path);
+        let sniff_buf = backend
+            .read_bytes(std::path::Path::new(&path), 0, SNIFF_LEN)
+            .await
+            .unwrap_or_default();
+        let sniff = sniff_image_format(&sniff_buf);
         let sniffed_format = match sniff {
             Sniff::Format(format) => Some(format),
             Sniff::AnimatedPng | Sniff::Unknown => None,
@@ -271,10 +321,13 @@ impl Tool for Read {
             // pi's `resizeImageInProcess`, which runs its WASM decode/resize/encode in a worker thread
             // specifically so it doesn't stall the event loop, keep it off this async runtime's worker
             // threads too (same pattern as `grep`/`find`'s own blocking walks).
+            let bytes = backend
+                .read_bytes(std::path::Path::new(&path), 0, MAX_READ_BYTES)
+                .await?;
             let path_for_task = path.clone();
             let auto_resize = self.image_auto_resize;
             let result = tokio::task::spawn_blocking(move || {
-                read_image(&path_for_task, format, auto_resize)
+                read_image(&path_for_task, bytes, format, auto_resize)
             })
             .await
             .map_err(|e| ToolError::Execution(format!("image read task failed: {e}")))?;
@@ -325,10 +378,15 @@ impl Tool for Read {
         // file. Run it off the async runtime's worker (same pattern as the image path above and
         // `grep`/`find`/`edit`) so a serve_ws per-session current-thread runtime isn't pinned for
         // the read's whole duration.
+        let bytes = backend
+            .read_bytes(std::path::Path::new(&path), 0, MAX_READ_BYTES)
+            .await?;
         let path_for_task = path.clone();
-        tokio::task::spawn_blocking(move || read_text_windowed(&path_for_task, offset, limit))
-            .await
-            .map_err(|e| ToolError::Execution(format!("read task failed: {e}")))?
+        tokio::task::spawn_blocking(move || {
+            read_text_windowed(&path_for_task, &bytes, offset, limit)
+        })
+        .await
+        .map_err(|e| ToolError::Execution(format!("read task failed: {e}")))?
     }
 }
 
@@ -336,13 +394,19 @@ impl Tool for Read {
 /// and, on truncation, drain the rest to count the file's true total line count. Runs on a
 /// `spawn_blocking` worker (see the call site in [`Read::run`]) since it is synchronous file I/O plus a
 /// potentially long scan of a large/slow file — it must not run inline on an async worker thread.
-fn read_text_windowed(path: &str, offset: usize, limit: usize) -> Result<ToolOutput, ToolError> {
-    // Stream the file line-by-line rather than slurping it whole: a windowed read (`offset`/`limit`)
-    // into a huge file shouldn't allocate the entire file first — we hold at most one line plus the
-    // bounded output window.
-    let file =
-        std::fs::File::open(path).map_err(|e| ToolError::Execution(format!("read {path}: {e}")))?;
-    let mut reader = BufReader::new(file);
+fn read_text_windowed(
+    path: &str,
+    bytes: &[u8],
+    offset: usize,
+    limit: usize,
+) -> Result<ToolOutput, ToolError> {
+    // The line loop below still streams — it holds at most one line plus the bounded output window —
+    // but it now streams over bytes already fetched rather than straight off a file handle. That is
+    // what the backend seam costs here: the caller reads up to `MAX_READ_BYTES` first, so a file
+    // larger than that has its line count reported for the prefix rather than the whole file. `read`
+    // truncates its own output far below that ceiling anyway, so a file big enough to hit it is
+    // already being reported as truncated.
+    let mut reader = BufReader::new(std::io::Cursor::new(bytes));
 
     // A rough per-line estimate (line-number prefix + a typical source line), capped by the same byte
     // ceiling the loop below enforces anyway — avoids paying for several `String` grow-and-copy steps
@@ -467,6 +531,11 @@ fn read_text_windowed(path: &str, offset: usize, limit: usize) -> Result<ToolOut
 /// [`is_animated_png`] enough room to actually reach it in practice, matching pi's own budget exactly.
 const SNIFF_LEN: usize = 4100;
 
+/// Ceiling on how many bytes `read` will pull for one call — the whole file for an image, or the
+/// window plus the line-count drain for text. Bounds memory for a pathological input; `read`'s own
+/// output caps bite long before this does.
+const MAX_READ_BYTES: usize = 64 * 1024 * 1024;
+
 /// The result of sniffing a file's leading bytes.
 enum Sniff {
     /// A recognized, servable image format.
@@ -499,16 +568,7 @@ enum Sniff {
 /// [`Sniff::Unknown`] on any read/probe failure (missing file, a directory, too few bytes, no
 /// recognizable header) — the caller falls back to the extension gate, or ultimately the ordinary text
 /// path.
-fn sniff_image_format(path: &str) -> Sniff {
-    use std::io::Read as _;
-    let mut buf = [0u8; SNIFF_LEN];
-    let Ok(mut f) = std::fs::File::open(path) else {
-        return Sniff::Unknown;
-    };
-    let Ok(n) = f.read(&mut buf) else {
-        return Sniff::Unknown;
-    };
-    let buf = &buf[..n];
+fn sniff_image_format(buf: &[u8]) -> Sniff {
     match image::guess_format(buf) {
         Ok(image::ImageFormat::Png) if is_animated_png(buf) => Sniff::AnimatedPng,
         // `image::guess_format`'s own BMP signature is just the 2 ASCII bytes "BM" (an empty mask in
@@ -718,11 +778,10 @@ fn bmp_conversion_note(converted_from_bmp: bool, to: &str) -> String {
 /// normal (if disappointing) outcome for the model to see, not a failed tool call.
 fn read_image(
     path: &str,
+    bytes: Vec<u8>,
     ext_format: image::ImageFormat,
     auto_resize: bool,
 ) -> Result<ToolOutput, ToolError> {
-    let bytes =
-        std::fs::read(path).map_err(|e| ToolError::Execution(format!("read {path}: {e}")))?;
     let format = image::guess_format(&bytes).unwrap_or(ext_format);
 
     // Most vision APIs (Anthropic: png/jpeg/gif/webp only) reject BMP outright. Convert it losslessly
@@ -2432,7 +2491,7 @@ mod tests {
         let path = dir.path().join("fake.bmp");
         std::fs::write(&path, b"BM not a real bmp header at all").unwrap();
         assert!(matches!(
-            sniff_image_format(path.to_str().unwrap()),
+            sniff_image_format(&std::fs::read(&path).unwrap()),
             Sniff::Unknown
         ));
     }
@@ -2443,7 +2502,7 @@ mod tests {
         let path = dir.path().join("real.bmp");
         std::fs::write(&path, valid_bmp_header(4, 4, 24)).unwrap();
         assert!(matches!(
-            sniff_image_format(path.to_str().unwrap()),
+            sniff_image_format(&std::fs::read(&path).unwrap()),
             Sniff::Format(image::ImageFormat::Bmp)
         ));
     }
@@ -2456,7 +2515,7 @@ mod tests {
         let path = dir.path().join("maybe.jpg");
         std::fs::write(&path, [0xFF, 0xD8, 0xFF, 0xF7, 0, 0, 0, 0]).unwrap();
         assert!(matches!(
-            sniff_image_format(path.to_str().unwrap()),
+            sniff_image_format(&std::fs::read(&path).unwrap()),
             Sniff::Unknown
         ));
     }
@@ -2468,7 +2527,7 @@ mod tests {
         let path = dir.path().join("ordinary.jpg");
         std::fs::write(&path, [0xFF, 0xD8, 0xFF, 0xE0, 0, 0, 0, 0]).unwrap(); // 0xE0 = APP0 (JFIF)
         assert!(matches!(
-            sniff_image_format(path.to_str().unwrap()),
+            sniff_image_format(&std::fs::read(&path).unwrap()),
             Sniff::Format(image::ImageFormat::Jpeg)
         ));
     }

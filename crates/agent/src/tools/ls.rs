@@ -12,6 +12,7 @@
 //! stat'd at all (permission race, dangling symlink) is silently skipped rather than guessed at.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::OnceLock;
 
 use agent_core::tool::Tool;
@@ -19,6 +20,9 @@ use agent_core::{ToolError, ToolOutput};
 use async_trait::async_trait;
 use serde_json::{Value, json};
 use unicode_normalization::UnicodeNormalization;
+
+use super::fs::local::LocalFs;
+use super::fs::{FileKind, FsBackend};
 
 /// Default cap on entries returned before truncating, to protect the model's context from a
 /// `node_modules`-sized directory. Overridable per call via the `limit` argument. The model can also
@@ -51,16 +55,32 @@ fn collation_key(name: &str) -> String {
         .collect()
 }
 
-#[derive(Default)]
 pub struct Ls {
     /// A relative `path` (including its `"."` default) resolves against this. Empty = the process cwd.
     /// See [`super::resolve_against`].
     root: PathBuf,
+    /// Where the listing actually happens. Defaults to the host filesystem.
+    backend: Arc<dyn FsBackend>,
+}
+
+impl Default for Ls {
+    fn default() -> Self {
+        Self::new(PathBuf::new())
+    }
 }
 
 impl Ls {
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        Self {
+            root: root.into(),
+            backend: Arc::new(LocalFs::new()),
+        }
+    }
+
+    /// List somewhere other than the host filesystem. See [`super::fs`].
+    pub fn with_backend(mut self, backend: Arc<dyn FsBackend>) -> Self {
+        self.backend = backend;
+        self
     }
 }
 
@@ -106,177 +126,128 @@ impl Tool for Ls {
             .map(|n| n as usize)
             .unwrap_or(DEFAULT_LIMIT);
 
-        // `read_dir` plus a `metadata` stat for every entry are blocking syscalls; on a wide directory
-        // (thousands of entries) that is real, unbounded work that would pin the `current_thread`
-        // runtime a `serve` session runs on — the `tool_reactor_stall` tests assert it must not, the
-        // same way `read`/`edit`/`write`/`exec` already run their filesystem I/O off the reactor. Hand
-        // the whole synchronous listing (read_dir + per-entry stat + sort + render) to `spawn_blocking`.
-        tokio::task::spawn_blocking(move || -> Result<ToolOutput, ToolError> {
-            let path = path.as_str();
-
-            // Sort by the bare name, not the display string (which gets a trailing `/` for directories) —
-        // comparing display strings inverts order for sibling names sharing a prefix (e.g. "src" vs
-        // "src-old": '-' sorts below '/' byte-wise, so "src-old/" would sort before "src/"). The
-        // display suffix is appended only after sorting, matching the reference agent's own two-step
-        // sort-then-suffix order.
         // Pi-parity fix: distinguish "doesn't exist" from "not a directory" with clean, specific
         // messages (matching pi's own `Path not found: {path}`/`Not a directory: {path}`) before ever
-        // calling `read_dir` — rather than a raw OS errno string covering both. `metadata` (not
-        // `symlink_metadata`) follows a symlink to check the *target*, matching pi's own `ops.stat`
-        // (Node's `fs.stat` follows symlinks) and ordinary `ls`'s own expectation that listing a
-        // symlink-to-a-directory lists the target's contents.
-        match std::fs::metadata(path) {
-            Ok(meta) => {
-                if !meta.is_dir() {
-                    return Err(ToolError::Execution(format!("Not a directory: {path}")));
-                }
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Err(ToolError::Execution(format!("Path not found: {path}")));
-            }
-            Err(e) => return Err(ToolError::Execution(format!("ls {path}: {e}"))),
+        // listing — rather than a raw OS errno string covering both. The backend's `stat` follows
+        // symlinks (not `symlink_metadata`), matching pi's own `ops.stat` (Node's `fs.stat` follows)
+        // and ordinary `ls`'s expectation that listing a symlink-to-a-directory lists the target.
+        match self.backend.stat(std::path::Path::new(&path)).await? {
+            Some(meta) if meta.kind == FileKind::Dir => {}
+            Some(_) => return Err(ToolError::Execution(format!("Not a directory: {path}"))),
+            None => return Err(ToolError::Execution(format!("Path not found: {path}"))),
         }
-        let mut entries: Vec<(String, bool)> = Vec::new();
-        // Set once the collection loop below bails at `HARD_CAP` — see its doc comment. When true,
-        // `entries.len()` (and everything derived from it, like `total`) reflects only the entries
-        // actually collected, not the directory's real size.
-        let mut hard_capped = false;
-        let dir =
-            std::fs::read_dir(path).map_err(|e| ToolError::Execution(format!("ls {path}: {e}")))?;
-        for entry in dir {
-            // Checked at the top of every iteration — same shape as `find.rs`'s own `HARD_CAP` check —
-            // so a pathologically large directory stops both walking and `metadata()`-stat'ing well
-            // before `entries` could grow unbounded, instead of only truncating after the fact.
-            if entries.len() >= HARD_CAP {
-                hard_capped = true;
-                break;
-            }
-            let entry = entry.map_err(|e| ToolError::Execution(e.to_string()))?;
-            let fname = entry.file_name();
-            let name = fname.to_string_lossy();
-            if !all && name.starts_with('.') {
-                continue;
-            }
-            // Fast path: `DirEntry::file_type()` is populated straight from the directory read itself
-            // (on Linux, from `d_type` — no extra syscall on the filesystems that support it), so a
-            // non-symlink entry — the overwhelming majority in a typical directory — never needs the
-            // full `stat` below at all.
-            //
-            // Pi-parity fix (slow path): `DirEntry::file_type` is lstat-like — it reports a symlink's
-            // own type, not its target's, so a symlink pointing at a directory was mislabeled as a
-            // plain file (no trailing `/`). pi's own `ls.ts` stats each entry with `fs.stat` (follows
-            // symlinks), so an actual symlink (or an entry `file_type()` itself couldn't resolve) falls
-            // back to `std::fs::metadata` on the full entry path to match. This also subsumes the
-            // unstattable-entry case: a vanished-between-readdir-and-here entry or a dangling symlink
-            // both fail `metadata` and are skipped (hidden), matching pi's own catch-and-skip behavior,
-            // instead of silently guessing `is_dir = false` for something we couldn't actually confirm.
-            let is_dir = match entry.file_type() {
-                Ok(ft) if !ft.is_symlink() => ft.is_dir(),
-                _ => {
-                    let Ok(meta) = std::fs::metadata(entry.path()) else {
-                        continue;
-                    };
-                    meta.is_dir()
-                }
-            };
-            entries.push((name.into_owned(), is_dir));
-        }
-        // Directories first, then case-insensitive alphabetical by bare name, collated in a way that
-        // groups an accented letter with its unaccented form (`collation_key`) rather than a raw
-        // codepoint compare — matches pi's `a.toLowerCase().localeCompare(b.toLowerCase())` far more
-        // closely than a byte-order compare would (which would also sort every uppercase-leading name
-        // before every lowercase one, e.g. "Zebra.txt" before "apple.txt", unlike what a human — or pi —
-        // would expect). Falls back to a case-sensitive compare only to break an exact tie (e.g.
-        // "Foo"/"foo" coexisting in one directory), so the order stays deterministic instead of
-        // depending on the OS's arbitrary `readdir` order.
-        //
-        // The key is computed once per entry up front (a Schwartzian transform), not inside the
-        // comparator: `collation_key` allocates (lowercase + NFD + collect), and a comparator recomputes
-        // its arguments on every one of the sort's O(n log n) comparisons — recomputing it there turned a
-        // 500-entry listing into ~4,500 allocations instead of 500.
-        let mut entries: Vec<(String, bool, String)> = entries
+        // The hard cap bounds both the walk and the per-entry stat work, so a pathologically large
+        // directory can't grow `entries` unbounded. `hard_capped` means `entries.len()` reflects only
+        // what was collected, not the directory's real size.
+        let listed = self
+            .backend
+            .list_dir(std::path::Path::new(&path), HARD_CAP, all)
+            .await?;
+        let hard_capped = listed.len() >= HARD_CAP;
+        let entries: Vec<(String, bool)> = listed
             .into_iter()
-            .map(|(name, is_dir)| {
-                let key = collation_key(&name);
-                (name, is_dir, key)
-            })
+            .map(|e| (e.name, e.kind == FileKind::Dir))
             .collect();
-        entries.sort_by(|(a_name, a_dir, a_key), (b_name, b_dir, b_key)| {
-            b_dir
-                .cmp(a_dir)
-                .then_with(|| a_key.cmp(b_key).then_with(|| a_name.cmp(b_name)))
-        });
-        if entries.is_empty() {
-            return Ok("(empty directory)".into());
-        }
-        // Cap the listing so a huge directory can't flood the model's context.
-        let total = entries.len();
-        let count_truncated = total > limit;
-        // `hard_capped` alone (without `count_truncated`) is only reachable when a caller passes a
-        // `limit` at or above `HARD_CAP` — rare, but still needs its own notice, since `total` in that
-        // case undercounts the directory's real size even though the ordinary "N more entries" marker
-        // wouldn't otherwise fire.
-        let needs_marker = count_truncated || hard_capped;
-        if count_truncated {
-            entries.truncate(limit);
-        }
-        // Render the sorted (and truncated) entries straight into `out` — the `\n`-joined bare names,
-        // each directory suffixed with `/` — instead of collecting an intermediate `Vec<String>` of
-        // display strings and joining it. Pre-sized to the exact byte length (names + one separator or
-        // trailing `/` per entry) so the buffer never reallocates.
-        let cap = entries
-            .iter()
-            .map(|(name, _, _)| name.len() + 1)
-            .sum::<usize>();
-        let mut out = String::with_capacity(cap);
-        for (i, (name, is_dir, _key)) in entries.iter().enumerate() {
-            if i > 0 {
+
+        // Sorting and rendering are pure CPU over an already-bounded list, so they stay here rather
+        // than on a blocking worker; the syscall-heavy part is inside the backend, which does its own
+        // `spawn_blocking`.
+        let render = move || -> Result<ToolOutput, ToolError> {
+            // Directories first, then case-insensitive alphabetical by bare name, collated in a way that
+            // groups an accented letter with its unaccented form (`collation_key`) rather than a raw
+            // codepoint compare — matches pi's `a.toLowerCase().localeCompare(b.toLowerCase())` far more
+            // closely than a byte-order compare would (which would also sort every uppercase-leading name
+            // before every lowercase one, e.g. "Zebra.txt" before "apple.txt", unlike what a human — or pi —
+            // would expect). Falls back to a case-sensitive compare only to break an exact tie (e.g.
+            // "Foo"/"foo" coexisting in one directory), so the order stays deterministic instead of
+            // depending on the OS's arbitrary `readdir` order.
+            //
+            // The key is computed once per entry up front (a Schwartzian transform), not inside the
+            // comparator: `collation_key` allocates (lowercase + NFD + collect), and a comparator recomputes
+            // its arguments on every one of the sort's O(n log n) comparisons — recomputing it there turned a
+            // 500-entry listing into ~4,500 allocations instead of 500.
+            let mut entries: Vec<(String, bool, String)> = entries
+                .into_iter()
+                .map(|(name, is_dir)| {
+                    let key = collation_key(&name);
+                    (name, is_dir, key)
+                })
+                .collect();
+            entries.sort_by(|(a_name, a_dir, a_key), (b_name, b_dir, b_key)| {
+                b_dir
+                    .cmp(a_dir)
+                    .then_with(|| a_key.cmp(b_key).then_with(|| a_name.cmp(b_name)))
+            });
+            if entries.is_empty() {
+                return Ok("(empty directory)".into());
+            }
+            // Cap the listing so a huge directory can't flood the model's context.
+            let total = entries.len();
+            let count_truncated = total > limit;
+            // `hard_capped` alone (without `count_truncated`) is only reachable when a caller passes a
+            // `limit` at or above `HARD_CAP` — rare, but still needs its own notice, since `total` in that
+            // case undercounts the directory's real size even though the ordinary "N more entries" marker
+            // wouldn't otherwise fire.
+            let needs_marker = count_truncated || hard_capped;
+            if count_truncated {
+                entries.truncate(limit);
+            }
+            // Render the sorted (and truncated) entries straight into `out` — the `\n`-joined bare names,
+            // each directory suffixed with `/` — instead of collecting an intermediate `Vec<String>` of
+            // display strings and joining it. Pre-sized to the exact byte length (names + one separator or
+            // trailing `/` per entry) so the buffer never reallocates.
+            let cap = entries
+                .iter()
+                .map(|(name, _, _)| name.len() + 1)
+                .sum::<usize>();
+            let mut out = String::with_capacity(cap);
+            for (i, (name, is_dir, _key)) in entries.iter().enumerate() {
+                if i > 0 {
+                    out.push('\n');
+                }
+                out.push_str(name);
+                if *is_dir {
+                    out.push('/');
+                }
+            }
+            if needs_marker {
                 out.push('\n');
             }
-            out.push_str(name);
-            if *is_dir {
-                out.push('/');
-            }
-        }
-        if needs_marker {
-            out.push('\n');
-        }
-        // The byte cap is checked *before* the count marker, and takes priority when both would
-        // otherwise fire — see `cap_listing_bytes`'s doc comment.
-        let byte_capped = super::output::cap_listing_bytes(
-            &mut out,
-            "narrow with a subpath or use `find`/`grep` to see more",
-        );
-        if !byte_capped && needs_marker {
-            let mut notices = Vec::new();
-            if count_truncated {
-                // pi-parity fix (pass 20): pi's own `ls.ts` truncation notice names a concrete next
-                // value to try ("${effectiveLimit} entries limit reached. Use limit=${effectiveLimit *
-                // 2} for more") — `grep.rs`/`find.rs` already picked this up (their own "match/result
-                // limit N reached; ... or use limit={2x} for more" wording) when it was first added,
-                // but it never reached `ls.rs`, whose notice gestured at "narrow with a subpath or use
-                // find/grep" with no number to raise. `saturating_mul`, not plain `*`: a model-supplied
-                // `limit` has no upper bound here, and this crate runs with `overflow-checks = true` in
-                // release — an adversarial/huge `limit` must degrade to `usize::MAX`, never panic.
-                notices.push(format!(
+            // The byte cap is checked *before* the count marker, and takes priority when both would
+            // otherwise fire — see `cap_listing_bytes`'s doc comment.
+            let byte_capped = super::output::cap_listing_bytes(
+                &mut out,
+                "narrow with a subpath or use `find`/`grep` to see more",
+            );
+            if !byte_capped && needs_marker {
+                let mut notices = Vec::new();
+                if count_truncated {
+                    // pi-parity fix (pass 20): pi's own `ls.ts` truncation notice names a concrete next
+                    // value to try ("${effectiveLimit} entries limit reached. Use limit=${effectiveLimit *
+                    // 2} for more") — `grep.rs`/`find.rs` already picked this up (their own "match/result
+                    // limit N reached; ... or use limit={2x} for more" wording) when it was first added,
+                    // but it never reached `ls.rs`, whose notice gestured at "narrow with a subpath or use
+                    // find/grep" with no number to raise. `saturating_mul`, not plain `*`: a model-supplied
+                    // `limit` has no upper bound here, and this crate runs with `overflow-checks = true` in
+                    // release — an adversarial/huge `limit` must degrade to `usize::MAX`, never panic.
+                    notices.push(format!(
                     "{} more entries; {total} total — use limit={} for more, or narrow with a subpath \
                      or use `find`/`grep`",
                     total - limit,
                     limit.saturating_mul(2)
                 ));
-            }
-            if hard_capped {
-                notices.push(format!(
+                }
+                if hard_capped {
+                    notices.push(format!(
                     "directory has more than {HARD_CAP} entries; only the first {HARD_CAP} were \
                      scanned (hard cap reached)"
                 ));
+                }
+                out.push_str(&super::output::marker(notices.join(". ")));
             }
-            out.push_str(&super::output::marker(notices.join(". ")));
-        }
-        Ok(out.into())
-        })
-        .await
-        .map_err(|e| ToolError::Execution(format!("ls: background task failed: {e}")))?
+            Ok(out.into())
+        };
+        render()
     }
 }
 

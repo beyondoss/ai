@@ -85,6 +85,51 @@ configured, the gateway is used (unless `AI_DIRECT=1`). Otherwise, routing is di
 
 Tools: `read`, `write`, `edit`, `bash`, `ls`, `grep`, `find` (pi's coding set) plus `fork`, `sync`, `logs` (Beyond platform). See [crates/agent-core/ARCHITECTURE.md](crates/agent-core/ARCHITECTURE.md).
 
+### Running the tools inside a sandbox VM
+
+`--sandbox <instance-id>` makes the filesystem tools — `read`, `write`, `edit`, `ls`, `grep`, `find` —
+act inside an `instd`-managed Firecracker VM instead of on the host. The model sees an **identical**
+toolset: same names, descriptions and JSON schemas, so no prompt changes and no prompt-cache miss.
+
+```sh
+# an instance that already exists and is running (the agent attaches; it never creates or destroys VMs)
+sudo instd instance ls
+
+# point the filesystem tools at it
+AI_GATEWAY_URL=http://ai.internal AI_AGENT_KEY=bai_v1... \
+  cargo run -p beyond-ai-agent -- run --sandbox 22f5evbtx520 --sandbox-sudo \
+    "find the TODOs under /srv/app and fix the one in main.rs"
+```
+
+`--sandbox-sudo` invokes `instd` through `sudo -n` (non-interactive), which is needed when the admin
+channel requires privilege the agent process doesn't have. Both flags have env equivalents:
+`AI_AGENT_SANDBOX` and `AI_AGENT_SANDBOX_SUDO`.
+
+On attach the agent prints which search engine the guest actually has:
+
+```
+sandbox 22f5evbtx520: filesystem tools run inside the VM (search engine: Ripgrep)
+```
+
+**Install `ripgrep` in the sandbox image if you can.** With `rg` present, results are byte-identical
+to running locally. Without it the fallback is POSIX `grep`, which diverges in two measured ways: it
+does not honor `.gitignore` (so it walks `target/` and `node_modules/`), and `grep -I` treats any file
+containing non-UTF-8 bytes as binary and **silently skips it**. Both are asserted by name in
+`crates/agent/tests/fs_backend_parity.rs`.
+
+Two limits worth knowing:
+
+- **`bash` still runs on the host.** Only the filesystem tools are redirected. A test pins this, so it
+  is a known state rather than a surprise.
+- **Paths are the guest's.** Point `--sandbox` at a VM whose working tree lives at the same absolute
+  path as the host's, or paths the agent reads from skills and the system prompt won't resolve.
+
+To verify against your own instance:
+
+```sh
+BEYOND_TEST_SANDBOX=<instance-id> cargo test -p beyond-ai-agent --test sandbox_live -- --nocapture
+```
+
 ## What It Does
 
 - **Managed keys** (`bai_v1…`) — Ed25519-verified, stateless. Swaps to the pool key. Attributes usage to tenant + VPC. Deny-set checked (spend/fraud).
