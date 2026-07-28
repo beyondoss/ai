@@ -168,8 +168,11 @@ impl Bash {
         self
     }
 
-    /// A `bash` tool over a custom runner (tests inject one to capture the invocation).
-    #[cfg(test)]
+    /// A `bash` tool over a caller-supplied runner.
+    ///
+    /// This is how `bash` runs somewhere other than this host: hand it the same
+    /// [`CommandRunner`] the filesystem tools are using, and the whole toolset acts on one machine.
+    /// Tests also use it to capture invocations without spawning anything.
     pub fn with_runner(runner: Arc<dyn CommandRunner>) -> Self {
         Self {
             runner,

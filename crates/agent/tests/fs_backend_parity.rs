@@ -138,7 +138,14 @@ async fn rg_backend() -> Option<Arc<dyn FsBackend>> {
 fn shell_posix_backend() -> Arc<dyn FsBackend> {
     Arc::new(ShellFs::with_capabilities(
         Arc::new(RealRunner),
-        Capabilities { rg: false },
+        Capabilities {
+            rg: false,
+            // The GNU rung: `-Z` and `-printf` available, ripgrep not. Busybox — which has neither —
+            // is covered by the live suite against a real Alpine container, since faking its absence
+            // here would only test the flag plumbing, not the tool it stands in for.
+            grep_null: true,
+            find_printf: true,
+        },
     ))
 }
 

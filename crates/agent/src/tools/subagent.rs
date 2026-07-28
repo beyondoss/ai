@@ -96,6 +96,9 @@ pub struct ChildToolConfig {
     /// constraints "would then *be* the sandbox escape". A parent whose tools act inside a sandbox
     /// spawning a child whose tools act on the host is exactly that.
     pub fs_backend: Option<std::sync::Arc<dyn crate::tools::fs::FsBackend>>,
+    /// The parent's command runner, inherited for the same reason as `fs_backend`: a child whose
+    /// `bash` runs on the host while its parent's runs in a sandbox would *be* the escape.
+    pub command_runner: Option<std::sync::Arc<dyn crate::tools::exec::CommandRunner>>,
 }
 
 /// Everything a [`Subagent`] needs to build and run a child. Shared by `Arc` across every depth level,
@@ -935,6 +938,7 @@ impl Subagent {
             web_allow_hosts: &self.ctx.tool_cfg.web_allow_hosts,
             web_timeout_ms: self.ctx.tool_cfg.web_timeout_ms,
             fs_backend: self.ctx.tool_cfg.fs_backend.clone(),
+            command_runner: self.ctx.tool_cfg.command_runner.clone(),
         });
         let allow = self.effective_tools(def);
         super::apply_filter(&mut registry, Some(&allow), None, false);

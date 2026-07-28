@@ -6322,6 +6322,7 @@ fn build_subagent_ctx(
             // `serve` has no non-local backend to hand down yet; when it gains one this must carry
             // it, or a child would act on the host while its parent acts elsewhere.
             fs_backend: None,
+            command_runner: None,
         },
         cwd: cwd.to_path_buf(),
         project_trusted,

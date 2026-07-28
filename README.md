@@ -4,7 +4,7 @@ Open-source AI at Beyond — a Cargo workspace:
 
 - **`crates/gateway`** (`beyond-ai`) — the LLM egress gateway. Route LLM traffic through one internal proxy; apps use their stock OpenAI or Anthropic SDK unchanged — the gateway authenticates, swaps in the real provider key, and meters every token.
 - **`crates/agent-core`** (`beyond-ai-agent-core`) — the agent harness core: a runtime/network-agnostic tool-calling loop (modeled on [pi](https://github.com/badlogic/pi-mono)), the OpenAI/Anthropic wire dialects, and the `ModelTransport`/`Tool` seams. Routes all model traffic through the gateway.
-- **`crates/agent`** (`beyond-ai-agent`) — the agent CLI: `run` (one-shot coding task) and `serve` (headless control protocol over stdio, for remote control over SSH). Ships the coding tools (read/write/edit/bash/ls/grep/find) plus the Beyond platform tools (fork/sync/logs).
+- **`crates/agent`** (`beyond-ai-agent`) — the agent CLI: `run` (one-shot coding task) and `serve` (headless control protocol over stdio, for remote control over SSH). Ships the coding tools (read/write/edit/bash/ls/grep/find) plus `todo` and `web`. Vendor-neutral: `--exec-url` points the whole toolset at any remote exec endpoint.
 
 The gateway is the unified model API: the agent speaks OpenAI/Anthropic wire to it with a `bai_v1` key and never holds a provider key. See each crate's `ARCHITECTURE.md`.
 
@@ -83,52 +83,59 @@ configured, the gateway is used (unless `AI_DIRECT=1`). Otherwise, routing is di
    your shell never silently moves a subscription onto pay-per-token billing
 5. the provider key for whichever provider natively serves the model id
 
-Tools: `read`, `write`, `edit`, `bash`, `ls`, `grep`, `find` (pi's coding set) plus `fork`, `sync`, `logs` (Beyond platform). See [crates/agent-core/ARCHITECTURE.md](crates/agent-core/ARCHITECTURE.md).
+Tools: `read`, `write`, `edit`, `bash`, `ls`, `grep`, `find` (pi's coding set), plus `todo` and `web`. See [crates/agent-core/ARCHITECTURE.md](crates/agent-core/ARCHITECTURE.md).
 
-### Running the tools inside a sandbox VM
+### Running the tools against a remote exec endpoint
 
-`--sandbox <instance-id>` makes the filesystem tools — `read`, `write`, `edit`, `ls`, `grep`, `find` —
-act inside an `instd`-managed Firecracker VM instead of on the host. The model sees an **identical**
-toolset: same names, descriptions and JSON schemas, so no prompt changes and no prompt-cache miss.
+`--exec-url <URL>` makes the agent's tools — `read`, `write`, `edit`, `ls`, `grep`, `find` **and
+`bash`** — run wherever that URL points instead of on the host. The model sees an identical toolset:
+same names, descriptions and JSON schemas, so no prompt changes and no prompt-cache miss.
+
+The agent knows one protocol and nothing else. It does not know what is behind the URL, and it does
+not manage sandboxes — creating, warming and destroying them is the caller's job.
 
 ```sh
-# an instance that already exists and is running (the agent attaches; it never creates or destroys VMs)
-sudo instd instance ls
-
-# point the filesystem tools at it
-AI_GATEWAY_URL=http://ai.internal AI_AGENT_KEY=bai_v1... \
-  cargo run -p beyond-ai-agent -- run --sandbox 22f5evbtx520 --sandbox-sudo \
+AI_GATEWAY_URL=… AI_AGENT_KEY=… \
+  cargo run -p beyond-ai-agent -- run \
+    --exec-url https://exec.internal/run \
+    --exec-header 'Authorization: Bearer $TOKEN' \
     "find the TODOs under /srv/app and fix the one in main.rs"
 ```
 
-`--sandbox-sudo` invokes `instd` through `sudo -n` (non-interactive), which is needed when the admin
-channel requires privilege the agent process doesn't have. Both flags have env equivalents:
-`AI_AGENT_SANDBOX` and `AI_AGENT_SANDBOX_SUDO`.
+The protocol is one POST, deliberately the smallest thing that carries a command and its result:
 
-On attach the agent prints which search engine the guest actually has:
-
+```jsonc
+// request
+{ "command": "rg", "args": ["--files"], "cwd": "/work", "timeout_ms": 120000 }
+// response — 200
+{ "exit_code": 0, "stdout": "…", "stderr": "…" }
 ```
-sandbox 22f5evbtx520: filesystem tools run inside the VM (search engine: Ripgrep)
-```
 
-**Install `ripgrep` in the sandbox image if you can.** With `rg` present, results are byte-identical
-to running locally. Without it the fallback is POSIX `grep`, which diverges in two measured ways: it
-does not honor `.gitignore` (so it walks `target/` and `node_modules/`), and `grep -I` treats any file
-containing non-UTF-8 bytes as binary and **silently skips it**. Both are asserted by name in
-`crates/agent/tests/fs_backend_parity.rs`.
+Putting that in front of a provider's SDK is a few dozen lines on your side, and that shim is where
+vendor specifics belong. `--exec-header` is repeatable and is where auth goes; which scheme the
+endpoint wants is the endpoint's business.
 
-Two limits worth knowing:
-
-- **`bash` still runs on the host.** Only the filesystem tools are redirected. A test pins this, so it
-  is a known state rather than a surprise.
-- **Paths are the guest's.** Point `--sandbox` at a VM whose working tree lives at the same absolute
-  path as the host's, or paths the agent reads from skills and the system prompt won't resolve.
-
-To verify against your own instance:
+For targets with no HTTP surface, `--exec-cmd` takes an argv template whose `{}` is replaced by the
+command:
 
 ```sh
-BEYOND_TEST_SANDBOX=<instance-id> cargo test -p beyond-ai-agent --test sandbox_live -- --nocapture
+--exec-cmd 'ssh build-host -- {}'
+--exec-cmd 'docker exec my-container {}'
+--exec-cmd 'kubectl exec pod/app -- {}'
 ```
+
+`{}` expands to **separate argv entries**, never into a shell string, so a path containing spaces,
+quotes or `;` stays one argument on the far side and cannot be reparsed as syntax.
+
+**Install `ripgrep` on the target if you can.** With `rg` present, results are byte-identical to
+running locally. Without it the fallback is POSIX `grep`, which diverges in two measured ways: it
+does not honor `.gitignore` (so it walks `target/` and `node_modules/`), and `grep -I` treats any
+file containing non-UTF-8 bytes as binary and **silently skips it**. Both are asserted by name in
+`crates/agent/tests/fs_backend_parity.rs`.
+
+One thing to know: **paths are the target's.** Point the endpoint at a machine whose working tree is
+at the same absolute path as the host's, or paths the agent reads from skills and the system prompt
+won't resolve.
 
 ## What It Does
 

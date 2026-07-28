@@ -90,10 +90,19 @@ jobs:
             filter: package(beyond-ai-agent) and kind(test) and binary(~serve)
             extra: ""
           - name: agent-rest
-            filter: package(beyond-ai-agent) and kind(test) and not binary(~serve)
+            filter: package(beyond-ai-agent) and kind(test) and not binary(~serve) and not binary(exec_endpoint_live)
             extra: ""
           - name: core-providers
             filter: package(beyond-ai-agent-core) or package(beyond-ai-providers)
+            extra: ""
+          # The remote-exec path against a **real, isolated target**, not a mock. Every other test of
+          # it runs commands on the same machine, which proves the wiring and nothing about a
+          # genuinely separate filesystem. Alpine is deliberate: it is busybox, whose `grep` has no
+          # `-Z`/`-I`/`--include` and whose `find` has no `-printf`, so it exercises the hardest rung
+          # — and it is what a large share of real sandboxes actually are. Running against a
+          # GNU-flavoured image would quietly skip the code path most likely to be wrong.
+          - name: exec-live
+            filter: package(beyond-ai-agent) and binary(exec_endpoint_live)
             extra: ""
     steps:
       - uses: actions/checkout@v7
@@ -119,6 +128,20 @@ jobs:
       # So: the test command writes to a file (inheritable, and an orphan holding it blocks nothing),
       # and a `tail -f` we own streams that file to the step's stdout. The tail does hold the step's
       # stdout — but it is ours to kill, so it always releases.
+      # Only the exec-live shard needs a target; the others must not pay for it.
+      - name: start a real sandbox target (Alpine = busybox, the hardest rung)
+        if: matrix.name == 'exec-live'
+        run: |
+          docker run -d --name agent-exec-target --rm alpine:latest sleep 900
+          docker exec agent-exec-target sh -c '
+            mkdir -p /work
+            printf "fn one() { NEEDLE }\n" > /work/a.rs
+            printf "TARGET-ONLY-MARKER\n"  > /work/marker.txt
+          '
+          # The asymmetry the assertions rely on: /work must NOT exist on the runner.
+          test ! -e /work
+          echo "AGENT_LIVE_EXEC_CMD=docker exec agent-exec-target {}" >> "$GITHUB_ENV"
+          echo "AGENT_LIVE_WORKDIR=/work" >> "$GITHUB_ENV"
       - name: test
         run: |
           set +e
