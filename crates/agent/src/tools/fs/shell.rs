@@ -48,6 +48,12 @@ pub struct Capabilities {
     /// engine as [`super::local::LocalFs`], so results match. Without it, see
     /// [`Capabilities::search_engine`].
     pub rg: bool,
+    /// `grep -Z` — a NUL after the filename, so a path containing `:` or a newline stays parseable.
+    /// GNU grep has it; **busybox does not**, and busybox is what Alpine ships, which is what a large
+    /// share of real containers are.
+    pub grep_null: bool,
+    /// `find -printf` — type and size in one pass. GNU find and `bfs` have it; **busybox does not**.
+    pub find_printf: bool,
 }
 
 /// Which program a search will actually use — the fallback ladder, named so it can be logged.
@@ -55,9 +61,13 @@ pub struct Capabilities {
 pub enum SearchEngine {
     /// `rg`. Same regex crate, same `.gitignore` semantics, same binary-file skipping as `LocalFs`.
     Ripgrep,
-    /// POSIX `grep -rnZIE`. Works everywhere, but **does not honor `.gitignore`** — it will walk
-    /// `target/` and `node_modules/` — and its ERE dialect is not Rust's regex dialect.
+    /// GNU-flavored `grep -rnZIE`. **Does not honor `.gitignore`** — it will walk `target/` and
+    /// `node_modules/` — and its ERE dialect is not Rust's regex dialect.
     PosixGrep,
+    /// Busybox `grep -rn`, the rung Alpine gets. Everything `PosixGrep` gives up, plus: no `-Z`, so a
+    /// path containing `:` cannot be told from the `path:line:` separator; no `--include`, so glob
+    /// filtering happens host-side; and no `-I`, so binary files are not skipped by the tool.
+    BusyboxGrep,
 }
 
 impl Capabilities {
@@ -65,20 +75,52 @@ impl Capabilities {
     /// is read as "absent" rather than failing the attach, because a missing optional tool is a
     /// degraded search, not a broken box.
     pub async fn probe(runner: &dyn CommandRunner) -> Self {
+        async fn ok(runner: &dyn CommandRunner, program: &str, args: &[&str]) -> bool {
+            runner
+                .run(
+                    program,
+                    &args.iter().map(|a| a.to_string()).collect::<Vec<_>>(),
+                    None,
+                    PROBE_TIMEOUT,
+                )
+                .await
+                // Exit 1 means "ran fine, found nothing" for grep/find; only a usage error (2 on GNU
+                // and busybox alike) means the flag is unsupported.
+                .map(|r| matches!(r.code, Some(0) | Some(1)))
+                .unwrap_or(false)
+        }
         let rg = runner
             .run("rg", &["--version".to_string()], None, PROBE_TIMEOUT)
             .await
             .map(|r| r.code == Some(0))
             .unwrap_or(false);
-        Self { rg }
+        // Probed against `/` because it exists everywhere; the pattern matches nothing, so this is a
+        // flag check rather than a search.
+        let grep_null = ok(
+            runner,
+            "grep",
+            &["-rnZ", "-e", "__cap_probe__", "--", "/dev/null"],
+        )
+        .await;
+        let find_printf = ok(
+            runner,
+            "find",
+            &["/dev/null", "-maxdepth", "0", "-printf", "%y"],
+        )
+        .await;
+        Self {
+            rg,
+            grep_null,
+            find_printf,
+        }
     }
 
     /// Which engine [`ShellFs::search`] will use.
     pub fn search_engine(&self) -> SearchEngine {
-        if self.rg {
-            SearchEngine::Ripgrep
-        } else {
-            SearchEngine::PosixGrep
+        match (self.rg, self.grep_null) {
+            (true, _) => SearchEngine::Ripgrep,
+            (false, true) => SearchEngine::PosixGrep,
+            (false, false) => SearchEngine::BusyboxGrep,
         }
     }
 }
@@ -143,11 +185,12 @@ impl FsBackend for ShellFs {
         let engine = self.caps.search_engine();
         let args = match engine {
             SearchEngine::Ripgrep => rg_args(q),
-            SearchEngine::PosixGrep => posix_grep_args(q),
+            SearchEngine::PosixGrep => posix_grep_args(q, true),
+            SearchEngine::BusyboxGrep => posix_grep_args(q, false),
         };
         let program = match engine {
             SearchEngine::Ripgrep => "rg",
-            SearchEngine::PosixGrep => "grep",
+            SearchEngine::PosixGrep | SearchEngine::BusyboxGrep => "grep",
         };
 
         let result: ExecResult = self
@@ -181,7 +224,13 @@ impl FsBackend for ShellFs {
             }
         }
 
-        let hits = parse_records(&result.stdout);
+        let hits = if engine == SearchEngine::BusyboxGrep {
+            // No `-Z`, so records are `path:line:text` with no unambiguous path terminator, and no
+            // `--include`, so the glob is applied here instead.
+            parse_colon_records(&result.stdout, q)
+        } else {
+            parse_records(&result.stdout)
+        };
         // `ExecResult` keeps only the first and last 128 KiB of each stream and drops the middle. On a
         // large result set that silently removes records from the middle of the output — so the flag
         // must reach the outcome, or this backend would report a confidently incomplete result as
@@ -199,14 +248,8 @@ impl FsBackend for ShellFs {
     }
 
     async fn stat(&self, path: &Path) -> Result<Option<Meta>, FsError> {
-        let mut args: Vec<String> = vec![path.to_string_lossy().into_owned()];
-        args.extend(STAT_ARGS_TAIL.iter().map(|s| s.to_string()));
-        args.push("-".to_string());
-        args.push(")".to_string());
-        args.push("-printf".to_string());
-        args.push("\\t%y\\t%s\\t%T@\\n".to_string());
-
-        let result = self.exec("find", &args).await?;
+        let args = sh_script(STAT_SCRIPT, &[path.to_string_lossy().into_owned()]);
+        let result = self.exec("sh", &args).await?;
         // A missing path is a non-zero exit with a message on stderr — an ordinary branch, not a
         // failure, so it maps to `None` exactly as `LocalFs`'s `metadata().ok()?` does.
         if result.code != Some(0) || result.stdout.trim().is_empty() {
@@ -298,28 +341,99 @@ impl FsBackend for ShellFs {
         cap: usize,
         include_hidden: bool,
     ) -> Result<Vec<DirEntry>, FsError> {
-        // `%Y` is the type *after* following a symlink, so a link to a directory lists as a directory
-        // — matching `LocalFs`'s use of `metadata` rather than `symlink_metadata`. A broken link
-        // reports `N`/`?` and is skipped, matching the local `metadata().ok()` skip.
-        // NUL record separators, because a filename may contain a newline.
-        let args = vec![
-            path.to_string_lossy().into_owned(),
-            "-mindepth".to_string(),
-            "1".to_string(),
-            "-maxdepth".to_string(),
-            "1".to_string(),
-            "-printf".to_string(),
-            "%Y\\t%s\\t%f\\0".to_string(),
-        ];
-        let result = self.exec("find", &args).await?;
-        if result.code != Some(0) && result.stdout.is_empty() {
+        let root = path.to_string_lossy().into_owned();
+        if self.caps.find_printf {
+            // `%Y` is the type *after* following a symlink, so a link to a directory lists as a
+            // directory — matching `LocalFs`'s use of `metadata` rather than `symlink_metadata`. A
+            // broken link reports `N`/`?` and is skipped, matching the local `metadata().ok()` skip.
+            // NUL record separators, because a filename may contain a newline.
+            let result = self
+                .exec(
+                    "find",
+                    &[
+                        root.clone(),
+                        "-mindepth".into(),
+                        "1".into(),
+                        "-maxdepth".into(),
+                        "1".into(),
+                        "-printf".into(),
+                        "%Y\\t%s\\t%f\\0".into(),
+                    ],
+                )
+                .await?;
+            if result.code != Some(0) && result.stdout.is_empty() {
+                return Err(FsError::Backend(format!(
+                    "ls {}: {}",
+                    path.display(),
+                    first_line_or(&result.stderr, "command failed")
+                )));
+            }
+            return Ok(parse_dir_entries(&result.stdout, cap, include_hidden));
+        }
+
+        // Busybox has no `-printf`, so type comes from a second pass restricted to directories. Two
+        // execs instead of one; `ls` renders only the directory distinction (the trailing `/`) and
+        // never reads a size, so nothing else is lost.
+        let listing = self
+            .exec(
+                "find",
+                &[
+                    root.clone(),
+                    "-mindepth".into(),
+                    "1".into(),
+                    "-maxdepth".into(),
+                    "1".into(),
+                    "-print0".into(),
+                ],
+            )
+            .await?;
+        if listing.code != Some(0) && listing.stdout.is_empty() {
             return Err(FsError::Backend(format!(
                 "ls {}: {}",
                 path.display(),
-                first_line_or(&result.stderr, "command failed")
+                first_line_or(&listing.stderr, "command failed")
             )));
         }
-        Ok(parse_dir_entries(&result.stdout, cap, include_hidden))
+        let dirs = self
+            .exec(
+                "find",
+                &[
+                    root,
+                    "-mindepth".into(),
+                    "1".into(),
+                    "-maxdepth".into(),
+                    "1".into(),
+                    "-type".into(),
+                    "d".into(),
+                    "-print0".into(),
+                ],
+            )
+            .await?;
+        let dir_set: std::collections::BTreeSet<&str> =
+            dirs.stdout.split('\0').filter(|r| !r.is_empty()).collect();
+        let mut out = Vec::new();
+        for raw in listing.stdout.split('\0') {
+            if raw.is_empty() || out.len() >= cap {
+                continue;
+            }
+            let name = Path::new(raw)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            if name.is_empty() || (!include_hidden && name.starts_with('.')) {
+                continue;
+            }
+            out.push(DirEntry {
+                name,
+                kind: if dir_set.contains(raw) {
+                    FileKind::Dir
+                } else {
+                    FileKind::File
+                },
+                len: 0,
+            });
+        }
+        Ok(out)
     }
 
     async fn glob(&self, q: &GlobQuery) -> Result<GlobOutcome, FsError> {
@@ -399,10 +513,61 @@ impl FsBackend for ShellFs {
                     .await?;
                 entries.extend(parse_typed_paths(&extra.stdout));
             }
-            SearchEngine::PosixGrep => {
-                // One pass: with no ignore-awareness to preserve there is nothing to derive, so every
-                // entry is enumerated directly *with its type* — which is also how a directory keeps
-                // its trailing slash in the rendered output.
+            SearchEngine::PosixGrep | SearchEngine::BusyboxGrep => {
+                // One pass when `-printf` exists: with no ignore-awareness to preserve there is
+                // nothing to derive, so every entry is enumerated directly *with its type* — which is
+                // also how a directory keeps its trailing slash in the rendered output. Busybox has
+                // no `-printf`, so it takes two `-print0` passes instead (all, then directories).
+                if !self.caps.find_printf {
+                    let all = self.exec("find", &[root.clone(), "-print0".into()]).await?;
+                    if all.code != Some(0) && all.stdout.is_empty() && !all.stderr.trim().is_empty()
+                    {
+                        return Err(FsError::Backend(format!(
+                            "find: {}",
+                            first_line_or(&all.stderr, "command failed")
+                        )));
+                    }
+                    let dirs = self
+                        .exec(
+                            "find",
+                            &[root.clone(), "-type".into(), "d".into(), "-print0".into()],
+                        )
+                        .await?;
+                    let dir_set: std::collections::BTreeSet<&str> =
+                        dirs.stdout.split('\0').filter(|r| !r.is_empty()).collect();
+                    stderr_note = incomplete_note(&all);
+                    for raw in all.stdout.split('\0').filter(|r| !r.is_empty()) {
+                        entries.push((PathBuf::from(raw), dir_set.contains(raw)));
+                    }
+                    let matcher2 = matcher;
+                    let mut paths: Vec<(PathBuf, bool)> = Vec::new();
+                    let mut hit_hard_cap = false;
+                    for (p, is_dir) in entries {
+                        if paths.len() >= super::HARD_CAP {
+                            hit_hard_cap = true;
+                            break;
+                        }
+                        if p == q.root {
+                            continue;
+                        }
+                        let candidate = if q.basename_only {
+                            p.file_name()
+                                .map(|n| n.to_string_lossy())
+                                .unwrap_or(std::borrow::Cow::Borrowed(""))
+                        } else {
+                            p.to_string_lossy()
+                        };
+                        if matcher2.is_match(&*candidate) {
+                            paths.push((p.clone(), is_dir));
+                        }
+                    }
+                    let (paths, truncated) = super::finalize_glob(paths, q.limit, hit_hard_cap);
+                    return Ok(GlobOutcome {
+                        paths,
+                        truncated,
+                        first_error: stderr_note,
+                    });
+                }
                 let all = self
                     .exec(
                         "find",
@@ -516,6 +681,68 @@ fn parse_stat(stdout: &str) -> Option<Meta> {
         mtime: Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs)),
         writable,
     })
+}
+
+/// Parse busybox `grep -rn` output: `<path><sep><line><sep><text>`, where `<sep>` is `:` for a match
+/// and `-` for a context line.
+///
+/// Without `-Z` there is no unambiguous end-of-path marker, so the split is the **first** separator
+/// followed by digits followed by the same separator. That is correct for every path without a `:` or
+/// `-` immediately preceding digits, and this is the documented cost of the busybox rung — see
+/// [`SearchEngine::BusyboxGrep`]. A path containing a newline cannot be represented at all here,
+/// which is why the NUL-capable rungs are preferred whenever available.
+///
+/// The `glob` is applied here too, because busybox `grep` has no `--include`. It is the same
+/// `globset` matcher [`super::local::LocalFs`] uses, so glob *semantics* stay identical; only where
+/// the filtering happens changes.
+fn parse_colon_records(stdout: &str, q: &SearchQuery) -> Vec<Hit> {
+    let glob = q.glob.as_ref().and_then(|(pattern, negate)| {
+        globset::GlobBuilder::new(pattern)
+            .case_insensitive(q.ignore_case)
+            .build()
+            .ok()
+            .map(|g| (g.compile_matcher(), *negate))
+    });
+    let mut hits = Vec::new();
+    for line in stdout.lines() {
+        if line == "--" {
+            continue; // context-group separator
+        }
+        let Some((path, line_no, is_match, text)) = split_colon_record(line) else {
+            continue;
+        };
+        if let Some((matcher, negate)) = &glob {
+            let matched = matcher.is_match(Path::new(path));
+            if if *negate { matched } else { !matched } {
+                continue;
+            }
+        }
+        hits.push(Hit {
+            path: Arc::from(Path::new(path)),
+            line: line_no,
+            text: clip(&trim_eol(text)),
+            is_match,
+        });
+    }
+    hits
+}
+
+/// Find the first `<sep><digits><sep>` boundary and split around it.
+fn split_colon_record(line: &str) -> Option<(&str, usize, bool, &str)> {
+    let bytes = line.as_bytes();
+    for (i, &c) in bytes.iter().enumerate() {
+        if c != b':' && c != b'-' {
+            continue;
+        }
+        let rest = &bytes[i + 1..];
+        let digits = rest.iter().take_while(|b| b.is_ascii_digit()).count();
+        if digits == 0 || rest.get(digits) != Some(&c) {
+            continue;
+        }
+        let line_no: usize = line[i + 1..i + 1 + digits].parse().ok()?;
+        return Some((&line[..i], line_no, c == b':', &line[i + 1 + digits + 1..]));
+    }
+    None
 }
 
 /// Parse NUL-terminated `<type>\t<path>` records from `find -printf '%y\t%p\0'`.
@@ -683,16 +910,22 @@ fn sh_script(script: &'static str, args: &[String]) -> Vec<String> {
 /// `-writable` runs a real access check as the invoking user rather than reporting mode bits, which
 /// is what [`Meta::writable`] promises. `%y` is the entry's own type and `%s`/`%T@` its size and
 /// mtime. Works on GNU find and on `bfs`, which is what `find` actually is on some hosts.
-const STAT_ARGS_TAIL: [&str; 8] = [
-    "-maxdepth",
-    "0",
-    "(",
-    "-writable",
-    "-printf",
-    "w",
-    "-o",
-    "-printf",
-];
+/// One `stat`, one round trip, portable everywhere.
+///
+/// Built from shell builtins (`[ -e ]`, `[ -d ]`, `[ -w ]`) plus `stat -c`, rather than
+/// `find -printf`, because busybox `find` has no `-printf` — and busybox is what Alpine ships, which
+/// is what a large share of real sandboxes are. The `[ -w ]` test is a real access check as the
+/// invoking user, which is what `Meta::writable` promises.
+const STAT_SCRIPT: &str = r#"[ -e "$1" ] || exit 1
+if [ -d "$1" ]; then t=d
+elif [ -f "$1" ]; then t=f
+else t=o
+fi
+if [ -w "$1" ]; then w=w; else w=-; fi
+printf '%s	%s	' "$w" "$t"
+stat -c '%s	%Y' -- "$1" 2>/dev/null || printf '0	0'
+printf '
+'"#;
 
 /// Read a byte window and base64 it. `dd`'s `skip_bytes`/`count_bytes` are what make an arbitrary
 /// offset expressible at all.
@@ -791,14 +1024,15 @@ fn rg_args(q: &SearchQuery) -> Vec<String> {
 /// treat `+`, `?`, `|` and `()` as literals — a silent and very confusing difference. It is still not
 /// Rust's regex dialect: `\d`, `\b`, and non-greedy quantifiers are GNU extensions at best and absent
 /// at worst. **This rung does not honor `.gitignore`.**
-fn posix_grep_args(q: &SearchQuery) -> Vec<String> {
-    let mut args = vec![
-        "-r".to_string(),
-        "-n".to_string(),
-        "-Z".to_string(),
-        "-I".to_string(),
-        "--color=never".to_string(),
-    ];
+fn posix_grep_args(q: &SearchQuery, gnu: bool) -> Vec<String> {
+    let mut args = vec!["-r".to_string(), "-n".to_string()];
+    if gnu {
+        // Busybox has neither: `-Z` (NUL after the filename) nor `-I` (skip binary files), and
+        // rejects `--color` outright.
+        args.push("-Z".to_string());
+        args.push("-I".to_string());
+        args.push("--color=never".to_string());
+    }
     if q.literal {
         // `-F` and `-E` are mutually exclusive; a literal search needs no dialect at all.
         args.push("-F".to_string());
@@ -808,7 +1042,9 @@ fn posix_grep_args(q: &SearchQuery) -> Vec<String> {
     if q.ignore_case {
         args.push("-i".to_string());
     }
-    if let Some((pattern, negate)) = &q.glob {
+    // `--include`/`--exclude` are GNU-only; on busybox the glob is applied host-side instead (see
+    // `parse_colon_records`), which is the same `globset` matcher `LocalFs` uses either way.
+    if gnu && let Some((pattern, negate)) = &q.glob {
         args.push(if *negate {
             format!("--exclude={pattern}")
         } else {
@@ -1007,19 +1243,23 @@ mod tests {
         let mut q = query("x", PathBuf::from("."), 100);
         q.glob = Some(("*.test.rs".into(), true));
         assert!(
-            posix_grep_args(&q)
+            posix_grep_args(&q, true)
                 .iter()
                 .any(|a| a == "--exclude=*.test.rs")
         );
         q.glob = Some(("*.rs".into(), false));
-        assert!(posix_grep_args(&q).iter().any(|a| a == "--include=*.rs"));
+        assert!(
+            posix_grep_args(&q, true)
+                .iter()
+                .any(|a| a == "--include=*.rs")
+        );
     }
 
     #[test]
     fn literal_mode_uses_fixed_strings_and_never_pairs_f_with_e() {
         let mut q = query("a.b(c)", PathBuf::from("."), 100);
         q.literal = true;
-        let args = posix_grep_args(&q);
+        let args = posix_grep_args(&q, true);
         assert!(args.iter().any(|a| a == "-F"));
         assert!(
             !args.iter().any(|a| a == "-E"),
