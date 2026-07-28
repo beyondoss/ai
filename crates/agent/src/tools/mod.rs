@@ -9,7 +9,6 @@ use std::sync::Arc;
 use agent_core::{Tool, ToolError, ToolRegistry};
 
 pub mod bash;
-pub mod beyond;
 pub mod edit;
 pub mod exec;
 pub mod find;
@@ -497,6 +496,16 @@ pub struct ToolConfig<'a> {
     pub web_allow_hosts: &'a [String],
     /// `--web-timeout-ms`: the `web` tool's per-request timeout (default 30 s).
     pub web_timeout_ms: Option<u64>,
+    /// Where `bash` runs.
+    ///
+    /// `None` means this host. A `Some` runner **must** be the same target `fs_backend` points at:
+    /// a `bash` on one machine and an `edit` on another is not a configuration, it is a bug — the
+    /// model would write a file and then run a command that cannot see it. More importantly, `bash`
+    /// is the tool that most needs containment, so isolating the filesystem while leaving arbitrary
+    /// command execution on the host would provide close to no isolation at all.
+    /// [`default_registry_with_config`] is the only place that pairs them, precisely so they cannot
+    /// drift apart.
+    pub command_runner: Option<Arc<dyn exec::CommandRunner>>,
     /// Where the six filesystem tools' I/O lands.
     ///
     /// `None` means the host filesystem — every existing caller, and behaviorally identical to the
@@ -573,9 +582,14 @@ pub fn default_registry_with_config(cfg: &ToolConfig<'_>) -> ToolRegistry {
     reg.register(Arc::new(ls_tool));
     reg.register(Arc::new(grep_tool));
     reg.register(Arc::new(find_tool));
-    let mut bash = match cfg.bash_timeout_ms {
-        Some(ms) => bash::Bash::real().with_default_timeout_ms(ms),
-        None => bash::Bash::real(),
+    // `bash` runs wherever the filesystem tools do — see `ToolConfig::command_runner`.
+    let mut bash = match (&cfg.command_runner, cfg.bash_timeout_ms) {
+        (Some(runner), Some(ms)) => {
+            bash::Bash::with_runner(runner.clone()).with_default_timeout_ms(ms)
+        }
+        (Some(runner), None) => bash::Bash::with_runner(runner.clone()),
+        (None, Some(ms)) => bash::Bash::real().with_default_timeout_ms(ms),
+        (None, None) => bash::Bash::real(),
     };
     bash = bash.with_root(root);
     if let Some(path) = cfg.bash_shell_path {
@@ -596,9 +610,6 @@ pub fn default_registry_with_config(cfg: &ToolConfig<'_>) -> ToolRegistry {
         cfg.web_allow_hosts,
         cfg.web_timeout_ms,
     )));
-    reg.register(Arc::new(beyond::Fork::real()));
-    reg.register(Arc::new(beyond::Sync::real()));
-    reg.register(Arc::new(beyond::Logs::real()));
     // After every built-in, so an allow/deny filter (`apply_filter`) scopes MCP tools too, and so a
     // server can't shadow a built-in by name (the `mcp__<server>__<tool>` prefix already prevents that).
     for tool in cfg.mcp_tools {
@@ -912,20 +923,24 @@ mod tests {
     }
 
     #[test]
-    fn default_registry_has_coding_and_beyond_tools() {
+    fn default_registry_has_the_coding_tools_and_nothing_vendor_specific() {
         let reg = default_registry();
         // pi's coding tools …
         for name in ["read", "write", "edit", "bash", "ls", "grep", "find"] {
             assert!(reg.get(name).is_some(), "missing coding tool: {name}");
         }
-        // … the model's own task list, and its window to the web …
+        // … the model's own task list, and its window to the web.
         assert!(reg.get("todo").is_some(), "missing todo tool");
         assert!(reg.get("web").is_some(), "missing web tool");
-        // … plus the Beyond platform tools.
+        // Nothing vendor-specific: the default set is the general coding toolset and nothing else.
+        // Platform tools belong in whatever ships them, not in the agent everyone runs.
         for name in ["fork", "sync", "logs"] {
-            assert!(reg.get(name).is_some(), "missing beyond tool: {name}");
+            assert!(
+                reg.get(name).is_none(),
+                "vendor-specific tool leaked in: {name}"
+            );
         }
-        assert_eq!(reg.len(), 12);
+        assert_eq!(reg.len(), 9);
     }
 
     #[test]
@@ -1015,9 +1030,7 @@ mod tests {
             default_registry().len(),
             default_registry_with(None, None).len()
         );
-        for name in [
-            "read", "write", "edit", "bash", "ls", "grep", "find", "fork", "sync", "logs",
-        ] {
+        for name in ["read", "write", "edit", "bash", "ls", "grep", "find"] {
             assert!(default_registry_with(None, None).get(name).is_some());
         }
     }
@@ -1052,9 +1065,7 @@ mod tests {
             ..ToolConfig::new()
         });
         // Every built-in is still there …
-        for name in [
-            "read", "write", "edit", "bash", "ls", "grep", "find", "fork", "sync", "logs",
-        ] {
+        for name in ["read", "write", "edit", "bash", "ls", "grep", "find"] {
             assert!(reg.get(name).is_some(), "missing built-in tool: {name}");
         }
         // … plus the MCP-discovered one, under its already-namespaced name.
