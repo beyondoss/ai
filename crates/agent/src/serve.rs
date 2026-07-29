@@ -617,14 +617,6 @@ pub struct ServeConfig {
     pub web_allow_hosts: Vec<String>,
     /// `--web-timeout-ms`: the `web` tool's per-request timeout (default 30 s).
     pub web_timeout_ms: Option<u64>,
-    /// A process-wide default exec endpoint, applied to every session at startup.
-    ///
-    /// For the single-tenant case (one server, one sandbox) this saves an RPC. A multi-tenant server
-    /// leaves it unset and calls `set_exec_endpoint` per session instead — the per-session value
-    /// always wins, because the cell is what the tools read.
-    pub exec_url: Option<String>,
-    pub exec_header: Vec<String>,
-    pub exec_cmd: Option<String>,
     /// Restrict the tool set to exactly these names, dropping everything else. Combine with
     /// `exclude_tools` to carve one back out of the allow-list. Fixed for the process — like `system`,
     /// there's no runtime RPC to change it, but it does survive a `set_model`/`set_thinking` rebuild
@@ -1405,17 +1397,6 @@ impl Persistence {
     }
 
     /// Set the current session's title.
-    /// Persist this session's exec endpoint so a resume reattaches it. Best-effort: a session
-    /// running without persistence still gets the live target, it just won't survive a restart.
-    fn set_exec_endpoint(&mut self, endpoint: Option<Value>) {
-        self.meta.exec_endpoint = endpoint.clone();
-        if let Some(store) = &mut self.store
-            && let Err(e) = store.set_exec_endpoint(endpoint)
-        {
-            tracing::warn!(error = %e, "failed to persist the session's exec endpoint");
-        }
-    }
-
     fn set_title(&mut self, title: &str) -> std::io::Result<()> {
         if let Some(store) = &mut self.store {
             store.set_title(title)?;
@@ -2106,20 +2087,6 @@ pub(crate) async fn serve_session(
     // Tools are fixed for the whole process (see `build_agent`'s doc comment), so this one check is
     // reused verbatim by `reload`'s own rebuild below rather than re-deriving it.
     let exec_cell = crate::exec_endpoint::ExecCell::new();
-    // A process-wide default, if configured. Per-session `set_exec_endpoint` overrides it, and a
-    // session switch re-derives from that session's own record — so this is a starting point, not a
-    // floor.
-    match (&cfg.exec_url, &cfg.exec_cmd) {
-        (Some(u), _) => match crate::exec_endpoint::ExecTarget::http(u, &cfg.exec_header).await {
-            Ok(t) => exec_cell.set(Some(t)),
-            Err(e) => eprintln!("warning: --exec-url ignored: {e}"),
-        },
-        (None, Some(c)) => match crate::exec_endpoint::ExecTarget::template(c).await {
-            Ok(t) => exec_cell.set(Some(t)),
-            Err(e) => eprintln!("warning: --exec-cmd ignored: {e}"),
-        },
-        (None, None) => {}
-    }
     let startup_tools = build_tools(&cfg, cfg.image_auto_resize, &exec_cell);
     let has_read = startup_tools.get("read").is_some();
     let has_todo = startup_tools.get(crate::tools::todo::NAME).is_some();
@@ -2198,30 +2165,7 @@ pub(crate) async fn serve_session(
     // "runs locally", not "runs in somebody else's box".
     macro_rules! reset_exec_endpoint {
         () => {
-            // Clear first, unconditionally: whatever the incoming session turns out to want, it must
-            // never keep the outgoing session's target even briefly.
             exec_cell.set(None);
-            if let Some(spec) = persistence.meta.exec_endpoint.clone() {
-                let url = spec.get("url").and_then(Value::as_str).map(str::to_string);
-                let cmd = spec.get("command").and_then(Value::as_str).map(str::to_string);
-                let headers: Vec<String> = spec
-                    .get("headers")
-                    .and_then(Value::as_array)
-                    .map(|a| {
-                        a.iter()
-                            .filter_map(|v| v.as_str().map(str::to_string))
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                let restored = match (url.as_deref(), cmd.as_deref()) {
-                    (Some(u), _) => crate::exec_endpoint::ExecTarget::http(u, &headers).await.ok(),
-                    (None, Some(c)) => crate::exec_endpoint::ExecTarget::template(c).await.ok(),
-                    (None, None) => None,
-                };
-                // A target that no longer resolves leaves the session on the host with the header
-                // still recorded, rather than failing the switch — the sandbox may simply be gone.
-                exec_cell.set(restored);
-            }
         };
     }
 
@@ -4170,18 +4114,6 @@ pub(crate) async fn serve_session(
                             .as_ref()
                             .map(|t| format!("{:?}", t.search_engine()))
                             .unwrap_or_else(|| "local".to_string());
-                        // Recorded on the session header so a resume reattaches rather than silently
-                        // falling back to the host — which for a sandboxed session would move the
-                        // tenant's work onto the server.
-                        persistence.set_exec_endpoint(if target.is_some() {
-                            Some(json!({
-                                "url": url,
-                                "command": exec_cmd,
-                                "headers": headers,
-                            }))
-                        } else {
-                            None
-                        });
                         exec_cell.set(target);
                         emit!(response(
                             id,
@@ -6473,12 +6405,10 @@ fn build_subagent_ctx(
             web_allow_hosts: cfg.web_allow_hosts.clone(),
             web_timeout_ms: cfg.web_timeout_ms,
             image_auto_resize: cfg.image_auto_resize,
-            // The **cell**, not a snapshot: a child must act on whatever machine its parent is
-            // pointed at *now*. Handing down `None` here was a sandbox escape — the parent's tools
-            // ran in the sandbox while any `subagent` it spawned ran on the host, so the model could
-            // reach around the isolation simply by delegating.
-            fs_backend: Some(exec.backend()),
-            command_runner: Some(exec.runner()),
+            // `serve` has no non-local backend to hand down yet; when it gains one this must carry
+            // it, or a child would act on the host while its parent acts elsewhere.
+            fs_backend: None,
+            command_runner: None,
         },
         cwd: cwd.to_path_buf(),
         project_trusted,

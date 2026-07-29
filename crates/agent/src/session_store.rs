@@ -130,20 +130,6 @@ pub struct SessionMeta {
     #[serde(default)]
     pub thinking_level: Option<String>,
 
-    /// The exec endpoint this session's tools act on, if any — `{"command": …}` or
-    /// `{"url": …, "headers": [...]}`, the same shape `set_exec_endpoint` accepts.
-    ///
-    /// Persisted so resuming a session reattaches it rather than silently falling back to the host,
-    /// which for a sandboxed session would move a tenant's work onto the server. Additive and
-    /// `#[serde(default)]`, so no format-version bump (see this module's format contract) and an old
-    /// session file simply has no endpoint.
-    ///
-    /// **Not** copied by `fork`: a fork is a new session, and a sandbox belongs to the session it was
-    /// provisioned for. Inheriting it would be the same cross-session reuse that clearing on switch
-    /// exists to prevent.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub exec_endpoint: Option<serde_json::Value>,
-
     // --- Derived listing fields ---
     // Populated only by [`SessionRepo::list`] (from the file's mtime and a light scan), never persisted
     // — `#[serde(skip)]` keeps them out of the on-disk header so they can't go stale, and defaults them
@@ -198,7 +184,6 @@ impl SessionMeta {
             branch_summaries: 0,
             summarized_branch_messages: 0,
             thinking_level: None,
-            exec_endpoint: None,
             updated_at: 0,
             message_count: 0,
             preview: None,
@@ -2546,19 +2531,6 @@ impl SessionStore {
     /// compaction run against this same still-open store (rather than a freshly reopened one) would see
     /// an empty `title_changes` and never find this rename, exactly the gap `record_model_change`/
     /// `record_thinking_level_change` already close for `model_changes`/`level_changes`.
-    /// Record this session's exec endpoint (or clear it) by appending a fresh header line.
-    ///
-    /// Header updates are appends, not rewrites — `open` takes the *last* header it sees (see this
-    /// module's doc), so this is O(1) and crash-safe: a torn append leaves the previous header intact
-    /// rather than corrupting the session.
-    pub fn set_exec_endpoint(
-        &mut self,
-        endpoint: Option<serde_json::Value>,
-    ) -> std::io::Result<()> {
-        self.meta.exec_endpoint = endpoint;
-        append_line(&self.path, &Entry::Session(self.meta.clone()))
-    }
-
     pub fn set_title(&mut self, title: impl Into<String>) -> std::io::Result<()> {
         let title = sanitize_title(&title.into());
         let anchor = self.active.last().cloned();
@@ -5937,36 +5909,6 @@ mod tests {
         assert_eq!(metas.len(), 2);
         // Newest first: the fork was created after `a`.
         assert!(metas[0].created_at >= metas[1].created_at);
-    }
-
-    #[test]
-    fn a_fork_does_not_inherit_the_sources_exec_endpoint() {
-        // A fork is a new session, and a sandbox belongs to the session it was provisioned for.
-        // Inheriting it would be the same cross-session reuse that clearing on switch exists to
-        // prevent — and it is the kind of thing that stays correct only while somebody remembers, so
-        // it is pinned here rather than left to `fork`'s field-by-field copying staying honest.
-        let dir = tmpdir();
-        let repo = SessionRepo::open(dir.path()).unwrap();
-        let mut src = repo
-            .create(SessionMeta::new(String::from("/w"), "m"))
-            .unwrap();
-        let mut s = Session::new();
-        s.user("hi");
-        src.append_new(&s.messages).unwrap();
-        src.set_exec_endpoint(Some(serde_json::json!({ "command": "docker exec a {}" })))
-            .unwrap();
-        assert!(
-            src.meta().exec_endpoint.is_some(),
-            "sanity: the source has one"
-        );
-        let src_id = src.meta().id.clone();
-
-        let (forked, _) = repo.fork(&src_id, usize::MAX).unwrap();
-        assert_eq!(
-            forked.meta().exec_endpoint,
-            None,
-            "the fork inherited the source's sandbox"
-        );
     }
 
     #[test]

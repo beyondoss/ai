@@ -115,29 +115,6 @@ Putting that in front of a provider's SDK is a few dozen lines on your side, and
 vendor specifics belong. `--exec-header` is repeatable and is where auth goes; which scheme the
 endpoint wants is the endpoint's business.
 
-#### Multi-tenant `serve`
-
-In `serve`, the endpoint is **per session**, so one server can multiplex tenants with a sandbox each:
-
-```jsonc
-{"id":"1","type":"set_exec_endpoint","url":"https://exec.internal/run","headers":["Authorization: Bearer …"]}
-{"id":"2","type":"set_exec_endpoint","command":"docker exec tenant-a {}"}   // or a template
-{"id":"3","type":"set_exec_endpoint"}                                        // detach, back to the host
-```
-
-Three properties this guarantees, each covered by a test:
-
-- **Switching sessions never inherits an endpoint.** The incoming session is detached first, then
-  reattached from its own record. Failing open to "runs on the host" is recoverable; failing open to
-  "runs in the previous tenant's sandbox" is not.
-- **Subagents act on their parent's machine.** A child whose tools ran on the host while its parent
-  was sandboxed would let the model escape by delegating.
-- **Resuming a session reattaches its endpoint**, so a restart doesn't silently move a tenant's work
-  onto the server. A fork does _not_ inherit it — a sandbox belongs to the session it was made for.
-
-`--exec-url`/`--exec-cmd` also work on `serve` as a process-wide default for the single-tenant case;
-a per-session `set_exec_endpoint` always wins.
-
 For targets with no HTTP surface, `--exec-cmd` takes an argv template whose `{}` is replaced by the
 command:
 
