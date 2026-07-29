@@ -255,7 +255,12 @@ impl ApprovalRuntime {
 /// `world` must be the same one the gated tools resolve paths in. A remembered "always allow
 /// `/workspace/notes.md`" is only sound if the key it was stored under names the file that will
 /// actually be written next time — and on a non-local filesystem, host `canonicalize` does not.
-pub fn scope_key(tool: &str, input: &Value, root: &std::path::Path, world: &PathWorld) -> String {
+pub fn scope_key(
+    tool: &str,
+    input: &Value,
+    root: &std::path::Path,
+    world: PathWorld<'_>,
+) -> String {
     match tool {
         "bash" => match input.get("command").and_then(Value::as_str) {
             // Verbatim, never a prefix.
@@ -344,7 +349,7 @@ pub async fn gated_before_tool_call(
         return None;
     }
 
-    let key = scope_key(name, input, policy.root(), &policy.world());
+    let key = scope_key(name, input, policy.root(), policy.world());
     let mem_key = memory_key(name, &key);
     match runtime.memory.lookup(&mem_key) {
         Some(true) => return None,
@@ -454,7 +459,7 @@ mod tests {
 
     #[test]
     fn a_bash_scope_key_is_the_verbatim_command_not_a_prefix() {
-        let key = |c: &str| scope_key("bash", &json!({ "command": c }), &cwd(), &PathWorld::Local);
+        let key = |c: &str| scope_key("bash", &json!({ "command": c }), &cwd(), PathWorld::Local);
         assert_eq!(key("git status"), "cmd:git status");
         assert_ne!(
             key("git status"),
@@ -474,19 +479,19 @@ mod tests {
             "write",
             &json!({ "path": "notes.md" }),
             root,
-            &PathWorld::Local,
+            PathWorld::Local,
         );
         let dotted = scope_key(
             "write",
             &json!({ "path": "./notes.md" }),
             root,
-            &PathWorld::Local,
+            PathWorld::Local,
         );
         let dotdot = scope_key(
             "edit",
             &json!({ "path": "sub/../notes.md" }),
             root,
-            &PathWorld::Local,
+            PathWorld::Local,
         );
         assert_eq!(direct, dotted);
         assert_eq!(
@@ -502,7 +507,7 @@ mod tests {
                 "write",
                 &json!({ "path": "other.md" }),
                 root,
-                &PathWorld::Local
+                PathWorld::Local
             )
         );
     }
@@ -514,7 +519,7 @@ mod tests {
                 "subagent",
                 &json!({ "agent": "x" }),
                 &cwd(),
-                &PathWorld::Local
+                PathWorld::Local
             ),
             "tool:subagent"
         );
@@ -523,11 +528,11 @@ mod tests {
     #[test]
     fn a_missing_argument_still_produces_a_stable_key_rather_than_panicking() {
         assert_eq!(
-            scope_key("bash", &json!({}), &cwd(), &PathWorld::Local),
+            scope_key("bash", &json!({}), &cwd(), PathWorld::Local),
             "cmd:<none>"
         );
         assert_eq!(
-            scope_key("write", &json!({}), &cwd(), &PathWorld::Local),
+            scope_key("write", &json!({}), &cwd(), PathWorld::Local),
             "path:<none>"
         );
     }

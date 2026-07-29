@@ -263,7 +263,7 @@ impl Tool for Read {
         let backend = self.backend.as_ref();
         let (path, meta) = resolve_read_path(
             backend,
-            &super::resolve_against_in(&self.root, path, &backend.world()),
+            &super::resolve_against_in(&self.root, path, backend.world()),
         )
         .await;
         // Refuse a FIFO/socket/device on its kind before anything opens it — opening a FIFO for

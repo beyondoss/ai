@@ -64,7 +64,7 @@ impl Counting {
 
 #[async_trait]
 impl FsBackend for Counting {
-    fn world(&self) -> PathWorld {
+    fn world(&self) -> PathWorld<'_> {
         PathWorld::Local
     }
     async fn search(&self, q: &SearchQuery) -> Result<SearchOutcome, FsError> {

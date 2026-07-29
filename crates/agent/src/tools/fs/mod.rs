@@ -59,17 +59,13 @@ pub const LINE_TRUNCATED_SUFFIX: &str = "… [truncated]";
 /// explicit parameter means the choice is visible at every call site instead of being an emergent
 /// property of whether a syscall happened to fail. See
 /// [`write_key`](crate::tools::write_key).
-/// Owns its `home` rather than borrowing it. A backend whose target can be swapped at runtime (see
-/// `ExecCell`) reports its world from behind a lock, and a borrowed variant could not outlive that
-/// guard. The cost is one small `String` clone per path resolution, against a tool call that is
-/// already doing I/O.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PathWorld {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathWorld<'a> {
     /// This host. `canonicalize` resolves real symlinks and `~` means this process's `$HOME`.
     Local,
     /// Somewhere else. Resolution stays lexical, and `~` means the *target's* home — `None` when it
     /// isn't known, which leaves a leading `~` untouched rather than guessing.
-    Remote { home: Option<String> },
+    Remote { home: Option<&'a str> },
 }
 
 /// One reported line: its path, line number, text, and whether it is a match (vs a context line). The
@@ -307,7 +303,7 @@ pub trait FsBackend: Send + Sync {
     /// any test double — gets the right answer without stating it. A backend that is *not* the host
     /// must override this, because the default silently licenses host `canonicalize` and host `~`
     /// expansion on paths that belong to another machine.
-    fn world(&self) -> PathWorld {
+    fn world(&self) -> PathWorld<'_> {
         PathWorld::Local
     }
 }

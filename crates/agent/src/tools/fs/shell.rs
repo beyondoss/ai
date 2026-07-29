@@ -175,9 +175,9 @@ impl FsBackend for ShellFs {
     /// depended on which runner it held would take the local path in every test and the remote path
     /// only in production, so the resolution logic that ships would be the one never exercised. The
     /// world is a property of the abstraction, not of today's transport.
-    fn world(&self) -> PathWorld {
+    fn world(&self) -> PathWorld<'_> {
         PathWorld::Remote {
-            home: self.home.clone(),
+            home: self.home.as_deref(),
         }
     }
 

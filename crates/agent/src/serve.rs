@@ -2086,8 +2086,7 @@ pub(crate) async fn serve_session(
     // (a restricted `--tools`/`--exclude-tools` invocation) just adds dead weight (pi-parity fix).
     // Tools are fixed for the whole process (see `build_agent`'s doc comment), so this one check is
     // reused verbatim by `reload`'s own rebuild below rather than re-deriving it.
-    let exec_cell = crate::exec_endpoint::ExecCell::new();
-    let startup_tools = build_tools(&cfg, cfg.image_auto_resize, &exec_cell);
+    let startup_tools = build_tools(&cfg, cfg.image_auto_resize);
     let has_read = startup_tools.get("read").is_some();
     let has_todo = startup_tools.get(crate::tools::todo::NAME).is_some();
 
@@ -2158,17 +2157,6 @@ pub(crate) async fn serve_session(
     // tool nor the agent has to be rebuilt. Harmless when the session mount is disabled (nothing reads the
     // cell). The injected `/session` index in the system prompt refreshes at the next prompt/`set_model`
     // rebuild; the tool's own live `view /session` is authoritative in the meantime.
-    // A session's exec target must NOT survive a switch to a different session. Inheriting it would
-    // hand the incoming session — in a multi-tenant server, a different tenant — the previous one's
-    // sandbox, which is a cross-tenant breach rather than stale config. Cleared to `None` (this host)
-    // and re-established by `set_exec_endpoint`, so the failure mode of forgetting to re-point is
-    // "runs locally", not "runs in somebody else's box".
-    macro_rules! reset_exec_endpoint {
-        () => {
-            exec_cell.set(None);
-        };
-    }
-
     macro_rules! repoint_session_memory {
         () => {
             session_dir_cell.set(crate::memory::session_dir(
@@ -2357,7 +2345,6 @@ pub(crate) async fn serve_session(
             None
         } else {
             Some(build_subagent_ctx(
-                &exec_cell,
                 &cfg,
                 &cwd,
                 project_trusted,
@@ -2390,7 +2377,6 @@ pub(crate) async fn serve_session(
     // that changes `current_model` at runtime — see `build_gateway_client`'s own doc comment.
     let mut client = Arc::new(build_gateway_client(&cfg, &current_model)?);
     let mut agent = build_agent(
-        &exec_cell,
         client.clone(),
         &full_system(&static_system, &cwd),
         &cfg,
@@ -2429,7 +2415,7 @@ pub(crate) async fn serve_session(
     // command below reports as a clean error rather than a side door around that restriction. A direct
     // `Arc<dyn Tool>` handle, not routed through `agent`/the model loop: the host `bash` RPC command runs
     // independent of any conversation turn.
-    let bash_tool = build_tools(&cfg, cfg.image_auto_resize, &exec_cell).get("bash");
+    let bash_tool = build_tools(&cfg, cfg.image_auto_resize).get("bash");
     // The same deny-list `build_agent` installs as an `AgentHooks` gate on the model's own tool calls —
     // built once here rather than inline in the `bash` RPC arm below, since `--deny-tool`/
     // `--deny-bash-pattern`/`--deny-path` are fixed for the whole process (`build_agent`'s doc comment).
@@ -2546,7 +2532,6 @@ pub(crate) async fn serve_session(
                 Ok(s) => {
                     session = s;
                     repoint_session_memory!();
-                    reset_exec_endpoint!();
                     steering.clear();
                     let _ = out_tx.send(response(
                         $id,
@@ -2579,7 +2564,6 @@ pub(crate) async fn serve_session(
                     Ok(s) => {
                         session = s;
                         repoint_session_memory!();
-                        reset_exec_endpoint!();
                         steering.clear();
                         // Restore whichever model/thinking-level this session was actually last
                         // running on, the same way `switch_branch` already does — without this, the
@@ -2612,7 +2596,6 @@ pub(crate) async fn serve_session(
                         }
                         if rebuild_needed {
                             agent = build_agent(
-                                &exec_cell,
                                 client.clone(),
                                 &full_system(&static_system, &cwd),
                                 &cfg,
@@ -2706,7 +2689,6 @@ pub(crate) async fn serve_session(
                 Ok((s, restored_model, restored_level)) => {
                     session = s;
                     repoint_session_memory!();
-                    reset_exec_endpoint!();
                     steering.clear();
                     // Restore whichever model/thinking-level was actually active at the forked-from
                     // point, the same way `switch_session`/`switch_branch` already do.
@@ -2734,7 +2716,6 @@ pub(crate) async fn serve_session(
                     }
                     if rebuild_needed {
                         agent = build_agent(
-                            &exec_cell,
                             client.clone(),
                             &full_system(&static_system, &cwd),
                             &cfg,
@@ -2781,7 +2762,6 @@ pub(crate) async fn serve_session(
                 Ok((s, restored_model, restored_level)) => {
                     session = s;
                     repoint_session_memory!();
-                    reset_exec_endpoint!();
                     steering.clear();
                     let restored_level = agent_core::clamp_thinking_level(
                         &agent_core::capabilities(&restored_model),
@@ -2807,7 +2787,6 @@ pub(crate) async fn serve_session(
                     }
                     if rebuild_needed {
                         agent = build_agent(
-                            &exec_cell,
                             client.clone(),
                             &full_system(&static_system, &cwd),
                             &cfg,
@@ -3080,7 +3059,6 @@ pub(crate) async fn serve_session(
                             },
                         );
                         agent = build_agent(
-                            &exec_cell,
                             client.clone(),
                             &full_system(&static_system, &cwd),
                             &cfg,
@@ -4078,56 +4056,6 @@ pub(crate) async fn serve_session(
                     None
                 ));
             }
-            "set_exec_endpoint" => {
-                // Point *this session's* tools at an exec endpoint, or clear it back to the host.
-                //
-                // Per-session rather than per-process because that is what a multi-tenant server
-                // needs: one machine per tenant, established when the session is set up and torn down
-                // with it. It takes effect on the very next tool call — the tools read the cell rather
-                // than capturing a target — so no registry rebuild is involved and none can be missed.
-                let url = cmd.get("url").and_then(Value::as_str);
-                let exec_cmd = cmd.get("command").and_then(Value::as_str);
-                let headers: Vec<String> = cmd
-                    .get("headers")
-                    .and_then(Value::as_array)
-                    .map(|a| {
-                        a.iter()
-                            .filter_map(|v| v.as_str().map(str::to_string))
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                let outcome = match (url, exec_cmd) {
-                    (Some(_), Some(_)) => Err("give `url` or `command`, not both".to_string()),
-                    (Some(u), None) => crate::exec_endpoint::ExecTarget::http(u, &headers)
-                        .await
-                        .map(Some),
-                    (None, Some(c)) => crate::exec_endpoint::ExecTarget::template(c)
-                        .await
-                        .map(Some),
-                    // Neither: detach, back to this host. Explicit rather than an error so a client
-                    // can hand a session back to local execution without tearing it down.
-                    (None, None) => Ok(None),
-                };
-                match outcome {
-                    Ok(target) => {
-                        let engine = target
-                            .as_ref()
-                            .map(|t| format!("{:?}", t.search_engine()))
-                            .unwrap_or_else(|| "local".to_string());
-                        exec_cell.set(target);
-                        emit!(response(
-                            id,
-                            "set_exec_endpoint",
-                            true,
-                            Some(
-                                json!({ "attached": url.is_some() || exec_cmd.is_some(), "engine": engine })
-                            ),
-                            None
-                        ));
-                    }
-                    Err(e) => emit!(response(id, "set_exec_endpoint", false, None, Some(&e))),
-                }
-            }
             "get_state" => {
                 let mut data = session_stats(&session, &current_model);
                 if let Value::Object(m) = &mut data {
@@ -4403,7 +4331,7 @@ pub(crate) async fn serve_session(
                 // variable around), plus `session`'s own running token totals — previously omitted
                 // entirely via the plainer `export_html_with_entries`.
                 let system_prompt = full_system(&static_system, &cwd);
-                let tool_defs = build_tools(&cfg, cfg.image_auto_resize, &exec_cell).definitions();
+                let tool_defs = build_tools(&cfg, cfg.image_auto_resize).definitions();
                 let usage = crate::export::UsageTotals {
                     input_tokens: session.input_tokens,
                     output_tokens: session.output_tokens,
@@ -4712,7 +4640,6 @@ pub(crate) async fn serve_session(
                     None
                 } else {
                     Some(build_subagent_ctx(
-                        &exec_cell,
                         &cfg,
                         &cwd,
                         project_trusted,
@@ -4747,7 +4674,6 @@ pub(crate) async fn serve_session(
                 // a mid-session-added agent wouldn't become delegable until the next `set_model`. Mirrors
                 // `set_model`'s own rebuild; the session is untouched.
                 agent = build_agent(
-                    &exec_cell,
                     client.clone(),
                     &full_system(&static_system, &cwd),
                     &cfg,
@@ -4839,7 +4765,6 @@ pub(crate) async fn serve_session(
                                         client = new_client;
                                     }
                                     agent = build_agent(
-                                        &exec_cell,
                                         client.clone(),
                                         &full_system(&static_system, &cwd),
                                         &cfg,
@@ -4897,7 +4822,6 @@ pub(crate) async fn serve_session(
                     Some(Value::Null) => {
                         current_thinking = None;
                         agent = build_agent(
-                            &exec_cell,
                             client.clone(),
                             &full_system(&static_system, &cwd),
                             &cfg,
@@ -4927,7 +4851,6 @@ pub(crate) async fn serve_session(
                     Some(v) if v.as_u64().is_some() => {
                         current_thinking = v.as_u64().map(|n| n as u32);
                         agent = build_agent(
-                            &exec_cell,
                             client.clone(),
                             &full_system(&static_system, &cwd),
                             &cfg,
@@ -4995,7 +4918,6 @@ pub(crate) async fn serve_session(
                                 current_level = level;
                                 current_thinking = None;
                                 agent = build_agent(
-                                    &exec_cell,
                                     client.clone(),
                                     &full_system(&static_system, &cwd),
                                     &cfg,
@@ -5101,7 +5023,6 @@ pub(crate) async fn serve_session(
                                     client = new_client;
                                 }
                                 agent = build_agent(
-                                    &exec_cell,
                                     client.clone(),
                                     &full_system(&static_system, &cwd),
                                     &cfg,
@@ -5158,7 +5079,6 @@ pub(crate) async fn serve_session(
                         current_level = next_level;
                         current_thinking = None;
                         agent = build_agent(
-                            &exec_cell,
                             client.clone(),
                             &full_system(&static_system, &cwd),
                             &cfg,
@@ -5216,7 +5136,6 @@ pub(crate) async fn serve_session(
                         eprintln!("serve: failed to persist auto-compaction setting: {e}");
                     }
                     agent = build_agent(
-                        &exec_cell,
                         client.clone(),
                         &full_system(&static_system, &cwd),
                         &cfg,
@@ -5255,7 +5174,6 @@ pub(crate) async fn serve_session(
                 Some(enabled) => {
                     current_auto_retry = enabled;
                     agent = build_agent(
-                        &exec_cell,
                         client.clone(),
                         &full_system(&static_system, &cwd),
                         &cfg,
@@ -5305,7 +5223,6 @@ pub(crate) async fn serve_session(
                         eprintln!("serve: failed to persist block-images setting: {e}");
                     }
                     agent = build_agent(
-                        &exec_cell,
                         client.clone(),
                         &full_system(&static_system, &cwd),
                         &cfg,
@@ -5348,7 +5265,6 @@ pub(crate) async fn serve_session(
                         eprintln!("serve: failed to persist image-auto-resize setting: {e}");
                     }
                     agent = build_agent(
-                        &exec_cell,
                         client.clone(),
                         &full_system(&static_system, &cwd),
                         &cfg,
@@ -5635,7 +5551,6 @@ pub(crate) async fn serve_session(
                             }
                             if rebuild_needed {
                                 agent = build_agent(
-                                    &exec_cell,
                                     client.clone(),
                                     &full_system(&static_system, &cwd),
                                     &cfg,
@@ -6355,7 +6270,6 @@ fn build_gateway_client(cfg: &ServeConfig, model: &str) -> Result<GatewayClient,
 /// once into `cfg.system` and doesn't carry the raw guideline list past that.
 #[allow(clippy::too_many_arguments)]
 fn build_subagent_ctx(
-    exec: &crate::exec_endpoint::ExecCell,
     cfg: &ServeConfig,
     cwd: &Path,
     project_trusted: bool,
@@ -6377,7 +6291,7 @@ fn build_subagent_ctx(
     });
     // The parent's effective set (after `--tools`/`--exclude-tools`) minus `subagent`, so a child with
     // no `tools:` of its own inherits exactly what the parent may do — no more.
-    let mut probe = build_tools(cfg, cfg.image_auto_resize, exec);
+    let mut probe = build_tools(cfg, cfg.image_auto_resize);
     crate::tools::apply_filter(
         &mut probe,
         cfg.tools.as_deref(),
@@ -6432,7 +6346,6 @@ fn build_subagent_ctx(
 // for the same tradeoff). Private, single-purpose helper, not a public API shape.
 #[allow(clippy::too_many_arguments)]
 fn build_agent(
-    exec: &crate::exec_endpoint::ExecCell,
     transport: Arc<GatewayClient>,
     system: &str,
     cfg: &ServeConfig,
@@ -6480,7 +6393,7 @@ fn build_agent(
         compaction.keep_recent_tokens = keep_recent;
     }
 
-    let mut registry = build_tools(cfg, image_auto_resize, exec);
+    let mut registry = build_tools(cfg, image_auto_resize);
     // Registered here, not in `build_tools`, because this is where `write_locks` is in scope — the ctx
     // needs the same registry every child shares. Reused across rebuilds; the ctx's factory handles the
     // per-child model itself, so a `set_model` rebuild doesn't invalidate it.
@@ -6672,11 +6585,7 @@ fn is_excluded_from_model_context(m: &agent_core::Message) -> bool {
 /// than `cfg`'s frozen startup value; the other call sites here only ever check tool
 /// presence/definitions, which don't depend on this flag either way, so they just pass
 /// `cfg.image_auto_resize` straight through.
-fn build_tools(
-    cfg: &ServeConfig,
-    image_auto_resize: bool,
-    exec: &crate::exec_endpoint::ExecCell,
-) -> agent_core::ToolRegistry {
+fn build_tools(cfg: &ServeConfig, image_auto_resize: bool) -> agent_core::ToolRegistry {
     // Task #34 (pi-parity fix): previously always called the plain `default_registry_with_prefix`,
     // hardcoding `image_auto_resize: true` regardless of `cfg.image_auto_resize` — `run`'s identical
     // `default_registry_with_prefix_and_image_auto_resize` call site (`main.rs::run_task`) is the one
@@ -6696,12 +6605,6 @@ fn build_tools(
         web_timeout_ms: cfg.web_timeout_ms,
         image_auto_resize,
         mcp_tools: &cfg.mcp_tools,
-        // The cell, not a fixed target: `build_agent` is skipped on a same-model `switch_session`, so
-        // a target captured here would leave the incoming session on the previous one's machine —
-        // in a multi-tenant server, one tenant's tools inside another tenant's sandbox. The tools read
-        // the cell per call, so a re-point cannot be missed by a rebuild that never happens.
-        fs_backend: Some(exec.backend()),
-        command_runner: Some(exec.runner()),
         ..tools::ToolConfig::new()
     });
     tools::apply_filter(

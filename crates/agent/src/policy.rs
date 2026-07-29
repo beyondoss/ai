@@ -107,10 +107,10 @@ impl ToolPolicy {
     }
 
     /// The world this policy resolves paths in — the same one the gated tools use.
-    pub fn world(&self) -> crate::tools::fs::PathWorld {
+    pub fn world(&self) -> crate::tools::fs::PathWorld<'_> {
         if self.remote {
             crate::tools::fs::PathWorld::Remote {
-                home: self.remote_home.clone(),
+                home: self.remote_home.as_deref(),
             }
         } else {
             crate::tools::fs::PathWorld::Local
@@ -219,7 +219,7 @@ impl AgentHooks for ToolPolicy {
             // a pattern like `--deny-path '/etc/**'` can't be sidestepped with a `./`/`..`-laden or
             // relative spelling of the same path. Resolving against a different root than the tools use
             // would check a path that is not the one about to be written.
-            let target = crate::tools::write_key(&self.root, path, &self.world());
+            let target = crate::tools::write_key(&self.root, path, self.world());
             if let Some(m) = self.denied_paths.iter().find(|m| m.is_match(&target)) {
                 return Some(format!(
                     "path '{target}' is denied by policy (matches {:?})",
