@@ -48,7 +48,7 @@ impl Edit {
     }
 
     fn resolve(&self, path: &str) -> String {
-        super::resolve_against_in(&self.root, path, self.backend.world())
+        super::resolve_against_in(&self.root, path, &self.backend.world())
     }
 }
 
@@ -91,7 +91,7 @@ impl Tool for Edit {
         input
             .get("path")
             .and_then(Value::as_str)
-            .map(|p| super::write_key(&self.root, p, self.backend.world()))
+            .map(|p| super::write_key(&self.root, p, &self.backend.world()))
     }
 
     /// Argument parsing stays on the caller's task (it's a few `Value` lookups); everything from the

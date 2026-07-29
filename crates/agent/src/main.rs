@@ -894,6 +894,16 @@ enum Command {
         /// The `web` tool's per-request timeout (ms). Default 30,000. `serve`'s identical flag.
         #[arg(long, env = "AI_AGENT_WEB_TIMEOUT_MS")]
         web_timeout_ms: Option<u64>,
+        /// Point every session's tools at a remote exec endpoint by default. A multi-tenant server
+        /// leaves this unset and uses the `set_exec_endpoint` command per session instead.
+        #[arg(long, env = "AI_AGENT_EXEC_URL", conflicts_with = "exec_cmd")]
+        exec_url: Option<String>,
+        /// A header sent with every exec request, `Name: value`. Repeatable.
+        #[arg(long, env = "AI_AGENT_EXEC_HEADER")]
+        exec_header: Vec<String>,
+        /// An argv template for targets with no HTTP surface, e.g. `ssh host -- {}`.
+        #[arg(long, env = "AI_AGENT_EXEC_CMD", conflicts_with = "exec_url")]
+        exec_cmd: Option<String>,
         /// Restrict the tool set to exactly these names (comma-separated), dropping everything else.
         /// Fixed for the process, like `--system-prompt`; survives `set_model`/`set_thinking` rebuilds.
         /// `-t` matches pi's own `--tools`/`-t`.
@@ -1659,6 +1669,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             web_allow_private,
             web_allow_host,
             web_timeout_ms,
+            exec_url,
+            exec_header,
+            exec_cmd,
             tools,
             exclude_tools,
             no_tools,
@@ -1965,6 +1978,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 web_allow_private,
                 web_allow_hosts: web_allow_host,
                 web_timeout_ms,
+                exec_url,
+                exec_header,
+                exec_cmd,
                 tools,
                 exclude_tools,
                 no_tools,
@@ -3920,10 +3936,10 @@ async fn run_task(
                 web_allow_hosts: web_allow_host.clone(),
                 web_timeout_ms,
                 image_auto_resize,
-                // `run` has no non-local backend to hand down yet; when it gains one this must carry
-                // it, or a child would act on the host while its parent acts elsewhere.
-                fs_backend: None,
-                command_runner: None,
+                // A child acts on the same machine as its parent. Handing down `None` here was a
+                // sandbox escape: the model could reach the host simply by delegating to a subagent.
+                fs_backend: fs_backend.clone(),
+                command_runner: exec_runner.clone(),
             },
             cwd: cwd.clone(),
             project_trusted,

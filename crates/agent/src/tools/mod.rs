@@ -331,7 +331,7 @@ pub(crate) fn lexical_write_target(root: &Path, path: &str) -> String {
 /// `canonical_write_target(root, &resolve_against(root, path))` composition, which worked only for as
 /// long as all three copies stayed in step — and a deny-list that resolves a path differently from the
 /// tool that writes it is a bypass, not a bug. One definition, three callers, no drift.
-pub(crate) fn write_key(root: &Path, path: &str, world: fs::PathWorld<'_>) -> String {
+pub(crate) fn write_key(root: &Path, path: &str, world: &fs::PathWorld) -> String {
     let resolved = resolve_against_in(root, path, world);
     match world {
         // On this host, `canonicalize` is meaningful and valuable: it unifies `./x`, `../dir/x` and a
@@ -362,16 +362,16 @@ pub(crate) fn write_key(root: &Path, path: &str, world: fs::PathWorld<'_>) -> St
 /// offer. The guarantee is that two cooperating children fanned out in parallel don't silently stomp each
 /// other, not that a determined one is jailed.
 pub(crate) fn resolve_against(root: &Path, path: &str) -> String {
-    resolve_against_in(root, path, fs::PathWorld::Local)
+    resolve_against_in(root, path, &fs::PathWorld::Local)
 }
 
 /// [`resolve_against`], but expanding `~` against the home of whichever filesystem `world` names —
 /// this host's `$HOME` for [`fs::PathWorld::Local`], the target's for a remote one. The join itself is
 /// pure string work and identical either way; only tilde expansion is world-sensitive.
-pub(crate) fn resolve_against_in(root: &Path, path: &str, world: fs::PathWorld<'_>) -> String {
+pub(crate) fn resolve_against_in(root: &Path, path: &str, world: &fs::PathWorld) -> String {
     let normalized = match world {
         fs::PathWorld::Local => normalize_path(path),
-        fs::PathWorld::Remote { home } => normalize_path_with_home(path, home),
+        fs::PathWorld::Remote { home } => normalize_path_with_home(path, home.as_deref()),
     };
     if root.as_os_str().is_empty() || Path::new(&normalized).is_absolute() {
         return normalized;
@@ -1403,7 +1403,7 @@ mod tests {
         let root = dir.path();
         for spelling in ["notes.md", "./notes.md", "sub/../notes.md", "notes.md"] {
             let before = canonical_write_target(root, &resolve_against(root, spelling));
-            let after = write_key(root, spelling, PathWorld::Local);
+            let after = write_key(root, spelling, &PathWorld::Local);
             assert_eq!(before, after, "spelling {spelling:?}");
         }
     }
@@ -1414,9 +1414,9 @@ mod tests {
         // too, or a `--deny-path` glob is sidesteppable by respelling the path.
         let root = std::path::Path::new("/workspace");
         for world in [PathWorld::Local, PathWorld::Remote { home: None }] {
-            let direct = write_key(root, "/workspace/notes.md", world);
-            let dotted = write_key(root, "/workspace/./notes.md", world);
-            let dotdot = write_key(root, "/workspace/sub/../notes.md", world);
+            let direct = write_key(root, "/workspace/notes.md", &world);
+            let dotted = write_key(root, "/workspace/./notes.md", &world);
+            let dotdot = write_key(root, "/workspace/sub/../notes.md", &world);
             assert_eq!(direct, dotted, "{world:?}");
             assert_eq!(direct, dotdot, "{world:?}");
         }
@@ -1428,12 +1428,12 @@ mod tests {
         let a = write_key(
             std::path::Path::new("/wt/a"),
             "src/lib.rs",
-            PathWorld::Remote { home: None },
+            &PathWorld::Remote { home: None },
         );
         let b = write_key(
             std::path::Path::new("/wt/b"),
             "src/lib.rs",
-            PathWorld::Remote { home: None },
+            &PathWorld::Remote { home: None },
         );
         assert_eq!(a, "/wt/a/src/lib.rs");
         assert_ne!(a, b, "two worktrees must not share one write-lock key");
@@ -1452,8 +1452,8 @@ mod tests {
         std::os::unix::fs::symlink(&real, &alias).unwrap();
         let root = dir.path();
 
-        let local_real = write_key(root, real.to_str().unwrap(), PathWorld::Local);
-        let local_alias = write_key(root, alias.to_str().unwrap(), PathWorld::Local);
+        let local_real = write_key(root, real.to_str().unwrap(), &PathWorld::Local);
+        let local_alias = write_key(root, alias.to_str().unwrap(), &PathWorld::Local);
         assert_eq!(
             local_real, local_alias,
             "locally, an alias and its target are one file and must share a key"
@@ -1462,7 +1462,7 @@ mod tests {
         let remote_alias = write_key(
             root,
             alias.to_str().unwrap(),
-            PathWorld::Remote { home: None },
+            &PathWorld::Remote { home: None },
         );
         assert_eq!(
             remote_alias,
@@ -1480,8 +1480,8 @@ mod tests {
         let remote = write_key(
             root,
             "~/notes.md",
-            PathWorld::Remote {
-                home: Some("/home/guest"),
+            &PathWorld::Remote {
+                home: Some("/home/guest".to_string()),
             },
         );
         assert_eq!(remote, "/home/guest/notes.md");
@@ -1494,7 +1494,7 @@ mod tests {
         let key = write_key(
             std::path::Path::new(""),
             "~/notes.md",
-            PathWorld::Remote { home: None },
+            &PathWorld::Remote { home: None },
         );
         assert!(
             key.contains('~'),
