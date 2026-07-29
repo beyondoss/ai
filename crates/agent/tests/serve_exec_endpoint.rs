@@ -221,3 +221,71 @@ fn a_malformed_endpoint_is_rejected_without_attaching_anything() {
     send(json!({ "id": "3", "type": "shutdown" }));
     let _ = out.read_line(&mut String::new());
 }
+
+#[test]
+fn a_resumed_session_reattaches_its_endpoint_and_a_sibling_does_not_inherit_it() {
+    // Persistence completes the story: an endpoint set on a session must come back when that session
+    // is resumed — otherwise a sandboxed tenant's work silently moves onto the server after a restart
+    // — while a *different* session must still start clean.
+    let a = tenant("SECRET-AAAA");
+    let sessions = tempfile::tempdir().unwrap();
+
+    let (base, _bodies) = spawn_model_server(vec![
+        turn_tool_use("t1", "read", &json!({ "path": "secret.txt" }).to_string()),
+        turn_text("one"),
+        turn_tool_use("t2", "read", &json!({ "path": "secret.txt" }).to_string()),
+        turn_text("two"),
+        turn_tool_use("t3", "read", &json!({ "path": "secret.txt" }).to_string()),
+        turn_text("three"),
+    ]);
+
+    let mut child = serve_dir_cmd(BIN, &base, sessions.path().to_str().unwrap()).spawn_guarded();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut out = BufReader::new(child.stdout.take().unwrap());
+    let mut send = |v: Value| {
+        writeln!(stdin, "{v}").unwrap();
+        stdin.flush().unwrap();
+    };
+
+    // Attach on the first session and note its id.
+    send(json!({ "id": "1", "type": "set_exec_endpoint", "command": target_cmd(a.path()) }));
+    assert_eq!(
+        response(&read_until_response(&mut out, "set_exec_endpoint"))["success"],
+        json!(true)
+    );
+    send(json!({ "id": "2", "type": "get_state" }));
+    let state = response(&read_until_response(&mut out, "get_state")).clone();
+    let first_id = state["data"]["session_id"]
+        .as_str()
+        .expect("session_id")
+        .to_string();
+
+    // A brand-new session must start clean — no inheritance.
+    send(json!({ "id": "3", "type": "new_session" }));
+    assert_eq!(
+        response(&read_until_response(&mut out, "new_session"))["success"],
+        json!(true)
+    );
+    send(json!({ "id": "4", "type": "prompt", "message": "read" }));
+    let fresh = all(&read_until_response(&mut out, "prompt"));
+    assert!(
+        !fresh.contains("SECRET-AAAA"),
+        "a new session inherited the previous session's sandbox: {fresh}"
+    );
+
+    // Switching *back* must restore what that session recorded.
+    send(json!({ "id": "5", "type": "switch_session", "session_id": first_id }));
+    assert_eq!(
+        response(&read_until_response(&mut out, "switch_session"))["success"],
+        json!(true)
+    );
+    send(json!({ "id": "6", "type": "prompt", "message": "read" }));
+    let resumed = all(&read_until_response(&mut out, "prompt"));
+    assert!(
+        resumed.contains("SECRET-AAAA"),
+        "switching back did not reattach the session's own endpoint: {resumed}"
+    );
+
+    send(json!({ "id": "7", "type": "shutdown" }));
+    let _ = out.read_line(&mut String::new());
+}
