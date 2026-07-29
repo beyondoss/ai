@@ -40,7 +40,7 @@ impl Write {
     }
 
     fn resolve(&self, path: &str) -> String {
-        super::resolve_against_in(&self.root, path, self.backend.world())
+        super::resolve_against_in(&self.root, path, &self.backend.world())
     }
 }
 
@@ -67,7 +67,7 @@ impl Tool for Write {
         input
             .get("path")
             .and_then(Value::as_str)
-            .map(|p| super::write_key(&self.root, p, self.backend.world()))
+            .map(|p| super::write_key(&self.root, p, &self.backend.world()))
     }
 
     async fn run(&self, input: Value) -> Result<ToolOutput, ToolError> {
