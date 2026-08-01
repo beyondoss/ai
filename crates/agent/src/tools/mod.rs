@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use agent_core::{Tool, ToolError, ToolRegistry};
 
+pub mod ask_user;
 pub mod bash;
 pub mod beyond;
 pub mod edit;
@@ -424,6 +425,11 @@ pub struct ToolConfig<'a> {
     /// the resulting `Arc`s in on every rebuild, so a `serve` rebuild reuses live connections rather
     /// than reconnecting to every server.
     pub mcp_tools: &'a [Arc<dyn Tool>],
+    /// Whether to offer `ask_user`, which ends a turn to wait for a person.
+    ///
+    /// Off by default because a host with nobody to ask must not offer it: the
+    /// model would end its turn waiting for an answer that can never arrive.
+    pub ask_user: bool,
     /// `--web-allow-private`: let the `web` tool reach loopback/private/link-local addresses. Off by
     /// default — the tool refuses them to prevent SSRF, since it fetches URLs the model chose. See
     /// [`web`].
@@ -502,6 +508,12 @@ pub fn default_registry_with_config(cfg: &ToolConfig<'_>) -> ToolRegistry {
     // Stateless: it validates and echoes the model's own full-replace list. See `todo`'s module doc for
     // why it holds nothing across calls (this registry is rebuilt on every `set_model`).
     reg.register(Arc::new(todo::Todo::new()));
+    // Only when the host has somebody to ask. Registering it unconditionally
+    // would let the model end its turn waiting on an answer nothing was ever
+    // going to deliver.
+    if cfg.ask_user {
+        reg.register(Arc::new(ask_user::AskUser::new()));
+    }
     // Owns its own reqwest client (SSRF resolver, no default redirects) — see `web`'s module doc. The
     // egress policy is fixed at build time from `cfg`; a `set_model` rebuild reconstructs it, which is
     // fine (the policy is cheap and immutable for the process).
@@ -978,6 +990,21 @@ mod tests {
     fn default_registry_with_config_with_no_servers_matches_plain_default() {
         let reg = default_registry_with_config(&ToolConfig::new());
         assert_eq!(reg.len(), default_registry().len());
+    }
+
+    #[test]
+    fn ask_user_is_off_unless_the_host_asks_for_it() {
+        // A tool that ends the turn to wait for a person is worse than useless
+        // where there is no person: the model stops, and nothing ever answers.
+        // Off by default means a host has to have thought about it.
+        assert!(!ToolConfig::new().ask_user);
+        assert!(default_registry_with_config(&ToolConfig::new()).get("ask_user").is_none());
+
+        let reg = default_registry_with_config(&ToolConfig {
+            ask_user: true,
+            ..ToolConfig::new()
+        });
+        assert!(reg.get("ask_user").is_some());
     }
 
     #[test]

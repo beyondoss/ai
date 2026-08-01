@@ -928,6 +928,12 @@ impl Subagent {
             web_allow_private: self.ctx.tool_cfg.web_allow_private,
             web_allow_hosts: &self.ctx.tool_cfg.web_allow_hosts,
             web_timeout_ms: self.ctx.tool_cfg.web_timeout_ms,
+            // Never for a child. `ask_user` works by ending the turn so a person
+            // can answer, and a subagent has no conversation to be answered in —
+            // its parent is blocked waiting for it, and the person is one level
+            // further away than that. A child that needs a decision should return
+            // and let the parent ask.
+            ask_user: false,
         });
         let allow = self.effective_tools(def);
         super::apply_filter(&mut registry, Some(&allow), None, false);

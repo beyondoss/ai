@@ -6601,6 +6601,10 @@ fn build_tools(cfg: &ServeConfig, image_auto_resize: bool) -> agent_core::ToolRe
         web_timeout_ms: cfg.web_timeout_ms,
         image_auto_resize,
         mcp_tools: &cfg.mcp_tools,
+        // A `serve` client is always somebody to ask: the `ask_user` call rides
+        // the same event stream every other tool call does, so a client
+        // following the session sees the question the moment it happens.
+        ask_user: true,
         ..tools::ToolConfig::new()
     });
     tools::apply_filter(
