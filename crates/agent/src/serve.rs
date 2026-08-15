@@ -80,7 +80,9 @@
 //!   - `{type:"new_session", parent_session?}` start a fresh session → `data: {session_id, parent}`
 //!     (repo mode: `parent` is `parent_session` when given, else whatever session id was active
 //!     immediately before this call — pi's own `parentSession` lineage marker, provenance only, not a
-//!     fork; `null` in single-file/in-memory mode, where there's no *new* id to link)
+//!     fork; `null` in single-file/in-memory mode, where there's no *new* id to link). An *addressed*
+//!     session — `--session-id`, the daemon's `?session_id=` — keeps its own id instead of minting one,
+//!     archiving the outgoing conversation into a sibling session; see [`Persistence::new_session`]
 //!   - `{type:"list_sessions", query?}`  (repo mode) → `data: {sessions: [SessionMeta + updated_at/
 //!     message_count/preview/search_text…]}` (via `SessionMeta::to_listing_json` — those four fields are
 //!     `#[serde(skip)]` on the struct itself), this project's sessions only (matched by the default
@@ -499,13 +501,20 @@ pub struct ServeConfig {
     /// Disable only the per-session `/session` working-memory mount (`--no-session-memory`), keeping the
     /// durable `/memories` store. On by default whenever memory is enabled. See [`crate::memory`].
     pub no_session_memory: bool,
-    /// Use this exact session id instead of a freshly generated one, wherever a *new* `SessionMeta` is
-    /// actually minted by [`Persistence::open`] — already-validated by `main.rs` (embedded directly into
-    /// a persisted filename, so it must be sanitized before it ever reaches here). Matches `run`'s
-    /// identical `--session-id` flag/contract: ignored when reattaching to an existing session (already
-    /// has a fixed id from disk), whether that's an existing `session_file` or a repo-mode match on the
-    /// current `cwd`.
+    /// **Address** this exact session: open it if it already exists, else create it under exactly this
+    /// id. Already-validated by `main.rs` (embedded directly into a persisted filename, so it must be
+    /// sanitized before it ever reaches here). Matches `run`'s identical `--session-id` flag/contract.
+    ///
+    /// This is the most specific selector there is, so it wins over [`Self::continue_session`] and over
+    /// the default — see [`SessionSelect`]. It never resolves to a *different* session, which is what
+    /// makes it usable as a routing key for a multi-tenant `serve` (and is exactly what the daemon's
+    /// `?session_id=` relies on). Repeating the same id is idempotent: same session, every time.
     pub session_id: Option<String>,
+    /// Reattach to this `cwd`'s most recent session instead of starting a fresh one (`--continue`).
+    /// Without it, `serve` starts a new session on every launch — two servers sharing a directory would
+    /// otherwise silently drive the same on-disk transcript. Ignored when [`Self::session_id`] is set
+    /// (that names one session outright) and in `session_file` mode (the path already names one).
+    pub continue_session: bool,
     /// Skip persistence entirely, even though neither `session_file` nor `session_dir` was set —
     /// without this, `Persistence::open` defaults to a per-cwd directory under
     /// `~/.claude/sessions/<encoded-cwd>/` rather than silently running in-memory-only (an operator
@@ -989,6 +998,34 @@ fn fresh_meta(cwd: &str, model: &str, session_id: Option<&str>) -> SessionMeta {
     }
 }
 
+/// How [`Persistence`] picks which session to open in repo mode. Spelled out as a choice rather than
+/// inferred from a pile of `Option`s at the point of use, because the precedence between these is the
+/// whole contract: an explicit id is the most specific selector and always wins, `--continue` is the
+/// only thing that reattaches, and everything else starts clean.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionSelect<'a> {
+    /// Address one specific session: open it, or create it under exactly this id
+    /// ([`SessionRepo::open_or_create_id`]). `--session-id`, and the daemon's `?session_id=`.
+    Id(&'a str),
+    /// `--continue`: this cwd's most recent session, else a fresh one.
+    Latest,
+    /// The default: always a brand-new session.
+    Fresh,
+}
+
+impl<'a> SessionSelect<'a> {
+    /// Resolve the selector from config. An explicit id beats `--continue` because it names exactly one
+    /// session while `--continue` only describes one, and a caller who supplied both has already been
+    /// more specific than "whatever ran here last".
+    fn from_cfg(cfg: &'a ServeConfig) -> Self {
+        match (&cfg.session_id, cfg.continue_session) {
+            (Some(id), _) => Self::Id(id),
+            (None, true) => Self::Latest,
+            (None, false) => Self::Fresh,
+        }
+    }
+}
+
 /// Where the server persists sessions: a multi-session [`SessionRepo`] (`--session-dir`), a single
 /// JSONL file (`--session-file`), or nowhere (in-memory). It always carries the current session's
 /// [`SessionMeta`] so the session id is stable across reattaches.
@@ -996,17 +1033,24 @@ struct Persistence {
     repo: Option<SessionRepo>,
     store: Option<SessionStore>,
     meta: SessionMeta,
+    /// Set when the caller *named* this session ([`ServeConfig::session_id`]), which makes the id a
+    /// routing key rather than an incidental label — the daemon reconnects `?session_id=<id>` to it, and
+    /// a supervised `serve --session-id` expects the same id back after a restart. [`Self::new_session`]
+    /// honors it by blanking the session in place instead of minting a new id, so the address a client
+    /// holds never goes stale underneath it. `None` leaves `new_session` free to mint (repo mode's
+    /// natural behavior).
+    pinned_id: Option<String>,
 }
 
 impl Persistence {
-    /// Open persistence and restore (or create) the active session. In repo mode, reopens the most
-    /// recent session or creates a fresh one; in file mode, opens the file or creates it.
+    /// Open persistence and select the active session: in repo mode per [`SessionSelect`], in file mode
+    /// by opening the named file (or creating it).
     fn open(cfg: &ServeConfig) -> std::io::Result<(Self, Session)> {
         let cwd = crate::session_store::canonical_cwd(&std::env::current_dir().unwrap_or_default())
             .to_string_lossy()
             .into_owned();
         if let Some(dir) = &cfg.session_dir {
-            return Self::open_repo(dir, &cwd, &cfg.model, cfg.session_id.as_deref());
+            return Self::open_repo(dir, &cwd, &cfg.model, SessionSelect::from_cfg(cfg));
         }
         if let Some(path) = &cfg.session_file {
             let path = std::path::PathBuf::from(path);
@@ -1027,6 +1071,10 @@ impl Persistence {
                     repo: None,
                     store: Some(store),
                     meta,
+                    // Recorded for consistency, but single-file mode never consults it: the operator
+                    // named the *file*, and `new_session`'s file-mode arm already resets in place, so
+                    // the id can't move regardless of whether one was pinned.
+                    pinned_id: cfg.session_id.clone(),
                 },
                 session,
             ));
@@ -1037,6 +1085,7 @@ impl Persistence {
                     repo: None,
                     store: None,
                     meta: fresh_meta(&cwd, &cfg.model, cfg.session_id.as_deref()),
+                    pinned_id: cfg.session_id.clone(),
                 },
                 Session::new(),
             ));
@@ -1048,28 +1097,40 @@ impl Persistence {
             crate::session_store::default_session_dir(&cwd),
             &cwd,
             &cfg.model,
-            cfg.session_id.as_deref(),
+            SessionSelect::from_cfg(cfg),
         )
     }
 
-    /// Open (creating if needed) a multi-session repo at `dir` and reattach to the most recent session
-    /// whose recorded cwd matches `cwd` — not just the globally newest one, so a shared `--session-dir`
-    /// spanning multiple projects (or the shared default directory before cwd-encoding existed) doesn't
-    /// resume a stranger's unrelated session. No match (a fresh directory, or one with no session for
-    /// this cwd yet) creates a new one, using `session_id` in place of a freshly generated one when
-    /// given (see `ServeConfig::session_id`'s doc comment).
+    /// Open (creating if needed) a multi-session repo at `dir` and pick a session out of it per
+    /// `select` — see [`SessionSelect`] for the precedence, and the two `SessionRepo` methods it
+    /// dispatches to for what each one guarantees.
+    ///
+    /// Note that [`SessionSelect::Fresh`] (the default) genuinely creates a new session on every start.
+    /// A supervised `serve` that wants to pick its conversation back up across restarts should pin
+    /// `--session-id`: that's deterministic and idempotent, whereas `--continue`'s "most recent for this
+    /// cwd" silently depends on what else has touched the directory since.
     fn open_repo(
         dir: impl Into<std::path::PathBuf>,
         cwd: &str,
         model: &str,
-        session_id: Option<&str>,
+        select: SessionSelect<'_>,
     ) -> std::io::Result<(Self, Session)> {
         let repo = SessionRepo::open(dir)?;
-        let (store, session) = repo.resume_or_create(cwd, model, session_id)?;
+        let (store, session) = match select {
+            SessionSelect::Id(id) => repo.open_or_create_id(id, cwd, model)?,
+            SessionSelect::Latest => repo.resume_latest_or_create(cwd, model)?,
+            SessionSelect::Fresh => (repo.create(SessionMeta::new(cwd, model))?, Session::new()),
+        };
         let meta = store.meta().clone();
         Ok((
             Self {
                 repo: Some(repo),
+                // Only an explicitly addressed session is pinned. `Latest`/`Fresh` produce an id the
+                // caller never asked for, so nothing is routing on it and `new_session` may mint freely.
+                pinned_id: match select {
+                    SessionSelect::Id(id) => Some(id.to_string()),
+                    SessionSelect::Latest | SessionSelect::Fresh => None,
+                },
                 store: Some(store),
                 meta,
             },
@@ -1142,6 +1203,13 @@ impl Persistence {
     /// Start a fresh session. In repo mode this creates a new file (new id); in single-file mode it
     /// resets the existing file (keeping its id); in-memory it just mints new metadata.
     ///
+    /// **Pinned sessions are the exception** ([`Self::pinned_id`]): when the caller named this session,
+    /// that name is an address something is routing on, so `new_session` keeps it and blanks the session
+    /// in place. The outgoing conversation is *snapshotted into its own session first* — a real, listable
+    /// sibling whose `parent` points back here — so "start a new session" never doubles as "destroy the
+    /// old one". That archive-then-blank order matters: the copy is taken from what's on disk, so a
+    /// failure to archive aborts before anything is cleared.
+    ///
     /// In repo mode, the fresh session's `parent` records whatever session id was active immediately
     /// before this call, unless `parent_session` explicitly names a different one — pi's own
     /// `parentSession` lineage marker on a `/new`-equivalent reset (pi's own default, absent an
@@ -1168,6 +1236,9 @@ impl Persistence {
     ) -> std::io::Result<Session> {
         let cwd = Self::cwd();
         if let Some(repo) = &self.repo {
+            if let Some(pinned) = self.pinned_id.clone() {
+                return self.blank_pinned_session(&pinned);
+            }
             let mut meta = SessionMeta::new(&cwd, model);
             meta.parent = Some(parent_session.unwrap_or(&self.meta.id).to_string());
             match repo.create(meta) {
@@ -1188,6 +1259,41 @@ impl Persistence {
         } else {
             self.meta = SessionMeta::new(&cwd, model);
         }
+        Ok(Session::new())
+    }
+
+    /// [`Self::new_session`] for a pinned (caller-addressed) session: archive the current conversation
+    /// into a session of its own, then clear this one in place, keeping the id.
+    ///
+    /// The archive is a plain [`SessionRepo::fork`] of the whole active transcript, so it lands as an
+    /// ordinary session — it appears in `list_sessions`, can be `switch_session`ed into, and records
+    /// `parent = <pinned id>`, leaving the lineage back to this slot legible. An empty session has
+    /// nothing worth archiving, so that's skipped and blanking an already-blank slot stays cheap.
+    fn blank_pinned_session(&mut self, pinned: &str) -> std::io::Result<Session> {
+        let Self {
+            repo: Some(repo),
+            store: Some(store),
+            ..
+        } = self
+        else {
+            // Not repo mode with a live store: single-file and in-memory both keep their id anyway, so
+            // the caller's own arms already do the right thing.
+            return Ok(Session::new());
+        };
+        if !store.active_ids().is_empty() {
+            // Copied from what's on disk, *before* anything is cleared — a failure here leaves the
+            // session exactly as it was rather than half-reset with its history already gone.
+            if let Err(e) = repo.fork(pinned, usize::MAX) {
+                eprintln!("serve: failed to archive session {pinned} before reset: {e}");
+                return Err(e);
+            }
+        }
+        if let Err(e) = store.reset_for_new_session() {
+            eprintln!("serve: failed to reset session: {e}");
+            return Err(e);
+        }
+        let meta = store.meta().clone();
+        self.meta = meta;
         Ok(Session::new())
     }
 
@@ -8837,7 +8943,8 @@ mod tests {
         // full history rather than zero/current-process-only.
         let dir = tempfile::tempdir().unwrap();
         let (mut persistence, mut session) =
-            Persistence::open_repo(dir.path(), "/w", "claude-opus-4-8", None).unwrap();
+            Persistence::open_repo(dir.path(), "/w", "claude-opus-4-8", SessionSelect::Latest)
+                .unwrap();
         session.user("go");
         session.push(
             agent_core::Message::assistant(vec![agent_core::ContentBlock::text("ok")])
@@ -8856,7 +8963,8 @@ mod tests {
         // in-memory counters the original process accumulated (matching a real process restart exactly,
         // since those counters never persist regardless).
         let (_restarted, reloaded) =
-            Persistence::open_repo(dir.path(), "/w", "claude-opus-4-8", None).unwrap();
+            Persistence::open_repo(dir.path(), "/w", "claude-opus-4-8", SessionSelect::Latest)
+                .unwrap();
         assert_eq!(
             reloaded.input_tokens, 0,
             "sanity: the running counter itself stayed at zero"
@@ -9335,6 +9443,7 @@ mod tests {
         // difference, not a gap to close), so the contract this test protects is simply "fails
         // cleanly, doesn't crash."
         let mut persistence = Persistence {
+            pinned_id: None,
             repo: None,
             store: None,
             meta: SessionMeta::new("/w", "claude-test"),
@@ -9369,7 +9478,7 @@ mod tests {
         // navigation).
         let dir = tempfile::tempdir().unwrap();
         let (mut persistence, _session) =
-            Persistence::open_repo(dir.path(), "/w", "claude-test", None).unwrap();
+            Persistence::open_repo(dir.path(), "/w", "claude-test", SessionSelect::Latest).unwrap();
         let ids = {
             let store = persistence.store.as_mut().unwrap();
             let mut session = Session::new();
@@ -9417,7 +9526,7 @@ mod tests {
         // fully replace the default structured template with its own instructions had no way to do so.
         let dir = tempfile::tempdir().unwrap();
         let (mut persistence, _session) =
-            Persistence::open_repo(dir.path(), "/w", "claude-test", None).unwrap();
+            Persistence::open_repo(dir.path(), "/w", "claude-test", SessionSelect::Latest).unwrap();
         let ids = {
             let store = persistence.store.as_mut().unwrap();
             let mut session = Session::new();
@@ -9481,6 +9590,7 @@ mod tests {
         // `get_label` are the RPC handlers' entry point. Same "no tree, no label" contract as
         // `switch_branch` above.
         let mut persistence = Persistence {
+            pinned_id: None,
             repo: None,
             store: None,
             meta: SessionMeta::new("/w", "claude-test"),
@@ -9507,6 +9617,7 @@ mod tests {
         // same as `delete`'s own repo-mode requirement — neither single-file nor in-memory-only mode has
         // a repo directory to consult.
         let persistence = Persistence {
+            pinned_id: None,
             repo: None,
             store: None,
             meta: SessionMeta::new("/w", "claude-test"),
@@ -9527,7 +9638,7 @@ mod tests {
     fn list_trash_and_restore_session_round_trip_through_persistence() {
         let dir = tempfile::tempdir().unwrap();
         let (persistence, _session) =
-            Persistence::open_repo(dir.path(), "/w", "claude-test", None).unwrap();
+            Persistence::open_repo(dir.path(), "/w", "claude-test", SessionSelect::Latest).unwrap();
         let repo = persistence.repo.as_ref().unwrap();
         let other = repo.create(SessionMeta::new("/w", "claude-test")).unwrap();
         let other_id = other.meta().id.clone();
@@ -9549,6 +9660,7 @@ mod tests {
         // surface at all — `Persistence::append_custom` is the RPC handler's entry point. Same
         // "no tree, nothing to append to" contract as `set_label`/`get_label` above.
         let mut persistence = Persistence {
+            pinned_id: None,
             repo: None,
             store: None,
             meta: SessionMeta::new("/w", "claude-test"),
@@ -9570,6 +9682,7 @@ mod tests {
         // `repo` to fork within either (`--session-file`/`--no-session-persistence` both leave `repo`
         // `None`; only `--session-dir` sets it).
         let mut persistence = Persistence {
+            pinned_id: None,
             repo: None,
             store: None,
             meta: SessionMeta::new("/w", "claude-test"),
@@ -9592,7 +9705,7 @@ mod tests {
         // before the fork swaps `self.store`.
         let dir = tempfile::tempdir().unwrap();
         let (mut persistence, _session) =
-            Persistence::open_repo(dir.path(), "/w", "claude-a", None).unwrap();
+            Persistence::open_repo(dir.path(), "/w", "claude-a", SessionSelect::Latest).unwrap();
         let ids = {
             let store = persistence.store.as_mut().unwrap();
             let mut session = Session::new();
@@ -9638,7 +9751,7 @@ mod tests {
         // path currently ends.
         let dir = tempfile::tempdir().unwrap();
         let (mut persistence, _session) =
-            Persistence::open_repo(dir.path(), "/w", "claude-a", None).unwrap();
+            Persistence::open_repo(dir.path(), "/w", "claude-a", SessionSelect::Latest).unwrap();
         let ids = {
             let store = persistence.store.as_mut().unwrap();
             let mut session = Session::new();
@@ -9738,7 +9851,8 @@ mod tests {
         // itself end to end.
         let dir = tempfile::tempdir().unwrap();
         let (mut persistence, _session) =
-            Persistence::open_repo(dir.path(), "/w", "claude-original", None).unwrap();
+            Persistence::open_repo(dir.path(), "/w", "claude-original", SessionSelect::Latest)
+                .unwrap();
         let mut session = Session::new();
         {
             let store = persistence.store.as_mut().unwrap();
@@ -9766,10 +9880,16 @@ mod tests {
         drop(persistence);
 
         // "Restart": a fresh `Persistence::open_repo` against the same directory/cwd, exactly like a
-        // brand-new `serve` process's `Persistence::open` would do — reattaching to the most recent
-        // session for this cwd rather than creating a new one.
-        let (restarted, _session) =
-            Persistence::open_repo(dir.path(), "/w", "claude-cli-default", None).unwrap();
+        // brand-new `serve --continue` process's `Persistence::open` would do — reattaching to the most
+        // recent session for this cwd rather than creating a new one. (A bare `serve` now selects
+        // `Fresh` instead; reattach is what this test is about, so it asks for it explicitly.)
+        let (restarted, _session) = Persistence::open_repo(
+            dir.path(),
+            "/w",
+            "claude-cli-default",
+            SessionSelect::Latest,
+        )
+        .unwrap();
 
         let cfg_level = agent_core::ThinkingLevel::Off;
         let (session_model, session_level) = restarted.model_and_level_at_active(cfg_level);

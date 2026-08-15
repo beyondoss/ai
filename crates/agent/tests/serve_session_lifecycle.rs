@@ -348,11 +348,12 @@ fn serve_resumes_newest_session_matching_cwd_not_globally_newest() {
         child.wait().unwrap();
     }
 
-    // Reattach from project_a again — must resume A's transcript, not B's.
+    // Reattach from project_a again — must resume A's transcript, not B's. `--continue` is what asks
+    // to reattach at all; a bare `serve` would start its own session.
     {
         let (base, _bodies) = spawn_model_server(vec![]);
         let mut cmd = serve_dir_cmd(bin, &base, &session_dir);
-        cmd.current_dir(project_a.path());
+        cmd.current_dir(project_a.path()).arg("--continue");
         let mut child = cmd.spawn_guarded();
         let mut stdin = child.stdin.take().unwrap();
         let mut stdout = BufReader::new(child.stdout.take().unwrap());
@@ -410,7 +411,7 @@ fn serve_reattaches_through_a_symlinked_cwd_to_the_session_recorded_under_its_re
     {
         let (base, _bodies) = spawn_model_server(vec![]);
         let mut cmd = serve_dir_cmd(bin, &base, &session_dir);
-        cmd.current_dir(&link);
+        cmd.current_dir(&link).arg("--continue");
         let mut child = cmd.spawn_guarded();
         let mut stdin = child.stdin.take().unwrap();
         let mut stdout = BufReader::new(child.stdout.take().unwrap());
@@ -1383,10 +1384,10 @@ fn serve_session_id_flag_applies_to_the_default_repo_mode_when_no_session_exists
 }
 
 #[test]
-fn serve_session_id_flag_is_ignored_when_reattaching_to_an_existing_session() {
-    // Matches `run`'s own documented contract: a caller-chosen id only ever applies when a *new*
-    // `SessionMeta` is minted — reattaching to an existing session (already has a fixed id from disk)
-    // must not be silently renamed out from under it.
+fn serve_session_id_flag_addresses_its_own_session_not_whatever_matched_the_cwd() {
+    // Matches `run`'s own contract: a caller-chosen id *addresses* a session. It used to be dropped
+    // whenever any session already matched this cwd, so a second process asking for a specific id was
+    // handed the first process's conversation instead — every id in a directory collapsing onto one.
     let session_dir_tmp = tempfile::tempdir().unwrap();
     let session_dir = session_dir_tmp.path().to_string_lossy().into_owned();
     let project = tempfile::tempdir().unwrap();
@@ -1412,12 +1413,12 @@ fn serve_session_id_flag_is_ignored_when_reattaching_to_an_existing_session() {
         id
     };
 
-    // Second process, same cwd/session-dir, now with `--session-id` — must reattach to the same
-    // existing session rather than minting (or renaming to) the given id.
+    // Second process, same cwd/session-dir, now with `--session-id` — must open the session it named,
+    // not the unrelated one that happens to share the cwd.
     let (base, _bodies) = spawn_model_server(vec![turn_text("second")]);
     let mut cmd = serve_dir_cmd(bin, &base, &session_dir);
     cmd.current_dir(project.path())
-        .args(["--session-id", "should-be-ignored"]);
+        .args(["--session-id", "mine-alone"]);
     let mut child = cmd.spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
@@ -1427,8 +1428,13 @@ fn serve_session_id_flag_is_ignored_when_reattaching_to_an_existing_session() {
     let state = read_until_response(&mut stdout, "get_state");
     assert_eq!(
         state.last().unwrap()["data"]["session_id"],
+        "mine-alone",
+        "--session-id must open the session it names, not one that merely shares the cwd"
+    );
+    assert_ne!(
+        state.last().unwrap()["data"]["session_id"],
         existing_id,
-        "reattaching to an existing session must keep its own id, not the --session-id argument"
+        "and must not be swallowed by the cwd match"
     );
 
     drop(stdin);

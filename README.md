@@ -85,6 +85,26 @@ configured, the gateway is used (unless `AI_DIRECT=1`). Otherwise, routing is di
 
 Tools: `read`, `write`, `edit`, `bash`, `ls`, `grep`, `find` (pi's coding set), plus `todo` and `web`. See [crates/agent-core/ARCHITECTURE.md](crates/agent-core/ARCHITECTURE.md).
 
+### Which session you get
+
+A session id is an **address**, and it's the only thing that names a session outright. Both `run` and
+`serve` take the same three:
+
+```sh
+agent run "..."                      # a new session, persisted under ~/.claude/sessions/<cwd>/
+agent run --continue "..."           # reattach to this directory's most recent session
+agent run --session-id build-42 "…"  # open session build-42, or create it — same session every time
+```
+
+`--session-id` outranks `--continue`, never resolves to a session it wasn't given, and is idempotent, so
+it's the right flag for anything supervised or scripted: a restarted `serve --session-id X` lands back on
+the same conversation deterministically, where `--continue` depends on whatever else touched the
+directory meanwhile. Distinct ids in one directory are distinct sessions — which is what makes `serve`
+multi-tenant, and what the daemon's `?session_id=` routing is built on.
+
+A bare launch starts its own session rather than reattaching, so two shells (or two servers) working in
+one directory don't silently drive the same transcript. Use `--continue` when you want the old one.
+
 ### Running the tools against a remote exec endpoint
 
 `--exec-url <URL>` makes the agent's tools — `read`, `write`, `edit`, `ls`, `grep`, `find` **and

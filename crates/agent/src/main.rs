@@ -586,20 +586,23 @@ enum Command {
         /// over `--continue` if both are given.
         #[arg(long)]
         session: Option<String>,
-        /// Use this exact session id instead of a freshly generated one — a caller (a script, a test
-        /// harness) that wants a known, predictable id to correlate against rather than parsing it back
-        /// out of the run's own output. Applies whenever a *new* `SessionMeta` is minted: a fresh
-        /// `--session <path>` (one that doesn't already exist) or a plain run with neither `--session`
-        /// nor `--continue` given (still persisted by default — see `--no-session-persistence`); ignored
-        /// when reopening an existing `--session <path>` or resuming via `--continue` (the id is already
-        /// fixed by whatever's on disk). Matches pi's own `--session-id` flag.
+        /// Address this exact session: continue it if it already exists, or create it under exactly this
+        /// id if it doesn't. Gives a caller (a script, an orchestrator, a test harness) a known,
+        /// predictable name to route on rather than parsing an id back out of the run's own output, and
+        /// re-running with the same id is idempotent — same conversation, every time.
+        ///
+        /// Outranks `--continue`, which only describes a session ("whatever ran here last") where this
+        /// names one. Distinct ids in one directory are distinct sessions: this used to be discarded
+        /// whenever *any* session already existed for the current cwd, which silently collapsed every id
+        /// onto one shared conversation. Ignored with `--no-session-persistence` (nothing is written, so
+        /// it only names the in-memory session) and with `--session <path>` (that already names a file).
         #[arg(long)]
         session_id: Option<String>,
         /// Continue the most recent session for the current directory (the same
         /// `~/.claude/sessions/<encoded-cwd>/` repo `serve` defaults to), creating one if this is the
-        /// first run here. Ignored if `--session` is also given. Kept as an explicit, self-documenting
-        /// spelling of what a plain no-flag `run` now does by default too (pi-parity fix — see
-        /// `--no-session-persistence`); harmless to pass either way.
+        /// first run here. This is the *only* flag that reattaches implicitly — a plain no-flag `run`
+        /// starts a new session (still persisted; see `--no-session-persistence`). Ignored if
+        /// `--session`/`--session-id` is also given, both of which name a session outright.
         #[arg(long, short = 'c', default_value_t = false)]
         r#continue: bool,
         /// Use this directory as the session repo instead of the default `~/.claude/sessions/
@@ -614,11 +617,11 @@ enum Command {
         #[arg(long, env = "AI_AGENT_SESSION_DIR")]
         session_dir: Option<String>,
         /// Skip persistence entirely, even without `--session`/`--continue`/`--fork`. Without this, a
-        /// plain no-flag `run` now defaults to the same per-cwd repo `serve` does
+        /// plain no-flag `run` writes a new session to the same per-cwd repo `serve` uses
         /// (`~/.claude/sessions/<encoded-cwd>/`, or `--session-dir`) rather than running in-memory-only —
         /// pass this for the rare case that's genuinely what you want (e.g. a short-lived script that
         /// mustn't leave a session file behind). Matches `serve`'s identical flag, so the CLI vocabulary
-        /// for opting out is the same either way.
+        /// for opting out is the same either way. `--continue` overrides it; `--session-id` does not.
         #[arg(long, default_value_t = false)]
         no_session_persistence: bool,
         /// Persistent-memory backend DSN. Absent ⇒ the stored `default_memory_backend` setting, else a
@@ -710,16 +713,25 @@ enum Command {
         /// `--listen`/`--listen-uds`; ignored on the stdio path.
         #[arg(long, env = "AI_AGENT_UPSTREAM_HTTP2", value_parser = parse_upstream_http2, default_value = "off")]
         upstream_http2: serve::UpstreamHttp2,
-        /// Use this exact session id instead of a freshly generated one — a caller (a script, a test
-        /// harness) that wants a known, predictable id to correlate against rather than parsing it back
-        /// out of `get_state`/the startup `{"kind":"session", id, …}` banner. Applies only when a *new*
-        /// `SessionMeta` is actually minted: a brand-new `--session-file` (one that doesn't already
-        /// exist), `--no-session-persistence`, or the default/`--session-dir` repo mode when no existing
-        /// session matches this `cwd` yet; ignored when reattaching to an existing one (already has a
-        /// fixed id from disk) — matches `run`'s identical flag/contract exactly (`main.rs::Run::
-        /// session_id`).
+        /// Address this exact session: reattach to it if it already exists, or create it under exactly
+        /// this id if it doesn't. Gives a caller a known, predictable name to route on rather than
+        /// parsing an id back out of `get_state`/the startup `{"kind":"session", id, …}` banner.
+        ///
+        /// This is the right flag for a supervised (systemd, container) `serve`: it's deterministic and
+        /// idempotent, so a restart lands back on the same conversation, where `--continue`'s "most
+        /// recent for this cwd" silently depends on whatever else touched the directory meanwhile. It is
+        /// also what makes `serve` multi-tenant — distinct ids are distinct sessions even in a shared
+        /// `--session-dir`, which is exactly what the daemon's own `?session_id=` routing relies on.
+        /// Outranks `--continue`. Matches `run`'s identical flag/contract (`main.rs::Run::session_id`).
         #[arg(long)]
         session_id: Option<String>,
+        /// Reattach to the most recent session for the current directory instead of starting a fresh
+        /// one, creating one if this is the first `serve` here. The only flag that reattaches
+        /// implicitly: without it (and without `--session-id`/`--session-file`, both of which name a
+        /// session outright) each launch starts its own session, so two servers sharing a directory
+        /// don't silently drive the same on-disk transcript. Matches `run`'s identical flag.
+        #[arg(long, short = 'c', default_value_t = false)]
+        r#continue: bool,
         /// Skip persistence entirely, even without `--session-file`/`--session-dir`. Without this,
         /// `serve` defaults to `~/.claude/sessions/<encoded-cwd>/` rather than silently running
         /// in-memory-only — pass this for the rare case that's genuinely what you want (e.g. a
@@ -1634,6 +1646,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             session_idle_timeout,
             upstream_http2,
             session_id,
+            r#continue: continue_session,
             no_session_persistence,
             memory,
             no_memory,
@@ -1954,6 +1967,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // session; the stdio/`run` path leaves it `None` and never pools.
                 shared_http: None,
                 session_id,
+                continue_session,
                 no_session_persistence,
                 context_window,
                 cache_long,
@@ -3771,28 +3785,33 @@ async fn run_task(
                     (Some(store), session)
                 }
             }
-            None if continue_session => {
+            // Pure in-memory. `--continue` still overrides `--no-session-persistence` (it always has:
+            // asking to continue a persisted session is a direct contradiction of not persisting, and
+            // the explicit verb wins), but `--session-id` does not — there it just names the ephemeral
+            // session for correlation, exactly as it does in `serve`'s own no-persistence branch.
+            None if no_session_persistence && !continue_session => (None, Session::new()),
+            // The selection ladder, most specific first — the same one `serve` applies via
+            // `serve::SessionSelect`, so the flags mean identically the same thing in both binaries.
+            None => {
                 let repo = SessionRepo::open(&repo_dir)?;
-                // `None` here, not `session_id` — see `resume_or_create`'s doc comment: `--session-id`
-                // is documented (and tested, above) to apply only to a genuinely fresh `--session <path>`
-                // or a plain ephemeral run, never `--continue`.
-                let (store, session) = repo.resume_or_create(&cwd_str, &model, None)?;
+                let (store, session) = match (session_id.as_deref(), continue_session) {
+                    // `--session-id` addresses one session outright: open it, or create it under
+                    // exactly that id. It outranks `--continue`, which only *describes* a session
+                    // ("whatever ran here last"). It used to be discarded outright whenever any session
+                    // already existed for this cwd, which collapsed every distinct id in a shared
+                    // directory onto one shared conversation.
+                    (Some(id), _) => repo.open_or_create_id(id, &cwd_str, &model)?,
+                    (None, true) => repo.resume_latest_or_create(&cwd_str, &model)?,
+                    // A bare `run` starts a genuinely new session — persisted, so nothing is lost, but
+                    // its own. It briefly reattached to this cwd's most recent session instead, which
+                    // meant two shells in one repo drove the same store: `append_new` is count-keyed,
+                    // so neither could observe the other's writes and the transcript interleaved into
+                    // nonsense. `--continue` is how you ask for the old behavior, and it is now the
+                    // only thing that reattaches implicitly.
+                    (None, false) => (repo.create(fresh_meta())?, Session::new()),
+                };
                 (Some(store), session)
             }
-            // pi-parity fix: previously always `(None, Session::new())` — in-memory only. Matches
-            // `serve`'s own default (no `--session-file`/`--session-dir` given) exactly: the same
-            // per-cwd repo, reattaching to this directory's most recent session if one already exists
-            // rather than starting fresh every single invocation (`SessionRepo::resume_or_create`'s own
-            // doc comment). `--session-id` *does* apply here (unlike the `--continue` arm above) — this
-            // is exactly the "plain ephemeral run" case that flag's own doc comment already documents it
-            // for.
-            None if !no_session_persistence => {
-                let repo = SessionRepo::open(&repo_dir)?;
-                let (store, session) =
-                    repo.resume_or_create(&cwd_str, &model, session_id.as_deref())?;
-                (Some(store), session)
-            }
-            None => (None, Session::new()),
         }
     };
 
