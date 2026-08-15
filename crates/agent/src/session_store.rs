@@ -2721,33 +2721,54 @@ impl SessionRepo {
         &self.dir
     }
 
-    /// Reopen the most recent session whose recorded `cwd` matches, or create a fresh one — not just
-    /// the globally newest session, so a shared repo directory spanning multiple projects doesn't
-    /// resume a stranger's unrelated session. Matching is an exact string comparison — callers are
-    /// expected to have already passed `cwd` through [`canonical_cwd`], so a symlinked or
-    /// trailing-slashed spelling of the same real directory still matches (`serve`'s own startup
-    /// reattach and `run --continue` both do). Shared by both, so they pick up "my last session in
-    /// this directory" the same way. `id`, when given, names the fresh session in the no-match branch
-    /// instead of a freshly generated one — a caller-chosen id (`serve`'s own `--session-id`); ignored
-    /// when an existing session is reattached instead (already has a fixed id from disk). `run
-    /// --continue` always passes `None` here, matching its own documented contract that `--session-id`
-    /// applies only to a genuinely fresh `--session <path>` or a plain ephemeral run, never `--continue`.
-    pub fn resume_or_create(
+    /// Open the session named `id`, or create it under exactly that id if it doesn't exist yet.
+    ///
+    /// **A session id is an address.** This resolves to the session named `id` or to a brand-new one
+    /// carrying that name — never to some *other* session, and never to a unique-prefix neighbour (see
+    /// [`Self::find_path_exact`]). That total, unambiguous mapping is what makes an id usable as a
+    /// routing key: a caller minting one id per tenant, per task, or per connection gets one session
+    /// apiece, and re-running with the same id is idempotent, landing back on the same conversation.
+    ///
+    /// Deliberately does **not** consult `cwd`. It's recorded on a freshly created session (and is what
+    /// [`Self::resume_latest_or_create`] matches on), but it never overrides an explicit name: an
+    /// earlier version of this API checked `cwd` first and silently discarded the caller's id, which
+    /// collapsed every distinct id in a shared directory onto one shared session.
+    pub fn open_or_create_id(
+        &self,
+        id: &str,
+        cwd: &str,
+        model: &str,
+    ) -> std::io::Result<(SessionStore, Session)> {
+        match self.find_path_exact(id)? {
+            Some(path) => SessionStore::open(path),
+            None => Ok((
+                self.create(SessionMeta::with_id(id.to_string(), cwd, model))?,
+                Session::new(),
+            )),
+        }
+    }
+
+    /// Reopen the most recent session whose recorded `cwd` matches, or create a fresh one — "my last
+    /// session in this directory", which is exactly what `--continue` means on both `run` and `serve`.
+    ///
+    /// Not just the globally newest session, so a shared repo directory spanning multiple projects
+    /// doesn't resume a stranger's unrelated session. Matching is an exact string comparison — callers
+    /// are expected to have already passed `cwd` through [`canonical_cwd`], so a symlinked or
+    /// trailing-slashed spelling of the same real directory still matches.
+    ///
+    /// Only ever reached when the caller explicitly asked to continue. It is deliberately **not** what a
+    /// bare invocation does: two shells running in one repo would both land on this same store and
+    /// interleave their transcripts into it, and since [`SessionStore::append_new`] is count-keyed
+    /// neither process can even observe the other's writes. Callers wanting a brand-new session call
+    /// [`Self::create`]; callers wanting a *named* one call [`Self::open_or_create_id`].
+    pub fn resume_latest_or_create(
         &self,
         cwd: &str,
         model: &str,
-        id: Option<&str>,
     ) -> std::io::Result<(SessionStore, Session)> {
         match self.list()?.into_iter().find(|m| m.cwd == cwd) {
             Some(meta) => self.open_id(&meta.id),
-            None => {
-                let meta = match id {
-                    Some(id) => SessionMeta::with_id(id.to_string(), cwd, model),
-                    None => SessionMeta::new(cwd, model),
-                };
-                let store = self.create(meta)?;
-                Ok((store, Session::new()))
-            }
+            None => Ok((self.create(SessionMeta::new(cwd, model))?, Session::new())),
         }
     }
 
@@ -3291,6 +3312,40 @@ impl SessionRepo {
         Ok(self.fork_at_entry_prefix(id, entry_id, before)?.messages)
     }
 
+    /// Every `.jsonl`-or-otherwise path directly under this repo's directory, unfiltered. A missing
+    /// directory is an empty list, not an error — nothing has been persisted here yet, which every
+    /// lookup below already treats as "no match" rather than a failure.
+    fn session_paths(&self) -> std::io::Result<Vec<PathBuf>> {
+        match fs::read_dir(&self.dir) {
+            Ok(entries) => Ok(entries.flatten().map(|e| e.path()).collect()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// The path whose `<id>` component is exactly `id`, from an already-gathered listing. Filename-only
+    /// — no file is opened, so this is a string compare per directory entry rather than a parse.
+    ///
+    /// Compares the parsed component, not an `_<id>.jsonl` *suffix*: ids may legally contain `_`
+    /// ([`is_valid_session_id`]), so a suffix test lets a lookup for `b` match a session actually named
+    /// `a_b`. Harmless while this only backed a convenience lookup; not harmless now that it decides
+    /// which session an address resolves to.
+    fn exact_match(entries: &[PathBuf], id: &str) -> Option<PathBuf> {
+        entries.iter().find(|p| file_id(p) == Some(id)).cloned()
+    }
+
+    /// Resolve `id` to its on-disk path by **exact** match only, with no unique-prefix fallback.
+    ///
+    /// This is the lookup an *addressing* caller needs — `--session-id`, `serve`'s `?session_id=` — as
+    /// opposed to [`Self::find_path`]'s human-convenience resolution. The distinction is not cosmetic:
+    /// under prefix matching, asking for `abc` when `abcdef` already exists would both hand back the
+    /// wrong session *and* suppress creating the one actually asked for, so a caller minting ids that
+    /// happen to share a prefix would silently collapse onto whichever landed first. Exact-or-absent
+    /// keeps "open it, else create it under this exact name" total and unambiguous.
+    fn find_path_exact(&self, id: &str) -> std::io::Result<Option<PathBuf>> {
+        Ok(Self::exact_match(&self.session_paths()?, id))
+    }
+
     /// Resolve `id` to its on-disk path in this repo: an exact match first (cheap, unambiguous), then a
     /// unique-prefix match — pi's own convenience for typing a shortened id (`main.ts`'s
     /// `resolveSessionPath`), but *not* pi's own silent "pick whichever sorts first" when a prefix
@@ -3299,28 +3354,15 @@ impl SessionRepo {
     /// candidate instead of a guess. `Ok(None)` when nothing matches at all — not found is not an error
     /// here, matching every existing caller's own "session may not exist" handling.
     fn find_path(&self, id: &str) -> std::io::Result<Option<PathBuf>> {
-        let entries: Vec<PathBuf> = match fs::read_dir(&self.dir) {
-            Ok(entries) => entries.flatten().map(|e| e.path()).collect(),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(e),
-        };
-        let exact_suffix = format!("_{id}.jsonl");
-        if let Some(path) = entries.iter().find(|p| {
-            p.file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| n.ends_with(&exact_suffix))
-        }) {
-            return Ok(Some(path.clone()));
+        let entries = self.session_paths()?;
+        if let Some(path) = Self::exact_match(&entries, id) {
+            return Ok(Some(path));
         }
-        // No exact match: fall back to a unique-prefix match over each file's own `<id>` component
-        // (`split_once` on the *first* underscore only, since `<created_at>` is always plain digits —
-        // never itself containing one — while a caller-supplied `--session-id` legally can).
+        // No exact match: fall back to a unique-prefix match over each file's own `<id>` component.
         let matches: Vec<(&str, &PathBuf)> = entries
             .iter()
             .filter_map(|path| {
-                let name = path.file_name()?.to_str()?;
-                let rest = name.strip_suffix(".jsonl")?;
-                let (_, file_id) = rest.split_once('_')?;
+                let file_id = file_id(path)?;
                 file_id.starts_with(id).then_some((file_id, path))
             })
             .collect();
@@ -3337,6 +3379,16 @@ impl SessionRepo {
             }
         }
     }
+}
+
+/// The `<id>` component of a `<created_at>_<id>.jsonl` session filename, or `None` for anything that
+/// isn't shaped like one. `split_once` on the *first* underscore only: `<created_at>` is always plain
+/// digits and so never contains one, while a caller-supplied `--session-id` legally can — so everything
+/// after that first separator is the id, `_` and all.
+fn file_id(path: &Path) -> Option<&str> {
+    let name = path.file_name()?.to_str()?;
+    let (_, id) = name.strip_suffix(".jsonl")?.split_once('_')?;
+    Some(id)
 }
 
 /// Canonicalize `cwd` for session-matching purposes: resolves symlinks and `.`/`..` components (and, as
@@ -6356,7 +6408,7 @@ mod tests {
     }
 
     #[test]
-    fn resume_or_create_reopens_the_session_matching_cwd() {
+    fn resume_latest_or_create_reopens_the_session_matching_cwd() {
         let dir = tmpdir();
         let repo = SessionRepo::open(dir.path()).unwrap();
         let mut other = repo.create(SessionMeta::new("/other", "m")).unwrap();
@@ -6369,34 +6421,35 @@ mod tests {
         sb.user("from my project");
         mine.append_new(&sb.messages).unwrap();
 
-        let (store, session) = repo.resume_or_create("/mine", "m", None).unwrap();
+        let (store, session) = repo.resume_latest_or_create("/mine", "m").unwrap();
         assert_eq!(store.meta().id, mine.meta().id);
         assert_eq!(session.messages.len(), 1);
     }
 
     #[test]
-    fn resume_or_create_makes_a_fresh_session_when_no_cwd_matches() {
+    fn resume_latest_or_create_makes_a_fresh_session_when_no_cwd_matches() {
         let dir = tmpdir();
         let repo = SessionRepo::open(dir.path()).unwrap();
-        let (store, session) = repo.resume_or_create("/brand/new", "m", None).unwrap();
+        let (store, session) = repo.resume_latest_or_create("/brand/new", "m").unwrap();
         assert_eq!(store.meta().cwd, "/brand/new");
         assert!(session.messages.is_empty());
     }
 
     #[test]
-    fn resume_or_create_uses_the_given_id_for_a_genuinely_fresh_session() {
-        // Backs `serve`'s own `--session-id` flag (pi-parity: `run` already had this, `serve` didn't).
+    fn open_or_create_id_mints_a_session_under_exactly_the_given_id() {
         let dir = tmpdir();
         let repo = SessionRepo::open(dir.path()).unwrap();
         let (store, session) = repo
-            .resume_or_create("/brand/new", "m", Some("my-chosen-id"))
+            .open_or_create_id("my-chosen-id", "/brand/new", "m")
             .unwrap();
         assert_eq!(store.meta().id, "my-chosen-id");
         assert!(session.messages.is_empty());
     }
 
     #[test]
-    fn resume_or_create_ignores_the_given_id_when_an_existing_session_matches_the_cwd() {
+    fn open_or_create_id_wins_over_a_session_matching_the_cwd() {
+        // The regression that started this: an explicit id used to be silently discarded whenever *any*
+        // session already existed for the same cwd, so the caller got a stranger's conversation.
         let dir = tmpdir();
         let repo = SessionRepo::open(dir.path()).unwrap();
         let mut mine = repo.create(SessionMeta::new("/mine", "m")).unwrap();
@@ -6404,15 +6457,97 @@ mod tests {
         s.user("already here");
         mine.append_new(&s.messages).unwrap();
 
-        let (store, session) = repo
-            .resume_or_create("/mine", "m", Some("should-be-ignored"))
-            .unwrap();
+        let (store, session) = repo.open_or_create_id("my-own-id", "/mine", "m").unwrap();
         assert_eq!(
             store.meta().id,
-            mine.meta().id,
-            "an existing session's own id must win over a caller-supplied one"
+            "my-own-id",
+            "a caller-supplied id must never resolve to a different session"
         );
+        assert_ne!(store.meta().id, mine.meta().id);
+        assert!(
+            session.messages.is_empty(),
+            "the named session is brand new, so it must not inherit the cwd match's transcript"
+        );
+    }
+
+    #[test]
+    fn distinct_ids_in_one_cwd_stay_distinct_sessions() {
+        // Multi-tenancy in one line: N ids in a shared directory must be N sessions, not one. This is
+        // the property `serve --session-id` and the daemon's `?session_id=` both route on.
+        let dir = tmpdir();
+        let repo = SessionRepo::open(dir.path()).unwrap();
+        for id in ["tenant-a", "tenant-b", "tenant-c"] {
+            let (mut store, mut session) = repo.open_or_create_id(id, "/shared", "m").unwrap();
+            session.user(id);
+            store.append_new(&session.messages).unwrap();
+        }
+        let ids: HashSet<String> = repo.list().unwrap().into_iter().map(|m| m.id).collect();
+        assert_eq!(ids.len(), 3, "each id must own its own session file");
+
+        // ...and each reopens to its own transcript, not a neighbour's.
+        for id in ["tenant-a", "tenant-b", "tenant-c"] {
+            let (_, session) = repo.open_or_create_id(id, "/shared", "m").unwrap();
+            assert_eq!(session.messages.len(), 1);
+            assert!(format!("{:?}", session.messages[0]).contains(id));
+        }
+    }
+
+    #[test]
+    fn open_or_create_id_is_idempotent() {
+        // Re-running with the same id lands back on the same conversation rather than stacking up a new
+        // session per invocation — the property a supervised `serve --session-id` restart depends on.
+        let dir = tmpdir();
+        let repo = SessionRepo::open(dir.path()).unwrap();
+        let (mut store, mut session) = repo.open_or_create_id("pinned", "/w", "m").unwrap();
+        session.user("first");
+        store.append_new(&session.messages).unwrap();
+
+        let (reopened, session) = repo.open_or_create_id("pinned", "/w", "m").unwrap();
+        assert_eq!(reopened.meta().id, "pinned");
         assert_eq!(session.messages.len(), 1);
+        assert_eq!(repo.list().unwrap().len(), 1, "no duplicate was created");
+    }
+
+    #[test]
+    fn open_or_create_id_does_not_confuse_an_id_with_an_underscored_suffix_of_another() {
+        // Ids may legally contain `_`, and sessions are stored as `<created_at>_<id>.jsonl`. Matching on
+        // an `_<id>.jsonl` *suffix* rather than the parsed component would resolve `b` onto `a_b`.
+        let dir = tmpdir();
+        let repo = SessionRepo::open(dir.path()).unwrap();
+        let (mut store, mut session) = repo.open_or_create_id("a_b", "/w", "m").unwrap();
+        session.user("belongs to a_b");
+        store.append_new(&session.messages).unwrap();
+
+        let (short, session) = repo.open_or_create_id("b", "/w", "m").unwrap();
+        assert_eq!(short.meta().id, "b");
+        assert!(
+            session.messages.is_empty(),
+            "`b` must not resolve onto the session named `a_b`"
+        );
+        assert_eq!(repo.list().unwrap().len(), 2);
+
+        // …and `a_b` still resolves to itself, by both lookups.
+        let (reopened, session) = repo.open_or_create_id("a_b", "/w", "m").unwrap();
+        assert_eq!(reopened.meta().id, "a_b");
+        assert_eq!(session.messages.len(), 1);
+        assert_eq!(repo.open_id("a_b").unwrap().0.meta().id, "a_b");
+    }
+
+    #[test]
+    fn open_or_create_id_matches_exactly_never_by_prefix() {
+        // `find_path`'s unique-prefix convenience is for a human typing a shortened id. Applying it to
+        // addressing would resolve `abc` onto `abcdef` *and* suppress creating `abc` — two wrongs that
+        // would silently collapse a set of prefix-sharing ids onto whichever landed first.
+        let dir = tmpdir();
+        let repo = SessionRepo::open(dir.path()).unwrap();
+        let (mut store, mut session) = repo.open_or_create_id("abcdef", "/w", "m").unwrap();
+        session.user("the long one");
+        store.append_new(&session.messages).unwrap();
+
+        let (short, session) = repo.open_or_create_id("abc", "/w", "m").unwrap();
+        assert_eq!(short.meta().id, "abc");
+        assert!(session.messages.is_empty());
+        assert_eq!(repo.list().unwrap().len(), 2);
     }
 
     #[test]
@@ -6433,7 +6568,8 @@ mod tests {
     }
 
     #[test]
-    fn resume_or_create_matches_a_session_recorded_under_a_symlinked_cwd_once_canonicalized() {
+    fn resume_latest_or_create_matches_a_session_recorded_under_a_symlinked_cwd_once_canonicalized()
+    {
         // The regression this guards: a project reached through a symlink one time and its real path
         // another must resolve to the same session, not silently fork into two.
         let dir = tmpdir();
@@ -6451,7 +6587,7 @@ mod tests {
         store.append_new(&s.messages).unwrap();
 
         let link_cwd = canonical_cwd(&link).to_string_lossy().into_owned();
-        let (reopened, session) = repo.resume_or_create(&link_cwd, "m", None).unwrap();
+        let (reopened, session) = repo.resume_latest_or_create(&link_cwd, "m").unwrap();
         assert_eq!(
             reopened.meta().id,
             store.meta().id,

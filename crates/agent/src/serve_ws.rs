@@ -19,12 +19,22 @@
 //!
 //! A connection names its session in the URL: `…/_beyond/agent?session_id=<id>` (absent ⇒ a fresh id
 //! is minted; the client learns it from any `response`/`get_state` frame). That id is both the
-//! supervisor's routing key **and** the persisted session id: each WS session is its own JSONL file
-//! `<session-dir>/<id>.jsonl` (via [`ServeConfig::session_id`]/`session_file`), so the id is stable
-//! across reconnects and a cold reconnect after a process restart re-opens the same file. Without a
-//! `--session-dir`, sessions are in-memory only (live re-attach still works for the process's
-//! lifetime). Repo-mode multi-session commands (`list_sessions`, `switch_session`) are not used — each
-//! connection is pinned to one session by its URL.
+//! supervisor's routing key **and** the persisted session id: it's handed to the session as
+//! [`ServeConfig::session_id`], which *addresses* it in the repo — open that session, or create it under
+//! exactly that id ([`crate::session_store::SessionRepo::open_or_create_id`]). So the id is stable
+//! across reconnects, and a cold reconnect after a full process restart reopens the same conversation
+//! rather than a blank one. `--no-session-persistence` opts out into in-memory-only sessions, which
+//! still live re-attach for the process's lifetime.
+//!
+//! Because the id is a routing key, `new_session` on a live connection **keeps** it: the conversation is
+//! archived into a session of its own and this one is blanked in place, so the address a client holds
+//! never goes stale (see [`crate::serve::Persistence::new_session`]). Creating a genuinely new session
+//! is a routing operation — connect with a new `?session_id=`.
+//!
+//! One limit worth naming: `switch_session` (and `fork`/`clone`) move *this process's* view to another
+//! session while the routing key stays put. That's fine while the session is live, but it isn't durable
+//! — if the session is reaped and later respawned, the key re-opens the session it was named for. For a
+//! durable move, reconnect at `?session_id=<target>` instead.
 //!
 //! ## Auth
 //!
@@ -142,9 +152,16 @@ struct Supervisor {
 }
 
 impl Supervisor {
-    /// Derive a per-session config: pin the id, drop `listen`, and give the session its own JSONL file
-    /// under the base `--session-dir` so its persisted id equals its routing key. No base dir ⇒
-    /// in-memory only (live re-attach still works while the task lives).
+    /// Derive a per-session config: address the session by its routing key and drop `listen`.
+    ///
+    /// Pinning `session_id` is the whole mechanism — repo mode opens exactly that session or creates it
+    /// under exactly that id, so the persisted id always equals the routing key. This used to rewrite
+    /// each session into single-file mode at `<session-dir>/<id>.jsonl` instead, purely to dodge repo
+    /// mode's old behavior of resolving by `cwd` and collapsing every session in a directory onto one.
+    /// With an id now taking precedence over the cwd match that workaround is unnecessary, and dropping
+    /// it fixes what it cost: daemon files were named `<id>.jsonl` where the repo names its own
+    /// `<created_at>_<id>.jsonl`, so `find_path`'s `_<id>.jsonl` lookup couldn't see them — a daemon
+    /// session appeared in `list_sessions` but `switch_session` reported it missing.
     fn session_cfg(&self, id: &str) -> ServeConfig {
         let mut c = self.cfg.clone();
         c.listen = None;
@@ -153,21 +170,13 @@ impl Supervisor {
         c.listen_uds = None;
         c.listen_uds_mode = None;
         c.session_id = Some(id.to_string());
-        match &self.cfg.session_dir {
-            Some(dir) => {
-                c.session_file = Some(
-                    std::path::Path::new(dir)
-                        .join(format!("{id}.jsonl"))
-                        .to_string_lossy()
-                        .into_owned(),
-                );
-                c.session_dir = None;
-            }
-            None => {
-                c.no_session_persistence = true;
-                c.session_file = None;
-            }
-        }
+        // An addressed session selects itself; `--continue`'s "most recent for this cwd" would only be
+        // able to disagree with the id the client actually routed on.
+        c.continue_session = false;
+        // Repo mode, always: one file can't hold the many sessions a daemon serves, so a `--session-file`
+        // meant for the stdio path can't carry over. `session_dir` (or, unset, the default per-cwd repo)
+        // is where they go; `--no-session-persistence` is still honored and keeps them in memory.
+        c.session_file = None;
         c
     }
 

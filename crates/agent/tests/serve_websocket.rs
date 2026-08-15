@@ -327,15 +327,18 @@ async fn ws_distinct_sessions_run_concurrently_and_stay_isolated() {
         "session bravo must be isolated: {db}"
     );
 
-    // Each session persisted to its own file, named by id.
-    assert!(
-        dir.path().join("alpha.jsonl").exists(),
-        "alpha.jsonl should exist"
-    );
-    assert!(
-        dir.path().join("bravo.jsonl").exists(),
-        "bravo.jsonl should exist"
-    );
+    // Each session persisted as an ordinary repo session under its routing key. The daemon used to
+    // hand-build `<id>.jsonl` while the repo names its own `<created_at>_<id>.jsonl`, so `find_path`'s
+    // `_<id>.jsonl` lookup couldn't see daemon sessions at all: they showed up in `list_sessions` but
+    // `switch_session`/`open_id` reported them missing. Resolving by id is the assertion that matters —
+    // the filename is just how the repo spells it.
+    let repo = beyond_ai_agent::session_store::SessionRepo::open(dir.path()).unwrap();
+    for id in ["alpha", "bravo"] {
+        let (store, _) = repo
+            .open_id(id)
+            .unwrap_or_else(|e| panic!("daemon session {id} must be openable by its id: {e}"));
+        assert_eq!(store.meta().id, id);
+    }
 
     let _ = child.kill();
     let _ = child.wait();
@@ -390,13 +393,14 @@ async fn ws_sigterm_persists_in_flight_session_and_exits() {
         "serve --listen must exit promptly on SIGTERM, not hang"
     );
 
-    // The in-flight session was persisted before exit (graceful, not killed mid-write).
-    let file = dir.path().join(format!("{SID}.jsonl"));
-    assert!(
-        file.exists(),
-        "the session file should exist after graceful shutdown"
-    );
-    let content = std::fs::read_to_string(&file).unwrap();
+    // The in-flight session was persisted before exit (graceful, not killed mid-write). Located
+    // through the repo by its routing key rather than by a hand-built filename — the daemon persists
+    // ordinary repo sessions (`<created_at>_<id>.jsonl`), so the id is what resolves it.
+    let repo = beyond_ai_agent::session_store::SessionRepo::open(dir.path()).unwrap();
+    let (store, _) = repo
+        .open_id(SID)
+        .expect("the session should be on disk, and resolvable by id, after graceful shutdown");
+    let content = std::fs::read_to_string(store.path()).unwrap();
     assert!(
         content.contains("SIGMARKER"),
         "the in-flight prompt must be persisted on graceful shutdown, not lost: {content}"

@@ -75,12 +75,14 @@ fn run_binary_session_flag_persists_and_resumes_across_invocations() {
 }
 
 #[test]
-fn run_binary_persists_and_resumes_a_session_by_default_with_no_session_flags_given() {
-    // pi-parity fix: a plain `run` with none of `--fork`/`--session`/`--continue` previously stayed
-    // in-memory-only — pi's own default (every mode, including one-shot print-mode) is a persisted,
-    // disk-backed session, matching `serve`'s own default repo-mode persistence. No `--continue` and no
-    // `--session` here at all: the second invocation must still pick up the first's history from the
-    // same per-cwd default repo `--continue` itself resolves against.
+fn run_binary_persists_but_does_not_resume_by_default_with_no_session_flags_given() {
+    // Two halves of one contract. A plain `run` with none of `--fork`/`--session`/`--continue`:
+    //   1. *persists* — pi's own default (every mode, including one-shot print-mode) is a disk-backed
+    //      session, so history isn't lost and `--continue` has something to find; but
+    //   2. does *not* resume — it starts its own session. It briefly did resume, which meant two shells
+    //      in one repo drove the same store, and since `append_new` is count-keyed neither could see the
+    //      other's writes: the transcript interleaved into nonsense. `--continue` is now the only thing
+    //      that reattaches implicitly (covered by the `--continue` tests above).
     let home_dir = tempfile::tempdir().unwrap();
     let project_dir = tempfile::tempdir().unwrap();
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
@@ -138,9 +140,28 @@ fn run_binary_persists_and_resumes_a_session_by_default_with_no_session_flags_gi
 
     let bodies2 = bodies2.lock().unwrap();
     assert!(
-        bodies2[0].contains("default-persist-99"),
-        "the second no-flag run must see the first no-flag run's history: {}",
+        !bodies2[0].contains("default-persist-99"),
+        "a second no-flag run must start its own session, not join the first's: {}",
         bodies2[0]
+    );
+
+    // Both runs persisted — two separate sessions in the one per-cwd repo, neither discarded.
+    let repo = std::fs::read_dir(home_dir.path().join(".claude/sessions"))
+        .expect("sessions root")
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .find(|p| p.is_dir())
+        .expect("a per-cwd repo directory");
+    let sessions: Vec<_> = std::fs::read_dir(&repo)
+        .expect("repo dir")
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("jsonl"))
+        .collect();
+    assert_eq!(
+        sessions.len(),
+        2,
+        "each no-flag run must own its own session file, and neither may be discarded: {sessions:?}"
     );
 }
 
@@ -863,6 +884,81 @@ fn run_session_flag_warns_when_the_sessions_recorded_cwd_no_longer_matches() {
         stderr.contains("warning") && stderr.contains("working directory"),
         "stderr: {stderr}"
     );
+}
+
+#[test]
+fn run_session_id_addresses_one_session_rather_than_whatever_matched_the_cwd() {
+    // `run`'s half of the same contract `serve` is covered for in `serve_session_addressing.rs`: an id
+    // names a session. It used to be discarded whenever any session already existed for this cwd, so a
+    // caller minting one id per task got a stranger's conversation instead of its own.
+    let home_dir = tempfile::tempdir().unwrap();
+    let project_dir = tempfile::tempdir().unwrap();
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+
+    let go = |base: &str, args: &[&str], msg: &str| {
+        let mut cmd = Command::new(bin);
+        cmd.env("HOME", home_dir.path())
+            .args(["run", msg, "--gateway-url", base, "--key", "bai_v1.test"])
+            .args(["--model", "claude-test"])
+            .args(args)
+            .current_dir(project_dir.path())
+            .stdin(Stdio::null());
+        let out = cmd.output().expect("spawn binary");
+        assert!(
+            out.status.success(),
+            "run failed.\nstderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+
+    // A plain run first, so the directory already holds a session for this cwd.
+    let (base1, _b1) = spawn_model_server(vec![turn_text("first answer")]);
+    go(&base1, &[], "remember the marker: squatter-3");
+
+    // Now an addressed run: it must open its *own* session, blind to the one above.
+    let (base2, bodies2) = spawn_model_server(vec![turn_text("second answer")]);
+    go(&base2, &["--session-id", "task-a"], "marker: task-a-1");
+    assert!(
+        !bodies2.lock().unwrap()[0].contains("squatter-3"),
+        "--session-id must not inherit the cwd match's transcript"
+    );
+
+    // …and the same id again continues that session, idempotently.
+    let (base3, bodies3) = spawn_model_server(vec![turn_text("third answer")]);
+    go(&base3, &["--session-id", "task-a"], "what was the marker?");
+    let body = &bodies3.lock().unwrap()[0];
+    assert!(
+        body.contains("task-a-1"),
+        "the same id must reopen the same conversation: {body}"
+    );
+    assert!(
+        !body.contains("squatter-3"),
+        "and still only that conversation: {body}"
+    );
+
+    // A second id in the same directory is a second session — 3 in total (squatter, task-a, task-b).
+    let (base4, bodies4) = spawn_model_server(vec![turn_text("fourth answer")]);
+    go(&base4, &["--session-id", "task-b"], "marker: task-b-1");
+    assert!(
+        !bodies4.lock().unwrap()[0].contains("task-a-1"),
+        "distinct ids must be distinct sessions"
+    );
+
+    let repo = std::fs::read_dir(home_dir.path().join(".claude/sessions"))
+        .expect("sessions root")
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .find(|p| p.is_dir())
+        .expect("a per-cwd repo directory");
+    let ids: Vec<String> = std::fs::read_dir(&repo)
+        .expect("repo dir")
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("jsonl"))
+        .map(|p| session_id_of(&p))
+        .collect();
+    assert_eq!(ids.len(), 3, "three separate sessions on disk: {ids:?}");
+    assert!(ids.contains(&"task-a".to_string()) && ids.contains(&"task-b".to_string()));
 }
 
 /// Reads a session `.jsonl` file's header line and returns its `id` field.
