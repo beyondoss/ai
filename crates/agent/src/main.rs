@@ -4542,6 +4542,53 @@ mod tests {
         }
     }
 
+    /// In-process argv parse cost only (no process start, no help rendering). Printed under
+    /// `--nocapture` so a release-mode run can be compared against process-level hyperfine numbers:
+    /// process startup for this binary is ~2 ms either way; the parse itself is microseconds.
+    #[test]
+    fn cli_parse_in_process_microbench() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        let cases: &[&[&str]] = &[
+            &["beyond-ai-agent", "tools"],
+            &["beyond-ai-agent", "run", "--model", "claude-opus-4-8", "hi"],
+            &[
+                "beyond-ai-agent",
+                "serve",
+                "--upstream-http2",
+                "off",
+                "--tools",
+                "bash,read,write",
+            ],
+            &["beyond-ai-agent", "settings", "--model", "claude-sonnet-4-5"],
+        ];
+        const WARMUP: u32 = 200;
+        const ITERS: u32 = 5_000;
+
+        for argv in cases {
+            let os: Vec<&OsStr> = argv.iter().map(OsStr::new).collect();
+            for _ in 0..WARMUP {
+                let _ = black_box(Cli::try_parse_from(&os));
+            }
+            let start = Instant::now();
+            for _ in 0..ITERS {
+                let _ = black_box(Cli::try_parse_from(&os));
+            }
+            let elapsed = start.elapsed();
+            let per = elapsed / ITERS;
+            eprintln!(
+                "cli_parse_in_process: {argv:?} → {per:?}/parse ({} over {ITERS})",
+                argv.join(" "),
+            );
+            // Sanity: a successful parse path must stay well under a millisecond in-process.
+            assert!(
+                per.as_micros() < 1_000,
+                "unexpectedly slow parse for {argv:?}: {per:?}"
+            );
+        }
+    }
+
     #[test]
     fn is_valid_session_id_accepts_ordinary_ids() {
         assert!(is_valid_session_id("abc123"));
