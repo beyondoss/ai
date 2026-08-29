@@ -115,11 +115,21 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 # The `web` tool's `markdown` mode: HTML→markdown, so the model reads a page's prose rather than its
 # HTML. See `tools/web/markdown.rs`.
 htmd = "0.5"
+# `SIGSYS` (telling a seccomp kill apart from an ordinary crash) and the syscall numbers the filter is
+# built from, which are per-architecture and so must come from a real binding rather than literals.
+# Already resolved transitively at this exact version (tokio → signal-hook-registry → errno), so
+# depending on it directly adds nothing to the build graph.
+libc = "0.2"
 # `export_html`'s markdown rendering (headers/bold/lists/code fences) for message text — pure Rust, no
 # vendored JS. Deliberately not paired with a syntax-highlighting crate (e.g. `syntect`): that pulls in
 # several MB of bundled syntax/theme data and would slow every build of this CLI, including `run`/
 # `serve`, which never touch export — see export.rs's module doc comment.
 pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
+# Confines the `web` tool's HTML parse to a seccomp allowlist (`tools::web::isolate`). AWS's own
+# filter compiler — the one Firecracker uses — so it is the same primitive the compute tier already
+# trusts, and its `unsafe` stays in a dependency rather than in a crate that forbids it.
+seccompiler = "0.5"
+
 # The `web` tool's HTML parsing (html5ever, the linkedom equivalent) for its outline/locate/extract/
 # table modes. `scraper` also re-exports the `selectors`/`ego-tree` it's built on. See `tools/web/`.
 scraper = { version = "0.27", default-features = false }

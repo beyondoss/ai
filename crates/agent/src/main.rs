@@ -1484,8 +1484,32 @@ fn cli() -> Cli {
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// The `web` tool's isolated HTML parser, dispatched *before* anything else exists.
+///
+/// Not a `Command` variant, and deliberately not routed through the CLI parser: the point of this
+/// process is to be small and single-threaded when its seccomp filter goes on. `#[tokio::main]` builds
+/// a multi-thread runtime before the function body runs, and those workers park in `epoll_wait` — a
+/// syscall the parse allowlist has no reason to permit, which would either widen the filter or kill
+/// the process on teardown. Intercepting argv here means the child is one thread that has opened
+/// nothing. See `tools::web::isolate`.
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|a| a == tools::web::isolate::SUBCOMMAND)
+    {
+        std::process::exit(tools::web::isolate::child_main());
+    }
+
+    // Everything else wants the async runtime `#[tokio::main]` used to build here — same shape
+    // (multi-thread, all drivers enabled), just constructed explicitly so the branch above can run
+    // first.
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(run())
+}
+
+async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Name the rustls crypto provider for the process up front. Every client-construction site calls
     // this too (it is a `Once`), so this is belt-and-braces rather than the only guard — but doing it
     // first means a provider is in place before any code path, including one added later, can reach a
