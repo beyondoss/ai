@@ -66,15 +66,15 @@ where
     let mut first = true;
 
     loop {
-        if let Some(deadline) = deadline {
-            if Instant::now() >= deadline {
-                let message = if saw_slow_down {
-                    SLOW_DOWN_TIMEOUT_MESSAGE
-                } else {
-                    TIMEOUT_MESSAGE
-                };
-                return Err(OAuthError::DeviceFlowTimedOut(message.to_string()));
-            }
+        if let Some(deadline) = deadline
+            && Instant::now() >= deadline
+        {
+            let message = if saw_slow_down {
+                SLOW_DOWN_TIMEOUT_MESSAGE
+            } else {
+                TIMEOUT_MESSAGE
+            };
+            return Err(OAuthError::DeviceFlowTimedOut(message.to_string()));
         }
 
         if !first || wait_before_first_poll {

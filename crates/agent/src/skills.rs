@@ -666,18 +666,18 @@ fn loose_root_skills(root: &Path, diagnostics: &mut Vec<String>) -> Vec<Skill> {
 /// issues below `warn!` even when the skill is still allowed to load, so a skill that fails to load at
 /// all must not produce *less* signal than one.
 fn parse_skill(manifest: &Path, diagnostics: &mut Vec<String>) -> Option<Skill> {
-    if let Ok(meta) = fs::metadata(manifest) {
-        if meta.len() > MAX_SKILL_FILE_LEN {
-            let message = format!(
-                "skill manifest {} exceeds {MAX_SKILL_FILE_LEN} bytes ({} bytes) — skipped without \
+    if let Ok(meta) = fs::metadata(manifest)
+        && meta.len() > MAX_SKILL_FILE_LEN
+    {
+        let message = format!(
+            "skill manifest {} exceeds {MAX_SKILL_FILE_LEN} bytes ({} bytes) — skipped without \
                  reading",
-                manifest.display(),
-                meta.len()
-            );
-            tracing::warn!("{message}");
-            diagnostics.push(message);
-            return None;
-        }
+            manifest.display(),
+            meta.len()
+        );
+        tracing::warn!("{message}");
+        diagnostics.push(message);
+        return None;
     }
     let text = match fs::read_to_string(manifest) {
         Ok(text) => text,

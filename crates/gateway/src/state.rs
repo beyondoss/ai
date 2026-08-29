@@ -354,10 +354,10 @@ impl GatewayState {
     pub async fn resolve(&self, authority: &str) -> Result<SocketAddr> {
         // Cache hit (the common case after warmup): a lock-free `ArcSwap` load — no mutex, no
         // syscall — so concurrent workers never serialize on a DNS lookup that's already resolved.
-        if let Some((addr, at)) = self.dns_cache.load().get(authority) {
-            if at.elapsed() < DNS_TTL {
-                return Ok(*addr);
-            }
+        if let Some((addr, at)) = self.dns_cache.load().get(authority)
+            && at.elapsed() < DNS_TTL
+        {
+            return Ok(*addr);
         }
         let addr = tokio::net::lookup_host(authority)
             .await

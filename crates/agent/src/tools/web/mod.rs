@@ -328,13 +328,12 @@ fn render_fetch(f: &Fetched) -> String {
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|c| c.to_str().ok())
         .is_some_and(|c| c.contains("json"));
-    if is_json {
-        if let Ok(v) = serde_json::from_str::<Value>(&body) {
-            if let Ok(pretty) = serde_json::to_string_pretty(&v) {
-                out.push_str(&pretty);
-                return finalize(out, f.truncated);
-            }
-        }
+    if is_json
+        && let Ok(v) = serde_json::from_str::<Value>(&body)
+        && let Ok(pretty) = serde_json::to_string_pretty(&v)
+    {
+        out.push_str(&pretty);
+        return finalize(out, f.truncated);
     }
     out.push_str(&body);
     finalize(out, f.truncated)

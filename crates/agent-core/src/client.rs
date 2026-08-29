@@ -650,10 +650,9 @@ impl ModelTransport for GatewayClient {
             .direct
             .as_ref()
             .and_then(|d| d.deployment_name.as_deref())
+            && let Some(obj) = body.as_object_mut()
         {
-            if let Some(obj) = body.as_object_mut() {
-                obj.insert("model".to_string(), Value::String(name.to_string()));
-            }
+            obj.insert("model".to_string(), Value::String(name.to_string()));
         }
         let hooks = self.hooks.clone();
         // Pi-parity gap: nothing between `ModelRequest` and this dialect-built body ever exposed the
@@ -682,34 +681,34 @@ impl ModelTransport for GatewayClient {
         // connection/setup failures"). `dialect == Dialect::OpenAiResponses` is a defensive
         // belt-and-suspenders check alongside `req.is_codex` — every real Codex route is this dialect,
         // and the module hard-depends on its specific wire/decoder shape.
-        if req.is_codex && dialect == Dialect::OpenAiResponses {
-            if let Some(cache) = self.codex_websocket.clone() {
-                if let Some(ws_url) = crate::codex_websocket::to_ws_url(&url) {
-                    let request_id = req
-                        .cache_key
-                        .clone()
-                        .unwrap_or_else(crate::codex_websocket::generate_request_id);
-                    let ws_headers = crate::codex_websocket::build_headers(
-                        credential.key.expose(),
-                        &direct_headers,
-                        &request_id,
-                    );
-                    match crate::codex_websocket::try_stream(
-                        cache,
-                        ws_url,
-                        ws_headers,
-                        req.cache_key.clone(),
-                        body.clone(),
-                    )
-                    .await
-                    {
-                        crate::codex_websocket::Attempt::Started(stream) => return Ok(stream),
-                        crate::codex_websocket::Attempt::Failed(e) => return Err(e),
-                        // Nothing streamed yet — fall through to the existing HTTP/SSE path below,
-                        // completely unchanged, exactly as if this block didn't exist.
-                        crate::codex_websocket::Attempt::Fallback => {}
-                    }
-                }
+        if req.is_codex
+            && dialect == Dialect::OpenAiResponses
+            && let Some(cache) = self.codex_websocket.clone()
+            && let Some(ws_url) = crate::codex_websocket::to_ws_url(&url)
+        {
+            let request_id = req
+                .cache_key
+                .clone()
+                .unwrap_or_else(crate::codex_websocket::generate_request_id);
+            let ws_headers = crate::codex_websocket::build_headers(
+                credential.key.expose(),
+                &direct_headers,
+                &request_id,
+            );
+            match crate::codex_websocket::try_stream(
+                cache,
+                ws_url,
+                ws_headers,
+                req.cache_key.clone(),
+                body.clone(),
+            )
+            .await
+            {
+                crate::codex_websocket::Attempt::Started(stream) => return Ok(stream),
+                crate::codex_websocket::Attempt::Failed(e) => return Err(e),
+                // Nothing streamed yet — fall through to the existing HTTP/SSE path below,
+                // completely unchanged, exactly as if this block didn't exist.
+                crate::codex_websocket::Attempt::Fallback => {}
             }
         }
 

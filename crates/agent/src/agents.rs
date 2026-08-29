@@ -247,18 +247,18 @@ fn load_dir(root: &Path) -> (Vec<AgentDef>, Vec<String>) {
 /// missing a non-empty `description`, or carries an unrecognized `isolation:` — see [`Isolation::parse`]
 /// for why that last one is fatal rather than a warned-and-defaulted field.
 fn parse_agent(path: &Path, diagnostics: &mut Vec<String>) -> Option<AgentDef> {
-    if let Ok(meta) = fs::metadata(path) {
-        if meta.len() > MAX_AGENT_FILE_LEN {
-            let message = format!(
-                "agent definition {} exceeds {MAX_AGENT_FILE_LEN} bytes ({} bytes) — skipped without \
+    if let Ok(meta) = fs::metadata(path)
+        && meta.len() > MAX_AGENT_FILE_LEN
+    {
+        let message = format!(
+            "agent definition {} exceeds {MAX_AGENT_FILE_LEN} bytes ({} bytes) — skipped without \
                  reading",
-                path.display(),
-                meta.len()
-            );
-            tracing::warn!("{message}");
-            diagnostics.push(message);
-            return None;
-        }
+            path.display(),
+            meta.len()
+        );
+        tracing::warn!("{message}");
+        diagnostics.push(message);
+        return None;
     }
     let text = match fs::read_to_string(path) {
         Ok(text) => text,

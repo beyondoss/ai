@@ -429,25 +429,25 @@ pub fn anthropic_stream_parts(parts: &[&[u8]]) -> Option<Usage> {
             let Ok(chunk) = serde_json::from_slice::<Chunk>(line) else {
                 continue;
             };
-            if let Some(u) = chunk.message.and_then(|m| m.usage) {
-                if !u.looks_openai_shaped() {
-                    usage.input_tokens = u.input_tokens;
-                    usage.cache_read_tokens = u.cache_read_input_tokens;
-                    usage.cache_write_tokens = u.cache_creation_input_tokens;
-                    saw_any = true;
-                }
+            if let Some(u) = chunk.message.and_then(|m| m.usage)
+                && !u.looks_openai_shaped()
+            {
+                usage.input_tokens = u.input_tokens;
+                usage.cache_read_tokens = u.cache_read_input_tokens;
+                usage.cache_write_tokens = u.cache_creation_input_tokens;
+                saw_any = true;
             }
-            if let Some(u) = chunk.usage {
-                if !u.looks_openai_shaped() {
-                    // message_delta carries the running output token count.
-                    if u.output_tokens > 0 {
-                        usage.output_tokens = u.output_tokens;
-                    }
-                    if let Some(rt) = u.output_tokens_details.thinking_tokens {
-                        usage.reasoning_tokens = Some(rt);
-                    }
-                    saw_any = true;
+            if let Some(u) = chunk.usage
+                && !u.looks_openai_shaped()
+            {
+                // message_delta carries the running output token count.
+                if u.output_tokens > 0 {
+                    usage.output_tokens = u.output_tokens;
                 }
+                if let Some(rt) = u.output_tokens_details.thinking_tokens {
+                    usage.reasoning_tokens = Some(rt);
+                }
+                saw_any = true;
             }
         }
     }

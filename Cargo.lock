@@ -390,7 +390,6 @@ dependencies = [
  "beyond-ai-agent-core",
  "beyond-ai-providers",
  "bytes",
- "clap",
  "divan",
  "futures",
  "getrandom 0.3.4",
@@ -425,6 +424,7 @@ dependencies = [
  "tracing-subscriber",
  "unicode-normalization",
  "url",
+ "usage-rs",
  "zeroize",
 ]
 
@@ -4402,6 +4402,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "syn"
+version = "3.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e6275cddf4610d1775e6d1fe9469b2e77d0f39fd98fb7450901b821e0c53649f"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "unicode-ident",
+]
+
+[[package]]
 name = "sync_wrapper"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5004,6 +5015,33 @@ dependencies = [
  "percent-encoding",
  "serde",
  "serde_derive",
+]
+
+[[package]]
+name = "usage-argv"
+version = "6.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8cf8735c2d0154550e8241d30579e28b2840394c7a3efaf33b28ce706babe6f4"
+
+[[package]]
+name = "usage-derive"
+version = "6.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bfa7bc7653408788950770f2aa53f0600e025d50c8b049cdab054284436d2413"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.4",
+]
+
+[[package]]
+name = "usage-rs"
+version = "6.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c12de82d13507fdafd64170f5f735bd5fa7778f94b1f4a55e3b66e8ea3bde301"
+dependencies = [
+ "usage-argv",
+ "usage-derive",
 ]
 
 [[package]]

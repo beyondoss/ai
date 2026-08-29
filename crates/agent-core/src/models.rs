@@ -609,10 +609,11 @@ fn capabilities_impl_lc(m: &str) -> ModelCaps {
         // shape unique to Copilot among the three hosts this branch now recognizes (native:
         // dash-spelled, unprefixed; OpenRouter: dot-spelled, "anthropic/"-prefixed; Copilot:
         // dot-spelled, unprefixed).
-        if is_dot_spelled && !is_vendor_slug {
-            if let Some(caps) = github_copilot_claude_overrides(m) {
-                return caps;
-            }
+        if is_dot_spelled
+            && !is_vendor_slug
+            && let Some(caps) = github_copilot_claude_overrides(m)
+        {
+            return caps;
         }
 
         // Generation 6+ (opus-4-6/4-7/4-8, sonnet-4-6, sonnet-5, fable-5) require the newer `adaptive`
@@ -2940,6 +2941,18 @@ impl ThinkingLevel {
             ThinkingLevel::High => Some(RE::High),
             ThinkingLevel::XHigh => Some(RE::XHigh),
         }
+    }
+}
+
+impl std::str::FromStr for ThinkingLevel {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::parse(s).ok_or_else(|| {
+            format!(
+                "invalid reasoning effort {s:?}; expected one of off/minimal/low/medium/high/xhigh"
+            )
+        })
     }
 }
 

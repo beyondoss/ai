@@ -381,10 +381,10 @@ impl OutputAccumulator {
             return;
         }
         self.finished = true;
-        if let Some(w) = self.temp_writer.as_mut() {
-            if w.flush().is_err() {
-                self.mark_spill_broken();
-            }
+        if let Some(w) = self.temp_writer.as_mut()
+            && w.flush().is_err()
+        {
+            self.mark_spill_broken();
         }
     }
 
@@ -414,10 +414,10 @@ impl OutputAccumulator {
         if persist_if_truncated && truncated {
             self.ensure_temp_file();
             // Flush so a reader (e.g. the model, or a test) sees the bytes we just wrote.
-            if let Some(w) = self.temp_writer.as_mut() {
-                if w.flush().is_err() {
-                    self.mark_spill_broken();
-                }
+            if let Some(w) = self.temp_writer.as_mut()
+                && w.flush().is_err()
+            {
+                self.mark_spill_broken();
             }
         }
 
@@ -626,11 +626,11 @@ impl OutputAccumulator {
     /// chunk can reopen the tap. `temp_path` stays — the prefix is still readable, and `spill_capped`
     /// is what tells the caller it stops short.
     fn close_spill_at_budget(&mut self) {
-        if let Some(mut w) = self.temp_writer.take() {
-            if w.flush().is_err() {
-                self.mark_spill_broken();
-                return;
-            }
+        if let Some(mut w) = self.temp_writer.take()
+            && w.flush().is_err()
+        {
+            self.mark_spill_broken();
+            return;
         }
         self.spill_capped = true;
     }

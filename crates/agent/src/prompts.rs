@@ -136,18 +136,18 @@ fn discover_with_diagnostics_impl(
         diagnostics: &mut Vec<String>,
     ) -> Option<(String, PathBuf, PromptTemplate)> {
         let name = path.file_stem().map(|s| s.to_string_lossy().into_owned())?;
-        if let Ok(meta) = fs::metadata(path) {
-            if meta.len() > MAX_PROMPT_TEMPLATE_FILE_LEN {
-                let message = format!(
-                    "prompt template {} exceeds {MAX_PROMPT_TEMPLATE_FILE_LEN} bytes ({} bytes) — \
+        if let Ok(meta) = fs::metadata(path)
+            && meta.len() > MAX_PROMPT_TEMPLATE_FILE_LEN
+        {
+            let message = format!(
+                "prompt template {} exceeds {MAX_PROMPT_TEMPLATE_FILE_LEN} bytes ({} bytes) — \
                      skipped without reading",
-                    path.display(),
-                    meta.len()
-                );
-                tracing::warn!("{message}");
-                diagnostics.push(message);
-                return None;
-            }
+                path.display(),
+                meta.len()
+            );
+            tracing::warn!("{message}");
+            diagnostics.push(message);
+            return None;
         }
         let text = match fs::read_to_string(path) {
             Ok(text) => text,

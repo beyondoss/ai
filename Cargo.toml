@@ -7,10 +7,9 @@ resolver = "3"
 [workspace.package]
 edition = "2024"
 license = "MIT"
-# Floor set by `process-wrap` (a transitive dep of `rmcp`'s `transport-child-process` feature,
-# crates/agent's MCP client), which declares `rust-version = "1.87.0"` — bumped from 1.85 so this
-# field stays an honest promise rather than one only crates/agent's own dependency tree violates.
-rust-version = "1.87"
+# Floor set by `usage-rs` 6.x (agent CLI parser), which declares `rust-version = "1.91"`. Matches
+# `mise.toml`'s rust 1.92 pin so the workspace field stays an honest promise of what we build with.
+rust-version = "1.92"
 
 # Lints live at the workspace level so every crate root in the tree inherits them via
 # `[lints] workspace = true`. That matters: a crate-level `#![deny(...)]` attribute only covers the
@@ -85,3 +84,4 @@ tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+usage = { package = "usage-rs", version = "6" }

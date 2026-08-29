@@ -125,13 +125,13 @@ impl Tool for Find {
         // clearly the moment the search path isn't a directory. Checked via `metadata` (not
         // `is_dir()`) so a path that doesn't exist at all still falls through to the walk below, which
         // already reports that case via `walk_error`.
-        if let Some(meta) = self.backend.stat(&root).await? {
-            if meta.kind != FileKind::Dir {
-                return Err(ToolError::Execution(format!(
-                    "Search path '{}' is not a directory.",
-                    root.display()
-                )));
-            }
+        if let Some(meta) = self.backend.stat(&root).await?
+            && meta.kind != FileKind::Dir
+        {
+            return Err(ToolError::Execution(format!(
+                "Search path '{}' is not a directory.",
+                root.display()
+            )));
         }
         let outcome = self
             .backend

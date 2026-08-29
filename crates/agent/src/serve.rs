@@ -1718,64 +1718,59 @@ impl Persistence {
                 Some(real_target) => store.abandoned_by_switch(real_target),
                 None => store.abandoned_to_root(),
             };
-            if !abandoned.is_empty() {
-                if let Some(from_id) = store.active_ids().last().cloned() {
-                    let (ids, messages): (Vec<String>, Vec<agent_core::Message>) =
-                        abandoned.into_iter().unzip();
-                    match agent
-                        .summarize_branch(
-                            &messages,
-                            cancel,
-                            custom_instructions,
-                            replace_instructions,
-                        )
-                        .await
-                    {
-                        Ok(summary) if !summary.trim().is_empty() => {
-                            let (mut read_files, mut modified_files) =
-                                agent_core::compaction::extract_file_ops(&messages);
-                            // Fold forward any nested branch summary's own file-tracking within this
-                            // same abandoned range — otherwise a detour-off-a-detour loses the earlier
-                            // summary's file awareness the moment only its prose survives to be scanned
-                            // (see `SessionStore::branch_summary_details_within`).
-                            let prior = store.branch_summary_details_within(&ids);
-                            for f in prior.read_files {
-                                if !read_files.contains(&f) {
-                                    read_files.push(f);
-                                }
+            if !abandoned.is_empty()
+                && let Some(from_id) = store.active_ids().last().cloned()
+            {
+                let (ids, messages): (Vec<String>, Vec<agent_core::Message>) =
+                    abandoned.into_iter().unzip();
+                match agent
+                    .summarize_branch(&messages, cancel, custom_instructions, replace_instructions)
+                    .await
+                {
+                    Ok(summary) if !summary.trim().is_empty() => {
+                        let (mut read_files, mut modified_files) =
+                            agent_core::compaction::extract_file_ops(&messages);
+                        // Fold forward any nested branch summary's own file-tracking within this
+                        // same abandoned range — otherwise a detour-off-a-detour loses the earlier
+                        // summary's file awareness the moment only its prose survives to be scanned
+                        // (see `SessionStore::branch_summary_details_within`).
+                        let prior = store.branch_summary_details_within(&ids);
+                        for f in prior.read_files {
+                            if !read_files.contains(&f) {
+                                read_files.push(f);
                             }
-                            for f in prior.modified_files {
-                                if !modified_files.contains(&f) {
-                                    modified_files.push(f);
-                                }
+                        }
+                        for f in prior.modified_files {
+                            if !modified_files.contains(&f) {
+                                modified_files.push(f);
                             }
-                            let details = BranchSummaryDetails {
-                                read_files,
-                                modified_files,
-                                summarized_messages: messages.len() as u64,
-                            };
-                            summary_to_apply = Some((summary, from_id, details));
                         }
-                        Ok(_) => {} // empty summary — nothing worth recording
-                        // A client-requested abort mid-summarization: unlike a genuine failure below,
-                        // this must not fall through to switching anyway — pi's own contract
-                        // (`navigateTree`'s `abortBranchSummary`) leaves the session completely
-                        // unchanged on cancel, distinct from `cancelled: true` in the response the
-                        // caller builds from this `Err`.
-                        Err(agent_core::Error::Cancelled) => {
-                            return Err(std::io::Error::new(
-                                std::io::ErrorKind::Interrupted,
-                                "branch summarization cancelled",
-                            ));
-                        }
-                        // Fix 3: any other summarization failure is fatal to the whole navigation — the
-                        // switch does not happen, and the RPC dispatch's generic `Err` handling reports
-                        // this as a failed `switch_branch` response the client can see and retry.
-                        Err(e) => {
-                            return Err(std::io::Error::other(format!(
-                                "branch summarization failed: {e}"
-                            )));
-                        }
+                        let details = BranchSummaryDetails {
+                            read_files,
+                            modified_files,
+                            summarized_messages: messages.len() as u64,
+                        };
+                        summary_to_apply = Some((summary, from_id, details));
+                    }
+                    Ok(_) => {} // empty summary — nothing worth recording
+                    // A client-requested abort mid-summarization: unlike a genuine failure below,
+                    // this must not fall through to switching anyway — pi's own contract
+                    // (`navigateTree`'s `abortBranchSummary`) leaves the session completely
+                    // unchanged on cancel, distinct from `cancelled: true` in the response the
+                    // caller builds from this `Err`.
+                    Err(agent_core::Error::Cancelled) => {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::Interrupted,
+                            "branch summarization cancelled",
+                        ));
+                    }
+                    // Fix 3: any other summarization failure is fatal to the whole navigation — the
+                    // switch does not happen, and the RPC dispatch's generic `Err` handling reports
+                    // this as a failed `switch_branch` response the client can see and retry.
+                    Err(e) => {
+                        return Err(std::io::Error::other(format!(
+                            "branch summarization failed: {e}"
+                        )));
                     }
                 }
             }
@@ -2116,12 +2111,12 @@ pub(crate) async fn serve_session(
     // invocation (last-write-wins) — a script that resumes the same session on a schedule would
     // otherwise get its title rewritten to the same value every single run, and there's no way for an
     // operator to tell "rename this" from "just start it the way I always do" apart on pi's side.
-    if let Some(name) = &cfg.name {
-        if session.messages.is_empty() && persistence.meta.title.is_none() {
-            if let Err(e) = persistence.set_title(name) {
-                eprintln!("serve: failed to set initial session name: {e}");
-            }
-        }
+    if let Some(name) = &cfg.name
+        && session.messages.is_empty()
+        && persistence.meta.title.is_none()
+        && let Err(e) = persistence.set_title(name)
+    {
+        eprintln!("serve: failed to set initial session name: {e}");
     }
 
     // Assemble the system prompt from the base identity + this repo's project instructions + skills +
@@ -8250,18 +8245,18 @@ impl OutFanout {
     /// buys the atomicity above, it is bounded by the transcript length, and it happens once per
     /// *attach* (a client reconnecting), never on the hot event path.
     pub(crate) fn add_with_catchup(&mut self, tx: OutSink) -> u64 {
-        if !self.history.is_empty() || self.recording {
-            if let Ok(data) = messages_payload(&self.history, &self.history_ids, None) {
-                let _ = tx.try_send(OutFrame::Value(json!({
-                    "type": "catchup",
-                    "data": data,
-                    // The turn in flight, if any, follows as replayed frames — unless it outgrew the
-                    // recorder, in which case say so rather than hand the client a turn with a hole in
-                    // it (see `turn_truncated`).
-                    "turn_in_flight": self.recording,
-                    "turn_truncated": self.turn_truncated,
-                })));
-            }
+        if (!self.history.is_empty() || self.recording)
+            && let Ok(data) = messages_payload(&self.history, &self.history_ids, None)
+        {
+            let _ = tx.try_send(OutFrame::Value(json!({
+                "type": "catchup",
+                "data": data,
+                // The turn in flight, if any, follows as replayed frames — unless it outgrew the
+                // recorder, in which case say so rather than hand the client a turn with a hole in
+                // it (see `turn_truncated`).
+                "turn_in_flight": self.recording,
+                "turn_truncated": self.turn_truncated,
+            })));
         }
         // Replay the in-flight turn *after* the catch-up and *before* the sink goes live: the base
         // transcript, then every frame since the run began, then the live stream — byte-identical to
@@ -8381,12 +8376,12 @@ fn messages_payload(
     since: Option<&str>,
 ) -> Result<Value, String> {
     let mut messages = serde_json::to_value(messages).unwrap_or(Value::Null);
-    if let Value::Array(arr) = &mut messages {
-        if arr.len() == msg_ids.len() {
-            for (m, mid) in arr.iter_mut().zip(msg_ids) {
-                if let Value::Object(obj) = m {
-                    obj.insert("id".into(), json!(mid));
-                }
+    if let Value::Array(arr) = &mut messages
+        && arr.len() == msg_ids.len()
+    {
+        for (m, mid) in arr.iter_mut().zip(msg_ids) {
+            if let Value::Object(obj) = m {
+                obj.insert("id".into(), json!(mid));
             }
         }
     }

@@ -104,10 +104,10 @@ impl Tool for Write {
                 return Err(ToolError::Execution(format!("{path} is not writable")));
             }
         }
-        if let Some(parent) = p.parent() {
-            if !parent.as_os_str().is_empty() {
-                self.backend.create_dir_all(parent).await?;
-            }
+        if let Some(parent) = p.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            self.backend.create_dir_all(parent).await?;
         }
         // Atomic temp-file + rename: an overwrite killed mid-write must not leave a half-written
         // file — the same guarantee `edit` makes (and which `serve` reattach depends on for the

@@ -3797,10 +3797,10 @@ pub(crate) fn scan_listings(
     // each keeps its own sidecar next to its own files.
     let mut indexes: HashMap<PathBuf, HashMap<String, ListingIndexEntry>> = HashMap::new();
     for p in &paths {
-        if let Some(dir) = p.parent() {
-            if !indexes.contains_key(dir) {
-                indexes.insert(dir.to_path_buf(), load_listing_index(dir));
-            }
+        if let Some(dir) = p.parent()
+            && !indexes.contains_key(dir)
+        {
+            indexes.insert(dir.to_path_buf(), load_listing_index(dir));
         }
     }
 
@@ -4034,10 +4034,10 @@ pub(crate) fn read_listing(path: &Path, mtime: Option<u64>) -> Option<SessionMet
             }) => {
                 message_count += 1;
                 max_message_timestamp = max_message_timestamp.max(timestamp);
-                if let Some(text) = first_user_text(&message) {
-                    if preview.is_none() {
-                        preview = Some(preview_of(text));
-                    }
+                if let Some(text) = first_user_text(&message)
+                    && preview.is_none()
+                {
+                    preview = Some(preview_of(text));
                 }
                 // The search corpus is broader than the preview: every user *and* assistant message's
                 // text (not just the first user turn) — matching pi's own `allMessagesText`, so a

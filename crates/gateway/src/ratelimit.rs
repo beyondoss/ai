@@ -433,12 +433,11 @@ impl RateLimit {
         // Global BYO backstop first: BYO is unverified and upstream-bound, so this is the ceiling that
         // protects our egress IPs from a distinct-token flood. Managed traffic skips it (verified,
         // can't be forged, already bounded per-credential) so it never shares this bucket.
-        if !managed {
-            if let Some(byo) = &self.byo_global {
-                if byo.observe(window) > byo.max {
-                    return Some(Throttled::ByoGlobal);
-                }
-            }
+        if !managed
+            && let Some(byo) = &self.byo_global
+            && byo.observe(window) > byo.max
+        {
+            return Some(Throttled::ByoGlobal);
         }
         // Per-credential ceiling: a single leaked/runaway key (managed or BYO), capped before verify.
         if let Some((rate, max)) = &self.per_cred {
