@@ -26,9 +26,9 @@ use serde::{Deserialize, Serialize};
 /// `main.rs`'s trust-resolution call site) — an explicit per-run flag always wins over this global
 /// default, the same way an explicit `--model`/`--gateway-url` always wins over `default_model`/
 /// `default_gateway_url` above.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, usage::ValueEnum, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-#[clap(rename_all = "snake_case")]
+#[usage(rename_all = "snake_case")]
 pub enum TrustPolicy {
     /// Treat every project as trusted by default, as if `--trust-project` were always passed.
     Always,

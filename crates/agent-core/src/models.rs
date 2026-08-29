@@ -2943,6 +2943,16 @@ impl ThinkingLevel {
     }
 }
 
+impl std::str::FromStr for ThinkingLevel {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::parse(s).ok_or_else(|| {
+            format!("invalid reasoning effort {s:?}; expected one of off/minimal/low/medium/high/xhigh")
+        })
+    }
+}
+
 impl From<crate::transport::ReasoningEffort> for ThinkingLevel {
     fn from(effort: crate::transport::ReasoningEffort) -> Self {
         use crate::transport::ReasoningEffort as RE;

@@ -21,7 +21,7 @@ beyond-ai-agent-core = { path = "../agent-core" }
 # across the in-flight-turn recording and every attached connection's sink on the per-event fan-out
 # hot path. Same zero-copy byte buffer `agent-core` frames SSE lines with.
 bytes.workspace = true
-clap.workspace = true
+usage.workspace = true
 # Draining a `ToolProgress` sink for `serve`'s host-level `bash` RPC command — the same channel type
 # `agent_core::ToolProgress` is built on, so we poll it directly rather than adapting between channel
 # flavors.

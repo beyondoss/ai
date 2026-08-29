@@ -14,6 +14,7 @@
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{IsTerminal, Read as _, Write as _};
 use std::path::{Path, PathBuf};
@@ -30,7 +31,7 @@ use beyond_ai_agent::session_store::{
     is_path_like, open_session_by_id, sessions_root,
 };
 use beyond_ai_agent::{serve, serve_ws, tools};
-use clap::{Parser, Subcommand};
+use usage::{Cli, Subcommands};
 
 /// Default model when neither `--model` nor `AI_AGENT_MODEL` is set.
 const DEFAULT_MODEL: &str = "claude-opus-4-8";
@@ -51,26 +52,6 @@ fn parse_reasoning_effort(s: &str) -> Result<agent_core::ThinkingLevel, String> 
     agent_core::ThinkingLevel::parse(s).ok_or_else(|| {
         format!("invalid reasoning effort {s:?}; expected one of off/minimal/low/medium/high/xhigh")
     })
-}
-
-/// Parse `--steering-mode`/`--follow-up-mode`'s value into [`agent_core::QueueMode`] — the exact same
-/// wire vocabulary (`"one_at_a_time"`/`"all"`) `serve`'s own `set_steering_mode`/`set_follow_up_mode` RPC
-/// commands already accept (see `serve.rs`'s module doc comment), reused here rather than inventing a
-/// second, divergent spelling for the same setting.
-fn parse_queue_mode(s: &str) -> Result<agent_core::QueueMode, String> {
-    match s {
-        "one_at_a_time" => Ok(agent_core::QueueMode::OneAtATime),
-        "all" => Ok(agent_core::QueueMode::All),
-        other => Err(format!(
-            "invalid queue mode {other:?}; expected one of one_at_a_time/all"
-        )),
-    }
-}
-
-/// Parse `--upstream-http2`'s value (`off`/`auto`/`h2c`) into [`serve::UpstreamHttp2`] — delegates to
-/// that type's own `FromStr` so the CLI and any programmatic caller share one spelling.
-fn parse_upstream_http2(s: &str) -> Result<serve::UpstreamHttp2, String> {
-    s.parse()
 }
 
 /// Parse `settings::Settings::thinking_budget_overrides`'s plain-string keys into the
@@ -238,14 +219,14 @@ impl beyond_ai_agent::oauth::LoginCallbacks for CliLoginCallbacks {
     }
 }
 
-#[derive(Parser)]
-#[command(name = "beyond-ai-agent", version, about = "Beyond agent harness")]
+#[derive(Cli)]
+#[usage(bin = "beyond-ai-agent", version, about = "Beyond agent harness", unknown_flags = "error")]
 struct Cli {
-    #[command(subcommand)]
+    #[usage(subcommand)]
     command: Command,
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommands)]
 enum Command {
     /// Run a one-shot agent task to completion, streaming output to stdout.
     Run {
@@ -256,32 +237,32 @@ enum Command {
         /// that). At least one of a message, `@file`, or piped stdin is required.
         tasks: Vec<String>,
         /// Model id (default `claude-opus-4-8`, or `AI_AGENT_MODEL`).
-        #[arg(long, env = "AI_AGENT_MODEL")]
+        #[usage(long, env = "AI_AGENT_MODEL")]
         model: Option<String>,
         /// Gateway base URL (default `http://ai.internal`, or `AI_GATEWAY_URL`).
-        #[arg(long, env = "AI_GATEWAY_URL")]
+        #[usage(long, env = "AI_GATEWAY_URL")]
         gateway_url: Option<String>,
         /// Virtual key (`bai_v1…`) or BYO provider key. Required; or set `AI_AGENT_KEY`.
-        #[arg(long, env = "AI_AGENT_KEY")]
+        #[usage(long, env = "AI_AGENT_KEY")]
         key: Option<String>,
         /// Opt-in cap on model turns before bailing with an error (default: unbounded).
-        #[arg(long)]
+        #[usage(long)]
         max_steps: Option<u32>,
         /// Per-turn output token ceiling. `serve`'s identical flag; defaults to the model's own
         /// capability-table `max_output` (see `agent_core::models::capabilities`) when omitted.
-        #[arg(long, env = "AI_AGENT_MAX_TOKENS")]
+        #[usage(long, env = "AI_AGENT_MAX_TOKENS")]
         max_tokens: Option<u32>,
         /// Use the 1-hour prompt-cache TTL (vs 5 minutes); helps when turns are spaced out. `serve`'s
         /// identical flag; `run`'s one-shot single-turn case rarely benefits, but a multi-message
         /// invocation (several `tasks` sent as sequential turns) can.
-        #[arg(long, default_value_t = false)]
+        #[usage(long)]
         cache_long: bool,
         /// Enable extended thinking with this token budget (must be below the per-turn max tokens). A
         /// raw token count, not pi's own `--thinking <level>` (off/minimal/low/medium/high/xhigh) — see
         /// `--reasoning-effort` for that portable level instead. `serve`'s identical flag; unlike
         /// `serve`, `run` has no thinking-level cycling, so this is applied as-is with no per-model
         /// default derivation when omitted.
-        #[arg(long)]
+        #[usage(long)]
         thinking: Option<u32>,
         /// Reasoning effort for models driven by an effort level rather than a token budget (OpenAI
         /// reasoning models via `reasoning_effort`; Anthropic adaptive-thinking models via
@@ -293,7 +274,7 @@ enum Command {
         /// pass 19): `off` is now accepted too, explicitly disabling reasoning — previously the only way
         /// to do that from a startup flag was the unrelated `--model <pattern>:off` colon-suffix
         /// shorthand. `serve`'s identical flag.
-        #[arg(long, env = "AI_AGENT_REASONING_EFFORT", value_parser = parse_reasoning_effort)]
+        #[usage(long, env = "AI_AGENT_REASONING_EFFORT")]
         reasoning_effort: Option<agent_core::ThinkingLevel>,
         /// How much of the mid-run *steer* lane a single drain point consumes per turn boundary
         /// (`agent_core::QueueMode`) — `one_at_a_time` (the default, matching pi) injects only the oldest
@@ -306,54 +287,54 @@ enum Command {
         /// in every mode, not just its TUI. Falls back to the persisted setting `serve`'s own
         /// `set_steering_mode` RPC command maintains (`settings::Settings::steering_mode`), before
         /// finally defaulting to `one_at_a_time`.
-        #[arg(long, env = "AI_AGENT_STEERING_MODE", value_parser = parse_queue_mode)]
+        #[usage(long, env = "AI_AGENT_STEERING_MODE")]
         steering_mode: Option<agent_core::QueueMode>,
         /// Same idea as `--steering-mode`, for the follow-up lane drained at a stop boundary (plus any
         /// stranded steer messages swept in there) — matches pi's own separate `followUpMode`.
-        #[arg(long, env = "AI_AGENT_FOLLOW_UP_MODE", value_parser = parse_queue_mode)]
+        #[usage(long, env = "AI_AGENT_FOLLOW_UP_MODE")]
         follow_up_mode: Option<agent_core::QueueMode>,
         /// Sampling temperature. Omitted (leaving the provider default) unless set. Silently ignored by
         /// Anthropic while `--thinking` is set (Anthropic forbids the two together). `serve`'s identical
         /// flag.
-        #[arg(long)]
+        #[usage(long)]
         temperature: Option<f64>,
         /// Replace the built-in base system prompt entirely. `serve`'s identical flag — e.g. a
         /// specialized reviewer/persona invocation for automation that needs a wholly different agent
         /// identity, not just extra instructions layered on top (see `--append-system-prompt`).
-        #[arg(long, env = "AI_AGENT_SYSTEM_PROMPT")]
+        #[usage(long, env = "AI_AGENT_SYSTEM_PROMPT")]
         system_prompt: Option<String>,
         /// Append extra instructions after the base system prompt (built-in, or `--system-prompt` if
         /// also given). Repeatable — pi-parity fix: previously a second occurrence silently clobbered
         /// the first instead of accumulating (matches pi, whose `appendSystemPrompt` is itself an
         /// array). Each occurrence is joined with the others by a blank line, in the order given.
         /// `serve`'s identical flag.
-        #[arg(long, env = "AI_AGENT_APPEND_SYSTEM_PROMPT")]
+        #[usage(long, env = "AI_AGENT_APPEND_SYSTEM_PROMPT")]
         append_system_prompt: Vec<String>,
         /// Trust `cwd` for this run only, so a project-local `.claude/SYSTEM.md` is honored even if
         /// `cwd` isn't in the persisted allowlist (`agent trust <path>`). A session-scoped override,
         /// not a permanent grant — see `agent trust` to record one. `-a` matches pi's own
         /// `--approve`/`-a` (same "trust this project" meaning, different flag name here).
-        #[arg(short = 'a', long, default_value_t = false)]
+        #[usage(short = 'a', long)]
         trust_project: bool,
         /// Force `cwd` *untrusted* for this run only, overriding both `--trust-project` and the
         /// persisted allowlist (`agent trust <path>`) — e.g. to test untrusted behavior against a
         /// directory that's otherwise permanently trusted. Wins over `--trust-project` if both are
         /// somehow given. `-na` matches pi's own `--no-approve`/`-na`.
-        #[arg(long, default_value_t = false)]
+        #[usage(long)]
         force_untrusted: bool,
         /// Model context window (tokens); the loop summarizes older turns to stay below it. Defaults
         /// to the model's own capability-table window (see `agent_core::models::capabilities`) — only
         /// pass this to pin a fixed budget regardless of which model ends up used. `serve`'s identical
         /// flag.
-        #[arg(long, env = "AI_AGENT_CONTEXT_WINDOW")]
+        #[usage(long, env = "AI_AGENT_CONTEXT_WINDOW")]
         context_window: Option<u32>,
         /// Compaction headroom (tokens) reserved below the context window before it fires. Defaults to
         /// `CompactionConfig::default()`'s 16,384. `serve`'s identical flag.
-        #[arg(long, env = "AI_AGENT_COMPACTION_RESERVE_TOKENS")]
+        #[usage(long, env = "AI_AGENT_COMPACTION_RESERVE_TOKENS")]
         compaction_reserve_tokens: Option<u32>,
         /// Roughly how many tokens of recent conversation compaction keeps verbatim. Defaults to
         /// `CompactionConfig::default()`'s 20,000. `serve`'s identical flag.
-        #[arg(long, env = "AI_AGENT_COMPACTION_KEEP_RECENT_TOKENS")]
+        #[usage(long, env = "AI_AGENT_COMPACTION_KEEP_RECENT_TOKENS")]
         compaction_keep_recent_tokens: Option<u32>,
         /// Token budget reserved below the context window when summarizing an abandoned tree branch —
         /// independent of `--compaction-reserve-tokens` (ordinary compaction's own reserve). Defaults to
@@ -361,27 +342,27 @@ enum Command {
         /// behavior); pi's own `branchSummary.reserveTokens` default is 16384. `serve`'s identical flag
         /// (Task #31, pi-parity feature: `agent_core::Agent::with_branch_summary_reserve_tokens`
         /// previously had no caller in either binary).
-        #[arg(long, env = "AI_AGENT_BRANCH_SUMMARY_RESERVE_TOKENS")]
+        #[usage(long, env = "AI_AGENT_BRANCH_SUMMARY_RESERVE_TOKENS")]
         branch_summary_reserve_tokens: Option<u32>,
         /// Disable automatic (threshold-triggered) compaction entirely — the loop only ever compacts on
         /// a genuine overflow (`agent_core::CompactionConfig::enabled`'s own doc comment: manual/overflow
         /// compaction ignores this setting), never proactively. For a caller that would rather fail/see
         /// the raw context-window error than have older turns silently summarized away.
-        #[arg(long, env = "AI_AGENT_NO_COMPACTION", default_value_t = false)]
+        #[usage(long, env = "AI_AGENT_NO_COMPACTION")]
         no_compaction: bool,
         /// How many times to retry a gateway request that fails before the first response byte
         /// arrives. Defaults to 3. `serve`'s identical flag.
-        #[arg(long, env = "AI_AGENT_RETRY_MAX_RETRIES")]
+        #[usage(long, env = "AI_AGENT_RETRY_MAX_RETRIES")]
         retry_max_retries: Option<u32>,
         /// Base of the exponential backoff between those retries, in milliseconds. Defaults to 250.
         /// `serve`'s identical flag.
-        #[arg(long, env = "AI_AGENT_RETRY_BASE_DELAY_MS")]
+        #[usage(long, env = "AI_AGENT_RETRY_BASE_DELAY_MS")]
         retry_base_delay_ms: Option<u64>,
         /// Ceiling on that exponential backoff, in milliseconds — overrides `agent_core::client::
         /// GatewayClient::with_max_backoff`'s built-in 60s default (`agent_core::client::MAX_BACKOFF`).
         /// `serve`'s identical flag (Task #30, pi-parity feature: the retry cluster's third knob,
         /// previously with no CLI flag or persisted override at all, unlike its two siblings above).
-        #[arg(long, env = "AI_AGENT_RETRY_MAX_BACKOFF_MS")]
+        #[usage(long, env = "AI_AGENT_RETRY_MAX_BACKOFF_MS")]
         retry_max_backoff_ms: Option<u64>,
         /// Disable the whole-run auto-retry-after-error loop outright — pi's `RetrySettings.enabled:
         /// false` (`settings-manager.ts:28`). Matches this codebase's own `--no-x` convention for
@@ -395,7 +376,7 @@ enum Command {
         /// pi-parity fix: previously the only discoverable spelling of "never retry a whole run"), just
         /// under a name that says what it means without requiring the operator to already know `0` has
         /// this effect.
-        #[arg(long, env = "AI_AGENT_NO_RETRY", default_value_t = false)]
+        #[usage(long, env = "AI_AGENT_NO_RETRY")]
         no_retry: bool,
         /// Idle-read timeout between response chunks on the gateway HTTP client, in milliseconds —
         /// overrides `agent_core::client::GatewayClient`'s built-in default, tuned for the gateway's own
@@ -403,7 +384,7 @@ enum Command {
         /// direct-routed/custom `models.json` `base_url` override, which bypasses the gateway entirely)
         /// since a self-hosted or alternate-provider endpoint's own slow/fast tail has no reason to
         /// match the gateway's (Task #19, pi-parity feature).
-        #[arg(long, env = "AI_AGENT_IDLE_TIMEOUT_MS")]
+        #[usage(long, env = "AI_AGENT_IDLE_TIMEOUT_MS")]
         idle_timeout_ms: Option<u64>,
         /// Force every image down the same downgrade-to-text-placeholder path a vision-incapable model
         /// already gets, regardless of the active model's real `supports_vision` capability — for an
@@ -411,7 +392,7 @@ enum Command {
         /// proxy that strips/rejects multipart image content) even on a vision-capable model. Falls back
         /// to the persisted `agent settings --block-images` default when not explicitly given (Task #26,
         /// pi-parity feature).
-        #[arg(long, env = "AI_AGENT_BLOCK_IMAGES", default_value_t = false)]
+        #[usage(long, env = "AI_AGENT_BLOCK_IMAGES")]
         block_images: bool,
         /// Force `--block-images` off for this invocation, even when a persisted `agent settings
         /// --block-images` default is `true` — `--block-images` above only ever ORs an explicit `true`
@@ -419,7 +400,7 @@ enum Command {
         /// for a single `run` (pass 20, pi-parity fix). Wins outright over both the persisted default
         /// and an explicit `--block-images`, mirroring `--no-image-auto-resize`'s identical
         /// escape-hatch shape just below.
-        #[arg(long, env = "AI_AGENT_NO_BLOCK_IMAGES", default_value_t = false)]
+        #[usage(long, env = "AI_AGENT_NO_BLOCK_IMAGES")]
         no_block_images: bool,
         /// Skip `read`'s resize/downscale path for an oversized image entirely, shipping its
         /// normalized (format-converted, if needed) bytes as-is regardless of size or pixel
@@ -427,31 +408,31 @@ enum Command {
         /// codebase's `--no-x` convention for negating an on-by-default behavior (`--no-compaction`,
         /// `--no-skills`, ...). Falls back to the persisted `agent settings --image-auto-resize`
         /// default when not explicitly given (Task #4, pi-parity feature).
-        #[arg(long, env = "AI_AGENT_NO_IMAGE_AUTO_RESIZE", default_value_t = false)]
+        #[usage(long, env = "AI_AGENT_NO_IMAGE_AUTO_RESIZE")]
         no_image_auto_resize: bool,
         /// Default `bash` command timeout (ms) when the model omits `timeout_ms`. Defaults to 1,800,000
         /// (30 minutes). `serve`'s identical flag.
-        #[arg(long, env = "AI_AGENT_BASH_TIMEOUT_MS")]
+        #[usage(long, env = "AI_AGENT_BASH_TIMEOUT_MS")]
         bash_timeout_ms: Option<u64>,
         /// Run `bash` commands through this shell instead of the auto-resolved one (`/bin/bash`, else
         /// `bash` on `$PATH`, else `sh`). Matches pi's own `shellPath` setting. `serve`'s identical flag.
-        #[arg(long, env = "AI_AGENT_BASH_SHELL_PATH")]
+        #[usage(long, env = "AI_AGENT_BASH_SHELL_PATH")]
         bash_shell_path: Option<String>,
         /// Prepend this line to every `bash` command, in the same shell invocation (e.g. sourcing a
         /// project's env setup, activating a venv). Matches pi's own `shellCommandPrefix` setting.
         /// `serve`'s identical flag.
-        #[arg(long, env = "AI_AGENT_BASH_COMMAND_PREFIX")]
+        #[usage(long, env = "AI_AGENT_BASH_COMMAND_PREFIX")]
         bash_command_prefix: Option<String>,
         /// Let the `web` tool reach loopback/private/link-local addresses. Off by default: the tool
         /// refuses them to prevent SSRF (it fetches URLs the model chose). `serve`'s identical flag.
-        #[arg(long, env = "AI_AGENT_WEB_ALLOW_PRIVATE")]
+        #[usage(long, env = "AI_AGENT_WEB_ALLOW_PRIVATE")]
         web_allow_private: bool,
         /// A hostname the `web` tool may reach even with private egress off (repeatable) — an internal
         /// service, or `127.0.0.1` for local testing. `serve`'s identical flag.
-        #[arg(long, env = "AI_AGENT_WEB_ALLOW_HOST")]
+        #[usage(long, env = "AI_AGENT_WEB_ALLOW_HOST")]
         web_allow_host: Vec<String>,
         /// The `web` tool's per-request timeout (ms). Default 30,000. `serve`'s identical flag.
-        #[arg(long, env = "AI_AGENT_WEB_TIMEOUT_MS")]
+        #[usage(long, env = "AI_AGENT_WEB_TIMEOUT_MS")]
         web_timeout_ms: Option<u64>,
         /// Run the filesystem tools (`read`/`write`/`edit`/`ls`/`grep`/`find`) against a remote
         /// **exec endpoint** instead of this host. Any URL that accepts
@@ -460,37 +441,37 @@ enum Command {
         /// Vendor-agnostic by construction: put a few dozen lines in front of Daytona, E2B, Modal, a
         /// container service or your own runner, and the agent neither knows nor cares which. The
         /// endpoint must already exist — provisioning and teardown are the caller's, not the agent's.
-        #[arg(long, env = "AI_AGENT_EXEC_URL", conflicts_with = "exec_cmd")]
+        #[usage(long, env = "AI_AGENT_EXEC_URL", conflicts = "exec_cmd")]
         exec_url: Option<String>,
         /// A header to send with every exec request, `Name: value`. Repeatable. This is where auth
         /// goes; which scheme the endpoint wants is the endpoint's business.
-        #[arg(long, env = "AI_AGENT_EXEC_HEADER")]
+        #[usage(long, env = "AI_AGENT_EXEC_HEADER")]
         exec_header: Vec<String>,
         /// For targets with no HTTP surface: an argv template whose `{}` is replaced by the command,
         /// e.g. `--exec-cmd 'ssh build-host -- {}'` or `--exec-cmd 'docker exec ctr {}'`. The command
         /// expands to separate argv entries, never into a shell string.
-        #[arg(long, env = "AI_AGENT_EXEC_CMD", conflicts_with = "exec_url")]
+        #[usage(long, env = "AI_AGENT_EXEC_CMD", conflicts = "exec_url")]
         exec_cmd: Option<String>,
         /// Restrict the tool set to exactly these names (comma-separated), dropping everything else.
         /// Combine with `--exclude-tools` to carve one back out of the allow-list. `serve`'s identical
         /// flag/env var — a deployment convention setting this env var to sandbox an agent must apply
         /// here too, not just to `serve`. `-t` matches pi's own `--tools`/`-t`.
-        #[arg(short = 't', long, env = "AI_AGENT_TOOLS", value_delimiter = ',')]
+        #[usage(short = 't', long, env = "AI_AGENT_TOOLS", delimiter = ',')]
         tools: Option<Vec<String>>,
         /// Drop these tools (comma-separated) from the default set — e.g. `--exclude-tools bash,write`
         /// for a read-only reviewer that can't run shell commands or mutate files. `serve`'s identical
         /// flag/env var. `-xt` matches pi's own `--exclude-tools`/`-xt`.
-        #[arg(long, env = "AI_AGENT_EXCLUDE_TOOLS", value_delimiter = ',')]
+        #[usage(long, env = "AI_AGENT_EXCLUDE_TOOLS", delimiter = ',')]
         exclude_tools: Option<Vec<String>>,
         /// Register no tools at all — a pure-conversation run. Wins over `--tools`/`--exclude-tools`.
         /// `-nt` matches pi's own `--no-tools`/`-nt`.
-        #[arg(long, default_value_t = false)]
+        #[usage(long)]
         no_tools: bool,
         /// Force every batch of tool calls in a turn to run one at a time instead of the default
         /// bounded-concurrent dispatch (`agent_core::Agent::with_sequential_tools`) — e.g. for a
         /// deterministic repro, or a host policy that never wants two tool calls actually overlapping.
         /// `serve`'s identical flag.
-        #[arg(long, default_value_t = false)]
+        #[usage(long)]
         sequential_tools: bool,
         /// Block every call to this tool (comma-separated, repeatable), even though it stays visible
         /// and registered — unlike `--exclude-tools` (the model never sees an excluded tool exists at
@@ -498,18 +479,18 @@ enum Command {
         /// it was blocked by policy. Installs an `agent_core::AgentHooks` permission gate
         /// (`policy::ToolPolicy`) on the agent; a no-op (no hook installed at all) when combined with
         /// `--deny-bash-pattern` leaves the list empty.
-        #[arg(long, env = "AI_AGENT_DENY_TOOL", value_delimiter = ',')]
+        #[usage(long, env = "AI_AGENT_DENY_TOOL", delimiter = ',')]
         deny_tool: Vec<String>,
         /// Block a `bash` call whenever its command contains this substring, case-insensitively
         /// (comma-separated, repeatable) — e.g. `--deny-bash-pattern "rm -rf"`. Combines with
         /// `--deny-tool` under the same policy hook.
-        #[arg(long, env = "AI_AGENT_DENY_BASH_PATTERN", value_delimiter = ',')]
+        #[usage(long, env = "AI_AGENT_DENY_BASH_PATTERN", delimiter = ',')]
         deny_bash_pattern: Vec<String>,
         /// Block a `write`/`edit` call whenever its `path` argument matches this glob (comma-separated,
         /// repeatable) — e.g. `--deny-path '.env,**/secrets/**'`. Same glob engine as `grep`'s
         /// `--glob`/`find`'s pattern matching (`globset::Glob`). Combines with `--deny-tool`/
         /// `--deny-bash-pattern` under the same policy hook.
-        #[arg(long, env = "AI_AGENT_DENY_PATH", value_delimiter = ',')]
+        #[usage(long, env = "AI_AGENT_DENY_PATH", delimiter = ',')]
         deny_path: Vec<String>,
         /// Disable *standard-root* skills discovery/loading (`~/.claude/skills`, `<cwd>/.claude/skills`)
         /// — no `<available_skills>` listing in the system prompt from either, and a `/skill:name`
@@ -519,7 +500,7 @@ enum Command {
         /// auto-discovered, only what I explicitly listed", not "no skills at all"). A one-shot `run`
         /// has no `reload` to re-enable it mid-process, unlike `serve`. `-ns` matches pi's own
         /// `--no-skills`/`-ns`.
-        #[arg(long, default_value_t = false)]
+        #[usage(long)]
         no_skills: bool,
         /// Disable *standard-root* prompt-template discovery/loading (`~/.claude/prompts`,
         /// `<cwd>/.claude/prompts`) — a `/name` invocation in the task message is sent through
@@ -527,21 +508,21 @@ enum Command {
         /// `--prompt-template <path>` is still honored even so, matching `--no-skills`'s identical
         /// carve-out and pi's own `--no-prompt-templates`. `-np` matches pi's own
         /// `--no-prompt-templates`/`-np`.
-        #[arg(long, default_value_t = false)]
+        #[usage(long)]
         no_prompt_templates: bool,
         /// Do not discover/inject AGENTS.md / CLAUDE.md project-instruction files. Matches `serve`'s
         /// identical flag — `run` previously hardcoded this on with no way to opt out. `-nc` matches
         /// pi's own `--no-context-files`/`-nc`.
-        #[arg(long, default_value_t = false)]
+        #[usage(long)]
         no_context_files: bool,
         /// Discover skills from this directory too, in addition to the two standard roots (repeatable,
         /// or comma-separated via `AI_AGENT_SKILL_PATH` — matching `--tools`/`AI_AGENT_TOOLS`'s own
         /// comma-separated env-var convention). Matches pi's own `--skill <path>`. A path that doesn't
         /// exist is warned about, not silently ignored. Wins over the standard roots on a name collision.
-        #[arg(
+        #[usage(
             long = "skill",
             env = "AI_AGENT_SKILL_PATH",
-            value_delimiter = ',',
+            delimiter = ',',
             value_name = "PATH"
         )]
         extra_skill_paths: Vec<String>,
@@ -549,10 +530,10 @@ enum Command {
         /// (repeatable, or comma-separated via `AI_AGENT_PROMPT_TEMPLATE_PATH`). Matches pi's own
         /// `--prompt-template <path>`; see `--skill`'s doc comment for the missing-path/shadow-order
         /// behavior, which applies identically here.
-        #[arg(
+        #[usage(
             long = "prompt-template",
             env = "AI_AGENT_PROMPT_TEMPLATE_PATH",
-            value_delimiter = ',',
+            delimiter = ',',
             value_name = "PATH"
         )]
         extra_prompt_template_paths: Vec<String>,
@@ -561,12 +542,12 @@ enum Command {
         /// `--name` validation. Unlike pi (renames unconditionally on every invocation), only takes
         /// effect on a genuinely fresh session — see the fresh-only check in `serve`, a deliberate
         /// deviation. The RPC `set_session_name` command covers renaming an already-running session.
-        #[arg(short = 'n', long)]
+        #[usage(short = 'n', long)]
         name: Option<String>,
         /// An extra guideline bullet appended to the default system prompt's `Guidelines:` section
         /// (repeatable) — pi's own `promptGuidelines`. Deduplicated and trimmed against the built-in
         /// guidelines.
-        #[arg(long = "prompt-guideline", value_name = "TEXT")]
+        #[usage(long = "prompt-guideline", value_name = "TEXT")]
         prompt_guidelines: Vec<String>,
         /// Fork an existing session into a brand-new one and continue from there, rather than reopening
         /// it in place — by id (searched in this project first, then every other project's own session
@@ -576,7 +557,7 @@ enum Command {
         /// over `--session`/`--continue` if more than one is given — a fork always starts a fresh child,
         /// never reopens one in place. Forks the whole active transcript; `serve`'s `fork`/`fork_at_entry`
         /// RPC commands cover forking at an earlier point once a session is running.
-        #[arg(long, value_name = "PATH_OR_ID")]
+        #[usage(long, value_name = "PATH_OR_ID")]
         fork: Option<String>,
         /// Persist this run to a specific session, creating it if missing or continuing it if it already
         /// exists — so a later `run --session <path|id>` picks up where this one left off. Accepts
@@ -584,7 +565,7 @@ enum Command {
         /// session id/unique prefix, resolved against the current project's own repo first, then every
         /// other project's under `--session-dir`'s root — matching pi's own `--session <path|id>`. Wins
         /// over `--continue` if both are given.
-        #[arg(long)]
+        #[usage(long)]
         session: Option<String>,
         /// Address this exact session: continue it if it already exists, or create it under exactly this
         /// id if it doesn't. Gives a caller (a script, an orchestrator, a test harness) a known,
@@ -596,14 +577,14 @@ enum Command {
         /// whenever *any* session already existed for the current cwd, which silently collapsed every id
         /// onto one shared conversation. Ignored with `--no-session-persistence` (nothing is written, so
         /// it only names the in-memory session) and with `--session <path>` (that already names a file).
-        #[arg(long)]
+        #[usage(long)]
         session_id: Option<String>,
         /// Continue the most recent session for the current directory (the same
         /// `~/.claude/sessions/<encoded-cwd>/` repo `serve` defaults to), creating one if this is the
         /// first run here. This is the *only* flag that reattaches implicitly — a plain no-flag `run`
         /// starts a new session (still persisted; see `--no-session-persistence`). Ignored if
         /// `--session`/`--session-id` is also given, both of which name a session outright.
-        #[arg(long, short = 'c', default_value_t = false)]
+        #[usage(long, short = 'c')]
         r#continue: bool,
         /// Use this directory as the session repo instead of the default `~/.claude/sessions/
         /// <encoded-cwd>/` — matches `serve`'s own `--session-dir`/`AI_AGENT_SESSION_DIR` (same flag,
@@ -614,7 +595,7 @@ enum Command {
         /// no-flag run's own default repo. Has no effect on `--session <path>` (already names an exact
         /// file directly) or `--no-session-persistence` (opts out of persistence entirely, so there is no
         /// repo to redirect).
-        #[arg(long, env = "AI_AGENT_SESSION_DIR")]
+        #[usage(long, env = "AI_AGENT_SESSION_DIR")]
         session_dir: Option<String>,
         /// Skip persistence entirely, even without `--session`/`--continue`/`--fork`. Without this, a
         /// plain no-flag `run` writes a new session to the same per-cwd repo `serve` uses
@@ -622,79 +603,79 @@ enum Command {
         /// pass this for the rare case that's genuinely what you want (e.g. a short-lived script that
         /// mustn't leave a session file behind). Matches `serve`'s identical flag, so the CLI vocabulary
         /// for opting out is the same either way. `--continue` overrides it; `--session-id` does not.
-        #[arg(long, default_value_t = false)]
+        #[usage(long)]
         no_session_persistence: bool,
         /// Persistent-memory backend DSN. Absent ⇒ the stored `default_memory_backend` setting, else a
         /// per-project local-file store under `~/.claude/projects/<cwd>/memory/`. A bare path or
         /// `file://` names a directory; `redis://`/`postgres://` select a networked backend (recognized,
         /// not yet implemented). See [`beyond_ai_agent::memory`].
-        #[arg(long, env = "AI_AGENT_MEMORY_URL")]
+        #[usage(long, env = "AI_AGENT_MEMORY_URL")]
         memory: Option<String>,
         /// Disable persistent memory entirely: don't register the `memory` tool or inject the MEMORY.md
         /// index. Mirrors `--no-tools`'s opt-out style.
-        #[arg(long, default_value_t = false)]
+        #[usage(long)]
         no_memory: bool,
         /// Disable only the per-session `/session` working-memory mount, keeping durable `/memories`. The
         /// working store is the compaction-surviving scratchpad; on by default when memory is enabled.
-        #[arg(long, default_value_t = false)]
+        #[usage(long)]
         no_session_memory: bool,
         /// After the run completes, export the transcript as a self-contained HTML file at this path
         /// (parent directories are created as needed) — the same rendering `serve`'s `export_html` RPC
         /// command produces, for a one-shot run with no server involved.
-        #[arg(long)]
+        #[usage(long)]
         export: Option<String>,
         /// Emit newline-delimited JSON to stdout instead of human-readable text: one leading session
         /// header line, then one `AgentEvent` object per line (tool calls/results and turn boundaries
         /// included, not just raw text deltas) — the same event shape `serve`'s NDJSON protocol streams,
         /// for a scripting caller that wants structured output without spawning `serve`.
-        #[arg(long, default_value_t = false)]
+        #[usage(long)]
         json: bool,
         /// Make this run a callable function: a JSON Schema (inline, or a path to a `.json` file) the
         /// agent must fill in and return via the `structured_output` tool instead of ending in prose.
         /// The validated payload is printed as the last stdout line; the run exits non-zero if the model
         /// never produced one. Registered after `--tools`/`--exclude-tools` filtering, so an unrelated
         /// allow-list can't strip the one tool this flag exists to add.
-        #[arg(long, env = "AI_AGENT_OUTPUT_SCHEMA")]
+        #[usage(long, env = "AI_AGENT_OUTPUT_SCHEMA")]
         output_schema: Option<String>,
         /// Override the `structured_output` tool's description — what the model is told the payload is
         /// for. Ignored without `--output-schema`.
-        #[arg(long)]
+        #[usage(long)]
         output_description: Option<String>,
     },
     /// Run the headless agent server: a newline-delimited JSON control protocol over stdio.
     Serve {
         /// Model id (default `claude-opus-4-8`, or `AI_AGENT_MODEL`).
-        #[arg(long, env = "AI_AGENT_MODEL")]
+        #[usage(long, env = "AI_AGENT_MODEL")]
         model: Option<String>,
         /// Gateway base URL (default `http://ai.internal`, or `AI_GATEWAY_URL`).
-        #[arg(long, env = "AI_GATEWAY_URL")]
+        #[usage(long, env = "AI_GATEWAY_URL")]
         gateway_url: Option<String>,
         /// Virtual key (`bai_v1…`) or BYO provider key. Required; or set `AI_AGENT_KEY`.
-        #[arg(long, env = "AI_AGENT_KEY")]
+        #[usage(long, env = "AI_AGENT_KEY")]
         key: Option<String>,
         /// Persist one session to this JSONL file so a later `serve` reattaches with the transcript.
-        #[arg(long, env = "AI_AGENT_SESSION_FILE")]
+        #[usage(long, env = "AI_AGENT_SESSION_FILE")]
         session_file: Option<String>,
         /// Persist many sessions under this directory (enables list/switch/fork/name commands).
-        #[arg(long, env = "AI_AGENT_SESSION_DIR")]
+        #[usage(long, env = "AI_AGENT_SESSION_DIR")]
         session_dir: Option<String>,
         /// Offer the control protocol over a WebSocket on this address instead of stdio (e.g.
         /// `127.0.0.1:8787`). Each connection drives a session at `/_beyond/agent?session_id=<id>`, and
         /// a session outlives a dropped connection so a reconnecting client re-attaches to a still-
         /// running run. Bind loopback/internal only: the agent authenticates no caller — it trusts the
         /// front door. Pair with `--session-dir` so sessions survive a process restart. Absent ⇒ stdio.
-        #[arg(long, env = "AI_AGENT_LISTEN")]
+        #[usage(long, env = "AI_AGENT_LISTEN")]
         listen: Option<std::net::SocketAddr>,
         /// Also (or instead) offer the control protocol over a Unix-domain socket at this path — a
         /// same-VM client gets kernel-enforced local authz via the socket's filesystem permissions,
         /// which loopback TCP does not provide. Bound on the *same* supervisor as `--listen`, so a
         /// session created over either transport is reachable over the other by its `?session_id=`.
         /// Only on unix targets. Pair with `--session-dir` for restart durability.
-        #[arg(long, env = "AI_AGENT_LISTEN_UDS")]
+        #[usage(long, env = "AI_AGENT_LISTEN_UDS")]
         listen_uds: Option<std::path::PathBuf>,
         /// Octal permission mode to `chmod` the `--listen-uds` socket to after binding (e.g. `0o660`
         /// or `660` for a shared group). Default `0o600` (owner-only). Ignored without `--listen-uds`.
-        #[arg(long, env = "AI_AGENT_LISTEN_UDS_MODE")]
+        #[usage(long, env = "AI_AGENT_LISTEN_UDS_MODE")]
         listen_uds_mode: Option<String>,
         /// Daemon mode only: reap a session that has had no attached connection for this many seconds
         /// and isn't mid-run — dropping it so it persists and exits, exactly like a graceful shutdown
@@ -703,7 +684,7 @@ enum Command {
         /// to a still-running session, finite so an unattended daemon's threads and gateway pools don't
         /// accumulate forever. Pass `0` to disable reaping entirely (every session then lives until the
         /// daemon stops). Ignored without `--listen`/`--listen-uds`.
-        #[arg(long, env = "AI_AGENT_SESSION_IDLE_TIMEOUT")]
+        #[usage(long, env = "AI_AGENT_SESSION_IDLE_TIMEOUT")]
         session_idle_timeout: Option<u64>,
         /// How the daemon pools its upstream (agent→gateway) connections across sessions: `off` (the
         /// default — each session opens its own pool, as before), `auto` (one shared client, HTTP/1.1
@@ -711,7 +692,7 @@ enum Command {
         /// multiplexing all sessions over ~one connection). `h2c` **requires** an h2c-capable gateway —
         /// against an h1-only gateway every request fails — so it stays opt-in. Only meaningful with
         /// `--listen`/`--listen-uds`; ignored on the stdio path.
-        #[arg(long, env = "AI_AGENT_UPSTREAM_HTTP2", value_parser = parse_upstream_http2, default_value = "off")]
+        #[usage(long, env = "AI_AGENT_UPSTREAM_HTTP2", default = "off")]
         upstream_http2: serve::UpstreamHttp2,
         /// Address this exact session: reattach to it if it already exists, or create it under exactly
         /// this id if it doesn't. Gives a caller a known, predictable name to route on rather than
@@ -723,64 +704,64 @@ enum Command {
         /// also what makes `serve` multi-tenant — distinct ids are distinct sessions even in a shared
         /// `--session-dir`, which is exactly what the daemon's own `?session_id=` routing relies on.
         /// Outranks `--continue`. Matches `run`'s identical flag/contract (`main.rs::Run::session_id`).
-        #[arg(long)]
+        #[usage(long)]
         session_id: Option<String>,
         /// Reattach to the most recent session for the current directory instead of starting a fresh
         /// one, creating one if this is the first `serve` here. The only flag that reattaches
         /// implicitly: without it (and without `--session-id`/`--session-file`, both of which name a
         /// session outright) each launch starts its own session, so two servers sharing a directory
         /// don't silently drive the same on-disk transcript. Matches `run`'s identical flag.
-        #[arg(long, short = 'c', default_value_t = false)]
+        #[usage(long, short = 'c')]
         r#continue: bool,
         /// Skip persistence entirely, even without `--session-file`/`--session-dir`. Without this,
         /// `serve` defaults to `~/.claude/sessions/<encoded-cwd>/` rather than silently running
         /// in-memory-only — pass this for the rare case that's genuinely what you want (e.g. a
         /// short-lived test harness).
-        #[arg(long, default_value_t = false)]
+        #[usage(long)]
         no_session_persistence: bool,
         /// Persistent-memory backend DSN. Absent ⇒ the stored `default_memory_backend` setting, else a
         /// per-project local-file store. A bare path or `file://` names a directory; `redis://`/
         /// `postgres://` select a networked backend (recognized, not yet implemented).
-        #[arg(long, env = "AI_AGENT_MEMORY_URL")]
+        #[usage(long, env = "AI_AGENT_MEMORY_URL")]
         memory: Option<String>,
         /// Disable persistent memory entirely: don't register the `memory` tool or inject the index.
-        #[arg(long, default_value_t = false)]
+        #[usage(long)]
         no_memory: bool,
         /// Disable only the per-session `/session` working-memory mount, keeping durable `/memories`. On
         /// by default when memory is enabled.
-        #[arg(long, default_value_t = false)]
+        #[usage(long)]
         no_session_memory: bool,
         /// Opt-in cap on model turns per prompt before bailing with an error (default: unbounded).
-        #[arg(long)]
+        #[usage(long)]
         max_steps: Option<u32>,
         /// Replace the built-in base system prompt entirely.
-        #[arg(long, env = "AI_AGENT_SYSTEM_PROMPT")]
+        #[usage(long, env = "AI_AGENT_SYSTEM_PROMPT")]
         system_prompt: Option<String>,
         /// Append extra instructions after the base system prompt. Repeatable — `run`'s identical flag;
         /// each occurrence is joined with the others by a blank line, in the order given.
-        #[arg(long, env = "AI_AGENT_APPEND_SYSTEM_PROMPT")]
+        #[usage(long, env = "AI_AGENT_APPEND_SYSTEM_PROMPT")]
         append_system_prompt: Vec<String>,
         /// Do not discover/inject AGENTS.md / CLAUDE.md project-instruction files. `-nc` matches pi's
         /// own `--no-context-files`/`-nc`.
-        #[arg(long, default_value_t = false)]
+        #[usage(long)]
         no_context_files: bool,
         /// Model context window (tokens); the loop summarizes older turns to stay below it. Defaults
         /// to the model's own capability-table window (see `agent_core::models::capabilities`) — only
         /// pass this to pin a fixed budget that survives a `set_model` switch to a different model.
-        #[arg(long, env = "AI_AGENT_CONTEXT_WINDOW")]
+        #[usage(long, env = "AI_AGENT_CONTEXT_WINDOW")]
         context_window: Option<u32>,
         /// Per-turn output token ceiling. Defaults to the model's own capability-table `max_output`
         /// (see `agent_core::models::capabilities`), floored at a sane minimum — only pass this to
         /// override that, e.g. capping generation length or lifting it past the model-derived default.
-        #[arg(long, env = "AI_AGENT_MAX_TOKENS")]
+        #[usage(long, env = "AI_AGENT_MAX_TOKENS")]
         max_tokens: Option<u32>,
         /// Use the 1-hour prompt-cache TTL (vs 5 minutes); helps when turns are spaced out.
-        #[arg(long, default_value_t = false)]
+        #[usage(long)]
         cache_long: bool,
         /// Enable extended thinking with this token budget (must be below the per-turn max tokens). A
         /// raw token count, not pi's own `--thinking <level>` (off/minimal/low/medium/high/xhigh) — see
         /// `--reasoning-effort` for that portable level instead.
-        #[arg(long)]
+        #[usage(long)]
         thinking: Option<u32>,
         /// Reasoning effort for models driven by an effort level rather than a token budget (OpenAI
         /// reasoning models via `reasoning_effort`; Anthropic adaptive-thinking models via
@@ -789,7 +770,7 @@ enum Command {
         /// `AI_AGENT_REASONING_EFFORT`, then the stored `agent settings --default-reasoning-effort`
         /// default, before finally leaving it unset. Task 2 (pi-parity fix, pass 19): `off` is now
         /// accepted too, explicitly disabling reasoning. `run`'s identical flag.
-        #[arg(long, env = "AI_AGENT_REASONING_EFFORT", value_parser = parse_reasoning_effort)]
+        #[usage(long, env = "AI_AGENT_REASONING_EFFORT")]
         reasoning_effort: Option<agent_core::ThinkingLevel>,
         /// How much of the mid-run *steer* lane a single drain point consumes per turn boundary
         /// (`agent_core::QueueMode`) — `one_at_a_time` (the default, matching pi) injects only the oldest
@@ -798,89 +779,89 @@ enum Command {
         /// setting `serve`'s own `set_steering_mode` RPC command maintains
         /// (`settings::Settings::steering_mode`), before finally defaulting to `one_at_a_time`. `run`'s
         /// identical flag.
-        #[arg(long, env = "AI_AGENT_STEERING_MODE", value_parser = parse_queue_mode)]
+        #[usage(long, env = "AI_AGENT_STEERING_MODE")]
         steering_mode: Option<agent_core::QueueMode>,
         /// Same idea as `--steering-mode`, for the follow-up lane drained at a stop boundary (plus any
         /// stranded steer messages swept in there) — matches pi's own separate `followUpMode`. `run`'s
         /// identical flag.
-        #[arg(long, env = "AI_AGENT_FOLLOW_UP_MODE", value_parser = parse_queue_mode)]
+        #[usage(long, env = "AI_AGENT_FOLLOW_UP_MODE")]
         follow_up_mode: Option<agent_core::QueueMode>,
         /// Sampling temperature. Omitted (leaving the provider default) unless set. Silently ignored by
         /// Anthropic while `--thinking` is set (Anthropic forbids the two together). `run`'s identical
         /// flag.
-        #[arg(long)]
+        #[usage(long)]
         temperature: Option<f64>,
         /// Trust `cwd` for this run only, so a project-local `.claude/SYSTEM.md` is honored even if
         /// `cwd` isn't in the persisted allowlist (`agent trust <path>`). A session-scoped override,
         /// not a permanent grant — see `agent trust` to record one. `-a` matches pi's own
         /// `--approve`/`-a` (same "trust this project" meaning, different flag name here).
-        #[arg(short = 'a', long, default_value_t = false)]
+        #[usage(short = 'a', long)]
         trust_project: bool,
         /// Force `cwd` *untrusted* for this session only, overriding both `--trust-project` and the
         /// persisted allowlist (`agent trust <path>`) — e.g. to test untrusted behavior against a
         /// directory that's otherwise permanently trusted. Wins over `--trust-project` if both are
         /// somehow given. `-na` matches pi's own `--no-approve`/`-na`.
-        #[arg(long, default_value_t = false)]
+        #[usage(long)]
         force_untrusted: bool,
         /// Compaction headroom (tokens) reserved below the context window before it fires. Defaults to
         /// `CompactionConfig::default()`'s 16,384.
-        #[arg(long, env = "AI_AGENT_COMPACTION_RESERVE_TOKENS")]
+        #[usage(long, env = "AI_AGENT_COMPACTION_RESERVE_TOKENS")]
         compaction_reserve_tokens: Option<u32>,
         /// Roughly how many tokens of recent conversation compaction keeps verbatim. Defaults to
         /// `CompactionConfig::default()`'s 20,000.
-        #[arg(long, env = "AI_AGENT_COMPACTION_KEEP_RECENT_TOKENS")]
+        #[usage(long, env = "AI_AGENT_COMPACTION_KEEP_RECENT_TOKENS")]
         compaction_keep_recent_tokens: Option<u32>,
         /// Token budget reserved below the context window when summarizing an abandoned tree branch —
         /// independent of `--compaction-reserve-tokens`. `run`'s identical flag (Task #31, pi-parity
         /// feature).
-        #[arg(long, env = "AI_AGENT_BRANCH_SUMMARY_RESERVE_TOKENS")]
+        #[usage(long, env = "AI_AGENT_BRANCH_SUMMARY_RESERVE_TOKENS")]
         branch_summary_reserve_tokens: Option<u32>,
         /// Disable automatic (threshold-triggered) compaction entirely — `run`'s identical flag. When
         /// absent (and `AI_AGENT_NO_COMPACTION` unset), falls back to the persisted `agent settings`
         /// `compaction_enabled` override before finally defaulting to enabled — see
         /// `serve::ServeConfig::no_compaction`'s doc comment.
-        #[arg(long, env = "AI_AGENT_NO_COMPACTION", default_value_t = false)]
+        #[usage(long, env = "AI_AGENT_NO_COMPACTION")]
         no_compaction: bool,
         /// How many times to retry a gateway request that fails before the first response byte
         /// arrives. Defaults to 3.
-        #[arg(long, env = "AI_AGENT_RETRY_MAX_RETRIES")]
+        #[usage(long, env = "AI_AGENT_RETRY_MAX_RETRIES")]
         retry_max_retries: Option<u32>,
         /// Base of the exponential backoff between those retries, in milliseconds. Defaults to 250.
-        #[arg(long, env = "AI_AGENT_RETRY_BASE_DELAY_MS")]
+        #[usage(long, env = "AI_AGENT_RETRY_BASE_DELAY_MS")]
         retry_base_delay_ms: Option<u64>,
         /// Ceiling on that exponential backoff, in milliseconds. `run`'s identical flag (Task #30,
         /// pi-parity feature).
-        #[arg(long, env = "AI_AGENT_RETRY_MAX_BACKOFF_MS")]
+        #[usage(long, env = "AI_AGENT_RETRY_MAX_BACKOFF_MS")]
         retry_max_backoff_ms: Option<u64>,
         /// Idle-read timeout between response chunks on the gateway HTTP client, in milliseconds —
         /// overrides `agent_core::client::GatewayClient`'s built-in default. `run`'s identical flag
         /// (Task #38, pi-parity fix: `serve` previously had no equivalent at all, so
         /// `--idle-timeout-ms`/`AI_AGENT_IDLE_TIMEOUT_MS`/the persisted `default_provider_timeout_ms`
         /// setting had no effect on a `serve` process).
-        #[arg(long, env = "AI_AGENT_IDLE_TIMEOUT_MS")]
+        #[usage(long, env = "AI_AGENT_IDLE_TIMEOUT_MS")]
         idle_timeout_ms: Option<u64>,
         /// Force every image down the same downgrade-to-text-placeholder path a vision-incapable model
         /// already gets, regardless of the active model's real `supports_vision` capability. Falls back
         /// to the persisted `agent settings --block-images` default when not explicitly given. `run`'s
         /// identical flag (Task #34, pi-parity fix: `serve` previously had no equivalent at all).
-        #[arg(long, env = "AI_AGENT_BLOCK_IMAGES", default_value_t = false)]
+        #[usage(long, env = "AI_AGENT_BLOCK_IMAGES")]
         block_images: bool,
         /// Force `--block-images` off for this invocation, even when a persisted `agent settings
         /// --block-images` default is `true` (pass 20, pi-parity fix). `run`'s identical flag — see its
         /// own doc comment.
-        #[arg(long, env = "AI_AGENT_NO_BLOCK_IMAGES", default_value_t = false)]
+        #[usage(long, env = "AI_AGENT_NO_BLOCK_IMAGES")]
         no_block_images: bool,
         /// Skip `read`'s resize/downscale path for an oversized image entirely, shipping its
         /// normalized (format-converted, if needed) bytes as-is regardless of size or pixel dimensions.
         /// Falls back to the persisted `agent settings --image-auto-resize` default when not explicitly
         /// given. `run`'s identical flag (Task #34, pi-parity fix: `serve` previously always hardcoded
         /// image auto-resize on, with no way to turn it off).
-        #[arg(long, env = "AI_AGENT_NO_IMAGE_AUTO_RESIZE", default_value_t = false)]
+        #[usage(long, env = "AI_AGENT_NO_IMAGE_AUTO_RESIZE")]
         no_image_auto_resize: bool,
         /// Default `bash` command timeout (ms) when the model omits `timeout_ms`. Defaults to 1,800,000
         /// (30 minutes) — see `tools::bash`'s doc comment for why this deliberately deviates from the
         /// reference agent's no-default.
-        #[arg(long, env = "AI_AGENT_BASH_TIMEOUT_MS")]
+        #[usage(long, env = "AI_AGENT_BASH_TIMEOUT_MS")]
         bash_timeout_ms: Option<u64>,
         /// Run `bash` commands through this shell instead of the auto-resolved one (`/bin/bash`, else
         /// `bash` on `$PATH`, else `sh`) — for a non-standard environment (Cygwin, a container without
@@ -888,66 +869,66 @@ enum Command {
         /// would pick the wrong binary. Matches pi's own `shellPath` setting. Checked to exist once
         /// here, at startup — a bad path fails the process immediately instead of surfacing as a
         /// confusing spawn error on the first `bash` call.
-        #[arg(long, env = "AI_AGENT_BASH_SHELL_PATH")]
+        #[usage(long, env = "AI_AGENT_BASH_SHELL_PATH")]
         bash_shell_path: Option<String>,
         /// Prepend this line to every `bash` command, in the same shell invocation (e.g. sourcing a
         /// project's env setup, activating a venv). Matches pi's own `shellCommandPrefix` setting.
         /// Fixed for the process, like `--bash-shell-path`; survives `set_model`/`set_thinking` rebuilds.
-        #[arg(long, env = "AI_AGENT_BASH_COMMAND_PREFIX")]
+        #[usage(long, env = "AI_AGENT_BASH_COMMAND_PREFIX")]
         bash_command_prefix: Option<String>,
         /// Let the `web` tool reach loopback/private/link-local addresses. Off by default: the tool
         /// refuses them to prevent SSRF (it fetches URLs the model chose). `serve`'s identical flag.
-        #[arg(long, env = "AI_AGENT_WEB_ALLOW_PRIVATE")]
+        #[usage(long, env = "AI_AGENT_WEB_ALLOW_PRIVATE")]
         web_allow_private: bool,
         /// A hostname the `web` tool may reach even with private egress off (repeatable) — an internal
         /// service, or `127.0.0.1` for local testing. `serve`'s identical flag.
-        #[arg(long, env = "AI_AGENT_WEB_ALLOW_HOST")]
+        #[usage(long, env = "AI_AGENT_WEB_ALLOW_HOST")]
         web_allow_host: Vec<String>,
         /// The `web` tool's per-request timeout (ms). Default 30,000. `serve`'s identical flag.
-        #[arg(long, env = "AI_AGENT_WEB_TIMEOUT_MS")]
+        #[usage(long, env = "AI_AGENT_WEB_TIMEOUT_MS")]
         web_timeout_ms: Option<u64>,
         /// Point every session's tools at a remote exec endpoint by default. A multi-tenant server
         /// leaves this unset and uses the `set_exec_endpoint` command per session instead.
-        #[arg(long, env = "AI_AGENT_EXEC_URL", conflicts_with = "exec_cmd")]
+        #[usage(long, env = "AI_AGENT_EXEC_URL", conflicts = "exec_cmd")]
         exec_url: Option<String>,
         /// A header sent with every exec request, `Name: value`. Repeatable.
-        #[arg(long, env = "AI_AGENT_EXEC_HEADER")]
+        #[usage(long, env = "AI_AGENT_EXEC_HEADER")]
         exec_header: Vec<String>,
         /// An argv template for targets with no HTTP surface, e.g. `ssh host -- {}`.
-        #[arg(long, env = "AI_AGENT_EXEC_CMD", conflicts_with = "exec_url")]
+        #[usage(long, env = "AI_AGENT_EXEC_CMD", conflicts = "exec_url")]
         exec_cmd: Option<String>,
         /// Restrict the tool set to exactly these names (comma-separated), dropping everything else.
         /// Fixed for the process, like `--system-prompt`; survives `set_model`/`set_thinking` rebuilds.
         /// `-t` matches pi's own `--tools`/`-t`.
-        #[arg(short = 't', long, env = "AI_AGENT_TOOLS", value_delimiter = ',')]
+        #[usage(short = 't', long, env = "AI_AGENT_TOOLS", delimiter = ',')]
         tools: Option<Vec<String>>,
         /// Drop these tools (comma-separated) from the default set — e.g. `--exclude-tools bash,write`
         /// for a read-only reviewer that can't run shell commands or mutate files. `-xt` matches pi's
         /// own `--exclude-tools`/`-xt`.
-        #[arg(long, env = "AI_AGENT_EXCLUDE_TOOLS", value_delimiter = ',')]
+        #[usage(long, env = "AI_AGENT_EXCLUDE_TOOLS", delimiter = ',')]
         exclude_tools: Option<Vec<String>>,
         /// Register no tools at all — a pure-conversation session. Wins over `--tools`/`--exclude-tools`.
         /// `-nt` matches pi's own `--no-tools`/`-nt`.
-        #[arg(long, default_value_t = false)]
+        #[usage(long)]
         no_tools: bool,
         /// Force every batch of tool calls in a turn to run one at a time instead of the default
         /// bounded-concurrent dispatch (`agent_core::Agent::with_sequential_tools`). `run`'s identical
         /// flag.
-        #[arg(long, default_value_t = false)]
+        #[usage(long)]
         sequential_tools: bool,
         /// Block every call to this tool (comma-separated, repeatable), even though it stays visible
         /// and registered — unlike `--exclude-tools`, a denied call still surfaces to the model as a
         /// normal error `tool_result` explaining it was blocked by policy, rather than the tool being
         /// invisible outright. `run`'s identical flag.
-        #[arg(long, env = "AI_AGENT_DENY_TOOL", value_delimiter = ',')]
+        #[usage(long, env = "AI_AGENT_DENY_TOOL", delimiter = ',')]
         deny_tool: Vec<String>,
         /// Block a `bash` call whenever its command contains this substring, case-insensitively
         /// (comma-separated, repeatable). `run`'s identical flag.
-        #[arg(long, env = "AI_AGENT_DENY_BASH_PATTERN", value_delimiter = ',')]
+        #[usage(long, env = "AI_AGENT_DENY_BASH_PATTERN", delimiter = ',')]
         deny_bash_pattern: Vec<String>,
         /// Block a `write`/`edit` call whenever its `path` argument matches this glob (comma-separated,
         /// repeatable). `run`'s identical flag.
-        #[arg(long, env = "AI_AGENT_DENY_PATH", value_delimiter = ',')]
+        #[usage(long, env = "AI_AGENT_DENY_PATH", delimiter = ',')]
         deny_path: Vec<String>,
         /// Require a human to approve a tool call before it runs: `off` (default), `writes`
         /// (`write`/`edit`), `all` (everything except the read-only tools), or `tools:<name>,<name>`.
@@ -958,18 +939,18 @@ enum Command {
         /// Fails closed: a timeout, an abort, or no attached client all deny the call (the model gets an
         /// error `tool_result` and the run continues). The static `--deny-*` lists still win first, with
         /// no round trip. `run` has no equivalent — it has no client to ask.
-        #[arg(long, env = "AI_AGENT_APPROVE", default_value = "off")]
+        #[usage(long, env = "AI_AGENT_APPROVE", default = "off")]
         approve: String,
         /// Seconds an unanswered approval request waits before it is denied. `0` waits forever, which is
         /// only safe with a reliably-attached client: a question nobody answers pins the session until an
         /// `abort`.
-        #[arg(long, env = "AI_AGENT_APPROVAL_TIMEOUT", default_value_t = 300)]
+        #[usage(long, env = "AI_AGENT_APPROVAL_TIMEOUT", default = "300")]
         approval_timeout: u64,
         /// Restrict `cycle_model`'s candidate list to exactly these ids, in this order
         /// (comma-separated) — e.g. `--models claude-opus-4-8,claude-sonnet-4-5,gpt-5`.
         /// `set_model`/`get_available_models` are unaffected; empty/absent cycles the full known-model
         /// list instead.
-        #[arg(long, env = "AI_AGENT_MODELS", value_delimiter = ',')]
+        #[usage(long, env = "AI_AGENT_MODELS", delimiter = ',')]
         models: Option<Vec<String>>,
         /// Disable *standard-root* skills discovery/loading (`~/.claude/skills`, `<cwd>/.claude/skills`)
         /// — no `<available_skills>` listing in the system prompt from either, and a `/skill:name`
@@ -977,32 +958,32 @@ enum Command {
         /// unexpanded unless it resolves against a `--skill` path instead. An explicit `--skill <path>`
         /// is still honored even so, matching `run`'s identical flag and pi's own `--no-skills`. Applies
         /// on every `reload` too. `-ns` matches pi's own `--no-skills`/`-ns`.
-        #[arg(long, default_value_t = false)]
+        #[usage(long)]
         no_skills: bool,
         /// Disable *standard-root* prompt-template discovery/loading (`~/.claude/prompts`,
         /// `<cwd>/.claude/prompts`) — a `/name` invocation is sent through unexpanded unless it resolves
         /// against a `--prompt-template` path instead. An explicit `--prompt-template <path>` is still
         /// honored even so, matching `run`'s identical flag and pi's own `--no-prompt-templates`. Applies
         /// on every `reload` too. `-np` matches pi's own `--no-prompt-templates`/`-np`.
-        #[arg(long, default_value_t = false)]
+        #[usage(long)]
         no_prompt_templates: bool,
         /// Discover skills from this directory too, in addition to the two standard roots (repeatable,
         /// or comma-separated via `AI_AGENT_SKILL_PATH`). Matches pi's own `--skill <path>` and `run`'s
         /// identical flag; applies on every `reload` too.
-        #[arg(
+        #[usage(
             long = "skill",
             env = "AI_AGENT_SKILL_PATH",
-            value_delimiter = ',',
+            delimiter = ',',
             value_name = "PATH"
         )]
         extra_skill_paths: Vec<String>,
         /// Discover prompt templates from this directory too, in addition to the two standard roots
         /// (repeatable, or comma-separated via `AI_AGENT_PROMPT_TEMPLATE_PATH`). Matches pi's own
         /// `--prompt-template <path>` and `run`'s identical flag; applies on every `reload` too.
-        #[arg(
+        #[usage(
             long = "prompt-template",
             env = "AI_AGENT_PROMPT_TEMPLATE_PATH",
-            value_delimiter = ',',
+            delimiter = ',',
             value_name = "PATH"
         )]
         extra_prompt_template_paths: Vec<String>,
@@ -1011,13 +992,13 @@ enum Command {
         /// every invocation, last-write-wins), this only ever takes effect on a genuinely fresh session
         /// — see the fresh-only check in `run_task`/`serve` for why: a deliberate deviation, not an
         /// oversight. The RPC `set_session_name` command covers renaming an existing session afterward.
-        #[arg(short = 'n', long)]
+        #[usage(short = 'n', long)]
         name: Option<String>,
         /// An extra guideline bullet appended to the default system prompt's `Guidelines:` section
         /// (repeatable) — pi's own `promptGuidelines`; `run`'s identical flag. Has no effect when
         /// `--system-prompt` supplies a full custom prompt (matches pi: a custom prompt replaces the
         /// whole guidelines mechanism, not just extends it).
-        #[arg(long = "prompt-guideline", value_name = "TEXT")]
+        #[usage(long = "prompt-guideline", value_name = "TEXT")]
         prompt_guidelines: Vec<String>,
     },
     /// List the tools the agent advertises to the model.
@@ -1106,31 +1087,31 @@ enum Command {
     /// `agent untrust` managing the trust store the same out-of-band way.
     Settings {
         /// Set the stored default model (used when neither `--model` nor `AI_AGENT_MODEL` is given).
-        #[arg(long)]
+        #[usage(long)]
         model: Option<String>,
         /// Clear the stored default model.
-        #[arg(long, default_value_t = false)]
+        #[usage(long)]
         clear_model: bool,
         /// Set the stored default gateway URL (used when neither `--gateway-url` nor `AI_GATEWAY_URL`
         /// is given).
-        #[arg(long)]
+        #[usage(long)]
         gateway_url: Option<String>,
         /// Clear the stored default gateway URL.
-        #[arg(long, default_value_t = false)]
+        #[usage(long)]
         clear_gateway_url: bool,
         /// Set the stored default session directory (used when neither `--session-dir` nor
         /// `AI_AGENT_SESSION_DIR` is given).
-        #[arg(long)]
+        #[usage(long)]
         session_dir: Option<String>,
         /// Clear the stored default session directory.
-        #[arg(long, default_value_t = false)]
+        #[usage(long)]
         clear_session_dir: bool,
         /// Set the stored default project-trust policy — `always`/`never`/`ask` (used when neither
         /// `--trust-project` nor `--force-untrusted` is given; see `settings::TrustPolicy`).
-        #[arg(long)]
+        #[usage(long, value_enum)]
         default_project_trust: Option<beyond_ai_agent::settings::TrustPolicy>,
         /// Clear the stored default project-trust policy.
-        #[arg(long, default_value_t = false)]
+        #[usage(long)]
         clear_default_project_trust: bool,
         /// Set the stored default reasoning effort — one of off/minimal/low/medium/high/xhigh (used when
         /// neither `--reasoning-effort` nor `AI_AGENT_REASONING_EFFORT` is given; Task 2, pi-parity fix,
@@ -1138,123 +1119,123 @@ enum Command {
         /// rather than a parse error). Fix 2 (pi-parity gap): previously the only numeric/string CLI
         /// tunable with no persisted-default surface at all, unlike `--model`/`--gateway-url`/
         /// `--session-dir` above.
-        #[arg(long, value_parser = parse_reasoning_effort)]
+        #[usage(long)]
         default_reasoning_effort: Option<agent_core::ThinkingLevel>,
         /// Clear the stored default reasoning effort.
-        #[arg(long, default_value_t = false)]
+        #[usage(long)]
         clear_default_reasoning_effort: bool,
         /// Set the stored default for `--block-images` (used when the flag isn't explicitly passed on a
         /// given `run` invocation) — Task #26 (pi-parity feature). `true` behaves as if `--block-images`
         /// were always given.
-        #[arg(long)]
+        #[usage(long)]
         block_images: Option<bool>,
         /// Clear the stored default for `--block-images`, reverting to `run`'s own built-in default
         /// (images allowed).
-        #[arg(long, default_value_t = false)]
+        #[usage(long)]
         clear_block_images: bool,
         /// Set the stored default for image auto-resize (used when `--no-image-auto-resize` isn't
         /// explicitly passed on a given `run` invocation) — Task #4 (pi-parity feature). `false`
         /// behaves as if `--no-image-auto-resize` were always given.
-        #[arg(long)]
+        #[usage(long)]
         image_auto_resize: Option<bool>,
         /// Clear the stored default for image auto-resize, reverting to `run`'s own built-in default
         /// (resize enabled).
-        #[arg(long, default_value_t = false)]
+        #[usage(long)]
         clear_image_auto_resize: bool,
         /// Set a persisted thinking-token-budget override for one reasoning-effort level —
         /// `<effort>=<tokens>` (e.g. `high=40000`), one of minimal/low/medium/high/xhigh — Task #36
         /// (pi-parity feature). Repeatable; consulted by `run` in place of the built-in
         /// effort-to-budget ladder wherever a turn's thinking budget is derived from
         /// `--reasoning-effort` (see `agent_core::models::budget_for_effort_with_override`).
-        #[arg(long = "thinking-budget", value_name = "EFFORT=TOKENS")]
+        #[usage(long = "thinking-budget", value_name = "EFFORT=TOKENS")]
         thinking_budget: Vec<String>,
         /// Clear a persisted thinking-token-budget override for this reasoning-effort level.
         /// Repeatable.
-        #[arg(long = "clear-thinking-budget", value_name = "EFFORT")]
+        #[usage(long = "clear-thinking-budget", value_name = "EFFORT")]
         clear_thinking_budget: Vec<String>,
         /// Set the stored default `--bash-shell-path` (used when neither `--bash-shell-path` nor
         /// `AI_AGENT_BASH_SHELL_PATH` is given, for both `run` and `serve`) — Round 3 (pi-parity fix).
-        #[arg(long)]
+        #[usage(long)]
         default_bash_shell_path: Option<String>,
         /// Clear the stored default `--bash-shell-path`.
-        #[arg(long, default_value_t = false)]
+        #[usage(long)]
         clear_default_bash_shell_path: bool,
         /// Set the stored default `--bash-command-prefix` (used when neither the flag nor
         /// `AI_AGENT_BASH_COMMAND_PREFIX` is given) — Round 3 (pi-parity fix).
-        #[arg(long)]
+        #[usage(long)]
         default_bash_command_prefix: Option<String>,
         /// Clear the stored default `--bash-command-prefix`.
-        #[arg(long, default_value_t = false)]
+        #[usage(long)]
         clear_default_bash_command_prefix: bool,
         /// Set the stored default compaction reserve-token override (used when neither
         /// `--compaction-reserve-tokens` nor `AI_AGENT_COMPACTION_RESERVE_TOKENS` is given) — Round 3
         /// (pi-parity fix).
-        #[arg(long)]
+        #[usage(long)]
         default_compaction_reserve_tokens: Option<u32>,
         /// Clear the stored default compaction reserve-token override.
-        #[arg(long, default_value_t = false)]
+        #[usage(long)]
         clear_default_compaction_reserve_tokens: bool,
         /// Set the stored default compaction keep-recent-token override (used when neither
         /// `--compaction-keep-recent-tokens` nor `AI_AGENT_COMPACTION_KEEP_RECENT_TOKENS` is given) —
         /// Round 3 (pi-parity fix).
-        #[arg(long)]
+        #[usage(long)]
         default_compaction_keep_recent_tokens: Option<u32>,
         /// Clear the stored default compaction keep-recent-token override.
-        #[arg(long, default_value_t = false)]
+        #[usage(long)]
         clear_default_compaction_keep_recent_tokens: bool,
         /// Set the stored default retry max-retries override (used when neither `--retry-max-retries`
         /// nor `AI_AGENT_RETRY_MAX_RETRIES` is given) — Round 3 (pi-parity fix).
-        #[arg(long)]
+        #[usage(long)]
         default_retry_max_retries: Option<u32>,
         /// Clear the stored default retry max-retries override.
-        #[arg(long, default_value_t = false)]
+        #[usage(long)]
         clear_default_retry_max_retries: bool,
         /// Set the stored default retry base-delay override, in milliseconds (used when neither
         /// `--retry-base-delay-ms` nor `AI_AGENT_RETRY_BASE_DELAY_MS` is given) — Round 3 (pi-parity
         /// fix).
-        #[arg(long)]
+        #[usage(long)]
         default_retry_base_delay_ms: Option<u64>,
         /// Clear the stored default retry base-delay override.
-        #[arg(long, default_value_t = false)]
+        #[usage(long)]
         clear_default_retry_base_delay_ms: bool,
         /// Set the stored default provider (idle-read) timeout override, in milliseconds (used when
         /// neither `--idle-timeout-ms` nor `AI_AGENT_IDLE_TIMEOUT_MS` is given, for both `run` and
         /// `serve`) — Round 3 (pi-parity fix); Task #38 extended it to cover `serve` too.
-        #[arg(long)]
+        #[usage(long)]
         default_provider_timeout_ms: Option<u64>,
         /// Clear the stored default provider-timeout override.
-        #[arg(long, default_value_t = false)]
+        #[usage(long)]
         clear_default_provider_timeout_ms: bool,
         /// Set the stored default retry backoff-ceiling override, in milliseconds (used when neither
         /// `--retry-max-backoff-ms` nor `AI_AGENT_RETRY_MAX_BACKOFF_MS` is given) — Task #30 (pi-parity
         /// feature): the retry cluster's third knob, `agent_core::client::GatewayClient::
         /// with_max_backoff`, previously had no CLI flag or persisted override at all.
-        #[arg(long)]
+        #[usage(long)]
         default_retry_max_backoff_ms: Option<u64>,
         /// Clear the stored default retry backoff-ceiling override.
-        #[arg(long, default_value_t = false)]
+        #[usage(long)]
         clear_default_retry_max_backoff_ms: bool,
         /// Set the stored default `--models` scoping/cycling candidate list, comma-separated (used when
         /// neither `--models` nor `AI_AGENT_MODELS` is given; `serve`-only) — Round 3 (pi-parity fix).
-        #[arg(long = "default-models", value_delimiter = ',')]
+        #[usage(long = "default-models", delimiter = ',')]
         default_models: Option<Vec<String>>,
         /// Clear the stored default `--models` list.
-        #[arg(long, default_value_t = false)]
+        #[usage(long)]
         clear_default_models: bool,
         /// Set the stored default extra skill-discovery paths, comma-separated (used when no `--skill
         /// <path>`/`AI_AGENT_SKILL_PATH` is given) — Round 3 (pi-parity fix).
-        #[arg(long = "default-skill-paths", value_delimiter = ',')]
+        #[usage(long = "default-skill-paths", delimiter = ',')]
         default_skill_paths: Option<Vec<String>>,
         /// Clear the stored default extra skill-discovery paths.
-        #[arg(long, default_value_t = false)]
+        #[usage(long)]
         clear_default_skill_paths: bool,
         /// Set the stored default extra prompt-template-discovery paths, comma-separated (used when no
         /// `--prompt-template <path>`/`AI_AGENT_PROMPT_TEMPLATE_PATH` is given) — Round 3 (pi-parity
         /// fix).
-        #[arg(long = "default-prompt-template-paths", value_delimiter = ',')]
+        #[usage(long = "default-prompt-template-paths", delimiter = ',')]
         default_prompt_template_paths: Option<Vec<String>>,
         /// Clear the stored default extra prompt-template-discovery paths.
-        #[arg(long, default_value_t = false)]
+        #[usage(long)]
         clear_default_prompt_template_paths: bool,
         /// Set the stored default branch-summary reserve-token budget (used when neither
         /// `--branch-summary-reserve-tokens` nor `AI_AGENT_BRANCH_SUMMARY_RESERVE_TOKENS` is given) —
@@ -1262,10 +1243,10 @@ enum Command {
         /// previously had no caller at all, so a branch summary's reserve was always hard-tied to
         /// ordinary compaction's own `--compaction-reserve-tokens`, matching pi's independently
         /// configurable `branchSummary.reserveTokens` (default 16384).
-        #[arg(long)]
+        #[usage(long)]
         default_branch_summary_reserve_tokens: Option<u32>,
         /// Clear the stored default branch-summary reserve-token budget.
-        #[arg(long, default_value_t = false)]
+        #[usage(long)]
         clear_default_branch_summary_reserve_tokens: bool,
     },
     /// Render an existing session's `.jsonl` file as a self-contained HTML transcript and exit — pure
@@ -1461,26 +1442,36 @@ fn expand_short_aliases(args: Vec<String>) -> Vec<String> {
 /// argv-position/substring checks below see the expanded (long-flag) form too.
 fn cli() -> Cli {
     let args = expand_short_aliases(std::env::args().collect());
-    match Cli::try_parse_from(&args) {
+    let run_json_help = args.get(1).map(String::as_str) == Some("run")
+        && args.iter().any(|a| a == "--json")
+        && args.iter().any(|a| a == "--help" || a == "-h");
+    let argv: Vec<OsString> = args.into_iter().map(OsString::from).collect();
+    let argv_refs: Vec<&OsStr> = argv.iter().map(|s| s.as_os_str()).collect();
+    match Cli::try_parse_from(&argv_refs) {
         Ok(cli) => cli,
-        Err(e) => {
-            let run_json_help = args.get(1).map(String::as_str) == Some("run")
-                && args.iter().any(|a| a == "--json")
-                && args.iter().any(|a| a == "--help" || a == "-h");
-            if run_json_help
-                && matches!(
-                    e.kind(),
-                    clap::error::ErrorKind::DisplayHelp
-                        | clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
-                )
-            {
-                eprint!("{}", e.render());
-                std::process::exit(0);
+        Err(usage::Error::Help { cmd, long }) => {
+            let text = Cli::render_help(cmd, long).unwrap_or_default();
+            if run_json_help {
+                eprint!("{text}");
+            } else {
+                print!("{text}");
             }
-            // Every other case (a real usage error, `--version`, bare `--help`) keeps clap's own
-            // default stream/exit-code behavior — see the doc comment above for why only the
-            // `run --json --help` combination needs overriding.
-            e.exit();
+            std::process::exit(0);
+        }
+        Err(usage::Error::Version { long }) => {
+            let spec = Cli::spec();
+            let bin = spec.bin.unwrap_or(spec.name);
+            let version = if long {
+                spec.long_version.or(spec.version).unwrap_or_default()
+            } else {
+                spec.version.unwrap_or_default()
+            };
+            print!("{bin} {version}\n");
+            std::process::exit(0);
+        }
+        Err(err) => {
+            eprint!("{}", Cli::render_failure(&argv_refs, &err));
+            std::process::exit(2);
         }
     }
 }
@@ -1887,7 +1878,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     stored_settings
                         .steering_mode
                         .as_deref()
-                        .and_then(|s| parse_queue_mode(s).ok())
+                        .and_then(|s| s.parse::<agent_core::QueueMode>().ok())
                 })
                 .unwrap_or_default();
             let follow_up_mode = follow_up_mode
@@ -1895,7 +1886,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     stored_settings
                         .follow_up_mode
                         .as_deref()
-                        .and_then(|s| parse_queue_mode(s).ok())
+                        .and_then(|s| s.parse::<agent_core::QueueMode>().ok())
                 })
                 .unwrap_or_default();
             let resolved_session_dir = session_dir.or_else(|| {
@@ -3543,7 +3534,7 @@ async fn run_task(
             stored_settings
                 .steering_mode
                 .as_deref()
-                .and_then(|s| parse_queue_mode(s).ok())
+                .and_then(|s| s.parse::<agent_core::QueueMode>().ok())
         })
         .unwrap_or_default();
     let follow_up_mode = follow_up_mode
@@ -3551,7 +3542,7 @@ async fn run_task(
             stored_settings
                 .follow_up_mode
                 .as_deref()
-                .and_then(|s| parse_queue_mode(s).ok())
+                .and_then(|s| s.parse::<agent_core::QueueMode>().ok())
         })
         .unwrap_or_default();
     // `run` has no live control channel to change either mode mid-invocation the way `serve`'s RPC
@@ -4530,21 +4521,22 @@ mod tests {
         // pi's own `--thinking <level>` (off/minimal/low/medium/high/xhigh) share a name but mean
         // different things — beyond's portable-level equivalent is `--reasoning-effort`. No behavior
         // change here, just making the naming collision self-explanatory in `--help`.
-        use clap::CommandFactory;
-        let help = Cli::command().render_long_help().to_string();
+        let help = Cli::render_help(Cli::command(), true).unwrap_or_default();
         for sub in ["run", "serve"] {
-            let mut cmd = Cli::command()
-                .get_subcommands()
-                .find(|c| c.get_name() == sub)
-                .unwrap_or_else(|| panic!("no {sub} subcommand in: {help}"))
-                .clone();
-            let sub_help = cmd.render_long_help().to_string();
+            let sub_cmd = Cli::command()
+                .subcommands
+                .iter()
+                .copied()
+                .find(|c| c.name == sub)
+                .unwrap_or_else(|| panic!("no {sub} subcommand in: {help}"));
+            let sub_help = Cli::render_help(sub_cmd, true).unwrap_or_default();
+            let normalized: String = sub_help.split_whitespace().collect::<Vec<_>>().join(" ");
             assert!(
-                sub_help.contains("see `--reasoning-effort`"),
+                normalized.contains("see `--reasoning-effort`"),
                 "{sub} --thinking help must reference --reasoning-effort: {sub_help}"
             );
             assert!(
-                sub_help.contains("see `--thinking`"),
+                normalized.contains("see `--thinking`"),
                 "{sub} --reasoning-effort help must reference --thinking: {sub_help}"
             );
         }

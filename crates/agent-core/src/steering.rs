@@ -181,6 +181,20 @@ pub enum QueueMode {
     All,
 }
 
+impl std::str::FromStr for QueueMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "one_at_a_time" => Ok(QueueMode::OneAtATime),
+            "all" => Ok(QueueMode::All),
+            other => Err(format!(
+                "invalid queue mode {other:?}; expected one of one_at_a_time/all"
+            )),
+        }
+    }
+}
+
 /// A requested mid-run model switch (and, optionally, a new thinking budget) — see
 /// [`Steering::request_model_switch`]. Mirrors pi's `prepareNextTurn`/`nextTurnSnapshot`: a host can
 /// downgrade to a cheaper model once a run turns out not to need much firepower, or raise the model or

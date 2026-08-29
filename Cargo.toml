@@ -10,7 +10,7 @@ license = "MIT"
 # Floor set by `process-wrap` (a transitive dep of `rmcp`'s `transport-child-process` feature,
 # crates/agent's MCP client), which declares `rust-version = "1.87.0"` — bumped from 1.85 so this
 # field stays an honest promise rather than one only crates/agent's own dependency tree violates.
-rust-version = "1.87"
+rust-version = "1.92"
 
 # Lints live at the workspace level so every crate root in the tree inherits them via
 # `[lints] workspace = true`. That matters: a crate-level `#![deny(...)]` attribute only covers the
@@ -65,6 +65,7 @@ async-trait = "0.1"
 base64 = "0.22"
 bytes = "1"
 clap = { version = "4", features = ["derive", "env"] }
+usage = { package = "usage-rs", version = "6" }
 figment = { version = "0.10", features = ["toml", "env"] }
 # Stream combinators for the agent loop's streaming transport (`BoxStream<StreamEvent>`).
 futures = "0.3"
