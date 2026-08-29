@@ -1486,6 +1486,12 @@ fn cli() -> Cli {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Name the rustls crypto provider for the process up front. Every client-construction site calls
+    // this too (it is a `Once`), so this is belt-and-braces rather than the only guard — but doing it
+    // first means a provider is in place before any code path, including one added later, can reach a
+    // `reqwest::Client`. See `agent_core::tls` for why the provider must be installed at all.
+    agent_core::ensure_provider();
+
     // Always stderr, never stdout: `serve`'s NDJSON control protocol and `run`'s streamed output both
     // live on stdout, and a line-based client reading it can't tell a stray log line from a protocol
     // frame. `RUST_LOG=debug` (or any filter admitting a `warn!`/`info!` already present on a live

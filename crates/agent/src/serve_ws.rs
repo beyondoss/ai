@@ -692,6 +692,7 @@ fn build_shared_h2_client(cfg: &ServeConfig) -> Result<Option<reqwest::Client>, 
         .map(Duration::from_millis)
         .unwrap_or(DEFAULT_READ_TIMEOUT);
     let build = |prior_knowledge: bool| -> Result<reqwest::Client, String> {
+        agent_core::ensure_provider();
         let mut builder = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(10))
             .read_timeout(read_timeout)

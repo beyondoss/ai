@@ -74,6 +74,12 @@ zeroize = "1"
 # bundled root store (`webpki-roots`) alongside it.
 tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect", "handshake", "rustls-tls-native-roots"] }
 
+# Names the crypto provider for every rustls user in this workspace's binaries — see `tls.rs` for why
+# the provider must be installed explicitly rather than inferred. `ring`, matching `crates/gateway`'s
+# own pin, so there is exactly one crypto implementation in the tree instead of `ring` plus the
+# `aws-lc-sys` C blob reqwest's default `rustls` feature would drag in.
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+
 # Compresses the Codex SSE-fallback request body (`codex_websocket`'s HTTP/SSE path, used when the live
 # WebSocket transport above can't be used for a turn) — matches pi's own `zstdCompressSync` call in
 # `openai-codex-responses.ts`, which the real Codex backend's SSE endpoint accepts via

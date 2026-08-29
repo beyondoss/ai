@@ -267,6 +267,7 @@ async fn connect_http(config: &McpServerConfig, url: &str) -> Result<McpClient, 
     if let Some(token) = &bearer_token {
         transport_config = transport_config.auth_header(token.clone());
     }
+    agent_core::ensure_provider();
     let transport =
         StreamableHttpClientTransport::with_client(reqwest::Client::new(), transport_config);
 

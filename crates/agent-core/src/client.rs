@@ -282,6 +282,7 @@ impl CredentialSource for StaticCredential {
 /// [`CONNECT_TIMEOUT`]. Factored out so [`GatewayClient::new`] and
 /// [`GatewayClient::with_idle_timeout`] share one construction path.
 fn build_http(read_timeout: Duration) -> Result<reqwest::Client> {
+    crate::tls::ensure_provider();
     reqwest::Client::builder()
         .connect_timeout(CONNECT_TIMEOUT)
         .read_timeout(read_timeout)
@@ -2232,6 +2233,7 @@ mod tests {
     #[test]
     fn with_http_client_then_with_idle_timeout_keeps_the_shared_client() {
         // A distinct, caller-owned client standing in for the daemon's one shared pool.
+        crate::tls::ensure_provider();
         let shared = reqwest::Client::builder().build().unwrap();
         let client = GatewayClient::new("http://ai.internal", "test-key")
             .unwrap()
