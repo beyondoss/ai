@@ -34,7 +34,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y musl-tools
           rustup target add ${{ matrix.target }}
-      - name: Build beyond-ai-agent (static musl)
+      - name: Build beyond-ai-agent (static musl, PGO)
         run: |
           # `musl-tools` installs a native `musl-gcc` on each runner (x86_64 on amd64, aarch64 on
           # arm64), so a native build needs no cross-linker. Point cargo's per-target linker + `cc`
@@ -43,7 +43,42 @@ jobs:
           cc_env="CC_$(echo '${{ matrix.target }}' | tr '-' '_')"
           export "$linker_env=musl-gcc"
           export "$cc_env=musl-gcc"
-          cargo build --release -p beyond-ai-agent --target ${{ matrix.target }}
+
+          # Profile-guided optimization, for MEMORY rather than speed (though it helps both).
+          #
+          # This binary's idle RSS is dominated by resident *code*: ~7.2 MB of the ~9.3 MB an idle
+          # `serve` holds is text paged in from the binary, against only ~2.1 MB of anon. That
+          # resident set turns out to be locality-bound, not size-bound — the startup path is
+          # scattered across the binary, and the kernel's 64 KB fault-around drags in each touched
+          # function's neighbours. Measured: `opt-level="z"` halves `.text` (16,981 → 9,202 KB) and
+          # makes resident text *worse* (6.32 → 6.55 MB), which is why we do not use it. PGO attacks
+          # the actual problem by grouping what runs, and measures out at 9.34 → 8.30 MB idle RSS
+          # (resident text 7.17 → 6.12) with startup unchanged-to-better.
+          #
+          # Three stages, per arch, on the native runner — profiles are architecture-specific, so
+          # each matrix job trains its own. The profile is generated fresh every release rather than
+          # checked in: a stale profile degrades silently, and 13 MB of binary data in git ages badly.
+          PROFDIR="$RUNNER_TEMP/pgo"
+          rm -rf "$PROFDIR"; mkdir -p "$PROFDIR/raw"
+          # `llvm-profdata` ships in the toolchain's own bin dir (the `llvm-tools-preview` component,
+          # pinned in mise.toml so CI and a developer's box agree). Its path embeds the *host* triple,
+          # which differs per runner, so ask rustc rather than hardcoding it.
+          host="$(rustc -vV | awk '/^host: /{print $2}')"
+          profdata="$(rustc --print sysroot)/lib/rustlib/$host/bin/llvm-profdata"
+          test -x "$profdata" || { echo "llvm-profdata missing at $profdata"; exit 1; }
+
+          RUSTFLAGS="-Cprofile-generate=$PROFDIR/raw" \
+            cargo build --release -p beyond-ai-agent --target ${{ matrix.target }}
+          python3 .github/pgo-train.py \
+            "target/${{ matrix.target }}/release/beyond-ai-agent" "$PROFDIR/raw"
+          "$profdata" merge -o "$PROFDIR/merged.profdata" "$PROFDIR"/raw/*.profraw
+
+          # The instrumented artifacts must not be reused by the optimized build — different
+          # RUSTFLAGS already force a rebuild, but be explicit so a future flag change can't make the
+          # shipped binary silently inherit instrumentation.
+          rm -rf "target/${{ matrix.target }}/release"
+          RUSTFLAGS="-Cprofile-use=$PROFDIR/merged.profdata" \
+            cargo build --release -p beyond-ai-agent --target ${{ matrix.target }}
       # Deliberately NOT UPX-compressed. UPX self-extracts the whole image into anonymous memory at
       # exec, which defeats demand paging: the text segment stops being a clean, shared, file-backed
       # mapping and becomes private dirty anon that can't be evicted (only swapped) and can't be

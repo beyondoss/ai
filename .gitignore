@@ -12,3 +12,6 @@ bench/out/
 .mcp.json
 .claude
 .env
+
+# Byte-compiled Python from `.github/pgo-train.py` (the release PGO training driver).
+__pycache__/
