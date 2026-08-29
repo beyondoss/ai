@@ -89,7 +89,10 @@ impl HttpExecRunner {
         }
         Ok(Self {
             url,
-            client: reqwest::Client::new(),
+            client: {
+                agent_core::ensure_provider();
+                reqwest::Client::new()
+            },
             headers: Vec::new(),
         })
     }

@@ -144,7 +144,15 @@ http = "1"
 # drive `rmcp::transport::auth::AuthorizationManager` directly, reusing this crate's existing
 # `oauth::callback_server::CallbackServer` for the redirect. Pulls in `oauth2` (new transitive dep) and
 # `url` (already an existing direct dependency, for the OAuth module's own callback-URL parsing).
-rmcp = { version = "2.1.0", default-features = false, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "reqwest", "auth"] }
+# `reqwest-tls-no-provider` rather than `reqwest`: the latter turns on reqwest's `rustls` feature, which
+# is hard-wired to the **aws-lc-rs** provider (`__rustls-aws-lc-rs`) and drags in the `aws-lc-sys` C
+# blob — 1.3 MiB of `.text` in a binary that ships into a 768 MB guest, and a second crypto stack
+# alongside the `ring` the rest of the workspace standardized on (`crates/gateway` pins
+# `rustls/ring` explicitly). The `-no-provider` variant enables the same TLS machinery but leaves the
+# provider unselected; `agent-core`'s `rustls` pin names it for the whole graph, and every
+# client-construction site installs it via `agent_core::ensure_provider()` (see `agent-core/src/tls.rs`
+# for why that has to be explicit rather than inferred from crate features).
+rmcp = { version = "2.1.0", default-features = false, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "reqwest-tls-no-provider", "auth"] }
 
 # `serve --listen`'s WebSocket transport (`serve_ws`): the server/`accept_async` side. Only
 # `handshake` is needed here (a plain-`ws://` loopback listener — the edge terminates TLS in front of

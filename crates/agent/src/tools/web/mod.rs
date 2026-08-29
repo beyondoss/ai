@@ -71,6 +71,10 @@ impl Web {
     /// and any hop) validates the *resolved* IP.
     fn client(&self) -> &reqwest::Client {
         self.client.get_or_init(|| {
+            // Before *any* builder call: with reqwest's `rustls-no-provider`, a missing process-wide
+            // provider panics inside `build()` rather than returning `Err`, so the `unwrap_or_else`
+            // fallback below could never catch it (and its `Client::new()` would panic too).
+            agent_core::ensure_provider();
             reqwest::Client::builder()
                 .user_agent(USER_AGENT)
                 .connect_timeout(Duration::from_secs(10))

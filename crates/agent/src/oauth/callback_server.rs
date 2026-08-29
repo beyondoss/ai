@@ -208,6 +208,7 @@ mod tests {
         let client = tokio::spawn(async move {
             // Give the server a moment to be actively waiting.
             tokio::time::sleep(Duration::from_millis(50)).await;
+            agent_core::ensure_provider();
             reqwest::Client::new()
                 .get(format!(
                     "http://127.0.0.1:{port}/callback?code=abc123&state=xyz"
@@ -232,6 +233,7 @@ mod tests {
         let cancel_for_client = cancel.clone();
         let client = tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(50)).await;
+            agent_core::ensure_provider();
             let http = reqwest::Client::new();
             let bad = http
                 .get(format!(

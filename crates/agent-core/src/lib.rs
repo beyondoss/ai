@@ -37,6 +37,7 @@ pub mod mock;
 pub mod models;
 pub mod session;
 pub mod steering;
+pub mod tls;
 pub mod tool;
 pub mod transport;
 pub mod validation;
@@ -60,6 +61,7 @@ pub use models::{
 };
 pub use session::Session;
 pub use steering::{ModelSwitch, QueueMode, Steering, SteeringMessage};
+pub use tls::ensure_provider;
 pub use tool::{Tool, ToolOutput, ToolProgress, ToolRegistry, ToolUpdate};
 pub use transport::{
     ModelRequest, ModelTransport, ReasoningEffort, ReasoningSummary, ServiceTier, ToolChoice,
