@@ -206,10 +206,11 @@ impl beyond_ai_agent::oauth::LoginCallbacks for CliLoginCallbacks {
         if choice.is_empty() {
             return Ok(options.first().map(|s| s.to_string()));
         }
-        if let Ok(n) = choice.parse::<usize>() {
-            if n >= 1 && n <= options.len() {
-                return Ok(Some(options[n - 1].to_string()));
-            }
+        if let Ok(n) = choice.parse::<usize>()
+            && n >= 1
+            && n <= options.len()
+        {
+            return Ok(Some(options[n - 1].to_string()));
         }
         // Also accept typing the id directly.
         Ok(options
@@ -220,7 +221,12 @@ impl beyond_ai_agent::oauth::LoginCallbacks for CliLoginCallbacks {
 }
 
 #[derive(Cli)]
-#[usage(bin = "beyond-ai-agent", version, about = "Beyond agent harness", unknown_flags = "error")]
+#[usage(
+    bin = "beyond-ai-agent",
+    version,
+    about = "Beyond agent harness",
+    unknown_flags = "error"
+)]
 struct Cli {
     #[usage(subcommand)]
     command: Command,
@@ -1338,17 +1344,19 @@ fn fuzzy_match(query: &str, candidate: &str) -> Option<f64> {
 /// regex pair. `None` for anything else (mixed/interleaved characters, or already all one class).
 fn swap_alpha_digit(query: &str) -> Option<String> {
     let chars: Vec<char> = query.chars().collect();
-    if let Some(split) = chars.iter().position(|c| !c.is_ascii_lowercase()) {
-        if split > 0 && chars[split..].iter().all(char::is_ascii_digit) {
-            let (letters, digits) = (&chars[..split], &chars[split..]);
-            return Some(digits.iter().chain(letters).collect());
-        }
+    if let Some(split) = chars.iter().position(|c| !c.is_ascii_lowercase())
+        && split > 0
+        && chars[split..].iter().all(char::is_ascii_digit)
+    {
+        let (letters, digits) = (&chars[..split], &chars[split..]);
+        return Some(digits.iter().chain(letters).collect());
     }
-    if let Some(split) = chars.iter().position(|c| !c.is_ascii_digit()) {
-        if split > 0 && chars[split..].iter().all(char::is_ascii_lowercase) {
-            let (digits, letters) = (&chars[..split], &chars[split..]);
-            return Some(letters.iter().chain(digits).collect());
-        }
+    if let Some(split) = chars.iter().position(|c| !c.is_ascii_digit())
+        && split > 0
+        && chars[split..].iter().all(char::is_ascii_lowercase)
+    {
+        let (digits, letters) = (&chars[..split], &chars[split..]);
+        return Some(letters.iter().chain(digits).collect());
     }
     None
 }
@@ -1466,7 +1474,7 @@ fn cli() -> Cli {
             } else {
                 spec.version.unwrap_or_default()
             };
-            print!("{bin} {version}\n");
+            println!("{bin} {version}");
             std::process::exit(0);
         }
         Err(err) => {
@@ -1695,10 +1703,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         } => {
             // Fail fast, before starting the server — see `run_task`'s identical check for why this
             // rejects rather than silently clearing (pi's own `--name` behavior).
-            if let Some(n) = &name {
-                if n.trim().is_empty() {
-                    return Err("--name requires a non-empty value".into());
-                }
+            if let Some(n) = &name
+                && n.trim().is_empty()
+            {
+                return Err("--name requires a non-empty value".into());
             }
             // A malformed `--deny-path` glob must never silently produce a no-op policy — see
             // `ToolPolicy::deny_path`'s doc comment for the fail-open this closes.
@@ -1707,14 +1715,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             // Same filesystem-path-injection concern as `run`'s identical check (`--session-id` becomes
             // part of a persisted session's filename) — see `is_valid_session_id`'s doc comment.
-            if let Some(id) = &session_id {
-                if !is_valid_session_id(id) {
-                    return Err(format!(
+            if let Some(id) = &session_id
+                && !is_valid_session_id(id)
+            {
+                return Err(format!(
                         "--session-id {id:?} is invalid: must contain only letters, digits, '.', '_', \
                          '-', and start/end with a letter or digit — it becomes part of a filesystem path"
                     )
                     .into());
-                }
             }
             // `--system-prompt`/`--append-system-prompt` may each name an existing, readable file
             // instead of literal text (pi-parity fix — matches pi's own `resolvePromptInput`). `run`'s
@@ -1807,10 +1815,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Validated once the whole fallback chain (explicit flag, then stored setting) has resolved
             // — moved below the resolution above so a value that only came from a stored default is
             // checked exactly like an explicit flag would be, not skipped.
-            if let Some(path) = &bash_shell_path {
-                if !std::path::Path::new(path).exists() {
-                    return Err(format!("--bash-shell-path not found: {path}").into());
-                }
+            if let Some(path) = &bash_shell_path
+                && !std::path::Path::new(path).exists()
+            {
+                return Err(format!("--bash-shell-path not found: {path}").into());
             }
             // Task #5 (pi-parity fix): whether the operator explicitly passed `--model`/
             // `--reasoning-effort` for *this* invocation, as opposed to falling back to a stored
@@ -1845,11 +1853,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // this block's own doc comment mentions must prefer this operator-requested depth over a
             // reattached session's last-recorded one, same as an explicit `--reasoning-effort` would.
             let mut reasoning_effort = reasoning_effort;
-            if !reasoning_effort_explicit {
-                if let Some(level) = model_thinking_level {
-                    reasoning_effort = Some(level);
-                    reasoning_effort_explicit = true;
-                }
+            if !reasoning_effort_explicit && let Some(level) = model_thinking_level {
+                reasoning_effort = Some(level);
+                reasoning_effort_explicit = true;
             }
             // Fix 2 (pi-parity gap): `run`'s identical stored-default fallback for `--reasoning-effort`
             // — see that call site's doc comment. Converted from the portable `ThinkingLevel` (off
@@ -2851,10 +2857,10 @@ async fn read_file_refs_with_home(
 /// that merely happens to look like a path.
 fn resolve_prompt_input(raw: &str) -> String {
     let path = Path::new(raw);
-    if path.is_file() {
-        if let Ok(contents) = fs::read_to_string(path) {
-            return contents;
-        }
+    if path.is_file()
+        && let Ok(contents) = fs::read_to_string(path)
+    {
+        return contents;
     }
     raw.to_string()
 }
@@ -3165,10 +3171,10 @@ impl agent_core::CheckpointHook for DirectCheckpoint {
         // eprintln, not silently swallowed — and the next successful persist, or `persist_run_tail`
         // after the turn ends, will catch up whatever this attempt missed).
         let mut guard = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(store) = guard.as_mut() {
-            if let Err(e) = store.append_new(&session.messages) {
-                eprintln!("run: failed to persist checkpoint: {e}");
-            }
+        if let Some(store) = guard.as_mut()
+            && let Err(e) = store.append_new(&session.messages)
+        {
+            eprintln!("run: failed to persist checkpoint: {e}");
         }
     }
 }
@@ -3279,10 +3285,10 @@ async fn run_task(
     // rejected outright here (a startup argument the operator clearly meant to be meaningful), unlike
     // the RPC `set_session_name` command's "empty clears the title" convention (renaming an
     // already-running session to nothing is a deliberate, different action).
-    if let Some(n) = &name {
-        if n.trim().is_empty() {
-            return Err("--name requires a non-empty value".into());
-        }
+    if let Some(n) = &name
+        && n.trim().is_empty()
+    {
+        return Err("--name requires a non-empty value".into());
     }
     // A malformed `--deny-path` glob must never silently produce a no-op policy — see
     // `ToolPolicy::deny_path`'s doc comment for the fail-open this closes.
@@ -3293,14 +3299,14 @@ async fn run_task(
     // `SessionRepo::path_for`'s `{created_at}_{id}.jsonl`) with no other sanitization — an id like
     // `../../../tmp/pwned/evil` would write (and `mkdir -p`, since `SessionStore::create` does that
     // too) outside the intended sessions directory. Matches pi's own `assertValidSessionId`.
-    if let Some(id) = &session_id {
-        if !is_valid_session_id(id) {
-            return Err(format!(
-                "--session-id {id:?} is invalid: must contain only letters, digits, '.', '_', '-', \
+    if let Some(id) = &session_id
+        && !is_valid_session_id(id)
+    {
+        return Err(format!(
+            "--session-id {id:?} is invalid: must contain only letters, digits, '.', '_', '-', \
                  and start/end with a letter or digit — it becomes part of a filesystem path"
-            )
-            .into());
-        }
+        )
+        .into());
     }
     let mut timing = beyond_ai_agent::timing::StartupTiming::new();
     let cwd = canonical_cwd(&std::env::current_dir().unwrap_or_default());
@@ -3434,10 +3440,10 @@ async fn run_task(
     // multi-step run, rather than failing the invocation immediately. Validated once the whole
     // fallback chain (explicit flag, then stored setting) has resolved, matching `Command::Serve`'s
     // own identical placement/comment.
-    if let Some(path) = &bash_shell_path {
-        if !std::path::Path::new(path).exists() {
-            return Err(format!("--bash-shell-path not found: {path}").into());
-        }
+    if let Some(path) = &bash_shell_path
+        && !std::path::Path::new(path).exists()
+    {
+        return Err(format!("--bash-shell-path not found: {path}").into());
     }
     let bash_command_prefix =
         bash_command_prefix.or_else(|| stored_settings.default_bash_command_prefix.clone());
@@ -4021,14 +4027,12 @@ async fn run_task(
     // branch above mints its own fresh `SessionMeta` internally when no cwd match exists, bypassing the
     // `fresh_meta` closure other branches use, so this was previously the one path `--name` silently
     // never reached even when it *did* open a brand-new session.
-    if let Some(name) = &name {
-        if session.messages.is_empty() {
-            if let Some(store) = &mut store {
-                if store.meta().title.is_none() {
-                    store.set_title(name)?;
-                }
-            }
-        }
+    if let Some(name) = &name
+        && session.messages.is_empty()
+        && let Some(store) = &mut store
+        && store.meta().title.is_none()
+    {
+        store.set_title(name)?;
     }
     let meta = store
         .as_ref()
@@ -4561,7 +4565,12 @@ mod tests {
                 "--tools",
                 "bash,read,write",
             ],
-            &["beyond-ai-agent", "settings", "--model", "claude-sonnet-4-5"],
+            &[
+                "beyond-ai-agent",
+                "settings",
+                "--model",
+                "claude-sonnet-4-5",
+            ],
         ];
         const WARMUP: u32 = 200;
         const ITERS: u32 = 5_000;

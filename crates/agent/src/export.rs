@@ -514,10 +514,10 @@ impl MessageStats {
                 }
                 Role::Assistant => {
                     assistant_messages += 1;
-                    if let Some(id) = &m.model_id {
-                        if !models.contains(id) {
-                            models.push(id.clone());
-                        }
+                    if let Some(id) = &m.model_id
+                        && !models.contains(id)
+                    {
+                        models.push(id.clone());
                     }
                 }
                 Role::System => {}
@@ -1436,19 +1436,19 @@ fn render_markdown(text: &str) -> String {
 
     let mut out_events: Vec<Event> = Vec::new();
     while let Some(event) = iter.next() {
-        if let Event::Start(Tag::CodeBlock(CodeBlockKind::Fenced(ref lang))) = event {
-            if lang.as_ref() == "diff" {
-                let mut code = String::new();
-                for inner in iter.by_ref() {
-                    match inner {
-                        Event::Text(t) => code.push_str(&t),
-                        Event::End(TagEnd::CodeBlock) => break,
-                        _ => {}
-                    }
+        if let Event::Start(Tag::CodeBlock(CodeBlockKind::Fenced(ref lang))) = event
+            && lang.as_ref() == "diff"
+        {
+            let mut code = String::new();
+            for inner in iter.by_ref() {
+                match inner {
+                    Event::Text(t) => code.push_str(&t),
+                    Event::End(TagEnd::CodeBlock) => break,
+                    _ => {}
                 }
-                out_events.push(Event::Html(CowStr::from(diff_html(&code))));
-                continue;
             }
+            out_events.push(Event::Html(CowStr::from(diff_html(&code))));
+            continue;
         }
         out_events.push(event);
     }
@@ -1571,12 +1571,11 @@ fn parse_summary_marker(text: &str) -> Option<(&'static str, &'static str, Optio
 /// entirely from a branch-summary body (that class never carries this line) or from a legacy/malformed
 /// marker predating this line's introduction, in which case this is a no-op (`None`, `body` unchanged).
 fn parse_compaction_tokens_before(body: &str) -> (Option<u64>, &str) {
-    if let Some(rest) = body.strip_prefix("Compacted from ") {
-        if let Some((count, rest)) = rest.split_once(" tokens\n\n") {
-            if let Ok(n) = count.parse::<u64>() {
-                return (Some(n), rest);
-            }
-        }
+    if let Some(rest) = body.strip_prefix("Compacted from ")
+        && let Some((count, rest)) = rest.split_once(" tokens\n\n")
+        && let Ok(n) = count.parse::<u64>()
+    {
+        return (Some(n), rest);
     }
     (None, body)
 }
@@ -1950,10 +1949,10 @@ pub fn export_html_with_usage(
         Some(p) => PathBuf::from(p),
         None => default_export_path(),
     };
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)?;
-        }
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
     }
     let html = render_html(meta, messages, branches, usage);
     let mut file = std::fs::File::create(&path)?;
@@ -1979,10 +1978,10 @@ pub fn export_html_with_entries(
         Some(p) => PathBuf::from(p),
         None => default_export_path(),
     };
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)?;
-        }
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
     }
     let html = render_html_with_entries(meta, messages, branches, None, events);
     let mut file = std::fs::File::create(&path)?;
@@ -2014,10 +2013,10 @@ pub fn export_html_full(
         Some(p) => PathBuf::from(p),
         None => default_export_path(),
     };
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)?;
-        }
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
     }
     let html = render_html_full(
         meta,

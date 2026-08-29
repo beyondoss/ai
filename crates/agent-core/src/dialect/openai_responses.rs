@@ -123,11 +123,11 @@ fn unescape_tool_id_part(s: &str) -> std::borrow::Cow<'_, str> {
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars();
     while let Some(c) = chars.next() {
-        if c == '\\' {
-            if let Some(next) = chars.next() {
-                out.push(next);
-                continue;
-            }
+        if c == '\\'
+            && let Some(next) = chars.next()
+        {
+            out.push(next);
+            continue;
         }
         out.push(c);
     }
@@ -361,11 +361,11 @@ fn push_assistant_content(input: &mut Vec<Value>, blocks: &[ContentBlock], msg_i
                 text_block_index += 1;
             }
             ContentBlock::Thinking { text, signature } => {
-                if !signature.is_empty() {
-                    if let Ok(item) = serde_json::from_str::<Value>(signature) {
-                        input.push(item);
-                        continue;
-                    }
+                if !signature.is_empty()
+                    && let Ok(item) = serde_json::from_str::<Value>(signature)
+                {
+                    input.push(item);
+                    continue;
                 }
                 // Non-JSON signature: a cross-model replay after `set_model`'s thinking scrub, or a
                 // genuinely foreign block. Can't be replayed as a reasoning item — degrade to plain
@@ -426,10 +426,10 @@ pub fn build_body(req: &ModelRequest) -> Value {
     // Codex/ChatGPT's own backend wants the system prompt carried in a separate top-level
     // `instructions` field (below) instead of folded into `input[0]` — every other route keeps this
     // vanilla native-OpenAI-Responses shape. See `req.is_codex`'s own doc comment.
-    if !req.is_codex {
-        if let Some(system) = req.system.as_deref() {
-            input.push(json!({ "role": instruction_role(&req.model, &caps), "content": system }));
-        }
+    if !req.is_codex
+        && let Some(system) = req.system.as_deref()
+    {
+        input.push(json!({ "role": instruction_role(&req.model, &caps), "content": system }));
     }
     for (msg_index, m) in req.messages.iter().enumerate() {
         match m.role {
@@ -575,13 +575,13 @@ pub fn build_body(req: &ModelRequest) -> Value {
     // options?.sessionId)` completely unconditionally — there's no `no_cache`-equivalent gate on that
     // backend's own `buildRequestBody` at all, so Codex must send its cache key regardless (latent today
     // since nothing sets `no_cache: true` in production yet, but a real divergence if that changes).
-    if req.is_codex || !req.no_cache {
-        if let Some(key) = &req.cache_key {
-            map.insert(
-                "prompt_cache_key".into(),
-                json!(super::openai::clamp_prompt_cache_key(key)),
-            );
-        }
+    if (req.is_codex || !req.no_cache)
+        && let Some(key) = &req.cache_key
+    {
+        map.insert(
+            "prompt_cache_key".into(),
+            json!(super::openai::clamp_prompt_cache_key(key)),
+        );
     }
     // pi's `azure-openai-responses.ts` never calls `resolveCacheRetention`/`getPromptCacheRetention` at
     // all — only the direct `openai-responses.ts` dialect opts into the 24h retention tier. See

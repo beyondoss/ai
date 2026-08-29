@@ -64,7 +64,6 @@ async-trait = "0.1"
 base64 = "0.22"
 bytes = "1"
 clap = { version = "4", features = ["derive", "env"] }
-usage = { package = "usage-rs", version = "6" }
 figment = { version = "0.10", features = ["toml", "env"] }
 # Stream combinators for the agent loop's streaming transport (`BoxStream<StreamEvent>`).
 futures = "0.3"
@@ -85,3 +84,4 @@ tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+usage = { package = "usage-rs", version = "6" }

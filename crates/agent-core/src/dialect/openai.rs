@@ -441,10 +441,10 @@ pub fn build_body(req: &ModelRequest) -> Value {
                                     "arguments": serde_json::to_string(input).unwrap_or_else(|_| "{}".into()),
                                 },
                             }));
-                            if let Some(sig) = thought_signature {
-                                if let Ok(detail) = serde_json::from_str::<Value>(sig) {
-                                    reasoning_details.push(detail);
-                                }
+                            if let Some(sig) = thought_signature
+                                && let Ok(detail) = serde_json::from_str::<Value>(sig)
+                            {
+                                reasoning_details.push(detail);
                             }
                         }
                         _ => {}
@@ -546,13 +546,14 @@ pub fn build_body(req: &ModelRequest) -> Value {
     // Also gated on `!req.no_cache` — `ModelRequest::no_cache`'s own doc comment promises to skip
     // OpenAI's `prompt_cache_key`/`prompt_cache_retention` too (equivalently to Anthropic's
     // `cache_control`), matching pi's `cacheRetention === "none"` check (`openai-completions.ts`).
-    if caps.supports_long_cache && !req.no_cache {
-        if let Some(key) = &req.cache_key {
-            map.insert(
-                "prompt_cache_key".into(),
-                json!(clamp_prompt_cache_key(key)),
-            );
-        }
+    if caps.supports_long_cache
+        && !req.no_cache
+        && let Some(key) = &req.cache_key
+    {
+        map.insert(
+            "prompt_cache_key".into(),
+            json!(clamp_prompt_cache_key(key)),
+        );
     }
     // Opt into the 24h cache-retention tier (vs the default, shorter one) when the caller asked and the
     // model's capability entry allows it — mirrors the Anthropic dialect's `cache_long` gating.
@@ -675,10 +676,10 @@ fn apply_reasoning_wire(
                 "reasoning".into(),
                 json!({ "enabled": requested.is_some() }),
             );
-            if caps.reasoning_effort {
-                if let Some(effort) = requested {
-                    map.insert("reasoning_effort".into(), json!(wire_str(effort)));
-                }
+            if caps.reasoning_effort
+                && let Some(effort) = requested
+            {
+                map.insert("reasoning_effort".into(), json!(wire_str(effort)));
             }
         }
         Fmt::OpenRouter => {
@@ -1108,19 +1109,19 @@ impl StreamDecoder for Decoder {
         }
 
         // Plain text content.
-        if let Some(text) = delta.and_then(|d| d.get("content")).and_then(Value::as_str) {
-            if !text.is_empty() {
-                if self.open == Open::Thinking {
-                    self.close_text_or_thinking(&mut out);
-                }
-                if self.open == Open::None {
-                    self.open = Open::Text;
-                }
-                out.push(StreamEvent::TextDelta {
-                    index: 0,
-                    text: text.to_string(),
-                });
+        if let Some(text) = delta.and_then(|d| d.get("content")).and_then(Value::as_str)
+            && !text.is_empty()
+        {
+            if self.open == Open::Thinking {
+                self.close_text_or_thinking(&mut out);
             }
+            if self.open == Open::None {
+                self.open = Open::Text;
+            }
+            out.push(StreamEvent::TextDelta {
+                index: 0,
+                text: text.to_string(),
+            });
         }
 
         // Tool-call deltas: id+name on first sight of a call, then `arguments` fragments. A provider
@@ -1224,34 +1225,33 @@ impl StreamDecoder for Decoder {
                 // First id wins — a later mutated id on an already-open index (Kimi/Moonshot) is still
                 // routed here by `wire_index`/the id lookup above, but never overwrites the id this
                 // call was first opened with.
-                if self.open_tools[slot].id.is_empty() {
-                    if let Some(id) = id {
-                        self.open_tools[slot].id = id.to_string();
-                    }
+                if self.open_tools[slot].id.is_empty()
+                    && let Some(id) = id
+                {
+                    self.open_tools[slot].id = id.to_string();
                 }
 
                 // A `reasoning_details` entry for this call's id may have arrived before the call
                 // itself opened (see the `reasoning_details` handling below) — drain it now that the
                 // id is known, rather than only checking at the moment the entry itself arrives.
-                if !self.open_tools[slot].id.is_empty() {
-                    if let Some(signature) = self
+                if !self.open_tools[slot].id.is_empty()
+                    && let Some(signature) = self
                         .pending_reasoning_details
                         .remove(&self.open_tools[slot].id)
-                    {
-                        out.push(StreamEvent::SignatureDelta {
-                            index: self.open_tools[slot].stream_index,
-                            signature,
-                        });
-                    }
+                {
+                    out.push(StreamEvent::SignatureDelta {
+                        index: self.open_tools[slot].stream_index,
+                        signature,
+                    });
                 }
 
-                if let Some(args) = args {
-                    if !args.is_empty() {
-                        out.push(StreamEvent::InputJsonDelta {
-                            index: self.open_tools[slot].stream_index,
-                            partial_json: args.to_string(),
-                        });
-                    }
+                if let Some(args) = args
+                    && !args.is_empty()
+                {
+                    out.push(StreamEvent::InputJsonDelta {
+                        index: self.open_tools[slot].stream_index,
+                        partial_json: args.to_string(),
+                    });
                 }
             }
         }

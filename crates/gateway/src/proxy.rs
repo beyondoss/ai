@@ -983,18 +983,18 @@ impl ProxyHttp for AiProxy {
         // IPs (global BYO tier — managed traffic is exempt, see `ratelimit`). The `check` borrow of
         // `raw_key` ends as the call returns, so the `&mut session` reject is free to run on the
         // over-limit path (where `raw_key` is unused afterward).
-        if let Some(rl) = &self.state.rate_limit {
-            if let Some(reason) = rl.check(raw_key, raw_key.starts_with("bai_")) {
-                self.state.metrics.rejection(reason.into()).inc();
-                return Self::reject_boxed(
-                    session,
-                    &request_id,
-                    429,
-                    "rate_limit_error",
-                    "rate limit exceeded",
-                )
-                .await;
-            }
+        if let Some(rl) = &self.state.rate_limit
+            && let Some(reason) = rl.check(raw_key, raw_key.starts_with("bai_"))
+        {
+            self.state.metrics.rejection(reason.into()).inc();
+            return Self::reject_boxed(
+                session,
+                &request_id,
+                429,
+                "rate_limit_error",
+                "rate limit exceeded",
+            )
+            .await;
         }
 
         // 4. Reject oversized bodies up front (Content-Length) so we never buffer a huge upload.
@@ -1004,17 +1004,17 @@ impl ProxyHttp for AiProxy {
             .get("content-length")
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.parse::<usize>().ok());
-        if let Some(len) = declared_len {
-            if len > MAX_REQUEST_BODY {
-                return Self::reject_boxed(
-                    session,
-                    &request_id,
-                    413,
-                    "invalid_request_error",
-                    "request body too large",
-                )
-                .await;
-            }
+        if let Some(len) = declared_len
+            && len > MAX_REQUEST_BODY
+        {
+            return Self::reject_boxed(
+                session,
+                &request_id,
+                413,
+                "invalid_request_error",
+                "request body too large",
+            )
+            .await;
         }
 
         // 5. Identity + key handling. `bai_…` → managed (stateless verify → deny-check → swap to the
@@ -1217,20 +1217,19 @@ impl ProxyHttp for AiProxy {
         // `upstream_peer` picks a candidate, and gating here would claim a permit against candidate
         // 0 and then claim a second one against whichever candidate is actually tried. That path
         // gates per candidate instead, at the same "last thing before the connection" position.
-        if model_route.is_none() {
-            if let Some(breaker) = &provider.breaker {
-                if breaker.allow().is_err() {
-                    self.state.metrics.rejection(Rejection::CircuitOpen).inc();
-                    return Self::reject_boxed(
-                        session,
-                        &request_id,
-                        503,
-                        "api_error",
-                        "provider temporarily unavailable",
-                    )
-                    .await;
-                }
-            }
+        if model_route.is_none()
+            && let Some(breaker) = &provider.breaker
+            && breaker.allow().is_err()
+        {
+            self.state.metrics.rejection(Rejection::CircuitOpen).inc();
+            return Self::reject_boxed(
+                session,
+                &request_id,
+                503,
+                "api_error",
+                "provider temporarily unavailable",
+            )
+            .await;
         }
         // A permit is now outstanding against this provider (see `RequestCtx::breaker_pending`).
         // `breaker.is_some()` is exactly the condition `logging` used to test inline before the
@@ -1378,12 +1377,12 @@ impl ProxyHttp for AiProxy {
                 // transition happens *inside* `allow()`, so a `state()`-based pre-check would report
                 // `Open` past the reset timeout, skip a candidate that `allow()` would have admitted
                 // as a probe, and leave the breaker with no way to ever close.
-                if let Some(b) = &p.breaker {
-                    if b.allow().is_err() {
-                        self.state.metrics.rejection(Rejection::CircuitOpen).inc();
-                        rc.advance_candidate(i);
-                        continue;
-                    }
+                if let Some(b) = &p.breaker
+                    && b.allow().is_err()
+                {
+                    self.state.metrics.rejection(Rejection::CircuitOpen).inc();
+                    rc.advance_candidate(i);
+                    continue;
                 }
                 // A permit (if this breaker has one to give) is now outstanding against `p`.
                 rc.breaker_pending = p.breaker.is_some();
@@ -1714,14 +1713,14 @@ impl ProxyHttp for AiProxy {
                 // One structural walk for every answer (see `peek::scan_buffered`).
                 let buf = std::mem::take(&mut rc.req_buf);
                 let scan = peek::scan_buffered(&buf);
-                if rc.model.is_empty() {
-                    if let Some(m) = scan.model {
-                        // The *client's* id, captured before any rewrite below — this is what
-                        // `requested_model` means, and it stays the canonical catalog name on a
-                        // model-routed request even though the upstream is about to be told
-                        // something else.
-                        rc.model = sanitize_model(m).into_owned();
-                    }
+                if rc.model.is_empty()
+                    && let Some(m) = scan.model
+                {
+                    // The *client's* id, captured before any rewrite below — this is what
+                    // `requested_model` means, and it stays the canonical catalog name on a
+                    // model-routed request even though the upstream is about to be told
+                    // something else.
+                    rc.model = sanitize_model(m).into_owned();
                 }
                 // Model-routed: re-spell `model` as the candidate serving *this attempt* spells it.
                 // Providers essentially never agree on an id — Anthropic's `claude-opus-4-8` is
@@ -1759,10 +1758,13 @@ impl ProxyHttp for AiProxy {
 
         // The streamed (non-buffered) path; the buffered one resolved `model` above from its single
         // fused walk, and its scanner was never fed.
-        if end_of_stream && rc.managed && !rc.inject_eligible && rc.model.is_empty() {
-            if let Some(m) = rc.model_scanner.take_model() {
-                rc.model = sanitize_model(m).into_owned();
-            }
+        if end_of_stream
+            && rc.managed
+            && !rc.inject_eligible
+            && rc.model.is_empty()
+            && let Some(m) = rc.model_scanner.take_model()
+        {
+            rc.model = sanitize_model(m).into_owned();
         }
         Ok(())
     }

@@ -35,10 +35,10 @@ impl OAuthCredentialSource {
 impl agent_core::client::CredentialSource for OAuthCredentialSource {
     async fn credential(&self) -> agent_core::Result<agent_core::client::Credential> {
         let now = now_ms();
-        if let Some((access, expires_at_ms)) = cached_snapshot(&self.cached) {
-            if now < expires_at_ms {
-                return Ok(agent_core::client::Credential::new(access, true));
-            }
+        if let Some((access, expires_at_ms)) = cached_snapshot(&self.cached)
+            && now < expires_at_ms
+        {
+            return Ok(agent_core::client::Credential::new(access, true));
         }
 
         let provider = self.provider;

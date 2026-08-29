@@ -337,137 +337,133 @@ fn resolve_with(
     // OAuth was never consulted at all for an override, silently going bearer-less for a model an
     // operator had a perfectly good subscription login for; this fix (and the paragraph above) make the
     // two agree.
-    if let Some(over) = overrides.get(model) {
-        if let Some(base_url) = over.base_url.clone() {
-            // Fix #39 (pi-parity audit, judgment call): a handful of third-party-aggregator model ids
-            // (OpenCode Zen's `gemini-3-flash`/`gemini-3.1-pro`/`gemini-3.5-flash`) speak Google's own
-            // Generative AI wire format, which `agent_core::dialect::Dialect` has no variant for (the
-            // standing "Gemini-direct native dialect" deferral — out of scope to build here). Left
-            // unchecked, a BYO override naming one of these ids with no explicit `dialect` would
-            // silently fall back to `Dialect::for_model`'s OpenAI-family default and send an
-            // OpenAI-shaped body to an endpoint that doesn't understand it — a confusing *provider*-side
-            // failure instead of a clear one from us. An explicit `dialect` on the override is the
-            // escape hatch (e.g. an operator fronting Gemini with an OpenAI-compatible proxy of their
-            // own) — this only fires when that's genuinely unset.
-            if over.dialect.is_none() {
-                if let Some(reason) = unsupported_wire_format_reason(model) {
-                    return Err(reason);
-                }
-            }
-            // pi-parity pass 20, Task 3/5: which known third-party aggregator (if any) this override's
-            // `base_url` names — see [`aggregator_host_for_base_url`]'s own doc comment. Computed here,
-            // before `dialect` below, so both the dialect selection AND `DirectRouting::aggregator_host`
-            // (threaded across the crate boundary to `agent_core::client::GatewayClient::stream`, which
-            // sets `ModelRequest::host` from it) reuse the identical value — no second, independent
-            // detection path.
-            let aggregator_host = aggregator_host_for_base_url(&base_url);
-            // Fix 1 (pi-parity, Round 2): an explicit `dialect` override wins over
-            // `Dialect::for_model_with_host`'s name/host heuristic — consulted here (to pick the right
-            // endpoint path for a provider whose model ids don't match the heuristic, e.g. Kimi-Coding's
-            // `kimi-k2-thinking`) AND threaded into `DirectRouting::dialect_override` below (for the
-            // actual body-building/decoding dialect `GatewayClient::stream` picks), so the two never
-            // disagree. Failing that, `for_model_with_host` is already host-aware (pi-parity pass 20,
-            // Task 6): a handful of OpenCode Zen/OpenCode-Go id/host combinations need a *different*
-            // default than `NATIVE_ANTHROPIC_WIRE_BARE_IDS`'s own host-agnostic default provides, and
-            // `aggregator_host` (just computed above) is exactly the signal that resolves them —
-            // formerly a separate `opencode_dialect_override` helper in this file (pi-parity remediation
-            // pass 19, Task 1), now folded into the one shared mechanism instead of a second, parallel
-            // "which host is this" check.
-            let dialect = over.dialect.unwrap_or_else(|| {
-                agent_core::dialect::Dialect::for_model_with_host(model, aggregator_host)
-            });
-            // Task #11 (pi-parity feature): resolved through `!command`/`$VAR`/literal syntax (see
-            // `ModelOverride::resolved_api_key`'s own doc comment) rather than used as a raw literal —
-            // lets an operator avoid storing a plaintext secret in `models.json`.
-            let bearer = over.resolved_api_key(key.as_deref());
-            // Fix 3 (pi-parity, Round 2): computed together so a `deployment_name` override's URL
-            // path segment (Task 46) and the `/v1`-doubling fix (Task 45) never fight each other — see
-            // `direct_route_base_and_path`'s own doc comment. Fix #33/#34 (pi-parity audit): also skips
-            // the deployment-segment insertion for the Responses dialect, and auto-normalizes a bare/
-            // partial Azure `base_url` to the canonical `/openai/v1` — see that function's own doc
-            // comment for both.
-            let (base_url, path) =
-                direct_route_base_and_path(&base_url, dialect, over.deployment_name.as_deref());
-            // Fix #35 (pi-parity audit): whether this override is genuinely an Azure endpoint at all —
-            // gates `azure_api_version_query`'s default so a plain (non-Azure) BYO override never picks
-            // up an unsolicited `?api-version=v1` it never asked for.
-            let is_azure = over.deployment_name.is_some() || is_azure_host(&base_url);
-            let query = azure_api_version_query(over.api_version.as_deref(), is_azure);
-            let routing = DirectRouting {
-                route: RouteOverride::Direct {
-                    base_url: base_url.clone(),
-                    path,
-                },
-                static_headers: Vec::new(),
-                copilot_dynamic_headers: false,
-                // Task #8 (pi-parity: Azure OpenAI routing support) — an operator-configured
-                // `auth_header` (e.g. `"api-key"` for Azure) sends `bearer` through that named header
-                // and omits `Authorization` entirely, instead of leaking a Bearer-shaped credential
-                // (or, worse, a silent fallback to the gateway's own virtual key) to an endpoint that
-                // doesn't want it.
-                auth_header: over.auth_header.clone(),
-                // Fix 4 (pi-parity, Round 2): Cloudflare AI Gateway's Bearer-prefixed named header
-                // (`cf-aig-authorization: Bearer <key>`) — `None` preserves `auth_header`'s existing
-                // bare-value behavior (Azure's `api-key`).
-                auth_header_prefix: over.auth_header_prefix.clone(),
-                dialect_override: over.dialect,
-                // Fix 2 (pi-parity, Round 2): Azure OpenAI's deployment-name mapping — sends this
-                // instead of `model` as the wire-level `"model"` field.
-                deployment_name: over.deployment_name.clone(),
-                // Fix 2 (pi-parity, Round 2): Azure's dated `api-version` query param.
-                query: query.clone(),
-                // pi-parity pass 20, Task 5: threads the same `aggregator_host` computed above across
-                // the crate boundary so `GatewayClient::stream` can set `ModelRequest::host` from it —
-                // see `DirectRouting::aggregator_host`'s own doc comment.
-                aggregator_host,
-            };
-            // pi-parity remediation pass 19, Task 2: the fallback tier below both this override's own
-            // credential (`bearer`, just above) and `--key`/`AI_AGENT_KEY` — a stored OAuth login, still
-            // routed to this override's own `base_url`/`routing` rather than the provider's usual
-            // endpoint. Reuses `DirectRoutedCredentialSource` (already used for Codex's own fixed
-            // routing further below) rather than inventing a second wrapper — the only thing that
-            // differs per call site is which `DirectRouting` it carries.
-            if let Some(provider) = oauth_fallback_provider(model, over, key.as_deref()) {
-                if let Some(stored) = store.get(provider.store_key()) {
-                    if stored.credential.provider() == provider {
-                        let identity = GatewayCredentialIdentity::DirectOverrideOauth {
-                            base_url: base_url.clone(),
-                            path,
-                            auth_header: over.auth_header.clone(),
-                            auth_header_prefix: over.auth_header_prefix.clone(),
-                            deployment_name: over.deployment_name.clone(),
-                            query: query.clone(),
-                            aggregator_host,
-                            provider,
-                        };
-                        return Ok((
-                            GatewayCredential::Oauth(Arc::new(DirectRoutedCredentialSource {
-                                inner: oauth_source(provider),
-                                routing: routing.clone(),
-                            })),
-                            identity,
-                        ));
-                    }
-                }
-            }
-            let identity = GatewayCredentialIdentity::DirectOverride {
-                base_url,
+    if let Some(over) = overrides.get(model)
+        && let Some(base_url) = over.base_url.clone()
+    {
+        // Fix #39 (pi-parity audit, judgment call): a handful of third-party-aggregator model ids
+        // (OpenCode Zen's `gemini-3-flash`/`gemini-3.1-pro`/`gemini-3.5-flash`) speak Google's own
+        // Generative AI wire format, which `agent_core::dialect::Dialect` has no variant for (the
+        // standing "Gemini-direct native dialect" deferral — out of scope to build here). Left
+        // unchecked, a BYO override naming one of these ids with no explicit `dialect` would
+        // silently fall back to `Dialect::for_model`'s OpenAI-family default and send an
+        // OpenAI-shaped body to an endpoint that doesn't understand it — a confusing *provider*-side
+        // failure instead of a clear one from us. An explicit `dialect` on the override is the
+        // escape hatch (e.g. an operator fronting Gemini with an OpenAI-compatible proxy of their
+        // own) — this only fires when that's genuinely unset.
+        if over.dialect.is_none()
+            && let Some(reason) = unsupported_wire_format_reason(model)
+        {
+            return Err(reason);
+        }
+        // pi-parity pass 20, Task 3/5: which known third-party aggregator (if any) this override's
+        // `base_url` names — see [`aggregator_host_for_base_url`]'s own doc comment. Computed here,
+        // before `dialect` below, so both the dialect selection AND `DirectRouting::aggregator_host`
+        // (threaded across the crate boundary to `agent_core::client::GatewayClient::stream`, which
+        // sets `ModelRequest::host` from it) reuse the identical value — no second, independent
+        // detection path.
+        let aggregator_host = aggregator_host_for_base_url(&base_url);
+        // Fix 1 (pi-parity, Round 2): an explicit `dialect` override wins over
+        // `Dialect::for_model_with_host`'s name/host heuristic — consulted here (to pick the right
+        // endpoint path for a provider whose model ids don't match the heuristic, e.g. Kimi-Coding's
+        // `kimi-k2-thinking`) AND threaded into `DirectRouting::dialect_override` below (for the
+        // actual body-building/decoding dialect `GatewayClient::stream` picks), so the two never
+        // disagree. Failing that, `for_model_with_host` is already host-aware (pi-parity pass 20,
+        // Task 6): a handful of OpenCode Zen/OpenCode-Go id/host combinations need a *different*
+        // default than `NATIVE_ANTHROPIC_WIRE_BARE_IDS`'s own host-agnostic default provides, and
+        // `aggregator_host` (just computed above) is exactly the signal that resolves them —
+        // formerly a separate `opencode_dialect_override` helper in this file (pi-parity remediation
+        // pass 19, Task 1), now folded into the one shared mechanism instead of a second, parallel
+        // "which host is this" check.
+        let dialect = over.dialect.unwrap_or_else(|| {
+            agent_core::dialect::Dialect::for_model_with_host(model, aggregator_host)
+        });
+        // Task #11 (pi-parity feature): resolved through `!command`/`$VAR`/literal syntax (see
+        // `ModelOverride::resolved_api_key`'s own doc comment) rather than used as a raw literal —
+        // lets an operator avoid storing a plaintext secret in `models.json`.
+        let bearer = over.resolved_api_key(key.as_deref());
+        // Fix 3 (pi-parity, Round 2): computed together so a `deployment_name` override's URL
+        // path segment (Task 46) and the `/v1`-doubling fix (Task 45) never fight each other — see
+        // `direct_route_base_and_path`'s own doc comment. Fix #33/#34 (pi-parity audit): also skips
+        // the deployment-segment insertion for the Responses dialect, and auto-normalizes a bare/
+        // partial Azure `base_url` to the canonical `/openai/v1` — see that function's own doc
+        // comment for both.
+        let (base_url, path) =
+            direct_route_base_and_path(&base_url, dialect, over.deployment_name.as_deref());
+        // Fix #35 (pi-parity audit): whether this override is genuinely an Azure endpoint at all —
+        // gates `azure_api_version_query`'s default so a plain (non-Azure) BYO override never picks
+        // up an unsolicited `?api-version=v1` it never asked for.
+        let is_azure = over.deployment_name.is_some() || is_azure_host(&base_url);
+        let query = azure_api_version_query(over.api_version.as_deref(), is_azure);
+        let routing = DirectRouting {
+            route: RouteOverride::Direct {
+                base_url: base_url.clone(),
                 path,
-                bearer: bearer.clone(),
+            },
+            static_headers: Vec::new(),
+            copilot_dynamic_headers: false,
+            // Task #8 (pi-parity: Azure OpenAI routing support) — an operator-configured
+            // `auth_header` (e.g. `"api-key"` for Azure) sends `bearer` through that named header
+            // and omits `Authorization` entirely, instead of leaking a Bearer-shaped credential
+            // (or, worse, a silent fallback to the gateway's own virtual key) to an endpoint that
+            // doesn't want it.
+            auth_header: over.auth_header.clone(),
+            // Fix 4 (pi-parity, Round 2): Cloudflare AI Gateway's Bearer-prefixed named header
+            // (`cf-aig-authorization: Bearer <key>`) — `None` preserves `auth_header`'s existing
+            // bare-value behavior (Azure's `api-key`).
+            auth_header_prefix: over.auth_header_prefix.clone(),
+            dialect_override: over.dialect,
+            // Fix 2 (pi-parity, Round 2): Azure OpenAI's deployment-name mapping — sends this
+            // instead of `model` as the wire-level `"model"` field.
+            deployment_name: over.deployment_name.clone(),
+            // Fix 2 (pi-parity, Round 2): Azure's dated `api-version` query param.
+            query: query.clone(),
+            // pi-parity pass 20, Task 5: threads the same `aggregator_host` computed above across
+            // the crate boundary so `GatewayClient::stream` can set `ModelRequest::host` from it —
+            // see `DirectRouting::aggregator_host`'s own doc comment.
+            aggregator_host,
+        };
+        // pi-parity remediation pass 19, Task 2: the fallback tier below both this override's own
+        // credential (`bearer`, just above) and `--key`/`AI_AGENT_KEY` — a stored OAuth login, still
+        // routed to this override's own `base_url`/`routing` rather than the provider's usual
+        // endpoint. Reuses `DirectRoutedCredentialSource` (already used for Codex's own fixed
+        // routing further below) rather than inventing a second wrapper — the only thing that
+        // differs per call site is which `DirectRouting` it carries.
+        if let Some(provider) = oauth_fallback_provider(model, over, key.as_deref())
+            && let Some(stored) = store.get(provider.store_key())
+            && stored.credential.provider() == provider
+        {
+            let identity = GatewayCredentialIdentity::DirectOverrideOauth {
+                base_url: base_url.clone(),
+                path,
                 auth_header: over.auth_header.clone(),
                 auth_header_prefix: over.auth_header_prefix.clone(),
                 deployment_name: over.deployment_name.clone(),
-                query,
+                query: query.clone(),
                 aggregator_host,
+                provider,
             };
             return Ok((
-                GatewayCredential::Oauth(Arc::new(StaticDirectCredentialSource {
-                    bearer,
-                    routing,
+                GatewayCredential::Oauth(Arc::new(DirectRoutedCredentialSource {
+                    inner: oauth_source(provider),
+                    routing: routing.clone(),
                 })),
                 identity,
             ));
         }
+        let identity = GatewayCredentialIdentity::DirectOverride {
+            base_url,
+            path,
+            bearer: bearer.clone(),
+            auth_header: over.auth_header.clone(),
+            auth_header_prefix: over.auth_header_prefix.clone(),
+            deployment_name: over.deployment_name.clone(),
+            query,
+            aggregator_host,
+        };
+        return Ok((
+            GatewayCredential::Oauth(Arc::new(StaticDirectCredentialSource { bearer, routing })),
+            identity,
+        ));
     }
 
     // --- Direct tiers, part 1: the two *explicit* ones. -------------------------------------------
@@ -603,95 +599,92 @@ fn resolve_with(
             GatewayCredentialIdentity::Anthropic,
         ));
     }
-    if model.contains("codex") {
-        if let Some(stored) = store.get("openai-codex") {
-            if let OAuthCredential::OpenaiCodex(c) = &stored.credential {
-                // Gateway mode relays through the `/openai-codex` prefix (`chatgpt.com` is a genuinely
-                // static host, so it gets a real provider row). Direct mode dials that host itself — the
-                // prefix route is *defined* in terms of the gateway's base URL, so with no gateway it
-                // would resolve against a host that isn't there. Same account header, same path, same
-                // bearer either way; only where the URL is rooted changes.
-                let route = if env.direct() {
-                    RouteOverride::Direct {
-                        base_url: "https://chatgpt.com".to_string(),
-                        path: "/backend-api/codex/responses",
-                    }
-                } else {
-                    RouteOverride::Prefixed {
-                        prefix: "/openai-codex",
-                        path: "/backend-api/codex/responses",
-                    }
-                };
-                let routing = DirectRouting {
-                    route,
-                    static_headers: vec![
-                        ("chatgpt-account-id", c.account_id.clone()),
-                        ("originator", CODEX_ORIGINATOR.to_string()),
-                        ("OpenAI-Beta", "responses=experimental".to_string()),
-                    ],
-                    copilot_dynamic_headers: false,
-                    auth_header: None,
-                    auth_header_prefix: None,
-                    dialect_override: None,
-                    deployment_name: None,
-                    query: None,
-                    // What tells `GatewayClient::stream` this is the Codex backend (`req.is_codex`, and
-                    // with it the Responses-body/zstd-SSE branch). It used to read that off the
-                    // `Prefixed` route shape, which stopped identifying Codex the moment Codex also
-                    // became reachable as a plain `Direct` route above.
-                    aggregator_host: Some(AggregatorHost::OpenAiCodex),
-                };
-                let identity = GatewayCredentialIdentity::OpenaiCodex {
-                    account_id: c.account_id.clone(),
-                };
-                return Ok((
-                    GatewayCredential::Oauth(Arc::new(DirectRoutedCredentialSource {
-                        inner: oauth_source(OAuthProviderId::OpenaiCodex),
-                        routing,
-                    })),
-                    identity,
-                ));
+    if model.contains("codex")
+        && let Some(stored) = store.get("openai-codex")
+        && let OAuthCredential::OpenaiCodex(c) = &stored.credential
+    {
+        // Gateway mode relays through the `/openai-codex` prefix (`chatgpt.com` is a genuinely
+        // static host, so it gets a real provider row). Direct mode dials that host itself — the
+        // prefix route is *defined* in terms of the gateway's base URL, so with no gateway it
+        // would resolve against a host that isn't there. Same account header, same path, same
+        // bearer either way; only where the URL is rooted changes.
+        let route = if env.direct() {
+            RouteOverride::Direct {
+                base_url: "https://chatgpt.com".to_string(),
+                path: "/backend-api/codex/responses",
             }
-        }
+        } else {
+            RouteOverride::Prefixed {
+                prefix: "/openai-codex",
+                path: "/backend-api/codex/responses",
+            }
+        };
+        let routing = DirectRouting {
+            route,
+            static_headers: vec![
+                ("chatgpt-account-id", c.account_id.clone()),
+                ("originator", CODEX_ORIGINATOR.to_string()),
+                ("OpenAI-Beta", "responses=experimental".to_string()),
+            ],
+            copilot_dynamic_headers: false,
+            auth_header: None,
+            auth_header_prefix: None,
+            dialect_override: None,
+            deployment_name: None,
+            query: None,
+            // What tells `GatewayClient::stream` this is the Codex backend (`req.is_codex`, and
+            // with it the Responses-body/zstd-SSE branch). It used to read that off the
+            // `Prefixed` route shape, which stopped identifying Codex the moment Codex also
+            // became reachable as a plain `Direct` route above.
+            aggregator_host: Some(AggregatorHost::OpenAiCodex),
+        };
+        let identity = GatewayCredentialIdentity::OpenaiCodex {
+            account_id: c.account_id.clone(),
+        };
+        return Ok((
+            GatewayCredential::Oauth(Arc::new(DirectRoutedCredentialSource {
+                inner: oauth_source(OAuthProviderId::OpenaiCodex),
+                routing,
+            })),
+            identity,
+        ));
     }
-    if let Some(stored) = store.get("github-copilot") {
-        if let OAuthCredential::GithubCopilot(c) = &stored.credential {
-            if c.available_model_ids.iter().any(|m| m == model) {
-                // Bypasses the gateway entirely: GitHub hands back a *different* proxy host per
-                // account/enterprise, embedded in the access token itself (`proxy-ep=…`) — not a
-                // static host the gateway's `KNOWN_PROVIDERS` table could ever hold as a row. See
-                // `RouteOverride::Direct`. Re-derived from the CURRENT token on every request by
-                // `CopilotRoutedCredentialSource` itself (not computed here and frozen) — see that
-                // type's own doc comment for why.
-                //
-                // `for_model_via_copilot(.., true, ..)`, not plain `for_model`: at least one id
-                // (`gpt-4.1`) is a different dialect under Copilot than it is natively (pi-parity — see
-                // that function's doc comment), and this dialect also picks `copilot_endpoint_path`'s
-                // baked-in `path` below, so getting it wrong here would send that id's Chat-Completions
-                // body to a `/responses` path. `host: None` — Copilot is matched via a stored
-                // credential's `available_model_ids`, never a BYO `base_url` override, so it has no
-                // `AggregatorHost` of its own to report.
-                let dialect =
-                    agent_core::dialect::Dialect::for_model_via_copilot(model, true, None);
-                let path = crate::oauth::github_copilot::copilot_endpoint_path(dialect);
-                let identity = GatewayCredentialIdentity::GithubCopilot {
+    if let Some(stored) = store.get("github-copilot")
+        && let OAuthCredential::GithubCopilot(c) = &stored.credential
+        && c.available_model_ids.iter().any(|m| m == model)
+    {
+        // Bypasses the gateway entirely: GitHub hands back a *different* proxy host per
+        // account/enterprise, embedded in the access token itself (`proxy-ep=…`) — not a
+        // static host the gateway's `KNOWN_PROVIDERS` table could ever hold as a row. See
+        // `RouteOverride::Direct`. Re-derived from the CURRENT token on every request by
+        // `CopilotRoutedCredentialSource` itself (not computed here and frozen) — see that
+        // type's own doc comment for why.
+        //
+        // `for_model_via_copilot(.., true, ..)`, not plain `for_model`: at least one id
+        // (`gpt-4.1`) is a different dialect under Copilot than it is natively (pi-parity — see
+        // that function's doc comment), and this dialect also picks `copilot_endpoint_path`'s
+        // baked-in `path` below, so getting it wrong here would send that id's Chat-Completions
+        // body to a `/responses` path. `host: None` — Copilot is matched via a stored
+        // credential's `available_model_ids`, never a BYO `base_url` override, so it has no
+        // `AggregatorHost` of its own to report.
+        let dialect = agent_core::dialect::Dialect::for_model_via_copilot(model, true, None);
+        let path = crate::oauth::github_copilot::copilot_endpoint_path(dialect);
+        let identity = GatewayCredentialIdentity::GithubCopilot {
+            enterprise_url: c.enterprise_url.clone(),
+            path,
+        };
+        return Ok((
+            GatewayCredential::Oauth(Arc::new(
+                crate::oauth::github_copilot::CopilotRoutedCredentialSource {
+                    inner: oauth_source(OAuthProviderId::GithubCopilot),
+                    store_path: store_path.clone(),
                     enterprise_url: c.enterprise_url.clone(),
                     path,
-                };
-                return Ok((
-                    GatewayCredential::Oauth(Arc::new(
-                        crate::oauth::github_copilot::CopilotRoutedCredentialSource {
-                            inner: oauth_source(OAuthProviderId::GithubCopilot),
-                            store_path: store_path.clone(),
-                            enterprise_url: c.enterprise_url.clone(),
-                            path,
-                            cached_routing: std::sync::Mutex::new(None),
-                        },
-                    )),
-                    identity,
-                ));
-            }
-        }
+                    cached_routing: std::sync::Mutex::new(None),
+                },
+            )),
+            identity,
+        ));
     }
 
     // --- Direct tiers, part 2: the *ambient* one. -------------------------------------------------

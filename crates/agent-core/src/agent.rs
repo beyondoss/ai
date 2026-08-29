@@ -836,14 +836,14 @@ impl Agent {
                     tool_names: current_tool_defs.iter().map(|d| d.name.clone()).collect(),
                 });
             }
-            if let Some(max_steps) = self.max_steps {
-                if steps_this_call >= max_steps {
-                    let err = Error::MaxSteps(max_steps);
-                    sink(AgentEvent::Error {
-                        message: err.to_string(),
-                    });
-                    return Err(err);
-                }
+            if let Some(max_steps) = self.max_steps
+                && steps_this_call >= max_steps
+            {
+                let err = Error::MaxSteps(max_steps);
+                sink(AgentEvent::Error {
+                    message: err.to_string(),
+                });
+                return Err(err);
             }
 
             // Proactive compaction: once the live prompt crosses the threshold, summarize the prefix
@@ -2362,12 +2362,11 @@ impl Agent {
                     // `turn_start` to exactly 1 when the scan found no history beyond it) — no new
                     // activity happened before this split turn began, so reuse it verbatim instead of
                     // spending a model call to ask for what would be an unchanged restatement.
-                    if turn_start == 1 {
-                        if let Some(prev) =
+                    if turn_start == 1
+                        && let Some(prev) =
                             compaction::previous_summary(&session.messages[..turn_start])
-                        {
-                            return Ok(prev.to_string());
-                        }
+                    {
+                        return Ok(prev.to_string());
                     }
                     let req = self.with_reasoning(compaction::summary_request(
                         &self.model,
@@ -3177,10 +3176,10 @@ fn close_incomplete_json(s: &str) -> Option<String> {
     // last complete element is cheap and safe: if it doesn't help, the result is no more or less
     // parseable than leaving it in.
     let trimmed_len = out.trim_end().len();
-    if let Some(last) = out[..trimmed_len].chars().next_back() {
-        if last == ',' || last == ':' {
-            out.truncate(trimmed_len - last.len_utf8());
-        }
+    if let Some(last) = out[..trimmed_len].chars().next_back()
+        && (last == ',' || last == ':')
+    {
+        out.truncate(trimmed_len - last.len_utf8());
     }
     while let Some(open) = stack.pop() {
         out.push(if open == '{' { '}' } else { ']' });

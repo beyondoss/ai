@@ -401,14 +401,14 @@ fn apply_copilot_headers(req: RequestBuilder) -> RequestBuilder {
 /// `https://api.individual.githubcopilot.com`. Pure string logic, no network — the *only*
 /// token-dependent request-time detail besides the bearer value itself.
 pub fn base_url_from_token(access_token: Option<&str>, enterprise_domain: Option<&str>) -> String {
-    if let Some(token) = access_token {
-        if let Some(proxy_ep) = extract_proxy_ep(token) {
-            let api_host = match proxy_ep.strip_prefix("proxy.") {
-                Some(rest) => format!("api.{rest}"),
-                None => proxy_ep,
-            };
-            return format!("https://{api_host}");
-        }
+    if let Some(token) = access_token
+        && let Some(proxy_ep) = extract_proxy_ep(token)
+    {
+        let api_host = match proxy_ep.strip_prefix("proxy.") {
+            Some(rest) => format!("api.{rest}"),
+            None => proxy_ep,
+        };
+        return format!("https://{api_host}");
     }
     if let Some(domain) = enterprise_domain {
         return format!("https://copilot-api.{domain}");
@@ -486,10 +486,10 @@ impl CopilotRoutedCredentialSource {
                 .cached_routing
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            if let Some((expires_at_ms, routing)) = guard.as_ref() {
-                if now_ms < *expires_at_ms {
-                    return routing.clone();
-                }
+            if let Some((expires_at_ms, routing)) = guard.as_ref()
+                && now_ms < *expires_at_ms
+            {
+                return routing.clone();
             }
         }
         // Cache empty or the cached token has expired: re-read whatever `inner`'s `credential()` just

@@ -305,11 +305,10 @@ impl Supervisor {
                         None => break,
                     },
                     ctrl = ctrl_rx.recv() => {
-                        if let Some(msg) = ctrl {
-                            if sink.send(msg).await.is_err() {
+                        if let Some(msg) = ctrl
+                            && sink.send(msg).await.is_err() {
                                 break;
                             }
-                        }
                     },
                     _ = ping.tick() => {
                         if sink.send(Message::Ping(Vec::new().into())).await.is_err() {
@@ -339,9 +338,9 @@ impl Supervisor {
                             // the supervisor sees every session), not forwarded to the pinned session. A
                             // cheap substring prefilter keeps the byte-identical hot path allocation-free
                             // for every other command; only a real match pays the parse.
-                            if text.contains("list_daemon_sessions") {
-                                if let Ok(v) = serde_json::from_str::<serde_json::Value>(text.as_str()) {
-                                    if v.get("type").and_then(serde_json::Value::as_str)
+                            if text.contains("list_daemon_sessions")
+                                && let Ok(v) = serde_json::from_str::<serde_json::Value>(text.as_str())
+                                    && v.get("type").and_then(serde_json::Value::as_str)
                                         == Some("list_daemon_sessions")
                                     {
                                         let client_id = v
@@ -352,8 +351,6 @@ impl Supervisor {
                                         let _ = reply_tx.try_send(frame);
                                         continue;
                                     }
-                                }
-                            }
                             // Never dropped, never coalesced: a client that got no error believes its
                             // command was accepted, so discarding one leaves it waiting forever on a
                             // response that will never come — a dropped command is a correctness bug,
@@ -946,12 +943,12 @@ where
     let requested_id = lock_ignoring_poison(&requested_id).take();
     // A client-supplied id becomes a filename component (`<id>.jsonl`) — reject anything that isn't a
     // safe session id rather than letting it escape the sessions directory.
-    if let Some(id) = &requested_id {
-        if !is_valid_session_id(id) {
-            let mut ws = ws;
-            let _ = ws.close(None).await;
-            return Err(format!("invalid session_id: {id:?}").into());
-        }
+    if let Some(id) = &requested_id
+        && !is_valid_session_id(id)
+    {
+        let mut ws = ws;
+        let _ = ws.close(None).await;
+        return Err(format!("invalid session_id: {id:?}").into());
     }
 
     supervisor.attach(requested_id, ws).await;

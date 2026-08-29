@@ -284,10 +284,10 @@ pub fn build_body(req: &ModelRequest, is_oauth: bool) -> Value {
         if caps.supports_eager_tool_streaming {
             mark_eager_tool_streaming(&mut tools);
         }
-        if let Some(cc) = &cc {
-            if caps.supports_cache_control_on_tools {
-                mark_last_tool(&mut tools, cc);
-            }
+        if let Some(cc) = &cc
+            && caps.supports_cache_control_on_tools
+        {
+            mark_last_tool(&mut tools, cc);
         }
         map.insert("tools".into(), tools);
     }
@@ -1009,15 +1009,15 @@ impl StreamDecoder for Decoder {
                 // proxy sitting in front of it could, and a stale `message_start`-only snapshot would
                 // then silently under/over-report the rest of the turn. Refresh only when present, so
                 // this is a no-op against the real API's actual behavior.
-                if let Some(read) = usage.and_then(|u| u.get("cache_read_input_tokens")) {
-                    if let Some(read) = read.as_u64() {
-                        self.usage.cache_read_tokens = read as u32;
-                    }
+                if let Some(read) = usage.and_then(|u| u.get("cache_read_input_tokens"))
+                    && let Some(read) = read.as_u64()
+                {
+                    self.usage.cache_read_tokens = read as u32;
                 }
-                if let Some(write) = usage.and_then(|u| u.get("cache_creation_input_tokens")) {
-                    if let Some(write) = write.as_u64() {
-                        self.usage.cache_write_tokens = write as u32;
-                    }
+                if let Some(write) = usage.and_then(|u| u.get("cache_creation_input_tokens"))
+                    && let Some(write) = write.as_u64()
+                {
+                    self.usage.cache_write_tokens = write as u32;
                 }
                 if let Some(cc) = usage.and_then(|u| u.get("cache_creation")) {
                     self.usage.cache_write_1h_tokens =

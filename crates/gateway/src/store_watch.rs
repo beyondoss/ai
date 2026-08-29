@@ -594,11 +594,10 @@ async fn watch_set<W: WatchedSet>(
                 // tenant deleted while we were offline — whose `Delete` was compacted away — which a
                 // later `load()` would replay and resurrect (wrongly re-denying a tenant). A clean
                 // rewrite from the live scan makes the on-disk state exactly match NATS.
-                if writer.is_some() {
-                    if let Some(path) = W::snapshot_path(state) {
-                        *writer =
-                            rebuild_snapshot(PathBuf::from(path), entries, cursor.clone()).await;
-                    }
+                if writer.is_some()
+                    && let Some(path) = W::snapshot_path(state)
+                {
+                    *writer = rebuild_snapshot(PathBuf::from(path), entries, cursor.clone()).await;
                 }
                 // Latch `seeded` only when the scan produced a cursor we can actually resume from.
                 // An empty bucket scans to revision 0, and `watch_prefix_from` degrades that to

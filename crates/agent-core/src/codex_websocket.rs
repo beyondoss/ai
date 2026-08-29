@@ -687,12 +687,11 @@ impl Receiver {
             let mut events = self.decoder.push(&value);
             // `value` is dropped at the end of this iteration, so move the harvested `item` out of it
             // rather than cloning — done *after* `decoder.push` has read the frame it needs.
-            if is_output_item_done {
-                if let Some(item) = value.as_object_mut().and_then(|obj| obj.remove("item")) {
-                    if is_replayable_output_item(&item) {
-                        self.harvested.push(item);
-                    }
-                }
+            if is_output_item_done
+                && let Some(item) = value.as_object_mut().and_then(|obj| obj.remove("item"))
+                && is_replayable_output_item(&item)
+            {
+                self.harvested.push(item);
             }
             if self.decoder.is_terminal() {
                 self.finished = true;
@@ -860,10 +859,10 @@ pub(crate) async fn try_stream(
     cache_key: Option<String>,
     full_body: Value,
 ) -> Attempt {
-    if let Some(key) = &cache_key {
-        if cache.is_fallback_active(key) {
-            return Attempt::Fallback;
-        }
+    if let Some(key) = &cache_key
+        && cache.is_fallback_active(key)
+    {
+        return Attempt::Fallback;
     }
 
     let fingerprint = body_fingerprint(&full_body);

@@ -156,22 +156,22 @@ async fn resolve_read_path(
         return (path.to_string(), Some(meta));
     }
     let nfd: String = path.nfd().collect();
-    if nfd != path {
-        if let Some(meta) = probe(backend, &nfd).await {
-            return (nfd, Some(meta));
-        }
+    if nfd != path
+        && let Some(meta) = probe(backend, &nfd).await
+    {
+        return (nfd, Some(meta));
     }
     let curly = path.replace('\'', "\u{2019}");
-    if curly != path {
-        if let Some(meta) = probe(backend, &curly).await {
-            return (curly, Some(meta));
-        }
+    if curly != path
+        && let Some(meta) = probe(backend, &curly).await
+    {
+        return (curly, Some(meta));
     }
     let nfd_curly = nfd.replace('\'', "\u{2019}");
-    if nfd_curly != path {
-        if let Some(meta) = probe(backend, &nfd_curly).await {
-            return (nfd_curly, Some(meta));
-        }
+    if nfd_curly != path
+        && let Some(meta) = probe(backend, &nfd_curly).await
+    {
+        return (nfd_curly, Some(meta));
     }
     (path.to_string(), None)
 }
@@ -270,10 +270,10 @@ impl Tool for Read {
         // reading blocks until a writer connects, with no timeout and no kill-on-drop. Reuses the
         // metadata the path resolution above already fetched rather than paying a second round trip
         // to ask the same question.
-        if let Some(meta) = &meta {
-            if meta.kind == FileKind::Other {
-                return Err(super::non_regular_file_error(&path, "read"));
-            }
+        if let Some(meta) = &meta
+            && meta.kind == FileKind::Other
+        {
+            return Err(super::non_regular_file_error(&path, "read"));
         }
 
         // Whether the active model can accept image input at all. `agent_core::tool::Tool::run` takes

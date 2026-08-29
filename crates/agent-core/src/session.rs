@@ -189,10 +189,10 @@ impl Session {
         if !id_remap.is_empty() {
             for message in messages.iter_mut() {
                 for block in &mut message.content {
-                    if let ContentBlock::ToolResult { tool_use_id, .. } = block {
-                        if let Some(new_id) = id_remap.get(tool_use_id) {
-                            new_id.clone_into(tool_use_id);
-                        }
+                    if let ContentBlock::ToolResult { tool_use_id, .. } = block
+                        && let Some(new_id) = id_remap.get(tool_use_id)
+                    {
+                        new_id.clone_into(tool_use_id);
                     }
                 }
             }

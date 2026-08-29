@@ -406,10 +406,10 @@ fn discover_claude_file(cwd: &Path, project_trusted: bool, filename: &str) -> Op
         candidates.push(home.join(".claude").join(filename));
     }
     for path in candidates {
-        if let Ok(body) = fs::read_to_string(&path) {
-            if !body.trim().is_empty() {
-                return Some(body);
-            }
+        if let Ok(body) = fs::read_to_string(&path)
+            && !body.trim().is_empty()
+        {
+            return Some(body);
         }
     }
     None
@@ -544,10 +544,10 @@ fn cached_local_utc_offset(now: i64) -> i64 {
     static CACHE: Mutex<Option<(Option<String>, i64)>> = Mutex::new(None);
     let tz = std::env::var("TZ").ok();
     let mut guard = CACHE.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some((cached_tz, offset)) = guard.as_ref() {
-        if *cached_tz == tz {
-            return *offset;
-        }
+    if let Some((cached_tz, offset)) = guard.as_ref()
+        && *cached_tz == tz
+    {
+        return *offset;
     }
     let offset = local_utc_offset(now);
     *guard = Some((tz, offset));
