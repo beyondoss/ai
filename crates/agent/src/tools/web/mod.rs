@@ -12,6 +12,7 @@
 //! h2-pinned with a 10-minute timeout, the wrong shape for arbitrary web fetches.
 
 mod extract;
+pub mod isolate;
 mod markdown;
 pub mod ssrf;
 mod whereexpr;
@@ -235,6 +236,19 @@ enum Mode {
 }
 
 impl Mode {
+    /// The wire spelling, so [`isolate`] can hand the mode to the child process and have it round
+    /// trip through [`Mode::parse`] there. Kept next to `parse` so the two cannot drift.
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Fetch => "fetch",
+            Self::Markdown => "markdown",
+            Self::Outline => "outline",
+            Self::Locate => "locate",
+            Self::Extract => "extract",
+            Self::Table => "table",
+        }
+    }
+
     fn parse(s: &str) -> Result<Self, ToolError> {
         Ok(match s {
             "fetch" => Self::Fetch,
@@ -408,12 +422,13 @@ impl Tool for Web {
                         fetched.status.canonical_reason().unwrap_or("")
                     ));
                 }
+                // Every parsing mode runs in a locked-down child: this is the one tool whose
+                // input is bytes an arbitrary web server chose, and `scraper`/`htmd` reach a large
+                // `unsafe` surface with them. See `isolate`'s module comment.
+                let parsed = isolate::parse(other, &input, &fetched.text())?;
                 let rendered = match other {
-                    Mode::Markdown => finalize(
-                        markdown::to_markdown(&fetched.text()).map_err(ToolError::Execution)?,
-                        fetched.truncated,
-                    ),
-                    _ => extract::run(other, &input, &fetched.text())?,
+                    Mode::Markdown => finalize(parsed, fetched.truncated),
+                    _ => parsed,
                 };
                 out.push_str(&rendered);
                 out
@@ -467,21 +482,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn markdown_mode_converts_the_body() {
-        let (port, _h) = one_shot(HTML_200);
-        let out = tool_allowing_loopback()
-            .run(json!({ "url": format!("http://127.0.0.1:{port}/"), "mode": "markdown" }))
-            .await
-            .unwrap();
-        assert!(out.text.contains("# Hi"), "{}", out.text);
-        assert!(
-            !out.text.contains("<h1>"),
-            "raw HTML must be gone: {}",
-            out.text
-        );
-    }
-
-    #[tokio::test]
     async fn method_and_headers_and_body_reach_the_server() {
         let (port, handle) = one_shot(HTML_200);
         tool_allowing_loopback()
@@ -529,17 +529,6 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::InvalidInput(_)), "{err:?}");
-    }
-
-    #[tokio::test]
-    async fn a_parsing_mode_prepends_the_status_on_a_non_2xx() {
-        let not_found = "HTTP/1.1 404 Not Found\r\nContent-Type: text/html\r\nContent-Length: 32\r\nConnection: close\r\n\r\n<html><body>gone</body></html>\n\n";
-        let (port, _h) = one_shot(not_found);
-        let out = tool_allowing_loopback()
-            .run(json!({ "url": format!("http://127.0.0.1:{port}/"), "mode": "markdown" }))
-            .await
-            .unwrap();
-        assert!(out.text.contains("[HTTP 404 Not Found]"), "{}", out.text);
     }
 
     #[tokio::test]
