@@ -77,7 +77,24 @@ jobs:
           # RUSTFLAGS already force a rebuild, but be explicit so a future flag change can't make the
           # shipped binary silently inherit instrumentation.
           rm -rf "target/${{ matrix.target }}/release"
-          RUSTFLAGS="-Cprofile-use=$PROFDIR/merged.profdata" \
+          # …and non-PIE, which is the other half of the memory win and a much bigger one than it
+          # looks. A position-independent executable carries 1.37 MB of `.rela.dyn`, and processing
+          # those relocations at startup *dirties* the 1.05 MB `.data.rel.ro` they write into — anon
+          # pages, per process, before `main` runs. Static relocation model removes both the section
+          # and the work. Measured on the shipped binary, idle `serve`, THP controlled, n=3:
+          #
+          #   baseline        RSS 9.34 MB   anon 2.09   resident text 7.17   startup 2.7 ms
+          #   PGO             RSS 8.30 MB   anon 2.20   resident text 6.12   startup 2.6 ms
+          #   PGO + non-PIE   RSS 6.31 MB   anon 1.03   resident text 5.28   startup 1.6 ms
+          #
+          # Startup improves for the same reason RSS does: minor faults halve, 670 -> 347.
+          #
+          # The cost is userspace ASLR, and it is only acceptable because the `web` tool no longer
+          # parses attacker-controlled HTML in this address space. That parse was the reachable
+          # memory-corruption surface (~190 `unsafe` blocks across `tendril`/`ego-tree`/`selectors`),
+          # and it now runs in a seccomp-confined child that holds no credentials — see
+          # `tools::web::isolate`. If that isolation is ever removed, this flag must go with it.
+          RUSTFLAGS="-Cprofile-use=$PROFDIR/merged.profdata -C relocation-model=static" \
             cargo build --release -p beyond-ai-agent --target ${{ matrix.target }}
       # Deliberately NOT UPX-compressed. UPX self-extracts the whole image into anonymous memory at
       # exec, which defeats demand paging: the text segment stops being a clean, shared, file-backed
