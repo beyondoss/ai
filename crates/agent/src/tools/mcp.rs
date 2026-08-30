@@ -118,12 +118,6 @@ struct McpConnection {
 /// long enough that a working session doesn't pay a re-spawn between consecutive tool calls. A
 /// re-spawn costs a process start plus an MCP handshake — a second or two for a heavy server — which
 /// is noise against the model round trip that precedes every tool call.
-/// How long a server may sit unused before its process is reaped.
-///
-/// Short enough that a guest which boots and is never asked to browse gives the memory back promptly,
-/// long enough that a working session doesn't pay a re-spawn between consecutive tool calls. A
-/// re-spawn costs a process start plus an MCP handshake — a second or two for a heavy server — which
-/// is noise against the model round trip that precedes every tool call.
 ///
 /// `Duration::ZERO` disables reaping entirely — every configured server stays resident for the
 /// process's life, which is the behavior that existed before this.
@@ -143,47 +137,103 @@ fn now_secs() -> u64 {
     STARTED.elapsed().as_secs()
 }
 
-/// How often the reaper looks: half the idle window, capped at 30s. Well under the window, so a
-/// server is reaped within roughly it rather than up to twice it, and floored at 1s so a tiny
-/// configured window can't hand `interval` a zero period (which panics).
-fn reap_tick(idle: Duration) -> Duration {
-    (idle / 2)
+/// How often the reaper looks: half the *shortest* live window, capped at 30s and floored at 1s.
+///
+/// Recomputed every pass rather than fixed when the sweeper starts. The sweeper is process-wide and
+/// starts once, so a period taken from whichever connection happened to register first would be wrong
+/// for every server configured afterwards — a 60s server registering ahead of a 1s one would leave the
+/// 1s one un-swept for half a minute. A test caught exactly that.
+///
+/// Half the window, so a server is reaped within roughly it rather than up to twice it. The floor
+/// keeps a tiny configured window from spinning (and from handing a sleep a zero period).
+fn reap_tick(windows: impl Iterator<Item = Duration>) -> Duration {
+    windows
+        .filter(|w| !w.is_zero())
+        .min()
+        .unwrap_or(DEFAULT_IDLE_REAP_AFTER)
+        .div_f32(2.0)
         .min(Duration::from_secs(30))
         .max(Duration::from_secs(1))
 }
 
-/// Start the sweeper, once per process.
+/// Whether a sweeper is currently running.
+///
+/// Deliberately not a `std::sync::Once`. The sweeper is a tokio task, so it lives and dies with the
+/// runtime that spawned it, and a runtime can go away underneath it — every `#[tokio::test]` builds
+/// its own, and an embedder may build one per unit of work. With a `Once`, the first runtime to shut
+/// down would take the sweeper with it and nothing could ever start another: every server configured
+/// after that point would stay resident forever, which is precisely the leak this module exists to
+/// prevent, made invisible. The task clears this flag as it is dropped, so the next connection that
+/// wants reaping starts a fresh sweeper.
+static REAPER_ALIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Wakes the sweeper when a connection registers.
+///
+/// The cadence comes from the live set, so a pass that ran before a connection existed slept on a
+/// cadence computed without it: register a 120s server, then a 1s one, and the 1s one goes unswept for
+/// the first 30 seconds of its life. Rather than poll fast enough to make that invisible — which costs
+/// wakeups forever to fix a moment — the registration says so.
+static REAPER_WAKE: std::sync::LazyLock<tokio::sync::Notify> =
+    std::sync::LazyLock::new(tokio::sync::Notify::new);
+
+/// Clears [`REAPER_ALIVE`] when the sweeper task ends — including the case that matters, the task
+/// being *dropped* by a shutting-down runtime rather than returning.
+struct ReaperGuard;
+
+impl Drop for ReaperGuard {
+    fn drop(&mut self) {
+        REAPER_ALIVE.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Start the sweeper if one isn't already running.
 ///
 /// One task for every server rather than one per connection: the work is a handful of atomic loads on
 /// a timer, and a task per MCP server would be its own small leak on a long-lived `serve` daemon that
 /// rebuilds its registry.
-fn spawn_reaper_once(idle: Duration) {
+fn spawn_reaper_if_needed(idle: Duration) {
     // Nothing to sweep for if this caller never wants reaping; another caller that does will start it.
     if idle.is_zero() {
         return;
     }
-    static ONCE: std::sync::Once = std::sync::Once::new();
-    ONCE.call_once(|| {
-        tokio::spawn(async move {
-            let mut tick = tokio::time::interval(reap_tick(idle));
-            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            loop {
-                tick.tick().await;
-                // Snapshot and drop the lock before awaiting: `reap_if_idle` takes an async lock, and
-                // holding a std Mutex across an await would be a deadlock waiting to happen.
-                let conns: Vec<Arc<McpConnection>> = {
-                    let Ok(mut live) = LIVE.lock() else { return };
-                    live.retain(|w| w.strong_count() > 0);
-                    live.iter().filter_map(std::sync::Weak::upgrade).collect()
-                };
-                for conn in conns {
-                    // Holding an `Arc<McpConnection>` here is harmless: the busy check inside looks at
-                    // the strong count of the *client*, which only a call in flight clones.
-                    conn.reap_if_idle().await;
-                }
+    if REAPER_ALIVE.swap(true, std::sync::atomic::Ordering::AcqRel) {
+        return;
+    }
+    tokio::spawn(async move {
+        let _alive = ReaperGuard;
+        loop {
+            // Snapshot and drop the lock before awaiting: `reap_if_idle` takes an async lock, and
+            // holding a std Mutex across an await would be a deadlock waiting to happen.
+            let conns: Vec<Arc<McpConnection>> = {
+                let Ok(mut live) = LIVE.lock() else { return };
+                live.retain(|w| w.strong_count() > 0);
+                live.iter().filter_map(std::sync::Weak::upgrade).collect()
+            };
+            let next = reap_tick(conns.iter().map(|c| c.idle_after));
+            for conn in conns {
+                // Holding an `Arc<McpConnection>` here is harmless: the busy check inside looks at
+                // the strong count of the *client*, which only a call in flight clones.
+                conn.reap_if_idle().await;
             }
-        });
+            // Whichever comes first: the cadence elapsing, or a new connection changing what the
+            // cadence should be.
+            tokio::select! {
+                () = tokio::time::sleep(next) => {}
+                () = REAPER_WAKE.notified() => {}
+            }
+        }
     });
+}
+
+/// Put a connection under the sweeper's eye. Weakly, so the connection disappearing (a `serve`
+/// registry rebuild, a finished `run`) takes it off the list on its own.
+fn register_for_reaping(conn: &Arc<McpConnection>, idle: Duration) {
+    if let Ok(mut live) = LIVE.lock() {
+        live.push(Arc::downgrade(conn));
+    }
+    spawn_reaper_if_needed(idle);
+    // Only meaningful if a sweeper was already running; a fresh one reads the live set immediately.
+    REAPER_WAKE.notify_one();
 }
 
 impl McpConnection {
@@ -191,6 +241,17 @@ impl McpConnection {
         Self {
             config,
             client: tokio::sync::Mutex::new(Some(Arc::new(client))),
+            last_used: std::sync::atomic::AtomicU64::new(now_secs()),
+            idle_after,
+        }
+    }
+
+    /// A connection with no process behind it yet, for tools rebuilt from a cached manifest. The
+    /// first `tools/call` dials; a boot that never calls one never starts a server at all.
+    fn dormant(config: McpServerConfig, idle_after: Duration) -> Self {
+        Self {
+            config,
+            client: tokio::sync::Mutex::new(None),
             last_used: std::sync::atomic::AtomicU64::new(now_secs()),
             idle_after,
         }
@@ -346,11 +407,12 @@ impl Tool for McpTool {
 pub async fn connect_all(
     configs: &[McpServerConfig],
     idle_reap_after: Duration,
+    manifest_dir: Option<&crate::tools::mcp_manifest::ManifestDir>,
 ) -> (Vec<Arc<dyn Tool>>, Vec<String>) {
     let results = futures::future::join_all(
         configs
             .iter()
-            .map(|config| connect_one(config, idle_reap_after)),
+            .map(|config| connect_one(config, idle_reap_after, manifest_dir)),
     )
     .await;
     let mut tools: Vec<Arc<dyn Tool>> = Vec::new();
@@ -381,12 +443,49 @@ async fn connect_one_client(config: &McpServerConfig) -> Result<McpClient, Strin
     }
 }
 
+/// Rebuild a server's tools from its cached manifest, starting nothing.
+///
+/// This is the difference between "reaped after 120s" and "never started": a guest that boots and is
+/// never asked to browse now spawns no browser server at any point.
+fn tools_from_manifest(
+    config: &McpServerConfig,
+    manifest: crate::tools::mcp_manifest::ServerManifest,
+    idle_reap_after: Duration,
+) -> Vec<Arc<dyn Tool>> {
+    let conn = Arc::new(McpConnection::dormant(config.clone(), idle_reap_after));
+    register_for_reaping(&conn, idle_reap_after);
+    manifest
+        .tools
+        .into_iter()
+        .map(|t| {
+            Arc::new(McpTool {
+                name: registered_name(&config.name, &t.remote_name),
+                description: t.description,
+                input_schema: t.input_schema,
+                remote_name: t.remote_name,
+                server_name: config.name.clone(),
+                conn: conn.clone(),
+            }) as Arc<dyn Tool>
+        })
+        .collect()
+}
+
 async fn connect_one(
     config: &McpServerConfig,
     idle_reap_after: Duration,
+    manifest_dir: Option<&crate::tools::mcp_manifest::ManifestDir>,
 ) -> Result<Vec<Arc<dyn Tool>>, String> {
+    // Cache hit: advertise from the manifest and start nothing.
+    if let Some(manifest) = manifest_dir.and_then(|d| crate::tools::mcp_manifest::load(d, config)) {
+        tracing::debug!(
+            server = %config.name,
+            tools = manifest.tools.len(),
+            "advertising MCP tools from the cached manifest; not starting the server"
+        );
+        return Ok(tools_from_manifest(config, manifest, idle_reap_after));
+    }
     let client = connect_one_client(config).await?;
-    tools_from_client(config, client, idle_reap_after).await
+    tools_from_client(config, client, idle_reap_after, manifest_dir).await
 }
 
 /// Spawns `command` as a plain child process — deliberately *not* its own process-group leader the way
@@ -531,16 +630,31 @@ async fn tools_from_client(
     config: &McpServerConfig,
     client: McpClient,
     idle_reap_after: Duration,
+    manifest_dir: Option<&crate::tools::mcp_manifest::ManifestDir>,
 ) -> Result<Vec<Arc<dyn Tool>>, String> {
     let remote_tools = client
         .list_all_tools()
         .await
         .map_err(|e| format!("`tools/list` failed: {e}"))?;
     let conn = Arc::new(McpConnection::new(config.clone(), client, idle_reap_after));
-    if let Ok(mut live) = LIVE.lock() {
-        live.push(Arc::downgrade(&conn));
+    register_for_reaping(&conn, idle_reap_after);
+
+    // Record what this server advertises so the *next* boot can skip starting it entirely. Written
+    // after a successful `tools/list`, so a server that failed to enumerate never poisons the cache.
+    if let Some(dir) = manifest_dir {
+        crate::tools::mcp_manifest::store(
+            dir,
+            config,
+            remote_tools
+                .iter()
+                .map(|t| crate::tools::mcp_manifest::CachedTool {
+                    remote_name: t.name.to_string(),
+                    description: t.description.as_deref().unwrap_or_default().to_string(),
+                    input_schema: t.schema_as_json_value(),
+                })
+                .collect(),
+        );
     }
-    spawn_reaper_once(idle_reap_after);
     Ok(remote_tools
         .into_iter()
         .map(|remote_tool| {

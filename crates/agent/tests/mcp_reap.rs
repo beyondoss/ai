@@ -44,7 +44,8 @@ fn fixture_processes(tag: &str) -> usize {
                 return false;
             };
             // cmdline is NUL-separated argv; the tag is its own argument.
-            String::from_utf8_lossy(&cmdline).contains(tag)
+            let c = String::from_utf8_lossy(&cmdline);
+            c.contains(FIXTURE) && c.contains(tag)
         })
         .count()
 }
@@ -83,7 +84,8 @@ async fn an_idle_server_is_reaped_and_reconnects_on_the_next_call() {
     assert_eq!(fixture_processes(tag), 0, "tag must start unused");
 
     // A one-second window: the production default is minutes, which no test can wait out.
-    let (tools, warnings) = mcp::connect_all(&[fixture_config(tag)], Duration::from_secs(1)).await;
+    let (tools, warnings) =
+        mcp::connect_all(&[fixture_config(tag)], Duration::from_secs(1), None).await;
     assert!(
         warnings.is_empty(),
         "fixture failed to connect: {warnings:?}"
@@ -135,7 +137,7 @@ async fn an_idle_server_is_reaped_and_reconnects_on_the_next_call() {
 async fn a_zero_window_keeps_the_server_resident() {
     let tag = "reap-zero-def456";
     assert_eq!(fixture_processes(tag), 0, "tag must start unused");
-    let (tools, warnings) = mcp::connect_all(&[fixture_config(tag)], Duration::ZERO).await;
+    let (tools, warnings) = mcp::connect_all(&[fixture_config(tag)], Duration::ZERO, None).await;
     assert!(
         warnings.is_empty(),
         "fixture failed to connect: {warnings:?}"
@@ -151,4 +153,82 @@ async fn a_zero_window_keeps_the_server_resident() {
         "a zero window must keep the server resident, not reap it immediately"
     );
     drop(tools);
+}
+
+/// The point of the manifest: once a server's tools are known, a later start advertises them and
+/// runs **nothing**. This is the difference between "reaped after 120s" and "never started" — a guest
+/// that boots and is never asked to browse should spawn no browser server at any moment.
+///
+/// Asserted on process count, because a cache that still spawns is just reaping with extra steps.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cached_manifest_advertises_tools_without_starting_the_server() {
+    let tag = "reap-manifest-ghi789";
+    let dir = std::env::temp_dir().join(format!("mcp-manifest-test-{tag}"));
+    let _ = std::fs::remove_dir_all(&dir);
+    let manifest = beyond_ai_agent::tools::mcp_manifest::ManifestDir::at(&dir);
+
+    // First start: nothing cached, so it connects, discovers, and records what it found.
+    let (tools, warnings) = mcp::connect_all(
+        &[fixture_config(tag)],
+        Duration::from_secs(60),
+        Some(&manifest),
+    )
+    .await;
+    assert!(
+        warnings.is_empty(),
+        "fixture failed to connect: {warnings:?}"
+    );
+    let discovered: Vec<String> = tools.iter().map(|t| t.name().to_string()).collect();
+    assert!(!discovered.is_empty(), "first start discovered no tools");
+    assert!(
+        within(Duration::from_secs(5), || fixture_processes(tag) == 1).await,
+        "the first start should have run the server in order to discover"
+    );
+
+    drop(tools);
+    assert!(
+        within(Duration::from_secs(10), || fixture_processes(tag) == 0).await,
+        "dropping the tools should have taken the server with it"
+    );
+
+    // Second start: same invocation, so the manifest answers and no process appears.
+    let (cached, warnings) = mcp::connect_all(
+        &[fixture_config(tag)],
+        Duration::from_secs(60),
+        Some(&manifest),
+    )
+    .await;
+    assert!(warnings.is_empty(), "cached start warned: {warnings:?}");
+    let from_cache: Vec<String> = cached.iter().map(|t| t.name().to_string()).collect();
+    assert_eq!(
+        from_cache, discovered,
+        "the cached start must advertise exactly what discovery found"
+    );
+
+    // The assertion this test exists for. Given a moment to be wrong, then checked.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(
+        fixture_processes(tag),
+        0,
+        "a cached start must run no server at all"
+    );
+
+    // ...and calling one still works, by dialing on demand.
+    let tool = cached
+        .iter()
+        .find(|t| t.name().starts_with("mcp__fixture__"))
+        .expect("cached tools");
+    let called = tool.run(json!({})).await;
+    assert!(
+        called.is_ok(),
+        "a tool from the cache must still be callable: {called:?}"
+    );
+    assert!(
+        within(Duration::from_secs(5), || fixture_processes(tag) == 1).await,
+        "the call should have started the server on demand"
+    );
+
+    drop(cached);
+    let _ = within(Duration::from_secs(10), || fixture_processes(tag) == 0).await;
+    let _ = std::fs::remove_dir_all(&dir);
 }

@@ -1484,6 +1484,13 @@ fn cli() -> Cli {
     }
 }
 
+/// Where the MCP tool manifest is cached, so a boot whose servers are already known starts none of
+/// them. `None` disables the cache — every boot then discovers by connecting, the behavior before it
+/// existed — which is what happens when there is no `HOME` to put it under.
+fn mcp_manifest_dir() -> Option<tools::mcp_manifest::ManifestDir> {
+    tools::mcp_manifest::ManifestDir::from_home()
+}
+
 /// The idle window after which an unused MCP server's process is reaped, re-spawned on the next call.
 ///
 /// An MCP server is a language runtime sitting idle waiting to be asked something — on the vps
@@ -1960,6 +1967,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             let (mcp_tools, mcp_warnings) = tools::mcp::connect_all(
                 stored_settings.mcp_servers.as_deref().unwrap_or(&[]),
                 mcp_idle_reap_after(),
+                mcp_manifest_dir().as_ref(),
             )
             .await;
             for warning in &mcp_warnings {
@@ -3674,6 +3682,7 @@ async fn run_task(
     let (mcp_tools, mcp_warnings) = tools::mcp::connect_all(
         stored_settings.mcp_servers.as_deref().unwrap_or(&[]),
         mcp_idle_reap_after(),
+        mcp_manifest_dir().as_ref(),
     )
     .await;
     for warning in &mcp_warnings {
