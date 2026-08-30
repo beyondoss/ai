@@ -30,6 +30,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use agent_core::{ImageSource, Tool, ToolError, ToolOutput};
 use async_trait::async_trait;
@@ -71,7 +72,172 @@ struct McpTool {
     remote_name: String,
     /// For error messages only, so a failure names which server misbehaved.
     server_name: String,
-    client: Arc<McpClient>,
+    /// The server's connection, which may or may not currently have a live process behind it — see
+    /// [`McpConnection`]. Shared by every tool discovered from the same server, so reaping one reaps
+    /// them all and reconnecting serves them all.
+    conn: Arc<McpConnection>,
+}
+
+/// A connection to one MCP server that can be dropped and rebuilt underneath the tools using it.
+///
+/// The point is memory. An MCP server is a whole language runtime sitting on a guest waiting to be
+/// asked something: measured on the vps primitive, `@playwright/mcp` costs **63.9 MB of anonymous
+/// memory** while completely idle, and 66.7 MB of that is one `require("playwright-core")` — a
+/// browser API loaded before any browser exists. On a guest whose whole job is an agent, that was 87%
+/// of everything anonymous in the VM.
+///
+/// Tools are still *discovered* eagerly at startup, because the model has to be told what it can call
+/// before it calls anything. But discovery is the only thing that needs a live process: an
+/// [`McpTool`] owns its own name, description, and schema, so once it exists the process behind it is
+/// dead weight until someone actually calls it. So the process is reaped after
+/// [`IDLE_REAP_AFTER`] without a call, and re-spawned on the next one.
+///
+/// Dropping the client is what kills the child: rmcp's `ChildWithCleanup` reaps the process in its
+/// `Drop`. There is no separate shutdown to call, and no zombie left behind.
+struct McpConnection {
+    config: McpServerConfig,
+    /// `None` once reaped (or before the first reconnect). A `tokio::sync::Mutex` rather than a
+    /// `std` one because reconnecting is `await`-ing I/O while holding it — two concurrent tool calls
+    /// arriving on a reaped connection must produce one process, not two.
+    client: tokio::sync::Mutex<Option<Arc<McpClient>>>,
+    /// When the connection was last used, for the reaper. Seconds since the process started, so it
+    /// fits an atomic and needs no lock on the hot path.
+    last_used: std::sync::atomic::AtomicU64,
+    /// How long *this* connection may idle before its process is reaped; `ZERO` never reaps it.
+    ///
+    /// Per-connection rather than a process-wide setting the reaper captured once: the sweeper is
+    /// started lazily by whoever connects first, so a captured window would silently apply to every
+    /// server configured afterwards — including one that asked never to be reaped. A test caught
+    /// exactly that.
+    idle_after: Duration,
+}
+
+/// How long a server may sit unused before its process is reaped.
+///
+/// Short enough that a guest which boots and is never asked to browse gives the memory back promptly,
+/// long enough that a working session doesn't pay a re-spawn between consecutive tool calls. A
+/// re-spawn costs a process start plus an MCP handshake — a second or two for a heavy server — which
+/// is noise against the model round trip that precedes every tool call.
+/// How long a server may sit unused before its process is reaped.
+///
+/// Short enough that a guest which boots and is never asked to browse gives the memory back promptly,
+/// long enough that a working session doesn't pay a re-spawn between consecutive tool calls. A
+/// re-spawn costs a process start plus an MCP handshake — a second or two for a heavy server — which
+/// is noise against the model round trip that precedes every tool call.
+///
+/// `Duration::ZERO` disables reaping entirely — every configured server stays resident for the
+/// process's life, which is the behavior that existed before this.
+pub const DEFAULT_IDLE_REAP_AFTER: Duration = Duration::from_secs(120);
+
+/// Every live connection, weakly. The reaper sweeps this rather than owning the connections, so a
+/// connection disappears from it as soon as the tools holding it are dropped — a `serve` registry
+/// rebuild or a finished `run` never leaves the reaper keeping a server alive.
+static LIVE: std::sync::Mutex<Vec<std::sync::Weak<McpConnection>>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Process start, the epoch `last_used` counts from. A monotonic seconds counter rather than
+/// `SystemTime`, so a clock step can never make an idle server look freshly used (or vice versa).
+static STARTED: std::sync::LazyLock<Instant> = std::sync::LazyLock::new(Instant::now);
+
+fn now_secs() -> u64 {
+    STARTED.elapsed().as_secs()
+}
+
+/// How often the reaper looks: half the idle window, capped at 30s. Well under the window, so a
+/// server is reaped within roughly it rather than up to twice it, and floored at 1s so a tiny
+/// configured window can't hand `interval` a zero period (which panics).
+fn reap_tick(idle: Duration) -> Duration {
+    (idle / 2)
+        .min(Duration::from_secs(30))
+        .max(Duration::from_secs(1))
+}
+
+/// Start the sweeper, once per process.
+///
+/// One task for every server rather than one per connection: the work is a handful of atomic loads on
+/// a timer, and a task per MCP server would be its own small leak on a long-lived `serve` daemon that
+/// rebuilds its registry.
+fn spawn_reaper_once(idle: Duration) {
+    // Nothing to sweep for if this caller never wants reaping; another caller that does will start it.
+    if idle.is_zero() {
+        return;
+    }
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(reap_tick(idle));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tick.tick().await;
+                // Snapshot and drop the lock before awaiting: `reap_if_idle` takes an async lock, and
+                // holding a std Mutex across an await would be a deadlock waiting to happen.
+                let conns: Vec<Arc<McpConnection>> = {
+                    let Ok(mut live) = LIVE.lock() else { return };
+                    live.retain(|w| w.strong_count() > 0);
+                    live.iter().filter_map(std::sync::Weak::upgrade).collect()
+                };
+                for conn in conns {
+                    // Holding an `Arc<McpConnection>` here is harmless: the busy check inside looks at
+                    // the strong count of the *client*, which only a call in flight clones.
+                    conn.reap_if_idle().await;
+                }
+            }
+        });
+    });
+}
+
+impl McpConnection {
+    fn new(config: McpServerConfig, client: McpClient, idle_after: Duration) -> Self {
+        Self {
+            config,
+            client: tokio::sync::Mutex::new(Some(Arc::new(client))),
+            last_used: std::sync::atomic::AtomicU64::new(now_secs()),
+            idle_after,
+        }
+    }
+
+    /// The live client, connecting first if the process was reaped.
+    async fn client(&self) -> Result<Arc<McpClient>, String> {
+        self.last_used
+            .store(now_secs(), std::sync::atomic::Ordering::Relaxed);
+        let mut guard = self.client.lock().await;
+        if let Some(client) = guard.as_ref() {
+            return Ok(client.clone());
+        }
+        let client = Arc::new(connect_one_client(&self.config).await?);
+        *guard = Some(client.clone());
+        Ok(client)
+    }
+
+    /// Drop the process if it has been idle long enough. Returns whether it reaped.
+    ///
+    /// Never reaps while a call is in flight: an in-flight call holds an `Arc` clone of the client, so
+    /// a strong count above one means someone is still using it and the reap is skipped. Without that
+    /// check a long-running `browser_navigate` could have the process killed out from under it.
+    async fn reap_if_idle(&self) -> bool {
+        let after = self.idle_after;
+        if after.is_zero() {
+            return false;
+        }
+        let idle =
+            now_secs().saturating_sub(self.last_used.load(std::sync::atomic::Ordering::Relaxed));
+        if idle < after.as_secs() {
+            return false;
+        }
+        let mut guard = self.client.lock().await;
+        match guard.as_ref() {
+            Some(client) if Arc::strong_count(client) == 1 => {
+                *guard = None;
+                tracing::debug!(
+                    server = %self.config.name,
+                    idle_secs = idle,
+                    "reaped an idle MCP server process"
+                );
+                true
+            }
+            _ => false,
+        }
+    }
 }
 
 #[async_trait]
@@ -108,7 +274,15 @@ impl Tool for McpTool {
             params = params.with_arguments(arguments);
         }
 
-        let result = self.client.call_tool(params).await.map_err(|e| {
+        // Re-spawns the server if it was reaped while idle. Held across the call, so the reaper
+        // cannot pull the process out from under it.
+        let client = self.conn.client().await.map_err(|e| {
+            ToolError::Execution(format!(
+                "mcp server `{}` is not reachable: {e}",
+                self.server_name
+            ))
+        })?;
+        let result = client.call_tool(params).await.map_err(|e| {
             ToolError::Execution(format!(
                 "mcp server `{}` tool `{}` call failed: {e}",
                 self.server_name, self.remote_name
@@ -169,8 +343,16 @@ impl Tool for McpTool {
 /// dependency on any other server, so connecting sequentially would needlessly add every server's own
 /// latency to `run`/`serve` startup instead of paying only the slowest one — a real, user-visible cost
 /// for an operator with several servers configured, not a micro-optimization.
-pub async fn connect_all(configs: &[McpServerConfig]) -> (Vec<Arc<dyn Tool>>, Vec<String>) {
-    let results = futures::future::join_all(configs.iter().map(connect_one)).await;
+pub async fn connect_all(
+    configs: &[McpServerConfig],
+    idle_reap_after: Duration,
+) -> (Vec<Arc<dyn Tool>>, Vec<String>) {
+    let results = futures::future::join_all(
+        configs
+            .iter()
+            .map(|config| connect_one(config, idle_reap_after)),
+    )
+    .await;
     let mut tools: Vec<Arc<dyn Tool>> = Vec::new();
     let mut warnings = Vec::new();
     for (config, result) in configs.iter().zip(results) {
@@ -189,12 +371,22 @@ pub async fn connect_all(configs: &[McpServerConfig]) -> (Vec<Arc<dyn Tool>>, Ve
     (tools, warnings)
 }
 
-async fn connect_one(config: &McpServerConfig) -> Result<Vec<Arc<dyn Tool>>, String> {
-    let client = match &config.transport {
-        McpTransport::Stdio { command, args, .. } => connect_stdio(config, command, args).await?,
-        McpTransport::Http { url, .. } => connect_http(config, url).await?,
-    };
-    tools_from_client(config, client).await
+/// Dial one server and complete the MCP handshake, without listing anything. Split out of
+/// [`connect_one`] so [`McpConnection`] can redial the exact same way after a reap — a reconnect must
+/// not drift from the original connect.
+async fn connect_one_client(config: &McpServerConfig) -> Result<McpClient, String> {
+    match &config.transport {
+        McpTransport::Stdio { command, args, .. } => connect_stdio(config, command, args).await,
+        McpTransport::Http { url, .. } => connect_http(config, url).await,
+    }
+}
+
+async fn connect_one(
+    config: &McpServerConfig,
+    idle_reap_after: Duration,
+) -> Result<Vec<Arc<dyn Tool>>, String> {
+    let client = connect_one_client(config).await?;
+    tools_from_client(config, client, idle_reap_after).await
 }
 
 /// Spawns `command` as a plain child process — deliberately *not* its own process-group leader the way
@@ -338,12 +530,17 @@ async fn oauth_bearer_token(server_name: &str, url: &str) -> Option<String> {
 async fn tools_from_client(
     config: &McpServerConfig,
     client: McpClient,
+    idle_reap_after: Duration,
 ) -> Result<Vec<Arc<dyn Tool>>, String> {
     let remote_tools = client
         .list_all_tools()
         .await
         .map_err(|e| format!("`tools/list` failed: {e}"))?;
-    let client = Arc::new(client);
+    let conn = Arc::new(McpConnection::new(config.clone(), client, idle_reap_after));
+    if let Ok(mut live) = LIVE.lock() {
+        live.push(Arc::downgrade(&conn));
+    }
+    spawn_reaper_once(idle_reap_after);
     Ok(remote_tools
         .into_iter()
         .map(|remote_tool| {
@@ -364,7 +561,7 @@ async fn tools_from_client(
                 input_schema: remote_tool.schema_as_json_value(),
                 remote_name: remote_tool.name.into_owned(),
                 server_name: config.name.clone(),
-                client: client.clone(),
+                conn: conn.clone(),
             }) as Arc<dyn Tool>
         })
         .collect())

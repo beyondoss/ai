@@ -1484,6 +1484,21 @@ fn cli() -> Cli {
     }
 }
 
+/// The idle window after which an unused MCP server's process is reaped, re-spawned on the next call.
+///
+/// An MCP server is a language runtime sitting idle waiting to be asked something — on the vps
+/// primitive `@playwright/mcp` holds 63.9 MB of anonymous memory having never opened a browser — so
+/// the default is minutes, not hours. `BEYOND_AI_AGENT_MCP_IDLE_SECS` overrides it for an operator
+/// who wants a different trade between re-spawn latency and idle memory; `0` disables reaping and
+/// keeps every configured server resident for the process's life.
+fn mcp_idle_reap_after() -> std::time::Duration {
+    std::env::var("BEYOND_AI_AGENT_MCP_IDLE_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(std::time::Duration::from_secs)
+        .unwrap_or(tools::mcp::DEFAULT_IDLE_REAP_AFTER)
+}
+
 /// The `web` tool's isolated HTML parser, dispatched *before* anything else exists.
 ///
 /// Not a `Command` variant, and deliberately not routed through the CLI parser: the point of this
@@ -1942,9 +1957,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             // skipped with a warning, matching `has_gated_resources`'s own "warn, don't block the run"
             // convention in the `run` path above. `stored_settings.mcp_servers` is already trust-gated —
             // see that field's own doc comment.
-            let (mcp_tools, mcp_warnings) =
-                tools::mcp::connect_all(stored_settings.mcp_servers.as_deref().unwrap_or(&[]))
-                    .await;
+            let (mcp_tools, mcp_warnings) = tools::mcp::connect_all(
+                stored_settings.mcp_servers.as_deref().unwrap_or(&[]),
+                mcp_idle_reap_after(),
+            )
+            .await;
             for warning in &mcp_warnings {
                 eprintln!("warning: {warning}");
             }
@@ -3654,8 +3671,11 @@ async fn run_task(
     // just above. `stored_settings.mcp_servers` is already trust-gated (a project's own
     // `.claude/settings.json` — where a project-tier `mcp_servers` entry would live — only merges in at
     // all when `effective_settings_for_cwd` found `cwd` trusted; the global tier always applies).
-    let (mcp_tools, mcp_warnings) =
-        tools::mcp::connect_all(stored_settings.mcp_servers.as_deref().unwrap_or(&[])).await;
+    let (mcp_tools, mcp_warnings) = tools::mcp::connect_all(
+        stored_settings.mcp_servers.as_deref().unwrap_or(&[]),
+        mcp_idle_reap_after(),
+    )
+    .await;
     for warning in &mcp_warnings {
         eprintln!("warning: {warning}");
     }
