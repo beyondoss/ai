@@ -232,3 +232,71 @@ async fn a_cached_manifest_advertises_tools_without_starting_the_server() {
     let _ = within(Duration::from_secs(10), || fixture_processes(tag) == 0).await;
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Whether `pid` is still alive.
+fn alive(pid: u32) -> bool {
+    std::path::Path::new(&format!("/proc/{pid}")).exists()
+}
+
+/// Reaping must reclaim what the server *spawned*, not just the server.
+///
+/// The failure this guards against is not theoretical: `rustwright-mcp` double-forks Chromium, so a
+/// SIGKILL aimed at the server left 16 orphaned processes holding 322 MB of anonymous memory —
+/// measured — while the reaper reported success. A reaper that frees 6 MB and strands 322 is worse
+/// than none, because the next call starts a second browser beside the first.
+#[tokio::test(flavor = "multi_thread")]
+async fn reaping_sweeps_a_grandchild_the_server_forked_away() {
+    let tag = "reap-orphan-jkl012";
+    let pidfile = std::env::temp_dir().join(format!("mcp-orphan-{tag}.pid"));
+    let _ = std::fs::remove_file(&pidfile);
+
+    let mut config = fixture_config(tag);
+    if let McpTransport::Stdio { env, .. } = &mut config.transport {
+        env.insert(
+            "MCP_FIXTURE_ORPHAN_PIDFILE".into(),
+            pidfile.display().to_string(),
+        );
+    }
+
+    let (tools, warnings) = mcp::connect_all(&[config], Duration::from_secs(1), None).await;
+    assert!(
+        warnings.is_empty(),
+        "fixture failed to connect: {warnings:?}"
+    );
+    let tool = tools
+        .iter()
+        .find(|t| t.name().starts_with("mcp__fixture__"))
+        .expect("fixture advertised no tools")
+        .clone();
+    assert!(tool.run(json!({})).await.is_ok(), "first call failed");
+
+    // The grandchild: alive, and no longer a child of anything we hold.
+    assert!(
+        within(Duration::from_secs(5), || pidfile.exists()).await,
+        "the fixture never recorded its orphan"
+    );
+    let orphan: u32 = std::fs::read_to_string(&pidfile)
+        .expect("orphan pidfile")
+        .trim()
+        .parse()
+        .expect("orphan pid");
+    assert!(
+        alive(orphan),
+        "the orphan should be running before the reap"
+    );
+
+    // Reaped by going idle — and the sweep has to reach past the server to the orphan.
+    assert!(
+        within(Duration::from_secs(20), || fixture_processes(tag) == 0).await,
+        "the server itself should have been reaped"
+    );
+    assert!(
+        within(Duration::from_secs(15), || !alive(orphan)).await,
+        "the reap left the server's forked-away grandchild running, \
+         which is the whole 322 MB failure this exists to prevent"
+    );
+
+    drop(tool);
+    drop(tools);
+    let _ = std::fs::remove_file(&pidfile);
+}

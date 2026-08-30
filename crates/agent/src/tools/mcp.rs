@@ -94,12 +94,23 @@ struct McpTool {
 ///
 /// Dropping the client is what kills the child: rmcp's `ChildWithCleanup` reaps the process in its
 /// `Drop`. There is no separate shutdown to call, and no zombie left behind.
+/// A connected server: the client, and the process group to sweep when it goes away.
+///
+/// The group is kept beside the client rather than on the connection because it belongs to *this*
+/// process — a reconnect after a reap starts a new one, and sweeping the old group id then would
+/// either do nothing or, if the id had been recycled, kill something unrelated.
+struct Live {
+    client: Arc<McpClient>,
+    /// `None` for HTTP transports: there is no process of ours to reap.
+    pgid: Option<u32>,
+}
+
 struct McpConnection {
     config: McpServerConfig,
     /// `None` once reaped (or before the first reconnect). A `tokio::sync::Mutex` rather than a
     /// `std` one because reconnecting is `await`-ing I/O while holding it — two concurrent tool calls
     /// arriving on a reaped connection must produce one process, not two.
-    client: tokio::sync::Mutex<Option<Arc<McpClient>>>,
+    client: tokio::sync::Mutex<Option<Live>>,
     /// When the connection was last used, for the reaper. Seconds since the process started, so it
     /// fits an atomic and needs no lock on the hot path.
     last_used: std::sync::atomic::AtomicU64,
@@ -237,10 +248,18 @@ fn register_for_reaping(conn: &Arc<McpConnection>, idle: Duration) {
 }
 
 impl McpConnection {
-    fn new(config: McpServerConfig, client: McpClient, idle_after: Duration) -> Self {
+    fn new(
+        config: McpServerConfig,
+        client: McpClient,
+        pgid: Option<u32>,
+        idle_after: Duration,
+    ) -> Self {
         Self {
             config,
-            client: tokio::sync::Mutex::new(Some(Arc::new(client))),
+            client: tokio::sync::Mutex::new(Some(Live {
+                client: Arc::new(client),
+                pgid,
+            })),
             last_used: std::sync::atomic::AtomicU64::new(now_secs()),
             idle_after,
         }
@@ -262,11 +281,15 @@ impl McpConnection {
         self.last_used
             .store(now_secs(), std::sync::atomic::Ordering::Relaxed);
         let mut guard = self.client.lock().await;
-        if let Some(client) = guard.as_ref() {
-            return Ok(client.clone());
+        if let Some(live) = guard.as_ref() {
+            return Ok(live.client.clone());
         }
-        let client = Arc::new(connect_one_client(&self.config).await?);
-        *guard = Some(client.clone());
+        let (client, pgid) = connect_one_client(&self.config).await?;
+        let client = Arc::new(client);
+        *guard = Some(Live {
+            client: client.clone(),
+            pgid,
+        });
         Ok(client)
     }
 
@@ -287,8 +310,13 @@ impl McpConnection {
         }
         let mut guard = self.client.lock().await;
         match guard.as_ref() {
-            Some(client) if Arc::strong_count(client) == 1 => {
+            Some(live) if Arc::strong_count(&live.client) == 1 => {
+                let pgid = live.pgid;
+                // Drops the client, which closes the server's stdin and kills it...
                 *guard = None;
+                // ...and this takes anything it forked away from itself, which a kill aimed at the
+                // server alone leaves running.
+                sweep_process_group(pgid);
                 tracing::debug!(
                     server = %self.config.name,
                     idle_secs = idle,
@@ -436,10 +464,12 @@ pub async fn connect_all(
 /// Dial one server and complete the MCP handshake, without listing anything. Split out of
 /// [`connect_one`] so [`McpConnection`] can redial the exact same way after a reap — a reconnect must
 /// not drift from the original connect.
-async fn connect_one_client(config: &McpServerConfig) -> Result<McpClient, String> {
+/// A live client, plus the process group to sweep when it is dropped. HTTP servers have no group —
+/// there is no process of ours to reap.
+async fn connect_one_client(config: &McpServerConfig) -> Result<(McpClient, Option<u32>), String> {
     match &config.transport {
         McpTransport::Stdio { command, args, .. } => connect_stdio(config, command, args).await,
-        McpTransport::Http { url, .. } => connect_http(config, url).await,
+        McpTransport::Http { url, .. } => connect_http(config, url).await.map(|c| (c, None)),
     }
 }
 
@@ -484,27 +514,31 @@ async fn connect_one(
         );
         return Ok(tools_from_manifest(config, manifest, idle_reap_after));
     }
-    let client = connect_one_client(config).await?;
-    tools_from_client(config, client, idle_reap_after, manifest_dir).await
+    let (client, pgid) = connect_one_client(config).await?;
+    tools_from_client(config, client, pgid, idle_reap_after, manifest_dir).await
 }
 
-/// Spawns `command` as a plain child process — deliberately *not* its own process-group leader the way
-/// `tools::exec::RealRunner` spawns `bash` (`cmd.process_group(0)`, so a timeout/cancellation can kill
-/// a whole backgrounded subtree): an MCP server is a single long-lived process, not a shell that can
-/// fork off detached descendants, so there's no subtree to worry about.
+/// Spawns `command` as its own process-group leader (`process_group(0)`), the same way
+/// `tools::exec::RealRunner` spawns `bash`, so that everything the server forks can be killed with it.
 ///
-/// Nor does this crate track the spawned pid for an explicit kill-before-exit barrier the way `bash`'s
-/// `GroupKillGuard`/`wait_for_pending_group_kills` do for a run that's about to call `std::process::exit`
-/// (which skips destructors entirely, so a merely-Rust-`Drop`-triggered cleanup — like `rmcp`'s own
-/// `TokioChildProcess`, which kills its child on drop — might never get to run). That asymmetry is
-/// deliberate, not an oversight: the MCP stdio transport's own contract is that a server watches its
-/// stdin for EOF as its shutdown signal, and the OS closes every fd of a terminated process
-/// unconditionally — including this one's end of the child's stdin pipe — regardless of *how* this
-/// process exits (a clean return, `std::process::exit`, or a fatal signal). A spec-compliant server (this
-/// crate's own `mcp_fixture_stdio_server` test fixture included) always sees that EOF and exits on its
-/// own; only a hung or non-compliant server would be left running, a materially different (and much
-/// lower-likelihood) risk than an arbitrary `bash`-run shell command backgrounding an uncooperative
-/// descendant.
+/// This used to be deliberately *not* a group leader, on the reasoning that an MCP server is a single
+/// long-lived process rather than a shell that can fork off detached descendants. Measurement retired
+/// that reasoning: a browser-driving server commonly double-forks its browser, which re-parents to
+/// init and survives any kill aimed at the server alone. Killing a `rustwright-mcp` that had opened
+/// one page left **16 orphaned Chromium processes holding 322 MB of anonymous memory**, indefinitely —
+/// so the reaper would have been freeing 6 MB while stranding 322, and the next call would start a
+/// second browser beside the first. (`@playwright/mcp` happens not to do this; "happens not to" is not
+/// a property to build a memory budget on.)
+///
+/// The group is what makes [`sweep_process_group`] able to catch them, and it is why the pid is read
+/// here and carried on the connection.
+///
+/// Dropping the client is still the primary shutdown, not the kill: the MCP stdio contract is that a
+/// server watches its stdin for EOF, and the OS closes this end of that pipe however this process
+/// exits — a clean return, `std::process::exit`, or a fatal signal. A spec-compliant server (this
+/// crate's own `mcp_fixture_stdio_server` test fixture included) sees the EOF and exits on its own,
+/// and a well-behaved browser server closes its browser on the way out. The group sweep is the
+/// backstop for everything that doesn't.
 ///
 /// `stderr` is left at `TokioChildProcess`'s own default (`Stdio::inherit()`), not captured — a
 /// deliberate choice, not an oversight: a server that fails to start or crashes typically explains why
@@ -514,19 +548,66 @@ async fn connect_stdio(
     config: &McpServerConfig,
     command: &str,
     args: &[String],
-) -> Result<McpClient, String> {
+) -> Result<(McpClient, Option<u32>), String> {
     let env = config.resolved_env();
     let child = TokioChildProcess::new(tokio::process::Command::new(command).configure(|cmd| {
         cmd.args(args);
         for (k, v) in &env {
             cmd.env(k, v);
         }
+        // Make the server its own process-group leader, so everything it spawns can be taken with it.
+        //
+        // Dropping the client kills the *server*, and for a server whose children stay in its tree
+        // that is enough. It is not enough in general: a browser-driving server commonly double-forks
+        // its browser, which re-parents to init and outlives any kill aimed at the server alone.
+        // Measured, killing a `rustwright-mcp` that had opened a page left 16 orphaned Chromium
+        // processes holding 322 MB of anonymous memory, indefinitely — a reap that reclaims nothing
+        // while the next call starts a second browser. A group leader here is what makes
+        // [`kill_process_group`] able to catch them.
+        cmd.process_group(0);
     }))
     .map_err(|e| format!("failed to spawn `{command}`: {e}"))?;
+    // Read before the transport is consumed; this is also the group id, since the child leads it.
+    let pgid = child.id();
 
-    ().serve(child)
+    let client = ()
+        .serve(child)
         .await
-        .map_err(|e| format!("MCP handshake over stdio failed: {e}"))
+        .map_err(|e| format!("MCP handshake over stdio failed: {e}"))?;
+    Ok((client, pgid))
+}
+
+/// The other way a server goes away: the last tool holding the connection is dropped (a `serve`
+/// registry rebuild, a finished `run`, process exit). rmcp kills the server itself on drop; this adds
+/// the sweep, so that path reclaims as much as a reap does.
+impl Drop for McpConnection {
+    fn drop(&mut self) {
+        // `get_mut` rather than a lock: we hold `&mut self`, so no one else can be holding it.
+        if let Some(live) = self.client.get_mut().take() {
+            let pgid = live.pgid;
+            drop(live);
+            sweep_process_group(pgid);
+        }
+    }
+}
+
+/// Sweep a reaped server's process group, in the background.
+///
+/// Deliberately *after* the client is dropped rather than instead of it: dropping closes the server's
+/// stdin, which is the MCP shutdown signal, and a well-behaved server closes its browser on seeing it.
+/// This is the backstop for the rest — and it reuses `exec`'s implementation rather than adding a
+/// second one, including its `ps`-enumeration pass, because group-signal delivery alone turned out not
+/// to be reliable there either.
+///
+/// What this does *not* cover is the agent being hard-killed: a server in its own group no longer
+/// receives the terminal's signals, and nothing then sweeps it. That is no worse than before — an
+/// orphaned browser already outlived a killed agent — and fixing it properly needs a supervisor rather
+/// than a signal.
+fn sweep_process_group(pgid: Option<u32>) {
+    let Some(pgid) = pgid else { return };
+    // On its own thread: `kill_process_group` blocks (it shells out and sleeps between passes), and
+    // this is called from both an async reap and a `Drop`, neither of which may block.
+    std::thread::spawn(move || crate::tools::exec::kill_process_group(pgid));
 }
 
 async fn connect_http(config: &McpServerConfig, url: &str) -> Result<McpClient, String> {
@@ -629,6 +710,8 @@ async fn oauth_bearer_token(server_name: &str, url: &str) -> Option<String> {
 async fn tools_from_client(
     config: &McpServerConfig,
     client: McpClient,
+    // The server's process group, so a reap can take its children too; `None` for HTTP.
+    pgid: Option<u32>,
     idle_reap_after: Duration,
     manifest_dir: Option<&crate::tools::mcp_manifest::ManifestDir>,
 ) -> Result<Vec<Arc<dyn Tool>>, String> {
@@ -636,7 +719,12 @@ async fn tools_from_client(
         .list_all_tools()
         .await
         .map_err(|e| format!("`tools/list` failed: {e}"))?;
-    let conn = Arc::new(McpConnection::new(config.clone(), client, idle_reap_after));
+    let conn = Arc::new(McpConnection::new(
+        config.clone(),
+        client,
+        pgid,
+        idle_reap_after,
+    ));
     register_for_reaping(&conn, idle_reap_after);
 
     // Record what this server advertises so the *next* boot can skip starting it entirely. Written

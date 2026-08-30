@@ -24,6 +24,12 @@
 //! `tools::mcp::connect_all` actually connects to multiple configured servers *concurrently* rather than
 //! one after another (start N of these with the same delay; total connect time should track the delay
 //! once, not N times).
+//!
+//! Also honors `MCP_FIXTURE_ORPHAN_PIDFILE`: leaves behind a long-lived process that has re-parented to
+//! init, and writes its pid to that path. This reproduces what a real browser-driving MCP server does —
+//! `rustwright-mcp` double-forks Chromium, so killing the server alone stranded 16 processes holding
+//! 322 MB — and lets a test prove the reaper's process-group sweep actually catches such a grandchild
+//! rather than only the child it can see.
 
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -41,6 +47,19 @@ async fn main() {
     {
         tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
     }
+    // A grandchild that outlives its parent: `sh` backgrounds `sleep` and exits immediately, so the
+    // sleep re-parents to init while *staying in this process's group* — exactly Chromium's shape under
+    // a double-forking MCP server. Not `setsid`, which would leave the group too and is a different
+    // (unsweepable-by-signal) problem.
+    if let Ok(pidfile) = std::env::var("MCP_FIXTURE_ORPHAN_PIDFILE") {
+        let script = format!("sleep 600 & echo $! > {pidfile}");
+        let _ = tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg(script)
+            .status()
+            .await;
+    }
+
     let stdin = tokio::io::stdin();
     let mut lines = BufReader::new(stdin).lines();
     let mut stdout = tokio::io::stdout();
