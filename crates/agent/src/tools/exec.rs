@@ -509,17 +509,25 @@ impl Capture {
 /// leader (`process_group(0)`), so pid and pgid are the same number. Shelling out (not `libc`/`nix`)
 /// keeps this free of `unsafe`, which the workspace forbids.
 ///
-/// Blocking, not async: called from two places that each need a *synchronous* guarantee rather than a
+/// Blocking, not async: called from places that each need a *synchronous* guarantee rather than a
 /// detached future — [`GroupKillGuard`]'s `Drop` impl (which can't `.await` at all, so this runs on a
 /// dedicated OS thread via `std::thread::spawn`, scheduled by the kernel independent of whatever the
 /// ambient tokio runtime is doing) and `exec`'s timeout branch (via `spawn_blocking`, so the caller
 /// actually waits for the kill to complete before `run()` returns, rather than firing it and hoping it
 /// lands before a caller re-checks side effects).
+///
+/// Also used by [`crate::tools::mcp`] to sweep a reaped MCP server's group, for the same reason `bash`
+/// needs it: the process that was killed is not necessarily the process holding the memory.
 #[cfg(unix)]
-fn kill_process_group(pgid: u32) {
+pub(crate) fn kill_process_group(pgid: u32) {
     let group_result = std::process::Command::new("kill")
         .arg("-KILL")
         .arg(format!("-{pgid}"))
+        // `kill` prints "No such process" on a group that already exited, which is the *expected*
+        // case here — and since an MCP connection sweeps its group on every drop, inheriting that
+        // would put a meaningless line on the operator's console routinely. The status is what this
+        // function acts on; the text adds nothing.
+        .stderr(std::process::Stdio::null())
         .status();
     // A non-success here (including `kill`'s own exit code, e.g. ESRCH because the group already
     // exited on its own between the timeout firing and this running) isn't worth logging on its own —
@@ -529,6 +537,7 @@ fn kill_process_group(pgid: u32) {
         match std::process::Command::new("kill")
             .arg("-KILL")
             .arg(pgid.to_string())
+            .stderr(std::process::Stdio::null())
             .status()
         {
             // Still only the "couldn't even run `kill`" case is worth a warning — a non-zero exit
