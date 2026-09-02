@@ -42,16 +42,21 @@
 //! can read resources and expand prompts without a separate host protocol. Completions are host-facing
 //! via `serve`'s `mcp_complete` RPC (argument autocomplete is a UI concern, not a model tool).
 //!
-//! **Elicitation / sampling / MRTR.** [`McpHandler`] advertises those client capabilities and fulfills
-//! server→client requests through [`crate::tools::mcp_host`] hubs (`serve` installs UI gates; headless
-//! `run` declines / rejects). Tool calls always use rmcp's MRTR-aware `call_tool` so `input_required`
-//! elicitation rounds complete under protocol `2026-07-28`. Connect uses
+//! **Elicitation / sampling / MRTR / tasks.** [`McpHandler`] advertises those client capabilities and
+//! fulfills server→client requests through [`crate::tools::mcp_host`] hubs (`serve` installs UI gates;
+//! headless `run` declines / rejects). Tool calls drive `call_tool_once` so SEP-2322 `input_required`
+//! rounds and SEP-2663 task handles complete under protocol `2026-07-28`. Connect uses
 //! [`ClientLifecycleMode::Auto`] preferring `2026-07-28` (discover), with legacy initialize fallback.
 //!
 //! Adding a brand-new server config mid-process (vs enabling one already configured at startup) remains
-//! out of scope. SEP-2663 tasks are not advertised yet (no task-polling loop).
+//! out of scope.
+//!
+//! **Tasks (SEP-2663).** Client advertises `io.modelcontextprotocol/tasks`. When `tools/call` returns
+//! `resultType: "task"`, we poll `tasks/get` (honoring `pollIntervalMs`), fulfill in-task
+//! `inputRequests` via `tasks/update`, surface `statusMessage` as [`ToolProgress`], and best-effort
+//! `tasks/cancel` if the tool future is dropped mid-poll.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -59,13 +64,16 @@ use agent_core::{ImageSource, Tool, ToolError, ToolOutput, ToolProgress};
 use async_trait::async_trait;
 use http::{HeaderName, HeaderValue};
 use rmcp::model::{
-    CallToolRequestParams, CallToolResult, ClientCapabilities, ClientInfo, ContentBlock,
-    CreateMessageRequestParams, CreateMessageResult, ElicitRequestParams, ElicitResult,
-    GetPromptRequestParams, Implementation, ProgressNotificationParam, ProgressToken,
-    ProtocolVersion, ReadResourceRequestParams, ResourceContents,
+    CallToolRequestParams, CallToolResponse, CallToolResult, CancelTaskParams, ClientCapabilities,
+    ClientInfo, ContentBlock, CreateMessageRequestParams, CreateMessageResult, CreateTaskResult,
+    DEFAULT_MRTR_MAX_ROUNDS, ElicitRequestParams, ElicitResult, GetPromptRequestParams,
+    GetTaskParams, Implementation, InputRequest, InputRequests, InputResponses, ListRootsResult,
+    ProgressNotificationParam, ProgressToken, ProtocolVersion, ReadResourceRequestParams,
+    ResourceContents, TaskPayload, TaskStatus, UpdateTaskParams,
 };
 use rmcp::service::{
-    ClientLifecycleMode, ClientServiceExt, NotificationContext, RequestContext, RunningService,
+    ClientLifecycleMode, ClientServiceExt, NotificationContext, Peer, RequestContext,
+    RunningService,
 };
 use rmcp::transport::streamable_http_client::{
     StreamableHttpClientTransport, StreamableHttpClientTransportConfig,
@@ -99,6 +107,7 @@ fn client_info() -> ClientInfo {
             .enable_elicitation()
             .enable_sampling()
             .enable_roots()
+            .enable_tasks()
             .build(),
         Implementation::new("beyond-ai-agent", env!("CARGO_PKG_VERSION")),
     )
@@ -107,14 +116,15 @@ fn client_info() -> ClientInfo {
 
 /// Routes progress, elicitation, and sampling for one MCP connection.
 ///
-/// Tool calls use MRTR-aware [`RunningService::call_tool`], which injects a `progressToken` we do
-/// not observe. Token-keyed sinks still work when a token is known; otherwise progress falls back to
-/// the LIFO active sink pushed for the in-flight `call_tool` (covers the normal model path).
+/// Tool calls use [`RunningService::call_tool_once`] (MRTR + SEP-2663 tasks). rmcp injects a
+/// `progressToken` we do not observe. Token-keyed sinks still work when a token is known; otherwise
+/// progress falls back to the LIFO active sink pushed for the in-flight call (covers the normal
+/// model path). Task `statusMessage` updates also emit on that sink while polling.
 #[derive(Clone)]
 struct McpHandler {
     server_name: String,
     sinks: Arc<std::sync::Mutex<HashMap<ProgressToken, ToolProgress>>>,
-    /// In-flight `call_tool` progress sinks (LIFO). See [`Self::push_active`].
+    /// In-flight tool-call progress sinks (LIFO). See [`Self::push_active`].
     active: Arc<std::sync::Mutex<Vec<ToolProgress>>>,
 }
 
@@ -609,10 +619,10 @@ impl Tool for McpTool {
 }
 
 impl McpTool {
-    /// Shared `tools/call` path. Always uses MRTR-aware `call_tool` so `input_required`
-    /// elicitation rounds auto-fulfill through [`McpHandler::create_elicitation`]. When a
-    /// [`ToolProgress`] sink is provided, it is pushed as the active fallback for progress
-    /// notifications whose token we cannot observe through `call_tool`.
+    /// Shared `tools/call` path. Drives MRTR `input_required` and SEP-2663 task handles via
+    /// [`drive_tool_call`]. When a [`ToolProgress`] sink is provided, it is pushed as the active
+    /// fallback for progress notifications whose token we cannot observe, and for task
+    /// `statusMessage` updates while polling.
     async fn call_remote(
         &self,
         input: Value,
@@ -641,15 +651,252 @@ impl McpTool {
         })?;
 
         let _active = progress.map(|p| client.service().push_active(p.clone()));
-        let result = client.call_tool(params).await.map_err(|e| {
-            ToolError::Execution(format!(
-                "mcp server `{}` tool `{}` call failed: {e}",
-                self.server_name, self.remote_name
-            ))
-        })?;
+        let result = drive_tool_call(
+            &client,
+            &self.server_name,
+            &self.remote_name,
+            params,
+            progress,
+        )
+        .await?;
 
         tool_output_from_result(&self.server_name, &self.remote_name, result)
     }
+}
+
+fn tool_call_err(server: &str, remote: &str, e: impl std::fmt::Display) -> ToolError {
+    ToolError::Execution(format!(
+        "mcp server `{server}` tool `{remote}` call failed: {e}"
+    ))
+}
+
+/// Drive one `tools/call` through MRTR rounds and/or a SEP-2663 task lifecycle.
+///
+/// rmcp's high-level `call_tool` fulfills MRTR but errors on `CreateTaskResult`; with tasks
+/// advertised we must use `call_tool_once` and poll ourselves. In-task elicitation/sampling/roots
+/// reuse the same host hubs as nested and MRTR input (rmcp's fulfill helpers are private).
+async fn drive_tool_call(
+    client: &McpClient,
+    server_name: &str,
+    remote_name: &str,
+    mut params: CallToolRequestParams,
+    progress: Option<&ToolProgress>,
+) -> Result<CallToolResult, ToolError> {
+    for _round in 0..DEFAULT_MRTR_MAX_ROUNDS {
+        match client
+            .call_tool_once(params.clone())
+            .await
+            .map_err(|e| tool_call_err(server_name, remote_name, e))?
+        {
+            CallToolResponse::Complete(result) => return Ok(result),
+            CallToolResponse::InputRequired(required) => {
+                let responses = fulfill_input_requests(
+                    server_name,
+                    required.input_requests.unwrap_or_default(),
+                )
+                .await?;
+                params.input_responses = (!responses.is_empty()).then_some(responses);
+                params.request_state = required.request_state;
+            }
+            CallToolResponse::Task(create) => {
+                return await_task(client, server_name, remote_name, create, progress).await;
+            }
+            other => {
+                return Err(ToolError::Execution(format!(
+                    "mcp server `{server_name}` tool `{remote_name}` returned unexpected tools/call response: {other:?}"
+                )));
+            }
+        }
+    }
+    Err(ToolError::Execution(format!(
+        "mcp server `{server_name}` tool `{remote_name}` exceeded {DEFAULT_MRTR_MAX_ROUNDS} input_required rounds"
+    )))
+}
+
+/// Fulfill SEP-2322 / in-task `inputRequests` through process-scoped host hubs.
+async fn fulfill_input_requests(
+    server_name: &str,
+    requests: InputRequests,
+) -> Result<InputResponses, ToolError> {
+    let mut responses = BTreeMap::new();
+    for (key, request) in requests {
+        let value = match request {
+            InputRequest::Elicitation(req) => {
+                let result = host()
+                    .elicitation
+                    .elicit(ElicitationAsk {
+                        server: server_name.to_string(),
+                        params: req.params,
+                    })
+                    .await;
+                serde_json::to_value(result).map_err(|e| {
+                    ToolError::Execution(format!("serialize elicitation result: {e}"))
+                })?
+            }
+            InputRequest::CreateMessage(req) => {
+                let result = host()
+                    .sampling
+                    .create_message(req.params)
+                    .await
+                    .map_err(|e| ToolError::Execution(format!("MCP sampling failed: {e}")))?;
+                serde_json::to_value(result)
+                    .map_err(|e| ToolError::Execution(format!("serialize sampling result: {e}")))?
+            }
+            InputRequest::ListRoots(_) => serde_json::to_value(ListRootsResult::new(Vec::new()))
+                .map_err(|e| ToolError::Execution(format!("serialize roots result: {e}")))?,
+            other => {
+                return Err(ToolError::Execution(format!(
+                    "unsupported MCP input request variant while fulfilling `{key}`: {other:?}"
+                )));
+            }
+        };
+        responses.insert(key, value);
+    }
+    Ok(responses)
+}
+
+/// Best-effort `tasks/cancel` when the tool future is aborted mid-poll.
+struct TaskCancelOnDrop {
+    peer: Peer<RoleClient>,
+    task_id: String,
+    finished: bool,
+}
+
+impl TaskCancelOnDrop {
+    fn finish(&mut self) {
+        self.finished = true;
+    }
+}
+
+impl Drop for TaskCancelOnDrop {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        let peer = self.peer.clone();
+        let task_id = self.task_id.clone();
+        tokio::spawn(async move {
+            let _ = peer.cancel_task(CancelTaskParams::new(task_id)).await;
+        });
+    }
+}
+
+/// Poll `tasks/get` until terminal; fulfill in-task input via `tasks/update`.
+async fn await_task(
+    client: &McpClient,
+    server_name: &str,
+    remote_name: &str,
+    create: CreateTaskResult,
+    progress: Option<&ToolProgress>,
+) -> Result<CallToolResult, ToolError> {
+    let peer = client.peer().clone();
+    let task_id = create.task.task_id.clone();
+    let mut cancel = TaskCancelOnDrop {
+        peer: peer.clone(),
+        task_id: task_id.clone(),
+        finished: false,
+    };
+    let mut poll_ms = create.task.poll_interval_ms.unwrap_or(1_000).max(10);
+    let mut last_status_message: Option<String> = None;
+
+    if let Some(message) = create.task.status_message.as_ref()
+        && let Some(sink) = progress
+    {
+        sink.emit(
+            message.clone(),
+            Some(json!({
+                "taskId": task_id,
+                "status": "working",
+                "statusMessage": message,
+            })),
+        );
+        last_status_message = Some(message.clone());
+    }
+
+    // Cap polls so a stuck server cannot hang the agent forever (~poll_ms * MAX, typically minutes).
+    const MAX_POLLS: usize = 10_000;
+    for _ in 0..MAX_POLLS {
+        tokio::time::sleep(Duration::from_millis(poll_ms)).await;
+
+        let info = peer
+            .get_task(GetTaskParams::new(task_id.clone()))
+            .await
+            .map_err(|e| tool_call_err(server_name, remote_name, e))?;
+        let detailed = info.task;
+
+        if let Some(interval) = detailed.task.poll_interval_ms {
+            poll_ms = interval.max(10);
+        }
+
+        if let Some(message) = detailed.task.status_message.as_ref()
+            && last_status_message.as_ref() != Some(message)
+        {
+            if let Some(sink) = progress {
+                let status = match detailed.status() {
+                    TaskStatus::Working => "working",
+                    TaskStatus::InputRequired => "input_required",
+                    TaskStatus::Completed => "completed",
+                    TaskStatus::Failed => "failed",
+                    TaskStatus::Cancelled => "cancelled",
+                    _ => "unknown",
+                };
+                sink.emit(
+                    message.clone(),
+                    Some(json!({
+                        "taskId": task_id,
+                        "status": status,
+                        "statusMessage": message,
+                    })),
+                );
+            }
+            last_status_message = Some(message.clone());
+        }
+
+        match detailed.payload {
+            TaskPayload::Working => {}
+            TaskPayload::InputRequired { input_requests } => {
+                let responses = fulfill_input_requests(server_name, input_requests).await?;
+                peer.update_task(UpdateTaskParams::new(task_id.clone(), responses))
+                    .await
+                    .map_err(|e| tool_call_err(server_name, remote_name, e))?;
+            }
+            TaskPayload::Completed { result } => {
+                cancel.finish();
+                let call_result: CallToolResult =
+                    serde_json::from_value(Value::Object(result)).map_err(|e| {
+                        ToolError::Execution(format!(
+                            "mcp task `{task_id}` on `{server_name}`/`{remote_name}` returned an invalid CallToolResult: {e}"
+                        ))
+                    })?;
+                return Ok(call_result);
+            }
+            TaskPayload::Failed { error } => {
+                cancel.finish();
+                return Err(ToolError::Execution(format!(
+                    "mcp task `{task_id}` on `{server_name}`/`{remote_name}` failed: {error:?}"
+                )));
+            }
+            TaskPayload::Cancelled => {
+                cancel.finish();
+                return Err(ToolError::Execution(format!(
+                    "mcp task `{task_id}` on `{server_name}`/`{remote_name}` was cancelled"
+                )));
+            }
+            other => {
+                return Err(ToolError::Execution(format!(
+                    "mcp task `{task_id}` on `{server_name}`/`{remote_name}` returned unknown payload: {other:?}"
+                )));
+            }
+        }
+    }
+
+    let _ = peer
+        .cancel_task(CancelTaskParams::new(task_id.clone()))
+        .await;
+    cancel.finish();
+    Err(ToolError::Execution(format!(
+        "mcp task `{task_id}` on `{server_name}`/`{remote_name}` did not complete within {MAX_POLLS} polls"
+    )))
 }
 
 fn tool_output_from_result(

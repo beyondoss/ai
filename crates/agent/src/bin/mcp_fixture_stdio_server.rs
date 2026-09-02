@@ -11,11 +11,22 @@
 //! - `ask_user`: nested `elicitation/create` mid-`tools/call` — classic server→client elicitation.
 //! - `ask_user_mrtr`: returns SEP-2322 `input_required` with an elicitation input request; on retry
 //!   with `inputResponses` completes — proves MRTR under protocol `2026-07-28`.
+//! - `slow_task`: returns SEP-2663 `resultType: "task"`; client polls `tasks/get` until completed
+//!   (status messages `task-phase-one` → `task-phase-two` → result `task-done`).
+//! - `fail_task` / `server_cancel_task`: timed tasks that end `failed` / `cancelled` (server-side).
+//! - `sticky_task`: stays `working` until `tasks/cancel` (abort proof; optional
+//!   `MCP_FIXTURE_CANCEL_FLAG` path gets the cancelled task id written).
+//! - `ask_task`: first `tasks/get` is `input_required` (elicitation); `tasks/update` completes.
 //!
-//! Also answers `resources/*`, `prompts/*`, `completion/complete`, and `server/discover`
-//! (advertising `2026-07-28` + `2025-11-25`). Legacy `initialize` still works for Auto fallback.
+//! Also answers `resources/*`, `prompts/*`, `completion/complete`, `tasks/get` / `tasks/cancel` /
+//! `tasks/update`, and `server/discover` (advertising `2026-07-28` + `2025-11-25` + tasks extension).
+//! Legacy `initialize` still works for Auto fallback.
 //!
 //! Env: `MCP_FIXTURE_STARTUP_DELAY_MS`, `MCP_FIXTURE_ORPHAN_PIDFILE` (unchanged).
+
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
@@ -28,6 +39,54 @@ const TINY_PNG_BASE64: &str =
 
 const RESOURCE_URI: &str = "fixture://doc";
 const RESOURCE_BODY: &str = "fixture-resource-body";
+
+const TASKS_EXTENSION_ID: &str = "io.modelcontextprotocol/tasks";
+
+/// How a fixture task reaches a terminal state (or waits for cancel / input).
+enum TaskMode {
+    /// Completes successfully after `complete_after`.
+    TimedSuccess { complete_after: Duration },
+    /// Ends as `failed` after `complete_after`.
+    TimedFailed { complete_after: Duration },
+    /// Ends as `cancelled` (server-initiated) after `complete_after`.
+    TimedServerCancelled { complete_after: Duration },
+    /// Never completes unless the client sends `tasks/cancel`.
+    Sticky,
+    /// First `tasks/get` asks for elicitation; `tasks/update` supplies the answer.
+    Ask { answered_name: Option<String> },
+}
+
+struct FixtureTask {
+    created: Instant,
+    mode: TaskMode,
+    /// Set by `tasks/cancel` (client-initiated).
+    cancelled: bool,
+    poll_interval_ms: u64,
+}
+
+fn tasks() -> &'static Mutex<HashMap<String, FixtureTask>> {
+    static TASKS: OnceLock<Mutex<HashMap<String, FixtureTask>>> = OnceLock::new();
+    TASKS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn record_cancel_flag(task_id: &str) {
+    let Ok(path) = std::env::var("MCP_FIXTURE_CANCEL_FLAG") else {
+        return;
+    };
+    let _ = std::fs::write(path, task_id);
+}
+
+fn capabilities() -> Value {
+    json!({
+        "tools": {},
+        "resources": {},
+        "prompts": {},
+        "completions": {},
+        "extensions": {
+            (TASKS_EXTENSION_ID): {}
+        },
+    })
+}
 
 #[tokio::main]
 async fn main() {
@@ -223,12 +282,7 @@ fn handle(method: &str, params: Value) -> Result<Value, (i64, String)> {
         "server/discover" => Ok(json!({
             "resultType": "complete",
             "supportedVersions": ["2026-07-28", "2025-11-25"],
-            "capabilities": {
-                "tools": {},
-                "resources": {},
-                "prompts": {},
-                "completions": {},
-            },
+            "capabilities": capabilities(),
             "ttlMs": 0,
             "cacheScope": "private",
             "_meta": {
@@ -240,16 +294,14 @@ fn handle(method: &str, params: Value) -> Result<Value, (i64, String)> {
         })),
         "initialize" => Ok(json!({
             "protocolVersion": "2025-11-25",
-            "capabilities": {
-                "tools": {},
-                "resources": {},
-                "prompts": {},
-                "completions": {},
-            },
+            "capabilities": capabilities(),
             "serverInfo": { "name": "mcp-fixture-stdio-server", "version": "0.0.0" },
         })),
         "tools/list" => Ok(json!({ "tools": tool_defs() })),
         "tools/call" => Ok(call_tool(params)),
+        "tasks/get" => tasks_get(params),
+        "tasks/cancel" => tasks_cancel(params),
+        "tasks/update" => tasks_update(params),
         "resources/list" => Ok(json!({
             "resources": [{
                 "uri": RESOURCE_URI,
@@ -389,6 +441,31 @@ fn tool_defs() -> Value {
             "description": "Asks the user their name via SEP-2322 input_required elicitation (MRTR).",
             "inputSchema": { "type": "object", "properties": {} },
         },
+        {
+            "name": "slow_task",
+            "description": "Returns a SEP-2663 task handle; completes after a short poll with `task-done`.",
+            "inputSchema": { "type": "object", "properties": {} },
+        },
+        {
+            "name": "fail_task",
+            "description": "SEP-2663 task that ends with status failed.",
+            "inputSchema": { "type": "object", "properties": {} },
+        },
+        {
+            "name": "server_cancel_task",
+            "description": "SEP-2663 task that ends with status cancelled (server-side).",
+            "inputSchema": { "type": "object", "properties": {} },
+        },
+        {
+            "name": "sticky_task",
+            "description": "SEP-2663 task that stays working until tasks/cancel.",
+            "inputSchema": { "type": "object", "properties": {} },
+        },
+        {
+            "name": "ask_task",
+            "description": "SEP-2663 task that needs in-task elicitation via tasks/update.",
+            "inputSchema": { "type": "object", "properties": {} },
+        },
     ])
 }
 
@@ -472,8 +549,276 @@ fn call_tool(params: Value) -> Value {
         "slow_progress" => text_result("progress-done", false),
         "ask_user" => text_result("ask_user should be handled asynchronously", true),
         "ask_user_mrtr" => call_ask_user_mrtr(&params),
+        "slow_task" => create_task(
+            TaskMode::TimedSuccess {
+                complete_after: Duration::from_millis(250),
+            },
+            "task-phase-one",
+            40,
+        ),
+        "fail_task" => create_task(
+            TaskMode::TimedFailed {
+                complete_after: Duration::from_millis(80),
+            },
+            "failing",
+            30,
+        ),
+        "server_cancel_task" => create_task(
+            TaskMode::TimedServerCancelled {
+                complete_after: Duration::from_millis(80),
+            },
+            "server-cancelling",
+            30,
+        ),
+        "sticky_task" => create_task(TaskMode::Sticky, "sticky-working", 40),
+        "ask_task" => create_task(
+            TaskMode::Ask {
+                answered_name: None,
+            },
+            "awaiting-name",
+            30,
+        ),
         other => text_result(&format!("fixture: unknown tool `{other}`"), true),
     }
+}
+
+fn create_task(mode: TaskMode, status_message: &str, poll_interval_ms: u64) -> Value {
+    let task_id = {
+        let Ok(mut guard) = tasks().lock() else {
+            return text_result("tasks lock poisoned", true);
+        };
+        let task_id = format!("fixture-task-{}", guard.len() + 1);
+        guard.insert(
+            task_id.clone(),
+            FixtureTask {
+                created: Instant::now(),
+                mode,
+                cancelled: false,
+                poll_interval_ms,
+            },
+        );
+        task_id
+    };
+    json!({
+        "resultType": "task",
+        "taskId": task_id,
+        "status": "working",
+        "statusMessage": status_message,
+        "createdAt": "2026-09-02T00:00:00Z",
+        "lastUpdatedAt": "2026-09-02T00:00:00Z",
+        "ttlMs": null,
+        "pollIntervalMs": poll_interval_ms,
+    })
+}
+
+fn tasks_get(params: Value) -> Result<Value, (i64, String)> {
+    let task_id = params
+        .get("taskId")
+        .and_then(Value::as_str)
+        .ok_or((-32602, "tasks/get requires taskId".into()))?
+        .to_string();
+    let Ok(guard) = tasks().lock() else {
+        return Err((-32603, "tasks lock poisoned".into()));
+    };
+    let Some(task) = guard.get(&task_id) else {
+        return Err((-32602, format!("unknown task `{task_id}`")));
+    };
+
+    if task.cancelled {
+        return Ok(task_base(
+            &task_id,
+            "cancelled",
+            None,
+            task.poll_interval_ms,
+            None,
+            None,
+        ));
+    }
+
+    match &task.mode {
+        TaskMode::Ask {
+            answered_name: Some(name),
+        } => Ok(task_base(
+            &task_id,
+            "completed",
+            Some("ask-complete"),
+            task.poll_interval_ms,
+            Some(json!({
+                "content": [{ "type": "text", "text": format!("task-ask-hello-{name}") }],
+                "isError": false,
+            })),
+            None,
+        )),
+        TaskMode::Ask {
+            answered_name: None,
+        } => Ok(json!({
+            "resultType": "complete",
+            "taskId": task_id,
+            "status": "input_required",
+            "statusMessage": "need-name",
+            "createdAt": "2026-09-02T00:00:00Z",
+            "lastUpdatedAt": "2026-09-02T00:00:00Z",
+            "ttlMs": null,
+            "pollIntervalMs": task.poll_interval_ms,
+            "inputRequests": {
+                "name": {
+                    "method": "elicitation/create",
+                    "params": {
+                        "mode": "form",
+                        "message": "What is your name? (task)",
+                        "requestedSchema": {
+                            "type": "object",
+                            "properties": { "name": { "type": "string" } },
+                            "required": ["name"],
+                        }
+                    }
+                }
+            }
+        })),
+        TaskMode::Sticky => Ok(task_base(
+            &task_id,
+            "working",
+            Some("sticky-working"),
+            task.poll_interval_ms,
+            None,
+            None,
+        )),
+        TaskMode::TimedSuccess { complete_after }
+        | TaskMode::TimedFailed { complete_after }
+        | TaskMode::TimedServerCancelled { complete_after } => {
+            let elapsed = task.created.elapsed();
+            if elapsed < *complete_after {
+                let status_message = match &task.mode {
+                    TaskMode::TimedSuccess { .. } if elapsed >= *complete_after / 2 => {
+                        "task-phase-two"
+                    }
+                    TaskMode::TimedSuccess { .. } => "task-phase-one",
+                    TaskMode::TimedFailed { .. } => "failing",
+                    TaskMode::TimedServerCancelled { .. } => "server-cancelling",
+                    _ => "working",
+                };
+                return Ok(task_base(
+                    &task_id,
+                    "working",
+                    Some(status_message),
+                    task.poll_interval_ms,
+                    None,
+                    None,
+                ));
+            }
+            match &task.mode {
+                TaskMode::TimedSuccess { .. } => Ok(task_base(
+                    &task_id,
+                    "completed",
+                    Some("task-complete"),
+                    task.poll_interval_ms,
+                    Some(json!({
+                        "content": [{ "type": "text", "text": "task-done" }],
+                        "isError": false,
+                    })),
+                    None,
+                )),
+                TaskMode::TimedFailed { .. } => Ok(task_base(
+                    &task_id,
+                    "failed",
+                    Some("task-failed"),
+                    task.poll_interval_ms,
+                    None,
+                    Some(json!({
+                        "code": -32000,
+                        "message": "task-failed-on-purpose",
+                    })),
+                )),
+                TaskMode::TimedServerCancelled { .. } => Ok(task_base(
+                    &task_id,
+                    "cancelled",
+                    Some("task-server-cancelled"),
+                    task.poll_interval_ms,
+                    None,
+                    None,
+                )),
+                _ => unreachable!(),
+            }
+        }
+    }
+}
+
+fn task_base(
+    task_id: &str,
+    status: &str,
+    status_message: Option<&str>,
+    poll_interval_ms: u64,
+    result: Option<Value>,
+    error: Option<Value>,
+) -> Value {
+    let mut v = json!({
+        "resultType": "complete",
+        "taskId": task_id,
+        "status": status,
+        "createdAt": "2026-09-02T00:00:00Z",
+        "lastUpdatedAt": "2026-09-02T00:00:01Z",
+        "ttlMs": null,
+        "pollIntervalMs": poll_interval_ms,
+    });
+    if let Some(message) = status_message {
+        v["statusMessage"] = json!(message);
+    }
+    if let Some(result) = result {
+        v["result"] = result;
+    }
+    if let Some(error) = error {
+        v["error"] = error;
+    }
+    v
+}
+
+fn tasks_update(params: Value) -> Result<Value, (i64, String)> {
+    let task_id = params
+        .get("taskId")
+        .and_then(Value::as_str)
+        .ok_or((-32602, "tasks/update requires taskId".into()))?
+        .to_string();
+    let Ok(mut guard) = tasks().lock() else {
+        return Err((-32603, "tasks lock poisoned".into()));
+    };
+    let Some(task) = guard.get_mut(&task_id) else {
+        return Err((-32602, format!("unknown task `{task_id}`")));
+    };
+    if let TaskMode::Ask { answered_name } = &mut task.mode {
+        let action = params
+            .pointer("/inputResponses/name/action")
+            .and_then(Value::as_str)
+            .unwrap_or("decline");
+        if action == "accept" {
+            let name = params
+                .pointer("/inputResponses/name/content/name")
+                .and_then(Value::as_str)
+                .unwrap_or("?")
+                .to_string();
+            *answered_name = Some(name);
+        } else {
+            *answered_name = Some("declined".into());
+        }
+    }
+    Ok(json!({ "resultType": "complete" }))
+}
+
+fn tasks_cancel(params: Value) -> Result<Value, (i64, String)> {
+    let task_id = params
+        .get("taskId")
+        .and_then(Value::as_str)
+        .ok_or((-32602, "tasks/cancel requires taskId".into()))?
+        .to_string();
+    let Ok(mut guard) = tasks().lock() else {
+        return Err((-32603, "tasks lock poisoned".into()));
+    };
+    let Some(task) = guard.get_mut(&task_id) else {
+        return Err((-32602, format!("unknown task `{task_id}`")));
+    };
+    task.cancelled = true;
+    drop(guard);
+    record_cancel_flag(&task_id);
+    Ok(json!({ "resultType": "complete" }))
 }
 
 fn text_result(text: &str, is_error: bool) -> Value {
