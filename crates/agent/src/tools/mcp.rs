@@ -665,7 +665,9 @@ impl McpTool {
 }
 
 fn tool_call_err(server: &str, remote: &str, e: impl std::fmt::Display) -> ToolError {
-    ToolError::Execution(format!("mcp server `{server}` tool `{remote}` call failed: {e}"))
+    ToolError::Execution(format!(
+        "mcp server `{server}` tool `{remote}` call failed: {e}"
+    ))
 }
 
 /// Drive one `tools/call` through MRTR rounds and/or a SEP-2663 task lifecycle.
