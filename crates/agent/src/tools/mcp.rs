@@ -27,13 +27,28 @@
 //! already use — so a long MCP call is observably live rather than a silent hang until the final
 //! result.
 //!
+//! Sampling and roots client capabilities remain advertised for protocol completeness even though
+//! SEP-2577 deprecates them; see [`crate::tools::mcp_host`].
+
+#![expect(deprecated)] // Sampling/roots: SEP-2577-deprecated but still on the wire.
+//!
 //! **Session enablement.** Configured servers stay connected (or lazily dormant) for the process, but
 //! which ones are *advertised* is session-scoped via [`McpEnabledSet`] (`serve`'s `set_mcp_enabled`).
 //! That is the kit-shaping seam: disable defaults with `--tools`/`--exclude-tools`, then enable only
 //! the MCP servers this task needs — without reconnecting or restarting.
 //!
-//! Out of scope (explicit, not an oversight): MCP *resources* and *prompts*. Adding a brand-new server
-//! config mid-process (vs enabling one already configured at startup) is also out of scope.
+//! **Resources / prompts.** At connect we also `resources/list` and `prompts/list`, wrapping each as
+//! an ordinary tool (`mcp__<server>__resource__<name>`, `mcp__<server>__prompt__<name>`) so the model
+//! can read resources and expand prompts without a separate host protocol. Completions are host-facing
+//! via `serve`'s `mcp_complete` RPC (argument autocomplete is a UI concern, not a model tool).
+//!
+//! **Elicitation / sampling.** [`McpHandler`] advertises those client capabilities and fulfills
+//! server→client requests through [`crate::tools::mcp_host`] hubs (`serve` installs UI gates; headless
+//! `run` declines / rejects). Tool calls use rmcp's MRTR-aware `call_tool` so `input_required`
+//! elicitation rounds complete under protocol `2026-07-28`.
+//!
+//! Adding a brand-new server config mid-process (vs enabling one already configured at startup) remains
+//! out of scope. SEP-2663 tasks are not advertised yet (no task-polling loop).
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -43,32 +58,69 @@ use agent_core::{ImageSource, Tool, ToolError, ToolOutput, ToolProgress};
 use async_trait::async_trait;
 use http::{HeaderName, HeaderValue};
 use rmcp::model::{
-    CallToolRequest, CallToolRequestParams, CallToolResult, ClientRequest, ContentBlock,
-    ProgressNotificationParam, ProgressToken, ServerResult,
+    CallToolRequest, CallToolRequestParams, CallToolResult, ClientCapabilities, ClientInfo,
+    ClientRequest, ContentBlock, CreateMessageRequestParams, CreateMessageResult,
+    ElicitRequestParams, ElicitResult, GetPromptRequestParams, Implementation,
+    ProgressNotificationParam, ProgressToken, ProtocolVersion, ReadResourceRequestParams,
+    ResourceContents, ServerResult,
 };
-use rmcp::service::{NotificationContext, PeerRequestOptions, RunningService};
+use rmcp::service::{
+    ClientLifecycleMode, ClientServiceExt, NotificationContext, PeerRequestOptions, RequestContext,
+    RunningService,
+};
 use rmcp::transport::streamable_http_client::{
     StreamableHttpClientTransport, StreamableHttpClientTransportConfig,
 };
 use rmcp::transport::{ConfigureCommandExt, TokioChildProcess};
-use rmcp::{ClientHandler, RoleClient, ServiceExt};
-use serde_json::{Value, json};
+use rmcp::{ClientHandler, ErrorData as McpError, RoleClient};
+use serde_json::{Map, Value, json};
 
 use crate::settings::{McpServerConfig, McpTransport};
+use crate::tools::mcp_host::{ElicitationAsk, McpHost};
 
-/// Routes MCP `notifications/progress` for in-flight `tools/call`s onto the matching
-/// [`ToolProgress`] sink. Shared by every tool on one server connection (one handler per
-/// [`RunningService`]).
+/// Process-scoped host callbacks (elicitation / sampling). `serve` installs gates after connect.
+pub fn host() -> &'static McpHost {
+    static HOST: std::sync::OnceLock<McpHost> = std::sync::OnceLock::new();
+    HOST.get_or_init(McpHost::new)
+}
+
+fn client_lifecycle() -> ClientLifecycleMode {
+    // Prefer initialize for stdio fixtures and today's ecosystem (most servers still speak the
+    // handshake). ClientInfo still requests `2026-07-28`; the handshake layer negotiates down to a
+    // mutually supported revision.
+    ClientLifecycleMode::Initialize
+}
+
+fn client_info() -> ClientInfo {
+    ClientInfo::new(
+        ClientCapabilities::builder()
+            .enable_elicitation()
+            .enable_sampling()
+            .enable_roots()
+            .build(),
+        Implementation::new("beyond-ai-agent", env!("CARGO_PKG_VERSION")),
+    )
+    .with_protocol_version(ProtocolVersion::V_2026_07_28)
+}
+
+/// Routes progress, elicitation, and sampling for one MCP connection.
 ///
-/// rmcp always stamps a fresh [`ProgressToken`] onto outbound requests; we register the sink under
-/// that token around `await_response` so concurrent calls on the same server cannot cross-wire
-/// each other's updates.
-#[derive(Clone, Default)]
-struct ProgressClient {
+/// Progress uses token-keyed sinks (via `send_cancellable_request`). MRTR `call_tool` is used when no
+/// progress sink is needed so elicitation rounds still auto-fulfill.
+#[derive(Clone)]
+struct McpHandler {
+    server_name: String,
     sinks: Arc<std::sync::Mutex<HashMap<ProgressToken, ToolProgress>>>,
 }
 
-impl ProgressClient {
+impl McpHandler {
+    fn new(server_name: impl Into<String>) -> Self {
+        Self {
+            server_name: server_name.into(),
+            sinks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        }
+    }
+
     fn register(&self, token: ProgressToken, progress: ToolProgress) {
         if let Ok(mut sinks) = self.sinks.lock() {
             sinks.insert(token, progress);
@@ -82,15 +134,16 @@ impl ProgressClient {
     }
 }
 
-impl ClientHandler for ProgressClient {
+impl ClientHandler for McpHandler {
+    fn get_info(&self) -> ClientInfo {
+        client_info()
+    }
+
     async fn on_progress(
         &self,
         params: ProgressNotificationParam,
         _context: NotificationContext<RoleClient>,
     ) {
-        // Clone the sink under the lock, emit outside — never hold `std::sync::Mutex` across an
-        // await, and never call into user code while the map is locked (re-entrant progress would
-        // deadlock).
         let sink = {
             let Ok(sinks) = self.sinks.lock() else {
                 return;
@@ -103,6 +156,28 @@ impl ClientHandler for ProgressClient {
         let snapshot = format_progress_snapshot(&params);
         let details = progress_details(&params);
         progress.emit(snapshot, Some(details));
+    }
+
+    async fn create_elicitation(
+        &self,
+        request: ElicitRequestParams,
+        _context: RequestContext<RoleClient>,
+    ) -> Result<ElicitResult, McpError> {
+        Ok(host()
+            .elicitation
+            .elicit(ElicitationAsk {
+                server: self.server_name.clone(),
+                params: request,
+            })
+            .await)
+    }
+
+    async fn create_message(
+        &self,
+        params: CreateMessageRequestParams,
+        _context: RequestContext<RoleClient>,
+    ) -> Result<CreateMessageResult, McpError> {
+        host().sampling.create_message(params).await
     }
 }
 
@@ -125,10 +200,8 @@ fn progress_details(params: &ProgressNotificationParam) -> Value {
     })
 }
 
-/// A connected MCP server's live client handle. [`ProgressClient`] receives
-/// `notifications/progress`; other server-initiated requests keep trait defaults. Shared (via `Arc`)
-/// by every [`McpTool`] the server produced.
-type McpClient = RunningService<RoleClient, ProgressClient>;
+/// A connected MCP server's live client handle. Shared (via `Arc`) by every tool the server produced.
+type McpClient = RunningService<RoleClient, McpHandler>;
 
 /// Session-scoped gate over which configured MCP servers' tools are advertised to the model.
 ///
@@ -172,6 +245,14 @@ impl McpEnabledSet {
 /// identical problem.
 fn registered_name(server: &str, remote_tool: &str) -> String {
     format!("mcp__{server}__{remote_tool}")
+}
+
+fn registered_resource_name(server: &str, resource_name: &str) -> String {
+    format!("mcp__{server}__resource__{resource_name}")
+}
+
+fn registered_prompt_name(server: &str, prompt_name: &str) -> String {
+    format!("mcp__{server}__prompt__{prompt_name}")
 }
 
 /// Inverse of [`registered_name`]: `mcp__filesystem__read_file` → `Some("filesystem")`.
@@ -507,9 +588,9 @@ impl Tool for McpTool {
 }
 
 impl McpTool {
-    /// Shared `tools/call` path. When `progress` is set, registers the sink under rmcp's
-    /// auto-assigned `progressToken` for the duration of the call so `notifications/progress`
-    /// become `ToolProgress` snapshots.
+    /// Shared `tools/call` path. Progress path uses `send_cancellable_request` so the
+    /// `progressToken` is known for routing. Non-progress uses MRTR-aware `call_tool` so
+    /// elicitation `input_required` rounds still auto-fulfill.
     async fn call_remote(
         &self,
         input: Value,
@@ -537,10 +618,6 @@ impl McpTool {
             ))
         })?;
 
-        // Non-progress path: use `call_tool` (same wire shape; slightly less ceremony). Progress path:
-        // `send_cancellable_request` so we learn the `progressToken` rmcp stamped onto the request —
-        // plain `call_tool` awaits internally and never exposes it, which would make progress
-        // unroutable. Matches rmcp's own `test_request_timeout_progress` client pattern.
         let result = if let Some(progress) = progress {
             let handle = client
                 .send_cancellable_request(
@@ -566,9 +643,9 @@ impl McpTool {
             })?;
             match response {
                 ServerResult::CallToolResult(result) => result,
-                _ => {
+                other => {
                     return Err(ToolError::Execution(format!(
-                        "mcp server `{}` tool `{}` returned an unexpected response shape",
+                        "mcp server `{}` tool `{}` returned an unexpected response shape: {other:?}",
                         self.server_name, self.remote_name
                     )));
                 }
@@ -634,9 +711,9 @@ fn tool_output_from_result(
 }
 
 /// Connect to every configured MCP server, returning every tool discovered (already wrapped and ready
-/// to [`register`](agent_core::ToolRegistry::register)) plus one warning string per server that failed
-/// to connect. Fail-soft: a misconfigured or dead server never blocks another configured server, or the
-/// agent's own startup — see the module doc comment for why.
+/// to [`register`](agent_core::ToolRegistry::register)), a catalog for host RPCs, plus one warning
+/// string per server that failed to connect. Fail-soft: a misconfigured or dead server never blocks
+/// another configured server, or the agent's own startup — see the module doc comment for why.
 ///
 /// Every server connects *concurrently* (`futures::future::join_all`), not one after another: each
 /// connect is independent I/O (a process spawn + handshake, or a network round trip) with zero data
@@ -647,7 +724,7 @@ pub async fn connect_all(
     configs: &[McpServerConfig],
     idle_reap_after: Duration,
     manifest_dir: Option<&crate::tools::mcp_manifest::ManifestDir>,
-) -> (Vec<Arc<dyn Tool>>, Vec<String>) {
+) -> (Vec<Arc<dyn Tool>>, McpCatalog, Vec<String>) {
     let results = futures::future::join_all(
         configs
             .iter()
@@ -655,10 +732,14 @@ pub async fn connect_all(
     )
     .await;
     let mut tools: Vec<Arc<dyn Tool>> = Vec::new();
+    let mut catalogs = Vec::new();
     let mut warnings = Vec::new();
     for (config, result) in configs.iter().zip(results) {
         match result {
-            Ok(server_tools) => tools.extend(server_tools),
+            Ok((server_tools, catalog)) => {
+                tools.extend(server_tools);
+                catalogs.push(catalog);
+            }
             Err(e) => {
                 tracing::warn!(
                     server = %config.name,
@@ -669,7 +750,7 @@ pub async fn connect_all(
             }
         }
     }
-    (tools, warnings)
+    (tools, McpCatalog::new(catalogs), warnings)
 }
 
 /// Dial one server and complete the MCP handshake, without listing anything. Split out of
@@ -692,10 +773,11 @@ fn tools_from_manifest(
     config: &McpServerConfig,
     manifest: crate::tools::mcp_manifest::ServerManifest,
     idle_reap_after: Duration,
-) -> Vec<Arc<dyn Tool>> {
+) -> (Vec<Arc<dyn Tool>>, McpServerCatalog) {
     let conn = Arc::new(McpConnection::dormant(config.clone(), idle_reap_after));
     register_for_reaping(&conn, idle_reap_after);
-    manifest
+
+    let mut tools: Vec<Arc<dyn Tool>> = manifest
         .tools
         .into_iter()
         .map(|t| {
@@ -708,14 +790,59 @@ fn tools_from_manifest(
                 conn: conn.clone(),
             }) as Arc<dyn Tool>
         })
-        .collect()
+        .collect();
+
+    let mut resource_infos = Vec::with_capacity(manifest.resources.len());
+    for resource in manifest.resources {
+        let tool_name = registered_resource_name(&config.name, &resource.name);
+        resource_infos.push(McpResourceInfo {
+            uri: resource.uri.clone(),
+            name: resource.name.clone(),
+            description: Some(resource.description.clone()).filter(|d| !d.is_empty()),
+            tool: tool_name.clone(),
+        });
+        tools.push(Arc::new(McpResourceTool {
+            name: tool_name,
+            description: resource.description,
+            server_name: config.name.clone(),
+            uri: resource.uri,
+            conn: conn.clone(),
+        }));
+    }
+
+    let mut prompt_infos = Vec::with_capacity(manifest.prompts.len());
+    for prompt in manifest.prompts {
+        let tool_name = registered_prompt_name(&config.name, &prompt.name);
+        prompt_infos.push(McpPromptInfo {
+            name: prompt.name.clone(),
+            description: Some(prompt.description.clone()).filter(|d| !d.is_empty()),
+            tool: tool_name.clone(),
+        });
+        tools.push(Arc::new(McpPromptTool {
+            name: tool_name,
+            description: prompt.description,
+            input_schema: prompt.input_schema,
+            server_name: config.name.clone(),
+            prompt_name: prompt.name,
+            conn: conn.clone(),
+        }));
+    }
+
+    let catalog = McpServerCatalog {
+        name: config.name.clone(),
+        conn: Arc::downgrade(&conn),
+        resources: resource_infos,
+        prompts: prompt_infos,
+        protocol_version: None,
+    };
+    (tools, catalog)
 }
 
 async fn connect_one(
     config: &McpServerConfig,
     idle_reap_after: Duration,
     manifest_dir: Option<&crate::tools::mcp_manifest::ManifestDir>,
-) -> Result<Vec<Arc<dyn Tool>>, String> {
+) -> Result<(Vec<Arc<dyn Tool>>, McpServerCatalog), String> {
     // Cache hit: advertise from the manifest and start nothing.
     if let Some(manifest) = manifest_dir.and_then(|d| crate::tools::mcp_manifest::load(d, config)) {
         tracing::debug!(
@@ -781,8 +908,8 @@ async fn connect_stdio(
     // Read before the transport is consumed; this is also the group id, since the child leads it.
     let pgid = child.id();
 
-    let client = ProgressClient::default()
-        .serve(child)
+    let client = McpHandler::new(&config.name)
+        .serve_with_lifecycle(child, client_lifecycle())
         .await
         .map_err(|e| format!("MCP handshake over stdio failed: {e}"))?;
     Ok((client, pgid))
@@ -854,8 +981,8 @@ async fn connect_http(config: &McpServerConfig, url: &str) -> Result<McpClient, 
     let transport =
         StreamableHttpClientTransport::with_client(reqwest::Client::new(), transport_config);
 
-    ProgressClient::default()
-        .serve(transport)
+    McpHandler::new(&config.name)
+        .serve_with_lifecycle(transport, client_lifecycle())
         .await
         .map_err(|e| {
             let hint = if bearer_token.is_none() {
@@ -921,6 +1048,266 @@ async fn oauth_bearer_token(server_name: &str, url: &str) -> Option<String> {
     }
 }
 
+/// One MCP resource, exposed as a zero-arg tool that `resources/read`s a fixed URI.
+struct McpResourceTool {
+    name: String,
+    description: String,
+    server_name: String,
+    uri: String,
+    conn: Arc<McpConnection>,
+}
+
+#[async_trait]
+impl Tool for McpResourceTool {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn description(&self) -> &str {
+        &self.description
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({ "type": "object", "properties": {} })
+    }
+
+    async fn run(&self, _input: Value) -> Result<ToolOutput, ToolError> {
+        let client = self.conn.client().await.map_err(|e| {
+            ToolError::Execution(format!(
+                "mcp server `{}` is not reachable: {e}",
+                self.server_name
+            ))
+        })?;
+        let result = client
+            .read_resource(ReadResourceRequestParams::new(self.uri.clone()))
+            .await
+            .map_err(|e| {
+                ToolError::Execution(format!(
+                    "mcp server `{}` resources/read `{}` failed: {e}",
+                    self.server_name, self.uri
+                ))
+            })?;
+        Ok(resource_contents_to_output(&result.contents))
+    }
+}
+
+/// One MCP prompt, exposed as a tool whose args match the prompt's declared arguments.
+struct McpPromptTool {
+    name: String,
+    description: String,
+    input_schema: Value,
+    server_name: String,
+    prompt_name: String,
+    conn: Arc<McpConnection>,
+}
+
+#[async_trait]
+impl Tool for McpPromptTool {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn description(&self) -> &str {
+        &self.description
+    }
+
+    fn input_schema(&self) -> Value {
+        self.input_schema.clone()
+    }
+
+    async fn run(&self, input: Value) -> Result<ToolOutput, ToolError> {
+        let arguments = match input {
+            Value::Object(map) => Some(map),
+            Value::Null => None,
+            other => {
+                return Err(ToolError::InvalidInput(format!(
+                    "expected a JSON object of arguments for `{}`, got: {other}",
+                    self.name
+                )));
+            }
+        };
+        let client = self.conn.client().await.map_err(|e| {
+            ToolError::Execution(format!(
+                "mcp server `{}` is not reachable: {e}",
+                self.server_name
+            ))
+        })?;
+        let mut params = GetPromptRequestParams::new(self.prompt_name.clone());
+        if let Some(arguments) = arguments {
+            params = params.with_arguments(arguments);
+        }
+        let result = client.get_prompt(params).await.map_err(|e| {
+            ToolError::Execution(format!(
+                "mcp server `{}` prompts/get `{}` failed: {e}",
+                self.server_name, self.prompt_name
+            ))
+        })?;
+        let mut text = String::new();
+        for msg in result.messages {
+            if !text.is_empty() {
+                text.push('\n');
+            }
+            let body = match &msg.content {
+                ContentBlock::Text(t) => t.text.clone(),
+                other => format!("[{other:?}]"),
+            };
+            text.push_str(&format!("{:?}: {body}", msg.role));
+        }
+        if let Some(desc) = result.description {
+            if text.is_empty() {
+                text = desc;
+            } else {
+                text = format!("{desc}\n{text}");
+            }
+        }
+        Ok(ToolOutput {
+            text,
+            images: Vec::new(),
+            terminate: false,
+        })
+    }
+}
+
+fn resource_contents_to_output(contents: &[ResourceContents]) -> ToolOutput {
+    let mut text = String::new();
+    let mut images = Vec::new();
+    for block in contents {
+        match block {
+            ResourceContents::TextResourceContents { text: t, .. } => {
+                if !text.is_empty() {
+                    text.push('\n');
+                }
+                text.push_str(t);
+            }
+            ResourceContents::BlobResourceContents {
+                blob, mime_type, ..
+            } => {
+                let mime = mime_type.as_deref().unwrap_or("application/octet-stream");
+                if mime.starts_with("image/") {
+                    images.push(ImageSource::base64(mime.to_string(), blob.clone()));
+                } else {
+                    if !text.is_empty() {
+                        text.push('\n');
+                    }
+                    text.push_str(&format!("[blob {mime}; {} bytes base64]", blob.len()));
+                }
+            }
+            _ => {
+                if !text.is_empty() {
+                    text.push('\n');
+                }
+                text.push_str("[unsupported MCP resource contents]");
+            }
+        }
+    }
+    ToolOutput {
+        text,
+        images,
+        terminate: false,
+    }
+}
+
+fn prompt_input_schema(arguments: Option<&[rmcp::model::PromptArgument]>) -> Value {
+    let mut properties = Map::new();
+    let mut required = Vec::new();
+    if let Some(args) = arguments {
+        for arg in args {
+            let mut prop = Map::new();
+            prop.insert("type".into(), json!("string"));
+            if let Some(desc) = &arg.description {
+                prop.insert("description".into(), json!(desc));
+            }
+            properties.insert(arg.name.clone(), Value::Object(prop));
+            if arg.required == Some(true) {
+                required.push(arg.name.clone());
+            }
+        }
+    }
+    let mut schema = Map::new();
+    schema.insert("type".into(), json!("object"));
+    schema.insert("properties".into(), Value::Object(properties));
+    if !required.is_empty() {
+        schema.insert("required".into(), json!(required));
+    }
+    Value::Object(schema)
+}
+
+/// Per-server catalog entry retained after connect — for `get_mcp` / `mcp_complete`.
+#[derive(Clone)]
+pub struct McpServerCatalog {
+    pub name: String,
+    /// Weak so a catalog snapshot cannot keep a reaped server's process alive after its tools drop.
+    conn: std::sync::Weak<McpConnection>,
+    pub resources: Vec<McpResourceInfo>,
+    pub prompts: Vec<McpPromptInfo>,
+    /// Negotiated peer protocol version, when known.
+    pub protocol_version: Option<String>,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct McpResourceInfo {
+    pub uri: String,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub tool: String,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct McpPromptInfo {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub tool: String,
+}
+
+/// Every connected server's catalog — completions + diagnostics.
+#[derive(Clone, Default)]
+pub struct McpCatalog {
+    servers: Arc<std::sync::Mutex<Vec<McpServerCatalog>>>,
+}
+
+impl McpCatalog {
+    pub fn new(servers: Vec<McpServerCatalog>) -> Self {
+        Self {
+            servers: Arc::new(std::sync::Mutex::new(servers)),
+        }
+    }
+
+    pub fn snapshot(&self) -> Vec<McpServerCatalog> {
+        self.servers.lock().ok().map(|g| g.clone()).unwrap_or_default()
+    }
+
+    pub fn filter_enabled(&self, enabled: &McpEnabledSet) -> Vec<McpServerCatalog> {
+        self.snapshot()
+            .into_iter()
+            .filter(|s| enabled.allows(&s.name))
+            .collect()
+    }
+
+    /// `completion/complete` against a live (or reconnected) server.
+    pub async fn complete(
+        &self,
+        server: &str,
+        params: rmcp::model::CompleteRequestParams,
+    ) -> Result<rmcp::model::CompleteResult, String> {
+        let entry = self
+            .snapshot()
+            .into_iter()
+            .find(|s| s.name == server)
+            .ok_or_else(|| format!("unknown MCP server `{server}`"))?;
+        let conn = entry
+            .conn
+            .upgrade()
+            .ok_or_else(|| format!("mcp server `{server}` is no longer connected"))?;
+        let client = conn.client().await?;
+        client
+            .complete(params)
+            .await
+            .map_err(|e| format!("mcp server `{server}` completion/complete failed: {e}"))
+    }
+}
+
 async fn tools_from_client(
     config: &McpServerConfig,
     client: McpClient,
@@ -928,11 +1315,30 @@ async fn tools_from_client(
     pgid: Option<u32>,
     idle_reap_after: Duration,
     manifest_dir: Option<&crate::tools::mcp_manifest::ManifestDir>,
-) -> Result<Vec<Arc<dyn Tool>>, String> {
+) -> Result<(Vec<Arc<dyn Tool>>, McpServerCatalog), String> {
     let remote_tools = client
         .list_all_tools()
         .await
         .map_err(|e| format!("`tools/list` failed: {e}"))?;
+    // Fail-soft: a server without resources/prompts capabilities returns an error; treat as empty.
+    let remote_resources = match client.list_all_resources().await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::debug!(server = %config.name, error = %e, "resources/list unavailable");
+            Vec::new()
+        }
+    };
+    let remote_prompts = match client.list_all_prompts().await {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::debug!(server = %config.name, error = %e, "prompts/list unavailable");
+            Vec::new()
+        }
+    };
+    let protocol_version = client
+        .peer_info()
+        .map(|info| info.protocol_version.to_string());
+
     let conn = Arc::new(McpConnection::new(
         config.clone(),
         client,
@@ -955,9 +1361,36 @@ async fn tools_from_client(
                     input_schema: t.schema_as_json_value(),
                 })
                 .collect(),
+            remote_resources
+                .iter()
+                .map(|r| crate::tools::mcp_manifest::CachedResource {
+                    name: r.name.clone(),
+                    uri: r.uri.clone(),
+                    description: r
+                        .description
+                        .clone()
+                        .unwrap_or_else(|| {
+                            format!(
+                                "MCP resource `{}` ({}) from server `{}`",
+                                r.name, r.uri, config.name
+                            )
+                        }),
+                })
+                .collect(),
+            remote_prompts
+                .iter()
+                .map(|p| crate::tools::mcp_manifest::CachedPrompt {
+                    name: p.name.clone(),
+                    description: p.description.clone().unwrap_or_else(|| {
+                        format!("MCP prompt `{}` from server `{}`", p.name, config.name)
+                    }),
+                    input_schema: prompt_input_schema(p.arguments.as_deref()),
+                })
+                .collect(),
         );
     }
-    Ok(remote_tools
+
+    let mut tools: Vec<Arc<dyn Tool>> = remote_tools
         .into_iter()
         .map(|remote_tool| {
             let description = remote_tool
@@ -980,7 +1413,74 @@ async fn tools_from_client(
                 conn: conn.clone(),
             }) as Arc<dyn Tool>
         })
-        .collect())
+        .collect();
+
+    let mut resource_infos = Vec::new();
+    for resource in &remote_resources {
+        let tool_name = registered_resource_name(&config.name, &resource.name);
+        let description = resource
+            .description
+            .clone()
+            .filter(|d| !d.is_empty())
+            .unwrap_or_else(|| {
+                format!(
+                    "MCP resource `{}` ({}) from server `{}`",
+                    resource.name, resource.uri, config.name
+                )
+            });
+        resource_infos.push(McpResourceInfo {
+            uri: resource.uri.clone(),
+            name: resource.name.clone(),
+            description: resource.description.clone(),
+            tool: tool_name.clone(),
+        });
+        tools.push(Arc::new(McpResourceTool {
+            name: tool_name,
+            description,
+            server_name: config.name.clone(),
+            uri: resource.uri.clone(),
+            conn: conn.clone(),
+        }));
+    }
+
+    let mut prompt_infos = Vec::new();
+    for prompt in &remote_prompts {
+        let tool_name = registered_prompt_name(&config.name, &prompt.name);
+        let description = prompt
+            .description
+            .clone()
+            .filter(|d| !d.is_empty())
+            .unwrap_or_else(|| {
+                format!(
+                    "MCP prompt `{}` from server `{}`",
+                    prompt.name, config.name
+                )
+            });
+        prompt_infos.push(McpPromptInfo {
+            name: prompt.name.clone(),
+            description: prompt.description.clone(),
+            tool: tool_name.clone(),
+        });
+        tools.push(Arc::new(McpPromptTool {
+            name: tool_name,
+            description,
+            input_schema: prompt_input_schema(prompt.arguments.as_deref()),
+            server_name: config.name.clone(),
+            prompt_name: prompt.name.clone(),
+            conn: conn.clone(),
+        }));
+    }
+
+    Ok((
+        tools,
+        McpServerCatalog {
+            name: config.name.clone(),
+            conn: Arc::downgrade(&conn),
+            resources: resource_infos,
+            prompts: prompt_infos,
+            protocol_version,
+        },
+    ))
 }
 
 #[cfg(test)]

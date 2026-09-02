@@ -1964,7 +1964,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             // skipped with a warning, matching `has_gated_resources`'s own "warn, don't block the run"
             // convention in the `run` path above. `stored_settings.mcp_servers` is already trust-gated —
             // see that field's own doc comment.
-            let (mcp_tools, mcp_warnings) = tools::mcp::connect_all(
+            let (mcp_tools, mcp_catalog, mcp_warnings) = tools::mcp::connect_all(
                 stored_settings.mcp_servers.as_deref().unwrap_or(&[]),
                 mcp_idle_reap_after(),
                 mcp_manifest_dir().as_ref(),
@@ -2051,6 +2051,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 exclude_tools,
                 no_tools,
                 mcp_tools,
+                mcp_catalog,
                 // Discovered by `serve_session` itself, after it resolves project trust (a project-local
                 // definition is trust-gated, like a skill) — not here, where the interactive trust grant
                 // hasn't happened yet.
@@ -3678,7 +3679,7 @@ async fn run_task(
     // just above. `stored_settings.mcp_servers` is already trust-gated (a project's own
     // `.claude/settings.json` — where a project-tier `mcp_servers` entry would live — only merges in at
     // all when `effective_settings_for_cwd` found `cwd` trusted; the global tier always applies).
-    let (mcp_tools, mcp_warnings) = tools::mcp::connect_all(
+    let (mcp_tools, _mcp_catalog, mcp_warnings) = tools::mcp::connect_all(
         stored_settings.mcp_servers.as_deref().unwrap_or(&[]),
         mcp_idle_reap_after(),
         mcp_manifest_dir().as_ref(),

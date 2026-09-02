@@ -4,42 +4,29 @@
 //! of mocking the protocol away.
 //!
 //! Deliberately dependency-free beyond `tokio`/`serde_json` (already ordinary dependencies of this
-//! crate) rather than pulling in `rmcp`'s own server-side machinery: this only ever needs to answer the
-//! handful of requests one client makes in a test (`initialize`, `notifications/initialized`,
-//! `tools/list`, `tools/call`), so hand-framing them is simpler than standing up a second, heavier
-//! dependency surface just for a test double.
+//! crate) rather than pulling in `rmcp`'s own server-side machinery.
 //!
-//! Tools, each proving a distinct thing the real `tools::mcp` client code must handle correctly:
-//! - `echo`: a one-required-string-argument tool — the ordinary case.
-//! - `add`: two-number arguments — proves a richer input schema round-trips.
-//! - `ping`: an empty input schema, called with *no* arguments — proves the `Value::Null` input path.
-//! - `fail`: always returns `isError: true` — proves error propagation into `ToolError::Execution`.
-//! - `echo_env`: returns the value of an env var read from *this process's own environment* — proves
-//!   `McpServerConfig`'s configured `env` actually reaches the spawned child.
-//! - `image`: returns an `ImageContent` block (a tiny embedded PNG) — proves image content maps to
-//!   `ToolOutput::images`, not just text.
-//! - `slow_progress`: emits two `notifications/progress` frames (with sleeps between) before the final
-//!   result — proves MCP progress bridges into `ToolProgress` / `AgentEvent::ToolProgress`.
+//! Tools:
+//! - `echo` / `add` / `ping` / `fail` / `echo_env` / `image` / `slow_progress` — see prior docs.
+//! - `ask_user`: nested `elicitation/create` mid-`tools/call` — proves classic server→client elicitation.
 //!
-//! Also honors `MCP_FIXTURE_STARTUP_DELAY_MS` (an env var, so it's set per-server via `McpServerConfig`'s
-//! own `env` map) — sleeps that long before doing anything else, purely so a test can prove
-//! `tools::mcp::connect_all` actually connects to multiple configured servers *concurrently* rather than
-//! one after another (start N of these with the same delay; total connect time should track the delay
-//! once, not N times).
+//! Also answers `resources/*`, `prompts/*`, and `completion/complete`. Unknown methods (including
+//! `server/discover`) return JSON-RPC `-32601` so the client's Auto discover→initialize fallback is
+//! fast rather than a 10s timeout.
 //!
-//! Also honors `MCP_FIXTURE_ORPHAN_PIDFILE`: leaves behind a long-lived process that has re-parented to
-//! init, and writes its pid to that path. This reproduces what a real browser-driving MCP server does —
-//! `rustwright-mcp` double-forks Chromium, so killing the server alone stranded 16 processes holding
-//! 322 MB — and lets a test prove the reaper's process-group sweep actually catches such a grandchild
-//! rather than only the child it can see.
+//! Env: `MCP_FIXTURE_STARTUP_DELAY_MS`, `MCP_FIXTURE_ORPHAN_PIDFILE` (unchanged).
 
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
+use tokio::io::{Stdin, Stdout};
 
 /// A 1x1 transparent PNG, base64-encoded — small enough to embed literally, real enough to prove image
 /// bytes survive the round trip unmodified.
 const TINY_PNG_BASE64: &str =
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
+
+const RESOURCE_URI: &str = "fixture://doc";
+const RESOURCE_BODY: &str = "fixture-resource-body";
 
 #[tokio::main]
 async fn main() {
@@ -49,10 +36,6 @@ async fn main() {
     {
         tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
     }
-    // A grandchild that outlives its parent: `sh` backgrounds `sleep` and exits immediately, so the
-    // sleep re-parents to init while *staying in this process's group* — exactly Chromium's shape under
-    // a double-forking MCP server. Not `setsid`, which would leave the group too and is a different
-    // (unsweepable-by-signal) problem.
     if let Ok(pidfile) = std::env::var("MCP_FIXTURE_ORPHAN_PIDFILE") {
         let script = format!("sleep 600 & echo $! > {pidfile}");
         let _ = tokio::process::Command::new("sh")
@@ -69,29 +52,25 @@ async fn main() {
     loop {
         let line = match lines.next_line().await {
             Ok(Some(line)) => line,
-            Ok(None) => break, // EOF: the client closed the pipe (graceful shutdown).
+            Ok(None) => break,
             Err(_) => break,
         };
         if line.trim().is_empty() {
             continue;
         }
         let Ok(request) = serde_json::from_str::<Value>(&line) else {
-            continue; // Not valid JSON — nothing sensible to respond with; skip the line.
+            continue;
         };
         let Some(method) = request.get("method").and_then(Value::as_str) else {
-            continue; // A response, not a request/notification — this fixture never sends requests.
+            continue;
         };
-        // A notification (no `id`) never gets a reply, per JSON-RPC 2.0.
         let Some(id) = request.get("id").cloned() else {
             continue;
         };
 
         let params = request.get("params").cloned().unwrap_or(Value::Null);
 
-        // `slow_progress` must emit notifications *before* the final result, so it can't go through
-        // the sync `handle` path that only returns one envelope.
-        if method == "tools/call"
-            && params.get("name").and_then(Value::as_str) == Some("slow_progress")
+        if method == "tools/call" && params.get("name").and_then(Value::as_str) == Some("slow_progress")
         {
             if write_slow_progress(&mut stdout, id, &params).await.is_err() {
                 break;
@@ -99,28 +78,43 @@ async fn main() {
             continue;
         }
 
-        let response = handle(method, params);
-        let envelope = json!({ "jsonrpc": "2.0", "id": id, "result": response });
-        if write_json_line(&mut stdout, &envelope).await.is_err() {
-            break; // The client hung up; nothing left to do.
+        if method == "tools/call" && params.get("name").and_then(Value::as_str) == Some("ask_user") {
+            if write_ask_user(&mut lines, &mut stdout, id).await.is_err() {
+                break;
+            }
+            continue;
+        }
+
+        match handle(method, params) {
+            Ok(result) => {
+                let envelope = json!({ "jsonrpc": "2.0", "id": id, "result": result });
+                if write_json_line(&mut stdout, &envelope).await.is_err() {
+                    break;
+                }
+            }
+            Err((code, message)) => {
+                let envelope = json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": { "code": code, "message": message },
+                });
+                if write_json_line(&mut stdout, &envelope).await.is_err() {
+                    break;
+                }
+            }
         }
     }
 }
 
-async fn write_json_line(
-    stdout: &mut tokio::io::Stdout,
-    value: &Value,
-) -> Result<(), std::io::Error> {
+async fn write_json_line(stdout: &mut Stdout, value: &Value) -> Result<(), std::io::Error> {
     let mut encoded = serde_json::to_vec(value).map_err(std::io::Error::other)?;
     encoded.push(b'\n');
     stdout.write_all(&encoded).await?;
     stdout.flush().await
 }
 
-/// Emit two progress notifications (keyed to the client's `progressToken`), then the final result.
-/// Sleeps between frames so an e2e test can prove progress arrived *before* `tool_end`.
 async fn write_slow_progress(
-    stdout: &mut tokio::io::Stdout,
+    stdout: &mut Stdout,
     id: Value,
     params: &Value,
 ) -> Result<(), std::io::Error> {
@@ -155,21 +149,154 @@ async fn write_slow_progress(
     write_json_line(stdout, &result).await
 }
 
-fn handle(method: &str, params: Value) -> Value {
-    match method {
-        "initialize" => json!({
-            "protocolVersion": "2025-06-18",
-            "capabilities": { "tools": {} },
-            "serverInfo": { "name": "mcp-fixture-stdio-server", "version": "0.0.0" },
-        }),
-        "tools/list" => json!({ "tools": tool_defs() }),
-        "tools/call" => call_tool(params),
-        // Anything else this fixture doesn't understand: a JSON-RPC-shaped error result. None of the
-        // e2e tests are expected to trigger this — it's here so an unexpected request fails loudly
-        // (a clear tool-result-shaped error) rather than the fixture silently hanging.
-        other => {
-            json!({ "content": [{ "type": "text", "text": format!("fixture: unhandled method `{other}`") }], "isError": true })
+/// Classic nested elicitation: send `elicitation/create`, wait for the client's result, finish the tool.
+async fn write_ask_user(
+    lines: &mut Lines<BufReader<Stdin>>,
+    stdout: &mut Stdout,
+    tool_id: Value,
+) -> Result<(), std::io::Error> {
+    let elicit_id = json!("fixture-elicit-1");
+    let elicit_req = json!({
+        "jsonrpc": "2.0",
+        "id": elicit_id,
+        "method": "elicitation/create",
+        "params": {
+            "mode": "form",
+            "message": "What is your name?",
+            "requestedSchema": {
+                "type": "object",
+                "properties": { "name": { "type": "string" } },
+                "required": ["name"],
+            }
         }
+    });
+    write_json_line(stdout, &elicit_req).await?;
+
+    let name = loop {
+        let line = match lines.next_line().await? {
+            Some(line) => line,
+            None => return Ok(()),
+        };
+        if line.trim().is_empty() {
+            continue;
+        }
+        let Ok(msg) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        if msg.get("id") != Some(&elicit_id) {
+            // Ignore unrelated traffic (shouldn't happen mid-call on this fixture).
+            continue;
+        }
+        let action = msg
+            .pointer("/result/action")
+            .and_then(Value::as_str)
+            .unwrap_or("decline");
+        if action != "accept" {
+            break None;
+        }
+        break msg
+            .pointer("/result/content/name")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+    };
+
+    let text = match name {
+        Some(n) => format!("hello-{n}"),
+        None => "elicitation-declined".into(),
+    };
+    let result = json!({
+        "jsonrpc": "2.0",
+        "id": tool_id,
+        "result": {
+            "content": [{ "type": "text", "text": text }],
+            "isError": false,
+        }
+    });
+    write_json_line(stdout, &result).await
+}
+
+fn handle(method: &str, params: Value) -> Result<Value, (i64, String)> {
+    match method {
+        "initialize" => Ok(json!({
+            "protocolVersion": "2025-11-25",
+            "capabilities": {
+                "tools": {},
+                "resources": {},
+                "prompts": {},
+                "completions": {},
+            },
+            "serverInfo": { "name": "mcp-fixture-stdio-server", "version": "0.0.0" },
+        })),
+        "tools/list" => Ok(json!({ "tools": tool_defs() })),
+        "tools/call" => Ok(call_tool(params)),
+        "resources/list" => Ok(json!({
+            "resources": [{
+                "uri": RESOURCE_URI,
+                "name": "doc",
+                "description": "A fixture text resource.",
+                "mimeType": "text/plain",
+            }]
+        })),
+        "resources/read" => {
+            let uri = params.get("uri").and_then(Value::as_str).unwrap_or_default();
+            if uri != RESOURCE_URI {
+                return Err((-32002, format!("unknown resource `{uri}`")));
+            }
+            Ok(json!({
+                "contents": [{
+                    "uri": RESOURCE_URI,
+                    "mimeType": "text/plain",
+                    "text": RESOURCE_BODY,
+                }]
+            }))
+        }
+        "prompts/list" => Ok(json!({
+            "prompts": [{
+                "name": "greet",
+                "description": "A fixture prompt that greets `who`.",
+                "arguments": [{
+                    "name": "who",
+                    "description": "Who to greet",
+                    "required": true,
+                }]
+            }]
+        })),
+        "prompts/get" => {
+            let name = params.get("name").and_then(Value::as_str).unwrap_or_default();
+            if name != "greet" {
+                return Err((-32602, format!("unknown prompt `{name}`")));
+            }
+            let who = params
+                .pointer("/arguments/who")
+                .and_then(Value::as_str)
+                .unwrap_or("world");
+            Ok(json!({
+                "description": "greet prompt",
+                "messages": [{
+                    "role": "user",
+                    "content": { "type": "text", "text": format!("Please greet {who}.") }
+                }]
+            }))
+        }
+        "completion/complete" => {
+            let arg = params
+                .pointer("/argument/value")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let suggestions: Vec<&str> = ["alice", "alex", "bob"]
+                .into_iter()
+                .filter(|s| s.starts_with(arg))
+                .collect();
+            Ok(json!({
+                "completion": {
+                    "values": suggestions,
+                    "total": suggestions.len(),
+                    "hasMore": false,
+                }
+            }))
+        }
+        // JSON-RPC Method not found — critical for Auto discover→initialize fallback (no 10s wait).
+        other => Err((-32601, format!("Method not found: {other}"))),
     }
 }
 
@@ -225,6 +352,11 @@ fn tool_defs() -> Value {
             "description": "Emits progress notifications, then returns `progress-done`.",
             "inputSchema": { "type": "object", "properties": {} },
         },
+        {
+            "name": "ask_user",
+            "description": "Asks the user their name via elicitation, then greets them.",
+            "inputSchema": { "type": "object", "properties": {} },
+        },
     ])
 }
 
@@ -262,8 +394,8 @@ fn call_tool(params: Value) -> Value {
             "content": [{ "type": "image", "data": TINY_PNG_BASE64, "mimeType": "image/png" }],
             "isError": false,
         }),
-        // Handled asynchronously in `main` — should never reach here.
         "slow_progress" => text_result("progress-done", false),
+        "ask_user" => text_result("ask_user should be handled asynchronously", true),
         other => text_result(&format!("fixture: unknown tool `{other}`"), true),
     }
 }
