@@ -1,5 +1,5 @@
 //! A throwaway, hand-rolled MCP server speaking stdio — a test fixture, not a real MCP server. It
-//! exists purely so `crates/agent/tests/mcp_client.rs` can exercise the real `tools::mcp` client code
+//! exists purely so `crates/agent/tests/mcp_*.rs` can exercise the real `tools::mcp` client code
 //! against a real subprocess speaking the real wire protocol (newline-delimited JSON-RPC 2.0), instead
 //! of mocking the protocol away.
 //!
@@ -9,7 +9,7 @@
 //! `tools/list`, `tools/call`), so hand-framing them is simpler than standing up a second, heavier
 //! dependency surface just for a test double.
 //!
-//! Six tools, each proving a distinct thing the real `tools::mcp` client code must handle correctly:
+//! Tools, each proving a distinct thing the real `tools::mcp` client code must handle correctly:
 //! - `echo`: a one-required-string-argument tool — the ordinary case.
 //! - `add`: two-number arguments — proves a richer input schema round-trips.
 //! - `ping`: an empty input schema, called with *no* arguments — proves the `Value::Null` input path.
@@ -18,6 +18,8 @@
 //!   `McpServerConfig`'s configured `env` actually reaches the spawned child.
 //! - `image`: returns an `ImageContent` block (a tiny embedded PNG) — proves image content maps to
 //!   `ToolOutput::images`, not just text.
+//! - `slow_progress`: emits two `notifications/progress` frames (with sleeps between) before the final
+//!   result — proves MCP progress bridges into `ToolProgress` / `AgentEvent::ToolProgress`.
 //!
 //! Also honors `MCP_FIXTURE_STARTUP_DELAY_MS` (an env var, so it's set per-server via `McpServerConfig`'s
 //! own `env` map) — sleeps that long before doing anything else, purely so a test can prove
@@ -84,19 +86,73 @@ async fn main() {
             continue;
         };
 
-        let response = handle(
-            method,
-            request.get("params").cloned().unwrap_or(Value::Null),
-        );
-        let envelope = json!({ "jsonrpc": "2.0", "id": id, "result": response });
-        let Ok(mut encoded) = serde_json::to_vec(&envelope) else {
+        let params = request.get("params").cloned().unwrap_or(Value::Null);
+
+        // `slow_progress` must emit notifications *before* the final result, so it can't go through
+        // the sync `handle` path that only returns one envelope.
+        if method == "tools/call"
+            && params.get("name").and_then(Value::as_str) == Some("slow_progress")
+        {
+            if write_slow_progress(&mut stdout, id, &params).await.is_err() {
+                break;
+            }
             continue;
-        };
-        encoded.push(b'\n');
-        if stdout.write_all(&encoded).await.is_err() || stdout.flush().await.is_err() {
+        }
+
+        let response = handle(method, params);
+        let envelope = json!({ "jsonrpc": "2.0", "id": id, "result": response });
+        if write_json_line(&mut stdout, &envelope).await.is_err() {
             break; // The client hung up; nothing left to do.
         }
     }
+}
+
+async fn write_json_line(
+    stdout: &mut tokio::io::Stdout,
+    value: &Value,
+) -> Result<(), std::io::Error> {
+    let mut encoded = serde_json::to_vec(value).map_err(std::io::Error::other)?;
+    encoded.push(b'\n');
+    stdout.write_all(&encoded).await?;
+    stdout.flush().await
+}
+
+/// Emit two progress notifications (keyed to the client's `progressToken`), then the final result.
+/// Sleeps between frames so an e2e test can prove progress arrived *before* `tool_end`.
+async fn write_slow_progress(
+    stdout: &mut tokio::io::Stdout,
+    id: Value,
+    params: &Value,
+) -> Result<(), std::io::Error> {
+    let token = params
+        .pointer("/_meta/progressToken")
+        .cloned()
+        .unwrap_or(json!("missing-token"));
+
+    for (progress, message) in [(1.0, "phase-one"), (2.0, "phase-two")] {
+        let notification = json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/progress",
+            "params": {
+                "progressToken": token,
+                "progress": progress,
+                "total": 3.0,
+                "message": message,
+            }
+        });
+        write_json_line(stdout, &notification).await?;
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+    }
+
+    let result = json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": {
+            "content": [{ "type": "text", "text": "progress-done" }],
+            "isError": false,
+        }
+    });
+    write_json_line(stdout, &result).await
 }
 
 fn handle(method: &str, params: Value) -> Value {
@@ -164,6 +220,11 @@ fn tool_defs() -> Value {
             "description": "Returns a tiny embedded PNG as image content.",
             "inputSchema": { "type": "object", "properties": {} },
         },
+        {
+            "name": "slow_progress",
+            "description": "Emits progress notifications, then returns `progress-done`.",
+            "inputSchema": { "type": "object", "properties": {} },
+        },
     ])
 }
 
@@ -201,6 +262,8 @@ fn call_tool(params: Value) -> Value {
             "content": [{ "type": "image", "data": TINY_PNG_BASE64, "mimeType": "image/png" }],
             "isError": false,
         }),
+        // Handled asynchronously in `main` — should never reach here.
+        "slow_progress" => text_result("progress-done", false),
         other => text_result(&format!("fixture: unknown tool `{other}`"), true),
     }
 }

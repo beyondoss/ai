@@ -2207,6 +2207,10 @@ pub(crate) async fn serve_session(
     // Tools are fixed for the whole process (see `build_agent`'s doc comment), so this one check is
     // reused verbatim by `reload`'s own rebuild below rather than re-deriving it.
     let exec_cell = crate::exec_endpoint::ExecCell::new();
+    // Per-session MCP kit gate (which configured servers' tools are advertised). Defaults to all
+    // enabled — matching prior behavior — and is cleared on session switch so tenants cannot inherit
+    // each other's enablement the way they must not inherit each other's exec endpoint.
+    let mcp_enabled = crate::tools::mcp::McpEnabledSet::new();
     // A process-wide default, if configured. Per-session `set_exec_endpoint` overrides it, and a
     // session switch re-derives from that session's own record — so this is a starting point, not a
     // floor.
@@ -2221,7 +2225,7 @@ pub(crate) async fn serve_session(
         },
         (None, None) => {}
     }
-    let startup_tools = build_tools(&cfg, cfg.image_auto_resize, &exec_cell);
+    let startup_tools = build_tools(&cfg, cfg.image_auto_resize, &exec_cell, &mcp_enabled);
     let has_read = startup_tools.get("read").is_some();
     let has_todo = startup_tools.get(crate::tools::todo::NAME).is_some();
 
@@ -2324,6 +2328,14 @@ pub(crate) async fn serve_session(
                 exec_cell.set(restored);
             }
         };
+    }
+
+    macro_rules! reset_mcp_enabled {
+        () => {{
+            // Same cross-tenant rule as exec: an incoming session must not inherit the previous
+            // session's MCP kit. Default back to all configured servers enabled.
+            mcp_enabled.set(None);
+        }};
     }
 
     macro_rules! repoint_session_memory {
@@ -2565,6 +2577,7 @@ pub(crate) async fn serve_session(
         structured_output.as_ref(),
         memory_tool.as_ref(),
         approval.as_ref(),
+        &mcp_enabled,
     );
     timing.mark("build agent");
     // Persistent across every `prompt` call (not just the one currently in flight), so `steer`/
@@ -2586,7 +2599,7 @@ pub(crate) async fn serve_session(
     // command below reports as a clean error rather than a side door around that restriction. A direct
     // `Arc<dyn Tool>` handle, not routed through `agent`/the model loop: the host `bash` RPC command runs
     // independent of any conversation turn.
-    let bash_tool = build_tools(&cfg, cfg.image_auto_resize, &exec_cell).get("bash");
+    let bash_tool = build_tools(&cfg, cfg.image_auto_resize, &exec_cell, &mcp_enabled).get("bash");
     // The same deny-list `build_agent` installs as an `AgentHooks` gate on the model's own tool calls —
     // built once here rather than inline in the `bash` RPC arm below, since `--deny-tool`/
     // `--deny-bash-pattern`/`--deny-path` are fixed for the whole process (`build_agent`'s doc comment).
@@ -2704,7 +2717,31 @@ pub(crate) async fn serve_session(
                     session = s;
                     repoint_session_memory!();
                     reset_exec_endpoint!();
+                    reset_mcp_enabled!();
                     steering.clear();
+                    // Fresh session defaults to all MCP servers enabled — rebuild so a previous
+                    // session's allowlist cannot linger on this process's Agent.
+                    agent = build_agent(
+                        &exec_cell,
+                        client.clone(),
+                        &full_system(&static_system, &cwd),
+                        &cfg,
+                        &current_model,
+                        current_thinking,
+                        current_level,
+                        current_auto_compaction,
+                        current_auto_retry,
+                        current_block_images,
+                        current_image_auto_resize,
+                        persistence.session_id(),
+                        &write_locks,
+                        &checkpoint,
+                        subagent_ctx.as_ref(),
+                        structured_output.as_ref(),
+                        memory_tool.as_ref(),
+                        approval.as_ref(),
+                        &mcp_enabled,
+                    );
                     let _ = out_tx.send(response(
                         $id,
                         "new_session",
@@ -2737,6 +2774,7 @@ pub(crate) async fn serve_session(
                         session = s;
                         repoint_session_memory!();
                         reset_exec_endpoint!();
+                        reset_mcp_enabled!();
                         steering.clear();
                         // Restore whichever model/thinking-level this session was actually last
                         // running on, the same way `switch_branch` already does — without this, the
@@ -2767,6 +2805,9 @@ pub(crate) async fn serve_session(
                             current_thinking = None;
                             rebuild_needed = true;
                         }
+                        // MCP kit reset to all-enabled above — rebuild so the advertised tool set
+                        // cannot keep the previous session's allowlist.
+                        rebuild_needed = true;
                         if rebuild_needed {
                             agent = build_agent(
                                 &exec_cell,
@@ -2787,6 +2828,7 @@ pub(crate) async fn serve_session(
                                 structured_output.as_ref(),
                                 memory_tool.as_ref(),
                                 approval.as_ref(),
+                                &mcp_enabled,
                                 );
                         }
                         let _ = out_tx.send(response(
@@ -2864,6 +2906,7 @@ pub(crate) async fn serve_session(
                     session = s;
                     repoint_session_memory!();
                     reset_exec_endpoint!();
+                    reset_mcp_enabled!();
                     steering.clear();
                     // Restore whichever model/thinking-level was actually active at the forked-from
                     // point, the same way `switch_session`/`switch_branch` already do.
@@ -2889,6 +2932,9 @@ pub(crate) async fn serve_session(
                         current_thinking = None;
                         rebuild_needed = true;
                     }
+                    // MCP kit was reset to all-enabled with the session switch — rebuild so the
+                    // advertised tool set cannot keep the previous session's allowlist.
+                    rebuild_needed = true;
                     if rebuild_needed {
                         agent = build_agent(
                             &exec_cell,
@@ -2909,6 +2955,7 @@ pub(crate) async fn serve_session(
                                 structured_output.as_ref(),
                                 memory_tool.as_ref(),
                                 approval.as_ref(),
+                                &mcp_enabled,
                             );
                     }
                     let _ = out_tx.send(response(
@@ -2939,6 +2986,7 @@ pub(crate) async fn serve_session(
                     session = s;
                     repoint_session_memory!();
                     reset_exec_endpoint!();
+                    reset_mcp_enabled!();
                     steering.clear();
                     let restored_level = agent_core::clamp_thinking_level(
                         &agent_core::capabilities(&restored_model),
@@ -2962,6 +3010,9 @@ pub(crate) async fn serve_session(
                         current_thinking = None;
                         rebuild_needed = true;
                     }
+                    // MCP kit was reset to all-enabled with the session switch — rebuild so the
+                    // advertised tool set cannot keep the previous session's allowlist.
+                    rebuild_needed = true;
                     if rebuild_needed {
                         agent = build_agent(
                             &exec_cell,
@@ -2982,6 +3033,7 @@ pub(crate) async fn serve_session(
                                 structured_output.as_ref(),
                                 memory_tool.as_ref(),
                                 approval.as_ref(),
+                                &mcp_enabled,
                             );
                     }
                     let _ = out_tx.send(response(
@@ -3255,6 +3307,7 @@ pub(crate) async fn serve_session(
                             structured_output.as_ref(),
                             memory_tool.as_ref(),
                             approval.as_ref(),
+                            &mcp_enabled,
                         );
                     }
                     Ok(_) => {}
@@ -4297,6 +4350,131 @@ pub(crate) async fn serve_session(
                     Err(e) => emit!(response(id, "set_exec_endpoint", false, None, Some(&e))),
                 }
             }
+            "set_mcp_enabled" => {
+                // Session-scoped MCP kit: which configured servers' tools are advertised.
+                //
+                // - omit `servers` / `servers: null` → all configured servers enabled (default)
+                // - `servers: []` → none (MCP tools gone from the registry)
+                // - `servers: ["a","b"]` → only those names
+                //
+                // Unknown names are rejected so a typo cannot silently empty the kit. Takes effect on
+                // the next model turn via an `Agent` rebuild (idle) — same shape as `set_model`.
+                let configured = crate::tools::mcp::server_names_from_tools(&cfg.mcp_tools);
+                let outcome = match cmd.get("servers") {
+                    None | Some(Value::Null) => {
+                        mcp_enabled.set(None);
+                        Ok(json!({
+                            "mode": "all",
+                            "enabled": configured.clone(),
+                            "configured": configured,
+                        }))
+                    }
+                    Some(Value::Array(arr)) => {
+                        let mut names = std::collections::HashSet::new();
+                        let mut unknown = Vec::new();
+                        let mut bad_entry = false;
+                        for v in arr {
+                            let Some(name) = v.as_str() else {
+                                bad_entry = true;
+                                break;
+                            };
+                            if configured.iter().any(|c| c == name) {
+                                names.insert(name.to_string());
+                            } else {
+                                unknown.push(name.to_string());
+                            }
+                        }
+                        if bad_entry {
+                            Err("`servers` entries must be strings".into())
+                        } else if !unknown.is_empty() {
+                            Err(format!(
+                                "unknown MCP server(s): {}; configured: {}",
+                                unknown.join(", "),
+                                if configured.is_empty() {
+                                    "(none)".into()
+                                } else {
+                                    configured.join(", ")
+                                }
+                            ))
+                        } else {
+                            let enabled: Vec<String> = {
+                                let mut v: Vec<_> = names.iter().cloned().collect();
+                                v.sort();
+                                v
+                            };
+                            mcp_enabled.set(Some(names));
+                            Ok(json!({
+                                "mode": "allowlist",
+                                "enabled": enabled,
+                                "configured": configured,
+                            }))
+                        }
+                    }
+                    Some(_) => Err("`servers` must be an array of server names, or null".into()),
+                };
+                match outcome {
+                    Ok(data) => {
+                        agent = build_agent(
+                            &exec_cell,
+                            client.clone(),
+                            &full_system(&static_system, &cwd),
+                            &cfg,
+                            &current_model,
+                            current_thinking,
+                            current_level,
+                            current_auto_compaction,
+                            current_auto_retry,
+                            current_block_images,
+                            current_image_auto_resize,
+                            persistence.session_id(),
+                            &write_locks,
+                            &checkpoint,
+                            subagent_ctx.as_ref(),
+                            structured_output.as_ref(),
+                            memory_tool.as_ref(),
+                            approval.as_ref(),
+                            &mcp_enabled,
+                        );
+                        emit!(response(id, "set_mcp_enabled", true, Some(data), None));
+                    }
+                    Err(e) => emit!(response(id, "set_mcp_enabled", false, None, Some(&e))),
+                }
+            }
+            "get_mcp" => {
+                let configured = crate::tools::mcp::server_names_from_tools(&cfg.mcp_tools);
+                let snapshot = mcp_enabled.snapshot();
+                let (mode, enabled) = match &snapshot {
+                    None => ("all".to_string(), configured.clone()),
+                    Some(set) => {
+                        let mut v: Vec<_> = set.iter().cloned().collect();
+                        v.sort();
+                        ("allowlist".to_string(), v)
+                    }
+                };
+                let tools: Vec<String> = build_tools(
+                    &cfg,
+                    cfg.image_auto_resize,
+                    &exec_cell,
+                    &mcp_enabled,
+                )
+                .definitions()
+                .into_iter()
+                .map(|d| d.name)
+                .filter(|n| n.starts_with("mcp__"))
+                .collect();
+                emit!(response(
+                    id,
+                    "get_mcp",
+                    true,
+                    Some(json!({
+                        "mode": mode,
+                        "enabled": enabled,
+                        "configured": configured,
+                        "tools": tools,
+                    })),
+                    None
+                ));
+            }
             "get_state" => {
                 let mut data = session_stats(&session, &current_model);
                 if let Value::Object(m) = &mut data {
@@ -4572,7 +4750,7 @@ pub(crate) async fn serve_session(
                 // variable around), plus `session`'s own running token totals — previously omitted
                 // entirely via the plainer `export_html_with_entries`.
                 let system_prompt = full_system(&static_system, &cwd);
-                let tool_defs = build_tools(&cfg, cfg.image_auto_resize, &exec_cell).definitions();
+                let tool_defs = build_tools(&cfg, cfg.image_auto_resize, &exec_cell, &mcp_enabled).definitions();
                 let usage = crate::export::UsageTotals {
                     input_tokens: session.input_tokens,
                     output_tokens: session.output_tokens,
@@ -4934,6 +5112,7 @@ pub(crate) async fn serve_session(
                     structured_output.as_ref(),
                     memory_tool.as_ref(),
                     approval.as_ref(),
+                    &mcp_enabled,
                 );
                 emit!(response(id, "reload", true, None, None));
             }
@@ -5026,6 +5205,7 @@ pub(crate) async fn serve_session(
                                         structured_output.as_ref(),
                                         memory_tool.as_ref(),
                                         approval.as_ref(),
+                                        &mcp_enabled,
                                     );
                                     emit!(response(
                                         id,
@@ -5084,6 +5264,7 @@ pub(crate) async fn serve_session(
                             structured_output.as_ref(),
                             memory_tool.as_ref(),
                             approval.as_ref(),
+                            &mcp_enabled,
                         );
                         emit!(response(
                             id,
@@ -5114,6 +5295,7 @@ pub(crate) async fn serve_session(
                             structured_output.as_ref(),
                             memory_tool.as_ref(),
                             approval.as_ref(),
+                            &mcp_enabled,
                         );
                         emit!(response(
                             id,
@@ -5182,6 +5364,7 @@ pub(crate) async fn serve_session(
                                     structured_output.as_ref(),
                                     memory_tool.as_ref(),
                                     approval.as_ref(),
+                                    &mcp_enabled,
                                 );
                                 let (thinking, reasoning_effort) = agent_core::thinking_for_level(
                                     &agent_core::capabilities(&current_model),
@@ -5288,6 +5471,7 @@ pub(crate) async fn serve_session(
                                     structured_output.as_ref(),
                                     memory_tool.as_ref(),
                                     approval.as_ref(),
+                                    &mcp_enabled,
                                 );
                                 let mut resp_data =
                                     model_switch_response(&current_model, current_level);
@@ -5345,6 +5529,7 @@ pub(crate) async fn serve_session(
                             structured_output.as_ref(),
                             memory_tool.as_ref(),
                             approval.as_ref(),
+                            &mcp_enabled,
                         );
                         let (thinking, reasoning_effort) = agent_core::thinking_for_level(
                             &agent_core::capabilities(&current_model),
@@ -5403,6 +5588,7 @@ pub(crate) async fn serve_session(
                         structured_output.as_ref(),
                         memory_tool.as_ref(),
                         approval.as_ref(),
+                        &mcp_enabled,
                     );
                     emit!(response(
                         id,
@@ -5442,6 +5628,7 @@ pub(crate) async fn serve_session(
                         structured_output.as_ref(),
                         memory_tool.as_ref(),
                         approval.as_ref(),
+                        &mcp_enabled,
                     );
                     emit!(response(
                         id,
@@ -5492,6 +5679,7 @@ pub(crate) async fn serve_session(
                         structured_output.as_ref(),
                         memory_tool.as_ref(),
                         approval.as_ref(),
+                        &mcp_enabled,
                     );
                     emit!(response(
                         id,
@@ -5535,6 +5723,7 @@ pub(crate) async fn serve_session(
                         structured_output.as_ref(),
                         memory_tool.as_ref(),
                         approval.as_ref(),
+                        &mcp_enabled,
                     );
                     emit!(response(
                         id,
@@ -5802,6 +5991,9 @@ pub(crate) async fn serve_session(
                                 current_thinking = None;
                                 rebuild_needed = true;
                             }
+                            // MCP kit was reset to all-enabled with the session switch — rebuild so the
+                            // advertised tool set cannot keep the previous session's allowlist.
+                            rebuild_needed = true;
                             if rebuild_needed {
                                 agent = build_agent(
                                     &exec_cell,
@@ -5822,6 +6014,7 @@ pub(crate) async fn serve_session(
                                     structured_output.as_ref(),
                                     memory_tool.as_ref(),
                                     approval.as_ref(),
+                                    &mcp_enabled,
                                 );
                             }
                             emit!(response(
@@ -6546,7 +6739,7 @@ fn build_subagent_ctx(
     });
     // The parent's effective set (after `--tools`/`--exclude-tools`) minus `subagent`, so a child with
     // no `tools:` of its own inherits exactly what the parent may do — no more.
-    let mut probe = build_tools(cfg, cfg.image_auto_resize, exec);
+    let mut probe = build_tools(cfg, cfg.image_auto_resize, exec, &crate::tools::mcp::McpEnabledSet::new());
     crate::tools::apply_filter(
         &mut probe,
         cfg.tools.as_deref(),
@@ -6636,6 +6829,9 @@ fn build_agent(
     // `set_model` rebuild so the session's remembered "always allow" decisions — and the one
     // prompt-serializing lock the whole subagent tree queues behind — survive a model switch.
     approval: Option<&crate::approval::ApprovalRuntime>,
+    // Session-scoped MCP server enablement (see `set_mcp_enabled`). Same lifetime as `exec`: per
+    // `serve_session`, not on `ServeConfig`, so multi-tenant WS sessions cannot inherit each other's kit.
+    mcp_enabled: &crate::tools::mcp::McpEnabledSet,
 ) -> Agent {
     let mut compaction = agent_core::CompactionConfig {
         context_window: cfg
@@ -6651,7 +6847,7 @@ fn build_agent(
         compaction.keep_recent_tokens = keep_recent;
     }
 
-    let mut registry = build_tools(cfg, image_auto_resize, exec);
+    let mut registry = build_tools(cfg, image_auto_resize, exec, mcp_enabled);
     // Registered here, not in `build_tools`, because this is where `write_locks` is in scope — the ctx
     // needs the same registry every child shares. Reused across rebuilds; the ctx's factory handles the
     // per-child model itself, so a `set_model` rebuild doesn't invalidate it.
@@ -6847,6 +7043,7 @@ fn build_tools(
     cfg: &ServeConfig,
     image_auto_resize: bool,
     exec: &crate::exec_endpoint::ExecCell,
+    mcp_enabled: &crate::tools::mcp::McpEnabledSet,
 ) -> agent_core::ToolRegistry {
     // Task #34 (pi-parity fix): previously always called the plain `default_registry_with_prefix`,
     // hardcoding `image_auto_resize: true` regardless of `cfg.image_auto_resize` — `run`'s identical
@@ -6857,7 +7054,9 @@ fn build_tools(
     // `tools::mcp`'s module doc comment) is merged in *before* `apply_filter` below, not after: an
     // operator's `--tools`/`--exclude-tools` allow/deny-list is meant to scope the *whole* tool set the
     // model sees, MCP-discovered tools included (e.g. excluding a misbehaving MCP tool by name), not
-    // just the built-ins.
+    // just the built-ins. Session-scoped [`McpEnabledSet`] further drops tools from disabled servers
+    // before that merge — kit shaping without reconnecting.
+    let mcp_tools = crate::tools::mcp::filter_by_enabled(&cfg.mcp_tools, mcp_enabled);
     let mut registry = tools::default_registry_with_config(&tools::ToolConfig {
         bash_timeout_ms: cfg.bash_timeout_ms,
         bash_shell_path: cfg.bash_shell_path.as_deref(),
@@ -6866,7 +7065,7 @@ fn build_tools(
         web_allow_hosts: &cfg.web_allow_hosts,
         web_timeout_ms: cfg.web_timeout_ms,
         image_auto_resize,
-        mcp_tools: &cfg.mcp_tools,
+        mcp_tools: &mcp_tools,
         // The cell, not a fixed target: `build_agent` is skipped on a same-model `switch_session`, so
         // a target captured here would leave the incoming session on the previous one's machine —
         // in a multi-tenant server, one tenant's tools inside another tenant's sandbox. The tools read

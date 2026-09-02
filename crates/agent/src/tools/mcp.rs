@@ -17,47 +17,191 @@
 //! server's own name.
 //!
 //! Connecting happens exactly once, at startup (`main.rs`'s `run` path, and once before `serve`'s main
-//! loop) — not per-session, and not re-done on a `serve` registry rebuild (`set_model`/`set_thinking`
-//! reuse the already-connected tools; see `serve.rs::ServeConfig::mcp_tools`). A server that fails to
-//! connect is skipped with a warning rather than failing the whole agent's startup (fail-soft — matches
-//! this crate's general "skip and warn, don't silently lose data, but don't hard-fail a normal
-//! invocation either" convention, e.g. `settings::read_store_file`).
+//! loop) — not re-done on a `serve` registry rebuild (`set_model`/`set_thinking` reuse the
+//! already-connected tools; see `serve.rs::ServeConfig::mcp_tools`). A server that fails to connect is
+//! skipped with a warning rather than failing the whole agent's startup (fail-soft).
 //!
-//! Out of scope for v1 (an explicit, narrower cut, not an oversight): MCP *resources* and *prompts* —
-//! only the `tools` primitive is wired up, since that's the actual need this feature exists for. Also
-//! out of scope: per-session dynamic add/remove of a single server (today's whole-registry-rebuild
-//! pattern, matched here, is the existing precedent for every other tool-set change).
+//! **Progress.** `tools/call` requests carry an MCP `progressToken` (rmcp injects one on every
+//! request). When the server emits `notifications/progress`, [`McpTool::run_streaming`] forwards each
+//! update into the harness [`ToolProgress`] sink — the same `AgentEvent::ToolProgress` path bash/todo
+//! already use — so a long MCP call is observably live rather than a silent hang until the final
+//! result.
+//!
+//! **Session enablement.** Configured servers stay connected (or lazily dormant) for the process, but
+//! which ones are *advertised* is session-scoped via [`McpEnabledSet`] (`serve`'s `set_mcp_enabled`).
+//! That is the kit-shaping seam: disable defaults with `--tools`/`--exclude-tools`, then enable only
+//! the MCP servers this task needs — without reconnecting or restarting.
+//!
+//! Out of scope (explicit, not an oversight): MCP *resources* and *prompts*. Adding a brand-new server
+//! config mid-process (vs enabling one already configured at startup) is also out of scope.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use agent_core::{ImageSource, Tool, ToolError, ToolOutput};
+use agent_core::{ImageSource, Tool, ToolError, ToolOutput, ToolProgress};
 use async_trait::async_trait;
 use http::{HeaderName, HeaderValue};
-use rmcp::model::{CallToolRequestParams, ContentBlock};
-use rmcp::service::RunningService;
+use rmcp::model::{
+    CallToolRequest, CallToolRequestParams, CallToolResult, ClientRequest, ContentBlock,
+    ProgressNotificationParam, ProgressToken, ServerResult,
+};
+use rmcp::service::{NotificationContext, PeerRequestOptions, RunningService};
 use rmcp::transport::streamable_http_client::{
     StreamableHttpClientTransport, StreamableHttpClientTransportConfig,
 };
 use rmcp::transport::{ConfigureCommandExt, TokioChildProcess};
-use rmcp::{RoleClient, ServiceExt};
-use serde_json::Value;
+use rmcp::{ClientHandler, RoleClient, ServiceExt};
+use serde_json::{Value, json};
 
 use crate::settings::{McpServerConfig, McpTransport};
 
-/// A connected MCP server's live client handle. `()` is `rmcp`'s no-op [`rmcp::ClientHandler`] — this
-/// process never needs to answer a server-initiated request (sampling, roots, elicitation), so there's
-/// nothing to customize. Shared (via `Arc`) by every [`McpTool`] the server produced: all of a server's
-/// tools reuse the one underlying stdio child process / HTTP connection rather than each dialing in
-/// independently.
-type McpClient = RunningService<RoleClient, ()>;
+/// Routes MCP `notifications/progress` for in-flight `tools/call`s onto the matching
+/// [`ToolProgress`] sink. Shared by every tool on one server connection (one handler per
+/// [`RunningService`]).
+///
+/// rmcp always stamps a fresh [`ProgressToken`] onto outbound requests; we register the sink under
+/// that token around `await_response` so concurrent calls on the same server cannot cross-wire
+/// each other's updates.
+#[derive(Clone, Default)]
+struct ProgressClient {
+    sinks: Arc<std::sync::Mutex<HashMap<ProgressToken, ToolProgress>>>,
+}
+
+impl ProgressClient {
+    fn register(&self, token: ProgressToken, progress: ToolProgress) {
+        if let Ok(mut sinks) = self.sinks.lock() {
+            sinks.insert(token, progress);
+        }
+    }
+
+    fn unregister(&self, token: &ProgressToken) {
+        if let Ok(mut sinks) = self.sinks.lock() {
+            sinks.remove(token);
+        }
+    }
+}
+
+impl ClientHandler for ProgressClient {
+    fn on_progress(
+        &self,
+        params: ProgressNotificationParam,
+        _context: NotificationContext<RoleClient>,
+    ) -> impl std::future::Future<Output = ()> + Send + '_ {
+        async move {
+            let Ok(sinks) = self.sinks.lock() else {
+                return;
+            };
+            let Some(progress) = sinks.get(&params.progress_token) else {
+                return;
+            };
+            let snapshot = format_progress_snapshot(&params);
+            let details = progress_details(&params);
+            progress.emit(snapshot, Some(details));
+        }
+    }
+}
+
+fn format_progress_snapshot(params: &ProgressNotificationParam) -> String {
+    match (&params.message, params.total) {
+        (Some(message), Some(total)) => {
+            format!("{message} ({}/{})", params.progress as i64, total as i64)
+        }
+        (Some(message), None) => message.clone(),
+        (None, Some(total)) => format!("{}/{}", params.progress as i64, total as i64),
+        (None, None) => format!("{}", params.progress as i64),
+    }
+}
+
+fn progress_details(params: &ProgressNotificationParam) -> Value {
+    json!({
+        "progress": params.progress,
+        "total": params.total,
+        "message": params.message,
+    })
+}
+
+/// A connected MCP server's live client handle. [`ProgressClient`] receives
+/// `notifications/progress`; other server-initiated requests keep trait defaults. Shared (via `Arc`)
+/// by every [`McpTool`] the server produced.
+type McpClient = RunningService<RoleClient, ProgressClient>;
+
+/// Session-scoped gate over which configured MCP servers' tools are advertised to the model.
+///
+/// Configured servers stay connected (or lazily dormant) for the whole process; this only controls
+/// which ones enter the [`ToolRegistry`] on each rebuild. `None` means every configured server is
+/// enabled (the default, matching prior behavior).
+#[derive(Clone, Default)]
+pub struct McpEnabledSet {
+    inner: Arc<std::sync::Mutex<Option<HashSet<String>>>>,
+}
+
+impl McpEnabledSet {
+    /// Every configured server enabled.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Replace the allow-list. `None` = all enabled; `Some(empty)` = none; `Some({a,b})` = only those.
+    pub fn set(&self, enabled: Option<HashSet<String>>) {
+        if let Ok(mut guard) = self.inner.lock() {
+            *guard = enabled;
+        }
+    }
+
+    /// Current allow-list snapshot (`None` = all enabled).
+    pub fn snapshot(&self) -> Option<HashSet<String>> {
+        self.inner.lock().ok().and_then(|g| g.clone())
+    }
+
+    /// Whether tools from `server` should be advertised.
+    pub fn allows(&self, server: &str) -> bool {
+        match self.snapshot() {
+            None => true,
+            Some(set) => set.contains(server),
+        }
+    }
+}
 
 /// The prefix every MCP-discovered tool's registered name carries — `mcp__<server>__<tool>` — so it
 /// can never collide with a built-in tool. Matches the convention Claude Code itself uses for the
 /// identical problem.
 fn registered_name(server: &str, remote_tool: &str) -> String {
     format!("mcp__{server}__{remote_tool}")
+}
+
+/// Inverse of [`registered_name`]: `mcp__filesystem__read_file` → `Some("filesystem")`.
+pub fn server_name_from_registered(tool_name: &str) -> Option<&str> {
+    let rest = tool_name.strip_prefix("mcp__")?;
+    let (server, _) = rest.split_once("__")?;
+    if server.is_empty() {
+        None
+    } else {
+        Some(server)
+    }
+}
+
+/// Keep only MCP tools whose server is currently enabled.
+pub fn filter_by_enabled(tools: &[Arc<dyn Tool>], enabled: &McpEnabledSet) -> Vec<Arc<dyn Tool>> {
+    tools
+        .iter()
+        .filter(|t| match server_name_from_registered(t.name()) {
+            Some(server) => enabled.allows(server),
+            None => true,
+        })
+        .cloned()
+        .collect()
+}
+
+/// Distinct server names represented in a tool list, sorted — for `get_mcp` / diagnostics.
+pub fn server_names_from_tools(tools: &[Arc<dyn Tool>]) -> Vec<String> {
+    let mut names: Vec<String> = tools
+        .iter()
+        .filter_map(|t| server_name_from_registered(t.name()).map(str::to_string))
+        .collect();
+    names.sort();
+    names.dedup();
+    names
 }
 
 /// One MCP-discovered tool. Holds no local behavior at all — `run` forwards straight to the remote
@@ -344,10 +488,29 @@ impl Tool for McpTool {
     }
 
     async fn run(&self, input: Value) -> Result<ToolOutput, ToolError> {
-        // MCP's `tools/call` arguments are a JSON object (`CallToolRequestParams::arguments:
-        // Option<JsonObject>`); the model always sends an object for a tool's arguments (matching every
-        // built-in tool's own schema), and `Value::Null` (a tool with an empty input schema, called with
-        // no arguments at all) maps to "no arguments" rather than an error.
+        // Non-streaming path (direct host invoke): still dials `tools/call`, just without registering
+        // a ToolProgress sink. The model loop always uses `run_streaming`.
+        self.call_remote(input, None).await
+    }
+
+    async fn run_streaming(
+        &self,
+        input: Value,
+        progress: &ToolProgress,
+    ) -> Result<ToolOutput, ToolError> {
+        self.call_remote(input, Some(progress)).await
+    }
+}
+
+impl McpTool {
+    /// Shared `tools/call` path. When `progress` is set, registers the sink under rmcp's
+    /// auto-assigned `progressToken` for the duration of the call so `notifications/progress`
+    /// become `ToolProgress` snapshots.
+    async fn call_remote(
+        &self,
+        input: Value,
+        progress: Option<&ToolProgress>,
+    ) -> Result<ToolOutput, ToolError> {
         let arguments = match input {
             Value::Object(map) => Some(map),
             Value::Null => None,
@@ -363,63 +526,99 @@ impl Tool for McpTool {
             params = params.with_arguments(arguments);
         }
 
-        // Re-spawns the server if it was reaped while idle. Held across the call, so the reaper
-        // cannot pull the process out from under it.
         let client = self.conn.client().await.map_err(|e| {
             ToolError::Execution(format!(
                 "mcp server `{}` is not reachable: {e}",
                 self.server_name
             ))
         })?;
-        let result = client.call_tool(params).await.map_err(|e| {
+
+        // Cancellable request so we learn the progressToken rmcp stamped onto the wire — plain
+        // `call_tool` awaits internally and never exposes it, which would make progress unroutable.
+        let handle = client
+            .send_cancellable_request(
+                ClientRequest::CallToolRequest(CallToolRequest::new(params)),
+                PeerRequestOptions::no_options(),
+            )
+            .await
+            .map_err(|e| {
+                ToolError::Execution(format!(
+                    "mcp server `{}` tool `{}` call failed: {e}",
+                    self.server_name, self.remote_name
+                ))
+            })?;
+
+        let token = handle.progress_token.clone();
+        if let Some(progress) = progress {
+            client.service().register(token.clone(), progress.clone());
+        }
+
+        let response = handle.await_response().await;
+        client.service().unregister(&token);
+
+        let response = response.map_err(|e| {
             ToolError::Execution(format!(
                 "mcp server `{}` tool `{}` call failed: {e}",
                 self.server_name, self.remote_name
             ))
         })?;
 
-        let mut text = String::new();
-        let mut images = Vec::new();
-        for block in result.content {
-            match block {
-                ContentBlock::Text(t) => {
-                    if !text.is_empty() {
-                        text.push('\n');
-                    }
-                    text.push_str(&t.text);
+        let ServerResult::CallToolResult(result) = response else {
+            return Err(ToolError::Execution(format!(
+                "mcp server `{}` tool `{}` returned an unexpected response shape",
+                self.server_name, self.remote_name
+            )));
+        };
+
+        tool_output_from_result(&self.server_name, &self.remote_name, result)
+    }
+}
+
+fn tool_output_from_result(
+    server_name: &str,
+    remote_name: &str,
+    result: CallToolResult,
+) -> Result<ToolOutput, ToolError> {
+    let mut text = String::new();
+    let mut images = Vec::new();
+    for block in result.content {
+        match block {
+            ContentBlock::Text(t) => {
+                if !text.is_empty() {
+                    text.push('\n');
                 }
-                ContentBlock::Image(img) => {
-                    images.push(ImageSource::base64(img.mime_type, img.data));
+                text.push_str(&t.text);
+            }
+            ContentBlock::Image(img) => {
+                images.push(ImageSource::base64(img.mime_type, img.data));
+            }
+            // Audio/embedded-resource/resource-link content has no representation in
+            // `ToolOutput` today (text + images only, matching every built-in tool). Summarized as
+            // text rather than silently dropped, so the model at least knows something came back
+            // that it can't fully see — resources/prompts are an explicit v2 scope, not this.
+            other => {
+                if !text.is_empty() {
+                    text.push('\n');
                 }
-                // Audio/embedded-resource/resource-link content has no representation in
-                // `ToolOutput` today (text + images only, matching every built-in tool). Summarized as
-                // text rather than silently dropped, so the model at least knows something came back
-                // that it can't fully see — resources/prompts are an explicit v2 scope, not this.
-                other => {
-                    if !text.is_empty() {
-                        text.push('\n');
-                    }
-                    text.push_str(&format!("[unsupported MCP content block: {other:?}]"));
-                }
+                text.push_str(&format!("[unsupported MCP content block: {other:?}]"));
             }
         }
-
-        if result.is_error == Some(true) {
-            return Err(ToolError::Execution(if text.is_empty() {
-                format!(
-                    "mcp server `{}` tool `{}` reported an error with no message",
-                    self.server_name, self.remote_name
-                )
-            } else {
-                text
-            }));
-        }
-        Ok(ToolOutput {
-            text,
-            images,
-            terminate: false,
-        })
     }
+
+    if result.is_error == Some(true) {
+        return Err(ToolError::Execution(if text.is_empty() {
+            format!(
+                "mcp server `{server_name}` tool `{remote_name}` reported an error with no message"
+            )
+        } else {
+            text
+        }));
+    }
+    Ok(ToolOutput {
+        text,
+        images,
+        terminate: false,
+    })
 }
 
 /// Connect to every configured MCP server, returning every tool discovered (already wrapped and ready
@@ -570,7 +769,7 @@ async fn connect_stdio(
     // Read before the transport is consumed; this is also the group id, since the child leads it.
     let pgid = child.id();
 
-    let client = ()
+    let client = ProgressClient::default()
         .serve(child)
         .await
         .map_err(|e| format!("MCP handshake over stdio failed: {e}"))?;
@@ -643,7 +842,7 @@ async fn connect_http(config: &McpServerConfig, url: &str) -> Result<McpClient, 
     let transport =
         StreamableHttpClientTransport::with_client(reqwest::Client::new(), transport_config);
 
-    ().serve(transport).await.map_err(|e| {
+    ProgressClient::default().serve(transport).await.map_err(|e| {
         let hint = if bearer_token.is_none() {
             format!(
                 " (if this server requires login, run `agent mcp-login {}` first)",
@@ -790,5 +989,30 @@ mod tests {
         for builtin in ["read", "write", "edit", "bash", "ls", "grep", "find"] {
             assert_ne!(registered_name("server", builtin), builtin);
         }
+    }
+
+    #[test]
+    fn server_name_from_registered_round_trips() {
+        assert_eq!(
+            server_name_from_registered("mcp__filesystem__read_file"),
+            Some("filesystem")
+        );
+        assert_eq!(server_name_from_registered("bash"), None);
+        assert_eq!(server_name_from_registered("mcp__"), None);
+        assert_eq!(server_name_from_registered("mcp__only"), None);
+    }
+
+    #[test]
+    fn mcp_enabled_set_defaults_to_all_and_filters() {
+        let gate = McpEnabledSet::new();
+        assert!(gate.allows("a"));
+        assert!(gate.allows("b"));
+        gate.set(Some(HashSet::from(["a".into()])));
+        assert!(gate.allows("a"));
+        assert!(!gate.allows("b"));
+        gate.set(Some(HashSet::new()));
+        assert!(!gate.allows("a"));
+        gate.set(None);
+        assert!(gate.allows("a"));
     }
 }
