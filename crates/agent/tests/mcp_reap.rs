@@ -137,7 +137,8 @@ async fn an_idle_server_is_reaped_and_reconnects_on_the_next_call() {
 async fn a_zero_window_keeps_the_server_resident() {
     let tag = "reap-zero-def456";
     assert_eq!(fixture_processes(tag), 0, "tag must start unused");
-    let (tools, _catalog, warnings) = mcp::connect_all(&[fixture_config(tag)], Duration::ZERO, None).await;
+    let (tools, _catalog, warnings) =
+        mcp::connect_all(&[fixture_config(tag)], Duration::ZERO, None).await;
     assert!(
         warnings.is_empty(),
         "fixture failed to connect: {warnings:?}"
@@ -258,7 +259,8 @@ async fn reaping_sweeps_a_grandchild_the_server_forked_away() {
         );
     }
 
-    let (tools, _catalog, warnings) = mcp::connect_all(&[config], Duration::from_secs(1), None).await;
+    let (tools, _catalog, warnings) =
+        mcp::connect_all(&[config], Duration::from_secs(1), None).await;
     assert!(
         warnings.is_empty(),
         "fixture failed to connect: {warnings:?}"

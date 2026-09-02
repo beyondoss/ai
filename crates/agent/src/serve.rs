@@ -8287,9 +8287,7 @@ impl crate::tools::mcp_host::ElicitationGate for ServeElicitationGate {
         self.broadcast(elicitation_request_frame(&request_id, &ask));
 
         // Never wait forever: an attached client that never answers must not pin the session.
-        let wait = self
-            .timeout
-            .or(Some(std::time::Duration::from_secs(120)));
+        let wait = self.timeout.or(Some(std::time::Duration::from_secs(120)));
         let outcome = tokio::select! {
             biased;
             answer = rx => answer.map_err(|_| crate::tools::mcp_host::ElicitationError::Cancelled),
@@ -8312,10 +8310,7 @@ fn elicitation_request_frame(
         "params".into(),
         crate::tools::mcp_host::elicitation_params_json(&ask.params),
     );
-    m.insert(
-        "options".into(),
-        json!(["accept", "decline", "cancel"]),
-    );
+    m.insert("options".into(), json!(["accept", "decline", "cancel"]));
     Value::Object(m).into()
 }
 

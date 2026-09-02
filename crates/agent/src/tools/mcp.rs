@@ -42,10 +42,11 @@
 //! can read resources and expand prompts without a separate host protocol. Completions are host-facing
 //! via `serve`'s `mcp_complete` RPC (argument autocomplete is a UI concern, not a model tool).
 //!
-//! **Elicitation / sampling.** [`McpHandler`] advertises those client capabilities and fulfills
+//! **Elicitation / sampling / MRTR.** [`McpHandler`] advertises those client capabilities and fulfills
 //! server→client requests through [`crate::tools::mcp_host`] hubs (`serve` installs UI gates; headless
-//! `run` declines / rejects). Tool calls use rmcp's MRTR-aware `call_tool` so `input_required`
-//! elicitation rounds complete under protocol `2026-07-28`.
+//! `run` declines / rejects). Tool calls always use rmcp's MRTR-aware `call_tool` so `input_required`
+//! elicitation rounds complete under protocol `2026-07-28`. Connect uses
+//! [`ClientLifecycleMode::Auto`] preferring `2026-07-28` (discover), with legacy initialize fallback.
 //!
 //! Adding a brand-new server config mid-process (vs enabling one already configured at startup) remains
 //! out of scope. SEP-2663 tasks are not advertised yet (no task-polling loop).
@@ -58,15 +59,13 @@ use agent_core::{ImageSource, Tool, ToolError, ToolOutput, ToolProgress};
 use async_trait::async_trait;
 use http::{HeaderName, HeaderValue};
 use rmcp::model::{
-    CallToolRequest, CallToolRequestParams, CallToolResult, ClientCapabilities, ClientInfo,
-    ClientRequest, ContentBlock, CreateMessageRequestParams, CreateMessageResult,
-    ElicitRequestParams, ElicitResult, GetPromptRequestParams, Implementation,
-    ProgressNotificationParam, ProgressToken, ProtocolVersion, ReadResourceRequestParams,
-    ResourceContents, ServerResult,
+    CallToolRequestParams, CallToolResult, ClientCapabilities, ClientInfo, ContentBlock,
+    CreateMessageRequestParams, CreateMessageResult, ElicitRequestParams, ElicitResult,
+    GetPromptRequestParams, Implementation, ProgressNotificationParam, ProgressToken,
+    ProtocolVersion, ReadResourceRequestParams, ResourceContents,
 };
 use rmcp::service::{
-    ClientLifecycleMode, ClientServiceExt, NotificationContext, PeerRequestOptions, RequestContext,
-    RunningService,
+    ClientLifecycleMode, ClientServiceExt, NotificationContext, RequestContext, RunningService,
 };
 use rmcp::transport::streamable_http_client::{
     StreamableHttpClientTransport, StreamableHttpClientTransportConfig,
@@ -85,10 +84,13 @@ pub fn host() -> &'static McpHost {
 }
 
 fn client_lifecycle() -> ClientLifecycleMode {
-    // Prefer initialize for stdio fixtures and today's ecosystem (most servers still speak the
-    // handshake). ClientInfo still requests `2026-07-28`; the handshake layer negotiates down to a
-    // mutually supported revision.
-    ClientLifecycleMode::Initialize
+    // Prefer `server/discover` so peers that speak `2026-07-28` negotiate MRTR (SEP-2322). Auto
+    // falls back to legacy `initialize` within 10s when discover is unsupported (-32601) or times
+    // out — our fixture answers discover so the fallback is never taken in tests.
+    ClientLifecycleMode::Auto {
+        preferred_versions: vec![ProtocolVersion::V_2026_07_28],
+        legacy_version: Some(ProtocolVersion::V_2025_11_25),
+    }
 }
 
 fn client_info() -> ClientInfo {
@@ -105,12 +107,15 @@ fn client_info() -> ClientInfo {
 
 /// Routes progress, elicitation, and sampling for one MCP connection.
 ///
-/// Progress uses token-keyed sinks (via `send_cancellable_request`). MRTR `call_tool` is used when no
-/// progress sink is needed so elicitation rounds still auto-fulfill.
+/// Tool calls use MRTR-aware [`RunningService::call_tool`], which injects a `progressToken` we do
+/// not observe. Token-keyed sinks still work when a token is known; otherwise progress falls back to
+/// the LIFO active sink pushed for the in-flight `call_tool` (covers the normal model path).
 #[derive(Clone)]
 struct McpHandler {
     server_name: String,
     sinks: Arc<std::sync::Mutex<HashMap<ProgressToken, ToolProgress>>>,
+    /// In-flight `call_tool` progress sinks (LIFO). See [`Self::push_active`].
+    active: Arc<std::sync::Mutex<Vec<ToolProgress>>>,
 }
 
 impl McpHandler {
@@ -118,18 +123,29 @@ impl McpHandler {
         Self {
             server_name: server_name.into(),
             sinks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            active: Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
 
-    fn register(&self, token: ProgressToken, progress: ToolProgress) {
-        if let Ok(mut sinks) = self.sinks.lock() {
-            sinks.insert(token, progress);
+    fn push_active(&self, progress: ToolProgress) -> ActiveProgressGuard {
+        if let Ok(mut active) = self.active.lock() {
+            active.push(progress);
+        }
+        ActiveProgressGuard {
+            active: self.active.clone(),
         }
     }
+}
 
-    fn unregister(&self, token: &ProgressToken) {
-        if let Ok(mut sinks) = self.sinks.lock() {
-            sinks.remove(token);
+/// Pops the active progress sink pushed for one `call_tool` when the call ends.
+struct ActiveProgressGuard {
+    active: Arc<std::sync::Mutex<Vec<ToolProgress>>>,
+}
+
+impl Drop for ActiveProgressGuard {
+    fn drop(&mut self) {
+        if let Ok(mut active) = self.active.lock() {
+            let _ = active.pop();
         }
     }
 }
@@ -144,12 +160,17 @@ impl ClientHandler for McpHandler {
         params: ProgressNotificationParam,
         _context: NotificationContext<RoleClient>,
     ) {
-        let sink = {
-            let Ok(sinks) = self.sinks.lock() else {
-                return;
-            };
-            sinks.get(&params.progress_token).cloned()
-        };
+        let sink = self
+            .sinks
+            .lock()
+            .ok()
+            .and_then(|sinks| sinks.get(&params.progress_token).cloned())
+            .or_else(|| {
+                self.active
+                    .lock()
+                    .ok()
+                    .and_then(|active| active.last().cloned())
+            });
         let Some(progress) = sink else {
             return;
         };
@@ -588,9 +609,10 @@ impl Tool for McpTool {
 }
 
 impl McpTool {
-    /// Shared `tools/call` path. Progress path uses `send_cancellable_request` so the
-    /// `progressToken` is known for routing. Non-progress uses MRTR-aware `call_tool` so
-    /// elicitation `input_required` rounds still auto-fulfill.
+    /// Shared `tools/call` path. Always uses MRTR-aware `call_tool` so `input_required`
+    /// elicitation rounds auto-fulfill through [`McpHandler::create_elicitation`]. When a
+    /// [`ToolProgress`] sink is provided, it is pushed as the active fallback for progress
+    /// notifications whose token we cannot observe through `call_tool`.
     async fn call_remote(
         &self,
         input: Value,
@@ -618,46 +640,13 @@ impl McpTool {
             ))
         })?;
 
-        let result = if let Some(progress) = progress {
-            let handle = client
-                .send_cancellable_request(
-                    ClientRequest::CallToolRequest(CallToolRequest::new(params)),
-                    PeerRequestOptions::no_options(),
-                )
-                .await
-                .map_err(|e| {
-                    ToolError::Execution(format!(
-                        "mcp server `{}` tool `{}` call failed: {e}",
-                        self.server_name, self.remote_name
-                    ))
-                })?;
-            let token = handle.progress_token.clone();
-            client.service().register(token.clone(), progress.clone());
-            let response = handle.await_response().await;
-            client.service().unregister(&token);
-            let response = response.map_err(|e| {
-                ToolError::Execution(format!(
-                    "mcp server `{}` tool `{}` call failed: {e}",
-                    self.server_name, self.remote_name
-                ))
-            })?;
-            match response {
-                ServerResult::CallToolResult(result) => result,
-                other => {
-                    return Err(ToolError::Execution(format!(
-                        "mcp server `{}` tool `{}` returned an unexpected response shape: {other:?}",
-                        self.server_name, self.remote_name
-                    )));
-                }
-            }
-        } else {
-            client.call_tool(params).await.map_err(|e| {
-                ToolError::Execution(format!(
-                    "mcp server `{}` tool `{}` call failed: {e}",
-                    self.server_name, self.remote_name
-                ))
-            })?
-        };
+        let _active = progress.map(|p| client.service().push_active(p.clone()));
+        let result = client.call_tool(params).await.map_err(|e| {
+            ToolError::Execution(format!(
+                "mcp server `{}` tool `{}` call failed: {e}",
+                self.server_name, self.remote_name
+            ))
+        })?;
 
         tool_output_from_result(&self.server_name, &self.remote_name, result)
     }
@@ -1275,7 +1264,11 @@ impl McpCatalog {
     }
 
     pub fn snapshot(&self) -> Vec<McpServerCatalog> {
-        self.servers.lock().ok().map(|g| g.clone()).unwrap_or_default()
+        self.servers
+            .lock()
+            .ok()
+            .map(|g| g.clone())
+            .unwrap_or_default()
     }
 
     pub fn filter_enabled(&self, enabled: &McpEnabledSet) -> Vec<McpServerCatalog> {
@@ -1366,15 +1359,12 @@ async fn tools_from_client(
                 .map(|r| crate::tools::mcp_manifest::CachedResource {
                     name: r.name.clone(),
                     uri: r.uri.clone(),
-                    description: r
-                        .description
-                        .clone()
-                        .unwrap_or_else(|| {
-                            format!(
-                                "MCP resource `{}` ({}) from server `{}`",
-                                r.name, r.uri, config.name
-                            )
-                        }),
+                    description: r.description.clone().unwrap_or_else(|| {
+                        format!(
+                            "MCP resource `{}` ({}) from server `{}`",
+                            r.name, r.uri, config.name
+                        )
+                    }),
                 })
                 .collect(),
             remote_prompts
@@ -1451,10 +1441,7 @@ async fn tools_from_client(
             .clone()
             .filter(|d| !d.is_empty())
             .unwrap_or_else(|| {
-                format!(
-                    "MCP prompt `{}` from server `{}`",
-                    prompt.name, config.name
-                )
+                format!("MCP prompt `{}` from server `{}`", prompt.name, config.name)
             });
         prompt_infos.push(McpPromptInfo {
             name: prompt.name.clone(),

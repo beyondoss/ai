@@ -8,11 +8,12 @@
 //!
 //! Tools:
 //! - `echo` / `add` / `ping` / `fail` / `echo_env` / `image` / `slow_progress` — see prior docs.
-//! - `ask_user`: nested `elicitation/create` mid-`tools/call` — proves classic server→client elicitation.
+//! - `ask_user`: nested `elicitation/create` mid-`tools/call` — classic server→client elicitation.
+//! - `ask_user_mrtr`: returns SEP-2322 `input_required` with an elicitation input request; on retry
+//!   with `inputResponses` completes — proves MRTR under protocol `2026-07-28`.
 //!
-//! Also answers `resources/*`, `prompts/*`, and `completion/complete`. Unknown methods (including
-//! `server/discover`) return JSON-RPC `-32601` so the client's Auto discover→initialize fallback is
-//! fast rather than a 10s timeout.
+//! Also answers `resources/*`, `prompts/*`, `completion/complete`, and `server/discover`
+//! (advertising `2026-07-28` + `2025-11-25`). Legacy `initialize` still works for Auto fallback.
 //!
 //! Env: `MCP_FIXTURE_STARTUP_DELAY_MS`, `MCP_FIXTURE_ORPHAN_PIDFILE` (unchanged).
 
@@ -70,7 +71,8 @@ async fn main() {
 
         let params = request.get("params").cloned().unwrap_or(Value::Null);
 
-        if method == "tools/call" && params.get("name").and_then(Value::as_str) == Some("slow_progress")
+        if method == "tools/call"
+            && params.get("name").and_then(Value::as_str) == Some("slow_progress")
         {
             if write_slow_progress(&mut stdout, id, &params).await.is_err() {
                 break;
@@ -78,7 +80,8 @@ async fn main() {
             continue;
         }
 
-        if method == "tools/call" && params.get("name").and_then(Value::as_str) == Some("ask_user") {
+        if method == "tools/call" && params.get("name").and_then(Value::as_str) == Some("ask_user")
+        {
             if write_ask_user(&mut lines, &mut stdout, id).await.is_err() {
                 break;
             }
@@ -217,6 +220,24 @@ async fn write_ask_user(
 
 fn handle(method: &str, params: Value) -> Result<Value, (i64, String)> {
     match method {
+        "server/discover" => Ok(json!({
+            "resultType": "complete",
+            "supportedVersions": ["2026-07-28", "2025-11-25"],
+            "capabilities": {
+                "tools": {},
+                "resources": {},
+                "prompts": {},
+                "completions": {},
+            },
+            "ttlMs": 0,
+            "cacheScope": "private",
+            "_meta": {
+                "io.modelcontextprotocol/serverInfo": {
+                    "name": "mcp-fixture-stdio-server",
+                    "version": "0.0.0",
+                }
+            }
+        })),
         "initialize" => Ok(json!({
             "protocolVersion": "2025-11-25",
             "capabilities": {
@@ -238,7 +259,10 @@ fn handle(method: &str, params: Value) -> Result<Value, (i64, String)> {
             }]
         })),
         "resources/read" => {
-            let uri = params.get("uri").and_then(Value::as_str).unwrap_or_default();
+            let uri = params
+                .get("uri")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
             if uri != RESOURCE_URI {
                 return Err((-32002, format!("unknown resource `{uri}`")));
             }
@@ -262,7 +286,10 @@ fn handle(method: &str, params: Value) -> Result<Value, (i64, String)> {
             }]
         })),
         "prompts/get" => {
-            let name = params.get("name").and_then(Value::as_str).unwrap_or_default();
+            let name = params
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
             if name != "greet" {
                 return Err((-32602, format!("unknown prompt `{name}`")));
             }
@@ -295,7 +322,7 @@ fn handle(method: &str, params: Value) -> Result<Value, (i64, String)> {
                 }
             }))
         }
-        // JSON-RPC Method not found — critical for Auto discover→initialize fallback (no 10s wait).
+        // JSON-RPC Method not found — keeps Auto discover→initialize fallback fast for unknown methods.
         other => Err((-32601, format!("Method not found: {other}"))),
     }
 }
@@ -357,7 +384,55 @@ fn tool_defs() -> Value {
             "description": "Asks the user their name via elicitation, then greets them.",
             "inputSchema": { "type": "object", "properties": {} },
         },
+        {
+            "name": "ask_user_mrtr",
+            "description": "Asks the user their name via SEP-2322 input_required elicitation (MRTR).",
+            "inputSchema": { "type": "object", "properties": {} },
+        },
     ])
+}
+
+/// SEP-2322 MRTR: first call returns `input_required`; retry with `inputResponses` completes.
+fn call_ask_user_mrtr(params: &Value) -> Value {
+    if let Some(responses) = params.get("inputResponses") {
+        let action = responses
+            .pointer("/name/action")
+            .and_then(Value::as_str)
+            .unwrap_or("decline");
+        let text = if action == "accept" {
+            let n = responses
+                .pointer("/name/content/name")
+                .and_then(Value::as_str)
+                .unwrap_or("?");
+            format!("mrtr-hello-{n}")
+        } else {
+            "mrtr-elicitation-declined".into()
+        };
+        return json!({
+            "resultType": "complete",
+            "content": [{ "type": "text", "text": text }],
+            "isError": false,
+        });
+    }
+
+    json!({
+        "resultType": "input_required",
+        "requestState": "fixture-mrtr-state",
+        "inputRequests": {
+            "name": {
+                "method": "elicitation/create",
+                "params": {
+                    "mode": "form",
+                    "message": "What is your name? (MRTR)",
+                    "requestedSchema": {
+                        "type": "object",
+                        "properties": { "name": { "type": "string" } },
+                        "required": ["name"],
+                    }
+                }
+            }
+        }
+    })
 }
 
 fn call_tool(params: Value) -> Value {
@@ -396,6 +471,7 @@ fn call_tool(params: Value) -> Value {
         }),
         "slow_progress" => text_result("progress-done", false),
         "ask_user" => text_result("ask_user should be handled asynchronously", true),
+        "ask_user_mrtr" => call_ask_user_mrtr(&params),
         other => text_result(&format!("fixture: unknown tool `{other}`"), true),
     }
 }

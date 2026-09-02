@@ -676,8 +676,21 @@ fn spawn_http_mcp_fixture() -> (String, Arc<Mutex<Vec<String>>>) {
             let id = request.get("id").cloned().unwrap_or(Value::Null);
             let method = request.get("method").and_then(Value::as_str).unwrap_or("");
             let result = match method {
+                "server/discover" => json!({
+                    "resultType": "complete",
+                    "supportedVersions": ["2026-07-28", "2025-11-25"],
+                    "capabilities": { "tools": {} },
+                    "ttlMs": 0,
+                    "cacheScope": "private",
+                    "_meta": {
+                        "io.modelcontextprotocol/serverInfo": {
+                            "name": "mcp-fixture-http-server",
+                            "version": "0.0.0",
+                        }
+                    }
+                }),
                 "initialize" => json!({
-                    "protocolVersion": "2025-06-18",
+                    "protocolVersion": "2025-11-25",
                     "capabilities": { "tools": {} },
                     "serverInfo": { "name": "mcp-fixture-http-server", "version": "0.0.0" },
                 }),
@@ -715,10 +728,24 @@ fn spawn_http_mcp_fixture() -> (String, Arc<Mutex<Vec<String>>>) {
                         json!({ "content": [{ "type": "text", "text": text }], "isError": false })
                     }
                 }
-                other => json!({
-                    "content": [{ "type": "text", "text": format!("unhandled method {other}") }],
-                    "isError": true,
-                }),
+                _ => {
+                    // Method not found — keep Auto discover→initialize fallback fast if discover
+                    // is ever removed from this fixture again.
+                    let envelope = json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "error": { "code": -32601, "message": format!("Method not found: {method}") },
+                    });
+                    let encoded = serde_json::to_vec(&envelope).unwrap();
+                    let http_header = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        encoded.len()
+                    );
+                    let _ = stream.write_all(http_header.as_bytes());
+                    let _ = stream.write_all(&encoded);
+                    let _ = stream.flush();
+                    continue;
+                }
             };
             let envelope = json!({ "jsonrpc": "2.0", "id": id, "result": result });
             let encoded = serde_json::to_vec(&envelope).unwrap();
