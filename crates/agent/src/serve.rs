@@ -4442,17 +4442,13 @@ pub(crate) async fn serve_session(
                         ("allowlist".to_string(), v)
                     }
                 };
-                let tools: Vec<String> = build_tools(
-                    &cfg,
-                    cfg.image_auto_resize,
-                    &exec_cell,
-                    &mcp_enabled,
-                )
-                .definitions()
-                .into_iter()
-                .map(|d| d.name)
-                .filter(|n| n.starts_with("mcp__"))
-                .collect();
+                let tools: Vec<String> =
+                    build_tools(&cfg, cfg.image_auto_resize, &exec_cell, &mcp_enabled)
+                        .definitions()
+                        .into_iter()
+                        .map(|d| d.name)
+                        .filter(|n| n.starts_with("mcp__"))
+                        .collect();
                 emit!(response(
                     id,
                     "get_mcp",
@@ -4741,7 +4737,8 @@ pub(crate) async fn serve_session(
                 // variable around), plus `session`'s own running token totals — previously omitted
                 // entirely via the plainer `export_html_with_entries`.
                 let system_prompt = full_system(&static_system, &cwd);
-                let tool_defs = build_tools(&cfg, cfg.image_auto_resize, &exec_cell, &mcp_enabled).definitions();
+                let tool_defs = build_tools(&cfg, cfg.image_auto_resize, &exec_cell, &mcp_enabled)
+                    .definitions();
                 let usage = crate::export::UsageTotals {
                     input_tokens: session.input_tokens,
                     output_tokens: session.output_tokens,
@@ -6727,7 +6724,12 @@ fn build_subagent_ctx(
     });
     // The parent's effective set (after `--tools`/`--exclude-tools`) minus `subagent`, so a child with
     // no `tools:` of its own inherits exactly what the parent may do — no more.
-    let mut probe = build_tools(cfg, cfg.image_auto_resize, exec, &crate::tools::mcp::McpEnabledSet::new());
+    let mut probe = build_tools(
+        cfg,
+        cfg.image_auto_resize,
+        exec,
+        &crate::tools::mcp::McpEnabledSet::new(),
+    );
     crate::tools::apply_filter(
         &mut probe,
         cfg.tools.as_deref(),

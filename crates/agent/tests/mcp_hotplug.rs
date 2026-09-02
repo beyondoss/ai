@@ -258,10 +258,7 @@ fn disabled_mcp_tool_is_not_callable() {
     .unwrap();
     stdin.flush().unwrap();
     let _frames = read_until_response(&mut stdout, "set_mcp_enabled");
-    assert_eq!(
-        response(&_frames, "set_mcp_enabled")["success"],
-        true
-    );
+    assert_eq!(response(&_frames, "set_mcp_enabled")["success"], true);
 
     writeln!(
         stdin,
@@ -315,10 +312,7 @@ fn new_session_resets_mcp_enablement() {
     .unwrap();
     stdin.flush().unwrap();
     let _frames = read_until_response(&mut stdout, "set_mcp_enabled");
-    assert_eq!(
-        response(&_frames, "set_mcp_enabled")["success"],
-        true
-    );
+    assert_eq!(response(&_frames, "set_mcp_enabled")["success"], true);
 
     writeln!(stdin, "{}", json!({ "type": "new_session" })).unwrap();
     stdin.flush().unwrap();

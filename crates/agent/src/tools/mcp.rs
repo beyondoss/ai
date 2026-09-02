@@ -854,17 +854,20 @@ async fn connect_http(config: &McpServerConfig, url: &str) -> Result<McpClient, 
     let transport =
         StreamableHttpClientTransport::with_client(reqwest::Client::new(), transport_config);
 
-    ProgressClient::default().serve(transport).await.map_err(|e| {
-        let hint = if bearer_token.is_none() {
-            format!(
-                " (if this server requires login, run `agent mcp-login {}` first)",
-                config.name
-            )
-        } else {
-            String::new()
-        };
-        format!("MCP handshake over streamable-HTTP to {url} failed: {e}{hint}")
-    })
+    ProgressClient::default()
+        .serve(transport)
+        .await
+        .map_err(|e| {
+            let hint = if bearer_token.is_none() {
+                format!(
+                    " (if this server requires login, run `agent mcp-login {}` first)",
+                    config.name
+                )
+            } else {
+                String::new()
+            };
+            format!("MCP handshake over streamable-HTTP to {url} failed: {e}{hint}")
+        })
 }
 
 /// A currently-valid bearer access token for `server_name`'s MCP OAuth login, if one exists —
