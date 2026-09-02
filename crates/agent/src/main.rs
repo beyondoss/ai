@@ -2292,12 +2292,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .map_err(|e| format!("failed to start MCP OAuth for `{name}`: {e}"))?;
             let auth_store = beyond_ai_agent::mcp_auth_store::McpAuthStore::open_default();
             manager.set_credential_store(auth_store.scoped(&name));
-            let metadata = manager.discover_metadata().await.map_err(|e| {
+            // rmcp 3.x: discovery is `resolve_metadata` (no longer `discover_metadata`).
+            let resolution = manager.resolve_metadata().await.map_err(|e| {
                 format!("`{name}` does not support MCP OAuth (or discovery failed): {e}")
             })?;
-            manager.set_metadata(metadata);
-            let scopes = manager.select_scopes(None, &[]);
-            let scope_refs: Vec<&str> = scopes.iter().map(String::as_str).collect();
+            manager.set_metadata(resolution.metadata);
 
             // Dynamic client registration means we choose our own redirect URI (unlike `agent
             // login`'s providers, each registered in advance against a fixed port) — pick a free
@@ -2309,15 +2308,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .port();
             let redirect_uri = format!("http://127.0.0.1:{port}/callback");
 
-            let session = rmcp::transport::auth::AuthorizationSession::new(
-                manager,
-                &scope_refs,
-                &redirect_uri,
-                Some("beyond-ai-agent"),
-                None,
-            )
-            .await
-            .map_err(|e| format!("failed to start MCP OAuth authorization for `{name}`: {e}"))?;
+            // rmcp 3.x folds scopes + client name into `AuthorizationRequest`; empty scopes
+            // auto-select via the manager's scope policy inside `AuthorizationSession::new`.
+            let request = rmcp::transport::auth::AuthorizationRequest::new(&redirect_uri)
+                .with_client_name("beyond-ai-agent");
+            let session = rmcp::transport::auth::AuthorizationSession::new(manager, request)
+                .await
+                .map_err(|(_manager, e)| {
+                    format!("failed to start MCP OAuth authorization for `{name}`: {e}")
+                })?;
             let auth_url = session.get_authorization_url().to_string();
             let csrf_token = url::Url::parse(&auth_url)
                 .ok()

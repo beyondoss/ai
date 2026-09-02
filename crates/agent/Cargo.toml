@@ -162,7 +162,7 @@ http = "1"
 # provider unselected; `agent-core`'s `rustls` pin names it for the whole graph, and every
 # client-construction site installs it via `agent_core::ensure_provider()` (see `agent-core/src/tls.rs`
 # for why that has to be explicit rather than inferred from crate features).
-rmcp = { version = "2.1.0", default-features = false, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "reqwest-tls-no-provider", "auth"] }
+rmcp = { version = "3.2.0", default-features = false, features = ["client", "macros", "transport-child-process", "transport-streamable-http-client-reqwest", "reqwest-tls-no-provider", "auth", "elicitation"] }
 
 # `serve --listen`'s WebSocket transport (`serve_ws`): the server/`accept_async` side. Only
 # `handshake` is needed here (a plain-`ws://` loopback listener — the edge terminates TLS in front of
