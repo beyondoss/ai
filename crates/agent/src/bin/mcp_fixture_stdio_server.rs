@@ -11,11 +11,18 @@
 //! - `ask_user`: nested `elicitation/create` mid-`tools/call` — classic server→client elicitation.
 //! - `ask_user_mrtr`: returns SEP-2322 `input_required` with an elicitation input request; on retry
 //!   with `inputResponses` completes — proves MRTR under protocol `2026-07-28`.
+//! - `slow_task`: returns SEP-2663 `resultType: "task"`; client polls `tasks/get` until completed
+//!   (status messages `task-phase-one` → `task-phase-two` → result `task-done`).
 //!
-//! Also answers `resources/*`, `prompts/*`, `completion/complete`, and `server/discover`
-//! (advertising `2026-07-28` + `2025-11-25`). Legacy `initialize` still works for Auto fallback.
+//! Also answers `resources/*`, `prompts/*`, `completion/complete`, `tasks/get` / `tasks/cancel` /
+//! `tasks/update`, and `server/discover` (advertising `2026-07-28` + `2025-11-25` + tasks extension).
+//! Legacy `initialize` still works for Auto fallback.
 //!
 //! Env: `MCP_FIXTURE_STARTUP_DELAY_MS`, `MCP_FIXTURE_ORPHAN_PIDFILE` (unchanged).
+
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
@@ -28,6 +35,32 @@ const TINY_PNG_BASE64: &str =
 
 const RESOURCE_URI: &str = "fixture://doc";
 const RESOURCE_BODY: &str = "fixture-resource-body";
+
+const TASKS_EXTENSION_ID: &str = "io.modelcontextprotocol/tasks";
+
+struct FixtureTask {
+    created: Instant,
+    complete_after: Duration,
+    cancelled: bool,
+    poll_interval_ms: u64,
+}
+
+fn tasks() -> &'static Mutex<HashMap<String, FixtureTask>> {
+    static TASKS: OnceLock<Mutex<HashMap<String, FixtureTask>>> = OnceLock::new();
+    TASKS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn capabilities() -> Value {
+    json!({
+        "tools": {},
+        "resources": {},
+        "prompts": {},
+        "completions": {},
+        "extensions": {
+            (TASKS_EXTENSION_ID): {}
+        },
+    })
+}
 
 #[tokio::main]
 async fn main() {
@@ -223,12 +256,7 @@ fn handle(method: &str, params: Value) -> Result<Value, (i64, String)> {
         "server/discover" => Ok(json!({
             "resultType": "complete",
             "supportedVersions": ["2026-07-28", "2025-11-25"],
-            "capabilities": {
-                "tools": {},
-                "resources": {},
-                "prompts": {},
-                "completions": {},
-            },
+            "capabilities": capabilities(),
             "ttlMs": 0,
             "cacheScope": "private",
             "_meta": {
@@ -240,16 +268,18 @@ fn handle(method: &str, params: Value) -> Result<Value, (i64, String)> {
         })),
         "initialize" => Ok(json!({
             "protocolVersion": "2025-11-25",
-            "capabilities": {
-                "tools": {},
-                "resources": {},
-                "prompts": {},
-                "completions": {},
-            },
+            "capabilities": capabilities(),
             "serverInfo": { "name": "mcp-fixture-stdio-server", "version": "0.0.0" },
         })),
         "tools/list" => Ok(json!({ "tools": tool_defs() })),
         "tools/call" => Ok(call_tool(params)),
+        "tasks/get" => tasks_get(params),
+        "tasks/cancel" => tasks_cancel(params),
+        "tasks/update" => {
+            // Fixture tasks never enter input_required; ack empty.
+            let _ = params;
+            Ok(json!({ "resultType": "complete" }))
+        }
         "resources/list" => Ok(json!({
             "resources": [{
                 "uri": RESOURCE_URI,
@@ -389,6 +419,11 @@ fn tool_defs() -> Value {
             "description": "Asks the user their name via SEP-2322 input_required elicitation (MRTR).",
             "inputSchema": { "type": "object", "properties": {} },
         },
+        {
+            "name": "slow_task",
+            "description": "Returns a SEP-2663 task handle; completes after a short poll with `task-done`.",
+            "inputSchema": { "type": "object", "properties": {} },
+        },
     ])
 }
 
@@ -472,8 +507,113 @@ fn call_tool(params: Value) -> Value {
         "slow_progress" => text_result("progress-done", false),
         "ask_user" => text_result("ask_user should be handled asynchronously", true),
         "ask_user_mrtr" => call_ask_user_mrtr(&params),
+        "slow_task" => call_slow_task(),
         other => text_result(&format!("fixture: unknown tool `{other}`"), true),
     }
+}
+
+/// SEP-2663: return a task handle; `tasks/get` advances status by wall clock until completed.
+fn call_slow_task() -> Value {
+    let task_id = {
+        let Ok(mut guard) = tasks().lock() else {
+            return text_result("tasks lock poisoned", true);
+        };
+        let task_id = format!("fixture-task-{}", guard.len() + 1);
+        guard.insert(
+            task_id.clone(),
+            FixtureTask {
+                created: Instant::now(),
+                complete_after: Duration::from_millis(250),
+                cancelled: false,
+                poll_interval_ms: 40,
+            },
+        );
+        task_id
+    };
+    json!({
+        "resultType": "task",
+        "taskId": task_id,
+        "status": "working",
+        "statusMessage": "task-phase-one",
+        "createdAt": "2026-09-02T00:00:00Z",
+        "lastUpdatedAt": "2026-09-02T00:00:00Z",
+        "ttlMs": null,
+        "pollIntervalMs": 40,
+    })
+}
+
+fn tasks_get(params: Value) -> Result<Value, (i64, String)> {
+    let task_id = params
+        .get("taskId")
+        .and_then(Value::as_str)
+        .ok_or((-32602, "tasks/get requires taskId".into()))?
+        .to_string();
+    let Ok(guard) = tasks().lock() else {
+        return Err((-32603, "tasks lock poisoned".into()));
+    };
+    let Some(task) = guard.get(&task_id) else {
+        return Err((-32602, format!("unknown task `{task_id}`")));
+    };
+    if task.cancelled {
+        return Ok(json!({
+            "resultType": "complete",
+            "taskId": task_id,
+            "status": "cancelled",
+            "createdAt": "2026-09-02T00:00:00Z",
+            "lastUpdatedAt": "2026-09-02T00:00:01Z",
+            "ttlMs": null,
+            "pollIntervalMs": task.poll_interval_ms,
+        }));
+    }
+    let elapsed = task.created.elapsed();
+    if elapsed >= task.complete_after {
+        return Ok(json!({
+            "resultType": "complete",
+            "taskId": task_id,
+            "status": "completed",
+            "statusMessage": "task-complete",
+            "createdAt": "2026-09-02T00:00:00Z",
+            "lastUpdatedAt": "2026-09-02T00:00:01Z",
+            "ttlMs": null,
+            "pollIntervalMs": task.poll_interval_ms,
+            "result": {
+                "content": [{ "type": "text", "text": "task-done" }],
+                "isError": false,
+            }
+        }));
+    }
+    // Mid-flight: flip status message after half the wait so the client surfaces progress.
+    let status_message = if elapsed >= task.complete_after / 2 {
+        "task-phase-two"
+    } else {
+        "task-phase-one"
+    };
+    Ok(json!({
+        "resultType": "complete",
+        "taskId": task_id,
+        "status": "working",
+        "statusMessage": status_message,
+        "createdAt": "2026-09-02T00:00:00Z",
+        "lastUpdatedAt": "2026-09-02T00:00:00Z",
+        "ttlMs": null,
+        "pollIntervalMs": task.poll_interval_ms,
+    }))
+}
+
+fn tasks_cancel(params: Value) -> Result<Value, (i64, String)> {
+    let task_id = params
+        .get("taskId")
+        .and_then(Value::as_str)
+        .ok_or((-32602, "tasks/cancel requires taskId".into()))?
+        .to_string();
+    let Ok(mut guard) = tasks().lock() else {
+        return Err((-32603, "tasks lock poisoned".into()));
+    };
+    let Some(task) = guard.get_mut(&task_id) else {
+        return Err((-32602, format!("unknown task `{task_id}`")));
+    };
+    task.cancelled = true;
+    Ok(json!({ "resultType": "complete" }))
 }
 
 fn text_result(text: &str, is_error: bool) -> Value {
