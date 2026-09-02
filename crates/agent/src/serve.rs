@@ -2787,7 +2787,6 @@ pub(crate) async fn serve_session(
                             &agent_core::capabilities(&restored_model),
                             restored_level,
                         );
-                        let mut rebuild_needed = false;
                         if restored_model != current_model {
                             session.scrub_cross_model_state(&restored_model);
                             match build_gateway_client(&cfg, &restored_model) {
@@ -2798,17 +2797,15 @@ pub(crate) async fn serve_session(
                                 ),
                             }
                             current_model = restored_model;
-                            rebuild_needed = true;
                         }
                         if restored_level != current_level {
                             current_level = restored_level;
                             current_thinking = None;
-                            rebuild_needed = true;
                         }
                         // MCP kit reset to all-enabled above — rebuild so the advertised tool set
                         // cannot keep the previous session's allowlist.
-                        rebuild_needed = true;
-                        if rebuild_needed {
+                        // always rebuild (MCP kit may have reset; model/level may have changed)
+                        {
                             agent = build_agent(
                                 &exec_cell,
                                 client.clone(),
@@ -2914,7 +2911,6 @@ pub(crate) async fn serve_session(
                         &agent_core::capabilities(&restored_model),
                         restored_level,
                     );
-                    let mut rebuild_needed = false;
                     if restored_model != current_model {
                         session.scrub_cross_model_state(&restored_model);
                         match build_gateway_client(&cfg, &restored_model) {
@@ -2925,17 +2921,15 @@ pub(crate) async fn serve_session(
                             ),
                         }
                         current_model = restored_model;
-                        rebuild_needed = true;
                     }
                     if restored_level != current_level {
                         current_level = restored_level;
                         current_thinking = None;
-                        rebuild_needed = true;
                     }
                     // MCP kit was reset to all-enabled with the session switch — rebuild so the
                     // advertised tool set cannot keep the previous session's allowlist.
-                    rebuild_needed = true;
-                    if rebuild_needed {
+                    // always rebuild (MCP kit may have reset; model/level may have changed)
+                    {
                         agent = build_agent(
                             &exec_cell,
                             client.clone(),
@@ -2992,7 +2986,6 @@ pub(crate) async fn serve_session(
                         &agent_core::capabilities(&restored_model),
                         restored_level,
                     );
-                    let mut rebuild_needed = false;
                     if restored_model != current_model {
                         session.scrub_cross_model_state(&restored_model);
                         match build_gateway_client(&cfg, &restored_model) {
@@ -3003,17 +2996,15 @@ pub(crate) async fn serve_session(
                             ),
                         }
                         current_model = restored_model;
-                        rebuild_needed = true;
                     }
                     if restored_level != current_level {
                         current_level = restored_level;
                         current_thinking = None;
-                        rebuild_needed = true;
                     }
                     // MCP kit was reset to all-enabled with the session switch — rebuild so the
                     // advertised tool set cannot keep the previous session's allowlist.
-                    rebuild_needed = true;
-                    if rebuild_needed {
+                    // always rebuild (MCP kit may have reset; model/level may have changed)
+                    {
                         agent = build_agent(
                             &exec_cell,
                             client.clone(),
@@ -5968,7 +5959,6 @@ pub(crate) async fn serve_session(
                                 &agent_core::capabilities(&restored_model),
                                 restored_level,
                             );
-                            let mut rebuild_needed = false;
                             if restored_model != current_model {
                                 session.scrub_cross_model_state(&restored_model);
                                 // The restored model can be on a different OAuth provider than whatever was
@@ -5984,17 +5974,15 @@ pub(crate) async fn serve_session(
                                     ),
                                 }
                                 current_model = restored_model;
-                                rebuild_needed = true;
                             }
                             if restored_level != current_level {
                                 current_level = restored_level;
                                 current_thinking = None;
-                                rebuild_needed = true;
                             }
                             // MCP kit was reset to all-enabled with the session switch — rebuild so the
                             // advertised tool set cannot keep the previous session's allowlist.
-                            rebuild_needed = true;
-                            if rebuild_needed {
+                            // always rebuild (MCP kit may have reset; model/level may have changed)
+                            {
                                 agent = build_agent(
                                     &exec_cell,
                                     client.clone(),

@@ -83,22 +83,26 @@ impl ProgressClient {
 }
 
 impl ClientHandler for ProgressClient {
-    fn on_progress(
+    async fn on_progress(
         &self,
         params: ProgressNotificationParam,
         _context: NotificationContext<RoleClient>,
-    ) -> impl std::future::Future<Output = ()> + Send + '_ {
-        async move {
+    ) {
+        // Clone the sink under the lock, emit outside — never hold `std::sync::Mutex` across an
+        // await, and never call into user code while the map is locked (re-entrant progress would
+        // deadlock).
+        let sink = {
             let Ok(sinks) = self.sinks.lock() else {
                 return;
             };
-            let Some(progress) = sinks.get(&params.progress_token) else {
-                return;
-            };
-            let snapshot = format_progress_snapshot(&params);
-            let details = progress_details(&params);
-            progress.emit(snapshot, Some(details));
-        }
+            sinks.get(&params.progress_token).cloned()
+        };
+        let Some(progress) = sink else {
+            return;
+        };
+        let snapshot = format_progress_snapshot(&params);
+        let details = progress_details(&params);
+        progress.emit(snapshot, Some(details));
     }
 }
 
@@ -533,41 +537,49 @@ impl McpTool {
             ))
         })?;
 
-        // Cancellable request so we learn the progressToken rmcp stamped onto the wire — plain
-        // `call_tool` awaits internally and never exposes it, which would make progress unroutable.
-        let handle = client
-            .send_cancellable_request(
-                ClientRequest::CallToolRequest(CallToolRequest::new(params)),
-                PeerRequestOptions::no_options(),
-            )
-            .await
-            .map_err(|e| {
+        // Non-progress path: use `call_tool` (same wire shape; slightly less ceremony). Progress path:
+        // `send_cancellable_request` so we learn the `progressToken` rmcp stamped onto the request —
+        // plain `call_tool` awaits internally and never exposes it, which would make progress
+        // unroutable. Matches rmcp's own `test_request_timeout_progress` client pattern.
+        let result = if let Some(progress) = progress {
+            let handle = client
+                .send_cancellable_request(
+                    ClientRequest::CallToolRequest(CallToolRequest::new(params)),
+                    PeerRequestOptions::no_options(),
+                )
+                .await
+                .map_err(|e| {
+                    ToolError::Execution(format!(
+                        "mcp server `{}` tool `{}` call failed: {e}",
+                        self.server_name, self.remote_name
+                    ))
+                })?;
+            let token = handle.progress_token.clone();
+            client.service().register(token.clone(), progress.clone());
+            let response = handle.await_response().await;
+            client.service().unregister(&token);
+            let response = response.map_err(|e| {
                 ToolError::Execution(format!(
                     "mcp server `{}` tool `{}` call failed: {e}",
                     self.server_name, self.remote_name
                 ))
             })?;
-
-        let token = handle.progress_token.clone();
-        if let Some(progress) = progress {
-            client.service().register(token.clone(), progress.clone());
-        }
-
-        let response = handle.await_response().await;
-        client.service().unregister(&token);
-
-        let response = response.map_err(|e| {
-            ToolError::Execution(format!(
-                "mcp server `{}` tool `{}` call failed: {e}",
-                self.server_name, self.remote_name
-            ))
-        })?;
-
-        let ServerResult::CallToolResult(result) = response else {
-            return Err(ToolError::Execution(format!(
-                "mcp server `{}` tool `{}` returned an unexpected response shape",
-                self.server_name, self.remote_name
-            )));
+            match response {
+                ServerResult::CallToolResult(result) => result,
+                _ => {
+                    return Err(ToolError::Execution(format!(
+                        "mcp server `{}` tool `{}` returned an unexpected response shape",
+                        self.server_name, self.remote_name
+                    )));
+                }
+            }
+        } else {
+            client.call_tool(params).await.map_err(|e| {
+                ToolError::Execution(format!(
+                    "mcp server `{}` tool `{}` call failed: {e}",
+                    self.server_name, self.remote_name
+                ))
+            })?
         };
 
         tool_output_from_result(&self.server_name, &self.remote_name, result)

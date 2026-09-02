@@ -8,7 +8,6 @@ mod common;
 
 use std::io::{BufReader, Write};
 use std::path::Path;
-use std::sync::{Arc, Mutex};
 
 use common::{
     SpawnGuarded, read_until_response, serve_cmd, spawn_model_server, turn_text, turn_tool_use,
@@ -48,27 +47,20 @@ fn two_servers() -> Value {
     ])
 }
 
-fn spawn_serve(
-    home: &Path,
-    session_file: &str,
-    base: &str,
-) -> (SpawnGuarded, impl Write, BufReader<impl std::io::Read>) {
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
-    let mut cmd = serve_cmd(bin, base, session_file);
-    cmd.env("HOME", home);
-    cmd.env("BEYOND_AI_AGENT_MCP_IDLE_SECS", "0");
-    let mut child = cmd.spawn_guarded();
-    let stdin = child.stdin.take().unwrap();
-    let stdout = BufReader::new(child.stdout.take().unwrap());
-    (child, stdin, stdout)
-}
-
-fn response(frames: &[Value], command: &str) -> &Value {
+fn response<'a>(frames: &'a [Value], command: &str) -> &'a Value {
     frames
         .iter()
         .rev()
         .find(|f| f["type"] == "response" && f["command"] == command)
         .unwrap_or_else(|| panic!("missing response for {command}: {frames:?}"))
+}
+
+fn tool_names(v: &Value) -> Vec<String> {
+    v.as_array()
+        .unwrap_or(&vec![])
+        .iter()
+        .filter_map(|t| t.as_str().map(str::to_string))
+        .collect()
 }
 
 #[test]
@@ -79,15 +71,21 @@ fn set_mcp_enabled_changes_advertised_tools_and_model_request() {
     write_global_settings(&home, two_servers());
 
     let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
-    // Two prompts: first with only alpha enabled, second after re-enabling all.
     let (base, bodies) = spawn_model_server(vec![turn_text("one"), turn_text("two")]);
 
-    let (mut child, mut stdin, mut stdout) = spawn_serve(&home, &session_file, &base);
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let mut cmd = serve_cmd(bin, &base, &session_file);
+    cmd.env("HOME", &home);
+    cmd.env("BEYOND_AI_AGENT_MCP_IDLE_SECS", "0");
+    let mut child = cmd.spawn_guarded();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
     // Default: both servers enabled.
     writeln!(stdin, "{}", json!({ "id": "g0", "type": "get_mcp" })).unwrap();
     stdin.flush().unwrap();
-    let g0 = response(&read_until_response(&mut stdout, "get_mcp"), "get_mcp");
+    let _g0_frames = read_until_response(&mut stdout, "get_mcp");
+    let g0 = response(&_g0_frames, "get_mcp");
     assert_eq!(g0["success"], true, "{g0}");
     assert_eq!(g0["data"]["mode"], "all");
     let configured = g0["data"]["configured"].as_array().unwrap();
@@ -95,10 +93,10 @@ fn set_mcp_enabled_changes_advertised_tools_and_model_request() {
         configured.iter().any(|v| v == "alpha") && configured.iter().any(|v| v == "beta"),
         "both servers configured: {g0}"
     );
-    let tools0 = g0["data"]["tools"].as_array().unwrap();
+    let tools0 = tool_names(&g0["data"]["tools"]);
     assert!(
-        tools0.iter().any(|t| t.as_str().unwrap().starts_with("mcp__alpha__"))
-            && tools0.iter().any(|t| t.as_str().unwrap().starts_with("mcp__beta__")),
+        tools0.iter().any(|t| t.starts_with("mcp__alpha__"))
+            && tools0.iter().any(|t| t.starts_with("mcp__beta__")),
         "default kit advertises both servers: {g0}"
     );
 
@@ -110,26 +108,23 @@ fn set_mcp_enabled_changes_advertised_tools_and_model_request() {
     )
     .unwrap();
     stdin.flush().unwrap();
-    let s1 = response(
-        &read_until_response(&mut stdout, "set_mcp_enabled"),
-        "set_mcp_enabled",
-    );
+    let _s1_frames = read_until_response(&mut stdout, "set_mcp_enabled");
+    let s1 = response(&_s1_frames, "set_mcp_enabled");
     assert_eq!(s1["success"], true, "{s1}");
     assert_eq!(s1["data"]["mode"], "allowlist");
     assert_eq!(s1["data"]["enabled"], json!(["alpha"]));
 
     writeln!(stdin, "{}", json!({ "id": "g1", "type": "get_mcp" })).unwrap();
     stdin.flush().unwrap();
-    let g1 = response(&read_until_response(&mut stdout, "get_mcp"), "get_mcp");
-    let tools1 = g1["data"]["tools"].as_array().unwrap();
+    let _g1_frames = read_until_response(&mut stdout, "get_mcp");
+    let g1 = response(&_g1_frames, "get_mcp");
+    let tools1 = tool_names(&g1["data"]["tools"]);
     assert!(
-        tools1.iter().any(|t| t.as_str().unwrap().starts_with("mcp__alpha__")),
+        tools1.iter().any(|t| t.starts_with("mcp__alpha__")),
         "alpha tools remain: {g1}"
     );
     assert!(
-        tools1
-            .iter()
-            .all(|t| !t.as_str().unwrap().starts_with("mcp__beta__")),
+        tools1.iter().all(|t| !t.starts_with("mcp__beta__")),
         "beta tools must be gone after set_mcp_enabled: {g1}"
     );
 
@@ -166,10 +161,8 @@ fn set_mcp_enabled_changes_advertised_tools_and_model_request() {
     )
     .unwrap();
     stdin.flush().unwrap();
-    let bad = response(
-        &read_until_response(&mut stdout, "set_mcp_enabled"),
-        "set_mcp_enabled",
-    );
+    let _bad_frames = read_until_response(&mut stdout, "set_mcp_enabled");
+    let bad = response(&_bad_frames, "set_mcp_enabled");
     assert_eq!(bad["success"], false, "{bad}");
     assert!(
         bad["error"]
@@ -187,10 +180,8 @@ fn set_mcp_enabled_changes_advertised_tools_and_model_request() {
     )
     .unwrap();
     stdin.flush().unwrap();
-    let s2 = response(
-        &read_until_response(&mut stdout, "set_mcp_enabled"),
-        "set_mcp_enabled",
-    );
+    let _s2_frames = read_until_response(&mut stdout, "set_mcp_enabled");
+    let s2 = response(&_s2_frames, "set_mcp_enabled");
     assert_eq!(s2["success"], true, "{s2}");
     assert_eq!(s2["data"]["mode"], "all");
 
@@ -221,14 +212,13 @@ fn set_mcp_enabled_changes_advertised_tools_and_model_request() {
     )
     .unwrap();
     stdin.flush().unwrap();
-    let s3 = response(
-        &read_until_response(&mut stdout, "set_mcp_enabled"),
-        "set_mcp_enabled",
-    );
+    let _s3_frames = read_until_response(&mut stdout, "set_mcp_enabled");
+    let s3 = response(&_s3_frames, "set_mcp_enabled");
     assert_eq!(s3["success"], true, "{s3}");
     writeln!(stdin, "{}", json!({ "id": "g3", "type": "get_mcp" })).unwrap();
     stdin.flush().unwrap();
-    let g3 = response(&read_until_response(&mut stdout, "get_mcp"), "get_mcp");
+    let _g3_frames = read_until_response(&mut stdout, "get_mcp");
+    let g3 = response(&_g3_frames, "get_mcp");
     assert_eq!(g3["data"]["tools"], json!([]), "{g3}");
 
     drop(stdin);
@@ -237,15 +227,13 @@ fn set_mcp_enabled_changes_advertised_tools_and_model_request() {
 
 #[test]
 fn disabled_mcp_tool_is_not_callable() {
-    // Even if the model somehow names a disabled tool, it must not succeed as a live call — the
-    // tool is absent from the registry (unregistered), so the loop synthesizes an error result.
     let dir = tempfile::tempdir().unwrap();
     let home = dir.path().join("home");
     std::fs::create_dir_all(&home).unwrap();
     write_global_settings(&home, two_servers());
 
     let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
-    let (base, _bodies): (String, Arc<Mutex<Vec<String>>>) = spawn_model_server(vec![
+    let (base, _bodies) = spawn_model_server(vec![
         turn_tool_use(
             "toolu_x",
             "mcp__beta__echo",
@@ -254,7 +242,13 @@ fn disabled_mcp_tool_is_not_callable() {
         turn_text("ok"),
     ]);
 
-    let (mut child, mut stdin, mut stdout) = spawn_serve(&home, &session_file, &base);
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let mut cmd = serve_cmd(bin, &base, &session_file);
+    cmd.env("HOME", &home);
+    cmd.env("BEYOND_AI_AGENT_MCP_IDLE_SECS", "0");
+    let mut child = cmd.spawn_guarded();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
     writeln!(
         stdin,
@@ -263,11 +257,9 @@ fn disabled_mcp_tool_is_not_callable() {
     )
     .unwrap();
     stdin.flush().unwrap();
+    let _frames = read_until_response(&mut stdout, "set_mcp_enabled");
     assert_eq!(
-        response(
-            &read_until_response(&mut stdout, "set_mcp_enabled"),
-            "set_mcp_enabled"
-        )["success"],
+        response(&_frames, "set_mcp_enabled")["success"],
         true
     );
 
@@ -304,24 +296,16 @@ fn new_session_resets_mcp_enablement() {
     std::fs::create_dir_all(&home).unwrap();
     write_global_settings(&home, two_servers());
 
-    let session_dir = dir.path().join("sessions");
-    std::fs::create_dir_all(&session_dir).unwrap();
+    let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
     let (base, _bodies) = spawn_model_server(vec![turn_text("x")]);
 
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
-    let mut cmd = serve_cmd(bin, &base, "unused.jsonl");
-    // Use a session dir so new_session can mint distinct sessions.
-    cmd.args([
-        "--session-dir",
-        session_dir.to_str().unwrap(),
-    ]);
-    // serve_cmd already sets --session-file; override by rebuilding... look at serve_cmd
-    // Actually serve_cmd takes session_file. For dir mode check how other tests do it.
-    drop(cmd);
-
-    // Simpler: same session-file serve, call set_mcp_enabled then new_session if supported with file mode.
-    let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
-    let (mut child, mut stdin, mut stdout) = spawn_serve(&home, &session_file, &base);
+    let mut cmd = serve_cmd(bin, &base, &session_file);
+    cmd.env("HOME", &home);
+    cmd.env("BEYOND_AI_AGENT_MCP_IDLE_SECS", "0");
+    let mut child = cmd.spawn_guarded();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
     writeln!(
         stdin,
@@ -330,29 +314,29 @@ fn new_session_resets_mcp_enablement() {
     )
     .unwrap();
     stdin.flush().unwrap();
+    let _frames = read_until_response(&mut stdout, "set_mcp_enabled");
     assert_eq!(
-        response(
-            &read_until_response(&mut stdout, "set_mcp_enabled"),
-            "set_mcp_enabled"
-        )["success"],
+        response(&_frames, "set_mcp_enabled")["success"],
         true
     );
 
     writeln!(stdin, "{}", json!({ "type": "new_session" })).unwrap();
     stdin.flush().unwrap();
-    let ns = response(
-        &read_until_response(&mut stdout, "new_session"),
-        "new_session",
-    );
+    let _ns_frames = read_until_response(&mut stdout, "new_session");
+    let ns = response(&_ns_frames, "new_session");
     assert_eq!(ns["success"], true, "{ns}");
 
     writeln!(stdin, "{}", json!({ "type": "get_mcp" })).unwrap();
     stdin.flush().unwrap();
-    let g = response(&read_until_response(&mut stdout, "get_mcp"), "get_mcp");
-    assert_eq!(g["data"]["mode"], "all", "new_session must reset MCP kit: {g}");
-    let tools = g["data"]["tools"].as_array().unwrap();
+    let _g_frames = read_until_response(&mut stdout, "get_mcp");
+    let g = response(&_g_frames, "get_mcp");
+    assert_eq!(
+        g["data"]["mode"], "all",
+        "new_session must reset MCP kit: {g}"
+    );
+    let tools = tool_names(&g["data"]["tools"]);
     assert!(
-        tools.iter().any(|t| t.as_str().unwrap().starts_with("mcp__beta__")),
+        tools.iter().any(|t| t.starts_with("mcp__beta__")),
         "beta must be back after new_session: {g}"
     );
 
