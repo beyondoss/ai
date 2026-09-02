@@ -87,11 +87,11 @@ fn get_mcp_lists_resources_and_prompts_and_tools_call_them() {
     let tools = g["data"]["tools"].as_array().unwrap();
     let tool_names: Vec<&str> = tools.iter().filter_map(|t| t.as_str()).collect();
     assert!(
-        tool_names.iter().any(|n| *n == "mcp__surf__resource__doc"),
+        tool_names.contains(&"mcp__surf__resource__doc"),
         "resource tool missing: {tool_names:?}"
     );
     assert!(
-        tool_names.iter().any(|n| *n == "mcp__surf__prompt__greet"),
+        tool_names.contains(&"mcp__surf__prompt__greet"),
         "prompt tool missing: {tool_names:?}"
     );
     assert!(

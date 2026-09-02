@@ -192,7 +192,18 @@ fn spawn_oauth_protected_mcp_fixture(expires_in_secs: u64) -> (String, Arc<Mutex
                 .path
                 .starts_with("/.well-known/oauth-protected-resource")
             {
-                write_response(&mut stream, "404 Not Found", "", b"");
+                // SEP-985 protected-resource metadata: points at this fixture's own AS so rmcp 3.x
+                // discovers the correct issuer (`http://host`) instead of expecting the resource
+                // URL (`http://host/mcp`) when probing AS metadata from the MCP path alone.
+                write_json(
+                    &mut stream,
+                    "200 OK",
+                    &json!({
+                        "resource": format!("{base_for_thread}/mcp"),
+                        "authorization_servers": [base_for_thread],
+                        "scopes_supported": ["mcp"],
+                    }),
+                );
                 continue;
             }
             if req
