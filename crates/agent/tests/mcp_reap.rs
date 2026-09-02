@@ -84,7 +84,7 @@ async fn an_idle_server_is_reaped_and_reconnects_on_the_next_call() {
     assert_eq!(fixture_processes(tag), 0, "tag must start unused");
 
     // A one-second window: the production default is minutes, which no test can wait out.
-    let (tools, warnings) =
+    let (tools, _catalog, warnings) =
         mcp::connect_all(&[fixture_config(tag)], Duration::from_secs(1), None).await;
     assert!(
         warnings.is_empty(),
@@ -137,7 +137,8 @@ async fn an_idle_server_is_reaped_and_reconnects_on_the_next_call() {
 async fn a_zero_window_keeps_the_server_resident() {
     let tag = "reap-zero-def456";
     assert_eq!(fixture_processes(tag), 0, "tag must start unused");
-    let (tools, warnings) = mcp::connect_all(&[fixture_config(tag)], Duration::ZERO, None).await;
+    let (tools, _catalog, warnings) =
+        mcp::connect_all(&[fixture_config(tag)], Duration::ZERO, None).await;
     assert!(
         warnings.is_empty(),
         "fixture failed to connect: {warnings:?}"
@@ -168,7 +169,7 @@ async fn a_cached_manifest_advertises_tools_without_starting_the_server() {
     let manifest = beyond_ai_agent::tools::mcp_manifest::ManifestDir::at(&dir);
 
     // First start: nothing cached, so it connects, discovers, and records what it found.
-    let (tools, warnings) = mcp::connect_all(
+    let (tools, _catalog, warnings) = mcp::connect_all(
         &[fixture_config(tag)],
         Duration::from_secs(60),
         Some(&manifest),
@@ -192,7 +193,7 @@ async fn a_cached_manifest_advertises_tools_without_starting_the_server() {
     );
 
     // Second start: same invocation, so the manifest answers and no process appears.
-    let (cached, warnings) = mcp::connect_all(
+    let (cached, _catalog, warnings) = mcp::connect_all(
         &[fixture_config(tag)],
         Duration::from_secs(60),
         Some(&manifest),
@@ -258,7 +259,8 @@ async fn reaping_sweeps_a_grandchild_the_server_forked_away() {
         );
     }
 
-    let (tools, warnings) = mcp::connect_all(&[config], Duration::from_secs(1), None).await;
+    let (tools, _catalog, warnings) =
+        mcp::connect_all(&[config], Duration::from_secs(1), None).await;
     assert!(
         warnings.is_empty(),
         "fixture failed to connect: {warnings:?}"

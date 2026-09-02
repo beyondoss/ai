@@ -652,6 +652,9 @@ pub struct ServeConfig {
     /// server) lives as long as this `Vec`'s `Arc<dyn Tool>` entries do, i.e. for the whole `serve`
     /// session.
     pub mcp_tools: Vec<Arc<dyn agent_core::Tool>>,
+    /// Catalog of connected MCP servers (resources/prompts metadata + live handles for
+    /// `mcp_complete`). Built alongside `mcp_tools` by `connect_all`.
+    pub mcp_catalog: crate::tools::mcp::McpCatalog,
     /// Agent definitions discovered at startup (see [`crate::agents`]) — the delegable personas the
     /// `subagent` tool accepts, advertised in `<available_agents>`. Discovered once, like `mcp_tools`,
     /// rather than re-walked on every registry rebuild. Empty when subagents aren't configured.
@@ -2364,6 +2367,13 @@ pub(crate) async fn serve_session(
         (Some(runtime), Some(pending))
     };
 
+    let (elicit_gate, pending_elicitations) = ServeElicitationGate::new(
+        out_conn.clone(),
+        cfg.approval_timeout,
+        persistence.session_id(),
+    );
+    crate::tools::mcp::host().elicitation.install(elicit_gate);
+
     // `structured_output` is installed per-`prompt` (see that arm's `output_schema` handling), not at
     // startup: one session can answer one request in prose and the next as typed JSON. The `OutputSlot`
     // outlives every rebuild — it is this session's return channel, and a `set_model` mid-run must not
@@ -3846,6 +3856,9 @@ pub(crate) async fn serve_session(
                                             "approve" => {
                                                 let _ = out_tx.send(handle_approve(cid, &c, pending_approvals.as_ref()));
                                             }
+                                            "elicit" => {
+                                                let _ = out_tx.send(handle_elicit(cid, &c, Some(&pending_elicitations)));
+                                            }
                                             "get_tree" => {
                                                 // Same `since` handling as the idle-loop arm below — see
                                                 // `nodes_since`'s own doc comment (Task #48, pi-parity gap).
@@ -4449,6 +4462,26 @@ pub(crate) async fn serve_session(
                         .map(|d| d.name)
                         .filter(|n| n.starts_with("mcp__"))
                         .collect();
+                let catalogs = cfg.mcp_catalog.filter_enabled(&mcp_enabled);
+                let resources: Vec<_> = catalogs
+                    .iter()
+                    .flat_map(|s| s.resources.iter().cloned())
+                    .collect();
+                let prompts: Vec<_> = catalogs
+                    .iter()
+                    .flat_map(|s| s.prompts.iter().cloned())
+                    .collect();
+                let servers: Vec<_> = catalogs
+                    .iter()
+                    .map(|s| {
+                        json!({
+                            "name": s.name,
+                            "protocol_version": s.protocol_version,
+                            "resources": s.resources.len(),
+                            "prompts": s.prompts.len(),
+                        })
+                    })
+                    .collect();
                 emit!(response(
                     id,
                     "get_mcp",
@@ -4458,9 +4491,61 @@ pub(crate) async fn serve_session(
                         "enabled": enabled,
                         "configured": configured,
                         "tools": tools,
+                        "resources": resources,
+                        "prompts": prompts,
+                        "servers": servers,
                     })),
                     None
                 ));
+            }
+            "mcp_complete" => {
+                let Some(server) = cmd.get("server").and_then(Value::as_str) else {
+                    emit!(response(
+                        id,
+                        "mcp_complete",
+                        false,
+                        None,
+                        Some("missing `server`")
+                    ));
+                    continue;
+                };
+                let Some(params_val) = cmd.get("params") else {
+                    emit!(response(
+                        id,
+                        "mcp_complete",
+                        false,
+                        None,
+                        Some("missing `params` (CompleteRequestParams JSON)")
+                    ));
+                    continue;
+                };
+                let params: rmcp::model::CompleteRequestParams =
+                    match serde_json::from_value(params_val.clone()) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            emit!(response(
+                                id,
+                                "mcp_complete",
+                                false,
+                                None,
+                                Some(&format!("invalid `params`: {e}"))
+                            ));
+                            continue;
+                        }
+                    };
+                match cfg.mcp_catalog.complete(server, params).await {
+                    Ok(result) => emit!(response(
+                        id,
+                        "mcp_complete",
+                        true,
+                        Some(serde_json::to_value(result).unwrap_or(Value::Null)),
+                        None
+                    )),
+                    Err(e) => emit!(response(id, "mcp_complete", false, None, Some(&e))),
+                }
+            }
+            "elicit" => {
+                emit!(handle_elicit(id, &cmd, Some(&pending_elicitations)));
             }
             "get_state" => {
                 let mut data = session_stats(&session, &current_model);
@@ -8114,6 +8199,201 @@ fn handle_approve(id: Option<String>, cmd: &Value, pending: Option<&PendingAppro
     response(
         id,
         "approve",
+        true,
+        Some(json!({ "accepted": accepted })),
+        None,
+    )
+}
+
+type PendingElicitations =
+    Arc<std::sync::Mutex<HashMap<String, tokio::sync::oneshot::Sender<rmcp::model::ElicitResult>>>>;
+
+struct PendingElicitGuard {
+    pending: PendingElicitations,
+    id: String,
+}
+
+impl Drop for PendingElicitGuard {
+    fn drop(&mut self) {
+        lock_ignoring_poison(&self.pending).remove(&self.id);
+    }
+}
+
+/// `serve`'s MCP elicitation gate — same ack-now/respond-later shape as [`ServeApprovalGate`].
+///
+/// Holds a [`std::sync::Weak`] to the session out-fanout (not a strong [`SharedOutConn`]) so installing
+/// this gate into the process-scoped MCP host hub cannot keep a session's connection graph alive or
+/// create lock-order surprises against the live writer.
+struct ServeElicitationGate {
+    out: std::sync::Weak<std::sync::Mutex<OutFanout>>,
+    pending: PendingElicitations,
+    timeout: Option<std::time::Duration>,
+    seq: AtomicU64,
+    session_id: String,
+}
+
+impl ServeElicitationGate {
+    fn new(
+        out: SharedOutConn,
+        timeout: Option<std::time::Duration>,
+        session_id: impl Into<String>,
+    ) -> (Arc<Self>, PendingElicitations) {
+        let pending: PendingElicitations = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let gate = Arc::new(Self {
+            out: Arc::downgrade(&out),
+            pending: pending.clone(),
+            timeout,
+            seq: AtomicU64::new(0),
+            session_id: session_id.into(),
+        });
+        (gate, pending)
+    }
+
+    fn broadcast(&self, frame: OutFrame) {
+        if let Some(out) = self.out.upgrade() {
+            lock_ignoring_poison(&out).broadcast(frame);
+        }
+    }
+
+    fn no_client(&self) -> bool {
+        self.out
+            .upgrade()
+            .map(|out| lock_ignoring_poison(&out).is_empty())
+            .unwrap_or(true)
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::tools::mcp_host::ElicitationGate for ServeElicitationGate {
+    async fn elicit(
+        &self,
+        ask: crate::tools::mcp_host::ElicitationAsk,
+    ) -> Result<rmcp::model::ElicitResult, crate::tools::mcp_host::ElicitationError> {
+        if self.no_client() {
+            return Err(crate::tools::mcp_host::ElicitationError::NoClient);
+        }
+        let request_id = format!(
+            "elicit:{}:{}",
+            self.session_id,
+            self.seq.fetch_add(1, Ordering::Relaxed)
+        );
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        lock_ignoring_poison(&self.pending).insert(request_id.clone(), tx);
+        let _slot = PendingElicitGuard {
+            pending: self.pending.clone(),
+            id: request_id.clone(),
+        };
+
+        self.broadcast(elicitation_request_frame(&request_id, &ask));
+
+        // Never wait forever: an attached client that never answers must not pin the session.
+        let wait = self.timeout.or(Some(std::time::Duration::from_secs(120)));
+        let outcome = tokio::select! {
+            biased;
+            answer = rx => answer.map_err(|_| crate::tools::mcp_host::ElicitationError::Cancelled),
+            _ = sleep_opt(wait) => Err(crate::tools::mcp_host::ElicitationError::TimedOut),
+        };
+        self.broadcast(elicitation_resolved_frame(&request_id, &outcome));
+        outcome
+    }
+}
+
+fn elicitation_request_frame(
+    request_id: &str,
+    ask: &crate::tools::mcp_host::ElicitationAsk,
+) -> OutFrame {
+    let mut m = Map::new();
+    m.insert("type".into(), json!("elicitation_request"));
+    m.insert("request_id".into(), json!(request_id));
+    m.insert("server".into(), json!(ask.server));
+    m.insert(
+        "params".into(),
+        crate::tools::mcp_host::elicitation_params_json(&ask.params),
+    );
+    m.insert("options".into(), json!(["accept", "decline", "cancel"]));
+    Value::Object(m).into()
+}
+
+fn elicitation_resolved_frame(
+    request_id: &str,
+    outcome: &Result<rmcp::model::ElicitResult, crate::tools::mcp_host::ElicitationError>,
+) -> OutFrame {
+    let mut m = Map::new();
+    m.insert("type".into(), json!("elicitation_resolved"));
+    m.insert("request_id".into(), json!(request_id));
+    match outcome {
+        Ok(result) => {
+            m.insert(
+                "action".into(),
+                json!(match result.action {
+                    rmcp::model::ElicitationAction::Accept => "accept",
+                    rmcp::model::ElicitationAction::Decline => "decline",
+                    rmcp::model::ElicitationAction::Cancel => "cancel",
+                    _ => "decline",
+                }),
+            );
+            if let Some(content) = &result.content {
+                m.insert("content".into(), content.clone());
+            }
+        }
+        Err(crate::tools::mcp_host::ElicitationError::TimedOut) => {
+            m.insert("action".into(), json!("decline"));
+            m.insert("reason".into(), json!("timed_out"));
+        }
+        Err(crate::tools::mcp_host::ElicitationError::Cancelled) => {
+            m.insert("action".into(), json!("decline"));
+            m.insert("reason".into(), json!("cancelled"));
+        }
+        Err(crate::tools::mcp_host::ElicitationError::NoClient) => {
+            m.insert("action".into(), json!("decline"));
+            m.insert("reason".into(), json!("no_client"));
+        }
+    }
+    Value::Object(m).into()
+}
+
+fn handle_elicit(
+    id: Option<String>,
+    cmd: &Value,
+    pending: Option<&PendingElicitations>,
+) -> OutFrame {
+    let Some(request_id) = cmd.get("request_id").and_then(Value::as_str) else {
+        return response(id, "elicit", false, None, Some("missing `request_id`"));
+    };
+    let action = match cmd.get("action").and_then(Value::as_str) {
+        Some("accept") => rmcp::model::ElicitationAction::Accept,
+        Some("decline") => rmcp::model::ElicitationAction::Decline,
+        Some("cancel") => rmcp::model::ElicitationAction::Cancel,
+        _ => {
+            return response(
+                id,
+                "elicit",
+                false,
+                None,
+                Some("`action` must be \"accept\", \"decline\", or \"cancel\""),
+            );
+        }
+    };
+    let mut result = rmcp::model::ElicitResult::new(action);
+    if let Some(content) = cmd.get("content") {
+        result = result.with_content(content.clone());
+    }
+    let Some(pending) = pending else {
+        return response(
+            id,
+            "elicit",
+            false,
+            None,
+            Some("this session has no elicitation gate"),
+        );
+    };
+    let accepted = lock_ignoring_poison(pending)
+        .remove(request_id)
+        .and_then(|tx| tx.send(result).ok())
+        .is_some();
+    response(
+        id,
+        "elicit",
         true,
         Some(json!({ "accepted": accepted })),
         None,

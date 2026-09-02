@@ -34,14 +34,20 @@ use crate::settings::{McpServerConfig, McpTransport};
 
 /// Bumped whenever the cached shape changes. Part of the key, so an older manifest is simply a miss
 /// rather than something that has to be migrated.
-const MANIFEST_VERSION: u32 = 1;
+const MANIFEST_VERSION: u32 = 2;
 
-/// One server's advertised tools, as they were when last discovered.
+/// One server's advertised tools / resources / prompts, as they were when last discovered.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ServerManifest {
     /// Identifies the exact invocation this was discovered from — see [`invocation_key`].
     pub key: String,
     pub tools: Vec<CachedTool>,
+    /// `resources/list` entries, exposed as `mcp__<server>__resource__<name>` tools.
+    #[serde(default)]
+    pub resources: Vec<CachedResource>,
+    /// `prompts/list` entries, exposed as `mcp__<server>__prompt__<name>` tools.
+    #[serde(default)]
+    pub prompts: Vec<CachedPrompt>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -49,6 +55,22 @@ pub struct CachedTool {
     /// The bare name as the server knows it, unprefixed.
     pub remote_name: String,
     pub description: String,
+    pub input_schema: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CachedResource {
+    /// Bare resource name (not the URI).
+    pub name: String,
+    pub uri: String,
+    pub description: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CachedPrompt {
+    pub name: String,
+    pub description: String,
+    /// JSON Schema derived from the prompt's declared arguments (same shape live discovery builds).
     pub input_schema: serde_json::Value,
 }
 
@@ -119,12 +141,18 @@ pub fn load(dir: &ManifestDir, config: &McpServerConfig) -> Option<ServerManifes
     read_store(dir)
         .remove(&config.name)
         .filter(|m| m.key == key)
-        .filter(|m| !m.tools.is_empty())
+        .filter(|m| !m.tools.is_empty() || !m.resources.is_empty() || !m.prompts.is_empty())
 }
 
 /// Record what `config`'s server advertises. Best-effort: a cache that cannot be written costs a
 /// server spawn on the next boot, which is the behavior without it.
-pub fn store(dir: &ManifestDir, config: &McpServerConfig, tools: Vec<CachedTool>) {
+pub fn store(
+    dir: &ManifestDir,
+    config: &McpServerConfig,
+    tools: Vec<CachedTool>,
+    resources: Vec<CachedResource>,
+    prompts: Vec<CachedPrompt>,
+) {
     let path = dir.file();
     let mut all = read_store(dir);
     all.insert(
@@ -132,6 +160,8 @@ pub fn store(dir: &ManifestDir, config: &McpServerConfig, tools: Vec<CachedTool>
         ServerManifest {
             key: invocation_key(config),
             tools,
+            resources,
+            prompts,
         },
     );
     let Ok(bytes) = serde_json::to_vec_pretty(&all) else {
