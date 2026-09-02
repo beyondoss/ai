@@ -784,24 +784,21 @@ fn tasks_update(params: Value) -> Result<Value, (i64, String)> {
     let Some(task) = guard.get_mut(&task_id) else {
         return Err((-32602, format!("unknown task `{task_id}`")));
     };
-    match &mut task.mode {
-        TaskMode::Ask { answered_name } => {
-            let action = params
-                .pointer("/inputResponses/name/action")
+    if let TaskMode::Ask { answered_name } = &mut task.mode {
+        let action = params
+            .pointer("/inputResponses/name/action")
+            .and_then(Value::as_str)
+            .unwrap_or("decline");
+        if action == "accept" {
+            let name = params
+                .pointer("/inputResponses/name/content/name")
                 .and_then(Value::as_str)
-                .unwrap_or("decline");
-            if action == "accept" {
-                let name = params
-                    .pointer("/inputResponses/name/content/name")
-                    .and_then(Value::as_str)
-                    .unwrap_or("?")
-                    .to_string();
-                *answered_name = Some(name);
-            } else {
-                *answered_name = Some("declined".into());
-            }
+                .unwrap_or("?")
+                .to_string();
+            *answered_name = Some(name);
+        } else {
+            *answered_name = Some("declined".into());
         }
-        _ => {}
     }
     Ok(json!({ "resultType": "complete" }))
 }
