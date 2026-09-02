@@ -13,6 +13,10 @@
 //!   with `inputResponses` completes — proves MRTR under protocol `2026-07-28`.
 //! - `slow_task`: returns SEP-2663 `resultType: "task"`; client polls `tasks/get` until completed
 //!   (status messages `task-phase-one` → `task-phase-two` → result `task-done`).
+//! - `fail_task` / `server_cancel_task`: timed tasks that end `failed` / `cancelled` (server-side).
+//! - `sticky_task`: stays `working` until `tasks/cancel` (abort proof; optional
+//!   `MCP_FIXTURE_CANCEL_FLAG` path gets the cancelled task id written).
+//! - `ask_task`: first `tasks/get` is `input_required` (elicitation); `tasks/update` completes.
 //!
 //! Also answers `resources/*`, `prompts/*`, `completion/complete`, `tasks/get` / `tasks/cancel` /
 //! `tasks/update`, and `server/discover` (advertising `2026-07-28` + `2025-11-25` + tasks extension).
@@ -38,9 +42,24 @@ const RESOURCE_BODY: &str = "fixture-resource-body";
 
 const TASKS_EXTENSION_ID: &str = "io.modelcontextprotocol/tasks";
 
+/// How a fixture task reaches a terminal state (or waits for cancel / input).
+enum TaskMode {
+    /// Completes successfully after `complete_after`.
+    TimedSuccess { complete_after: Duration },
+    /// Ends as `failed` after `complete_after`.
+    TimedFailed { complete_after: Duration },
+    /// Ends as `cancelled` (server-initiated) after `complete_after`.
+    TimedServerCancelled { complete_after: Duration },
+    /// Never completes unless the client sends `tasks/cancel`.
+    Sticky,
+    /// First `tasks/get` asks for elicitation; `tasks/update` supplies the answer.
+    Ask { answered_name: Option<String> },
+}
+
 struct FixtureTask {
     created: Instant,
-    complete_after: Duration,
+    mode: TaskMode,
+    /// Set by `tasks/cancel` (client-initiated).
     cancelled: bool,
     poll_interval_ms: u64,
 }
@@ -48,6 +67,13 @@ struct FixtureTask {
 fn tasks() -> &'static Mutex<HashMap<String, FixtureTask>> {
     static TASKS: OnceLock<Mutex<HashMap<String, FixtureTask>>> = OnceLock::new();
     TASKS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn record_cancel_flag(task_id: &str) {
+    let Ok(path) = std::env::var("MCP_FIXTURE_CANCEL_FLAG") else {
+        return;
+    };
+    let _ = std::fs::write(path, task_id);
 }
 
 fn capabilities() -> Value {
@@ -275,11 +301,7 @@ fn handle(method: &str, params: Value) -> Result<Value, (i64, String)> {
         "tools/call" => Ok(call_tool(params)),
         "tasks/get" => tasks_get(params),
         "tasks/cancel" => tasks_cancel(params),
-        "tasks/update" => {
-            // Fixture tasks never enter input_required; ack empty.
-            let _ = params;
-            Ok(json!({ "resultType": "complete" }))
-        }
+        "tasks/update" => tasks_update(params),
         "resources/list" => Ok(json!({
             "resources": [{
                 "uri": RESOURCE_URI,
@@ -424,6 +446,26 @@ fn tool_defs() -> Value {
             "description": "Returns a SEP-2663 task handle; completes after a short poll with `task-done`.",
             "inputSchema": { "type": "object", "properties": {} },
         },
+        {
+            "name": "fail_task",
+            "description": "SEP-2663 task that ends with status failed.",
+            "inputSchema": { "type": "object", "properties": {} },
+        },
+        {
+            "name": "server_cancel_task",
+            "description": "SEP-2663 task that ends with status cancelled (server-side).",
+            "inputSchema": { "type": "object", "properties": {} },
+        },
+        {
+            "name": "sticky_task",
+            "description": "SEP-2663 task that stays working until tasks/cancel.",
+            "inputSchema": { "type": "object", "properties": {} },
+        },
+        {
+            "name": "ask_task",
+            "description": "SEP-2663 task that needs in-task elicitation via tasks/update.",
+            "inputSchema": { "type": "object", "properties": {} },
+        },
     ])
 }
 
@@ -507,13 +549,40 @@ fn call_tool(params: Value) -> Value {
         "slow_progress" => text_result("progress-done", false),
         "ask_user" => text_result("ask_user should be handled asynchronously", true),
         "ask_user_mrtr" => call_ask_user_mrtr(&params),
-        "slow_task" => call_slow_task(),
+        "slow_task" => create_task(
+            TaskMode::TimedSuccess {
+                complete_after: Duration::from_millis(250),
+            },
+            "task-phase-one",
+            40,
+        ),
+        "fail_task" => create_task(
+            TaskMode::TimedFailed {
+                complete_after: Duration::from_millis(80),
+            },
+            "failing",
+            30,
+        ),
+        "server_cancel_task" => create_task(
+            TaskMode::TimedServerCancelled {
+                complete_after: Duration::from_millis(80),
+            },
+            "server-cancelling",
+            30,
+        ),
+        "sticky_task" => create_task(TaskMode::Sticky, "sticky-working", 40),
+        "ask_task" => create_task(
+            TaskMode::Ask {
+                answered_name: None,
+            },
+            "awaiting-name",
+            30,
+        ),
         other => text_result(&format!("fixture: unknown tool `{other}`"), true),
     }
 }
 
-/// SEP-2663: return a task handle; `tasks/get` advances status by wall clock until completed.
-fn call_slow_task() -> Value {
+fn create_task(mode: TaskMode, status_message: &str, poll_interval_ms: u64) -> Value {
     let task_id = {
         let Ok(mut guard) = tasks().lock() else {
             return text_result("tasks lock poisoned", true);
@@ -523,9 +592,9 @@ fn call_slow_task() -> Value {
             task_id.clone(),
             FixtureTask {
                 created: Instant::now(),
-                complete_after: Duration::from_millis(250),
+                mode,
                 cancelled: false,
-                poll_interval_ms: 40,
+                poll_interval_ms,
             },
         );
         task_id
@@ -534,11 +603,11 @@ fn call_slow_task() -> Value {
         "resultType": "task",
         "taskId": task_id,
         "status": "working",
-        "statusMessage": "task-phase-one",
+        "statusMessage": status_message,
         "createdAt": "2026-09-02T00:00:00Z",
         "lastUpdatedAt": "2026-09-02T00:00:00Z",
         "ttlMs": null,
-        "pollIntervalMs": 40,
+        "pollIntervalMs": poll_interval_ms,
     })
 }
 
@@ -554,50 +623,187 @@ fn tasks_get(params: Value) -> Result<Value, (i64, String)> {
     let Some(task) = guard.get(&task_id) else {
         return Err((-32602, format!("unknown task `{task_id}`")));
     };
+
     if task.cancelled {
-        return Ok(json!({
-            "resultType": "complete",
-            "taskId": task_id,
-            "status": "cancelled",
-            "createdAt": "2026-09-02T00:00:00Z",
-            "lastUpdatedAt": "2026-09-02T00:00:01Z",
-            "ttlMs": null,
-            "pollIntervalMs": task.poll_interval_ms,
-        }));
+        return Ok(task_base(
+            &task_id,
+            "cancelled",
+            None,
+            task.poll_interval_ms,
+            None,
+            None,
+        ));
     }
-    let elapsed = task.created.elapsed();
-    if elapsed >= task.complete_after {
-        return Ok(json!({
-            "resultType": "complete",
-            "taskId": task_id,
-            "status": "completed",
-            "statusMessage": "task-complete",
-            "createdAt": "2026-09-02T00:00:00Z",
-            "lastUpdatedAt": "2026-09-02T00:00:01Z",
-            "ttlMs": null,
-            "pollIntervalMs": task.poll_interval_ms,
-            "result": {
-                "content": [{ "type": "text", "text": "task-done" }],
+
+    match &task.mode {
+        TaskMode::Ask {
+            answered_name: Some(name),
+        } => Ok(task_base(
+            &task_id,
+            "completed",
+            Some("ask-complete"),
+            task.poll_interval_ms,
+            Some(json!({
+                "content": [{ "type": "text", "text": format!("task-ask-hello-{name}") }],
                 "isError": false,
+            })),
+            None,
+        )),
+        TaskMode::Ask {
+            answered_name: None,
+        } => Ok(json!({
+            "resultType": "complete",
+            "taskId": task_id,
+            "status": "input_required",
+            "statusMessage": "need-name",
+            "createdAt": "2026-09-02T00:00:00Z",
+            "lastUpdatedAt": "2026-09-02T00:00:00Z",
+            "ttlMs": null,
+            "pollIntervalMs": task.poll_interval_ms,
+            "inputRequests": {
+                "name": {
+                    "method": "elicitation/create",
+                    "params": {
+                        "mode": "form",
+                        "message": "What is your name? (task)",
+                        "requestedSchema": {
+                            "type": "object",
+                            "properties": { "name": { "type": "string" } },
+                            "required": ["name"],
+                        }
+                    }
+                }
             }
-        }));
+        })),
+        TaskMode::Sticky => Ok(task_base(
+            &task_id,
+            "working",
+            Some("sticky-working"),
+            task.poll_interval_ms,
+            None,
+            None,
+        )),
+        TaskMode::TimedSuccess { complete_after }
+        | TaskMode::TimedFailed { complete_after }
+        | TaskMode::TimedServerCancelled { complete_after } => {
+            let elapsed = task.created.elapsed();
+            if elapsed < *complete_after {
+                let status_message = match &task.mode {
+                    TaskMode::TimedSuccess { .. } if elapsed >= *complete_after / 2 => {
+                        "task-phase-two"
+                    }
+                    TaskMode::TimedSuccess { .. } => "task-phase-one",
+                    TaskMode::TimedFailed { .. } => "failing",
+                    TaskMode::TimedServerCancelled { .. } => "server-cancelling",
+                    _ => "working",
+                };
+                return Ok(task_base(
+                    &task_id,
+                    "working",
+                    Some(status_message),
+                    task.poll_interval_ms,
+                    None,
+                    None,
+                ));
+            }
+            match &task.mode {
+                TaskMode::TimedSuccess { .. } => Ok(task_base(
+                    &task_id,
+                    "completed",
+                    Some("task-complete"),
+                    task.poll_interval_ms,
+                    Some(json!({
+                        "content": [{ "type": "text", "text": "task-done" }],
+                        "isError": false,
+                    })),
+                    None,
+                )),
+                TaskMode::TimedFailed { .. } => Ok(task_base(
+                    &task_id,
+                    "failed",
+                    Some("task-failed"),
+                    task.poll_interval_ms,
+                    None,
+                    Some(json!({
+                        "code": -32000,
+                        "message": "task-failed-on-purpose",
+                    })),
+                )),
+                TaskMode::TimedServerCancelled { .. } => Ok(task_base(
+                    &task_id,
+                    "cancelled",
+                    Some("task-server-cancelled"),
+                    task.poll_interval_ms,
+                    None,
+                    None,
+                )),
+                _ => unreachable!(),
+            }
+        }
     }
-    // Mid-flight: flip status message after half the wait so the client surfaces progress.
-    let status_message = if elapsed >= task.complete_after / 2 {
-        "task-phase-two"
-    } else {
-        "task-phase-one"
-    };
-    Ok(json!({
+}
+
+fn task_base(
+    task_id: &str,
+    status: &str,
+    status_message: Option<&str>,
+    poll_interval_ms: u64,
+    result: Option<Value>,
+    error: Option<Value>,
+) -> Value {
+    let mut v = json!({
         "resultType": "complete",
         "taskId": task_id,
-        "status": "working",
-        "statusMessage": status_message,
+        "status": status,
         "createdAt": "2026-09-02T00:00:00Z",
-        "lastUpdatedAt": "2026-09-02T00:00:00Z",
+        "lastUpdatedAt": "2026-09-02T00:00:01Z",
         "ttlMs": null,
-        "pollIntervalMs": task.poll_interval_ms,
-    }))
+        "pollIntervalMs": poll_interval_ms,
+    });
+    if let Some(message) = status_message {
+        v["statusMessage"] = json!(message);
+    }
+    if let Some(result) = result {
+        v["result"] = result;
+    }
+    if let Some(error) = error {
+        v["error"] = error;
+    }
+    v
+}
+
+fn tasks_update(params: Value) -> Result<Value, (i64, String)> {
+    let task_id = params
+        .get("taskId")
+        .and_then(Value::as_str)
+        .ok_or((-32602, "tasks/update requires taskId".into()))?
+        .to_string();
+    let Ok(mut guard) = tasks().lock() else {
+        return Err((-32603, "tasks lock poisoned".into()));
+    };
+    let Some(task) = guard.get_mut(&task_id) else {
+        return Err((-32602, format!("unknown task `{task_id}`")));
+    };
+    match &mut task.mode {
+        TaskMode::Ask { answered_name } => {
+            let action = params
+                .pointer("/inputResponses/name/action")
+                .and_then(Value::as_str)
+                .unwrap_or("decline");
+            if action == "accept" {
+                let name = params
+                    .pointer("/inputResponses/name/content/name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("?")
+                    .to_string();
+                *answered_name = Some(name);
+            } else {
+                *answered_name = Some("declined".into());
+            }
+        }
+        _ => {}
+    }
+    Ok(json!({ "resultType": "complete" }))
 }
 
 fn tasks_cancel(params: Value) -> Result<Value, (i64, String)> {
@@ -613,6 +819,8 @@ fn tasks_cancel(params: Value) -> Result<Value, (i64, String)> {
         return Err((-32602, format!("unknown task `{task_id}`")));
     };
     task.cancelled = true;
+    drop(guard);
+    record_cancel_flag(&task_id);
     Ok(json!({ "resultType": "complete" }))
 }
 
