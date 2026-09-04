@@ -1,4 +1,4 @@
-The Python package under `/app/svc` has a few dangerous runtime calls mixed with comments, docstrings, and string literals that *mention* the same names.
+The Python package under `/app/svc` has a few dangerous runtime calls mixed with comments, docstrings, and string literals that _mention_ the same names.
 
 Write `/app/report.json`: a JSON array of every **AST Call** to exactly one of:
 
