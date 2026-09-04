@@ -2,10 +2,18 @@
 # Run a small FrontierHarness v1.0 Terminal-Bench subset through Harbor.
 # Verifier pass/fail, turns, tokens, $. Not the Code Mode MCP smokes.
 #
-# Three arms, same tasks, same model (Kimi K3 via OpenRouter):
+# Three arms on Terminal-Bench (no MCP catalog):
 #   HARNESS=beyond              density-default musl binary (no QuickJS)
 #   HARNESS=beyond-code-mode    --features code-mode binary + --code-mode
 #   HARNESS=pi                  Harbor Pi 0.84.2 (FrontierHarness pin)
+#
+# Code Mode *with* MCP (local Harbor task, stdlib AST server — not the echo fixture):
+#   HARNESS=beyond-mcp              flattened mcp__ast__* tools
+#   HARNESS=beyond-mcp-code-mode    same catalog behind execute
+#
+# beyond* drop `web` (`--exclude-tools web`). Keep `web` in the product.
+# TB Code Mode is a regression check (empty execute). The MCP task is the
+# schema / composition eval.
 #
 # beyond / beyond-code-mode drop `web` (`--exclude-tools web`). Keep `web` in
 # the product; on TB it was a token spiral, not a coding-agent comparison.
@@ -16,6 +24,8 @@
 #     crates/agent/eval/run_frontier_subset.sh
 #   TASKS=terminal-bench/polyglot-c-py HARNESS=pi JOBS_DIR=/tmp/poly-pi \
 #     crates/agent/eval/run_frontier_subset.sh
+#   HARNESS=beyond-mcp JOBS_DIR=/tmp/ast-flat crates/agent/eval/run_frontier_subset.sh
+#   HARNESS=beyond-mcp-code-mode JOBS_DIR=/tmp/ast-code crates/agent/eval/run_frontier_subset.sh
 #
 # Terminal-Bench has no MCP catalog. beyond vs beyond-code-mode is a
 # regression/overhead check (empty `execute` still registers). Pi is the
@@ -121,8 +131,44 @@ case "${HARNESS}" in
       --ae "OPENROUTER_API_KEY=${OPENROUTER_API_KEY}" \
       "$@"
     ;;
+  beyond-mcp|beyond-mcp-code-mode)
+    ast_task="${ROOT}/crates/agent/eval/tasks/ast-hotspots"
+    mcp_common=(
+      --path "${ast_task}"
+      --n-concurrent 1
+      --jobs-dir "${JOBS_DIR}"
+      --allow-agent-host openrouter.ai
+    )
+    if [[ "${HARNESS}" == "beyond-mcp-code-mode" ]]; then
+      export BEYOND_AI_AGENT_BIN="${CODE_MODE_BIN}"
+      require_bin "${BEYOND_AI_AGENT_BIN}" \
+        "build: cargo build -p beyond-ai-agent --release --target x86_64-unknown-linux-musl --features code-mode && cp target/x86_64-unknown-linux-musl/release/beyond-ai-agent ${CODE_MODE_BIN}"
+      exec harbor run \
+        "${mcp_common[@]}" \
+        --agent harbor_beyond_agent:BeyondAiAgentCodeMode \
+        --model "${MODEL}" \
+        --ak code_mode=true \
+        --ak mcp_ast=true \
+        --ae AI_PROVIDER=openrouter \
+        --ae AI_DIRECT=1 \
+        --ae "OPENROUTER_API_KEY=${OPENROUTER_API_KEY}" \
+        "$@"
+    fi
+    export BEYOND_AI_AGENT_BIN="${BEYOND_AI_AGENT_BIN:-${DEFAULT_BIN}}"
+    require_bin "${BEYOND_AI_AGENT_BIN}" \
+      "build: cargo build -p beyond-ai-agent --release --target x86_64-unknown-linux-musl"
+    exec harbor run \
+      "${mcp_common[@]}" \
+      --agent harbor_beyond_agent:BeyondAiAgent \
+      --model "${MODEL}" \
+      --ak mcp_ast=true \
+      --ae AI_PROVIDER=openrouter \
+      --ae AI_DIRECT=1 \
+      --ae "OPENROUTER_API_KEY=${OPENROUTER_API_KEY}" \
+      "$@"
+    ;;
   *)
-    echo "HARNESS must be beyond, beyond-code-mode, or pi (got ${HARNESS})" >&2
+    echo "HARNESS must be beyond, beyond-code-mode, pi, beyond-mcp, or beyond-mcp-code-mode (got ${HARNESS})" >&2
     exit 1
     ;;
 esac

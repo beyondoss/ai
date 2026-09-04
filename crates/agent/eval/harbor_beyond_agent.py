@@ -7,13 +7,10 @@ Frontier Terminal-Bench tasks default to no internet.
 
 This is the eval harness (verifier pass/fail, turns, tokens, $). Terminal-Bench
 tasks have no MCP catalog, so `--code-mode` vs default is a regression check,
-not the MCP schema-token win. Use `BeyondAiAgentCodeMode` and a
-`--features code-mode` binary for that arm; Harbor's built-in `pi` agent is the
-harness baseline.
-
-The product still has `web`. This adapter drops it (`--exclude-tools web`) so
-the coding-agent surface matches Pi on TB. A Kimi K3 polyglot run spent most of
-its `$` on seven `web` fetches; that is eval noise, not a product question.
+not the MCP schema-token win. The Code Mode eval is the local Harbor task
+`eval/tasks/ast-hotspots` plus `--ak mcp_ast=true` (stdlib AST MCP, not the
+echo/add fixture). Use `BeyondAiAgentCodeMode` and a `--features code-mode`
+binary for that arm; Harbor's built-in `pi` agent is the TB harness baseline.
 """
 
 from __future__ import annotations
@@ -40,6 +37,7 @@ _DONE_RE = re.compile(
     r"\[done in (\d+) step\(s\); (\d+) in / (\d+) out tokens\]"
 )
 _REMOTE_BIN = "/usr/local/bin/beyond-ai-agent"
+_REMOTE_AST_MCP = "/usr/local/lib/beyond-eval/mcp_ast.py"
 _OUTPUT_JSONL = "beyond.jsonl"
 _OUTPUT_STDERR = "beyond.stderr"
 
@@ -122,6 +120,13 @@ class BeyondAiAgent(BaseInstalledAgent):
         ),
     ]
 
+    def __init__(self, *args, mcp_ast: bool = False, **kwargs):
+        raw = kwargs.pop("mcp_ast", mcp_ast)
+        super().__init__(*args, **kwargs)
+        if isinstance(raw, str):
+            raw = raw.strip().lower() in ("1", "true", "yes")
+        self._mcp_ast = bool(raw)
+
     @staticmethod
     @override
     def name() -> str:
@@ -141,6 +146,17 @@ class BeyondAiAgent(BaseInstalledAgent):
             environment,
             command=f"chmod 755 {quoted} && {quoted} --version",
         )
+        if self._mcp_ast:
+            local = Path(__file__).resolve().parent / "mcp_ast.py"
+            await self.exec_as_root(
+                environment,
+                command="mkdir -p /usr/local/lib/beyond-eval",
+            )
+            await environment.upload_file(local, _REMOTE_AST_MCP)
+            await self.exec_as_root(
+                environment,
+                command=f"chmod 755 {shlex.quote(_REMOTE_AST_MCP)}",
+            )
 
     @with_prompt_template
     async def run(
@@ -195,8 +211,31 @@ class BeyondAiAgent(BaseInstalledAgent):
             )
 
         # Stdin is the instruction: `@file` would wrap it in a <file> block.
+        mcp_setup = ""
+        if self._mcp_ast:
+            settings = {
+                "mcp_servers": [
+                    {
+                        "name": "ast",
+                        "transport": "stdio",
+                        "command": "python3",
+                        "args": [_REMOTE_AST_MCP],
+                        "env": {},
+                    }
+                ]
+            }
+            remote_settings = f"{logs}/mcp-settings.json"
+            with tempfile.TemporaryDirectory(prefix="beyond-mcp-") as tmp:
+                local = Path(tmp) / "settings.json"
+                local.write_text(json.dumps(settings, indent=2) + "\n")
+                await environment.upload_file(local, remote_settings)
+            mcp_setup = (
+                f"mkdir -p \"$HOME/.claude\" && "
+                f"cp {shlex.quote(remote_settings)} \"$HOME/.claude/settings.json\"; "
+            )
         cmd = (
             f"mkdir -p {shlex.quote(logs)}; "
+            f"{mcp_setup}"
             f"{shlex.quote(_REMOTE_BIN)} run --json --no-session-persistence "
             f"--model {shlex.quote(model)}{flags} "
             f"< {shlex.quote(instruction_path)} "

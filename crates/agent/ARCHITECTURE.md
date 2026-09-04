@@ -900,10 +900,14 @@ The harness layers several capabilities over the bare tools + loop:
   `web` (`--exclude-tools web`); the shipped binary still has it — a TB polyglot run burned most
   of its `$` on web fetches, which is not a coding-agent comparison to Pi. Iterate by changing
   one thing and re-running the expensive task (`TASKS=terminal-bench/polyglot-c-py`). TB has no
-  MCP catalog, so beyond vs Code Mode is a regression/overhead check (empty `execute` still
-  registers), not the MCP schema-token win. Pi is the harness baseline. Code Mode still needs an
-  MCP-heavy verifier suite before it can be a default. This slice is not the published 30-task
-  board (21 TB + 9 DeepSWE) and not a Runta golden-checkpoint run.
+  MCP catalog, so beyond vs Code Mode on that slice is a regression/overhead check (empty
+  `execute` still registers), not the MCP schema-token win. The Code Mode eval is
+  `HARNESS=beyond-mcp` vs `HARNESS=beyond-mcp-code-mode`: local Harbor task
+  [`eval/tasks/ast-hotspots`](eval/tasks/ast-hotspots) plus a stdlib Python AST MCP (`list_functions`,
+  `find_calls`, …) — tree-sitter-shaped, no native parser, useful on a coding guest. Flattened
+  `mcp__ast__*` vs `--code-mode` `execute`. Pi is the TB harness baseline. Code Mode still needs
+  this MCP-heavy verifier (and RSS/`.text`) before it can be a default. The TB slice is not the
+  published 30-task board (21 TB + 9 DeepSWE) and not a Runta golden-checkpoint run.
 
   ```sh
   cargo test -p beyond-ai-agent --test code_mode_density
@@ -923,6 +927,9 @@ The harness layers several capabilities over the bare tools + loop:
     crates/agent/eval/run_frontier_subset.sh
   TASKS=terminal-bench/polyglot-c-py HARNESS=pi JOBS_DIR=/tmp/poly-pi \
     crates/agent/eval/run_frontier_subset.sh
+  # Code Mode with a real MCP catalog (AST hotspots, hidden verifier):
+  HARNESS=beyond-mcp JOBS_DIR=/tmp/ast-flat crates/agent/eval/run_frontier_subset.sh
+  HARNESS=beyond-mcp-code-mode JOBS_DIR=/tmp/ast-code crates/agent/eval/run_frontier_subset.sh
   ```
 - **Multimodal** — `prompt` accepts `images: [{media_type, data}]` (base64), built into a multimodal
   user turn. `read` on an oversized image file downscales/re-encodes it (Lanczos3, PNG-then-JPEG
