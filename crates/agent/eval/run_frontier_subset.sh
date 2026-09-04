@@ -23,6 +23,11 @@
 #   HARNESS=beyond-mcp JOBS_DIR=/tmp/ast-flat crates/agent/eval/run_frontier_subset.sh
 #   HARNESS=beyond-mcp-code-mode JOBS_DIR=/tmp/ast-code crates/agent/eval/run_frontier_subset.sh
 #
+# Compare arms on pass/fail and tokens. `$` is OpenRouter *list* rates applied to
+# both (`python3 crates/agent/eval/tabulate_harbor_job.py DIR…`). Do not compare
+# Harbor's reported `cost_usd` across beyond vs Pi: Pi copies billed usage.cost,
+# beyond fills list. Harbor `n_input_tokens` includes cache.
+#
 # Terminal-Bench has no MCP catalog. beyond vs beyond-code-mode is a
 # regression/overhead check (empty `execute` still registers). Pi is the
 # harness baseline. This is not the 30-task FrontierHarness board.

@@ -901,8 +901,11 @@ The harness layers several capabilities over the bare tools + loop:
   `#[ignore]`), not an eval. Density: [`tests/code_mode_density.rs`](tests/code_mode_density.rs)
   (default binary must not contain `JS_NewRuntime`). Harness eval is Harbor on a FrontierHarness
   v1.0 Terminal-Bench subset ([`eval/harbor_beyond_agent.py`](eval/harbor_beyond_agent.py),
-  [`eval/run_frontier_subset.sh`](eval/run_frontier_subset.sh)) — verifier pass/fail, turns, tokens,
-  `$`. Three arms, same tasks, same model (Kimi K3): `HARNESS=beyond` (density-default, no
+  [`eval/run_frontier_subset.sh`](eval/run_frontier_subset.sh)) — verifier pass/fail and tokens.
+  `$` is one OpenRouter list-price card applied to both arms
+  ([`eval/tabulate_harbor_job.py`](eval/tabulate_harbor_job.py), [`eval/token_price.py`](eval/token_price.py));
+  do not compare Harbor's raw `cost_usd` (Pi copies billed `usage.cost`, beyond fills list).
+  Harbor `n_input_tokens` includes cache. Three arms, same tasks, same model (Kimi K3): `HARNESS=beyond` (density-default, no
   QuickJS), `HARNESS=beyond-code-mode` (`--features code-mode` binary + `--code-mode`), and
   `HARNESS=pi` (Harbor's Pi agent at FrontierHarness pin **0.84.2**). The shipped binary does
   not advertise `web` (a TB polyglot run burned most of its `$` fetching pages); `--tools web`
