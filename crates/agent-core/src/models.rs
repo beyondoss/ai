@@ -57,9 +57,9 @@ pub enum OpenAiReasoningFormat {
     /// `reasoning_effort` string.
     DeepSeek,
     /// Z.ai/GLM: `thinking: {"type": "enabled", "clear_thinking": false}` / `{"type": "disabled"}`,
-    /// sent unconditionally (unlike `DeepSeek`, pi never gates this on a disableable check), plus —
-    /// only when [`ModelCaps::reasoning_effort`] is also `true` (GLM-5.2+ only) — a sibling top-level
-    /// `reasoning_effort` string.
+    /// with `"disabled"` only when [`ModelCaps::reasoning_disableable`] (GLM-5.3 cannot turn thinking
+    /// off), plus — only when [`ModelCaps::reasoning_effort`] is also `true` (GLM-5.2+ only) — a
+    /// sibling top-level `reasoning_effort` string.
     Zai,
     /// Together: a nested `reasoning: {"enabled": bool}`, sent unconditionally, plus — only when
     /// [`ModelCaps::reasoning_effort`] is also `true` — a sibling top-level `reasoning_effort` string.
@@ -1426,15 +1426,27 @@ fn capabilities_impl_lc(m: &str) -> ModelCaps {
 
     // Z.ai/GLM: `compat.thinkingFormat: "zai"` — a `thinking:{enabled/disabled}` toggle sent
     // unconditionally, with a `reasoning_effort` string only from GLM-5.2 onward
-    // (`supportsReasoningEffort` is `false` on every earlier id in pi's catalogue). `glm-5v*` is the
+    // (`supportsReasoningEffort` is `false` on every earlier id in pi's catalogue). GLM-5.3 is
+    // always-on (no `thinking.disabled`; low/high/max, default max). `glm-5v*` is the
     // one vision-capable id; every other current id is text-only. Also matches a vendor-slug id (e.g.
     // Together's/HuggingFace's `"zai-org/GLM-5.2"`) via `family_id` — see its own doc comment above.
     if m.starts_with("glm") || family_id.starts_with("glm") {
         // Keyed on whether `m` is slug-shaped at all (not on which disjunct above matched) — same
         // reasoning as the MiniMax branch below, applied uniformly even though no current GLM org
         // slug happens to collide with the literal prefix "glm" the way MiniMax's does.
-        let g = if m.contains('/') { family_id } else { m };
-        let (context_window, max_output, reasoning_effort) = if g.starts_with("glm-5.2") {
+        let is_vendor_slug = m.contains('/');
+        let g = if is_vendor_slug { family_id } else { m };
+        let (context_window, max_output, reasoning_effort) = if g.starts_with("glm-5.3") {
+            // Always-on reasoning. OpenRouter's `z-ai/glm-5.3` reports 1_048_576 / 131_072; native
+            // Z.ai lists 1M context / 128k output — keep the OpenRouter ceiling on that exact slug
+            // (do NOT add it to `nvidia_caps`: that table strips reasoning, and `z-ai/glm-5.2` is
+            // the only GLM string NVIDIA also hosts).
+            if m == "z-ai/glm-5.3" {
+                (1_048_576, 131_072, true)
+            } else {
+                (1_000_000, 131_072, true)
+            }
+        } else if g.starts_with("glm-5.2") {
             // pi-parity Task #15: Together's and HuggingFace's own vendor-slug "zai-org/GLM-5.2"
             // (`together.models.ts:363`, `huggingface.models.ts:853`) both report a real context of
             // 262144, far smaller than NVIDIA's/native's own 1,000,000 this branch otherwise returns —
@@ -1508,7 +1520,8 @@ fn capabilities_impl_lc(m: &str) -> ModelCaps {
             supports_temperature: true,
             thinking: ThinkingShape::None,
             reasoning_effort,
-            reasoning_disableable: true,
+            // GLM-5.3 rejects `thinking.type: disabled`. Earlier ids still take an explicit off.
+            reasoning_disableable: !g.starts_with("glm-5.3"),
             supports_eager_tool_streaming: false,
             // Every current GLM id sets pi's `compat.zaiToolStream: true` except "glm-4.5-air", the
             // one id both `zai.models.ts` and `zai-coding-cn.models.ts` leave it off for (see
@@ -1518,14 +1531,20 @@ fn capabilities_impl_lc(m: &str) -> ModelCaps {
             // glm-5.2+ nulls "minimal" out of its `thinkingLevelMap` (excluded entirely, not just
             // remapped) — every earlier GLM id has no reasoning vocabulary at all, so this floor is
             // unread for them regardless.
-            min_reasoning_effort: if g.starts_with("glm-5.2") {
+            min_reasoning_effort: if g.starts_with("glm-5.2") || g.starts_with("glm-5.3") {
                 RE::Low
             } else {
                 RE::Minimal
             },
             supports_xhigh_reasoning: reasoning_effort,
             adaptive_xhigh_effort_wire: "max",
-            openai_reasoning_format: OpenAiReasoningFormat::Zai,
+            // OpenRouter vendor-slug `z-ai/glm-5.3` (and any other slug) speaks nested
+            // `reasoning:{effort}` like Kimi K3; native/bare ids keep the Z.ai thinking toggle.
+            openai_reasoning_format: if g.starts_with("glm-5.3") && is_vendor_slug {
+                OpenAiReasoningFormat::OpenRouter
+            } else {
+                OpenAiReasoningFormat::Zai
+            },
             supports_cache_control_on_tools: true,
         };
     }
@@ -2836,6 +2855,15 @@ pub fn reasoning_wire_override(
     // OpenRouter's own effort ladder unchanged (Harbor's Pi 0.84.2 path).
     if m.starts_with("kimi-k3") || family_id.starts_with("kimi-k3") {
         return (effort == RE::XHigh).then_some("max");
+    }
+    // GLM-5.3: native vocabulary is low/high/max (no medium). Portable `medium` is the `high`
+    // rung; `xhigh` is `max`. `low`/`high` keep their own names.
+    if m.starts_with("glm-5.3") || family_id.starts_with("glm-5.3") {
+        return match effort {
+            RE::Medium => Some("high"),
+            RE::XHigh => Some("max"),
+            RE::Low | RE::High | RE::Minimal => None,
+        };
     }
     // GLM-5.2+: low/medium/high all collapse to the literal "high", and xhigh remaps to "max". Every
     // earlier GLM id has no reasoning_effort vocabulary at all (`caps.reasoning_effort == false`), so
@@ -4193,6 +4221,36 @@ mod tests {
         // glm-5v-turbo is the one vision-capable id in this family.
         assert!(capabilities("glm-5v-turbo").supports_vision);
         assert!(!capabilities("glm-4.7").supports_vision);
+    }
+
+    #[test]
+    fn glm_5_3_is_always_on_effort_and_openrouter_slug_is_not_nvidia_stripped() {
+        // GLM-5.3 rejects thinking.disabled. Do not treat it as pre-5.2 (toggle only) or as
+        // z-ai/glm-5.2 (nvidia_caps strips reasoning).
+        let native = capabilities("glm-5.3");
+        assert!(native.reasoning_effort);
+        assert!(!native.reasoning_disableable);
+        assert_eq!(
+            native.min_reasoning_effort,
+            crate::transport::ReasoningEffort::Low
+        );
+        assert_eq!(native.openai_reasoning_format, OpenAiReasoningFormat::Zai);
+        assert_eq!(native.context_window, 1_000_000);
+        assert_eq!(native.max_output, 131_072);
+        assert_ne!(
+            clamp_thinking_level(&native, ThinkingLevel::Off),
+            ThinkingLevel::Off
+        );
+
+        let or = capabilities("z-ai/glm-5.3");
+        assert!(or.reasoning_effort, "must not hit nvidia_caps");
+        assert!(!or.reasoning_disableable);
+        assert_eq!(
+            or.openai_reasoning_format,
+            OpenAiReasoningFormat::OpenRouter
+        );
+        assert_eq!(or.context_window, 1_048_576);
+        assert_eq!(or.max_output, 131_072);
     }
 
     #[test]
@@ -6465,6 +6523,20 @@ mod tests {
         // function would ever see it in practice; confirm that floor directly.
         assert_eq!(capabilities("glm-5.2").min_reasoning_effort, RE::Low);
         assert_eq!(capabilities("glm-4.7").min_reasoning_effort, RE::Minimal);
+    }
+
+    #[test]
+    fn reasoning_wire_override_remaps_glm_5_3_medium_and_xhigh_only() {
+        use crate::transport::ReasoningEffort as RE;
+        // Native vocabulary is low/high/max — unlike 5.2, low is a real rung.
+        assert_eq!(reasoning_wire_override("glm-5.3", RE::Low), None);
+        assert_eq!(reasoning_wire_override("glm-5.3", RE::High), None);
+        assert_eq!(reasoning_wire_override("glm-5.3", RE::Medium), Some("high"));
+        assert_eq!(reasoning_wire_override("glm-5.3", RE::XHigh), Some("max"));
+        assert_eq!(
+            reasoning_wire_override("z-ai/glm-5.3", RE::Medium),
+            Some("high")
+        );
     }
 
     #[test]

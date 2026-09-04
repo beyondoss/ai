@@ -352,14 +352,19 @@ builder on `Agent` or `ModelRequest`, and each is exercised by unit tests):
   OpenAI `reasoning_effort` on a bare `kimi-k3` id and OpenRouter's nested `reasoning:{effort}` on a
   vendor-slug id such as `moonshotai/kimi-k3`. Putting K3 in the K2 bucket omits effort and the
   provider defaults to `max` — same session thinking level as Pi, ~40× the reasoning tokens.
+  GLM-5.3 is the same class of miss: always-on (`thinking.disabled` is rejected), `low`/`high`/`max`
+  (portable `medium` → `"high"`, `xhigh` → `"max"`), Z.ai thinking toggle on a bare `glm-5.3` id and
+  OpenRouter nested `reasoning:{effort}` on `z-ai/glm-5.3`. It must not hit `nvidia_caps` (that table
+  owns `z-ai/glm-5.2` and strips reasoning).
   `models::has_reasoning_mechanism` (consulted by
   `available_thinking_levels`/`clamp_thinking_level`/`thinking_for_level`) treats
   `openai_reasoning_format != Standard` as its own "has a mechanism" signal so such a model isn't
   reported as `Off`-locked. Once a level clears `clamp_reasoning_effort`, `models::reasoning_wire_override(model,
   effort)` gets one more say over _how it's spelled_ on the wire before `dialect::openai`'s
   `apply_reasoning_wire` falls back to the effort's own literal name — mirroring pi's per-model
-  `thinkingLevelMap` remaps (DeepSeek's `xhigh` → `"max"`; Kimi K3's `xhigh` → `"max"`; GLM-5.2's
-  `low`/`medium`/`high` → `"high"` and `xhigh` → `"max"`; Groq's one qwen id's `high` → `"default"`;
+  `thinkingLevelMap` remaps (DeepSeek's `xhigh` → `"max"`; Kimi K3's `xhigh` → `"max"`; GLM-5.3's
+  `medium` → `"high"` and `xhigh` → `"max"`; GLM-5.2's `low`/`medium`/`high` → `"high"` and `xhigh` →
+  `"max"`; Groq's one qwen id's `high` → `"default"`;
   every Mistral reasoning id's any active level → `"high"`, matching its real API's bare `"none"|"high"`
   vocabulary). Deliberately a
   standalone lookup, not a `ModelCaps` field — `ModelCaps::adaptive_xhigh_effort_wire` already covers

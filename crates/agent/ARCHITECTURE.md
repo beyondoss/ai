@@ -907,7 +907,9 @@ The harness layers several capabilities over the bare tools + loop:
   not advertise `web` (a TB polyglot run burned most of its `$` fetching pages); `--tools web`
   opts it in. Do not disable thinking on the eval adapter to chase Pi: Harbor's Pi 0.84.2 pin
   also defaults to medium (`DEFAULT_THINKING_LEVEL`); Kimi K3 always thinks, and omitting
-  `reasoning_effort` selects the provider default `max`. The polyglot `$` gap after dropping
+  `reasoning_effort` selects the provider default `max`. GLM-5.3 is the same always-on class
+  (`z-ai/glm-5.3` on OpenRouter: nested `reasoning:{effort}`, `medium`→`high`; `thinking.disabled`
+  is rejected). The polyglot `$` gap after dropping
   `web` was a Kimi K3 catalog miss (treated as K2, provider-default `max`), not thinking-on vs
   thinking-off. Iterate by changing one thing and re-running the expensive task
   (`TASKS=terminal-bench/polyglot-c-py`). TB has no MCP catalog, so beyond vs Code Mode on that

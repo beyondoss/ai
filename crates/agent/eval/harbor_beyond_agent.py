@@ -42,11 +42,23 @@ _REMOTE_AST_MCP = "/usr/local/lib/beyond-eval/mcp_ast.py"
 _OUTPUT_JSONL = "beyond.jsonl"
 _OUTPUT_STDERR = "beyond.stderr"
 
-# OpenRouter list price for Kimi K3 at FrontierHarness freeze time
-# (skills/frontierharness-eval/reference.md). Used only to fill cost_usd.
+# OpenRouter list prices. Used only to fill Harbor cost_usd.
+# Kimi K3: FrontierHarness freeze (skills/frontierharness-eval/reference.md).
+# GLM 5.3: OpenRouter list ($1.40 / $0.26 cache / $4.40).
 _KIMI_K3_INPUT_PER_M = 3.00
 _KIMI_K3_CACHE_PER_M = 0.30
 _KIMI_K3_OUTPUT_PER_M = 15.00
+_GLM_53_INPUT_PER_M = 1.40
+_GLM_53_CACHE_PER_M = 0.26
+_GLM_53_OUTPUT_PER_M = 4.40
+
+
+def _token_rates(model_name: str | None) -> tuple[float, float, float]:
+    """(input, cache-read, output) USD per million tokens."""
+    name = (model_name or "").lower()
+    if "glm-5.3" in name:
+        return _GLM_53_INPUT_PER_M, _GLM_53_CACHE_PER_M, _GLM_53_OUTPUT_PER_M
+    return _KIMI_K3_INPUT_PER_M, _KIMI_K3_CACHE_PER_M, _KIMI_K3_OUTPUT_PER_M
 
 
 def _workspace_root() -> Path:
@@ -294,10 +306,11 @@ class BeyondAiAgent(BaseInstalledAgent):
             context.n_output_tokens = output_tokens
             context.n_cache_tokens = cache_read
             fresh = max(input_tokens, 0)
+            inp, cache, out = _token_rates(self.model_name)
             context.cost_usd = (
-                fresh / 1_000_000 * _KIMI_K3_INPUT_PER_M
-                + cache_read / 1_000_000 * _KIMI_K3_CACHE_PER_M
-                + output_tokens / 1_000_000 * _KIMI_K3_OUTPUT_PER_M
+                fresh / 1_000_000 * inp
+                + cache_read / 1_000_000 * cache
+                + output_tokens / 1_000_000 * out
             )
 
 
