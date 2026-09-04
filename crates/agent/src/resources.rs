@@ -29,8 +29,8 @@ use crate::skills::{self, Skill};
 /// listing (`Use them to accomplish...with tools: {names}`) already avoids that duplication, so only
 /// the genuinely useful, non-redundant half of pi's feature is ported here: the guideline-bullet
 /// mechanism itself, including its built-in conditionals (`bash` registered but none of its usual
-/// companions; `grep`/`read`/`bash` registered → prefer grep/read over bash search, and `| head`
-/// a bash grep only).
+/// companions; `grep`/`read`/`bash` registered → prefer grep/read over bash search/cat, and `| head`
+/// a bash grep/cat/ls only).
 ///
 /// Lives here, not in `main.rs`, because a **subagent** must recompute it against its *own* (usually
 /// restricted) registry: a child given `tools: read,grep` must not be told it has `bash` and `edit`.
@@ -58,15 +58,19 @@ pub fn default_system_prompt(
         );
     }
     // Dedicated search/read tools already bound their own output. Unbounded `bash grep` (a
-    // secret-scan dump) overflowed the ~50KB bash-output cap. The model also generalized a bare
-    // "pipe head" to `pip install | tail`, which hides exit status — so this names grep/rg only.
+    // secret-scan dump) and `bash cat` of log files both overflowed the ~50KB bash-output cap —
+    // and bash keeps the *tail*, so a cat dump is both expensive and the wrong end. Pi never
+    // prompts for `| head`; the habit is emergent from bash-only listing (no `ls` tool in their
+    // default set) plus that tail truncation. A GLM-5.3 TB run still `cat`'d three full logs
+    // through bash despite the read guideline, so this names `cat`/`sed`/`ls` too. Still not a
+    // bare "pipe head": Kimi generalized that to `pip install | tail`, which hides exit status.
     // Only fires when all three tools are actually registered: a read-only child must not be told
-    // to bash grep.
+    // to bash grep/cat.
     if has("grep") && has("read") && has("bash") {
         add(
-            "Prefer grep/read over bash for search and file contents. Do not `bash grep`/`rg`; \
-             if unavoidable, `| head` that grep only — never `| head`/`| tail` installs or tests \
-             (hides exit status)."
+            "Prefer grep/read over bash for search and file contents. Do not `bash grep`/`rg`/`cat`/`sed`; \
+             if you must sample via bash, `| head` that grep/cat/ls only — never `| head`/`| tail` \
+             installs or tests (hides exit status)."
                 .to_string(),
             &mut guidelines,
             &mut seen,
@@ -80,7 +84,9 @@ pub fn default_system_prompt(
     // `promptGuidelines` on pi's side, so there's nothing to port for those.
     if has("read") {
         add(
-            "Use read to examine files instead of cat or sed.".to_string(),
+            "Use read to examine files instead of cat or sed. Never bash-cat; read paginates from \
+             the start, bash truncates from the tail."
+                .to_string(),
             &mut guidelines,
             &mut seen,
         );
@@ -842,8 +848,8 @@ mod tests {
 
     #[test]
     fn default_system_prompt_prefers_grep_read_and_caps_bash_grep() {
-        // Advertised default includes grep/read: prefer those tools, and if bash grep still happens,
-        // pipe head so a dump cannot overflow the bash output cap.
+        // Advertised default includes grep/read: prefer those tools, and if bash grep/cat/ls still
+        // happens, pipe head so a dump cannot overflow the bash output cap (named commands only).
         let mut advertised = crate::tools::default_registry();
         crate::tools::apply_filter(&mut advertised, None, None, false);
         let prompt = default_system_prompt(&advertised, &[]);
@@ -851,7 +857,14 @@ mod tests {
             prompt.contains("Prefer grep/read over bash for search and file contents."),
             "got: {prompt}"
         );
-        assert!(prompt.contains("| head` that grep only"), "got: {prompt}");
+        assert!(
+            prompt.contains("| head` that grep/cat/ls only"),
+            "got: {prompt}"
+        );
+        assert!(
+            prompt.contains("Do not `bash grep`/`rg`/`cat`/`sed`"),
+            "got: {prompt}"
+        );
         assert!(
             prompt.contains("never `| head`/`| tail` installs or tests"),
             "got: {prompt}"
@@ -882,6 +895,12 @@ mod tests {
         let prompt = default_system_prompt(&registry, &[]);
         assert!(
             prompt.contains("Use read to examine files instead of cat or sed."),
+            "got: {prompt}"
+        );
+        assert!(
+            prompt.contains(
+                "Never bash-cat; read paginates from the start, bash truncates from the tail."
+            ),
             "got: {prompt}"
         );
         assert!(

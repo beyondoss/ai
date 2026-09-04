@@ -868,9 +868,10 @@ The harness layers several capabilities over the bare tools + loop:
   advertises eight tools (`read`/`write`/`edit`/`bash`/`ls`/`grep`/`find`/`todo`). `web` stays
   constructed so `--tools web` can opt it in, but is **not** advertised by default (a TB polyglot run
   burned most of its `$` fetching pages). When `grep` and `read` are registered, the system prompt
-  prefers those over bash for search and file contents. Do not `bash grep`/`rg`; if unavoidable,
-  `| head` that grep only — never `| head`/`| tail` installs or tests (hides exit status; unbounded
-  grep overflowed the ~50KB bash cap). The `todo` protocol in the system prompt is a short
+  prefers those over bash for search and file contents. Do not `bash grep`/`rg`/`cat`/`sed`; if you
+  must sample via bash, `| head` that grep/cat/ls only — never `| head`/`| tail` installs or tests
+  (hides exit status; unbounded grep/cat overflowed the ~50KB bash cap, and bash keeps the tail).
+  Use read instead of cat (read paginates from the start). The `todo` protocol in the system prompt is a short
   full-replace / one-`in_progress` block (field tenses live on the tool schema).
 - **Code Mode** — `--code-mode` / `AI_AGENT_CODE_MODE` (both `run` and `serve`, off by default), and
   **not linked into the default binary**. MCP tools stop being advertised as flattened
