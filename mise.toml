@@ -33,6 +33,10 @@ run = "cargo run -p beyond-ai-agent --"
 description = "Unit tests for the agent harness core (messages, tool registry, session)."
 run = "cargo test -p beyond-ai-agent-core"
 
+[tasks."test:code-mode"]
+description = "Code Mode evals: catalog-token A/B + execute composition (needs --features code-mode). Live Grok/OpenRouter: OPENROUTER_API_KEY and pass -- --ignored."
+run = "cargo test -p beyond-ai-agent --features code-mode --test code_mode_eval -- --nocapture"
+
 [tasks."check:rs"]
 run = "cargo clippy --all-targets -- -D warnings"
 

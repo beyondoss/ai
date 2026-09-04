@@ -9,6 +9,7 @@ use std::sync::Arc;
 use agent_core::{Tool, ToolError, ToolRegistry};
 
 pub mod bash;
+pub mod code_mode;
 pub mod edit;
 pub mod exec;
 pub mod find;
@@ -480,6 +481,17 @@ pub struct ToolConfig<'a> {
     /// and every test that doesn't care about roots gets. A subagent running under `isolation: worktree`
     /// passes its worktree here. See [`resolve_against`].
     pub root: PathBuf,
+    /// When true, MCP tools are not advertised as `mcp__…` entries. They become the deferred catalog
+    /// inside the Code Mode `execute` tool (`tools.<server>.<method>`). Off by default. A no-op
+    /// unless this binary was built with `--features code-mode` — otherwise MCP stays advertised
+    /// (hiding the catalog behind an `execute` that does not exist would strand it). The CLI rejects
+    /// `--code-mode` on a density-default binary before this constructor runs.
+    pub code_mode: bool,
+    /// `--exclude-tools` names applied to the nested Code Mode catalog (so an excluded MCP tool is
+    /// unreachable through `execute` as well as missing from the advertised set).
+    pub nested_exclude: &'a [String],
+    /// `--deny-tool` names applied to the nested catalog — same names the policy hook blocks.
+    pub nested_deny: &'a [String],
     /// Already-connected tools from configured MCP servers (see [`mcp::connect_all`]), registered after
     /// every built-in so an allow/deny filter scopes them too.
     ///
@@ -536,9 +548,15 @@ impl<'a> ToolConfig<'a> {
     }
 }
 
-/// The default tool set: pi's seven coding tools (read, write, edit, bash, ls, grep, find), the `todo`
-/// task list, and the Beyond platform tools (fork, sync, logs), with production defaults and no root
-/// (process cwd).
+/// Built-ins that [`default_registry`] constructs but a bare `run`/`serve` does **not** advertise.
+///
+/// `web` stays constructed so `--tools web` can opt it in, but it is not a coding-agent default: a
+/// TB polyglot run burned most of its `$` fetching pages. `grep`/`find`/`ls`/`todo` stay advertised.
+pub const OPTIONAL_BUILTINS: &[&str] = &["web"];
+
+/// The constructed tool set: Pi's seven coding tools (read, write, edit, bash, ls, grep, find), the
+/// `todo` task list, and `web`. Advertised default is those eight minus `web`; `web` stays registered
+/// so `--tools web` can opt it in. No vendor-specific platform tools, no root (process cwd).
 pub fn default_registry() -> ToolRegistry {
     default_registry_with_config(&ToolConfig::new())
 }
@@ -614,8 +632,24 @@ pub fn default_registry_with_config(cfg: &ToolConfig<'_>) -> ToolRegistry {
     )));
     // After every built-in, so an allow/deny filter (`apply_filter`) scopes MCP tools too, and so a
     // server can't shadow a built-in by name (the `mcp__<server>__<tool>` prefix already prevents that).
-    for tool in cfg.mcp_tools {
-        reg.register(tool.clone());
+    // Code Mode defers that catalog: MCP tools stay callable from `execute` but are not advertised.
+    // Without `--features code-mode` there is no interpreter to hide them behind, so they stay direct.
+    #[cfg(feature = "code-mode")]
+    if cfg.code_mode {
+        let nested =
+            code_mode::select_deferred_tools(cfg.mcp_tools, cfg.nested_exclude, cfg.nested_deny);
+        reg.register(Arc::new(code_mode::Execute::new(nested)));
+    } else {
+        for tool in cfg.mcp_tools {
+            reg.register(tool.clone());
+        }
+    }
+    #[cfg(not(feature = "code-mode"))]
+    {
+        let _ = cfg.code_mode;
+        for tool in cfg.mcp_tools {
+            reg.register(tool.clone());
+        }
     }
     reg
 }
@@ -628,6 +662,10 @@ pub fn default_registry_with_config(cfg: &ToolConfig<'_>) -> ToolRegistry {
 /// of an allow-list, though picking just one of the three is the common case. Unknown names in either
 /// list are silently ignored (there's nothing to remove/keep that isn't already there), matching
 /// `ToolRegistry::retain`'s set semantics rather than erroring on a typo.
+///
+/// With no `--tools` allow-list, [`OPTIONAL_BUILTINS`] (`web`) is dropped so a bare invocation does
+/// not advertise `web`. Pass `--tools web` to opt it in; it stays constructed in [`default_registry`]
+/// so the allow-list can name it.
 pub fn apply_filter(
     reg: &mut ToolRegistry,
     tools: Option<&[String]>,
@@ -643,6 +681,11 @@ pub fn apply_filter(
     }
     if let Some(deny) = exclude {
         reg.retain(|name| !deny.iter().any(|d| d == name));
+    }
+    // No `--tools` allow-list: drop opt-in built-ins (`web`). `--tools web` is how it comes back;
+    // `--exclude-tools` alone must not re-advertise it.
+    if tools.is_none() && !no_tools {
+        reg.retain(|name| !OPTIONAL_BUILTINS.contains(&name));
     }
 }
 
@@ -931,7 +974,7 @@ mod tests {
         for name in ["read", "write", "edit", "bash", "ls", "grep", "find"] {
             assert!(reg.get(name).is_some(), "missing coding tool: {name}");
         }
-        // … the model's own task list, and its window to the web.
+        // … the model's own task list, and its window to the web (constructed, not advertised).
         assert!(reg.get("todo").is_some(), "missing todo tool");
         assert!(reg.get("web").is_some(), "missing web tool");
         // Nothing vendor-specific: the default set is the general coding toolset and nothing else.
@@ -943,6 +986,32 @@ mod tests {
             );
         }
         assert_eq!(reg.len(), 9);
+    }
+
+    #[test]
+    fn advertised_default_omits_web() {
+        let mut reg = default_registry();
+        apply_filter(&mut reg, None, None, false);
+        for name in [
+            "read", "write", "edit", "bash", "ls", "grep", "find", "todo",
+        ] {
+            assert!(reg.get(name).is_some(), "missing advertised tool: {name}");
+        }
+        assert!(
+            reg.get("web").is_none(),
+            "web must be opt-in via --tools, not advertised by default"
+        );
+        assert_eq!(reg.len(), 8);
+    }
+
+    #[test]
+    fn tools_allow_list_opts_in_web() {
+        let mut reg = default_registry();
+        apply_filter(&mut reg, Some(&["read".into(), "web".into()]), None, false);
+        assert!(reg.get("web").is_some());
+        assert!(reg.get("read").is_some());
+        assert!(reg.get("grep").is_none());
+        assert_eq!(reg.len(), 2);
     }
 
     #[test]
@@ -997,7 +1066,10 @@ mod tests {
         assert!(reg.get("edit").is_none());
         assert!(reg.get("write").is_none());
         assert!(reg.get("read").is_some());
-        assert_eq!(reg.len(), default_registry().len() - 3);
+        assert!(reg.get("grep").is_some());
+        assert!(reg.get("web").is_none());
+        // Advertised default (8) minus bash/edit/write.
+        assert_eq!(reg.len(), 5);
     }
 
     #[test]
@@ -1019,9 +1091,12 @@ mod tests {
     #[test]
     fn apply_filter_unknown_names_are_silently_ignored() {
         let mut reg = default_registry();
-        let before = reg.len();
         apply_filter(&mut reg, None, Some(&["does-not-exist".to_string()]), false);
-        assert_eq!(reg.len(), before);
+        // Unknown deny names are ignored; the advertised default (eight tools, no web) still applies.
+        assert_eq!(reg.len(), 8);
+        assert!(reg.get("read").is_some());
+        assert!(reg.get("grep").is_some());
+        assert!(reg.get("web").is_none());
     }
 
     #[test]
@@ -1073,6 +1148,85 @@ mod tests {
         // … plus the MCP-discovered one, under its already-namespaced name.
         assert!(reg.get("mcp__filesystem__read_file").is_some());
         assert_eq!(reg.len(), default_registry().len() + 1);
+    }
+
+    #[cfg(not(feature = "code-mode"))]
+    #[test]
+    fn code_mode_without_the_runtime_does_not_hide_mcp() {
+        let mcp_tools: Vec<Arc<dyn Tool>> =
+            vec![Arc::new(FakeMcpTool("mcp__filesystem__read_file"))];
+        let deny: Vec<String> = Vec::new();
+        let reg = default_registry_with_config(&ToolConfig {
+            mcp_tools: &mcp_tools,
+            code_mode: true,
+            nested_deny: &deny,
+            ..ToolConfig::new()
+        });
+        assert!(
+            reg.get("execute").is_none(),
+            "default binaries must not register execute (QuickJS is not linked)"
+        );
+        assert!(
+            reg.get("mcp__filesystem__read_file").is_some(),
+            "without an interpreter, Code Mode must not strand the MCP catalog"
+        );
+    }
+
+    #[cfg(feature = "code-mode")]
+    #[test]
+    fn code_mode_defers_mcp_tools_behind_execute() {
+        let mcp_tools: Vec<Arc<dyn Tool>> =
+            vec![Arc::new(FakeMcpTool("mcp__filesystem__read_file"))];
+        let exclude = vec!["mcp__filesystem__read_file".to_string()];
+        let deny: Vec<String> = Vec::new();
+        let reg = default_registry_with_config(&ToolConfig {
+            mcp_tools: &mcp_tools,
+            code_mode: true,
+            nested_exclude: &[],
+            nested_deny: &deny,
+            ..ToolConfig::new()
+        });
+        assert!(reg.get("execute").is_some());
+        assert!(
+            reg.get("mcp__filesystem__read_file").is_none(),
+            "MCP tools must not be advertised when Code Mode is on"
+        );
+        // Nested exclude drops the tool from execute's catalog too — registry still has execute.
+        let reg = default_registry_with_config(&ToolConfig {
+            mcp_tools: &mcp_tools,
+            code_mode: true,
+            nested_exclude: &exclude,
+            nested_deny: &deny,
+            ..ToolConfig::new()
+        });
+        assert!(reg.get("execute").is_some());
+        assert!(reg.get("mcp__filesystem__read_file").is_none());
+    }
+
+    #[cfg(feature = "code-mode")]
+    #[test]
+    fn code_mode_restore_keeps_execute_on_a_builtins_allow_list() {
+        let mcp_tools: Vec<Arc<dyn Tool>> =
+            vec![Arc::new(FakeMcpTool("mcp__filesystem__read_file"))];
+        let deny: Vec<String> = Vec::new();
+        let mut reg = default_registry_with_config(&ToolConfig {
+            mcp_tools: &mcp_tools,
+            code_mode: true,
+            nested_deny: &deny,
+            ..ToolConfig::new()
+        });
+        apply_filter(&mut reg, Some(&["read".to_string()]), None, false);
+        assert!(reg.get("execute").is_none());
+        let nested = code_mode::select_deferred_tools(&mcp_tools, &[], &deny);
+        code_mode::restore_execute(
+            &mut reg,
+            Arc::new(code_mode::Execute::new(nested)),
+            None,
+            false,
+        );
+        assert!(reg.get("read").is_some());
+        assert!(reg.get("execute").is_some());
+        assert!(reg.get("mcp__filesystem__read_file").is_none());
     }
 
     #[test]

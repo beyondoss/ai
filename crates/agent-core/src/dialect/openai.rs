@@ -613,10 +613,10 @@ pub fn build_body(req: &ModelRequest) -> Value {
 ///   `reasoning_disableable` (pi: `thinkingLevelMap?.off !== null`) — plus a sibling top-level
 ///   `reasoning_effort` string only when [`ModelCaps::reasoning_effort`] is also `true` (DeepSeek has a
 ///   real effort vocabulary; Kimi never does).
-/// - [`OpenAiReasoningFormat::Zai`] (Z.ai/GLM): the same `thinking` toggle, but sent *unconditionally*
-///   (pi never gates the `"disabled"` arm here) and with `clear_thinking: false` on the enabled shape;
-///   plus a sibling `reasoning_effort` string only from GLM-5.2 onward
-///   ([`ModelCaps::reasoning_effort`]).
+/// - [`OpenAiReasoningFormat::Zai`] (Z.ai/GLM): the same `thinking` toggle, sent with
+///   `clear_thinking: false` on the enabled shape; `"disabled"` only when
+///   [`ModelCaps::reasoning_disableable`] (GLM-5.3 cannot be turned off). Sibling
+///   `reasoning_effort` string only from GLM-5.2 onward ([`ModelCaps::reasoning_effort`]).
 /// - [`OpenAiReasoningFormat::Together`]: a nested `reasoning: {"enabled": bool}`, sent
 ///   unconditionally, plus a sibling top-level `reasoning_effort` string only when
 ///   [`ModelCaps::reasoning_effort`] is also `true`.
@@ -667,9 +667,11 @@ fn apply_reasoning_wire(
                 if caps.reasoning_effort {
                     map.insert("reasoning_effort".into(), json!(wire_str(effort)));
                 }
-            } else {
+            } else if caps.reasoning_disableable {
                 map.insert("thinking".into(), json!({ "type": "disabled" }));
             }
+            // GLM-5.3 rejects `thinking.type: disabled`. Idle Off is clamped to Low before this
+            // call; if we still have no requested level, omit the field and let the provider default.
         }
         Fmt::Together => {
             map.insert(
@@ -1531,9 +1533,10 @@ mod tests {
     #[test]
     fn kimi_thinking_toggle_is_emitted_with_no_reasoning_effort_string() {
         use crate::transport::ReasoningEffort;
-        // Moonshot/Kimi shares DeepSeek's toggle shape but has no effort vocabulary at all
-        // (`supportsReasoningEffort: false` on every id) — the toggle turns on, but no
-        // `reasoning_effort` string ever accompanies it.
+        // K2 shares DeepSeek's toggle shape but has no effort vocabulary at all
+        // (`supportsReasoningEffort: false`) — the toggle turns on, but no
+        // `reasoning_effort` string ever accompanies it. K3 is the opposite (see
+        // `kimi_k3_emits_effort_not_a_k2_thinking_toggle`).
         let body = build_body(
             &ModelRequest::new("kimi-k2-thinking", vec![Message::user("hi")], 64)
                 .with_reasoning_effort(ReasoningEffort::Medium),
@@ -1541,15 +1544,48 @@ mod tests {
         assert_eq!(body["thinking"], json!({ "type": "enabled" }));
         assert!(
             body.get("reasoning_effort").is_none(),
-            "Kimi never gets a reasoning_effort string"
+            "Kimi K2 never gets a reasoning_effort string"
         );
+    }
+
+    #[test]
+    fn kimi_k3_emits_effort_not_a_k2_thinking_toggle() {
+        use crate::transport::ReasoningEffort;
+        // Native Moonshot: OpenAI `reasoning_effort`. Always-on, so idle omits rather than
+        // sending `thinking:{disabled}` or `effort:none` (K3 rejects the K2 thinking object).
+        let native = build_body(
+            &ModelRequest::new("kimi-k3", vec![Message::user("hi")], 64)
+                .with_reasoning_effort(ReasoningEffort::Medium),
+        );
+        assert_eq!(native["reasoning_effort"], "medium");
+        assert!(native.get("thinking").is_none(), "{native:#?}");
+        assert!(native.get("reasoning").is_none(), "{native:#?}");
+
+        let native_idle = build_body(&ModelRequest::new("kimi-k3", vec![Message::user("hi")], 64));
+        assert!(native_idle.get("reasoning_effort").is_none());
+        assert!(native_idle.get("thinking").is_none());
+
+        // OpenRouter vendor-slug: nested `reasoning:{effort}` — Pi 0.84.2's Harbor path.
+        let or = build_body(
+            &ModelRequest::new("moonshotai/kimi-k3", vec![Message::user("hi")], 64)
+                .with_reasoning_effort(ReasoningEffort::Medium),
+        );
+        assert_eq!(or["reasoning"], json!({ "effort": "medium" }));
+        assert!(or.get("reasoning_effort").is_none(), "{or:#?}");
+        assert!(or.get("thinking").is_none(), "{or:#?}");
+        assert_eq!(or["max_tokens"], 64);
+
+        let xhigh = build_body(
+            &ModelRequest::new("moonshotai/kimi-k3", vec![Message::user("hi")], 64)
+                .with_reasoning_effort(ReasoningEffort::XHigh),
+        );
+        assert_eq!(xhigh["reasoning"], json!({ "effort": "max" }));
     }
 
     #[test]
     fn zai_glm_thinking_toggle_is_unconditional_even_when_idle() {
         use crate::transport::ReasoningEffort;
-        // Z.ai/GLM sends the toggle unconditionally (pi never gates the "disabled" arm on a
-        // reasoning_disableable check the way DeepSeek does), with `clear_thinking: false` on enable.
+        // Disableable GLM ids (pre-5.3) still send the idle "disabled" toggle. GLM-5.3 does not.
         let body = build_body(
             &ModelRequest::new("glm-4.7", vec![Message::user("hi")], 64)
                 .with_reasoning_effort(ReasoningEffort::High),
@@ -1570,9 +1606,33 @@ mod tests {
         );
         assert_eq!(body["reasoning_effort"], "high");
 
-        // Idle (no level requested) still gets the unconditional "disabled" toggle.
+        // Idle (no level requested) still gets the "disabled" toggle on disableable GLM ids.
         let body = build_body(&ModelRequest::new("glm-4.7", vec![Message::user("hi")], 64));
         assert_eq!(body["thinking"], json!({ "type": "disabled" }));
+    }
+
+    #[test]
+    fn glm_5_3_openrouter_slug_uses_nested_reasoning_effort_not_thinking_disabled() {
+        use crate::transport::ReasoningEffort;
+        // Default portable medium remaps to GLM-5.3's `high`. OpenRouter nested shape, not Z.ai
+        // thinking.disabled (that 400s).
+        let body = build_body(
+            &ModelRequest::new("z-ai/glm-5.3", vec![Message::user("hi")], 64)
+                .with_reasoning_effort(ReasoningEffort::Medium),
+        );
+        assert_eq!(body["reasoning"], json!({ "effort": "high" }));
+        assert!(body.get("thinking").is_none());
+        assert!(body.get("reasoning_effort").is_none());
+
+        let native = build_body(
+            &ModelRequest::new("glm-5.3", vec![Message::user("hi")], 64)
+                .with_reasoning_effort(ReasoningEffort::Low),
+        );
+        assert_eq!(
+            native["thinking"],
+            json!({ "type": "enabled", "clear_thinking": false })
+        );
+        assert_eq!(native["reasoning_effort"], "low");
     }
 
     #[test]

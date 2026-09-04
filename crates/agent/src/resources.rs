@@ -28,8 +28,9 @@ use crate::skills::{self, Skill};
 /// information twice, in two different places the model reads. This function's own dynamic tool-name
 /// listing (`Use them to accomplish...with tools: {names}`) already avoids that duplication, so only
 /// the genuinely useful, non-redundant half of pi's feature is ported here: the guideline-bullet
-/// mechanism itself, including its one built-in conditional (`bash` registered but none of its usual
-/// companions).
+/// mechanism itself, including its built-in conditionals (`bash` registered but none of its usual
+/// companions; `grep`/`read`/`bash` registered → prefer grep/read over bash search/cat, and `| head`
+/// a bash grep/cat/ls only).
 ///
 /// Lives here, not in `main.rs`, because a **subagent** must recompute it against its *own* (usually
 /// restricted) registry: a child given `tools: read,grep` must not be told it has `bash` and `edit`.
@@ -56,6 +57,25 @@ pub fn default_system_prompt(
             &mut seen,
         );
     }
+    // Dedicated search/read tools already bound their own output. Unbounded `bash grep` (a
+    // secret-scan dump) and `bash cat` of log files both overflowed the ~50KB bash-output cap —
+    // and bash keeps the *tail*, so a cat dump is both expensive and the wrong end. Pi never
+    // prompts for `| head`; the habit is emergent from bash-only listing (no `ls` tool in their
+    // default set) plus that tail truncation. A GLM-5.3 TB run still `cat`'d three full logs
+    // through bash despite the read guideline, so this names `cat`/`sed`/`ls` too. Still not a
+    // bare "pipe head": Kimi generalized that to `pip install | tail`, which hides exit status.
+    // Only fires when all three tools are actually registered: a read-only child must not be told
+    // to bash grep/cat.
+    if has("grep") && has("read") && has("bash") {
+        add(
+            "Prefer grep/read over bash for search and file contents. Do not `bash grep`/`rg`/`cat`/`sed`; \
+             if you must sample via bash, `| head` that grep/cat/ls only — never `| head`/`| tail` \
+             installs or tests (hides exit status)."
+                .to_string(),
+            &mut guidelines,
+            &mut seen,
+        );
+    }
     // pi's own per-tool `promptGuidelines` (`read.ts`/`edit.ts`/`write.ts`) — declared on the tool
     // definition itself and collected from whatever's actually registered. Adapted, not ported
     // verbatim: pi's edit tool takes an `edits[].oldText`/`newText` array, ours takes `edits[].old_string`/
@@ -63,11 +83,16 @@ pub fn default_system_prompt(
     // model to look for parameters that don't exist on our tool. `bash`/`grep`/`find`/`ls` carry no
     // `promptGuidelines` on pi's side, so there's nothing to port for those.
     if has("read") {
-        add(
-            "Use read to examine files instead of cat or sed.".to_string(),
-            &mut guidelines,
-            &mut seen,
-        );
+        // Pi's own wording is just the first sentence. The second is ours: GLM-5.3 still
+        // `bash cat`'d whole logs through the 50KB tail-truncated cap. Only mention bash
+        // when the tool is actually registered — a read-only child must not be told about it.
+        let read_g = if has("bash") {
+            "Use read to examine files instead of cat or sed. Never bash-cat; read paginates from \
+             the start, bash truncates from the tail."
+        } else {
+            "Use read to examine files instead of cat or sed."
+        };
+        add(read_g.to_string(), &mut guidelines, &mut seen);
     }
     if has("edit") {
         for g in [
@@ -340,21 +365,15 @@ run. If the payload you send does not match the schema, you will be told what wa
 the tool again with a corrected one.
 </structured_output_protocol>";
 
-/// How to drive the `todo` tool. Gated on [`PromptOptions::has_todo`].
+/// How to drive the `todo` tool. Gated on [`PromptOptions::has_todo`]. Field names and tenses also
+/// live on the tool schema; this is the protocol the schema cannot express (full-replace, one
+/// `in_progress`, skip trivial, empty clears).
 const TODO_GUIDANCE: &str = "\
 <todo_protocol>
-You have a `todo` tool for planning multi-step work. Use it for any task that takes more than a couple \
-of steps, or when the user gives you several things to do. Skip it for trivial single-step requests \
-where a plan adds nothing.
-
-Call `todo` with the COMPLETE list every time — it fully replaces the previous list, so always include \
-every item, not just the one that changed. Give each item a `content` (imperative: \"Add the retry \
-loop\"), an `activeForm` (present continuous: \"Adding the retry loop\"), and a `status` of `pending`, \
-`in_progress`, or `completed`.
-
-Keep exactly one item `in_progress` at a time: mark an item `in_progress` right before you start it, \
-and `completed` the moment it is done — don't batch completions. Send an empty list to clear the plan \
-once the work is finished.
+Multi-step work only — skip trivial one-step requests. Each call fully replaces the previous list: \
+send the COMPLETE list, not a delta. Items: `content` (imperative), `activeForm` (present continuous), \
+`status` pending|in_progress|completed. Keep exactly one item `in_progress`; mark it when you start, \
+`completed` when done — don't batch. Empty list clears.
 </todo_protocol>";
 
 /// The cheap, time-varying tail of the system prompt: the current date and working directory. Does no
@@ -831,6 +850,44 @@ mod tests {
     }
 
     #[test]
+    fn default_system_prompt_prefers_grep_read_and_caps_bash_grep() {
+        // Advertised default includes grep/read: prefer those tools, and if bash grep/cat/ls still
+        // happens, pipe head so a dump cannot overflow the bash output cap (named commands only).
+        let mut advertised = crate::tools::default_registry();
+        crate::tools::apply_filter(&mut advertised, None, None, false);
+        let prompt = default_system_prompt(&advertised, &[]);
+        assert!(
+            prompt.contains("Prefer grep/read over bash for search and file contents."),
+            "got: {prompt}"
+        );
+        assert!(
+            prompt.contains("| head` that grep/cat/ls only"),
+            "got: {prompt}"
+        );
+        assert!(
+            prompt.contains("Do not `bash grep`/`rg`/`cat`/`sed`"),
+            "got: {prompt}"
+        );
+        assert!(
+            prompt.contains("never `| head`/`| tail` installs or tests"),
+            "got: {prompt}"
+        );
+        assert!(!prompt.contains("Use bash for file operations like ls, rg, find"));
+
+        let mut only_bash = agent_core::tool::ToolRegistry::new();
+        only_bash.register(std::sync::Arc::new(crate::tools::bash::Bash::real()));
+        let prompt = default_system_prompt(&only_bash, &[]);
+        assert!(!prompt.contains("Prefer grep/read"));
+
+        // Excluding bash must drop the guideline so a read-only agent is not told to bash grep.
+        let mut no_bash = crate::tools::default_registry();
+        crate::tools::apply_filter(&mut no_bash, None, Some(&["bash".to_string()]), false);
+        let prompt = default_system_prompt(&no_bash, &[]);
+        assert!(!prompt.contains("Prefer grep/read"));
+        assert!(!prompt.contains("bash"));
+    }
+
+    #[test]
     fn default_system_prompt_includes_pis_per_tool_guidelines_for_read_edit_write() {
         // pi-parity fix: pi declares real default guidance on its read/edit/write tool definitions
         // (`promptGuidelines`), collected automatically whenever the tool is registered — we ported
@@ -841,6 +898,12 @@ mod tests {
         let prompt = default_system_prompt(&registry, &[]);
         assert!(
             prompt.contains("Use read to examine files instead of cat or sed."),
+            "got: {prompt}"
+        );
+        assert!(
+            prompt.contains(
+                "Never bash-cat; read paginates from the start, bash truncates from the tail."
+            ),
             "got: {prompt}"
         );
         assert!(
@@ -865,6 +928,15 @@ mod tests {
         assert!(!prompt.contains("Use read to examine files"));
         assert!(!prompt.contains("Use edit for precise changes"));
         assert!(!prompt.contains("Use write only for new files"));
+
+        // Read without bash keeps Pi's original wording — no "bash-cat" (that sentence is gated
+        // on bash being registered, same as the grep/cat preference bullet).
+        let mut only_read = agent_core::tool::ToolRegistry::new();
+        only_read.register(std::sync::Arc::new(crate::tools::read::Read::default()));
+        let prompt = default_system_prompt(&only_read, &[]);
+        assert!(prompt.contains("Use read to examine files instead of cat or sed."));
+        assert!(!prompt.contains("Never bash-cat"));
+        assert!(!prompt.contains("bash"));
     }
 
     #[test]
