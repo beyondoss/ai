@@ -29,7 +29,8 @@ use crate::skills::{self, Skill};
 /// listing (`Use them to accomplish...with tools: {names}`) already avoids that duplication, so only
 /// the genuinely useful, non-redundant half of pi's feature is ported here: the guideline-bullet
 /// mechanism itself, including its built-in conditionals (`bash` registered but none of its usual
-/// companions; `grep`/`read`/`bash` registered → prefer grep/read, and cap bash grep with `head`).
+/// companions; `grep`/`read`/`bash` registered → prefer grep/read over bash search, and `| head`
+/// a bash grep only).
 ///
 /// Lives here, not in `main.rs`, because a **subagent** must recompute it against its *own* (usually
 /// restricted) registry: a child given `tools: read,grep` must not be told it has `bash` and `edit`.
@@ -57,12 +58,16 @@ pub fn default_system_prompt(
         );
     }
     // Dedicated search/read tools already bound their own output. Unbounded `bash grep` (a
-    // secret-scan dump, for example) overflowed the ~50KB bash-output cap; if the model still
-    // greps through bash, pipe `head`. Only fires when all three tools are actually registered —
-    // a read-only child must not be told to bash grep.
+    // secret-scan dump) overflowed the ~50KB bash-output cap. The model also generalized a bare
+    // "pipe head" to `pip install | tail`, which hides exit status — so this names grep/rg only.
+    // Only fires when all three tools are actually registered: a read-only child must not be told
+    // to bash grep.
     if has("grep") && has("read") && has("bash") {
         add(
-            "Prefer grep/read; if you bash grep, pipe head.".to_string(),
+            "Prefer grep/read over bash for search and file contents. Do not `bash grep`/`rg`; \
+             if unavoidable, `| head` that grep only — never `| head`/`| tail` installs or tests \
+             (hides exit status)."
+                .to_string(),
             &mut guidelines,
             &mut seen,
         );
@@ -351,21 +356,15 @@ run. If the payload you send does not match the schema, you will be told what wa
 the tool again with a corrected one.
 </structured_output_protocol>";
 
-/// How to drive the `todo` tool. Gated on [`PromptOptions::has_todo`].
+/// How to drive the `todo` tool. Gated on [`PromptOptions::has_todo`]. Field names and tenses also
+/// live on the tool schema; this is the protocol the schema cannot express (full-replace, one
+/// `in_progress`, skip trivial, empty clears).
 const TODO_GUIDANCE: &str = "\
 <todo_protocol>
-You have a `todo` tool for planning multi-step work. Use it for any task that takes more than a couple \
-of steps, or when the user gives you several things to do. Skip it for trivial single-step requests \
-where a plan adds nothing.
-
-Call `todo` with the COMPLETE list every time — it fully replaces the previous list, so always include \
-every item, not just the one that changed. Give each item a `content` (imperative: \"Add the retry \
-loop\"), an `activeForm` (present continuous: \"Adding the retry loop\"), and a `status` of `pending`, \
-`in_progress`, or `completed`.
-
-Keep exactly one item `in_progress` at a time: mark an item `in_progress` right before you start it, \
-and `completed` the moment it is done — don't batch completions. Send an empty list to clear the plan \
-once the work is finished.
+Multi-step work only — skip trivial one-step requests. Each call fully replaces the previous list: \
+send the COMPLETE list, not a delta. Items: `content` (imperative), `activeForm` (present continuous), \
+`status` pending|in_progress|completed. Keep exactly one item `in_progress`; mark it when you start, \
+`completed` when done — don't batch. Empty list clears.
 </todo_protocol>";
 
 /// The cheap, time-varying tail of the system prompt: the current date and working directory. Does no
@@ -849,7 +848,12 @@ mod tests {
         crate::tools::apply_filter(&mut advertised, None, None, false);
         let prompt = default_system_prompt(&advertised, &[]);
         assert!(
-            prompt.contains("Prefer grep/read; if you bash grep, pipe head."),
+            prompt.contains("Prefer grep/read over bash for search and file contents."),
+            "got: {prompt}"
+        );
+        assert!(prompt.contains("| head` that grep only"), "got: {prompt}");
+        assert!(
+            prompt.contains("never `| head`/`| tail` installs or tests"),
             "got: {prompt}"
         );
         assert!(!prompt.contains("Use bash for file operations like ls, rg, find"));
