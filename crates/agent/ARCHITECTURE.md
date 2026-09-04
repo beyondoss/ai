@@ -898,9 +898,13 @@ The harness layers several capabilities over the bare tools + loop:
   QuickJS), `HARNESS=beyond-code-mode` (`--features code-mode` binary + `--code-mode`), and
   `HARNESS=pi` (Harbor's Pi agent at FrontierHarness pin **0.84.2**). The eval adapter drops
   `web` (`--exclude-tools web`); the shipped binary still has it — a TB polyglot run burned most
-  of its `$` on web fetches, which is not a coding-agent comparison to Pi. Iterate by changing
-  one thing and re-running the expensive task (`TASKS=terminal-bench/polyglot-c-py`). TB has no
-  MCP catalog, so beyond vs Code Mode on that slice is a regression/overhead check (empty
+  of its `$` on web fetches, which is not a coding-agent comparison to Pi. Do not disable thinking
+  on the eval adapter to chase Pi: Harbor's Pi 0.84.2 pin also defaults to medium
+  (`DEFAULT_THINKING_LEVEL`); Kimi K3 always thinks, and omitting `reasoning_effort` selects the
+  provider default `max`. The polyglot `$` gap after dropping `web` was that catalog miss, not
+  thinking-on vs thinking-off. Iterate by changing one thing and re-running the expensive task
+  (`TASKS=terminal-bench/polyglot-c-py`). TB has no MCP catalog, so beyond vs Code Mode on that
+  slice is a regression/overhead check (empty
   `execute` still registers), not the MCP schema-token win. The Code Mode eval is
   `HARNESS=beyond-mcp` vs `HARNESS=beyond-mcp-code-mode`: local Harbor task
   [`eval/tasks/ast-hotspots`](eval/tasks/ast-hotspots) plus a stdlib Python AST MCP (`list_functions`,

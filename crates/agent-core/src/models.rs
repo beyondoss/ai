@@ -1530,15 +1530,18 @@ fn capabilities_impl_lc(m: &str) -> ModelCaps {
         };
     }
 
-    // Moonshot/Kimi: pi tags this family with the identical `"deepseek"` thinkingFormat (the same
-    // `thinking:{enabled/disabled}` toggle), but `supportsReasoningEffort` is `false` on every current
-    // id — no `reasoning_effort` string ever, just the toggle. Only the non-"thinking" ids
-    // (0711/0905/turbo-preview previews) have `reasoning: false` in pi's catalogue, so they get
-    // `OpenAiReasoningFormat::Standard` instead (with `reasoning_effort: false`, that emits nothing —
-    // matching pi's own `model.reasoning` gate). `kimi-k2.7-code*` uniquely has no "off" wire value
-    // (`thinkingLevelMap: {"off": null}`); every other reasoning-capable id can be disabled. Also
-    // matches a vendor-slug id (e.g. Together's/HuggingFace's `"moonshotai/Kimi-K2.6"`) via
-    // `family_id` — see its own doc comment above.
+    // Moonshot/Kimi: K2 ids are tagged with the identical `"deepseek"` thinkingFormat (the same
+    // `thinking:{enabled/disabled}` toggle) and `supportsReasoningEffort: false` — no
+    // `reasoning_effort` string, just the toggle. Kimi K3 is the exception (pi 0.81+): always-on
+    // thinking, a real `low`/`high`/`max` effort vocabulary, OpenAI `reasoning_effort` on native
+    // Moonshot and OpenRouter's nested `reasoning:{effort}` on vendor-slug ids. Only the
+    // non-"thinking" K2 ids (0711/0905/turbo-preview previews) have `reasoning: false` in pi's
+    // catalogue, so they get `OpenAiReasoningFormat::Standard` instead (with `reasoning_effort:
+    // false`, that emits nothing — matching pi's own `model.reasoning` gate). `kimi-k2.7-code*`
+    // uniquely has no "off" wire value (`thinkingLevelMap: {"off": null}`); every other
+    // reasoning-capable K2 id can be disabled. Also matches a vendor-slug id (e.g.
+    // Together's/HuggingFace's `"moonshotai/Kimi-K2.6"`) via `family_id` — see its own doc comment
+    // above.
     //
     // KNOWN COLLISION (documented, not fixed — no id-level signal exists to disambiguate): GitHub
     // Copilot hosts its own `"kimi-k2.7-code"` (`github-copilot.models.ts`) with real numbers
@@ -1556,6 +1559,36 @@ fn capabilities_impl_lc(m: &str) -> ModelCaps {
         // Keyed on whether `m` is slug-shaped at all — same reasoning as the MiniMax/GLM branches.
         let is_vendor_slug = m.contains('/');
         let k = if is_vendor_slug { family_id } else { m };
+        // Kimi K3 is not K2. Treating it as the toggle-only bucket below sends DeepSeek
+        // `thinking:{type:enabled}` and omits effort, so the provider's own default (`max`) fires.
+        // Pi 0.84.2's generate-models.ts: native Moonshot sets `thinkingFormat: "openai"` +
+        // `supportsReasoningEffort`; OpenRouter `moonshotai/kimi-k3` keeps the catalogue's OpenRouter
+        // `reasoning:{effort}` shape and pins `maxTokens` to 131072. Thinking cannot be disabled.
+        if k.starts_with("kimi-k3") {
+            return ModelCaps {
+                context_window: 1_048_576,
+                max_output: 131_072,
+                max_tokens_field: MaxTokensField::MaxTokens,
+                supports_long_cache: true,
+                supports_vision: true,
+                supports_temperature: true,
+                thinking: ThinkingShape::None,
+                reasoning_effort: true,
+                reasoning_disableable: false,
+                supports_eager_tool_streaming: false,
+                supports_tool_stream: false,
+                api: ApiKind::ChatCompletions,
+                min_reasoning_effort: RE::Low,
+                supports_xhigh_reasoning: true,
+                adaptive_xhigh_effort_wire: "max",
+                openai_reasoning_format: if is_vendor_slug {
+                    OpenAiReasoningFormat::OpenRouter
+                } else {
+                    OpenAiReasoningFormat::Standard
+                },
+                supports_cache_control_on_tools: true,
+            };
+        }
         // Kimi-Coding (`api.kimi.com/coding`, pi's `kimi-coding.models.ts`) hosts three ids with a much
         // smaller real `maxTokens` (32_768) than this bucket's generic 262_144 default: its own "k2p7"
         // alias and "kimi-for-coding" (neither collides with any moonshotai-native id at all), plus
@@ -2796,6 +2829,12 @@ pub fn reasoning_wire_override(
     // `min_reasoning_effort: High`, so only High/XHigh can ever reach here); xhigh alone remaps, to
     // "max".
     if m.starts_with("deepseek") || family_id.starts_with("deepseek") {
+        return (effort == RE::XHigh).then_some("max");
+    }
+    // Kimi K3: native vocabulary is low/high/max. Portable `xhigh` is the `max` rung (pi's
+    // thinkingLevelMap). `medium` is left as "medium" so an OpenRouter vendor-slug id can send
+    // OpenRouter's own effort ladder unchanged (Harbor's Pi 0.84.2 path).
+    if m.starts_with("kimi-k3") || family_id.starts_with("kimi-k3") {
         return (effort == RE::XHigh).then_some("max");
     }
     // GLM-5.2+: low/medium/high all collapse to the literal "high", and xhigh remaps to "max". Every
@@ -4074,14 +4113,13 @@ mod tests {
 
     #[test]
     fn kimi_thinking_models_have_a_mechanism_despite_no_reasoning_effort_string() {
-        // Moonshot/Kimi: `supportsReasoningEffort: false` on every id (no graduated effort vocabulary
-        // at all), but the "thinking"-suffixed ids still have a real client-steerable on/off toggle
-        // (`OpenAiReasoningFormat::DeepSeek`, the same shape pi tags them with). Regression guard for
-        // `has_reasoning_mechanism`: without its third arm, this model would incorrectly report having
-        // no mechanism at all (`available_thinking_levels` collapsing to `[Off]`) even though
-        // `--thinking high` genuinely turns its reasoning on.
+        // Moonshot/Kimi K2: `supportsReasoningEffort: false` (no graduated effort vocabulary),
+        // but the "thinking"-suffixed ids still have a real client-steerable on/off toggle
+        // (`OpenAiReasoningFormat::DeepSeek`, the same shape pi tags them with). K3 is not this
+        // bucket (see asserts below). Regression guard for `has_reasoning_mechanism`: without its
+        // third arm, this model would incorrectly report having no mechanism at all.
         let caps = capabilities("kimi-k2-thinking");
-        assert!(!caps.reasoning_effort, "Kimi has no effort vocabulary");
+        assert!(!caps.reasoning_effort, "Kimi K2 has no effort vocabulary");
         assert_eq!(
             caps.openai_reasoning_format,
             OpenAiReasoningFormat::DeepSeek
@@ -4095,6 +4133,21 @@ mod tests {
         // even though the model never gets a graduated wire string for it.
         let (_, effort) = thinking_for_level(&caps, ThinkingLevel::Medium);
         assert!(effort.is_some(), "the toggle gate must be populated");
+
+        // Kimi K3 is not this toggle-only bucket: real effort vocabulary, always-on thinking.
+        let k3 = capabilities("kimi-k3");
+        assert!(k3.reasoning_effort);
+        assert!(!k3.reasoning_disableable);
+        assert_eq!(k3.openai_reasoning_format, OpenAiReasoningFormat::Standard);
+        assert_eq!(k3.max_output, 131_072);
+        let k3_or = capabilities("moonshotai/kimi-k3");
+        assert!(k3_or.reasoning_effort);
+        assert!(!k3_or.reasoning_disableable);
+        assert_eq!(
+            k3_or.openai_reasoning_format,
+            OpenAiReasoningFormat::OpenRouter
+        );
+        assert_eq!(k3_or.max_output, 131_072);
 
         // The non-"thinking" preview ids (reasoning: false in pi's catalogue) get no mechanism at all.
         let non_reasoning = capabilities("kimi-k2-0711-preview");
@@ -6373,6 +6426,18 @@ mod tests {
     }
 
     // ---- Per-model reasoning-effort wire remap (pi-parity pass 15) ----
+
+    #[test]
+    fn reasoning_wire_override_remaps_kimi_k3_xhigh_to_max() {
+        use crate::transport::ReasoningEffort as RE;
+        assert_eq!(reasoning_wire_override("kimi-k3", RE::XHigh), Some("max"));
+        assert_eq!(
+            reasoning_wire_override("moonshotai/kimi-k3", RE::XHigh),
+            Some("max")
+        );
+        assert_eq!(reasoning_wire_override("kimi-k3", RE::Medium), None);
+        assert_eq!(reasoning_wire_override("kimi-k2-thinking", RE::XHigh), None);
+    }
 
     #[test]
     fn reasoning_wire_override_remaps_deepseek_xhigh_to_max() {

@@ -9813,6 +9813,11 @@ mod tests {
             default_reasoning_effort_for_model("kimi-k2-thinking"),
             Some(agent_core::ReasoningEffort::Medium)
         );
+        // K3 always thinks; the default is still Pi's medium, not the provider's hidden `max`.
+        assert_eq!(
+            default_reasoning_effort_for_model("moonshotai/kimi-k3"),
+            Some(agent_core::ReasoningEffort::Medium)
+        );
     }
 
     #[test]

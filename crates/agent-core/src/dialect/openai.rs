@@ -1531,9 +1531,10 @@ mod tests {
     #[test]
     fn kimi_thinking_toggle_is_emitted_with_no_reasoning_effort_string() {
         use crate::transport::ReasoningEffort;
-        // Moonshot/Kimi shares DeepSeek's toggle shape but has no effort vocabulary at all
-        // (`supportsReasoningEffort: false` on every id) — the toggle turns on, but no
-        // `reasoning_effort` string ever accompanies it.
+        // K2 shares DeepSeek's toggle shape but has no effort vocabulary at all
+        // (`supportsReasoningEffort: false`) — the toggle turns on, but no
+        // `reasoning_effort` string ever accompanies it. K3 is the opposite (see
+        // `kimi_k3_emits_effort_not_a_k2_thinking_toggle`).
         let body = build_body(
             &ModelRequest::new("kimi-k2-thinking", vec![Message::user("hi")], 64)
                 .with_reasoning_effort(ReasoningEffort::Medium),
@@ -1541,8 +1542,42 @@ mod tests {
         assert_eq!(body["thinking"], json!({ "type": "enabled" }));
         assert!(
             body.get("reasoning_effort").is_none(),
-            "Kimi never gets a reasoning_effort string"
+            "Kimi K2 never gets a reasoning_effort string"
         );
+    }
+
+    #[test]
+    fn kimi_k3_emits_effort_not_a_k2_thinking_toggle() {
+        use crate::transport::ReasoningEffort;
+        // Native Moonshot: OpenAI `reasoning_effort`. Always-on, so idle omits rather than
+        // sending `thinking:{disabled}` or `effort:none` (K3 rejects the K2 thinking object).
+        let native = build_body(
+            &ModelRequest::new("kimi-k3", vec![Message::user("hi")], 64)
+                .with_reasoning_effort(ReasoningEffort::Medium),
+        );
+        assert_eq!(native["reasoning_effort"], "medium");
+        assert!(native.get("thinking").is_none(), "{native:#?}");
+        assert!(native.get("reasoning").is_none(), "{native:#?}");
+
+        let native_idle = build_body(&ModelRequest::new("kimi-k3", vec![Message::user("hi")], 64));
+        assert!(native_idle.get("reasoning_effort").is_none());
+        assert!(native_idle.get("thinking").is_none());
+
+        // OpenRouter vendor-slug: nested `reasoning:{effort}` — Pi 0.84.2's Harbor path.
+        let or = build_body(
+            &ModelRequest::new("moonshotai/kimi-k3", vec![Message::user("hi")], 64)
+                .with_reasoning_effort(ReasoningEffort::Medium),
+        );
+        assert_eq!(or["reasoning"], json!({ "effort": "medium" }));
+        assert!(or.get("reasoning_effort").is_none(), "{or:#?}");
+        assert!(or.get("thinking").is_none(), "{or:#?}");
+        assert_eq!(or["max_tokens"], 64);
+
+        let xhigh = build_body(
+            &ModelRequest::new("moonshotai/kimi-k3", vec![Message::user("hi")], 64)
+                .with_reasoning_effort(ReasoningEffort::XHigh),
+        );
+        assert_eq!(xhigh["reasoning"], json!({ "effort": "max" }));
     }
 
     #[test]
