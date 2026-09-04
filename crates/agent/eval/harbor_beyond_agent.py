@@ -5,7 +5,8 @@ headless. LLM calls go out during `agent.run()` only — pass Harbor
 `--allow-agent-host openrouter.ai` (or the provider you actually hit) because
 Frontier Terminal-Bench tasks default to no internet.
 
-This is the eval harness (verifier pass/fail, turns, tokens, $). Terminal-Bench
+This is the eval harness (verifier pass/fail, turns, tokens, $). Advertised tools are
+`read`/`write`/`edit`/`bash`/`ls`/`grep`/`find`/`todo`. `web` is not in that set. Terminal-Bench
 tasks have no MCP catalog, so `--code-mode` vs default is a regression check,
 not the MCP schema-token win. The Code Mode eval is the local Harbor task
 `eval/tasks/ast-hotspots` plus `--ak mcp_ast=true` (stdlib AST MCP, not the
@@ -110,12 +111,9 @@ class BeyondAiAgent(BaseInstalledAgent):
             default=False,
             env_fallback="AI_AGENT_CODE_MODE",
         ),
-        # Keep `web` in the shipped binary. Drop it here: TB is a coding eval,
-        # and `web` was the polyglot token spiral vs Pi.
         CliFlag(
             "exclude_tools",
             cli="--exclude-tools",
-            default="web",
             env_fallback="AI_AGENT_EXCLUDE_TOOLS",
         ),
     ]

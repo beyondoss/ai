@@ -28,8 +28,8 @@ use crate::skills::{self, Skill};
 /// information twice, in two different places the model reads. This function's own dynamic tool-name
 /// listing (`Use them to accomplish...with tools: {names}`) already avoids that duplication, so only
 /// the genuinely useful, non-redundant half of pi's feature is ported here: the guideline-bullet
-/// mechanism itself, including its one built-in conditional (`bash` registered but none of its usual
-/// companions).
+/// mechanism itself, including its built-in conditionals (`bash` registered but none of its usual
+/// companions; `grep`/`read`/`bash` registered → prefer grep/read, and cap bash grep with `head`).
 ///
 /// Lives here, not in `main.rs`, because a **subagent** must recompute it against its *own* (usually
 /// restricted) registry: a child given `tools: read,grep` must not be told it has `bash` and `edit`.
@@ -52,6 +52,17 @@ pub fn default_system_prompt(
     if has("bash") && !has("grep") && !has("find") && !has("ls") {
         add(
             "Use bash for file operations like ls, rg, find".to_string(),
+            &mut guidelines,
+            &mut seen,
+        );
+    }
+    // Dedicated search/read tools already bound their own output. Unbounded `bash grep` (a
+    // secret-scan dump, for example) overflowed the ~50KB bash-output cap; if the model still
+    // greps through bash, pipe `head`. Only fires when all three tools are actually registered —
+    // a read-only child must not be told to bash grep.
+    if has("grep") && has("read") && has("bash") {
+        add(
+            "Prefer grep/read; if you bash grep, pipe head.".to_string(),
             &mut guidelines,
             &mut seen,
         );
@@ -828,6 +839,32 @@ mod tests {
         let full = crate::tools::default_registry();
         let prompt = default_system_prompt(&full, &[]);
         assert!(!prompt.contains("Use bash for file operations like ls, rg, find"));
+    }
+
+    #[test]
+    fn default_system_prompt_prefers_grep_read_and_caps_bash_grep() {
+        // Advertised default includes grep/read: prefer those tools, and if bash grep still happens,
+        // pipe head so a dump cannot overflow the bash output cap.
+        let mut advertised = crate::tools::default_registry();
+        crate::tools::apply_filter(&mut advertised, None, None, false);
+        let prompt = default_system_prompt(&advertised, &[]);
+        assert!(
+            prompt.contains("Prefer grep/read; if you bash grep, pipe head."),
+            "got: {prompt}"
+        );
+        assert!(!prompt.contains("Use bash for file operations like ls, rg, find"));
+
+        let mut only_bash = agent_core::tool::ToolRegistry::new();
+        only_bash.register(std::sync::Arc::new(crate::tools::bash::Bash::real()));
+        let prompt = default_system_prompt(&only_bash, &[]);
+        assert!(!prompt.contains("Prefer grep/read"));
+
+        // Excluding bash must drop the guideline so a read-only agent is not told to bash grep.
+        let mut no_bash = crate::tools::default_registry();
+        crate::tools::apply_filter(&mut no_bash, None, Some(&["bash".to_string()]), false);
+        let prompt = default_system_prompt(&no_bash, &[]);
+        assert!(!prompt.contains("Prefer grep/read"));
+        assert!(!prompt.contains("bash"));
     }
 
     #[test]

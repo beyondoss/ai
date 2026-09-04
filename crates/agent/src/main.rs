@@ -2157,7 +2157,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             std::process::exit(shutdown_cause.map(serve::Signal::exit_code).unwrap_or(0));
         }
         Command::Tools => {
-            let reg = tools::default_registry();
+            let mut reg = tools::default_registry();
+            tools::apply_filter(&mut reg, None, None, false);
             println!("{} tools:\n", reg.len());
             println!("{}", serde_json::to_string_pretty(&reg.definitions())?);
         }

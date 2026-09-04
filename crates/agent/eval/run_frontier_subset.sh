@@ -11,12 +11,8 @@
 #   HARNESS=beyond-mcp              flattened mcp__ast__* tools
 #   HARNESS=beyond-mcp-code-mode    same catalog behind execute
 #
-# beyond* drop `web` (`--exclude-tools web`). Keep `web` in the product.
-# TB Code Mode is a regression check (empty execute). The MCP task is the
-# schema / composition eval.
-#
-# beyond / beyond-code-mode drop `web` (`--exclude-tools web`). Keep `web` in
-# the product; on TB it was a token spiral, not a coding-agent comparison.
+# beyond* advertised default is read/write/edit/bash/ls/grep/find/todo. `web` stays
+# in the binary and is opt-in via `--tools`.
 #
 # Self-improvement loop: find the expensive task, change one thing, re-run
 # that task against Pi. Override TASKS (space or comma separated):
