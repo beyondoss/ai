@@ -83,13 +83,16 @@ pub fn default_system_prompt(
     // model to look for parameters that don't exist on our tool. `bash`/`grep`/`find`/`ls` carry no
     // `promptGuidelines` on pi's side, so there's nothing to port for those.
     if has("read") {
-        add(
+        // Pi's own wording is just the first sentence. The second is ours: GLM-5.3 still
+        // `bash cat`'d whole logs through the 50KB tail-truncated cap. Only mention bash
+        // when the tool is actually registered — a read-only child must not be told about it.
+        let read_g = if has("bash") {
             "Use read to examine files instead of cat or sed. Never bash-cat; read paginates from \
              the start, bash truncates from the tail."
-                .to_string(),
-            &mut guidelines,
-            &mut seen,
-        );
+        } else {
+            "Use read to examine files instead of cat or sed."
+        };
+        add(read_g.to_string(), &mut guidelines, &mut seen);
     }
     if has("edit") {
         for g in [
@@ -925,6 +928,15 @@ mod tests {
         assert!(!prompt.contains("Use read to examine files"));
         assert!(!prompt.contains("Use edit for precise changes"));
         assert!(!prompt.contains("Use write only for new files"));
+
+        // Read without bash keeps Pi's original wording — no "bash-cat" (that sentence is gated
+        // on bash being registered, same as the grep/cat preference bullet).
+        let mut only_read = agent_core::tool::ToolRegistry::new();
+        only_read.register(std::sync::Arc::new(crate::tools::read::Read::default()));
+        let prompt = default_system_prompt(&only_read, &[]);
+        assert!(prompt.contains("Use read to examine files instead of cat or sed."));
+        assert!(!prompt.contains("Never bash-cat"));
+        assert!(!prompt.contains("bash"));
     }
 
     #[test]
