@@ -663,6 +663,9 @@ pub struct ServeConfig {
     /// bounded-concurrent dispatch (`agent_core::Agent::with_sequential_tools`). Fixed for the process,
     /// like `tools`/`no_tools` — `build_agent` reapplies it every rebuild.
     pub sequential_tools: bool,
+    /// Defer MCP tools behind the Code Mode `execute` tool. Fixed for the process; `build_tools`
+    /// reapplies it every rebuild.
+    pub code_mode: bool,
     /// Block every call to a tool named here, even though it stays registered/visible to the model —
     /// unlike `exclude_tools` (the model never learns it exists), a denied call still surfaces as a
     /// normal error `tool_result` explaining it was blocked by policy. Installs an `AgentHooks` gate
@@ -6848,6 +6851,8 @@ fn build_subagent_ctx(
             // reach around the isolation simply by delegating.
             fs_backend: Some(exec.backend()),
             command_runner: Some(exec.runner()),
+            code_mode: cfg.code_mode,
+            exclude_tools: cfg.exclude_tools.clone().unwrap_or_default(),
         },
         cwd: cwd.to_path_buf(),
         project_trusted,
@@ -7132,6 +7137,8 @@ fn build_tools(
     // just the built-ins. Session-scoped [`McpEnabledSet`] further drops tools from disabled servers
     // before that merge — kit shaping without reconnecting.
     let mcp_tools = crate::tools::mcp::filter_by_enabled(&cfg.mcp_tools, mcp_enabled);
+    let empty: &[String] = &[];
+    let nested_exclude = cfg.exclude_tools.as_deref().unwrap_or(empty);
     let mut registry = tools::default_registry_with_config(&tools::ToolConfig {
         bash_timeout_ms: cfg.bash_timeout_ms,
         bash_shell_path: cfg.bash_shell_path.as_deref(),
@@ -7140,6 +7147,9 @@ fn build_tools(
         web_allow_hosts: &cfg.web_allow_hosts,
         web_timeout_ms: cfg.web_timeout_ms,
         image_auto_resize,
+        code_mode: cfg.code_mode,
+        nested_exclude,
+        nested_deny: &cfg.deny_tool,
         mcp_tools: &mcp_tools,
         // The cell, not a fixed target: `build_agent` is skipped on a same-model `switch_session`, so
         // a target captured here would leave the incoming session on the previous one's machine —
@@ -7155,6 +7165,19 @@ fn build_tools(
         cfg.exclude_tools.as_deref(),
         cfg.no_tools,
     );
+    if cfg.code_mode {
+        let nested = crate::tools::code_mode::select_deferred_tools(
+            &mcp_tools,
+            nested_exclude,
+            &cfg.deny_tool,
+        );
+        crate::tools::code_mode::restore_execute(
+            &mut registry,
+            std::sync::Arc::new(crate::tools::code_mode::Execute::new(nested)),
+            cfg.exclude_tools.as_deref(),
+            cfg.no_tools,
+        );
+    }
     registry
 }
 

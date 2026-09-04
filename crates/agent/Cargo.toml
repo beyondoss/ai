@@ -171,6 +171,12 @@ rmcp = { version = "3.2.0", default-features = false, features = ["client", "mac
 # so this adds nothing new to the build graph — it just enables our own use of the accept path.
 tokio-tungstenite = { version = "0.29", default-features = false, features = ["handshake"] }
 
+# Code Mode (`tools/code_mode.rs`): confined QuickJS-NG interpreter for composing deferred MCP tools.
+# `futures` bridges JS Promises to Rust async so nested tool calls can `await` / `Promise.all`. No
+# `loader`/`dyn-load` — the sandbox must not grow a module or filesystem surface. QuickJS-NG is a
+# handful of C files; the agent's static-musl release already compiles C (`ring`/`mimalloc`).
+rquickjs = { version = "0.12", default-features = true, features = ["futures", "parallel"] }
+
 # systemd socket activation for `serve --listen`: adopt the already-bound listener fd systemd passes
 # (`LISTEN_FDS`/`LISTEN_PID`) instead of binding our own, so the socket outlives a `systemctl restart`
 # (connections queue in the kernel — zero-downtime). The workspace forbids `unsafe_code`, so we can't

@@ -9,6 +9,7 @@ use std::sync::Arc;
 use agent_core::{Tool, ToolError, ToolRegistry};
 
 pub mod bash;
+pub mod code_mode;
 pub mod edit;
 pub mod exec;
 pub mod find;
@@ -480,6 +481,14 @@ pub struct ToolConfig<'a> {
     /// and every test that doesn't care about roots gets. A subagent running under `isolation: worktree`
     /// passes its worktree here. See [`resolve_against`].
     pub root: PathBuf,
+    /// When true, MCP tools are not advertised as `mcp__…` entries. They become the deferred catalog
+    /// inside the Code Mode [`code_mode::Execute`] tool (`tools.<server>.<method>`). Off by default.
+    pub code_mode: bool,
+    /// `--exclude-tools` names applied to the nested Code Mode catalog (so an excluded MCP tool is
+    /// unreachable through `execute` as well as missing from the advertised set).
+    pub nested_exclude: &'a [String],
+    /// `--deny-tool` names applied to the nested catalog — same names the policy hook blocks.
+    pub nested_deny: &'a [String],
     /// Already-connected tools from configured MCP servers (see [`mcp::connect_all`]), registered after
     /// every built-in so an allow/deny filter scopes them too.
     ///
@@ -614,8 +623,15 @@ pub fn default_registry_with_config(cfg: &ToolConfig<'_>) -> ToolRegistry {
     )));
     // After every built-in, so an allow/deny filter (`apply_filter`) scopes MCP tools too, and so a
     // server can't shadow a built-in by name (the `mcp__<server>__<tool>` prefix already prevents that).
-    for tool in cfg.mcp_tools {
-        reg.register(tool.clone());
+    // Code Mode defers that catalog: MCP tools stay callable from `execute` but are not advertised.
+    if cfg.code_mode {
+        let nested =
+            code_mode::select_deferred_tools(cfg.mcp_tools, cfg.nested_exclude, cfg.nested_deny);
+        reg.register(Arc::new(code_mode::Execute::new(nested)));
+    } else {
+        for tool in cfg.mcp_tools {
+            reg.register(tool.clone());
+        }
     }
     reg
 }
@@ -1073,6 +1089,61 @@ mod tests {
         // … plus the MCP-discovered one, under its already-namespaced name.
         assert!(reg.get("mcp__filesystem__read_file").is_some());
         assert_eq!(reg.len(), default_registry().len() + 1);
+    }
+
+    #[test]
+    fn code_mode_defers_mcp_tools_behind_execute() {
+        let mcp_tools: Vec<Arc<dyn Tool>> =
+            vec![Arc::new(FakeMcpTool("mcp__filesystem__read_file"))];
+        let exclude = vec!["mcp__filesystem__read_file".to_string()];
+        let deny: Vec<String> = Vec::new();
+        let reg = default_registry_with_config(&ToolConfig {
+            mcp_tools: &mcp_tools,
+            code_mode: true,
+            nested_exclude: &[],
+            nested_deny: &deny,
+            ..ToolConfig::new()
+        });
+        assert!(reg.get("execute").is_some());
+        assert!(
+            reg.get("mcp__filesystem__read_file").is_none(),
+            "MCP tools must not be advertised when Code Mode is on"
+        );
+        // Nested exclude drops the tool from execute's catalog too — registry still has execute.
+        let reg = default_registry_with_config(&ToolConfig {
+            mcp_tools: &mcp_tools,
+            code_mode: true,
+            nested_exclude: &exclude,
+            nested_deny: &deny,
+            ..ToolConfig::new()
+        });
+        assert!(reg.get("execute").is_some());
+        assert!(reg.get("mcp__filesystem__read_file").is_none());
+    }
+
+    #[test]
+    fn code_mode_restore_keeps_execute_on_a_builtins_allow_list() {
+        let mcp_tools: Vec<Arc<dyn Tool>> =
+            vec![Arc::new(FakeMcpTool("mcp__filesystem__read_file"))];
+        let deny: Vec<String> = Vec::new();
+        let mut reg = default_registry_with_config(&ToolConfig {
+            mcp_tools: &mcp_tools,
+            code_mode: true,
+            nested_deny: &deny,
+            ..ToolConfig::new()
+        });
+        apply_filter(&mut reg, Some(&["read".to_string()]), None, false);
+        assert!(reg.get("execute").is_none());
+        let nested = code_mode::select_deferred_tools(&mcp_tools, &[], &deny);
+        code_mode::restore_execute(
+            &mut reg,
+            Arc::new(code_mode::Execute::new(nested)),
+            None,
+            false,
+        );
+        assert!(reg.get("read").is_some());
+        assert!(reg.get("execute").is_some());
+        assert!(reg.get("mcp__filesystem__read_file").is_none());
     }
 
     #[test]
