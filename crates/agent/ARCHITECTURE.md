@@ -894,13 +894,16 @@ The harness layers several capabilities over the bare tools + loop:
   (default binary must not contain `JS_NewRuntime`). Harness eval is Harbor on a FrontierHarness
   v1.0 Terminal-Bench subset ([`eval/harbor_beyond_agent.py`](eval/harbor_beyond_agent.py),
   [`eval/run_frontier_subset.sh`](eval/run_frontier_subset.sh)) — verifier pass/fail, turns, tokens,
-  `$`. Three arms, same 4 tasks, same model (Kimi K3): `HARNESS=beyond` (density-default, no
+  `$`. Three arms, same tasks, same model (Kimi K3): `HARNESS=beyond` (density-default, no
   QuickJS), `HARNESS=beyond-code-mode` (`--features code-mode` binary + `--code-mode`), and
-  `HARNESS=pi` (Harbor's Pi agent at FrontierHarness pin **0.84.2**). TB has no MCP catalog, so
-  beyond vs Code Mode is a regression/overhead check (empty `execute` still registers), not the
-  MCP schema-token win. Pi is the harness baseline. Code Mode still needs an MCP-heavy verifier
-  suite before it can be a default. This slice is not the published 30-task board (21 TB + 9
-  DeepSWE) and not a Runta golden-checkpoint run.
+  `HARNESS=pi` (Harbor's Pi agent at FrontierHarness pin **0.84.2**). The eval adapter drops
+  `web` (`--exclude-tools web`); the shipped binary still has it — a TB polyglot run burned most
+  of its `$` on web fetches, which is not a coding-agent comparison to Pi. Iterate by changing
+  one thing and re-running the expensive task (`TASKS=terminal-bench/polyglot-c-py`). TB has no
+  MCP catalog, so beyond vs Code Mode is a regression/overhead check (empty `execute` still
+  registers), not the MCP schema-token win. Pi is the harness baseline. Code Mode still needs an
+  MCP-heavy verifier suite before it can be a default. This slice is not the published 30-task
+  board (21 TB + 9 DeepSWE) and not a Runta golden-checkpoint run.
 
   ```sh
   cargo test -p beyond-ai-agent --test code_mode_density
@@ -915,6 +918,11 @@ The harness layers several capabilities over the bare tools + loop:
     target/x86_64-unknown-linux-musl/release/beyond-ai-agent-code-mode
   HARNESS=beyond-code-mode JOBS_DIR=/tmp/beyond-frontier-code-mode crates/agent/eval/run_frontier_subset.sh
   HARNESS=pi JOBS_DIR=/tmp/beyond-frontier-pi crates/agent/eval/run_frontier_subset.sh
+  # one-task loop vs Pi (example: the expensive polyglot):
+  TASKS=terminal-bench/polyglot-c-py HARNESS=beyond JOBS_DIR=/tmp/poly-beyond \
+    crates/agent/eval/run_frontier_subset.sh
+  TASKS=terminal-bench/polyglot-c-py HARNESS=pi JOBS_DIR=/tmp/poly-pi \
+    crates/agent/eval/run_frontier_subset.sh
   ```
 - **Multimodal** — `prompt` accepts `images: [{media_type, data}]` (base64), built into a multimodal
   user turn. `read` on an oversized image file downscales/re-encodes it (Lanczos3, PNG-then-JPEG

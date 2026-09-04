@@ -2,10 +2,20 @@
 # Run a small FrontierHarness v1.0 Terminal-Bench subset through Harbor.
 # Verifier pass/fail, turns, tokens, $. Not the Code Mode MCP smokes.
 #
-# Three arms, same 4 tasks, same model (Kimi K3 via OpenRouter):
+# Three arms, same tasks, same model (Kimi K3 via OpenRouter):
 #   HARNESS=beyond              density-default musl binary (no QuickJS)
 #   HARNESS=beyond-code-mode    --features code-mode binary + --code-mode
 #   HARNESS=pi                  Harbor Pi 0.84.2 (FrontierHarness pin)
+#
+# beyond / beyond-code-mode drop `web` (`--exclude-tools web`). Keep `web` in
+# the product; on TB it was a token spiral, not a coding-agent comparison.
+#
+# Self-improvement loop: find the expensive task, change one thing, re-run
+# that task against Pi. Override TASKS (space or comma separated):
+#   TASKS=terminal-bench/polyglot-c-py HARNESS=beyond JOBS_DIR=/tmp/poly-beyond \
+#     crates/agent/eval/run_frontier_subset.sh
+#   TASKS=terminal-bench/polyglot-c-py HARNESS=pi JOBS_DIR=/tmp/poly-pi \
+#     crates/agent/eval/run_frontier_subset.sh
 #
 # Terminal-Bench has no MCP catalog. beyond vs beyond-code-mode is a
 # regression/overhead check (empty `execute` still registers). Pi is the
@@ -32,12 +42,17 @@ CODE_MODE_BIN="${BEYOND_AI_AGENT_CODE_MODE_BIN:-${ROOT}/target/x86_64-unknown-li
 
 # FrontierHarness v1.0 TB slice: four medium tasks with prebuilt images.
 # Full set is 21 TB + 9 DeepSWE; DeepSWE needs Pier, not this script.
-TASKS=(
-  terminal-bench/openssl-selfsigned-cert
-  terminal-bench/sanitize-git-repo
-  terminal-bench/polyglot-c-py
-  terminal-bench/sqlite-db-truncate
-)
+# Override with TASKS=terminal-bench/polyglot-c-py (space/comma separated).
+if [[ -n "${TASKS:-}" ]]; then
+  IFS=$' ,\n' read -r -a TASK_LIST <<< "${TASKS}"
+else
+  TASK_LIST=(
+    terminal-bench/openssl-selfsigned-cert
+    terminal-bench/sanitize-git-repo
+    terminal-bench/polyglot-c-py
+    terminal-bench/sqlite-db-truncate
+  )
+fi
 
 require_bin() {
   local path="$1"
@@ -51,7 +66,7 @@ require_bin() {
 
 mkdir -p "${JOBS_DIR}"
 task_args=()
-for t in "${TASKS[@]}"; do
+for t in "${TASK_LIST[@]}"; do
   task_args+=(--include-task-name "${t}")
 done
 

@@ -10,6 +10,10 @@ tasks have no MCP catalog, so `--code-mode` vs default is a regression check,
 not the MCP schema-token win. Use `BeyondAiAgentCodeMode` and a
 `--features code-mode` binary for that arm; Harbor's built-in `pi` agent is the
 harness baseline.
+
+The product still has `web`. This adapter drops it (`--exclude-tools web`) so
+the coding-agent surface matches Pi on TB. A Kimi K3 polyglot run spent most of
+its `$` on seven `web` fetches; that is eval noise, not a product question.
 """
 
 from __future__ import annotations
@@ -107,6 +111,14 @@ class BeyondAiAgent(BaseInstalledAgent):
             type="bool",
             default=False,
             env_fallback="AI_AGENT_CODE_MODE",
+        ),
+        # Keep `web` in the shipped binary. Drop it here: TB is a coding eval,
+        # and `web` was the polyglot token spiral vs Pi.
+        CliFlag(
+            "exclude_tools",
+            cli="--exclude-tools",
+            default="web",
+            env_fallback="AI_AGENT_EXCLUDE_TOOLS",
         ),
     ]
 
