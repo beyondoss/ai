@@ -25,10 +25,10 @@ MODEL="${MODEL:-moonshotai/kimi-k3}"
 # FrontierHarness v1.0 TB slice: four medium tasks with prebuilt images.
 # Full set is 21 TB + 9 DeepSWE; DeepSWE needs Pier, not this script.
 TASKS=(
-  openssl-selfsigned-cert
-  sanitize-git-repo
-  polyglot-c-py
-  sqlite-db-truncate
+  terminal-bench/openssl-selfsigned-cert
+  terminal-bench/sanitize-git-repo
+  terminal-bench/polyglot-c-py
+  terminal-bench/sqlite-db-truncate
 )
 
 mkdir -p "${JOBS_DIR}"
