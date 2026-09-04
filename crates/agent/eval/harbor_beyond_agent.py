@@ -5,9 +5,11 @@ headless. LLM calls go out during `agent.run()` only — pass Harbor
 `--allow-agent-host openrouter.ai` (or the provider you actually hit) because
 Frontier Terminal-Bench tasks default to no internet.
 
-This is the eval harness (verifier pass/fail, turns, tokens, $). It is not Code
-Mode: Terminal-Bench has no MCP catalog, and the density-default binary does
-not link QuickJS.
+This is the eval harness (verifier pass/fail, turns, tokens, $). Terminal-Bench
+tasks have no MCP catalog, so `--code-mode` vs default is a regression check,
+not the MCP schema-token win. Use `BeyondAiAgentCodeMode` and a
+`--features code-mode` binary for that arm; Harbor's built-in `pi` agent is the
+harness baseline.
 """
 
 from __future__ import annotations
@@ -98,6 +100,13 @@ class BeyondAiAgent(BaseInstalledAgent):
             type="int",
             default=120,
             env_fallback="AI_AGENT_MAX_STEPS",
+        ),
+        CliFlag(
+            "code_mode",
+            cli="--code-mode",
+            type="bool",
+            default=False,
+            env_fallback="AI_AGENT_CODE_MODE",
         ),
     ]
 
@@ -241,3 +250,18 @@ class BeyondAiAgent(BaseInstalledAgent):
                 + cache_read / 1_000_000 * _KIMI_K3_CACHE_PER_M
                 + output_tokens / 1_000_000 * _KIMI_K3_OUTPUT_PER_M
             )
+
+
+class BeyondAiAgentCodeMode(BeyondAiAgent):
+    """Same adapter with `--code-mode`. Binary must be built `--features code-mode`."""
+
+    def __init__(self, *args, **kwargs):
+        kwargs.setdefault("code_mode", True)
+        super().__init__(*args, **kwargs)
+
+    @staticmethod
+    @override
+    def name() -> str:
+        return "beyond-ai-agent-code-mode"
+
+

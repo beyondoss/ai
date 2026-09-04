@@ -892,10 +892,15 @@ The harness layers several capabilities over the bare tools + loop:
   scripted `execute` composition against the MCP fixture; live Grok 4.6 / OpenRouter is
   `#[ignore]`), not an eval. Density: [`tests/code_mode_density.rs`](tests/code_mode_density.rs)
   (default binary must not contain `JS_NewRuntime`). Harness eval is Harbor on a FrontierHarness
-  v1.0 Terminal-Bench subset ([`eval/harbor_beyond_agent.py`](eval/harbor_beyond_agent.py)) —
-  verifier pass/fail, turns, tokens, `$`. TB has no MCP catalog, so that run scores the shipped
-  harness (no `--code-mode`, no QuickJS). Code Mode still needs an MCP-heavy verifier suite
-  before it can be a default.
+  v1.0 Terminal-Bench subset ([`eval/harbor_beyond_agent.py`](eval/harbor_beyond_agent.py),
+  [`eval/run_frontier_subset.sh`](eval/run_frontier_subset.sh)) — verifier pass/fail, turns, tokens,
+  `$`. Three arms, same 4 tasks, same model (Kimi K3): `HARNESS=beyond` (density-default, no
+  QuickJS), `HARNESS=beyond-code-mode` (`--features code-mode` binary + `--code-mode`), and
+  `HARNESS=pi` (Harbor's Pi agent at FrontierHarness pin **0.84.2**). TB has no MCP catalog, so
+  beyond vs Code Mode is a regression/overhead check (empty `execute` still registers), not the
+  MCP schema-token win. Pi is the harness baseline. Code Mode still needs an MCP-heavy verifier
+  suite before it can be a default. This slice is not the published 30-task board (21 TB + 9
+  DeepSWE) and not a Runta golden-checkpoint run.
 
   ```sh
   cargo test -p beyond-ai-agent --test code_mode_density
@@ -904,7 +909,12 @@ The harness layers several capabilities over the bare tools + loop:
   OPENROUTER_API_KEY=… cargo test -p beyond-ai-agent --features code-mode --test code_mode_eval -- --ignored --nocapture
   # FrontierHarness subset (Harbor + Docker; Kimi K3 via OpenRouter):
   cargo build -p beyond-ai-agent --release --target x86_64-unknown-linux-musl
-  crates/agent/eval/run_frontier_subset.sh
+  HARNESS=beyond JOBS_DIR=/tmp/beyond-frontier-beyond crates/agent/eval/run_frontier_subset.sh
+  cargo build -p beyond-ai-agent --release --target x86_64-unknown-linux-musl --features code-mode
+  cp target/x86_64-unknown-linux-musl/release/beyond-ai-agent \
+    target/x86_64-unknown-linux-musl/release/beyond-ai-agent-code-mode
+  HARNESS=beyond-code-mode JOBS_DIR=/tmp/beyond-frontier-code-mode crates/agent/eval/run_frontier_subset.sh
+  HARNESS=pi JOBS_DIR=/tmp/beyond-frontier-pi crates/agent/eval/run_frontier_subset.sh
   ```
 - **Multimodal** — `prompt` accepts `images: [{media_type, data}]` (base64), built into a multimodal
   user turn. `read` on an oversized image file downscales/re-encodes it (Lanczos3, PNG-then-JPEG
