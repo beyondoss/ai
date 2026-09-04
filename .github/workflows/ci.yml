@@ -89,11 +89,11 @@ jobs:
           - name: agent-lib
             filter: package(beyond-ai-agent) and (kind(lib) or kind(bin))
             extra: ""
-          # Same agent-lib filter with QuickJS linked. Default shards must not enable `code-mode`
-          # (that is the density-default graph); this shard is the only one that compiles the
-          # interpreter and runs the `execute` tests.
+          # Same agent-lib filter with QuickJS linked, plus the Code Mode eval harness (catalog
+          # tokens + real-MCP composition). Default shards must not enable `code-mode` (that is the
+          # density-default graph); this shard is the only one that compiles the interpreter.
           - name: agent-code-mode
-            filter: package(beyond-ai-agent) and (kind(lib) or kind(bin))
+            filter: package(beyond-ai-agent) and (kind(lib) or kind(bin) or binary(code_mode_eval))
             extra: "--features code-mode"
           - name: agent-serve
             filter: package(beyond-ai-agent) and kind(test) and binary(~serve)

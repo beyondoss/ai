@@ -888,7 +888,17 @@ The harness layers several capabilities over the bare tools + loop:
 
   This is the OpenCode/Cloudflare "code mode" pattern aimed at MCP-heavy context and multi-hop
   composition — measure `$/pass`, turns, schema tokens, **and RSS / `.text`** before making it a
-  default.
+  default. Merge bar: [`tests/code_mode_eval.rs`](tests/code_mode_eval.rs) (catalog-byte A/B + a
+  scripted `execute` composition against the real MCP fixture; live Grok 4.6 / OpenRouter is
+  `#[ignore]`) and [`tests/code_mode_density.rs`](tests/code_mode_density.rs) (default binary must
+  not contain `JS_NewRuntime`).
+
+  ```sh
+  cargo test -p beyond-ai-agent --test code_mode_density
+  cargo test -p beyond-ai-agent --features code-mode --test code_mode_eval -- --nocapture
+  # live (bills a real request):
+  OPENROUTER_API_KEY=… cargo test -p beyond-ai-agent --features code-mode --test code_mode_eval -- --ignored --nocapture
+  ```
 - **Multimodal** — `prompt` accepts `images: [{media_type, data}]` (base64), built into a multimodal
   user turn. `read` on an oversized image file downscales/re-encodes it (Lanczos3, PNG-then-JPEG
   re-encode, Exif orientation correction via the `image` crate's own generic

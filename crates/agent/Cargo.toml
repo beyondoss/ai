@@ -195,6 +195,14 @@ default = []
 # Links QuickJS-NG. Off by default and MUST stay off in `.github/workflows/release-agent.yml`.
 code-mode = ["dep:rquickjs"]
 
+# Catalog-token + composition evals (and the ignored live Grok/OpenRouter eval). Requires the
+# feature so `CARGO_BIN_EXE_beyond-ai-agent` is the binary that actually links QuickJS;
+# `--code-mode` on the density-default binary is a hard error.
+[[test]]
+name = "code_mode_eval"
+path = "tests/code_mode_eval.rs"
+required-features = ["code-mode"]
+
 [dev-dependencies]
 # The client side of the WebSocket transport, for `tests/serve_websocket.rs` and the live WS smokes:
 # `connect_async` to a `ws://127.0.0.1` listener (no TLS). Same crate/version as the non-dev dep above.
