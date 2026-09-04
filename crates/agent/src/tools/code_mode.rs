@@ -150,8 +150,8 @@ mod runtime {
     const DEFAULT_MAX_CALLS: usize = 64;
     const DEFAULT_MAX_OUTPUT: usize = 256 * 1024;
     /// Tight on purpose: a 768 MB guest multiplexes many agent VMs, and `serve` can have several
-    /// sessions. This is a cap, not a reservation, but a JS program can use it; 32 MiB × N sessions
-    /// blows the box. 4 MiB is enough for catalog JSON + a composition script.
+    /// sessions. This is a **cap**, not a reservation — idle Code Mode does not hold 4 MiB. A JS
+    /// program can grow to it; one process-wide slot means at most one such heap at a time.
     const DEFAULT_MEMORY_LIMIT: usize = 4 * 1024 * 1024;
     const DEFAULT_STACK_SIZE: usize = 128 * 1024;
 

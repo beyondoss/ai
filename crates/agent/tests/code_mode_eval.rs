@@ -253,17 +253,14 @@ fn eval_execute_composes_real_mcp_calls() {
 
 /// Live Grok 4.6 over OpenRouter: the model, not a script, has to choose `execute` and compose.
 /// Bills a real request. Skip when the key is unset rather than failing CI.
-#[test]
-#[ignore = "live OpenRouter/Grok; needs OPENROUTER_API_KEY"]
-fn eval_live_grok_composes_via_execute() {
-    let key = std::env::var("OPENROUTER_API_KEY")
-        .ok()
-        .filter(|s| !s.trim().is_empty());
-    let Some(_key) = key else {
-        eprintln!("OPENROUTER_API_KEY unset — skipping live Code Mode eval");
-        return;
-    };
+const LIVE_PROMPT: &str = "You have MCP tools from github, jira, slack, and linear. \
+     Compute 2+3 with add, echo the exact string CODEMODE-EVAL, and ping. \
+     If you have an `execute` tool, do all three inside one JavaScript program using \
+     Promise.all (tools.github.add / tools.github.echo / tools.github.ping) and return \
+     JSON {sum, echo, ping}. Otherwise call the MCP tools directly. \
+     Reply with only that JSON object.";
 
+fn live_grok(code_mode: bool) -> (bool, String, String) {
     let home = tempfile::tempdir().unwrap();
     let cwd = tempfile::tempdir().unwrap();
     write_global_settings(
@@ -275,20 +272,13 @@ fn eval_live_grok_composes_via_execute() {
             stdio_server_config("linear"),
         ],
     );
-
-    let output = Command::new(env!("CARGO_BIN_EXE_beyond-ai-agent"))
-        .env("HOME", home.path())
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_beyond-ai-agent"));
+    cmd.env("HOME", home.path())
         .env("AI_PROVIDER", "openrouter")
         .env("AI_DIRECT", "1")
         .args([
             "run",
-            "You have MCP tools from github, jira, slack, and linear. \
-             Compute 2+3 with add, echo the exact string CODEMODE-EVAL, and ping. \
-             If you have an `execute` tool, do all three inside one JavaScript program using \
-             Promise.all (tools.github.add / tools.github.echo / tools.github.ping) and return \
-             JSON {sum, echo, ping}. Otherwise call the MCP tools directly. \
-             Reply with only that JSON object.",
-            "--code-mode",
+            LIVE_PROMPT,
             "--model",
             "x-ai/grok-4.6",
             "--reasoning-effort",
@@ -297,19 +287,39 @@ fn eval_live_grok_composes_via_execute() {
             "12",
             "--no-session-persistence",
         ])
-        .current_dir(cwd.path())
-        .output()
-        .expect("spawn live agent");
+        .current_dir(cwd.path());
+    if code_mode {
+        cmd.arg("--code-mode");
+    }
+    let output = cmd.output().expect("spawn live agent");
+    (
+        output.status.success(),
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    eprintln!("live grok stdout:\n{stdout}");
+fn require_openrouter_key() -> bool {
+    std::env::var("OPENROUTER_API_KEY")
+        .ok()
+        .is_some_and(|s| !s.trim().is_empty())
+}
+
+#[test]
+#[ignore = "live OpenRouter/Grok; needs OPENROUTER_API_KEY"]
+fn eval_live_grok_composes_via_execute() {
+    if !require_openrouter_key() {
+        eprintln!("OPENROUTER_API_KEY unset — skipping live Code Mode eval");
+        return;
+    }
+    let (ok, stdout, stderr) = live_grok(true);
+    eprintln!("live grok --code-mode stdout:\n{stdout}");
     if !stderr.is_empty() {
-        eprintln!("live grok stderr:\n{stderr}");
+        eprintln!("live grok --code-mode stderr:\n{stderr}");
     }
     assert!(
-        output.status.success(),
-        "live grok run failed.\nstdout: {stdout}\nstderr: {stderr}"
+        ok,
+        "live grok --code-mode failed.\nstdout: {stdout}\nstderr: {stderr}"
     );
     assert!(
         stdout.contains("[tool: execute]"),
@@ -322,5 +332,35 @@ fn eval_live_grok_composes_via_execute() {
     assert!(
         stdout.contains("pong"),
         "ping result missing.\nstdout: {stdout}"
+    );
+}
+
+#[test]
+#[ignore = "live OpenRouter/Grok; needs OPENROUTER_API_KEY"]
+fn eval_live_grok_flattened_mcp_baseline() {
+    if !require_openrouter_key() {
+        eprintln!("OPENROUTER_API_KEY unset — skipping live flattened baseline");
+        return;
+    }
+    let (ok, stdout, stderr) = live_grok(false);
+    eprintln!("live grok flattened stdout:\n{stdout}");
+    if !stderr.is_empty() {
+        eprintln!("live grok flattened stderr:\n{stderr}");
+    }
+    assert!(
+        ok,
+        "live grok flattened failed.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("CODEMODE-EVAL"),
+        "echo result missing.\nstdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("pong"),
+        "ping result missing.\nstdout: {stdout}"
+    );
+    assert!(
+        !stdout.contains("[tool: execute]"),
+        "flattened baseline must not have an execute tool.\nstdout: {stdout}"
     );
 }
