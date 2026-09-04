@@ -685,7 +685,7 @@ pub fn apply_filter(
     // No `--tools` allow-list: drop opt-in built-ins (`web`). `--tools web` is how it comes back;
     // `--exclude-tools` alone must not re-advertise it.
     if tools.is_none() && !no_tools {
-        reg.retain(|name| !OPTIONAL_BUILTINS.iter().any(|t| *t == name));
+        reg.retain(|name| !OPTIONAL_BUILTINS.contains(&name));
     }
 }
 
