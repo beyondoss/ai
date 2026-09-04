@@ -384,9 +384,33 @@ pub fn read_until_response(reader: &mut impl BufRead, command: &str) -> Vec<Valu
     frames
 }
 
+/// Strip ambient provider-routing env so a mock `--gateway-url` actually wins.
+///
+/// Eval hosts (this one included) export `AI_DIRECT=1` / `AI_PROVIDER=openrouter` /
+/// `OPENROUTER_API_KEY` for Harbor runs. `AI_DIRECT=1` makes the binary ignore `--gateway-url`
+/// and dial OpenRouter; a hermetic test that inherited that would bill a live provider and fail
+/// on `claude-test`. Tests that *want* those vars (the ignored live Code Mode smoke) re-set them
+/// after [`run_cmd`] — `Command::env` is last-write.
+fn isolate_provider_env(cmd: &mut Command) {
+    for key in [
+        "AI_DIRECT",
+        "AI_PROVIDER",
+        "AI_BASE_URL",
+        "AI_API_KEY",
+        "AI_GATEWAY_URL",
+        "OPENROUTER_API_KEY",
+        "OPENAI_API_KEY",
+        "OPENAI_BASE_URL",
+        "ANTHROPIC_API_KEY",
+    ] {
+        cmd.env_remove(key);
+    }
+}
+
 /// A `serve` child bound to a single session file, talking to the mock gateway at `base`.
 pub fn serve_cmd(bin: &str, base: &str, session_file: &str) -> Command {
     let mut c = Command::new(bin);
+    isolate_provider_env(&mut c);
     c.args([
         "serve",
         "--gateway-url",
@@ -409,6 +433,7 @@ pub fn serve_cmd(bin: &str, base: &str, session_file: &str) -> Command {
 /// exercises the multi-session-per-process repo mode (`list_sessions`, `switch`, fork).
 pub fn serve_dir_cmd(bin: &str, base: &str, session_dir: &str) -> Command {
     let mut c = Command::new(bin);
+    isolate_provider_env(&mut c);
     c.args([
         "serve",
         "--gateway-url",
@@ -432,6 +457,7 @@ pub fn serve_dir_cmd(bin: &str, base: &str, session_dir: &str) -> Command {
 /// `.env("HOME", ...)`, which simply wins (`Command::env` is last-write).
 pub fn run_cmd(bin: &str) -> Command {
     let mut c = Command::new(bin);
+    isolate_provider_env(&mut c);
     c.env("HOME", ISOLATED_HOME);
     c
 }
