@@ -480,7 +480,9 @@ enum Command {
         #[usage(long)]
         sequential_tools: bool,
         /// Defer MCP tools behind a confined JS `execute` tool (OpenCode-style Code Mode). Built-in
-        /// coding tools stay direct. Off by default. `serve`'s identical flag.
+        /// coding tools stay direct. Off by default. Requires a binary built with `--features
+        /// code-mode` (omitted from default/release so every agent VM does not link QuickJS).
+        /// `serve`'s identical flag.
         #[usage(long, env = "AI_AGENT_CODE_MODE")]
         code_mode: bool,
         /// Block every call to this tool (comma-separated, repeatable), even though it stays visible
@@ -927,7 +929,9 @@ enum Command {
         #[usage(long)]
         sequential_tools: bool,
         /// Defer MCP tools behind a confined JS `execute` tool (OpenCode-style Code Mode). Built-in
-        /// coding tools stay direct. Off by default. `run`'s identical flag.
+        /// coding tools stay direct. Off by default. Requires a binary built with `--features
+        /// code-mode` (omitted from default/release so every agent VM does not link QuickJS).
+        /// `run`'s identical flag.
         #[usage(long, env = "AI_AGENT_CODE_MODE")]
         code_mode: bool,
         /// Block every call to this tool (comma-separated, repeatable), even though it stays visible
@@ -1770,6 +1774,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 && n.trim().is_empty()
             {
                 return Err("--name requires a non-empty value".into());
+            }
+            if code_mode {
+                tools::code_mode::require_compiled()?;
             }
             // A malformed `--deny-path` glob must never silently produce a no-op policy — see
             // `ToolPolicy::deny_path`'s doc comment for the fail-open this closes.
@@ -3358,6 +3365,9 @@ async fn run_task(
     {
         return Err("--name requires a non-empty value".into());
     }
+    if code_mode {
+        tools::code_mode::require_compiled()?;
+    }
     // A malformed `--deny-path` glob must never silently produce a no-op policy — see
     // `ToolPolicy::deny_path`'s doc comment for the fail-open this closes.
     if let Err(e) = ToolPolicy::validate_deny_path_patterns(&deny_path) {
@@ -3761,6 +3771,7 @@ async fn run_task(
         tools_exclude.as_deref(),
         no_tools,
     );
+    #[cfg(feature = "code-mode")]
     if code_mode {
         let nested =
             tools::code_mode::select_deferred_tools(&mcp_tools, nested_exclude, &deny_tool);

@@ -482,7 +482,10 @@ pub struct ToolConfig<'a> {
     /// passes its worktree here. See [`resolve_against`].
     pub root: PathBuf,
     /// When true, MCP tools are not advertised as `mcp__…` entries. They become the deferred catalog
-    /// inside the Code Mode [`code_mode::Execute`] tool (`tools.<server>.<method>`). Off by default.
+    /// inside the Code Mode `execute` tool (`tools.<server>.<method>`). Off by default. A no-op
+    /// unless this binary was built with `--features code-mode` — otherwise MCP stays advertised
+    /// (hiding the catalog behind an `execute` that does not exist would strand it). The CLI rejects
+    /// `--code-mode` on a density-default binary before this constructor runs.
     pub code_mode: bool,
     /// `--exclude-tools` names applied to the nested Code Mode catalog (so an excluded MCP tool is
     /// unreachable through `execute` as well as missing from the advertised set).
@@ -624,11 +627,20 @@ pub fn default_registry_with_config(cfg: &ToolConfig<'_>) -> ToolRegistry {
     // After every built-in, so an allow/deny filter (`apply_filter`) scopes MCP tools too, and so a
     // server can't shadow a built-in by name (the `mcp__<server>__<tool>` prefix already prevents that).
     // Code Mode defers that catalog: MCP tools stay callable from `execute` but are not advertised.
+    // Without `--features code-mode` there is no interpreter to hide them behind, so they stay direct.
+    #[cfg(feature = "code-mode")]
     if cfg.code_mode {
         let nested =
             code_mode::select_deferred_tools(cfg.mcp_tools, cfg.nested_exclude, cfg.nested_deny);
         reg.register(Arc::new(code_mode::Execute::new(nested)));
     } else {
+        for tool in cfg.mcp_tools {
+            reg.register(tool.clone());
+        }
+    }
+    #[cfg(not(feature = "code-mode"))]
+    {
+        let _ = cfg.code_mode;
         for tool in cfg.mcp_tools {
             reg.register(tool.clone());
         }
@@ -1091,6 +1103,29 @@ mod tests {
         assert_eq!(reg.len(), default_registry().len() + 1);
     }
 
+    #[cfg(not(feature = "code-mode"))]
+    #[test]
+    fn code_mode_without_the_runtime_does_not_hide_mcp() {
+        let mcp_tools: Vec<Arc<dyn Tool>> =
+            vec![Arc::new(FakeMcpTool("mcp__filesystem__read_file"))];
+        let deny: Vec<String> = Vec::new();
+        let reg = default_registry_with_config(&ToolConfig {
+            mcp_tools: &mcp_tools,
+            code_mode: true,
+            nested_deny: &deny,
+            ..ToolConfig::new()
+        });
+        assert!(
+            reg.get("execute").is_none(),
+            "default binaries must not register execute (QuickJS is not linked)"
+        );
+        assert!(
+            reg.get("mcp__filesystem__read_file").is_some(),
+            "without an interpreter, Code Mode must not strand the MCP catalog"
+        );
+    }
+
+    #[cfg(feature = "code-mode")]
     #[test]
     fn code_mode_defers_mcp_tools_behind_execute() {
         let mcp_tools: Vec<Arc<dyn Tool>> =
@@ -1121,6 +1156,7 @@ mod tests {
         assert!(reg.get("mcp__filesystem__read_file").is_none());
     }
 
+    #[cfg(feature = "code-mode")]
     #[test]
     fn code_mode_restore_keeps_execute_on_a_builtins_allow_list() {
         let mcp_tools: Vec<Arc<dyn Tool>> =

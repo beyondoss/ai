@@ -664,7 +664,8 @@ pub struct ServeConfig {
     /// like `tools`/`no_tools` — `build_agent` reapplies it every rebuild.
     pub sequential_tools: bool,
     /// Defer MCP tools behind the Code Mode `execute` tool. Fixed for the process; `build_tools`
-    /// reapplies it every rebuild.
+    /// reapplies it every rebuild. A no-op unless the binary was built with `--features code-mode`;
+    /// the CLI rejects `--code-mode` on a density-default binary before this is set.
     pub code_mode: bool,
     /// Block every call to a tool named here, even though it stays registered/visible to the model —
     /// unlike `exclude_tools` (the model never learns it exists), a denied call still surfaces as a
@@ -7165,6 +7166,7 @@ fn build_tools(
         cfg.exclude_tools.as_deref(),
         cfg.no_tools,
     );
+    #[cfg(feature = "code-mode")]
     if cfg.code_mode {
         let nested = crate::tools::code_mode::select_deferred_tools(
             &mcp_tools,

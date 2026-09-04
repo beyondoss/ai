@@ -47,6 +47,9 @@ jobs:
       # clippy `-D warnings` across all targets; `[lints.clippy]` denies the panic surface
       # (unwrap/expect/panic/todo/unimplemented), so a new `.unwrap()` in production code fails here.
       - run: mise check:rs
+      # Code Mode is a cargo feature so default/release binaries do not link QuickJS (agent VM
+      # density: idle RSS is resident `.text`). The feature-gated paths still have to clippy clean.
+      - run: cargo clippy -p beyond-ai-agent --all-targets --features code-mode -- -D warnings
   # Unit + integration tests via nextest: it runs the whole suite in parallel across the runner's
   # cores, and — crucially — its per-test `slow-timeout` (see .config/nextest.toml) TERMINATES and
   # *names* a test that hangs, so a deadlock fails the job in a couple of minutes with the culprit
@@ -86,6 +89,12 @@ jobs:
           - name: agent-lib
             filter: package(beyond-ai-agent) and (kind(lib) or kind(bin))
             extra: ""
+          # Same agent-lib filter with QuickJS linked. Default shards must not enable `code-mode`
+          # (that is the density-default graph); this shard is the only one that compiles the
+          # interpreter and runs the `execute` tests.
+          - name: agent-code-mode
+            filter: package(beyond-ai-agent) and (kind(lib) or kind(bin))
+            extra: "--features code-mode"
           - name: agent-serve
             filter: package(beyond-ai-agent) and kind(test) and binary(~serve)
             extra: ""
