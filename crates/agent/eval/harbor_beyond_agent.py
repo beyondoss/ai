@@ -21,7 +21,12 @@ import tempfile
 from pathlib import Path
 from typing import override
 
-from harbor.agents.installed.base import BaseInstalledAgent, CliFlag, with_prompt_template
+from harbor.agents.installed.base import (
+    BaseInstalledAgent,
+    CliFlag,
+    NonZeroAgentExitCodeError,
+    with_prompt_template,
+)
 from harbor.environments.base import BaseEnvironment
 from harbor.models.agent.context import AgentContext
 
@@ -176,7 +181,12 @@ class BeyondAiAgent(BaseInstalledAgent):
             f"< {shlex.quote(instruction_path)} "
             f"> {shlex.quote(jsonl)} 2> {shlex.quote(stderr_path)}"
         )
-        await self.exec_as_agent(environment, command=cmd, env=env)
+        try:
+            await self.exec_as_agent(environment, command=cmd, env=env)
+        except NonZeroAgentExitCodeError as exc:
+            # Leave the workspace for the verifier; a non-zero CLI exit is a
+            # scored miss (or a transport error), not a Harbor infra exception.
+            self.logger.warning("beyond-ai-agent exited non-zero: %s", exc)
 
     @override
     def populate_context_post_run(self, context: AgentContext) -> None:
