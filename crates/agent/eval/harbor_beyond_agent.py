@@ -80,9 +80,9 @@ def resolve_agent_binary() -> Path:
 
 
 def _cli_model_id(model_name: str | None) -> str:
-    """Harbor `-m openrouter/moonshotai/kimi-k3` → the id OpenRouter expects."""
+    """Harbor `-m openrouter/z-ai/glm-5.3` → the id OpenRouter expects."""
     if not model_name:
-        return "moonshotai/kimi-k3"
+        return "z-ai/glm-5.3"
     name = model_name.strip()
     for prefix in ("openrouter/", "openai/"):
         if name.startswith(prefix):

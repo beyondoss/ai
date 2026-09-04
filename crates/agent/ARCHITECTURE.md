@@ -905,17 +905,20 @@ The harness layers several capabilities over the bare tools + loop:
   `$` is one OpenRouter list-price card applied to both arms
   ([`eval/tabulate_harbor_job.py`](eval/tabulate_harbor_job.py), [`eval/token_price.py`](eval/token_price.py));
   do not compare Harbor's raw `cost_usd` (Pi copies billed `usage.cost`, beyond fills list).
-  Harbor `n_input_tokens` includes cache. Three arms, same tasks, same model (Kimi K3): `HARNESS=beyond` (density-default, no
+  Harbor `n_input_tokens` includes cache. Three arms, same tasks, same model
+  (**GLM 5.3** / `z-ai/glm-5.3` by default; `MODEL=moonshotai/kimi-k3` for the
+  published FrontierHarness freeze): `HARNESS=beyond` (density-default, no
   QuickJS), `HARNESS=beyond-code-mode` (`--features code-mode` binary + `--code-mode`), and
   `HARNESS=pi` (Harbor's Pi agent at FrontierHarness pin **0.84.2**). The shipped binary does
   not advertise `web` (a TB polyglot run burned most of its `$` fetching pages); `--tools web`
   opts it in. Do not disable thinking on the eval adapter to chase Pi: Harbor's Pi 0.84.2 pin
-  also defaults to medium (`DEFAULT_THINKING_LEVEL`); Kimi K3 always thinks, and omitting
-  `reasoning_effort` selects the provider default `max`. GLM-5.3 is the same always-on class
-  (`z-ai/glm-5.3` on OpenRouter: nested `reasoning:{effort}`, `medium`→`high`; `thinking.disabled`
-  is rejected). The polyglot `$` gap after dropping
-  `web` was a Kimi K3 catalog miss (treated as K2, provider-default `max`), not thinking-on vs
-  thinking-off. Iterate by changing one thing and re-running the expensive task
+  also defaults to medium (`DEFAULT_THINKING_LEVEL`). GLM-5.3 always thinks
+  (`z-ai/glm-5.3` on OpenRouter: nested `reasoning:{effort}`, `medium`→`high`;
+  `thinking.disabled` is rejected). Kimi K3 is the same always-on class; omitting
+  `reasoning_effort` selects the provider default `max`. A historical polyglot `$`
+  gap after dropping `web` was a Kimi K3 catalog miss (treated as K2, provider-default
+  `max`), not thinking-on vs thinking-off. Iterate by changing one thing and re-running
+  the expensive task
   (`TASKS=terminal-bench/polyglot-c-py`). TB has no MCP catalog, so beyond vs Code Mode on that
   slice is a regression/overhead check (empty
   `execute` still registers), not the MCP schema-token win. The Code Mode eval is
@@ -931,7 +934,7 @@ The harness layers several capabilities over the bare tools + loop:
   cargo test -p beyond-ai-agent --features code-mode --test code_mode_eval -- --nocapture
   # live MCP smoke (bills a real request; not an eval):
   OPENROUTER_API_KEY=… cargo test -p beyond-ai-agent --features code-mode --test code_mode_eval -- --ignored --nocapture
-  # FrontierHarness subset (Harbor + Docker; Kimi K3 via OpenRouter):
+  # Harbor TB subset (Docker; GLM 5.3 via OpenRouter; not the Kimi K3 FH board):
   cargo build -p beyond-ai-agent --release --target x86_64-unknown-linux-musl
   HARNESS=beyond JOBS_DIR=/tmp/beyond-frontier-beyond crates/agent/eval/run_frontier_subset.sh
   cargo build -p beyond-ai-agent --release --target x86_64-unknown-linux-musl --features code-mode

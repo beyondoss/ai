@@ -8,8 +8,8 @@ Harbor `n_input_tokens` includes cache; fresh input is `n_input - n_cache`.
 
 from __future__ import annotations
 
-# Kimi K3: FrontierHarness freeze (skills/frontierharness-eval/reference.md).
-# GLM 5.3: OpenRouter list ($1.40 / $0.26 cache / $4.40).
+# GLM 5.3: Harbor subset default (`z-ai/glm-5.3`; $1.40 / $0.26 cache / $4.40).
+# Kimi K3: published FrontierHarness freeze (skills/frontierharness-eval/reference.md).
 _KIMI_K3 = (3.00, 0.30, 15.00)
 _GLM_53 = (1.40, 0.26, 4.40)
 

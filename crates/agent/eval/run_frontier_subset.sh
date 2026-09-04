@@ -23,6 +23,11 @@
 #   HARNESS=beyond-mcp JOBS_DIR=/tmp/ast-flat crates/agent/eval/run_frontier_subset.sh
 #   HARNESS=beyond-mcp-code-mode JOBS_DIR=/tmp/ast-code crates/agent/eval/run_frontier_subset.sh
 #
+# Default model is OpenRouter `z-ai/glm-5.3`. The published FrontierHarness v1.0
+# freeze is Kimi K3 — override with MODEL=moonshotai/kimi-k3 when you want that
+# board, not this default. Do not pass --reasoning-effort off: GLM-5.3 rejects
+# thinking.disabled and always reasons.
+#
 # Compare arms on pass/fail and tokens. `$` is OpenRouter *list* rates applied to
 # both (`python3 crates/agent/eval/tabulate_harbor_job.py DIR…`). Do not compare
 # Harbor's reported `cost_usd` across beyond vs Pi: Pi copies billed usage.cost,
@@ -46,7 +51,7 @@ export PYTHONPATH="${ROOT}/crates/agent/eval${PYTHONPATH:+:${PYTHONPATH}}"
 : "${OPENROUTER_API_KEY:?set OPENROUTER_API_KEY}"
 
 JOBS_DIR="${JOBS_DIR:-/tmp/beyond-frontier-jobs}"
-MODEL="${MODEL:-moonshotai/kimi-k3}"
+MODEL="${MODEL:-z-ai/glm-5.3}"
 HARNESS="${HARNESS:-beyond}"
 DEFAULT_BIN="${ROOT}/target/x86_64-unknown-linux-musl/release/beyond-ai-agent"
 CODE_MODE_BIN="${BEYOND_AI_AGENT_CODE_MODE_BIN:-${ROOT}/target/x86_64-unknown-linux-musl/release/beyond-ai-agent-code-mode}"
