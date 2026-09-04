@@ -1,14 +1,15 @@
-//! Code Mode evals — verification that must pass before merging the feature.
+//! Code Mode integration smokes — not an eval (no hidden verifier, no $/pass).
 //!
-//! Two always-on evals against the real `beyond-ai-agent` binary (built with `--features code-mode`)
-//! and the real MCP fixture subprocess, with the model mocked:
+//! Harness evals live in [`eval/`](../eval/) (Harbor + FrontierHarness Terminal-Bench
+//! subset). These tests only check that `execute` is wired: mocked-model catalog A/B and
+//! a scripted `Promise.all` against the MCP fixture.
 //!
 //! 1. **Catalog tokens** — a fat MCP catalog advertised as flattened `mcp__…` tools vs deferred
 //!    behind `execute`. The win is schema bytes on the first model request.
 //! 2. **Composition** — a scripted `execute` program `Promise.all`s real MCP tools; the nested
 //!    calls must actually run and the results must reach the next model turn.
 //!
-//! A live Grok 4.6 / OpenRouter eval is `#[ignore]` and skips when `OPENROUTER_API_KEY` is unset:
+//! A live Grok 4.6 / OpenRouter smoke is `#[ignore]` and skips when `OPENROUTER_API_KEY` is unset:
 //!
 //! ```sh
 //! AI_PROVIDER=openrouter OPENROUTER_API_KEY=… \

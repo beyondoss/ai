@@ -888,16 +888,23 @@ The harness layers several capabilities over the bare tools + loop:
 
   This is the OpenCode/Cloudflare "code mode" pattern aimed at MCP-heavy context and multi-hop
   composition — measure `$/pass`, turns, schema tokens, **and RSS / `.text`** before making it a
-  default. Merge bar: [`tests/code_mode_eval.rs`](tests/code_mode_eval.rs) (catalog-byte A/B + a
-  scripted `execute` composition against the real MCP fixture; live Grok 4.6 / OpenRouter is
-  `#[ignore]`) and [`tests/code_mode_density.rs`](tests/code_mode_density.rs) (default binary must
-  not contain `JS_NewRuntime`).
+  default. [`tests/code_mode_eval.rs`](tests/code_mode_eval.rs) is a **smoke** (catalog-byte A/B + a
+  scripted `execute` composition against the MCP fixture; live Grok 4.6 / OpenRouter is
+  `#[ignore]`), not an eval. Density: [`tests/code_mode_density.rs`](tests/code_mode_density.rs)
+  (default binary must not contain `JS_NewRuntime`). Harness eval is Harbor on a FrontierHarness
+  v1.0 Terminal-Bench subset ([`eval/harbor_beyond_agent.py`](eval/harbor_beyond_agent.py)) —
+  verifier pass/fail, turns, tokens, `$`. TB has no MCP catalog, so that run scores the shipped
+  harness (no `--code-mode`, no QuickJS). Code Mode still needs an MCP-heavy verifier suite
+  before it can be a default.
 
   ```sh
   cargo test -p beyond-ai-agent --test code_mode_density
   cargo test -p beyond-ai-agent --features code-mode --test code_mode_eval -- --nocapture
-  # live (bills a real request):
+  # live MCP smoke (bills a real request; not an eval):
   OPENROUTER_API_KEY=… cargo test -p beyond-ai-agent --features code-mode --test code_mode_eval -- --ignored --nocapture
+  # FrontierHarness subset (Harbor + Docker; Kimi K3 via OpenRouter):
+  cargo build -p beyond-ai-agent --release --target x86_64-unknown-linux-musl
+  crates/agent/eval/run_frontier_subset.sh
   ```
 - **Multimodal** — `prompt` accepts `images: [{media_type, data}]` (base64), built into a multimodal
   user turn. `read` on an oversized image file downscales/re-encodes it (Lanczos3, PNG-then-JPEG
