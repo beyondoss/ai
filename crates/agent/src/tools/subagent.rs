@@ -99,6 +99,11 @@ pub struct ChildToolConfig {
     /// The parent's command runner, inherited for the same reason as `fs_backend`: a child whose
     /// `bash` runs on the host while its parent's runs in a sandbox would *be* the escape.
     pub command_runner: Option<std::sync::Arc<dyn crate::tools::exec::CommandRunner>>,
+    /// Inherit the parent's Code Mode so a child doesn't re-advertise the MCP catalog the parent
+    /// deferred.
+    pub code_mode: bool,
+    /// The parent's `--exclude-tools` list, applied to the child's nested Code Mode catalog.
+    pub exclude_tools: Vec<String>,
 }
 
 /// Everything a [`Subagent`] needs to build and run a child. Shared by `Arc` across every depth level,
@@ -933,6 +938,9 @@ impl Subagent {
             bash_command_prefix: self.ctx.tool_cfg.bash_command_prefix.as_deref(),
             image_auto_resize: self.ctx.tool_cfg.image_auto_resize,
             root: root.to_path_buf(),
+            code_mode: self.ctx.tool_cfg.code_mode,
+            nested_exclude: &self.ctx.tool_cfg.exclude_tools,
+            nested_deny: &self.ctx.deny_tool,
             mcp_tools: &self.ctx.mcp_tools,
             web_allow_private: self.ctx.tool_cfg.web_allow_private,
             web_allow_hosts: &self.ctx.tool_cfg.web_allow_hosts,

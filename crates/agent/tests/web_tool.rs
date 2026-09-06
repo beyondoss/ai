@@ -85,6 +85,8 @@ fn drive(fixture_response: String, args: Value) -> (Vec<Value>, Vec<String>) {
             "4",
             "--no-session-persistence",
             "--json",
+            "--tools",
+            "web",
             "--web-allow-host",
             "127.0.0.1",
         ])
@@ -219,6 +221,8 @@ fn a_blocked_url_is_refused_end_to_end() {
             "4",
             "--no-session-persistence",
             "--json",
+            "--tools",
+            "web",
             "--web-allow-host",
             "127.0.0.1",
         ])
@@ -242,7 +246,7 @@ fn a_blocked_url_is_refused_end_to_end() {
 }
 
 #[test]
-fn the_tool_and_its_schema_are_advertised_by_default() {
+fn the_tool_and_its_schema_are_opt_in_not_advertised_by_default() {
     let (gw_base, bodies) = spawn_model_server(vec![turn_text("nothing to fetch")]);
     let dir = tempfile::tempdir().unwrap();
     run_cmd(BIN)
@@ -263,8 +267,33 @@ fn the_tool_and_its_schema_are_advertised_by_default() {
     let body = &bodies.lock().unwrap()[0];
     let tools = common::advertised_tools(body);
     assert!(
+        !tools.iter().any(|t| t == "web"),
+        "web must not be advertised by default: {tools:?}"
+    );
+
+    let (gw_base, bodies) = spawn_model_server(vec![turn_text("nothing to fetch")]);
+    run_cmd(BIN)
+        .args([
+            "run",
+            "hi",
+            "--gateway-url",
+            &gw_base,
+            "--key",
+            "bai_v1.test",
+            "--model",
+            "claude-test",
+            "--no-session-persistence",
+            "--tools",
+            "web",
+        ])
+        .current_dir(dir.path())
+        .output()
+        .expect("spawn binary");
+    let body = &bodies.lock().unwrap()[0];
+    let tools = common::advertised_tools(body);
+    assert!(
         tools.iter().any(|t| t == "web"),
-        "web must be advertised: {tools:?}"
+        "web must be advertised when --tools names it: {tools:?}"
     );
 }
 

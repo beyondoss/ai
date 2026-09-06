@@ -346,17 +346,27 @@ builder on `Agent` or `ModelRequest`, and each is exercised by unit tests):
   families' real reasoning-toggle shape to emit — `Standard`'s bare `reasoning_effort` string (o-series,
   gpt-5, xAI, Groq, Cerebras, Mistral, and anything unrecognized), or a third-party shape (`DeepSeek`'s/
   `Zai`'s nested `thinking:{}` toggle, `Together`'s/`OpenRouter`'s nested `reasoning:{}` object) —
-  mirroring pi's own `compat.thinkingFormat` tag. Several of these families (Kimi; GLM below 5.2) have a
-  real on/off toggle but no graduated effort vocabulary at all (`reasoning_effort: false`);
+  mirroring pi's own `compat.thinkingFormat` tag. Several of these families (Kimi K2; GLM below 5.2) have a
+  real on/off toggle but no graduated effort vocabulary at all (`reasoning_effort: false`). Kimi K3 is
+  the break: always-on thinking, a real `low`/`high`/`max` effort vocabulary (`xhigh` remaps to `"max"`),
+  OpenAI `reasoning_effort` on a bare `kimi-k3` id and OpenRouter's nested `reasoning:{effort}` on a
+  vendor-slug id such as `moonshotai/kimi-k3`. Putting K3 in the K2 bucket omits effort and the
+  provider defaults to `max` — same session thinking level as Pi, ~40× the reasoning tokens.
+  GLM-5.3 is the same class of miss: always-on (`thinking.disabled` is rejected), `low`/`high`/`max`
+  (portable `medium` → `"high"`, `xhigh` → `"max"`), Z.ai thinking toggle on a bare `glm-5.3` id and
+  OpenRouter nested `reasoning:{effort}` on `z-ai/glm-5.3`. It must not hit `nvidia_caps` (that table
+  owns `z-ai/glm-5.2` and strips reasoning).
   `models::has_reasoning_mechanism` (consulted by
   `available_thinking_levels`/`clamp_thinking_level`/`thinking_for_level`) treats
   `openai_reasoning_format != Standard` as its own "has a mechanism" signal so such a model isn't
   reported as `Off`-locked. Once a level clears `clamp_reasoning_effort`, `models::reasoning_wire_override(model,
   effort)` gets one more say over _how it's spelled_ on the wire before `dialect::openai`'s
   `apply_reasoning_wire` falls back to the effort's own literal name — mirroring pi's per-model
-  `thinkingLevelMap` remaps (DeepSeek's `xhigh` → `"max"`; GLM-5.2's `low`/`medium`/`high` → `"high"`
-  and `xhigh` → `"max"`; Groq's one qwen id's `high` → `"default"`; every Mistral reasoning id's any
-  active level → `"high"`, matching its real API's bare `"none"|"high"` vocabulary). Deliberately a
+  `thinkingLevelMap` remaps (DeepSeek's `xhigh` → `"max"`; Kimi K3's `xhigh` → `"max"`; GLM-5.3's
+  `medium` → `"high"` and `xhigh` → `"max"`; GLM-5.2's `low`/`medium`/`high` → `"high"` and `xhigh` →
+  `"max"`; Groq's one qwen id's `high` → `"default"`;
+  every Mistral reasoning id's any active level → `"high"`, matching its real API's bare `"none"|"high"`
+  vocabulary). Deliberately a
   standalone lookup, not a `ModelCaps` field — `ModelCaps::adaptive_xhigh_effort_wire` already covers
   the analogous single-value need on the Anthropic adaptive shape, but a per-model _map_ would need
   touching every one of this table's ~25 `ModelCaps` struct-literal construction sites for a table only

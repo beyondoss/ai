@@ -57,9 +57,9 @@ pub enum OpenAiReasoningFormat {
     /// `reasoning_effort` string.
     DeepSeek,
     /// Z.ai/GLM: `thinking: {"type": "enabled", "clear_thinking": false}` / `{"type": "disabled"}`,
-    /// sent unconditionally (unlike `DeepSeek`, pi never gates this on a disableable check), plus —
-    /// only when [`ModelCaps::reasoning_effort`] is also `true` (GLM-5.2+ only) — a sibling top-level
-    /// `reasoning_effort` string.
+    /// with `"disabled"` only when [`ModelCaps::reasoning_disableable`] (GLM-5.3 cannot turn thinking
+    /// off), plus — only when [`ModelCaps::reasoning_effort`] is also `true` (GLM-5.2+ only) — a
+    /// sibling top-level `reasoning_effort` string.
     Zai,
     /// Together: a nested `reasoning: {"enabled": bool}`, sent unconditionally, plus — only when
     /// [`ModelCaps::reasoning_effort`] is also `true` — a sibling top-level `reasoning_effort` string.
@@ -1426,15 +1426,27 @@ fn capabilities_impl_lc(m: &str) -> ModelCaps {
 
     // Z.ai/GLM: `compat.thinkingFormat: "zai"` — a `thinking:{enabled/disabled}` toggle sent
     // unconditionally, with a `reasoning_effort` string only from GLM-5.2 onward
-    // (`supportsReasoningEffort` is `false` on every earlier id in pi's catalogue). `glm-5v*` is the
+    // (`supportsReasoningEffort` is `false` on every earlier id in pi's catalogue). GLM-5.3 is
+    // always-on (no `thinking.disabled`; low/high/max, default max). `glm-5v*` is the
     // one vision-capable id; every other current id is text-only. Also matches a vendor-slug id (e.g.
     // Together's/HuggingFace's `"zai-org/GLM-5.2"`) via `family_id` — see its own doc comment above.
     if m.starts_with("glm") || family_id.starts_with("glm") {
         // Keyed on whether `m` is slug-shaped at all (not on which disjunct above matched) — same
         // reasoning as the MiniMax branch below, applied uniformly even though no current GLM org
         // slug happens to collide with the literal prefix "glm" the way MiniMax's does.
-        let g = if m.contains('/') { family_id } else { m };
-        let (context_window, max_output, reasoning_effort) = if g.starts_with("glm-5.2") {
+        let is_vendor_slug = m.contains('/');
+        let g = if is_vendor_slug { family_id } else { m };
+        let (context_window, max_output, reasoning_effort) = if g.starts_with("glm-5.3") {
+            // Always-on reasoning. OpenRouter's `z-ai/glm-5.3` reports 1_048_576 / 131_072; native
+            // Z.ai lists 1M context / 128k output — keep the OpenRouter ceiling on that exact slug
+            // (do NOT add it to `nvidia_caps`: that table strips reasoning, and `z-ai/glm-5.2` is
+            // the only GLM string NVIDIA also hosts).
+            if m == "z-ai/glm-5.3" {
+                (1_048_576, 131_072, true)
+            } else {
+                (1_000_000, 131_072, true)
+            }
+        } else if g.starts_with("glm-5.2") {
             // pi-parity Task #15: Together's and HuggingFace's own vendor-slug "zai-org/GLM-5.2"
             // (`together.models.ts:363`, `huggingface.models.ts:853`) both report a real context of
             // 262144, far smaller than NVIDIA's/native's own 1,000,000 this branch otherwise returns —
@@ -1508,7 +1520,8 @@ fn capabilities_impl_lc(m: &str) -> ModelCaps {
             supports_temperature: true,
             thinking: ThinkingShape::None,
             reasoning_effort,
-            reasoning_disableable: true,
+            // GLM-5.3 rejects `thinking.type: disabled`. Earlier ids still take an explicit off.
+            reasoning_disableable: !g.starts_with("glm-5.3"),
             supports_eager_tool_streaming: false,
             // Every current GLM id sets pi's `compat.zaiToolStream: true` except "glm-4.5-air", the
             // one id both `zai.models.ts` and `zai-coding-cn.models.ts` leave it off for (see
@@ -1518,27 +1531,36 @@ fn capabilities_impl_lc(m: &str) -> ModelCaps {
             // glm-5.2+ nulls "minimal" out of its `thinkingLevelMap` (excluded entirely, not just
             // remapped) — every earlier GLM id has no reasoning vocabulary at all, so this floor is
             // unread for them regardless.
-            min_reasoning_effort: if g.starts_with("glm-5.2") {
+            min_reasoning_effort: if g.starts_with("glm-5.2") || g.starts_with("glm-5.3") {
                 RE::Low
             } else {
                 RE::Minimal
             },
             supports_xhigh_reasoning: reasoning_effort,
             adaptive_xhigh_effort_wire: "max",
-            openai_reasoning_format: OpenAiReasoningFormat::Zai,
+            // OpenRouter vendor-slug `z-ai/glm-5.3` (and any other slug) speaks nested
+            // `reasoning:{effort}` like Kimi K3; native/bare ids keep the Z.ai thinking toggle.
+            openai_reasoning_format: if g.starts_with("glm-5.3") && is_vendor_slug {
+                OpenAiReasoningFormat::OpenRouter
+            } else {
+                OpenAiReasoningFormat::Zai
+            },
             supports_cache_control_on_tools: true,
         };
     }
 
-    // Moonshot/Kimi: pi tags this family with the identical `"deepseek"` thinkingFormat (the same
-    // `thinking:{enabled/disabled}` toggle), but `supportsReasoningEffort` is `false` on every current
-    // id — no `reasoning_effort` string ever, just the toggle. Only the non-"thinking" ids
-    // (0711/0905/turbo-preview previews) have `reasoning: false` in pi's catalogue, so they get
-    // `OpenAiReasoningFormat::Standard` instead (with `reasoning_effort: false`, that emits nothing —
-    // matching pi's own `model.reasoning` gate). `kimi-k2.7-code*` uniquely has no "off" wire value
-    // (`thinkingLevelMap: {"off": null}`); every other reasoning-capable id can be disabled. Also
-    // matches a vendor-slug id (e.g. Together's/HuggingFace's `"moonshotai/Kimi-K2.6"`) via
-    // `family_id` — see its own doc comment above.
+    // Moonshot/Kimi: K2 ids are tagged with the identical `"deepseek"` thinkingFormat (the same
+    // `thinking:{enabled/disabled}` toggle) and `supportsReasoningEffort: false` — no
+    // `reasoning_effort` string, just the toggle. Kimi K3 is the exception (pi 0.81+): always-on
+    // thinking, a real `low`/`high`/`max` effort vocabulary, OpenAI `reasoning_effort` on native
+    // Moonshot and OpenRouter's nested `reasoning:{effort}` on vendor-slug ids. Only the
+    // non-"thinking" K2 ids (0711/0905/turbo-preview previews) have `reasoning: false` in pi's
+    // catalogue, so they get `OpenAiReasoningFormat::Standard` instead (with `reasoning_effort:
+    // false`, that emits nothing — matching pi's own `model.reasoning` gate). `kimi-k2.7-code*`
+    // uniquely has no "off" wire value (`thinkingLevelMap: {"off": null}`); every other
+    // reasoning-capable K2 id can be disabled. Also matches a vendor-slug id (e.g.
+    // Together's/HuggingFace's `"moonshotai/Kimi-K2.6"`) via `family_id` — see its own doc comment
+    // above.
     //
     // KNOWN COLLISION (documented, not fixed — no id-level signal exists to disambiguate): GitHub
     // Copilot hosts its own `"kimi-k2.7-code"` (`github-copilot.models.ts`) with real numbers
@@ -1556,6 +1578,36 @@ fn capabilities_impl_lc(m: &str) -> ModelCaps {
         // Keyed on whether `m` is slug-shaped at all — same reasoning as the MiniMax/GLM branches.
         let is_vendor_slug = m.contains('/');
         let k = if is_vendor_slug { family_id } else { m };
+        // Kimi K3 is not K2. Treating it as the toggle-only bucket below sends DeepSeek
+        // `thinking:{type:enabled}` and omits effort, so the provider's own default (`max`) fires.
+        // Pi 0.84.2's generate-models.ts: native Moonshot sets `thinkingFormat: "openai"` +
+        // `supportsReasoningEffort`; OpenRouter `moonshotai/kimi-k3` keeps the catalogue's OpenRouter
+        // `reasoning:{effort}` shape and pins `maxTokens` to 131072. Thinking cannot be disabled.
+        if k.starts_with("kimi-k3") {
+            return ModelCaps {
+                context_window: 1_048_576,
+                max_output: 131_072,
+                max_tokens_field: MaxTokensField::MaxTokens,
+                supports_long_cache: true,
+                supports_vision: true,
+                supports_temperature: true,
+                thinking: ThinkingShape::None,
+                reasoning_effort: true,
+                reasoning_disableable: false,
+                supports_eager_tool_streaming: false,
+                supports_tool_stream: false,
+                api: ApiKind::ChatCompletions,
+                min_reasoning_effort: RE::Low,
+                supports_xhigh_reasoning: true,
+                adaptive_xhigh_effort_wire: "max",
+                openai_reasoning_format: if is_vendor_slug {
+                    OpenAiReasoningFormat::OpenRouter
+                } else {
+                    OpenAiReasoningFormat::Standard
+                },
+                supports_cache_control_on_tools: true,
+            };
+        }
         // Kimi-Coding (`api.kimi.com/coding`, pi's `kimi-coding.models.ts`) hosts three ids with a much
         // smaller real `maxTokens` (32_768) than this bucket's generic 262_144 default: its own "k2p7"
         // alias and "kimi-for-coding" (neither collides with any moonshotai-native id at all), plus
@@ -2797,6 +2849,21 @@ pub fn reasoning_wire_override(
     // "max".
     if m.starts_with("deepseek") || family_id.starts_with("deepseek") {
         return (effort == RE::XHigh).then_some("max");
+    }
+    // Kimi K3: native vocabulary is low/high/max. Portable `xhigh` is the `max` rung (pi's
+    // thinkingLevelMap). `medium` is left as "medium" so an OpenRouter vendor-slug id can send
+    // OpenRouter's own effort ladder unchanged (Harbor's Pi 0.84.2 path).
+    if m.starts_with("kimi-k3") || family_id.starts_with("kimi-k3") {
+        return (effort == RE::XHigh).then_some("max");
+    }
+    // GLM-5.3: native vocabulary is low/high/max (no medium). Portable `medium` is the `high`
+    // rung; `xhigh` is `max`. `low`/`high` keep their own names.
+    if m.starts_with("glm-5.3") || family_id.starts_with("glm-5.3") {
+        return match effort {
+            RE::Medium => Some("high"),
+            RE::XHigh => Some("max"),
+            RE::Low | RE::High | RE::Minimal => None,
+        };
     }
     // GLM-5.2+: low/medium/high all collapse to the literal "high", and xhigh remaps to "max". Every
     // earlier GLM id has no reasoning_effort vocabulary at all (`caps.reasoning_effort == false`), so
@@ -4074,14 +4141,13 @@ mod tests {
 
     #[test]
     fn kimi_thinking_models_have_a_mechanism_despite_no_reasoning_effort_string() {
-        // Moonshot/Kimi: `supportsReasoningEffort: false` on every id (no graduated effort vocabulary
-        // at all), but the "thinking"-suffixed ids still have a real client-steerable on/off toggle
-        // (`OpenAiReasoningFormat::DeepSeek`, the same shape pi tags them with). Regression guard for
-        // `has_reasoning_mechanism`: without its third arm, this model would incorrectly report having
-        // no mechanism at all (`available_thinking_levels` collapsing to `[Off]`) even though
-        // `--thinking high` genuinely turns its reasoning on.
+        // Moonshot/Kimi K2: `supportsReasoningEffort: false` (no graduated effort vocabulary),
+        // but the "thinking"-suffixed ids still have a real client-steerable on/off toggle
+        // (`OpenAiReasoningFormat::DeepSeek`, the same shape pi tags them with). K3 is not this
+        // bucket (see asserts below). Regression guard for `has_reasoning_mechanism`: without its
+        // third arm, this model would incorrectly report having no mechanism at all.
         let caps = capabilities("kimi-k2-thinking");
-        assert!(!caps.reasoning_effort, "Kimi has no effort vocabulary");
+        assert!(!caps.reasoning_effort, "Kimi K2 has no effort vocabulary");
         assert_eq!(
             caps.openai_reasoning_format,
             OpenAiReasoningFormat::DeepSeek
@@ -4095,6 +4161,21 @@ mod tests {
         // even though the model never gets a graduated wire string for it.
         let (_, effort) = thinking_for_level(&caps, ThinkingLevel::Medium);
         assert!(effort.is_some(), "the toggle gate must be populated");
+
+        // Kimi K3 is not this toggle-only bucket: real effort vocabulary, always-on thinking.
+        let k3 = capabilities("kimi-k3");
+        assert!(k3.reasoning_effort);
+        assert!(!k3.reasoning_disableable);
+        assert_eq!(k3.openai_reasoning_format, OpenAiReasoningFormat::Standard);
+        assert_eq!(k3.max_output, 131_072);
+        let k3_or = capabilities("moonshotai/kimi-k3");
+        assert!(k3_or.reasoning_effort);
+        assert!(!k3_or.reasoning_disableable);
+        assert_eq!(
+            k3_or.openai_reasoning_format,
+            OpenAiReasoningFormat::OpenRouter
+        );
+        assert_eq!(k3_or.max_output, 131_072);
 
         // The non-"thinking" preview ids (reasoning: false in pi's catalogue) get no mechanism at all.
         let non_reasoning = capabilities("kimi-k2-0711-preview");
@@ -4140,6 +4221,36 @@ mod tests {
         // glm-5v-turbo is the one vision-capable id in this family.
         assert!(capabilities("glm-5v-turbo").supports_vision);
         assert!(!capabilities("glm-4.7").supports_vision);
+    }
+
+    #[test]
+    fn glm_5_3_is_always_on_effort_and_openrouter_slug_is_not_nvidia_stripped() {
+        // GLM-5.3 rejects thinking.disabled. Do not treat it as pre-5.2 (toggle only) or as
+        // z-ai/glm-5.2 (nvidia_caps strips reasoning).
+        let native = capabilities("glm-5.3");
+        assert!(native.reasoning_effort);
+        assert!(!native.reasoning_disableable);
+        assert_eq!(
+            native.min_reasoning_effort,
+            crate::transport::ReasoningEffort::Low
+        );
+        assert_eq!(native.openai_reasoning_format, OpenAiReasoningFormat::Zai);
+        assert_eq!(native.context_window, 1_000_000);
+        assert_eq!(native.max_output, 131_072);
+        assert_ne!(
+            clamp_thinking_level(&native, ThinkingLevel::Off),
+            ThinkingLevel::Off
+        );
+
+        let or = capabilities("z-ai/glm-5.3");
+        assert!(or.reasoning_effort, "must not hit nvidia_caps");
+        assert!(!or.reasoning_disableable);
+        assert_eq!(
+            or.openai_reasoning_format,
+            OpenAiReasoningFormat::OpenRouter
+        );
+        assert_eq!(or.context_window, 1_048_576);
+        assert_eq!(or.max_output, 131_072);
     }
 
     #[test]
@@ -6375,6 +6486,18 @@ mod tests {
     // ---- Per-model reasoning-effort wire remap (pi-parity pass 15) ----
 
     #[test]
+    fn reasoning_wire_override_remaps_kimi_k3_xhigh_to_max() {
+        use crate::transport::ReasoningEffort as RE;
+        assert_eq!(reasoning_wire_override("kimi-k3", RE::XHigh), Some("max"));
+        assert_eq!(
+            reasoning_wire_override("moonshotai/kimi-k3", RE::XHigh),
+            Some("max")
+        );
+        assert_eq!(reasoning_wire_override("kimi-k3", RE::Medium), None);
+        assert_eq!(reasoning_wire_override("kimi-k2-thinking", RE::XHigh), None);
+    }
+
+    #[test]
     fn reasoning_wire_override_remaps_deepseek_xhigh_to_max() {
         use crate::transport::ReasoningEffort as RE;
         assert_eq!(
@@ -6400,6 +6523,20 @@ mod tests {
         // function would ever see it in practice; confirm that floor directly.
         assert_eq!(capabilities("glm-5.2").min_reasoning_effort, RE::Low);
         assert_eq!(capabilities("glm-4.7").min_reasoning_effort, RE::Minimal);
+    }
+
+    #[test]
+    fn reasoning_wire_override_remaps_glm_5_3_medium_and_xhigh_only() {
+        use crate::transport::ReasoningEffort as RE;
+        // Native vocabulary is low/high/max — unlike 5.2, low is a real rung.
+        assert_eq!(reasoning_wire_override("glm-5.3", RE::Low), None);
+        assert_eq!(reasoning_wire_override("glm-5.3", RE::High), None);
+        assert_eq!(reasoning_wire_override("glm-5.3", RE::Medium), Some("high"));
+        assert_eq!(reasoning_wire_override("glm-5.3", RE::XHigh), Some("max"));
+        assert_eq!(
+            reasoning_wire_override("z-ai/glm-5.3", RE::Medium),
+            Some("high")
+        );
     }
 
     #[test]

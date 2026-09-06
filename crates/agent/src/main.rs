@@ -479,6 +479,12 @@ enum Command {
         /// `serve`'s identical flag.
         #[usage(long)]
         sequential_tools: bool,
+        /// Defer MCP tools behind a confined JS `execute` tool (OpenCode-style Code Mode). Built-in
+        /// coding tools stay direct. Off by default. Requires a binary built with `--features
+        /// code-mode` (omitted from default/release so every agent VM does not link QuickJS).
+        /// `serve`'s identical flag.
+        #[usage(long, env = "AI_AGENT_CODE_MODE")]
+        code_mode: bool,
         /// Block every call to this tool (comma-separated, repeatable), even though it stays visible
         /// and registered — unlike `--exclude-tools` (the model never sees an excluded tool exists at
         /// all), a denied call still surfaces to the model as a normal error `tool_result` explaining
@@ -922,6 +928,12 @@ enum Command {
         /// flag.
         #[usage(long)]
         sequential_tools: bool,
+        /// Defer MCP tools behind a confined JS `execute` tool (OpenCode-style Code Mode). Built-in
+        /// coding tools stay direct. Off by default. Requires a binary built with `--features
+        /// code-mode` (omitted from default/release so every agent VM does not link QuickJS).
+        /// `run`'s identical flag.
+        #[usage(long, env = "AI_AGENT_CODE_MODE")]
+        code_mode: bool,
         /// Block every call to this tool (comma-separated, repeatable), even though it stays visible
         /// and registered — unlike `--exclude-tools`, a denied call still surfaces to the model as a
         /// normal error `tool_result` explaining it was blocked by policy, rather than the tool being
@@ -1592,6 +1604,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             exclude_tools,
             no_tools,
             sequential_tools,
+            code_mode,
             deny_tool,
             deny_bash_pattern,
             deny_path,
@@ -1659,6 +1672,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 exclude_tools,
                 no_tools,
                 sequential_tools,
+                code_mode,
                 deny_tool,
                 deny_bash_pattern,
                 deny_path,
@@ -1740,6 +1754,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             exclude_tools,
             no_tools,
             sequential_tools,
+            code_mode,
             deny_tool,
             deny_bash_pattern,
             deny_path,
@@ -1759,6 +1774,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 && n.trim().is_empty()
             {
                 return Err("--name requires a non-empty value".into());
+            }
+            if code_mode {
+                tools::code_mode::require_compiled()?;
             }
             // A malformed `--deny-path` glob must never silently produce a no-op policy — see
             // `ToolPolicy::deny_path`'s doc comment for the fail-open this closes.
@@ -2057,6 +2075,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 // hasn't happened yet.
                 agents: Vec::new(),
                 sequential_tools,
+                code_mode,
                 deny_tool,
                 deny_bash_pattern,
                 deny_path,
@@ -2138,7 +2157,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             std::process::exit(shutdown_cause.map(serve::Signal::exit_code).unwrap_or(0));
         }
         Command::Tools => {
-            let reg = tools::default_registry();
+            let mut reg = tools::default_registry();
+            tools::apply_filter(&mut reg, None, None, false);
             println!("{} tools:\n", reg.len());
             println!("{}", serde_json::to_string_pretty(&reg.definitions())?);
         }
@@ -3312,6 +3332,7 @@ async fn run_task(
     tools_exclude: Option<Vec<String>>,
     no_tools: bool,
     sequential_tools: bool,
+    code_mode: bool,
     deny_tool: Vec<String>,
     deny_bash_pattern: Vec<String>,
     deny_path: Vec<String>,
@@ -3344,6 +3365,9 @@ async fn run_task(
         && n.trim().is_empty()
     {
         return Err("--name requires a non-empty value".into());
+    }
+    if code_mode {
+        tools::code_mode::require_compiled()?;
     }
     // A malformed `--deny-path` glob must never silently produce a no-op policy — see
     // `ToolPolicy::deny_path`'s doc comment for the fail-open this closes.
@@ -3724,6 +3748,8 @@ async fn run_task(
         }
         None => None,
     };
+    let empty: &[String] = &[];
+    let nested_exclude = tools_exclude.as_deref().unwrap_or(empty);
     let mut registry = tools::default_registry_with_config(&tools::ToolConfig {
         bash_timeout_ms,
         bash_shell_path: bash_shell_path.as_deref(),
@@ -3732,6 +3758,9 @@ async fn run_task(
         web_allow_hosts: &web_allow_host,
         web_timeout_ms,
         image_auto_resize,
+        code_mode,
+        nested_exclude,
+        nested_deny: &deny_tool,
         mcp_tools: &mcp_tools,
         fs_backend: fs_backend.clone(),
         command_runner: exec_runner.clone(),
@@ -3743,6 +3772,17 @@ async fn run_task(
         tools_exclude.as_deref(),
         no_tools,
     );
+    #[cfg(feature = "code-mode")]
+    if code_mode {
+        let nested =
+            tools::code_mode::select_deferred_tools(&mcp_tools, nested_exclude, &deny_tool);
+        tools::code_mode::restore_execute(
+            &mut registry,
+            std::sync::Arc::new(tools::code_mode::Execute::new(nested)),
+            tools_exclude.as_deref(),
+            no_tools,
+        );
+    }
 
     // `--session`/`--continue` persist this run (and load prior history to continue it) exactly like
     // `serve`'s own repo/file modes. pi-parity fix: neither given previously kept `run` in-memory-only —
@@ -4015,6 +4055,8 @@ async fn run_task(
                 // sandbox escape: the model could reach the host simply by delegating to a subagent.
                 fs_backend: fs_backend.clone(),
                 command_runner: exec_runner.clone(),
+                code_mode,
+                exclude_tools: tools_exclude.clone().unwrap_or_default(),
             },
             cwd: cwd.clone(),
             project_trusted,
