@@ -934,6 +934,11 @@ impl Subagent {
             // further away than that. A child that needs a decision should return
             // and let the parent ask.
             ask_user: false,
+            // A subagent has no conversation of its own: its parent is the only
+            // thing reading it, and a message posted to somebody's channel from
+            // inside one would arrive with no context about which piece of work
+            // it came from.
+            say: false,
         });
         let allow = self.effective_tools(def);
         super::apply_filter(&mut registry, Some(&allow), None, false);

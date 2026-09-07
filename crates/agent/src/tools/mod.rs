@@ -20,6 +20,7 @@ pub mod mcp;
 pub mod memory;
 pub mod output;
 pub mod read;
+pub mod say;
 pub mod structured_output;
 pub mod subagent;
 pub mod todo;
@@ -430,6 +431,16 @@ pub struct ToolConfig<'a> {
     /// Off by default because a host with nobody to ask must not offer it: the
     /// model would end its turn waiting for an answer that can never arrive.
     pub ask_user: bool,
+    /// Whether to offer `say`, which posts a message to the person mid-run.
+    ///
+    /// Gated on the same thing as `ask_user` and for the same reason: a host
+    /// with nobody watching has nowhere to put the message, and a tool that
+    /// reports success into the void is worse than not having it — the model
+    /// leaves the message out of its summary too, and nobody ever hears it.
+    ///
+    /// Unlike `ask_user` this does not end the turn: it is something worth
+    /// knowing, not something the run is waiting on.
+    pub say: bool,
     /// `--web-allow-private`: let the `web` tool reach loopback/private/link-local addresses. Off by
     /// default — the tool refuses them to prevent SSRF, since it fetches URLs the model chose. See
     /// [`web`].
@@ -513,6 +524,10 @@ pub fn default_registry_with_config(cfg: &ToolConfig<'_>) -> ToolRegistry {
     // going to deliver.
     if cfg.ask_user {
         reg.register(Arc::new(ask_user::AskUser::new()));
+    }
+    // Same gate, same reason: somewhere for the message to land.
+    if cfg.say {
+        reg.register(Arc::new(say::Say::new()));
     }
     // Owns its own reqwest client (SSRF resolver, no default redirects) — see `web`'s module doc. The
     // egress policy is fixed at build time from `cfg`; a `set_model` rebuild reconstructs it, which is
