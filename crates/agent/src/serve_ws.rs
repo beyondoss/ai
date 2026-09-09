@@ -213,11 +213,13 @@ impl Supervisor {
                 let running = Arc::new(AtomicBool::new(false));
                 let session_running = running.clone();
                 // `serve_session`'s event sink is a `Box<dyn FnMut>` (not `Send`), so its future
-                // can't be `tokio::spawn`ed onto the multi-threaded accept runtime — the stdio path
-                // only ever `.await`s it inline. Give each session its own thread with a
-                // current-thread runtime instead; the `mpsc` channels bridging it to the accept
-                // runtime are runtime-agnostic. Sessions are few (one per connected client), so a
-                // thread apiece is fine.
+                // can't be `tokio::spawn`ed onto the process accept runtime — the stdio path only
+                // ever `.await`s it inline. Give each session its own thread with a current-thread
+                // runtime instead; the `mpsc` channels bridging it to the accept runtime are
+                // runtime-agnostic. Sessions are few (one per connected client), so a thread
+                // apiece is fine. The process runtime itself is also `current_thread` by default
+                // (see `main.rs::build_runtime`): accept/WS-I/O is cooperative, and extra
+                // work-stealing workers would only cost RSS.
                 let join = std::thread::spawn(move || {
                     let rt = match tokio::runtime::Builder::new_current_thread()
                         .enable_all()
