@@ -15,6 +15,7 @@ pub mod auth_store;
 pub mod exec_endpoint;
 pub mod export;
 pub mod gateway_credential;
+pub mod lifecycle;
 pub mod mcp_auth_store;
 pub mod memory;
 pub mod oauth;
