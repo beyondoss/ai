@@ -98,7 +98,8 @@ impl Tool for Edit {
     /// file read onward goes to `spawn_blocking`.
     ///
     /// This tool is the one that genuinely needed it. `serve_ws` runs each session on its own
-    /// `current_thread` runtime, so work done inline here pins that session's whole executor — its event
+    /// `current_thread` runtime (and, in `serve_ws`, a worker of the daemon's *shared* runtime), so
+    /// work done inline here pins that executor — the session's event
     /// pump *and* its `abort`/`steer` command loop — for the duration. `read`/`grep`/`find`/`exec`
     /// already hand their work off this way; `edit` did not, and on a multi-MB file it blocked the
     /// runtime for tens of milliseconds (measured at ~73 ms on a 4 MB file — see
@@ -179,10 +180,9 @@ impl Edit {
             .map_err(|_| ToolError::Execution(format!("read {path}: file is not valid UTF-8")))?;
 
         // The match/splice work is pure CPU over an in-memory string and can run for tens of
-        // milliseconds on a multi-MB file, so it stays on a blocking worker — `serve_ws` gives each
-        // session its own `current_thread` runtime, and work done inline here would pin that session's
-        // whole executor, its event pump and its abort/steer loop included.
-        // See `tests/tool_reactor_stall.rs`, which pins this invariant.
+        // milliseconds on a multi-MB file, so it stays on a blocking worker — inline it would pin a
+        // worker of `serve_ws`'s shared runtime (and a `current_thread` test runtime), stalling that
+        // session's event pump and abort/steer loop. See `tests/tool_reactor_stall.rs`.
         let plan_path = path.clone();
         let (content, ok) = match tokio::task::spawn_blocking(move || {
             plan_edits(&plan_path, &raw, edits, replace_all)

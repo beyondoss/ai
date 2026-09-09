@@ -3,9 +3,11 @@
 
 //! A tool must not pin the async runtime for the duration of its file I/O and CPU work.
 //!
-//! `serve_ws` gives every session its own **`current_thread`** runtime, so a tool that does its work
-//! inline — rather than handing it to `spawn_blocking` — stops that session's executor dead for as
-//! long as it runs. Nothing else on that runtime gets polled: not the outbound event pump, and not the
+//! `serve_ws` runs every session as a task on one **shared** runtime, so a tool that does its work
+//! inline — rather than handing it to `spawn_blocking` — stalls a worker that other sessions also
+//! use. The cheapest place to catch that is a `current_thread` runtime (one thread, no other worker
+//! to hide behind): a tool that blocks there stops *that* executor dead for as long as it runs.
+//! Nothing else on that runtime gets polled: not the outbound event pump, and not the
 //! stdin/WebSocket command loop that carries `abort` and `steer`. `serve.rs`'s `persist_blocking`
 //! already moved `sync_all` off the reactor for exactly this reason, and its doc comment says so; the
 //! file tools are the ones that hadn't followed.

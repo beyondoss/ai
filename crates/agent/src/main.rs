@@ -693,18 +693,20 @@ enum Command {
         /// and isn't mid-run — dropping it so it persists and exits, exactly like a graceful shutdown
         /// does per-session. Nothing is lost: reconnecting to a reaped id respawns it and replays from
         /// disk. Absent ⇒ 3600 (one hour) — long enough that a client can drop its socket and re-attach
-        /// to a still-running session, finite so an unattended daemon's threads and gateway pools don't
+        /// to a still-running session, finite so an unattended daemon's tasks and gateway clients don't
         /// accumulate forever. Pass `0` to disable reaping entirely (every session then lives until the
         /// daemon stops). Ignored without `--listen`/`--listen-uds`.
         #[usage(long, env = "AI_AGENT_SESSION_IDLE_TIMEOUT")]
         session_idle_timeout: Option<u64>,
-        /// How the daemon pools its upstream (agent→gateway) connections across sessions: `off` (the
-        /// default — each session opens its own pool, as before), `auto` (one shared client, HTTP/1.1
-        /// pooling now, h2 if the hop later gains ALPN), or `h2c` (one shared HTTP/2-cleartext client
-        /// multiplexing all sessions over ~one connection). `h2c` **requires** an h2c-capable gateway —
-        /// against an h1-only gateway every request fails — so it stays opt-in. Only meaningful with
-        /// `--listen`/`--listen-uds`; ignored on the stdio path.
-        #[usage(long, env = "AI_AGENT_UPSTREAM_HTTP2", default = "off")]
+        /// How the daemon pools its upstream (agent→gateway) connections across sessions: `auto` (the
+        /// default — one shared client, HTTP/1.1 pooling now, h2 if the hop later gains ALPN), `off`
+        /// (each session opens its own pool), or `h2c` (one shared HTTP/2-cleartext client multiplexing
+        /// all sessions over ~one connection). `h2c` **requires** an h2c-capable gateway — against an
+        /// h1-only gateway every request fails — so it stays opt-in. Sharing the pool is the density
+        /// default: N sessions collapse onto one TLS config and connection set, while credentials stay
+        /// per-request on each session's `GatewayClient`. Only meaningful with `--listen`/`--listen-uds`;
+        /// ignored on the stdio path.
+        #[usage(long, env = "AI_AGENT_UPSTREAM_HTTP2", default = "auto")]
         upstream_http2: serve::UpstreamHttp2,
         /// Address this exact session: reattach to it if it already exists, or create it under exactly
         /// this id if it doesn't. Gives a caller a known, predictable name to route on rather than

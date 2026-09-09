@@ -376,7 +376,7 @@ impl Tool for Read {
         // The whole text read — open, the streaming line loop, and the post-truncation total-line
         // drain — is blocking file I/O plus a potentially long line-by-line scan of a large/slow
         // file. Run it off the async runtime's worker (same pattern as the image path above and
-        // `grep`/`find`/`edit`) so a serve_ws per-session current-thread runtime isn't pinned for
+        // `grep`/`find`/`edit`) so a serve_ws shared-runtime worker isn't pinned for
         // the read's whole duration.
         let bytes = backend
             .read_bytes(std::path::Path::new(&path), 0, MAX_READ_BYTES)

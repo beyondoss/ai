@@ -55,8 +55,15 @@ The harness layers several capabilities over the bare tools + loop:
   snapshot rather than from `session` (which `run_events_steered` holds `&mut` for a run's whole duration
   — the same escape hatch `LiveStats` gives `get_state`), so a client can reconcile instead of being told
   to come back later. `serve_ws` owns a `session id → running session`
-  map; each session runs on its own thread (its event sink isn't `Send`) and persists to its own
-  `<session-dir>/<id>.jsonl`. **Multiple connections can attach to one session at once** (the user's own
+  map; each session is a task on the daemon's **shared Tokio runtime** (the event sink is `FnMut +
+  Send`, and `serve_session`'s error type is `Box<dyn Error + Send + Sync>`, so the future is `Send`
+  and can be `tokio::spawn`ed — it used to take a dedicated OS thread and current-thread runtime
+  because the error type wasn't `Send`) and persists to its own `<session-dir>/<id>.jsonl`. Sharing
+  the executor does **not** share tenant state: credentials stay per-request on each session's
+  `GatewayClient` (never as default headers on the shared `reqwest::Client`), and transcripts,
+  `/session` working memory, persistence files, tools/`ExecCell`, and approvals are built inside
+  `serve_session`. Cross-session leakage is pinned by `tests/serve_session_isolation.rs`. **Multiple
+  connections can attach to one session at once** (the user's own
   phone + TUI): the session's output is **broadcast** to every attached connection (`serve::OutFanout`,
   with a zero-copy fast path for the single-connection case) and input is shared (any device drives; the
   others watch live). Query responses (`get_state`/`get_messages`) broadcast too, so clients correlate
@@ -72,10 +79,11 @@ The harness layers several capabilities over the bare tools + loop:
   with no attached connection, idle past the timeout, and not mid-run (a per-session `running` flag
   `serve_session` flips around a `prompt`), dropping the retained `input_tx` so the session persists and
   exits exactly as graceful shutdown does per-entry (both share `join_handles`, which polls
-  `JoinHandle::is_finished` under a grace period rather than parking a blocking join, so a wedged session
-  can't burn a blocking-pool thread for the daemon's life). The default has to be finite: a connection
-  that omits `?session_id=` mints a fresh id, and every id owns a thread, an `Agent`, and a gateway pool
-  until something reclaims it. A reconnect to a just-reaped id respawns it from disk, and the `catchup`
+  `JoinHandle::is_finished` under a grace period rather than parking on an unfinished task, so a wedged
+  session can't hang shutdown for the daemon's life). The default has to be finite: a connection
+  that omits `?session_id=` mints a fresh id, and every id owns a runtime task, an `Agent`, and (unless
+  the HTTP pool is shared) a gateway client until something reclaims it. A reconnect to a just-reaped
+  id respawns it from disk, and the `catchup`
   frame seeded on attach replays its restored history. That respawn works because the routing key is
   handed to the session as `--session-id`, which _addresses_ an ordinary repo session — so the key
   survives a full process restart, not just a reap. `session_cfg` used to rewrite each session into
@@ -85,14 +93,16 @@ The harness layers several capabilities over the bare tools + loop:
   **keeps** it: the outgoing conversation is archived into a sibling session (`parent` = the slot) and the
   slot is blanked in place, so a client's address never goes stale. Creating a genuinely new session is a
   routing operation — connect with a new `?session_id=`. A third daemon facility, **shared upstream
-  pooling** (`--upstream-http2 <off|auto|h2c>`, off by default): instead of each session building its own
-  `reqwest::Client` (so N sessions ≈ N connections to the gateway on the plaintext HTTP/1.1 hop),
+  pooling** (`--upstream-http2 <off|auto|h2c>`, **auto by default**): instead of each session building
+  its own `reqwest::Client` (so N sessions ≈ N connections to the gateway on the plaintext HTTP/1.1 hop),
   `serve_ws` builds **one** client and injects it into every session via
   `GatewayClient::with_http_client` (guarded so a model-switch/idle rebuild never discards the shared
-  pool). `h2c` gives it `.http2_prior_knowledge()`, so all sessions multiplex over ~one cleartext-HTTP/2
-  connection — paired with the gateway's downstream `h2c` support (backward-compatible: Pingora peeks the
-  H2 preface and falls back to h1). `off` keeps the per-session-client behavior; `auto` shares the pool
-  over h1 today (h2 later if the hop gains TLS+ALPN).
+  pool). Credentials are *not* on that client — they are applied per-request by each session's
+  `GatewayClient`. `h2c` gives it `.http2_prior_knowledge()`, so all sessions multiplex over ~one
+  cleartext-HTTP/2 connection — paired with the gateway's downstream `h2c` support (backward-compatible:
+  Pingora peeks the H2 preface and falls back to h1). `off` keeps the per-session-client behavior; `auto`
+  shares the pool over h1 today (h2 later if the hop gains TLS+ALPN). Packing density (RSS, thread
+  count, `get_state` p95) is measured by `tests/serve_session_density.rs`.
 - **Trust** ([`trust_store`](src/trust_store.rs)) — a tri-state, ancestor-inheriting allowlist
   (`~/.claude/trusted-projects.json`: `{trusted: [...], untrusted: [...]}`, most-specific directory
   wins, untrusted checked first at each level) gates the project-local `SYSTEM.md`/`APPEND_SYSTEM.md`

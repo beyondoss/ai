@@ -403,16 +403,18 @@ use crate::tools;
 ///
 /// The agent→gateway hop is plaintext, so `H2c` (HTTP/2 cleartext) is what actually collapses N
 /// sessions onto ~one multiplexed connection — but it hard-requires a gateway that speaks h2c, so it
-/// is **not** the default (see the variant docs). `FromStr` backs the CLI flag's `value_parser`.
+/// stays opt-in (see the variant docs). `Auto` is the daemon default: one shared `reqwest::Client`
+/// (HTTP/1.1 pooling today), credentials still applied per-request on each session's
+/// [`GatewayClient`]. `FromStr` backs the CLI flag's `value_parser`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum UpstreamHttp2 {
-    /// No shared client — every session (and every model switch) builds its own `reqwest::Client`, as
-    /// before this feature. The default until the gateway's h2c support is verified end-to-end.
-    #[default]
+    /// No shared client — every session (and every model switch) builds its own `reqwest::Client`.
+    /// The opt-out for an operator who wants connection isolation at the cost of per-session pool RSS.
     Off,
     /// One shared client with **no** prior-knowledge: HTTP/1.1 connection pooling across all sessions
     /// today, transparently negotiating h2 if the hop later moves to `https://` with ALPN. Safe against
-    /// an h1-only gateway (unlike [`Self::H2c`]).
+    /// an h1-only gateway (unlike [`Self::H2c`]). The daemon default.
+    #[default]
     Auto,
     /// One shared client pinned to HTTP/2 cleartext (`http2_prior_knowledge`) — multiplexes every
     /// session over ~one TCP connection to the gateway. **Requires a gateway that accepts h2c**: against
@@ -439,7 +441,10 @@ impl std::str::FromStr for UpstreamHttp2 {
 ///
 /// `Clone` so a WebSocket supervisor ([`crate::serve_ws`]) can hand each per-session task its own
 /// copy with a distinct [`Self::session_id`] pinned in — `mcp_tools` clones the `Arc`s (shared live
-/// connections), every other field is a plain owned value.
+/// connections), `shared_http` clones the daemon-wide pool, every other field is a plain owned value.
+/// Tenant-private state (credentials on the per-session [`GatewayClient`], transcript, `/session`
+/// memory, persistence, tools/`ExecCell`, approvals) is **not** in this struct; each `serve_session`
+/// task builds those itself.
 #[derive(Clone)]
 pub struct ServeConfig {
     /// The gateway base URL. Still a plain `String` — `main.rs` resolves the `DEFAULT_GATEWAY` fallback
@@ -766,8 +771,7 @@ pub struct ServeConfig {
     pub session_idle_timeout: Option<std::time::Duration>,
     /// How the daemon pools upstream (agent→gateway) connections across sessions — the mode from
     /// `--upstream-http2`. Only consulted in the WebSocket daemon path ([`crate::serve_ws::serve_ws`],
-    /// which reads it once to build [`Self::shared_http`]); the stdio/`run` path leaves it at
-    /// [`UpstreamHttp2::Off`] and never pools.
+    /// which reads it once to build [`Self::shared_http`]); the stdio/`run` path never pools.
     pub upstream_http2: UpstreamHttp2,
     /// The one `reqwest::Client` every session in this daemon shares, so N concurrent sessions collapse
     /// onto one connection pool (HTTP/2-multiplexed under [`UpstreamHttp2::H2c`]) instead of N. Built
@@ -2084,7 +2088,9 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
 
     // Stdio has no supervisor and no reaper, so the `running` flag is inert here — a throwaway.
     let running = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let sig = serve_session(cfg, input_rx, out_conn, running).await?;
+    let sig = serve_session(cfg, input_rx, out_conn, running)
+        .await
+        .map_err(|e| e.to_string())?;
     // The session has ended (and dropped its `out_conn` clones), so `conn_rx` is now closed — this
     // just reaps the stdout task after it flushes the last frame.
     let _ = stdout_task.await;
@@ -2098,6 +2104,10 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
 /// task — because `input_rx`'s `Sender` is held by the supervisor (not the socket), a dropped
 /// connection is *not* an EOF: `input_rx.recv()` simply pends until the next command, and the run
 /// keeps going. The command protocol below is byte-identical across both transports.
+///
+/// The future is `Send` (`Box<dyn Error + Send + Sync>` plus a `Send` event sink) so the WebSocket
+/// daemon can `tokio::spawn` it onto the process-wide runtime instead of pinning a thread and a
+/// current-thread executor per session.
 pub(crate) async fn serve_session(
     mut cfg: ServeConfig,
     mut input_rx: mpsc::Receiver<String>,
@@ -2106,7 +2116,7 @@ pub(crate) async fn serve_session(
     // reaper reads this to never reap a session with an in-flight background run (see
     // [`crate::serve_ws`]); the stdio wrapper passes a throwaway it never observes.
     running: Arc<std::sync::atomic::AtomicBool>,
-) -> Result<Option<Signal>, Box<dyn std::error::Error>> {
+) -> Result<Option<Signal>, Box<dyn std::error::Error + Send + Sync>> {
     let mut timing = crate::timing::StartupTiming::new();
     let (mut persistence, mut session) = Persistence::open(&cfg)?;
     timing.mark("open persistence");
@@ -2247,7 +2257,7 @@ pub(crate) async fn serve_session(
         } else {
             Some(
                 crate::memory::open(cfg.memory.as_deref(), &cwd)
-                    .map_err(Box::<dyn std::error::Error>::from)?,
+                    .map_err(Box::<dyn std::error::Error + Send + Sync>::from)?,
             )
         };
     let has_memory = memory_backend.is_some();
