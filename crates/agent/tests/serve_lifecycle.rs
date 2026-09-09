@@ -197,7 +197,7 @@ fn serve_prompt_posts_started_then_succeeded_with_command_id_and_summary() {
 }
 
 #[test]
-fn serve_abort_posts_started_then_aborted() {
+fn serve_client_stop_posts_started_then_terminal() {
     let dir = tempfile::tempdir().unwrap();
     let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
     let collector = Collector::spawn();
