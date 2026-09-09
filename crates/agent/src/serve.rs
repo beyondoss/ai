@@ -642,7 +642,7 @@ pub struct ServeConfig {
     /// Run-lifecycle emitter. [`crate::lifecycle::NoLifecycle`] when unconfigured — zero I/O, no
     /// worker. Constructed once at process startup (`lifecycle::open`) so a malformed URL fails
     /// before any session runs, and cloned (the `Arc`) into every daemon session so they share one
-    /// outbound worker.
+    /// outbound worker. The URL is `http`/`https` or `unix:` (same machine, no host, no TLS).
     pub lifecycle: std::sync::Arc<dyn crate::lifecycle::RunLifecycle>,
     /// Restrict the tool set to exactly these names, dropping everything else. Combine with
     /// `exclude_tools` to carve one back out of the allow-list. Fixed for the process — like `system`,

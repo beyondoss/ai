@@ -12,6 +12,7 @@
 //! consumer is logged and dropped; it never adds latency to the turn.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -82,16 +83,74 @@ pub fn open(url: Option<&str>, headers: &[String]) -> Result<Arc<dyn RunLifecycl
     Ok(Arc::new(HttpLifecycle::spawn(url, parsed)?))
 }
 
-fn validate_url(url: &str) -> Result<(), String> {
+/// Where the worker POSTs. `http`/`https` are a network peer; `unix:` is a socket on this machine
+/// (no host to name, no TLS to terminate). Reqwest still wants an `http://` request URL when bound
+/// to a Unix socket, so `unix:` is rewritten to `http://localhost/` at this boundary.
+#[derive(Debug)]
+struct Endpoint {
+    request_url: String,
+    unix_socket: Option<PathBuf>,
+}
+
+fn parse_endpoint(url: &str) -> Result<Endpoint, String> {
     let parsed =
         reqwest::Url::parse(url).map_err(|e| format!("invalid lifecycle URL {url:?}: {e}"))?;
-    if !matches!(parsed.scheme(), "http" | "https") {
+    match parsed.scheme() {
+        "http" | "https" => Ok(Endpoint {
+            request_url: url.to_string(),
+            unix_socket: None,
+        }),
+        "unix" => parse_unix(&parsed, url),
+        other => Err(format!(
+            "lifecycle URL must be http, https, or unix, got {other:?}"
+        )),
+    }
+}
+
+fn parse_unix(parsed: &reqwest::Url, raw: &str) -> Result<Endpoint, String> {
+    #[cfg(not(unix))]
+    {
+        let _ = parsed;
         return Err(format!(
-            "lifecycle URL must be http or https, got {:?}",
-            parsed.scheme()
+            "lifecycle unix: URLs are only supported on unix, got {raw:?}"
         ));
     }
-    Ok(())
+    #[cfg(unix)]
+    {
+        if !parsed.username().is_empty() || parsed.password().is_some() {
+            return Err(format!(
+                "lifecycle unix: URL must not carry userinfo, got {raw:?}"
+            ));
+        }
+        if let Some(host) = parsed.host_str()
+            && host != "localhost"
+        {
+            return Err(format!(
+                "lifecycle unix: URL names a host ({host:?}); use http(s):// for a network peer, or unix:///path for a local socket"
+            ));
+        }
+        if parsed.query().is_some() || parsed.fragment().is_some() {
+            return Err(format!(
+                "lifecycle unix: URL must not have a query or fragment, got {raw:?}"
+            ));
+        }
+        let path = parsed.path();
+        if path.is_empty() || path == "/" {
+            return Err(format!(
+                "lifecycle unix: URL must name a socket path, got {raw:?}"
+            ));
+        }
+        if !path.starts_with('/') {
+            return Err(format!(
+                "lifecycle unix: socket path must be absolute, got {path:?}"
+            ));
+        }
+        Ok(Endpoint {
+            // Dummy origin: the client is bound to the socket and never dials this host.
+            request_url: "http://localhost/".to_string(),
+            unix_socket: Some(PathBuf::from(path)),
+        })
+    }
 }
 
 /// One lifecycle event. Tagged `type` on the wire so a consumer can switch without a wrapping envelope.
@@ -462,14 +521,18 @@ struct HttpInner {
 
 impl HttpLifecycle {
     fn spawn(url: &str, headers: Vec<(String, String)>) -> Result<Self, String> {
-        validate_url(url)?;
+        let endpoint = parse_endpoint(url)?;
         agent_core::ensure_provider();
-        let client = reqwest::Client::builder()
-            .timeout(HTTP_TIMEOUT)
+        let mut builder = reqwest::Client::builder().timeout(HTTP_TIMEOUT);
+        #[cfg(unix)]
+        if let Some(ref sock) = endpoint.unix_socket {
+            builder = builder.unix_socket(sock.clone());
+        }
+        let client = builder
             .build()
             .map_err(|e| format!("lifecycle HTTP client: {e}"))?;
         let inner = Arc::new(HttpInner {
-            url: url.to_string(),
+            url: endpoint.request_url,
             headers,
             client,
             durable: Mutex::new(VecDeque::new()),
@@ -618,7 +681,7 @@ mod tests {
     use agent_core::{ContentBlock, Message, Session};
     use serde_json::json;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
     fn rec_run() -> (Arc<RecordingLifecycle>, Arc<Run>) {
         let rec = RecordingLifecycle::new();
@@ -769,8 +832,68 @@ mod tests {
     fn malformed_url_fails_at_construction() {
         assert!(open(Some("file:///etc/passwd"), &[]).is_err());
         assert!(open(Some("not a url"), &[]).is_err());
-        assert!(validate_url("http://127.0.0.1:9/ok").is_ok());
+        assert!(parse_endpoint("http://127.0.0.1:9/ok").is_ok());
         assert!(open(Some("http://127.0.0.1:9/ok"), &["no-colon".into()]).is_err());
+        let unix_err = parse_endpoint("unix://").unwrap_err();
+        assert!(
+            unix_err.contains("unix") || unix_err.contains("socket path"),
+            "{unix_err}"
+        );
+        assert!(parse_endpoint("unix:///tmp/lifecycle.sock").is_ok());
+        assert!(parse_endpoint("unix://localhost/tmp/lifecycle.sock").is_ok());
+        assert!(parse_endpoint("unix://example.com/tmp/lifecycle.sock").is_err());
+        assert!(parse_endpoint("unix:///tmp/lifecycle.sock?x=1").is_err());
+    }
+
+    async fn serve_collector_conn<S>(
+        mut sock: S,
+        delay: Duration,
+        status: u16,
+        seen: Arc<Mutex<Vec<(String, String)>>>,
+        hits: Arc<AtomicUsize>,
+    ) where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 4096];
+        let (mut need, mut head_end) = (0usize, None);
+        loop {
+            let Ok(n) = sock.read(&mut chunk).await else {
+                return;
+            };
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&chunk[..n]);
+            if head_end.is_none()
+                && let Some(p) = buf.windows(4).position(|w| w == b"\r\n\r\n")
+            {
+                head_end = Some(p + 4);
+                let head = String::from_utf8_lossy(&buf[..p]).to_lowercase();
+                need = head
+                    .lines()
+                    .find_map(|l| l.strip_prefix("content-length:"))
+                    .and_then(|v| v.trim().parse().ok())
+                    .unwrap_or(0);
+            }
+            if let Some(h) = head_end
+                && buf.len() >= h + need
+            {
+                break;
+            }
+        }
+        hits.fetch_add(1, Ordering::Relaxed);
+        let head_end = head_end.unwrap_or(buf.len());
+        let headers = String::from_utf8_lossy(&buf[..head_end]).into_owned();
+        let body = String::from_utf8_lossy(&buf[head_end..]).into_owned();
+        lock(&seen).push((headers, body));
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
+        }
+        let resp =
+            format!("HTTP/1.1 {status} OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
+        let _ = sock.write_all(resp.as_bytes()).await;
+        let _ = sock.shutdown().await;
     }
 
     async fn collect_posts(
@@ -783,57 +906,43 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
             loop {
-                let Ok((mut sock, _)) = listener.accept().await else {
+                let Ok((sock, _)) = listener.accept().await else {
                     return;
                 };
                 let seen = Arc::clone(&seen);
                 let hits = Arc::clone(&hits);
                 tokio::spawn(async move {
-                    let mut buf = Vec::new();
-                    let mut chunk = [0u8; 4096];
-                    let (mut need, mut head_end) = (0usize, None);
-                    loop {
-                        let Ok(n) = sock.read(&mut chunk).await else {
-                            return;
-                        };
-                        if n == 0 {
-                            break;
-                        }
-                        buf.extend_from_slice(&chunk[..n]);
-                        if head_end.is_none()
-                            && let Some(p) = buf.windows(4).position(|w| w == b"\r\n\r\n")
-                        {
-                            head_end = Some(p + 4);
-                            let head = String::from_utf8_lossy(&buf[..p]).to_lowercase();
-                            need = head
-                                .lines()
-                                .find_map(|l| l.strip_prefix("content-length:"))
-                                .and_then(|v| v.trim().parse().ok())
-                                .unwrap_or(0);
-                        }
-                        if let Some(h) = head_end
-                            && buf.len() >= h + need
-                        {
-                            break;
-                        }
-                    }
-                    hits.fetch_add(1, Ordering::Relaxed);
-                    let head_end = head_end.unwrap_or(buf.len());
-                    let headers = String::from_utf8_lossy(&buf[..head_end]).into_owned();
-                    let body = String::from_utf8_lossy(&buf[head_end..]).into_owned();
-                    lock(&seen).push((headers, body));
-                    if !delay.is_zero() {
-                        tokio::time::sleep(delay).await;
-                    }
-                    let resp = format!(
-                        "HTTP/1.1 {status} OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"
-                    );
-                    let _ = sock.write_all(resp.as_bytes()).await;
-                    let _ = sock.shutdown().await;
+                    serve_collector_conn(sock, delay, status, seen, hits).await;
                 });
             }
         });
         format!("http://{addr}/lifecycle")
+    }
+
+    #[cfg(unix)]
+    async fn collect_unix_posts(
+        delay: Duration,
+        status: u16,
+        seen: Arc<Mutex<Vec<(String, String)>>>,
+        hits: Arc<AtomicUsize>,
+    ) -> (String, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let sock_path = dir.path().join("lifecycle.sock");
+        let listener = tokio::net::UnixListener::bind(&sock_path).unwrap();
+        let url = format!("unix://{}", sock_path.display());
+        tokio::spawn(async move {
+            loop {
+                let Ok((sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let seen = Arc::clone(&seen);
+                let hits = Arc::clone(&hits);
+                tokio::spawn(async move {
+                    serve_collector_conn(sock, delay, status, seen, hits).await;
+                });
+            }
+        });
+        (url, dir)
     }
 
     #[tokio::test]
@@ -862,6 +971,29 @@ mod tests {
         assert_eq!(
             bodies.iter().filter(|v| v["type"] == "succeeded").count(),
             1
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unix_socket_posts_started_then_terminal() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let hits = Arc::new(AtomicUsize::new(0));
+        let (url, _dir) = collect_unix_posts(Duration::ZERO, 200, seen.clone(), hits.clone()).await;
+        let sink = open(Some(&url), &[]).unwrap();
+        let run = Run::begin(Arc::clone(&sink), "s", Some("p1".into()), "claude-test");
+        run.succeeded(1, false, Some("hello".into()), None);
+        run.drain().await;
+        let bodies: Vec<Value> = lock(&seen)
+            .iter()
+            .filter_map(|(_, b)| serde_json::from_str(b).ok())
+            .collect();
+        assert!(bodies.iter().any(|v| v["type"] == "started"), "{bodies:#?}");
+        assert!(
+            bodies
+                .iter()
+                .any(|v| v["type"] == "succeeded" && v["summary"] == "hello"),
+            "{bodies:#?}"
         );
     }
 

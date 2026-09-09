@@ -459,8 +459,9 @@ enum Command {
         #[usage(long, env = "AI_AGENT_EXEC_CMD", conflicts = "exec_url")]
         exec_cmd: Option<String>,
         /// POST this run's lifecycle (started / progress / succeeded|failed|aborted) to this URL.
-        /// Unset: zero I/O. The model never sees this; a slow or unreachable consumer is dropped.
-        /// `serve`'s identical flag.
+        /// `http://`/`https://` for a network peer; `unix:///path/to.sock` when the consumer shares
+        /// this machine (no host to name, no TLS to terminate). Unset: zero I/O. The model never
+        /// sees this; a slow or unreachable consumer is dropped. `serve`'s identical flag.
         #[usage(long, env = "AI_AGENT_LIFECYCLE_URL")]
         lifecycle_url: Option<String>,
         /// A header sent with every lifecycle POST, `Name: value`. Repeatable. Auth belongs here.
@@ -920,8 +921,10 @@ enum Command {
         #[usage(long, env = "AI_AGENT_EXEC_CMD", conflicts = "exec_url")]
         exec_cmd: Option<String>,
         /// POST each prompt's lifecycle (started / progress / succeeded|failed|aborted) to this URL.
-        /// Unset: zero I/O. Validated at startup. A slow or unreachable consumer is dropped and
-        /// never delays the turn. `run`'s identical flag.
+        /// `http://`/`https://` for a network peer; `unix:///path/to.sock` when the consumer shares
+        /// this machine (no host to name, no TLS to terminate). Unset: zero I/O. Validated at
+        /// startup. A slow or unreachable consumer is dropped and never delays the turn. `run`'s
+        /// identical flag.
         #[usage(long, env = "AI_AGENT_LIFECYCLE_URL")]
         lifecycle_url: Option<String>,
         /// A header sent with every lifecycle POST, `Name: value`. Repeatable.

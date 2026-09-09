@@ -9,7 +9,7 @@
 mod common;
 
 use std::io::{BufReader, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpListener;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -27,6 +27,7 @@ const WAIT: Duration = Duration::from_secs(5);
 struct Collector {
     url: String,
     posts: Arc<Mutex<Vec<(String, String)>>>,
+    _guard: Option<tempfile::TempDir>,
 }
 
 impl Collector {
@@ -49,6 +50,7 @@ impl Collector {
         Self {
             url: format!("http://{addr}/lifecycle"),
             posts,
+            _guard: None,
         }
     }
 
@@ -75,6 +77,26 @@ impl Collector {
         }
     }
 
+    fn spawn_unix() -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("lifecycle.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        let posts = Arc::new(Mutex::new(Vec::new()));
+        let recorder = posts.clone();
+        thread::spawn(move || {
+            for conn in listener.incoming() {
+                let Ok(stream) = conn else { break };
+                let recorder = recorder.clone();
+                thread::spawn(move || handle_post(stream, Duration::ZERO, recorder));
+            }
+        });
+        Self {
+            url: format!("unix://{}", sock.display()),
+            posts,
+            _guard: Some(dir),
+        }
+    }
+
     fn headers_joined(&self) -> String {
         self.posts
             .lock()
@@ -86,7 +108,11 @@ impl Collector {
     }
 }
 
-fn handle_post(mut stream: TcpStream, delay: Duration, posts: Arc<Mutex<Vec<(String, String)>>>) {
+fn handle_post(
+    mut stream: impl Read + Write,
+    delay: Duration,
+    posts: Arc<Mutex<Vec<(String, String)>>>,
+) {
     let mut buf = Vec::new();
     let mut tmp = [0u8; 2048];
     loop {
@@ -191,6 +217,36 @@ fn serve_prompt_posts_started_then_succeeded_with_command_id_and_summary() {
         headers.contains("x-tenant: acme"),
         "auth header must reach the collector: {headers}"
     );
+
+    drop(stdin);
+    child.wait().unwrap();
+}
+
+#[test]
+fn serve_unix_socket_posts_started_then_succeeded() {
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
+    let collector = Collector::spawn_unix();
+    let (base, _bodies) = spawn_model_server(vec![turn_text("hello over unix")]);
+
+    let mut child = serve_life(&base, &session_file, &collector.url).spawn_guarded();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    send(
+        &mut stdin,
+        json!({ "type": "prompt", "id": "u1", "message": "say hi" }),
+    );
+    let frames = read_until_response(&mut stdout, "prompt");
+    assert_eq!(frames.last().unwrap()["success"], true, "{frames:#?}");
+
+    let bodies = collector
+        .wait_until(|b| of_type(b, "started").len() == 1 && of_type(b, "succeeded").len() == 1);
+    let started = of_type(&bodies, "started")[0];
+    let done = of_type(&bodies, "succeeded")[0];
+    assert_eq!(started["run_id"], done["run_id"], "{bodies:#?}");
+    assert_eq!(started["command_id"], "u1");
+    assert_eq!(done["summary"], "hello over unix");
 
     drop(stdin);
     child.wait().unwrap();
@@ -413,7 +469,9 @@ fn serve_fails_fast_on_a_malformed_lifecycle_url() {
     assert!(!status.success(), "stderr: {stderr}");
     assert_eq!(status.code(), Some(2), "stderr: {stderr}");
     assert!(
-        stderr.contains("lifecycle URL") || stderr.contains("http or https"),
+        stderr.contains("lifecycle URL")
+            || stderr.contains("http, https, or unix")
+            || stderr.contains("http or https"),
         "stderr: {stderr}"
     );
 }
