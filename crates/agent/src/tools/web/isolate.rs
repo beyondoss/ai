@@ -383,10 +383,12 @@ mod sandbox {
 
     /// Install the filter across the whole process.
     ///
-    /// `apply_filter` would cover only the calling thread, which is not enough: `main` is
-    /// `#[tokio::main]`, so a runtime with worker threads is already up by the time the subcommand
-    /// dispatches, and an unfiltered sibling thread is an unfiltered process. `apply_filter_all_threads`
-    /// uses seccomp's `TSYNC` to cover every thread or fail — no partial application.
+    /// `apply_filter` would cover only the calling thread, which is not enough: if a tokio runtime
+    /// were already up by the time the subcommand dispatched, an unfiltered sibling thread would be
+    /// an unfiltered process. (`main` intercepts this argv *before* building that runtime, so the
+    /// child is one thread — this is belt-and-braces if that intercept ever moves.)
+    /// `apply_filter_all_threads` uses seccomp's `TSYNC` to cover every thread or fail — no partial
+    /// application.
     pub fn lock_down() -> Result<(), String> {
         // Syscall numbers are per-architecture, so the filter has to be built for the one we are
         // actually running on. An unknown arch is a hard error rather than a silent pass-through:

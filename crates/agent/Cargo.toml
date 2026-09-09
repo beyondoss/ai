@@ -236,3 +236,10 @@ harness = false
 [[bench]]
 name = "persistence"
 harness = false
+
+# Process-level Tokio runtime A/B for `serve --listen`: current_thread vs multi_thread under
+# concurrent WebSocket load (RSS, throughput, p95, CPU). Spawns the real binary; see the bench's
+# module doc. Custom harness — this is a comparison table, not a Criterion/divan microbench.
+[[bench]]
+name = "serve_runtime"
+harness = false
