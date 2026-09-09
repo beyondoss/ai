@@ -542,6 +542,9 @@ struct HttpInner {
     client: reqwest::Client,
     durable: Mutex<VecDeque<RunEvent>>,
     progress: Mutex<HashMap<String, RunEvent>>,
+    /// Run ids whose terminal is queued or in flight. Drops the TOCTOU between [`Run`]'s latch
+    /// (which already refuses progress after terminal) and this `emit`. Evicted once that terminal
+    /// has been POSTed or dropped — not retained for process lifetime.
     terminated: Mutex<HashSet<String>>,
     notify: Notify,
     drain: Mutex<Vec<oneshot::Sender<()>>>,
@@ -588,8 +591,7 @@ impl RunLifecycle for HttpLifecycle {
             return;
         }
         if event.is_terminal() {
-            lock(&self.inner.terminated).insert(event.run_id().to_string());
-            lock(&self.inner.progress).remove(event.run_id());
+            self.inner.remember_terminal(event.run_id());
         }
         {
             let mut q = lock(&self.inner.durable);
@@ -598,6 +600,9 @@ impl RunLifecycle for HttpLifecycle {
                     run_id = event.run_id(),
                     "lifecycle durable queue full; dropping event"
                 );
+                if event.is_terminal() {
+                    self.inner.forget_terminal(event.run_id());
+                }
                 return;
             }
             q.push_back(event);
@@ -613,14 +618,31 @@ impl RunLifecycle for HttpLifecycle {
     }
 }
 
+impl HttpInner {
+    fn remember_terminal(&self, run_id: &str) {
+        lock(&self.terminated).insert(run_id.to_string());
+        lock(&self.progress).remove(run_id);
+    }
+
+    fn forget_terminal(&self, run_id: &str) {
+        lock(&self.terminated).remove(run_id);
+    }
+}
+
 async fn worker_loop(inner: Arc<HttpInner>) {
     loop {
         inner.notify.notified().await;
         loop {
             let batch: Vec<RunEvent> = lock(&inner.durable).drain(..).collect();
-            for ev in batch {
-                post_durable(&inner, &ev).await;
+            let mut flushed_terminal: Vec<String> = Vec::new();
+            for ev in &batch {
+                post_durable(&inner, ev).await;
+                if ev.is_terminal() {
+                    flushed_terminal.push(ev.run_id().to_string());
+                }
             }
+            // Filter late progress *before* forgetting the id, so a sample that raced the latch
+            // into the slot is dropped rather than POSTed after the terminal.
             let samples: Vec<RunEvent> = {
                 let terminated = lock(&inner.terminated);
                 lock(&inner.progress)
@@ -629,6 +651,9 @@ async fn worker_loop(inner: Arc<HttpInner>) {
                     .map(|(_, ev)| ev)
                     .collect()
             };
+            for id in flushed_terminal {
+                inner.forget_terminal(&id);
+            }
             for ev in samples {
                 let _ = post_once(&inner, &ev).await;
             }
@@ -1069,6 +1094,51 @@ mod tests {
         assert_eq!(
             bodies.iter().filter(|v| v["type"] == "succeeded").count(),
             1
+        );
+    }
+
+    #[tokio::test]
+    async fn terminated_is_evicted_after_terminal_flush() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let hits = Arc::new(AtomicUsize::new(0));
+        // Hold each POST so a late progress emit still sees `terminated` before flush.
+        let url = collect_posts(Duration::from_millis(50), 200, seen.clone(), hits.clone()).await;
+        let http = Arc::new(HttpLifecycle::spawn(&url, vec![]).unwrap());
+        for i in 0..3 {
+            let run = Run::begin(http.clone(), "s", None, "m");
+            let run_id = run.run_id().to_string();
+            run.succeeded(1, false, Some(format!("done-{i}")), None);
+            http.emit(RunEvent::Progress {
+                run_id,
+                session_id: "s".into(),
+                command_id: None,
+                ts: 0,
+                steps: 99,
+                tools: vec!["bash".into()],
+                attempt: None,
+                todos: None,
+                depth: None,
+            });
+            http.drain().await;
+            assert_eq!(
+                lock(&http.inner.terminated).len(),
+                0,
+                "run {i}: terminated must not accumulate after flush"
+            );
+        }
+        let bodies: Vec<Value> = lock(&seen)
+            .iter()
+            .filter_map(|(_, b)| serde_json::from_str(b).ok())
+            .collect();
+        assert_eq!(
+            bodies.iter().filter(|v| v["type"] == "progress").count(),
+            0,
+            "late progress must not ride out after terminal: {bodies:#?}"
+        );
+        assert_eq!(
+            bodies.iter().filter(|v| v["type"] == "succeeded").count(),
+            3,
+            "{bodies:#?}"
         );
     }
 
