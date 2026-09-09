@@ -1523,11 +1523,11 @@ fn mcp_idle_reap_after() -> std::time::Duration {
 /// The `web` tool's isolated HTML parser, dispatched *before* anything else exists.
 ///
 /// Not a `Command` variant, and deliberately not routed through the CLI parser: the point of this
-/// process is to be small and single-threaded when its seccomp filter goes on. `#[tokio::main]` builds
-/// a multi-thread runtime before the function body runs, and those workers park in `epoll_wait` — a
-/// syscall the parse allowlist has no reason to permit, which would either widen the filter or kill
-/// the process on teardown. Intercepting argv here means the child is one thread that has opened
-/// nothing. See `tools::web::isolate`.
+/// process is to be small and single-threaded when its seccomp filter goes on. Building a tokio
+/// runtime before the function body runs parks a worker in `epoll_wait` — a syscall the parse
+/// allowlist has no reason to permit, which would either widen the filter or kill the process on
+/// teardown. Intercepting argv here means the child is one thread that has opened nothing. See
+/// `tools::web::isolate`.
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     if std::env::args_os()
         .nth(1)
@@ -1536,13 +1536,57 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(tools::web::isolate::child_main());
     }
 
-    // Everything else wants the async runtime `#[tokio::main]` used to build here — same shape
-    // (multi-thread, all drivers enabled), just constructed explicitly so the branch above can run
-    // first.
-    tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?
-        .block_on(run())
+    // Everything else wants the async runtime. Constructed explicitly so the isolate branch above
+    // can run first, before any worker exists. Default is `current_thread`: see [`build_runtime`].
+    build_runtime()?.block_on(run())
+}
+
+/// How many tokio *async* worker threads the process runtime should run.
+///
+/// `None` (unset, empty, or `1`) is a `current_thread` runtime — the production default. `Some(0)`
+/// is tokio's multi-thread default (one worker per core). `Some(n)` for `n >= 2` pins that many
+/// workers.
+///
+/// Production leaves this unset. `BEYOND_AI_AGENT_TOKIO_WORKER_THREADS` exists so
+/// `benches/serve_runtime.rs` can A/B the two schedulers against the same binary (and so an
+/// operator can restore the old work-stealing runtime without a rebuild).
+fn tokio_worker_threads_from_env() -> Result<Option<usize>, Box<dyn std::error::Error>> {
+    match std::env::var("BEYOND_AI_AGENT_TOKIO_WORKER_THREADS") {
+        Err(_) => Ok(None),
+        Ok(s) if s.is_empty() => Ok(None),
+        Ok(s) => {
+            let n: usize = s.parse().map_err(|_| {
+                format!(
+                    "BEYOND_AI_AGENT_TOKIO_WORKER_THREADS={s:?} is not a thread count \
+                     (unset/1 = current_thread, 0 = one worker per core, N>=2 = N workers)"
+                )
+            })?;
+            Ok(if n == 1 { None } else { Some(n) })
+        }
+    }
+}
+
+/// The process-wide tokio runtime.
+///
+/// Default is `current_thread`. Session tasks (`serve_ws`), the accept loop, the idle reaper, stdio
+/// `serve`, and one-shot `run` all share it — `serve_session` is `Send`, so there is no per-session
+/// OS thread. CPU-bound tool work (`grep`/`find`/image resize) is `spawn_blocking`, which a
+/// current-thread runtime still has a blocking pool for. Extra work-stealing workers cost per-thread
+/// stacks and mimalloc heaps; `benches/serve_runtime.rs` A/B's that tradeoff now that session work
+/// lives on this runtime. `BEYOND_AI_AGENT_TOKIO_WORKER_THREADS` restores work-stealing without a
+/// rebuild.
+fn build_runtime() -> Result<tokio::runtime::Runtime, Box<dyn std::error::Error>> {
+    let mut builder = match tokio_worker_threads_from_env()? {
+        None => tokio::runtime::Builder::new_current_thread(),
+        Some(0) => tokio::runtime::Builder::new_multi_thread(),
+        Some(n) => {
+            let mut b = tokio::runtime::Builder::new_multi_thread();
+            b.worker_threads(n);
+            b
+        }
+    };
+    builder.enable_all();
+    Ok(builder.build()?)
 }
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
@@ -2139,10 +2183,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             // (a client that doesn't hang up, or — the case this matters for — a SIGTERM/SIGINT
             // whose handler cancels the run and returns without stdin ever reaching EOF), that
             // thread is still parked here even though all async work is done. Falling through to
-            // `#[tokio::main]`'s implicit runtime shutdown would then hang indefinitely: dropping
-            // a `Runtime` waits for every outstanding blocking task, and a parked stdin read never
-            // completes on its own. Exit explicitly instead — `serve` has already drained,
-            // persisted, and flushed everything before returning, so there's nothing left to lose.
+            // `Runtime` drop would then hang indefinitely: dropping a `Runtime` waits for every
+            // outstanding blocking task, and a parked stdin read never completes on its own. Exit
+            // explicitly instead — `serve` has already drained, persisted, and flushed everything
+            // before returning, so there's nothing left to lose.
             // Task #41 (pi-parity fix): `shutdown_cause` distinguishes a real signal-triggered
             // shutdown from a clean stdin-EOF one — previously every graceful path exited 0
             // unconditionally, matching neither pi's own `rpc-mode.ts` (143/129 for SIGTERM/SIGHUP)

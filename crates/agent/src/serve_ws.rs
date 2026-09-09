@@ -219,7 +219,8 @@ impl Supervisor {
                 // runtime rather than a dedicated OS thread + current-thread executor. Tenant state
                 // stays on the task: credentials, transcript, `/session` memory, persistence, tools,
                 // approvals, and exec endpoints are built inside `serve_session`, not shared. The
-                // `mpsc` channels bridging it to the accept loop are unchanged.
+                // `mpsc` channels bridging it to the accept loop are unchanged. The process runtime
+                // itself is `current_thread` by default (see `main.rs::build_runtime`).
                 let join = tokio::spawn(async move {
                     match serve_session(cfg, input_rx, session_out, session_running).await {
                         Ok(_) => {}
