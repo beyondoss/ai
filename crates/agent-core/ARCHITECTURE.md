@@ -885,7 +885,7 @@ per turn. See `agent.rs:tests::request_snapshots_are_isolated_across_turns` for 
 this depends on: an in-flight request's message snapshot must not retroactively see a later turn's
 appends.
 
-The copy that *does* scale with the transcript is the provider wire body: every dialect's `build_body`
+The copy that _does_ scale with the transcript is the provider wire body: every dialect's `build_body`
 walks the history into a `serde_json::Value` tree (owned `String`s, `BTreeMap` objects).
 `GatewayClient::stream` serializes that tree to compact JSON `Bytes` immediately after the payload hook
 and drops it before the SSE stream is built, so the tree does not sit alongside the response for the
