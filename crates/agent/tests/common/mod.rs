@@ -384,7 +384,8 @@ pub fn read_until_response(reader: &mut impl BufRead, command: &str) -> Vec<Valu
     frames
 }
 
-/// Strip ambient provider-routing env so a mock `--gateway-url` actually wins.
+/// Strip ambient provider-routing env so a mock `--gateway-url` actually wins, and strip
+/// run-lifecycle env so an unconfigured test never POSTs to a URL the developer happened to export.
 ///
 /// Eval hosts (this one included) export `AI_DIRECT=1` / `AI_PROVIDER=openrouter` /
 /// `OPENROUTER_API_KEY` for Harbor runs. `AI_DIRECT=1` makes the binary ignore `--gateway-url`
@@ -402,6 +403,11 @@ fn isolate_provider_env(cmd: &mut Command) {
         "OPENAI_API_KEY",
         "OPENAI_BASE_URL",
         "ANTHROPIC_API_KEY",
+        // A developer/CI env that POSTs run lifecycle must not leak into hermetic tests; tests that
+        // want the emitter set it after [`serve_cmd`]/[`run_cmd`] (last-write wins).
+        "AI_AGENT_LIFECYCLE_URL",
+        "AI_AGENT_LIFECYCLE_HEADER",
+        "AI_AGENT_LIFECYCLE_HEARTBEAT_SECS",
     ] {
         cmd.env_remove(key);
     }

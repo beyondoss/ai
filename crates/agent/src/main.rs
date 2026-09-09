@@ -458,6 +458,22 @@ enum Command {
         /// expands to separate argv entries, never into a shell string.
         #[usage(long, env = "AI_AGENT_EXEC_CMD", conflicts = "exec_url")]
         exec_cmd: Option<String>,
+        /// POST this run's lifecycle (started / progress / succeeded|failed|aborted) to this URL.
+        /// `http://`/`https://` for a network peer; `unix:///path/to.sock` when the consumer shares
+        /// this machine (no host to name, no TLS to terminate). Unset: zero I/O. The model never
+        /// sees this; a slow or unreachable consumer is dropped. `serve`'s identical flag.
+        #[usage(long, env = "AI_AGENT_LIFECYCLE_URL")]
+        lifecycle_url: Option<String>,
+        /// A header sent with every lifecycle POST, `Name: value`. Repeatable. Auth belongs here.
+        #[usage(long, env = "AI_AGENT_LIFECYCLE_HEADER")]
+        lifecycle_header: Vec<String>,
+        /// Seconds between in-flight progress catch-up POSTs. Default 10. `0` disables the timer;
+        /// tool start/end, todos, and turn-end still emit a progress sample immediately. An
+        /// unchanged sample is not re-POSTed, so a long `bash` is one progress event, not one per
+        /// interval. Heartbeat names this timer, not the wire event (`progress`). `serve`'s identical
+        /// flag.
+        #[usage(long, env = "AI_AGENT_LIFECYCLE_HEARTBEAT_SECS", default = "10")]
+        lifecycle_heartbeat_secs: u64,
         /// Restrict the tool set to exactly these names (comma-separated), dropping everything else.
         /// Combine with `--exclude-tools` to carve one back out of the allow-list. `serve`'s identical
         /// flag/env var — a deployment convention setting this env var to sandbox an agent must apply
@@ -911,6 +927,23 @@ enum Command {
         /// An argv template for targets with no HTTP surface, e.g. `ssh host -- {}`.
         #[usage(long, env = "AI_AGENT_EXEC_CMD", conflicts = "exec_url")]
         exec_cmd: Option<String>,
+        /// POST each prompt's lifecycle (started / progress / succeeded|failed|aborted) to this URL.
+        /// `http://`/`https://` for a network peer; `unix:///path/to.sock` when the consumer shares
+        /// this machine (no host to name, no TLS to terminate). Unset: zero I/O. Validated at
+        /// startup. A slow or unreachable consumer is dropped and never delays the turn. `run`'s
+        /// identical flag.
+        #[usage(long, env = "AI_AGENT_LIFECYCLE_URL")]
+        lifecycle_url: Option<String>,
+        /// A header sent with every lifecycle POST, `Name: value`. Repeatable.
+        #[usage(long, env = "AI_AGENT_LIFECYCLE_HEADER")]
+        lifecycle_header: Vec<String>,
+        /// Seconds between in-flight progress catch-up POSTs. Default 10. `0` disables the timer;
+        /// tool start/end, todos, and turn-end still emit a progress sample immediately. An
+        /// unchanged sample is not re-POSTed, so a long `bash` is one progress event, not one per
+        /// interval. Heartbeat names this timer, not the wire event (`progress`). `run`'s identical
+        /// flag.
+        #[usage(long, env = "AI_AGENT_LIFECYCLE_HEARTBEAT_SECS", default = "10")]
+        lifecycle_heartbeat_secs: u64,
         /// Restrict the tool set to exactly these names (comma-separated), dropping everything else.
         /// Fixed for the process, like `--system-prompt`; survives `set_model`/`set_thinking` rebuilds.
         /// `-t` matches pi's own `--tools`/`-t`.
@@ -1646,6 +1679,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             exec_url,
             exec_header,
             exec_cmd,
+            lifecycle_url,
+            lifecycle_header,
+            lifecycle_heartbeat_secs,
             tools,
             exclude_tools,
             no_tools,
@@ -1714,6 +1750,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 exec_url,
                 exec_header,
                 exec_cmd,
+                lifecycle_url,
+                lifecycle_header,
+                lifecycle_heartbeat_secs,
                 tools,
                 exclude_tools,
                 no_tools,
@@ -1796,6 +1835,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             exec_url,
             exec_header,
             exec_cmd,
+            lifecycle_url,
+            lifecycle_header,
+            lifecycle_heartbeat_secs,
             tools,
             exclude_tools,
             no_tools,
@@ -2111,6 +2153,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 exec_url,
                 exec_header,
                 exec_cmd,
+                lifecycle: beyond_ai_agent::lifecycle::open(
+                    lifecycle_url.as_deref(),
+                    &lifecycle_header,
+                )
+                .unwrap_or_else(|e| {
+                    eprintln!("{e}");
+                    std::process::exit(2);
+                }),
+                lifecycle_heartbeat: std::time::Duration::from_secs(lifecycle_heartbeat_secs),
                 tools,
                 exclude_tools,
                 no_tools,
@@ -3014,14 +3065,35 @@ fn trim_piped_stdin(buf: &str) -> Option<String> {
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
-/// [`run_turn_once`], wrapped with the same whole-run auto-retry `serve.rs`'s `"prompt"` command gets
-/// (see `beyond_ai_agent::retry`) — a run that ends in a transient-looking error (one already
-/// exhausted `agent_core`'s own within-turn retries) is re-invoked from scratch against the same
-/// session, up to `retry::MAX_RUN_RETRIES` times with backoff, rather than failing a whole `agent run`
-/// invocation (plausibly unattended — a cron job, a CI step) outright on a hiccup that `serve` would
-/// have quietly recovered from. A retried attempt's own streamed output (text/JSON events) follows
-/// directly after a `[retrying...]` stderr notice — nothing is erased, matching how `serve` demarcates
-/// attempts with an `auto_retry_start` frame rather than hiding the failed one.
+/// How a CLI `run` invocation ended, matching the process's own exit contract.
+enum CliTerminal {
+    Succeeded { refused: bool },
+    Failed { error: String, refused: bool },
+    Aborted,
+}
+
+async fn emit_cli_lifecycle(
+    life: Option<&std::sync::Arc<beyond_ai_agent::lifecycle::Run>>,
+    session: &Session,
+    kind: CliTerminal,
+    structured: Option<serde_json::Value>,
+) {
+    let Some(life) = life else {
+        return;
+    };
+    let summary = beyond_ai_agent::lifecycle::closing_summary(session);
+    match kind {
+        CliTerminal::Succeeded { refused } => {
+            life.succeeded(session.steps, refused, summary, structured);
+        }
+        CliTerminal::Failed { error, refused } => {
+            life.failed(session.steps, error, refused, summary, structured);
+        }
+        CliTerminal::Aborted => life.aborted(session.steps, summary),
+    }
+    life.drain().await;
+}
+
 /// A cancelled turn (SIGTERM/SIGHUP/Ctrl-C — see the `ShutdownSignal` wiring in `run_task`, or a future
 /// `--timeout` equivalent) is an expected, clean stop, not a crash: printing it through `main`'s
 /// default `Result` `Termination` would dump `Error: Cancelled` (the bare enum variant, via `Debug`)
@@ -3059,6 +3131,14 @@ fn unwrap_turn_result(
     }
 }
 
+/// [`run_turn_once`], wrapped with the same whole-run auto-retry `serve.rs`'s `"prompt"` command gets
+/// (see `beyond_ai_agent::retry`) — a run that ends in a transient-looking error (one already
+/// exhausted `agent_core`'s own within-turn retries) is re-invoked from scratch against the same
+/// session, up to `retry::MAX_RUN_RETRIES` times with backoff, rather than failing a whole `agent run`
+/// invocation (plausibly unattended — a cron job, a CI step) outright on a hiccup that `serve` would
+/// have quietly recovered from. A retried attempt's own streamed output (text/JSON events) follows
+/// directly after a `[retrying...]` stderr notice — nothing is erased, matching how `serve` demarcates
+/// attempts with an `auto_retry_start` frame rather than hiding the failed one.
 #[allow(clippy::too_many_arguments)]
 async fn run_turn(
     agent: &Agent,
@@ -3070,9 +3150,14 @@ async fn run_turn(
     steering: &agent_core::Steering,
     session_memory_active: bool,
     pressure_point: u32,
+    life: Option<&std::sync::Arc<beyond_ai_agent::lifecycle::Run>>,
+    heartbeat: std::time::Duration,
 ) -> agent_core::Result<agent_core::StopReason> {
     let mut attempt = 0u32;
     loop {
+        if let Some(life) = life {
+            life.set_attempt(attempt);
+        }
         let result = run_turn_once(
             agent,
             session,
@@ -3082,6 +3167,8 @@ async fn run_turn(
             steering,
             session_memory_active,
             pressure_point,
+            life,
+            heartbeat,
         )
         .await;
         match &result {
@@ -3180,6 +3267,8 @@ async fn run_turn_once(
     // The live-prompt size at which to warn of an approaching compaction
     // (`memory::compaction_pressure_point`), fixed for the run (`run`'s model can't change mid-run).
     pressure_point: u32,
+    life: Option<&std::sync::Arc<beyond_ai_agent::lifecycle::Run>>,
+    heartbeat_every: std::time::Duration,
 ) -> agent_core::Result<agent_core::StopReason> {
     // Two `/session` steers, mirroring `serve`'s observer: a *pre*-compaction pressure nudge (checkpoint
     // now, while detail is intact) fired at most once per fill cycle, and a *post*-compaction recall
@@ -3212,11 +3301,28 @@ async fn run_turn_once(
         }
     };
     let mut stop_reason = agent_core::StopReason::default();
-    if json {
+    let life_obs = life.cloned();
+    let heartbeat = match (life.cloned(), heartbeat_every) {
+        (Some(life), every) if !every.is_zero() => Some(tokio::spawn(async move {
+            let Some(mut interval) = beyond_ai_agent::lifecycle::heartbeat_interval(every) else {
+                return;
+            };
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                life.heartbeat();
+            }
+        })),
+        _ => None,
+    };
+    let result = if json {
         agent
             .run_events_steered(
                 session,
                 |ev| {
+                    if let Some(life) = &life_obs {
+                        life.observe(&ev);
+                    }
                     if let agent_core::AgentEvent::TurnEnd { stop_reason: r, .. } = &ev {
                         stop_reason = *r;
                     }
@@ -3229,47 +3335,61 @@ async fn run_turn_once(
                 cancel.clone(),
                 steering.clone(),
             )
-            .await?;
-        return Ok(stop_reason);
+            .await
+    } else {
+        // Task 1 (pi-parity fix, pass 19): `run_events_steered` directly (rather than the plain
+        // `run_cancellable`, which always builds its own default `Steering::new()` internally), so `run`'s
+        // own resolved `steering_mode`/`follow_up_mode` (see `run_task`'s construction of `steering`) is
+        // actually in effect at agent/session construction time, matching pi's own agent construction in
+        // every mode — same `AgentEvent::Stream` filter `Agent::run_cancellable` itself applies internally.
+        let r = agent
+            .run_events_steered(
+                session,
+                |ev| {
+                    if let Some(life) = &life_obs {
+                        life.observe(&ev);
+                    }
+                    session_steers(&ev);
+                    let agent_core::AgentEvent::Stream(ev) = &ev else {
+                        return;
+                    };
+                    match ev {
+                        StreamEvent::TextDelta { text, .. } => {
+                            write_stdout_or_exit(text, cancel, broken_pipe);
+                        }
+                        StreamEvent::ToolUseStart { name, .. } => {
+                            // No trailing newline: `InputJsonDelta` fragments print immediately after, live,
+                            // on this same line — a growing preview of the call's arguments as they stream
+                            // in, rather than the model appearing to hang until the whole call (and its
+                            // result) land.
+                            write_stdout_or_exit(
+                                &format!("\n[tool: {name}] "),
+                                cancel,
+                                broken_pipe,
+                            );
+                        }
+                        StreamEvent::InputJsonDelta { partial_json, .. } => {
+                            write_stdout_or_exit(partial_json, cancel, broken_pipe);
+                        }
+                        StreamEvent::MessageStop { stop_reason: r } => {
+                            stop_reason = *r;
+                        }
+                        _ => {}
+                    }
+                },
+                cancel.clone(),
+                steering.clone(),
+            )
+            .await;
+        if r.is_ok() {
+            write_stdout_or_exit("\n", cancel, broken_pipe);
+        }
+        r
+    };
+    if let Some(hb) = heartbeat {
+        hb.abort();
     }
-    // Task 1 (pi-parity fix, pass 19): `run_events_steered` directly (rather than the plain
-    // `run_cancellable`, which always builds its own default `Steering::new()` internally), so `run`'s
-    // own resolved `steering_mode`/`follow_up_mode` (see `run_task`'s construction of `steering`) is
-    // actually in effect at agent/session construction time, matching pi's own agent construction in
-    // every mode — same `AgentEvent::Stream` filter `Agent::run_cancellable` itself applies internally.
-    agent
-        .run_events_steered(
-            session,
-            |ev| {
-                session_steers(&ev);
-                let agent_core::AgentEvent::Stream(ev) = &ev else {
-                    return;
-                };
-                match ev {
-                    StreamEvent::TextDelta { text, .. } => {
-                        write_stdout_or_exit(text, cancel, broken_pipe);
-                    }
-                    StreamEvent::ToolUseStart { name, .. } => {
-                        // No trailing newline: `InputJsonDelta` fragments print immediately after, live,
-                        // on this same line — a growing preview of the call's arguments as they stream
-                        // in, rather than the model appearing to hang until the whole call (and its
-                        // result) land.
-                        write_stdout_or_exit(&format!("\n[tool: {name}] "), cancel, broken_pipe);
-                    }
-                    StreamEvent::InputJsonDelta { partial_json, .. } => {
-                        write_stdout_or_exit(partial_json, cancel, broken_pipe);
-                    }
-                    StreamEvent::MessageStop { stop_reason: r } => {
-                        stop_reason = *r;
-                    }
-                    _ => {}
-                }
-            },
-            cancel.clone(),
-            steering.clone(),
-        )
-        .await?;
-    write_stdout_or_exit("\n", cancel, broken_pipe);
+    result?;
     Ok(stop_reason)
 }
 
@@ -3374,6 +3494,9 @@ async fn run_task(
     exec_url: Option<String>,
     exec_header: Vec<String>,
     exec_cmd: Option<String>,
+    lifecycle_url: Option<String>,
+    lifecycle_header: Vec<String>,
+    lifecycle_heartbeat_secs: u64,
     tools_allow: Option<Vec<String>>,
     tools_exclude: Option<Vec<String>>,
     no_tools: bool,
@@ -3781,6 +3904,8 @@ async fn run_task(
             )),
             (None, None) => None,
         };
+    let lifecycle = beyond_ai_agent::lifecycle::open(lifecycle_url.as_deref(), &lifecycle_header)
+        .map_err(std::io::Error::other)?;
     let fs_backend: Option<std::sync::Arc<dyn tools::fs::FsBackend>> = match &exec_runner {
         Some(runner) => {
             let backend = tools::fs::shell::ShellFs::connect(runner.clone()).await;
@@ -4414,6 +4539,14 @@ async fn run_task(
             initial_images,
         ));
     }
+    let life = lifecycle.enabled().then(|| {
+        beyond_ai_agent::lifecycle::Run::begin(
+            std::sync::Arc::clone(&lifecycle),
+            meta.id.clone(),
+            None,
+            meta.model.clone(),
+        )
+    });
     let turn_result = run_turn(
         &agent,
         &mut session,
@@ -4424,6 +4557,8 @@ async fn run_task(
         &steering,
         session_memory_active,
         pressure_point,
+        life.as_ref(),
+        std::time::Duration::from_secs(lifecycle_heartbeat_secs),
     )
     .await;
     // Persist whatever's in `session` regardless of outcome: `run_events_cancellable` mutates
@@ -4434,13 +4569,25 @@ async fn run_task(
     // only ever captured here.
     persist_run_tail(&store, &session)?;
     if broken_pipe.load(Ordering::Relaxed) {
-        // Reached *because* `write_stdout_or_exit` tripped `cancel`, so the same in-flight bash tool
-        // future a signal would have dropped has just been dropped here too — with the same detached
-        // `GroupKillGuard` cleanup thread still running, and the same `process::exit` about to kill it
-        // mid-`kill`. See `unwrap_turn_result`, which pays this toll for the signal path.
+        emit_cli_lifecycle(life.as_ref(), &session, CliTerminal::Aborted, None).await;
         #[cfg(unix)]
         tools::exec::wait_for_pending_group_kills(std::time::Duration::from_secs(2));
         std::process::exit(0);
+    }
+    if let Err(e) = &turn_result {
+        emit_cli_lifecycle(
+            life.as_ref(),
+            &session,
+            match e {
+                agent_core::Error::Cancelled => CliTerminal::Aborted,
+                other => CliTerminal::Failed {
+                    error: other.to_string(),
+                    refused: false,
+                },
+            },
+            None,
+        )
+        .await;
     }
     let mut stop_reason = unwrap_turn_result(turn_result, &shutdown_cause)?;
     for message in messages {
@@ -4455,15 +4602,31 @@ async fn run_task(
             &steering,
             session_memory_active,
             pressure_point,
+            life.as_ref(),
+            std::time::Duration::from_secs(lifecycle_heartbeat_secs),
         )
         .await;
         persist_run_tail(&store, &session)?;
         if broken_pipe.load(Ordering::Relaxed) {
-            // Same broken-pipe cancellation as the first turn's exit above — drain the pending
-            // process-group kills before tearing their threads down.
+            emit_cli_lifecycle(life.as_ref(), &session, CliTerminal::Aborted, None).await;
             #[cfg(unix)]
             tools::exec::wait_for_pending_group_kills(std::time::Duration::from_secs(2));
             std::process::exit(0);
+        }
+        if let Err(e) = &turn_result {
+            emit_cli_lifecycle(
+                life.as_ref(),
+                &session,
+                match e {
+                    agent_core::Error::Cancelled => CliTerminal::Aborted,
+                    other => CliTerminal::Failed {
+                        error: other.to_string(),
+                        refused: false,
+                    },
+                },
+                None,
+            )
+            .await;
         }
         stop_reason = unwrap_turn_result(turn_result, &shutdown_cause)?;
     }
@@ -4527,10 +4690,37 @@ async fn run_task(
                 };
                 write_stdout_or_exit(&line, &cancel, &broken_pipe);
                 write_stdout_or_exit("\n", &cancel, &broken_pipe);
+                emit_cli_lifecycle(
+                    life.as_ref(),
+                    &session,
+                    if !json && stop_reason == agent_core::StopReason::Refusal {
+                        CliTerminal::Failed {
+                            error: "refused".into(),
+                            refused: true,
+                        }
+                    } else {
+                        CliTerminal::Succeeded {
+                            refused: stop_reason == agent_core::StopReason::Refusal,
+                        }
+                    },
+                    Some(value),
+                )
+                .await;
             }
             None => {
-                // The contract the run was started with was never met. Exiting 0 here would be
-                // indistinguishable from success to a script that pipes stdout into `jq`.
+                emit_cli_lifecycle(
+                    life.as_ref(),
+                    &session,
+                    CliTerminal::Failed {
+                        error: format!(
+                            "no structured output: the model ended the run without calling `{}`",
+                            tools::structured_output::NAME
+                        ),
+                        refused: false,
+                    },
+                    None,
+                )
+                .await;
                 eprintln!(
                     "[no structured output: the model ended the run without calling `{}`]",
                     tools::structured_output::NAME
@@ -4538,6 +4728,27 @@ async fn run_task(
                 std::process::exit(1);
             }
         }
+    } else {
+        emit_cli_lifecycle(
+            life.as_ref(),
+            &session,
+            if text_mode_failure_message(json, stop_reason).is_some() {
+                if stop_reason == agent_core::StopReason::Refusal {
+                    CliTerminal::Failed {
+                        error: "refused".into(),
+                        refused: true,
+                    }
+                } else {
+                    CliTerminal::Aborted
+                }
+            } else {
+                CliTerminal::Succeeded {
+                    refused: stop_reason == agent_core::StopReason::Refusal,
+                }
+            },
+            None,
+        )
+        .await;
     }
 
     // Text mode has no other failure signal a script/CI caller could key off of — a refusal would
@@ -4888,6 +5099,8 @@ mod tests {
             &agent_core::Steering::new(),
             false,
             u32::MAX,
+            None,
+            std::time::Duration::ZERO,
         )
         .await
         .unwrap();
@@ -5149,6 +5362,8 @@ mod tests {
             &agent_core::Steering::new(),
             false,
             u32::MAX,
+            None,
+            std::time::Duration::ZERO,
         )
         .await
         .expect("the whole-run retry must recover once a real turn is finally scripted");
@@ -5188,6 +5403,8 @@ mod tests {
             &agent_core::Steering::new(),
             false,
             u32::MAX,
+            None,
+            std::time::Duration::ZERO,
         )
         .await
         .expect_err("must eventually give up, not retry forever");
@@ -5235,6 +5452,8 @@ mod tests {
             &agent_core::Steering::new(),
             false,
             u32::MAX,
+            None,
+            std::time::Duration::ZERO,
         )
         .await
         .expect_err(

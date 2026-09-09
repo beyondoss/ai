@@ -639,6 +639,15 @@ pub struct ServeConfig {
     pub exec_url: Option<String>,
     pub exec_header: Vec<String>,
     pub exec_cmd: Option<String>,
+    /// Run-lifecycle emitter. [`crate::lifecycle::NoLifecycle`] when unconfigured — zero I/O, no
+    /// worker. Constructed once at process startup (`lifecycle::open`) so a malformed URL fails
+    /// before any session runs, and cloned (the `Arc`) into every daemon session so they share one
+    /// outbound worker. The URL is `http`/`https` or `unix:` (same machine, no host, no TLS).
+    pub lifecycle: std::sync::Arc<dyn crate::lifecycle::RunLifecycle>,
+    /// How often to re-POST the latest progress sample while a run is in flight. `Duration::ZERO`
+    /// disables the timer; tool-edge / todo / turn-end samples still fire. Default
+    /// [`crate::lifecycle::HEARTBEAT`] (10s). An unchanged sample is not re-POSTed.
+    pub lifecycle_heartbeat: std::time::Duration,
     /// Restrict the tool set to exactly these names, dropping everything else. Combine with
     /// `exclude_tools` to carve one back out of the allow-list. Fixed for the process — like `system`,
     /// there's no runtime RPC to change it, but it does survive a `set_model`/`set_thinking` rebuild
@@ -3357,6 +3366,17 @@ pub(crate) async fn serve_session(
                 // Acknowledge immediately — the turn is queued and about to start — rather than
                 // leaving a client with no signal until the (possibly much later) terminal response.
                 emit!(ack(id.clone(), "prompt"));
+                // One run_id for the whole prompt, including whole-run retries. Minted here, next to
+                // the ack the client just got, so a crash between accept and the loop still has a
+                // `started` in flight. Unconfigured (`NoLifecycle`) skips construction entirely.
+                let life = cfg.lifecycle.enabled().then(|| {
+                    crate::lifecycle::Run::begin(
+                        Arc::clone(&cfg.lifecycle),
+                        persistence.session_id().to_string(),
+                        id.clone(),
+                        current_model.clone(),
+                    )
+                });
                 let cancel = CancellationToken::new();
                 // The sink sets this to the compaction's `tokens_before` when the loop compacts
                 // mid-run, so we know to non-destructively rewrite (not append) the persisted
@@ -3484,6 +3504,10 @@ pub(crate) async fn serve_session(
                     // Mark this session busy for the reaper's benefit (daemon mode) — it never reaps a
                     // session with a run in flight. Cleared once the attempt's future resolves, below.
                     running.store(true, Ordering::Relaxed);
+                    if let Some(life) = &life {
+                        life.set_attempt(retry_attempt);
+                    }
+                    let life_obs = life.clone();
                     let attempt_result = {
                         let run = agent.run_events_steered(
                             &mut session,
@@ -3567,6 +3591,9 @@ pub(crate) async fn serve_session(
                                 // gone the send fails here and the terminal response send below detects it
                                 // via `emit!` and stops the loop. An unserializable event is skipped rather
                                 // than emitted as a malformed frame (see `event_frame`).
+                                if let Some(life) = &life_obs {
+                                    life.observe(&ev);
+                                }
                                 if let Some(frame) = event_frame(ev) {
                                     let _ = tx.send(frame);
                                 }
@@ -3575,6 +3602,17 @@ pub(crate) async fn serve_session(
                             steering.clone(),
                         );
                         tokio::pin!(run);
+                        // No timer when unconfigured or `--lifecycle-heartbeat-secs 0`. Tool-edge
+                        // samples still fire from `observe` above.
+                        let mut heartbeat = life.as_ref().and_then(|_| {
+                            crate::lifecycle::heartbeat_interval(cfg.lifecycle_heartbeat)
+                        });
+                        // Consume the immediate first tick so the first sample is one interval in,
+                        // not stacked on `started`.
+                        if let Some(h) = heartbeat.as_mut() {
+                            h.tick().await;
+                        }
+                        let life_beat = life.clone();
                         loop {
                             tokio::select! {
                                 biased;
@@ -3966,6 +4004,18 @@ pub(crate) async fn serve_session(
                                         stdin_open = false;
                                         cancel.cancel();
                                     }
+                                },
+                                _ = async {
+                                    match heartbeat.as_mut() {
+                                        Some(h) => {
+                                            h.tick().await;
+                                        }
+                                        None => std::future::pending::<()>().await,
+                                    }
+                                } => {
+                                    if let Some(life) = &life_beat {
+                                        life.heartbeat();
+                                    }
                                 }
                             }
                         }
@@ -4217,8 +4267,33 @@ pub(crate) async fn serve_session(
                             None => response(id.clone(), "prompt", true, Some(data), None),
                         }
                     }
-                    Err(e) => response(id.clone(), "prompt", false, None, Some(&e.to_string())),
+                    Err(ref e) => response(id.clone(), "prompt", false, None, Some(&e.to_string())),
                 };
+                if let Some(life) = &life {
+                    let summary = crate::lifecycle::closing_summary(&session);
+                    let structured = current_output_spec
+                        .is_some()
+                        .then(|| output_slot.get().unwrap_or(Value::Null));
+                    let refused_now = refused.load(Ordering::Relaxed);
+                    match &result {
+                        Ok(()) => match &persist_error {
+                            Some(e) => life.failed(
+                                session.steps,
+                                format!("run completed but failed to persist: {e}"),
+                                refused_now,
+                                summary,
+                                structured,
+                            ),
+                            None => life.succeeded(session.steps, refused_now, summary, structured),
+                        },
+                        Err(agent_core::Error::Cancelled) => {
+                            life.aborted(session.steps, summary);
+                        }
+                        Err(e) => {
+                            life.failed(session.steps, e.to_string(), false, summary, structured);
+                        }
+                    }
+                }
                 emit!(frame);
                 // pi-parity (Task 4): this run has now actually gone idle (same guarantee
                 // `pending_abort_acks` relies on above) and its own terminal response has just been
