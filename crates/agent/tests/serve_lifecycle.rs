@@ -316,7 +316,10 @@ fn serve_todo_and_tool_progress_carries_tools_and_todos() {
         turn_text("all done"),
     ]);
 
-    let mut child = serve_life(&base, &session_file, &collector.url).spawn_guarded();
+    let mut child = serve_life(&base, &session_file, &collector.url)
+        // `0` disables the catch-up timer; ToolStart/todo still emit immediately.
+        .args(["--lifecycle-heartbeat-secs", "0"])
+        .spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
 

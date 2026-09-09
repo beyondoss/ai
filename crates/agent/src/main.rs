@@ -467,6 +467,13 @@ enum Command {
         /// A header sent with every lifecycle POST, `Name: value`. Repeatable. Auth belongs here.
         #[usage(long, env = "AI_AGENT_LIFECYCLE_HEADER")]
         lifecycle_header: Vec<String>,
+        /// Seconds between in-flight progress catch-up POSTs. Default 10. `0` disables the timer;
+        /// tool start/end, todos, and turn-end still emit a progress sample immediately. An
+        /// unchanged sample is not re-POSTed, so a long `bash` is one progress event, not one per
+        /// interval. Heartbeat names this timer, not the wire event (`progress`). `serve`'s identical
+        /// flag.
+        #[usage(long, env = "AI_AGENT_LIFECYCLE_HEARTBEAT_SECS", default = "10")]
+        lifecycle_heartbeat_secs: u64,
         /// Restrict the tool set to exactly these names (comma-separated), dropping everything else.
         /// Combine with `--exclude-tools` to carve one back out of the allow-list. `serve`'s identical
         /// flag/env var — a deployment convention setting this env var to sandbox an agent must apply
@@ -930,6 +937,13 @@ enum Command {
         /// A header sent with every lifecycle POST, `Name: value`. Repeatable.
         #[usage(long, env = "AI_AGENT_LIFECYCLE_HEADER")]
         lifecycle_header: Vec<String>,
+        /// Seconds between in-flight progress catch-up POSTs. Default 10. `0` disables the timer;
+        /// tool start/end, todos, and turn-end still emit a progress sample immediately. An
+        /// unchanged sample is not re-POSTed, so a long `bash` is one progress event, not one per
+        /// interval. Heartbeat names this timer, not the wire event (`progress`). `run`'s identical
+        /// flag.
+        #[usage(long, env = "AI_AGENT_LIFECYCLE_HEARTBEAT_SECS", default = "10")]
+        lifecycle_heartbeat_secs: u64,
         /// Restrict the tool set to exactly these names (comma-separated), dropping everything else.
         /// Fixed for the process, like `--system-prompt`; survives `set_model`/`set_thinking` rebuilds.
         /// `-t` matches pi's own `--tools`/`-t`.
@@ -1667,6 +1681,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             exec_cmd,
             lifecycle_url,
             lifecycle_header,
+            lifecycle_heartbeat_secs,
             tools,
             exclude_tools,
             no_tools,
@@ -1737,6 +1752,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 exec_cmd,
                 lifecycle_url,
                 lifecycle_header,
+                lifecycle_heartbeat_secs,
                 tools,
                 exclude_tools,
                 no_tools,
@@ -1821,6 +1837,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             exec_cmd,
             lifecycle_url,
             lifecycle_header,
+            lifecycle_heartbeat_secs,
             tools,
             exclude_tools,
             no_tools,
@@ -2144,6 +2161,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     eprintln!("{e}");
                     std::process::exit(2);
                 }),
+                lifecycle_heartbeat: std::time::Duration::from_secs(lifecycle_heartbeat_secs),
                 tools,
                 exclude_tools,
                 no_tools,
@@ -3133,6 +3151,7 @@ async fn run_turn(
     session_memory_active: bool,
     pressure_point: u32,
     life: Option<&std::sync::Arc<beyond_ai_agent::lifecycle::Run>>,
+    heartbeat: std::time::Duration,
 ) -> agent_core::Result<agent_core::StopReason> {
     let mut attempt = 0u32;
     loop {
@@ -3149,6 +3168,7 @@ async fn run_turn(
             session_memory_active,
             pressure_point,
             life,
+            heartbeat,
         )
         .await;
         match &result {
@@ -3248,6 +3268,7 @@ async fn run_turn_once(
     // (`memory::compaction_pressure_point`), fixed for the run (`run`'s model can't change mid-run).
     pressure_point: u32,
     life: Option<&std::sync::Arc<beyond_ai_agent::lifecycle::Run>>,
+    heartbeat_every: std::time::Duration,
 ) -> agent_core::Result<agent_core::StopReason> {
     // Two `/session` steers, mirroring `serve`'s observer: a *pre*-compaction pressure nudge (checkpoint
     // now, while detail is intact) fired at most once per fill cycle, and a *post*-compaction recall
@@ -3281,18 +3302,19 @@ async fn run_turn_once(
     };
     let mut stop_reason = agent_core::StopReason::default();
     let life_obs = life.cloned();
-    let life_hb = life.cloned();
-    let heartbeat = life_hb.map(|life| {
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(beyond_ai_agent::lifecycle::HEARTBEAT);
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let heartbeat = match (life.cloned(), heartbeat_every) {
+        (Some(life), every) if !every.is_zero() => Some(tokio::spawn(async move {
+            let Some(mut interval) = beyond_ai_agent::lifecycle::heartbeat_interval(every) else {
+                return;
+            };
             interval.tick().await;
             loop {
                 interval.tick().await;
                 life.heartbeat();
             }
-        })
-    });
+        })),
+        _ => None,
+    };
     let result = if json {
         agent
             .run_events_steered(
@@ -3474,6 +3496,7 @@ async fn run_task(
     exec_cmd: Option<String>,
     lifecycle_url: Option<String>,
     lifecycle_header: Vec<String>,
+    lifecycle_heartbeat_secs: u64,
     tools_allow: Option<Vec<String>>,
     tools_exclude: Option<Vec<String>>,
     no_tools: bool,
@@ -4535,6 +4558,7 @@ async fn run_task(
         session_memory_active,
         pressure_point,
         life.as_ref(),
+        std::time::Duration::from_secs(lifecycle_heartbeat_secs),
     )
     .await;
     // Persist whatever's in `session` regardless of outcome: `run_events_cancellable` mutates
@@ -4579,6 +4603,7 @@ async fn run_task(
             session_memory_active,
             pressure_point,
             life.as_ref(),
+            std::time::Duration::from_secs(lifecycle_heartbeat_secs),
         )
         .await;
         persist_run_tail(&store, &session)?;
@@ -5075,6 +5100,7 @@ mod tests {
             false,
             u32::MAX,
             None,
+            std::time::Duration::ZERO,
         )
         .await
         .unwrap();
@@ -5337,6 +5363,7 @@ mod tests {
             false,
             u32::MAX,
             None,
+            std::time::Duration::ZERO,
         )
         .await
         .expect("the whole-run retry must recover once a real turn is finally scripted");
@@ -5377,6 +5404,7 @@ mod tests {
             false,
             u32::MAX,
             None,
+            std::time::Duration::ZERO,
         )
         .await
         .expect_err("must eventually give up, not retry forever");
@@ -5425,6 +5453,7 @@ mod tests {
             false,
             u32::MAX,
             None,
+            std::time::Duration::ZERO,
         )
         .await
         .expect_err(

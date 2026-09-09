@@ -35,9 +35,24 @@ const DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
 /// Per-request HTTP timeout. Progress is not retried; started/terminal retry a few times inside this.
 const HTTP_TIMEOUT: Duration = Duration::from_secs(2);
 const HTTP_RETRIES: u32 = 3;
-/// In-flight sample cadence. Tool start/end also emit immediately, so a long `bash` is not stuck on
-/// the previous tool for a full interval.
-pub const HEARTBEAT: Duration = Duration::from_secs(1);
+/// Default in-flight catch-up interval. Tool start/end, todos, and turn-end emit a progress sample
+/// immediately; this timer only re-POSTs if the sample has changed since the last POST. A long
+/// `bash` is one progress event, not one per tick. Silence means unchanged, not dead.
+///
+/// The wire event is `progress`. **Heartbeat** names this optional timer, not the event. `0` on
+/// `--lifecycle-heartbeat-secs` disables the timer without touching sample-on-change.
+pub const HEARTBEAT: Duration = Duration::from_secs(10);
+
+/// Timer for the in-flight catch-up, or `None` when disabled (`Duration::ZERO`). The caller must
+/// consume the first tick so the first sample is one interval after `started`, not stacked on it.
+pub fn heartbeat_interval(every: Duration) -> Option<tokio::time::Interval> {
+    if every.is_zero() {
+        return None;
+    }
+    let mut interval = tokio::time::interval(every);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    Some(interval)
+}
 
 /// The host's seam for run lifecycle. Follows the crate idiom: a trait with a no-op default.
 ///
@@ -258,8 +273,12 @@ pub struct Run {
     /// 0 = idle, 1 = in flight, 2 = terminal emitted.
     state: std::sync::atomic::AtomicU8,
     sample: Mutex<ProgressSample>,
+    /// Last sample that was actually emitted. Seeded empty so a timer tick with nothing in flight
+    /// does not POST a no-op `progress` on top of `started`.
+    last_emitted: Mutex<Option<ProgressSample>>,
 }
 
+#[derive(Clone, Default, PartialEq)]
 struct ProgressSample {
     steps: u32,
     /// `(tool_use id, name)` in start order, so two concurrent `grep`s both appear.
@@ -285,13 +304,8 @@ impl Run {
             command_id,
             model: model.into(),
             state: std::sync::atomic::AtomicU8::new(0),
-            sample: Mutex::new(ProgressSample {
-                steps: 0,
-                tools: Vec::new(),
-                todos: None,
-                attempt: 0,
-                depth: 0,
-            }),
+            sample: Mutex::new(ProgressSample::default()),
+            last_emitted: Mutex::new(Some(ProgressSample::default())),
         });
         this.started();
         this
@@ -323,7 +337,7 @@ impl Run {
         });
     }
 
-    /// Fold a loop event into the sample. Tool edges emit a progress sample immediately.
+    /// Fold a loop event into the sample. Tool edges, todos, and turn-end emit immediately.
     pub fn observe(&self, ev: &AgentEvent) {
         match ev {
             AgentEvent::ToolStart { id, name, .. } => {
@@ -331,14 +345,14 @@ impl Run {
                     let mut s = lock(&self.sample);
                     s.tools.push((id.clone(), name.clone()));
                 }
-                self.heartbeat();
+                self.emit_progress();
             }
             AgentEvent::ToolEnd { id, .. } => {
                 {
                     let mut s = lock(&self.sample);
                     s.tools.retain(|(i, _)| i != id);
                 }
-                self.heartbeat();
+                self.emit_progress();
             }
             AgentEvent::ToolProgress {
                 name,
@@ -347,11 +361,12 @@ impl Run {
             } if name == crate::tools::todo::NAME => {
                 if let Some(todos) = d.get("todos") {
                     lock(&self.sample).todos = Some(todos.clone());
-                    self.heartbeat();
+                    self.emit_progress();
                 }
             }
             AgentEvent::TurnEnd { step, .. } => {
                 lock(&self.sample).steps = *step;
+                self.emit_progress();
             }
             _ => {}
         }
@@ -365,12 +380,25 @@ impl Run {
         lock(&self.sample).steps = steps;
     }
 
-    /// Latest-wins progress sample. Dropped if the run is not in flight.
+    /// Timer path: re-POST the latest sample only if it changed. Hosts call this on the interval.
     pub fn heartbeat(&self) {
+        self.emit_progress();
+    }
+
+    /// Latest-wins progress sample. Dropped if the run is not in flight, or if this sample was
+    /// already the last one posted (an unchanged timer tick is not a new event).
+    fn emit_progress(&self) {
         if self.state.load(std::sync::atomic::Ordering::Acquire) != 1 {
             return;
         }
-        let s = lock(&self.sample);
+        let s = lock(&self.sample).clone();
+        {
+            let mut last = lock(&self.last_emitted);
+            if last.as_ref() == Some(&s) {
+                return;
+            }
+            *last = Some(s.clone());
+        }
         self.sink.emit(RunEvent::Progress {
             run_id: self.run_id.clone(),
             session_id: self.session_id.clone(),
@@ -379,7 +407,7 @@ impl Run {
             steps: s.steps,
             tools: s.tools.iter().map(|(_, n)| n.clone()).collect(),
             attempt: (s.attempt > 0).then_some(s.attempt),
-            todos: s.todos.clone(),
+            todos: s.todos,
             depth: (s.depth > 0).then_some(s.depth),
         });
     }
@@ -730,6 +758,76 @@ mod tests {
             })
             .collect();
         assert_eq!(kinds, ["started", "aborted"], "{kinds:?}");
+    }
+
+    #[test]
+    fn heartbeat_skips_an_unchanged_sample() {
+        let (rec, run) = rec_run();
+        run.heartbeat();
+        run.heartbeat();
+        assert_eq!(
+            rec.snapshot()
+                .iter()
+                .filter(|e| matches!(e, RunEvent::Progress { .. }))
+                .count(),
+            0,
+            "empty in-flight sample must not POST on top of started: {:#?}",
+            rec.snapshot()
+        );
+
+        run.observe(&AgentEvent::ToolStart {
+            id: "t1".into(),
+            name: "bash".into(),
+            input: json!({}),
+        });
+        run.heartbeat();
+        run.heartbeat();
+        let progress: Vec<_> = rec
+            .snapshot()
+            .into_iter()
+            .filter(|e| matches!(e, RunEvent::Progress { .. }))
+            .collect();
+        assert_eq!(
+            progress.len(),
+            1,
+            "timer must not re-POST an unchanged sample: {progress:#?}"
+        );
+        match &progress[0] {
+            RunEvent::Progress { tools, steps, .. } => {
+                assert_eq!(tools, &["bash".to_string()]);
+                assert_eq!(*steps, 0);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn turn_end_emits_steps() {
+        let (rec, run) = rec_run();
+        run.observe(&AgentEvent::TurnEnd {
+            stop_reason: agent_core::StopReason::EndTurn,
+            step: 3,
+        });
+        let progress: Vec<_> = rec
+            .snapshot()
+            .into_iter()
+            .filter_map(|e| match e {
+                RunEvent::Progress { steps, tools, .. } => Some((steps, tools)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(progress, [(3, Vec::new())], "{progress:?}");
+    }
+
+    #[test]
+    fn heartbeat_interval_is_none_when_disabled() {
+        assert!(heartbeat_interval(Duration::ZERO).is_none());
+        assert_eq!(HEARTBEAT, Duration::from_secs(10));
+    }
+
+    #[tokio::test]
+    async fn heartbeat_interval_is_some_when_enabled() {
+        assert!(heartbeat_interval(HEARTBEAT).is_some());
     }
 
     #[test]

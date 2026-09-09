@@ -407,6 +407,7 @@ fn isolate_provider_env(cmd: &mut Command) {
         // want the emitter set it after [`serve_cmd`]/[`run_cmd`] (last-write wins).
         "AI_AGENT_LIFECYCLE_URL",
         "AI_AGENT_LIFECYCLE_HEADER",
+        "AI_AGENT_LIFECYCLE_HEARTBEAT_SECS",
     ] {
         cmd.env_remove(key);
     }

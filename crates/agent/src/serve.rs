@@ -644,6 +644,10 @@ pub struct ServeConfig {
     /// before any session runs, and cloned (the `Arc`) into every daemon session so they share one
     /// outbound worker. The URL is `http`/`https` or `unix:` (same machine, no host, no TLS).
     pub lifecycle: std::sync::Arc<dyn crate::lifecycle::RunLifecycle>,
+    /// How often to re-POST the latest progress sample while a run is in flight. `Duration::ZERO`
+    /// disables the timer; tool-edge / todo / turn-end samples still fire. Default
+    /// [`crate::lifecycle::HEARTBEAT`] (10s). An unchanged sample is not re-POSTed.
+    pub lifecycle_heartbeat: std::time::Duration,
     /// Restrict the tool set to exactly these names, dropping everything else. Combine with
     /// `exclude_tools` to carve one back out of the allow-list. Fixed for the process — like `system`,
     /// there's no runtime RPC to change it, but it does survive a `set_model`/`set_thinking` rebuild
@@ -3598,11 +3602,16 @@ pub(crate) async fn serve_session(
                             steering.clone(),
                         );
                         tokio::pin!(run);
-                        let mut heartbeat = tokio::time::interval(crate::lifecycle::HEARTBEAT);
-                        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                        // No timer when unconfigured or `--lifecycle-heartbeat-secs 0`. Tool-edge
+                        // samples still fire from `observe` above.
+                        let mut heartbeat = life.as_ref().and_then(|_| {
+                            crate::lifecycle::heartbeat_interval(cfg.lifecycle_heartbeat)
+                        });
                         // Consume the immediate first tick so the first sample is one interval in,
                         // not stacked on `started`.
-                        heartbeat.tick().await;
+                        if let Some(h) = heartbeat.as_mut() {
+                            h.tick().await;
+                        }
                         let life_beat = life.clone();
                         loop {
                             tokio::select! {
@@ -3996,7 +4005,14 @@ pub(crate) async fn serve_session(
                                         cancel.cancel();
                                     }
                                 },
-                                _ = heartbeat.tick() => {
+                                _ = async {
+                                    match heartbeat.as_mut() {
+                                        Some(h) => {
+                                            h.tick().await;
+                                        }
+                                        None => std::future::pending::<()>().await,
+                                    }
+                                } => {
                                     if let Some(life) = &life_beat {
                                         life.heartbeat();
                                     }
