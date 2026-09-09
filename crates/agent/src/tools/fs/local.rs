@@ -206,8 +206,8 @@ impl FsBackend for LocalFs {
 
 /// Run a blocking filesystem body on the blocking pool, mapping a join failure to a backend error.
 /// Every `LocalFs` method funnels through this so none of them can accidentally run a synchronous
-/// syscall inline on an async worker — which in `serve_ws` would pin a per-session current-thread
-/// runtime for the whole call.
+/// syscall inline on an async worker — which in `serve_ws` would pin a worker of the daemon's shared
+/// runtime (and, in tests, a `current_thread` runtime) for the whole call.
 async fn blocking<T, F>(what: &'static str, f: F) -> Result<T, FsError>
 where
     T: Send + 'static,

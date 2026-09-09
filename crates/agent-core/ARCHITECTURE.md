@@ -670,7 +670,10 @@ Send` for the stream-only entry points). The `+ Send` is what lets a *nested* ag
 `Tool::run` future — the `agent` crate's `subagent` tool drives a child `Agent` and awaits it directly,
 which requires the run future to be `Send`, which requires the sink to be. The loop's internal helpers
 hold the sink as `&mut (dyn FnMut(AgentEvent) + Send)` across `.await` for the same reason. Every
-existing sink (stdout writers, `serve`'s mpsc push, test collectors) is already `Send`.
+existing sink (stdout writers, `serve`'s mpsc push, test collectors) is already `Send`. The `serve`
+daemon relies on that bound: `serve_session` is itself `Send`, so the WebSocket supervisor
+`tokio::spawn`s each session onto the process-wide runtime instead of dedicating an OS thread and a
+current-thread executor per tenant.
 
 Dispatch gates on the presence of complete `tool_use` blocks alone (pi-parity fix) — never on
 `stop_reason` for any *other* value, which the diagram above no longer branches on. A `MaxTokens`-

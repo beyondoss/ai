@@ -151,9 +151,9 @@ async fn every_tool_follows_the_switch_not_just_the_ones_that_are_easy() {
 #[tokio::test]
 async fn concurrent_sessions_each_keep_their_own_target() {
     // Two sessions live at once, each with its own cell and its own registry — the shape `serve`'s
-    // daemon mode has, where every session runs on its own thread with its own registry. Interleaved
-    // on purpose: a target held in any process-global would surface here as one session reading the
-    // other's secret.
+    // daemon mode has, where every session is a task on the shared runtime with its own registry.
+    // Interleaved on purpose: a target held in any process-global would surface here as one session
+    // reading the other's secret.
     let a = tenant_dir("tenant-a", "SECRET-AAAA");
     let b = tenant_dir("tenant-b", "SECRET-BBBB");
 

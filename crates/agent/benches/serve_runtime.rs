@@ -3,11 +3,10 @@
 
 //! Process-level Tokio runtime A/B for `serve --listen`.
 //!
-//! The process runtime is **not** the per-session executor: `serve_ws` already gives every session
-//! its own OS thread with a `current_thread` runtime. Extra work-stealing workers on the accept
-//! runtime therefore sit in `epoll_wait` paying per-thread stacks and mimalloc heaps. This bench
-//! is the measurement that picked `current_thread` as the production default (`main.rs::
-//! build_runtime`).
+//! Every WebSocket session is a task on this process runtime (`serve_ws` `tokio::spawn`s
+//! `serve_session`; the future is `Send`). Extra work-stealing workers therefore run real session
+//! work, not just the accept loop — they also cost per-thread stacks and mimalloc heaps. This bench
+//! A/Bs `current_thread` (the production default in `main.rs::build_runtime`) against multi-thread.
 //!
 //! It spawns the real `beyond-ai-agent` binary twice — once per flavor, selected by
 //! `BEYOND_AI_AGENT_TOKIO_WORKER_THREADS` — and drives concurrent WebSocket sessions against a

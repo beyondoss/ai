@@ -102,17 +102,18 @@ const MAX_INBOUND_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
 /// How long a **detached** session (no attached connection) stays live before the reaper reclaims it,
 /// when the operator gave no `--session-idle-timeout`. The default has to be finite: without a reaper
 /// the session map only grows — a connection that omits `?session_id=` mints a fresh id, and every id
-/// owns an OS thread, an `Agent`, and a gateway pool until the daemon stops. It also has to be *long*,
-/// because a detached session is not a dead one: re-attaching to a still-running run is the entire point
+/// owns a runtime task, an `Agent`, and (unless the HTTP pool is shared) a gateway client until the
+/// daemon stops. It also has to be *long*, because a detached session is not a dead one: re-attaching
+/// to a still-running run is the entire point
 /// of the design (see the module doc), so the window must comfortably outlast a tunnel, a locked screen,
 /// or a lunch break. An hour is both. Nothing is lost when it fires — a reaped session persisted on its
 /// way out, and reconnecting to its id respawns it and replays from disk.
 const DEFAULT_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 
-/// How long a batch of session threads gets to persist and exit before the caller stops waiting on them.
+/// How long a batch of session tasks gets to persist and exit before the caller stops waiting on them.
 const JOIN_GRACE: Duration = Duration::from_secs(10);
 
-/// How often [`join_handles_within`] re-checks whether the session threads it's waiting on have exited.
+/// How often [`join_handles_within`] re-checks whether the session tasks it's waiting on have exited.
 /// Short enough not to add perceptible latency to a graceful shutdown (the common case: every session
 /// persists in milliseconds), long enough to cost nothing while waiting.
 const JOIN_POLL: Duration = Duration::from_millis(10);
@@ -130,10 +131,11 @@ struct SessionHandle {
     /// (see [`crate::serve::OutFanout`]). Each connection registers its sink on attach and removes it on
     /// disconnect.
     out_conn: SharedOutConn,
-    /// The session's dedicated thread. Retained so a graceful shutdown can **wait** for the session to
-    /// persist and exit (dropping `input_tx` closes its input, then this joins) rather than letting
-    /// `process::exit` race the persist. `None` only transiently while a handle is being moved out.
-    join: Option<std::thread::JoinHandle<()>>,
+    /// The session's task on the daemon's shared runtime. Retained so a graceful shutdown can **wait**
+    /// for the session to persist and exit (dropping `input_tx` closes its input, then this awaits)
+    /// rather than letting `process::exit` race the persist. `None` only transiently while a handle is
+    /// being moved out.
+    join: Option<tokio::task::JoinHandle<()>>,
     /// How many connections are currently attached. The idle reaper only considers a session for
     /// reclamation when this reaches `0` (see [`Self::last_detached_at`]).
     attached: usize,
@@ -212,31 +214,18 @@ impl Supervisor {
                 // reads this handle-side clone to never reclaim a mid-run background session.
                 let running = Arc::new(AtomicBool::new(false));
                 let session_running = running.clone();
-                // `serve_session`'s event sink is a `Box<dyn FnMut>` (not `Send`), so its future
-                // can't be `tokio::spawn`ed onto the process accept runtime — the stdio path only
-                // ever `.await`s it inline. Give each session its own thread with a current-thread
-                // runtime instead; the `mpsc` channels bridging it to the accept runtime are
-                // runtime-agnostic. Sessions are few (one per connected client), so a thread
-                // apiece is fine. The process runtime itself is also `current_thread` by default
-                // (see `main.rs::build_runtime`): accept/WS-I/O is cooperative, and extra
-                // work-stealing workers would only cost RSS.
-                let join = std::thread::spawn(move || {
-                    let rt = match tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                    {
-                        Ok(rt) => rt,
-                        Err(e) => {
-                            eprintln!("serve: session {log_id} runtime build failed: {e}");
-                            return;
-                        }
-                    };
-                    rt.block_on(async move {
-                        match serve_session(cfg, input_rx, session_out, session_running).await {
-                            Ok(_) => {}
-                            Err(e) => eprintln!("serve: session {log_id} ended: {e}"),
-                        }
-                    });
+                // `serve_session` is `Send` (its event sink is `FnMut + Send`, and the error type is
+                // `Box<dyn Error + Send + Sync>`), so the session is a task on this process-wide
+                // runtime rather than a dedicated OS thread + current-thread executor. Tenant state
+                // stays on the task: credentials, transcript, `/session` memory, persistence, tools,
+                // approvals, and exec endpoints are built inside `serve_session`, not shared. The
+                // `mpsc` channels bridging it to the accept loop are unchanged. The process runtime
+                // itself is `current_thread` by default (see `main.rs::build_runtime`).
+                let join = tokio::spawn(async move {
+                    match serve_session(cfg, input_rx, session_out, session_running).await {
+                        Ok(_) => {}
+                        Err(e) => eprintln!("serve: session {log_id} ended: {e}"),
+                    }
                 });
                 SessionHandle {
                     input_tx,
@@ -401,10 +390,10 @@ impl Supervisor {
 
     /// Graceful shutdown: drain the session map (dropping each `input_tx`, which closes that session's
     /// input channel → it cancels any in-flight run, persists, and exits), then wait for every session
-    /// thread to finish so persistence is durable before the process exits. Bounded so a wedged session
+    /// task to finish so persistence is durable before the process exits. Bounded so a wedged session
     /// can't hang the shutdown forever — a straggler is left to `process::exit`.
     async fn shutdown(&self) {
-        let joins: Vec<std::thread::JoinHandle<()>> = {
+        let joins: Vec<tokio::task::JoinHandle<()>> = {
             let mut sessions = lock_ignoring_poison(&self.sessions);
             sessions
                 .drain()
@@ -471,10 +460,10 @@ impl Supervisor {
 
     /// Idle reaper: reclaim every session [`is_reapable`] names. Removing the handle drops its retained
     /// `input_tx`, so the session observes EOF and persists+exits exactly as in [`shutdown`]; the join
-    /// then waits for that persist to land (and reclaims the thread of one that had already exited). A
+    /// then waits for that persist to land (and reaps the task of one that had already exited). A
     /// reconnect to a just-reaped id transparently respawns and replays via `get_messages{since}`.
     async fn reap_idle(&self, timeout: Duration) {
-        let joins: Vec<std::thread::JoinHandle<()>> = {
+        let joins: Vec<tokio::task::JoinHandle<()>> = {
             let mut sessions = lock_ignoring_poison(&self.sessions);
             let reap: Vec<String> = sessions
                 .iter()
@@ -494,7 +483,7 @@ impl Supervisor {
 /// A **closed `input_tx`** is the strongest reason of all: the session's loop is already gone (it
 /// returned early — no credential, an unwritable session dir — or hit an internal error), so nothing
 /// will ever read its input again. The entry is pure garbage: a `HashMap` slot, a `SharedOutConn`, and
-/// an unreclaimed `JoinHandle` for a thread that has already exited. Reap it whatever its attach state
+/// an unreclaimed `JoinHandle` for a task that has already exited. Reap it whatever its attach state
 /// or clock says — a live connection still pinned to it is no reason to keep a corpse (that connection's
 /// next command fails its `input_tx.send` and tears the socket down; a reconnect respawns the id).
 ///
@@ -510,27 +499,26 @@ fn is_reapable(h: &SessionHandle, timeout: Duration) -> bool {
         && !h.running.load(Ordering::Relaxed)
 }
 
-/// Wait for a batch of session threads to finish persisting, bounded by [`JOIN_GRACE`] so a wedged
+/// Wait for a batch of session tasks to finish persisting, bounded by [`JOIN_GRACE`] so a wedged
 /// session can't hang the caller forever. Shared by [`Supervisor::shutdown`] and
 /// [`Supervisor::reap_idle`] so both persist-then-join on the same discipline.
-async fn join_handles(joins: Vec<std::thread::JoinHandle<()>>) {
+async fn join_handles(joins: Vec<tokio::task::JoinHandle<()>>) {
     join_handles_within(joins, JOIN_GRACE).await;
 }
 
 /// The waiting itself, with the grace period as a parameter so it can be tested.
 ///
-/// The wait **polls `is_finished`** rather than parking a blocking join behind a timeout, because a
-/// timeout only abandons the *await* — the blocking join underneath it keeps running. Wedge one session
-/// and a `spawn_blocking(|| handle.join())` would sit on one of tokio's blocking threads (a finite pool)
-/// for the rest of the process's life; wedge enough of them and every `spawn_blocking` in the daemon
-/// stalls behind an empty pool, session persistence included. `join()` is therefore only ever called on
-/// a thread that has *already exited*, where it cannot block: it just reaps the thread.
+/// The wait **polls `is_finished`** rather than parking on `JoinHandle::await` behind a timeout.
+/// `timeout(grace, handle.await)` only abandons the *await* — dropping a tokio `JoinHandle` detaches
+/// the task, which is the straggler behavior we want past `grace`, but a naive `join_all` would also
+/// hide how many actually finished. Polling lets us reap the ones that *did* exit (`.await` on an
+/// already-finished handle cannot block) and report the rest.
 ///
-/// A straggler past `grace` is dropped, which detaches it — the OS reclaims its stack when it finally
-/// does exit, and nothing (no caller, no pool thread) is left waiting on it. That is all the caller can
-/// do: a graceful shutdown falls through to `process::exit` regardless, and the reaper has already
-/// removed the id from the map, so it will never see that session again.
-async fn join_handles_within(joins: Vec<std::thread::JoinHandle<()>>, grace: Duration) {
+/// A straggler past `grace` is dropped, which detaches it — the task keeps running until it exits,
+/// and nothing is left waiting on it. That is all the caller can do: a graceful shutdown falls through
+/// to `process::exit` regardless, and the reaper has already removed the id from the map, so it will
+/// never see that session again.
+async fn join_handles_within(joins: Vec<tokio::task::JoinHandle<()>>, grace: Duration) {
     if joins.is_empty() {
         return;
     }
@@ -540,7 +528,7 @@ async fn join_handles_within(joins: Vec<std::thread::JoinHandle<()>>, grace: Dur
         let mut still = Vec::with_capacity(pending.len());
         for j in pending {
             if j.is_finished() {
-                let _ = j.join();
+                let _ = j.await;
             } else {
                 still.push(j);
             }
@@ -811,7 +799,7 @@ pub async fn serve_ws(
     if idle_timeout.is_none() {
         eprintln!(
             "serve: idle-session reaper OFF (--session-idle-timeout 0) — every session, including one \
-             no client ever re-attaches to, holds its thread and gateway pool until the daemon stops"
+             no client ever re-attaches to, holds its task and gateway client until the daemon stops"
         );
     }
     let reaper = idle_timeout.map(|t| {
@@ -849,9 +837,8 @@ pub async fn serve_ws(
                     let _ = std::fs::remove_file(path);
                 }
                 // Drive shutdown deterministically from here rather than relying on each session's own
-                // signal handler (which runs on a spawned-thread runtime that may not receive the
-                // signal): drop every retained `input_tx` so each session observes EOF and
-                // cancels+persists+exits, then join its thread so persistence actually completes before
+                // signal handler: drop every retained `input_tx` so each session observes EOF and
+                // cancels+persists+exits, then await its task so persistence actually completes before
                 // the caller's `process::exit`.
                 supervisor.shutdown().await;
                 return Ok(Some(sig));
@@ -1003,7 +990,7 @@ mod tests {
     fn a_dead_session_is_reapable_however_it_looks_otherwise() {
         // Its loop ended (input receiver gone) while a connection is *still attached* and its idle clock
         // never started: every ordinary condition says "keep", and it must still be reaped — otherwise
-        // the entry, its fanout, and its exited thread's handle are retained for the daemon's life.
+        // the entry, its fanout, and its exited task's handle are retained for the daemon's life.
         let (h, input_rx) = handle(1, None);
         drop(input_rx);
         assert!(is_reapable(&h, Duration::from_secs(3600)));
@@ -1039,20 +1026,20 @@ mod tests {
         );
     }
 
-    /// A wedged session must not hold the caller (nor a blocking-pool thread) past the grace period, and
-    /// the threads that *did* exit must still be reaped in the same pass.
+    /// A wedged session must not hold the caller past the grace period, and the tasks that *did*
+    /// exit must still be reaped in the same pass.
     #[tokio::test]
-    async fn a_wedged_thread_does_not_hold_the_join_past_the_grace_period() {
+    async fn a_wedged_task_does_not_hold_the_join_past_the_grace_period() {
         let release = Arc::new(AtomicBool::new(false));
         let wedged = {
             let release = release.clone();
-            std::thread::spawn(move || {
+            tokio::spawn(async move {
                 while !release.load(Ordering::Relaxed) {
-                    std::thread::sleep(Duration::from_millis(5));
+                    tokio::time::sleep(Duration::from_millis(5)).await;
                 }
             })
         };
-        let finished = std::thread::spawn(|| {});
+        let finished = tokio::spawn(async {});
 
         let start = Instant::now();
         join_handles_within(vec![finished, wedged], Duration::from_millis(200)).await;
@@ -1066,13 +1053,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn joining_returns_as_soon_as_every_thread_has_exited() {
-        let threads: Vec<_> = (0..4).map(|_| std::thread::spawn(|| {})).collect();
+    async fn joining_returns_as_soon_as_every_task_has_exited() {
+        let tasks: Vec<_> = (0..4).map(|_| tokio::spawn(async {})).collect();
         let start = Instant::now();
-        join_handles_within(threads, Duration::from_secs(10)).await;
+        join_handles_within(tasks, Duration::from_secs(10)).await;
         assert!(
             start.elapsed() < Duration::from_secs(1),
-            "finished threads must not wait out the grace period"
+            "finished tasks must not wait out the grace period"
         );
     }
 }

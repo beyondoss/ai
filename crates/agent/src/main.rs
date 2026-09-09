@@ -693,18 +693,20 @@ enum Command {
         /// and isn't mid-run — dropping it so it persists and exits, exactly like a graceful shutdown
         /// does per-session. Nothing is lost: reconnecting to a reaped id respawns it and replays from
         /// disk. Absent ⇒ 3600 (one hour) — long enough that a client can drop its socket and re-attach
-        /// to a still-running session, finite so an unattended daemon's threads and gateway pools don't
+        /// to a still-running session, finite so an unattended daemon's tasks and gateway clients don't
         /// accumulate forever. Pass `0` to disable reaping entirely (every session then lives until the
         /// daemon stops). Ignored without `--listen`/`--listen-uds`.
         #[usage(long, env = "AI_AGENT_SESSION_IDLE_TIMEOUT")]
         session_idle_timeout: Option<u64>,
-        /// How the daemon pools its upstream (agent→gateway) connections across sessions: `off` (the
-        /// default — each session opens its own pool, as before), `auto` (one shared client, HTTP/1.1
-        /// pooling now, h2 if the hop later gains ALPN), or `h2c` (one shared HTTP/2-cleartext client
-        /// multiplexing all sessions over ~one connection). `h2c` **requires** an h2c-capable gateway —
-        /// against an h1-only gateway every request fails — so it stays opt-in. Only meaningful with
-        /// `--listen`/`--listen-uds`; ignored on the stdio path.
-        #[usage(long, env = "AI_AGENT_UPSTREAM_HTTP2", default = "off")]
+        /// How the daemon pools its upstream (agent→gateway) connections across sessions: `auto` (the
+        /// default — one shared client, HTTP/1.1 pooling now, h2 if the hop later gains ALPN), `off`
+        /// (each session opens its own pool), or `h2c` (one shared HTTP/2-cleartext client multiplexing
+        /// all sessions over ~one connection). `h2c` **requires** an h2c-capable gateway — against an
+        /// h1-only gateway every request fails — so it stays opt-in. Sharing the pool is the density
+        /// default: N sessions collapse onto one TLS config and connection set, while credentials stay
+        /// per-request on each session's `GatewayClient`. Only meaningful with `--listen`/`--listen-uds`;
+        /// ignored on the stdio path.
+        #[usage(long, env = "AI_AGENT_UPSTREAM_HTTP2", default = "auto")]
         upstream_http2: serve::UpstreamHttp2,
         /// Address this exact session: reattach to it if it already exists, or create it under exactly
         /// this id if it doesn't. Gives a caller a known, predictable name to route on rather than
@@ -1566,12 +1568,13 @@ fn tokio_worker_threads_from_env() -> Result<Option<usize>, Box<dyn std::error::
 
 /// The process-wide tokio runtime.
 ///
-/// Default is `current_thread`. The process runtime is the accept loop, the idle reaper, stdio
-/// `serve`, and one-shot `run` — not the per-session executor. `serve --listen` already gives every
-/// WebSocket session its own OS thread with a `current_thread` runtime (`serve_ws`), and CPU-bound
-/// tool work (`grep`/`find`/image resize) is `spawn_blocking`, which a current-thread runtime still
-/// has a blocking pool for. Extra work-stealing workers would sit in `epoll_wait` paying per-thread
-/// stacks and mimalloc heaps; `benches/serve_runtime.rs` is the measurement that picked this.
+/// Default is `current_thread`. Session tasks (`serve_ws`), the accept loop, the idle reaper, stdio
+/// `serve`, and one-shot `run` all share it — `serve_session` is `Send`, so there is no per-session
+/// OS thread. CPU-bound tool work (`grep`/`find`/image resize) is `spawn_blocking`, which a
+/// current-thread runtime still has a blocking pool for. Extra work-stealing workers cost per-thread
+/// stacks and mimalloc heaps; `benches/serve_runtime.rs` A/B's that tradeoff now that session work
+/// lives on this runtime. `BEYOND_AI_AGENT_TOKIO_WORKER_THREADS` restores work-stealing without a
+/// rebuild.
 fn build_runtime() -> Result<tokio::runtime::Runtime, Box<dyn std::error::Error>> {
     let mut builder = match tokio_worker_threads_from_env()? {
         None => tokio::runtime::Builder::new_current_thread(),
