@@ -1926,7 +1926,7 @@ spawn ──► Booting ──writer task up + "ready" frame sent──► Ready
 Every WebSocket session already runs on its own OS thread with a `current_thread` runtime
 (`serve_ws`: the event sink is `Box<dyn FnMut>` and isn't `Send`, so the session future can't be
 `tokio::spawn`ed onto a shared scheduler). CPU-bound tool work (`grep`/`find`/image resize) is
-`spawn_blocking`, which a current-thread runtime still has a blocking pool for. What the *process*
+`spawn_blocking`, which a current-thread runtime still has a blocking pool for. What the _process_
 runtime actually does is accept TCP/UDS connections, copy WebSocket frames onto `mpsc` channels, and
 tick the idle reaper — cooperative I/O. Extra workers park in `epoll_wait` paying per-thread stacks
 and mimalloc heaps, on a binary whose idle RSS in a 768 MB guest is already the density budget.
@@ -1937,14 +1937,14 @@ default) against `=0` (one worker per core, the previous default). On a 4-core r
 sessions, 4s windows:
 
 ```
-                    idle RSS   peak RSS   threads   rpc rps   rpc p95   prompt rps   prompt p95   CPU
-    multi_thread     16.84      216.8      36        5115      11.4      710          48.2        58%
-    current_thread   16.50      205.9      33        5124      10.8      722          47.8        55%
+                idle RSS   peak RSS   threads   rpc rps   rpc p95   prompt rps   prompt p95   CPU
+multi_thread     16.84      216.8      36        5115      11.4      710          48.2        58%
+current_thread   16.50      205.9      33        5124      10.8      722          47.8        55%
 ```
 
 Idle RSS barely moves — parked workers don't fault their stacks. Peak RSS under load drops ~11 MiB
 (mimalloc per-thread heaps once the accept runtime is actually copying frames), three fewer
-threads, throughput and p95 within noise (rpc p95 is slightly *better* on one thread). If that A/B
+threads, throughput and p95 within noise (rpc p95 is slightly _better_ on one thread). If that A/B
 ever shows a regression the RSS win doesn't cover, pin workers with the env var rather than
 silently widening the default.
 
