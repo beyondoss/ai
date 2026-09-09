@@ -23,6 +23,8 @@ pub mod policy;
 pub mod prompts;
 pub mod resources;
 pub mod retry;
+// Reporting a run's outcome to a Beyond host, when there is one. Inert otherwise.
+pub mod run_events;
 pub mod serve;
 pub mod serve_ws;
 pub mod session_store;

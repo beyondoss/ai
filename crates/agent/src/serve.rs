@@ -4185,6 +4185,21 @@ pub(crate) async fn serve_session(
                     }
                 };
 
+                // Derived before `result` is consumed below, from exactly the same two
+                // values that decide `frame` — so the report and the client's response
+                // can never disagree about how the run ended.
+                // The agent's own closing words, so a receiver can show a person what
+                // happened without opening a session to ask. Read here, where the run
+                // has released `&mut session` and the transcript is final.
+                let run_summary = crate::run_events::summarize(&session.messages);
+                let (run_status, run_error) = match (&result, &persist_error) {
+                    (Ok(()), None) => (crate::run_events::RunStatus::Succeeded, None),
+                    (Ok(()), Some(e)) => (
+                        crate::run_events::RunStatus::Failed,
+                        Some(format!("run completed but failed to persist: {e}")),
+                    ),
+                    (Err(e), _) => (crate::run_events::RunStatus::Failed, Some(e.to_string())),
+                };
                 let frame = match result {
                     Ok(()) => {
                         let mut data = session_stats(&session, &current_model);
@@ -4220,6 +4235,31 @@ pub(crate) async fn serve_session(
                     Err(e) => response(id.clone(), "prompt", false, None, Some(&e.to_string())),
                 };
                 emit!(frame);
+                // Tell the host how this run ended, if it asked to be told.
+                //
+                // Here, and not in the event sink above, because this is the only place
+                // the OUTCOME is known: retries have finished, persistence has been
+                // attempted, and the terminal response has just gone out. An
+                // `AgentEnd` event says a turn stopped; it does not say whether the run
+                // succeeded, and a run report that disagreed with the response the
+                // client just received would be worse than none.
+                //
+                // The status is derived from exactly the same values that decided
+                // `frame`, so the two can never disagree. A refusal is deliberately NOT
+                // a failure: the existing response reports success with `refused` in its
+                // data, and the report follows it rather than inventing a second
+                // opinion about what a refusal means.
+                //
+                // Spawned, never awaited: the client already has its answer, and a host
+                // that stopped reading must not hold up an agent that has finished.
+                tokio::spawn(async move {
+                    crate::run_events::report_terminal(
+                        run_status,
+                        run_summary.as_deref(),
+                        run_error.as_deref(),
+                    )
+                    .await;
+                });
                 // pi-parity (Task 4): this run has now actually gone idle (same guarantee
                 // `pending_abort_acks` relies on above) and its own terminal response has just been
                 // sent — run each command that arrived mid-run and self-aborted-and-proceeded through
