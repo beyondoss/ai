@@ -166,7 +166,7 @@ builder on `Agent` or `ModelRequest`, and each is exercised by unit tests):
   `ModelRequest`, and `after_provider_response` is read-only, so nothing previously exposed the
   _literal_ dialect-specific wire JSON a host might need to inspect or rewrite. Called from
   `client.rs::GatewayClient::stream`, once per attempt, immediately after `dialect.build_body(..)` builds
-  the wire body and before it's handed to `send_with_retry` — mirrors pi's real (single-layer) `onPayload`
+  the wire body and before that tree is serialized to compact JSON bytes for `send_with_retry` — mirrors pi's real (single-layer) `onPayload`
   (`sdk.ts:332-338`, wired to the extension event confusingly also named `"before_provider_request"` —
   despite the name collision, it operates on the literal wire JSON, matching this hook, not the
   `ModelRequest`-level hook above). The unused `agent-harness.ts` additionally exposes its own,
@@ -871,19 +871,27 @@ alternation valid; **follow-ups** (`push`) are a separate lane, injected only at
 ### Session history sharing
 
 `Session.messages` is `Arc<Vec<Message>>`. `Session::push` mutates via `Arc::make_mut` — in place when
-the session solely owns the `Arc` (the steady state between turns), cloning only if a still-live
-`ModelRequest` snapshot holds the same pointer. When that clone does happen (the end-of-turn `push`
-while the turn's request still shares the history), it's cheap by construction: the large immutable
+the session solely owns the `Arc` (the steady state between turns), cloning only if another snapshot
+still holds the same pointer (an in-flight `ModelRequest`, a serve catch-up `OutFanout` history, or a
+queued checkpoint `Arc`). When that clone does happen, it's cheap by construction: the large immutable
 `ContentBlock` payloads (`Text`/`Thinking` text, `RedactedThinking`/`ToolResult`/`ImageSource` bodies —
 the multi-KB tool results and base64 images) are `Arc<str>`, so `make_mut`'s per-message deep clone is a
-refcount bump per payload, not a byte copy — only the small `String` fields (ids, names, signatures) are
-actually re-allocated. `ModelRequest::messages` and `Agent::tool_defs` are
+refcount bump per payload, not a byte copy — only the small `String` fields (ids, names, signatures) and
+`ToolUse.input` (`serde_json::Value`) are actually re-allocated. `ModelRequest::messages` and `Agent::tool_defs` are
 both `Arc`-shared for the same reason: building a request clones a pointer, not a deep copy of a
 history that grows every step (an O(n²) cost over a long run otherwise) or a tool-definition list with
 embedded JSON Schemas. `tool_defs` specifically is computed once in `Agent::with_tools`, not rebuilt
 per turn. See `agent.rs:tests::request_snapshots_are_isolated_across_turns` for the isolation guarantee
 this depends on: an in-flight request's message snapshot must not retroactively see a later turn's
 appends.
+
+The copy that *does* scale with the transcript is the provider wire body: every dialect's `build_body`
+walks the history into a `serde_json::Value` tree (owned `String`s, `BTreeMap` objects).
+`GatewayClient::stream` serializes that tree to compact JSON `Bytes` immediately after the payload hook
+and drops it before the SSE stream is built, so the tree does not sit alongside the response for the
+whole turn. Retries reuse those bytes. The Codex WebSocket path still needs the `Value` long enough to
+delta-diff (and parks a `Vec<Value>` baseline on a cached connection between turns). Serve catch-up
+history is the same `Arc<Vec<Message>>` — it is serialized to JSON only once per attach, not per turn.
 
 ### SSE byte framing
 
@@ -976,10 +984,12 @@ crate's vocabulary is modeled on.
 
 A naive `Vec<Message>` cloned into every `ModelRequest` is an O(n²) cost over a long-running session
 (each of n turns deep-copies a history of average size n/2). Sharing via `Arc` makes building a request
-a pointer clone; `Arc::make_mut` on `push` keeps appends in-place in the common case (no live request
-still holds the old snapshot) and falls back to a real clone only when one does — which is also what
+a pointer clone; `Arc::make_mut` on `push` keeps appends in-place in the common case (no live snapshot
+still holds the old pointer) and falls back to a real clone only when one does — which is also what
 _must_ happen for request-snapshot isolation: a request built from turn 3's history must not silently
-see turn 4's appended tool results.
+see turn 4's appended tool results. The remaining per-turn copy is the dialect wire body: a
+`serde_json::Value` of the transcript, serialized to bytes and dropped before the stream waits on the
+model, rather than held as a tree for the whole turn.
 
 ### Why the SSE client buffers bytes instead of decoding each chunk independently
 

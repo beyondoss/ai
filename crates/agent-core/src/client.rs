@@ -713,6 +713,17 @@ impl ModelTransport for GatewayClient {
             }
         }
 
+        // `build_body` materializes the whole transcript as a `serde_json::Value` tree — a real
+        // deep copy, unlike `ModelRequest::messages`'s `Arc` pointer clone. Serialize it to compact
+        // JSON bytes *now* and drop the tree: `async_stream` would otherwise capture `body` for the
+        // entire SSE lifetime (seconds to minutes of thinking), so the tree would sit alongside the
+        // HTTP send buffer, the response, and the accumulator. mimalloc then tends to keep those
+        // pages. Retries reuse the same `Bytes` (a refcount bump) instead of walking the tree again.
+        let body = Bytes::from(
+            serde_json::to_vec(&body)
+                .map_err(|e| Error::Transport(format!("serialize request body: {e}")))?,
+        );
+
         let tools_for_decoder = req.tools.clone();
         let http = self.http.clone();
         let max_retries = self.max_retries;
@@ -771,7 +782,7 @@ impl ModelTransport for GatewayClient {
                 &http,
                 &url,
                 credential.key.expose(),
-                &body,
+                body,
                 is_codex_sse_fallback,
                 is_anthropic,
                 is_oauth,
@@ -1035,7 +1046,7 @@ async fn send_with_retry(
     http: &reqwest::Client,
     url: &str,
     api_key: &str,
-    body: &Value,
+    body: Bytes,
     // Whether this request is Codex's own HTTP/SSE fallback path (the WebSocket transport declined
     // or wasn't attempted) — the one case where the body is zstd-compressed before sending, mirroring
     // pi's own `compressRequestBodyZstd`/`content-encoding: zstd` behavior for that exact backend.
@@ -1075,14 +1086,12 @@ async fn send_with_retry(
 ) -> Result<reqwest::Response> {
     let mut attempt = 0u32;
     loop {
-        // Codex's HTTP/SSE fallback accepts a zstd-compressed body (bandwidth optimization only —
-        // the endpoint still accepts plain JSON, so a compression failure falls back to that rather
-        // than failing the request). Every other route keeps sending `.json(body)` unchanged.
+        // Body bytes were serialized once, above `try_stream`, so a retry is a `Bytes` refcount bump
+        // plus a send — not another walk of the transcript `Value` tree. Codex's HTTP/SSE fallback
+        // still zstd-compresses (bandwidth only — the endpoint accepts plain JSON, so a compression
+        // failure sends the uncompressed bytes rather than failing the request).
         let mut builder = if is_codex_sse_fallback {
-            match serde_json::to_vec(body)
-                .ok()
-                .and_then(|bytes| crate::codex_websocket::compress_sse_fallback_body(&bytes))
-            {
+            match crate::codex_websocket::compress_sse_fallback_body(&body) {
                 Some(compressed) => http
                     .post(url)
                     .header(
@@ -1091,10 +1100,15 @@ async fn send_with_retry(
                     )
                     .header(reqwest::header::CONTENT_TYPE, "application/json")
                     .body(compressed),
-                None => http.post(url).json(body),
+                None => http
+                    .post(url)
+                    .header(reqwest::header::CONTENT_TYPE, "application/json")
+                    .body(body.clone()),
             }
         } else {
-            http.post(url).json(body)
+            http.post(url)
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .body(body.clone())
         };
         builder = match auth_header {
             // Azure OpenAI shape (no prefix, the ordinary case): the bare key, verbatim, in its own

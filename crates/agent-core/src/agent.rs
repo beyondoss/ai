@@ -883,6 +883,9 @@ impl Agent {
 
             let mut req = ModelRequest::new(
                 current_model.clone(),
+                // `Arc` pointer clone, not a deep copy of the transcript. The wire-shaped copy is
+                // `dialect::build_body` turning this history into a `serde_json::Value` (then
+                // immediately into compact JSON bytes — see `GatewayClient::stream`).
                 session.messages.clone(),
                 self.max_tokens,
             )
