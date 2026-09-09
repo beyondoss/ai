@@ -97,12 +97,17 @@ The harness layers several capabilities over the bare tools + loop:
   its own `reqwest::Client` (so N sessions ≈ N connections to the gateway on the plaintext HTTP/1.1 hop),
   `serve_ws` builds **one** client and injects it into every session via
   `GatewayClient::with_http_client` (guarded so a model-switch/idle rebuild never discards the shared
-  pool). Credentials are *not* on that client — they are applied per-request by each session's
+  pool). Credentials are _not_ on that client — they are applied per-request by each session's
   `GatewayClient`. `h2c` gives it `.http2_prior_knowledge()`, so all sessions multiplex over ~one
   cleartext-HTTP/2 connection — paired with the gateway's downstream `h2c` support (backward-compatible:
   Pingora peeks the H2 preface and falls back to h1). `off` keeps the per-session-client behavior; `auto`
-  shares the pool over h1 today (h2 later if the hop gains TLS+ALPN). Packing density (RSS, thread
-  count, `get_state` p95) is measured by `tests/serve_session_density.rs`.
+  shares the pool over h1 today (h2 later if the hop gains TLS+ALPN). Packing density is measured by
+  `tests/serve_session_density.rs` (CI gates thread count; the ignored `density_sweep` prints RSS / CPU /
+  `get_state` QPS / p95). A debug-profile idle sweep on a Linux host after one `get_state` warmup:
+  thread count stayed at **5** from 1–32 sessions (was one OS thread per session); RSS grew
+  54 MB → 74 MB (sublinear, ~2.3 MB/session at N=32 including the process baseline); `get_state` p95
+  after warmup was ~1.4–1.7 ms at N≥8 (~850 QPS at N=32). N=1 p95 is a small-sample cold outlier and is
+  not the density story. Release-profile RSS is lower; the thread invariant is the load-bearing win.
 - **Trust** ([`trust_store`](src/trust_store.rs)) — a tri-state, ancestor-inheriting allowlist
   (`~/.claude/trusted-projects.json`: `{trusted: [...], untrusted: [...]}`, most-specific directory
   wins, untrusted checked first at each level) gates the project-local `SYSTEM.md`/`APPEND_SYSTEM.md`

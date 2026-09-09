@@ -204,6 +204,9 @@ async fn density_sweep() {
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
 
+        // Discard a warmup round so p95 isn't the cold first `get_state` (session spawn).
+        let _ = ping_all(&mut sockets, 1).await;
+
         const ROUNDS: usize = 8;
         let mut samples = ping_all(&mut sockets, ROUNDS).await;
         samples.sort();
