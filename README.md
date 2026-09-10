@@ -70,6 +70,13 @@ AI_GATEWAY_URL=http://ai.internal AI_AGENT_KEY=bai_v1... \
 AI_GATEWAY_URL=http://ai.internal AI_AGENT_KEY=bai_v1... \
   cargo run -p beyond-ai-agent -- serve --session-file /tmp/agent.json
 # then: {"type":"prompt","message":"…"} → streamed event frames, then a response
+
+# Or over a loopback socket: WebSocket, or POST one command without holding a connection
+cargo run -p beyond-ai-agent -- serve --listen 127.0.0.1:8787 --session-dir /tmp/sessions
+curl -D- -H 'Content-Type: application/json' \
+  --data '{"type":"prompt","message":"add a CHANGELOG entry"}' \
+  'http://127.0.0.1:8787/_beyond/agent?session_id=build-42'
+# 202 + X-Session-Id; the run continues. Watch it on a WebSocket to the same URL, or via --lifecycle-url.
 ```
 
 **Credential precedence.** A gateway is _configured_ if `AI_GATEWAY_URL`, a stored `default_gateway_url`,

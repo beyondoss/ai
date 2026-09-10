@@ -1,7 +1,8 @@
 //! `serve --listen <addr>` — the [`serve`](crate::serve) control protocol offered over a WebSocket
-//! instead of stdio, for a client (the Beyond iPhone app) that speaks one JSON object per WS **text**
-//! message. The protocol is **byte-identical** to stdio mode; this module is a thin transport adapter
-//! over the same [`serve_session`](crate::serve::serve_session) core.
+//! **or** a one-shot HTTP POST, instead of stdio. A client (the Beyond iPhone app, a script, a
+//! lifecycle consumer) speaks one JSON object per WS **text** message, or POSTs that same object to
+//! the same path. The protocol is **byte-identical** to stdio mode; this module is a thin transport
+//! adapter over the same [`serve_session`](crate::serve::serve_session) core.
 //!
 //! ## The connection is a *view*, not the session's owner
 //!
@@ -18,13 +19,37 @@
 //! ## Routing, ids, and persistence
 //!
 //! A connection names its session in the URL: `…/_beyond/agent?session_id=<id>` (absent ⇒ a fresh id
-//! is minted; the client learns it from any `response`/`get_state` frame). That id is both the
+//! is minted; a WebSocket client learns it from any `response`/`get_state` frame, an HTTP POST client
+//! from the `X-Session-Id` response header). That id is both the
 //! supervisor's routing key **and** the persisted session id: it's handed to the session as
 //! [`ServeConfig::session_id`], which *addresses* it in the repo — open that session, or create it under
 //! exactly that id ([`crate::session_store::SessionRepo::open_or_create_id`]). So the id is stable
 //! across reconnects, and a cold reconnect after a full process restart reopens the same conversation
 //! rather than a blank one. `--no-session-persistence` opts out into in-memory-only sessions, which
 //! still live re-attach for the process's lifetime.
+//!
+//! ## HTTP POST
+//!
+//! The same listener accepts `POST /_beyond/agent?session_id=<id>` with a JSON command body — the
+//! identical `{type, …}` object a WebSocket text message carries. This is how a consumer that does
+//! not want to hold a socket (a job runner, a lifecycle collector, `curl`) **starts a run**: the
+//! session is a view, not owned by the request, so the POST can return the moment the command is
+//! accepted and the run keeps going. Combined with [`crate::lifecycle`]'s outbound POSTs, the
+//! control plane is HTTP in both directions.
+//!
+//! - A `prompt` that is acknowledged (`{type:"ack"}`) returns **202** with that ack as the body.
+//!   Events and the terminal `response` do **not** stream on this connection — attach a WebSocket
+//!   (same `?session_id=`) or watch lifecycle. A `prompt` rejected before the ack (busy, missing
+//!   `message`, bad `output_schema`) returns **200** with the `response` frame, same as any other
+//!   command.
+//! - Every other command waits for its `response` frame and returns **200**.
+//! - `list_daemon_sessions` is answered here (the supervisor sees every session) and does not spawn
+//!   one.
+//! - Catch-up is a WebSocket-attach concern; a POST sink is not seeded with history.
+//!
+//! The body is the protocol frame, byte-identical to the WebSocket. The session id is an HTTP
+//! header (`X-Session-Id`) because an `ack` frame does not carry it. Auth is still the front
+//! door's: this crate never parses a user token.
 //!
 //! Because the id is a routing key, `new_session` on a live connection **keeps** it: the conversation is
 //! archived into a session of its own and this one is blanked in place, so the address a client holds
@@ -49,16 +74,16 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use futures::{SinkExt, StreamExt};
-use serde_json::json;
-use tokio::io::{AsyncRead, AsyncWrite};
+use serde_json::{Value, json};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 #[cfg(unix)]
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::mpsc;
 use tokio::time::{Duration, MissedTickBehavior};
 use tokio_tungstenite::WebSocketStream;
-use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
-use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
+use tokio_tungstenite::tungstenite::handshake::server::create_response;
+use tokio_tungstenite::tungstenite::protocol::{Role, WebSocketConfig};
 use tokio_tungstenite::tungstenite::{Message, Utf8Bytes};
 use tokio_util::sync::CancellationToken;
 
@@ -98,6 +123,23 @@ const CTRL_CHANNEL_BOUND: usize = 8;
 /// exceeds it gets a protocol error and its connection closed, never a silently truncated command.
 /// Generous enough for a `prompt` carrying a large pasted body.
 const MAX_INBOUND_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
+
+/// Cap on HTTP/1.1 request headers (the POST path reads these itself; the WebSocket upgrade does too
+/// once we peek the request-line). Far above any legitimate `Host` + `Content-Length` + a handful of
+/// forwarding headers; a client that exceeds it is probing, not sending a command.
+const MAX_HEADER_BYTES: usize = 16 * 1024;
+
+/// How long an HTTP POST waits for the command's `ack`/`response` before giving up. A freshly spawned
+/// session still has to open persistence and discover skills before it reads the first command, so
+/// this is not a tight "the loop is idle" bound — it has to cover that startup. A `prompt`'s ack is
+/// emitted the moment the turn is queued, so a healthy session replies well inside this; hitting it
+/// means the session never answered, not that the run is slow.
+const HTTP_REPLY_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// HTTP header carrying the session id on every POST response. An `ack` frame does not include it
+/// (WebSocket clients learn it from `get_state`/`ready`); POST clients that omitted `?session_id=`
+/// have no other way to address the session they just created.
+const SESSION_ID_HEADER: &str = "X-Session-Id";
 
 /// How long a **detached** session (no attached connection) stays live before the reaper reclaims it,
 /// when the operator gave no `--session-idle-timeout`. The default has to be finite: without a reaper
@@ -182,19 +224,16 @@ impl Supervisor {
         c
     }
 
-    /// Attach `ws` to the session named `requested_id` (minting a fresh id if `None`), spawning the
-    /// session if it isn't already live. Supersedes any previous connection to that session
-    /// (last-attach-wins), then drives this socket until it closes or is superseded — the session
-    /// itself keeps running either way.
-    async fn attach<S>(self: &Arc<Self>, requested_id: Option<String>, ws: WebSocketStream<S>)
-    where
-        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-    {
+    /// Look up (or spawn) the session named `requested_id` (minting a fresh id if `None`) and count
+    /// this caller as attached. The lock is never held across an `.await`. No eviction: multiple
+    /// attachments coexist on one session (WebSocket connections and in-flight HTTP POSTs), so a
+    /// phone, a TUI, and a `curl` can watch/drive it together.
+    ///
+    /// The caller **must** [`unpin`](Self::unpin) when the attachment ends — a WebSocket on socket
+    /// close, an HTTP POST when its response has been written — so the idle reaper's clock starts
+    /// once nobody is attached.
+    fn pin(&self, requested_id: Option<String>) -> (String, mpsc::Sender<String>, SharedOutConn) {
         let id = requested_id.unwrap_or_else(new_id);
-
-        // Look up (or spawn) the session and register this connection — all under the map lock, which is
-        // never held across an `.await`. No eviction: multiple connections coexist on one session (the
-        // output fans out to all; input is shared), so a phone and a TUI can watch/drive it together.
         let (input_tx, out_conn) = {
             let mut sessions = lock_ignoring_poison(&self.sessions);
 
@@ -243,6 +282,28 @@ impl Supervisor {
             handle.last_detached_at = None;
             (handle.input_tx.clone(), handle.out_conn.clone())
         };
+        (id, input_tx, out_conn)
+    }
+
+    /// One fewer attached connection; if that was the last, start the idle reaper's clock.
+    fn unpin(&self, id: &str) {
+        let mut sessions = lock_ignoring_poison(&self.sessions);
+        if let Some(h) = sessions.get_mut(id) {
+            h.attached = h.attached.saturating_sub(1);
+            if h.attached == 0 {
+                h.last_detached_at = Some(Instant::now());
+            }
+        }
+    }
+
+    /// Attach `ws` to the session named `requested_id` (minting a fresh id if `None`), spawning the
+    /// session if it isn't already live. Drives this socket until it closes — the session itself
+    /// keeps running either way.
+    async fn attach<S>(self: &Arc<Self>, requested_id: Option<String>, ws: WebSocketStream<S>)
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        let (id, input_tx, out_conn) = self.pin(requested_id);
 
         // Register this connection's send channel as one of the session's output sinks — the session
         // broadcasts every frame to all registered sinks. Keep the `sink_id` to remove it on disconnect.
@@ -377,15 +438,7 @@ impl Supervisor {
         let _ = send_task.await;
 
         // One fewer attached connection; if that was the last, start the idle reaper's clock.
-        {
-            let mut sessions = lock_ignoring_poison(&self.sessions);
-            if let Some(h) = sessions.get_mut(&id) {
-                h.attached = h.attached.saturating_sub(1);
-                if h.attached == 0 {
-                    h.last_detached_at = Some(Instant::now());
-                }
-            }
-        }
+        self.unpin(&id);
     }
 
     /// Graceful shutdown: drain the session map (dropping each `input_tx`, which closes that session's
@@ -885,64 +938,491 @@ async fn accept_uds_arm(_listener: &Option<()>) -> Option<TcpStream> {
     std::future::pending().await
 }
 
-/// Perform the WebSocket handshake (validating the path and extracting `?session_id=`), then hand the
-/// connection to the supervisor to attach to its session. Generic over the underlying byte stream so
-/// the same handshake+attach path serves both TCP and Unix-domain sockets.
+/// Read one HTTP/1.1 request and either attach it as a WebSocket or run it as a one-shot POST
+/// command. Generic over the underlying byte stream so the same path serves both TCP and Unix-domain
+/// sockets. We parse the request-line ourselves rather than handing every connection to tungstenite:
+/// a POST has a body tungstenite's upgrade handshake would discard, and a GET that isn't an upgrade
+/// deserves 405 rather than a failed handshake.
 async fn handle_connection<S>(
     supervisor: &Arc<Supervisor>,
-    stream: S,
+    mut stream: S,
 ) -> Result<(), Box<dyn std::error::Error>>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    // The handshake callback sees the HTTP request. Reject a wrong path outright; stash the requested
-    // session id (parsed from the query) for use after the upgrade completes.
-    let requested_id: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
-    let slot = requested_id.clone();
-    // Every inbound message becomes one queued command line, so cap what a single one can cost us —
-    // tungstenite's defaults (64 MiB message / 16 MiB frame) let a client hand the session queue tens of
-    // MB at a time. Oversize is a hard protocol error (the connection closes); nothing is truncated.
-    let config = WebSocketConfig::default()
-        .max_message_size(Some(MAX_INBOUND_MESSAGE_BYTES))
-        .max_frame_size(Some(MAX_INBOUND_MESSAGE_BYTES));
-    let ws = tokio_tungstenite::accept_hdr_async_with_config(
-        stream,
-        move |req: &Request, resp: Response| -> Result<Response, ErrorResponse> {
-            let uri = req.uri();
-            if uri.path() != WS_PATH {
-                // Build the rejection without the fallible `ResponseBuilder` (`http::Response::new` is
-                // infallible, avoiding a bare `expect` on a value that can't fail).
-                let mut err: ErrorResponse =
-                    http::Response::new(Some(format!("not found: expected {WS_PATH}")));
-                *err.status_mut() = http::StatusCode::NOT_FOUND;
-                return Err(err);
-            }
-            if let Some(query) = uri.query() {
-                for (k, v) in url::form_urlencoded::parse(query.as_bytes()) {
-                    if k == "session_id" {
-                        *lock_ignoring_poison(&slot) = Some(v.into_owned());
-                    }
-                }
-            }
-            Ok(resp)
-        },
-        Some(config),
-    )
-    .await?;
+    let (head, leftover) = match read_http_head(&mut stream).await {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = write_http_err(&mut stream, &e, None).await;
+            return Ok(());
+        }
+    };
 
-    let requested_id = lock_ignoring_poison(&requested_id).take();
-    // A client-supplied id becomes a filename component (`<id>.jsonl`) — reject anything that isn't a
-    // safe session id rather than letting it escape the sessions directory.
+    if head.path != WS_PATH {
+        let _ = write_http_err(&mut stream, &HttpError::NotFound, None).await;
+        return Ok(());
+    }
+
+    let requested_id = session_id_from_query(head.query.as_deref());
     if let Some(id) = &requested_id
         && !is_valid_session_id(id)
     {
-        let mut ws = ws;
-        let _ = ws.close(None).await;
-        return Err(format!("invalid session_id: {id:?}").into());
+        let _ = write_http_err(
+            &mut stream,
+            &HttpError::BadRequest("invalid session_id"),
+            None,
+        )
+        .await;
+        return Ok(());
     }
 
+    match head.method.as_str() {
+        "POST" => {
+            if let Err(e) =
+                handle_http_post(supervisor, &mut stream, &head, leftover, requested_id).await
+            {
+                let _ = write_http_err(&mut stream, &e, None).await;
+            }
+            Ok(())
+        }
+        "GET" => handle_websocket_upgrade(supervisor, stream, &head, leftover, requested_id).await,
+        _ => {
+            let _ = write_http_err(&mut stream, &HttpError::MethodNotAllowed, None).await;
+            Ok(())
+        }
+    }
+}
+
+/// Finish the WebSocket handshake from an already-parsed GET and attach the socket to its session.
+/// `leftover` is any bytes read past the header block (should be empty for a well-formed upgrade;
+/// tungstenite treats them as the start of the WebSocket stream).
+async fn handle_websocket_upgrade<S>(
+    supervisor: &Arc<Supervisor>,
+    mut stream: S,
+    head: &HttpHead,
+    leftover: Vec<u8>,
+    requested_id: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let request = match http_request_from_head(head) {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = write_http_err(&mut stream, &e, None).await;
+            return Ok(());
+        }
+    };
+    let response = match create_response(&request) {
+        Ok(r) => r,
+        Err(_) => {
+            let _ = write_http_err(&mut stream, &HttpError::UpgradeRequired, None).await;
+            return Ok(());
+        }
+    };
+    write_raw_http_response(&mut stream, &response).await?;
+
+    let config = WebSocketConfig::default()
+        .max_message_size(Some(MAX_INBOUND_MESSAGE_BYTES))
+        .max_frame_size(Some(MAX_INBOUND_MESSAGE_BYTES));
+    let ws =
+        WebSocketStream::from_partially_read(stream, leftover, Role::Server, Some(config)).await;
     supervisor.attach(requested_id, ws).await;
     Ok(())
+}
+
+/// POST `/_beyond/agent`: inject one command into the session and return its `ack` or `response`.
+async fn handle_http_post<S>(
+    supervisor: &Arc<Supervisor>,
+    stream: &mut S,
+    head: &HttpHead,
+    leftover: Vec<u8>,
+    requested_id: Option<String>,
+) -> Result<(), HttpError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    if head
+        .transfer_encoding
+        .as_deref()
+        .is_some_and(|t| !t.eq_ignore_ascii_case("identity"))
+    {
+        return Err(HttpError::LengthRequired);
+    }
+    let content_length = head.content_length.ok_or(HttpError::LengthRequired)?;
+    let body = read_http_body(stream, &leftover, content_length).await?;
+    if body.is_empty() {
+        return Err(HttpError::BadRequest("empty body"));
+    }
+
+    let mut cmd: Value =
+        serde_json::from_slice(&body).map_err(|_| HttpError::BadRequest("body is not JSON"))?;
+    if !cmd.is_object() {
+        return Err(HttpError::BadRequest("body must be a JSON object"));
+    }
+    // Always correlate by `id`: a POST sink also sees live frames from any concurrent WebSocket on
+    // the same session, and without an id the first `response` of the matching command type would
+    // be stolen. A client that omitted one still gets it echoed on the frame they receive.
+    let client_id = match cmd.get("id").and_then(Value::as_str) {
+        Some(id) if !id.is_empty() => id.to_string(),
+        _ => {
+            let minted = new_id();
+            if let Value::Object(map) = &mut cmd {
+                map.insert("id".into(), json!(minted.clone()));
+            }
+            minted
+        }
+    };
+    let command = cmd
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    if command.is_empty() {
+        return Err(HttpError::BadRequest("missing `type`"));
+    }
+
+    if command == "list_daemon_sessions" {
+        let frame = supervisor
+            .list_daemon_sessions(Some(client_id.clone()))
+            .await;
+        let Some(line) = frame_to_line(frame) else {
+            return Err(HttpError::BadRequest("failed to serialize response"));
+        };
+        // No session was pinned — there isn't one to name. An empty header would be a lie; omit it.
+        return write_http_ok(stream, 200, "OK", None, &line).await;
+    }
+
+    let line = serde_json::to_string(&cmd)
+        .map_err(|_| HttpError::BadRequest("failed to serialize command"))?;
+
+    let (id, input_tx, out_conn) = supervisor.pin(requested_id);
+    let (conn_tx, mut conn_rx) = mpsc::channel::<OutFrame>(OUT_CHANNEL_BOUND);
+    // No catch-up: a POST is one command's reply, not a streaming attach. Seeding history here
+    // would dump the transcript into a buffer the waiter has to skip, and could fill it before the
+    // ack ever arrived.
+    let sink_id = lock_ignoring_poison(&out_conn).add(OutSink::Bounded(conn_tx));
+
+    // Unpin + remove the sink on every exit (timeout, send failure, reply). A session with
+    // `attached > 0` is invisible to the idle reaper; leaking a pin would pin it for the daemon's
+    // life.
+    struct PinGuard {
+        supervisor: Arc<Supervisor>,
+        id: String,
+        out_conn: SharedOutConn,
+        sink_id: u64,
+    }
+    impl Drop for PinGuard {
+        fn drop(&mut self) {
+            lock_ignoring_poison(&self.out_conn).remove(self.sink_id);
+            self.supervisor.unpin(&self.id);
+        }
+    }
+    let _guard = PinGuard {
+        supervisor: Arc::clone(supervisor),
+        id: id.clone(),
+        out_conn,
+        sink_id,
+    };
+
+    if input_tx.send(line).await.is_err() {
+        return Err(HttpError::BadRequest("session ended"));
+    }
+
+    let wait = async {
+        loop {
+            match conn_rx.recv().await {
+                Some(frame) => {
+                    if let Some(v) = frame_as_value(&frame)
+                        && reply_matches(&v, &command, &client_id)
+                    {
+                        return Ok((v["type"].as_str() == Some("ack"), frame));
+                    }
+                }
+                None => return Err(HttpError::BadRequest("session ended")),
+            }
+        }
+    };
+    let (is_ack, frame) = match tokio::time::timeout(HTTP_REPLY_TIMEOUT, wait).await {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) => return Err(e),
+        Err(_) => return Err(HttpError::Timeout),
+    };
+    let Some(body) = frame_to_line(frame) else {
+        return Err(HttpError::BadRequest("failed to serialize response"));
+    };
+    let (status, reason) = if is_ack && command == "prompt" {
+        (202, "Accepted")
+    } else {
+        (200, "OK")
+    };
+    write_http_ok(stream, status, reason, Some(&id), &body).await
+}
+
+fn frame_as_value(frame: &OutFrame) -> Option<Value> {
+    match frame {
+        OutFrame::Value(v) => Some(v.clone()),
+        OutFrame::Raw(b) => serde_json::from_slice(b).ok(),
+    }
+}
+
+/// Whether `v` is the `ack` or `response` this POST is waiting on. Matched on `id` (always set by
+/// [`handle_http_post`]) so a concurrent WebSocket's frames on the same session cannot satisfy it.
+fn reply_matches(v: &Value, command: &str, client_id: &str) -> bool {
+    let ty = v.get("type").and_then(Value::as_str);
+    if ty != Some("ack") && ty != Some("response") {
+        return false;
+    }
+    v.get("id").and_then(Value::as_str) == Some(client_id)
+        && v.get("command").and_then(Value::as_str) == Some(command)
+}
+
+#[derive(Debug)]
+struct HttpHead {
+    method: String,
+    path: String,
+    query: Option<String>,
+    path_and_query: String,
+    content_length: Option<usize>,
+    transfer_encoding: Option<String>,
+    headers: Vec<(String, String)>,
+}
+
+fn session_id_from_query(query: Option<&str>) -> Option<String> {
+    let query = query?;
+    url::form_urlencoded::parse(query.as_bytes())
+        .find_map(|(k, v)| (k == "session_id").then(|| v.into_owned()))
+}
+
+#[derive(Debug)]
+enum HttpError {
+    Incomplete,
+    BadRequest(&'static str),
+    NotFound,
+    MethodNotAllowed,
+    UpgradeRequired,
+    PayloadTooLarge,
+    LengthRequired,
+    Timeout,
+    Io,
+}
+
+impl std::fmt::Display for HttpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            HttpError::Incomplete => write!(f, "incomplete request"),
+            HttpError::BadRequest(m) => write!(f, "{m}"),
+            HttpError::NotFound => write!(f, "not found: expected {WS_PATH}"),
+            HttpError::MethodNotAllowed => write!(f, "method not allowed"),
+            HttpError::UpgradeRequired => write!(f, "WebSocket upgrade required"),
+            HttpError::PayloadTooLarge => write!(f, "payload too large"),
+            HttpError::LengthRequired => write!(f, "Content-Length required"),
+            HttpError::Timeout => write!(f, "timed out waiting for session reply"),
+            HttpError::Io => write!(f, "i/o error"),
+        }
+    }
+}
+
+impl HttpError {
+    fn status(&self) -> (u16, &'static str) {
+        match self {
+            HttpError::NotFound => (404, "Not Found"),
+            HttpError::MethodNotAllowed => (405, "Method Not Allowed"),
+            HttpError::UpgradeRequired => (426, "Upgrade Required"),
+            HttpError::PayloadTooLarge => (413, "Payload Too Large"),
+            HttpError::LengthRequired => (411, "Length Required"),
+            HttpError::Timeout => (504, "Gateway Timeout"),
+            HttpError::Incomplete | HttpError::BadRequest(_) | HttpError::Io => {
+                (400, "Bad Request")
+            }
+        }
+    }
+}
+
+/// Parse a complete HTTP/1.1 header block. `Incomplete` means the buffer does not yet contain
+/// `\r\n\r\n` (or httparse still wants more) — the reader should append and retry.
+fn parse_http_head(buf: &[u8]) -> Result<(HttpHead, usize), HttpError> {
+    let mut headers = [httparse::EMPTY_HEADER; 64];
+    let mut req = httparse::Request::new(&mut headers);
+    let header_len = match req.parse(buf) {
+        Ok(httparse::Status::Complete(n)) => n,
+        Ok(httparse::Status::Partial) => return Err(HttpError::Incomplete),
+        Err(_) => return Err(HttpError::BadRequest("malformed request")),
+    };
+    let method = req
+        .method
+        .ok_or(HttpError::BadRequest("missing method"))?
+        .to_string();
+    let path_and_query = req
+        .path
+        .ok_or(HttpError::BadRequest("missing path"))?
+        .to_string();
+    let (path, query) = match path_and_query.split_once('?') {
+        Some((p, q)) => (p.to_string(), Some(q.to_string())),
+        None => (path_and_query.clone(), None),
+    };
+    let mut content_length = None;
+    let mut transfer_encoding = None;
+    let mut collected = Vec::with_capacity(req.headers.len());
+    for h in req.headers {
+        let name = h.name;
+        let value = std::str::from_utf8(h.value).unwrap_or("");
+        if name.eq_ignore_ascii_case("content-length") {
+            let n: usize = value
+                .trim()
+                .parse()
+                .map_err(|_| HttpError::BadRequest("invalid Content-Length"))?;
+            if n > MAX_INBOUND_MESSAGE_BYTES {
+                return Err(HttpError::PayloadTooLarge);
+            }
+            content_length = Some(n);
+        }
+        if name.eq_ignore_ascii_case("transfer-encoding") {
+            transfer_encoding = Some(value.to_string());
+        }
+        collected.push((name.to_string(), value.to_string()));
+    }
+    Ok((
+        HttpHead {
+            method,
+            path,
+            query,
+            path_and_query,
+            content_length,
+            transfer_encoding,
+            headers: collected,
+        },
+        header_len,
+    ))
+}
+
+async fn read_http_head<S: AsyncRead + Unpin>(
+    stream: &mut S,
+) -> Result<(HttpHead, Vec<u8>), HttpError> {
+    let mut buf = Vec::with_capacity(512);
+    let mut tmp = [0u8; 1024];
+    loop {
+        let n = stream.read(&mut tmp).await.map_err(|_| HttpError::Io)?;
+        if n == 0 {
+            return Err(if buf.is_empty() {
+                HttpError::BadRequest("empty request")
+            } else {
+                HttpError::BadRequest("truncated request")
+            });
+        }
+        buf.extend_from_slice(&tmp[..n]);
+        if buf.len() > MAX_HEADER_BYTES {
+            return Err(HttpError::BadRequest("headers too large"));
+        }
+        match parse_http_head(&buf) {
+            Ok((head, header_len)) => {
+                let leftover = buf[header_len..].to_vec();
+                return Ok((head, leftover));
+            }
+            Err(HttpError::Incomplete) => continue,
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+async fn read_http_body<S: AsyncRead + Unpin>(
+    stream: &mut S,
+    leftover: &[u8],
+    content_length: usize,
+) -> Result<Vec<u8>, HttpError> {
+    if content_length > MAX_INBOUND_MESSAGE_BYTES {
+        return Err(HttpError::PayloadTooLarge);
+    }
+    let mut body = Vec::with_capacity(content_length);
+    let take = leftover.len().min(content_length);
+    body.extend_from_slice(&leftover[..take]);
+    while body.len() < content_length {
+        let mut tmp = [0u8; 8192];
+        let want = (content_length - body.len()).min(tmp.len());
+        let n = stream
+            .read(&mut tmp[..want])
+            .await
+            .map_err(|_| HttpError::Io)?;
+        if n == 0 {
+            return Err(HttpError::BadRequest("truncated body"));
+        }
+        body.extend_from_slice(&tmp[..n]);
+    }
+    Ok(body)
+}
+
+fn http_request_from_head(head: &HttpHead) -> Result<http::Request<()>, HttpError> {
+    let mut builder = http::Request::builder()
+        .method(head.method.as_str())
+        .uri(head.path_and_query.as_str());
+    for (k, v) in &head.headers {
+        builder = builder.header(k.as_str(), v.as_str());
+    }
+    builder
+        .body(())
+        .map_err(|_| HttpError::BadRequest("malformed request"))
+}
+
+async fn write_raw_http_response<S: AsyncWrite + Unpin>(
+    stream: &mut S,
+    response: &http::Response<()>,
+) -> std::io::Result<()> {
+    let status = response.status();
+    let reason = status.canonical_reason().unwrap_or("OK");
+    let mut out = format!("HTTP/1.1 {} {reason}\r\n", status.as_u16());
+    for (k, v) in response.headers() {
+        out.push_str(k.as_str());
+        out.push_str(": ");
+        if let Ok(v) = v.to_str() {
+            out.push_str(v);
+        }
+        out.push_str("\r\n");
+    }
+    out.push_str("\r\n");
+    stream.write_all(out.as_bytes()).await?;
+    stream.flush().await
+}
+
+async fn write_http_ok<S: AsyncWrite + Unpin>(
+    stream: &mut S,
+    status: u16,
+    reason: &str,
+    session_id: Option<&str>,
+    body: &[u8],
+) -> Result<(), HttpError> {
+    let mut out = format!("HTTP/1.1 {status} {reason}\r\n");
+    out.push_str("Content-Type: application/json\r\n");
+    out.push_str(&format!("Content-Length: {}\r\n", body.len()));
+    out.push_str("Connection: close\r\n");
+    if let Some(id) = session_id {
+        out.push_str(SESSION_ID_HEADER);
+        out.push_str(": ");
+        out.push_str(id);
+        out.push_str("\r\n");
+    }
+    if status == 405 {
+        out.push_str("Allow: GET, POST\r\n");
+    }
+    if status == 426 {
+        out.push_str("Upgrade: websocket\r\n");
+    }
+    out.push_str("\r\n");
+    stream
+        .write_all(out.as_bytes())
+        .await
+        .map_err(|_| HttpError::Io)?;
+    stream.write_all(body).await.map_err(|_| HttpError::Io)?;
+    stream.flush().await.map_err(|_| HttpError::Io)
+}
+
+async fn write_http_err<S: AsyncWrite + Unpin>(
+    stream: &mut S,
+    err: &HttpError,
+    session_id: Option<&str>,
+) -> Result<(), HttpError> {
+    let (status, reason) = err.status();
+    let body = json!({ "error": err.to_string() }).to_string();
+    write_http_ok(stream, status, reason, session_id, body.as_bytes()).await
 }
 
 #[cfg(test)]
@@ -1061,5 +1541,53 @@ mod tests {
             start.elapsed() < Duration::from_secs(1),
             "finished tasks must not wait out the grace period"
         );
+    }
+
+    #[test]
+    fn parse_http_head_reads_post_path_query_and_content_length() {
+        let raw = b"POST /_beyond/agent?session_id=abc HTTP/1.1\r\nHost: localhost\r\nContent-Length: 12\r\n\r\n{\"type\":\"x\"}";
+        let (head, n) = parse_http_head(raw).unwrap();
+        assert_eq!(head.method, "POST");
+        assert_eq!(head.path, "/_beyond/agent");
+        assert_eq!(head.query.as_deref(), Some("session_id=abc"));
+        assert_eq!(head.content_length, Some(12));
+        assert_eq!(&raw[n..], b"{\"type\":\"x\"}");
+        assert_eq!(
+            session_id_from_query(head.query.as_deref()).as_deref(),
+            Some("abc")
+        );
+    }
+
+    #[test]
+    fn parse_http_head_rejects_oversize_content_length_before_reading_the_body() {
+        let raw = format!(
+            "POST /_beyond/agent HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
+            MAX_INBOUND_MESSAGE_BYTES + 1
+        );
+        match parse_http_head(raw.as_bytes()) {
+            Err(HttpError::PayloadTooLarge) => {}
+            other => panic!("expected PayloadTooLarge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_http_head_reports_incomplete_until_the_header_block_ends() {
+        match parse_http_head(b"POST /_beyond/agent HTTP/1.1\r\nHost: localhost\r\n") {
+            Err(HttpError::Incomplete) => {}
+            other => panic!("expected Incomplete, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reply_matches_requires_id_and_command() {
+        let ack = json!({"type":"ack","command":"prompt","id":"p1"});
+        let resp = json!({"type":"response","command":"prompt","id":"p1","success":true});
+        let other = json!({"type":"response","command":"prompt","id":"p2","success":true});
+        let event = json!({"type":"event","event":{"kind":"text"}});
+        assert!(reply_matches(&ack, "prompt", "p1"));
+        assert!(reply_matches(&resp, "prompt", "p1"));
+        assert!(!reply_matches(&other, "prompt", "p1"));
+        assert!(!reply_matches(&event, "prompt", "p1"));
+        assert!(!reply_matches(&ack, "get_state", "p1"));
     }
 }

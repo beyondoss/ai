@@ -416,6 +416,7 @@ dependencies = [
  "hex",
  "htmd",
  "http",
+ "httparse",
  "ignore",
  "image",
  "jsonschema",

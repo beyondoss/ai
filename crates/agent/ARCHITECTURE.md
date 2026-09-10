@@ -18,11 +18,16 @@ The harness layers several capabilities over the bare tools + loop:
 
 - **`serve` transports** ([`serve`](src/serve.rs), [`serve_ws`](src/serve_ws.rs)) — the headless
   control protocol runs over **stdio** (default, one line per command/frame — built for an `ssh` pipe)
-  or a **WebSocket** — over a **TCP** listener (`--listen <addr>`) and/or a **Unix-domain socket**
-  (`--listen-uds <path>`), one text message per command/frame. Both socket transports run the same WS
-  handshake + `?session_id=` routing (`serve_ws`'s `handle_connection`/`attach` are generic over the
-  stream), share **one** supervisor/session map (a session created over TCP is reachable over the UDS by
-  the same id), and can be bound simultaneously. UDS is the local-authz story TCP loopback can't give:
+  or a **socket** — over a **TCP** listener (`--listen <addr>`) and/or a **Unix-domain socket**
+  (`--listen-uds <path>`). The socket listener accepts two HTTP/1.1 methods on the same path
+  (`/_beyond/agent?session_id=`): **GET** upgrades to a **WebSocket** (one text message per
+  command/frame), and **POST** injects one JSON command body and returns the matching `ack` (a
+  `prompt` is **202 Accepted** — the run keeps going without the caller holding the socket) or
+  `response` (**200**). Combined with [`lifecycle`](src/lifecycle.rs)'s outbound POSTs, a consumer
+  that does not speak WebSocket can start a run and watch it over HTTP in both directions. Both
+  socket transports share **one** supervisor/session map (a session created over TCP is reachable over
+  the UDS by the same id, and a POST and a WebSocket on the same id are the same session), and can be
+  bound simultaneously. UDS is the local-authz story TCP loopback can't give:
   the socket is `chmod`ed (default `0o600`, `--listen-uds-mode`), so kernel filesystem permissions —
   not "anything on `127.0.0.1`" — decide who may connect; stale sockets are reclaimed with a
   connect-probe (never clobbering a live daemon). Under **systemd socket activation** (`LISTEN_FDS`
@@ -35,7 +40,7 @@ The harness layers several capabilities over the bare tools + loop:
   key property this buys the WebSocket path: **the session is a view, not owned by the connection** — a
   dropped mobile client does not abort the run (the retained input `Sender` means a dropped socket is
   not an EOF), and a reconnecting client (same `?session_id=`) re-attaches to the same still-running
-  session. **Catch-up is seeded server-side, at attach**, and is **base plus frames**: the connection is
+  session. A POST is the same view for one command. **Catch-up is seeded server-side, at attach**, and is **base plus frames**: the connection is
   queued a one-shot `catchup` frame (carrying `get_messages`' exact `{messages, leaf_id}` payload — the
   transcript as of the current run's _start_), immediately followed by a replay of every frame that run
   has emitted so far, and only then does its sink go live. The two together reconstruct exactly what a
