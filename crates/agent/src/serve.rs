@@ -1,23 +1,28 @@
-//! Headless `serve` — a newline-delimited JSON control protocol, over stdio or a WebSocket.
+//! Headless `serve` — a newline-delimited JSON control protocol, over stdio, a WebSocket, or HTTP POST.
 //!
-//! The server is the source of truth; any client (a TUI, an editor, an `ssh` pipe, or the Beyond
+//! The server is the source of truth; any client (a TUI, an editor, an `ssh` pipe, a script, or the Beyond
 //! iPhone app) drives it by sending one JSON command per message and reading one JSON frame per
 //! message. The shape mirrors pi's `rpc` mode and opencode's session server: commands get a
 //! `response` frame, and a `prompt` streams `event` frames (the agent's `AgentEvent`s) before its
 //! response.
 //!
-//! **Two transports, one protocol.** The command/frame protocol below is byte-identical regardless of
+//! **Three transports, one protocol.** The command/frame protocol below is byte-identical regardless of
 //! transport. [`serve`] is the default stdio transport (one line per command on stdin, one frame per
 //! line on stdout — built for an `ssh` pipe). [`serve_ws`](crate::serve_ws), enabled by
-//! `--listen <addr>`, offers the same protocol over a WebSocket: one command per inbound text message,
-//! one frame per outbound text message. Both feed the transport-agnostic [`serve_session`] core, which
+//! `--listen <addr>`, offers the same protocol over a WebSocket (one command per inbound text message,
+//! one frame per outbound text message) **and** over HTTP POST to the same path (one command in the
+//! body; the matching `ack`/`response` is the HTTP body). Both socket transports feed the
+//! transport-agnostic [`serve_session`] core, which
 //! reads commands from an `mpsc` channel and emits frames to whichever connection is currently
 //! attached — so a WebSocket session **outlives its connection**: a dropped mobile client reconnects
-//! (same `?session_id=`) and re-attaches to the same still-running run. It is caught up on whatever
-//! committed while it was gone by a `catchup` frame the server seeds on attach, *before* the connection
-//! starts receiving live frames — catch-up is not something the client asks for and hopes arrives first,
-//! because frames carry no sequence number and delivery order is the only order a client has (see
-//! [`OutFanout::add_with_catchup`]).
+//! (same `?session_id=`) and re-attaches to the same still-running run. An HTTP POST is a *view* in
+//! the same sense: it injects one command and returns, and the run keeps going (a `prompt` is 202
+//! Accepted on the ack; events live on a WebSocket attach or on [`crate::lifecycle`]). A reconnecting
+//! WebSocket is caught up on whatever committed while it was gone by a `catchup` frame the server
+//! seeds on attach, *before* the connection starts receiving live frames — catch-up is not something
+//! the client asks for and hopes arrives first, because frames carry no sequence number and delivery
+//! order is the only order a client has (see [`OutFanout::add_with_catchup`]). A POST is not seeded
+//! with catch-up: it is waiting for one command's `ack`/`response`, not reconstructing a stream.
 //!
 //! Sessions persist as append-only JSONL: `--session-file` for one session, or `--session-dir` for a
 //! [`SessionRepo`](crate::session_store::SessionRepo) of many (WebSocket sessions get one file each,
@@ -2028,7 +2033,7 @@ fn resolve_startup_model_and_level(
     )
 }
 
-/// Depth of a session's inbound command queue, shared by both transports.
+/// Depth of a session's inbound command queue, shared by all three transports.
 ///
 /// The counterpart to [`crate::serve_ws::OUT_CHANNEL_BOUND`] on the way *in*. The consumer is a single
 /// session loop that runs one command to completion — and some commands are genuinely slow (a
@@ -2041,7 +2046,8 @@ fn resolve_startup_model_and_level(
 /// correctness bug — the client is left waiting on a response that will never come, with no signal that
 /// anything went wrong. So a full queue makes the producer wait instead. On the WebSocket path that
 /// means the read loop stops pulling from the socket and TCP's own window carries the backpressure to
-/// the client; on stdio it simply pauses the stdin reader. Deep enough that ordinary pipelining never
+/// the client; on HTTP POST the handler awaits the same send; on stdio it simply pauses the stdin
+/// reader. Deep enough that ordinary pipelining never
 /// touches it, shallow enough that a flood can't grow memory without limit.
 pub(crate) const IN_CHANNEL_BOUND: usize = 256;
 
@@ -2109,10 +2115,11 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
 /// The transport-agnostic control loop: one session, driven by a stream of command lines
 /// (`input_rx`) and emitting frames to whatever connection is currently attached (`out_conn`). The
 /// stdio [`serve`] wrapper feeds it (stdin lines / a stdout task); [`crate::serve_ws`] feeds it from a
-/// WebSocket, where the connection can detach and a later one re-attach to this same still-running
+/// WebSocket or a one-shot HTTP POST, where the connection can detach and a later one re-attach to
+/// this same still-running
 /// task — because `input_rx`'s `Sender` is held by the supervisor (not the socket), a dropped
 /// connection is *not* an EOF: `input_rx.recv()` simply pends until the next command, and the run
-/// keeps going. The command protocol below is byte-identical across both transports.
+/// keeps going. The command protocol below is byte-identical across all three transports.
 ///
 /// The future is `Send` (`Box<dyn Error + Send + Sync>` plus a `Send` event sink) so the WebSocket
 /// daemon can `tokio::spawn` it onto the process-wide runtime instead of pinning a thread and a
@@ -3366,6 +3373,12 @@ pub(crate) async fn serve_session(
                 // Acknowledge immediately — the turn is queued and about to start — rather than
                 // leaving a client with no signal until the (possibly much later) terminal response.
                 emit!(ack(id.clone(), "prompt"));
+                // The reaper must see this session as mid-run from the ack, not from when the model
+                // call actually starts. An HTTP POST returns 202 on this ack and unpins; the gap
+                // between ack and `run_events_steered` (and the retry-backoff window between
+                // attempts) is still "a prompt is in flight" — reaping here would drop a run the
+                // client was just told had started. Cleared after the terminal `prompt` response.
+                running.store(true, Ordering::Relaxed);
                 // One run_id for the whole prompt, including whole-run retries. Minted here, next to
                 // the ack the client just got, so a crash between accept and the loop still has a
                 // `started` in flight. Unconfigured (`NoLifecycle`) skips construction entirely.
@@ -3501,8 +3514,10 @@ pub(crate) async fn serve_session(
                         }),
                     );
 
-                    // Mark this session busy for the reaper's benefit (daemon mode) — it never reaps a
-                    // session with a run in flight. Cleared once the attempt's future resolves, below.
+                    // Mark this session busy for the reaper's benefit (daemon mode). Already set at
+                    // the ack above; re-asserted here so a retry attempt is still protected if anything
+                    // cleared it. The matching clear is *after* the whole prompt, not after this
+                    // attempt — retry backoff is still mid-run.
                     running.store(true, Ordering::Relaxed);
                     if let Some(life) = &life {
                         life.set_attempt(retry_attempt);
@@ -4020,10 +4035,10 @@ pub(crate) async fn serve_session(
                             }
                         }
                     };
-                    // The run's future has resolved (idle again) — clear the busy flag so the reaper may
-                    // reclaim this session once it's also been detached long enough. A subsequent retry
-                    // attempt re-sets it at the top of the next loop iteration.
-                    running.store(false, Ordering::Relaxed);
+                    // Do **not** clear `running` here. The attempt's future has resolved, but the
+                    // prompt may still retry (backoff below) or emit its terminal response; an HTTP
+                    // POST that already unpinned on the ack would otherwise be reapable in that gap.
+                    // Cleared after `emit!(frame)` once the command is actually done.
 
                     // Fix 4: the run has now actually gone idle — `run_events_steered`'s future only
                     // resolves once the whole run (including tool cleanup) has stopped touching
@@ -4295,6 +4310,7 @@ pub(crate) async fn serve_session(
                     }
                 }
                 emit!(frame);
+                running.store(false, Ordering::Relaxed);
                 // pi-parity (Task 4): this run has now actually gone idle (same guarantee
                 // `pending_abort_acks` relies on above) and its own terminal response has just been
                 // sent — run each command that arrived mid-run and self-aborted-and-proceeded through
@@ -8990,9 +9006,10 @@ fn messages_payload(
 /// Serialize one [`OutFrame`] to its final JSON line (no trailing newline), as [`bytes::Bytes`]. `Raw`
 /// (the hot `event`-frame path) is already the final text and moves out with no copy; only `Value` pays
 /// a `serde_json::to_string`. Returns `None` only if a frame we built ourselves fails to serialize — a
-/// bug, skipped rather than tearing down the stream. Shared by both transports so stdio and WebSocket
-/// emit byte-identical frame text; each converts the `Bytes` to its own wire form at the socket edge
-/// (a validation-only `Utf8Bytes` for WebSocket, a buffered `\n`-terminated write for stdio).
+/// bug, skipped rather than tearing down the stream. Shared so every transport emits byte-identical
+/// frame text; each converts the `Bytes` to its own wire form at the socket edge
+/// (a validation-only `Utf8Bytes` for WebSocket, a buffered `\n`-terminated write for stdio, JSON
+/// body for HTTP POST).
 pub(crate) fn frame_to_line(frame: OutFrame) -> Option<Bytes> {
     match frame {
         OutFrame::Raw(line) => Some(line),

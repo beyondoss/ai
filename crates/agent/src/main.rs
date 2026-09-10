@@ -687,11 +687,14 @@ enum Command {
         /// Persist many sessions under this directory (enables list/switch/fork/name commands).
         #[usage(long, env = "AI_AGENT_SESSION_DIR")]
         session_dir: Option<String>,
-        /// Offer the control protocol over a WebSocket on this address instead of stdio (e.g.
-        /// `127.0.0.1:8787`). Each connection drives a session at `/_beyond/agent?session_id=<id>`, and
-        /// a session outlives a dropped connection so a reconnecting client re-attaches to a still-
-        /// running run. Bind loopback/internal only: the agent authenticates no caller — it trusts the
-        /// front door. Pair with `--session-dir` so sessions survive a process restart. Absent ⇒ stdio.
+        /// Offer the control protocol over a WebSocket **and** HTTP POST on this address instead of
+        /// stdio (e.g. `127.0.0.1:8787`). Each connection drives a session at
+        /// `/_beyond/agent?session_id=<id>` — `GET` upgrades to a WebSocket; `POST` sends one JSON
+        /// command (a `prompt` returns 202 on ack so the caller does not have to hold the socket
+        /// for the run). A session outlives a dropped connection so a reconnecting client re-attaches
+        /// to a still-running run. Bind loopback/internal only: the agent authenticates no caller — it
+        /// trusts the front door. Pair with `--session-dir` so sessions survive a process restart.
+        /// Absent ⇒ stdio.
         #[usage(long, env = "AI_AGENT_LISTEN")]
         listen: Option<std::net::SocketAddr>,
         /// Also (or instead) offer the control protocol over a Unix-domain socket at this path — a

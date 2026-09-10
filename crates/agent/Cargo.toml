@@ -75,6 +75,10 @@ tiny_http = "0.12"
 # Parses the local callback's query string (code/state/error) and the manual-paste fallback's
 # `code=&state=`/full-redirect-URL input. Already resolved transitively via `reqwest`.
 url = "2"
+# HTTP/1.1 request-line + header parse for `serve --listen`'s POST command path (same listener as
+# the WebSocket upgrade). Already in the graph via `tungstenite`; depending on it directly adds
+# nothing — we call its API rather than linking it incidentally.
+httparse = "1"
 # Zeroize-on-drop for `auth_store::Secret` (OAuth access/refresh tokens held at rest). Same crate/
 # version `agent_core::client::ApiKey` already uses for the identical purpose.
 zeroize = "1"
