@@ -225,9 +225,12 @@ and `request_filter` takes the request's dialect from **the row** rather than fr
 it happens to start on. Reading the provider there fails silently in the worst way — an Anthropic
 response meets the OpenAI extractor, trips the dialect-mismatch guard, and bills zero tokens.
 
-That is what makes **Claude failover real today**: `claude-opus-4-8` routes to Anthropic first and
-falls back to OpenRouter's Messages endpoint as `anthropic/claude-opus-4.8`. Every row and candidate
-is verified against the live providers by `catalog_rows_are_servable` in `tests/smoke.rs`, and the
+That is what makes **Claude failover real today**: every Claude row (current Fable 5.1 / Opus 5 /
+Sonnet 5 / Haiku 4.5, plus the still-served 4.x snapshots) routes to Anthropic first and falls back
+to OpenRouter's Messages endpoint under the vendor-slug spelling (`claude-opus-5` →
+`anthropic/claude-opus-5`; `claude-opus-4-8` → `anthropic/claude-opus-4.8`). GPT rows do the same on
+the Chat Completions wire (`gpt-6-astra` → `openai/gpt-6-astra`). Every row and candidate is
+verified against the live providers by `catalog_rows_are_servable` in `tests/smoke.rs`, and the
 failover itself by `model_route_fails_over_to_a_real_provider`.
 
 **What that failover does and does not cover.** OpenRouter picks its own backend per request — these

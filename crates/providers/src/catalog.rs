@@ -78,9 +78,48 @@ pub struct ModelRoute {
 /// bitmask with no per-request allocation.
 pub const MAX_CANDIDATES: usize = 8;
 
+/// Anthropic-native primary, OpenRouter Messages failover. OpenRouter spells Claude with a vendor
+/// prefix and dots (`anthropic/claude-opus-4.8`), not dashes.
+const fn claude(native: &'static str, openrouter: &'static str) -> [Candidate; 2] {
+    [
+        Candidate {
+            provider: ProviderId::Anthropic,
+            upstream_model: native,
+            path: "/v1/messages",
+        },
+        Candidate {
+            provider: ProviderId::OpenRouter,
+            upstream_model: openrouter,
+            path: "/api/v1/messages",
+        },
+    ]
+}
+
+/// OpenAI-native primary, OpenRouter Chat Completions failover. Same Chat Completions mount on
+/// both sides (`/v1` vs `/api/v1`); every current id below is also served on `/v1/responses`, but
+/// the seed row spoke Chat Completions and a mixed-endpoint row is forbidden (see
+/// `candidates_within_a_row_share_one_endpoint`).
+const fn openai_chat(native: &'static str, openrouter: &'static str) -> [Candidate; 2] {
+    [
+        Candidate {
+            provider: ProviderId::OpenAi,
+            upstream_model: native,
+            path: "/v1/chat/completions",
+        },
+        Candidate {
+            provider: ProviderId::OpenRouter,
+            upstream_model: openrouter,
+            path: "/api/v1/chat/completions",
+        },
+    ]
+}
+
 /// Every routable model, **sorted by `model`** — [`for_model`] binary-searches it.
 ///
-/// Each id/path pair below returned `200` from the real provider when it was added.
+/// Native ids are the providers' own published aliases (Anthropic Models overview and OpenAI
+/// Models catalog, 2026-09-12). OpenRouter spellings were taken from the live
+/// `https://openrouter.ai/api/v1/models` list the same day. `catalog_rows_are_servable` re-verifies
+/// each pair against the real providers whenever the keys are present.
 pub const MODEL_ROUTES: &[ModelRoute] = &[
     // Claude on the Anthropic wire, with a real second source: OpenRouter's `/api/v1/messages` is a
     // genuine Messages endpoint, reached with a different key over a different network path.
@@ -96,54 +135,130 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
     // the request body, and `{"provider":{"only":["amazon-bedrock"]}}` returns a 200 from Bedrock
     // with the usage block unchanged. That needs a per-candidate body fragment here plus a splice in
     // the gateway — the same shape as the `model` rewrite it already performs.
+    //
+    // Current lineup (Fable 5.1 / Opus 5 / Sonnet 5 / Haiku 4.5) plus the still-served 4.x
+    // snapshots Anthropic lists as legacy. Dateless 4.6+ ids are pinned snapshots, not aliases.
+    ModelRoute {
+        model: "claude-fable-5",
+        wire: WireFormat::Anthropic,
+        candidates: &claude("claude-fable-5", "anthropic/claude-fable-5"),
+    },
+    ModelRoute {
+        model: "claude-fable-5-1",
+        wire: WireFormat::Anthropic,
+        candidates: &claude("claude-fable-5-1", "anthropic/claude-fable-5.1"),
+    },
     ModelRoute {
         model: "claude-haiku-4-5",
         wire: WireFormat::Anthropic,
-        candidates: &[
-            Candidate {
-                provider: ProviderId::Anthropic,
-                upstream_model: "claude-haiku-4-5",
-                path: "/v1/messages",
-            },
-            Candidate {
-                provider: ProviderId::OpenRouter,
-                upstream_model: "anthropic/claude-haiku-4.5",
-                path: "/api/v1/messages",
-            },
-        ],
+        candidates: &claude("claude-haiku-4-5", "anthropic/claude-haiku-4.5"),
+    },
+    ModelRoute {
+        model: "claude-opus-4-6",
+        wire: WireFormat::Anthropic,
+        candidates: &claude("claude-opus-4-6", "anthropic/claude-opus-4.6"),
+    },
+    ModelRoute {
+        model: "claude-opus-4-7",
+        wire: WireFormat::Anthropic,
+        candidates: &claude("claude-opus-4-7", "anthropic/claude-opus-4.7"),
     },
     ModelRoute {
         model: "claude-opus-4-8",
         wire: WireFormat::Anthropic,
-        candidates: &[
-            Candidate {
-                provider: ProviderId::Anthropic,
-                upstream_model: "claude-opus-4-8",
-                path: "/v1/messages",
-            },
-            Candidate {
-                provider: ProviderId::OpenRouter,
-                upstream_model: "anthropic/claude-opus-4.8",
-                path: "/api/v1/messages",
-            },
-        ],
+        candidates: &claude("claude-opus-4-8", "anthropic/claude-opus-4.8"),
+    },
+    ModelRoute {
+        model: "claude-opus-5",
+        wire: WireFormat::Anthropic,
+        candidates: &claude("claude-opus-5", "anthropic/claude-opus-5"),
+    },
+    ModelRoute {
+        model: "claude-sonnet-4-5",
+        wire: WireFormat::Anthropic,
+        candidates: &claude("claude-sonnet-4-5", "anthropic/claude-sonnet-4.5"),
+    },
+    ModelRoute {
+        model: "claude-sonnet-4-6",
+        wire: WireFormat::Anthropic,
+        candidates: &claude("claude-sonnet-4-6", "anthropic/claude-sonnet-4.6"),
+    },
+    ModelRoute {
+        model: "claude-sonnet-5",
+        wire: WireFormat::Anthropic,
+        candidates: &claude("claude-sonnet-5", "anthropic/claude-sonnet-5"),
     },
     // The same shape on the OpenAI wire, where the two mounts differ as well (`/v1` vs `/api/v1`).
+    // Flagships first in the *id* sort: 4.x, then 5 / 5.4 / 5.5 / 5.6, then 6 Astra, then o-series.
+    ModelRoute {
+        model: "gpt-4.1",
+        wire: WireFormat::OpenAi,
+        candidates: &openai_chat("gpt-4.1", "openai/gpt-4.1"),
+    },
+    ModelRoute {
+        model: "gpt-4o",
+        wire: WireFormat::OpenAi,
+        candidates: &openai_chat("gpt-4o", "openai/gpt-4o"),
+    },
     ModelRoute {
         model: "gpt-4o-mini",
         wire: WireFormat::OpenAi,
-        candidates: &[
-            Candidate {
-                provider: ProviderId::OpenAi,
-                upstream_model: "gpt-4o-mini",
-                path: "/v1/chat/completions",
-            },
-            Candidate {
-                provider: ProviderId::OpenRouter,
-                upstream_model: "openai/gpt-4o-mini",
-                path: "/api/v1/chat/completions",
-            },
-        ],
+        candidates: &openai_chat("gpt-4o-mini", "openai/gpt-4o-mini"),
+    },
+    ModelRoute {
+        model: "gpt-5",
+        wire: WireFormat::OpenAi,
+        candidates: &openai_chat("gpt-5", "openai/gpt-5"),
+    },
+    ModelRoute {
+        model: "gpt-5-mini",
+        wire: WireFormat::OpenAi,
+        candidates: &openai_chat("gpt-5-mini", "openai/gpt-5-mini"),
+    },
+    ModelRoute {
+        model: "gpt-5.4",
+        wire: WireFormat::OpenAi,
+        candidates: &openai_chat("gpt-5.4", "openai/gpt-5.4"),
+    },
+    ModelRoute {
+        model: "gpt-5.4-mini",
+        wire: WireFormat::OpenAi,
+        candidates: &openai_chat("gpt-5.4-mini", "openai/gpt-5.4-mini"),
+    },
+    ModelRoute {
+        model: "gpt-5.5",
+        wire: WireFormat::OpenAi,
+        candidates: &openai_chat("gpt-5.5", "openai/gpt-5.5"),
+    },
+    ModelRoute {
+        model: "gpt-5.6-luna",
+        wire: WireFormat::OpenAi,
+        candidates: &openai_chat("gpt-5.6-luna", "openai/gpt-5.6-luna"),
+    },
+    ModelRoute {
+        model: "gpt-5.6-sol",
+        wire: WireFormat::OpenAi,
+        candidates: &openai_chat("gpt-5.6-sol", "openai/gpt-5.6-sol"),
+    },
+    ModelRoute {
+        model: "gpt-5.6-terra",
+        wire: WireFormat::OpenAi,
+        candidates: &openai_chat("gpt-5.6-terra", "openai/gpt-5.6-terra"),
+    },
+    ModelRoute {
+        model: "gpt-6-astra",
+        wire: WireFormat::OpenAi,
+        candidates: &openai_chat("gpt-6-astra", "openai/gpt-6-astra"),
+    },
+    ModelRoute {
+        model: "o3",
+        wire: WireFormat::OpenAi,
+        candidates: &openai_chat("o3", "openai/o3"),
+    },
+    ModelRoute {
+        model: "o4-mini",
+        wire: WireFormat::OpenAi,
+        candidates: &openai_chat("o4-mini", "openai/o4-mini"),
     },
 ];
 
@@ -470,5 +585,59 @@ mod tests {
         // The point: the fallback provider's own wire disagrees with the row's, and that is fine
         // because the row and the path are what decide.
         assert_eq!(by_id(ProviderId::OpenRouter).wire, WireFormat::OpenAi);
+    }
+
+    /// Spot-check the current-generation rows: native id matches the catalog name, OpenRouter uses
+    /// the vendor-slug + (for Claude) dot-spelled form published on 2026-09-12.
+    #[test]
+    fn current_flagships_have_native_plus_openrouter_candidates() {
+        let cases = [
+            (
+                "claude-opus-5",
+                WireFormat::Anthropic,
+                ProviderId::Anthropic,
+                "claude-opus-5",
+                "anthropic/claude-opus-5",
+            ),
+            (
+                "claude-fable-5-1",
+                WireFormat::Anthropic,
+                ProviderId::Anthropic,
+                "claude-fable-5-1",
+                "anthropic/claude-fable-5.1",
+            ),
+            (
+                "claude-sonnet-5",
+                WireFormat::Anthropic,
+                ProviderId::Anthropic,
+                "claude-sonnet-5",
+                "anthropic/claude-sonnet-5",
+            ),
+            (
+                "gpt-6-astra",
+                WireFormat::OpenAi,
+                ProviderId::OpenAi,
+                "gpt-6-astra",
+                "openai/gpt-6-astra",
+            ),
+            (
+                "gpt-5.6-sol",
+                WireFormat::OpenAi,
+                ProviderId::OpenAi,
+                "gpt-5.6-sol",
+                "openai/gpt-5.6-sol",
+            ),
+        ];
+        for (name, wire, primary, native, openrouter) in cases {
+            assert!(for_model(name).is_some(), "{name} must be in the catalog");
+            if let Some(row) = for_model(name) {
+                assert_eq!(row.wire, wire, "{name}");
+                assert_eq!(row.candidates.len(), 2, "{name}");
+                assert_eq!(row.candidates[0].provider, primary, "{name}");
+                assert_eq!(row.candidates[0].upstream_model, native, "{name}");
+                assert_eq!(row.candidates[1].provider, ProviderId::OpenRouter, "{name}");
+                assert_eq!(row.candidates[1].upstream_model, openrouter, "{name}");
+            }
+        }
     }
 }

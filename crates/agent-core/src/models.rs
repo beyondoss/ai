@@ -144,9 +144,9 @@ pub struct ModelCaps {
     /// meaningless (and unread) otherwise. See [`clamp_reasoning_effort`].
     pub min_reasoning_effort: crate::transport::ReasoningEffort,
     /// Whether this model's wire has a distinct `xhigh` tier at all. Several current OpenAI reasoning
-    /// models (o-series, bare/gpt-5.1-family gpt-5) and two Anthropic adaptive models (sonnet-4-6,
-    /// sonnet-5) top out at `high` — requesting `xhigh` there must clamp down to `high`, not send a
-    /// value the provider doesn't recognize. See [`clamp_reasoning_effort`].
+    /// models (o-series, bare/gpt-5.1-family gpt-5) and Anthropic `claude-sonnet-4-6` top out at
+    /// `high` — requesting `xhigh` there must clamp down to `high`, not send a value the provider
+    /// doesn't recognize. Sonnet 5 and later adaptive ids accept `xhigh`. See [`clamp_reasoning_effort`].
     pub supports_xhigh_reasoning: bool,
     /// The Anthropic adaptive-thinking wire string for `xhigh`, once [`clamp_reasoning_effort`] has
     /// confirmed the model supports it at all. Only `claude-opus-4-6` differs (`"max"` — pi: "effort
@@ -195,15 +195,16 @@ impl ModelCaps {
 }
 
 /// Whether a `gpt-5.*` id's wire has a distinct `xhigh` reasoning tier. True from generation 5.2
-/// onward (`gpt-5.2`/`.3`/`.4`/`.5`, any suffix — codex/pro/spark/chat-latest all included); false for
-/// bare `gpt-5` and every `gpt-5.1` variant, none of which list `xhigh` in pi's live catalogue at all.
-/// Shared across all three `gpt-5` return sites below (chat-latest, the codex-spark special case, and
-/// the general bucket) rather than duplicated per branch.
+/// onward (`gpt-5.2`/`.3`/`.4`/`.5`/`.6`, any suffix — codex/pro/spark/chat-latest/sol/terra/luna
+/// all included); false for bare `gpt-5` and every `gpt-5.1` variant, none of which list `xhigh` in
+/// pi's live catalogue at all. Shared across all three `gpt-5` return sites below (chat-latest, the
+/// codex-spark special case, and the general bucket) rather than duplicated per branch.
 fn gpt5_supports_xhigh(m: &str) -> bool {
     m.starts_with("gpt-5.2")
         || m.starts_with("gpt-5.3")
         || m.starts_with("gpt-5.4")
         || m.starts_with("gpt-5.5")
+        || m.starts_with("gpt-5.6")
 }
 
 /// Adjust a native-OpenAI-family `ModelCaps` (o-series/gpt-4/gpt-5) for a vendor-slug id (e.g.
@@ -616,14 +617,17 @@ fn capabilities_impl_lc(m: &str) -> ModelCaps {
             return caps;
         }
 
-        // Generation 6+ (opus-4-6/4-7/4-8, sonnet-4-6, sonnet-5, fable-5) require the newer `adaptive`
-        // thinking shape (`Budget`'s `{type:"enabled", budget_tokens}` is rejected) and ship a 1M-token
-        // context window — a full step up from every earlier generation. Matched by the exact
-        // family+generation token so "claude-opus-4-5" can't collide with "claude-opus-4-6" and later.
+        // Generation 6+ (opus-4-6/4-7/4-8, opus-5, sonnet-4-6, sonnet-5, fable-5 / fable-5-1)
+        // require the newer `adaptive` thinking shape (`Budget`'s `{type:"enabled", budget_tokens}`
+        // is rejected) and ship a 1M-token context window — a full step up from every earlier
+        // generation. Matched by the exact family+generation token so "claude-opus-4-5" can't
+        // collide with "claude-opus-4-6" and later. `claude-opus-5` is its own major (Anthropic's
+        // 2026 recommended default); `claude-fable-5` also matches `claude-fable-5-1`.
         const GEN6_PLUS: &[&str] = &[
             "claude-opus-4-6",
             "claude-opus-4-7",
             "claude-opus-4-8",
+            "claude-opus-5",
             "claude-sonnet-4-6",
             "claude-sonnet-5",
             "claude-fable-5",
@@ -640,11 +644,11 @@ fn capabilities_impl_lc(m: &str) -> ModelCaps {
             // `thinkingLevelMap: {"off": null}` — there's no "off" wire shape for it at all).
             let reasoning_disableable =
                 !(m.starts_with("claude-fable-5") || m.starts_with("fable-5"));
-            // sonnet-4-6/sonnet-5 carry no `thinkingLevelMap` at all in pi's catalogue, and an unmapped
-            // "xhigh" isn't a value their wire accepts — only opus-4-6/4-7/4-8 and fable-5 do (see
-            // `adaptive_xhigh_effort_wire`'s doc comment).
-            let supports_xhigh_reasoning =
-                !(m.starts_with("claude-sonnet-4-6") || m.starts_with("claude-sonnet-5"));
+            // sonnet-4-6 carries no `xhigh` wire value (pi: max but not xhigh). Sonnet 5 and every
+            // later adaptive id (opus-5, fable-5.1) accept it — Anthropic's current Sonnet 5 docs
+            // list low/medium/high/max/x-high, and pi's live `supports-xhigh` test now includes
+            // `claude-sonnet-5`.
+            let supports_xhigh_reasoning = !m.starts_with("claude-sonnet-4-6");
             // Only opus-4-6 remaps xhigh to "max"; every other adaptive id that supports it sends the
             // literal "xhigh" (the field's own default).
             let adaptive_xhigh_effort_wire = if m.starts_with("claude-opus-4-6") {
@@ -926,9 +930,11 @@ fn capabilities_impl_lc(m: &str) -> ModelCaps {
         }
         // "-pro" ships a much larger 1.05M context — but only the 5.4/5.5 generation of it;
         // gpt-5-pro/gpt-5.2-pro are 400k like the rest of the family. The bare "gpt-5.4"/"gpt-5.5"
-        // release (no mini/nano/pro suffix) runs a smaller 272k window; every other family member is
-        // 400k.
-        let context_window = if m == "gpt-5.4-pro" || m == "gpt-5.5-pro" {
+        // release (no mini/nano/pro suffix) runs a smaller 272k window. GPT-5.6 (sol/terra/luna,
+        // plus the `gpt-5.6` alias that routes to sol) shipped a 1.05M window across the family —
+        // OpenAI Models catalog, 2026-09-12. Every other family member is 400k.
+        let context_window = if m.starts_with("gpt-5.6") || m == "gpt-5.4-pro" || m == "gpt-5.5-pro"
+        {
             1_050_000
         } else if m == "gpt-5.4" || m == "gpt-5.5" {
             272_000
@@ -938,6 +944,7 @@ fn capabilities_impl_lc(m: &str) -> ModelCaps {
         // Disable-capability is a per-exact-id allowlist in pi's catalogue, not a blanket rule — an
         // id under this generic branch that isn't listed here (e.g. bare "gpt-5", "gpt-5-mini",
         // "gpt-5.3" without "-codex", any "-pro"/"-nano" variant not listed) has no "off" signal.
+        // GPT-5.6's official `reasoning.effort` vocabulary includes `none` on every current id.
         const GPT5_DISABLE_CAPABLE: &[&str] = &[
             "gpt-5.1",
             "gpt-5.2",
@@ -946,14 +953,18 @@ fn capabilities_impl_lc(m: &str) -> ModelCaps {
             "gpt-5.4-mini",
             "gpt-5.4-nano",
             "gpt-5.5",
+            "gpt-5.6",
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-5.6-luna",
         ];
-        let reasoning_disableable = GPT5_DISABLE_CAPABLE.contains(&m);
-        // gpt-5.5-pro excludes both "minimal" and "low" (floor: medium); gpt-5.5 excludes just
-        // "minimal" (floor: low) — pi's `thinkingLevelMap` nulls those out explicitly. Every earlier
-        // gpt-5 generation accepts the full ladder from minimal up.
+        let reasoning_disableable = GPT5_DISABLE_CAPABLE.contains(&m) || m.starts_with("gpt-5.6");
+        // gpt-5.5-pro excludes both "minimal" and "low" (floor: medium); gpt-5.5 and the 5.6 family
+        // exclude just "minimal" (floor: low) — official 5.6 docs list none/low/medium/high/xhigh/max,
+        // no `minimal`. Every earlier gpt-5 generation accepts the full ladder from minimal up.
         let min_reasoning_effort = if m == "gpt-5.5-pro" {
             crate::transport::ReasoningEffort::Medium
-        } else if m == "gpt-5.5" {
+        } else if m == "gpt-5.5" || m.starts_with("gpt-5.6") {
             crate::transport::ReasoningEffort::Low
         } else {
             crate::transport::ReasoningEffort::Minimal
@@ -985,6 +996,34 @@ fn capabilities_impl_lc(m: &str) -> ModelCaps {
             min_reasoning_effort,
             supports_xhigh_reasoning: gpt5_supports_xhigh(m),
             adaptive_xhigh_effort_wire: "xhigh", // unread: this bucket never uses Adaptive shape.
+            openai_reasoning_format: OpenAiReasoningFormat::Standard,
+            supports_cache_control_on_tools: true,
+        };
+        return openai_family_caps_for_vendor_slug(caps, is_vendor_slug);
+    }
+
+    // ---- OpenAI GPT-6 family (reasoning) ----
+    // Official catalog (2026-09-12): `gpt-6-astra` is the flagship — 1.05M context, 128k output,
+    // vision, Responses + Chat Completions, `reasoning.effort` of low/medium/high/xhigh/max (no
+    // `none` / `minimal`). The `-pro` sibling on OpenRouter shares the same numbers.
+    if m.starts_with("gpt-6") || family_id.starts_with("gpt-6") {
+        let is_vendor_slug = m.contains('/');
+        let caps = ModelCaps {
+            context_window: 1_050_000,
+            max_output: 128_000,
+            max_tokens_field: MaxTokensField::MaxCompletionTokens,
+            supports_long_cache: true,
+            supports_vision: true,
+            supports_temperature: true,
+            thinking: ThinkingShape::None,
+            reasoning_effort: true,
+            reasoning_disableable: false,
+            supports_eager_tool_streaming: false,
+            supports_tool_stream: false,
+            api: ApiKind::Responses,
+            min_reasoning_effort: crate::transport::ReasoningEffort::Low,
+            supports_xhigh_reasoning: true,
+            adaptive_xhigh_effort_wire: "xhigh",
             openai_reasoning_format: OpenAiReasoningFormat::Standard,
             supports_cache_control_on_tools: true,
         };
@@ -1712,12 +1751,13 @@ fn capabilities_impl_lc(m: &str) -> ModelCaps {
         };
     }
 
-    // xAI/Grok: pi's `detectCompat` marks every xAI id `supportsReasoningEffort: false`
-    // unconditionally — the reasoning models in this family (grok-4.2x-reasoning, grok-4.3,
-    // grok-build) reason on their own, with no client-steerable toggle at all, so `Standard` format
-    // with `reasoning_effort: false` correctly emits nothing (matching pi exactly) rather than
-    // guessing at a shape xAI doesn't accept. `maxTokensField` auto-detects to
-    // `max_completion_tokens` (xAI isn't in pi's `useMaxTokens` allowlist).
+    // xAI/Grok: older ids (grok-4.3, grok-4.2x-reasoning, grok-build) reason on their own with no
+    // client-steerable toggle — pi's `detectCompat` marks those `supportsReasoningEffort: false`
+    // unconditionally, so `Standard` format with `reasoning_effort: false` correctly emits nothing.
+    // Grok 4.5/4.6 are the break: xAI's own 2026 docs publish a real effort vocabulary (4.5:
+    // low/medium/high; 4.6: low/medium/high/xhigh) and a 500k context (not the 1M the earlier 4.x
+    // ids ship). `maxTokensField` auto-detects to `max_completion_tokens` (xAI isn't in pi's
+    // `useMaxTokens` allowlist).
     // Also matches a vendor-slug id (OpenRouter's `"x-ai/grok-4.3"`) via `family_id` — see its own doc
     // comment above.
     if m.starts_with("grok") || family_id.starts_with("grok") {
@@ -1729,9 +1769,13 @@ fn capabilities_impl_lc(m: &str) -> ModelCaps {
             (32_768, 8_192, false)
         } else if g.starts_with("grok-build") {
             (256_000, 256_000, true)
+        } else if g.starts_with("grok-4.5") || g.starts_with("grok-4.6") {
+            (500_000, 30_000, true)
         } else {
             (1_000_000, 30_000, true)
         };
+        let reasoning_effort = g.starts_with("grok-4.5") || g.starts_with("grok-4.6");
+        let supports_xhigh_reasoning = g.starts_with("grok-4.6");
         // OpenRouter hosts every current xAI id with a much smaller real output ceiling than xAI's own
         // native API — pi's `openrouter.models.ts` lists `maxTokens: 4096` for every grok-4.x/grok-build
         // entry there (vs the much larger native ones `xai.models.ts` this table otherwise ports).
@@ -1753,13 +1797,17 @@ fn capabilities_impl_lc(m: &str) -> ModelCaps {
             supports_vision,
             supports_temperature: true,
             thinking: ThinkingShape::None,
-            reasoning_effort: false,
+            reasoning_effort,
             reasoning_disableable: false,
             supports_eager_tool_streaming: false,
             supports_tool_stream: false,
             api: ApiKind::ChatCompletions,
-            min_reasoning_effort: RE::Minimal,
-            supports_xhigh_reasoning: false,
+            min_reasoning_effort: if reasoning_effort {
+                RE::Low
+            } else {
+                RE::Minimal
+            },
+            supports_xhigh_reasoning,
             adaptive_xhigh_effort_wire: "xhigh",
             openai_reasoning_format: OpenAiReasoningFormat::Standard,
             supports_cache_control_on_tools: true,
@@ -3087,7 +3135,7 @@ pub fn budget_for_effort_with_override(
 /// actually accepts on the wire — pi's `clampThinkingLevel`, specialized to the two edges every current
 /// model's exclusions actually trim (never a gap in the middle): a floor (`min_reasoning_effort`, e.g.
 /// `gpt-5.5-pro` rejects `minimal`/`low`) and an `xhigh` ceiling (`supports_xhigh_reasoning`, e.g.
-/// o-series/bare-gpt-5/gpt-5.1\* and Anthropic sonnet-4-6/sonnet-5 top out at `high`). Called by every
+/// o-series/bare-gpt-5/gpt-5.1\* and Anthropic sonnet-4-6 top out at `high`). Called by every
 /// dialect at the point it's about to put an effort string on the wire, rather than by
 /// [`thinking_for_level`], so a raw `with_reasoning_effort`/`--reasoning-effort` call (which never goes
 /// through `thinking_for_level`) is clamped too.
@@ -3270,8 +3318,10 @@ mod tests {
         for id in [
             "claude-opus-4-6",
             "claude-opus-4-7",
+            "claude-opus-5",
             "claude-sonnet-5",
             "claude-fable-5",
+            "claude-fable-5-1",
         ] {
             let c = capabilities(id);
             assert_eq!(
@@ -3301,9 +3351,11 @@ mod tests {
         }
         for id in [
             "claude-opus-4-6",
+            "claude-opus-5",
             "claude-sonnet-4-6",
             "claude-sonnet-5",
             "claude-fable-5",
+            "claude-fable-5-1",
             "claude-opus-4-5",
             "claude-sonnet-4-5",
             "claude-3-5-sonnet-20241022",
@@ -3389,6 +3441,15 @@ mod tests {
         assert_eq!(capabilities("gpt-5.4").context_window, 272_000);
         assert_eq!(capabilities("gpt-5.4-mini").context_window, 400_000);
         assert_eq!(capabilities("gpt-5.4-pro").context_window, 1_050_000);
+        assert_eq!(capabilities("gpt-5.6").context_window, 1_050_000);
+        assert_eq!(capabilities("gpt-5.6-sol").context_window, 1_050_000);
+        assert_eq!(capabilities("gpt-5.6-terra").context_window, 1_050_000);
+        assert_eq!(capabilities("gpt-5.6-luna").context_window, 1_050_000);
+        assert_eq!(capabilities("gpt-5.6-sol").max_output, 128_000);
+        assert_eq!(capabilities("gpt-6-astra").context_window, 1_050_000);
+        assert_eq!(capabilities("gpt-6-astra").max_output, 128_000);
+        assert!(capabilities("gpt-6-astra").reasoning_effort);
+        assert_eq!(capabilities("gpt-6-astra").api, ApiKind::Responses);
         assert_eq!(
             capabilities("gpt-5-chat-latest").thinking,
             ThinkingShape::None
@@ -3451,8 +3512,10 @@ mod tests {
     fn reasoning_disableable_is_id_specific_not_family_wide() {
         // Anthropic: every gen6+ id can be told to disable thinking explicitly, except claude-fable-5.
         assert!(capabilities("claude-opus-4-8").reasoning_disableable);
+        assert!(capabilities("claude-opus-5").reasoning_disableable);
         assert!(capabilities("claude-sonnet-5").reasoning_disableable);
         assert!(!capabilities("claude-fable-5").reasoning_disableable);
+        assert!(!capabilities("claude-fable-5-1").reasoning_disableable);
         assert!(!capabilities("fable-5").reasoning_disableable);
         // Budget-shaped (pre-gen6, post-gen3) Claude ids are disable-capable too.
         assert!(capabilities("claude-opus-4-5").reasoning_disableable);
@@ -3471,6 +3534,14 @@ mod tests {
         assert!(capabilities("gpt-5.4-mini").reasoning_disableable);
         assert!(capabilities("gpt-5.4-nano").reasoning_disableable);
         assert!(capabilities("gpt-5.5").reasoning_disableable);
+        assert!(capabilities("gpt-5.6").reasoning_disableable);
+        assert!(capabilities("gpt-5.6-sol").reasoning_disableable);
+        assert!(capabilities("gpt-5.6-terra").reasoning_disableable);
+        assert!(capabilities("gpt-5.6-luna").reasoning_disableable);
+        assert!(
+            !capabilities("gpt-6-astra").reasoning_disableable,
+            "gpt-6-astra has no none/off effort"
+        );
         assert!(
             !capabilities("gpt-5").reasoning_disableable,
             "bare gpt-5 isn't in the allowlist"
@@ -3734,8 +3805,8 @@ mod tests {
     #[test]
     fn clamp_reasoning_effort_drops_unsupported_xhigh_to_high() {
         use crate::transport::ReasoningEffort as RE;
-        // o-series, bare/early gpt-5 ids, and sonnet-4-6/sonnet-5 carry no `xhigh` wire value at all in
-        // pi's live catalogue — requesting it must clamp down to `high`, not send an invalid value.
+        // o-series, bare/early gpt-5 ids, and sonnet-4-6 carry no `xhigh` wire value at all —
+        // requesting it must clamp down to `high`, not send an invalid value.
         for id in [
             "o3",
             "o1",
@@ -3747,7 +3818,6 @@ mod tests {
             "gpt-5.1-codex",
             "gpt-5.1-chat-latest",
             "claude-sonnet-4-6",
-            "claude-sonnet-5",
         ] {
             let caps = capabilities(id);
             assert_eq!(
@@ -3756,7 +3826,7 @@ mod tests {
                 "{id} should clamp xhigh down to high"
             );
         }
-        // gpt-5.2+ and opus-4-6/4-7/4-8/fable-5 do support xhigh — must pass through unclamped.
+        // gpt-5.2+, gpt-6, and opus-4-6/4-7/4-8/opus-5/sonnet-5/fable-5 do support xhigh.
         for id in [
             "gpt-5.2",
             "gpt-5.2-codex",
@@ -3765,10 +3835,15 @@ mod tests {
             "gpt-5.4",
             "gpt-5.5",
             "gpt-5.5-pro",
+            "gpt-5.6-sol",
+            "gpt-6-astra",
             "claude-opus-4-6",
             "claude-opus-4-7",
             "claude-opus-4-8",
+            "claude-opus-5",
+            "claude-sonnet-5",
             "claude-fable-5",
+            "claude-fable-5-1",
         ] {
             let caps = capabilities(id);
             assert_eq!(
@@ -3792,6 +3867,20 @@ mod tests {
         assert_eq!(clamp_reasoning_effort(&gpt55_pro, RE::Minimal), RE::Medium);
         assert_eq!(clamp_reasoning_effort(&gpt55_pro, RE::Low), RE::Medium);
         assert_eq!(clamp_reasoning_effort(&gpt55_pro, RE::Medium), RE::Medium);
+
+        // GPT-5.6 / GPT-6 reject `minimal` the same way gpt-5.5 does (official vocab starts at low).
+        for id in [
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-5.6-luna",
+            "gpt-6-astra",
+        ] {
+            assert_eq!(
+                clamp_reasoning_effort(&capabilities(id), RE::Minimal),
+                RE::Low,
+                "{id} should clamp minimal up to low"
+            );
+        }
 
         // Every other reasoning model accepts minimal unclamped.
         for id in ["o3", "gpt-5", "gpt-5.2", "claude-opus-4-8"] {
@@ -3822,27 +3911,31 @@ mod tests {
             assert_eq!(anthropic_adaptive_effort_wire(&caps, RE::Medium), "medium");
             assert_eq!(anthropic_adaptive_effort_wire(&caps, RE::High), "high");
         }
-        // xhigh is model-specific: opus-4-6 uniquely sends "max"; opus-4-7/4-8/fable-5 send "xhigh"
-        // literally; sonnet-4-6/sonnet-5 have already been clamped to High and so never reach "xhigh"
-        // as an input in practice, but the function must still degrade gracefully if it ever did.
+        // xhigh is model-specific: opus-4-6 uniquely sends "max"; later adaptive ids that support
+        // it send "xhigh" literally; sonnet-4-6 has already been clamped to High.
         assert_eq!(
             anthropic_adaptive_effort_wire(&capabilities("claude-opus-4-6"), RE::XHigh),
             "max"
         );
-        for id in ["claude-opus-4-7", "claude-opus-4-8", "claude-fable-5"] {
+        for id in [
+            "claude-opus-4-7",
+            "claude-opus-4-8",
+            "claude-opus-5",
+            "claude-sonnet-5",
+            "claude-fable-5",
+            "claude-fable-5-1",
+        ] {
             assert_eq!(
                 anthropic_adaptive_effort_wire(&capabilities(id), RE::XHigh),
                 "xhigh",
                 "{id} should send xhigh literally"
             );
         }
-        for id in ["claude-sonnet-4-6", "claude-sonnet-5"] {
-            assert_eq!(
-                anthropic_adaptive_effort_wire(&capabilities(id), RE::XHigh),
-                "high",
-                "{id} has no xhigh wire value; must degrade to high"
-            );
-        }
+        assert_eq!(
+            anthropic_adaptive_effort_wire(&capabilities("claude-sonnet-4-6"), RE::XHigh),
+            "high",
+            "sonnet-4-6 has no xhigh wire value; must degrade to high"
+        );
     }
 
     #[test]
@@ -3866,6 +3959,8 @@ mod tests {
             "gpt-5.3-codex-spark",
             "gpt-5.4-pro",
             "claude-fable-5",
+            "claude-fable-5-1",
+            "gpt-6-astra",
         ] {
             let caps = capabilities(id);
             assert!(
@@ -4002,9 +4097,9 @@ mod tests {
             );
         }
 
-        // Adaptive-shape gen6+ models are unaffected: xhigh is still offered where pi's catalogue
-        // actually maps it (opus-4-6/4-7/4-8, fable-5 — sonnet-4-6/sonnet-5 are the two adaptive
-        // exceptions covered by other tests in this module).
+        // Adaptive-shape gen6+ models are unaffected: xhigh is still offered where the catalogue
+        // actually maps it (opus-4-6/4-7/4-8/opus-5, sonnet-5, fable-5 — sonnet-4-6 is the remaining
+        // adaptive exception covered by other tests in this module).
         let caps = capabilities("claude-opus-4-8");
         assert_eq!(caps.thinking, ThinkingShape::Adaptive);
         assert!(caps.supports_xhigh_reasoning);
@@ -4285,6 +4380,25 @@ mod tests {
         }
         assert_eq!(capabilities("grok-3").context_window, 131_072);
         assert_eq!(capabilities("grok-4.3").context_window, 1_000_000);
+        // Grok 4.5/4.6 are the first xAI ids with a published client-steerable effort vocabulary
+        // and a 500k window (xAI docs, 2026-09-12). 4.6 also has xhigh; 4.5 tops out at high.
+        let g45 = capabilities("grok-4.5");
+        assert_eq!(g45.context_window, 500_000);
+        assert!(g45.reasoning_effort);
+        assert!(!g45.supports_xhigh_reasoning);
+        assert_eq!(
+            g45.min_reasoning_effort,
+            crate::transport::ReasoningEffort::Low
+        );
+        let g46 = capabilities("grok-4.6");
+        assert_eq!(g46.context_window, 500_000);
+        assert!(g46.reasoning_effort);
+        assert!(g46.supports_xhigh_reasoning);
+        assert_eq!(
+            capabilities("x-ai/grok-4.6").context_window,
+            500_000,
+            "vendor-slug grok-4.6 must not fall through to the generic 1M/32k bucket"
+        );
     }
 
     #[test]

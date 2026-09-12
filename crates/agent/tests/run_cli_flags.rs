@@ -115,7 +115,7 @@ fn run_binary_list_models_search_argument_filters_to_matching_model_ids() {
 #[test]
 fn run_binary_list_models_search_argument_fuzzy_matches_a_non_contiguous_subsequence() {
     // Task #51 (pi-parity fix): `--list-models <search>` used to be a plain case-insensitive substring
-    // check, which "sn5" would never match against "claude-sonnet-4-5" (no such literal substring
+    // check, which "sn5" would never match against "claude-sonnet-5" (no such literal substring
     // exists). pi's own `--list-models` uses a fuzzy, order-preserving subsequence match instead.
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
     let output = run_cmd(bin)
@@ -130,8 +130,8 @@ fn run_binary_list_models_search_argument_fuzzy_matches_a_non_contiguous_subsequ
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("claude-sonnet-4-5"),
-        "a fuzzy subsequence match on \"sn5\" must find claude-sonnet-4-5: {stdout}"
+        stdout.contains("claude-sonnet-5"),
+        "a fuzzy subsequence match on \"sn5\" must find claude-sonnet-5: {stdout}"
     );
     assert!(
         !stdout.contains("gpt-5-mini"),
@@ -617,8 +617,8 @@ fn run_binary_model_flag_colon_suffix_resolves_the_id_and_sets_reasoning_effort(
     // Fix 2 (pi-parity gap): `--model <pattern>:<thinking-level>` (pi's own `model-resolver.ts::
     // parseModelPattern`, help text example `pi --model sonnet:high`) previously only worked for
     // `--models`; a bare `--model` ignored the suffix as part of a (then-unresolvable) literal id.
-    // "sonnet" resolves to "claude-sonnet-4-5" (Budget-shape, 64_000 max output), so "high" derives a
-    // 16384-token budget with no separate `--reasoning-effort` needed.
+    // "sonnet" resolves to "claude-sonnet-5" (Adaptive-shape), so "high" is sent as
+    // `output_config.effort` rather than a numeric budget.
     let (base, bodies) = spawn_model_server(vec![turn_text("ok")]);
 
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
@@ -646,13 +646,13 @@ fn run_binary_model_flag_colon_suffix_resolves_the_id_and_sets_reasoning_effort(
     );
     let bodies = bodies.lock().unwrap();
     assert!(
-        bodies[0].contains(r#""model":"claude-sonnet-4-5""#),
-        "--model sonnet:high must resolve the id to claude-sonnet-4-5: {}",
+        bodies[0].contains(r#""model":"claude-sonnet-5""#),
+        "--model sonnet:high must resolve the id to claude-sonnet-5: {}",
         bodies[0]
     );
     assert!(
-        bodies[0].contains(r#""budget_tokens":16384"#),
-        "--model sonnet:high must set reasoning effort to high (a 16384-token budget): {}",
+        bodies[0].contains(r#""effort":"high""#),
+        "--model sonnet:high must set adaptive effort to high: {}",
         bodies[0]
     );
 }
