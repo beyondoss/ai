@@ -655,6 +655,7 @@ fn pool_key(provider: &str) -> &'static str {
     match provider {
         "openai" => "sk-pool-secret",
         "anthropic" => "sk-anthropic-pool",
+        "bedrock" => "sk-bedrock-pool",
         "fireworks" => "sk-fireworks-pool",
         "openrouter" => "sk-openrouter-pool",
         _ => "sk-unknown-pool",

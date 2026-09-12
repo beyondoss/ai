@@ -135,6 +135,43 @@ async fn smoke_anthropic() {
     eprintln!("smoke[anthropic]: OK ({status}) — verified, swapped to x-api-key, real 2xx");
 }
 
+#[tokio::test]
+#[ignore = "live provider smoke; run via `mise run test:smoke` with API keys set"]
+async fn smoke_bedrock() {
+    let Some(key) = env_key("AWS_BEARER_TOKEN_BEDROCK") else {
+        eprintln!("smoke[bedrock]: AWS_BEARER_TOKEN_BEDROCK unset — skipping");
+        return;
+    };
+    let nats = Nats::start().await;
+    let (gw, vkey) = managed_gateway(&nats, "bedrock", &key).await;
+    let client = test_client();
+
+    // `/bedrock/anthropic/v1/messages` → provider `bedrock` (stripped to `/anthropic/v1/messages`
+    // upstream). Same x-api-key swap as Anthropic, different host, Bedrock's US geo inference id.
+    // The required `anthropic-version` header passes through.
+    let body = r#"{"model":"us.anthropic.claude-haiku-4-5-20251001-v1:0","max_tokens":16,"messages":[{"role":"user","content":"Reply with the single word: ping"}]}"#;
+    let resp = client
+        .post(format!("{}/bedrock/anthropic/v1/messages", gw.url()))
+        .header("x-api-key", &vkey)
+        .header("anthropic-version", "2023-06-01")
+        .header("content-type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .expect("request to gateway");
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+    assert!(
+        status.is_success(),
+        "smoke[bedrock]: expected 2xx, got {status}. body: {text}"
+    );
+    assert!(
+        text.contains("\"content\""),
+        "smoke[bedrock]: {status} but no `content` in body: {text}"
+    );
+    eprintln!("smoke[bedrock]: OK ({status}) — verified, swapped to x-api-key, real 2xx");
+}
+
 // --- OpenAI-wire providers. Same code path; testing more than one confirms each host/base-path/auth
 // row in `route::KNOWN_PROVIDERS` against the real endpoint. ---
 

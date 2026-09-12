@@ -82,20 +82,18 @@ pub const MAX_CANDIDATES: usize = 8;
 ///
 /// Each id/path pair below returned `200` from the real provider when it was added.
 pub const MODEL_ROUTES: &[ModelRoute] = &[
-    // Claude on the Anthropic wire, with a real second source: OpenRouter's `/api/v1/messages` is a
-    // genuine Messages endpoint, reached with a different key over a different network path.
+    // Claude on the Anthropic wire. Three sources, in preference order:
     //
-    // Know what this does and does not buy. OpenRouter chooses its own backend per request —
-    // observed serving these ids from both Anthropic directly and Amazon Bedrock — so the second
-    // candidate is *not* a guaranteed independent supply of the model. It reliably covers the
-    // failures that are ours: our egress blocked, our Anthropic key throttled or suspended,
-    // api.anthropic.com unreachable from us. It does not guarantee cover for Anthropic's own
-    // serving being down, because OpenRouter may be forwarding there too.
-    //
-    // Making it independent is cheap and not yet done: OpenRouter honours a `provider` preference in
-    // the request body, and `{"provider":{"only":["amazon-bedrock"]}}` returns a 200 from Bedrock
-    // with the usage block unchanged. That needs a per-candidate body fragment here plus a splice in
-    // the gateway — the same shape as the `model` rewrite it already performs.
+    // 1. Anthropic first-party.
+    // 2. Amazon Bedrock's own Messages API (`/anthropic/v1/messages`, `x-api-key`). This is a
+    //    genuine independent supply — a different account, a different network path, and AWS's
+    //    serving of Claude rather than a proxy that may still land on api.anthropic.com.
+    //    Model ids are the US geo inference profiles that the default
+    //    `bedrock-runtime.us-east-1.amazonaws.com` host serves (see the Bedrock row).
+    // 3. OpenRouter's Messages endpoint. Covers *our* side of the wire (egress blocked, our
+    //    Anthropic/Bedrock key throttled) but is not independently guaranteed: OpenRouter picks
+    //    its own backend per request and has been observed serving these ids from Anthropic
+    //    directly *and* from Bedrock.
     ModelRoute {
         model: "claude-haiku-4-5",
         wire: WireFormat::Anthropic,
@@ -104,6 +102,11 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
                 provider: ProviderId::Anthropic,
                 upstream_model: "claude-haiku-4-5",
                 path: "/v1/messages",
+            },
+            Candidate {
+                provider: ProviderId::Bedrock,
+                upstream_model: "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+                path: "/anthropic/v1/messages",
             },
             Candidate {
                 provider: ProviderId::OpenRouter,
@@ -120,6 +123,11 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
                 provider: ProviderId::Anthropic,
                 upstream_model: "claude-opus-4-8",
                 path: "/v1/messages",
+            },
+            Candidate {
+                provider: ProviderId::Bedrock,
+                upstream_model: "us.anthropic.claude-opus-4-8",
+                path: "/anthropic/v1/messages",
             },
             Candidate {
                 provider: ProviderId::OpenRouter,
@@ -444,16 +452,22 @@ mod tests {
         assert_eq!(wire_of_path("/v1/responses"), WireFormat::OpenAi);
     }
 
-    /// Claude has a genuine second source, and it is *not* the provider's declared wire that makes
-    /// it work. Pinned explicitly because this row is the whole point of the wire rework: OpenRouter
-    /// is an OpenAI-wire provider by `ProviderSpec`, yet serves this row's Anthropic-wire traffic.
+    /// Claude has two real fallbacks, and they are not the same kind. Bedrock is an independent
+    /// Anthropic-wire source (its `ProviderSpec::wire` agrees with the row). OpenRouter is the
+    /// wire-rework case: an OpenAI-wire provider that still serves this row's Anthropic-wire
+    /// traffic because the row and the path decide, not the provider.
     #[test]
-    fn claude_fails_over_to_openrouter_on_the_anthropic_wire() {
+    fn claude_fails_over_to_bedrock_then_openrouter_on_the_anthropic_wire() {
         let want = [
             Candidate {
                 provider: ProviderId::Anthropic,
                 upstream_model: "claude-opus-4-8",
                 path: "/v1/messages",
+            },
+            Candidate {
+                provider: ProviderId::Bedrock,
+                upstream_model: "us.anthropic.claude-opus-4-8",
+                path: "/anthropic/v1/messages",
             },
             Candidate {
                 provider: ProviderId::OpenRouter,
@@ -465,10 +479,49 @@ mod tests {
         assert_eq!(
             for_model("claude-opus-4-8").map(|r| (r.wire, r.candidates)),
             Some((WireFormat::Anthropic, &want[..])),
-            "Claude must have a real Anthropic-wire fallback",
+            "Claude must fail over to Bedrock, then OpenRouter, on the Anthropic wire",
         );
-        // The point: the fallback provider's own wire disagrees with the row's, and that is fine
-        // because the row and the path are what decide.
+        assert_eq!(by_id(ProviderId::Bedrock).wire, WireFormat::Anthropic);
         assert_eq!(by_id(ProviderId::OpenRouter).wire, WireFormat::OpenAi);
+    }
+
+    /// Every Claude row shares the same failover shape. Pinned so a new Claude id cannot ship with
+    /// only the OpenRouter proxy as its second source — that was the previous, non-independent,
+    /// fallback and is exactly what Bedrock is here to replace as #2.
+    #[test]
+    fn every_claude_row_fails_over_through_bedrock() {
+        let claude = MODEL_ROUTES
+            .iter()
+            .filter(|r| r.model.starts_with("claude-"))
+            .collect::<Vec<_>>();
+        assert!(
+            !claude.is_empty(),
+            "the catalog has Claude rows this pin is meant to cover"
+        );
+        for route in claude {
+            assert_eq!(route.wire, WireFormat::Anthropic, "{:?}", route.model);
+            assert!(
+                route.candidates.len() >= 2,
+                "{:?} must have a Bedrock fallback",
+                route.model
+            );
+            assert_eq!(
+                route.candidates[0].provider,
+                ProviderId::Anthropic,
+                "{:?} primary",
+                route.model
+            );
+            assert_eq!(
+                route.candidates[1].provider,
+                ProviderId::Bedrock,
+                "{:?} second source must be Bedrock, not a proxy",
+                route.model
+            );
+            assert_eq!(
+                route.candidates[1].path, "/anthropic/v1/messages",
+                "{:?} Bedrock path",
+                route.model
+            );
+        }
     }
 }

@@ -24,7 +24,7 @@ pub mod catalog;
 
 pub use catalog::{Candidate, MAX_CANDIDATES, ModelRoute, for_model};
 
-/// Every upstream this codebase can route to, by either path. The gateway's 11 `/{name}/…` routes and
+/// Every upstream this codebase can route to, by either path. The gateway's 12 `/{name}/…` routes and
 /// the 5 BYO-only aggregator platforms (reachable only by base-URL override, no gateway-native route)
 /// are one enum because they are one *concept* — "which upstream" — and splitting them is what
 /// produced the two-tables-out-of-sync problem this crate exists to end.
@@ -46,6 +46,12 @@ pub enum ProviderId {
     /// ChatGPT Plus/Pro subscription backend. Gateway-routable, but only ever with a *BYO* OAuth
     /// bearer — there is no `AI_POOL_KEY_OPENAI_CODEX`, hence no [`ProviderSpec::env_var`].
     OpenAiCodex,
+    /// Amazon Bedrock's Anthropic Messages surface (`/anthropic/v1/messages`), authenticated with a
+    /// static Amazon Bedrock API key (`AWS_BEARER_TOKEN_BEDROCK` / `x-api-key`). Not SigV4 and not
+    /// the Converse/eventstream APIs — those don't fit a byte-relay-plus-key-swap gateway. The
+    /// OpenAI-compat surface at `/openai/v1` is a config-added alias (`bedrock-openai`) because one
+    /// row has one auth scheme and one wire.
+    Bedrock,
 
     // --- BYO-only rows: no gateway route, named via a `models.json` `base_url` or `AI_PROVIDER`. ---
     HuggingFace,
@@ -67,7 +73,7 @@ impl ProviderId {
     /// gateway's model-routed path switches providers between connect attempts and wants that lookup
     /// to be an index, not a string compare. Also spares `every_id_has_exactly_one_row` from
     /// hand-maintaining its own copy of the variant list.
-    pub const ALL: [ProviderId; 16] = [
+    pub const ALL: [ProviderId; 17] = [
         ProviderId::OpenAi,
         ProviderId::Anthropic,
         ProviderId::OpenRouter,
@@ -79,6 +85,7 @@ impl ProviderId {
         ProviderId::Mistral,
         ProviderId::XAi,
         ProviderId::OpenAiCodex,
+        ProviderId::Bedrock,
         ProviderId::HuggingFace,
         ProviderId::Nvidia,
         ProviderId::KimiCoding,
@@ -106,11 +113,12 @@ impl ProviderId {
             ProviderId::Mistral => 8,
             ProviderId::XAi => 9,
             ProviderId::OpenAiCodex => 10,
-            ProviderId::HuggingFace => 11,
-            ProviderId::Nvidia => 12,
-            ProviderId::KimiCoding => 13,
-            ProviderId::OpenCodeZen => 14,
-            ProviderId::OpenCodeGo => 15,
+            ProviderId::Bedrock => 11,
+            ProviderId::HuggingFace => 12,
+            ProviderId::Nvidia => 13,
+            ProviderId::KimiCoding => 14,
+            ProviderId::OpenCodeZen => 15,
+            ProviderId::OpenCodeGo => 16,
         }
     }
 }
@@ -460,6 +468,38 @@ pub const PROVIDERS: &[ProviderSpec] = &[
         path_prefix: None,
         default_headers: &[],
     },
+    // docs: https://docs.aws.amazon.com/bedrock/latest/userguide/inference-messages-api.html —
+    // Anthropic Messages at https://bedrock-runtime.{region}.amazonaws.com/anthropic/v1/messages,
+    // auth is `x-api-key` (the Amazon Bedrock API key, conventionally `AWS_BEARER_TOKEN_BEDROCK`).
+    // Region is overridable via gateway `provider_authorities.bedrock`; us-east-1 is the default
+    // because it hosts every current Claude geo/global inference profile. SigV4 and Converse/
+    // eventstream are deliberately not this row — see gateway ARCHITECTURE.md.
+    // Gateway path: /bedrock/anthropic/v1/messages.
+    ProviderSpec {
+        id: ProviderId::Bedrock,
+        name: "bedrock",
+        authority: "bedrock-runtime.us-east-1.amazonaws.com:443",
+        base_url: Some("https://bedrock-runtime.us-east-1.amazonaws.com/anthropic"),
+        wire: WireFormat::Anthropic,
+        auth: AuthScheme::XApiKey,
+        env_var: Some("AWS_BEARER_TOKEN_BEDROCK"),
+        // Inference-profile and foundation-model ids. Must not claim bare `claude-` — that is
+        // Anthropic's native prefix, and stealing it would POST an Anthropic body to Bedrock with
+        // Anthropic's own key (or the reverse). OpenRouter's vendor-slug `anthropic/claude-…` is
+        // a different string (`/` vs `.`) and stays unmatched.
+        model_id_match: &[
+            "us.anthropic.",
+            "eu.anthropic.",
+            "au.anthropic.",
+            "jp.anthropic.",
+            "apac.anthropic.",
+            "global.anthropic.",
+            "anthropic.claude-",
+        ],
+        host_match: &["bedrock-runtime.us-east-1.amazonaws.com"],
+        path_prefix: None,
+        default_headers: &[],
+    },
     // --- BYO-only from here: no gateway route (no `/{name}/…` mount, no pool key). ---
     // docs: https://huggingface.co/docs/inference-providers — base https://router.huggingface.co/v1, Bearer.
     ProviderSpec {
@@ -715,6 +755,7 @@ mod tests {
             (ProviderId::XAi, "/v1"),
             // No direct-route base URL at all.
             (ProviderId::OpenAiCodex, ""),
+            (ProviderId::Bedrock, "/anthropic"),
         ];
         for (id, want) in cases {
             assert_eq!(
@@ -768,10 +809,12 @@ mod tests {
     /// wrong mis-meters every request through it; getting an OpenAI-wire provider's wrong POSTs an
     /// Anthropic body to a Chat Completions endpoint.
     #[test]
-    fn only_anthropic_and_kimi_coding_speak_anthropic_wire() {
+    fn only_anthropic_kimi_coding_and_bedrock_speak_anthropic_wire() {
         for spec in PROVIDERS {
             let want = match spec.id {
-                ProviderId::Anthropic | ProviderId::KimiCoding => WireFormat::Anthropic,
+                ProviderId::Anthropic | ProviderId::KimiCoding | ProviderId::Bedrock => {
+                    WireFormat::Anthropic
+                }
                 _ => WireFormat::OpenAi,
             };
             assert_eq!(spec.wire, want, "{} wire", spec.name);
@@ -878,6 +921,19 @@ mod tests {
             Some(ProviderId::Anthropic),
             "model ids are matched case-insensitively"
         );
+        assert_eq!(
+            for_model_id("us.anthropic.claude-opus-4-8").map(|p| p.id),
+            Some(ProviderId::Bedrock)
+        );
+        assert_eq!(
+            for_model_id("global.anthropic.claude-haiku-4-5-20251001-v1:0").map(|p| p.id),
+            Some(ProviderId::Bedrock)
+        );
+        assert_eq!(
+            for_model_id("anthropic.claude-opus-4-8").map(|p| p.id),
+            Some(ProviderId::Bedrock),
+            "a foundation-model id is Bedrock's, not Anthropic's bare claude- prefix"
+        );
     }
 
     /// The heart of it: a vendor-slug id belongs to an *aggregator*, and no aggregator claims prefixes.
@@ -912,6 +968,10 @@ mod tests {
         assert_eq!(
             for_host("api.anthropic.com", "/").map(|p| p.id),
             Some(ProviderId::Anthropic)
+        );
+        assert_eq!(
+            for_host("bedrock-runtime.us-east-1.amazonaws.com", "/anthropic").map(|p| p.id),
+            Some(ProviderId::Bedrock)
         );
         assert_eq!(for_host("example.com", "/v1"), None);
     }
@@ -969,6 +1029,7 @@ mod tests {
             by_name("openai-codex").map(|p| p.id),
             Some(ProviderId::OpenAiCodex)
         );
+        assert_eq!(by_name("bedrock").map(|p| p.id), Some(ProviderId::Bedrock));
         assert_eq!(by_name("nope"), None);
     }
 
@@ -977,8 +1038,9 @@ mod tests {
     #[test]
     fn gateway_providers_excludes_byo_only_rows() {
         let names: Vec<_> = gateway_providers().map(|p| p.name).collect();
-        assert_eq!(names.len(), 11);
+        assert_eq!(names.len(), 12);
         assert!(names.contains(&"openai-codex"));
+        assert!(names.contains(&"bedrock"));
         assert!(!names.contains(&"huggingface"));
         assert!(!names.contains(&"opencode-zen"));
         assert!(!names.contains(&"kimi-coding"));
@@ -1083,6 +1145,7 @@ mod tests {
             (ProviderId::Cerebras, "CEREBRAS_API_KEY"),
             (ProviderId::Mistral, "MISTRAL_API_KEY"),
             (ProviderId::XAi, "XAI_API_KEY"),
+            (ProviderId::Bedrock, "AWS_BEARER_TOKEN_BEDROCK"),
         ];
         for (id, var) in want {
             assert_eq!(by_id(id).env_var, Some(var), "{id:?}");

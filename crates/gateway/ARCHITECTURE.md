@@ -160,9 +160,9 @@ can never stop the gateway serving. Do not put must-have config behind a watched
 
 ### Routing (`route.rs`)
 
-Providers are **data rows**, not code paths. `KNOWN_PROVIDERS` in `route.rs` lists 11 built-in
+Providers are **data rows**, not code paths. `KNOWN_PROVIDERS` in `route.rs` lists 12 built-in
 providers (openai, anthropic, openrouter, fireworks, groq, deepseek, together, cerebras, mistral,
-xai, openai-codex); each row carries its authority (host:port), dialect (OpenAI-wire vs
+xai, openai-codex, bedrock); each row carries its authority (host:port), dialect (OpenAI-wire vs
 Anthropic-wire), and auth scheme (`Bearer`, `x-api-key`, or `api-key`). The `provider_authorities`
 config key adds or overrides rows at boot with zero code change; `provider_dialects`/
 `provider_auth_schemes` set the dialect/auth scheme for a **config-added** provider (default
@@ -170,8 +170,9 @@ OpenAI/Bearer for backward compatibility — see Configuration). A known provide
 always fixed in `KNOWN_PROVIDERS`, never overridable from config. This is how Azure OpenAI is
 supported: its per-resource host isn't knowable at compile time, so it's always config-added
 (`provider_authorities.azure = "..."` + `provider_auth_schemes.azure = "api-key"`), never a
-`KNOWN_PROVIDERS` row — see `config.example.toml` and the AWS SigV4 section below for the same
-pattern applied to Bedrock's bearer-token mode.
+`KNOWN_PROVIDERS` row — see `config.example.toml`. Bedrock is the opposite case: it has a real
+default host (`bedrock-runtime.us-east-1.amazonaws.com`) and a static API key, so it *is* a
+built-in row; override the region with `provider_authorities.bedrock` if you need another one.
 
 The routing rule: **first path segment = provider name**. `/groq/openai/v1/chat/completions` routes
 to Groq and forwards `/openai/v1/chat/completions` verbatim. A bare path that is _exactly_ `/v1` or
@@ -225,24 +226,19 @@ and `request_filter` takes the request's dialect from **the row** rather than fr
 it happens to start on. Reading the provider there fails silently in the worst way — an Anthropic
 response meets the OpenAI extractor, trips the dialect-mismatch guard, and bills zero tokens.
 
-That is what makes **Claude failover real today**: `claude-opus-4-8` routes to Anthropic first and
-falls back to OpenRouter's Messages endpoint as `anthropic/claude-opus-4.8`. Every row and candidate
-is verified against the live providers by `catalog_rows_are_servable` in `tests/smoke.rs`, and the
-failover itself by `model_route_fails_over_to_a_real_provider`.
+That is what makes **Claude failover real today**: `claude-opus-4-8` routes to Anthropic first, then
+Amazon Bedrock's Messages API as `us.anthropic.claude-opus-4-8`, then OpenRouter's Messages endpoint
+as `anthropic/claude-opus-4.8`. Every row and candidate is verified against the live providers by
+`catalog_rows_are_servable` in `tests/smoke.rs`, and the failover itself by
+`model_route_fails_over_to_a_real_provider`.
 
-**What that failover does and does not cover.** OpenRouter picks its own backend per request — these
-ids have been observed served from Anthropic directly _and_ from Amazon Bedrock — so the second
-candidate is not a guaranteed independent supply of the model. It reliably covers the failures that
-are on our side of the wire: egress blocked, our Anthropic key throttled or suspended,
-`api.anthropic.com` unreachable from us, or that account rate-limited. It does not guarantee cover
-for Anthropic's own serving being down, because OpenRouter may be forwarding to the same place.
-Making it genuinely independent turns out to be cheap, and much cheaper than the SigV4 route
-described below: OpenRouter honours a `provider` preference in the request body, and
-`{"provider":{"only":["amazon-bedrock"]}}` on `/api/v1/messages` returns a `200` served by Bedrock
-with the usage block unchanged (verified). Reaching that would mean the catalog carrying a per-
-candidate body fragment and the gateway splicing it the way it already splices `model` and
-`stream_options` — a known shape, in a place that already does this. That is the recommended path to
-real Claude redundancy, ahead of implementing Bedrock's own auth and eventstream framing.
+**What that failover does and does not cover.** Bedrock is the independent second source: a different
+account, a different network path, and AWS's own serving of Claude. OpenRouter is the third
+candidate and covers failures that are on our side of the wire (egress blocked, our Anthropic or
+Bedrock key throttled) but is not independently guaranteed — it picks its own backend per request
+and has been observed serving these ids from Anthropic directly *and* from Bedrock. A 5xx from
+Anthropic therefore fails over to Bedrock first; OpenRouter is what is left if Bedrock is down or
+unkeyed too.
 
 ### Identity (`key.rs`)
 
@@ -537,7 +533,7 @@ returns 401 if the token is invalid — the client sees the same rejection it wo
 just routed through the gateway. Adding a gateway-side preflight check would double the latency for
 every BYO request on the error path with no security benefit at the gateway layer.
 
-### Why AWS SigV4 (Bedrock's default credential chain) is not supported
+### Why AWS SigV4 (Bedrock's IAM credential chain) is not supported — and what is
 
 `AuthScheme` has four variants — `Bearer`, `XApiKey`, `ApiKey` (Azure OpenAI's bare-key `api-key`
 header), and `CustomHeader` (a `Bearer`-prefixed value in a differently-named header — Cloudflare AI
@@ -561,24 +557,23 @@ deliberately do not bolt on a partial implementation (e.g. accepting only unsign
 signing with a fixed clock skew) — a SigV4 gateway that's subtly wrong fails silently at the provider
 with a cryptic signature-mismatch 403, which is worse than not supporting the mode at all.
 
-**`AWS_BEARER_TOKEN_BEDROCK` mode solves the auth half only — it does not make Bedrock a working
-route.** Bedrock also accepts a plain long-lived bearer token (no signing), which is exactly the
-`Bearer`/`XApiKey` shape this gateway already handles as a config-added provider (see
-`provider_authorities`/`provider_dialects` in Configuration), so a bearer-token credential _authenticates_
-cleanly. But authenticating is not the same as completing a turn: there is zero Bedrock Converse/
-Converse-Stream **wire-format** code anywhere in this gateway or in `agent-core`'s dialects (`grep -ri
-bedrock` across both turns up only prose and error-message pattern-matching, never a request/response
-shape). Bedrock's request body isn't Anthropic's `/v1/messages` shape and its response isn't SSE — it's
-AWS's own binary `application/vnd.amazon.eventstream` framing, which this gateway's usage extractor and
-every agent-core dialect decoder assume is never what arrives. Configuring `provider_dialects.bedrock =
-"anthropic"` today would relay a request the provider rejects (wrong body shape) or, if that were
-somehow fixed client-side, a response this stack can't parse at all (wrong stream framing) — an operator
-following this doc's bearer-token instructions alone gets a route that passes auth and then fails to
-complete a turn, not a working Bedrock integration. Full support needs both the SigV4 signing infra
-described above (for the default credential chain) _and_ a dedicated Bedrock wire dialect (Converse-API
-request mapping, event-stream response decoding) — neither exists, and building the latter without the
-former only covers Bedrock's less common auth mode. Out of proportion for this pass; revisit as a
-dedicated feature if Bedrock support is ever prioritized.
+**The built-in `bedrock` row is Bedrock's Anthropic Messages API, keyed with an Amazon Bedrock API
+key.** AWS now serves Claude on the same `/anthropic/v1/messages` wire Anthropic does, at
+`https://bedrock-runtime.{region}.amazonaws.com/anthropic/v1/messages`, authenticated with
+`x-api-key: $AWS_BEARER_TOKEN_BEDROCK` (see the Messages API and API-keys docs). That is exactly a
+data row: static host (default `us-east-1`, overridable), Anthropic dialect, `XApiKey` scheme, pool
+key from `AI_POOL_KEY_BEDROCK` / `AWS_BEARER_TOKEN_BEDROCK`. The catalog puts it second on every
+Claude row, so a 5xx from `api.anthropic.com` fails over to a genuinely independent supply of the
+model. The client still sends `anthropic-version: 2023-06-01`; that header is required on Bedrock's
+Messages path the same way it is on Anthropic's.
+
+**What this row is not.** It is not Converse, Converse-Stream, or InvokeModel — those use AWS's own
+body shape and `application/vnd.amazon.eventstream` framing, which this gateway's usage extractor
+and every agent-core dialect decoder assume never arrives. It is not SigV4. It is not the
+OpenAI-compat surface at `/openai/v1/chat/completions`, which wants `Authorization: Bearer` and the
+OpenAI wire: one `ProviderSpec` has one auth scheme and one `wire`, so that path is a config-added
+alias (`provider_authorities.bedrock-openai` + Bearer + OpenAI dialect) rather than a second
+built-in. See `config.example.toml`.
 
 ### Why OpenAI Codex traffic only ever goes over HTTP+SSE, never WebSocket
 
