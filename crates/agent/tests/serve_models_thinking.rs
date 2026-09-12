@@ -242,7 +242,8 @@ fn serve_set_model_and_cycle_model_responses_carry_capability_info() {
 fn serve_set_model_colon_suffix_resolves_the_id_and_sets_reasoning_effort() {
     // Fix 2 (pi-parity gap): `set_model`'s `model` may carry a `:<level>` suffix (the same shorthand
     // `--model`/`--models` already support) to switch model and reasoning effort in one round trip,
-    // winning outright over whatever level was already active.
+    // winning outright over whatever level was already active. `"opus"` alone is ambiguous now that
+    // the hint list carries both opus-5 and opus-4-8, so the id side uses the unique `opus-4-8`.
     let dir = tempfile::tempdir().unwrap();
     let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
     let (base, _bodies) = spawn_model_server(vec![]);
@@ -255,7 +256,7 @@ fn serve_set_model_colon_suffix_resolves_the_id_and_sets_reasoning_effort() {
     writeln!(
         stdin,
         "{}",
-        json!({ "type": "set_model", "model": "opus:low" })
+        json!({ "type": "set_model", "model": "opus-4-8:low" })
     )
     .unwrap();
     stdin.flush().unwrap();
@@ -388,15 +389,8 @@ fn serve_models_flag_expands_a_glob_against_the_known_catalog() {
     // Pin to the first claude-* entry in catalog order so cycling from a known position is
     // unambiguous, then walk the whole scoped cycle and confirm it's exactly the claude-* subset of
     // `available_models()`, in catalog order, wrapping back to the start — never a gpt-*/o*-series id.
-    writeln!(
-        stdin,
-        "{}",
-        json!({ "type": "set_model", "model": "claude-opus-4-8" })
-    )
-    .unwrap();
-    stdin.flush().unwrap();
-    read_until_response(&mut stdout, "set_model");
-
+    // Derived from the live hint list (not a hardcoded id) so adding a new flagship ahead of the
+    // previous first entry does not rotate the expected cycle out from under the fixture.
     let expected: Vec<&str> = beyond_ai_agent::serve::available_models()
         .iter()
         .copied()
@@ -406,6 +400,15 @@ fn serve_models_flag_expands_a_glob_against_the_known_catalog() {
         expected.len() >= 2,
         "fixture assumption: the known catalog has multiple claude-* ids"
     );
+
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "set_model", "model": expected[0] })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    read_until_response(&mut stdout, "set_model");
 
     let cycle_order: Vec<&str> = expected[1..]
         .iter()

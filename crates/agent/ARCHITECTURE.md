@@ -288,7 +288,7 @@ The harness layers several capabilities over the bare tools + loop:
   `resolve_model_scope`) a literal `--models` entry all resolve a partial/fuzzy id against the known-model
   hint list (`serve::available_models`) before falling back to forwarding it verbatim: an exact,
   case-insensitive match wins outright; otherwise every catalog id _containing_ the input as a substring
-  is a candidate (e.g. `opus` → `claude-opus-4-8`); exactly one candidate resolves to it, more than one is
+  is a candidate (e.g. `sonnet` → `claude-sonnet-5`); exactly one candidate resolves to it, more than one is
   an error naming every candidate (mirroring `SessionRepo::find_path`'s own "list every candidate, don't
   guess" philosophy rather than pi's own `model-resolver.ts`, which silently picks whichever sorts first),
   and no candidates at all falls through unchanged (`available_models` is a hint, not an allowlist — the
