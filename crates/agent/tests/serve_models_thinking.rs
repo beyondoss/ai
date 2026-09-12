@@ -242,7 +242,8 @@ fn serve_set_model_and_cycle_model_responses_carry_capability_info() {
 fn serve_set_model_colon_suffix_resolves_the_id_and_sets_reasoning_effort() {
     // Fix 2 (pi-parity gap): `set_model`'s `model` may carry a `:<level>` suffix (the same shorthand
     // `--model`/`--models` already support) to switch model and reasoning effort in one round trip,
-    // winning outright over whatever level was already active.
+    // winning outright over whatever level was already active. `"opus"` alone is ambiguous now that
+    // the hint list carries both opus-5 and opus-4-8, so the id side uses the unique `opus-4-8`.
     let dir = tempfile::tempdir().unwrap();
     let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
     let (base, _bodies) = spawn_model_server(vec![]);
@@ -255,7 +256,7 @@ fn serve_set_model_colon_suffix_resolves_the_id_and_sets_reasoning_effort() {
     writeln!(
         stdin,
         "{}",
-        json!({ "type": "set_model", "model": "opus:low" })
+        json!({ "type": "set_model", "model": "opus-4-8:low" })
     )
     .unwrap();
     stdin.flush().unwrap();
