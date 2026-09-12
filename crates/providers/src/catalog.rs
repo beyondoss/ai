@@ -632,31 +632,33 @@ mod tests {
     #[test]
     fn verified_claude_bedrock_rows_fail_over_through_bedrock() {
         for name in ["claude-haiku-4-5", "claude-opus-4-8"] {
-            let route = for_model(name).unwrap_or_else(|| panic!("{name} must be in the catalog"));
-            assert_eq!(route.wire, WireFormat::Anthropic, "{name}");
-            assert!(
-                route.candidates.len() >= 3,
-                "{name} must have Anthropic + Bedrock + OpenRouter"
-            );
-            assert_eq!(
-                route.candidates[0].provider,
-                ProviderId::Anthropic,
-                "{name} primary"
-            );
-            assert_eq!(
-                route.candidates[1].provider,
-                ProviderId::Bedrock,
-                "{name} second source must be Bedrock, not a proxy"
-            );
-            assert_eq!(
-                route.candidates[1].path, "/anthropic/v1/messages",
-                "{name} Bedrock path"
-            );
-            assert_eq!(
-                route.candidates[2].provider,
-                ProviderId::OpenRouter,
-                "{name} third"
-            );
+            assert!(for_model(name).is_some(), "{name} must be in the catalog");
+            if let Some(route) = for_model(name) {
+                assert_eq!(route.wire, WireFormat::Anthropic, "{name}");
+                assert!(
+                    route.candidates.len() >= 3,
+                    "{name} must have Anthropic + Bedrock + OpenRouter"
+                );
+                assert_eq!(
+                    route.candidates[0].provider,
+                    ProviderId::Anthropic,
+                    "{name} primary"
+                );
+                assert_eq!(
+                    route.candidates[1].provider,
+                    ProviderId::Bedrock,
+                    "{name} second source must be Bedrock, not a proxy"
+                );
+                assert_eq!(
+                    route.candidates[1].path, "/anthropic/v1/messages",
+                    "{name} Bedrock path"
+                );
+                assert_eq!(
+                    route.candidates[2].provider,
+                    ProviderId::OpenRouter,
+                    "{name} third"
+                );
+            }
         }
     }
 
