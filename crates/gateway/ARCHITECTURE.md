@@ -226,19 +226,25 @@ and `request_filter` takes the request's dialect from **the row** rather than fr
 it happens to start on. Reading the provider there fails silently in the worst way — an Anthropic
 response meets the OpenAI extractor, trips the dialect-mismatch guard, and bills zero tokens.
 
-That is what makes **Claude failover real today**: `claude-opus-4-8` routes to Anthropic first, then
-Amazon Bedrock's Messages API as `us.anthropic.claude-opus-4-8`, then OpenRouter's Messages endpoint
-as `anthropic/claude-opus-4.8`. Every row and candidate is verified against the live providers by
+That is what makes **Claude failover real today**: every Claude row (current Fable 5.1 / Opus 5 /
+Sonnet 5 / Haiku 4.5, plus the still-served 4.x snapshots) routes to Anthropic first and falls back
+to OpenRouter's Messages endpoint under the vendor-slug spelling (`claude-opus-5` →
+`anthropic/claude-opus-5`; `claude-opus-4-8` → `anthropic/claude-opus-4.8`). `claude-haiku-4-5` and
+`claude-opus-4-8` insert Amazon Bedrock's Messages API as an independent second source
+(`us.anthropic.claude-haiku-4-5-20251001-v1:0` / `us.anthropic.claude-opus-4-8`) before OpenRouter.
+GPT rows do the same Anthropic/OpenRouter shape on the Chat Completions wire (`gpt-6-astra` →
+`openai/gpt-6-astra`). Every row and candidate is verified against the live providers by
 `catalog_rows_are_servable` in `tests/smoke.rs`, and the failover itself by
 `model_route_fails_over_to_a_real_provider`.
 
-**What that failover does and does not cover.** Bedrock is the independent second source: a different
-account, a different network path, and AWS's own serving of Claude. OpenRouter is the third
-candidate and covers failures that are on our side of the wire (egress blocked, our Anthropic or
-Bedrock key throttled) but is not independently guaranteed — it picks its own backend per request
-and has been observed serving these ids from Anthropic directly _and_ from Bedrock. A 5xx from
-Anthropic therefore fails over to Bedrock first; OpenRouter is what is left if Bedrock is down or
-unkeyed too.
+**What that failover does and does not cover.** On the two Bedrock-backed rows, Bedrock is the
+independent second source: a different account, a different network path, and AWS's own serving of
+Claude. OpenRouter is the last candidate and covers failures that are on our side of the wire
+(egress blocked, our Anthropic or Bedrock key throttled) but is not independently guaranteed — it
+picks its own backend per request and has been observed serving these ids from Anthropic directly
+_and_ from Bedrock. A 5xx from Anthropic on those rows therefore fails over to Bedrock first;
+OpenRouter is what is left if Bedrock is down or unkeyed too. Other Claude rows still go
+Anthropic → OpenRouter until a live-verified Bedrock inference-profile id is added.
 
 ### Identity (`key.rs`)
 
@@ -562,9 +568,11 @@ key.** AWS now serves Claude on the same `/anthropic/v1/messages` wire Anthropic
 `https://bedrock-runtime.{region}.amazonaws.com/anthropic/v1/messages`, authenticated with
 `x-api-key: $AWS_BEARER_TOKEN_BEDROCK` (see the Messages API and API-keys docs). That is exactly a
 data row: static host (default `us-east-1`, overridable), Anthropic dialect, `XApiKey` scheme, pool
-key from `AI_POOL_KEY_BEDROCK` / `AWS_BEARER_TOKEN_BEDROCK`. The catalog puts it second on every
-Claude row, so a 5xx from `api.anthropic.com` fails over to a genuinely independent supply of the
-model. The client still sends `anthropic-version: 2023-06-01`; that header is required on Bedrock's
+key from `AI_POOL_KEY_BEDROCK` / `AWS_BEARER_TOKEN_BEDROCK`. The catalog puts it second on the
+Claude rows whose Bedrock inference-profile ids were live-verified (`claude-haiku-4-5`,
+`claude-opus-4-8`), so a 5xx from `api.anthropic.com` on those models fails over to a genuinely
+independent supply. Other Claude rows stay Anthropic → OpenRouter until those ids are checked.
+The client still sends `anthropic-version: 2023-06-01`; that header is required on Bedrock's
 Messages path the same way it is on Anthropic's.
 
 **What this row is not.** It is not Converse, Converse-Stream, or InvokeModel — those use AWS's own

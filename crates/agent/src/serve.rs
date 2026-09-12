@@ -7320,9 +7320,16 @@ pub fn default_reasoning_effort_for_model(model: &str) -> Option<agent_core::Rea
 /// own `get_available_models`/`cycle_model` and `main`'s `list-models` CLI subcommand.
 pub fn available_models() -> &'static [&'static str] {
     &[
+        "claude-fable-5-1",
+        "claude-opus-5",
         "claude-opus-4-8",
-        "claude-sonnet-4-5",
+        "claude-sonnet-5",
         "claude-haiku-4-5",
+        "gpt-6-astra",
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
+        "gpt-5.6-luna",
+        "gpt-5.5",
         "gpt-5",
         "gpt-5-mini",
         "gpt-4o",
@@ -7409,7 +7416,7 @@ fn resolve_model_scope(patterns: &[String], catalog: &[&str]) -> Vec<ScopedModel
         } else {
             // Fix 10 (pi-parity feature): a literal, non-glob pattern that doesn't exactly match a
             // catalog id now also gets the same partial/substring resolution `--model`/`set_model` get
-            // — e.g. `--models sonnet` resolves to `claude-sonnet-4-5` instead of cycling to the
+            // — e.g. `--models sonnet` resolves to `claude-sonnet-5` instead of cycling to the
             // literal, almost-certainly-wrong string "sonnet". An ambiguous partial match can't fail
             // the whole `serve` startup the way an ambiguous `--model` does (this is a background
             // candidate-list build, not the one model actively in use) — it's warned about and kept
@@ -7445,9 +7452,9 @@ fn resolve_model_scope(patterns: &[String], catalog: &[&str]) -> Vec<ScopedModel
 /// - An exact, case-insensitive match against `catalog` resolves to the catalog's own canonical
 ///   spelling (so `--model Claude-Opus-4-8` still lands on `claude-opus-4-8`).
 /// - Otherwise, every catalog id that *contains* `input` as a substring (case-insensitive) is a
-///   candidate — e.g. `opus` matches `claude-opus-4-8`. Exactly one candidate resolves to it; more than
+///   candidate — e.g. `sonnet` matches `claude-sonnet-5`. Exactly one candidate resolves to it; more than
 ///   one is `Err`, naming every candidate so the caller can be specific instead of silently guessing
-///   which one was meant (e.g. `gpt` matches all of `gpt-5`/`gpt-5-mini`/`gpt-4o`/`gpt-4.1`).
+///   which one was meant (e.g. `gpt` matches `gpt-6-astra`/`gpt-5.6-*`/`gpt-5`/`gpt-4o`/…).
 /// - No candidates at all returns `Ok(input)` unchanged — `available_models` is explicitly documented as
 ///   a non-exhaustive hint, not an allowlist, so an id genuinely outside it (a brand-new model, a
 ///   provider-specific id the gateway still understands) must still reach the gateway verbatim rather
@@ -9749,12 +9756,12 @@ mod tests {
     fn resolve_model_scope_fuzzy_resolves_a_literal_partial_match_against_the_catalog() {
         // Fix 10: a literal, non-glob `--models` entry that partially matches exactly one catalog id
         // now resolves to it, the same as `--model`/`set_model` — `--models sonnet` must cycle to
-        // `claude-sonnet-4-5`, not the literal, almost-certainly-wrong string "sonnet".
+        // `claude-sonnet-5`, not the literal, almost-certainly-wrong string "sonnet".
         let scoped = resolve_model_scope(&["sonnet".to_string()], available_models());
         assert_eq!(
             scoped,
             vec![ScopedModel {
-                id: "claude-sonnet-4-5".to_string(),
+                id: "claude-sonnet-5".to_string(),
                 thinking_level: None,
             }]
         );
@@ -9782,14 +9789,20 @@ mod tests {
         let ids: Vec<&str> = scoped.iter().map(|m| m.id.as_str()).collect();
         assert_eq!(
             ids,
-            vec!["claude-opus-4-8", "claude-sonnet-4-5", "claude-haiku-4-5"]
+            vec![
+                "claude-fable-5-1",
+                "claude-opus-5",
+                "claude-opus-4-8",
+                "claude-sonnet-5",
+                "claude-haiku-4-5",
+            ]
         );
     }
 
     #[test]
     fn resolve_model_scope_glob_matching_is_case_insensitive() {
         let scoped = resolve_model_scope(&["CLAUDE-*".to_string()], available_models());
-        assert_eq!(scoped.len(), 3, "got: {scoped:?}");
+        assert_eq!(scoped.len(), 5, "got: {scoped:?}");
     }
 
     #[test]
@@ -9828,7 +9841,7 @@ mod tests {
                 .all(|m| m.thinking_level == Some(agent_core::ThinkingLevel::Low)),
             "got: {scoped:?}"
         );
-        assert_eq!(scoped.len(), 3);
+        assert_eq!(scoped.len(), 5);
     }
 
     #[test]
@@ -9962,12 +9975,12 @@ mod tests {
     #[test]
     fn resolve_model_id_an_unambiguous_partial_match_resolves_to_the_full_id() {
         assert_eq!(
-            resolve_model_id("opus", available_models()).unwrap().0,
-            "claude-opus-4-8"
+            resolve_model_id("opus-5", available_models()).unwrap().0,
+            "claude-opus-5"
         );
         assert_eq!(
             resolve_model_id("SONNET", available_models()).unwrap().0,
-            "claude-sonnet-4-5"
+            "claude-sonnet-5"
         );
     }
 
@@ -9976,8 +9989,12 @@ mod tests {
         let err = resolve_model_id("gpt", available_models()).unwrap_err();
         assert!(err.contains("gpt-5"), "got: {err}");
         assert!(err.contains("gpt-5-mini"), "got: {err}");
+        assert!(err.contains("gpt-6-astra"), "got: {err}");
         assert!(err.contains("gpt-4o"), "got: {err}");
         assert!(err.contains("gpt-4.1"), "got: {err}");
+        let opus_err = resolve_model_id("opus", available_models()).unwrap_err();
+        assert!(opus_err.contains("claude-opus-5"), "got: {opus_err}");
+        assert!(opus_err.contains("claude-opus-4-8"), "got: {opus_err}");
     }
 
     #[test]
@@ -10008,14 +10025,14 @@ mod tests {
         // report `high` as the level to apply — pi's own `--model <pattern>:<thinking-level>`
         // shorthand, previously only honored by `--models`/`resolve_model_scope`.
         let (id, level) = resolve_model_id("sonnet:high", available_models()).unwrap();
-        assert_eq!(id, "claude-sonnet-4-5");
+        assert_eq!(id, "claude-sonnet-5");
         assert_eq!(level, Some(agent_core::ThinkingLevel::High));
     }
 
     #[test]
     fn resolve_model_id_no_colon_suffix_returns_no_level() {
-        let (id, level) = resolve_model_id("opus", available_models()).unwrap();
-        assert_eq!(id, "claude-opus-4-8");
+        let (id, level) = resolve_model_id("opus-5", available_models()).unwrap();
+        assert_eq!(id, "claude-opus-5");
         assert_eq!(level, None);
     }
 

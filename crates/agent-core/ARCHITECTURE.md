@@ -322,8 +322,9 @@ builder on `Agent` or `ModelRequest`, and each is exercised by unit tests):
   `Budget` shape. Whatever `ReasoningEffort` reaches a dialect — via `thinking_for_level` or a raw
   `with_reasoning_effort`/`--reasoning-effort` call — is clamped there to what the specific model's wire
   actually accepts (`models::clamp_reasoning_effort`): several OpenAI reasoning models (o-series, bare
-  gpt-5, every gpt-5.1 variant) and two Anthropic adaptive ids (sonnet-4-6, sonnet-5) have no `xhigh`
-  tier and clamp down to `high`; `gpt-5.5`/`gpt-5.5-pro` reject `minimal`(+`low`) and clamp up. Anthropic
+  gpt-5, every gpt-5.1 variant) and Anthropic `claude-sonnet-4-6` have no `xhigh` tier and clamp down
+  to `high`; Sonnet 5 / Opus 5 / Fable 5.1 accept `xhigh`. `gpt-5.5`/`gpt-5.5-pro` and the GPT-5.6 /
+  GPT-6 family reject `minimal`(+`low` on 5.5-pro) and clamp up. Anthropic
   adaptive additionally has no `minimal` wire tier at all (always sent as `"low"`) and remaps `xhigh` per
   model (`"max"` on `claude-opus-4-6` uniquely; `"xhigh"` elsewhere) via `models::anthropic_adaptive_effort_wire`.
 - **Model capabilities** — [`models::capabilities`](src/models.rs) maps a model id (by prefix) to a

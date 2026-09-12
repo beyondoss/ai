@@ -78,80 +78,222 @@ pub struct ModelRoute {
 /// bitmask with no per-request allocation.
 pub const MAX_CANDIDATES: usize = 8;
 
+/// Anthropic-native primary, OpenRouter Messages failover. OpenRouter spells Claude with a vendor
+/// prefix and dots (`anthropic/claude-opus-4.8`), not dashes.
+const fn claude(native: &'static str, openrouter: &'static str) -> [Candidate; 2] {
+    [
+        Candidate {
+            provider: ProviderId::Anthropic,
+            upstream_model: native,
+            path: "/v1/messages",
+        },
+        Candidate {
+            provider: ProviderId::OpenRouter,
+            upstream_model: openrouter,
+            path: "/api/v1/messages",
+        },
+    ]
+}
+
+/// Anthropic → Bedrock Messages → OpenRouter Messages.
+///
+/// `bedrock` is a US geo inference-profile id, not a mechanical rewrite of `native`. Only call this
+/// with a live-verified string — a guessed id 404s and looks like the client's fault.
+const fn claude_bedrock(
+    native: &'static str,
+    bedrock: &'static str,
+    openrouter: &'static str,
+) -> [Candidate; 3] {
+    [
+        Candidate {
+            provider: ProviderId::Anthropic,
+            upstream_model: native,
+            path: "/v1/messages",
+        },
+        Candidate {
+            provider: ProviderId::Bedrock,
+            upstream_model: bedrock,
+            path: "/anthropic/v1/messages",
+        },
+        Candidate {
+            provider: ProviderId::OpenRouter,
+            upstream_model: openrouter,
+            path: "/api/v1/messages",
+        },
+    ]
+}
+
+/// OpenAI-native primary, OpenRouter Chat Completions failover. Same Chat Completions mount on
+/// both sides (`/v1` vs `/api/v1`); every current id below is also served on `/v1/responses`, but
+/// the seed row spoke Chat Completions and a mixed-endpoint row is forbidden (see
+/// `candidates_within_a_row_share_one_endpoint`).
+const fn openai_chat(native: &'static str, openrouter: &'static str) -> [Candidate; 2] {
+    [
+        Candidate {
+            provider: ProviderId::OpenAi,
+            upstream_model: native,
+            path: "/v1/chat/completions",
+        },
+        Candidate {
+            provider: ProviderId::OpenRouter,
+            upstream_model: openrouter,
+            path: "/api/v1/chat/completions",
+        },
+    ]
+}
+
 /// Every routable model, **sorted by `model`** — [`for_model`] binary-searches it.
 ///
-/// Each id/path pair below returned `200` from the real provider when it was added.
+/// Native ids are the providers' own published aliases (Anthropic Models overview and OpenAI
+/// Models catalog, 2026-09-12). OpenRouter spellings were taken from the live
+/// `https://openrouter.ai/api/v1/models` list the same day. `catalog_rows_are_servable` re-verifies
+/// each pair against the real providers whenever the keys are present.
 pub const MODEL_ROUTES: &[ModelRoute] = &[
-    // Claude on the Anthropic wire. Three sources, in preference order:
+    // Claude on the Anthropic wire.
     //
-    // 1. Anthropic first-party.
-    // 2. Amazon Bedrock's own Messages API (`/anthropic/v1/messages`, `x-api-key`). This is a
-    //    genuine independent supply — a different account, a different network path, and AWS's
-    //    serving of Claude rather than a proxy that may still land on api.anthropic.com.
-    //    Model ids are the US geo inference profiles that the default
-    //    `bedrock-runtime.us-east-1.amazonaws.com` host serves (see the Bedrock row).
-    // 3. OpenRouter's Messages endpoint. Covers *our* side of the wire (egress blocked, our
-    //    Anthropic/Bedrock key throttled) but is not independently guaranteed: OpenRouter picks
-    //    its own backend per request and has been observed serving these ids from Anthropic
-    //    directly *and* from Bedrock.
+    // Default shape is Anthropic first-party, then OpenRouter Messages (`claude()`). OpenRouter
+    // chooses its own backend per request — observed serving these ids from both Anthropic
+    // directly and Amazon Bedrock — so that second candidate is *not* a guaranteed independent
+    // supply. It covers failures that are ours: egress blocked, our Anthropic key throttled,
+    // api.anthropic.com unreachable from us.
+    //
+    // Two rows have a live-verified independent second source: Amazon Bedrock's Messages API
+    // (`claude_bedrock()`, `/anthropic/v1/messages`, `x-api-key`). Ids are the US geo inference
+    // profiles the default `bedrock-runtime.us-east-1.amazonaws.com` host serves. OpenRouter
+    // stays third on those rows. Do not add a Bedrock candidate without a live-verified
+    // inference-profile id — a wrong id 404s and looks like the client's fault.
+    //
+    // Current lineup (Fable 5.1 / Opus 5 / Sonnet 5 / Haiku 4.5) plus the still-served 4.x
+    // snapshots Anthropic lists as legacy. Dateless 4.6+ ids are pinned snapshots, not aliases.
+    ModelRoute {
+        model: "claude-fable-5",
+        wire: WireFormat::Anthropic,
+        candidates: &claude("claude-fable-5", "anthropic/claude-fable-5"),
+    },
+    ModelRoute {
+        model: "claude-fable-5-1",
+        wire: WireFormat::Anthropic,
+        candidates: &claude("claude-fable-5-1", "anthropic/claude-fable-5.1"),
+    },
     ModelRoute {
         model: "claude-haiku-4-5",
         wire: WireFormat::Anthropic,
-        candidates: &[
-            Candidate {
-                provider: ProviderId::Anthropic,
-                upstream_model: "claude-haiku-4-5",
-                path: "/v1/messages",
-            },
-            Candidate {
-                provider: ProviderId::Bedrock,
-                upstream_model: "us.anthropic.claude-haiku-4-5-20251001-v1:0",
-                path: "/anthropic/v1/messages",
-            },
-            Candidate {
-                provider: ProviderId::OpenRouter,
-                upstream_model: "anthropic/claude-haiku-4.5",
-                path: "/api/v1/messages",
-            },
-        ],
+        candidates: &claude_bedrock(
+            "claude-haiku-4-5",
+            "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+            "anthropic/claude-haiku-4.5",
+        ),
+    },
+    ModelRoute {
+        model: "claude-opus-4-6",
+        wire: WireFormat::Anthropic,
+        candidates: &claude("claude-opus-4-6", "anthropic/claude-opus-4.6"),
+    },
+    ModelRoute {
+        model: "claude-opus-4-7",
+        wire: WireFormat::Anthropic,
+        candidates: &claude("claude-opus-4-7", "anthropic/claude-opus-4.7"),
     },
     ModelRoute {
         model: "claude-opus-4-8",
         wire: WireFormat::Anthropic,
-        candidates: &[
-            Candidate {
-                provider: ProviderId::Anthropic,
-                upstream_model: "claude-opus-4-8",
-                path: "/v1/messages",
-            },
-            Candidate {
-                provider: ProviderId::Bedrock,
-                upstream_model: "us.anthropic.claude-opus-4-8",
-                path: "/anthropic/v1/messages",
-            },
-            Candidate {
-                provider: ProviderId::OpenRouter,
-                upstream_model: "anthropic/claude-opus-4.8",
-                path: "/api/v1/messages",
-            },
-        ],
+        candidates: &claude_bedrock(
+            "claude-opus-4-8",
+            "us.anthropic.claude-opus-4-8",
+            "anthropic/claude-opus-4.8",
+        ),
+    },
+    ModelRoute {
+        model: "claude-opus-5",
+        wire: WireFormat::Anthropic,
+        candidates: &claude("claude-opus-5", "anthropic/claude-opus-5"),
+    },
+    ModelRoute {
+        model: "claude-sonnet-4-5",
+        wire: WireFormat::Anthropic,
+        candidates: &claude("claude-sonnet-4-5", "anthropic/claude-sonnet-4.5"),
+    },
+    ModelRoute {
+        model: "claude-sonnet-4-6",
+        wire: WireFormat::Anthropic,
+        candidates: &claude("claude-sonnet-4-6", "anthropic/claude-sonnet-4.6"),
+    },
+    ModelRoute {
+        model: "claude-sonnet-5",
+        wire: WireFormat::Anthropic,
+        candidates: &claude("claude-sonnet-5", "anthropic/claude-sonnet-5"),
     },
     // The same shape on the OpenAI wire, where the two mounts differ as well (`/v1` vs `/api/v1`).
+    // Flagships first in the *id* sort: 4.x, then 5 / 5.4 / 5.5 / 5.6, then 6 Astra, then o-series.
+    ModelRoute {
+        model: "gpt-4.1",
+        wire: WireFormat::OpenAi,
+        candidates: &openai_chat("gpt-4.1", "openai/gpt-4.1"),
+    },
+    ModelRoute {
+        model: "gpt-4o",
+        wire: WireFormat::OpenAi,
+        candidates: &openai_chat("gpt-4o", "openai/gpt-4o"),
+    },
     ModelRoute {
         model: "gpt-4o-mini",
         wire: WireFormat::OpenAi,
-        candidates: &[
-            Candidate {
-                provider: ProviderId::OpenAi,
-                upstream_model: "gpt-4o-mini",
-                path: "/v1/chat/completions",
-            },
-            Candidate {
-                provider: ProviderId::OpenRouter,
-                upstream_model: "openai/gpt-4o-mini",
-                path: "/api/v1/chat/completions",
-            },
-        ],
+        candidates: &openai_chat("gpt-4o-mini", "openai/gpt-4o-mini"),
+    },
+    ModelRoute {
+        model: "gpt-5",
+        wire: WireFormat::OpenAi,
+        candidates: &openai_chat("gpt-5", "openai/gpt-5"),
+    },
+    ModelRoute {
+        model: "gpt-5-mini",
+        wire: WireFormat::OpenAi,
+        candidates: &openai_chat("gpt-5-mini", "openai/gpt-5-mini"),
+    },
+    ModelRoute {
+        model: "gpt-5.4",
+        wire: WireFormat::OpenAi,
+        candidates: &openai_chat("gpt-5.4", "openai/gpt-5.4"),
+    },
+    ModelRoute {
+        model: "gpt-5.4-mini",
+        wire: WireFormat::OpenAi,
+        candidates: &openai_chat("gpt-5.4-mini", "openai/gpt-5.4-mini"),
+    },
+    ModelRoute {
+        model: "gpt-5.5",
+        wire: WireFormat::OpenAi,
+        candidates: &openai_chat("gpt-5.5", "openai/gpt-5.5"),
+    },
+    ModelRoute {
+        model: "gpt-5.6-luna",
+        wire: WireFormat::OpenAi,
+        candidates: &openai_chat("gpt-5.6-luna", "openai/gpt-5.6-luna"),
+    },
+    ModelRoute {
+        model: "gpt-5.6-sol",
+        wire: WireFormat::OpenAi,
+        candidates: &openai_chat("gpt-5.6-sol", "openai/gpt-5.6-sol"),
+    },
+    ModelRoute {
+        model: "gpt-5.6-terra",
+        wire: WireFormat::OpenAi,
+        candidates: &openai_chat("gpt-5.6-terra", "openai/gpt-5.6-terra"),
+    },
+    ModelRoute {
+        model: "gpt-6-astra",
+        wire: WireFormat::OpenAi,
+        candidates: &openai_chat("gpt-6-astra", "openai/gpt-6-astra"),
+    },
+    ModelRoute {
+        model: "o3",
+        wire: WireFormat::OpenAi,
+        candidates: &openai_chat("o3", "openai/o3"),
+    },
+    ModelRoute {
+        model: "o4-mini",
+        wire: WireFormat::OpenAi,
+        candidates: &openai_chat("o4-mini", "openai/o4-mini"),
     },
 ];
 
@@ -485,43 +627,93 @@ mod tests {
         assert_eq!(by_id(ProviderId::OpenRouter).wire, WireFormat::OpenAi);
     }
 
-    /// Every Claude row shares the same failover shape. Pinned so a new Claude id cannot ship with
-    /// only the OpenRouter proxy as its second source — that was the previous, non-independent,
-    /// fallback and is exactly what Bedrock is here to replace as #2.
+    /// The two Claude rows whose Bedrock inference-profile ids were live-verified. Other Claude
+    /// rows from the 2026-09 lineup stay on Anthropic → OpenRouter until those ids are checked.
     #[test]
-    fn every_claude_row_fails_over_through_bedrock() {
-        let claude = MODEL_ROUTES
-            .iter()
-            .filter(|r| r.model.starts_with("claude-"))
-            .collect::<Vec<_>>();
-        assert!(
-            !claude.is_empty(),
-            "the catalog has Claude rows this pin is meant to cover"
-        );
-        for route in claude {
-            assert_eq!(route.wire, WireFormat::Anthropic, "{:?}", route.model);
+    fn verified_claude_bedrock_rows_fail_over_through_bedrock() {
+        for name in ["claude-haiku-4-5", "claude-opus-4-8"] {
+            let route = for_model(name).unwrap_or_else(|| panic!("{name} must be in the catalog"));
+            assert_eq!(route.wire, WireFormat::Anthropic, "{name}");
             assert!(
-                route.candidates.len() >= 2,
-                "{:?} must have a Bedrock fallback",
-                route.model
+                route.candidates.len() >= 3,
+                "{name} must have Anthropic + Bedrock + OpenRouter"
             );
             assert_eq!(
                 route.candidates[0].provider,
                 ProviderId::Anthropic,
-                "{:?} primary",
-                route.model
+                "{name} primary"
             );
             assert_eq!(
                 route.candidates[1].provider,
                 ProviderId::Bedrock,
-                "{:?} second source must be Bedrock, not a proxy",
-                route.model
+                "{name} second source must be Bedrock, not a proxy"
             );
             assert_eq!(
                 route.candidates[1].path, "/anthropic/v1/messages",
-                "{:?} Bedrock path",
-                route.model
+                "{name} Bedrock path"
             );
+            assert_eq!(
+                route.candidates[2].provider,
+                ProviderId::OpenRouter,
+                "{name} third"
+            );
+        }
+    }
+
+    /// Spot-check the current-generation rows: native id matches the catalog name, OpenRouter uses
+    /// the vendor-slug + (for Claude) dot-spelled form published on 2026-09-12.
+    ///
+    /// These flagships still use the two-candidate `claude()` / `openai_chat()` shape. Haiku 4.5
+    /// and Opus 4.8 insert Bedrock and are pinned separately.
+    #[test]
+    fn current_flagships_have_native_plus_openrouter_candidates() {
+        let cases = [
+            (
+                "claude-opus-5",
+                WireFormat::Anthropic,
+                ProviderId::Anthropic,
+                "claude-opus-5",
+                "anthropic/claude-opus-5",
+            ),
+            (
+                "claude-fable-5-1",
+                WireFormat::Anthropic,
+                ProviderId::Anthropic,
+                "claude-fable-5-1",
+                "anthropic/claude-fable-5.1",
+            ),
+            (
+                "claude-sonnet-5",
+                WireFormat::Anthropic,
+                ProviderId::Anthropic,
+                "claude-sonnet-5",
+                "anthropic/claude-sonnet-5",
+            ),
+            (
+                "gpt-6-astra",
+                WireFormat::OpenAi,
+                ProviderId::OpenAi,
+                "gpt-6-astra",
+                "openai/gpt-6-astra",
+            ),
+            (
+                "gpt-5.6-sol",
+                WireFormat::OpenAi,
+                ProviderId::OpenAi,
+                "gpt-5.6-sol",
+                "openai/gpt-5.6-sol",
+            ),
+        ];
+        for (name, wire, primary, native, openrouter) in cases {
+            assert!(for_model(name).is_some(), "{name} must be in the catalog");
+            if let Some(row) = for_model(name) {
+                assert_eq!(row.wire, wire, "{name}");
+                assert_eq!(row.candidates.len(), 2, "{name}");
+                assert_eq!(row.candidates[0].provider, primary, "{name}");
+                assert_eq!(row.candidates[0].upstream_model, native, "{name}");
+                assert_eq!(row.candidates[1].provider, ProviderId::OpenRouter, "{name}");
+                assert_eq!(row.candidates[1].upstream_model, openrouter, "{name}");
+            }
         }
     }
 }
