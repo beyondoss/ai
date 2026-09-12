@@ -172,13 +172,31 @@ jobs:
               sleep 20
             done ) > "$RUNNER_TEMP/samples.log" 2>&1 &
           SAMPLER=$!
-          timeout --signal=TERM --kill-after=30s 15m \
+          # Last-resort watchdog. `timeout` can fail to return when a leaked serve daemon
+          # stays in the process group and ignores SIGTERM; GitHub then never sees EOF on
+          # the step (the `tail -f` still holds stdout) and the shard sits until a ~30m
+          # cancel. That cancel makes `needs.test.result=cancelled` and fails the required
+          # `Check` gate even though every other job passed. Kill the tail first so the
+          # step can actually end, then the leftover daemons.
+          (
+            sleep 960
+            echo "::error::watchdog: test step still running after 16m — killing leftovers"
+            kill -9 "$TAIL" "$SAMPLER" 2>/dev/null
+            pkill -9 -f 'cargo-nextest|cargo nextest|beyond-ai-agent|nats-server' 2>/dev/null
+          ) &
+          WATCHDOG=$!
+          # `--foreground`: wait only on cargo/nextest, not a grandchild that left the
+          # group. SIGKILL: a serve that traps TERM is exactly what outlived TERM+30s.
+          timeout --foreground --signal=KILL 15m \
             cargo nextest run --workspace --profile ci ${{ matrix.extra }} -E '${{ matrix.filter }}' \
             > "$LOG" 2>&1 </dev/null
           status=$?
+          kill "$WATCHDOG" 2>/dev/null
           sleep 2                      # let the tail flush the last lines
           kill "$TAIL" 2>/dev/null; wait "$TAIL" 2>/dev/null
           kill "$SAMPLER" 2>/dev/null
+          pkill -9 -f 'beyond-ai-agent' 2>/dev/null
+          pkill -9 -f 'nats-server' 2>/dev/null
           # The tail is a convenience, not the record. If it dies the step would otherwise look wedged
           # while the run is fine, so the file itself is always the source of truth at the end.
           echo "--- last 200 lines of the log file (authoritative; the stream above can lag) ---"
@@ -186,6 +204,7 @@ jobs:
           echo "--- resource samples taken DURING the run ---"
           cat "$RUNNER_TEMP/samples.log" 2>/dev/null || echo "  (none)"
           [ $status -eq 124 ] && echo "::error::timed out after 15m — the last test above is where it stopped"
+          [ $status -eq 137 ] && echo "::error::killed after 15m (SIGKILL) — the last test above is where it stopped"
           exit $status
         timeout-minutes: 20
       # Belt and braces: runs even if the step above somehow does not, and names anything still alive.
