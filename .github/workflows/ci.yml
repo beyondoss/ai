@@ -67,7 +67,9 @@ jobs:
     # The four filters are exhaustive: 180 + 45 + 1820 + 898 = 2943, the whole suite.
     name: test (${{ matrix.name }})
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    # Compile (20m) + run (15m) + setup. The previous 25m cap was enough for a cache-hot
+    # run and too tight once compile was split out of the timed test step.
+    timeout-minutes: 45
     strategy:
       # A failing group must not cancel the others — their logs are the diagnostic.
       fail-fast: false
@@ -121,22 +123,18 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: nextest
-      # Two requirements that pull against each other, so this is deliberate.
+      # Compile is a separate step from the run. agent-serve / agent-rest link dozens of
+      # integration-test binaries; that compile cannot leak a `serve` daemon. Mixing it with
+      # the run put compile under the same `timeout` as the tests. The failure mode that
+      # kept failing Check: a leaked grandchild (or `tail -f`) held GitHub's stdout pipe,
+      # so job/step/`timeout` never saw EOF, the shard sat until a ~30m cancel, and
+      # `needs.test.result=cancelled` even though every other shard passed.
       #
-      # 1. Nothing that can be *inherited* may hold the step's stdout. GitHub captures a step through
-      #    a pipe and waits for EOF on it, so a single leaked child — a `serve` daemon that outlived
-      #    its test, reparented to init — wedges the job forever: no output, no log upload, and no
-      #    timeout of any kind fires. Not the job's `timeout-minutes`, not the step's, not even a
-      #    shell `timeout`, because `timeout` kills the command it launched, never its descendants.
-      #    That is the 30:00 death this suite kept hitting. Reproduced both ways in isolation: with a
-      #    pipe the step hangs long past `timeout` firing; with a file it returns the instant it does.
+      # The run step must not let anything we do not own inherit its stdout. Heartbeats go
+      # to that pipe; nextest writes to a file. No `tail -f`. If the script is still
+      # blocked after 16m, the watchdog closes its own fd and kills *this shell* so
+      # GitHub sees EOF — killing only descendants leaves bash holding the pipe.
       #
-      # 2. The step must still print as it goes. A silent step is indistinguishable from a wedged one
-      #    to anybody watching, which is its own kind of unusable.
-      #
-      # So: the test command writes to a file (inheritable, and an orphan holding it blocks nothing),
-      # and a `tail -f` we own streams that file to the step's stdout. The tail does hold the step's
-      # stdout — but it is ours to kill, so it always releases.
       # Only the exec-live shard needs a target; the others must not pay for it.
       - name: start a real sandbox target (Alpine = busybox, the hardest rung)
         if: matrix.name == 'exec-live'
@@ -151,18 +149,20 @@ jobs:
           test ! -e /work
           echo "AGENT_LIVE_EXEC_CMD=docker exec agent-exec-target {}" >> "$GITHUB_ENV"
           echo "AGENT_LIVE_WORKDIR=/work" >> "$GITHUB_ENV"
+      - name: compile tests
+        run: cargo nextest run --workspace --profile ci ${{ matrix.extra }} -E '${{ matrix.filter }}' --no-run
+        timeout-minutes: 20
       - name: test
         run: |
           set +e
           LOG="$RUNNER_TEMP/nextest.log"
           : > "$LOG"
-          tail -f "$LOG" &
-          TAIL=$!
-          # Sample resources every 20s. A single postmortem reading cannot distinguish "ran out"
-          # from "was never the problem" -- the trend can. Cheap, and written to its own file so a
-          # wedged run still leaves the history behind.
+          PARENT=$$
+          # Heartbeats on the step pipe so a live run is visible. Sampler must not be
+          # redirected to a file — that is the liveness signal. Nothing else inherits
+          # this fd: nextest writes to $LOG, serve tests already null their stderr.
           ( while :; do
-              printf '%s pids=%s load=%s mem_avail_mb=%s disk_avail=%s procs=%s\n' \
+              printf 'heartbeat %s pids=%s load=%s mem_avail_mb=%s disk_avail=%s beyond=%s\n' \
                 "$(date -u +%H:%M:%S)" \
                 "$(ps -eo pid= | wc -l)" \
                 "$(cut -d" " -f1 /proc/loadavg)" \
@@ -170,43 +170,36 @@ jobs:
                 "$(df -Pk / | awk 'NR==2{print int($4/1048576)"G"}')" \
                 "$(pgrep -c -f 'beyond-ai' 2>/dev/null || echo 0)"
               sleep 20
-            done ) > "$RUNNER_TEMP/samples.log" 2>&1 &
+            done ) &
           SAMPLER=$!
-          # Last-resort watchdog. `timeout` can fail to return when a leaked serve daemon
-          # stays in the process group and ignores SIGTERM; GitHub then never sees EOF on
-          # the step (the `tail -f` still holds stdout) and the shard sits until a ~30m
-          # cancel. That cancel makes `needs.test.result=cancelled` and fails the required
-          # `Check` gate even though every other job passed. Kill the tail first so the
-          # step can actually end, then the leftover daemons.
+          # If the script is still blocked after 16m, close *our* copy of the pipe
+          # first (this subshell inherited it), then kill leftovers and *this shell*.
+          # Killing only descendants leaves bash holding stdout — that is the ~30m
+          # cancel that fails Check. `timeout` without `--foreground` SIGKILLs the
+          # process group so rustc/nextest workers die with cargo.
           (
             sleep 960
-            echo "::error::watchdog: test step still running after 16m — killing leftovers"
-            kill -9 "$TAIL" "$SAMPLER" 2>/dev/null
+            echo "::error::watchdog: test step still running after 16m — killing the step"
+            exec >/dev/null 2>&1
             pkill -9 -f 'cargo-nextest|cargo nextest|beyond-ai-agent|nats-server' 2>/dev/null
+            kill -9 "$SAMPLER" 2>/dev/null
+            kill -9 "$PARENT" 2>/dev/null
           ) &
           WATCHDOG=$!
-          # `--foreground`: wait only on cargo/nextest, not a grandchild that left the
-          # group. SIGKILL: a serve that traps TERM is exactly what outlived TERM+30s.
-          timeout --foreground --signal=KILL 15m \
+          timeout --signal=KILL 12m \
             cargo nextest run --workspace --profile ci ${{ matrix.extra }} -E '${{ matrix.filter }}' \
             > "$LOG" 2>&1 </dev/null
           status=$?
           kill "$WATCHDOG" 2>/dev/null
-          sleep 2                      # let the tail flush the last lines
-          kill "$TAIL" 2>/dev/null; wait "$TAIL" 2>/dev/null
           kill "$SAMPLER" 2>/dev/null
           pkill -9 -f 'beyond-ai-agent' 2>/dev/null
           pkill -9 -f 'nats-server' 2>/dev/null
-          # The tail is a convenience, not the record. If it dies the step would otherwise look wedged
-          # while the run is fine, so the file itself is always the source of truth at the end.
-          echo "--- last 200 lines of the log file (authoritative; the stream above can lag) ---"
+          echo "--- last 200 lines of the log file ---"
           tail -200 "$LOG"
-          echo "--- resource samples taken DURING the run ---"
-          cat "$RUNNER_TEMP/samples.log" 2>/dev/null || echo "  (none)"
-          [ $status -eq 124 ] && echo "::error::timed out after 15m — the last test above is where it stopped"
-          [ $status -eq 137 ] && echo "::error::killed after 15m (SIGKILL) — the last test above is where it stopped"
+          [ $status -eq 124 ] && echo "::error::timed out after 12m — the last test above is where it stopped"
+          [ $status -eq 137 ] && echo "::error::killed after 12m (SIGKILL) — the last test above is where it stopped"
           exit $status
-        timeout-minutes: 20
+        timeout-minutes: 15
       # Belt and braces: runs even if the step above somehow does not, and names anything still alive.
       - name: what was left running
         if: always()
