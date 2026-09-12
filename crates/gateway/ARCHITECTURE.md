@@ -171,7 +171,7 @@ always fixed in `KNOWN_PROVIDERS`, never overridable from config. This is how Az
 supported: its per-resource host isn't knowable at compile time, so it's always config-added
 (`provider_authorities.azure = "..."` + `provider_auth_schemes.azure = "api-key"`), never a
 `KNOWN_PROVIDERS` row — see `config.example.toml`. Bedrock is the opposite case: it has a real
-default host (`bedrock-runtime.us-east-1.amazonaws.com`) and a static API key, so it *is* a
+default host (`bedrock-runtime.us-east-1.amazonaws.com`) and a static API key, so it _is_ a
 built-in row; override the region with `provider_authorities.bedrock` if you need another one.
 
 The routing rule: **first path segment = provider name**. `/groq/openai/v1/chat/completions` routes
@@ -236,7 +236,7 @@ as `anthropic/claude-opus-4.8`. Every row and candidate is verified against the 
 account, a different network path, and AWS's own serving of Claude. OpenRouter is the third
 candidate and covers failures that are on our side of the wire (egress blocked, our Anthropic or
 Bedrock key throttled) but is not independently guaranteed — it picks its own backend per request
-and has been observed serving these ids from Anthropic directly *and* from Bedrock. A 5xx from
+and has been observed serving these ids from Anthropic directly _and_ from Bedrock. A 5xx from
 Anthropic therefore fails over to Bedrock first; OpenRouter is what is left if Bedrock is down or
 unkeyed too.
 
