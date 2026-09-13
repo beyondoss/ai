@@ -403,6 +403,7 @@ fn isolate_provider_env(cmd: &mut Command) {
         "OPENAI_API_KEY",
         "OPENAI_BASE_URL",
         "ANTHROPIC_API_KEY",
+        "AWS_BEARER_TOKEN_BEDROCK",
         // A developer/CI env that POSTs run lifecycle must not leak into hermetic tests; tests that
         // want the emitter set it after [`serve_cmd`]/[`run_cmd`] (last-write wins).
         "AI_AGENT_LIFECYCLE_URL",

@@ -114,7 +114,8 @@ capture_queue_depth = 1024
 # Optional per-provider upstream authority (host:port), BY PROVIDER NAME. For a known provider this
 # overrides its built-in default; for an unknown name it ADDS a new provider, then reachable at
 # `/{name}/…` (the provider is the first path segment of the request). Known providers (zero-config
-# defaults): openai, anthropic, openrouter, fireworks, groq, deepseek, together, cerebras, mistral, xai.
+# defaults): openai, anthropic, openrouter, fireworks, groq, deepseek, together, cerebras, mistral,
+# xai, bedrock.
 # [provider_authorities]
 # openai = "api.openai.com:443"
 # my-self-hosted = "llm.internal:8443"
@@ -160,12 +161,34 @@ capture_queue_depth = 1024
 # code change — this is purely config, and it's the officially recommended way to add an
 # Anthropic-wire vendor at a host the gateway already knows.
 
+# Amazon Bedrock. The built-in `bedrock` row is Claude's Anthropic Messages surface at
+# `https://bedrock-runtime.us-east-1.amazonaws.com/anthropic/v1/messages`, authenticated with the
+# Amazon Bedrock API key in `x-api-key` (`AWS_BEARER_TOKEN_BEDROCK` on the direct/agent path;
+# `AI_POOL_KEY_BEDROCK` here). That is the catalog's independent Claude failover. Override the
+# region if you are not in us-east-1; catalog candidates use the US geo inference profiles this
+# default host serves.
+# [provider_authorities]
+# bedrock = "bedrock-runtime.eu-west-1.amazonaws.com:443"
+#
+# Bedrock's OpenAI-compat surface (`/openai/v1/chat/completions`, Bearer) is a different wire and a
+# different auth scheme, so it is a config-added alias — same host, not the built-in row. The client
+# reaches it at `/bedrock-openai/openai/v1/chat/completions`.
+# [provider_authorities]
+# bedrock-openai = "bedrock-runtime.us-east-1.amazonaws.com:443"
+# [provider_dialects]
+# bedrock-openai = "openai"
+# [provider_auth_schemes]
+# bedrock-openai = "bearer"
+# [pool_keys]
+# bedrock-openai = "<amazon-bedrock-api-key>"
+
 # Managed Beyond pool keys, BY PROVIDER NAME. Inject via SSM-backed env in production
 # (AI_POOL_KEY_OPENAI, AI_POOL_KEY_GROQ, …) rather than this file; env wins over any value here.
 # A provider with no pool key can't serve managed traffic (→ 503); BYO is unaffected.
 # [pool_keys]
 # openai = "sk-..."
 # anthropic = "sk-ant-..."
+# bedrock = "<amazon-bedrock-api-key>"   # or AI_POOL_KEY_BEDROCK / AWS_BEARER_TOKEN_BEDROCK
 # fireworks = "fw-..."
 # fireworks-anthropic = "fw-..."   # same Fireworks account key, second alias — see provider_authorities above
 

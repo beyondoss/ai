@@ -12,6 +12,9 @@ fail-fast = false
 # 6-hour ceiling (which is exactly what happened before this split). 180s is comfortably above any
 # legitimate test here (the slowest are large-file reads and process-spawn tests, all seconds).
 slow-timeout = { period = "60s", terminate-after = 3 }
+# Whole-run cap, compile excluded (CI compiles with `--no-run` first). A wedged nextest then exits
+# instead of sitting on GitHub's pipe until the ~30m cancel that fails the required Check gate.
+global-timeout = "10m"
 # One retry absorbs a genuine one-off timing blip on a shared runner without reding the PR; a test that
 # fails (or hangs) on *every* attempt still fails, and nextest prints the retried test's name either
 # way — so a flaky hang is surfaced, not silently masked.

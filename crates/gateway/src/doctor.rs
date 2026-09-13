@@ -342,6 +342,7 @@ mod tests {
             pool_keys: HashMap::from([
                 ("openai".to_string(), Secret::new("sk-openai")),
                 ("anthropic".to_string(), Secret::new("sk-anthropic")),
+                ("bedrock".to_string(), Secret::new("sk-bedrock")),
                 ("openrouter".to_string(), Secret::new("sk-openrouter")),
             ]),
             ..Default::default()
