@@ -99,9 +99,7 @@ jobs:
             extra: "--features code-mode"
           - name: agent-serve
             filter: package(beyond-ai-agent) and kind(test) and binary(~serve)
-            # Parallel serve daemons pile up on a leaked child and have wedged this shard
-            # until a runner-level cancel (needs.test.result=cancelled → Check red).
-            extra: "--test-threads 1"
+            extra: ""
           - name: agent-rest
             filter: package(beyond-ai-agent) and kind(test) and not binary(~serve) and not binary(exec_endpoint_live)
             extra: ""
@@ -128,13 +126,13 @@ jobs:
       # Compile is a separate step from the run. agent-serve / agent-rest link dozens of
       # integration-test binaries; that compile cannot leak a `serve` daemon.
       #
-      # The run step must not let a grandchild inherit GitHub's stdout pipe (the runner
-      # waits for EOF on it, and job/step timeouts do not fire while it is held). nextest
-      # writes to a file. No `tail -f`, no GNU `timeout`, no background watchdog: GNU
-      # `timeout` without `--foreground` puts cargo in a new process group the runner's
-      # timeout does not reap, which is how agent-serve sat `in_progress` for 52m after
-      # compile finished in 3m. Keep the tree in this script's group so `timeout-minutes`
-      # can actually kill it.
+      # nextest writes to a file so a leaked serve cannot inherit GitHub's stdout pipe.
+      # The script stays in the foreground and polls: a silent `cargo nextest` wait is
+      # how this step sat `in_progress` for 36m past `timeout-minutes` (the runner does
+      # not fire that timeout while the cgroup is busy and the step is quiet). Heartbeats
+      # copy the last log lines onto the pipe so a cancel still leaves a name. After 9m
+      # we SIGKILL the cargo tree, print the log, and exit — so Check sees `failure`,
+      # not `cancelled`.
       #
       # Only the exec-live shard needs a target; the others must not pay for it.
       - name: start a real sandbox target (Alpine = busybox, the hardest rung)
@@ -160,12 +158,37 @@ jobs:
           : > "$LOG"
           echo "nextest output -> $LOG"
           cargo nextest run --workspace --profile ci ${{ matrix.extra }} -E '${{ matrix.filter }}' \
-            > "$LOG" 2>&1 </dev/null
-          status=$?
+            > "$LOG" 2>&1 </dev/null &
+          CARGO_PID=$!
+          elapsed=0
+          status=0
+          while kill -0 "$CARGO_PID" 2>/dev/null; do
+            if [ "$elapsed" -ge 540 ]; then
+              echo "::error::nextest still running after 9m — killing the tree"
+              # Children first so they cannot outlive cargo and keep the cgroup busy.
+              if command -v pstree >/dev/null; then pstree -p "$CARGO_PID" || true; fi
+              ps -o pid,ppid,pgid,etime,args --ppid "$CARGO_PID" || true
+              pkill -9 -P "$CARGO_PID" 2>/dev/null
+              kill -9 "$CARGO_PID" 2>/dev/null
+              pkill -9 -f 'cargo-nextest|beyond-ai-agent|nats-server' 2>/dev/null
+              wait "$CARGO_PID" 2>/dev/null
+              status=124
+              break
+            fi
+            echo "heartbeat ${elapsed}s load=$(cut -d' ' -f1 /proc/loadavg) beyond=$(pgrep -c -f beyond-ai-agent 2>/dev/null || echo 0)"
+            tail -15 "$LOG" || true
+            sleep 15
+            elapsed=$((elapsed + 15))
+          done
+          if [ "$status" -eq 0 ]; then
+            wait "$CARGO_PID"
+            status=$?
+          fi
           pkill -9 -f 'beyond-ai-agent' 2>/dev/null
           pkill -9 -f 'nats-server' 2>/dev/null
           echo "--- last 200 lines of the log file ---"
           tail -200 "$LOG"
+          [ "$status" -eq 124 ] && echo "::error::timed out after 9m — the last test above is where it stopped"
           exit $status
         timeout-minutes: 12
       # Belt and braces: runs even if the step above somehow does not, and names anything still alive.
