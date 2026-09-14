@@ -16,7 +16,7 @@ published `beyond-slipstream` — clones, CI-builds, and publishes anywhere.
 | ------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------- |
 | **Managed key** (`bai_v1.…`)                     | Ed25519-verified identity; enables key swap, deny-set check, and `ai.usage` billing                                                                                               | A session token or capability grant — just tenant attribution                |
 | **BYO key** (anything else)                      | Forwarded as-is to the provider; no swap, no billing, no deny-set                                                                                                                 | A lesser tier — same proxy, minus attribution and billing                    |
-| **Pool key**                                     | Real provider API key held by the gateway; swapped in for managed traffic                                                                                                         | Per-tenant — one key per provider, shared by all managed callers             |
+| **Pool key**                                     | Real provider API key(s) held by the gateway; swapped in for managed traffic. A 429 walks the next unused key on the *same* provider                                              | Per-tenant — keys are per provider, shared by all managed callers            |
 | **Tenant**                                       | The billing entity from the virtual key payload (`tenant_id: u64`)                                                                                                                | An org, user, or namespace — an opaque integer the gateway doesn't interpret |
 | **Dialect**                                      | A provider attribute (OpenAI-wire vs Anthropic-wire) driving usage parsing; for a bare-path request it's derived from the path to pick the default provider                       | The provider — a prefixed request uses its provider's dialect, not the path  |
 | **Provider**                                     | The request's **first path segment** (`/{provider}/…`); a named row in the routing table: authority, dialect, auth scheme                                                         | A vendor relationship — just connection facts and auth wiring                |
@@ -73,7 +73,8 @@ Client (stock OpenAI/Anthropic SDK)
   │
   ▼  upstream_request_filter (proxy.rs)
   │  Managed: remove every static-key header (authorization, x-api-key, api-key,
-  │    x-goog-api-key) UNCONDITIONALLY → inject pool key in the provider's own scheme
+  │    x-goog-api-key) UNCONDITIONALLY → inject the next unused pool key in the
+  │    provider's own scheme (never provider A's key on provider B)
   │  BYO: leave auth header unchanged
   │  Strip x-beyond-* control headers (ours; meaningless upstream)
   │  Set Host; path: verbatim for /{provider} (prefix stripped), or the candidate's
@@ -453,11 +454,12 @@ the rate guardrails (which protect against abusive _inbound_ load):
   instead of piling up against `read_timeout_secs` and exhausting connection / in-flight slots for
   _every_ provider (head-of-line blocking by one sick dependency). After `circuit_breaker_reset_secs`
   it half-opens and admits a probe; success closes it, failure reopens it.
-- **A `429` is NOT a failure.** It means the provider is healthy and throttling our pool key — a
-  velocity/spend signal the rate limiter and the client's `Retry-After` backoff own. Tripping on it
-  would convert a self-healing throttle into a self-inflicted outage. The breaker records any response
-  that _arrived_ (2xx/3xx/4xx incl. 429) as a **success**; only 5xx and transport failures count
-  against it.
+- **A `429` is NOT a failure.** It means the provider is healthy and throttling *that credential* — a
+  velocity/spend signal the rate limiter, the same-provider key walk, and the client's `Retry-After`
+  backoff own. Tripping on it would convert a self-healing throttle into a self-inflicted outage. The
+  breaker records any response that _arrived_ (2xx/3xx/4xx incl. 429) as a **success**; only 5xx and
+  transport failures count against it. A key-walk retry does not record a breaker failure and does
+  not claim a second permit.
 - **A client giving up is NOT a failure.** Pingora tags a client-side abort `ErrorSource::Downstream`,
   and only non-`Downstream` errors count. Cancellation is routine for a coding agent (a user hits ESC
   on a slow turn); counting those opened breakers on perfectly healthy providers, and because
@@ -629,11 +631,17 @@ Erroring at that hook rather than in `response_filter` keeps the per-attempt sta
 observes TTFT, or sets `upstream_status`, and `response_body_filter` never feeds the tail, head, or
 response model scanner. The next attempt starts from the slate the first one did.
 
-Two deliberate non-cases:
+Two deliberate non-cases, plus one same-provider retry:
 
-- **A `429` is relayed, never failed over.** It is a healthy provider throttling our pool key — the
+- **A `429` is not a vendor failover.** It is a healthy provider throttling *that credential* — the
   same judgement the circuit breaker makes. Re-asking a different vendor converts a self-healing
-  throttle into spend somewhere else, and the client's `Retry-After` already owns it.
+  throttle into spend somewhere else. If another unused pool key remains for this provider and the
+  body is replayable (`is_body_done && !retry_buffer_truncated`), `upstream_response_filter` returns
+  a retryable error and the next attempt stays on the same provider with the next key. Works for
+  `/{provider}` and `/auto`. BYO does not walk. The last 429 is relayed, with `Retry-After` if the
+  upstream sent one. Counted on `ai_key_walks_total`, never on `ai_candidate_failovers_total`.
+- **A `5xx` does not walk keys.** Vendor walk already owns that on `/auto`. Keys stay with their
+  provider.
 - **When every candidate 5xxes, the client gets the last provider's own status**, not a synthetic
   error. Better diagnostics than an exhausted retry loop produces.
 
@@ -730,7 +738,7 @@ Secret-bearing fields (`pool_keys`, `nats_creds`) are held as `Secret<T>` — st
 | ------------------------------- | --------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `signing_keys`                  | _(required for managed)_          | Map of kid → base64 Ed25519 public key. Multiple kids enable rotation. Missing → every `bai_v1` token 401s (fail-closed); BYO still works.                                                                 |
 | `require_signing_keys`          | `false`                           | When `true`, an empty `signing_keys` is a hard boot failure. Set on managed deployments so a typo'd/absent SSM param fails at boot rather than 401-ing every managed client.                               |
-| `pool_keys.<name>`              | _(from `AI_POOL_KEY_<NAME>` env)_ | Real provider API key. Missing for a provider → managed requests to that provider return 503 before any upstream connection.                                                                               |
+| `pool_keys.<name>`              | _(from `AI_POOL_KEY_<NAME>` env)_ | Real provider API key(s). TOML array (a string is a list of one); env stays one key = list of one. Missing or empty → managed requests to that provider return 503 before any upstream connection. A managed 429 walks the next unused key on the same provider. |
 | `provider_authorities.<name>`   | _(none)_                          | Override or add a provider's `authority` (host:port). Enables config-added providers beyond `KNOWN_PROVIDERS` with zero code change.                                                                       |
 | `provider_dialects.<name>`      | `"openai"`                        | Wire dialect for a **config-added** provider (`"openai"` or `"anthropic"`, case-insensitive). No effect on a known provider (dialect fixed in code). Unrecognized value → hard boot failure.               |
 | `provider_auth_schemes.<name>`  | `"bearer"`                        | Managed auth scheme for a **config-added** provider (`"bearer"`, `"x-api-key"`, or `"api-key"` — the last is Azure OpenAI's shape). No effect on a known provider. Unrecognized value → hard boot failure. |
@@ -772,7 +780,7 @@ Secret-bearing fields (`pool_keys`, `nats_creds`) are held as `Secret<T>` — st
 | Provider DNS fails                                                 | `upstream_peer` returns error → 502 to client.                                                                                                                                                                                                                     | TTL-cached DNS (60s) serves stale; poisoned-lock guard re-resolves on next request.                                                                                                                                                                                                                                      |
 | Provider TCP connect fails                                         | `fail_to_connect` retries up to 2×, then returns 502. Counts as a circuit-breaker failure.                                                                                                                                                                         | Client SDK retries with backoff. No HTTP-status retries (Pingora-idiomatic).                                                                                                                                                                                                                                             |
 | Provider brownout (sustained 5xx)                                  | After `circuit_breaker_threshold` 5xx/connect failures in the window, the breaker opens; requests fast-fail 503 (`circuit_open`) instead of stalling against the read timeout.                                                                                     | Auto: after `circuit_breaker_reset_secs` a half-open probe is admitted — success closes the breaker, failure reopens it. Per-provider, so other providers are unaffected.                                                                                                                                                |
-| Provider throttles (429 storm)                                     | Relayed to the client as 429; the client's `Retry-After` backoff applies. Does **not** trip the breaker (provider is healthy).                                                                                                                                     | Backpressure via client + the rate guardrails; no gateway-side circuit action.                                                                                                                                                                                                                                           |
+| Provider throttles (429 storm)                                     | Walk the next unused pool key on the same provider when the body is replayable; the last 429 is relayed with `Retry-After` if the upstream sent one. Does **not** trip the breaker (provider is healthy). Does **not** fail over to another vendor.                | Client `Retry-After` backoff after keys are exhausted; no gateway-side circuit action.                                                                                                                                                                                                                                   |
 | Response body > 128KB before usage chunk                           | Tail compaction fires: `drain(..half)` discards first half, keeps tail. Usage extracted from retained tail.                                                                                                                                                        | No action — SSE usage is always in the final `data:` line, which always lands in the tail.                                                                                                                                                                                                                               |
 | Client cancels mid-request (ESC on a slow turn)                    | Relayed as a downstream abort. **Not** counted against the provider's breaker — pingora tags it `ErrorSource::Downstream`. Was previously recorded as a provider failure, so a burst of cancellations opened the breaker and 503'd everyone.                       | None. `tests/cancellation.rs` pins both halves: aborts do not open the breaker, sustained 5xx still does.                                                                                                                                                                                                                |
 | Retry replays a partially-read request body                        | `upstream_peer` resets the body-phase state each attempt, so the replayed prefix replaces rather than appends. Previously it was appended, producing a duplicated JSON fragment the provider rejected with a `400` that `logging` recorded as a breaker _success_. | None — the reset is unconditional and O(1) on the first attempt.                                                                                                                                                                                                                                                         |
@@ -806,6 +814,7 @@ Prometheus on the default registry, exposed at `/metrics` on `metrics_listen`.
 | `ai_control_header_errors_total`      | Counter   | —                    | `x-beyond-*` headers present but unusable (dropped; request still served)              |
 | `ai_usage_parse_errors_total`         | Counter   | —                    | Managed 2xx responses with no parseable usage (emitted as a zero-token billing row)    |
 | `ai_candidate_failovers_total`        | Counter   | —                    | Model-routed requests that abandoned a candidate for the next one                      |
+| `ai_key_walks_total`                  | Counter   | —                    | Managed 429s that retried the same provider with the next unused pool key              |
 | `ai_model_header_body_mismatch_total` | Counter   | —                    | Model-routed requests whose routing header and body `model` disagreed (client bug)     |
 | `ai_failover_body_too_large_total`    | Counter   | —                    | 5xx that could not fail over: request body exceeded the 64 KiB replay buffer           |
 
@@ -847,7 +856,9 @@ Prometheus on the default registry, exposed at `/metrics` on `metrics_listen`.
   passthrough** (raw token unchanged), the **virtual key in either inbound header** (`Bearer` or
   `x-api-key`), and deny-set propagation: spend (write `blackhole.{tenant}` → 402, delete → 200)
   and **fraud** (→ 403). Error/edge paths: **missing key → 401**, **oversized `Content-Length` →
-  413**, **managed key for an unconfigured provider → 503**, **streaming tail compaction** (>128KB
+  413**, **managed key for an unconfigured provider → 503**, **managed 429 key-walk** (two keys,
+  first throttled, second serves; one key and an unreplayable body still relay 429 with
+  `Retry-After`; BYO does not walk), **streaming tail compaction** (>128KB
   before the usage chunk still meters), **deny-set fail-open** (kill NATS → stale set retained,
   auth still works), and **on-disk snapshot survival** (blackhole a tenant, restart with NATS down
   → the hold is still enforced from disk).
@@ -858,7 +869,8 @@ Prometheus on the default registry, exposed at `/metrics` on `metrics_listen`.
   request), the breaker ledger (the abandoned candidate's breaker opens while the fallback keeps
   serving), missing/unknown model → 404, BYO → 400, the routing header never reaching an upstream,
   `ai.usage` naming the candidate that served, all-candidates-down, a **256 KiB body surviving a
-  failover byte-for-byte**, and provider-routed traffic being unaffected.
+  failover byte-for-byte**, a **429 walking keys not vendors**, and provider-routed traffic being
+  unaffected.
 - **Cancellation (`tests/cancellation.rs`):** a client that gives up must not open the provider's
   breaker, and a genuinely broken provider still must. Verified non-vacuous — reverting the fix makes
   the first test fail.

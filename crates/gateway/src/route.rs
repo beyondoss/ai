@@ -78,8 +78,30 @@ pub fn dialect_default(d: Dialect) -> &'static str {
     }
 }
 
+/// One precomputed managed auth value: the formatted secret plus, when the bytes are header-safe,
+/// a ready-to-insert [`http::HeaderValue`].
+///
+/// `insert_header(name, &str)` runs `HeaderValue::from_str`, which validates the bytes and copies
+/// them into a fresh `Bytes` — a heap allocation per managed request for a value fixed at boot.
+/// Cloning a `HeaderValue` is a refcount bump instead.
+///
+/// `header` is `None` only if the configured key isn't a legal header value (a stray newline, say),
+/// which no key that could ever have worked would be — `insert_header` would have rejected it per
+/// request. The caller falls back to the string form so that stays true rather than becoming a
+/// silent 503.
+///
+/// Hygiene note: a `HeaderValue` is not zeroized on drop, so this is one long-lived plaintext copy
+/// of the pool key. That is a net *improvement* — `secret.rs` already concedes the key is "copied
+/// into Pingora's request headers we don't own", and previously that copy was made and freed
+/// thousands of times a second, scattering key bytes across the heap. The `Secret` is kept for the
+/// redacting `Debug`.
+pub struct PoolAuth {
+    pub value: Secret,
+    pub header: Option<http::HeaderValue>,
+}
+
 /// A *resolved* provider: static wire facts + the boot-resolved upstream authority/host + (for
-/// managed traffic) the precomputed pool auth header value. Built once at boot (see
+/// managed traffic) the precomputed pool auth header values. Built once at boot (see
 /// `state::build_providers`); the request hot path holds an `Arc<Provider>` (cheap clone) and
 /// borrows these fields, so nothing is re-allocated or re-formatted per request.
 pub struct Provider {
@@ -91,28 +113,11 @@ pub struct Provider {
     /// The provider's wire format (usage parsing + injection eligibility). See [`ProviderSpec::wire`].
     pub dialect: Dialect,
     pub auth: AuthScheme,
-    /// Precomputed managed auth header value (`Bearer <key>` / bare key). `None` ⇒ no pool key is
-    /// configured for this provider ⇒ managed requests to it are rejected (503). Kept in `Secret`
-    /// for the redacting-`Debug` + zeroize-on-drop hygiene of the underlying key.
-    pub pool_auth_value: Option<Secret>,
-    /// `pool_auth_value` as a ready-to-insert [`http::HeaderValue`].
-    ///
-    /// `insert_header(name, &str)` runs `HeaderValue::from_str`, which validates the bytes and
-    /// copies them into a fresh `Bytes` — a heap allocation per managed request for a value fixed at
-    /// boot. Cloning a `HeaderValue` is a refcount bump instead. Same for [`Self::host_header`].
-    ///
-    /// `None` only if the configured key isn't a legal header value (a stray newline, say), which no
-    /// key that could ever have worked would be — `insert_header` would have rejected it per
-    /// request. The caller falls back to the string form so that stays true rather than becoming a
-    /// silent 503.
-    ///
-    /// Hygiene note: a `HeaderValue` is not zeroized on drop, so this is one long-lived plaintext
-    /// copy of the pool key. That is a net *improvement* — `secret.rs` already concedes the key is
-    /// "copied into Pingora's request headers we don't own", and previously that copy was made and
-    /// freed thousands of times a second, scattering key bytes across the heap. The `Secret` is kept
-    /// for the redacting `Debug`.
-    pub pool_auth_header: Option<http::HeaderValue>,
-    /// `host` as a ready-to-insert `HeaderValue` — see [`Self::pool_auth_header`].
+    /// Precomputed managed auth values, one per configured pool key, in config order. Empty ⇒ no
+    /// pool key is configured for this provider ⇒ managed requests to it are rejected (503). A
+    /// managed 429 walks the next unused entry; the key is never sent to a different provider.
+    pub pool_auth: Box<[PoolAuth]>,
+    /// `host` as a ready-to-insert `HeaderValue` — see [`PoolAuth`].
     pub host_header: Option<http::HeaderValue>,
     /// Per-provider metric handles, resolved once here so the response path bumps a direct
     /// counter/histogram instead of a string-keyed label lookup per response.
@@ -124,15 +129,21 @@ pub struct Provider {
 }
 
 impl Provider {
-    /// Resolve a provider from its name, upstream authority, dialect, auth scheme, (optional) pool
-    /// key, and pre-resolved per-provider metric handles. Derives the bare host and precomputes the
-    /// managed auth header value once.
+    /// Whether at least one pool key is configured — the 503 gate for managed traffic.
+    pub fn has_pool_key(&self) -> bool {
+        !self.pool_auth.is_empty()
+    }
+
+    /// Resolve a provider from its name, upstream authority, dialect, auth scheme, pool keys, and
+    /// pre-resolved per-provider metric handles. Derives the bare host and precomputes each
+    /// managed auth header value once. An empty `pool_keys` is the same as none: managed requests
+    /// to this provider 503.
     pub fn resolve(
         name: &str,
         authority: String,
         dialect: Dialect,
         auth: AuthScheme,
-        pool_key: Option<&str>,
+        pool_keys: &[&str],
         metrics: ProviderMetrics,
         breaker: Option<CircuitBreaker>,
     ) -> Self {
@@ -141,10 +152,14 @@ impl Provider {
             .next()
             .unwrap_or(&authority)
             .to_string();
-        let pool_auth_value = pool_key.map(|k| Secret::new(auth.format(k)));
-        let pool_auth_header = pool_auth_value
-            .as_ref()
-            .and_then(|s| http::HeaderValue::from_str(s.expose()).ok());
+        let pool_auth = pool_keys
+            .iter()
+            .map(|k| {
+                let value = Secret::new(auth.format(k));
+                let header = http::HeaderValue::from_str(value.expose()).ok();
+                PoolAuth { value, header }
+            })
+            .collect();
         let host_header = http::HeaderValue::from_str(&host).ok();
         Provider {
             name: name.to_string(),
@@ -152,8 +167,7 @@ impl Provider {
             host,
             dialect,
             auth,
-            pool_auth_value,
-            pool_auth_header,
+            pool_auth,
             host_header,
             metrics,
             breaker,
@@ -228,13 +242,13 @@ mod tests {
             "api.openai.com:443".to_string(),
             Dialect::OpenAi,
             AuthScheme::Bearer,
-            Some("sk-x"),
+            &["sk-x"],
             ProviderMetrics::disconnected(),
             None,
         );
         assert_eq!(p.host, "api.openai.com");
         assert_eq!(p.dialect, Dialect::OpenAi);
-        assert_eq!(p.pool_auth_value.as_ref().unwrap().expose(), "Bearer sk-x");
+        assert_eq!(p.pool_auth[0].value.expose(), "Bearer sk-x");
 
         // No pool key ⇒ no managed auth value (managed requests to it would 503).
         let a = Provider::resolve(
@@ -242,11 +256,27 @@ mod tests {
             "api.anthropic.com:443".to_string(),
             Dialect::Anthropic,
             AuthScheme::XApiKey,
-            None,
+            &[],
             ProviderMetrics::disconnected(),
             None,
         );
-        assert!(a.pool_auth_value.is_none());
+        assert!(a.pool_auth.is_empty());
+    }
+
+    #[test]
+    fn resolve_holds_every_configured_key() {
+        let p = Provider::resolve(
+            "openai",
+            "api.openai.com:443".to_string(),
+            Dialect::OpenAi,
+            AuthScheme::Bearer,
+            &["sk-a", "sk-b"],
+            ProviderMetrics::disconnected(),
+            None,
+        );
+        assert_eq!(p.pool_auth.len(), 2);
+        assert_eq!(p.pool_auth[0].value.expose(), "Bearer sk-a");
+        assert_eq!(p.pool_auth[1].value.expose(), "Bearer sk-b");
     }
 
     #[test]
@@ -268,7 +298,7 @@ mod tests {
                 authority.to_string(),
                 Dialect::OpenAi,
                 scheme,
-                Some(key),
+                &[key],
                 ProviderMetrics::disconnected(),
                 None,
             );
@@ -276,10 +306,10 @@ mod tests {
                 p.host_header.as_ref().expect("host is header-safe"),
                 &http::HeaderValue::from_str(&p.host).unwrap()
             );
-            let av = p.pool_auth_value.as_ref().expect("pool key configured");
+            let auth = p.pool_auth.first().expect("pool key configured");
             assert_eq!(
-                p.pool_auth_header.as_ref().expect("key is header-safe"),
-                &http::HeaderValue::from_str(av.expose()).unwrap()
+                auth.header.as_ref().expect("key is header-safe"),
+                &http::HeaderValue::from_str(auth.value.expose()).unwrap()
             );
         }
 
@@ -289,27 +319,26 @@ mod tests {
             "h:443".to_string(),
             Dialect::OpenAi,
             AuthScheme::Bearer,
-            None,
+            &[],
             ProviderMetrics::disconnected(),
             None,
         );
-        assert!(none.pool_auth_value.is_none());
-        assert!(none.pool_auth_header.is_none());
+        assert!(none.pool_auth.is_empty());
 
-        // A key that is not a legal header value precomputes to `None`, so the caller falls back to
-        // the string form and gets the same per-request error it always did — rather than this
-        // quietly turning into a 503.
+        // A key that is not a legal header value precomputes header = None, so the caller falls
+        // back to the string form and gets the same per-request error it always did — rather than
+        // this quietly turning into a 503.
         let bad = Provider::resolve(
             "p",
             "h:443".to_string(),
             Dialect::OpenAi,
             AuthScheme::XApiKey,
-            Some("has\nnewline"),
+            &["has\nnewline"],
             ProviderMetrics::disconnected(),
             None,
         );
-        assert!(bad.pool_auth_value.is_some());
-        assert!(bad.pool_auth_header.is_none());
+        assert_eq!(bad.pool_auth.len(), 1);
+        assert!(bad.pool_auth[0].header.is_none());
     }
 
     #[test]
@@ -322,14 +351,11 @@ mod tests {
             "my-resource.openai.azure.com:443".to_string(),
             Dialect::OpenAi,
             AuthScheme::ApiKey,
-            Some("azure-secret"),
+            &["azure-secret"],
             ProviderMetrics::disconnected(),
             None,
         );
         assert_eq!(azure.auth.header(), "api-key");
-        assert_eq!(
-            azure.pool_auth_value.as_ref().unwrap().expose(),
-            "azure-secret"
-        );
+        assert_eq!(azure.pool_auth[0].value.expose(), "azure-secret");
     }
 }

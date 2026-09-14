@@ -10,7 +10,93 @@ use figment::Figment;
 use figment::providers::{Env, Format, Toml};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::fmt;
+use std::ops::Deref;
 use std::path::Path;
+
+/// One provider's pool keys.
+///
+/// A TOML string or an `AI_POOL_KEY_*` env value is a list of one; a TOML array is N keys, walked
+/// in order on a managed 429 (see `proxy::upstream_response_filter`). An empty list is the same as
+/// a missing entry: managed traffic to that provider 503s.
+#[derive(Clone, Default, Debug)]
+pub struct PoolKeyList(Vec<Secret>);
+
+impl PoolKeyList {
+    pub fn as_slice(&self) -> &[Secret] {
+        &self.0
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl Deref for PoolKeyList {
+    type Target = [Secret];
+    fn deref(&self) -> &[Secret] {
+        &self.0
+    }
+}
+
+impl From<Secret> for PoolKeyList {
+    fn from(s: Secret) -> Self {
+        Self(vec![s])
+    }
+}
+
+impl From<&str> for PoolKeyList {
+    fn from(s: &str) -> Self {
+        Self(vec![Secret::new(s)])
+    }
+}
+
+impl From<Vec<Secret>> for PoolKeyList {
+    fn from(v: Vec<Secret>) -> Self {
+        Self(v)
+    }
+}
+
+impl Serialize for PoolKeyList {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        self.0.serialize(s)
+    }
+}
+
+impl<'de> Deserialize<'de> for PoolKeyList {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        struct V;
+        impl<'de> serde::de::Visitor<'de> for V {
+            type Value = PoolKeyList;
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("a pool key string or an array of pool keys")
+            }
+            fn visit_str<E: serde::de::Error>(
+                self,
+                v: &str,
+            ) -> std::result::Result<Self::Value, E> {
+                Ok(PoolKeyList(vec![Secret::new(v)]))
+            }
+            fn visit_string<E: serde::de::Error>(
+                self,
+                v: String,
+            ) -> std::result::Result<Self::Value, E> {
+                Ok(PoolKeyList(vec![Secret::new(v)]))
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> std::result::Result<Self::Value, A::Error> {
+                let mut keys = Vec::new();
+                while let Some(s) = seq.next_element::<Secret>()? {
+                    keys.push(s);
+                }
+                Ok(PoolKeyList(keys))
+            }
+        }
+        d.deserialize_any(V)
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 // `default` so every field is optional. We deliberately do NOT set serde's `deny_unknown_fields`:
@@ -85,11 +171,12 @@ pub struct AiConfig {
     pub require_signing_keys: bool,
 
     /// Managed Beyond pool keys, **by provider name** (`openai`, `anthropic`, `fireworks`, …).
-    /// From the `[pool_keys]` TOML table or SSM-injected `AI_POOL_KEY_<NAME>` env (the env form is
-    /// the production path — see `load_with_path`). A provider with no pool key here can't serve
-    /// managed traffic (→ 503); BYO is unaffected. Values are `Secret` so a key can't leak through
-    /// the `Debug`/`Serialize` this struct derives; read the plaintext via `expose` at the use site.
-    pub pool_keys: HashMap<String, Secret>,
+    /// From the `[pool_keys]` TOML table (an array of keys, or a string = list of one) or
+    /// SSM-injected `AI_POOL_KEY_<NAME>` env (the env form is the production path and stays one
+    /// key = list of one — see `load_with_path`). A provider with no keys / an empty list can't
+    /// serve managed traffic (→ 503); BYO is unaffected. On a managed 429 the gateway walks the
+    /// next unused key for that same provider; it never sends provider A's key to provider B.
+    pub pool_keys: HashMap<String, PoolKeyList>,
 
     /// Per-provider upstream authority (`host:port`), **by provider name**. For a known provider
     /// (see `route::KNOWN_PROVIDERS`) this *overrides* its default; for an unknown name it *adds* a
@@ -190,9 +277,9 @@ pub struct AiConfig {
     /// Per-provider circuit breaker: number of upstream **failures within `circuit_breaker_window_secs`**
     /// that trips the breaker open for that provider. A failure is a **5xx response or a connect
     /// failure** — i.e. the *provider is broken*. A `429` is deliberately **not** a failure: it means
-    /// the provider is healthy and throttling our pool key (a velocity/spend signal the rate limiter
-    /// and the client's `Retry-After` backoff own), so tripping on it would convert a self-healing
-    /// throttle into a self-inflicted outage. While open, requests to that provider fast-fail with a
+    /// the provider is healthy and throttling that credential (a velocity/spend signal the rate
+    /// limiter, the same-provider key walk, and the client's `Retry-After` backoff own), so tripping
+    /// on it would convert a self-healing throttle into a self-inflicted outage. While open, requests to that provider fast-fail with a
     /// `503` (`ai_rejections_total{reason="circuit_open"}`) instead of piling up against
     /// `read_timeout_secs` and exhausting connection/in-flight slots for *every* provider. After
     /// `circuit_breaker_reset_secs` a probe request is allowed; success closes it, failure reopens it.
@@ -397,7 +484,7 @@ impl AiConfig {
         for (k, v) in vars {
             if let Some(name) = k.strip_prefix("AI_POOL_KEY_") {
                 self.pool_keys
-                    .insert(name.to_ascii_lowercase(), Secret::new(v));
+                    .insert(name.to_ascii_lowercase(), Secret::new(v).into());
             } else if let Some(kid) = k.strip_prefix("AI_SIGNING_KEY_") {
                 self.signing_keys.insert(kid.to_string(), v);
             }
@@ -682,7 +769,7 @@ mod tests {
         // `AI_POOL_KEY_<NAME>` → `pool_keys[name]` (lowercased), and env wins over a config-file
         // value (the production secret path). A non-pool `AI_*` var is ignored.
         let mut c = AiConfig {
-            pool_keys: HashMap::from([("openai".to_string(), Secret::new("from-file"))]),
+            pool_keys: HashMap::from([("openai".to_string(), "from-file".into())]),
             ..Default::default()
         };
         c.merge_secret_env(
@@ -693,9 +780,40 @@ mod tests {
             ]
             .into_iter(),
         );
-        assert_eq!(c.pool_keys.get("openai").unwrap().expose(), "from-env");
-        assert_eq!(c.pool_keys.get("groq").unwrap().expose(), "gsk-x");
+        assert_eq!(c.pool_keys.get("openai").unwrap()[0].expose(), "from-env");
+        assert_eq!(c.pool_keys.get("groq").unwrap()[0].expose(), "gsk-x");
+        assert_eq!(c.pool_keys.get("openai").unwrap().len(), 1);
         assert!(!c.pool_keys.contains_key("log"));
+    }
+
+    #[test]
+    fn pool_keys_toml_array_or_string() {
+        // TOML array is N keys; a TOML string is a list of one (same as env).
+        let dir = std::env::temp_dir().join(format!("ai-pool-keys-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(
+            &path,
+            "[pool_keys]\n\
+             openai = [\"sk-a\", \"sk-b\"]\n\
+             anthropic = \"sk-ant\"\n\
+             empty = []\n",
+        )
+        .unwrap();
+        let defaults =
+            pre_read(figment::providers::Serialized::defaults(AiConfig::default())).unwrap();
+        let toml = read_toml(&path).unwrap();
+        let cfg: AiConfig = Figment::from(defaults).merge(toml).extract().unwrap();
+        let openai = cfg.pool_keys.get("openai").unwrap();
+        assert_eq!(openai.len(), 2);
+        assert_eq!(openai[0].expose(), "sk-a");
+        assert_eq!(openai[1].expose(), "sk-b");
+        assert_eq!(
+            cfg.pool_keys.get("anthropic").unwrap()[0].expose(),
+            "sk-ant"
+        );
+        assert!(cfg.pool_keys.get("empty").unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

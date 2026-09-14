@@ -300,8 +300,12 @@ pub enum Mode {
     /// can prove the proxy still meters them — see [`anthropic_sse_large`].
     AnthropicSseLarge,
     /// Always reply with this HTTP status and a small JSON error body — for circuit-breaker tests
-    /// (5xx trips the breaker; 4xx/429 do not).
+    /// (5xx trips the breaker; 4xx/429 do not). A 429 also carries `Retry-After` so relay tests can
+    /// assert the gateway forwards it.
     Status(u16),
+    /// 429 (with `Retry-After`) when the presented credential contains this secret; 200 otherwise.
+    /// Proves a key-walk actually sent the second pool key.
+    ThrottleKey(&'static str),
     /// Kill any request that is **not the first on its connection**, without answering it.
     ///
     /// This is pingora's *reused-connection* failure, produced deterministically. Keying on
@@ -402,7 +406,7 @@ fn anthropic_sse_large() -> String {
 fn canned_body(mode: Mode) -> (&'static str, Bytes) {
     match mode {
         // A slow reply, and the surviving requests of a close-on-Nth mock, are ordinary successes.
-        Mode::Json | Mode::Slow(_) | Mode::CloseOnReusedConnection => (
+        Mode::Json | Mode::Slow(_) | Mode::CloseOnReusedConnection | Mode::ThrottleKey(_) => (
             "application/json",
             Bytes::from_static(CANNED_JSON.as_bytes()),
         ),
@@ -483,6 +487,14 @@ async fn mock_handle(
     if matches!(mode, Mode::CloseOnReusedConnection) && on_conn > 0 {
         return Err(std::io::Error::other("mock closing a reused connection"));
     }
+    let throttled = match mode {
+        Mode::ThrottleKey(key) => authorization
+            .as_deref()
+            .into_iter()
+            .chain(x_api_key.as_deref())
+            .any(|v| v.contains(key)),
+        _ => false,
+    };
     *cap.lock().unwrap() = Some(Captured {
         path,
         authorization,
@@ -498,17 +510,27 @@ async fn mock_handle(
     if let Mode::Slow(ms) = mode {
         sleep(Duration::from_millis(ms)).await;
     }
-    let (ct, payload) = canned_body(mode);
     let status = match mode {
         Mode::Status(s) => s,
+        Mode::ThrottleKey(_) if throttled => 429,
         _ => 200,
     };
-    Ok(Response::builder()
+    let (ct, payload) = if status == 429 {
+        (
+            "application/json",
+            Bytes::from_static(br#"{"error":{"message":"mock"}}"#),
+        )
+    } else {
+        canned_body(mode)
+    };
+    let mut builder = Response::builder()
         .status(status)
         .header("content-type", ct)
-        .header("x-mock-proto", proto_label(version))
-        .body(Full::new(payload))
-        .unwrap())
+        .header("x-mock-proto", proto_label(version));
+    if status == 429 {
+        builder = builder.header("retry-after", "7");
+    }
+    Ok(builder.body(Full::new(payload)).unwrap())
 }
 
 impl MockUpstream {
@@ -662,6 +684,20 @@ fn pool_key(provider: &str) -> &'static str {
     }
 }
 
+fn write_pool_keys_toml(cfg: &mut String, provider: &str, keys: &[String]) {
+    cfg.push_str(provider);
+    cfg.push_str(" = [");
+    for (i, k) in keys.iter().enumerate() {
+        if i > 0 {
+            cfg.push_str(", ");
+        }
+        cfg.push('"');
+        cfg.push_str(k);
+        cfg.push('"');
+    }
+    cfg.push_str("]\n");
+}
+
 /// Builds a gateway config, choosing which providers are *configured* (authority → the mock + a
 /// pool key). A managed request to a provider absent from this list has no pool key → 503.
 pub struct GatewayBuilder {
@@ -671,7 +707,7 @@ pub struct GatewayBuilder {
     providers: Vec<&'static str>,
     snapshot_path: Option<String>,
     real_upstreams: bool,
-    pool_key_overrides: Vec<(String, String)>,
+    pool_key_overrides: Vec<(String, Vec<String>)>,
     rate_limit_rps: Option<u32>,
     byo_rate_limit_rps: Option<u32>,
     /// Point at a TLS mock (`MockUpstream::start_tls`): `upstream_tls = true` + skip cert verification
@@ -739,8 +775,26 @@ impl GatewayBuilder {
     /// (the `signkey_b64` passed to `builder`) to smoke-test the full managed path against the real
     /// provider.
     pub fn pool_key(mut self, provider: &str, key: &str) -> Self {
-        self.pool_key_overrides
-            .push((provider.to_string(), key.to_string()));
+        if let Some((_, keys)) = self
+            .pool_key_overrides
+            .iter_mut()
+            .find(|(p, _)| p == provider)
+        {
+            keys.push(key.to_string());
+        } else {
+            self.pool_key_overrides
+                .push((provider.to_string(), vec![key.to_string()]));
+        }
+        self
+    }
+
+    /// Set every managed pool key for a provider (TOML array). Replaces any earlier override.
+    pub fn pool_keys(mut self, provider: &str, keys: &[&str]) -> Self {
+        self.pool_key_overrides.retain(|(p, _)| p != provider);
+        self.pool_key_overrides.push((
+            provider.to_string(),
+            keys.iter().map(|k| (*k).to_string()).collect(),
+        ));
         self
     }
 
@@ -854,8 +908,8 @@ impl GatewayBuilder {
             // With neither set, this is a BYO smoke (the caller's token passes through).
             if !self.pool_key_overrides.is_empty() {
                 cfg.push_str("\n[pool_keys]\n");
-                for (p, k) in &self.pool_key_overrides {
-                    cfg.push_str(&format!("{p} = \"{k}\"\n"));
+                for (p, keys) in &self.pool_key_overrides {
+                    write_pool_keys_toml(&mut cfg, p, keys);
                 }
             }
             if !self.signkey_b64.is_empty() {
@@ -885,7 +939,13 @@ impl GatewayBuilder {
             // ...with a distinct pool key per provider so key-swap assertions can tell them apart.
             cfg.push_str("\n[pool_keys]\n");
             for p in &self.providers {
-                cfg.push_str(&format!("{p} = \"{}\"\n", pool_key(p)));
+                let keys = self
+                    .pool_key_overrides
+                    .iter()
+                    .find(|(name, _)| name == p)
+                    .map(|(_, ks)| ks.clone())
+                    .unwrap_or_else(|| vec![pool_key(p).to_string()]);
+                write_pool_keys_toml(&mut cfg, p, &keys);
             }
             cfg.push_str(&format!("\n[signing_keys]\n1 = \"{}\"\n", self.signkey_b64));
         }

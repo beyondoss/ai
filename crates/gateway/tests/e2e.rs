@@ -1172,3 +1172,223 @@ async fn circuit_breaker_does_not_trip_on_429() {
         mock.hits()
     );
 }
+
+const WALK_KEY_A: &str = "sk-walk-a";
+const WALK_KEY_B: &str = "sk-walk-b";
+
+#[tokio::test]
+async fn managed_429_walks_the_next_pool_key() {
+    // Two keys on one provider: the first is throttled, the second serves. A public 429 must not
+    // become everyone's outage, and must not be treated as a vendor failover.
+    let nats = Nats::start().await;
+    let (pubkey, sk) = test_keypair(31);
+    let mock = MockUpstream::start(Mode::ThrottleKey(WALK_KEY_A)).await;
+    let gw = Gateway::builder(nats.port, &mock.authority(), &b64(&pubkey))
+        .providers(&["openai"])
+        .pool_keys("openai", &[WALK_KEY_A, WALK_KEY_B])
+        .start()
+        .await;
+    let vkey = mint(
+        &VirtualKey {
+            tenant_id: 31,
+            vpc_id: 1,
+        },
+        1,
+        &sk,
+    );
+    let client = test_client();
+    {
+        let (c, u, k) = (client.clone(), gw.url(), vkey.clone());
+        wait_for_status(200, move || {
+            let (c, u, k) = (c.clone(), u.clone(), k.clone());
+            async move { post_status(&c, &u, &k, body_for("gpt-4o")).await }
+        })
+        .await;
+    }
+
+    let cap = mock.captured().expect("second key served");
+    assert_eq!(
+        cap.authorization.as_deref(),
+        Some("Bearer sk-walk-b"),
+        "the retry must present the second secret, not the throttled one"
+    );
+    assert!(
+        mock.hits() >= 2,
+        "the first key's 429 and the second key's 200 must both have reached upstream (got {})",
+        mock.hits()
+    );
+    let metrics = gw.metrics().await;
+    assert!(
+        parse_metric(&metrics, "ai_key_walks_total", "") >= 1.0,
+        "the key-walk must be counted, not folded into vendor failover:\n{metrics}"
+    );
+    assert_eq!(
+        parse_metric(&metrics, "ai_candidate_failovers_total", ""),
+        0.0,
+        "a same-provider key walk is not a candidate failover:\n{metrics}"
+    );
+    assert_eq!(
+        parse_metric(&metrics, "ai_rejections_total", "circuit_open"),
+        0.0,
+        "a 429 key-walk must not trip the breaker"
+    );
+}
+
+#[tokio::test]
+async fn one_pool_key_relays_429_with_retry_after() {
+    // A single key has nowhere to walk. The last (only) 429 is relayed, Retry-After included.
+    let nats = Nats::start().await;
+    let (pubkey, sk) = test_keypair(32);
+    let mock = MockUpstream::start(Mode::Status(429)).await;
+    let gw = Gateway::builder(nats.port, &mock.authority(), &b64(&pubkey))
+        .providers(&["openai"])
+        .start()
+        .await;
+    let vkey = mint(
+        &VirtualKey {
+            tenant_id: 32,
+            vpc_id: 1,
+        },
+        1,
+        &sk,
+    );
+    let client = test_client();
+    {
+        let (c, u, k) = (client.clone(), gw.url(), vkey.clone());
+        wait_for_status(429, move || {
+            let (c, u, k) = (c.clone(), u.clone(), k.clone());
+            async move { post_status(&c, &u, &k, body_for("gpt-4o")).await }
+        })
+        .await;
+    }
+
+    let resp = client
+        .post(format!("{}/v1/chat/completions", gw.url()))
+        .header("authorization", format!("Bearer {vkey}"))
+        .header("content-type", "application/json")
+        .body(body_for("gpt-4o"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 429);
+    assert_eq!(
+        resp.headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok()),
+        Some("7"),
+        "the last 429 must keep the upstream Retry-After"
+    );
+    assert_eq!(
+        parse_metric(&gw.metrics().await, "ai_key_walks_total", ""),
+        0.0,
+        "one key has nothing to walk"
+    );
+}
+
+#[tokio::test]
+async fn unreplayable_body_relays_429_without_walking() {
+    // Same gate as vendor failover: a body past pingora's 64 KiB replay buffer is not walked.
+    let nats = Nats::start().await;
+    let (pubkey, sk) = test_keypair(33);
+    let mock = MockUpstream::start(Mode::Status(429)).await;
+    let gw = Gateway::builder(nats.port, &mock.authority(), &b64(&pubkey))
+        .providers(&["openai"])
+        .pool_keys("openai", &[WALK_KEY_A, WALK_KEY_B])
+        .start()
+        .await;
+    let vkey = mint(
+        &VirtualKey {
+            tenant_id: 33,
+            vpc_id: 1,
+        },
+        1,
+        &sk,
+    );
+
+    // Ready on the admin listener so the first upstream request is the unreplayable one.
+    {
+        let gw = &gw;
+        wait_for_status(200, move || {
+            let gw = gw;
+            async move { gw.admin_get("/livez").await.0 }
+        })
+        .await;
+    }
+
+    let filler = "x".repeat(256 * 1024);
+    let big =
+        format!(r#"{{"model":"gpt-4o","messages":[{{"role":"user","content":"{filler}"}}]}}"#);
+    let resp = test_client()
+        .post(format!("{}/v1/chat/completions", gw.url()))
+        .header("authorization", format!("Bearer {vkey}"))
+        .header("content-type", "application/json")
+        .body(big)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        429,
+        "an unreplayable body must relay the 429, not attempt a retry it cannot complete"
+    );
+    assert_eq!(
+        resp.headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok()),
+        Some("7"),
+        "the relayed 429 must keep Retry-After"
+    );
+    assert_eq!(
+        mock.hits(),
+        1,
+        "the second key must not be sent headers for a body we cannot resend"
+    );
+    assert_eq!(
+        parse_metric(&gw.metrics().await, "ai_key_walks_total", ""),
+        0.0,
+        "an unreplayable 429 is not a key-walk"
+    );
+}
+
+#[tokio::test]
+async fn byo_429_does_not_walk_pool_keys() {
+    // BYO forwards the caller's token; a 429 must not swap in a pool key.
+    let nats = Nats::start().await;
+    let (pubkey, _sk) = test_keypair(34);
+    let mock = MockUpstream::start(Mode::Status(429)).await;
+    let gw = Gateway::builder(nats.port, &mock.authority(), &b64(&pubkey))
+        .providers(&["openai"])
+        .pool_keys("openai", &[WALK_KEY_A, WALK_KEY_B])
+        .byo_rate_limit_rps(0)
+        .start()
+        .await;
+    let client = test_client();
+    {
+        let (c, u) = (client.clone(), gw.url());
+        wait_for_status(429, move || {
+            let (c, u) = (c.clone(), u.clone());
+            async move { post_status(&c, &u, "sk-user-byo", body_for("gpt-4o")).await }
+        })
+        .await;
+    }
+    let before = mock.hits();
+    assert_eq!(
+        post_status(&client, &gw.url(), "sk-user-byo", body_for("gpt-4o")).await,
+        429
+    );
+    assert_eq!(
+        mock.hits(),
+        before + 1,
+        "BYO must not retry with the next pool key"
+    );
+    let cap = mock.captured().expect("BYO reached upstream");
+    assert_eq!(
+        cap.authorization.as_deref(),
+        Some("Bearer sk-user-byo"),
+        "BYO must keep the caller's token"
+    );
+    assert_eq!(
+        parse_metric(&gw.metrics().await, "ai_key_walks_total", ""),
+        0.0
+    );
+}

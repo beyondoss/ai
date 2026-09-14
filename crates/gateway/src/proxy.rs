@@ -168,10 +168,9 @@ const USAGE_HEAD_CAP: usize = 8 * 1024;
 
 /// Max upstream **connect** retries before surfacing the failure to the client.
 ///
-/// We retry connect failures only (the idiomatic Pingora pattern, same as edge). Retrying on a
-/// received **5xx/429 response** is deliberately *not* done: Pingora 0.8 has no clean
-/// post-response retry hook for a streaming passthrough (edge doesn't do it either), the upstream
-/// may have started streaming, and the provider SDKs already back off on 429/5xx + `Retry-After`.
+/// Connect retries stay same-peer / same-key. A received **5xx** is a vendor walk on `/auto` only
+/// (`upstream_response_filter`). A received **429** is a same-provider key walk when another unused
+/// pool key remains — not a connect retry, not a vendor failover, and not a breaker failure.
 const MAX_CONNECT_RETRIES: u8 = 2;
 
 pub struct AiProxy {
@@ -240,6 +239,13 @@ pub struct RequestCtx {
     start: Instant,
     /// Connect-retry counter (see `fail_to_connect`).
     attempt: u8,
+    /// Index into `provider.pool_auth` of the key used on this attempt. Advanced on a managed 429
+    /// when another unused key remains. Reset to 0 when `provider` changes — never send provider
+    /// A's key to provider B.
+    pool_key: u8,
+    /// The previous attempt was a same-provider key walk. `upstream_peer` must not treat that as a
+    /// candidate/breaker failure (a 429 is a healthy throttle) and must not pick a new vendor.
+    same_provider_retry: bool,
     /// Whether an `allow()` on `provider`'s breaker is outstanding and still owes exactly one
     /// `record_*`.
     ///
@@ -685,6 +691,12 @@ fn first_usable(usable: u8, from: u8) -> Option<u8> {
     (remaining != 0).then(|| remaining.trailing_zeros() as u8)
 }
 
+/// Pingora will only replay a body that has fully arrived and fit in its private 64 KiB buffer.
+/// See `upstream_response_filter` — the same gate for a 429 key-walk and a 5xx vendor walk.
+fn body_replayable(session: &mut Session) -> bool {
+    session.as_mut().is_body_done() && !session.as_ref().retry_buffer_truncated()
+}
+
 fn dialect_for_path(path: &str) -> Dialect {
     // Anthropic Messages vs OpenAI Chat Completions/Embeddings. Embeddings are OpenAI-dialect only.
     if path.starts_with("/v1/messages") {
@@ -1064,7 +1076,7 @@ impl ProxyHttp for AiProxy {
             // Skipped for a model-routed request: there a pool key is a property of each *candidate*,
             // and the first one lacking a key is a reason to try the next, not to fail the request.
             // The equivalent gate is the usable-candidate check below.
-            if model_route.is_none() && provider.pool_auth_value.is_none() {
+            if model_route.is_none() && !provider.has_pool_key() {
                 return Self::reject_boxed(
                     session,
                     &request_id,
@@ -1114,7 +1126,7 @@ impl ProxyHttp for AiProxy {
                     let keyed = self
                         .state
                         .provider_by_id(c.provider)
-                        .is_some_and(|p| p.pool_auth_value.is_some());
+                        .is_some_and(|p| p.has_pool_key());
                     if keyed {
                         usable |= 1 << i;
                     }
@@ -1287,6 +1299,8 @@ impl ProxyHttp for AiProxy {
             upstream_status: None,
             start,
             attempt: 0,
+            pool_key: 0,
+            same_provider_retry: false,
             breaker_pending,
             auto: model_route.map(|route| {
                 Box::new(ModelRouting {
@@ -1326,6 +1340,34 @@ impl ProxyHttp for AiProxy {
         // Pingora calls this once per attempt, always before a body byte moves, so it is the one
         // place a retry's leftover request-body state can be cleared. No-op on the first attempt.
         rc.reset_request_body_phase();
+
+        // Same-provider key walk after a managed 429. Stay on this provider, keep the outstanding
+        // breaker permit (429 is a success, not a failure), and do not enter the candidate walk —
+        // that walk would send this provider's remaining keys to a different vendor.
+        if rc.same_provider_retry {
+            rc.same_provider_retry = false;
+            if let Some(a) = rc.auto.as_mut() {
+                a.attempt_start = Instant::now();
+            }
+            let addr = match self.state.resolve(&rc.provider.authority).await {
+                Ok(a) => a,
+                Err(e) => {
+                    warn!(
+                        request_id = %rc.request_id,
+                        provider = rc.provider.name.as_str(),
+                        authority = rc.provider.authority.as_str(),
+                        error = %e,
+                        "upstream dns resolution failed",
+                    );
+                    return Err(pingora_core::Error::because(
+                        pingora_core::ErrorType::ConnectError,
+                        "upstream dns resolution failed",
+                        e,
+                    ));
+                }
+            };
+            return Ok(Box::new(self.build_peer(addr, &rc.provider)));
+        }
 
         // Model-routed: this hook owns the candidate walk *and* the breaker ledger.
         //
@@ -1390,6 +1432,9 @@ impl ProxyHttp for AiProxy {
                 }
                 // A permit (if this breaker has one to give) is now outstanding against `p`.
                 rc.breaker_pending = p.breaker.is_some();
+                // New vendor ⇒ that vendor's first key. Never carry provider A's index (or secret)
+                // onto provider B.
+                rc.pool_key = 0;
                 rc.provider = p.clone();
 
                 match self.state.resolve(&p.authority).await {
@@ -1454,12 +1499,12 @@ impl ProxyHttp for AiProxy {
         Ok(Box::new(self.build_peer(addr, &rc.provider)))
     }
 
-    /// Fail over on a **5xx**, before a byte of it reaches the client.
+    /// Fail over — or walk a pool key — before a byte of the error reaches the client.
     ///
     /// This hook runs strictly before anything is written downstream (`h1_response_filter` /
     /// `h2_response_filter` both call it ahead of `write_response_tasks`), so returning a retryable
-    /// error here re-enters pingora's retry loop and `upstream_peer` picks the next candidate. That
-    /// is the only place in the response path where abandoning an answer is still possible.
+    /// error here re-enters pingora's retry loop. That is the only place in the response path where
+    /// abandoning an answer is still possible.
     ///
     /// Erroring *here* rather than in `response_filter` also keeps the per-attempt state clean for
     /// free: `response_filter` never runs for the abandoned attempt, so nothing increments
@@ -1467,18 +1512,19 @@ impl ProxyHttp for AiProxy {
     /// feeds the tail, head, or response model scanner. The next attempt starts from the same slate
     /// the first one did.
     ///
-    /// Four conditions, all necessary:
+    /// Two distinct retries, never mixed:
     ///
-    /// - **Model-routed.** A provider-routed request named its provider; there is nowhere else to go.
-    /// - **5xx only.** A `429` is a healthy provider throttling our pool key — the same judgement the
-    ///   circuit breaker makes. Re-asking a *different* vendor would convert a self-healing throttle
-    ///   into spend somewhere else, and the client's `Retry-After` already owns that case.
-    /// - **A candidate is left.** Otherwise relay the 5xx: the client learns what the last provider
-    ///   actually said, which beats the synthetic error an exhausted retry loop would produce.
-    /// - **The body is replayable.** Pingora's replay buffer is a private 64 KiB constant; past it
-    ///   `get_retry_buffer` yields nothing and a retry would send headers describing a body it then
-    ///   never writes, hanging the upstream until `read_timeout_secs`. That case is counted, not
-    ///   attempted — see `ai_failover_body_too_large_total`.
+    /// - **Managed 429 → next unused key, same provider.** A 429 is a healthy provider throttling
+    ///   *that credential*, not a vendor outage. Walks `/{provider}` and `/auto`. BYO does not
+    ///   walk. The last 429 is relayed, `Retry-After` included. Counted on `ai_key_walks_total`.
+    /// - **Model-routed 5xx → next candidate.** A provider-routed request named its provider; there
+    ///   is nowhere else to go. A 429 is *not* a vendor failover — re-asking a different vendor
+    ///   would convert a self-healing throttle into spend somewhere else. Counted on
+    ///   `ai_candidate_failovers_total`.
+    ///
+    /// Both require a **replayable** body. Pingora's replay buffer is a private 64 KiB constant;
+    /// past it a retry would send headers describing a body it then never writes. That case is
+    /// relayed, not attempted.
     async fn upstream_response_filter(
         &self,
         session: &mut Session,
@@ -1488,10 +1534,45 @@ impl ProxyHttp for AiProxy {
         let Some(rc) = ctx.as_mut() else {
             return Ok(());
         };
+        let status = upstream_response.status.as_u16();
+
+        // Managed 429: walk the next unused key on *this* provider. Not a vendor failover (those
+        // rules stay — `/auto` 5xx owns that) and not a breaker failure (429 is still success).
+        if rc.managed && status == 429 {
+            let next = usize::from(rc.pool_key).saturating_add(1);
+            if next < rc.provider.pool_auth.len()
+                && let Ok(next) = u8::try_from(next)
+            {
+                if body_replayable(session) {
+                    self.state.metrics.key_walks_total.inc();
+                    warn!(
+                        request_id = %rc.request_id,
+                        provider = rc.provider.name.as_str(),
+                        key = rc.pool_key,
+                        "upstream returned 429; trying the next pool key",
+                    );
+                    rc.pool_key = next;
+                    rc.same_provider_retry = true;
+                    let mut e =
+                        pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(status));
+                    e.set_retry(true);
+                    return Err(e);
+                }
+                warn!(
+                    request_id = %rc.request_id,
+                    provider = rc.provider.name.as_str(),
+                    status,
+                    body_done = session.as_mut().is_body_done(),
+                    "upstream returned 429 but the request body is not provably replayable; relaying",
+                );
+            }
+            // Last key, or unreplayable: relay this 429, Retry-After included.
+            return Ok(());
+        }
+
         let Some((usable, at)) = rc.auto.as_ref().map(|a| (a.usable, a.candidate)) else {
             return Ok(());
         };
-        let status = upstream_response.status.as_u16();
         if status < 500 {
             return Ok(());
         }
@@ -1516,9 +1597,7 @@ impl ProxyHttp for AiProxy {
         // The cost is real and worth naming: a 5xx that arrives while the client is still uploading
         // is relayed rather than retried, even when it would have replayed fine. That is what
         // `ai_failover_unreplayable_total` counts.
-        let replayable =
-            session.as_mut().is_body_done() && !session.as_ref().retry_buffer_truncated();
-        if !replayable {
+        if !body_replayable(session) {
             self.state.metrics.failover_unreplayable_total.inc();
             warn!(
                 request_id = %rc.request_id,
@@ -1576,18 +1655,17 @@ impl ProxyHttp for AiProxy {
             for header in STATIC_KEY_HEADERS {
                 upstream_request.remove_header(header);
             }
-            if let Some(av) = &rc.provider.pool_auth_value {
+            if let Some(auth) = rc.provider.pool_auth.get(usize::from(rc.pool_key)) {
                 // Clone the boot-built `HeaderValue` (a refcount bump) rather than re-validating and
                 // re-copying the key out of a `&str` on every managed request. The `&str` path is
                 // kept as a fallback for a key that isn't a legal header value, which could never
-                // have worked anyway — see `Provider::pool_auth_header`.
-                match &rc.provider.pool_auth_header {
+                // have worked anyway — see `PoolAuth`.
+                match &auth.header {
                     Some(hv) => {
                         upstream_request.insert_header(rc.provider.auth.header(), hv.clone())?
                     }
-                    None => {
-                        upstream_request.insert_header(rc.provider.auth.header(), av.expose())?
-                    }
+                    None => upstream_request
+                        .insert_header(rc.provider.auth.header(), auth.value.expose())?,
                 }
             }
         }
@@ -2192,7 +2270,7 @@ mod tests {
             "api.openai.com:443".to_string(),
             Dialect::OpenAi,
             AuthScheme::Bearer,
-            Some("sk-pool"),
+            &["sk-pool"],
             ProviderMetrics::disconnected(),
             None,
         );
@@ -2215,6 +2293,8 @@ mod tests {
             req_buf: Vec::new(),
             start: Instant::now(),
             attempt: 0,
+            pool_key: 0,
+            same_provider_retry: false,
             breaker_pending: false,
             auto: None,
             control: None,
