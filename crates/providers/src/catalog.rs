@@ -667,12 +667,11 @@ mod tests {
                 if c.upstream_model == route.model {
                     continue;
                 }
-                if let Some(owner) = seen.insert(c.upstream_model, route.model) {
-                    panic!(
-                        "{:?} is a candidate of both {owner:?} and {:?}",
-                        c.upstream_model, route.model
-                    );
-                }
+                assert!(
+                    seen.insert(c.upstream_model, route.model).is_none(),
+                    "{:?} is a candidate of more than one catalog row",
+                    c.upstream_model
+                );
                 assert!(
                     !MODEL_ROUTES.iter().any(|r| r.model == c.upstream_model),
                     "{:?} cannot be both a catalog name and another row's candidate id",
