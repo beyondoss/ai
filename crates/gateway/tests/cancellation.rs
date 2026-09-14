@@ -43,6 +43,7 @@ async fn client_cancellations_do_not_open_the_providers_breaker() {
         &VirtualKey {
             tenant_id: 42,
             vpc_id: 7,
+            key_id: None,
         },
         1,
         &sk,
@@ -117,6 +118,7 @@ async fn upstream_failures_still_open_the_breaker() {
         &VirtualKey {
             tenant_id: 42,
             vpc_id: 7,
+            key_id: None,
         },
         1,
         &sk,
@@ -164,6 +166,7 @@ async fn a_reused_connection_failure_is_retried_and_the_body_survives() {
         &VirtualKey {
             tenant_id: 42,
             vpc_id: 7,
+            key_id: None,
         },
         1,
         &sk,

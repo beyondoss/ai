@@ -5,8 +5,9 @@
 //! Auth and pool/signing keys come from config, so they're unaffected by NATS being down — only
 //! spend/fraud enforcement goes stale.
 //!
-//! Two sets are watched, both per-tenant and both sparse, differing only in prefix and payload: the
-//! **deny-set** (`blackhole.`, enforcement) and the **capture-set** (`aicapture.`, payload logging).
+//! Two sets are watched, both sparse, differing only in prefix and payload: the
+//! **deny-set** (`blackhole.`, enforcement — `blackhole.{tenant}` and `blackhole.key.{id}` share
+//! this one watcher) and the **capture-set** (`aicapture.`, payload logging).
 //! The seed → watch → batch-apply → reconnect loop below is written **once**, over the [`WatchedSet`]
 //! trait, and instantiated per set. That loop carries several non-obvious correctness properties —
 //! `is_resumable`'s revision-0 trap, the scan→subscribe race, batched `rcu`, backoff crediting — and
@@ -134,7 +135,7 @@ pub trait WatchedSet: Send + Sync + 'static {
     fn snapshot_path(state: &GatewayState) -> Option<String>;
 }
 
-/// The deny-set: spend/fraud holds written by the control plane under `blackhole.{tenant}`.
+/// The deny-set: spend/fraud holds under `blackhole.{tenant}` and `blackhole.key.{id}`.
 pub struct Deny;
 
 impl WatchedSet for Deny {
@@ -462,13 +463,13 @@ pub fn apply_batch(cur: &DenySet, updates: &[KvUpdate]) -> DenySet {
         match update {
             KvUpdate::Put(e) => {
                 if let Some(t) = deny::parse_key(&e.key) {
-                    set.insert(t, deny::parse_reason(&e.value));
+                    set.insert_target(t, deny::parse_reason(&e.value));
                 }
             }
             // Delete/Purge = restore (explicit delete or TTL expiry).
             KvUpdate::Delete { key, .. } | KvUpdate::Purge { key, .. } => {
                 if let Some(t) = deny::parse_key(key) {
-                    set.remove(t);
+                    set.remove_target(t);
                 }
             }
         }
@@ -476,11 +477,16 @@ pub fn apply_batch(cur: &DenySet, updates: &[KvUpdate]) -> DenySet {
     set
 }
 
-/// Build a `DenySet` from KV entries, dropping any whose key isn't a `blackhole.{tenant}`.
+/// Build a `DenySet` from KV entries, dropping any whose key isn't a `blackhole.{tenant}`
+/// or `blackhole.key.{id}`. Both shapes share the `blackhole.` watch prefix — one watcher.
 fn denyset_from_entries<'a>(entries: impl Iterator<Item = &'a KvEntry>) -> DenySet {
-    entries
-        .filter_map(|e| Some((deny::parse_key(&e.key)?, deny::parse_reason(&e.value))))
-        .collect()
+    let mut set = DenySet::new();
+    for e in entries {
+        if let Some(target) = deny::parse_key(&e.key) {
+            set.insert_target(target, deny::parse_reason(&e.value));
+        }
+    }
+    set
 }
 
 /// Rewrite the on-disk snapshot from a fresh scan: truncate, write one `Put` per live entry, and
@@ -772,7 +778,14 @@ mod tests {
         assert_eq!(Deny::PREFIX, "blackhole.");
         // And the keys `deny::parse_key` accepts must actually live under it — the prefix and the
         // parser are two halves of one contract, and agreeing with each other is the whole job.
-        assert_eq!(deny::parse_key(&format!("{}42", Deny::PREFIX)), Some(42));
+        assert_eq!(
+            deny::parse_key(&format!("{}42", Deny::PREFIX)),
+            Some(deny::DenyTarget::Tenant(42))
+        );
+        assert_eq!(
+            deny::parse_key(&format!("{}key.7", Deny::PREFIX)),
+            Some(deny::DenyTarget::Key(7))
+        );
     }
 
     #[test]
@@ -783,10 +796,12 @@ mod tests {
         let entries = [
             entry("blackhole.42", b"spend"),
             entry("blackhole.99", b"fraud"),
-            // Not a `blackhole.{tenant}` key — must be dropped, never inserted as tenant 0 or junk.
+            entry("blackhole.key.1001", b"fraud"),
+            // Not a `blackhole.{tenant}` / `blackhole.key.{id}` key — dropped.
             entry("signkey.1", b"spend"),
             // `blackhole.` with a non-numeric tail — `parse_key` rejects it, so it's dropped too.
             entry("blackhole.notanumber", b"spend"),
+            entry("blackhole.key.notanumber", b"spend"),
             // Unrecognized reason value still denies (fail-safe) under `DenyReason::Unknown`.
             entry("blackhole.7", b"mystery"),
         ];
@@ -795,15 +810,17 @@ mod tests {
 
         assert_eq!(
             set.len(),
-            3,
-            "only the three valid blackhole keys are seeded"
+            4,
+            "three tenant entries plus one key entry are seeded"
         );
         assert_eq!(set.reason(42), Some(DenyReason::Spend));
         assert_eq!(set.reason(99), Some(DenyReason::Fraud));
         assert_eq!(set.reason(7), Some(DenyReason::Unknown));
+        assert_eq!(set.reason_for(1, Some(1001)), Some(DenyReason::Fraud));
         // The malformed keys produced no entries (and crucially no spurious tenant 0).
         assert!(!set.is_denied(0));
         assert!(!set.is_denied(1));
+        assert_eq!(set.reason_for(1, Some(0)), None);
     }
 
     #[test]
@@ -836,6 +853,8 @@ mod tests {
             },
             // Foreign key in the stream must not corrupt the set.
             KvUpdate::Put(entry("signkey.1", b"spend")),
+            // Per-credential deny lives under the same prefix; must apply, not look like tenant 0.
+            KvUpdate::Put(entry("blackhole.key.500", b"spend")),
         ];
 
         let batched = apply_batch(&DenySet::new(), &updates);
@@ -845,9 +864,10 @@ mod tests {
         }
 
         assert_eq!(batched.len(), sequential.len());
-        assert_eq!(batched.len(), 1, "only tenant 1 survives the batch");
+        assert_eq!(batched.len(), 2, "tenant 1 and key 500 survive the batch");
         assert_eq!(batched.reason(1), Some(DenyReason::Fraud)); // last Put wins
         assert_eq!(sequential.reason(1), Some(DenyReason::Fraud));
+        assert_eq!(batched.reason_for(9, Some(500)), Some(DenyReason::Spend));
         assert!(!batched.is_denied(2)); // deleted
         assert!(!batched.is_denied(9)); // purge of an absent tenant
         assert!(!batched.is_denied(0)); // `signkey.1` never became tenant 0

@@ -9,7 +9,7 @@
 
 mod common;
 
-use beyond_ai::key::{VirtualKey, mint};
+use beyond_ai::key::{VirtualKey, mint, mint_v2};
 use common::*;
 
 fn body_for(model: &str) -> String {
@@ -97,6 +97,7 @@ async fn managed_swaps_key_relays_body_and_meters_usage() {
         &VirtualKey {
             tenant_id: 42,
             vpc_id: 7,
+            key_id: None,
         },
         1,
         &sk,
@@ -158,6 +159,7 @@ async fn managed_openai_stream_relays_a_large_multichunk_body() {
         &VirtualKey {
             tenant_id: 42,
             vpc_id: 7,
+            key_id: None,
         },
         1,
         &sk,
@@ -223,6 +225,7 @@ async fn fireworks_path_prefix_strips_and_swaps_pool_key() {
         &VirtualKey {
             tenant_id: 5,
             vpc_id: 6,
+            key_id: None,
         },
         1,
         &sk,
@@ -276,6 +279,7 @@ async fn openai_prefix_matches_bare_default() {
         &VirtualKey {
             tenant_id: 1,
             vpc_id: 1,
+            key_id: None,
         },
         1,
         &sk,
@@ -320,6 +324,7 @@ async fn unknown_provider_segment_returns_404() {
         &VirtualKey {
             tenant_id: 1,
             vpc_id: 1,
+            key_id: None,
         },
         1,
         &sk,
@@ -346,6 +351,7 @@ async fn streaming_relays_sse_and_meters_usage() {
         &VirtualKey {
             tenant_id: 7,
             vpc_id: 1,
+            key_id: None,
         },
         1,
         &sk,
@@ -409,6 +415,7 @@ async fn streaming_injects_usage_option_when_the_path_carries_a_query_string() {
         &VirtualKey {
             tenant_id: 7,
             vpc_id: 1,
+            key_id: None,
         },
         1,
         &sk,
@@ -453,6 +460,7 @@ async fn blackhole_denies_then_restores() {
         &VirtualKey {
             tenant_id: 99,
             vpc_id: 1,
+            key_id: None,
         },
         1,
         &sk,
@@ -490,6 +498,7 @@ async fn blackhole_fraud_returns_403() {
         &VirtualKey {
             tenant_id: 1234,
             vpc_id: 1,
+            key_id: None,
         },
         1,
         &sk,
@@ -513,6 +522,45 @@ async fn blackhole_fraud_returns_403() {
 }
 
 #[tokio::test]
+async fn blackhole_key_denies_one_credential_tenant_denies_both() {
+    // Two v2 keys, same tenant, distinct key_ids. Cutting off one credential must not take the
+    // other with it; a tenant deny still 402s both.
+    let nats = Nats::start().await;
+    let (pubkey, sk) = test_keypair(22);
+    let mock = MockUpstream::start(Mode::Json).await;
+    let gw = Gateway::start(nats.port, &mock.authority(), &b64(&pubkey)).await;
+
+    let id = VirtualKey {
+        tenant_id: 77,
+        vpc_id: 1,
+        key_id: None,
+    };
+    let key_a = mint_v2(&id, 9001, 1, &sk);
+    let key_b = mint_v2(&id, 9002, 1, &sk);
+    let client = test_client();
+
+    let probe = |key: String, want: u16| {
+        let (c, u) = (client.clone(), gw.url());
+        async move {
+            wait_for_status(want, move || {
+                let (c, u, k) = (c.clone(), u.clone(), key.clone());
+                async move { post_status(&c, &u, &k, body_for("gpt-4o")).await }
+            })
+            .await
+        }
+    };
+
+    probe(key_a.clone(), 200).await;
+    probe(key_b.clone(), 200).await;
+    put_kv(nats.port, "blackhole.key.9001", b"spend").await;
+    probe(key_a.clone(), 402).await; // this credential only
+    probe(key_b.clone(), 200).await; // sibling still serves
+    put_kv(nats.port, "blackhole.77", b"spend").await;
+    probe(key_a.clone(), 402).await;
+    probe(key_b, 402).await; // tenant deny kills every key
+}
+
+#[tokio::test]
 async fn oversized_content_length_is_rejected_413() {
     let nats = Nats::start().await;
     let (pubkey, sk) = test_keypair(21);
@@ -522,6 +570,7 @@ async fn oversized_content_length_is_rejected_413() {
         &VirtualKey {
             tenant_id: 1,
             vpc_id: 1,
+            key_id: None,
         },
         1,
         &sk,
@@ -672,6 +721,7 @@ async fn managed_key_via_x_api_key_header_is_accepted() {
         &VirtualKey {
             tenant_id: 8,
             vpc_id: 8,
+            key_id: None,
         },
         1,
         &sk,
@@ -704,6 +754,7 @@ async fn managed_key_for_unconfigured_provider_returns_503() {
         &VirtualKey {
             tenant_id: 11,
             vpc_id: 1,
+            key_id: None,
         },
         1,
         &sk,
@@ -741,6 +792,7 @@ async fn anthropic_dialect_swaps_key_relays_and_meters() {
         &VirtualKey {
             tenant_id: 77,
             vpc_id: 2,
+            key_id: None,
         },
         1,
         &sk,
@@ -799,6 +851,7 @@ async fn long_anthropic_stream_still_meters_input_and_cache_tokens() {
         &VirtualKey {
             tenant_id: 78,
             vpc_id: 2,
+            key_id: None,
         },
         1,
         &sk,
@@ -902,6 +955,7 @@ async fn deny_set_is_fail_open_when_nats_drops() {
         &VirtualKey {
             tenant_id: 555,
             vpc_id: 1,
+            key_id: None,
         },
         1,
         &sk,
@@ -910,6 +964,7 @@ async fn deny_set_is_fail_open_when_nats_drops() {
         &VirtualKey {
             tenant_id: 556,
             vpc_id: 1,
+            key_id: None,
         },
         1,
         &sk,
@@ -949,6 +1004,7 @@ async fn streaming_tail_compaction_preserves_usage_event() {
         &VirtualKey {
             tenant_id: 21,
             vpc_id: 1,
+            key_id: None,
         },
         1,
         &sk,
@@ -996,6 +1052,7 @@ async fn on_disk_snapshot_enforces_across_restart_without_nats() {
         &VirtualKey {
             tenant_id: 8800,
             vpc_id: 1,
+            key_id: None,
         },
         1,
         &sk,
@@ -1004,6 +1061,7 @@ async fn on_disk_snapshot_enforces_across_restart_without_nats() {
         &VirtualKey {
             tenant_id: 8801,
             vpc_id: 1,
+            key_id: None,
         },
         1,
         &sk,
@@ -1192,6 +1250,7 @@ async fn managed_429_walks_the_next_pool_key() {
         &VirtualKey {
             tenant_id: 31,
             vpc_id: 1,
+            key_id: None,
         },
         1,
         &sk,
@@ -1248,6 +1307,7 @@ async fn one_pool_key_relays_429_with_retry_after() {
         &VirtualKey {
             tenant_id: 32,
             vpc_id: 1,
+            key_id: None,
         },
         1,
         &sk,
@@ -1300,6 +1360,7 @@ async fn unreplayable_body_relays_429_without_walking() {
         &VirtualKey {
             tenant_id: 33,
             vpc_id: 1,
+            key_id: None,
         },
         1,
         &sk,

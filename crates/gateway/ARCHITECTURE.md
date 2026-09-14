@@ -12,23 +12,23 @@ published `beyond-slipstream` — clones, CI-builds, and publishes anywhere.
 
 ## Concepts & Terminology
 
-| Term                                             | What It Controls / Gates                                                                                                                                                          | NOT                                                                          |
-| ------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------- |
-| **Managed key** (`bai_v1.…`)                     | Ed25519-verified identity; enables key swap, deny-set check, and `ai.usage` billing                                                                                               | A session token or capability grant — just tenant attribution                |
-| **BYO key** (anything else)                      | Forwarded as-is to the provider; no swap, no billing, no deny-set                                                                                                                 | A lesser tier — same proxy, minus attribution and billing                    |
-| **Pool key**                                     | Real provider API key(s) held by the gateway; swapped in for managed traffic. A 429 walks the next unused key on the _same_ provider                                              | Per-tenant — keys are per provider, shared by all managed callers            |
-| **Tenant**                                       | The billing entity from the virtual key payload (`tenant_id: u64`)                                                                                                                | An org, user, or namespace — an opaque integer the gateway doesn't interpret |
-| **Dialect**                                      | A provider attribute (OpenAI-wire vs Anthropic-wire) driving usage parsing; for a bare-path request it's derived from the path to pick the default provider                       | The provider — a prefixed request uses its provider's dialect, not the path  |
-| **Provider**                                     | The request's **first path segment** (`/{provider}/…`); a named row in the routing table: authority, dialect, auth scheme                                                         | A vendor relationship — just connection facts and auth wiring                |
-| **Model route** (`/auto/…`)                      | Reserved first segment; provider, upstream path, and model id all come from the catalog row named by the `x-beyond-model` header, and the body's `model` is rewritten per attempt | A dialect translator — candidates must share a wire format                   |
-| **Candidate**                                    | One `(provider, upstream model id, path)` a catalog row will accept, in preference order; tried on a connect failure                                                              | A load-balancing pool — strictly ordered, and only entered on failure        |
-| **Deny-set**                                     | Sparse map of denied `tenant_id`s → reason; gates managed traffic; default-allow                                                                                                  | An allowlist or ACL — misses are allowed, not blocked                        |
-| **Tail tap**                                     | Bounded 64KB window kept from the end of the response for usage extraction                                                                                                        | A buffer or copy — the response is relayed unbuffered; only the tail is kept |
-| **Capture-set**                                  | Sparse map of `tenant_id`s with payload logging on; default-**off**; watched under its own prefix by its own watcher                                                              | Retention policy — the gateway emits and forgets; the store owns TTL/erasure |
-| **Capture tap**                                  | Bounded **head**-keeping copy of each body, taken pre-rewrite; relayed bytes are untouched                                                                                        | A buffer — nothing is withheld, so it costs memcpy, never latency            |
-| **Control header** (`x-beyond-*`)                | Per-request caller input: `metadata` tags, `capture` on/off. Managed only; stripped before the upstream                                                                           | A way to fail a request — unusable values are dropped and counted, never 4xx |
-| **Snapshot**                                     | On-disk deny-set cache (entries + NATS cursor) for edge/tunnel deployments                                                                                                        | Persistent store — a pure cache; delete it and the gateway re-scans NATS     |
-| **Virtual key** (`bai_v1.{kid}.{payload}.{sig}`) | Ed25519-signed token encoding `tenant_id` + `vpc_id` (16-byte fixed payload)                                                                                                      | A session or auth token — stateless, no server-side lookup, no revocation    |
+| Term                                      | What It Controls / Gates                                                                                                                                                          | NOT                                                                          |
+| ----------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------- |
+| **Managed key** (`bai_v1.…` / `bai_v2.…`) | Ed25519-verified identity; enables key swap, deny-set check, and `ai.usage` billing                                                                                               | A session token or capability grant — just tenant attribution                |
+| **BYO key** (anything else)               | Forwarded as-is to the provider; no swap, no billing, no deny-set                                                                                                                 | A lesser tier — same proxy, minus attribution and billing                    |
+| **Pool key**                              | Real provider API key(s) held by the gateway; swapped in for managed traffic. A 429 walks the next unused key on the _same_ provider                                              | Per-tenant — keys are per provider, shared by all managed callers            |
+| **Tenant**                                | The billing entity from the virtual key payload (`tenant_id: u64`)                                                                                                                | An org, user, or namespace — an opaque integer the gateway doesn't interpret |
+| **Dialect**                               | A provider attribute (OpenAI-wire vs Anthropic-wire) driving usage parsing; for a bare-path request it's derived from the path to pick the default provider                       | The provider — a prefixed request uses its provider's dialect, not the path  |
+| **Provider**                              | The request's **first path segment** (`/{provider}/…`); a named row in the routing table: authority, dialect, auth scheme                                                         | A vendor relationship — just connection facts and auth wiring                |
+| **Model route** (`/auto/…`)               | Reserved first segment; provider, upstream path, and model id all come from the catalog row named by the `x-beyond-model` header, and the body's `model` is rewritten per attempt | A dialect translator — candidates must share a wire format                   |
+| **Candidate**                             | One `(provider, upstream model id, path)` a catalog row will accept, in preference order; tried on a connect failure                                                              | A load-balancing pool — strictly ordered, and only entered on failure        |
+| **Deny-set**                              | Sparse maps of denied `tenant_id`s and `key_id`s → reason; gates managed traffic; default-allow; tenant deny kills every key                                                      | An allowlist or ACL — misses are allowed, not blocked                        |
+| **Tail tap**                              | Bounded 64KB window kept from the end of the response for usage extraction                                                                                                        | A buffer or copy — the response is relayed unbuffered; only the tail is kept |
+| **Capture-set**                           | Sparse map of `tenant_id`s with payload logging on; default-**off**; watched under its own prefix by its own watcher                                                              | Retention policy — the gateway emits and forgets; the store owns TTL/erasure |
+| **Capture tap**                           | Bounded **head**-keeping copy of each body, taken pre-rewrite; relayed bytes are untouched                                                                                        | A buffer — nothing is withheld, so it costs memcpy, never latency            |
+| **Control header** (`x-beyond-*`)         | Per-request caller input: `metadata` tags, `capture` on/off. Managed only; stripped before the upstream                                                                           | A way to fail a request — unusable values are dropped and counted, never 4xx |
+| **Snapshot**                              | On-disk deny-set cache (entries + NATS cursor) for edge/tunnel deployments                                                                                                        | Persistent store — a pure cache; delete it and the gateway re-scans NATS     |
+| **Virtual key** (`bai_v1` / `bai_v2`)     | Ed25519-signed token: v1 is `tenant_id`+`vpc_id` (16 B); v2 adds unique `key_id` (24 B). Same keyring.                                                                            | A session or auth token — stateless, no server-side lookup                   |
 
 ---
 
@@ -51,7 +51,7 @@ Client (stock OpenAI/Anthropic SDK)
   │  │    global BYO aggregate (managed exempt)  ─────────────────► 429
   │  ├─ Content-Length abuse guard  ──────────────────────────────► 413
   │  └─ Identity branch:
-  │       bai_v1.…  → Ed25519 verify → deny-set check (O(1))
+  │       bai_v1/v2.…  → Ed25519 verify → deny-set (tenant OR key_id, O(1))
   │       │               │                    │
   │       │             401 (bad sig)     402 Spend / 403 Fraud
   │       │                                    │
@@ -111,7 +111,7 @@ Client (stock OpenAI/Anthropic SDK)
   │
   ▼  logging (proxy.rs)
      Parse usage from tail (by dialect + streaming flag)
-     Emit ai.usage fact: tenant, vpc, model, requested_model, routed_model, token counts +
+     Emit ai.usage fact: tenant, vpc, key_id, model, requested_model, routed_model, token counts +
        reasoning breakout, + x-beyond-metadata tags (managed only) → blocking stdout, lossless
      Capturing: emit ai.payload (both bodies, truncation + completeness flags), correlated by
        request_id → bounded queue, DROPPED on overflow so a stalled sink can't backpressure
@@ -249,12 +249,30 @@ Anthropic → OpenRouter until a live-verified Bedrock inference-profile id is a
 
 ### Identity (`key.rs`)
 
-Virtual key format: `bai_v1.{kid}.{payload}.{sig}` where payload is exactly 16 bytes (8-byte
-`tenant_id` + 8-byte `vpc_id`, little-endian u64). Verification is **stateless Ed25519** — no
+Virtual key format: `bai_vN.{kid}.{payload}.{sig}`. Both versions are **stateless Ed25519** — no
 database, no network call. The keyring holds multiple `kid` → public key mappings simultaneously
 (zero-downtime rotation: add the new kid, deploy, remove the old kid). A tampered or forged key
-that carries the `bai_v1` prefix is **fail-closed: 401**, never BYO. One branch in
-`request_filter`: prefix match → verify; verify failure → 401. Anything else is BYO.
+that carries a managed prefix (`bai_v1` / `bai_v2`) is **fail-closed: 401**, never BYO. One
+branch in `request_filter`: prefix match → verify; verify failure → 401. Anything else is BYO.
+
+**v1** payload is 16 bytes little-endian: `tenant_id u64 || vpc_id u64`. `mint(tenant, vpc)` is
+deterministic. There is no per-credential identity, so a v1 token can only be cut off by
+`blackhole.{tenant}`.
+
+**v2** payload is 24 bytes little-endian: `tenant_id u64 || vpc_id u64 || key_id u64`. `mint_v2`
+takes an **explicit** `key_id` (not derived from tenant+vpc). Two credentials for the same
+tenant are distinct tokens. Control-plane mint (Go) must match this layout exactly:
+
+```
+token       = "bai_v2" "." kid "." payload_b64 "." sig_b64
+payload     = tenant_id || vpc_id || key_id     // 24 bytes, little-endian u64s
+payload_b64 = base64url(payload)                // no padding, 32 chars
+signed      = "bai_v2" "." kid "." payload_b64  // Ed25519 message
+sig_b64     = base64url(sig)                    // no padding, 86 chars
+```
+
+`vpc_id` is still not an access check — decoded and emitted on `ai.usage` only. `key_id` is
+emitted on `ai.usage` (`None` for v1).
 
 Verification cost ≈ 28µs per request — this is the gateway's only meaningful per-request CPU cost
 (everything else runs in nanoseconds; see Benchmarking). The rate guardrails sit **before** verify
@@ -309,9 +327,12 @@ tripping `usage_parse_errors_total` (see Metrics) instead of a silent zero-billi
 
 ### Deny-Set (`deny.rs`)
 
-A `HashMap<u64, DenyReason>` (tenant_id → reason). Only denied tenants are stored — the map is
-`O(denied)` in memory regardless of total tenant count. Lookup is one hash probe. Written
-exclusively by the NATS watcher via `ArcSwap`; reads on the hot path are lock-free.
+Two `HashMap<u64, DenyReason>`s — tenants (`blackhole.{tenant}`) and credentials
+(`blackhole.key.{id}`). Only denied ids are stored: `O(denied)` memory, not `O(tenants)`. A
+request is denied if the tenant is in the set **or** (v2) its `key_id` is. Tenant deny wins when
+both match and kills every key for that tenant. v1 tokens have no `key_id`, so only the tenant
+map can deny them. Both key shapes live under the `blackhole.` prefix; one `WatchedSet` watcher
+applies both. Written exclusively via `ArcSwap`; reads on the hot path are lock-free.
 
 Reasons: `Spend` (→ 402), `Fraud` (→ 403), `Unknown` (→ 403, fail-safe for unrecognized values).
 Restore = explicit delete from NATS KV or TTL expiry — no gateway-side timer.
@@ -696,8 +717,8 @@ prefix requires no SDK modification.
 **What the gateway verifies (rejects if invalid):**
 
 - Virtual key signature (Ed25519, stateless — no DB lookup)
-- Virtual key format (`bai_v1.{kid}.{payload}.{sig}`, fixed 16-byte payload)
-- Tenant not in deny-set (managed traffic only; O(1) HashMap lookup)
+- Virtual key format (`bai_v1` 16-byte payload, `bai_v2` 24-byte payload with `key_id`)
+- Tenant / key not in deny-set (managed traffic only; O(1) HashMap lookup; tenant deny kills every key)
 - Pool key configured for the requested provider (managed traffic only — else 503)
 - Request body size ≤ `MAX_REQUEST_BODY` (declared `Content-Length` + streaming running total)
 - Per-credential request rate within ceiling; aggregate BYO rate within ceiling
@@ -854,8 +875,10 @@ Prometheus on the default registry, exposed at `/metrics` on `metrics_listen`.
   nats-server + mock upstream. Covers managed key-swap + passthrough fidelity + usage metering
   (OpenAI JSON + SSE, **Anthropic `/v1/messages`** with `x-api-key` swap + metering), **BYO
   passthrough** (raw token unchanged), the **virtual key in either inbound header** (`Bearer` or
-  `x-api-key`), and deny-set propagation: spend (write `blackhole.{tenant}` → 402, delete → 200)
-  and **fraud** (→ 403). Error/edge paths: **missing key → 401**, **oversized `Content-Length` →
+  `x-api-key`), and deny-set propagation: spend (write `blackhole.{tenant}` → 402, delete → 200),
+  **fraud** (→ 403), and **per-credential** (write `blackhole.key.{id}` → 402 for that `bai_v2`
+  key only; a sibling key for the same tenant still serves; tenant deny then 402s both).
+  Error/edge paths: **missing key → 401**, **oversized `Content-Length` →
   413**, **managed key for an unconfigured provider → 503**, **managed 429 key-walk** (two keys,
   first throttled, second serves; one key and an unreplayable body still relay 429 with
   `Retry-After`; BYO does not walk), **streaming tail compaction** (>128KB

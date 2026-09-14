@@ -93,6 +93,7 @@ async fn start_stack_with(mode: Mode) -> Stack {
         &VirtualKey {
             tenant_id: 42,
             vpc_id: 7,
+            key_id: None,
         },
         1,
         &sk,
@@ -146,6 +147,7 @@ async fn start_auto_stack() -> Stack {
         &VirtualKey {
             tenant_id: 42,
             vpc_id: 7,
+            key_id: None,
         },
         1,
         &sk,
@@ -197,6 +199,7 @@ async fn start_auto_failover_stack() -> Stack {
         &VirtualKey {
             tenant_id: 42,
             vpc_id: 7,
+            key_id: None,
         },
         1,
         &sk,
@@ -292,6 +295,7 @@ async fn start_anthropic_stack(mode: Mode) -> Stack {
         &VirtualKey {
             tenant_id: 42,
             vpc_id: 7,
+            key_id: None,
         },
         1,
         &sk,
@@ -646,6 +650,7 @@ fn bench_concurrency(c: &mut Criterion) {
         &VirtualKey {
             tenant_id: 42,
             vpc_id: 7,
+            key_id: None,
         },
         1,
         &sk,
@@ -730,6 +735,7 @@ fn bench_worker_threads(c: &mut Criterion) {
         &VirtualKey {
             tenant_id: 42,
             vpc_id: 7,
+            key_id: None,
         },
         1,
         &sk,

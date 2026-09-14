@@ -182,6 +182,8 @@ pub struct AiProxy {
 pub struct RequestCtx {
     tenant_id: u64,
     vpc_id: u64,
+    /// `bai_v2` credential id. `None` for v1 (and BYO). Emitted on `ai.usage`; used with the deny-set.
+    key_id: Option<u64>,
     dialect: Dialect,
     /// The resolved upstream provider (authority/host + precomputed managed auth value), shared from
     /// the boot-time registry — a cheap `Arc` clone, nothing re-allocated per request.
@@ -194,7 +196,7 @@ pub struct RequestCtx {
     /// distinction is in the type rather than discovered by rebuilding the path and comparing it,
     /// so the common route allocates nothing.
     forward_path: Option<String>,
-    /// Whether this is a **managed** request (`bai_v1…` key → swap to the pool key). `false` for
+    /// Whether this is a **managed** request (`bai_v1…` / `bai_v2…` key → swap to the pool key). `false` for
     /// **BYO** — we leave the user's own auth header untouched (passthrough).
     managed: bool,
     /// Model the client *requested*, extracted from the request body. This is the billing-log
@@ -1031,12 +1033,13 @@ impl ProxyHttp for AiProxy {
             .await;
         }
 
-        // 5. Identity + key handling. One branch: `bai_v1…` is fail-closed (prefix match → verify;
-        // any verify failure is 401, never BYO). Anything else → BYO: the user's own provider
-        // token, passed through unchanged (no Beyond identity, so no deny-set and no per-tenant
-        // attribution). A public listener without this split would forward a forged `bai_v1` as
-        // BYO — junk-auth egress, and the rate guard already exempted it from the BYO aggregate.
-        let (tenant_id, vpc_id, managed) = if key::is_managed_prefix(raw_key) {
+        // 5. Identity + key handling. One branch: `bai_v1`/`bai_v2` is fail-closed (prefix match →
+        // verify; any verify failure is 401, never BYO). Anything else → BYO: the user's own
+        // provider token, passed through unchanged (no Beyond identity, so no deny-set and no
+        // per-tenant attribution). A public listener without this split would forward a forged
+        // virtual key as BYO — junk-auth egress, and the rate guard already exempted it from the
+        // BYO aggregate.
+        let (tenant_id, vpc_id, key_id, managed) = if key::is_managed_prefix(raw_key) {
             let Ok(identity) = self.state.keyring.verify(raw_key) else {
                 self.state.metrics.rejection(Rejection::Auth).inc();
                 return Self::reject_boxed(
@@ -1048,8 +1051,13 @@ impl ProxyHttp for AiProxy {
                 )
                 .await;
             };
-            // Deny-set: O(1), default-allow. The gateway never learns *why*, only the reason code.
-            if let Some(reason) = self.state.deny.load().reason(identity.tenant_id) {
+            // Deny-set: O(1), default-allow. Tenant deny OR (v2) key deny. Tenant wins if both.
+            if let Some(reason) = self
+                .state
+                .deny
+                .load()
+                .reason_for(identity.tenant_id, identity.key_id)
+            {
                 // Distinct label per reason — `Unknown` is *not* folded into `deny_fraud`. An
                 // `Unknown` arises when the control plane writes a reason string this gateway
                 // doesn't recognize (a control-plane deploy ahead of a gateway deploy), which would
@@ -1086,9 +1094,9 @@ impl ProxyHttp for AiProxy {
                 )
                 .await;
             }
-            (identity.tenant_id, identity.vpc_id, true)
+            (identity.tenant_id, identity.vpc_id, identity.key_id, true)
         } else {
-            (0, 0, false)
+            (0, 0, None, false)
         };
 
         // Model routing is **managed-only**, and the first candidate is chosen here.
@@ -1256,6 +1264,7 @@ impl ProxyHttp for AiProxy {
         *ctx = Some(RequestCtx {
             tenant_id,
             vpc_id,
+            key_id,
             dialect,
             provider,
             forward_path,
@@ -2195,6 +2204,7 @@ impl ProxyHttp for AiProxy {
                 request_id = %rc.request_id,
                 tenant_id = rc.tenant_id,
                 vpc_id = rc.vpc_id,
+                key_id = rc.key_id,
                 provider = rc.provider.name.as_str(),
                 model = billed_model,
                 requested_model,
@@ -2277,6 +2287,7 @@ mod tests {
         RequestCtx {
             tenant_id: 42,
             vpc_id: 7,
+            key_id: None,
             dialect: Dialect::OpenAi,
             provider: Arc::new(provider),
             forward_path: None,
@@ -2393,12 +2404,14 @@ mod tests {
     /// A ceiling rather than an equality: padding and field order are the compiler's business, and a
     /// few bytes either way is not what this guards. What it guards is someone adding a `String` or
     /// an `Instant` here without noticing that the cost is paid per chunk on every stream.
+    /// `key_id` (identity, every managed request) is why 384 became 416 — do not spend that slack
+    /// on route-specific state.
     #[test]
     fn request_ctx_stays_small_enough_to_be_cheap_per_chunk() {
         let size = std::mem::size_of::<RequestCtx>();
         assert!(
-            size <= 384,
-            "RequestCtx grew to {size} bytes (ceiling 384). It is touched once per response chunk \
+            size <= 416,
+            "RequestCtx grew to {size} bytes (ceiling 416). It is touched once per response chunk \
              on a stream — if the new state is only needed on one route, box it the way \
              `ModelRouting` is rather than paying for it on every request.",
         );
