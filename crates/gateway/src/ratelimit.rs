@@ -7,7 +7,7 @@
 //! cap velocity, both charged in `proxy::request_filter` *before* the Ed25519 verify and the upstream
 //! connect, so a flood can't drive unbounded crypto/socket work:
 //!
-//! 1. **Per-credential** — keyed by the raw presented credential (the whole `bai_…` virtual key or
+//! 1. **Per-credential** — keyed by the raw presented credential (the whole `bai_v1…` virtual key or
 //!    BYO token). Catches a single leaked/runaway key. Granularity is per-credential: managed virtual
 //!    keys are deterministic per `(tenant, app)`, so this is effectively a per-(tenant, app) ceiling —
 //!    one credential's runaway can't throttle another. A flood of *distinct* credentials slips past
@@ -18,8 +18,9 @@
 //!    connections to providers from our egress IPs, getting them rate-limited or banned (we put
 //!    ourselves in the firing line). This bounds that aggregate regardless of how the tokens vary.
 //!    **Managed traffic is exempt** — it's Ed25519-verified before any upstream connect and can't be
-//!    forged (the signing key lives only in the control plane), so a random `bai_` flood fails verify
-//!    and never reaches a provider (CPU only, no egress impact). Exempting it means this shared bucket
+//!    forged (the signing key lives only in the control plane), so a random `bai_v1` flood fails
+//!    verify (401, fail-closed) and never reaches a provider (CPU only, no egress impact). Exempting
+//!    it means this shared bucket
 //!    only ever sheds BYO load under a flood, never the core managed tenants.
 //!
 //! Both tiers are deliberately generous: ceilings well above legitimate steady state, so they never
@@ -99,7 +100,7 @@ use std::time::{Duration, Instant};
 ///   global BYO ceiling **before** it touches the sketch. An unbounded junk-token flood is already
 ///   shed a tier earlier and never lands here.
 /// - Managed traffic is the unbounded term. It is exempt from tier 2 by design, and a flood of
-///   forged `bai_…` strings is charged here in full — it is only rejected later, at verify.
+///   forged `bai_v1…` strings is charged here in full — it is only rejected later, at verify.
 ///
 /// So `peak_N` ≈ the peak *managed* rps a single node can accept. **Assume 100k rps.** A flood of
 /// distinct forged keys cannot outrun the node's Ed25519 verify throughput (22.9 µs/verify measured
@@ -406,7 +407,7 @@ impl RateLimit {
         (now.saturating_duration_since(self.start).as_millis() as u64) / WINDOW_MS
     }
 
-    /// Charge one request. `managed` is `true` for a verified-path (`bai_…`) credential, `false` for
+    /// Charge one request. `managed` is `true` for a verified-path (`bai_v1…`) credential, `false` for
     /// BYO. Returns `None` when within budget, or `Some(reason)` once a ceiling is crossed — the very
     /// request that crosses the line is the first one rejected (`observe` returns the running total).
     /// The credential itself is never stored; only its seeded digest feeds the per-credential sketch.

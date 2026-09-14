@@ -21,7 +21,19 @@ use std::collections::HashMap;
 
 /// Wire prefix + version. Bumping the version is a breaking change to the token format;
 /// the version is inside the signed bytes so it cannot be downgraded by an attacker.
+///
+/// `request_filter` fail-closes on this prefix: a match that then fails verify is 401, never BYO.
 pub const PREFIX: &str = "bai_v1";
+
+/// Whether a presented credential claims to be a managed virtual key (`bai_v1…`).
+///
+/// Used by the identity branch and the rate-guard managed flag — they must agree. A prefix match
+/// is fail-closed at verify (401), so classifying it as managed here also exempts a forged flood
+/// from the BYO aggregate without ever forwarding it upstream.
+#[inline]
+pub fn is_managed_prefix(token: &str) -> bool {
+    token.starts_with(PREFIX)
+}
 
 /// Signing-key identifier. Lets the control plane rotate signing keys: new tokens are minted
 /// under a new `kid` while the gateway still trusts the public keys of older, un-retired `kid`s.
@@ -381,5 +393,15 @@ mod tests {
             ring.verify("sk-openai.1.aaaa.bbbb"),
             Err(KeyError::Malformed)
         );
+    }
+
+    #[test]
+    fn managed_prefix_is_exactly_bai_v1() {
+        assert!(is_managed_prefix("bai_v1.1.payload.sig"));
+        // A future version is not this prefix — it must not steal the managed branch
+        // (and the BYO-aggregate exemption) until verify knows how to accept it.
+        assert!(!is_managed_prefix("bai_v2.1.aaaa.bbbb"));
+        assert!(!is_managed_prefix("bai_"));
+        assert!(!is_managed_prefix("sk-openai"));
     }
 }

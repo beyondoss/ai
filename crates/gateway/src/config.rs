@@ -76,12 +76,12 @@ pub struct AiConfig {
     /// → base64 public key. Multiple allowed for zero-downtime rotation. Config, not NATS.
     pub signing_keys: HashMap<String, String>,
 
-    /// Fail the boot if `signing_keys` is empty, instead of degrading to BYO-only. Empty signing
-    /// keys is a *legitimate* mode (a BYO-only deployment) but is far more often a mis-deploy — a
-    /// typo'd/absent SSM param — that looks healthy while silently dropping **all** managed billing
-    /// and deny-set enforcement. A managed deployment should set this `true` so a bad deploy fails
-    /// fast and visibly at boot rather than serving for free. Default `false` to keep BYO-only and
-    /// the test/e2e harnesses (which run keyless) working out of the box.
+    /// Fail the boot if `signing_keys` is empty, instead of serving BYO-only with every `bai_v1`
+    /// token 401ing (fail-closed). Empty signing keys is a *legitimate* mode (a BYO-only
+    /// deployment) but is far more often a mis-deploy — a typo'd/absent SSM param — that 401s
+    /// every managed client. A managed deployment should set this `true` so a bad deploy fails
+    /// fast and visibly at boot. Default `false` to keep BYO-only and the test/e2e harnesses
+    /// (which run keyless) working out of the box.
     pub require_signing_keys: bool,
 
     /// Managed Beyond pool keys, **by provider name** (`openai`, `anthropic`, `fireworks`, …).
@@ -312,8 +312,8 @@ impl AiConfig {
         // for the merge.
         let defaults = pre_read(figment::providers::Serialized::defaults(AiConfig::default()))?;
         // Catch a typo'd key in the operator's own TOML *before* any of it merges — a misspelled
-        // `require_signing_keys` would otherwise load its default and silently drop all managed
-        // billing while the gateway looks healthy. Only the TOML file is checked (see the
+        // `require_signing_keys` would otherwise load its default and 401 every managed client
+        // while the gateway looks healthy. Only the TOML file is checked (see the
         // `deny_unknown_fields` note on `AiConfig`); the env layer must stay lenient.
         let toml = read_toml(toml_path)?;
         reject_unknown_toml_keys(toml_path, &defaults, &toml)?;

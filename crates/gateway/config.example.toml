@@ -193,6 +193,7 @@ capture_queue_depth = 1024
 # fireworks-anthropic = "fw-..."   # same Fireworks account key, second alias — see provider_authorities above
 
 # Trusted Ed25519 signing PUBLIC keys (kid -> base64). Multiple for zero-downtime rotation.
-# Managed virtual keys (bai_…) are verified against these; BYO raw tokens skip verification.
+# Managed virtual keys (bai_v1…) are verified against these; a prefix match that fails verify
+# is 401 (fail-closed), never BYO. BYO raw tokens skip verification.
 [signing_keys]
 # 1 = "<base64-ed25519-public-key>"

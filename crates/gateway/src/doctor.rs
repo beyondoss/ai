@@ -157,14 +157,14 @@ fn dedup_joined(mut items: Vec<String>) -> String {
 }
 
 /// The signing keyring is what authenticates managed traffic. An empty or invalid keyring isn't a
-/// hard boot failure (the gateway still serves BYO), but it silently turns *every* `bai_…` key into a
+/// hard boot failure (the gateway still serves BYO), but it fail-closes *every* `bai_v1` key into a
 /// 401 — a footgun worth surfacing loudly here. `build_keyring` already rejects a non-numeric kid or
 /// an unparseable public key, so a success means every configured key installed.
 fn check_signing_keys(config: &AiConfig) -> CheckResult {
     match config.build_keyring() {
         Ok(ring) if ring.is_empty() => fail(
             "signing_keys",
-            "no signing keys configured — all managed (bai_…) traffic will 401, only BYO works",
+            "no signing keys configured — all managed (bai_v1) traffic will 401, only BYO works",
             "set [signing_keys] (kid → base64 Ed25519 public key) in config or AI_ env",
         ),
         Ok(ring) => pass(

@@ -26,10 +26,11 @@
 //! The Responses API needs no such injection — it always reports usage on its terminal event — so it
 //! stays pure passthrough too (see `is_streamable_path`).
 //!
-//! Auth branches on key format: `bai_…` is a managed virtual key (verify → deny-check → swap to
-//! the pool key); anything else is a **BYO** request — the user's own provider token, passed
-//! through unchanged (no swap, no Beyond identity, no deny-set). The key is read from whichever
-//! header (or, for Google Gemini, query param) the client's SDK uses — see `extract_virtual_key`.
+//! Auth branches on key format: `bai_v1…` is a managed virtual key (verify → deny-check → swap to
+//! the pool key; verify failure is **401, never BYO**); anything else is a **BYO** request — the
+//! user's own provider token, passed through unchanged (no swap, no Beyond identity, no deny-set).
+//! The key is read from whichever header (or, for Google Gemini, query param) the client's SDK
+//! uses — see `extract_virtual_key`.
 //!
 //! Routing is by the **first path segment** = provider name (`route`, data-driven): `/{provider}/…`
 //! selects the provider and the rest of the path is forwarded **verbatim** (the gateway holds no
@@ -41,6 +42,7 @@
 //! used for routing (the body isn't read pre-connect); it's still captured from the body for usage.
 
 use crate::capture::CaptureBufs;
+use crate::key;
 use crate::metrics::Rejection;
 use crate::route::{self, Dialect, Provider};
 use crate::state::{GatewayState, RequestId};
@@ -193,7 +195,7 @@ pub struct RequestCtx {
     /// distinction is in the type rather than discovered by rebuilding the path and comparing it,
     /// so the common route allocates nothing.
     forward_path: Option<String>,
-    /// Whether this is a **managed** request (`bai_…` key → swap to the pool key). `false` for
+    /// Whether this is a **managed** request (`bai_v1…` key → swap to the pool key). `false` for
     /// **BYO** — we leave the user's own auth header untouched (passthrough).
     managed: bool,
     /// Model the client *requested*, extracted from the request body. This is the billing-log
@@ -963,7 +965,7 @@ impl ProxyHttp for AiProxy {
         // billing row**. Silent revenue loss, on the exact path that makes Claude failover possible.
         let dialect = model_route.map_or(provider.dialect, |r| r.wire);
 
-        // 2. Extract the presented key — a managed virtual key (`bai_…`) or a raw BYO provider token.
+        // 2. Extract the presented key — a managed virtual key (`bai_v1…`) or a raw BYO provider token.
         let Some(raw_key) = extract_virtual_key(session.req_header()) else {
             return Self::reject_boxed(
                 session,
@@ -984,7 +986,7 @@ impl ProxyHttp for AiProxy {
         // `raw_key` ends as the call returns, so the `&mut session` reject is free to run on the
         // over-limit path (where `raw_key` is unused afterward).
         if let Some(rl) = &self.state.rate_limit
-            && let Some(reason) = rl.check(raw_key, raw_key.starts_with("bai_"))
+            && let Some(reason) = rl.check(raw_key, key::is_managed_prefix(raw_key))
         {
             self.state.metrics.rejection(reason.into()).inc();
             return Self::reject_boxed(
@@ -1017,10 +1019,12 @@ impl ProxyHttp for AiProxy {
             .await;
         }
 
-        // 5. Identity + key handling. `bai_…` → managed (stateless verify → deny-check → swap to the
-        // pool key). Anything else → BYO: the user's own provider token, passed through unchanged
-        // (no Beyond identity, so no deny-set and no per-tenant attribution).
-        let (tenant_id, vpc_id, managed) = if raw_key.starts_with("bai_") {
+        // 5. Identity + key handling. One branch: `bai_v1…` is fail-closed (prefix match → verify;
+        // any verify failure is 401, never BYO). Anything else → BYO: the user's own provider
+        // token, passed through unchanged (no Beyond identity, so no deny-set and no per-tenant
+        // attribution). A public listener without this split would forward a forged `bai_v1` as
+        // BYO — junk-auth egress, and the rate guard already exempted it from the BYO aggregate.
+        let (tenant_id, vpc_id, managed) = if key::is_managed_prefix(raw_key) {
             let Ok(identity) = self.state.keyring.verify(raw_key) else {
                 self.state.metrics.rejection(Rejection::Auth).inc();
                 return Self::reject_boxed(
