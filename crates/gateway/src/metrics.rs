@@ -35,8 +35,9 @@ pub enum Rejection {
     RateLimit,
     /// Aggregate BYO rate ceiling.
     RateLimitByoGlobal,
-    /// Model-routed request whose model could not be resolved — the routing header was absent, or
-    /// named a model the catalog does not carry.
+    /// Model-routed request whose model could not be resolved — the routing header named a model
+    /// the catalog does not carry, or (headerless `/auto` / managed `/v1`) the body's root `model`
+    /// was missing or unknown. The catalog is the allowlist.
     UnknownModel,
     /// Model-routed request whose model resolved, but no candidate is usable: none of the providers
     /// that serve it has a pool key configured. Distinct from `CircuitOpen`, which means the

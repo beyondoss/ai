@@ -12,11 +12,17 @@
 //! mock upstream — passthrough fidelity, key swap, usage metering (non-streaming + SSE), BYO
 //! passthrough, and deny-set propagation all pass.
 //!
-//! We never read the request body in `request_filter`: Pingora's body-forward phase reads the
-//! downstream body itself, so draining it earlier would make Pingora send `Content-Length` bytes
-//! with no body and the upstream would hang. We let the body flow through `request_body_filter`
-//! (the supported hook), feeding each chunk to a streaming structural scanner (`peek::ModelScanner`,
-//! O(1) memory) — never withholding or buffering it.
+//! We never drain the request body in `request_filter` and leave Pingora with an empty forward:
+//! Pingora's body-forward phase reads the downstream body itself, so consuming it earlier without
+//! replaying would make Pingora send `Content-Length` bytes with no body and the upstream would hang.
+//! The supported hook is `request_body_filter`, which feeds each chunk to a streaming structural
+//! scanner (`peek::ModelScanner`, O(1) memory) — never withholding it on the ordinary path.
+//!
+//! One exception that still replays: a **managed** request on the bare `/v1` default (or `/auto`
+//! with no routing header) must resolve a catalog row from the body's root `model` before
+//! `upstream_peer` runs. That peek enables pingora's 64 KiB retry buffer, reads at most that many
+//! bytes, and — if the buffer truncated — prepends our copy in `request_body_filter`. Untruncated
+//! peeks are replayed by pingora itself. Unknown or missing model → 404.
 //!
 //! One deliberate exception to the no-buffer rule: a **managed** OpenAI Chat Completions request is
 //! buffered and gets `stream_options.include_usage` injected when it streams without it — otherwise
@@ -37,9 +43,11 @@
 //! per-provider mount knowledge). A bare path with no provider prefix that is exactly `/v1` or
 //! starts with `/v1/` (boundary-checked — see `route::is_default_prefix`, not a raw
 //! `starts_with("/v1")`, which would also absorb a lookalike like Google Gemini's `/v1beta/…`) is
-//! the drop-in default — dialect picks openai/anthropic (`dialect_for_path`) — so an OpenAI/
-//! Anthropic client works by changing only the host. An unknown first segment is a 404. Model isn't
-//! used for routing (the body isn't read pre-connect); it's still captured from the body for usage.
+//! the drop-in default. BYO traffic there still dialect-picks openai/anthropic (`dialect_for_path`).
+//! A **managed** request to that default — or to `/auto` — resolves a catalog row from
+//! `x-beyond-model` if present, else the body's root `model`; the catalog is the allowlist
+//! (unknown/missing → 404) and the request walks that row's same-wire candidates. `/{provider}/…`
+//! is the escape hatch and does not consult the catalog. An unknown first segment is a 404.
 
 use crate::capture::CaptureBufs;
 use crate::key;
@@ -168,9 +176,10 @@ const USAGE_HEAD_CAP: usize = 8 * 1024;
 
 /// Max upstream **connect** retries before surfacing the failure to the client.
 ///
-/// Connect retries stay same-peer / same-key. A received **5xx** is a vendor walk on `/auto` only
-/// (`upstream_response_filter`). A received **429** is a same-provider key walk when another unused
-/// pool key remains — not a connect retry, not a vendor failover, and not a breaker failure.
+/// Connect retries stay same-peer / same-key. A received **5xx** is a vendor walk on a catalog
+/// walk (`/auto`, or managed `/v1`) only (`upstream_response_filter`). A received **429** is a
+/// same-provider key walk when another unused pool key remains — not a connect retry, not a vendor
+/// failover, and not a breaker failure.
 const MAX_CONNECT_RETRIES: u8 = 2;
 
 pub struct AiProxy {
@@ -260,9 +269,9 @@ pub struct RequestCtx {
     /// On the `/{provider}/…` path this is simply `breaker.is_some()`, set once in `request_filter`
     /// — exactly the condition `logging` used to test inline — so that path's behaviour is unchanged.
     breaker_pending: bool,
-    /// Model-routing state — `Some` only for `/auto`. `None` keeps every provider-routed request on
-    /// exactly the code it ran before model routing existed. See [`ModelRouting`] for why it is
-    /// boxed rather than inline.
+    /// Model-routing state — `Some` for `/auto` and for a managed bare `/v1` catalog walk. `None`
+    /// keeps every provider-routed request on exactly the code it ran before model routing existed.
+    /// See [`ModelRouting`] for why it is boxed rather than inline.
     auto: Option<Box<ModelRouting>>,
     /// Control-surface state — `Some` only when the caller sent an `x-beyond-*` header or the tenant
     /// is being captured. Boxed for [`ModelRouting`]'s measured reason: `RequestCtx` is touched once
@@ -289,7 +298,8 @@ struct RequestControl {
     capture: Option<CaptureBufs>,
 }
 
-/// State that exists only for a **model-routed** (`/auto`) request.
+/// State that exists only for a **model-routed** request (`/auto`, or a managed bare `/v1` catalog
+/// walk).
 ///
 /// Boxed, and `None` for provider-routed traffic — which is the overwhelming majority. Held inline
 /// these fields added 64 bytes to `RequestCtx` (368 → 432), a struct that is touched on every hook
@@ -299,7 +309,8 @@ struct RequestControl {
 /// per-request one.
 ///
 /// So the model-routed path pays one small allocation and every other request pays nothing. That is
-/// the right way round: `/auto` is opt-in, and the request it serves is about to cross a network.
+/// the right way round: catalog walking is opt-in (or the managed `/v1` drop-in), and the request it
+/// serves is about to cross a network.
 struct ModelRouting {
     /// The catalog row this request routes over. `&'static`, so it costs a pointer.
     route: &'static route::ModelRoute,
@@ -315,6 +326,10 @@ struct ModelRouting {
     /// candidate A as a latency regression at candidate B, inverting the point of the per-provider
     /// label.
     attempt_start: Instant,
+    /// Body prefix consumed in `request_filter` so the catalog could be resolved from the body's
+    /// `model`. `Some` only when pingora's 64 KiB retry buffer truncated and will not replay that
+    /// prefix itself — `request_body_filter` prepends it before the remaining chunks.
+    replay: Option<Bytes>,
 }
 
 impl RequestCtx {
@@ -699,6 +714,78 @@ fn body_replayable(session: &mut Session) -> bool {
     session.as_mut().is_body_done() && !session.as_ref().retry_buffer_truncated()
 }
 
+/// Same cap as pingora's private `BODY_BUF_LIMIT`. The managed `/v1` / headerless `/auto` peek
+/// reads at most this many bytes before `upstream_peer`. A root `model` that has not appeared by
+/// then is missing — 404. Past this, pingora will not replay the prefix itself (the retry buffer
+/// truncates), so [`ModelRouting::replay`] carries our copy for `request_body_filter` to prepend.
+const BODY_PEEK_LIMIT: usize = 64 * 1024;
+
+/// The `x-beyond-model` header, viewed as a catalog lookup. Present-but-unknown is distinct from
+/// absent: the header wins, so an unknown header is a 404 rather than a fall-through to the body.
+#[derive(Clone, Copy)]
+enum CatalogHeader {
+    Absent,
+    Known(&'static route::ModelRoute),
+    Unknown,
+}
+
+fn catalog_from_header(session: &Session) -> CatalogHeader {
+    match session
+        .req_header()
+        .headers
+        .get(route::MODEL_HEADER)
+        .and_then(|v| v.to_str().ok())
+    {
+        None => CatalogHeader::Absent,
+        Some(name) => match route::model_route(name) {
+            Some(r) => CatalogHeader::Known(r),
+            None => CatalogHeader::Unknown,
+        },
+    }
+}
+
+/// Body prefix read so a catalog row can be chosen before `upstream_peer`.
+struct BodyPeek {
+    model: Option<String>,
+    /// `Some` when pingora's retry buffer truncated and will not replay this prefix.
+    replay: Option<Bytes>,
+}
+
+/// Enable pingora's 64 KiB retry buffer, read until a root `model` appears, the body ends, or the
+/// cap is hit, then scan once. Boxed at the call site so this I/O is not inlined into
+/// `request_filter`'s future.
+///
+/// Stopping at the first `model` is load-bearing. Pingora will not send a first attempt when the
+/// retry buffer truncated *and* the body is already fully consumed (`get_retry_buffer()` is `None`
+/// and `is_body_empty()` is false). Stock SDKs put `model` first, so a large body still leaves
+/// unread bytes on the socket and pingora continues the duplex. A root `model` that has not
+/// appeared by [`BODY_PEEK_LIMIT`] is missing — 404 — so we never admit that truncated-complete
+/// case either.
+async fn peek_body_model(session: &mut Session) -> pingora_core::Result<BodyPeek> {
+    session.as_mut().enable_retry_buffering();
+    let mut buf = Vec::new();
+    loop {
+        if buf.len() >= BODY_PEEK_LIMIT {
+            break;
+        }
+        match session.read_request_body().await? {
+            Some(chunk) if !chunk.is_empty() => {
+                buf.extend_from_slice(&chunk);
+                if peek::scan_buffered(&buf).model.is_some() {
+                    break;
+                }
+            }
+            Some(_) => {}
+            None => break,
+        }
+    }
+    let truncated = session.as_ref().retry_buffer_truncated();
+    Ok(BodyPeek {
+        model: peek::scan_buffered(&buf).model,
+        replay: truncated.then(|| Bytes::from(buf)),
+    })
+}
+
 fn dialect_for_path(path: &str) -> Dialect {
     // Anthropic Messages vs OpenAI Chat Completions/Embeddings. Embeddings are OpenAI-dialect only.
     if path.starts_with("/v1/messages") {
@@ -793,28 +880,31 @@ fn apply_stream_usage_injection(mut body: Vec<u8>, at: Option<usize>) -> Vec<u8>
 
 /// What the first path segment resolved to.
 ///
-/// An enum rather than a wider tuple because the three failure shapes need *different* rejections
+/// An enum rather than a wider tuple because the failure shapes need *different* rejections
 /// (404 unknown provider, 404 unknown model, and — later, once identity is known — 400 for a BYO key
-/// on the managed-only model route), and a tuple of `Option`s would encode that in which fields
-/// happened to be `None`.
+/// on a catalog walk), and a tuple of `Option`s would encode that in which fields happened to be
+/// `None`.
 enum Routed {
-    /// `/{provider}/…`, or the bare `/v1` default. The provider is named by the request.
+    /// `/{provider}/…`. The provider is named by the request. Not a catalog walk — the escape hatch.
     Provider {
         provider: Arc<Provider>,
-        /// `None` for the bare default, whose path already is what the upstream should see.
+        /// Always `Some`: the inbound path with the `/{provider}` segment stripped.
         forward_path: Option<String>,
         streamable: bool,
     },
-    /// `/auto/…` with a routing header naming a model the catalog carries.
-    ///
-    /// Carries no path: on this route the upstream path is the *candidate's*, taken from the
-    /// catalog, because providers do not agree on where an endpoint lives and the disagreement is
-    /// not a prefix (Anthropic serves Messages at `/v1/messages`, OpenRouter at `/api/v1/messages`).
-    /// The client's own suffix is ignored — it points the SDK at `…/auto` and the row decides.
-    Model { route: &'static route::ModelRoute },
-    /// `/auto/…` with no routing header, or one naming a model we do not serve. Collapsed into one
-    /// outcome deliberately: a value we cannot match is a value we do not serve, and splitting it
-    /// would leak whether a given name is in the catalog to a caller who has not authenticated.
+    /// Bare `/v1` default. BYO keeps the dialect-picked provider; managed becomes a catalog walk.
+    BareDefault {
+        provider: Arc<Provider>,
+        streamable: bool,
+    },
+    /// `/auto/…`. `header` is the catalog row if `x-beyond-model` resolved; `None` means peek the
+    /// body's root `model` after identity is known. An *unknown* header is [`Routed::UnknownModel`],
+    /// not this — the header wins, and a catalog miss is the allowlist.
+    Auto {
+        header: Option<&'static route::ModelRoute>,
+    },
+    /// A routing header (on `/auto`) naming a model we do not serve. Collapsed with a missing body
+    /// model into one 404: a value we cannot match is a value we do not serve.
     UnknownModel,
     /// The first segment matches no provider, is not the bare default, and is not `/auto`.
     UnknownProvider,
@@ -872,15 +962,11 @@ impl ProxyHttp for AiProxy {
                     streamable: is_streamable_path(rest),
                 }
             } else if let Some(name) = bare_default_provider_name(path) {
-                // Bare default: dialect picks the provider and the path is forwarded unchanged, so
-                // there is nothing to rewrite — `None`. This used to build the path back up with its
-                // query appended, hand it to `upstream_request_filter`, get compared equal against
-                // the inbound `path_and_query`, and dropped: one wasted allocation per request on
-                // the drop-in default route, three when a query string was present.
+                // Bare default: dialect picks the BYO provider; managed traffic becomes a catalog
+                // walk after identity. Path is forwarded unchanged for BYO (`None`).
                 match self.state.provider(name) {
-                    Some(p) => Routed::Provider {
+                    Some(p) => Routed::BareDefault {
                         provider: p.clone(),
-                        forward_path: None,
                         streamable: is_streamable_path(path),
                     },
                     None => Routed::UnknownProvider,
@@ -889,36 +975,61 @@ impl ProxyHttp for AiProxy {
                 // Model-routed. Reached only after a provider-table miss, so the established routes
                 // pay nothing for this arm — and `state::build_providers` refuses to boot with a
                 // provider named `auto`, so the miss is guaranteed rather than merely likely.
-                let rest = &path[1 + first.len()..];
-                let rest = if rest.is_empty() { "/" } else { rest };
-                // Resolved to a `&'static` row inside the borrow, so nothing borrowed from the
-                // session escapes into the rejection paths below.
-                let row = req
-                    .headers
-                    .get(route::MODEL_HEADER)
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(route::model_route);
-                let _ = rest;
-                match row {
-                    Some(route) => Routed::Model { route },
-                    None => Routed::UnknownModel,
+                // An unknown header 404s here (header wins, catalog miss is the allowlist). An
+                // *absent* header waits until after identity so a managed caller can put `model` in
+                // the body the way a stock SDK does.
+                match catalog_from_header(session) {
+                    CatalogHeader::Known(route) => Routed::Auto {
+                        header: Some(route),
+                    },
+                    CatalogHeader::Absent => Routed::Auto { header: None },
+                    CatalogHeader::Unknown => Routed::UnknownModel,
                 }
             } else {
                 Routed::UnknownProvider
             }
         };
 
-        // Model routing needs identity before it can pick a provider (it is managed-only, and a
-        // candidate is only usable if we hold a pool key for it), so the catalog row is carried
-        // through the auth gates and resolved to a provider after them. `provider` below is the
-        // row's first candidate, which is also what the request will attempt first.
-        let (provider, forward_path, forward_streamable, model_route) = match routed {
+        // Catalog resolution needs identity: `/auto` is managed-only, a candidate is only usable if
+        // we hold a pool key for it, and managed `/v1` peeks the body only after the key is known
+        // (BYO `/v1` stays dialect-default passthrough and must not drain the body). `provider` is
+        // `None` only for headerless `/auto` — there is no dialect default, and BYO 400s before
+        // `RequestCtx` is built.
+        let provider: Option<Arc<Provider>>;
+        let forward_path: Option<String>;
+        let mut forward_streamable: bool;
+        let mut model_route: Option<&'static route::ModelRoute>;
+        // Peek the body's root `model` after identity (managed `/v1`, headerless `/auto`).
+        let resolve_from_body: bool;
+        // BYO is 400 — the `/auto` path, with or without a routing header.
+        let managed_only: bool;
+        match routed {
             Routed::Provider {
-                provider,
-                forward_path,
+                provider: p,
+                forward_path: fp,
                 streamable,
-            } => (provider, forward_path, streamable, None),
-            Routed::Model { route } => {
+            } => {
+                provider = Some(p);
+                forward_path = fp;
+                forward_streamable = streamable;
+                model_route = None;
+                resolve_from_body = false;
+                managed_only = false;
+            }
+            Routed::BareDefault {
+                provider: p,
+                streamable,
+            } => {
+                provider = Some(p);
+                forward_path = None;
+                forward_streamable = streamable;
+                model_route = None;
+                resolve_from_body = true;
+                managed_only = false;
+            }
+            Routed::Auto {
+                header: Some(route),
+            } => {
                 // Streamability is a property of the *row*: its candidates all serve one wire at
                 // matching endpoints (a catalog invariant), so the first candidate's path answers it
                 // for all of them.
@@ -931,7 +1042,14 @@ impl ProxyHttp for AiProxy {
                     .first()
                     .and_then(|c| self.state.provider_by_id(c.provider).cloned());
                 match first {
-                    Some(p) => (p, None, streamable, Some(route)),
+                    Some(p) => {
+                        provider = Some(p);
+                        forward_path = None;
+                        forward_streamable = streamable;
+                        model_route = Some(route);
+                        resolve_from_body = false;
+                        managed_only = true;
+                    }
                     // Unreachable in practice: `every_catalog_candidate_is_a_known_provider` proves
                     // every row names a provider the gateway registers. Answer rather than panic.
                     None => {
@@ -946,6 +1064,14 @@ impl ProxyHttp for AiProxy {
                         .await;
                     }
                 }
+            }
+            Routed::Auto { header: None } => {
+                provider = None;
+                forward_path = None;
+                forward_streamable = false;
+                model_route = None;
+                resolve_from_body = true;
+                managed_only = true;
             }
             Routed::UnknownModel => {
                 self.state.metrics.rejection(Rejection::UnknownModel).inc();
@@ -968,16 +1094,7 @@ impl ProxyHttp for AiProxy {
                 )
                 .await;
             }
-        };
-        // Dialect drives usage parsing and injection eligibility.
-        //
-        // For a model-routed request it comes from the **row**, not the provider, because a provider
-        // can serve more than one wire: OpenRouter is `WireFormat::OpenAi` in the provider table and
-        // still serves genuine Anthropic Messages traffic at `/api/v1/messages`. Reading
-        // `provider.dialect` there would hand an Anthropic response to the OpenAI usage extractor,
-        // which does not error — it trips the dialect-mismatch guard and emits a **zero-token
-        // billing row**. Silent revenue loss, on the exact path that makes Claude failover possible.
-        let dialect = model_route.map_or(provider.dialect, |r| r.wire);
+        }
 
         // 2. Extract the presented key — a managed virtual key (`bai_v1…`) or a raw BYO provider token.
         let Some(raw_key) = extract_virtual_key(session.req_header()) else {
@@ -1081,10 +1198,14 @@ impl ProxyHttp for AiProxy {
             // The actual `Bearer …`/`x-api-key` value is precomputed in the provider registry and
             // applied in `upstream_request_filter`; here we only confirm a pool key exists.
             //
-            // Skipped for a model-routed request: there a pool key is a property of each *candidate*,
+            // Skipped for a catalog walk: there a pool key is a property of each *candidate*,
             // and the first one lacking a key is a reason to try the next, not to fail the request.
-            // The equivalent gate is the usable-candidate check below.
-            if model_route.is_none() && !provider.has_pool_key() {
+            // The equivalent gate is the usable-candidate check below. Also skipped for managed
+            // `/v1` before the body peek — the dialect-default provider is not the allowlist.
+            if model_route.is_none()
+                && !resolve_from_body
+                && !provider.as_ref().is_some_and(|p| p.has_pool_key())
+            {
                 return Self::reject_boxed(
                     session,
                     &request_id,
@@ -1099,9 +1220,91 @@ impl ProxyHttp for AiProxy {
             (0, 0, None, false)
         };
 
+        // Catalog walk is **managed-only**. BYO on `/auto` 400s before any peek — a BYO token
+        // belongs to one vendor, and reading the body to pick among candidates would still be a
+        // guess (and a failover would send that key to a different vendor). BYO on `/v1` does not
+        // enter this block: it keeps the dialect-default provider and never consults the catalog.
+        if !managed && managed_only {
+            self.state
+                .metrics
+                .rejection(Rejection::ByoOnModelRoute)
+                .inc();
+            return Self::reject_boxed(
+                session,
+                &request_id,
+                400,
+                "invalid_request_error",
+                "model routing requires a managed key",
+            )
+            .await;
+        }
+
+        let mut body_replay: Option<Bytes> = None;
+        if managed && model_route.is_none() && resolve_from_body {
+            // Header wins if present (unknown → 404, no fall-through to the body). Absent → peek.
+            match catalog_from_header(session) {
+                CatalogHeader::Known(route) => model_route = Some(route),
+                CatalogHeader::Unknown => {
+                    self.state.metrics.rejection(Rejection::UnknownModel).inc();
+                    return Self::reject_boxed(
+                        session,
+                        &request_id,
+                        404,
+                        "invalid_request_error",
+                        "unknown model",
+                    )
+                    .await;
+                }
+                CatalogHeader::Absent => {
+                    let peek = Box::pin(peek_body_model(session)).await?;
+                    let Some(name) = peek.model.filter(|n| !n.is_empty()) else {
+                        self.state.metrics.rejection(Rejection::UnknownModel).inc();
+                        return Self::reject_boxed(
+                            session,
+                            &request_id,
+                            404,
+                            "invalid_request_error",
+                            "unknown model",
+                        )
+                        .await;
+                    };
+                    let Some(route) = route::model_route(&name) else {
+                        self.state.metrics.rejection(Rejection::UnknownModel).inc();
+                        return Self::reject_boxed(
+                            session,
+                            &request_id,
+                            404,
+                            "invalid_request_error",
+                            "unknown model",
+                        )
+                        .await;
+                    };
+                    model_route = Some(route);
+                    body_replay = peek.replay;
+                }
+            }
+        }
+
         // Model routing is **managed-only**, and the first candidate is chosen here.
         let (provider, usable) = match model_route {
-            None => (provider, 0u8),
+            None => {
+                // Provider-routed, or BYO `/v1` dialect default. Headerless `/auto` always set
+                // `model_route` above (or 400/404'd).
+                match provider {
+                    Some(p) => (p, 0u8),
+                    None => {
+                        self.state.metrics.rejection(Rejection::NoCandidate).inc();
+                        return Self::reject_boxed(
+                            session,
+                            &request_id,
+                            503,
+                            "api_error",
+                            "no provider available for model",
+                        )
+                        .await;
+                    }
+                }
+            }
             Some(row) => {
                 // A BYO token belongs to exactly one provider. Selecting among candidates would be a
                 // guess about which — the guess the `providers` crate exists to refuse — and failing
@@ -1174,6 +1377,22 @@ impl ProxyHttp for AiProxy {
                 }
             }
         };
+
+        // Dialect drives usage parsing and injection eligibility.
+        //
+        // For a model-routed request it comes from the **row**, not the provider, because a provider
+        // can serve more than one wire: OpenRouter is `WireFormat::OpenAi` in the provider table and
+        // still serves genuine Anthropic Messages traffic at `/api/v1/messages`. Reading
+        // `provider.dialect` there would hand an Anthropic response to the OpenAI usage extractor,
+        // which does not error — it trips the dialect-mismatch guard and emits a **zero-token
+        // billing row**. Silent revenue loss, on the exact path that makes Claude failover possible.
+        let dialect = model_route.map_or(provider.dialect, |r| r.wire);
+        if let Some(row) = model_route {
+            forward_streamable = row
+                .candidates
+                .first()
+                .is_some_and(|c| is_streamable_path(c.path));
+        }
 
         // Mark OpenAI managed chat/completions streams for body buffering + `stream_options` injection
         // (handled in `request_body_filter`). Scoped tight: managed only (BYO stays pure
@@ -1321,6 +1540,7 @@ impl ProxyHttp for AiProxy {
                     // Overwritten per attempt by `upstream_peer`; seeded so the first attempt is
                     // timed even if it fails before the prologue runs.
                     attempt_start: start,
+                    replay: body_replay,
                 })
             }),
             request_id,
@@ -1756,6 +1976,21 @@ impl ProxyHttp for AiProxy {
         let Some(rc) = ctx.as_mut() else {
             return Ok(());
         };
+        // Truncated peek: pingora will not replay the prefix (retry buffer discarded it), so
+        // splice our copy in front of whatever remaining chunk arrives first. `take()` so a
+        // retry cannot prepend twice — and a truncated body is not replayable for failover
+        // anyway (`body_replayable` is false).
+        if let Some(prefix) = rc.auto.as_mut().and_then(|a| a.replay.take()) {
+            match body {
+                Some(chunk) if !chunk.is_empty() => {
+                    let mut out = Vec::with_capacity(prefix.len() + chunk.len());
+                    out.extend_from_slice(&prefix);
+                    out.extend_from_slice(chunk);
+                    *body = Some(Bytes::from(out));
+                }
+                _ => *body = Some(prefix),
+            }
+        }
         // Feed the body through the structural scanner as it passes (never withheld, never
         // buffered) to extract the exact root-level `model` — but only for **managed** traffic,
         // which is the only path that reads it. `rc.model` is used at exactly two places, both
@@ -2175,20 +2410,21 @@ impl ProxyHttp for AiProxy {
 
             // What the client *asked for*.
             //
-            // On the model-routed path that is the catalog name from the routing header, **not** the
-            // body's `model`. The body's value is overwritten with the serving candidate's id before
-            // the request leaves the gateway, so it runs nothing and determines nothing; reporting a
-            // discarded input as "requested" was a leftover from an earlier design that did not
-            // rewrite bodies. On the provider-routed path the body is untouched and is exactly what
-            // was asked for, so it stays the answer there.
+            // On the model-routed path that is the catalog name from `x-beyond-model` if present,
+            // else the body's root `model` — **not** the id we splice for the serving candidate.
+            // The body's value is overwritten with that candidate's id before the request leaves,
+            // so a discarded spelling determines nothing; reporting it as "requested" was a leftover
+            // from an earlier design that did not rewrite bodies. On the provider-routed path the
+            // body is untouched and is exactly what was asked for, so it stays the answer there.
             let requested_model = routed_model.unwrap_or(rc.model.as_str());
 
-            // A model-routed client should send the same id in both places; nothing enforces it,
-            // because the route is chosen from the header before the body is ever read. It is
-            // harmless — the body is overwritten either way — but it means the client believes it
-            // asked for something it did not get, which is a client bug worth being able to see.
-            // Counted rather than logged per request: a client that always disagrees would otherwise
-            // produce one warn line per request forever.
+            // A model-routed client should send the same id in the header (when they send one) and
+            // the body; nothing enforces it, because the route is chosen from the header before the
+            // body is rewritten. It is harmless — the body is overwritten either way — but it means
+            // the client believes it asked for something it did not get, which is a client bug
+            // worth being able to see. Counted rather than logged per request: a client that always
+            // disagrees would otherwise produce one warn line per request forever. Header still
+            // wins; a headerless walk has nothing to disagree with.
             if routed_model.is_some_and(|r| !rc.model.is_empty() && rc.model != r) {
                 self.state.metrics.model_header_body_mismatch_total.inc();
             }

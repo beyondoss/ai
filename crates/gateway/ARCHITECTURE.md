@@ -20,7 +20,7 @@ published `beyond-slipstream` — clones, CI-builds, and publishes anywhere.
 | **Tenant**                                | The billing entity from the virtual key payload (`tenant_id: u64`)                                                                                                                | An org, user, or namespace — an opaque integer the gateway doesn't interpret |
 | **Dialect**                               | A provider attribute (OpenAI-wire vs Anthropic-wire) driving usage parsing; for a bare-path request it's derived from the path to pick the default provider                       | The provider — a prefixed request uses its provider's dialect, not the path  |
 | **Provider**                              | The request's **first path segment** (`/{provider}/…`); a named row in the routing table: authority, dialect, auth scheme                                                         | A vendor relationship — just connection facts and auth wiring                |
-| **Model route** (`/auto/…`)               | Reserved first segment; provider, upstream path, and model id all come from the catalog row named by the `x-beyond-model` header, and the body's `model` is rewritten per attempt | A dialect translator — candidates must share a wire format                   |
+| **Model route** (`/auto/…`, managed `/v1`) | Catalog row named by `x-beyond-model` if present, else the body's root `model`; provider, upstream path, and model id come from that row and the body's `model` is rewritten per attempt. Catalog miss → 404 | A dialect translator — candidates must share a wire format. Not a per-key grant. |
 | **Candidate**                             | One `(provider, upstream model id, path)` a catalog row will accept, in preference order; tried on a connect failure                                                              | A load-balancing pool — strictly ordered, and only entered on failure        |
 | **Deny-set**                              | Sparse maps of denied `tenant_id`s and `key_id`s → reason; gates managed traffic; default-allow; tenant deny kills every key                                                      | An allowlist or ACL — misses are allowed, not blocked                        |
 | **Tail tap**                              | Bounded 64KB window kept from the end of the response for usage extraction                                                                                                        | A buffer or copy — the response is relayed unbuffered; only the tail is kept |
@@ -41,9 +41,12 @@ Client (stock OpenAI/Anthropic SDK)
   │
   ▼  request_filter (proxy.rs)
   │  ├─ Route: first segment → provider row (authority, dialect, auth scheme)
-  │  │    …or `/auto` → x-beyond-model header → catalog row → ordered candidates
+  │  │    `/{provider}/…` is the escape hatch (no catalog)
+  │  │    …or `/auto` / managed `/v1` → x-beyond-model if present, else body's root `model`
+  │  │      → catalog row → ordered candidates
   │  │      no/unknown model ──────────────────────────────────► 404
-  │  │      BYO key (managed-only route) ─────────────────────► 400
+  │  │      BYO key on `/auto` (managed-only route) ───────────► 400
+  │  │      BYO on `/v1` ─ dialect-default passthrough (no catalog)
   │  │      no candidate holds a pool key ────────────────────► 503
   │  ├─ Extract key: x-api-key / api-key / x-goog-api-key / Authorization Bearer / ?key= query param
   │  ├─ Rate guardrails (BEFORE verify — keeps forged-key floods at ns cost)
@@ -78,7 +81,8 @@ Client (stock OpenAI/Anthropic SDK)
   │  BYO: leave auth header unchanged
   │  Strip x-beyond-* control headers (ours; meaningless upstream)
   │  Set Host; path: verbatim for /{provider} (prefix stripped), or the candidate's
-  │    own catalog path for /auto. Model-routed: strip x-beyond-model
+  │    own catalog path for a catalog walk (`/auto`, managed `/v1`). Model-routed: strip
+  │    x-beyond-model
   │  OpenRouter + managed only: dashboard-attribution headers (HTTP-Referer, X-OpenRouter-*)
   │
   ▼  request_body_filter (proxy.rs)  — streamed through, except where a rewrite needs the whole body
@@ -177,20 +181,32 @@ built-in row; override the region with `provider_authorities.bedrock` if you nee
 
 The routing rule: **first path segment = provider name**. `/groq/openai/v1/chat/completions` routes
 to Groq and forwards `/openai/v1/chat/completions` verbatim. A bare path that is _exactly_ `/v1` or
-starts with `/v1/` (boundary-checked — `route::is_default_prefix`, not a raw string-prefix test)
-matches the dialect default (OpenAI or Anthropic based on which default is set); a lookalike like
-Google Gemini's `/v1beta/…` does **not** qualify and 404s as an unknown provider instead of being
-silently absorbed into the OpenAI default. Unknown segment → 404.
+starts with `/v1/` (boundary-checked — `route::is_default_prefix`, not a raw string-prefix test) is
+the drop-in default: BYO dialect-picks OpenAI or Anthropic; a **managed** request there is a catalog
+walk (see below). A lookalike like Google Gemini's `/v1beta/…` does **not** qualify and 404s as an
+unknown provider instead of being silently absorbed into the OpenAI default. Unknown segment → 404.
 
-### Model routing (`/auto`, `providers::catalog`)
+### Model routing (`/auto`, managed `/v1`, `providers::catalog`)
 
-One reserved first segment routes by **model** instead of provider: `/auto/…` takes the canonical
-model name from the `x-beyond-model` header, resolves it in the catalog to an ordered list of
-candidate providers, and tries them in order. The name is a header rather than the request body
-because the provider must be chosen before `upstream_peer` runs, which is strictly before any body
-byte is available. This arm is reached only after a provider-table miss, so `/{provider}/…` traffic
-runs exactly the code it always did; `auto` is refused as a provider name at boot so config cannot
-shadow it.
+One reserved first segment — and the managed bare `/v1` default — routes by **model** instead of
+provider. `/auto/…` and managed `/v1/chat/completions` / `/v1/messages` take the canonical model
+name from the `x-beyond-model` header if present, else the body's root `model`, resolve it in the
+catalog to an ordered list of candidate providers, and try them in order. The catalog **is** the
+allowlist: unknown or missing model → 404. There is no parallel grant set.
+
+A stock OpenAI or Anthropic SDK pointed at `/v1` with `model` in the JSON body is `/auto` without
+the header. Same-wire failover only — the gateway rewrites ids, it does not translate OpenAI ↔
+Anthropic.
+
+`/{provider}/…` is the escape hatch and does not consult the catalog. This arm is reached only after
+a provider-table miss, so `/{provider}/…` traffic runs exactly the code it always did; `auto` is
+refused as a provider name at boot so config cannot shadow it.
+
+The name can live in the body because the gateway peeks it itself: pingora's 64 KiB retry buffer is
+enabled, at most that many bytes are read, and — if the buffer truncated — the prefix is prepended
+in `request_body_filter`. Untruncated peeks are replayed by pingora. Draining the body in
+`request_filter` and leaving Pingora with an empty forward hangs the upstream; that is why the peek
+replays rather than consuming.
 
 Three things differ from the provider-routed path, all consequences of the client no longer naming
 the provider:
@@ -199,14 +215,15 @@ the provider:
   endpoint lives and the disagreement is _not_ a prefix: Anthropic serves Messages at `/v1/messages`
   from a base carrying no path, OpenRouter serves the same wire at `/api/v1/messages`. No client
   suffix is correct for both, so each candidate states its path outright and `forward_path` is set
-  from it per attempt. The client points its SDK at `…/auto` and the row decides.
+  from it per attempt. The client points its SDK at `/v1` (or `…/auto`) and the row decides.
 - **The model id is rewritten per attempt.** Providers essentially never share a string —
   `claude-opus-4-8` at Anthropic is `anthropic/claude-opus-4.8` at OpenRouter — so the body's `model`
   is spliced to whatever the serving candidate calls it (`peek::scan_buffered` reports the value's
-  byte span). Because the body may change length, `/auto` requests are buffered and re-framed exactly
-  as the injection path is; the two are one predicate (`RequestCtx::rewrites_body`).
-- **It is managed-only.** A BYO token belongs to one provider, so selecting among candidates would be
-  a guess and failing over would hand one vendor's key to another. BYO on `/auto` → 400.
+  byte span). Because the body may change length, catalog-walk requests are buffered and re-framed
+  exactly as the injection path is; the two are one predicate (`RequestCtx::rewrites_body`).
+- **It is managed-only on `/auto`, and on `/v1` only for managed keys.** A BYO token belongs to one
+  provider, so selecting among candidates would be a guess and failing over would hand one vendor's
+  key to another. BYO on `/auto` → 400. BYO on `/v1` is unchanged dialect-default passthrough.
 
 Failover covers both shapes: a candidate that will not **connect** (refused, timed out, or absent
 from DNS) and one that **answers with a 5xx**, provided nothing has gone downstream yet and the
@@ -710,6 +727,10 @@ balancers that strip custom headers. A `/{provider}/` prefix was preferred over 
 because SDKs already let callers set the base URL; swapping in the gateway's URL with a provider
 prefix requires no SDK modification.
 
+The managed `/v1` catalog walk is the other half of that: a stock SDK that can only set a host and
+put `model` in the JSON body does not have to learn `x-beyond-model` or `/auto`. `/{provider}/…`
+remains the escape hatch when the catalog should not apply.
+
 ---
 
 ## Trust Boundaries
@@ -719,32 +740,43 @@ prefix requires no SDK modification.
 - Virtual key signature (Ed25519, stateless — no DB lookup)
 - Virtual key format (`bai_v1` 16-byte payload, `bai_v2` 24-byte payload with `key_id`)
 - Tenant / key not in deny-set (managed traffic only; O(1) HashMap lookup; tenant deny kills every key)
-- Pool key configured for the requested provider (managed traffic only — else 503)
+- Pool key configured for the requested provider (managed traffic only — else 503). On a catalog
+  walk this is per candidate: none keyed → 503, not a request-wide missing openai key.
+- Catalog model on managed `/v1` and `/auto` (unknown or missing → 404). `/{provider}/…` is not
+  allowlisted.
 - Request body size ≤ `MAX_REQUEST_BODY` (declared `Content-Length` + streaming running total)
 - Per-credential request rate within ceiling; aggregate BYO rate within ceiling
 
 **What passes through unchecked:**
 
 - Request body content and schema — no validation at the gateway layer
-- Model name in the request — extracted for billing facts, never validated against an allowlist
-- **The request body's `model` on `/auto`.** It is an input the gateway _overwrites_ with the
-  serving candidate's id, so it determines nothing — the routing header does. A body that names a
-  different model is counted on `ai_model_header_body_mismatch_total` (a client bug worth finding)
-  and otherwise ignored; `requested_model` in `ai.usage` reports the catalog name, which is what was
-  actually asked for.
-- **Which pool key a model-routed request draws on.** The header alone selects the catalog row, and
-  there is no per-tenant entitlement check on rows — any managed tenant can route to any row. Not
+- Model name on `/{provider}/…` — extracted for billing facts, never validated against an allowlist.
+  That path is the escape hatch.
+- **The request body's `model` on a catalog walk when `x-beyond-model` is set.** It is an input the
+  gateway _overwrites_ with the serving candidate's id, so it determines nothing — the header does.
+  A body that names a different model is counted on `ai_model_header_body_mismatch_total` (a client
+  bug worth finding) and otherwise ignored; `requested_model` in `ai.usage` reports the catalog
+  name, which is what was actually asked for. Header still wins.
+- **Which pool key a model-routed request draws on.** The header or body selects the catalog row,
+  and there is no per-tenant entitlement check on rows — any managed tenant can route to any row. Not
   price-gameable (billing uses the id the provider echoes back), but worth knowing before rows are
   added whose pool keys differ in cost or contract.
 - Provider response content — relayed byte-for-byte
 - BYO token validity — forwarded as-is; the provider rejects it if invalid
 - `vpc_id` in the virtual key — decoded and emitted in billing facts, not used for access control
 
+**What the catalog allowlists (managed `/v1` and `/auto` only):**
+
+- The model name. A catalog miss is a 404. This is not a per-key grant list and not a parallel set
+  beside the catalog — the catalog row *is* the allowlist.
+
 **Why these boundaries are where they are:**
 
 - Body schema validation belongs to the provider — duplicate validation adds latency without a
   security benefit at the gateway layer
-- Model allowlisting would require a per-provider list coupled to model release cadence
+- A per-provider model allowlist coupled to release cadence is what the catalog already is, for the
+  drop-in `/v1` and `/auto` paths. `/{provider}/…` stays unlisted so an operator can still send an
+  id the catalog does not carry
 - BYO token validation requires a provider round-trip — the provider does it anyway
 
 ---
@@ -836,7 +868,7 @@ Prometheus on the default registry, exposed at `/metrics` on `metrics_listen`.
 | `ai_usage_parse_errors_total`         | Counter   | —                    | Managed 2xx responses with no parseable usage (emitted as a zero-token billing row)    |
 | `ai_candidate_failovers_total`        | Counter   | —                    | Model-routed requests that abandoned a candidate for the next one                      |
 | `ai_key_walks_total`                  | Counter   | —                    | Managed 429s that retried the same provider with the next unused pool key              |
-| `ai_model_header_body_mismatch_total` | Counter   | —                    | Model-routed requests whose routing header and body `model` disagreed (client bug)     |
+| `ai_model_header_body_mismatch_total` | Counter   | —                    | Catalog-walk requests whose `x-beyond-model` and body `model` disagreed (header wins; client bug) |
 | `ai_failover_body_too_large_total`    | Counter   | —                    | 5xx that could not fail over: request body exceeded the 64 KiB replay buffer           |
 
 ---
@@ -885,15 +917,16 @@ Prometheus on the default registry, exposed at `/metrics` on `metrics_listen`.
   before the usage chunk still meters), **deny-set fail-open** (kill NATS → stale set retained,
   auth still works), and **on-disk snapshot survival** (blackhole a tenant, restart with NATS down
   → the hold is still enforced from disk).
-- **Model routing (`tests/model_routing.rs`):** the `/auto` route end-to-end against two mocks with
-  different mounts, pool keys, and model ids. Covers primary routing, **failover on a refused
-  connection** (asserting the fallback's mount, its pool key, and its spelling of the model — the key
-  assertion, since forwarding the primary's key would be a credential leak rather than a failed
-  request), the breaker ledger (the abandoned candidate's breaker opens while the fallback keeps
-  serving), missing/unknown model → 404, BYO → 400, the routing header never reaching an upstream,
-  `ai.usage` naming the candidate that served, all-candidates-down, a **256 KiB body surviving a
-  failover byte-for-byte**, a **429 walking keys not vendors**, and provider-routed traffic being
-  unaffected.
+- **Model routing (`tests/model_routing.rs`):** the `/auto` route and managed `/v1` catalog walk
+  end-to-end against two mocks with different mounts, pool keys, and model ids. Covers primary
+  routing, **failover on a refused connection** (asserting the fallback's mount, its pool key, and
+  its spelling of the model — the key assertion, since forwarding the primary's key would be a
+  credential leak rather than a failed request), the breaker ledger (the abandoned candidate's
+  breaker opens while the fallback keeps serving), missing/unknown model → 404, BYO on `/auto` →
+  400, BYO on `/v1` still forwarded, `/openai/…` ignoring the catalog, a stock SDK shape against
+  `/v1` with only `model` in the body, the routing header never reaching an upstream, `ai.usage`
+  naming the candidate that served, all-candidates-down, a **256 KiB body surviving a failover
+  byte-for-byte**, a **429 walking keys not vendors**, and provider-routed traffic being unaffected.
 - **Cancellation (`tests/cancellation.rs`):** a client that gives up must not open the provider's
   breaker, and a genuinely broken provider still must. Verified non-vacuous — reverting the fix makes
   the first test fail.

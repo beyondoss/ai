@@ -5,7 +5,9 @@
 //! returns nothing for an aggregator, because `moonshotai/kimi-k2.6` is equally a Fireworks,
 //! Together and OpenRouter id and guessing between them is the mis-route this crate exists to
 //! prevent. The catalog is where that guess becomes a *decision*: a named model, the wire its
-//! clients speak, and the ordered upstreams we are willing to serve it from.
+//! clients speak, and the ordered upstreams we are willing to serve it from. On the gateway, that
+//! table **is** the allowlist for managed `/v1` and `/auto` — a name that is not a row is a 404.
+//! `/{provider}/…` does not consult it.
 //!
 //! It carries routing facts only — provider, the id that provider spells it with, and the path to
 //! send it to. Model *capability* facts (context window, thinking shape) stay in
@@ -62,7 +64,8 @@ pub struct Candidate {
 /// A canonical model name, the wire its clients speak, and the ordered upstreams that serve it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ModelRoute {
-    /// The value a client puts in the routing header. Lowercase and restricted to `[a-z0-9._/-]`,
+    /// The catalog name a client puts in `x-beyond-model` or, on a managed `/v1` (and headerless
+    /// `/auto`) request, the body's root `model`. Lowercase and restricted to `[a-z0-9._/-]`,
     /// which is what lets the gateway log it verbatim without sanitizing.
     pub model: &'static str,
     /// The API shape a client of this row sends, and the shape its responses come back in. Drives
