@@ -1,10 +1,14 @@
-//! Sparse per-tenant deny-set — the gateway's *entire* spend/fraud surface.
+//! Sparse deny-set — the gateway's *entire* spend/fraud surface.
 //!
-//! Design (deliberate, see plan): the gateway only ever asks "is this tenant cut off?" and
-//! default-**allows** on a miss. We hold **only the exceptions** (the cut-off tenants), so memory
-//! is `O(denied)`, not `O(tenants)` — this scales to millions of tenants because `denied` stays a
-//! tiny slice of them. The gateway never decides *why* a tenant is denied — the control plane
-//! writes/removes entries; we just enforce + log.
+//! Design (deliberate, see plan): the gateway only ever asks "is this tenant or credential cut
+//! off?" and default-**allows** on a miss. We hold **only the exceptions**, so memory is
+//! `O(denied)`, not `O(tenants)` — this scales to millions of tenants because `denied` stays a
+//! tiny slice of them. The gateway never decides *why* — the control plane writes/removes
+//! entries; we just enforce + log.
+//!
+//! Two memberships, one set: `blackhole.{tenant}` cuts off every key for that tenant;
+//! `blackhole.key.{id}` cuts off one `bai_v2` credential. A request is denied if **either**
+//! matches. v1 tokens have no `key_id`, so only the tenant map can deny them.
 //!
 //! Sizing, honestly: the stored element is the **pair** `(u64, DenyReason)` = 16 bytes (the 1-byte
 //! enum is padded out to the id's 8-byte alignment), and hashbrown rounds up to a power-of-two
@@ -26,13 +30,13 @@ use std::hash::BuildHasherDefault;
 /// The deny map's hasher. **Deliberately not** std's `RandomState` (SipHash-1-3).
 ///
 /// HashDoS resistance exists to stop an attacker from *choosing* keys that collide. Here the key is
-/// `identity.tenant_id`, which only ever comes out of `keyring.verify(raw_key)` — an Ed25519
-/// signature check over a token minted by the control plane, which holds the only signing key. And
-/// the ordering is load-bearing: `proxy::request_filter` verifies **first** and only then looks the
-/// tenant up (`proxy.rs`, step 5), so an unforgeable id is the *only* thing that ever reaches this
-/// map. An attacker cannot pick their tenant id, cannot enumerate ids to farm collisions, and never
-/// gets an unverified id into the table at all — so SipHash's collision resistance buys nothing and
-/// costs ~4x on a lookup that runs on **every managed request**.
+/// `identity.tenant_id` or `identity.key_id`, which only ever comes out of `keyring.verify(raw_key)`
+/// — an Ed25519 signature check over a token minted by the control plane, which holds the only
+/// signing key. And the ordering is load-bearing: `proxy::request_filter` verifies **first** and
+/// only then looks the id up (`proxy.rs`, step 5), so an unforgeable id is the *only* thing that
+/// ever reaches this map. An attacker cannot pick their tenant or key id, cannot enumerate ids to
+/// farm collisions, and never gets an unverified id into the table at all — so SipHash's collision
+/// resistance buys nothing and costs ~4x on a lookup that runs on **every managed request**.
 ///
 /// Measured on the dev host (`benches/unit.rs`, `deny::reason_*`, 1M entries): SipHash 6.21 ns vs
 /// Fx 1.49 ns single-threaded; 13.44 ns vs 3.40 ns at 16 threads (the gateway is many-core, so the
@@ -65,9 +69,17 @@ impl DenyReason {
     }
 }
 
+/// Who a `blackhole.*` entry names. Parsed from the KV key; the value is still just a reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DenyTarget {
+    Tenant(u64),
+    Key(u64),
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct DenySet {
     denied: HashMap<u64, DenyReason, DenyHasher>,
+    keys: HashMap<u64, DenyReason, DenyHasher>,
 }
 
 impl DenySet {
@@ -80,6 +92,7 @@ impl DenySet {
     pub fn with_capacity(n: usize) -> Self {
         Self {
             denied: HashMap::with_capacity_and_hasher(n, DenyHasher::default()),
+            keys: HashMap::with_hasher(DenyHasher::default()),
         }
     }
 
@@ -89,24 +102,57 @@ impl DenySet {
         self.denied.contains_key(&tenant_id)
     }
 
+    /// Tenant-only reason. Prefer [`Self::reason_for`] on the request path so a key-level deny
+    /// is visible too.
     pub fn reason(&self, tenant_id: u64) -> Option<DenyReason> {
         self.denied.get(&tenant_id).copied()
+    }
+
+    /// Denied if the tenant is in the set **or** (when present) the credential's `key_id` is.
+    /// Tenant deny wins when both match — it is the broader cut-off.
+    pub fn reason_for(&self, tenant_id: u64, key_id: Option<u64>) -> Option<DenyReason> {
+        if let Some(r) = self.denied.get(&tenant_id).copied() {
+            return Some(r);
+        }
+        key_id.and_then(|id| self.keys.get(&id).copied())
     }
 
     pub fn insert(&mut self, tenant_id: u64, reason: DenyReason) {
         self.denied.insert(tenant_id, reason);
     }
 
+    pub fn insert_key(&mut self, key_id: u64, reason: DenyReason) {
+        self.keys.insert(key_id, reason);
+    }
+
+    pub fn insert_target(&mut self, target: DenyTarget, reason: DenyReason) {
+        match target {
+            DenyTarget::Tenant(t) => self.insert(t, reason),
+            DenyTarget::Key(k) => self.insert_key(k, reason),
+        }
+    }
+
     pub fn remove(&mut self, tenant_id: u64) {
         self.denied.remove(&tenant_id);
     }
 
+    pub fn remove_key(&mut self, key_id: u64) {
+        self.keys.remove(&key_id);
+    }
+
+    pub fn remove_target(&mut self, target: DenyTarget) {
+        match target {
+            DenyTarget::Tenant(t) => self.remove(t),
+            DenyTarget::Key(k) => self.remove_key(k),
+        }
+    }
+
     pub fn len(&self) -> usize {
-        self.denied.len()
+        self.denied.len() + self.keys.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.denied.is_empty()
+        self.denied.is_empty() && self.keys.is_empty()
     }
 }
 
@@ -117,14 +163,25 @@ impl FromIterator<(u64, DenyReason)> for DenySet {
     fn from_iter<I: IntoIterator<Item = (u64, DenyReason)>>(iter: I) -> Self {
         Self {
             denied: iter.into_iter().collect(),
+            keys: HashMap::with_hasher(DenyHasher::default()),
         }
     }
 }
 
-/// Parse a slipstream deny key `blackhole.{tenant_id}` → tenant id. Returns `None` for keys that
-/// don't match (so an unrelated watched key never corrupts the set).
-pub fn parse_key(key: &str) -> Option<u64> {
-    key.strip_prefix("blackhole.")?.parse().ok()
+/// Parse a slipstream deny key.
+///
+/// - `blackhole.{tenant_id}` → [`DenyTarget::Tenant`]
+/// - `blackhole.key.{id}` → [`DenyTarget::Key`]
+///
+/// Both live under the `blackhole.` watch prefix, so one watcher sees both. `None` for anything
+/// else (so an unrelated watched key never corrupts the set). The `key.` form is checked first —
+/// otherwise `blackhole.key.42` would be a failed tenant parse and silently dropped.
+pub fn parse_key(key: &str) -> Option<DenyTarget> {
+    let rest = key.strip_prefix("blackhole.")?;
+    if let Some(id) = rest.strip_prefix("key.") {
+        return Some(DenyTarget::Key(id.parse().ok()?));
+    }
+    Some(DenyTarget::Tenant(rest.parse().ok()?))
 }
 
 /// The only field of the control plane's JSON entry value we care about; everything else it writes
@@ -218,9 +275,30 @@ mod tests {
 
     #[test]
     fn key_parsing() {
-        assert_eq!(parse_key("blackhole.42"), Some(42));
+        assert_eq!(parse_key("blackhole.42"), Some(DenyTarget::Tenant(42)));
+        assert_eq!(parse_key("blackhole.key.7"), Some(DenyTarget::Key(7)));
         assert_eq!(parse_key("blackhole.notanumber"), None);
+        assert_eq!(parse_key("blackhole.key.notanumber"), None);
+        assert_eq!(parse_key("blackhole.key"), None);
         assert_eq!(parse_key("signkey.1"), None);
+    }
+
+    #[test]
+    fn key_or_tenant_deny() {
+        let mut set = DenySet::new();
+        set.insert_key(100, DenyReason::Fraud);
+        // Same tenant, two credentials: only the named key is cut off.
+        assert_eq!(set.reason_for(1, Some(100)), Some(DenyReason::Fraud));
+        assert_eq!(set.reason_for(1, Some(101)), None);
+        assert_eq!(set.reason_for(1, None), None); // v1: no key_id, tenant not denied
+        set.insert(1, DenyReason::Spend);
+        // Tenant deny kills every key for that tenant, including one already key-denied.
+        assert_eq!(set.reason_for(1, Some(100)), Some(DenyReason::Spend));
+        assert_eq!(set.reason_for(1, Some(101)), Some(DenyReason::Spend));
+        assert_eq!(set.reason_for(1, None), Some(DenyReason::Spend));
+        assert_eq!(set.reason_for(2, Some(100)), Some(DenyReason::Fraud)); // key still denied
+        set.remove_key(100);
+        assert_eq!(set.reason_for(2, Some(100)), None);
     }
 
     #[test]

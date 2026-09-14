@@ -44,6 +44,7 @@ fn main() {
     let vk = VirtualKey {
         tenant_id: 1,
         vpc_id: 1,
+        key_id: None,
     };
     let token = mint(&vk, KID, &signing_key);
 

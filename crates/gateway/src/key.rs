@@ -1,4 +1,4 @@
-//! Stateless virtual API key: `bai_v1.{kid}.{payload}.{sig}`.
+//! Stateless virtual API key: `bai_v1` / `bai_v2`.
 //!
 //! The gateway authenticates every request from a `{payload}` it can verify **without a
 //! lookup**: tenant/app identity lives *inside* the token, signed with Ed25519. We hold only
@@ -10,62 +10,90 @@
 //! Identity is stateless here; the only per-request state is the sparse deny-set (see `deny`),
 //! which is a membership check, not an identity lookup.
 //!
-//! Why deterministic (no nonce/timestamp in the payload): `mint(tenant, app)` is reproducible,
-//! so the control plane can re-derive a tenant's key on demand and store nothing. Revocation is
-//! handled out-of-band by the deny-set, not by per-key expiry.
+//! `bai_v1` is tenant+vpc only and `mint` is deterministic for those two fields — the control
+//! plane can re-derive one key per (tenant, vpc). That cannot name a *credential*, so it cannot
+//! be cut off without cutting off the tenant. `bai_v2` adds an explicit `key_id` the caller
+//! supplies (not derived from tenant+vpc); mint is still deterministic for a given key_id.
+//! Revocation is out-of-band via the deny-set (`blackhole.{tenant}` and `blackhole.key.{id}`).
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use std::collections::HashMap;
 
-/// Wire prefix + version. Bumping the version is a breaking change to the token format;
-/// the version is inside the signed bytes so it cannot be downgraded by an attacker.
+/// Wire prefix + version. Inside the signed bytes, so it cannot be downgraded by an attacker.
 ///
-/// `request_filter` fail-closes on this prefix: a match that then fails verify is 401, never BYO.
-pub const PREFIX: &str = "bai_v1";
+/// `request_filter` fail-closes on a managed prefix: a match that then fails verify is 401, never BYO.
+pub const PREFIX_V1: &str = "bai_v1";
+pub const PREFIX_V2: &str = "bai_v2";
+/// Alias for the original version — existing call sites and benches.
+pub const PREFIX: &str = PREFIX_V1;
 
-/// Whether a presented credential claims to be a managed virtual key (`bai_v1…`).
+/// Whether a presented credential claims to be a managed virtual key (`bai_v1…` or `bai_v2…`).
 ///
 /// Used by the identity branch and the rate-guard managed flag — they must agree. A prefix match
 /// is fail-closed at verify (401), so classifying it as managed here also exempts a forged flood
 /// from the BYO aggregate without ever forwarding it upstream.
 #[inline]
 pub fn is_managed_prefix(token: &str) -> bool {
-    token.starts_with(PREFIX)
+    token.starts_with(PREFIX_V1) || token.starts_with(PREFIX_V2)
 }
 
 /// Signing-key identifier. Lets the control plane rotate signing keys: new tokens are minted
 /// under a new `kid` while the gateway still trusts the public keys of older, un-retired `kid`s.
 pub type Kid = u32;
 
-/// The identity carried by (and the entire contents of) a virtual key.
+/// The identity carried by a virtual key.
 ///
-/// `tenant_id`/`vpc_id` are `u64` to match the platform's id width (cf. ClickHouse
-/// `tenant_id UInt64` / `vpc_id UInt64`) and to keep the payload a fixed 16 bytes.
+/// `tenant_id`/`vpc_id`/`key_id` are `u64` to match the platform's id width (cf. ClickHouse
+/// `tenant_id UInt64` / `vpc_id UInt64`). `key_id` is `Some` on `bai_v2` only — v1 has no
+/// per-credential identity, so a key-level deny cannot apply to it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VirtualKey {
     pub tenant_id: u64,
     pub vpc_id: u64,
+    pub key_id: Option<u64>,
 }
 
 impl VirtualKey {
-    /// Fixed 16-byte little-endian payload: `tenant_id ++ vpc_id`. Fixed layout (not JSON) so
-    /// the encoding is deterministic byte-for-byte — required for `mint` to be reproducible.
-    fn encode_payload(&self) -> [u8; 16] {
+    /// v1: fixed 16-byte little-endian payload `tenant_id ++ vpc_id`.
+    fn encode_payload_v1(&self) -> [u8; 16] {
         let mut out = [0u8; 16];
         out[..8].copy_from_slice(&self.tenant_id.to_le_bytes());
         out[8..].copy_from_slice(&self.vpc_id.to_le_bytes());
         out
     }
 
-    fn decode_payload(bytes: &[u8]) -> Option<Self> {
+    /// v2: fixed 24-byte little-endian payload `tenant_id ++ vpc_id ++ key_id`.
+    /// `key_id` is an argument, not derived from tenant+vpc — two credentials for the
+    /// same tenant are distinct tokens and can be denied independently.
+    fn encode_payload_v2(&self, key_id: u64) -> [u8; 24] {
+        let mut out = [0u8; 24];
+        out[..8].copy_from_slice(&self.tenant_id.to_le_bytes());
+        out[8..16].copy_from_slice(&self.vpc_id.to_le_bytes());
+        out[16..].copy_from_slice(&key_id.to_le_bytes());
+        out
+    }
+
+    fn decode_payload_v1(bytes: &[u8]) -> Option<Self> {
         if bytes.len() != 16 {
             return None;
         }
         Some(Self {
             tenant_id: u64::from_le_bytes(bytes[..8].try_into().ok()?),
             vpc_id: u64::from_le_bytes(bytes[8..].try_into().ok()?),
+            key_id: None,
+        })
+    }
+
+    fn decode_payload_v2(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() != 24 {
+            return None;
+        }
+        Some(Self {
+            tenant_id: u64::from_le_bytes(bytes[..8].try_into().ok()?),
+            vpc_id: u64::from_le_bytes(bytes[8..16].try_into().ok()?),
+            key_id: Some(u64::from_le_bytes(bytes[16..].try_into().ok()?)),
         })
     }
 }
@@ -115,9 +143,9 @@ impl Keyring {
     }
 
     /// Verify a virtual key string and extract its identity. Stateless: the only input besides
-    /// the token is the public keyring.
+    /// the token is the public keyring. Accepts `bai_v1` and `bai_v2`.
     pub fn verify(&self, token: &str) -> Result<VirtualKey, KeyError> {
-        // Split into exactly 4 parts: `bai_v1`, kid, payload, sig. `splitn(4, '.')` rejects any
+        // Split into exactly 4 parts: prefix, kid, payload, sig. `splitn(4, '.')` rejects any
         // token with fewer separators; a payload/sig never contains '.' (base64url has none).
         let mut parts = token.splitn(4, '.');
         let prefix = parts.next().ok_or(KeyError::Malformed)?;
@@ -125,24 +153,20 @@ impl Keyring {
         let payload_b64 = parts.next().ok_or(KeyError::Malformed)?;
         let sig_b64 = parts.next().ok_or(KeyError::Malformed)?;
 
-        if prefix != PREFIX {
-            // Distinguish "wrong version of our token" from "not our token at all" only loosely;
-            // both are unauthenticated. A `bai_vN` with N != 1 reports BadVersion for clarity.
-            return if prefix.starts_with("bai_v") {
-                Err(KeyError::BadVersion)
-            } else {
-                Err(KeyError::Malformed)
-            };
-        }
+        let version = match prefix {
+            PREFIX_V1 => 1u8,
+            PREFIX_V2 => 2,
+            p if p.starts_with("bai_v") => return Err(KeyError::BadVersion),
+            _ => return Err(KeyError::Malformed),
+        };
 
         let kid: Kid = kid_str.parse().map_err(|_| KeyError::Malformed)?;
 
         // Decode the fixed-size fields straight onto the stack — no per-request heap allocation on
-        // the verify hot path. The payload is always 16 bytes, the signature 64. `decode_slice`
-        // sizes its bounds check against a (ceil) estimate, so the buffers are a few bytes larger
-        // than the exact decoded length; we slice to what was actually written and the fixed-size
-        // checks below reject anything off (an oversized field overruns the estimate → Malformed).
-        let mut payload_buf = [0u8; 24]; // ≥ estimate for a 22-char (16-byte) payload
+        // the verify hot path. v1 payload is 16 bytes (22-char b64), v2 is 24 bytes (32-char b64);
+        // the signature is 64. `decode_slice` sizes its bounds check against a (ceil) estimate, so
+        // the buffers are a few bytes larger than the exact decoded length.
+        let mut payload_buf = [0u8; 36];
         let plen = URL_SAFE_NO_PAD
             .decode_slice(payload_b64, &mut payload_buf)
             .map_err(|_| KeyError::Malformed)?;
@@ -161,38 +185,41 @@ impl Keyring {
         // cheap rejection (no signature math on keys we don't trust).
         let vk = self.get(kid).ok_or(KeyError::UnknownKid(kid))?;
 
-        // The signed message binds version + kid + payload, so none can be swapped independently.
-        // Build it into a stack buffer (≤ 40 bytes) — no allocation per verify. A payload longer
-        // than the buffer can hold can't be a valid 16-byte payload anyway, so it's `Malformed`
-        // rather than a panic on this per-request hot path.
+        // The signed message binds version + kid + payload, so none can be swapped independently
+        // (including a v1↔v2 downgrade). Stack buffer, no allocation per verify.
         let mut signed_buf = [0u8; SIGNED_BYTES_CAP];
-        let signed =
-            write_signed_bytes(&mut signed_buf, kid, payload_b64).ok_or(KeyError::Malformed)?;
+        let signed = write_signed_bytes(&mut signed_buf, prefix, kid, payload_b64)
+            .ok_or(KeyError::Malformed)?;
         vk.verify(signed, &signature)
             .map_err(|_| KeyError::BadSignature)?;
 
-        VirtualKey::decode_payload(payload).ok_or(KeyError::Malformed)
+        match version {
+            1 => VirtualKey::decode_payload_v1(payload).ok_or(KeyError::Malformed),
+            2 => VirtualKey::decode_payload_v2(payload).ok_or(KeyError::Malformed),
+            _ => Err(KeyError::BadVersion),
+        }
     }
 }
 
-/// Upper bound on `bai_v1.{kid}.{payload}`: `PREFIX` (6) + `.` + a `u32` kid (≤ 10 digits) + `.`
-/// + a 16-byte base64url payload (22 chars) = 40 bytes. 64 leaves headroom.
+/// Upper bound on `{prefix}.{kid}.{payload}`: prefix (6) + `.` + a `u32` kid (≤ 10 digits) + `.`
+/// + a 24-byte base64url payload (32 chars, v2) = 50 bytes. 64 leaves headroom. v1 is 40.
 const SIGNED_BYTES_CAP: usize = 64;
 
-/// Write the signature-covered bytes `bai_v1.{kid}.{payload}` into `buf`, returning the written
-/// slice — or `None` if they don't fit in `SIGNED_BYTES_CAP`. Binding kid + payload here is what
-/// stops an attacker from re-pointing a valid signature at a different kid or a tampered payload.
-/// For a well-formed key the length is bounded (≤ 40 bytes; see `SIGNED_BYTES_CAP`), so `None`
-/// means the input was malformed — `write!` returns `WriteZero` rather than panicking or
+/// Write the signature-covered bytes `{prefix}.{kid}.{payload}` into `buf`, returning the written
+/// slice — or `None` if they don't fit in `SIGNED_BYTES_CAP`. Binding version + kid + payload here
+/// is what stops an attacker from re-pointing a valid signature at a different kid, a tampered
+/// payload, or the other version. For a well-formed key the length is bounded (≤ 50 bytes), so
+/// `None` means the input was malformed — `write!` returns `WriteZero` rather than panicking or
 /// truncating, keeping the verify hot path allocation- *and* panic-free.
 fn write_signed_bytes<'a>(
     buf: &'a mut [u8; SIGNED_BYTES_CAP],
+    prefix: &str,
     kid: Kid,
     payload_b64: &str,
 ) -> Option<&'a [u8]> {
     use std::io::Write;
     let mut cur = std::io::Cursor::new(&mut buf[..]);
-    write!(cur, "{PREFIX}.{kid}.{payload_b64}").ok()?;
+    write!(cur, "{prefix}.{kid}.{payload_b64}").ok()?;
     let n = cur.position() as usize;
     Some(&buf[..n])
 }
@@ -216,20 +243,36 @@ pub fn verifying_key_from_value(bytes: &[u8]) -> Option<VerifyingKey> {
     VerifyingKey::from_bytes(&arr).ok()
 }
 
-/// Mint a virtual key. Lives here for tests + determinism checks and as the reference
-/// implementation; production minting is the Go control plane (`crypto/ed25519`), which must
-/// produce byte-identical output for the same inputs.
+/// Mint a `bai_v1` virtual key (tenant+vpc only). Lives here for tests + determinism checks
+/// and as the reference implementation; production minting is the Go control plane
+/// (`crypto/ed25519`), which must produce byte-identical output for the same inputs.
 #[allow(clippy::expect_used)] // payload is a fixed 22-char base64 of 16 bytes; always fits the cap
 pub fn mint(vk: &VirtualKey, kid: Kid, signing_key: &SigningKey) -> String {
-    let payload_b64 = URL_SAFE_NO_PAD.encode(vk.encode_payload());
+    let payload_b64 = URL_SAFE_NO_PAD.encode(vk.encode_payload_v1());
     let mut signed_buf = [0u8; SIGNED_BYTES_CAP];
-    // mint builds the payload itself (a fixed 22-char base64 of 16 bytes) from controlled inputs,
-    // so it always fits; this `expect` is a true invariant assertion, not a fallible runtime path.
-    let signed = write_signed_bytes(&mut signed_buf, kid, &payload_b64)
+    let signed = write_signed_bytes(&mut signed_buf, PREFIX_V1, kid, &payload_b64)
         .expect("minted signed bytes fit in SIGNED_BYTES_CAP");
     let sig: Signature = signing_key.sign(signed);
     let sig_b64 = URL_SAFE_NO_PAD.encode(sig.to_bytes());
-    format!("{PREFIX}.{kid}.{payload_b64}.{sig_b64}")
+    format!("{PREFIX_V1}.{kid}.{payload_b64}.{sig_b64}")
+}
+
+/// Mint a `bai_v2` virtual key. `key_id` is explicit — not derived from tenant+vpc — so two
+/// credentials for the same tenant are distinct and can be denied independently.
+///
+/// Byte layout (document this for the Go control plane; do not invent a second encoding):
+/// `bai_v2.{kid}.{payload_b64}.{sig_b64}` where `payload` is 24 bytes little-endian
+/// `tenant_id u64 || vpc_id u64 || key_id u64`, `payload_b64`/`sig_b64` are base64url (no pad),
+/// and the signed bytes are `bai_v2.{kid}.{payload_b64}`. Same Ed25519 keyring as v1.
+#[allow(clippy::expect_used)] // payload is a fixed 32-char base64 of 24 bytes; always fits the cap
+pub fn mint_v2(vk: &VirtualKey, key_id: u64, kid: Kid, signing_key: &SigningKey) -> String {
+    let payload_b64 = URL_SAFE_NO_PAD.encode(vk.encode_payload_v2(key_id));
+    let mut signed_buf = [0u8; SIGNED_BYTES_CAP];
+    let signed = write_signed_bytes(&mut signed_buf, PREFIX_V2, kid, &payload_b64)
+        .expect("minted v2 signed bytes fit in SIGNED_BYTES_CAP");
+    let sig: Signature = signing_key.sign(signed);
+    let sig_b64 = URL_SAFE_NO_PAD.encode(sig.to_bytes());
+    format!("{PREFIX_V2}.{kid}.{payload_b64}.{sig_b64}")
 }
 
 #[cfg(test)]
@@ -256,10 +299,36 @@ mod tests {
         let id = VirtualKey {
             tenant_id: 42,
             vpc_id: 99,
+            key_id: None,
         };
 
         let token = mint(&id, 7, &sk);
         assert_eq!(ring.verify(&token).unwrap(), id);
+        assert!(token.starts_with("bai_v1."));
+    }
+
+    #[test]
+    fn mint_v2_roundtrips_explicit_key_id() {
+        let (sk, vk) = test_keypair(1);
+        let ring = ring_with(7, vk);
+        let id = VirtualKey {
+            tenant_id: 42,
+            vpc_id: 99,
+            key_id: None,
+        };
+
+        let token = mint_v2(&id, 1_000_042, 7, &sk);
+        let got = ring.verify(&token).unwrap();
+        assert_eq!(got.tenant_id, 42);
+        assert_eq!(got.vpc_id, 99);
+        assert_eq!(got.key_id, Some(1_000_042));
+        assert!(token.starts_with("bai_v2."));
+        // Same tenant+vpc, different key_id → a different credential.
+        let other = mint_v2(&id, 1_000_043, 7, &sk);
+        assert_ne!(token, other);
+        assert_eq!(ring.verify(&other).unwrap().key_id, Some(1_000_043));
+        // key_id is not derived from tenant+vpc: mint is deterministic for the explicit id.
+        assert_eq!(token, mint_v2(&id, 1_000_042, 7, &sk));
     }
 
     #[test]
@@ -268,6 +337,7 @@ mod tests {
         let id = VirtualKey {
             tenant_id: 1,
             vpc_id: 2,
+            key_id: None,
         };
         // Ed25519 is deterministic (RFC 8032) and the payload has no nonce, so two mints match.
         assert_eq!(mint(&id, 1, &sk), mint(&id, 1, &sk));
@@ -281,6 +351,7 @@ mod tests {
             &VirtualKey {
                 tenant_id: 10,
                 vpc_id: 20,
+                key_id: None,
             },
             1,
             &sk,
@@ -305,6 +376,7 @@ mod tests {
             &VirtualKey {
                 tenant_id: 5,
                 vpc_id: 6,
+                key_id: None,
             },
             1,
             &sk,
@@ -329,6 +401,7 @@ mod tests {
             &VirtualKey {
                 tenant_id: 1,
                 vpc_id: 1,
+                key_id: None,
             },
             2,
             &sk,
@@ -349,6 +422,7 @@ mod tests {
         let id = VirtualKey {
             tenant_id: 3,
             vpc_id: 4,
+            key_id: None,
         };
         let token2 = mint(&id, 2, &sk2);
         // Re-label the kid segment as 1 while keeping kid=2's signature.
@@ -388,7 +462,9 @@ mod tests {
         let ring = ring_with(1, vk);
         assert_eq!(ring.verify("garbage"), Err(KeyError::Malformed));
         assert_eq!(ring.verify("bai_v1.1.only-three"), Err(KeyError::Malformed));
-        assert_eq!(ring.verify("bai_v2.1.aaaa.bbbb"), Err(KeyError::BadVersion));
+        assert_eq!(ring.verify("bai_v3.1.aaaa.bbbb"), Err(KeyError::BadVersion));
+        // A v2-shaped token with junk payload/sig is this version, just malformed — not BadVersion.
+        assert_eq!(ring.verify("bai_v2.1.aaaa.bbbb"), Err(KeyError::Malformed));
         assert_eq!(
             ring.verify("sk-openai.1.aaaa.bbbb"),
             Err(KeyError::Malformed)
@@ -396,11 +472,11 @@ mod tests {
     }
 
     #[test]
-    fn managed_prefix_is_exactly_bai_v1() {
+    fn managed_prefix_is_v1_or_v2() {
         assert!(is_managed_prefix("bai_v1.1.payload.sig"));
-        // A future version is not this prefix — it must not steal the managed branch
-        // (and the BYO-aggregate exemption) until verify knows how to accept it.
-        assert!(!is_managed_prefix("bai_v2.1.aaaa.bbbb"));
+        assert!(is_managed_prefix("bai_v2.1.payload.sig"));
+        // Unknown versions stay off the managed branch (verify would BadVersion if we entered).
+        assert!(!is_managed_prefix("bai_v3.1.aaaa.bbbb"));
         assert!(!is_managed_prefix("bai_"));
         assert!(!is_managed_prefix("sk-openai"));
     }

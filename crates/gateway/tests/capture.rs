@@ -22,6 +22,7 @@ fn vkey(sk: &ed25519_dalek::SigningKey, tenant_id: u64) -> String {
         &VirtualKey {
             tenant_id,
             vpc_id: 7,
+            key_id: None,
         },
         1,
         sk,

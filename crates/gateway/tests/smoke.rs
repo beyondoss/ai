@@ -50,6 +50,7 @@ async fn managed_gateway(nats: &Nats, provider: &str, real_key: &str) -> (Gatewa
         &VirtualKey {
             tenant_id: 1,
             vpc_id: 1,
+            key_id: None,
         },
         1,
         &sk,
@@ -466,6 +467,7 @@ async fn model_route_fails_over_to_a_real_provider() {
         &VirtualKey {
             tenant_id: 1,
             vpc_id: 1,
+            key_id: None,
         },
         1,
         &sk,
