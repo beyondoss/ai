@@ -178,36 +178,81 @@ pub fn sse(events: &[Value]) -> String {
     events.iter().map(|e| format!("data: {e}\n\n")).collect()
 }
 
+fn read_more(stream: &mut TcpStream, buf: &mut Vec<u8>) -> bool {
+    let mut tmp = [0u8; 2048];
+    let n = stream.read(&mut tmp).unwrap_or(0);
+    if n == 0 {
+        return false;
+    }
+    buf.extend_from_slice(&tmp[..n]);
+    true
+}
+
+/// Drain an HTTP/1.1 chunked body starting at `cursor`. The gateway's catalog walk (and OpenAI
+/// `stream_options` injection) strips `Content-Length` and forwards `transfer-encoding: chunked`,
+/// so a mock that only honors `Content-Length` returns on headers and never sees the body.
+fn read_chunked_body(stream: &mut TcpStream, buf: &mut Vec<u8>, mut cursor: usize) {
+    loop {
+        let size_end = loop {
+            if let Some(i) = buf[cursor..].windows(2).position(|w| w == b"\r\n") {
+                break cursor + i;
+            }
+            if !read_more(stream, buf) {
+                return;
+            }
+        };
+        let size_line = std::str::from_utf8(&buf[cursor..size_end]).unwrap_or("");
+        let size_hex = size_line.split(';').next().unwrap_or("").trim();
+        let size = usize::from_str_radix(size_hex, 16).unwrap_or(0);
+        if size == 0 {
+            // Last chunk, then optional trailers, then a terminating blank line.
+            loop {
+                if buf[cursor..].windows(4).any(|w| w == b"\r\n\r\n") {
+                    return;
+                }
+                if !read_more(stream, buf) {
+                    return;
+                }
+            }
+        }
+        let chunk_end = size_end + 2 + size + 2; // CRLF after size, data, CRLF after data
+        while buf.len() < chunk_end {
+            if !read_more(stream, buf) {
+                return;
+            }
+        }
+        cursor = chunk_end;
+    }
+}
+
 fn read_http_request(stream: &mut TcpStream) -> String {
     let mut buf = Vec::new();
-    let mut tmp = [0u8; 2048];
     loop {
         if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
             let headers = String::from_utf8_lossy(&buf[..pos]).to_ascii_lowercase();
-            let len = headers
-                .lines()
-                .find_map(|l| {
-                    l.strip_prefix("content-length:")
-                        .map(|v| v.trim().parse::<usize>().unwrap_or(0))
-                })
-                .unwrap_or(0);
             // Keep reading until the full body has arrived, then return the WHOLE raw request
             // (headers + body) so callers can assert on both (e.g. a swapped-in pool key).
-            let need = pos + 4 + len;
-            while buf.len() < need {
-                let n = stream.read(&mut tmp).unwrap_or(0);
-                if n == 0 {
-                    break;
-                }
-                buf.extend_from_slice(&tmp[..n]);
+            if headers.lines().any(|l| {
+                l.strip_prefix("transfer-encoding:")
+                    .is_some_and(|v| v.split(',').any(|e| e.trim() == "chunked"))
+            }) {
+                read_chunked_body(stream, &mut buf, pos + 4);
+            } else {
+                let len = headers
+                    .lines()
+                    .find_map(|l| {
+                        l.strip_prefix("content-length:")
+                            .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+                    })
+                    .unwrap_or(0);
+                let need = pos + 4 + len;
+                while buf.len() < need && read_more(stream, &mut buf) {}
             }
             return String::from_utf8_lossy(&buf).into_owned();
         }
-        let n = stream.read(&mut tmp).unwrap_or(0);
-        if n == 0 {
+        if !read_more(stream, &mut buf) {
             return String::from_utf8_lossy(&buf).into_owned();
         }
-        buf.extend_from_slice(&tmp[..n]);
     }
 }
 
