@@ -44,7 +44,9 @@ Client (stock OpenAI/Anthropic SDK)
   │  │    `/{provider}/…` is the escape hatch (no catalog)
   │  │    …or `/auto` / managed `/v1` → x-beyond-model if present, else body's root `model`
   │  │      → catalog row → ordered candidates
-  │  │      no/unknown model ──────────────────────────────────► 404
+  │  │      no/unknown model ──────────────────────────────────► 404 (names the miss)
+  │  │      inbound path's wire ≠ row ─────────────────────────► 400
+  │  │      GET /v1/models ────────────────────────────────────► catalog list
   │  │      BYO key on `/auto` (managed-only route) ───────────► 400
   │  │      BYO on `/v1` ─ dialect-default passthrough (no catalog)
   │  │      no candidate holds a pool key ────────────────────► 503
@@ -192,11 +194,20 @@ One reserved first segment — and the managed bare `/v1` default — routes by 
 provider. `/auto/…` and managed `/v1/chat/completions` / `/v1/messages` take the canonical model
 name from the `x-beyond-model` header if present, else the body's root `model`, resolve it in the
 catalog to an ordered list of candidate providers, and try them in order. The catalog **is** the
-allowlist: unknown or missing model → 404. There is no parallel grant set.
+allowlist: unknown or missing model → 404, with a message that names the miss (`model "…" is not
+in the catalog` vs `missing model: …`). There is no parallel grant set. A candidate's own
+`upstream_model` spelling (OpenRouter's `anthropic/claude-opus-4.8`, Bedrock's inference-profile
+id) is an alias for the row — those are the ids we already rewrite _to_.
+
+`GET /v1/models` (and `HEAD`) lists the catalog in OpenAI list shape, plus a `wire` field
+(`openai` / `anthropic`) so a caller can pick the matching SDK. Served after identity, before the
+body peek, so an empty GET is not a missing-model 404.
 
 A stock OpenAI or Anthropic SDK pointed at `/v1` with `model` in the JSON body is `/auto` without
 the header. Same-wire failover only — the gateway rewrites ids, it does not translate OpenAI ↔
-Anthropic.
+Anthropic. If the inbound path implies the other wire (`POST /v1/chat/completions` with a Claude
+row, or `/v1/messages` with a GPT row) that is a **400** from us (`claude-opus-4-8 is Anthropic
+Messages; POST /v1/messages`), not a provider 400 on the wrong JSON.
 
 `/{provider}/…` is the escape hatch and does not consult the catalog. This arm is reached only after
 a provider-table miss, so `/{provider}/…` traffic runs exactly the code it always did; `auto` is
@@ -742,8 +753,9 @@ remains the escape hatch when the catalog should not apply.
 - Tenant / key not in deny-set (managed traffic only; O(1) HashMap lookup; tenant deny kills every key)
 - Pool key configured for the requested provider (managed traffic only — else 503). On a catalog
   walk this is per candidate: none keyed → 503, not a request-wide missing openai key.
-- Catalog model on managed `/v1` and `/auto` (unknown or missing → 404). `/{provider}/…` is not
-  allowlisted.
+- Catalog model on managed `/v1` and `/auto` (unknown or missing → 404 naming the miss). Candidate
+  spellings are aliases. Inbound path must match the row's wire (else 400). `/{provider}/…` is not
+  allowlisted. `GET /v1/models` lists the catalog.
 - Request body size ≤ `MAX_REQUEST_BODY` (declared `Content-Length` + streaming running total)
 - Per-credential request rate within ceiling; aggregate BYO rate within ceiling
 
@@ -847,29 +859,29 @@ Secret-bearing fields (`pool_keys`, `nats_creds`) are held as `Secret<T>` — st
 
 Prometheus on the default registry, exposed at `/metrics` on `metrics_listen`.
 
-| Metric                                | Type      | Labels               | What It Measures                                                                                  |
-| ------------------------------------- | --------- | -------------------- | ------------------------------------------------------------------------------------------------- |
-| `ai_requests_total`                   | Counter   | —                    | Total admitted requests                                                                           |
-| `ai_rejections_total`                 | Counter   | `reason`             | Rejected requests by cause (auth, deny_spend, deny_fraud, rate_limit, circuit_open, …)            |
-| `ai_upstream_responses_total`         | Counter   | `provider`, `status` | Upstream responses by provider and status class                                                   |
-| `ai_tokens_total`                     | Counter   | `kind`               | input / output / cache_read / cache_write token counts                                            |
-| `ai_ttft_seconds`                     | Histogram | `provider`           | Time to first token (50ms–30s buckets)                                                            |
-| `ai_upstream_latency_seconds`         | Histogram | `provider`           | Full request latency (100ms–600s buckets)                                                         |
-| `ai_active_streams`                   | Gauge     | —                    | Open SSE streams                                                                                  |
-| `ai_requests_in_flight`               | Gauge     | —                    | All in-flight requests (streaming + non-streaming)                                                |
-| `ai_deny_set_size`                    | Gauge     | —                    | Current number of denied tenants                                                                  |
-| `ai_nats_connected`                   | Gauge     | —                    | 1 if the **deny-set** watcher is connected, 0 otherwise                                           |
-| `ai_capture_set_size`                 | Gauge     | —                    | Tenants with payload capture enabled (climbing and never falling ⇒ missing TTLs)                  |
-| `ai_capture_nats_connected`           | Gauge     | —                    | 1 if the **capture-set** watcher is connected — separate watcher, separate connection             |
-| `ai_captures_total`                   | Counter   | —                    | Requests whose payloads were captured (post-sampling)                                             |
-| `ai_capture_bytes_total`              | Counter   | —                    | Payload bytes handed to the sink — the cost signal, ahead of the storage bill                     |
-| `ai_capture_dropped_total`            | Counter   | —                    | Captures dropped on a full sink queue — distinguishes "lost it" from "capture was off"            |
-| `ai_control_header_errors_total`      | Counter   | —                    | `x-beyond-*` headers present but unusable (dropped; request still served)                         |
-| `ai_usage_parse_errors_total`         | Counter   | —                    | Managed 2xx responses with no parseable usage (emitted as a zero-token billing row)               |
-| `ai_candidate_failovers_total`        | Counter   | —                    | Model-routed requests that abandoned a candidate for the next one                                 |
-| `ai_key_walks_total`                  | Counter   | —                    | Managed 429s that retried the same provider with the next unused pool key                         |
-| `ai_model_header_body_mismatch_total` | Counter   | —                    | Catalog-walk requests whose `x-beyond-model` and body `model` disagreed (header wins; client bug) |
-| `ai_failover_body_too_large_total`    | Counter   | —                    | 5xx that could not fail over: request body exceeded the 64 KiB replay buffer                      |
+| Metric                                | Type      | Labels               | What It Measures                                                                                                     |
+| ------------------------------------- | --------- | -------------------- | -------------------------------------------------------------------------------------------------------------------- |
+| `ai_requests_total`                   | Counter   | —                    | Total admitted requests                                                                                              |
+| `ai_rejections_total`                 | Counter   | `reason`             | Rejected requests by cause (auth, deny_spend, deny_fraud, rate_limit, circuit_open, unknown_model, wire_mismatch, …) |
+| `ai_upstream_responses_total`         | Counter   | `provider`, `status` | Upstream responses by provider and status class                                                                      |
+| `ai_tokens_total`                     | Counter   | `kind`               | input / output / cache_read / cache_write token counts                                                               |
+| `ai_ttft_seconds`                     | Histogram | `provider`           | Time to first token (50ms–30s buckets)                                                                               |
+| `ai_upstream_latency_seconds`         | Histogram | `provider`           | Full request latency (100ms–600s buckets)                                                                            |
+| `ai_active_streams`                   | Gauge     | —                    | Open SSE streams                                                                                                     |
+| `ai_requests_in_flight`               | Gauge     | —                    | All in-flight requests (streaming + non-streaming)                                                                   |
+| `ai_deny_set_size`                    | Gauge     | —                    | Current number of denied tenants                                                                                     |
+| `ai_nats_connected`                   | Gauge     | —                    | 1 if the **deny-set** watcher is connected, 0 otherwise                                                              |
+| `ai_capture_set_size`                 | Gauge     | —                    | Tenants with payload capture enabled (climbing and never falling ⇒ missing TTLs)                                     |
+| `ai_capture_nats_connected`           | Gauge     | —                    | 1 if the **capture-set** watcher is connected — separate watcher, separate connection                                |
+| `ai_captures_total`                   | Counter   | —                    | Requests whose payloads were captured (post-sampling)                                                                |
+| `ai_capture_bytes_total`              | Counter   | —                    | Payload bytes handed to the sink — the cost signal, ahead of the storage bill                                        |
+| `ai_capture_dropped_total`            | Counter   | —                    | Captures dropped on a full sink queue — distinguishes "lost it" from "capture was off"                               |
+| `ai_control_header_errors_total`      | Counter   | —                    | `x-beyond-*` headers present but unusable (dropped; request still served)                                            |
+| `ai_usage_parse_errors_total`         | Counter   | —                    | Managed 2xx responses with no parseable usage (emitted as a zero-token billing row)                                  |
+| `ai_candidate_failovers_total`        | Counter   | —                    | Model-routed requests that abandoned a candidate for the next one                                                    |
+| `ai_key_walks_total`                  | Counter   | —                    | Managed 429s that retried the same provider with the next unused pool key                                            |
+| `ai_model_header_body_mismatch_total` | Counter   | —                    | Catalog-walk requests whose `x-beyond-model` and body `model` disagreed (header wins; client bug)                    |
+| `ai_failover_body_too_large_total`    | Counter   | —                    | 5xx that could not fail over: request body exceeded the 64 KiB replay buffer                                         |
 
 ---
 
@@ -922,11 +934,13 @@ Prometheus on the default registry, exposed at `/metrics` on `metrics_listen`.
   routing, **failover on a refused connection** (asserting the fallback's mount, its pool key, and
   its spelling of the model — the key assertion, since forwarding the primary's key would be a
   credential leak rather than a failed request), the breaker ledger (the abandoned candidate's
-  breaker opens while the fallback keeps serving), missing/unknown model → 404, BYO on `/auto` →
-  400, BYO on `/v1` still forwarded, `/openai/…` ignoring the catalog, a stock SDK shape against
-  `/v1` with only `model` in the body, the routing header never reaching an upstream, `ai.usage`
-  naming the candidate that served, all-candidates-down, a **256 KiB body surviving a failover
-  byte-for-byte**, a **429 walking keys not vendors**, and provider-routed traffic being unaffected.
+  breaker opens while the fallback keeps serving), missing/unknown model → 404 (named), wire
+  mismatch → 400, `GET /v1/models` lists the catalog, a candidate spelling is an alias, BYO on
+  `/auto` → 400, BYO on `/v1` still forwarded, `/openai/…` ignoring the catalog, a stock SDK shape
+  against `/v1` with only `model` in the body, the routing header never reaching an upstream,
+  `ai.usage` naming the candidate that served, all-candidates-down, a **256 KiB body surviving a
+  failover byte-for-byte**, a **429 walking keys not vendors**, and provider-routed traffic being
+  unaffected.
 - **Cancellation (`tests/cancellation.rs`):** a client that gives up must not open the provider's
   breaker, and a genuinely broken provider still must. Verified non-vacuous — reverting the fix makes
   the first test fail.

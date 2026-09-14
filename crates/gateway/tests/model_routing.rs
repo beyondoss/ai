@@ -211,6 +211,12 @@ async fn a_missing_or_unknown_model_is_rejected_before_any_upstream() {
 
     let unknown_header = post_auto(&client, &gw.url(), &key, Some("no-such-model")).await;
     assert_eq!(unknown_header.status().as_u16(), 404);
+    let unknown_header_body = unknown_header.text().await.unwrap();
+    assert!(
+        unknown_header_body.contains("no-such-model")
+            && unknown_header_body.contains("not in the catalog"),
+        "{unknown_header_body}"
+    );
 
     let unknown_body = post_v1(
         &client,
@@ -220,6 +226,12 @@ async fn a_missing_or_unknown_model_is_rejected_before_any_upstream() {
     )
     .await;
     assert_eq!(unknown_body.status().as_u16(), 404);
+    let unknown_body_text = unknown_body.text().await.unwrap();
+    assert!(
+        unknown_body_text.contains("no-such-model")
+            && unknown_body_text.contains("not in the catalog"),
+        "{unknown_body_text}"
+    );
 
     let missing_body = post_v1(
         &client,
@@ -229,6 +241,8 @@ async fn a_missing_or_unknown_model_is_rejected_before_any_upstream() {
     )
     .await;
     assert_eq!(missing_body.status().as_u16(), 404);
+    let missing_text = missing_body.text().await.unwrap();
+    assert!(missing_text.contains("missing model"), "{missing_text}");
 
     let unknown_auto_body = client
         .post(format!("{}/auto/chat/completions", gw.url()))
@@ -1095,4 +1109,106 @@ async fn explicit_provider_path_ignores_the_catalog() {
         got.contains(r#""model":"no-such-model""#),
         "/openai/… must not apply the catalog allowlist: {got}"
     );
+}
+
+/// A Claude model posted to Chat Completions is a 400 from us, not a provider 400 on the wrong JSON.
+#[tokio::test]
+async fn a_wire_mismatch_is_rejected_before_any_upstream() {
+    let nats_port = unused_nats_port();
+    let (pubkey, sk) = test_keypair(1);
+    let mock = MockUpstream::start(Mode::Json).await;
+    let gw = Gateway::builder(nats_port, &mock.authority(), &b64(&pubkey))
+        .providers(&["openai", "openrouter", "anthropic"])
+        .start()
+        .await;
+
+    let resp = post_v1(
+        &test_client(),
+        &gw.url(),
+        &vkey(&sk),
+        r#"{"model":"claude-opus-4-8","messages":[{"role":"user","content":"hi"}]}"#.into(),
+    )
+    .await;
+    assert_eq!(resp.status().as_u16(), 400);
+    let text = resp.text().await.unwrap();
+    assert!(
+        text.contains("claude-opus-4-8") && text.contains("/v1/messages"),
+        "{text}"
+    );
+    assert_eq!(mock.hits(), 0, "the mismatched body must not be forwarded");
+    let metrics = gw.metrics().await;
+    assert!(
+        parse_metric(&metrics, "ai_rejections_total", "wire_mismatch") >= 1.0,
+        "{metrics}"
+    );
+}
+
+/// OpenRouter (and other candidate) spellings are aliases for the catalog row.
+#[tokio::test]
+async fn v1_accepts_a_candidate_spelling_as_an_alias() {
+    let nats_port = unused_nats_port();
+    let (pubkey, sk) = test_keypair(1);
+    let primary = MockUpstream::start(Mode::Json).await;
+    let fallback = MockUpstream::start(Mode::Json).await;
+    let gw = catalog_gateway(
+        nats_port,
+        &b64(&pubkey),
+        &primary.authority(),
+        &fallback.authority(),
+    )
+    .await;
+
+    let resp = post_v1(
+        &test_client(),
+        &gw.url(),
+        &vkey(&sk),
+        r#"{"model":"openai/gpt-4o-mini","messages":[{"role":"user","content":"hi"}]}"#.into(),
+    )
+    .await;
+    assert_eq!(resp.status().as_u16(), 200);
+    let cap = primary.captured().expect("alias must resolve to the row");
+    let got = String::from_utf8(cap.body).unwrap();
+    assert!(
+        got.contains(r#""model":"gpt-4o-mini""#),
+        "the alias must be rewritten to the serving candidate's id: {got}"
+    );
+    assert_eq!(fallback.hits(), 0);
+}
+
+/// Stock OpenAI/Anthropic SDKs list models at GET /v1/models — the catalog, with each row's wire.
+#[tokio::test]
+async fn v1_models_lists_the_catalog() {
+    let nats_port = unused_nats_port();
+    let (pubkey, sk) = test_keypair(1);
+    let mock = MockUpstream::start(Mode::Json).await;
+    let gw = Gateway::builder(nats_port, &mock.authority(), &b64(&pubkey))
+        .providers(&["openai", "openrouter"])
+        .start()
+        .await;
+
+    let resp = test_client()
+        .get(format!("{}/v1/models", gw.url()))
+        .header("authorization", format!("Bearer {}", vkey(&sk)))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let v: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(v["object"], "list");
+    let data = v["data"].as_array().expect("data array");
+    assert!(
+        data.len() >= 2,
+        "catalog list must include more than a token model: {v}"
+    );
+    let gpt = data
+        .iter()
+        .find(|m| m["id"] == "gpt-4o-mini")
+        .expect("gpt-4o-mini");
+    assert_eq!(gpt["wire"], "openai");
+    let claude = data
+        .iter()
+        .find(|m| m["id"] == "claude-opus-4-8")
+        .expect("claude-opus-4-8");
+    assert_eq!(claude["wire"], "anthropic");
+    assert_eq!(mock.hits(), 0, "listing must not contact an upstream");
 }

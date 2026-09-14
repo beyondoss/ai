@@ -22,7 +22,8 @@
 //! with no routing header) must resolve a catalog row from the body's root `model` before
 //! `upstream_peer` runs. That peek enables pingora's 64 KiB retry buffer, reads at most that many
 //! bytes, and — if the buffer truncated — prepends our copy in `request_body_filter`. Untruncated
-//! peeks are replayed by pingora itself. Unknown or missing model → 404.
+//! peeks are replayed by pingora itself. Unknown or missing model → 404 naming the miss. Inbound
+//! path vs row wire mismatch → 400. `GET /v1/models` lists the catalog.
 //!
 //! One deliberate exception to the no-buffer rule: a **managed** OpenAI Chat Completions request is
 //! buffered and gets `stream_options.include_usage` injected when it streams without it — otherwise
@@ -46,8 +47,10 @@
 //! the drop-in default. BYO traffic there still dialect-picks openai/anthropic (`dialect_for_path`).
 //! A **managed** request to that default — or to `/auto` — resolves a catalog row from
 //! `x-beyond-model` if present, else the body's root `model`; the catalog is the allowlist
-//! (unknown/missing → 404) and the request walks that row's same-wire candidates. `/{provider}/…`
-//! is the escape hatch and does not consult the catalog. An unknown first segment is a 404.
+//! (unknown/missing → 404 naming the miss) and the request walks that row's same-wire candidates.
+//! Candidate spellings are aliases. Inbound path must match the row's wire (else 400).
+//! `GET /v1/models` lists the catalog. `/{provider}/…` is the escape hatch and does not consult
+//! the catalog. An unknown first segment is a 404.
 
 use crate::capture::CaptureBufs;
 use crate::key;
@@ -414,12 +417,13 @@ impl RequestCtx {
 
 /// Every `(error_type, message)` pair the gateway rejects with, paired with its wire body.
 ///
-/// The set is closed: `reject` is only ever called with literals, so the response body is one of
-/// these constants and never needs building. Kept as a table rather than scattered `const`s so
+/// The set of **flood-path** rejections: `reject` is only ever called with these literals, so the
+/// response body is one of these constants and never needs building. Catalog-walk errors that
+/// echo a caller-supplied name (`reject_message`) allocate; they are not this table.
 /// `reject_bodies_are_valid_json` can walk it and assert each entry parses, carries the `type` and
 /// `message` it claims, and is reachable — a hand-written JSON literal is exactly the thing that
 /// rots silently otherwise.
-pub const REJECT_BODIES: [(&str, &str, &str); 11] = [
+pub const REJECT_BODIES: [(&str, &str, &str); 10] = [
     (
         "invalid_request_error",
         "unknown provider",
@@ -459,11 +463,6 @@ pub const REJECT_BODIES: [(&str, &str, &str); 11] = [
         "api_error",
         "provider temporarily unavailable",
         r#"{"error":{"message":"provider temporarily unavailable","type":"api_error"}}"#,
-    ),
-    (
-        "invalid_request_error",
-        "unknown model",
-        r#"{"error":{"message":"unknown model","type":"invalid_request_error"}}"#,
     ),
     (
         "invalid_request_error",
@@ -591,6 +590,77 @@ impl AiProxy {
         msg: &str,
     ) -> Result<bool> {
         Box::pin(Self::reject(session, request_id, status, typ, msg)).await
+    }
+
+    /// Catalog-walk errors that must echo a caller-supplied name (unknown model, wire mismatch).
+    /// Allocating is fine: this is not the flood path the static [`REJECT_BODIES`] table exists for.
+    async fn reject_message(
+        session: &mut Session,
+        request_id: &str,
+        status: u16,
+        typ: &'static str,
+        msg: String,
+    ) -> Result<bool> {
+        warn!(request_id, status, error_type = typ, "request rejected");
+        let body = Bytes::from(
+            serde_json::json!({ "error": { "type": typ, "message": msg } }).to_string(),
+        );
+        let mut len_buf = ArrayString::<20>::new();
+        let _ = write!(len_buf, "{}", body.len());
+        let mut resp = ResponseHeader::build(status, Some(3))?;
+        resp.insert_header("content-type", "application/json")?;
+        resp.insert_header("content-length", len_buf.as_str())?;
+        resp.insert_header(REQUEST_ID_HEADER, request_id)?;
+        session.write_response_header(Box::new(resp), false).await?;
+        session.write_response_body(Some(body), true).await?;
+        Ok(true)
+    }
+
+    async fn reject_message_boxed(
+        session: &mut Session,
+        request_id: &str,
+        status: u16,
+        typ: &'static str,
+        msg: String,
+    ) -> Result<bool> {
+        Box::pin(Self::reject_message(session, request_id, status, typ, msg)).await
+    }
+
+    async fn reject_catalog_miss(
+        session: &mut Session,
+        request_id: &str,
+        name: Option<&str>,
+    ) -> Result<bool> {
+        let msg = match name.map(str::trim).filter(|s| !s.is_empty()) {
+            None => {
+                "missing model: set the JSON body's model (or x-beyond-model) to a catalog name"
+                    .to_string()
+            }
+            Some(n) => format!("model \"{}\" is not in the catalog", clip_catalog_name(n)),
+        };
+        Self::reject_message_boxed(session, request_id, 404, "invalid_request_error", msg).await
+    }
+
+    async fn reply_models_list(session: &mut Session, request_id: &str) -> Result<bool> {
+        let body = Bytes::from(providers::catalog::models_list_json());
+        let head_only = session.req_header().method == http::Method::HEAD;
+        let mut len_buf = ArrayString::<20>::new();
+        let _ = write!(len_buf, "{}", body.len());
+        let mut resp = ResponseHeader::build(200, Some(3))?;
+        resp.insert_header("content-type", "application/json")?;
+        resp.insert_header("content-length", len_buf.as_str())?;
+        resp.insert_header(REQUEST_ID_HEADER, request_id)?;
+        session
+            .write_response_header(Box::new(resp), head_only)
+            .await?;
+        if !head_only {
+            session.write_response_body(Some(body), true).await?;
+        }
+        Ok(true)
+    }
+
+    async fn reply_models_list_boxed(session: &mut Session, request_id: &str) -> Result<bool> {
+        Box::pin(Self::reply_models_list(session, request_id)).await
     }
 }
 
@@ -793,6 +863,29 @@ fn dialect_for_path(path: &str) -> Dialect {
     } else {
         Dialect::OpenAi
     }
+}
+
+/// Stock OpenAI/Anthropic SDKs list models at `GET /v1/models`. Intercepted before the catalog walk
+/// so an empty GET body is not a missing-model 404.
+fn is_v1_models_list(session: &Session) -> bool {
+    let req = session.req_header();
+    let path = req.uri.path();
+    (req.method == http::Method::GET || req.method == http::Method::HEAD)
+        && (path == "/v1/models" || path == "/v1/models/")
+}
+
+/// Cap a caller-supplied model name before echoing it in an error. The peek is 64 KiB; we do not
+/// want that in a JSON error body.
+fn clip_catalog_name(name: &str) -> &str {
+    const MAX: usize = 128;
+    if name.len() <= MAX {
+        return name;
+    }
+    let mut end = MAX;
+    while end > 0 && !name.is_char_boundary(end) {
+        end -= 1;
+    }
+    &name[..end]
 }
 
 /// Resolve the provider name for a request whose first path segment matched no known/config
@@ -1075,14 +1168,13 @@ impl ProxyHttp for AiProxy {
             }
             Routed::UnknownModel => {
                 self.state.metrics.rejection(Rejection::UnknownModel).inc();
-                return Self::reject_boxed(
-                    session,
-                    &request_id,
-                    404,
-                    "invalid_request_error",
-                    "unknown model",
-                )
-                .await;
+                let name = session
+                    .req_header()
+                    .headers
+                    .get(route::MODEL_HEADER)
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_owned);
+                return Self::reject_catalog_miss(session, &request_id, name.as_deref()).await;
             }
             Routed::UnknownProvider => {
                 return Self::reject_boxed(
@@ -1239,6 +1331,12 @@ impl ProxyHttp for AiProxy {
             .await;
         }
 
+        // Stock SDKs list models at GET /v1/models. Serve the catalog here so an empty GET is not
+        // a missing-model 404, and so BYO keys can discover names before they hold a managed one.
+        if is_v1_models_list(session) {
+            return Self::reply_models_list_boxed(session, &request_id).await;
+        }
+
         let mut body_replay: Option<Bytes> = None;
         if managed && model_route.is_none() && resolve_from_body {
             // Header wins if present (unknown → 404, no fall-through to the body). Absent → peek.
@@ -1246,38 +1344,23 @@ impl ProxyHttp for AiProxy {
                 CatalogHeader::Known(route) => model_route = Some(route),
                 CatalogHeader::Unknown => {
                     self.state.metrics.rejection(Rejection::UnknownModel).inc();
-                    return Self::reject_boxed(
-                        session,
-                        &request_id,
-                        404,
-                        "invalid_request_error",
-                        "unknown model",
-                    )
-                    .await;
+                    let name = session
+                        .req_header()
+                        .headers
+                        .get(route::MODEL_HEADER)
+                        .and_then(|v| v.to_str().ok())
+                        .map(str::to_owned);
+                    return Self::reject_catalog_miss(session, &request_id, name.as_deref()).await;
                 }
                 CatalogHeader::Absent => {
                     let peek = Box::pin(peek_body_model(session)).await?;
                     let Some(name) = peek.model.filter(|n| !n.is_empty()) else {
                         self.state.metrics.rejection(Rejection::UnknownModel).inc();
-                        return Self::reject_boxed(
-                            session,
-                            &request_id,
-                            404,
-                            "invalid_request_error",
-                            "unknown model",
-                        )
-                        .await;
+                        return Self::reject_catalog_miss(session, &request_id, None).await;
                     };
                     let Some(route) = route::model_route(&name) else {
                         self.state.metrics.rejection(Rejection::UnknownModel).inc();
-                        return Self::reject_boxed(
-                            session,
-                            &request_id,
-                            404,
-                            "invalid_request_error",
-                            "unknown model",
-                        )
-                        .await;
+                        return Self::reject_catalog_miss(session, &request_id, Some(&name)).await;
                     };
                     model_route = Some(route);
                     body_replay = peek.replay;
@@ -1377,6 +1460,28 @@ impl ProxyHttp for AiProxy {
                 }
             }
         };
+
+        // Stock SDK footgun: Claude posted to Chat Completions (or GPT to Messages) would be
+        // forwarded to the row's candidate path with the wrong JSON. We do not translate, so
+        // reject here rather than relaying a provider 400 that looks like the client's.
+        let wire_mismatch = {
+            let path = session.req_header().uri.path();
+            model_route.and_then(|row| {
+                let got = route::implied_wire(path)?;
+                (got != row.wire).then_some(row)
+            })
+        };
+        if let Some(row) = wire_mismatch {
+            self.state.metrics.rejection(Rejection::WireMismatch).inc();
+            return Self::reject_message_boxed(
+                session,
+                &request_id,
+                400,
+                "invalid_request_error",
+                format!("{} is {}", row.model, route::wire_post_hint(row.wire)),
+            )
+            .await;
+        }
 
         // Dialect drives usage parsing and injection eligibility.
         //
@@ -3098,6 +3203,13 @@ mod tests {
             apply_stream_usage_injection(untouched.clone(), None),
             untouched
         );
+    }
+
+    #[test]
+    fn clip_catalog_name_caps_a_long_caller_string() {
+        assert_eq!(clip_catalog_name("gpt-4o-mini"), "gpt-4o-mini");
+        let long = "x".repeat(200);
+        assert_eq!(clip_catalog_name(&long).len(), 128);
     }
 
     #[test]

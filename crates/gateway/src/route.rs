@@ -83,6 +83,44 @@ pub fn dialect_default(d: Dialect) -> &'static str {
     }
 }
 
+/// The wire an inbound catalog-walk path *implies*, if any.
+///
+/// Bare `/v1` and `/auto` (no suffix) do not name an endpoint — the catalog picks the path.
+/// `/v1/messages` and `/auto/v1/messages` imply Anthropic; `/v1/chat/completions` and
+/// `/auto/chat/completions` imply OpenAI. Used to reject the stock-SDK footgun: posting a
+/// Claude body to Chat Completions (or GPT to Messages) would otherwise be forwarded to the
+/// row's candidate path with the wrong JSON shape, and the provider's 400 looks like the
+/// client's.
+pub fn implied_wire(path: &str) -> Option<Dialect> {
+    let rest = match path.strip_prefix("/auto") {
+        Some("") | Some("/") => return None,
+        Some(r) => r,
+        None => path,
+    };
+    if rest.is_empty() || rest == "/v1" || rest == "/v1/" {
+        return None;
+    }
+    if rest.starts_with("/v1/messages")
+        || rest == "/messages"
+        || rest.starts_with("/messages/")
+        || rest.ends_with("/messages")
+    {
+        return Some(Dialect::Anthropic);
+    }
+    if rest.contains("chat/completions") || rest.starts_with("/v1/") {
+        return Some(Dialect::OpenAi);
+    }
+    None
+}
+
+/// Caller-facing hint for a catalog row's wire, used in the wire-mismatch 400.
+pub fn wire_post_hint(d: Dialect) -> &'static str {
+    match d {
+        Dialect::Anthropic => "Anthropic Messages; POST /v1/messages",
+        Dialect::OpenAi => "OpenAI Chat Completions; POST /v1/chat/completions",
+    }
+}
+
 /// One precomputed managed auth value: the formatted secret plus, when the bytes are header-safe,
 /// a ready-to-insert [`http::HeaderValue`].
 ///
@@ -232,6 +270,24 @@ mod tests {
         assert!(!is_default_prefix("/v2/messages"));
         assert!(!is_default_prefix(""));
         assert!(!is_default_prefix("/"));
+    }
+
+    #[test]
+    fn implied_wire_matches_stock_sdk_paths() {
+        assert_eq!(implied_wire("/v1"), None);
+        assert_eq!(implied_wire("/v1/"), None);
+        assert_eq!(implied_wire("/auto"), None);
+        assert_eq!(implied_wire("/auto/"), None);
+        assert_eq!(implied_wire("/v1/messages"), Some(Dialect::Anthropic));
+        assert_eq!(implied_wire("/auto/v1/messages"), Some(Dialect::Anthropic));
+        assert_eq!(implied_wire("/auto/messages"), Some(Dialect::Anthropic));
+        assert_eq!(implied_wire("/v1/chat/completions"), Some(Dialect::OpenAi));
+        assert_eq!(
+            implied_wire("/auto/chat/completions"),
+            Some(Dialect::OpenAi)
+        );
+        assert_eq!(implied_wire("/v1/embeddings"), Some(Dialect::OpenAi));
+        assert_eq!(implied_wire("/v1/models"), Some(Dialect::OpenAi));
     }
 
     #[test]
