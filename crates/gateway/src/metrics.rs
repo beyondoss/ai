@@ -35,8 +35,9 @@ pub enum Rejection {
     RateLimit,
     /// Aggregate BYO rate ceiling.
     RateLimitByoGlobal,
-    /// Model-routed request whose model could not be resolved — the routing header was absent, or
-    /// named a model the catalog does not carry.
+    /// Model-routed request whose model could not be resolved — the routing header named a model
+    /// the catalog does not carry, or (headerless `/auto` / managed `/v1`) the body's root `model`
+    /// was missing or unknown. The catalog is the allowlist.
     UnknownModel,
     /// Model-routed request whose model resolved, but no candidate is usable: none of the providers
     /// that serve it has a pool key configured. Distinct from `CircuitOpen`, which means the
@@ -45,12 +46,16 @@ pub enum Rejection {
     /// BYO key presented to the model-routed route, which is managed-only — a BYO token belongs to
     /// one provider, so neither selecting among candidates nor failing over is meaningful for it.
     ByoOnModelRoute,
+    /// Catalog walk whose inbound path implies a different wire than the row (Claude posted to
+    /// Chat Completions, GPT posted to Messages). We do not translate; this is a 400 rather than a
+    /// provider 400 on the wrong JSON shape.
+    WireMismatch,
 }
 
 impl Rejection {
     /// Every variant, in `as_index` order. The array in `Metrics` is built from this, so adding a
     /// variant without adding it here fails the exhaustive `match` in `as_index`.
-    pub(crate) const ALL: [Rejection; 11] = [
+    pub(crate) const ALL: [Rejection; 12] = [
         Rejection::Auth,
         Rejection::DenySpend,
         Rejection::DenyFraud,
@@ -62,6 +67,7 @@ impl Rejection {
         Rejection::UnknownModel,
         Rejection::NoCandidate,
         Rejection::ByoOnModelRoute,
+        Rejection::WireMismatch,
     ];
 
     /// The `reason=` label value. `RateLimit` keeps the original `"rate_limit"` string so existing
@@ -79,6 +85,7 @@ impl Rejection {
             Rejection::UnknownModel => "unknown_model",
             Rejection::NoCandidate => "no_candidate",
             Rejection::ByoOnModelRoute => "byo_on_model_route",
+            Rejection::WireMismatch => "wire_mismatch",
         }
     }
 
@@ -95,6 +102,7 @@ impl Rejection {
             Rejection::UnknownModel => 8,
             Rejection::NoCandidate => 9,
             Rejection::ByoOnModelRoute => 10,
+            Rejection::WireMismatch => 11,
         }
     }
 }
@@ -109,7 +117,7 @@ pub struct Metrics {
     /// path fires at full request rate under a credential-stuffing flood. Measured 14.3 ns vs 1.3 ns
     /// single-threaded, and 808 ns vs 151 ns with 16 threads contending the same lock.
     /// Indexed by [`Rejection::as_index`]; read it through [`Metrics::rejection`].
-    rejections: [IntCounter; 11],
+    rejections: [IntCounter; 12],
     /// Upstream responses by provider + status class ("2xx"/"4xx"/"5xx"). A provider degrading
     /// (429/5xx) is otherwise invisible until it surfaces as latency or missing usage events —
     /// this is the per-provider error-rate signal an oncall pages on.

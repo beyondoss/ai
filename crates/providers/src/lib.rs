@@ -151,6 +151,14 @@ impl WireFormat {
             _ => None,
         }
     }
+
+    /// The catalog/`GET /v1/models` spelling of this wire.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            WireFormat::OpenAi => "openai",
+            WireFormat::Anthropic => "anthropic",
+        }
+    }
 }
 
 /// How the upstream expects the API key. OpenAI-wire providers use `Authorization: Bearer <key>`;

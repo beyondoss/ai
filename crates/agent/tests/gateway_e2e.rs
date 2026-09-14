@@ -5,6 +5,7 @@
 //! authenticates with a `bai_v1` virtual key, the gateway verifies it, swaps in the pool key, routes
 //! to the (mock) provider, and relays the streamed tool round-trip back. No NATS (the gateway fails
 //! open), no real provider, no TLS (plaintext upstream) — but every byte flows through the gateway.
+//! `--model` must be a catalog row: managed `/v1` 404s unknown ids (`claude-test` is mock-only).
 //!
 //! The signing key is the gateway's deterministic dev key (`mise run ai:mint-dev-key`), so the
 //! public key + token are fixed constants — no dependency on the gateway crate.
@@ -69,7 +70,7 @@ fn agent_through_real_gateway_to_mock_upstream() {
             "--key",
             DEV_TOKEN,
             "--model",
-            "claude-test",
+            "claude-opus-4-8",
             "--max-steps",
             "4",
         ])

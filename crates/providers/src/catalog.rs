@@ -5,7 +5,10 @@
 //! returns nothing for an aggregator, because `moonshotai/kimi-k2.6` is equally a Fireworks,
 //! Together and OpenRouter id and guessing between them is the mis-route this crate exists to
 //! prevent. The catalog is where that guess becomes a *decision*: a named model, the wire its
-//! clients speak, and the ordered upstreams we are willing to serve it from.
+//! clients speak, and the ordered upstreams we are willing to serve it from. On the gateway, that
+//! table **is** the allowlist for managed `/v1` and `/auto` — a name that is not a row is a 404.
+//! A candidate's `upstream_model` spelling is an alias for the same row. `/{provider}/…` does
+//! not consult it.
 //!
 //! It carries routing facts only — provider, the id that provider spells it with, and the path to
 //! send it to. Model *capability* facts (context window, thinking shape) stay in
@@ -62,7 +65,8 @@ pub struct Candidate {
 /// A canonical model name, the wire its clients speak, and the ordered upstreams that serve it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ModelRoute {
-    /// The value a client puts in the routing header. Lowercase and restricted to `[a-z0-9._/-]`,
+    /// The catalog name a client puts in `x-beyond-model` or, on a managed `/v1` (and headerless
+    /// `/auto`) request, the body's root `model`. Lowercase and restricted to `[a-z0-9._/-]`,
     /// which is what lets the gateway log it verbatim without sanitizing.
     pub model: &'static str,
     /// The API shape a client of this row sends, and the shape its responses come back in. Drives
@@ -303,13 +307,49 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
 /// — no allocation, and the result is `&'static` so the caller stores a thin pointer. The
 /// case-insensitive linear fallback covers a client that upcased the header; it never runs for a
 /// well-formed request.
+///
+/// A miss then tries each row's candidate `upstream_model` ids (OpenRouter's
+/// `anthropic/claude-opus-4.8`, Bedrock's inference-profile id, …). Those are not extra products —
+/// they are the spellings we already rewrite *to* — so accepting them as aliases is how a caller
+/// who copied a vendor slug still hits the row.
 pub fn for_model(name: &str) -> Option<&'static ModelRoute> {
     match MODEL_ROUTES.binary_search_by(|r| r.model.cmp(name)) {
         Ok(i) => MODEL_ROUTES.get(i),
         Err(_) => MODEL_ROUTES
             .iter()
-            .find(|r| r.model.eq_ignore_ascii_case(name)),
+            .find(|r| r.model.eq_ignore_ascii_case(name))
+            .or_else(|| {
+                MODEL_ROUTES.iter().find(|r| {
+                    r.candidates
+                        .iter()
+                        .any(|c| c.upstream_model.eq_ignore_ascii_case(name))
+                })
+            }),
     }
+}
+
+/// OpenAI-shaped `GET /v1/models` body for the catalog. Extra `wire` (`"openai"` / `"anthropic"`)
+/// so a caller can pick the matching SDK. Names are log-safe (`[a-z0-9._/-]`), so this needs no
+/// JSON escaping.
+pub fn models_list_json() -> &'static str {
+    static JSON: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    JSON.get_or_init(|| {
+        use std::fmt::Write as _;
+        let mut out = String::from("{\"object\":\"list\",\"data\":[");
+        for (i, r) in MODEL_ROUTES.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            let _ = write!(
+                out,
+                "{{\"id\":\"{}\",\"object\":\"model\",\"type\":\"model\",\"owned_by\":\"system\",\"wire\":\"{}\"}}",
+                r.model,
+                r.wire.as_str(),
+            );
+        }
+        out.push_str("]}");
+        out
+    })
 }
 
 #[cfg(test)]
@@ -579,6 +619,91 @@ mod tests {
                 for_model(unknown),
                 None,
                 "{unknown:?} must not resolve — a near-miss is not a match",
+            );
+        }
+    }
+
+    /// A candidate's upstream id is an alias for its row, not a second product. OpenRouter slugs
+    /// and Bedrock inference-profile ids must resolve to the same row as the canonical name.
+    #[test]
+    fn for_model_accepts_candidate_spellings_as_aliases() {
+        assert_eq!(
+            for_model("anthropic/claude-opus-4.8").map(|r| r.model),
+            Some("claude-opus-4-8"),
+        );
+        assert_eq!(
+            for_model("us.anthropic.claude-opus-4-8").map(|r| r.model),
+            Some("claude-opus-4-8"),
+        );
+        assert_eq!(
+            for_model("openai/gpt-4o-mini").map(|r| r.model),
+            Some("gpt-4o-mini"),
+        );
+        assert_eq!(
+            for_model("ANTHROPIC/CLAUDE-OPUS-4.8").map(|r| r.model),
+            Some("claude-opus-4-8"),
+        );
+        for route in MODEL_ROUTES {
+            for c in route.candidates {
+                assert_eq!(
+                    for_model(c.upstream_model).map(|r| r.model),
+                    Some(route.model),
+                    "{:?} must alias to {:?}",
+                    c.upstream_model,
+                    route.model,
+                );
+            }
+        }
+    }
+
+    /// Two rows cannot share a candidate id, or `for_model` would have to guess. Canonical names
+    /// already unique (`model_routes_are_sorted_and_unique`); this extends that to aliases.
+    #[test]
+    fn candidate_ids_are_unambiguous_aliases() {
+        use std::collections::HashMap;
+        let mut seen: HashMap<&str, &str> = HashMap::new();
+        for route in MODEL_ROUTES {
+            for c in route.candidates {
+                if c.upstream_model == route.model {
+                    continue;
+                }
+                assert!(
+                    seen.insert(c.upstream_model, route.model).is_none(),
+                    "{:?} is a candidate of more than one catalog row",
+                    c.upstream_model
+                );
+                assert!(
+                    !MODEL_ROUTES.iter().any(|r| r.model == c.upstream_model),
+                    "{:?} cannot be both a catalog name and another row's candidate id",
+                    c.upstream_model
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn models_list_json_names_every_row_and_its_wire() {
+        let json = models_list_json();
+        assert!(
+            json.starts_with("{\"object\":\"list\",\"data\":["),
+            "OpenAI list envelope: {json}"
+        );
+        assert!(json.ends_with("]}"), "{json}");
+        for route in MODEL_ROUTES {
+            assert!(
+                json.contains(&format!("\"id\":\"{}\"", route.model)),
+                "{:?} missing from {json}",
+                route.model
+            );
+            assert!(
+                json.contains(&format!(
+                    "\"id\":\"{}\",\"object\":\"model\",\"type\":\"model\",\"owned_by\":\"system\",\"wire\":\"{}\"",
+                    route.model,
+                    route.wire.as_str()
+                )),
+                "{:?} wire {} missing from {json}",
+                route.model,
+                route.wire.as_str()
             );
         }
     }

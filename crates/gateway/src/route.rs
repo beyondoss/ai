@@ -2,9 +2,10 @@
 //!
 //! The provider is the **first path segment** of the request (`/{provider}/…`); the rest of the path
 //! is forwarded to the upstream **verbatim** (native passthrough — the gateway holds no per-provider
-//! path knowledge). A path with no provider prefix that starts with `/v1` routes by *dialect* —
-//! `/v1/messages*` → `anthropic`, else → `openai` — so an OpenAI/Anthropic client is drop-in by
-//! changing only the host. An unrecognized first segment is a 404 (see `proxy::request_filter`).
+//! path knowledge). A path with no provider prefix that starts with `/v1` is the drop-in default:
+//! BYO dialect-picks openai/anthropic; managed traffic resolves a catalog row from `x-beyond-model`
+//! or the body's `model` and walks that row. An unrecognized first segment is a 404
+//! (see `proxy::request_filter`).
 //!
 //! A provider is a *row* in [`known_providers`] (name, upstream authority, wire format, auth scheme) —
 //! adding an OpenAI-wire provider (Groq, DeepSeek, Together, …) is one line there, no new code
@@ -32,9 +33,9 @@ pub use providers::{AuthScheme, ProviderSpec, gateway_providers as known_provide
 pub use providers::WireFormat as Dialect;
 
 /// The default API prefix OpenAI/Anthropic clients use. A request with no provider segment whose
-/// path is exactly this or begins with this plus `/` (see [`is_default_prefix`]) is routed to a
-/// default provider by [`dialect_for_path`](crate::proxy) (the bare-path drop-in case); anything
-/// else with an unknown first segment is a 404.
+/// path is exactly this or begins with this plus `/` (see [`is_default_prefix`]) is the drop-in
+/// default: BYO dialect-picks openai/anthropic; managed traffic is a catalog walk. Anything else
+/// with an unknown first segment is a 404.
 pub const DEFAULT_PREFIX: &str = "/v1";
 
 /// The model catalog — see [`providers::catalog`]. A `/{AUTO_SEGMENT}/…` request names a *model*
@@ -42,14 +43,18 @@ pub const DEFAULT_PREFIX: &str = "/v1";
 pub use providers::{Candidate, MAX_CANDIDATES, ModelRoute, for_model as model_route};
 
 /// The reserved first path segment for **model-routed** requests: `/auto/…` picks its provider from
-/// the catalog using the `x-beyond-model` header instead of from the path.
+/// the catalog using `x-beyond-model` if present, else the body's root `model`. Managed `/v1` is
+/// the same walk without this segment.
 ///
 /// Reserved, not merely conventional: `state::build_providers` refuses to boot if config tries to
 /// register a provider under this name. Provider lookup runs first in `proxy::request_filter`, so a
 /// `provider_authorities.auto = …` entry would otherwise shadow the whole feature silently.
 pub const AUTO_SEGMENT: &str = "auto";
 
-/// The header carrying the canonical model name on the model-routed route.
+/// The header carrying the canonical model name on a catalog walk.
+///
+/// Optional on managed `/v1` and `/auto`: when absent, the body's root `model` is the name. When
+/// present it wins, including over a disagreeing body (counted on `ai_model_header_body_mismatch_total`).
 ///
 /// Sits in the `x-beyond-*` namespace the gateway already owns (`x-beyond-request-id`), so it cannot
 /// collide with a header a provider defines, and is stripped before the request goes upstream.
@@ -75,6 +80,44 @@ pub fn dialect_default(d: Dialect) -> &'static str {
     match d {
         Dialect::OpenAi => "openai",
         Dialect::Anthropic => "anthropic",
+    }
+}
+
+/// The wire an inbound catalog-walk path *implies*, if any.
+///
+/// Bare `/v1` and `/auto` (no suffix) do not name an endpoint — the catalog picks the path.
+/// `/v1/messages` and `/auto/v1/messages` imply Anthropic; `/v1/chat/completions` and
+/// `/auto/chat/completions` imply OpenAI. Used to reject the stock-SDK footgun: posting a
+/// Claude body to Chat Completions (or GPT to Messages) would otherwise be forwarded to the
+/// row's candidate path with the wrong JSON shape, and the provider's 400 looks like the
+/// client's.
+pub fn implied_wire(path: &str) -> Option<Dialect> {
+    let rest = match path.strip_prefix("/auto") {
+        Some("") | Some("/") => return None,
+        Some(r) => r,
+        None => path,
+    };
+    if rest.is_empty() || rest == "/v1" || rest == "/v1/" {
+        return None;
+    }
+    if rest.starts_with("/v1/messages")
+        || rest == "/messages"
+        || rest.starts_with("/messages/")
+        || rest.ends_with("/messages")
+    {
+        return Some(Dialect::Anthropic);
+    }
+    if rest.contains("chat/completions") || rest.starts_with("/v1/") {
+        return Some(Dialect::OpenAi);
+    }
+    None
+}
+
+/// Caller-facing hint for a catalog row's wire, used in the wire-mismatch 400.
+pub fn wire_post_hint(d: Dialect) -> &'static str {
+    match d {
+        Dialect::Anthropic => "Anthropic Messages; POST /v1/messages",
+        Dialect::OpenAi => "OpenAI Chat Completions; POST /v1/chat/completions",
     }
 }
 
@@ -227,6 +270,24 @@ mod tests {
         assert!(!is_default_prefix("/v2/messages"));
         assert!(!is_default_prefix(""));
         assert!(!is_default_prefix("/"));
+    }
+
+    #[test]
+    fn implied_wire_matches_stock_sdk_paths() {
+        assert_eq!(implied_wire("/v1"), None);
+        assert_eq!(implied_wire("/v1/"), None);
+        assert_eq!(implied_wire("/auto"), None);
+        assert_eq!(implied_wire("/auto/"), None);
+        assert_eq!(implied_wire("/v1/messages"), Some(Dialect::Anthropic));
+        assert_eq!(implied_wire("/auto/v1/messages"), Some(Dialect::Anthropic));
+        assert_eq!(implied_wire("/auto/messages"), Some(Dialect::Anthropic));
+        assert_eq!(implied_wire("/v1/chat/completions"), Some(Dialect::OpenAi));
+        assert_eq!(
+            implied_wire("/auto/chat/completions"),
+            Some(Dialect::OpenAi)
+        );
+        assert_eq!(implied_wire("/v1/embeddings"), Some(Dialect::OpenAi));
+        assert_eq!(implied_wire("/v1/models"), Some(Dialect::OpenAi));
     }
 
     #[test]
