@@ -603,8 +603,9 @@ async fn fails_over_when_the_primary_answers_5xx() {
     );
 }
 
-/// A `429` is a healthy provider throttling us, not a broken one. It must be relayed, not failed
-/// over — re-asking a different vendor turns a self-healing throttle into spend somewhere else.
+/// A `429` is a healthy provider throttling *that credential*, not a broken vendor. With one key
+/// it is relayed, not failed over — re-asking a different vendor turns a self-healing throttle
+/// into spend somewhere else. (Two keys walk on the same provider; see `a_429_walks_keys_not_vendors`.)
 #[tokio::test]
 async fn a_429_is_relayed_not_failed_over() {
     let nats_port = unused_nats_port();
@@ -627,6 +628,57 @@ async fn a_429_is_relayed_not_failed_over() {
         fallback.hits(),
         0,
         "a throttle must not spend at another vendor"
+    );
+    assert_eq!(
+        parse_metric(&gw.metrics().await, "ai_candidate_failovers_total", ""),
+        0.0,
+        "a 429 must not count as a candidate failover"
+    );
+}
+
+/// Two keys on the primary: a 429 walks the next key on the *same* provider. The fallback vendor
+/// is not asked, and `ai_candidate_failovers_total` stays at zero.
+#[tokio::test]
+async fn a_429_walks_keys_not_vendors() {
+    let nats_port = unused_nats_port();
+    let (pubkey, sk) = test_keypair(1);
+    let primary = MockUpstream::start(Mode::ThrottleKey("sk-walk-a")).await;
+    let fallback = MockUpstream::start(Mode::Json).await;
+    let gw = Gateway::builder(nats_port, &primary.authority(), &b64(&pubkey))
+        .providers(&["openai", "openrouter"])
+        .provider_authority("openrouter", &fallback.authority())
+        .pool_keys("openai", &["sk-walk-a", "sk-walk-b"])
+        .start()
+        .await;
+
+    let resp = post_auto(&test_client(), &gw.url(), &vkey(&sk), Some(MODEL)).await;
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "the second key on the primary must serve"
+    );
+    assert_eq!(
+        fallback.hits(),
+        0,
+        "a throttle must not spend at another vendor"
+    );
+    let cap = primary
+        .captured()
+        .expect("the primary served with the second key");
+    assert_eq!(
+        cap.authorization.as_deref(),
+        Some("Bearer sk-walk-b"),
+        "the retry must present the second secret on the same provider"
+    );
+    let metrics = gw.metrics().await;
+    assert!(
+        parse_metric(&metrics, "ai_key_walks_total", "") >= 1.0,
+        "the key-walk must be counted:\n{metrics}"
+    );
+    assert_eq!(
+        parse_metric(&metrics, "ai_candidate_failovers_total", ""),
+        0.0,
+        "walking keys is not a candidate failover:\n{metrics}"
     );
 }
 

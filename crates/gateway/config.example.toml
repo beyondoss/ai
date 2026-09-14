@@ -145,7 +145,7 @@ capture_queue_depth = 1024
 # [provider_auth_schemes]
 # azure = "api-key"
 # [pool_keys]
-# azure = "<azure-api-key>"          # or AI_POOL_KEY_AZURE in production
+# azure = ["<azure-api-key>"]          # or AI_POOL_KEY_AZURE in production
 
 # Example: Fireworks' KNOWN_PROVIDERS row is fixed at OpenAI-dialect + Bearer for its
 # `/inference/v1/chat/completions` endpoint (docs: https://docs.fireworks.ai/tools-sdks/openai-compatibility) —
@@ -155,7 +155,7 @@ capture_queue_depth = 1024
 # pi's `packages/ai/src/providers/fireworks.models.ts`. A known provider's dialect/auth is fixed in
 # code and never overridable from config, so route Anthropic-wire Fireworks models through a second,
 # config-added provider alias instead — combine the three tables above (uncomment all three
-# `fireworks-anthropic` lines) and add a pool key under `[pool_keys] fireworks-anthropic = "fw-..."`.
+# `fireworks-anthropic` lines) and add a pool key under `[pool_keys] fireworks-anthropic = ["fw-..."]`.
 # The client then reaches those models at `/fireworks-anthropic/v1/messages`; Fireworks' own
 # `/inference/v1/chat/completions` OpenAI-wire models stay on the built-in `fireworks` provider. Zero
 # code change — this is purely config, and it's the officially recommended way to add an
@@ -180,17 +180,19 @@ capture_queue_depth = 1024
 # [provider_auth_schemes]
 # bedrock-openai = "bearer"
 # [pool_keys]
-# bedrock-openai = "<amazon-bedrock-api-key>"
+# bedrock-openai = ["<amazon-bedrock-api-key>"]
 
-# Managed Beyond pool keys, BY PROVIDER NAME. Inject via SSM-backed env in production
-# (AI_POOL_KEY_OPENAI, AI_POOL_KEY_GROQ, …) rather than this file; env wins over any value here.
-# A provider with no pool key can't serve managed traffic (→ 503); BYO is unaffected.
+# Managed Beyond pool keys, BY PROVIDER NAME. A TOML array; a string is a list of one.
+# Inject via SSM-backed env in production (AI_POOL_KEY_OPENAI, AI_POOL_KEY_GROQ, …) rather than
+# this file; env stays one key = list of one and wins over any value here.
+# A provider with no keys / an empty list can't serve managed traffic (→ 503); BYO is unaffected.
+# On a managed 429 the gateway walks the next unused key on the same provider.
 # [pool_keys]
-# openai = "sk-..."
-# anthropic = "sk-ant-..."
-# bedrock = "<amazon-bedrock-api-key>"   # or AI_POOL_KEY_BEDROCK / AWS_BEARER_TOKEN_BEDROCK
-# fireworks = "fw-..."
-# fireworks-anthropic = "fw-..."   # same Fireworks account key, second alias — see provider_authorities above
+# openai = ["sk-..."]
+# anthropic = ["sk-ant-...", "sk-ant-other"]
+# bedrock = ["<amazon-bedrock-api-key>"]   # or AI_POOL_KEY_BEDROCK / AWS_BEARER_TOKEN_BEDROCK
+# fireworks = ["fw-..."]
+# fireworks-anthropic = ["fw-..."]   # same Fireworks account key, second alias — see provider_authorities above
 
 # Trusted Ed25519 signing PUBLIC keys (kid -> base64). Multiple for zero-downtime rotation.
 # Managed virtual keys (bai_v1…) are verified against these; a prefix match that fails verify

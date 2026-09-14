@@ -146,6 +146,12 @@ pub struct Metrics {
     /// that answers "is failover actually firing, and how often". The per-provider
     /// `connect_retries_total` still fires alongside it, labelled with the candidate we left.
     pub candidate_failovers_total: IntCounter,
+    /// Managed requests that retried the same provider with the next unused pool key after a 429.
+    ///
+    /// Deliberately *not* folded into `candidate_failovers_total`: that counter means "we abandoned
+    /// a vendor". This one means "the credential was throttled and another key on the same provider
+    /// served" — a 429 is not a vendor outage.
+    pub key_walks_total: IntCounter,
     /// Labeled by kind: input|output|cache_read|cache_write. Cache tokens are also in the `ai.usage`
     /// billing log, but that ships with lag — the Prometheus counter is the alerting surface for
     /// "cache hit rate fell off a cliff after a deploy" (cache write ≈ 3× input, cache read ≈ 0.1×,
@@ -236,6 +242,10 @@ impl Metrics {
         let candidate_failovers_total = IntCounter::with_opts(Opts::new(
             "ai_candidate_failovers_total",
             "Model-routed requests that moved to the next candidate provider",
+        ))?;
+        let key_walks_total = IntCounter::with_opts(Opts::new(
+            "ai_key_walks_total",
+            "Managed requests that retried the same provider with the next unused pool key after a 429",
         ))?;
         let model_header_body_mismatch_total = IntCounter::with_opts(Opts::new(
             "ai_model_header_body_mismatch_total",
@@ -332,6 +342,7 @@ impl Metrics {
 
         r.register(Box::new(requests_total.clone()))?;
         r.register(Box::new(candidate_failovers_total.clone()))?;
+        r.register(Box::new(key_walks_total.clone()))?;
         r.register(Box::new(model_header_body_mismatch_total.clone()))?;
         r.register(Box::new(failover_unreplayable_total.clone()))?;
         r.register(Box::new(rejections_total.clone()))?;
@@ -355,6 +366,7 @@ impl Metrics {
         Ok(Arc::new(Self {
             requests_total,
             candidate_failovers_total,
+            key_walks_total,
             model_header_body_mismatch_total,
             failover_unreplayable_total,
             rejections_total,

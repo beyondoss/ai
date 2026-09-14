@@ -84,7 +84,8 @@ fn check_catalog_coverage(config: &AiConfig) -> CheckResult {
             .filter(|c| {
                 config
                     .pool_keys
-                    .contains_key(providers::by_id(c.provider).name)
+                    .get(providers::by_id(c.provider).name)
+                    .is_some_and(|k| !k.is_empty())
             })
             .count();
         if usable == 0 {
@@ -96,7 +97,7 @@ fn check_catalog_coverage(config: &AiConfig) -> CheckResult {
 
     // No pool keys at all is a pure-BYO deployment, which `check_pool_keys` already speaks to. The
     // model-routed route is managed-only, so it is simply unused here — not misconfigured.
-    if config.pool_keys.is_empty() {
+    if config.pool_keys.values().all(|k| k.is_empty()) {
         return pass(
             "model_catalog",
             "no pool keys configured — model routing is unused (it is managed-only)",
@@ -184,7 +185,12 @@ fn check_signing_keys(config: &AiConfig) -> CheckResult {
 /// every managed request 503s — a real misconfiguration. A pure-BYO deployment (no signing keys) with
 /// no pool keys is legitimate, so that case passes with a note instead of failing.
 fn check_pool_keys(config: &AiConfig) -> CheckResult {
-    let mut names: Vec<&str> = config.pool_keys.keys().map(String::as_str).collect();
+    let mut names: Vec<&str> = config
+        .pool_keys
+        .iter()
+        .filter(|(_, keys)| !keys.is_empty())
+        .map(|(k, _)| k.as_str())
+        .collect();
     names.sort_unstable();
     let managed_intended = !config.signing_keys.is_empty();
     match (names.is_empty(), managed_intended) {
@@ -307,7 +313,6 @@ pub fn print_results(title: &str, results: &[CheckResult]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::secret::Secret;
     use std::collections::HashMap;
 
     /// The catalog seed carries at least one Anthropic-only row, so a deployment with only an
@@ -316,7 +321,7 @@ mod tests {
     #[test]
     fn catalog_coverage_fails_when_a_model_has_no_reachable_provider() {
         let config = AiConfig {
-            pool_keys: HashMap::from([("openai".to_string(), Secret::new("sk-openai"))]),
+            pool_keys: HashMap::from([("openai".to_string(), "sk-openai".into())]),
             ..Default::default()
         };
         let r = check_catalog_coverage(&config);
@@ -340,10 +345,10 @@ mod tests {
     fn catalog_coverage_passes_when_every_candidate_is_reachable() {
         let config = AiConfig {
             pool_keys: HashMap::from([
-                ("openai".to_string(), Secret::new("sk-openai")),
-                ("anthropic".to_string(), Secret::new("sk-anthropic")),
-                ("bedrock".to_string(), Secret::new("sk-bedrock")),
-                ("openrouter".to_string(), Secret::new("sk-openrouter")),
+                ("openai".to_string(), "sk-openai".into()),
+                ("anthropic".to_string(), "sk-anthropic".into()),
+                ("bedrock".to_string(), "sk-bedrock".into()),
+                ("openrouter".to_string(), "sk-openrouter".into()),
             ]),
             ..Default::default()
         };
@@ -362,8 +367,8 @@ mod tests {
     fn catalog_coverage_reports_reduced_failover_without_failing() {
         let config = AiConfig {
             pool_keys: HashMap::from([
-                ("openai".to_string(), Secret::new("sk-openai")),
-                ("anthropic".to_string(), Secret::new("sk-anthropic")),
+                ("openai".to_string(), "sk-openai".into()),
+                ("anthropic".to_string(), "sk-anthropic".into()),
                 // no openrouter key ⇒ gpt-4o-mini keeps its primary, loses its fallback
             ]),
             ..Default::default()
@@ -430,7 +435,7 @@ mod tests {
     #[test]
     fn pool_keys_present_passes() {
         let c = AiConfig {
-            pool_keys: HashMap::from([("openai".to_string(), Secret::new("sk-x"))]),
+            pool_keys: HashMap::from([("openai".to_string(), "sk-x".into())]),
             ..Default::default()
         };
         assert!(check_pool_keys(&c).passed);

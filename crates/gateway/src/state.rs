@@ -98,7 +98,11 @@ fn build_providers(config: &AiConfig, metrics: &Metrics) -> Result<HashMap<Strin
             .get(spec.name)
             .cloned()
             .unwrap_or_else(|| spec.authority.to_string());
-        let pool_key = config.pool_keys.get(spec.name).map(|s| s.expose());
+        let pool_keys: Vec<&str> = config
+            .pool_keys
+            .get(spec.name)
+            .map(|k| k.iter().map(|s| s.expose()).collect())
+            .unwrap_or_default();
         providers.insert(
             spec.name.to_string(),
             Arc::new(Provider::resolve(
@@ -106,7 +110,7 @@ fn build_providers(config: &AiConfig, metrics: &Metrics) -> Result<HashMap<Strin
                 authority,
                 spec.wire,
                 spec.auth,
-                pool_key,
+                &pool_keys,
                 ProviderMetrics::resolve(metrics, spec.name),
                 breaker(),
             )),
@@ -122,7 +126,11 @@ fn build_providers(config: &AiConfig, metrics: &Metrics) -> Result<HashMap<Strin
     // prevent (see `usage::openai_body`'s dialect-mismatch guard for the runtime backstop).
     for (name, authority) in &config.provider_authorities {
         if !providers.contains_key(name) {
-            let pool_key = config.pool_keys.get(name).map(|s| s.expose());
+            let pool_keys: Vec<&str> = config
+                .pool_keys
+                .get(name)
+                .map(|k| k.iter().map(|s| s.expose()).collect())
+                .unwrap_or_default();
             let dialect = match config.provider_dialects.get(name) {
                 Some(s) => Dialect::parse_config(s).ok_or_else(|| {
                     GatewayError::Config(format!(
@@ -148,7 +156,7 @@ fn build_providers(config: &AiConfig, metrics: &Metrics) -> Result<HashMap<Strin
                     authority.clone(),
                     dialect,
                     auth,
-                    pool_key,
+                    &pool_keys,
                     ProviderMetrics::resolve(metrics, name),
                     breaker(),
                 )),
@@ -392,7 +400,6 @@ impl GatewayState {
 mod tests {
     use super::*;
     use crate::route::AuthScheme;
-    use crate::secret::Secret;
 
     /// One process-wide `Metrics` (it registers on the default Prometheus registry, which rejects a
     /// second registration), shared by every test that needs a `GatewayState`.
@@ -474,8 +481,8 @@ mod tests {
                 ("custom2".to_string(), "other.internal:8443".to_string()),
             ]),
             pool_keys: HashMap::from([
-                ("openai".to_string(), Secret::new("sk-openai")),
-                ("custom".to_string(), Secret::new("sk-custom")),
+                ("openai".to_string(), "sk-openai".into()),
+                ("custom".to_string(), "sk-custom".into()),
             ]),
             ..Default::default()
         };
@@ -485,31 +492,25 @@ mod tests {
         let openai = providers.get("openai").unwrap();
         assert_eq!(openai.authority, "127.0.0.1:9");
         assert_eq!(openai.auth, AuthScheme::Bearer);
-        assert_eq!(
-            openai.pool_auth_value.as_ref().unwrap().expose(),
-            "Bearer sk-openai"
-        );
+        assert_eq!(openai.pool_auth[0].value.expose(), "Bearer sk-openai");
 
         // Known provider, no override: built-in default + no pool key ⇒ no managed auth value.
         let anthropic = providers.get("anthropic").unwrap();
         assert_eq!(anthropic.authority, "api.anthropic.com:443");
         assert_eq!(anthropic.auth, AuthScheme::XApiKey);
-        assert!(anthropic.pool_auth_value.is_none());
+        assert!(anthropic.pool_auth.is_empty());
 
         // Config-only provider: added as OpenAI-wire (Bearer), reachable by name.
         let custom = providers.get("custom").unwrap();
         assert_eq!(custom.host, "llm.internal");
-        assert_eq!(
-            custom.pool_auth_value.as_ref().unwrap().expose(),
-            "Bearer sk-custom"
-        );
+        assert_eq!(custom.pool_auth[0].value.expose(), "Bearer sk-custom");
 
         // Config-only provider with no pool key: registered (reachable by name) but with no managed
         // auth value — this `None` is exactly what `request_filter` turns into a 503 for a managed
         // request. (BYO to it still works; it just can't serve the pooled path.)
         let custom2 = providers.get("custom2").unwrap();
         assert!(
-            custom2.pool_auth_value.is_none(),
+            custom2.pool_auth.is_empty(),
             "a provider with no configured pool key must have no managed auth value (→ 503)"
         );
     }
@@ -529,14 +530,14 @@ mod tests {
                 "minimax".to_string(),
                 "x-api-key".to_string(),
             )]),
-            pool_keys: HashMap::from([("minimax".to_string(), Secret::new("mm-key"))]),
+            pool_keys: HashMap::from([("minimax".to_string(), "mm-key".into())]),
             ..Default::default()
         };
         let providers = build_providers(&config, &test_metrics()).unwrap();
         let minimax = providers.get("minimax").unwrap();
         assert_eq!(minimax.dialect, Dialect::Anthropic);
         assert_eq!(minimax.auth, AuthScheme::XApiKey);
-        assert_eq!(minimax.pool_auth_value.as_ref().unwrap().expose(), "mm-key");
+        assert_eq!(minimax.pool_auth[0].value.expose(), "mm-key");
 
         // Unset dialect/auth_scheme still defaults to OpenAI/Bearer (backward compatible).
         let default_config = AiConfig {
