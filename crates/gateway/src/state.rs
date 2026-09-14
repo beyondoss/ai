@@ -227,24 +227,24 @@ pub struct GatewayState {
 impl GatewayState {
     pub fn new(config: AiConfig, metrics: Arc<Metrics>) -> Result<Arc<Self>> {
         let keyring = config.build_keyring()?;
-        // No signing keys ⇒ every `bai_…` fails verify and falls through to BYO treatment: no key
-        // swap, no deny-set, no `ai.usage` billing. That's a *valid* mode (a BYO-only deployment),
-        // but a far more common cause is a missing/typo'd `signing_keys` (SSM param, env) — which
-        // looks healthy while silently dropping all billing. A managed deployment sets
-        // `require_signing_keys = true` so this mis-deploy is a hard, visible boot failure; otherwise
-        // we warn loudly and continue (BYO-only is legitimate and the test/e2e harnesses run keyless).
+        // No signing keys ⇒ every `bai_v1…` fails verify and 401s (fail-closed). BYO still works.
+        // That's a *valid* mode (a BYO-only deployment), but a far more common cause is a
+        // missing/typo'd `signing_keys` (SSM param, env) — which 401s every managed tenant. A
+        // managed deployment sets `require_signing_keys = true` so this mis-deploy is a hard,
+        // visible boot failure; otherwise we warn loudly and continue (BYO-only is legitimate and
+        // the test/e2e harnesses run keyless).
         if config.signing_keys.is_empty() {
             if config.require_signing_keys {
                 return Err(GatewayError::Config(
                     "require_signing_keys is set but no signing_keys are configured — refusing to \
-                     boot into silent BYO-only mode (no key swap, no deny-set, no billing). Check \
-                     the signing_keys config / SSM param."
+                     boot into a mode where every bai_v1 token 401s. Check the signing_keys \
+                     config / SSM param."
                         .to_string(),
                 ));
             }
             warn!(
-                "no signing_keys configured — all managed (bai_) traffic will be treated as BYO \
-                 (no key swap, no deny-set, no billing). Expected only for a BYO-only deployment."
+                "no signing_keys configured — all managed (bai_v1) traffic will 401 (fail-closed); \
+                 only BYO works. Expected only for a BYO-only deployment."
             );
         }
         // Disabling upstream cert verification turns every provider connection into an unverified

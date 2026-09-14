@@ -33,7 +33,7 @@ const MANAGED_BODY: &str = r#"{"model":"gpt-4o","messages":[{"role":"user","cont
 /// `managed_json_latency` is the model route's own cost and not a payload difference.
 const AUTO_BODY: &str = r#"{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}]}"#;
 
-/// A plausible BYO provider token (anything not starting with `bai_` is BYO — passed through
+/// A plausible BYO provider token (anything not starting with `bai_v1` is BYO — passed through
 /// unchanged, no verify/deny/swap). The mock upstream accepts any token.
 const BYO_KEY: &str = "sk-byo-provider-token-1234567890";
 
@@ -347,7 +347,7 @@ async fn anthropic_roundtrip(s: &Stack) {
 }
 
 /// One round-trip with an arbitrary key and body, so a bench can vary either. `key` decides the
-/// path: a `bai_…` virtual key is managed, anything else is BYO.
+/// path: a `bai_v1…` virtual key is managed, anything else is BYO.
 async fn roundtrip_with(s: &Stack, key: &str, body: &str) {
     let resp = s
         .client
@@ -366,7 +366,7 @@ async fn roundtrip_with(s: &Stack, key: &str, body: &str) {
     let _ = resp.bytes().await.expect("body");
 }
 
-/// One **BYO** round-trip: a non-`bai_` token, passed straight through — no key verify, no deny-set
+/// One **BYO** round-trip: a non-`bai_v1` token, passed straight through — no key verify, no deny-set
 /// check, no key swap. Isolates the passthrough path's overhead from the managed path's auth work.
 async fn byo_roundtrip(s: &Stack) {
     let resp = s
