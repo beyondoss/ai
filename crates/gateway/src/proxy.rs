@@ -415,14 +415,13 @@ impl RequestCtx {
     }
 }
 
-/// Every `(error_type, message)` pair the gateway rejects with, paired with its wire body.
+/// Every flood-path `(error_type, message)` pair, paired with its wire body.
 ///
-/// The set of **flood-path** rejections: `reject` is only ever called with these literals, so the
-/// response body is one of these constants and never needs building. Catalog-walk errors that
-/// echo a caller-supplied name (`reject_message`) allocate; they are not this table.
-/// `reject_bodies_are_valid_json` can walk it and assert each entry parses, carries the `type` and
-/// `message` it claims, and is reachable — a hand-written JSON literal is exactly the thing that
-/// rots silently otherwise.
+/// `reject` is only ever called with these literals, so the body is a compile-time constant.
+/// Catalog-walk errors that echo a caller-supplied name go through `reject_message` and allocate.
+/// Kept as a table so `reject_bodies_are_valid_json` can walk it and assert each entry parses,
+/// carries the `type` and `message` it claims, and is reachable — a hand-written JSON literal is
+/// exactly the thing that rots silently otherwise.
 pub const REJECT_BODIES: [(&str, &str, &str); 10] = [
     (
         "invalid_request_error",
