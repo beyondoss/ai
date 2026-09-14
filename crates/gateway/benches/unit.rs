@@ -28,12 +28,13 @@ fn main() {
 
 mod key {
     use super::*;
-    use beyond_ai::key::{Keyring, VirtualKey, mint};
+    use beyond_ai::key::{Keyring, VirtualKey, mint, mint_v2};
     use ed25519_dalek::SigningKey;
 
     const ID: VirtualKey = VirtualKey {
         tenant_id: 42,
         vpc_id: 7,
+        key_id: None,
     };
 
     /// Stateless verify — must not touch the heap (stack-only base64 decode + signature check).
@@ -43,6 +44,16 @@ mod key {
         let mut ring = Keyring::new();
         ring.insert(1, sk.verifying_key());
         let token = mint(&ID, 1, &sk);
+        bencher.bench(|| ring.verify(black_box(&token)));
+    }
+
+    /// Same stack-only path for v2 (24-byte payload). Must stay 0 allocs.
+    #[divan::bench]
+    fn verify_v2(bencher: Bencher) {
+        let sk = SigningKey::from_bytes(&[1u8; 32]);
+        let mut ring = Keyring::new();
+        ring.insert(1, sk.verifying_key());
+        let token = mint_v2(&ID, 99, 1, &sk);
         bencher.bench(|| ring.verify(black_box(&token)));
     }
 
@@ -351,7 +362,7 @@ mod deny {
     // --- ingest path: parse a watched NATS key/value into the set (off the request hot path) ---
 
     #[divan::bench]
-    fn parse_key() -> Option<u64> {
+    fn parse_key() -> Option<beyond_ai::deny::DenyTarget> {
         deny::parse_key(black_box("blackhole.123456789"))
     }
 
