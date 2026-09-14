@@ -12,23 +12,23 @@ published `beyond-slipstream` — clones, CI-builds, and publishes anywhere.
 
 ## Concepts & Terminology
 
-| Term                                      | What It Controls / Gates                                                                                                                                                          | NOT                                                                          |
-| ----------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------- |
-| **Managed key** (`bai_v1.…` / `bai_v2.…`) | Ed25519-verified identity; enables key swap, deny-set check, and `ai.usage` billing                                                                                               | A session token or capability grant — just tenant attribution                |
-| **BYO key** (anything else)               | Forwarded as-is to the provider; no swap, no billing, no deny-set                                                                                                                 | A lesser tier — same proxy, minus attribution and billing                    |
-| **Pool key**                              | Real provider API key(s) held by the gateway; swapped in for managed traffic. A 429 walks the next unused key on the _same_ provider                                              | Per-tenant — keys are per provider, shared by all managed callers            |
-| **Tenant**                                | The billing entity from the virtual key payload (`tenant_id: u64`)                                                                                                                | An org, user, or namespace — an opaque integer the gateway doesn't interpret |
-| **Dialect**                               | A provider attribute (OpenAI-wire vs Anthropic-wire) driving usage parsing; for a bare-path request it's derived from the path to pick the default provider                       | The provider — a prefixed request uses its provider's dialect, not the path  |
-| **Provider**                              | The request's **first path segment** (`/{provider}/…`); a named row in the routing table: authority, dialect, auth scheme                                                         | A vendor relationship — just connection facts and auth wiring                |
+| Term                                       | What It Controls / Gates                                                                                                                                                                                     | NOT                                                                              |
+| ------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------- |
+| **Managed key** (`bai_v1.…` / `bai_v2.…`)  | Ed25519-verified identity; enables key swap, deny-set check, and `ai.usage` billing                                                                                                                          | A session token or capability grant — just tenant attribution                    |
+| **BYO key** (anything else)                | Forwarded as-is to the provider; no swap, no billing, no deny-set                                                                                                                                            | A lesser tier — same proxy, minus attribution and billing                        |
+| **Pool key**                               | Real provider API key(s) held by the gateway; swapped in for managed traffic. A 429 walks the next unused key on the _same_ provider                                                                         | Per-tenant — keys are per provider, shared by all managed callers                |
+| **Tenant**                                 | The billing entity from the virtual key payload (`tenant_id: u64`)                                                                                                                                           | An org, user, or namespace — an opaque integer the gateway doesn't interpret     |
+| **Dialect**                                | A provider attribute (OpenAI-wire vs Anthropic-wire) driving usage parsing; for a bare-path request it's derived from the path to pick the default provider                                                  | The provider — a prefixed request uses its provider's dialect, not the path      |
+| **Provider**                               | The request's **first path segment** (`/{provider}/…`); a named row in the routing table: authority, dialect, auth scheme                                                                                    | A vendor relationship — just connection facts and auth wiring                    |
 | **Model route** (`/auto/…`, managed `/v1`) | Catalog row named by `x-beyond-model` if present, else the body's root `model`; provider, upstream path, and model id come from that row and the body's `model` is rewritten per attempt. Catalog miss → 404 | A dialect translator — candidates must share a wire format. Not a per-key grant. |
-| **Candidate**                             | One `(provider, upstream model id, path)` a catalog row will accept, in preference order; tried on a connect failure                                                              | A load-balancing pool — strictly ordered, and only entered on failure        |
-| **Deny-set**                              | Sparse maps of denied `tenant_id`s and `key_id`s → reason; gates managed traffic; default-allow; tenant deny kills every key                                                      | An allowlist or ACL — misses are allowed, not blocked                        |
-| **Tail tap**                              | Bounded 64KB window kept from the end of the response for usage extraction                                                                                                        | A buffer or copy — the response is relayed unbuffered; only the tail is kept |
-| **Capture-set**                           | Sparse map of `tenant_id`s with payload logging on; default-**off**; watched under its own prefix by its own watcher                                                              | Retention policy — the gateway emits and forgets; the store owns TTL/erasure |
-| **Capture tap**                           | Bounded **head**-keeping copy of each body, taken pre-rewrite; relayed bytes are untouched                                                                                        | A buffer — nothing is withheld, so it costs memcpy, never latency            |
-| **Control header** (`x-beyond-*`)         | Per-request caller input: `metadata` tags, `capture` on/off. Managed only; stripped before the upstream                                                                           | A way to fail a request — unusable values are dropped and counted, never 4xx |
-| **Snapshot**                              | On-disk deny-set cache (entries + NATS cursor) for edge/tunnel deployments                                                                                                        | Persistent store — a pure cache; delete it and the gateway re-scans NATS     |
-| **Virtual key** (`bai_v1` / `bai_v2`)     | Ed25519-signed token: v1 is `tenant_id`+`vpc_id` (16 B); v2 adds unique `key_id` (24 B). Same keyring.                                                                            | A session or auth token — stateless, no server-side lookup                   |
+| **Candidate**                              | One `(provider, upstream model id, path)` a catalog row will accept, in preference order; tried on a connect failure                                                                                         | A load-balancing pool — strictly ordered, and only entered on failure            |
+| **Deny-set**                               | Sparse maps of denied `tenant_id`s and `key_id`s → reason; gates managed traffic; default-allow; tenant deny kills every key                                                                                 | An allowlist or ACL — misses are allowed, not blocked                            |
+| **Tail tap**                               | Bounded 64KB window kept from the end of the response for usage extraction                                                                                                                                   | A buffer or copy — the response is relayed unbuffered; only the tail is kept     |
+| **Capture-set**                            | Sparse map of `tenant_id`s with payload logging on; default-**off**; watched under its own prefix by its own watcher                                                                                         | Retention policy — the gateway emits and forgets; the store owns TTL/erasure     |
+| **Capture tap**                            | Bounded **head**-keeping copy of each body, taken pre-rewrite; relayed bytes are untouched                                                                                                                   | A buffer — nothing is withheld, so it costs memcpy, never latency                |
+| **Control header** (`x-beyond-*`)          | Per-request caller input: `metadata` tags, `capture` on/off. Managed only; stripped before the upstream                                                                                                      | A way to fail a request — unusable values are dropped and counted, never 4xx     |
+| **Snapshot**                               | On-disk deny-set cache (entries + NATS cursor) for edge/tunnel deployments                                                                                                                                   | Persistent store — a pure cache; delete it and the gateway re-scans NATS         |
+| **Virtual key** (`bai_v1` / `bai_v2`)      | Ed25519-signed token: v1 is `tenant_id`+`vpc_id` (16 B); v2 adds unique `key_id` (24 B). Same keyring.                                                                                                       | A session or auth token — stateless, no server-side lookup                       |
 
 ---
 
@@ -768,7 +768,7 @@ remains the escape hatch when the catalog should not apply.
 **What the catalog allowlists (managed `/v1` and `/auto` only):**
 
 - The model name. A catalog miss is a 404. This is not a per-key grant list and not a parallel set
-  beside the catalog — the catalog row *is* the allowlist.
+  beside the catalog — the catalog row _is_ the allowlist.
 
 **Why these boundaries are where they are:**
 
@@ -847,29 +847,29 @@ Secret-bearing fields (`pool_keys`, `nats_creds`) are held as `Secret<T>` — st
 
 Prometheus on the default registry, exposed at `/metrics` on `metrics_listen`.
 
-| Metric                                | Type      | Labels               | What It Measures                                                                       |
-| ------------------------------------- | --------- | -------------------- | -------------------------------------------------------------------------------------- |
-| `ai_requests_total`                   | Counter   | —                    | Total admitted requests                                                                |
-| `ai_rejections_total`                 | Counter   | `reason`             | Rejected requests by cause (auth, deny_spend, deny_fraud, rate_limit, circuit_open, …) |
-| `ai_upstream_responses_total`         | Counter   | `provider`, `status` | Upstream responses by provider and status class                                        |
-| `ai_tokens_total`                     | Counter   | `kind`               | input / output / cache_read / cache_write token counts                                 |
-| `ai_ttft_seconds`                     | Histogram | `provider`           | Time to first token (50ms–30s buckets)                                                 |
-| `ai_upstream_latency_seconds`         | Histogram | `provider`           | Full request latency (100ms–600s buckets)                                              |
-| `ai_active_streams`                   | Gauge     | —                    | Open SSE streams                                                                       |
-| `ai_requests_in_flight`               | Gauge     | —                    | All in-flight requests (streaming + non-streaming)                                     |
-| `ai_deny_set_size`                    | Gauge     | —                    | Current number of denied tenants                                                       |
-| `ai_nats_connected`                   | Gauge     | —                    | 1 if the **deny-set** watcher is connected, 0 otherwise                                |
-| `ai_capture_set_size`                 | Gauge     | —                    | Tenants with payload capture enabled (climbing and never falling ⇒ missing TTLs)       |
-| `ai_capture_nats_connected`           | Gauge     | —                    | 1 if the **capture-set** watcher is connected — separate watcher, separate connection  |
-| `ai_captures_total`                   | Counter   | —                    | Requests whose payloads were captured (post-sampling)                                  |
-| `ai_capture_bytes_total`              | Counter   | —                    | Payload bytes handed to the sink — the cost signal, ahead of the storage bill          |
-| `ai_capture_dropped_total`            | Counter   | —                    | Captures dropped on a full sink queue — distinguishes "lost it" from "capture was off" |
-| `ai_control_header_errors_total`      | Counter   | —                    | `x-beyond-*` headers present but unusable (dropped; request still served)              |
-| `ai_usage_parse_errors_total`         | Counter   | —                    | Managed 2xx responses with no parseable usage (emitted as a zero-token billing row)    |
-| `ai_candidate_failovers_total`        | Counter   | —                    | Model-routed requests that abandoned a candidate for the next one                      |
-| `ai_key_walks_total`                  | Counter   | —                    | Managed 429s that retried the same provider with the next unused pool key              |
+| Metric                                | Type      | Labels               | What It Measures                                                                                  |
+| ------------------------------------- | --------- | -------------------- | ------------------------------------------------------------------------------------------------- |
+| `ai_requests_total`                   | Counter   | —                    | Total admitted requests                                                                           |
+| `ai_rejections_total`                 | Counter   | `reason`             | Rejected requests by cause (auth, deny_spend, deny_fraud, rate_limit, circuit_open, …)            |
+| `ai_upstream_responses_total`         | Counter   | `provider`, `status` | Upstream responses by provider and status class                                                   |
+| `ai_tokens_total`                     | Counter   | `kind`               | input / output / cache_read / cache_write token counts                                            |
+| `ai_ttft_seconds`                     | Histogram | `provider`           | Time to first token (50ms–30s buckets)                                                            |
+| `ai_upstream_latency_seconds`         | Histogram | `provider`           | Full request latency (100ms–600s buckets)                                                         |
+| `ai_active_streams`                   | Gauge     | —                    | Open SSE streams                                                                                  |
+| `ai_requests_in_flight`               | Gauge     | —                    | All in-flight requests (streaming + non-streaming)                                                |
+| `ai_deny_set_size`                    | Gauge     | —                    | Current number of denied tenants                                                                  |
+| `ai_nats_connected`                   | Gauge     | —                    | 1 if the **deny-set** watcher is connected, 0 otherwise                                           |
+| `ai_capture_set_size`                 | Gauge     | —                    | Tenants with payload capture enabled (climbing and never falling ⇒ missing TTLs)                  |
+| `ai_capture_nats_connected`           | Gauge     | —                    | 1 if the **capture-set** watcher is connected — separate watcher, separate connection             |
+| `ai_captures_total`                   | Counter   | —                    | Requests whose payloads were captured (post-sampling)                                             |
+| `ai_capture_bytes_total`              | Counter   | —                    | Payload bytes handed to the sink — the cost signal, ahead of the storage bill                     |
+| `ai_capture_dropped_total`            | Counter   | —                    | Captures dropped on a full sink queue — distinguishes "lost it" from "capture was off"            |
+| `ai_control_header_errors_total`      | Counter   | —                    | `x-beyond-*` headers present but unusable (dropped; request still served)                         |
+| `ai_usage_parse_errors_total`         | Counter   | —                    | Managed 2xx responses with no parseable usage (emitted as a zero-token billing row)               |
+| `ai_candidate_failovers_total`        | Counter   | —                    | Model-routed requests that abandoned a candidate for the next one                                 |
+| `ai_key_walks_total`                  | Counter   | —                    | Managed 429s that retried the same provider with the next unused pool key                         |
 | `ai_model_header_body_mismatch_total` | Counter   | —                    | Catalog-walk requests whose `x-beyond-model` and body `model` disagreed (header wins; client bug) |
-| `ai_failover_body_too_large_total`    | Counter   | —                    | 5xx that could not fail over: request body exceeded the 64 KiB replay buffer           |
+| `ai_failover_body_too_large_total`    | Counter   | —                    | 5xx that could not fail over: request body exceeded the 64 KiB replay buffer                      |
 
 ---
 
