@@ -7,14 +7,15 @@
 //!
 //! Why signed-token instead of opaque-token + registry lookup: at millions of tenants we don't
 //! want a per-request lookup (latency + a state dependency) just to learn *who* is calling.
-//! Identity is stateless here; the only per-request state is the sparse deny-set (see `deny`),
-//! which is a membership check, not an identity lookup.
+//! Identity is stateless here; the only per-request state is the sparse deny-set (see `deny`) and
+//! the sparse allowance-set (see `allowance`) — membership checks, not an identity lookup.
 //!
 //! `bai_v1` is tenant+vpc only and `mint` is deterministic for those two fields — the control
 //! plane can re-derive one key per (tenant, vpc). That cannot name a *credential*, so it cannot
 //! be cut off without cutting off the tenant. `bai_v2` adds an explicit `key_id` the caller
 //! supplies (not derived from tenant+vpc); mint is still deterministic for a given key_id.
 //! Revocation is out-of-band via the deny-set (`blackhole.{tenant}` and `blackhole.key.{id}`).
+//! Quota exhaust is the same shape on the allowance-set (`allowance.{tenant}` / `allowance.key.{id}`).
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;

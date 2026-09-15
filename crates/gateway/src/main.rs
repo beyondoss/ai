@@ -16,7 +16,7 @@ use beyond_ai::doctor;
 use beyond_ai::metrics::Metrics;
 use beyond_ai::proxy::AiProxy;
 use beyond_ai::state::GatewayState;
-use beyond_ai::store_watch::{Capture, Deny, WatcherService};
+use beyond_ai::store_watch::{Allowance, Capture, Deny, WatcherService};
 use clap::{Parser, Subcommand};
 use pingora_core::apps::HttpServerOptions;
 use pingora_core::apps::http_app::HttpServer;
@@ -211,10 +211,14 @@ fn main() {
 
     // slipstream watchers + NATS connectivity (connects on Pingora's runtime; see WatcherService).
     // One service per watched set, each with its own connection, cursor, and reconnect loop — so a
-    // capture-set outage backs off on its own schedule and can't disturb deny enforcement.
+    // capture-set outage backs off on its own schedule and can't disturb deny or allowance.
     server.add_service(background_service(
         "ai-watch-deny",
         WatcherService::<Deny>::new(state.clone()),
+    ));
+    server.add_service(background_service(
+        "ai-watch-allowance",
+        WatcherService::<Allowance>::new(state.clone()),
     ));
     server.add_service(background_service(
         "ai-watch-capture",

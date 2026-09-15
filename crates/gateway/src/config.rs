@@ -1,7 +1,8 @@
 //! Layered configuration (PATTERNS.md: Figment defaults → TOML → `AI_`-prefixed env).
 //!
-//! Auth + key material come from config (signing public keys, managed pool keys), so the gateway
-//! is fully functional from boot config alone — NATS is only needed for the deny-set.
+//! Auth + key material come from config (signing public keys, managed pool keys). Deny is
+//! fail-open without NATS; allowance is fail-closed until its watcher stores a scan or snapshot,
+//! so managed traffic 402s until that read. BYO still serves from boot config alone.
 
 use crate::error::{GatewayError, Result};
 use crate::key::{Keyring, Kid};
@@ -141,19 +142,21 @@ pub struct AiConfig {
     pub downstream_h2c: bool,
 
     /// NATS / slipstream connection (cf. `_envcommon/ecs-service.hcl`: `tls://connect.ngs.global`).
-    /// Used only for the watched deny-set (`blackhole.*`).
+    /// Used for the watched deny-set (`blackhole.*`), allowance-set (`allowance.*`), and
+    /// capture-set (`aicapture.*`).
     pub nats_url: String,
     /// Base64 `.creds` (ECS via SOPS) — takes priority over `nats_creds_file`. Held in `Secret` so
     /// it can't leak through the `Debug`/`Serialize` this struct derives (a stray `?config` log).
     pub nats_creds: Option<Secret>,
     pub nats_creds_file: Option<String>,
-    /// slipstream bucket holding `blackhole.*` (the deny-set — the only thing in NATS).
+    /// slipstream bucket holding `blackhole.*`, `allowance.*`, and `aicapture.*`.
     pub config_bucket: String,
 
     /// Optional path to an on-disk deny-set snapshot (slipstream's append-log + resume cursor). When
     /// set **and on durable storage** (the edge/tunnel deployment model), a restart seeds the
     /// deny-set from this file and *resumes the NATS watch from the saved revision* — skipping the
-    /// boot scan and surviving a restart with enforcement intact even before NATS reconnects. Unset
+    /// boot scan and surviving a restart with enforcement intact even before NATS reconnects. The
+    /// allowance-set uses `{path}.allowance` so the two files cannot be loaded as each other. Unset
     /// (the default, e.g. ephemeral/Fargate) ⇒ seed from a NATS scan each boot, unchanged. The file
     /// is a pure cache: delete it (or point at scratch) and the gateway falls back to scanning.
     pub snapshot_path: Option<String>,
@@ -318,6 +321,9 @@ pub struct AiConfig {
     /// catalog walks whose client body is already in hand before `upstream_peer` (`/auto`, managed
     /// `/v1`) look up or fill. A hit replays the stored 2xx and skips the provider; a miss stays an
     /// unbuffered relay and fills via a tap. BYO and `/{provider}` passthrough are not cached.
+    ///
+    /// The store is **this process**. Another replica does not see the entry; a miss never consults
+    /// Redis or any shared backend.
     pub cache_ttl_secs: u64,
     /// Cap on stored entries. Oldest insertion is dropped when a new one would exceed it.
     pub cache_max_entries: usize,
@@ -327,6 +333,9 @@ pub struct AiConfig {
     /// Rank managed catalog walks by observed time-to-first-byte (in-process EWMA per catalog
     /// candidate). Off falls back to the row's static order, still subject to `x-beyond-order` /
     /// `only` / `split`. Default on: the headers pin when a caller wants a fixed sequence.
+    ///
+    /// Ranking is **this process**. Replicas do not share TTFT samples, so the default walk is not
+    /// a fleet-wide smart router.
     pub smart_router: bool,
 }
 

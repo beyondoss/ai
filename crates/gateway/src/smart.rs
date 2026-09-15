@@ -1,7 +1,12 @@
 //! In-process catalog-walk ranking from observed time-to-first-byte.
 //!
-//! A managed `/auto` or `/v1` request still walks one catalog row — same wire, no provider the row
-//! does not already name. What changes is the **order** of that walk when the caller did not pin it
+//! **Per-pod, not fleet-wide.** EWMA samples never leave this process. Two replicas of the same
+//! catalog row can walk candidates in different orders; `x-beyond-split` is the only cross-replica
+//! pin (hash of the request counter, not a shared rank). There is no Redis on this path.
+//! `ai_smart_rank_scope{kind="process"}` is the metric that says so.
+//!
+//! A managed `/auto` or `/v1` request still walks one catalog row — no provider the row does not
+//! already name. What changes is the **order** of that walk when the caller did not pin it
 //! (`x-beyond-order` / `x-beyond-split`).
 //!
 //! Default with no samples is the row's static order. After a candidate answers, its EWMA TTFT is
