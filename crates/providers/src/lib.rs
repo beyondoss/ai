@@ -22,7 +22,9 @@
 
 pub mod catalog;
 
-pub use catalog::{Candidate, MAX_CANDIDATES, ModelRoute, for_model};
+pub use catalog::{
+    Candidate, MAX_CANDIDATES, ModelRoute, endpoint_of_path, for_model, wire_of_path,
+};
 
 /// Every upstream this codebase can route to, by either path. The gateway's 12 `/{name}/…` routes and
 /// the 5 BYO-only aggregator platforms (reachable only by base-URL override, no gateway-native route)

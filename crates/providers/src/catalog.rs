@@ -24,18 +24,19 @@
 //! gateway's Anthropic usage extractor reads. (Fireworks is the same story from the other side: see
 //! `agent_core::dialect::is_fireworks_anthropic_wire_model`.)
 //!
-//! So a row declares its own [`ModelRoute::wire`] and each candidate carries the [`Candidate::path`]
-//! that serves it. Deriving the wire from the provider would have been wrong in a specifically nasty
-//! way: an Anthropic-wire response parsed by the OpenAI extractor trips the dialect-mismatch guard
-//! and emits a **zero-token billing row**, not an error.
+//! So a row declares its own [`ModelRoute::wire`] (the *client default* / primary endpoint) and
+//! each candidate carries the [`Candidate::path`] that serves it. Deriving the wire from the
+//! provider would have been wrong in a specifically nasty way: an Anthropic-wire response parsed
+//! by the OpenAI extractor trips the dialect-mismatch guard and emits a **zero-token billing row**,
+//! not an error.
 //!
-//! Every candidate in a row must still agree on the wire (enforced by
-//! `candidates_within_a_row_share_one_endpoint`): failover is same-wire, and mixed-wire rows are
-//! out of scope. GPT rows also list a parallel [`ModelRoute::responses`] arm (OpenAI `/v1/responses`)
-//! used when the inbound path is Responses; Chat Completions/Messages inbound still walks
-//! [`ModelRoute::candidates`]. The gateway *does* translate Chat Completions ↔ Messages when a
-//! managed `/v1` or `/auto` walk's inbound path names the other wire — that is a client-dialect
-//! mismatch, not a mixed row. `/{provider}/…` never translates.
+//! Candidates in a row may disagree on the endpoint (Messages vs Chat Completions). The gateway
+//! translates the original client body onto **this candidate's** path each attempt, so Claude can
+//! fail onto an OpenAI-compat host without sending a Messages body at Chat Completions.
+//! GPT rows also list a parallel [`ModelRoute::responses`] arm (OpenAI `/v1/responses`) used when
+//! the inbound path is Responses **and** the body uses session state; Chat Completions / Messages
+//! inbound, and `store: false` one-shot Responses, still walk [`ModelRoute::candidates`].
+//! `/{provider}/…` never translates.
 //!
 //! # Maintenance
 //!
@@ -57,13 +58,13 @@ pub struct Candidate {
     /// every other candidate's — `claude-opus-4-8` at Anthropic is `anthropic/claude-opus-4.8` at
     /// OpenRouter, dots and all.
     pub upstream_model: &'static str,
-    /// The full upstream path for this candidate on this row's wire.
+    /// The full upstream path for this candidate.
     ///
     /// Absolute and complete, not a suffix to be composed: providers do not agree on where an
     /// endpoint lives, and the disagreement is not a simple prefix. Anthropic serves Messages at
-    /// `/v1/messages` from a base URL carrying no path; OpenRouter serves the same wire at
-    /// `/api/v1/messages`. There is no client-supplied suffix that is correct for both, so the
-    /// catalog states each one outright.
+    /// `/v1/messages` from a base URL carrying no path; OpenRouter may serve the same model at
+    /// `/api/v1/chat/completions`. There is no client-supplied suffix that is correct for both, so
+    /// the catalog states each one outright. Mixed-wire rows are translated per candidate.
     pub path: &'static str,
 }
 
@@ -74,9 +75,12 @@ pub struct ModelRoute {
     /// `/auto`) request, the body's root `model`. Lowercase and restricted to `[a-z0-9._/-]`,
     /// which is what lets the gateway log it verbatim without sanitizing.
     pub model: &'static str,
-    /// The API shape this row's candidates speak, and the shape the gateway's usage extractor
-    /// reads. A managed catalog walk whose inbound path names the other Chat Completions/Messages
-    /// wire is translated into this one; `/{provider}/…` never is.
+    /// The API shape the *primary* speaks, and the shape a bare `/v1` client is assumed to send.
+    /// Failover candidates may speak a different endpoint; the gateway translates the original
+    /// client body onto each candidate's path. Inbound `/v1/responses` without session state is
+    /// translated onto Chat Completions or Messages according to this field for the primary, then
+    /// per candidate. Session-state Responses walks [`Self::responses`] instead.
+    /// `/{provider}/…` never translates.
     pub wire: WireFormat,
     /// Preference order: `[0]` is primary, the rest are failover candidates. Non-empty, at most
     /// [`MAX_CANDIDATES`], no provider repeated. Chat Completions / Messages inbound, and one-shot
@@ -95,8 +99,38 @@ pub struct ModelRoute {
 /// bitmask with no per-request allocation.
 pub const MAX_CANDIDATES: usize = 8;
 
-/// Anthropic-native primary, OpenRouter Messages failover. OpenRouter spells Claude with a vendor
-/// prefix and dots (`anthropic/claude-opus-4.8`), not dashes.
+/// The wire a path serves — `…/messages` is Anthropic, everything else is OpenAI-shaped.
+///
+/// An independent read of the same fact a candidate's path declares, which is what lets the
+/// gateway pick a usage extractor **per attempt** rather than from the row or the provider.
+pub fn wire_of_path(path: &str) -> WireFormat {
+    if path.ends_with("/messages") {
+        WireFormat::Anthropic
+    } else {
+        WireFormat::OpenAi
+    }
+}
+
+/// Chat Completions vs Messages vs Responses, from a candidate path.
+///
+/// Distinct from [`wire_of_path`]: `/v1/chat/completions` and `/v1/responses` are both OpenAI-wire
+/// but different endpoints. The gateway translates when this candidate's path differs from the
+/// client's; it never sends a Messages body at Chat Completions (or the reverse).
+pub fn endpoint_of_path(path: &str) -> &'static str {
+    if path.ends_with("/messages") {
+        "messages"
+    } else if path.contains("/responses") {
+        "responses"
+    } else if path.contains("chat/completions") {
+        "chat/completions"
+    } else {
+        "other"
+    }
+}
+
+/// Anthropic-native primary, OpenRouter Chat Completions failover. OpenRouter spells Claude with a
+/// vendor prefix and dots (`anthropic/claude-opus-4.8`), not dashes. The OpenRouter arm is the
+/// mixed-wire case: Claude fails onto an OpenAI-compat host; the gateway translates per candidate.
 const fn claude(native: &'static str, openrouter: &'static str) -> [Candidate; 2] {
     [
         Candidate {
@@ -107,12 +141,12 @@ const fn claude(native: &'static str, openrouter: &'static str) -> [Candidate; 2
         Candidate {
             provider: ProviderId::OpenRouter,
             upstream_model: openrouter,
-            path: "/api/v1/messages",
+            path: "/api/v1/chat/completions",
         },
     ]
 }
 
-/// Anthropic → Bedrock Messages → OpenRouter Messages.
+/// Anthropic → Bedrock Messages → OpenRouter Chat Completions.
 ///
 /// `bedrock` is a US geo inference-profile id, not a mechanical rewrite of `native`. Only call this
 /// with a live-verified string — a guessed id 404s and looks like the client's fault.
@@ -135,15 +169,17 @@ const fn claude_bedrock(
         Candidate {
             provider: ProviderId::OpenRouter,
             upstream_model: openrouter,
-            path: "/api/v1/messages",
+            path: "/api/v1/chat/completions",
         },
     ]
 }
 
 /// OpenAI-native primary, OpenRouter Chat Completions failover. Same Chat Completions mount on
+/// OpenAI-native primary, OpenRouter Chat Completions failover. Same Chat Completions mount on
 /// both sides (`/v1` vs `/api/v1`). The matching Responses arm lives on [`ModelRoute::responses`]
 /// rather than here: mixing `/v1/chat/completions` and `/v1/responses` in one walk would break
-/// `stream_options.include_usage` injection (see `candidates_within_a_row_share_one_endpoint`).
+/// `stream_options.include_usage` injection. `store: false` one-shot inbound Responses still
+/// translates onto this Chat Completions row.
 const fn openai_chat(native: &'static str, openrouter: &'static str) -> [Candidate; 2] {
     [
         Candidate {
@@ -179,7 +215,7 @@ const fn openai_responses(native: &'static str) -> [Candidate; 1] {
 pub const MODEL_ROUTES: &[ModelRoute] = &[
     // Claude on the Anthropic wire.
     //
-    // Default shape is Anthropic first-party, then OpenRouter Messages (`claude()`). OpenRouter
+    // Default shape is Anthropic first-party, then OpenRouter Chat Completions (`claude()`). OpenRouter
     // chooses its own backend per request — observed serving these ids from both Anthropic
     // directly and Amazon Bedrock — so that second candidate is *not* a guaranteed independent
     // supply. It covers failures that are ours: egress blocked, our Anthropic key throttled,
@@ -407,17 +443,6 @@ mod tests {
     use super::*;
     use crate::{by_id, gateway_providers};
 
-    /// The wire a path serves, inferred from its endpoint — `…/messages` is Anthropic, everything
-    /// else is OpenAI-shaped. An independent read of the same fact the row declares, which is what
-    /// lets the two be cross-checked.
-    fn wire_of_path(path: &str) -> WireFormat {
-        if path.ends_with("/messages") {
-            WireFormat::Anthropic
-        } else {
-            WireFormat::OpenAi
-        }
-    }
-
     /// The binary search in `for_model` is only correct on a sorted table, and duplicate names would
     /// make which row wins depend on where the search landed.
     #[test]
@@ -499,74 +524,61 @@ mod tests {
         }
     }
 
-    /// Load-bearing. The gateway rewrites the body's `model` id per attempt but does **not**
-    /// translate between API shapes, so a row whose candidates disagree on the wire would forward an
-    /// Anthropic Messages body to a Chat Completions endpoint — and, worse, parse the reply with the
-    /// wrong dialect's usage extractor, which yields a zero-token billing row rather than an error.
-    ///
-    /// Checked against each candidate's **path**, not its provider: OpenRouter serves both wires, so
-    /// the provider's own `wire` field cannot answer this.
+    /// The primary speaks the row's declared wire; failover candidates may speak another endpoint.
+    /// The gateway translates the original client body onto **this** candidate's path, so a mixed
+    /// row never forwards a Messages body at Chat Completions (or the reverse).
     #[test]
-    fn candidate_paths_match_the_rows_declared_wire() {
+    fn primary_candidate_matches_the_rows_declared_wire() {
         for route in MODEL_ROUTES {
-            for c in route.candidates {
-                assert_eq!(
-                    wire_of_path(c.path),
-                    route.wire,
-                    "route {:?} declares {:?} but candidate {:?} points at {:?}",
-                    route.model,
-                    route.wire,
-                    c.provider,
-                    c.path,
-                );
-            }
-        }
-    }
-
-    /// Every candidate in a row must serve the **same endpoint**, not merely the same wire.
-    ///
-    /// `wire_of_path` only separates Messages from everything else, so `/v1/chat/completions` and
-    /// `/v1/responses` both read as OpenAI and would pass the wire check while behaving differently:
-    /// the gateway's `stream_options.include_usage` injection is a Chat Completions construct, and
-    /// `is_streamable_path` is taken from the *walk's* first arm. Mixing those endpoints in
-    /// [`ModelRoute::candidates`] would inject into a Responses request, or skip injection on a Chat
-    /// Completions one. GPT Responses lives on [`ModelRoute::responses`] instead, a parallel walk.
-    #[test]
-    fn candidates_within_a_row_share_one_endpoint() {
-        for route in MODEL_ROUTES {
-            let endpoint = |p: &str| p.rsplit_once("/v1").map_or(p, |(_, tail)| tail).to_string();
             let Some(first) = route.candidates.first() else {
                 continue;
             };
-            let want = endpoint(first.path);
+            assert_eq!(
+                wire_of_path(first.path),
+                route.wire,
+                "route {:?} declares {:?} but primary {:?} points at {:?}",
+                route.model,
+                route.wire,
+                first.provider,
+                first.path,
+            );
+        }
+    }
+
+    /// Every candidate path must name Chat Completions, Messages, or Responses so the gateway can
+    /// translate onto it. Mixed Messages + Chat Completions in one row is allowed (Claude →
+    /// OpenRouter); an unrecognized path would be forwarded as the wrong wire.
+    #[test]
+    fn every_candidate_path_names_a_known_endpoint() {
+        for route in MODEL_ROUTES {
             for c in route.candidates {
-                assert_eq!(
-                    endpoint(c.path),
-                    want,
-                    "route {:?}: {:?} serves {:?} but {:?} serves {:?} — same wire, different \
-                     endpoint, which the injection path cannot straddle",
-                    route.model,
-                    first.provider,
-                    first.path,
-                    c.provider,
-                    c.path,
+                let ep = endpoint_of_path(c.path);
+                assert_ne!(
+                    ep, "other",
+                    "route {:?} candidate {:?} path {:?} is not Chat Completions, Messages, or Responses",
+                    route.model, c.provider, c.path,
                 );
             }
         }
     }
 
-    /// ...and prove that check can fail, since the seed table contains no violation to catch.
+    /// The two OpenAI-wire endpoints stay distinguishable so a translate walk can target one
+    /// without inventing a mixed type *inside* a single candidate path.
     #[test]
-    fn the_endpoint_check_rejects_chat_completions_mixed_with_responses() {
-        let endpoint = |p: &str| p.rsplit_once("/v1").map_or(p, |(_, tail)| tail).to_string();
+    fn chat_completions_and_responses_are_distinct_endpoints() {
         assert_eq!(
-            endpoint("/v1/chat/completions"),
-            endpoint("/api/v1/chat/completions")
+            endpoint_of_path("/v1/chat/completions"),
+            endpoint_of_path("/api/v1/chat/completions")
         );
         assert_ne!(
-            endpoint("/v1/chat/completions"),
-            endpoint("/v1/responses"),
+            endpoint_of_path("/v1/chat/completions"),
+            endpoint_of_path("/v1/responses"),
             "the two OpenAI-wire endpoints must be distinguishable",
+        );
+        assert_eq!(endpoint_of_path("/v1/messages"), "messages");
+        assert_eq!(
+            endpoint_of_path("/api/v1/chat/completions"),
+            "chat/completions"
         );
     }
 
@@ -758,8 +770,8 @@ mod tests {
         }
     }
 
-    /// `wire_of_path` is what `candidate_paths_match_the_rows_declared_wire` leans on, so prove it
-    /// discriminates rather than always answering the same thing.
+    /// `wire_of_path` is what per-candidate usage parsing leans on, so prove it discriminates
+    /// rather than always answering the same thing.
     #[test]
     fn wire_of_path_discriminates_messages_from_chat_completions() {
         assert_eq!(wire_of_path("/v1/messages"), WireFormat::Anthropic);
@@ -769,12 +781,11 @@ mod tests {
         assert_eq!(wire_of_path("/v1/responses"), WireFormat::OpenAi);
     }
 
-    /// Claude has two real fallbacks, and they are not the same kind. Bedrock is an independent
-    /// Anthropic-wire source (its `ProviderSpec::wire` agrees with the row). OpenRouter is the
-    /// wire-rework case: an OpenAI-wire provider that still serves this row's Anthropic-wire
-    /// traffic because the row and the path decide, not the provider.
+    /// Claude has two real fallbacks, and they are not the same kind. Bedrock stays Messages.
+    /// OpenRouter is the mixed-wire arm: an OpenAI-compat Chat Completions host. The gateway
+    /// translates the original client body onto that path; billing follows the serving candidate.
     #[test]
-    fn claude_fails_over_to_bedrock_then_openrouter_on_the_anthropic_wire() {
+    fn claude_fails_over_to_bedrock_then_openrouter_chat_completions() {
         let want = [
             Candidate {
                 provider: ProviderId::Anthropic,
@@ -790,16 +801,26 @@ mod tests {
                 provider: ProviderId::OpenRouter,
                 // OpenRouter spells Claude with a vendor prefix and dots, not dashes.
                 upstream_model: "anthropic/claude-opus-4.8",
-                path: "/api/v1/messages",
+                path: "/api/v1/chat/completions",
             },
         ];
         assert_eq!(
             for_model("claude-opus-4-8").map(|r| (r.wire, r.candidates)),
             Some((WireFormat::Anthropic, &want[..])),
-            "Claude must fail over to Bedrock, then OpenRouter, on the Anthropic wire",
+            "Claude must fail over to Bedrock Messages, then OpenRouter Chat Completions",
         );
         assert_eq!(by_id(ProviderId::Bedrock).wire, WireFormat::Anthropic);
         assert_eq!(by_id(ProviderId::OpenRouter).wire, WireFormat::OpenAi);
+        assert_eq!(
+            endpoint_of_path(want[0].path),
+            "messages",
+            "primary stays Messages"
+        );
+        assert_eq!(
+            endpoint_of_path(want[2].path),
+            "chat/completions",
+            "OpenRouter arm is Chat Completions, not Messages"
+        );
     }
 
     /// The two Claude rows whose Bedrock inference-profile ids were live-verified. Other Claude

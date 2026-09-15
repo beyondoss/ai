@@ -3,8 +3,9 @@
 //!
 //! This is the end-to-end proof that the harness works *through the actual gateway*: the agent
 //! authenticates with a `bai_v1` virtual key, the gateway verifies it, swaps in the pool key, routes
-//! to the (mock) provider, and relays the streamed tool round-trip back. No NATS (the gateway fails
-//! open), no real provider, no TLS (plaintext upstream) — but every byte flows through the gateway.
+//! to the (mock) provider, and relays the streamed tool round-trip back. A real nats-server seeds
+//! the fail-closed allowance watcher (empty scan = remaining-ok). No real provider, no TLS
+//! (plaintext upstream) — but every byte flows through the gateway.
 //! `--model` must be a catalog row: managed `/v1` 404s unknown ids (`claude-test` is mock-only).
 //!
 //! The signing key is the gateway's deterministic dev key (`mise run ai:mint-dev-key`), so the
@@ -17,7 +18,7 @@ use std::process::{Command, Stdio};
 
 use common::{
     DEV_PUBKEY_B64, DEV_TOKEN, SpawnGuarded, free_port, gateway_bin, spawn_model_server, turn_text,
-    turn_tool_use, wait_for_port,
+    turn_tool_use, unused_nats_port, wait_for_allowance_ready, wait_for_port,
 };
 use serde_json::json;
 
@@ -36,10 +37,11 @@ fn agent_through_real_gateway_to_mock_upstream() {
     // Gateway config: Anthropic provider → the mock (plaintext), pool key to swap in, dev signing key.
     let gw_port = free_port();
     let metrics_port = free_port();
+    let nats_port = unused_nats_port();
     let config = format!(
         "listen = \"127.0.0.1:{gw_port}\"\n\
          metrics_listen = \"127.0.0.1:{metrics_port}\"\n\
-         nats_url = \"nats://127.0.0.1:59321\"\n\
+         nats_url = \"nats://127.0.0.1:{nats_port}\"\n\
          config_bucket = \"ai-gateway\"\n\
          upstream_tls = false\n\
          \n[provider_authorities]\nanthropic = \"{mock_authority}\"\n\
@@ -59,6 +61,7 @@ fn agent_through_real_gateway_to_mock_upstream() {
         .stderr(Stdio::null())
         .spawn_guarded();
     wait_for_port(gw_port);
+    wait_for_allowance_ready(metrics_port);
 
     // Drive the agent through the gateway.
     let output = Command::new(env!("CARGO_BIN_EXE_beyond-ai-agent"))

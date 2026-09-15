@@ -1,7 +1,8 @@
 //! End-to-end: real `beyond-ai` binary + real nats-server + mock upstream.
 //! Run via `mise run test:integration:rs` (needs `nats-server` on PATH).
 //!
-//! Signing key + pool key come from the gateway's *config*; NATS carries only the deny-set.
+//! Signing key + pool key come from the gateway's *config*; NATS carries the deny-set and the
+//! allowance-set.
 
 // Test target: `.unwrap()`/`.expect()`/`panic!` are assertions, not production code — allow the
 // panic-surface restriction lints denied workspace-wide in `[workspace.lints.clippy]`.
@@ -558,6 +559,117 @@ async fn blackhole_key_denies_one_credential_tenant_denies_both() {
     put_kv(nats.port, "blackhole.77", b"spend").await;
     probe(key_a.clone(), 402).await;
     probe(key_b, 402).await; // tenant deny kills every key
+}
+
+#[tokio::test]
+async fn allowance_key_exhausts_one_credential_not_its_sibling() {
+    let nats = Nats::start().await;
+    let (pubkey, sk) = test_keypair(23);
+    let mock = MockUpstream::start(Mode::Json).await;
+    let gw = Gateway::start(nats.port, &mock.authority(), &b64(&pubkey)).await;
+
+    let id = VirtualKey {
+        tenant_id: 88,
+        vpc_id: 1,
+        key_id: None,
+    };
+    let key_a = mint_v2(&id, 8001, 1, &sk);
+    let key_b = mint_v2(&id, 8002, 1, &sk);
+    let client = test_client();
+
+    let probe = |key: String, want: u16| {
+        let (c, u) = (client.clone(), gw.url());
+        async move {
+            wait_for_status(want, move || {
+                let (c, u, k) = (c.clone(), u.clone(), key.clone());
+                async move { post_status(&c, &u, &k, body_for("gpt-4o")).await }
+            })
+            .await
+        }
+    };
+
+    probe(key_a.clone(), 200).await;
+    probe(key_b.clone(), 200).await;
+    put_kv(nats.port, "allowance.key.8001", b"1").await;
+    probe(key_a.clone(), 402).await; // this credential only
+    probe(key_b.clone(), 200).await; // sibling still serves
+    put_kv(nats.port, "allowance.88", b"1").await;
+    probe(key_a.clone(), 402).await;
+    probe(key_b, 402).await; // tenant exhaust kills every key, including v1-grain
+}
+
+#[tokio::test]
+async fn allowance_exhaust_does_not_connect_upstream() {
+    let nats = Nats::start().await;
+    let (pubkey, sk) = test_keypair(24);
+    let mock = MockUpstream::start(Mode::Json).await;
+    let gw = Gateway::start(nats.port, &mock.authority(), &b64(&pubkey)).await;
+    let key_a = mint_v2(
+        &VirtualKey {
+            tenant_id: 89,
+            vpc_id: 1,
+            key_id: None,
+        },
+        8100,
+        1,
+        &sk,
+    );
+    let client = test_client();
+    wait_for_status(200, {
+        let (c, u, k) = (client.clone(), gw.url(), key_a.clone());
+        move || {
+            let (c, u, k) = (c.clone(), u.clone(), k.clone());
+            async move { post_status(&c, &u, &k, body_for("gpt-4o")).await }
+        }
+    })
+    .await;
+    let hits_after_warmup = mock.hits();
+    put_kv(nats.port, "allowance.key.8100", b"1").await;
+    wait_for_status(402, {
+        let (c, u, k) = (client.clone(), gw.url(), key_a.clone());
+        move || {
+            let (c, u, k) = (c.clone(), u.clone(), k.clone());
+            async move { post_status(&c, &u, &k, body_for("gpt-4o")).await }
+        }
+    })
+    .await;
+    assert_eq!(
+        mock.hits(),
+        hits_after_warmup,
+        "402 must happen before upstream_peer"
+    );
+    wait_for_metric(&gw, "ai_rejections_total", "quota", 1.0).await;
+}
+
+#[tokio::test]
+async fn allowance_unready_402s_without_connecting() {
+    let nats_port = closed_port();
+    let (pubkey, sk) = test_keypair(25);
+    let mock = MockUpstream::start(Mode::Json).await;
+    let gw = Gateway::builder(nats_port, &mock.authority(), &b64(&pubkey))
+        .skip_allowance_ready()
+        .start()
+        .await;
+    let vkey = mint(
+        &VirtualKey {
+            tenant_id: 1,
+            vpc_id: 1,
+            key_id: None,
+        },
+        1,
+        &sk,
+    );
+    let client = test_client();
+    wait_for_status(402, {
+        let (c, u, k) = (client.clone(), gw.url(), vkey.clone());
+        move || {
+            let (c, u, k) = (c.clone(), u.clone(), k.clone());
+            async move { post_status(&c, &u, &k, body_for("gpt-4o")).await }
+        }
+    })
+    .await;
+    assert_eq!(mock.hits(), 0, "unready allowance must not connect a pool");
+    wait_for_metric(&gw, "ai_rejections_total", "allowance_unavailable", 1.0).await;
 }
 
 #[tokio::test]

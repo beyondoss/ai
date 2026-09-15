@@ -3,9 +3,10 @@
 Takes HTTP requests carrying an OpenAI- or Anthropic-dialect payload, authenticates the caller via
 Ed25519 virtual key or BYO provider token, swaps in a pool key for managed traffic, relays the
 request and response to the upstream provider (byte-for-byte when the inbound path and the catalog
-row share a wire, including same-endpoint Responses; translated Chat Completions ↔ Messages when
-they don't), and emits a token-usage billing fact (`ai.usage`) on completion. Usage taps the
-upstream body; the client sees the inbound dialect.
+row share an endpoint, including same-endpoint Responses; translated Chat Completions ↔ Messages ↔
+Responses when they don't), and
+emits a token-usage billing fact (`ai.usage`) on completion. Usage taps the upstream body; the
+client sees the inbound dialect.
 
 **Self-contained:** no `path` deps into the `beyond` repo. Depends only on crates.io + the
 published `beyond-slipstream` — clones, CI-builds, and publishes anywhere.
@@ -14,25 +15,26 @@ published `beyond-slipstream` — clones, CI-builds, and publishes anywhere.
 
 ## Concepts & Terminology
 
-| Term                                       | What It Controls / Gates                                                                                                                                                                                                                                                                                                              | NOT                                                                                                                                          |
-| ------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Managed key** (`bai_v1.…` / `bai_v2.…`)  | Ed25519-verified identity; enables key swap, deny-set check, and `ai.usage` billing                                                                                                                                                                                                                                                   | A session token or capability grant — just tenant attribution                                                                                |
-| **BYO key** (anything else)                | Forwarded as-is to the provider; no swap, no billing, no deny-set                                                                                                                                                                                                                                                                     | A lesser tier — same proxy, minus attribution and billing                                                                                    |
-| **Pool key**                               | Real provider API key(s) held by the gateway; swapped in for managed traffic. A 429 walks the next unused key on the _same_ provider                                                                                                                                                                                                  | Per-tenant — keys are per provider, shared by all managed callers                                                                            |
-| **Tenant**                                 | The billing entity from the virtual key payload (`tenant_id: u64`)                                                                                                                                                                                                                                                                    | An org, user, or namespace — an opaque integer the gateway doesn't interpret                                                                 |
-| **Dialect**                                | A provider attribute (OpenAI-wire vs Anthropic-wire) driving usage parsing; for a bare-path request it's derived from the path to pick the default provider                                                                                                                                                                           | The provider — a prefixed request uses its provider's dialect, not the path                                                                  |
-| **Provider**                               | The request's **first path segment** (`/{provider}/…`); a named row in the routing table: authority, dialect, auth scheme                                                                                                                                                                                                             | A vendor relationship — just connection facts and auth wiring                                                                                |
-| **Model route** (`/auto/…`, managed `/v1`) | Catalog row named by `x-beyond-model` if present, else the body's root `model`; provider, upstream path, and model id come from that row and the body's `model` is rewritten per attempt. Catalog miss → 404. Same-wire walks are a byte relay; Chat Completions ↔ Messages is translated when the inbound path names the other wire. Inbound Responses with session state walks the GPT row's `/v1/responses` arm (or 400s). | Mixed-wire catalog rows, Gemini. Not a per-key grant.                                                                                       |
-| **Candidate**                              | One `(provider, upstream model id, path)` a catalog row will accept. Default walk is TTFT-ranked (in-process EWMA); `x-beyond-order` / `split` pin, `only` filters. Cannot add a provider the row does not list.                                                                                                                      | A parallel pool — still a sequence, entered on failure. Not a cost sort.                                                                     |
-| **Deny-set**                               | Sparse maps of denied `tenant_id`s and `key_id`s → reason; gates managed traffic; default-allow; tenant deny kills every key                                                                                                                                                                                                          | An allowlist or ACL — misses are allowed, not blocked                                                                                        |
-| **Tail tap**                               | Bounded 64KB window kept from the end of the response for usage extraction                                                                                                                                                                                                                                                            | A buffer or copy — the response is relayed unbuffered; only the tail is kept                                                                 |
-| **Capture-set**                            | Sparse map of `tenant_id`s with payload logging on; default-**off**; watched under its own prefix by its own watcher                                                                                                                                                                                                                  | Retention policy — the gateway emits and forgets; the store owns TTL/erasure                                                                 |
-| **Capture tap**                            | Bounded **head**-keeping copy of each body, taken pre-rewrite; relayed bytes are untouched                                                                                                                                                                                                                                            | A buffer — nothing is withheld, so it costs memcpy, never latency                                                                            |
-| **Response cache**                         | In-process exact-match store: identical managed catalog-walk request (pre-rewrite body + inbound path + `tenant_id` + effective candidate order) replays a stored 2xx. Off unless `cache_ttl_secs > 0`. Miss is an unbuffered relay; fill is a tap.                                                                                   | Redis, semantic cache, or a pool-key key — none of those                                                                                     |
-| **Control header** (`x-beyond-*`)          | Per-request caller input: `metadata` tags, `capture` on/off, `cache` on/off, catalog `order` / `only` / `split`. Managed only; stripped before the upstream                                                                                                                                                                           | A way to 4xx a request — unusable values are dropped and counted; an `only` that leaves no keyed candidate is the same 503 as an unkeyed row |
-| **Smart router**                           | In-process EWMA of TTFT per catalog candidate. Default walk for managed `/auto` and `/v1` when `order`/`split` are absent. Probe of unmeasured arms every 8th request. `smart_router = false` restores static catalog order.                                                                                                          | Live Redis, cost sort, or a cross-replica shared ranking — none of those                                                                     |
-| **Snapshot**                               | On-disk deny-set cache (entries + NATS cursor) for edge/tunnel deployments                                                                                                                                                                                                                                                            | Persistent store — a pure cache; delete it and the gateway re-scans NATS                                                                     |
-| **Virtual key** (`bai_v1` / `bai_v2`)      | Ed25519-signed token: v1 is `tenant_id`+`vpc_id` (16 B); v2 adds unique `key_id` (24 B). Same keyring.                                                                                                                                                                                                                                | A session or auth token — stateless, no server-side lookup                                                                                   |
+| Term                                       | What It Controls / Gates                                                                                                                                                                                                                                                                                                                                                                         | NOT                                                                                                                                          |
+| ------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Managed key** (`bai_v1.…` / `bai_v2.…`)  | Ed25519-verified identity; enables key swap, deny-set check, allowance check, and `ai.usage` billing                                                                                                                                                                                                                                                                                             | A session token or capability grant — just tenant attribution                                                                                |
+| **BYO key** (anything else)                | Forwarded as-is to the provider; no swap, no billing, no deny-set                                                                                                                                                                                                                                                                                                                                | A lesser tier — same proxy, minus attribution and billing                                                                                    |
+| **Pool key**                               | Real provider API key(s) held by the gateway; swapped in for managed traffic. A 429 walks the next unused key on the _same_ provider                                                                                                                                                                                                                                                             | Per-tenant — keys are per provider, shared by all managed callers                                                                            |
+| **Tenant**                                 | The billing entity from the virtual key payload (`tenant_id: u64`)                                                                                                                                                                                                                                                                                                                               | An org, user, or namespace — an opaque integer the gateway doesn't interpret                                                                 |
+| **Dialect**                                | A provider attribute (OpenAI-wire vs Anthropic-wire) driving usage parsing; for a bare-path request it's derived from the path to pick the default provider                                                                                                                                                                                                                                      | The provider — a prefixed request uses its provider's dialect, not the path                                                                  |
+| **Provider**                               | The request's **first path segment** (`/{provider}/…`); a named row in the routing table: authority, dialect, auth scheme                                                                                                                                                                                                                                                                        | A vendor relationship — just connection facts and auth wiring                                                                                |
+| **Model route** (`/auto/…`, managed `/v1`) | Catalog row named by `x-beyond-model` if present, else the body's root `model`; provider, upstream path, and model id come from that row and the body's `model` is rewritten per attempt. Catalog miss → 404. Same-endpoint walks are a byte relay; Chat Completions ↔ Messages ↔ Responses is translated when the inbound path _or this candidate's path_ names a different one of those three. Inbound Responses with session state walks the GPT row's `/v1/responses` arm (or 400s). | Gemini. Not a per-key grant.                                                                                                                 |
+| **Candidate**                              | One `(provider, upstream model id, path)` a catalog row will accept. Default walk is TTFT-ranked (in-process EWMA); `x-beyond-order` / `split` pin, `only` filters. Cannot add a provider the row does not list.                                                                                                                                                                                 | A parallel pool — still a sequence, entered on failure. Not a cost sort.                                                                     |
+| **Deny-set**                               | Sparse maps of denied `tenant_id`s and `key_id`s → reason; gates managed traffic; default-allow; tenant deny kills every key                                                                                                                                                                                                                                                                     | An allowlist or ACL — misses are allowed, not blocked                                                                                        |
+| **Allowance-set**                          | Sparse maps of exhausted `tenant_id`s and `key_id`s; remaining-ok vs exhausted; 402 **before** `upstream_peer`. Fail-closed until the watcher stores a scan/snapshot (empty = remaining-ok). v1 tokens: tenant grain only. Not a price table — the control plane writes the bit.                                                                                                                 | A price table, remaining-token counter the gateway decrements, or Redis on the miss path                                                     |
+| **Tail tap**                               | Bounded 64KB window kept from the end of the response for usage extraction                                                                                                                                                                                                                                                                                                                       | A buffer or copy — the response is relayed unbuffered; only the tail is kept                                                                 |
+| **Capture-set**                            | Sparse map of `tenant_id`s with payload logging on; default-**off**; watched under its own prefix by its own watcher                                                                                                                                                                                                                                                                             | Retention policy — the gateway emits and forgets; the store owns TTL/erasure                                                                 |
+| **Capture tap**                            | Bounded **head**-keeping copy of each body, taken pre-rewrite; relayed bytes are untouched                                                                                                                                                                                                                                                                                                       | A buffer — nothing is withheld, so it costs memcpy, never latency                                                                            |
+| **Response cache**                         | **Per-pod** exact-match store: identical managed catalog-walk request (pre-rewrite body + inbound path + `tenant_id` + effective candidate order) replays a stored 2xx on **this process**. Off unless `cache_ttl_secs > 0`. Miss is an unbuffered relay; fill is a tap. Replicas do not share entries.                                                                                          | Redis, semantic cache, a pool-key key, or a fleet-wide cache — none of those                                                                 |
+| **Control header** (`x-beyond-*`)          | Per-request caller input: `metadata` tags, `capture` on/off, `cache` on/off, catalog `order` / `only` / `split`. Managed only; stripped before the upstream                                                                                                                                                                                                                                      | A way to 4xx a request — unusable values are dropped and counted; an `only` that leaves no keyed candidate is the same 503 as an unkeyed row |
+| **Smart router**                           | **Per-pod** EWMA of TTFT per catalog candidate. Default walk for managed `/auto` and `/v1` when `order`/`split` are absent. Probe of unmeasured arms every 8th request. `smart_router = false` restores static catalog order. Two replicas can rank the same row differently.                                                                                                                    | Live Redis, cost sort, or a fleet-wide shared ranking — none of those                                                                        |
+| **Snapshot**                               | On-disk deny-set cache (entries + NATS cursor) for edge/tunnel deployments. Allowance uses `{snapshot_path}.allowance`.                                                                                                                                                                                                                                                                          | Persistent store — a pure cache; delete it and the gateway re-scans NATS                                                                     |
+| **Virtual key** (`bai_v1` / `bai_v2`)      | Ed25519-signed token: v1 is `tenant_id`+`vpc_id` (16 B); v2 adds unique `key_id` (24 B). Same keyring.                                                                                                                                                                                                                                                                                           | A session or auth token — stateless, no server-side lookup                                                                                   |
 
 ---
 
@@ -50,8 +52,8 @@ Client (stock OpenAI/Anthropic SDK)
   │  │      → catalog row → candidate list (default: TTFT rank; cold start = the row's static order)
   │  │      x-beyond-order / split pin; only filters; then the ranker (same wire; no new providers)
   │  │      no/unknown model ──────────────────────────────────► 404 (names the miss)
-  │  │      inbound path's wire ≠ row
-  │  │        Chat Completions ↔ Messages ──────────► translate
+  │  │      inbound path's endpoint ≠ row
+  │  │        Chat Completions ↔ Messages ↔ Responses ─► translate
   │  │        Responses + session state ─► GPT `/v1/responses` arm (relay) or 400 naming the field
   │  │        other mismatch ────────────────────────► 400
   │  │      GET /v1/models ────────────────────────────────────► catalog list
@@ -68,6 +70,9 @@ Client (stock OpenAI/Anthropic SDK)
   │       │               │                    │
   │       │             401 (bad sig)     402 Spend / 403 Fraud
   │       │                                    │
+  │       │           allowance-set (tenant OR key_id; fail-closed if unread)
+  │       │             remaining-ok ───────────────────────────────────
+  │       │             exhausted / unread ─────────────────────────── 402
   │       │           pool key required ───────────────────────── 503
   │       └─ BYO: pass through (no verify, no deny-set, no billing)
   │  ├─ Managed only: parse x-beyond-* control headers (never 4xx; bad values counted)
@@ -75,6 +80,7 @@ Client (stock OpenAI/Anthropic SDK)
   │  │    capture decision = header (wins both ways) else capture-set rule ∧ 1-in-N sample
   │  ├─ Exact-match cache (managed catalog walk, body already in hand, cache_ttl_secs > 0):
   │  │    key = pre-rewrite body + inbound path + tenant_id + effective candidate order
+  │  │    per-pod table (ai_cache_scope{kind="process"}); miss does not consult Redis
   │  │    x-beyond-cache: off / Cache-Control: no-store ────────── skip lookup and store
   │  │    hit: write stored 2xx (no upstream, no breaker, no key-walk)
   │  │    miss: unbuffered relay; fill is a tap, insert only on complete 2xx
@@ -112,12 +118,12 @@ Client (stock OpenAI/Anthropic SDK)
   │    span, and the splice offset → inject stream_options.include_usage → re-frame chunked
   │  Model-routed: same buffer, and `model` is spliced to the serving candidate's own id
   │    (rewrite first — the injection offset precedes the value, so it cannot move)
-  │  Wire-mismatched catalog walk (Chat Completions ↔ Messages): map the buffered JSON
-  │    *before* the model splice. OpenAI→Anthropic does not inject `stream_options`.
-  │    Anthropic→OpenAI injects `include_usage` on the translated OpenAI body if it streams.
-  │  Inbound Responses, same-endpoint: byte relay (session fields pass through). `store: false`
-  │    onto Chat Completions: drop `store` / `previous_response_id` / `include` / `truncation`
-  │    and map `input` → `messages`. Session fields on a non-Responses candidate: skip or 400.
+  │  Wire-mismatched catalog walk (Chat Completions ↔ Messages ↔ Responses): map the
+  │    buffered JSON *before* the model splice. OpenAI→Anthropic does not inject
+  │    `stream_options`. Anthropic→OpenAI (and Responses→Chat Completions) injects
+  │    `include_usage` on the translated Chat Completions body if it streams.
+  │    Inbound Responses, same-endpoint: byte relay (session fields pass through).
+  │    Session fields on a non-Responses candidate: skip or 400.
   │
   ▼  Provider upstream  (OpenAI / Anthropic / Groq / DeepSeek / …)
   │
@@ -155,38 +161,37 @@ Client (stock OpenAI/Anthropic SDK)
 
 ### Background: Control-Plane Watchers
 
-Two sparse per-tenant sets, watched independently. The seed → watch → batch-apply → reconnect loop
+Three sparse per-tenant sets, watched independently. The seed → watch → batch-apply → reconnect loop
 is written **once**, over the `WatchedSet` trait, and instantiated per set — that loop carries the
 non-obvious correctness properties (revision-0 resume trap, scan→subscribe race, batched `rcu`,
-backoff crediting), and a second copy would be a standing invitation for the two to drift.
+backoff crediting), and a second copy would be a standing invitation for the sets to drift.
 
 ```
-NATS (blackhole.* KV entries)          NATS (aicapture.* KV entries)
-  │                                      │
-  ▼  store_watch.rs::WatcherService<Deny>│  store_watch.rs::WatcherService<Capture>
-  │  (Pingora BackgroundService)         │  (its own connection, cursor, reconnect loop)
-  │  On connect: seed from disk snapshot │  On connect: seed from NATS scan only
-  │  (if snapshot_path) or NATS scan     │  (no snapshot — see below)
-  │  Resume from saved revision          │  Resume from saved revision
-  │  Reconnect backoff: 1s → 30s         │  Reconnect backoff: 1s → 30s
-  │                                      │
-  ▼  ArcSwap<DenySet>  (state.rs)        ▼  ArcSwap<CaptureSet>  (state.rs)
-     Lock-free read, every managed req      Lock-free read, every managed req
+NATS (blackhole.*)     NATS (allowance.*)      NATS (aicapture.*)
+  │                      │                       │
+  ▼  WatcherService<Deny>│  WatcherService<Allowance>
+  │                      │  WatcherService<Capture>
+  │  seed snapshot/scan  │  seed snapshot/scan    │  scan only
+  │                      │  (empty scan = ready)  │
+  ▼  ArcSwap<DenySet>    ▼  ArcSwap<AllowanceSet> ▼  ArcSwap<CaptureSet>
+     fail-open                fail-closed until        fail-open (off)
+                              first successful read
 ```
 
-**One service per set, hence one NATS connection per set.** The extra connection buys independent
+**One service per set, hence one NATS connection per set.** The extra connections buy independent
 failure domains: a capture-set scan that keeps failing backs off on its own schedule and cannot
-slow, stall, or reseed deny enforcement.
+slow, stall, or reseed deny or allowance enforcement.
 
-**Only the deny-set gets an on-disk snapshot.** The snapshot exists so _enforcement_ survives a cold
-start before NATS reconnects. Capture is not enforcement — "captured nothing for the first few
-seconds after a restart" is a non-event — so `Capture::snapshot_path` returns `None`, which makes
-every snapshot path in the module inert for that set without a single conditional elsewhere.
+**Deny and allowance get on-disk snapshots** (`snapshot_path` and `{snapshot_path}.allowance`). The
+snapshot exists so _enforcement_ survives a cold start before NATS reconnects. Capture is not
+enforcement — "captured nothing for the first few seconds after a restart" is a non-event — so
+`Capture::snapshot_path` returns `None`.
 
-Both sets are **fail-open and off the critical path**, which is the property that lets them live
-behind NATS at all: a deny-set outage degrades to stale enforcement, a capture-set outage degrades
-to no capture. Auth, signing keys, and pool keys deliberately stay in boot config so a NATS outage
-can never stop the gateway serving. Do not put must-have config behind a watched set.
+Deny is **fail-open** on an unread store (empty map = allow). Allowance is **fail-closed** until
+`from_entries` has run (even on an empty scan): managed traffic 402s with
+`ai_rejections_total{reason="allowance_unavailable"}`. After seed, a NATS blip keeps the last-known
+set the same way deny does. Auth, signing keys, and pool keys stay in boot config.
+`/readyz` stays 200 with NATS down and does **not** gate on allowance ready.
 
 ---
 
@@ -226,12 +231,14 @@ in the catalog` vs `missing model: …`). There is no parallel grant set. A cand
 `upstream_model` spelling (OpenRouter's `anthropic/claude-opus-4.8`, Bedrock's inference-profile
 id) is an alias for the row — those are the ids we already rewrite _to_.
 
-The default walk is TTFT-ranked (`smart.rs`): in-process EWMA per catalog candidate, measured
+The default walk is TTFT-ranked (`smart.rs`): **this process's** EWMA per catalog candidate, measured
 from `attempt_start` the same way `ai_ttft_seconds` is. Cold start (no samples) is the row's static
 order. A connect failure or 5xx takes a penalty floor so a fast error does not outrank a slower 2xx;
 a 429 is a real answer. Unmeasured arms stay failover until a deterministic probe (every 8th
 request, skipping seq `0`) promotes one. A sample older than 30s is treated as unmeasured so a
-recovered arm is retried. `smart_router = false` restores static catalog order.
+recovered arm is retried. `smart_router = false` restores static catalog order. Samples never leave
+the pod — `ai_smart_rank_scope{kind="process"}=1` is the honesty metric; this is not fleet-wide
+smart routing. `x-beyond-split` is the only cross-replica pin (hash of the request counter).
 
 A managed request may also permute that list with headers, still on the same wire, without adding a
 provider the row does not already name (`ProviderSpec::name` on that row). Parsed in `control.rs`,
@@ -260,28 +267,32 @@ body peek, so an empty GET is not a missing-model 404.
 
 A stock OpenAI or Anthropic SDK pointed at `/v1` with `model` in the JSON body is `/auto` without
 the header. Same-wire failover is a byte relay — the gateway rewrites ids, not API shapes, across
-candidates in a row. When the inbound path names the other Chat Completions/Messages wire
-(`POST /v1/chat/completions` with a Claude row, or `/v1/messages` with a GPT row) the gateway
-**translates** both ways so the stock SDK completes. Usage/billing still parse the upstream
-body/SSE; `ai.usage.model` is what the provider echoed. GPT rows also list an OpenAI
-`/v1/responses` arm. Inbound `/v1/responses` that uses session state (`previous_response_id` set,
-or `store` not explicitly `false`) walks that arm as a **byte relay** — `store`,
-`previous_response_id`, `include`, and `truncation` pass through. A Responses 5xx may walk another
-Responses candidate; it does not walk onto Chat Completions/Messages while those fields are in
-play. `store: false` one-shot Responses may still translate onto Chat Completions (lossy). Claude
-rows have no OpenAI store: Responses + session state is a **400** naming the field, not a hollow
-Messages call. Other mismatches (`/v1/embeddings`) are still a **400**
-(`claude-opus-4-8 is Anthropic Messages; POST /v1/messages`). `/{provider}/…` never translates.
+candidates in a row. When the inbound path names a different Chat Completions / Messages /
+Responses endpoint (`POST /v1/chat/completions` with a Claude row, `/v1/messages` with a GPT row,
+or `/v1/responses` with either) the gateway **translates** so the stock SDK completes — except
+inbound `/v1/responses` that uses session state (`previous_response_id` set, or `store` not
+explicitly `false`). GPT rows list a parallel OpenAI `/v1/responses` arm for that case: a **byte
+relay** so `store`, `previous_response_id`, `include`, and `truncation` pass through. A Responses
+5xx may walk another Responses candidate; it does not walk onto Chat Completions/Messages while
+those fields are in play. `store: false` one-shot Responses may still translate onto Chat
+Completions (lossy). Claude rows have no OpenAI store: Responses + session state is a **400**
+naming the field, not a hollow Messages call. Usage/billing still parse the upstream body/SSE;
+`ai.usage.model` is what the provider echoed. Other mismatches (`/v1/embeddings` with a Claude
+row) are still a **400**. Same-wire Responses (`/{provider}/v1/responses`) stays a byte relay.
+`/{provider}/…` never translates.
 
-v1 mapping is lossy on extras a stock SDK does not need for a tool loop: `thinking` /
-`redacted_thinking`, `cache_control`, `reasoning_effort`, and `http(s)` image URLs are dropped
-(base64 data-URI images convert). Tools, text, and usage round-trip. Anthropic requires
-`max_tokens`; a missing OpenAI value becomes 4096. OpenAI→Anthropic does not inject
-`stream_options`. Anthropic→OpenAI injects `include_usage` on the translated OpenAI body when
-streaming. A stock OpenAI SDK also does not send `anthropic-version`; the gateway injects
-`2023-06-01` on that walk. Responses-only fields (`store`, `previous_response_id`, `include`,
-`truncation`) are dropped when translating *off* Responses onto Chat Completions; they are **not**
-dropped when the walk stays on `/v1/responses`.
+v1 mapping is lossy on extras a stock SDK does not need for a tool loop: Responses-only
+fields (`store`, `previous_response_id`, `include`, `truncation`, …) are dropped when leaving
+Responses; they are **not** dropped when the walk stays on `/v1/responses`. `http(s)` image URLs
+are dropped (base64 data-URI images convert). `thinking` /
+`redacted_thinking` blocks, `cache_control`, and `reasoning_effort` (mapped to Anthropic
+`thinking`) pass both ways so an agent workload round-trips. Tools, text, and usage still
+round-trip. Anthropic requires `max_tokens`; a missing OpenAI value becomes 4096. OpenAI→Anthropic
+does not inject `stream_options`. Anthropic→OpenAI injects `include_usage` on the translated
+Chat Completions body when streaming; Responses→Chat Completions does the same because injection
+follows the **upstream** endpoint. A stock OpenAI SDK also does not send `anthropic-version`; the
+gateway injects `2023-06-01` on a walk that lands on Messages. Usage/billing still parse the
+**upstream** body. Responses ↔ Messages is composed through Chat Completions.
 
 `/{provider}/…` is the escape hatch and does not consult the catalog. This arm is reached only after
 a provider-table miss, so `/{provider}/…` traffic runs exactly the code it always did; `auto` is
@@ -298,7 +309,7 @@ the provider:
 
 - **The upstream path comes from the catalog, per candidate.** Providers disagree on where an
   endpoint lives and the disagreement is _not_ a prefix: Anthropic serves Messages at `/v1/messages`
-  from a base carrying no path, OpenRouter serves the same wire at `/api/v1/messages`. No client
+  from a base carrying no path, OpenRouter serves Claude at `/api/v1/chat/completions`. No client
   suffix is correct for both, so each candidate states its path outright and `forward_path` is set
   from it per attempt. The client points its SDK at `/v1` (or `…/auto`) and the row decides.
 - **The model id is rewritten per attempt.** Providers essentially never share a string —
@@ -315,26 +326,29 @@ from DNS) and one that **answers with a 5xx**, provided nothing has gone downstr
 request body is still replayable. Candidates whose breaker is open are skipped without an attempt.
 See "Status-based failover, and where it stops" for the 5xx path and its one real limit.
 
-Catalog rows live in `providers::catalog`, shared with the agent. Every candidate in a row must
-share a wire format, enforced by a test: failover rewrites ids but does **not** translate between
-API shapes _across candidates_, so a mixed row would send an Anthropic Messages body to a Chat
-Completions endpoint and then parse the reply with the wrong dialect's usage extractor — a
-zero-token billing row rather than a visible error. The Chat Completions ↔ Messages translate
-above is a client-path vs row mismatch, not a mixed row. GPT Responses is a **parallel arm**
-(`ModelRoute::responses`), not mixed into `candidates`, so Chat Completions TTFT ranking and
-`stream_options` injection stay on that walk.
+Catalog rows live in `providers::catalog`, shared with the agent. A row's `wire` is the _client
+default_ (what the primary speaks, and what a bare `/v1` caller is assumed to send). Candidates may
+list Messages and Chat Completions (or Responses) together — Claude's OpenRouter arm is Chat
+Completions. Each attempt translates the **original** client body onto **this candidate's** path
+(`endpoint_of_path` / `wire_of_path`); injection (`stream_options`) follows the upstream candidate,
+not the client. Billing dialect is the serving candidate's path, never the row or the provider
+table. Sending the wrong wire would trip the dialect-mismatch guard and emit a zero-token billing
+row. `/{provider}/…` never translates. Do not invent mixed endpoint types inside one candidate
+path. GPT session-state Responses is a **parallel arm** (`ModelRoute::responses`), not mixed into
+`candidates`, so Chat Completions TTFT ranking and `stream_options` injection stay on that walk.
 
-**Wire belongs to the row, not the provider.** `ProviderSpec::wire` is one value per provider and
-that is an approximation: OpenRouter serves the OpenAI wire at `/api/v1/chat/completions` _and_ a
-genuine Anthropic Messages wire at `/api/v1/messages`, and Fireworks is the same story from the other
-side (`agent_core::dialect::is_fireworks_anthropic_wire_model`). So each row declares its own `wire`,
-and `request_filter` takes the request's dialect from **the row** rather than from whichever provider
-it happens to start on. Reading the provider there fails silently in the worst way — an Anthropic
-response meets the OpenAI extractor, trips the dialect-mismatch guard, and bills zero tokens.
+**Wire belongs to the serving candidate's path, not the provider and not only the row.**
+`ProviderSpec::wire` is one value per provider and that is an approximation: OpenRouter serves the
+OpenAI wire at `/api/v1/chat/completions` _and_ a genuine Anthropic Messages wire at
+`/api/v1/messages`, and Fireworks is the same story from the other side
+(`agent_core::dialect::is_fireworks_anthropic_wire_model`). `request_filter` seeds dialect from the
+row; `upstream_peer` overwrites it from the candidate about to be dialed. Reading the provider there
+fails silently in the worst way — an Anthropic response meets the OpenAI extractor, trips the
+dialect-mismatch guard, and bills zero tokens.
 
 That is what makes **Claude failover real today**: every Claude row (current Fable 5.1 / Opus 5 /
 Sonnet 5 / Haiku 4.5, plus the still-served 4.x snapshots) routes to Anthropic first and falls back
-to OpenRouter's Messages endpoint under the vendor-slug spelling (`claude-opus-5` →
+to OpenRouter's Chat Completions endpoint under the vendor-slug spelling (`claude-opus-5` →
 `anthropic/claude-opus-5`; `claude-opus-4-8` → `anthropic/claude-opus-4.8`). `claude-haiku-4-5` and
 `claude-opus-4-8` insert Amazon Bedrock's Messages API as an independent second source
 (`us.anthropic.claude-haiku-4-5-20251001-v1:0` / `us.anthropic.claude-opus-4-8`) before OpenRouter.
@@ -442,6 +456,18 @@ applies both. Written exclusively via `ArcSwap`; reads on the hot path are lock-
 Reasons: `Spend` (→ 402), `Fraud` (→ 403), `Unknown` (→ 403, fail-safe for unrecognized values).
 Restore = explicit delete from NATS KV or TTL expiry — no gateway-side timer.
 
+### Allowance-Set (`allowance.rs`)
+
+Same WatchedSet / ArcSwap shape as deny, inverted fail direction. Membership = exhausted
+(`allowance.{tenant}`, `allowance.key.{id}`). After a successful scan or snapshot — **including
+an empty one** — absence is remaining-ok. Until that read, every managed request 402s
+(`allowance_unavailable`) and does not call `upstream_peer`. v1 tokens have no `key_id`, so only
+the tenant grain applies. The control plane writes the bit; this is not a price table and the
+gateway does not decrement a remaining counter. Restore = delete the KV entry.
+
+Checked after deny, before the exact-match cache, so an exhausted key cannot be served from a
+cached 2xx.
+
 ### Control surface (`control.rs`) and payload capture (`capture.rs`)
 
 The `x-beyond-*` headers are the per-request control surface, parsed once in `request_filter` after
@@ -538,8 +564,11 @@ carries the tokens.
 
 ### Response cache (`cache.rs`)
 
-An in-process exact-match store. Identical managed catalog-walk requests replay a stored 2xx and
-skip the provider. Off unless `cache_ttl_secs > 0`.
+An **in-process** exact-match store — this pod, not the fleet. Identical managed catalog-walk
+requests replay a stored 2xx and skip the provider **on the replica that filled it**. Another
+replica starts empty. Off unless `cache_ttl_secs > 0`. There is no Redis (or other shared store) on
+the miss path: a miss is always the unbuffered upstream relay. `ai_cache_scope{kind="process"}=1`
+is the honesty metric; do not alert as if a shared cache were in front of the providers.
 
 **The key is the client request plus the walk, not the upstream attempt.** Hash of the pre-rewrite
 body + inbound path + `tenant_id` + the effective candidate order (`ProviderId` indices). Not the
@@ -878,12 +907,13 @@ to serve.
 - Virtual key signature (Ed25519, stateless — no DB lookup)
 - Virtual key format (`bai_v1` 16-byte payload, `bai_v2` 24-byte payload with `key_id`)
 - Tenant / key not in deny-set (managed traffic only; O(1) HashMap lookup; tenant deny kills every key)
+- Tenant / key remaining-ok on the allowance-set (managed only; fail-closed until the set has been read; 402 before `upstream_peer`)
 - Pool key configured for the requested provider (managed traffic only — else 503). On a catalog
   walk this is per candidate: none keyed → 503, not a request-wide missing openai key.
 - Catalog model on managed `/v1` and `/auto` (unknown or missing → 404 naming the miss). Candidate
-  spellings are aliases. Chat Completions ↔ Messages is translated when the inbound path names the
-  other wire; any other inbound-path vs row mismatch is a 400. `/{provider}/…` is not
-  allowlisted and never translates. `GET /v1/models` lists the catalog.
+  spellings are aliases. Chat Completions ↔ Messages ↔ Responses is translated when the inbound
+  path names a different one of those three; any other inbound-path vs row mismatch is a 400.
+  `/{provider}/…` is not allowlisted and never translates. `GET /v1/models` lists the catalog.
 - Request body size ≤ `MAX_REQUEST_BODY` (declared `Content-Length` + streaming running total)
 - Per-credential request rate within ceiling; aggregate BYO rate within ceiling
 
@@ -901,9 +931,9 @@ to serve.
   and there is no per-tenant entitlement check on rows — any managed tenant can route to any row. Not
   price-gameable (billing uses the id the provider echoes back), but worth knowing before rows are
   added whose pool keys differ in cost or contract.
-- Provider response content — relayed byte-for-byte on a same-wire walk; Chat Completions ↔
-  Messages is translated so the client sees the inbound dialect. Usage taps stay on the upstream
-  body.
+- Provider response content — relayed byte-for-byte on a same-endpoint walk; Chat Completions ↔
+  Messages ↔ Responses is translated so the client sees the inbound dialect. Usage taps stay on
+  the upstream body.
 - BYO token validity — forwarded as-is; the provider rejects it if invalid
 - `vpc_id` in the virtual key — decoded and emitted in billing facts, not used for access control
 
@@ -937,7 +967,7 @@ Secret-bearing fields (`pool_keys`, `nats_creds`) are held as `Secret<T>` — st
 | `provider_authorities.<name>`   | _(none)_                          | Override or add a provider's `authority` (host:port). Enables config-added providers beyond `KNOWN_PROVIDERS` with zero code change.                                                                                                                             |
 | `provider_dialects.<name>`      | `"openai"`                        | Wire dialect for a **config-added** provider (`"openai"` or `"anthropic"`, case-insensitive). No effect on a known provider (dialect fixed in code). Unrecognized value → hard boot failure.                                                                     |
 | `provider_auth_schemes.<name>`  | `"bearer"`                        | Managed auth scheme for a **config-added** provider (`"bearer"`, `"x-api-key"`, or `"api-key"` — the last is Azure OpenAI's shape). No effect on a known provider. Unrecognized value → hard boot failure.                                                       |
-| `snapshot_path`                 | _(unset)_                         | Path for the on-disk deny-set cache. Unset → re-scan NATS on every cold boot. Set → load from disk and enforce before NATS reconnects (edge/tunnel deployments).                                                                                                 |
+| `snapshot_path`                 | _(unset)_                         | Path for the on-disk deny-set cache. Allowance uses `{path}.allowance`. Unset → re-scan NATS on every cold boot. Set → load from disk and enforce before NATS reconnects (edge/tunnel deployments).                                                              |
 | `rate_limit_rps`                | `100`                             | Per-credential request ceiling (count-min, keyed on raw key hash). `0` disables. Exceeded → 429. Checked before Ed25519 verify.                                                                                                                                  |
 | `byo_rate_limit_rps`            | `1000`                            | Aggregate ceiling for all BYO traffic (single shared bucket). `0` disables. Managed traffic exempt. Exceeded → 429.                                                                                                                                              |
 | `circuit_breaker_threshold`     | `20`                              | Per-provider upstream failures (5xx / connect; **not** 429) within the window before the breaker opens. While open, requests to that provider fast-fail with 503. `0` disables.                                                                                  |
@@ -952,11 +982,11 @@ Secret-bearing fields (`pool_keys`, `nats_creds`) are held as `Secret<T>` — st
 | `capture_max_bytes`             | `262144`                          | Per-direction cap on a captured payload before truncation; the default a per-tenant entry overrides. Really a bound on what the log pipeline will carry — raise only alongside its per-record limit.                                                             |
 | `capture_default_sample_n`      | `1`                               | Default sampling for control-plane-enabled capture (keep 1 request in N). `1` captures every request. A capture requested via `x-beyond-capture: on` is never sampled away.                                                                                      |
 | `capture_queue_depth`           | `1024`                            | Depth of the bounded `ai.payload` sink queue. When full, captures are **dropped** (`ai_capture_dropped_total`) rather than blocking — a stalled log sink must never backpressure the data plane.                                                                 |
-| `cache_ttl_secs`                | `0`                               | Exact-match response cache TTL. `0` disables. Only managed catalog walks whose body is already in hand before `upstream_peer`. A hit replays the stored 2xx; a miss stays an unbuffered relay.                                                                   |
+| `cache_ttl_secs`                | `0`                               | Per-pod exact-match response cache TTL. `0` disables. Only managed catalog walks whose body is already in hand before `upstream_peer`. A hit on **this process** replays the stored 2xx; a miss stays an unbuffered relay (no Redis).                            |
 | `cache_max_entries`             | `1024`                            | Cap on stored cache entries. Oldest insertion is dropped when a new one would exceed it.                                                                                                                                                                         |
 | `cache_max_bytes`               | `65536`                           | Cap on a single stored response body. Oversize complete 2xxs are relayed but not stored.                                                                                                                                                                         |
-| `smart_router`                  | `true`                            | Rank managed catalog walks by in-process TTFT EWMA. `false` restores static catalog order. `x-beyond-order` / `split` pin either way.                                                                                                                            |
-| `nats_url`                      | `nats://localhost:4222`           | NATS server for both control-plane watchers. Unreachable → fail-open (deny-set stale, capture off).                                                                                                                                                              |
+| `smart_router`                  | `true`                            | Rank managed catalog walks by **this process's** TTFT EWMA. `false` restores static catalog order. `x-beyond-order` / `split` pin either way. Not a fleet-wide ranking.                                                                                          |
+| `nats_url`                      | `nats://localhost:4222`           | NATS server for the control-plane watchers. Unreachable → deny-set stale (fail-open), capture off, allowance fail-closed until a scan or `{snapshot_path}.allowance` lands.                                                                                      |
 | `nats_creds`                    | _(unset)_                         | NATS credentials file path. Required for authenticated clusters.                                                                                                                                                                                                 |
 | `listen_addr`                   | `0.0.0.0:8080`                    | Proxy listener address (client traffic).                                                                                                                                                                                                                         |
 | `provider_authorities.auto`     | _(rejected)_                      | Reserved: `auto` is the model-routed segment, and a provider of that name would shadow it. Hard boot failure.                                                                                                                                                    |
@@ -968,8 +998,8 @@ Secret-bearing fields (`pool_keys`, `nats_creds`) are held as `Secret<T>` — st
 
 | Failure                                                            | What Actually Happens                                                                                                                                                                                                                                              | Recovery                                                                                                                                                                                                                                                                                                                 |
 | ------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| NATS unreachable at boot                                           | Deny-set starts empty (fail-open). Auth still works — keys from config.                                                                                                                                                                                            | Watcher reconnects; seeds from NATS or disk snapshot on connect.                                                                                                                                                                                                                                                         |
-| NATS disconnects mid-run                                           | Last-known deny-set stays active. New deny entries not applied until reconnect.                                                                                                                                                                                    | Watcher reconnects (1s→30s exponential backoff, reset only after a watch that ran ≥30s — _connecting_ is not success, or a reachable NATS with a broken watch loops at 1 Hz forever) and resumes from the saved revision. Rescans instead when the seed found no entries, since revision 0 is not resumable — see above. |
+| NATS unreachable at boot                                           | Deny-set starts empty (fail-open). Allowance is unread → managed traffic 402s fail-closed. Auth still works — keys from config.                                                                                                                                    | Watcher reconnects; seeds from NATS or disk snapshot on connect. Allowance flips remaining-ok once `from_entries` runs (empty scan included).                                                                                                                                                                            |
+| NATS disconnects mid-run                                           | Last-known deny-set and allowance-set stay active. New entries not applied until reconnect. Unready allowance (never seeded) keeps 402ing managed traffic.                                                                                                         | Watcher reconnects (1s→30s exponential backoff, reset only after a watch that ran ≥30s — _connecting_ is not success, or a reachable NATS with a broken watch loops at 1 Hz forever) and resumes from the saved revision. Rescans instead when the seed found no entries, since revision 0 is not resumable — see above. |
 | NATS history compacted past snapshot cursor                        | `CursorExpired` → full re-scan from current NATS state.                                                                                                                                                                                                            | After re-scan, new cursor set; delta watch resumes normally.                                                                                                                                                                                                                                                             |
 | Virtual key tampered or forged                                     | Prefix matches (`bai_v1`) and Ed25519 verify fails → **401**, never BYO. No billing event. The error does not name which part of the token failed.                                                                                                                 | Client retries with a valid key. A public listener that forwarded a failed verify as BYO would open junk-auth egress while the rate guard had already exempted the token from the BYO aggregate.                                                                                                                         |
 | `signing_keys` absent (typo'd/missing SSM)                         | Default: warn; every `bai_v1` token 401s (fail-closed); BYO still works. With `require_signing_keys=true`: hard boot failure.                                                                                                                                      | Set `require_signing_keys=true` on managed deployments so the mis-deploy fails at boot rather than 401-ing every tenant.                                                                                                                                                                                                 |
@@ -993,30 +1023,35 @@ Secret-bearing fields (`pool_keys`, `nats_creds`) are held as `Secret<T>` — st
 
 Prometheus on the default registry, exposed at `/metrics` on `metrics_listen`.
 
-| Metric                                | Type      | Labels               | What It Measures                                                                                                     |
-| ------------------------------------- | --------- | -------------------- | -------------------------------------------------------------------------------------------------------------------- |
-| `ai_requests_total`                   | Counter   | —                    | Total admitted requests                                                                                              |
-| `ai_rejections_total`                 | Counter   | `reason`             | Rejected requests by cause (auth, deny_spend, deny_fraud, rate_limit, circuit_open, unknown_model, wire_mismatch, …) |
-| `ai_upstream_responses_total`         | Counter   | `provider`, `status` | Upstream responses by provider and status class                                                                      |
-| `ai_tokens_total`                     | Counter   | `kind`               | input / output / cache_read / cache_write token counts                                                               |
-| `ai_ttft_seconds`                     | Histogram | `provider`           | Time to first token (50ms–30s buckets)                                                                               |
-| `ai_upstream_latency_seconds`         | Histogram | `provider`           | Full request latency (100ms–600s buckets)                                                                            |
-| `ai_active_streams`                   | Gauge     | —                    | Open SSE streams                                                                                                     |
-| `ai_requests_in_flight`               | Gauge     | —                    | All in-flight requests (streaming + non-streaming)                                                                   |
-| `ai_deny_set_size`                    | Gauge     | —                    | Current number of denied tenants                                                                                     |
-| `ai_nats_connected`                   | Gauge     | —                    | 1 if the **deny-set** watcher is connected, 0 otherwise                                                              |
-| `ai_capture_set_size`                 | Gauge     | —                    | Tenants with payload capture enabled (climbing and never falling ⇒ missing TTLs)                                     |
-| `ai_capture_nats_connected`           | Gauge     | —                    | 1 if the **capture-set** watcher is connected — separate watcher, separate connection                                |
-| `ai_captures_total`                   | Counter   | —                    | Requests whose payloads were captured (post-sampling)                                                                |
-| `ai_capture_bytes_total`              | Counter   | —                    | Payload bytes handed to the sink — the cost signal, ahead of the storage bill                                        |
-| `ai_capture_dropped_total`            | Counter   | —                    | Captures dropped on a full sink queue — distinguishes "lost it" from "capture was off"                               |
-| `ai_control_header_errors_total`      | Counter   | —                    | `x-beyond-*` headers present but unusable (dropped; request still served)                                            |
-| `ai_usage_parse_errors_total`         | Counter   | —                    | Managed 2xx responses with no parseable usage (emitted as a zero-token billing row)                                  |
-| `ai_cache_hits_total`                 | Counter   | —                    | Exact-match cache hits that replayed a stored 2xx and skipped the provider                                           |
-| `ai_candidate_failovers_total`        | Counter   | —                    | Model-routed requests that abandoned a candidate for the next one                                                    |
-| `ai_key_walks_total`                  | Counter   | —                    | Managed 429s that retried the same provider with the next unused pool key                                            |
-| `ai_model_header_body_mismatch_total` | Counter   | —                    | Catalog-walk requests whose `x-beyond-model` and body `model` disagreed (header wins; client bug)                    |
-| `ai_failover_body_too_large_total`    | Counter   | —                    | 5xx that could not fail over: request body exceeded the 64 KiB replay buffer                                         |
+| Metric                                | Type      | Labels               | What It Measures                                                                                       |
+| ------------------------------------- | --------- | -------------------- | ------------------------------------------------------------------------------------------------------ |
+| `ai_requests_total`                   | Counter   | —                    | Total admitted requests                                                                                |
+| `ai_rejections_total`                 | Counter   | `reason`             | Rejected requests by cause (auth, deny_spend, quota, allowance_unavailable, deny_fraud, rate_limit, …) |
+| `ai_upstream_responses_total`         | Counter   | `provider`, `status` | Upstream responses by provider and status class                                                        |
+| `ai_tokens_total`                     | Counter   | `kind`               | input / output / cache_read / cache_write token counts                                                 |
+| `ai_ttft_seconds`                     | Histogram | `provider`           | Time to first token (50ms–30s buckets)                                                                 |
+| `ai_upstream_latency_seconds`         | Histogram | `provider`           | Full request latency (100ms–600s buckets)                                                              |
+| `ai_active_streams`                   | Gauge     | —                    | Open SSE streams                                                                                       |
+| `ai_requests_in_flight`               | Gauge     | —                    | All in-flight requests (streaming + non-streaming)                                                     |
+| `ai_deny_set_size`                    | Gauge     | —                    | Current number of denied tenants                                                                       |
+| `ai_nats_connected`                   | Gauge     | —                    | 1 if the **deny-set** watcher is connected, 0 otherwise                                                |
+| `ai_allowance_set_size`               | Gauge     | —                    | Exhausted tenants + keys in the allowance-set                                                          |
+| `ai_allowance_ready`                  | Gauge     | —                    | 1 after a successful allowance scan/snapshot (empty = remaining-ok); 0 = fail-closed                   |
+| `ai_allowance_nats_connected`         | Gauge     | —                    | 1 if the **allowance-set** watcher is connected                                                        |
+| `ai_capture_set_size`                 | Gauge     | —                    | Tenants with payload capture enabled (climbing and never falling ⇒ missing TTLs)                       |
+| `ai_capture_nats_connected`           | Gauge     | —                    | 1 if the **capture-set** watcher is connected — separate watcher, separate connection                  |
+| `ai_captures_total`                   | Counter   | —                    | Requests whose payloads were captured (post-sampling)                                                  |
+| `ai_capture_bytes_total`              | Counter   | —                    | Payload bytes handed to the sink — the cost signal, ahead of the storage bill                          |
+| `ai_capture_dropped_total`            | Counter   | —                    | Captures dropped on a full sink queue — distinguishes "lost it" from "capture was off"                 |
+| `ai_control_header_errors_total`      | Counter   | —                    | `x-beyond-*` headers present but unusable (dropped; request still served)                              |
+| `ai_usage_parse_errors_total`         | Counter   | —                    | Managed 2xx responses with no parseable usage (emitted as a zero-token billing row)                    |
+| `ai_cache_hits_total`                 | Counter   | —                    | Exact-match cache hits that replayed a stored 2xx and skipped the provider                             |
+| `ai_cache_scope`                      | Gauge     | `kind`               | Constant `1` with `kind="process"`: this pod's cache table, not a fleet store                          |
+| `ai_smart_rank_scope`                 | Gauge     | `kind`               | Constant `1` with `kind="process"`: this pod's TTFT EWMA, not a fleet-wide ranking                     |
+| `ai_candidate_failovers_total`        | Counter   | —                    | Model-routed requests that abandoned a candidate for the next one                                      |
+| `ai_key_walks_total`                  | Counter   | —                    | Managed 429s that retried the same provider with the next unused pool key                              |
+| `ai_model_header_body_mismatch_total` | Counter   | —                    | Catalog-walk requests whose `x-beyond-model` and body `model` disagreed (header wins; client bug)      |
+| `ai_failover_body_too_large_total`    | Counter   | —                    | 5xx that could not fail over: request body exceeded the 64 KiB replay buffer                           |
 
 ---
 
@@ -1030,28 +1065,30 @@ Prometheus on the default registry, exposed at `/metrics` on `metrics_listen`.
 | `peek`            | `ModelScanner` — streaming structural scan for the root-level `model`; O(1) memory                                              | unit ✓         |
 | `usage`           | Token extraction (OpenAI / Anthropic, body + SSE)                                                                               | unit ✓         |
 | `deny`            | Sparse deny-set, default-allow, reason → HTTP status                                                                            | unit ✓         |
+| `allowance`       | Sparse remaining-ok / exhausted set; fail-closed until seeded; 402 before `upstream_peer`                                       | unit ✓ + e2e ✓ |
 | `capture`         | Sparse capture-set (default-off) + head-bounded `CaptureBufs` and 1-in-N sampling                                               | unit ✓ + e2e ✓ |
 | `capture_sink`    | Bounded, lossy `ai.payload` writer — drops on a full queue so a stalled log sink can't backpressure                             | unit ✓         |
 | `control`         | `x-beyond-*` header parse/validate; metadata canonicalized and re-serialized; catalog walk permute (`order` / `only` / `split`) | unit ✓ + e2e ✓ |
-| `smart`           | In-process TTFT EWMA table; ranks unpinned catalog walks; probe of unmeasured arms                                              | unit ✓ + e2e ✓ |
-| `cache`           | In-process exact-match response store (TTL + max entries + max bytes/entry); tap, never a buffer                                | unit ✓ + e2e ✓ |
+| `translate`       | Chat Completions ↔ Messages ↔ Responses mapping for a catalog endpoint mismatch; SSE event-by-event                             | unit ✓ + e2e ✓ |
+| `smart`           | Per-pod TTFT EWMA table; ranks unpinned catalog walks; probe of unmeasured arms; not fleet-wide                                 | unit ✓ + e2e ✓ |
+| `cache`           | Per-pod exact-match response store (TTL + max entries + max bytes/entry); tap, never a buffer; miss does not consult Redis      | unit ✓ + e2e ✓ |
 | `ratelimit`       | Two-tier guardrail: per-credential (count-min sketch, fixed memory, no GC) + global BYO (one atomic)                            | unit ✓         |
 | `circuit_breaker` | Per-provider lock-free breaker (packed `AtomicU64`, windowed policy) — trips on 5xx/connect, not 429                            | unit ✓ + e2e ✓ |
-| `state`           | Keyring + provider registry + watched deny-/capture-sets (ArcSwap) + TTL DNS cache                                              | unit ✓         |
+| `state`           | Keyring + provider registry + watched deny-/allowance-/capture-sets (ArcSwap) + TTL DNS cache                                   | unit ✓         |
 | `store_watch`     | Generic `WatchedSet` driver — gap-free seeding + delta watch, instantiated per set                                              | e2e ✓          |
 | `config`          | Figment config; build keyring; pool keys / authorities by provider name                                                         | unit ✓         |
 | `secret`          | Redacting, zeroize-on-drop `Secret<T>` newtype for pool keys and NATS creds                                                     | unit ✓         |
 | `admin`           | `ServeHttp` on the metrics listener: `/livez`, `/readyz`, `/metrics`                                                            | e2e ✓          |
 | `metrics`         | Prometheus counter/histogram/gauge registration and update helpers                                                              | compile ✓      |
 | `doctor`          | Boot-time diagnostics (`beyond-ai doctor`)                                                                                      | compile ✓      |
-| `main`            | CLI (`run` / `doctor`), rustls init, config load, Pingora server + three services bootstrap                                     | compile ✓      |
+| `main`            | CLI (`run` / `doctor`), rustls init, config load, Pingora server + proxy/watchers/admin bootstrap                               | compile ✓      |
 
 ---
 
 ## Verification
 
-- **Unit (`cargo test --lib`):** key, route, peek, usage, deny, secret, config, cache, control,
-  smart. `clippy --all-targets -D warnings` clean.
+- **Unit (`cargo test --lib`):** key, route, peek, usage, deny, allowance, secret, config, cache, control,
+  smart, translate. `clippy --all-targets -D warnings` clean.
 - **End-to-end (`tests/e2e.rs`, `mise run test:integration:rs`):** real `beyond-ai` binary + real
   nats-server + mock upstream. Covers managed key-swap + passthrough fidelity + usage metering
   (OpenAI JSON + SSE, **Anthropic `/v1/messages`** with `x-api-key` swap + metering), **BYO
@@ -1059,6 +1096,9 @@ Prometheus on the default registry, exposed at `/metrics` on `metrics_listen`.
   `x-api-key`), and deny-set propagation: spend (write `blackhole.{tenant}` → 402, delete → 200),
   **fraud** (→ 403), and **per-credential** (write `blackhole.key.{id}` → 402 for that `bai_v2`
   key only; a sibling key for the same tenant still serves; tenant deny then 402s both).
+  **Allowance:** exhaust one `bai_v2` key (`allowance.key.{id}`) → 402 for that credential only
+  (sibling still serves; no pool connect on 402); tenant exhaust 402s both; keyed deny still works;
+  unready (NATS never seeded) 402s with `allowance_unavailable` and `mock.hits()==0`.
   Error/edge paths: **missing key → 401**, **oversized `Content-Length` →
   413**, **managed key for an unconfigured provider → 503**, **managed 429 key-walk** (two keys,
   first throttled, second serves; one key and an unreplayable body still relay 429 with
@@ -1074,12 +1114,21 @@ Prometheus on the default registry, exposed at `/metrics` on `metrics_listen`.
   breaker opens while the fallback keeps serving), missing/unknown model → 404 (named), Chat
   Completions ↔ Messages **translate** (OpenAI body + `claude-opus-4-8` on `/v1/chat/completions`
   reaches Anthropic `/v1/messages` with the pool key; client SSE is `chat.completion.chunk`;
-  `ai.usage` has non-zero Anthropic tokens; the reverse with a GPT id on `/v1/messages`; same-wire
-  walks still byte-relay; `/{provider}` still 400s a Claude body to OpenAI; `/v1/embeddings` with
-  a Claude row is still a wire-mismatch 400), `GET /v1/models` lists the catalog, a candidate
-  spelling is an alias, BYO on `/auto` → 400, BYO on `/v1` still forwarded, `/openai/…` ignoring
-  the catalog, a stock SDK shape against `/v1` with only `model` in the body, the routing header
-  never reaching an upstream, `ai.usage` naming the candidate that served, all-candidates-down, a
+  `ai.usage` has non-zero Anthropic tokens including cache/reasoning from the upstream parser;
+  `cache_control` / `reasoning_effort` reach Anthropic fields and thinking blocks reappear on the
+  client stream; the reverse with a GPT id on `/v1/messages`; same-wire walks still byte-relay;
+  `/{provider}` still 400s a Claude body to OpenAI; `/v1/embeddings` with a Claude row is still a
+  wire-mismatch 400). **Mixed-wire rows:** Anthropic 5xx fails onto OpenRouter Chat Completions with
+  a Chat Completions body spliced from the original client; billing dialect is the serving
+  candidate. **Responses** (`tests/translate.rs`): a stock `/v1/responses` body with `store: false`
+  and a GPT catalog id is translated onto Chat Completions; the same body with `claude-*` lands on
+  Messages. Managed `/v1/responses` + `gpt-4o` + `previous_response_id` hits OpenAI `/v1/responses`
+  with the field intact; Claude + `previous_response_id` is 400 naming the field, no upstream;
+  `/{provider}/v1/responses` stays a relay. `ai.usage` still comes from the upstream parser. `GET /v1/models` lists the catalog, a candidate
+  spelling is an alias, BYO on
+  `/auto` → 400, BYO on `/v1` still forwarded, `/openai/…` ignoring the catalog, a stock SDK shape
+  against `/v1` with only `model` in the body, the routing header never reaching an upstream,
+  `ai.usage` naming the candidate that served, all-candidates-down, a
   **256 KiB body surviving a failover byte-for-byte**, a **429 walking keys not vendors**,
   provider-routed traffic being unaffected, **`x-beyond-order` hitting Bedrock's mount/key/id on
   an Anthropic-first row**, **`only` of an unkeyed provider → 503**, a junk walk header keeping
@@ -1089,7 +1138,8 @@ Prometheus on the default registry, exposed at `/metrics` on `metrics_listen`.
 - **Response cache (`tests/cache.rs`):** two identical managed `/v1` requests hit once upstream,
   the replayed body and status are byte-identical, a different tenant misses, `x-beyond-cache: off`
   always goes upstream and never fills, a 429-then-200 is still one cacheable client-body hash, and
-  two candidate orders (default vs `x-beyond-order`) do not cross-hit.
+  two candidate orders (default vs `x-beyond-order`) do not cross-hit. `ai_cache_scope{kind="process"}`
+  and `ai_smart_rank_scope{kind="process"}` are `1` — rank and cache are per-pod, not fleet-wide.
 - **Cancellation (`tests/cancellation.rs`):** a client that gives up must not open the provider's
   breaker, and a genuinely broken provider still must. Verified non-vacuous — reverting the fix makes
   the first test fail.

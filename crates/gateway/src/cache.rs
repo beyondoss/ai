@@ -10,6 +10,11 @@
 //! the raw virtual key: a 429 that walks to a second key and then 200s is still one client request.
 //! Split/order permute the walk, so each arm is its own cache entry rather than pinning A/B traffic
 //! to whichever provider filled first.
+//!
+//! **Per-pod, not fleet-wide.** This table lives in the process. A second replica has its own
+//! empty table; a hit on pod A is a miss on pod B. There is no Redis (or other shared store) on
+//! the miss path — a miss is always the unbuffered upstream relay. `ai_cache_scope{kind="process"}`
+//! is the metric that says so; do not dashboards this as a shared cache.
 
 use crate::usage::Usage;
 use bytes::Bytes;

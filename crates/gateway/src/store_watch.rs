@@ -1,19 +1,22 @@
 //! slipstream control-plane watchers — the gateway's **only** use of NATS.
 //!
-//! Seeds a sparse per-tenant set at boot, then streams deltas. **Fail-open**: a NATS blip keeps the
-//! last-known set (we never clear), so an outage degrades to a stale set, not "reject everything".
-//! Auth and pool/signing keys come from config, so they're unaffected by NATS being down — only
-//! spend/fraud enforcement goes stale.
+//! Seeds a sparse per-tenant set at boot, then streams deltas. Deny and capture **fail-open**: a
+//! NATS blip keeps the last-known set (we never clear), so an outage degrades to a stale set, not
+//! "reject everything". **Allowance is fail-closed until the first successful scan or snapshot**
+//! (an empty scan is remaining-ok): a managed request 402s while that set is unread. After seed,
+//! a NATS blip keeps the last-known allowance the same way deny does. Auth and pool/signing keys
+//! come from config, so they're unaffected by NATS being down.
 //!
-//! Two sets are watched, both sparse, differing only in prefix and payload: the
+//! Three sets are watched, all sparse, differing in prefix, payload, and fail direction: the
 //! **deny-set** (`blackhole.`, enforcement — `blackhole.{tenant}` and `blackhole.key.{id}` share
-//! this one watcher) and the **capture-set** (`aicapture.`, payload logging).
+//! this one watcher), the **allowance-set** (`allowance.`, quota bit — `allowance.{tenant}` and
+//! `allowance.key.{id}`), and the **capture-set** (`aicapture.`, payload logging).
 //! The seed → watch → batch-apply → reconnect loop below is written **once**, over the [`WatchedSet`]
 //! trait, and instantiated per set. That loop carries several non-obvious correctness properties —
 //! `is_resumable`'s revision-0 trap, the scan→subscribe race, batched `rcu`, backoff crediting — and
-//! a copied second version would be a standing invitation for the two to drift apart. Each set gets
+//! a copied second version would be a standing invitation for the sets to drift apart. Each set gets
 //! its own [`WatcherService`] (hence its own NATS connection, cursor, and reconnect loop), so a
-//! capture-set problem cannot disturb deny enforcement.
+//! capture-set problem cannot disturb deny or allowance enforcement.
 //!
 //! Seeding has two modes, chosen by `config.snapshot_path`:
 //!
@@ -42,6 +45,7 @@
 //! Runs as a Pingora `BackgroundService` so the NATS client is created on the serving runtime
 //! (async-nats ties its tasks to the runtime it's built on; connecting earlier would break it).
 
+use crate::allowance::{self, AllowanceSet};
 use crate::capture::{self, CaptureSet};
 use crate::deny::{self, DenySet};
 use crate::state::GatewayState;
@@ -92,8 +96,8 @@ pub trait WatchedSet: Send + Sync + 'static {
     /// KV key prefix this set is scanned and watched under.
     const PREFIX: &'static str;
 
-    /// Noun for this watcher's log lines ("deny-set", "capture-set") — so an oncall reading a
-    /// `"…watch exited; reconnecting"` line can tell which of the two it came from.
+    /// Noun for this watcher's log lines ("deny-set", "allowance-set", "capture-set") — so an oncall
+    /// reading a `"…watch exited; reconnecting"` line can tell which watcher it came from.
     const NOUN: &'static str;
 
     /// Build the set from scanned or snapshot-loaded entries, dropping any malformed key/value.
@@ -247,6 +251,64 @@ impl WatchedSet for Capture {
     /// for this set without a single `if` anywhere else.
     fn snapshot_path(_state: &GatewayState) -> Option<String> {
         None
+    }
+}
+
+/// The allowance-set: exhausted tenants/keys under `allowance.{tenant}` and `allowance.key.{id}`.
+///
+/// Fail-closed until [`AllowanceSet::from_ready`] via a scan or snapshot. An empty scan is still a
+/// successful read — remaining-ok for everyone — and is what flips `ai_allowance_ready`.
+pub struct Allowance;
+
+impl WatchedSet for Allowance {
+    type Set = AllowanceSet;
+
+    const PREFIX: &'static str = "allowance.";
+    const NOUN: &'static str = "allowance-set";
+
+    fn from_entries<'a>(
+        _state: &GatewayState,
+        entries: impl Iterator<Item = &'a KvEntry>,
+    ) -> AllowanceSet {
+        allowanceset_from_entries(entries)
+    }
+
+    fn apply_batch(
+        _state: &GatewayState,
+        cur: &AllowanceSet,
+        updates: &[KvUpdate],
+    ) -> AllowanceSet {
+        apply_allowance_batch(cur, updates)
+    }
+
+    fn len(set: &AllowanceSet) -> usize {
+        set.len()
+    }
+
+    fn slot(state: &GatewayState) -> &ArcSwap<AllowanceSet> {
+        &state.allowance
+    }
+
+    fn record_size(state: &GatewayState, len: usize) {
+        state.metrics.allowance_set_size.set(len as i64);
+        // from_entries / apply_batch only run after a store read, so this is the ready flip.
+        state.metrics.allowance_ready.set(1);
+    }
+
+    fn record_connected(state: &GatewayState, connected: bool) {
+        state
+            .metrics
+            .allowance_nats_connected
+            .set(i64::from(connected));
+    }
+
+    fn snapshot_path(state: &GatewayState) -> Option<String> {
+        // Own file so a deny-set snapshot cannot be loaded as allowance (or vice versa).
+        state
+            .config
+            .snapshot_path
+            .as_ref()
+            .map(|p| format!("{p}.allowance"))
     }
 }
 
@@ -484,6 +546,39 @@ fn denyset_from_entries<'a>(entries: impl Iterator<Item = &'a KvEntry>) -> DenyS
     for e in entries {
         if let Some(target) = deny::parse_key(&e.key) {
             set.insert_target(target, deny::parse_reason(&e.value));
+        }
+    }
+    set
+}
+
+/// Apply a batch of watched deltas to the allowance-set. Presence = exhausted; the value is ignored.
+fn apply_allowance_batch(cur: &AllowanceSet, updates: &[KvUpdate]) -> AllowanceSet {
+    let mut set = cur.clone();
+    set.mark_ready();
+    for update in updates {
+        match update {
+            KvUpdate::Put(e) => {
+                if let Some(t) = allowance::parse_key(&e.key) {
+                    set.insert_target(t);
+                }
+            }
+            KvUpdate::Delete { key, .. } | KvUpdate::Purge { key, .. } => {
+                if let Some(t) = allowance::parse_key(key) {
+                    set.remove_target(t);
+                }
+            }
+        }
+    }
+    set
+}
+
+/// Build an [`AllowanceSet`] from KV entries, dropping any whose key isn't `allowance.{tenant}`
+/// or `allowance.key.{id}`. A successful call — including zero entries — is remaining-ok.
+fn allowanceset_from_entries<'a>(entries: impl Iterator<Item = &'a KvEntry>) -> AllowanceSet {
+    let mut set = AllowanceSet::from_ready();
+    for e in entries {
+        if let Some(target) = allowance::parse_key(&e.key) {
+            set.insert_target(target);
         }
     }
     set
@@ -785,6 +880,71 @@ mod tests {
         assert_eq!(
             deny::parse_key(&format!("{}key.7", Deny::PREFIX)),
             Some(deny::DenyTarget::Key(7))
+        );
+    }
+
+    #[test]
+    fn allowance_watches_the_allowance_prefix() {
+        assert_eq!(Allowance::PREFIX, "allowance.");
+        assert_eq!(
+            allowance::parse_key(&format!("{}42", Allowance::PREFIX)),
+            Some(allowance::AllowanceTarget::Tenant(42))
+        );
+        assert_eq!(
+            allowance::parse_key(&format!("{}key.7", Allowance::PREFIX)),
+            Some(allowance::AllowanceTarget::Key(7))
+        );
+    }
+
+    #[test]
+    fn allowanceset_from_entries_seeds_ready_and_skips_malformed() {
+        let entries = [
+            entry("allowance.42", b"1"),
+            entry("allowance.key.1001", b"0"),
+            entry("blackhole.42", b"spend"),
+            entry("allowance.notanumber", b"1"),
+            entry("allowance.key.notanumber", b"1"),
+        ];
+        let set = allowanceset_from_entries(entries.iter());
+        assert!(set.is_ready());
+        assert_eq!(set.len(), 2);
+        assert_eq!(
+            set.reason_for(42, None),
+            Some(crate::allowance::AllowanceReject::Exhausted)
+        );
+        assert_eq!(
+            set.reason_for(1, Some(1001)),
+            Some(crate::allowance::AllowanceReject::Exhausted)
+        );
+        assert_eq!(set.reason_for(1, Some(0)), None);
+        assert_eq!(set.reason_for(99, None), None);
+    }
+
+    #[test]
+    fn allowanceset_from_entries_empty_is_remaining_ok() {
+        let set = allowanceset_from_entries([].iter());
+        assert!(set.is_ready());
+        assert!(set.is_empty());
+        assert_eq!(set.reason_for(42, None), None);
+    }
+
+    #[test]
+    fn apply_allowance_batch_put_and_delete() {
+        let cur = AllowanceSet::from_ready();
+        let updates = vec![
+            KvUpdate::Put(entry("allowance.1", b"1")),
+            KvUpdate::Put(entry("allowance.key.500", b"1")),
+            KvUpdate::Delete {
+                key: "allowance.1".to_string(),
+                version: VersionToken::from_u64(3),
+            },
+        ];
+        let batched = apply_allowance_batch(&cur, &updates);
+        assert!(batched.is_ready());
+        assert_eq!(batched.reason_for(1, None), None);
+        assert_eq!(
+            batched.reason_for(9, Some(500)),
+            Some(crate::allowance::AllowanceReject::Exhausted)
         );
     }
 

@@ -1,7 +1,8 @@
 //! The Pingora `ProxyHttp` passthrough service.
 //!
 //! Flow: pick the provider from the **first path segment** (`/{provider}/…`) → verify the virtual
-//! key (stateless) → deny-set check (O(1), default-allow) → swap the auth
+//! key (stateless) → deny-set check (O(1), default-allow) → allowance check (O(1), fail-closed
+//! until seeded) → swap the auth
 //! header to the pool key (managed only) → **stream the request body straight through** (never
 //! buffered; original framing preserved) while feeding it to a structural scanner that extracts the
 //! exact root-level `model` → relay the response **without buffering** → tap usage from a bounded
@@ -341,9 +342,6 @@ struct ModelRouting {
     /// The candidate slice this walk indexes — [`ModelRoute::candidates`] or
     /// [`ModelRoute::responses`].
     arms: &'static [route::Candidate],
-    /// Inbound path is `/v1/responses` (or `/auto/…/responses`). Same-endpoint Responses is a
-    /// byte relay; a `store: false` one-shot may still reshape onto Chat Completions.
-    inbound_responses: bool,
     /// Named session field (`previous_response_id` / `store`) that must not be stripped onto a
     /// non-Responses candidate. `None` is a one-shot (or not a Responses request).
     session_field: Option<&'static str>,
@@ -359,8 +357,8 @@ struct ModelRouting {
     replay: Option<Bytes>,
     /// Exact-match cache: fill a miss, or a hit already written to the client.
     cache: Option<cache::Pending>,
-    /// Inbound wire differs from `route.wire` on Chat Completions ↔ Messages. `None` is the
-    /// same-wire byte-relay, which is still the common catalog-walk case.
+    /// Inbound endpoint. Always set on a catalog walk so a mixed-row failover can translate
+    /// onto the next candidate's path. Same-endpoint attempts skip the mapper (`from == to`).
     translate: Option<translate::TranslateState>,
 }
 
@@ -470,7 +468,7 @@ impl RequestCtx {
 /// Kept as a table so `reject_bodies_are_valid_json` can walk it and assert each entry parses,
 /// carries the `type` and `message` it claims, and is reachable — a hand-written JSON literal is
 /// exactly the thing that rots silently otherwise.
-pub const REJECT_BODIES: [(&str, &str, &str); 10] = [
+pub const REJECT_BODIES: [(&str, &str, &str); 12] = [
     (
         "invalid_request_error",
         "unknown provider",
@@ -520,6 +518,16 @@ pub const REJECT_BODIES: [(&str, &str, &str); 10] = [
         "api_error",
         "no provider available for model",
         r#"{"error":{"message":"no provider available for model","type":"api_error"}}"#,
+    ),
+    (
+        "insufficient_quota",
+        "quota exhausted",
+        r#"{"error":{"message":"quota exhausted","type":"insufficient_quota"}}"#,
+    ),
+    (
+        "insufficient_quota",
+        "allowance unavailable",
+        r#"{"error":{"message":"allowance unavailable","type":"insufficient_quota"}}"#,
     ),
 ];
 
@@ -1047,6 +1055,30 @@ fn is_streamable_path(forward_path: &str) -> bool {
     forward_path.ends_with("/chat/completions")
 }
 
+/// Overwrite dialect + `stream_options` eligibility from **this** catalog candidate's path.
+/// Injection follows the upstream candidate, not the client: a Messages body must not grow
+/// `stream_options`, and a Chat Completions failover of a Messages client must.
+fn apply_serving_candidate(rc: &mut RequestCtx) {
+    let Some(c) = rc.auto.as_ref().and_then(|a| a.candidate_at(a.candidate)) else {
+        return;
+    };
+    let ep = route::Endpoint::of_upstream_path(c.path);
+    rc.dialect = ep.wire();
+    rc.inject_eligible = rc.managed && is_streamable_path(c.path);
+}
+
+fn catalog_serving_endpoint(auto: &ModelRouting) -> Option<route::Endpoint> {
+    auto.candidate_at(auto.candidate)
+        .map(|c| route::Endpoint::of_upstream_path(c.path))
+}
+
+fn catalog_translating(auto: &ModelRouting) -> bool {
+    let Some(t) = auto.translate.as_ref() else {
+        return false;
+    };
+    catalog_serving_endpoint(auto).is_some_and(|up| t.client != up)
+}
+
 /// The fragment spliced into a streaming OpenAI chat body. Always followed by a comma, since the
 /// splice point is just inside a root object that is non-empty by construction (a root `"stream"`
 /// key is what made it eligible).
@@ -1374,10 +1406,10 @@ impl ProxyHttp for AiProxy {
 
         // 5. Identity + key handling. One branch: `bai_v1`/`bai_v2` is fail-closed (prefix match →
         // verify; any verify failure is 401, never BYO). Anything else → BYO: the user's own
-        // provider token, passed through unchanged (no Beyond identity, so no deny-set and no
-        // per-tenant attribution). A public listener without this split would forward a forged
-        // virtual key as BYO — junk-auth egress, and the rate guard already exempted it from the
-        // BYO aggregate.
+        // provider token, passed through unchanged (no Beyond identity, so no deny-set, no
+        // allowance, and no per-tenant attribution). A public listener without this split would
+        // forward a forged virtual key as BYO — junk-auth egress, and the rate guard already
+        // exempted it from the BYO aggregate.
         let (tenant_id, vpc_id, key_id, managed) = if key::is_managed_prefix(raw_key) {
             let Ok(identity) = self.state.keyring.verify(raw_key) else {
                 self.state.metrics.rejection(Rejection::Auth).inc();
@@ -1416,6 +1448,42 @@ impl ProxyHttp for AiProxy {
                     "tenant is over limit or suspended",
                 )
                 .await;
+            }
+            // Allowance: remaining-ok vs exhausted, same WatchedSet shape as deny. Fail-closed
+            // while the set has not been read. 402 before cache and before `upstream_peer`.
+            if let Some(reason) = self
+                .state
+                .allowance
+                .load()
+                .reason_for(identity.tenant_id, identity.key_id)
+            {
+                match reason {
+                    crate::allowance::AllowanceReject::Exhausted => {
+                        self.state.metrics.rejection(Rejection::Quota).inc();
+                        return Self::reject_boxed(
+                            session,
+                            &request_id,
+                            402,
+                            "insufficient_quota",
+                            "quota exhausted",
+                        )
+                        .await;
+                    }
+                    crate::allowance::AllowanceReject::Unavailable => {
+                        self.state
+                            .metrics
+                            .rejection(Rejection::AllowanceUnavailable)
+                            .inc();
+                        return Self::reject_boxed(
+                            session,
+                            &request_id,
+                            402,
+                            "insufficient_quota",
+                            "allowance unavailable",
+                        )
+                        .await;
+                    }
+                }
             }
             // The actual `Bearer …`/`x-api-key` value is precomputed in the provider registry and
             // applied in `upstream_request_filter`; here we only confirm a pool key exists.
@@ -1705,18 +1773,16 @@ impl ProxyHttp for AiProxy {
             }
         };
 
-        // Catalog walk: inbound path may name Chat Completions while the row is Messages (a stock
-        // OpenAI SDK calling Claude), or the reverse. Translate those two; any other mismatch is
-        // still a 400 (`/v1/embeddings`). Inbound Responses with session state already chose the
-        // Responses arm (or 400'd). `/{provider}/…` never reaches this — it has no row.
+        // Catalog walk: inbound path may name Chat Completions, Messages, or Responses while the
+        // serving *candidate* speaks a different one of those three. Always keep the client
+        // endpoint so failover can translate onto the next path; embeddings-class mismatches
+        // are still a 400. Inbound Responses with session state already chose the Responses arm
+        // (or 400'd) — same-endpoint is a byte relay (`from == to`). `/{provider}/…` never
+        // reaches this — it has no row.
         let mut translate_state = None;
         if let Some(row) = model_route {
             let path = session.req_header().uri.path();
             match route::catalog_wire_action(path, row.wire) {
-                route::WireAction::Relay => {}
-                route::WireAction::Translate { client } => {
-                    translate_state = Some(translate::TranslateState::new(client));
-                }
                 route::WireAction::Reject => {
                     self.state.metrics.rejection(Rejection::WireMismatch).inc();
                     return Self::reject_message_boxed(
@@ -1728,17 +1794,27 @@ impl ProxyHttp for AiProxy {
                     )
                     .await;
                 }
+                route::WireAction::Relay => {
+                    translate_state = Some(translate::TranslateState::new(
+                        route::implied_endpoint(path)
+                            .unwrap_or_else(|| route::Endpoint::of_wire(row.wire)),
+                    ));
+                }
+                route::WireAction::Translate { client } => {
+                    translate_state = Some(translate::TranslateState::new(client));
+                }
             }
         }
 
         // Dialect drives usage parsing and injection eligibility.
         //
-        // For a model-routed request it comes from the **row**, not the provider, because a provider
-        // can serve more than one wire: OpenRouter is `WireFormat::OpenAi` in the provider table and
-        // still serves genuine Anthropic Messages traffic at `/api/v1/messages`. Reading
-        // `provider.dialect` there would hand an Anthropic response to the OpenAI usage extractor,
+        // For a model-routed request it is seeded from the **row** here and overwritten in
+        // `upstream_peer` from **this candidate's path**. A provider can serve more than one
+        // wire (OpenRouter Chat Completions *and* Messages), and a mixed row can list both, so
+        // neither the provider table nor the row's declared wire is the serving dialect.
+        // Reading the wrong one hands an Anthropic response to the OpenAI usage extractor,
         // which does not error — it trips the dialect-mismatch guard and emits a **zero-token
-        // billing row**. Silent revenue loss, on the exact path that makes Claude failover possible.
+        // billing row**.
         let dialect = model_route.map_or(provider.dialect, |r| r.wire);
         if model_route.is_some() {
             // From the arm this request will actually walk, not the row's Chat Completions primary:
@@ -1844,7 +1920,6 @@ impl ProxyHttp for AiProxy {
                             usable,
                             walk,
                             arms: walk_arms,
-                            inbound_responses,
                             session_field,
                             attempt_start: start,
                             replay: None,
@@ -1958,7 +2033,6 @@ impl ProxyHttp for AiProxy {
                     usable,
                     walk,
                     arms: walk_arms,
-                    inbound_responses,
                     session_field,
                     // Overwritten per attempt by `upstream_peer`; seeded so the first attempt is
                     // timed even if it fails before the prologue runs.
@@ -2098,6 +2172,7 @@ impl ProxyHttp for AiProxy {
                 // onto provider B.
                 rc.pool_key = 0;
                 rc.provider = p.clone();
+                apply_serving_candidate(rc);
 
                 match self.state.resolve(&p.authority).await {
                     Ok(addr) => {
@@ -2362,12 +2437,15 @@ impl ProxyHttp for AiProxy {
         apply_provider_attribution(upstream_request, rc.provider.name.as_str(), rc.managed)?;
 
         // A stock OpenAI SDK does not send `anthropic-version`. Anthropic (and Bedrock Messages)
-        // require it; inject the current version when we translated Chat Completions → Messages.
+        // require it; inject the current version when we translated Chat Completions or Responses
+        // → Messages.
         if rc
             .auto
             .as_ref()
             .and_then(|a| a.translate.as_ref())
-            .is_some_and(|t| t.client == Dialect::OpenAi && rc.dialect == Dialect::Anthropic)
+            .is_some_and(|t| {
+                t.client != route::Endpoint::Messages && rc.dialect == Dialect::Anthropic
+            })
             && upstream_request.headers.get("anthropic-version").is_none()
         {
             upstream_request.insert_header("anthropic-version", "2023-06-01")?;
@@ -2376,7 +2454,7 @@ impl ProxyHttp for AiProxy {
             .auto
             .as_ref()
             .and_then(|a| a.translate.as_ref())
-            .is_some_and(|t| t.client == Dialect::Anthropic && rc.dialect == Dialect::OpenAi)
+            .is_some_and(|_| rc.dialect == Dialect::OpenAi)
         {
             upstream_request.remove_header("anthropic-version");
         }
@@ -2495,23 +2573,19 @@ impl ProxyHttp for AiProxy {
             if end_of_stream {
                 // One structural walk for every answer (see `peek::scan_buffered`).
                 let mut buf = std::mem::take(&mut rc.req_buf);
-                // Wire mismatch on this catalog walk: map the inbound JSON into the row's wire
-                // *before* the model splice. The candidate id is a property of the upstream, so
-                // it is written after the shape is already right. OpenAI→Anthropic drops
-                // `stream_options` here (Anthropic has no such field); Anthropic→OpenAI leaves
-                // `include_usage` to the inject below, on the translated OpenAI body.
-                if let Some(t) = rc.auto.as_ref().and_then(|a| a.translate.as_ref()) {
-                    buf = translate::request(t.client, rc.dialect, &buf);
-                } else if rc.auto.as_ref().is_some_and(|a| {
-                    a.inbound_responses
-                        && a.session_field.is_none()
-                        && !a
-                            .candidate_at(a.candidate)
-                            .is_some_and(|c| route::candidate_path_is_responses(c.path))
-                }) {
-                    // `store: false` one-shot onto Chat Completions. Session fields are not in
-                    // play; same-endpoint Responses is the branch above (byte relay).
-                    buf = translate::responses_to_chat(&buf);
+                // Wire mismatch on this *candidate*: map the inbound JSON onto this path's
+                // endpoint *before* the model splice. Keep the original client body in `req_buf`
+                // (cleared and replayed per attempt) so a mixed-row failover re-translates rather
+                // than forwarding the previous candidate's wire. OpenAI→Anthropic drops
+                // `stream_options` here; Anthropic→OpenAI leaves `include_usage` to the inject
+                // below, on the translated Chat Completions body. Same-endpoint Responses
+                // (session arm) is `from == to` and is a byte relay.
+                if let Some(a) = rc.auto.as_ref()
+                    && let Some(t) = a.translate.as_ref()
+                    && let Some(to) = catalog_serving_endpoint(a.as_ref())
+                    && t.client != to
+                {
+                    buf = translate::request(t.client, to, &buf);
                 }
                 let scan = peek::scan_buffered(&buf);
                 if rc.model.is_empty()
@@ -2634,12 +2708,18 @@ impl ProxyHttp for AiProxy {
 
             // Translate changes the body length (and SSE event count). Drop the upstream
             // Content-Length so the client is not truncated; H1 needs chunked framing.
-            if rc.auto.as_ref().is_some_and(|a| a.translate.is_some()) {
+            // Same-endpoint candidates stay a byte relay — do not wrap them in SseBridge.
+            if rc.auto.as_ref().is_some_and(|a| catalog_translating(a)) {
                 let streaming = rc.streaming;
+                let upstream = rc
+                    .auto
+                    .as_ref()
+                    .and_then(|a| catalog_serving_endpoint(a))
+                    .unwrap_or_else(|| route::Endpoint::of_wire(rc.dialect));
                 if let Some(t) = rc.auto.as_mut().and_then(|a| a.translate.as_mut())
                     && streaming
                 {
-                    t.sse = Some(translate::SseBridge::new(t.client));
+                    t.sse = Some(translate::SseBridge::new(t.client, upstream));
                 }
                 upstream_response.remove_header("content-length");
                 if upstream_response.version != http::Version::HTTP_2 {
@@ -2699,22 +2779,27 @@ impl ProxyHttp for AiProxy {
             rc.resp_tail.push(chunk);
         }
 
-        let translating = rc.auto.as_ref().is_some_and(|a| a.translate.is_some());
+        let translating = rc.auto.as_ref().is_some_and(|a| catalog_translating(a));
         if translating {
             let streaming = rc.streaming;
             let dialect = rc.dialect;
+            let upstream = rc
+                .auto
+                .as_ref()
+                .and_then(|a| catalog_serving_endpoint(a))
+                .unwrap_or_else(|| route::Endpoint::of_wire(dialect));
             let out = if let Some(t) = rc.auto.as_mut().and_then(|a| a.translate.as_mut()) {
                 if streaming {
                     let client = t.client;
                     t.sse
-                        .get_or_insert_with(|| translate::SseBridge::new(client))
+                        .get_or_insert_with(|| translate::SseBridge::new(client, upstream))
                         .feed(chunk, end_of_stream)
                 } else {
                     if !chunk.is_empty() {
                         t.json_buf.extend_from_slice(chunk);
                     }
                     if end_of_stream {
-                        translate::response_json(dialect, t.client, &t.json_buf)
+                        translate::response_json(upstream, t.client, &t.json_buf)
                     } else {
                         Vec::new()
                     }
@@ -3106,20 +3191,17 @@ impl ProxyHttp for AiProxy {
                 && let Some(body) = tap.complete_body()
                 && let Some(store) = &self.state.cache
             {
-                store.insert(
-                    key,
-                    cache::CachedResponse {
-                        status: rc.upstream_status.unwrap_or(200),
-                        content_type: content_type.unwrap_or_else(|| "application/json".into()),
-                        body: Bytes::copy_from_slice(body),
-                        usage,
-                        billed_model: billed_model.to_owned().into_boxed_str(),
-                        requested_model: requested_model.to_owned().into_boxed_str(),
-                        routed_model,
-                        provider: rc.provider.name.clone().into_boxed_str(),
-                        streaming: rc.streaming,
-                    },
-                );
+                store.insert(key, cache::CachedResponse {
+                    status: rc.upstream_status.unwrap_or(200),
+                    content_type: content_type.unwrap_or_else(|| "application/json".into()),
+                    body: Bytes::copy_from_slice(body),
+                    usage,
+                    billed_model: billed_model.to_owned().into_boxed_str(),
+                    requested_model: requested_model.to_owned().into_boxed_str(),
+                    routed_model,
+                    provider: rc.provider.name.clone().into_boxed_str(),
+                    streaming: rc.streaming,
+                });
             }
         }
     }
@@ -3276,35 +3358,38 @@ mod tests {
         );
     }
 
-    /// A model-routed request takes its dialect from the **row**, not from the provider it happens
-    /// to start on.
-    ///
-    /// Not currently distinguishable end-to-end: every catalog row's primary candidate is a provider
-    /// whose own wire already matches the row, so both derivations agree. It stops agreeing the
-    /// moment a row's primary is an OpenAI-wire provider serving the Anthropic wire — Fireworks does
-    /// exactly that for its own models — and the failure is silent: the Anthropic response meets the
-    /// OpenAI extractor, trips the dialect-mismatch guard, and bills zero tokens without erroring.
+    /// A model-routed request takes its dialect from **this candidate's path**, not the row and
+    /// not the provider. Mixed-wire rows (Claude → OpenRouter Chat Completions) would otherwise
+    /// parse a Chat Completions reply with the Anthropic extractor — or the reverse — and emit a
+    /// zero-token billing row.
     #[test]
-    fn a_model_route_takes_its_dialect_from_the_row_not_the_provider() {
-        // OpenRouter is `OpenAi` in the provider table but serves this row's Anthropic wire.
+    fn a_model_route_takes_its_dialect_from_the_serving_candidate_path() {
         let openrouter = providers::by_id(providers::ProviderId::OpenRouter);
         assert_eq!(openrouter.wire, Dialect::OpenAi, "premise");
 
         let row = route::model_route("claude-opus-4-8").expect("seed row");
-        assert_eq!(row.wire, Dialect::Anthropic, "premise");
-
-        // The derivation under test, as `request_filter` performs it.
-        let from_row = Some(row).map_or(openrouter.wire, |r| r.wire);
+        assert_eq!(row.wire, Dialect::Anthropic, "premise: client default");
+        let primary = row.candidates[0];
+        let fallback = *row.candidates.last().expect("OpenRouter arm");
+        assert_eq!(primary.provider, providers::ProviderId::Anthropic);
+        assert_eq!(fallback.provider, providers::ProviderId::OpenRouter);
         assert_eq!(
-            from_row,
-            Dialect::Anthropic,
-            "the row's wire must win; taking the provider's would parse an Anthropic response with \
-             the OpenAI extractor and emit a zero-token billing row",
+            route::Endpoint::of_upstream_path(primary.path),
+            route::Endpoint::Messages,
         );
-
-        // ...and a provider-routed request is unaffected: no row, so the provider decides.
-        let none: Option<&route::ModelRoute> = None;
-        assert_eq!(none.map_or(openrouter.wire, |r| r.wire), Dialect::OpenAi);
+        assert_eq!(
+            route::Endpoint::of_upstream_path(fallback.path),
+            route::Endpoint::ChatCompletions,
+            "Claude's OpenRouter arm is Chat Completions, mixed-wire with the row",
+        );
+        assert_eq!(
+            route::Endpoint::of_upstream_path(fallback.path).wire(),
+            Dialect::OpenAi,
+            "billing for the serving candidate must use the OpenAI extractor",
+        );
+        // The old derivation (row.wire, or provider.wire) is wrong for this fallback:
+        assert_eq!(row.wire, Dialect::Anthropic);
+        assert_eq!(openrouter.wire, Dialect::OpenAi);
     }
 
     /// The candidate cursor. `from` strictly increases across a request, which is what guarantees
@@ -3467,10 +3552,10 @@ mod tests {
 
     #[test]
     fn extract_virtual_key_recognizes_openai_bearer() {
-        let req = req_with_headers(
-            "/v1/chat/completions",
-            &[("authorization", "Bearer sk-openai-key")],
-        );
+        let req = req_with_headers("/v1/chat/completions", &[(
+            "authorization",
+            "Bearer sk-openai-key",
+        )]);
         assert_eq!(extract_virtual_key(&req), Some("sk-openai-key"));
     }
 
@@ -3485,10 +3570,10 @@ mod tests {
     #[test]
     fn extract_virtual_key_recognizes_google_goog_api_key_header() {
         // Task #31: Google Gemini authenticates via `x-goog-api-key`.
-        let req = req_with_headers(
-            "/v1beta/models/gemini-2.5-pro:generateContent",
-            &[("x-goog-api-key", "goog-secret")],
-        );
+        let req = req_with_headers("/v1beta/models/gemini-2.5-pro:generateContent", &[(
+            "x-goog-api-key",
+            "goog-secret",
+        )]);
         assert_eq!(extract_virtual_key(&req), Some("goog-secret"));
     }
 

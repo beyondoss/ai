@@ -24,8 +24,9 @@ use std::process::{Command, Output, Stdio};
 use std::thread;
 
 use common::{
-    ChildGuard, DEV_PUBKEY_B64, DEV_TOKEN, SpawnGuarded, free_port, gateway_bin, wait_for_port,
-    ws_connect, ws_connect_uds, ws_next_frame, ws_read_until_response, ws_send,
+    ChildGuard, DEV_PUBKEY_B64, DEV_TOKEN, SpawnGuarded, free_port, gateway_bin, unused_nats_port,
+    wait_for_allowance_ready, wait_for_port, ws_connect, ws_connect_uds, ws_next_frame,
+    ws_read_until_response, ws_send,
 };
 use serde_json::{Value, json};
 
@@ -87,6 +88,7 @@ fn boot_gateway(dir: &Path, pool: &str, key: &str) -> (u16, ChildGuard) {
 fn boot_gateway_pools(dir: &Path, pools: &[(&str, &str)]) -> (u16, ChildGuard) {
     let gw_port = free_port();
     let metrics_port = free_port();
+    let nats_port = unused_nats_port();
     let pool_keys: String = pools
         .iter()
         .map(|(pool, key)| format!("{pool} = \"{key}\"\n"))
@@ -94,7 +96,7 @@ fn boot_gateway_pools(dir: &Path, pools: &[(&str, &str)]) -> (u16, ChildGuard) {
     let config = format!(
         "listen = \"127.0.0.1:{gw_port}\"\n\
          metrics_listen = \"127.0.0.1:{metrics_port}\"\n\
-         nats_url = \"nats://127.0.0.1:59321\"\n\
+         nats_url = \"nats://127.0.0.1:{nats_port}\"\n\
          config_bucket = \"ai-gateway\"\n\
          upstream_tls = true\n\
          \n[pool_keys]\n{pool_keys}\
@@ -111,6 +113,7 @@ fn boot_gateway_pools(dir: &Path, pools: &[(&str, &str)]) -> (u16, ChildGuard) {
         .stderr(Stdio::inherit())
         .spawn_guarded();
     wait_for_port(gw_port);
+    wait_for_allowance_ready(metrics_port);
     (gw_port, gateway)
 }
 
