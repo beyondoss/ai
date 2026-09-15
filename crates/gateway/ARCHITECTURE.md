@@ -28,9 +28,9 @@ published `beyond-slipstream` — clones, CI-builds, and publishes anywhere.
 | **Tail tap**                               | Bounded 64KB window kept from the end of the response for usage extraction                                                                                                                                                                                                                                                            | A buffer or copy — the response is relayed unbuffered; only the tail is kept                                                                 |
 | **Capture-set**                            | Sparse map of `tenant_id`s with payload logging on; default-**off**; watched under its own prefix by its own watcher                                                                                                                                                                                                                  | Retention policy — the gateway emits and forgets; the store owns TTL/erasure                                                                 |
 | **Capture tap**                            | Bounded **head**-keeping copy of each body, taken pre-rewrite; relayed bytes are untouched                                                                                                                                                                                                                                            | A buffer — nothing is withheld, so it costs memcpy, never latency                                                                            |
-| **Response cache**                         | In-process exact-match store: identical managed catalog-walk request (pre-rewrite body + inbound path + `tenant_id` + effective candidate order) replays a stored 2xx. Off unless `cache_ttl_secs > 0`. Miss is an unbuffered relay; fill is a tap.                                                                                   | Redis, semantic cache, or a pool-key key — none of those                                                                                     |
+| **Response cache**                         | **Per-pod** exact-match store: identical managed catalog-walk request (pre-rewrite body + inbound path + `tenant_id` + effective candidate order) replays a stored 2xx on **this process**. Off unless `cache_ttl_secs > 0`. Miss is an unbuffered relay; fill is a tap. Replicas do not share entries.                              | Redis, semantic cache, a pool-key key, or a fleet-wide cache — none of those                                                                 |
 | **Control header** (`x-beyond-*`)          | Per-request caller input: `metadata` tags, `capture` on/off, `cache` on/off, catalog `order` / `only` / `split`. Managed only; stripped before the upstream                                                                                                                                                                           | A way to 4xx a request — unusable values are dropped and counted; an `only` that leaves no keyed candidate is the same 503 as an unkeyed row |
-| **Smart router**                           | In-process EWMA of TTFT per catalog candidate. Default walk for managed `/auto` and `/v1` when `order`/`split` are absent. Probe of unmeasured arms every 8th request. `smart_router = false` restores static catalog order.                                                                                                          | Live Redis, cost sort, or a cross-replica shared ranking — none of those                                                                     |
+| **Smart router**                           | **Per-pod** EWMA of TTFT per catalog candidate. Default walk for managed `/auto` and `/v1` when `order`/`split` are absent. Probe of unmeasured arms every 8th request. `smart_router = false` restores static catalog order. Two replicas can rank the same row differently.                                                        | Live Redis, cost sort, or a fleet-wide shared ranking — none of those                                                                        |
 | **Snapshot**                               | On-disk deny-set cache (entries + NATS cursor) for edge/tunnel deployments                                                                                                                                                                                                                                                            | Persistent store — a pure cache; delete it and the gateway re-scans NATS                                                                     |
 | **Virtual key** (`bai_v1` / `bai_v2`)      | Ed25519-signed token: v1 is `tenant_id`+`vpc_id` (16 B); v2 adds unique `key_id` (24 B). Same keyring.                                                                                                                                                                                                                                | A session or auth token — stateless, no server-side lookup                                                                                   |
 
@@ -74,6 +74,7 @@ Client (stock OpenAI/Anthropic SDK)
   │  │    capture decision = header (wins both ways) else capture-set rule ∧ 1-in-N sample
   │  ├─ Exact-match cache (managed catalog walk, body already in hand, cache_ttl_secs > 0):
   │  │    key = pre-rewrite body + inbound path + tenant_id + effective candidate order
+  │  │    per-pod table (ai_cache_scope{kind="process"}); miss does not consult Redis
   │  │    x-beyond-cache: off / Cache-Control: no-store ────────── skip lookup and store
   │  │    hit: write stored 2xx (no upstream, no breaker, no key-walk)
   │  │    miss: unbuffered relay; fill is a tap, insert only on complete 2xx
@@ -223,12 +224,14 @@ in the catalog` vs `missing model: …`). There is no parallel grant set. A cand
 `upstream_model` spelling (OpenRouter's `anthropic/claude-opus-4.8`, Bedrock's inference-profile
 id) is an alias for the row — those are the ids we already rewrite _to_.
 
-The default walk is TTFT-ranked (`smart.rs`): in-process EWMA per catalog candidate, measured
+The default walk is TTFT-ranked (`smart.rs`): **this process's** EWMA per catalog candidate, measured
 from `attempt_start` the same way `ai_ttft_seconds` is. Cold start (no samples) is the row's static
 order. A connect failure or 5xx takes a penalty floor so a fast error does not outrank a slower 2xx;
 a 429 is a real answer. Unmeasured arms stay failover until a deterministic probe (every 8th
 request, skipping seq `0`) promotes one. A sample older than 30s is treated as unmeasured so a
-recovered arm is retried. `smart_router = false` restores static catalog order.
+recovered arm is retried. `smart_router = false` restores static catalog order. Samples never leave
+the pod — `ai_smart_rank_scope{kind="process"}=1` is the honesty metric; this is not fleet-wide
+smart routing. `x-beyond-split` is the only cross-replica pin (hash of the request counter).
 
 A managed request may also permute that list with headers, still on the same wire, without adding a
 provider the row does not already name (`ProviderSpec::name` on that row). Parsed in `control.rs`,
@@ -532,8 +535,11 @@ carries the tokens.
 
 ### Response cache (`cache.rs`)
 
-An in-process exact-match store. Identical managed catalog-walk requests replay a stored 2xx and
-skip the provider. Off unless `cache_ttl_secs > 0`.
+An **in-process** exact-match store — this pod, not the fleet. Identical managed catalog-walk
+requests replay a stored 2xx and skip the provider **on the replica that filled it**. Another
+replica starts empty. Off unless `cache_ttl_secs > 0`. There is no Redis (or other shared store) on
+the miss path: a miss is always the unbuffered upstream relay. `ai_cache_scope{kind="process"}=1`
+is the honesty metric; do not alert as if a shared cache were in front of the providers.
 
 **The key is the client request plus the walk, not the upstream attempt.** Hash of the pre-rewrite
 body + inbound path + `tenant_id` + the effective candidate order (`ProviderId` indices). Not the
@@ -946,10 +952,10 @@ Secret-bearing fields (`pool_keys`, `nats_creds`) are held as `Secret<T>` — st
 | `capture_max_bytes`             | `262144`                          | Per-direction cap on a captured payload before truncation; the default a per-tenant entry overrides. Really a bound on what the log pipeline will carry — raise only alongside its per-record limit.                                                             |
 | `capture_default_sample_n`      | `1`                               | Default sampling for control-plane-enabled capture (keep 1 request in N). `1` captures every request. A capture requested via `x-beyond-capture: on` is never sampled away.                                                                                      |
 | `capture_queue_depth`           | `1024`                            | Depth of the bounded `ai.payload` sink queue. When full, captures are **dropped** (`ai_capture_dropped_total`) rather than blocking — a stalled log sink must never backpressure the data plane.                                                                 |
-| `cache_ttl_secs`                | `0`                               | Exact-match response cache TTL. `0` disables. Only managed catalog walks whose body is already in hand before `upstream_peer`. A hit replays the stored 2xx; a miss stays an unbuffered relay.                                                                   |
+| `cache_ttl_secs`                | `0`                               | Per-pod exact-match response cache TTL. `0` disables. Only managed catalog walks whose body is already in hand before `upstream_peer`. A hit on **this process** replays the stored 2xx; a miss stays an unbuffered relay (no Redis).                            |
 | `cache_max_entries`             | `1024`                            | Cap on stored cache entries. Oldest insertion is dropped when a new one would exceed it.                                                                                                                                                                         |
 | `cache_max_bytes`               | `65536`                           | Cap on a single stored response body. Oversize complete 2xxs are relayed but not stored.                                                                                                                                                                         |
-| `smart_router`                  | `true`                            | Rank managed catalog walks by in-process TTFT EWMA. `false` restores static catalog order. `x-beyond-order` / `split` pin either way.                                                                                                                            |
+| `smart_router`                  | `true`                            | Rank managed catalog walks by **this process's** TTFT EWMA. `false` restores static catalog order. `x-beyond-order` / `split` pin either way. Not a fleet-wide ranking.                                                                                          |
 | `nats_url`                      | `nats://localhost:4222`           | NATS server for both control-plane watchers. Unreachable → fail-open (deny-set stale, capture off).                                                                                                                                                              |
 | `nats_creds`                    | _(unset)_                         | NATS credentials file path. Required for authenticated clusters.                                                                                                                                                                                                 |
 | `listen_addr`                   | `0.0.0.0:8080`                    | Proxy listener address (client traffic).                                                                                                                                                                                                                         |
@@ -1007,6 +1013,8 @@ Prometheus on the default registry, exposed at `/metrics` on `metrics_listen`.
 | `ai_control_header_errors_total`      | Counter   | —                    | `x-beyond-*` headers present but unusable (dropped; request still served)                                            |
 | `ai_usage_parse_errors_total`         | Counter   | —                    | Managed 2xx responses with no parseable usage (emitted as a zero-token billing row)                                  |
 | `ai_cache_hits_total`                 | Counter   | —                    | Exact-match cache hits that replayed a stored 2xx and skipped the provider                                           |
+| `ai_cache_scope`                      | Gauge     | `kind`               | Constant `1` with `kind="process"`: this pod's cache table, not a fleet store                                        |
+| `ai_smart_rank_scope`                 | Gauge     | `kind`               | Constant `1` with `kind="process"`: this pod's TTFT EWMA, not a fleet-wide ranking                                   |
 | `ai_candidate_failovers_total`        | Counter   | —                    | Model-routed requests that abandoned a candidate for the next one                                                    |
 | `ai_key_walks_total`                  | Counter   | —                    | Managed 429s that retried the same provider with the next unused pool key                                            |
 | `ai_model_header_body_mismatch_total` | Counter   | —                    | Catalog-walk requests whose `x-beyond-model` and body `model` disagreed (header wins; client bug)                    |
@@ -1028,8 +1036,8 @@ Prometheus on the default registry, exposed at `/metrics` on `metrics_listen`.
 | `capture_sink`    | Bounded, lossy `ai.payload` writer — drops on a full queue so a stalled log sink can't backpressure                             | unit ✓         |
 | `control`         | `x-beyond-*` header parse/validate; metadata canonicalized and re-serialized; catalog walk permute (`order` / `only` / `split`) | unit ✓ + e2e ✓ |
 | `translate`       | Chat Completions ↔ Messages ↔ Responses mapping for a catalog endpoint mismatch; SSE event-by-event | unit ✓ + e2e ✓ |
-| `smart`           | In-process TTFT EWMA table; ranks unpinned catalog walks; probe of unmeasured arms                                              | unit ✓ + e2e ✓ |
-| `cache`           | In-process exact-match response store (TTL + max entries + max bytes/entry); tap, never a buffer                                | unit ✓ + e2e ✓ |
+| `smart`           | Per-pod TTFT EWMA table; ranks unpinned catalog walks; probe of unmeasured arms; not fleet-wide                                 | unit ✓ + e2e ✓ |
+| `cache`           | Per-pod exact-match response store (TTL + max entries + max bytes/entry); tap, never a buffer; miss does not consult Redis      | unit ✓ + e2e ✓ |
 | `ratelimit`       | Two-tier guardrail: per-credential (count-min sketch, fixed memory, no GC) + global BYO (one atomic)                            | unit ✓         |
 | `circuit_breaker` | Per-provider lock-free breaker (packed `AtomicU64`, windowed policy) — trips on 5xx/connect, not 429                            | unit ✓ + e2e ✓ |
 | `state`           | Keyring + provider registry + watched deny-/capture-sets (ArcSwap) + TTL DNS cache                                              | unit ✓         |
@@ -1091,7 +1099,8 @@ Prometheus on the default registry, exposed at `/metrics` on `metrics_listen`.
 - **Response cache (`tests/cache.rs`):** two identical managed `/v1` requests hit once upstream,
   the replayed body and status are byte-identical, a different tenant misses, `x-beyond-cache: off`
   always goes upstream and never fills, a 429-then-200 is still one cacheable client-body hash, and
-  two candidate orders (default vs `x-beyond-order`) do not cross-hit.
+  two candidate orders (default vs `x-beyond-order`) do not cross-hit. `ai_cache_scope{kind="process"}`
+  and `ai_smart_rank_scope{kind="process"}` are `1` — rank and cache are per-pod, not fleet-wide.
 - **Cancellation (`tests/cancellation.rs`):** a client that gives up must not open the provider's
   breaker, and a genuinely broken provider still must. Verified non-vacuous — reverting the fix makes
   the first test fail.

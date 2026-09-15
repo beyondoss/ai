@@ -318,6 +318,9 @@ pub struct AiConfig {
     /// catalog walks whose client body is already in hand before `upstream_peer` (`/auto`, managed
     /// `/v1`) look up or fill. A hit replays the stored 2xx and skips the provider; a miss stays an
     /// unbuffered relay and fills via a tap. BYO and `/{provider}` passthrough are not cached.
+    ///
+    /// The store is **this process**. Another replica does not see the entry; a miss never consults
+    /// Redis or any shared backend.
     pub cache_ttl_secs: u64,
     /// Cap on stored entries. Oldest insertion is dropped when a new one would exceed it.
     pub cache_max_entries: usize,
@@ -327,6 +330,9 @@ pub struct AiConfig {
     /// Rank managed catalog walks by observed time-to-first-byte (in-process EWMA per catalog
     /// candidate). Off falls back to the row's static order, still subject to `x-beyond-order` /
     /// `only` / `split`. Default on: the headers pin when a caller wants a fixed sequence.
+    ///
+    /// Ranking is **this process**. Replicas do not share TTFT samples, so the default walk is not
+    /// a fleet-wide smart router.
     pub smart_router: bool,
 }
 

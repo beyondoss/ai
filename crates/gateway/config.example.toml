@@ -113,17 +113,19 @@ capture_queue_depth = 1024
 
 # Exact-match response cache. Off by default (`0`). When set, a managed catalog walk (`/auto`,
 # managed `/v1`) whose client body is already in hand before upstream_peer hashes that pre-rewrite
-# body + inbound path + tenant_id and, on a hit, replays the stored 2xx without talking to a
-# provider. A miss is still an unbuffered relay; the fill is a tap (like capture) and only a
-# complete 2xx is stored. `x-beyond-cache: off` or `Cache-Control: no-store` skips lookup and store.
-# BYO and /{provider} passthrough are not cached this round.
+# body + inbound path + tenant_id + effective candidate order and, on a hit, replays the stored 2xx
+# without talking to a provider. A miss is still an unbuffered relay; the fill is a tap (like
+# capture) and only a complete 2xx is stored. `x-beyond-cache: off` or `Cache-Control: no-store`
+# skips lookup and store. BYO and /{provider} passthrough are not cached this round.
+# Per-pod: another replica does not see this table. A miss never consults Redis.
 # cache_ttl_secs = 0
 # cache_max_entries = 1024
 # cache_max_bytes = 65536
 
-# Rank managed catalog walks (`/auto`, managed `/v1`) by observed time-to-first-byte. In-process
+# Rank managed catalog walks (`/auto`, managed `/v1`) by observed time-to-first-byte. This process's
 # EWMA per catalog candidate; cold start is the row's static order. `x-beyond-order` / `split` pin
-# a sequence; `only` filters then ranks. Set false to always use catalog order.
+# a sequence; `only` filters then ranks. Set false to always use catalog order. Not fleet-wide:
+# replicas do not share TTFT samples.
 # smart_router = true
 
 # Optional per-provider upstream authority (host:port), BY PROVIDER NAME. For a known provider this

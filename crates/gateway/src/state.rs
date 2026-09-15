@@ -211,12 +211,13 @@ pub struct GatewayState {
     /// entry that doesn't override them (and to a capture requested by header, which has no entry).
     pub capture_defaults: CaptureRule,
 
-    /// Exact-match response cache. `None` when `cache_ttl_secs == 0`.
+    /// Exact-match response cache. `None` when `cache_ttl_secs == 0`. Process-local: another replica
+    /// does not share this table, and a miss does not consult a shared store.
     pub cache: Option<ResponseCache>,
 
     /// Per-candidate TTFT EWMA used to rank catalog walks. Always allocated; [`AiConfig::smart_router`]
     /// gates whether `rank` runs. Observing while the flag is off is wasted work, so the proxy
-    /// skips both.
+    /// skips both. Process-local: replicas do not share samples.
     pub smart: smart::Router,
 
     /// Per-key request-rate guardrail (see `ratelimit`). `None` when `rate_limit_rps == 0`. Fixed

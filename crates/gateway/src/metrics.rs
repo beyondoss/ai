@@ -4,7 +4,7 @@
 //! exposes them with no extra wiring. `Metrics::new` is called exactly once (in `main`).
 
 use prometheus::{
-    Histogram, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, Opts,
+    Histogram, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Opts,
     default_registry,
 };
 use std::sync::Arc;
@@ -47,7 +47,7 @@ pub enum Rejection {
     /// one provider, so neither selecting among candidates nor failing over is meaningful for it.
     ByoOnModelRoute,
     /// Catalog walk whose inbound path implies a different wire than the row, on a path we do
-    /// not translate (`/v1/embeddings`, Responses, …). Chat Completions ↔ Messages is translated
+    /// not translate (embeddings-class, …). Chat Completions ↔ Messages ↔ Responses is translated
     /// instead of rejected. `/{provider}/…` never hits this — it does not consult the catalog.
     WireMismatch,
 }
@@ -225,6 +225,13 @@ pub struct Metrics {
     pub usage_parse_errors_total: IntCounter,
     /// Exact-match cache hits that replayed a stored 2xx and never reached a provider.
     pub cache_hits_total: IntCounter,
+    /// Constant `1` with `kind="process"`: the exact-match cache is this pod's table, not a fleet
+    /// store. A miss here still goes upstream even if another replica would have hit. Do not read
+    /// this as "shared cache is healthy" — there is no shared cache on the miss path.
+    pub cache_scope: IntGauge,
+    /// Constant `1` with `kind="process"`: TTFT ranking is this pod's EWMA table. Replicas do not
+    /// share samples, so two pods can walk the same catalog row in different orders.
+    pub smart_rank_scope: IntGauge,
 }
 
 /// TTFT buckets (seconds). Tuned for LLM latency: sub-second prompts up through the multi-second
@@ -353,6 +360,24 @@ impl Metrics {
             "ai_cache_hits_total",
             "Exact-match cache hits that replayed a stored 2xx and skipped the provider",
         ))?;
+        let cache_scope = IntGaugeVec::new(
+            Opts::new(
+                "ai_cache_scope",
+                "Exact-match cache scope. kind=process means this pod's table only; hits skip upstream here, misses do not consult another replica or Redis",
+            ),
+            &["kind"],
+        )?;
+        let cache_scope_process = cache_scope.with_label_values(&["process"]);
+        cache_scope_process.set(1);
+        let smart_rank_scope = IntGaugeVec::new(
+            Opts::new(
+                "ai_smart_rank_scope",
+                "Catalog-walk TTFT ranker scope. kind=process means this pod's EWMA only; not a fleet-wide ranking",
+            ),
+            &["kind"],
+        )?;
+        let smart_rank_scope_process = smart_rank_scope.with_label_values(&["process"]);
+        smart_rank_scope_process.set(1);
 
         r.register(Box::new(requests_total.clone()))?;
         r.register(Box::new(candidate_failovers_total.clone()))?;
@@ -377,6 +402,8 @@ impl Metrics {
         r.register(Box::new(control_header_errors_total.clone()))?;
         r.register(Box::new(usage_parse_errors_total.clone()))?;
         r.register(Box::new(cache_hits_total.clone()))?;
+        r.register(Box::new(cache_scope.clone()))?;
+        r.register(Box::new(smart_rank_scope.clone()))?;
 
         Ok(Arc::new(Self {
             requests_total,
@@ -407,6 +434,8 @@ impl Metrics {
             control_header_errors_total,
             usage_parse_errors_total,
             cache_hits_total,
+            cache_scope: cache_scope_process,
+            smart_rank_scope: smart_rank_scope_process,
         }))
     }
 
