@@ -6,8 +6,10 @@
 //!
 //! v1 is allowed to be lossy on extras a stock SDK does not need for a tool loop:
 //! - **Dropped:** `thinking` / `redacted_thinking` blocks, `cache_control`, `reasoning_effort`,
-//!   `stream_options` on the Anthropic body, Responses-only fields, image `http(s)` URLs (Anthropic
-//!   wants base64). Base64 data-URI images are converted both ways.
+//!   `stream_options` on the Anthropic body, Responses-only fields (`store`, `previous_response_id`,
+//!   `include`, `truncation`) when translating *off* Responses onto Chat Completions / Messages,
+//!   image `http(s)` URLs (Anthropic wants base64). Base64 data-URI images are converted both ways.
+//!   Same-endpoint Responses is a byte relay: those fields pass through.
 //! - **Required mapping:** system/messages, `max_tokens`, temperature, stop, stream, tools,
 //!   `tool_choice`, text + tool_use/tool_result, usage. Anthropic requires `max_tokens`; a missing
 //!   OpenAI value becomes 4096.
@@ -428,6 +430,133 @@ fn message_text(m: &Value) -> Option<String> {
 fn copy_if(out: &mut Map<String, Value>, v: &Value, key: &str) {
     if let Some(x) = v.get(key) {
         out.insert(key.to_owned(), x.clone());
+    }
+}
+
+/// Root-level Responses session field that cannot be honored off `/v1/responses`.
+///
+/// `None` means the body is a `store: false` one-shot (no `previous_response_id`). Unparseable
+/// JSON is `Some("store")` so a catalog walk fail-closes onto a real Responses arm rather than
+/// silently stripping session state.
+pub fn responses_session_field(body: &[u8]) -> Option<&'static str> {
+    let Ok(v) = serde_json::from_slice::<Value>(body) else {
+        return Some("store");
+    };
+    if previous_response_id_set(&v) {
+        return Some("previous_response_id");
+    }
+    match v.get("store") {
+        Some(Value::Bool(false)) => None,
+        _ => Some("store"),
+    }
+}
+
+fn previous_response_id_set(v: &Value) -> bool {
+    match v.get("previous_response_id") {
+        Some(Value::String(s)) => !s.is_empty(),
+        Some(Value::Null) | None => false,
+        Some(_) => true,
+    }
+}
+
+/// Drop Responses-only session/control fields and reshape `input` onto Chat Completions
+/// `messages`. Used when a `store: false` one-shot is allowed to leave the Responses endpoint.
+/// Same-endpoint Responses must not call this — those fields pass through as a byte relay.
+pub fn responses_to_chat(body: &[u8]) -> Vec<u8> {
+    let Ok(Value::Object(mut m)) = serde_json::from_slice(body) else {
+        return body.to_vec();
+    };
+    m.remove("store");
+    m.remove("previous_response_id");
+    m.remove("include");
+    m.remove("truncation");
+    if let Some(t) = m.remove("max_output_tokens") {
+        m.entry("max_tokens".to_owned()).or_insert(t);
+    }
+    let instructions = m.remove("instructions");
+    if m.get("messages").is_none()
+        && let Some(input) = m.remove("input")
+    {
+        m.insert("messages".into(), input_to_messages(input));
+    } else {
+        m.remove("input");
+    }
+    if let Some(instr) = instructions {
+        prepend_system_message(&mut m, instr);
+    }
+    encode(&Value::Object(m))
+}
+
+fn input_to_messages(input: Value) -> Value {
+    match input {
+        Value::String(s) => json!([{ "role": "user", "content": s }]),
+        Value::Array(items) => {
+            let msgs: Vec<Value> = items
+                .into_iter()
+                .filter_map(input_item_to_message)
+                .collect();
+            if msgs.is_empty() {
+                json!([{ "role": "user", "content": "" }])
+            } else {
+                Value::Array(msgs)
+            }
+        }
+        other => json!([{ "role": "user", "content": other }]),
+    }
+}
+
+fn input_item_to_message(item: Value) -> Option<Value> {
+    let Value::Object(mut obj) = item else {
+        return Some(json!({ "role": "user", "content": item }));
+    };
+    if obj.get("role").is_some() {
+        rewrite_input_text_parts(&mut obj);
+        return Some(Value::Object(obj));
+    }
+    match obj.get("type").and_then(Value::as_str) {
+        Some("message") => {
+            rewrite_input_text_parts(&mut obj);
+            if obj.get("role").is_none() {
+                obj.insert("role".into(), json!("user"));
+            }
+            Some(Value::Object(obj))
+        }
+        Some("input_text") => {
+            let text = obj.get("text").cloned().unwrap_or(json!(""));
+            Some(json!({ "role": "user", "content": text }))
+        }
+        _ => None,
+    }
+}
+
+fn rewrite_input_text_parts(obj: &mut Map<String, Value>) {
+    let Some(Value::Array(parts)) = obj.get_mut("content") else {
+        return;
+    };
+    for p in parts.iter_mut() {
+        if p.get("type").and_then(Value::as_str) != Some("input_text") {
+            continue;
+        }
+        if let Some(t) = p.get("text").cloned() {
+            *p = json!({ "type": "text", "text": t });
+        }
+    }
+}
+
+fn prepend_system_message(m: &mut Map<String, Value>, instr: Value) {
+    let text = match instr {
+        Value::String(s) => s,
+        other => other.to_string(),
+    };
+    if text.is_empty() {
+        return;
+    }
+    let sys = json!({ "role": "system", "content": text });
+    match m.get_mut("messages") {
+        Some(Value::Array(msgs)) => msgs.insert(0, sys),
+        _ => {
+            m.insert("messages".into(), json!([sys]));
+        }
     }
 }
 
@@ -1633,5 +1762,45 @@ mod tests {
         assert_eq!(back["stop_reason"], "tool_use");
         assert_eq!(back["content"][0]["type"], "tool_use");
         assert_eq!(back["content"][0]["input"]["city"], "SF");
+    }
+
+    #[test]
+    fn responses_session_field_names_previous_response_id_first() {
+        let body = br#"{"model":"gpt-4o","previous_response_id":"resp_1","store":false}"#;
+        assert_eq!(responses_session_field(body), Some("previous_response_id"));
+        let omitted = br#"{"model":"gpt-4o","input":"hi"}"#;
+        assert_eq!(responses_session_field(omitted), Some("store"));
+        let stored = br#"{"model":"gpt-4o","store":true}"#;
+        assert_eq!(responses_session_field(stored), Some("store"));
+        let one_shot = br#"{"model":"gpt-4o","store":false,"input":"hi"}"#;
+        assert_eq!(responses_session_field(one_shot), None);
+        let empty_prev = br#"{"model":"gpt-4o","previous_response_id":"","store":false}"#;
+        assert_eq!(responses_session_field(empty_prev), None);
+        assert_eq!(responses_session_field(b"not-json"), Some("store"));
+    }
+
+    #[test]
+    fn responses_to_chat_drops_session_fields_and_maps_input() {
+        let body = serde_json::to_vec(&json!({
+            "model": "gpt-4o",
+            "input": [{"role":"user","content":[{"type":"input_text","text":"hi"}]}],
+            "max_output_tokens": 16,
+            "store": false,
+            "include": ["reasoning.encrypted_content"],
+            "truncation": "auto",
+            "previous_response_id": "resp_x",
+        }))
+        .unwrap();
+        let v: Value = serde_json::from_slice(&responses_to_chat(&body)).unwrap();
+        assert!(v.get("store").is_none(), "{v}");
+        assert!(v.get("previous_response_id").is_none(), "{v}");
+        assert!(v.get("include").is_none(), "{v}");
+        assert!(v.get("truncation").is_none(), "{v}");
+        assert!(v.get("input").is_none(), "{v}");
+        assert_eq!(v["max_tokens"], 16);
+        assert_eq!(v["messages"][0]["role"], "user");
+        assert_eq!(v["messages"][0]["content"][0]["type"], "text");
+        assert_eq!(v["messages"][0]["content"][0]["text"], "hi");
+        assert_eq!(v["model"], "gpt-4o");
     }
 }

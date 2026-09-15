@@ -90,7 +90,10 @@ pub fn dialect_default(d: Dialect) -> &'static str {
 /// `/v1/messages` and `/auto/v1/messages` imply Anthropic; `/v1/chat/completions` and
 /// `/auto/chat/completions` imply OpenAI. A mismatch against the row is translated when the
 /// path is Chat Completions ↔ Messages (see [`catalog_wire_action`]); any other mismatch is
-/// still a 400 (`/v1/embeddings` with a Claude row, Responses, …).
+/// still a 400 (`/v1/embeddings` with a Claude row). Inbound `/v1/responses` is OpenAI-shaped:
+/// GPT rows walk their Responses arm when the body uses session state, and may still translate
+/// a `store: false` one-shot onto Chat Completions. Claude rows have no OpenAI store — session
+/// state is a 400 naming the field, not a hollow Messages call.
 pub fn implied_wire(path: &str) -> Option<Dialect> {
     let rest = catalog_path_rest(path)?;
     if rest.is_empty() || rest == "/v1" || rest == "/v1/" {
@@ -130,6 +133,22 @@ pub fn is_messages_path(path: &str) -> bool {
     catalog_path_rest(path).is_some_and(is_messages_rest)
 }
 
+/// Whether `path` is a Responses endpoint (including `/auto/v1/responses`).
+pub fn is_responses_path(path: &str) -> bool {
+    catalog_path_rest(path).is_some_and(|r| {
+        let tail = r
+            .strip_prefix("/v1/")
+            .or_else(|| r.strip_prefix('/'))
+            .unwrap_or(r);
+        tail == "responses" || tail.starts_with("responses/")
+    })
+}
+
+/// Whether a catalog candidate path is the Responses endpoint.
+pub fn candidate_path_is_responses(path: &str) -> bool {
+    path.ends_with("/responses")
+}
+
 /// What a managed catalog walk should do when the inbound path names a wire that may disagree
 /// with the row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -139,7 +158,7 @@ pub enum WireAction {
     /// Inbound Chat Completions ↔ row Messages, or the reverse. Translate; `client` is what
     /// the caller sent and must receive.
     Translate { client: Dialect },
-    /// Mismatch we do not translate (`/v1/embeddings`, `/v1/responses`, …). 400.
+    /// Mismatch we do not translate (`/v1/embeddings`, …). 400.
     Reject,
 }
 
@@ -289,7 +308,7 @@ mod tests {
     #[test]
     fn every_catalog_candidate_is_a_known_provider() {
         for route in providers::catalog::MODEL_ROUTES {
-            for c in route.candidates {
+            for c in route.candidates.iter().chain(route.responses.iter()) {
                 let spec = providers::by_id(c.provider);
                 assert!(
                     known_providers().any(|p| p.id == c.provider),
@@ -339,6 +358,20 @@ mod tests {
         );
         assert_eq!(implied_wire("/v1/embeddings"), Some(Dialect::OpenAi));
         assert_eq!(implied_wire("/v1/models"), Some(Dialect::OpenAi));
+        assert_eq!(implied_wire("/v1/responses"), Some(Dialect::OpenAi));
+        assert_eq!(implied_wire("/auto/v1/responses"), Some(Dialect::OpenAi));
+    }
+
+    #[test]
+    fn is_responses_path_matches_stock_sdk_and_auto_suffixes() {
+        assert!(is_responses_path("/v1/responses"));
+        assert!(is_responses_path("/auto/v1/responses"));
+        assert!(is_responses_path("/auto/responses"));
+        assert!(!is_responses_path("/v1/chat/completions"));
+        assert!(!is_responses_path("/v1/messages"));
+        assert!(!is_responses_path("/v1/embeddings"));
+        assert!(!is_responses_path("/v1"));
+        assert!(!is_responses_path("/openai/v1/responses"));
     }
 
     #[test]
@@ -384,6 +417,10 @@ mod tests {
         assert_eq!(
             catalog_wire_action("/v1/responses", Dialect::Anthropic),
             WireAction::Reject
+        );
+        assert_eq!(
+            catalog_wire_action("/v1/responses", Dialect::OpenAi),
+            WireAction::Relay
         );
         // Bare /v1 does not name an endpoint.
         assert_eq!(

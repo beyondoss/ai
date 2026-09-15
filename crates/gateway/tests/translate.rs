@@ -614,3 +614,181 @@ async fn failover_while_translating_still_returns_the_client_dialect() {
         "failover must splice the OpenRouter candidate id after translate: {got}"
     );
 }
+
+fn gpt_responses_session() -> &'static str {
+    r#"{"model":"gpt-4o","input":[{"role":"user","content":[{"type":"input_text","text":"hi"}]}],"previous_response_id":"resp_abc","include":["reasoning.encrypted_content"],"truncation":"auto"}"#
+}
+
+fn gpt_responses_one_shot() -> &'static str {
+    r#"{"model":"gpt-4o","input":[{"role":"user","content":[{"type":"input_text","text":"hi"}]}],"max_output_tokens":16,"store":false,"include":["file_search_call.results"],"truncation":"auto"}"#
+}
+
+/// Managed `/v1/responses` + a GPT row + `previous_response_id` must hit OpenAI `/v1/responses`
+/// with the field intact — not Chat Completions with the id stripped.
+#[tokio::test]
+async fn managed_responses_with_previous_response_id_relays_to_openai_responses() {
+    let nats_port = unused_nats_port();
+    let (pubkey, sk) = test_keypair(1);
+    let mock = MockUpstream::start(Mode::Json).await;
+    let gw = Gateway::builder(nats_port, &mock.authority(), &b64(&pubkey))
+        .providers(&["openai", "openrouter", "anthropic"])
+        .start()
+        .await;
+
+    let resp = test_client()
+        .post(format!("{}/v1/responses", gw.url()))
+        .header("authorization", format!("Bearer {}", vkey(&sk)))
+        .header("content-type", "application/json")
+        .body(gpt_responses_session())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "{}",
+        resp.text().await.unwrap()
+    );
+
+    let cap = mock
+        .captured()
+        .expect("session Responses must reach OpenAI");
+    assert_eq!(cap.path, "/v1/responses");
+    let got = String::from_utf8(cap.body).unwrap();
+    assert!(
+        got.contains(r#""previous_response_id":"resp_abc""#),
+        "previous_response_id must pass through: {got}"
+    );
+    assert!(
+        got.contains(r#""include""#) && got.contains("reasoning.encrypted_content"),
+        "include must pass through on same-endpoint Responses: {got}"
+    );
+    assert!(
+        got.contains(r#""truncation":"auto""#),
+        "truncation must pass through on same-endpoint Responses: {got}"
+    );
+    assert!(
+        !got.contains("chat/completions"),
+        "must not rewrite the path into Chat Completions"
+    );
+}
+
+/// `store: false` one-shot Responses may still translate onto Chat Completions.
+#[tokio::test]
+async fn store_false_one_shot_responses_may_translate_onto_chat_completions() {
+    let nats_port = unused_nats_port();
+    let (pubkey, sk) = test_keypair(1);
+    let mock = MockUpstream::start(Mode::Json).await;
+    let gw = Gateway::builder(nats_port, &mock.authority(), &b64(&pubkey))
+        .providers(&["openai", "openrouter", "anthropic"])
+        .start()
+        .await;
+
+    let resp = test_client()
+        .post(format!("{}/v1/responses", gw.url()))
+        .header("authorization", format!("Bearer {}", vkey(&sk)))
+        .header("content-type", "application/json")
+        .body(gpt_responses_one_shot())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "{}",
+        resp.text().await.unwrap()
+    );
+
+    let cap = mock.captured().expect("one-shot must reach OpenAI");
+    assert_eq!(
+        cap.path, "/v1/chat/completions",
+        "store:false may still land on Chat Completions"
+    );
+    let got = String::from_utf8(cap.body).unwrap();
+    assert!(
+        !got.contains("previous_response_id"),
+        "session fields must not be required on a one-shot: {got}"
+    );
+    assert!(
+        !got.contains(r#""store""#),
+        "store is Responses-only and is dropped onto Chat Completions: {got}"
+    );
+    assert!(
+        !got.contains(r#""include""#) && !got.contains("truncation"),
+        "include/truncation are dropped when leaving Responses: {got}"
+    );
+    assert!(
+        got.contains(r#""messages""#),
+        "input must become messages on Chat Completions: {got}"
+    );
+}
+
+/// Claude rows have no OpenAI store. Responses + `previous_response_id` is 400, not Messages.
+#[tokio::test]
+async fn claude_responses_with_previous_response_id_is_400() {
+    let nats_port = unused_nats_port();
+    let (pubkey, sk) = test_keypair(1);
+    let mock = MockUpstream::start(Mode::AnthropicJson).await;
+    let gw = Gateway::builder(nats_port, &mock.authority(), &b64(&pubkey))
+        .providers(&["anthropic", "openai", "openrouter"])
+        .start()
+        .await;
+
+    let resp = test_client()
+        .post(format!("{}/v1/responses", gw.url()))
+        .header("authorization", format!("Bearer {}", vkey(&sk)))
+        .header("content-type", "application/json")
+        .body(r#"{"model":"claude-opus-4-8","input":"hi","previous_response_id":"resp_1"}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 400);
+    let text = resp.text().await.unwrap();
+    assert!(
+        text.contains("previous_response_id"),
+        "400 must name the field: {text}"
+    );
+    assert!(text.contains("claude-opus-4-8"), "{text}");
+    assert_eq!(mock.hits(), 0, "must not become a hollow Messages call");
+}
+
+/// `/{provider}/v1/responses` is the escape hatch: byte relay, no catalog.
+#[tokio::test]
+async fn provider_prefixed_responses_is_still_a_relay() {
+    let nats_port = unused_nats_port();
+    let (pubkey, sk) = test_keypair(1);
+    let mock = MockUpstream::start(Mode::Json).await;
+    let gw = Gateway::builder(nats_port, &mock.authority(), &b64(&pubkey))
+        .providers(&["openai", "openrouter"])
+        .start()
+        .await;
+
+    let resp = test_client()
+        .post(format!("{}/openai/v1/responses", gw.url()))
+        .header("authorization", format!("Bearer {}", vkey(&sk)))
+        .header("content-type", "application/json")
+        .body(gpt_responses_session())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "{}",
+        resp.text().await.unwrap()
+    );
+
+    let cap = mock
+        .captured()
+        .expect("provider-prefixed Responses must reach the upstream");
+    assert_eq!(cap.path, "/v1/responses");
+    let got = String::from_utf8(cap.body).unwrap();
+    assert!(
+        got.contains(r#""previous_response_id":"resp_abc""#),
+        "provider path is a relay: {got}"
+    );
+    assert!(
+        got.contains(r#""include""#) && got.contains(r#""truncation":"auto""#),
+        "include/truncation pass through on the provider path: {got}"
+    );
+}
