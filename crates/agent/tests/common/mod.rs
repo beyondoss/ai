@@ -1,13 +1,15 @@
-//! Shared test helpers: a mock model server speaking Anthropic SSE, port helpers, and a locator for
-//! the gateway binary.
+//! Shared test helpers: a mock model server speaking Anthropic SSE, port helpers, a locator for
+//! the gateway binary, and a process-lifetime JetStream for managed-gateway tests (allowance is
+//! fail-closed until the watcher seeds).
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, dead_code)]
 
 use std::io::{BufRead, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
@@ -401,9 +403,93 @@ pub fn wait_for_port(port: u16) {
         if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
             return;
         }
-        thread::sleep(std::time::Duration::from_millis(10));
+        thread::sleep(Duration::from_millis(10));
     }
     panic!("port {port} never came up");
+}
+
+/// One JetStream server for this test process. Held until exit so many gateway boots can share it.
+///
+/// Allowance is fail-closed until the watcher stores a scan (empty = remaining-ok). A closed NATS
+/// port 402s every managed request, which is why [`wait_for_allowance_ready`] exists alongside this.
+struct SharedNats {
+    port: u16,
+    child: Child,
+}
+
+impl SharedNats {
+    fn spawn() -> Self {
+        let port = free_port();
+        let store_dir = std::env::temp_dir().join(format!("beyond-ai-agent-nats-{port}"));
+        let _ = std::fs::create_dir_all(&store_dir);
+        let mut child = Command::new("nats-server")
+            .args([
+                "-js",
+                "-a",
+                "127.0.0.1",
+                "-p",
+                &port.to_string(),
+                "-sd",
+                store_dir.to_str().unwrap(),
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn nats-server (on PATH? run via mise)");
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while Instant::now() < deadline {
+            if TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                return Self { port, child };
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("shared nats-server did not come up on port {port}");
+    }
+}
+
+pub fn unused_nats_port() -> u16 {
+    static SERVER: OnceLock<SharedNats> = OnceLock::new();
+    SERVER.get_or_init(SharedNats::spawn).port
+}
+
+/// Block until the gateway's allowance watcher has seeded (`ai_allowance_ready==1`).
+///
+/// Listen-port readiness is not enough: managed traffic 402s until the first scan (including an
+/// empty one).
+pub fn wait_for_allowance_ready(metrics_port: u16) {
+    wait_for_port(metrics_port);
+    for _ in 0..200 {
+        if scrape_gauge(&fetch_metrics(metrics_port), "ai_allowance_ready") >= 1.0 {
+            return;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    panic!("ai_allowance_ready never reached 1 on metrics port {metrics_port}");
+}
+
+fn fetch_metrics(port: u16) -> String {
+    let Ok(mut stream) = TcpStream::connect(("127.0.0.1", port)) else {
+        return String::new();
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+    let _ = write!(
+        stream,
+        "GET /metrics HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+    );
+    let mut buf = Vec::new();
+    let _ = stream.read_to_end(&mut buf);
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
+fn scrape_gauge(metrics: &str, name: &str) -> f64 {
+    metrics
+        .lines()
+        .find(|l| l.starts_with(name) && !l[name.len()..].starts_with('_'))
+        .and_then(|l| l.rsplit(' ').next())
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0.0)
 }
 
 /// Read stdout frames from a `serve` child until the `response` frame for `command` arrives; return

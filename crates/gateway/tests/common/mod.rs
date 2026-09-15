@@ -134,40 +134,25 @@ const LOG_CAPTURE_CAP: usize = 512 * 1024;
 ///
 /// Allowance is fail-closed until the watcher stores a scan (empty = remaining-ok), so a closed
 /// port would 402 every managed request. This starts **one** JetStream server per test process
-/// (leaked until exit) and returns its port. Tests that *write* KV still use [`Nats::start()`] so
-/// they cannot see each other's `blackhole.*` / `allowance.*` keys.
+/// (held in a `OnceLock` until exit) and returns its port. Tests that *write* KV still use
+/// [`Nats::start()`] so they cannot see each other's `blackhole.*` / `allowance.*` keys.
 pub fn unused_nats_port() -> u16 {
-    static PORT: OnceLock<u16> = OnceLock::new();
-    *PORT.get_or_init(|| {
-        let port = free_port();
-        let store_dir = std::env::temp_dir().join(format!("beyond-ai-nats-shared-{port}"));
-        let _ = std::fs::create_dir_all(&store_dir);
-        let mut child = Command::new("nats-server")
-            .args([
-                "-js",
-                "-a",
-                "127.0.0.1",
-                "-p",
-                &port.to_string(),
-                "-sd",
-                store_dir.to_str().unwrap(),
-            ])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn nats-server (on PATH? run via mise)");
-        let deadline = std::time::Instant::now() + Duration::from_secs(20);
-        while std::time::Instant::now() < deadline {
-            if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
-                std::mem::forget(child);
-                std::mem::forget(store_dir);
-                return port;
+    static SERVER: OnceLock<Nats> = OnceLock::new();
+    SERVER
+        .get_or_init(|| {
+            let mut nats = Nats::spawn("beyond-ai-nats-shared");
+            let deadline = std::time::Instant::now() + Duration::from_secs(20);
+            while std::time::Instant::now() < deadline {
+                if std::net::TcpStream::connect(("127.0.0.1", nats.port)).is_ok() {
+                    return nats;
+                }
+                std::thread::sleep(Duration::from_millis(50));
             }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        let _ = child.kill();
-        panic!("shared nats-server did not come up on port {port}");
-    })
+            let port = nats.port;
+            nats.stop();
+            panic!("shared nats-server did not come up on port {port}");
+        })
+        .port
 }
 
 /// A TCP port nothing is listening on. The fail-closed allowance test uses this so the watcher
@@ -228,9 +213,9 @@ pub struct Nats {
 }
 
 impl Nats {
-    pub async fn start() -> Self {
+    fn spawn(store_prefix: &str) -> Self {
         let port = free_port();
-        let store_dir = std::env::temp_dir().join(format!("beyond-ai-nats-{port}"));
+        let store_dir = std::env::temp_dir().join(format!("{store_prefix}-{port}"));
         let _ = std::fs::create_dir_all(&store_dir);
         let child = Command::new("nats-server")
             .args([
@@ -246,12 +231,16 @@ impl Nats {
             .stderr(std::process::Stdio::null())
             .spawn()
             .expect("spawn nats-server (on PATH? run via mise)");
-        let nats = Nats {
+        Nats {
             child,
             port,
             store_dir,
-        };
-        wait_for_port(port, "nats-server").await;
+        }
+    }
+
+    pub async fn start() -> Self {
+        let nats = Self::spawn("beyond-ai-nats");
+        wait_for_port(nats.port, "nats-server").await;
         nats
     }
 }
