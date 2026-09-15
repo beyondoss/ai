@@ -12,24 +12,24 @@ published `beyond-slipstream` — clones, CI-builds, and publishes anywhere.
 
 ## Concepts & Terminology
 
-| Term                                       | What It Controls / Gates                                                                                                                                                                                                | NOT                                                                              |
-| ------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------- |
-| **Managed key** (`bai_v1.…` / `bai_v2.…`)  | Ed25519-verified identity; enables key swap, deny-set check, and `ai.usage` billing                                                                                                                                     | A session token or capability grant — just tenant attribution                    |
-| **BYO key** (anything else)                | Forwarded as-is to the provider; no swap, no billing, no deny-set                                                                                                                                                       | A lesser tier — same proxy, minus attribution and billing                        |
-| **Pool key**                               | Real provider API key(s) held by the gateway; swapped in for managed traffic. A 429 walks the next unused key on the _same_ provider                                                                                    | Per-tenant — keys are per provider, shared by all managed callers                |
-| **Tenant**                                 | The billing entity from the virtual key payload (`tenant_id: u64`)                                                                                                                                                      | An org, user, or namespace — an opaque integer the gateway doesn't interpret     |
-| **Dialect**                                | A provider attribute (OpenAI-wire vs Anthropic-wire) driving usage parsing; for a bare-path request it's derived from the path to pick the default provider                                                             | The provider — a prefixed request uses its provider's dialect, not the path      |
-| **Provider**                               | The request's **first path segment** (`/{provider}/…`); a named row in the routing table: authority, dialect, auth scheme                                                                                               | A vendor relationship — just connection facts and auth wiring                    |
-| **Model route** (`/auto/…`, managed `/v1`) | Catalog row named by `x-beyond-model` if present, else the body's root `model`; provider, upstream path, and model id come from that row and the body's `model` is rewritten per attempt. Catalog miss → 404            | A dialect translator — candidates must share a wire format. Not a per-key grant. |
-| **Candidate**                              | One `(provider, upstream model id, path)` a catalog row will accept, in preference order; tried on a connect failure. A request may permute that sequence (`x-beyond-order` / `only` / `split`) but cannot add a provider the row does not list. | A load-balancing pool — still strictly ordered after permute, and only entered on failure |
-| **Deny-set**                               | Sparse maps of denied `tenant_id`s and `key_id`s → reason; gates managed traffic; default-allow; tenant deny kills every key                                                                                            | An allowlist or ACL — misses are allowed, not blocked                            |
-| **Tail tap**                               | Bounded 64KB window kept from the end of the response for usage extraction                                                                                                                                              | A buffer or copy — the response is relayed unbuffered; only the tail is kept     |
-| **Capture-set**                            | Sparse map of `tenant_id`s with payload logging on; default-**off**; watched under its own prefix by its own watcher                                                                                                    | Retention policy — the gateway emits and forgets; the store owns TTL/erasure     |
-| **Capture tap**                            | Bounded **head**-keeping copy of each body, taken pre-rewrite; relayed bytes are untouched                                                                                                                              | A buffer — nothing is withheld, so it costs memcpy, never latency                |
-| **Response cache**                         | In-process exact-match store: identical managed catalog-walk request (pre-rewrite body + inbound path + `tenant_id` + effective candidate order) replays a stored 2xx. Off unless `cache_ttl_secs > 0`. Miss is an unbuffered relay; fill is a tap. | Redis, semantic cache, or a pool-key key — none of those                         |
-| **Control header** (`x-beyond-*`)          | Per-request caller input: `metadata` tags, `capture` on/off, `cache` on/off, catalog `order` / `only` / `split`. Managed only; stripped before the upstream                                                             | A way to 4xx a request — unusable values are dropped and counted; an `only` that leaves no keyed candidate is the same 503 as an unkeyed row |
-| **Snapshot**                               | On-disk deny-set cache (entries + NATS cursor) for edge/tunnel deployments                                                                                                                                              | Persistent store — a pure cache; delete it and the gateway re-scans NATS         |
-| **Virtual key** (`bai_v1` / `bai_v2`)      | Ed25519-signed token: v1 is `tenant_id`+`vpc_id` (16 B); v2 adds unique `key_id` (24 B). Same keyring.                                                                                                                  | A session or auth token — stateless, no server-side lookup                       |
+| Term                                       | What It Controls / Gates                                                                                                                                                                                                                            | NOT                                                                                                                                          |
+| ------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Managed key** (`bai_v1.…` / `bai_v2.…`)  | Ed25519-verified identity; enables key swap, deny-set check, and `ai.usage` billing                                                                                                                                                                 | A session token or capability grant — just tenant attribution                                                                                |
+| **BYO key** (anything else)                | Forwarded as-is to the provider; no swap, no billing, no deny-set                                                                                                                                                                                   | A lesser tier — same proxy, minus attribution and billing                                                                                    |
+| **Pool key**                               | Real provider API key(s) held by the gateway; swapped in for managed traffic. A 429 walks the next unused key on the _same_ provider                                                                                                                | Per-tenant — keys are per provider, shared by all managed callers                                                                            |
+| **Tenant**                                 | The billing entity from the virtual key payload (`tenant_id: u64`)                                                                                                                                                                                  | An org, user, or namespace — an opaque integer the gateway doesn't interpret                                                                 |
+| **Dialect**                                | A provider attribute (OpenAI-wire vs Anthropic-wire) driving usage parsing; for a bare-path request it's derived from the path to pick the default provider                                                                                         | The provider — a prefixed request uses its provider's dialect, not the path                                                                  |
+| **Provider**                               | The request's **first path segment** (`/{provider}/…`); a named row in the routing table: authority, dialect, auth scheme                                                                                                                           | A vendor relationship — just connection facts and auth wiring                                                                                |
+| **Model route** (`/auto/…`, managed `/v1`) | Catalog row named by `x-beyond-model` if present, else the body's root `model`; provider, upstream path, and model id come from that row and the body's `model` is rewritten per attempt. Catalog miss → 404                                        | A dialect translator — candidates must share a wire format. Not a per-key grant.                                                             |
+| **Candidate**                              | One `(provider, upstream model id, path)` a catalog row will accept, in preference order; tried on a connect failure. A request may permute that sequence (`x-beyond-order` / `only` / `split`) but cannot add a provider the row does not list.    | A load-balancing pool — still strictly ordered after permute, and only entered on failure                                                    |
+| **Deny-set**                               | Sparse maps of denied `tenant_id`s and `key_id`s → reason; gates managed traffic; default-allow; tenant deny kills every key                                                                                                                        | An allowlist or ACL — misses are allowed, not blocked                                                                                        |
+| **Tail tap**                               | Bounded 64KB window kept from the end of the response for usage extraction                                                                                                                                                                          | A buffer or copy — the response is relayed unbuffered; only the tail is kept                                                                 |
+| **Capture-set**                            | Sparse map of `tenant_id`s with payload logging on; default-**off**; watched under its own prefix by its own watcher                                                                                                                                | Retention policy — the gateway emits and forgets; the store owns TTL/erasure                                                                 |
+| **Capture tap**                            | Bounded **head**-keeping copy of each body, taken pre-rewrite; relayed bytes are untouched                                                                                                                                                          | A buffer — nothing is withheld, so it costs memcpy, never latency                                                                            |
+| **Response cache**                         | In-process exact-match store: identical managed catalog-walk request (pre-rewrite body + inbound path + `tenant_id` + effective candidate order) replays a stored 2xx. Off unless `cache_ttl_secs > 0`. Miss is an unbuffered relay; fill is a tap. | Redis, semantic cache, or a pool-key key — none of those                                                                                     |
+| **Control header** (`x-beyond-*`)          | Per-request caller input: `metadata` tags, `capture` on/off, `cache` on/off, catalog `order` / `only` / `split`. Managed only; stripped before the upstream                                                                                         | A way to 4xx a request — unusable values are dropped and counted; an `only` that leaves no keyed candidate is the same 503 as an unkeyed row |
+| **Snapshot**                               | On-disk deny-set cache (entries + NATS cursor) for edge/tunnel deployments                                                                                                                                                                          | Persistent store — a pure cache; delete it and the gateway re-scans NATS                                                                     |
+| **Virtual key** (`bai_v1` / `bai_v2`)      | Ed25519-signed token: v1 is `tenant_id`+`vpc_id` (16 B); v2 adds unique `key_id` (24 B). Same keyring.                                                                                                                                              | A session or auth token — stateless, no server-side lookup                                                                                   |
 
 ---
 
@@ -214,11 +214,11 @@ The default walk is the row's static order. A managed request may permute that l
 same wire, without adding a provider the row does not already name (`ProviderSpec::name` on that
 row). Parsed in `control.rs`, stripped before the upstream, never a 4xx:
 
-| Header            | Value                         | Walk                                                                                          |
-| ----------------- | ----------------------------- | --------------------------------------------------------------------------------------------- |
-| `x-beyond-order`  | `bedrock,anthropic`           | those providers first (stable as written), then any remaining row candidates                  |
-| `x-beyond-only`   | `bedrock,openrouter`          | drop anyone not named                                                                         |
-| `x-beyond-split`  | `anthropic=70,bedrock=30`     | pick the primary with those weights (hash of the request counter, not `rand` per replica); leftover stay failover in the current order |
+| Header           | Value                     | Walk                                                                                                                                   |
+| ---------------- | ------------------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
+| `x-beyond-order` | `bedrock,anthropic`       | those providers first (stable as written), then any remaining row candidates                                                           |
+| `x-beyond-only`  | `bedrock,openrouter`      | drop anyone not named                                                                                                                  |
+| `x-beyond-split` | `anthropic=70,bedrock=30` | pick the primary with those weights (hash of the request counter, not `rand` per replica); leftover stay failover in the current order |
 
 Unknown names are dropped. Unparseable values are dropped, counted on
 `ai_control_header_errors_total`, and the request uses default catalog order. If nothing usable
@@ -402,14 +402,14 @@ identity is verified and stripped in `upstream_request_filter` before the reques
 **Managed only** — a BYO request carries no verified `tenant_id`, so a tag on it would be an
 unattributable row, the same reason `ai.usage` is managed-only.
 
-| Header              | Value                                       | Effect                                         |
-| ------------------- | ------------------------------------------- | ---------------------------------------------- |
-| `x-beyond-metadata` | flat JSON object of scalars, ≤1KB, ≤16 keys | tags `ai.usage` + `ai.payload`                 |
-| `x-beyond-capture`  | `on` / `off`                                | enables or suppresses capture for this request |
-| `x-beyond-cache`    | `on` / `off`                                | `off` skips exact-match cache lookup and store |
+| Header              | Value                                       | Effect                                          |
+| ------------------- | ------------------------------------------- | ----------------------------------------------- |
+| `x-beyond-metadata` | flat JSON object of scalars, ≤1KB, ≤16 keys | tags `ai.usage` + `ai.payload`                  |
+| `x-beyond-capture`  | `on` / `off`                                | enables or suppresses capture for this request  |
+| `x-beyond-cache`    | `on` / `off`                                | `off` skips exact-match cache lookup and store  |
 | `x-beyond-order`    | comma-separated `ProviderSpec::name`s       | those providers first, then the rest of the row |
-| `x-beyond-only`     | comma-separated `ProviderSpec::name`s       | drop anyone on the row not named               |
-| `x-beyond-split`    | `name=weight` pairs                         | weighted primary; leftover stay failover       |
+| `x-beyond-only`     | comma-separated `ProviderSpec::name`s       | drop anyone on the row not named                |
+| `x-beyond-split`    | `name=weight` pairs                         | weighted primary; leftover stay failover        |
 
 **Nothing here can fail a request with a 4xx.** Malformed, oversize, or unrecognized values are
 dropped and counted on `ai_control_header_errors_total`; the request proceeds as if the header were
@@ -971,28 +971,28 @@ Prometheus on the default registry, exposed at `/metrics` on `metrics_listen`.
 
 ## Modules
 
-| Module            | Role                                                                                                 | Tested         |
-| ----------------- | ---------------------------------------------------------------------------------------------------- | -------------- |
-| `proxy`           | `ProxyHttp` impl — request/response pipeline (request_filter through logging)                        | e2e ✓          |
-| `key`             | `bai_v1` parse + Ed25519 verify + mint; keyring with multi-kid rotation support                      | unit ✓         |
-| `route`           | Data-driven provider table (name / authority / auth) + dialect default + model-route re-exports      | unit ✓         |
-| `peek`            | `ModelScanner` — streaming structural scan for the root-level `model`; O(1) memory                   | unit ✓         |
-| `usage`           | Token extraction (OpenAI / Anthropic, body + SSE)                                                    | unit ✓         |
-| `deny`            | Sparse deny-set, default-allow, reason → HTTP status                                                 | unit ✓         |
-| `capture`         | Sparse capture-set (default-off) + head-bounded `CaptureBufs` and 1-in-N sampling                    | unit ✓ + e2e ✓ |
-| `capture_sink`    | Bounded, lossy `ai.payload` writer — drops on a full queue so a stalled log sink can't backpressure  | unit ✓         |
+| Module            | Role                                                                                                                            | Tested         |
+| ----------------- | ------------------------------------------------------------------------------------------------------------------------------- | -------------- |
+| `proxy`           | `ProxyHttp` impl — request/response pipeline (request_filter through logging)                                                   | e2e ✓          |
+| `key`             | `bai_v1` parse + Ed25519 verify + mint; keyring with multi-kid rotation support                                                 | unit ✓         |
+| `route`           | Data-driven provider table (name / authority / auth) + dialect default + model-route re-exports                                 | unit ✓         |
+| `peek`            | `ModelScanner` — streaming structural scan for the root-level `model`; O(1) memory                                              | unit ✓         |
+| `usage`           | Token extraction (OpenAI / Anthropic, body + SSE)                                                                               | unit ✓         |
+| `deny`            | Sparse deny-set, default-allow, reason → HTTP status                                                                            | unit ✓         |
+| `capture`         | Sparse capture-set (default-off) + head-bounded `CaptureBufs` and 1-in-N sampling                                               | unit ✓ + e2e ✓ |
+| `capture_sink`    | Bounded, lossy `ai.payload` writer — drops on a full queue so a stalled log sink can't backpressure                             | unit ✓         |
 | `control`         | `x-beyond-*` header parse/validate; metadata canonicalized and re-serialized; catalog walk permute (`order` / `only` / `split`) | unit ✓ + e2e ✓ |
-| `cache`           | In-process exact-match response store (TTL + max entries + max bytes/entry); tap, never a buffer     | unit ✓ + e2e ✓ |
-| `ratelimit`       | Two-tier guardrail: per-credential (count-min sketch, fixed memory, no GC) + global BYO (one atomic) | unit ✓         |
-| `circuit_breaker` | Per-provider lock-free breaker (packed `AtomicU64`, windowed policy) — trips on 5xx/connect, not 429 | unit ✓ + e2e ✓ |
-| `state`           | Keyring + provider registry + watched deny-/capture-sets (ArcSwap) + TTL DNS cache                   | unit ✓         |
-| `store_watch`     | Generic `WatchedSet` driver — gap-free seeding + delta watch, instantiated per set                   | e2e ✓          |
-| `config`          | Figment config; build keyring; pool keys / authorities by provider name                              | unit ✓         |
-| `secret`          | Redacting, zeroize-on-drop `Secret<T>` newtype for pool keys and NATS creds                          | unit ✓         |
-| `admin`           | `ServeHttp` on the metrics listener: `/livez`, `/readyz`, `/metrics`                                 | e2e ✓          |
-| `metrics`         | Prometheus counter/histogram/gauge registration and update helpers                                   | compile ✓      |
-| `doctor`          | Boot-time diagnostics (`beyond-ai doctor`)                                                           | compile ✓      |
-| `main`            | CLI (`run` / `doctor`), rustls init, config load, Pingora server + three services bootstrap          | compile ✓      |
+| `cache`           | In-process exact-match response store (TTL + max entries + max bytes/entry); tap, never a buffer                                | unit ✓ + e2e ✓ |
+| `ratelimit`       | Two-tier guardrail: per-credential (count-min sketch, fixed memory, no GC) + global BYO (one atomic)                            | unit ✓         |
+| `circuit_breaker` | Per-provider lock-free breaker (packed `AtomicU64`, windowed policy) — trips on 5xx/connect, not 429                            | unit ✓ + e2e ✓ |
+| `state`           | Keyring + provider registry + watched deny-/capture-sets (ArcSwap) + TTL DNS cache                                              | unit ✓         |
+| `store_watch`     | Generic `WatchedSet` driver — gap-free seeding + delta watch, instantiated per set                                              | e2e ✓          |
+| `config`          | Figment config; build keyring; pool keys / authorities by provider name                                                         | unit ✓         |
+| `secret`          | Redacting, zeroize-on-drop `Secret<T>` newtype for pool keys and NATS creds                                                     | unit ✓         |
+| `admin`           | `ServeHttp` on the metrics listener: `/livez`, `/readyz`, `/metrics`                                                            | e2e ✓          |
+| `metrics`         | Prometheus counter/histogram/gauge registration and update helpers                                                              | compile ✓      |
+| `doctor`          | Boot-time diagnostics (`beyond-ai doctor`)                                                                                      | compile ✓      |
+| `main`            | CLI (`run` / `doctor`), rustls init, config load, Pingora server + three services bootstrap                                     | compile ✓      |
 
 ---
 
