@@ -323,6 +323,11 @@ pub struct AiConfig {
     pub cache_max_entries: usize,
     /// Cap on a single stored response body (bytes). Oversize 2xxs are relayed but not stored.
     pub cache_max_bytes: usize,
+
+    /// Rank managed catalog walks by observed time-to-first-byte (in-process EWMA per catalog
+    /// candidate). Off falls back to the row's static order, still subject to `x-beyond-order` /
+    /// `only` / `split`. Default on: the headers pin when a caller wants a fixed sequence.
+    pub smart_router: bool,
 }
 
 impl Default for AiConfig {
@@ -398,6 +403,7 @@ impl Default for AiConfig {
             // 64 KiB: the same bound as the catalog-walk peek, so a cached response is no larger
             // than the request that produced it was allowed to be while still being "in hand".
             cache_max_bytes: 64 * 1024,
+            smart_router: true,
         }
     }
 }
