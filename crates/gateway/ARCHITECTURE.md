@@ -22,7 +22,7 @@ published `beyond-slipstream` — clones, CI-builds, and publishes anywhere.
 | **Tenant**                                 | The billing entity from the virtual key payload (`tenant_id: u64`)                                                                                                                                                                                                                                                                    | An org, user, or namespace — an opaque integer the gateway doesn't interpret                                                                 |
 | **Dialect**                                | A provider attribute (OpenAI-wire vs Anthropic-wire) driving usage parsing; for a bare-path request it's derived from the path to pick the default provider                                                                                                                                                                           | The provider — a prefixed request uses its provider's dialect, not the path                                                                  |
 | **Provider**                               | The request's **first path segment** (`/{provider}/…`); a named row in the routing table: authority, dialect, auth scheme                                                                                                                                                                                                             | A vendor relationship — just connection facts and auth wiring                                                                                |
-| **Model route** (`/auto/…`, managed `/v1`) | Catalog row named by `x-beyond-model` if present, else the body's root `model`; provider, upstream path, and model id come from that row and the body's `model` is rewritten per attempt. Catalog miss → 404. Same-endpoint walks are a byte relay; Chat Completions ↔ Messages ↔ Responses is translated when the inbound path names a different one of those three. | Mixed-wire catalog rows, Gemini. Not a per-key grant.                                                                             |
+| **Model route** (`/auto/…`, managed `/v1`) | Catalog row named by `x-beyond-model` if present, else the body's root `model`; provider, upstream path, and model id come from that row and the body's `model` is rewritten per attempt. Catalog miss → 404. Same-endpoint walks are a byte relay; Chat Completions ↔ Messages ↔ Responses is translated when the inbound path *or this candidate's path* names a different one of those three. | Gemini. Not a per-key grant.                                                                             |
 | **Candidate**                              | One `(provider, upstream model id, path)` a catalog row will accept. Default walk is TTFT-ranked (in-process EWMA); `x-beyond-order` / `split` pin, `only` filters. Cannot add a provider the row does not list.                                                                                                                      | A parallel pool — still a sequence, entered on failure. Not a cost sort.                                                                     |
 | **Deny-set**                               | Sparse maps of denied `tenant_id`s and `key_id`s → reason; gates managed traffic; default-allow; tenant deny kills every key                                                                                                                                                                                                          | An allowlist or ACL — misses are allowed, not blocked                                                                                        |
 | **Tail tap**                               | Bounded 64KB window kept from the end of the response for usage extraction                                                                                                                                                                                                                                                            | A buffer or copy — the response is relayed unbuffered; only the tail is kept                                                                 |
@@ -291,7 +291,7 @@ the provider:
 
 - **The upstream path comes from the catalog, per candidate.** Providers disagree on where an
   endpoint lives and the disagreement is _not_ a prefix: Anthropic serves Messages at `/v1/messages`
-  from a base carrying no path, OpenRouter serves the same wire at `/api/v1/messages`. No client
+  from a base carrying no path, OpenRouter serves Claude at `/api/v1/chat/completions`. No client
   suffix is correct for both, so each candidate states its path outright and `forward_path` is set
   from it per attempt. The client points its SDK at `/v1` (or `…/auto`) and the row decides.
 - **The model id is rewritten per attempt.** Providers essentially never share a string —
@@ -308,24 +308,27 @@ from DNS) and one that **answers with a 5xx**, provided nothing has gone downstr
 request body is still replayable. Candidates whose breaker is open are skipped without an attempt.
 See "Status-based failover, and where it stops" for the 5xx path and its one real limit.
 
-Catalog rows live in `providers::catalog`, shared with the agent. Every candidate in a row must
-share a wire format, enforced by a test: failover rewrites ids but does **not** translate between
-API shapes _across candidates_, so a mixed row would send an Anthropic Messages body to a Chat
-Completions endpoint and then parse the reply with the wrong dialect's usage extractor — a
-zero-token billing row rather than a visible error. The Chat Completions ↔ Messages ↔ Responses
-translate above is a client-path vs row mismatch, not a mixed row.
+Catalog rows live in `providers::catalog`, shared with the agent. A row's `wire` is the *client
+default* (what the primary speaks, and what a bare `/v1` caller is assumed to send). Candidates may
+list Messages and Chat Completions (or Responses) together — Claude's OpenRouter arm is Chat
+Completions. Each attempt translates the **original** client body onto **this candidate's** path
+(`endpoint_of_path` / `wire_of_path`); injection (`stream_options`) follows the upstream candidate,
+not the client. Billing dialect is the serving candidate's path, never the row or the provider
+table. Sending the wrong wire would trip the dialect-mismatch guard and emit a zero-token billing
+row. `/{provider}/…` never translates. Do not invent mixed endpoint types inside one candidate path.
 
-**Wire belongs to the row, not the provider.** `ProviderSpec::wire` is one value per provider and
-that is an approximation: OpenRouter serves the OpenAI wire at `/api/v1/chat/completions` _and_ a
-genuine Anthropic Messages wire at `/api/v1/messages`, and Fireworks is the same story from the other
-side (`agent_core::dialect::is_fireworks_anthropic_wire_model`). So each row declares its own `wire`,
-and `request_filter` takes the request's dialect from **the row** rather than from whichever provider
-it happens to start on. Reading the provider there fails silently in the worst way — an Anthropic
-response meets the OpenAI extractor, trips the dialect-mismatch guard, and bills zero tokens.
+**Wire belongs to the serving candidate's path, not the provider and not only the row.**
+`ProviderSpec::wire` is one value per provider and that is an approximation: OpenRouter serves the
+OpenAI wire at `/api/v1/chat/completions` _and_ a genuine Anthropic Messages wire at
+`/api/v1/messages`, and Fireworks is the same story from the other side
+(`agent_core::dialect::is_fireworks_anthropic_wire_model`). `request_filter` seeds dialect from the
+row; `upstream_peer` overwrites it from the candidate about to be dialed. Reading the provider there
+fails silently in the worst way — an Anthropic response meets the OpenAI extractor, trips the
+dialect-mismatch guard, and bills zero tokens.
 
 That is what makes **Claude failover real today**: every Claude row (current Fable 5.1 / Opus 5 /
 Sonnet 5 / Haiku 4.5, plus the still-served 4.x snapshots) routes to Anthropic first and falls back
-to OpenRouter's Messages endpoint under the vendor-slug spelling (`claude-opus-5` →
+to OpenRouter's Chat Completions endpoint under the vendor-slug spelling (`claude-opus-5` →
 `anthropic/claude-opus-5`; `claude-opus-4-8` → `anthropic/claude-opus-4.8`). `claude-haiku-4-5` and
 `claude-opus-4-8` insert Amazon Bedrock's Messages API as an independent second source
 (`us.anthropic.claude-haiku-4-5-20251001-v1:0` / `us.anthropic.claude-opus-4-8`) before OpenRouter.
@@ -1070,7 +1073,9 @@ Prometheus on the default registry, exposed at `/metrics` on `metrics_listen`.
   `cache_control` / `reasoning_effort` reach Anthropic fields and thinking blocks reappear on the
   client stream; the reverse with a GPT id on `/v1/messages`; same-wire walks still byte-relay;
   `/{provider}` still 400s a Claude body to OpenAI; `/v1/embeddings` with a Claude row is still a
-  wire-mismatch 400). **Responses** (`tests/translate.rs`): a stock `/v1/responses` body with a GPT
+  wire-mismatch 400). **Mixed-wire rows:** Anthropic 5xx fails onto OpenRouter Chat Completions with
+  a Chat Completions body spliced from the original client; billing dialect is the serving
+  candidate. **Responses** (`tests/translate.rs`): a stock `/v1/responses` body with a GPT
   catalog id is translated onto Chat Completions; the same body with `claude-*` lands on Messages;
   `ai.usage` still comes from the upstream parser. `GET /v1/models` lists the catalog, a candidate
   spelling is an alias, BYO on

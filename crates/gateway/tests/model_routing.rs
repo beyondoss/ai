@@ -464,26 +464,13 @@ async fn provider_routed_requests_are_unaffected() {
     );
 }
 
-/// Claude fails over Anthropic → OpenRouter **on the Anthropic wire**, and the usage is parsed with
-/// the Anthropic extractor even though OpenRouter is an OpenAI-wire provider in the provider table.
-///
-/// On the metering half, be clear about what this test can and cannot prove. `rc.dialect` now comes
-/// from the row's `wire`; it used to come from `provider.dialect`. For *this* row those agree, since
-/// the primary candidate is Anthropic and Anthropic is an Anthropic-wire provider — so reverting the
-/// fix leaves this test green (checked, not assumed). What it does prove is that the whole
-/// Anthropic-wire path — route, rewrite, relay, extract — meters end to end.
-///
-/// The case the fix actually guards is a row whose *primary* is an OpenAI-wire provider serving the
-/// Anthropic wire (Fireworks does exactly this for its own models). There, `provider.dialect` says
-/// `OpenAi`, the Anthropic response hits the dialect-mismatch guard, and the row bills **zero
-/// tokens** without erroring. No such row is in the catalog yet, so the derivation is pinned as a
-/// unit test in `proxy.rs` instead of contriving one here.
+/// Claude fails onto OpenRouter Chat Completions. Connect-fail the Anthropic primary; the
+/// fallback must receive a Chat Completions body and be billed with the OpenAI extractor.
 #[tokio::test]
-async fn claude_fails_over_on_the_anthropic_wire_and_is_still_metered() {
+async fn claude_fails_over_to_openrouter_chat_and_is_still_metered() {
     let nats_port = unused_nats_port();
     let (pubkey, sk) = test_keypair(1);
-    // The fallback answers in Anthropic shape: `usage.input_tokens`, not `usage.prompt_tokens`.
-    let fallback = MockUpstream::start(Mode::AnthropicJson).await;
+    let fallback = MockUpstream::start(Mode::Json).await;
     let gw = Gateway::builder(nats_port, &GatewayBuilder::dead_authority(), &b64(&pubkey))
         .providers(&["anthropic", "openrouter"])
         .provider_authority("openrouter", &fallback.authority())
@@ -502,17 +489,18 @@ async fn claude_fails_over_on_the_anthropic_wire_and_is_still_metered() {
     assert_eq!(
         resp.status().as_u16(),
         200,
-        "Anthropic is dead; OpenRouter must serve it"
+        "Anthropic is dead; OpenRouter Chat Completions must serve it"
+    );
+    let text = resp.text().await.unwrap();
+    assert!(
+        text.contains(r#""type":"message""#),
+        "client is Messages: {text}"
     );
 
     let cap = fallback
         .captured()
         .expect("the fallback served the request");
-    // OpenRouter's Messages endpoint, which is not reachable by composing Anthropic's `/v1/messages`
-    // with any per-provider mount — the catalog states it outright.
-    assert_eq!(cap.path, "/api/v1/messages");
-    // Auth followed the candidate, and so did its *scheme*: Anthropic wants `x-api-key`, OpenRouter
-    // wants Bearer. Sending Anthropic's scheme to OpenRouter would 401.
+    assert_eq!(cap.path, "/api/v1/chat/completions");
     assert_eq!(
         cap.authorization.as_deref(),
         Some("Bearer sk-openrouter-pool"),
@@ -521,21 +509,26 @@ async fn claude_fails_over_on_the_anthropic_wire_and_is_still_metered() {
         cap.x_api_key, None,
         "the Anthropic scheme must not leak to OpenRouter"
     );
-    // And the model was re-spelled the way OpenRouter names it — dots, vendor-prefixed.
+    assert_eq!(
+        cap.anthropic_version, None,
+        "anthropic-version must not ride a Chat Completions candidate"
+    );
     let body = String::from_utf8(cap.body).unwrap();
     assert!(
         body.contains(r#""model":"anthropic/claude-opus-4.8""#),
         "the fallback must be asked for its own id: {body}"
     );
+    assert!(
+        body.contains(r#""messages""#),
+        "Messages client must be spliced into a Chat Completions body: {body}"
+    );
 
-    // The billing row must carry real tokens. Zero here means the OpenAI extractor ran against an
-    // Anthropic body and the dialect-mismatch guard swallowed it.
     let line = gw
         .wait_for_log_line(&["ai.usage", r#""provider":"openrouter""#])
         .await;
     assert!(
-        line.contains(r#""input_tokens":13"#),
-        "usage must be parsed with the row's Anthropic dialect, not the provider's OpenAI one: {line}"
+        line.contains(r#""input_tokens":11"#),
+        "usage must be parsed with the serving candidate's OpenAI dialect: {line}"
     );
     assert!(
         line.contains(r#""routed_model":"claude-opus-4-8""#),
@@ -991,11 +984,12 @@ async fn v1_body_model_fails_over_when_the_primary_wont_connect() {
 }
 
 /// Stock Anthropic SDK: `POST /v1/messages` with `model` in the body and `x-api-key`.
+/// Anthropic is dead; OpenRouter Chat Completions serves a translated body.
 #[tokio::test]
-async fn v1_messages_body_model_fails_over_on_the_anthropic_wire() {
+async fn v1_messages_body_model_fails_over_to_openrouter_chat() {
     let nats_port = unused_nats_port();
     let (pubkey, sk) = test_keypair(1);
-    let fallback = MockUpstream::start(Mode::AnthropicJson).await;
+    let fallback = MockUpstream::start(Mode::Json).await;
     let gw = Gateway::builder(nats_port, &GatewayBuilder::dead_authority(), &b64(&pubkey))
         .providers(&["anthropic", "openrouter"])
         .provider_authority("openrouter", &fallback.authority())
@@ -1013,13 +1007,18 @@ async fn v1_messages_body_model_fails_over_on_the_anthropic_wire() {
     assert_eq!(
         resp.status().as_u16(),
         200,
-        "Anthropic is dead; OpenRouter must serve it"
+        "Anthropic is dead; OpenRouter Chat Completions must serve it"
+    );
+    let text = resp.text().await.unwrap();
+    assert!(
+        text.contains(r#""type":"message""#),
+        "client is Messages: {text}"
     );
 
     let cap = fallback
         .captured()
         .expect("the fallback served the request");
-    assert_eq!(cap.path, "/api/v1/messages");
+    assert_eq!(cap.path, "/api/v1/chat/completions");
     assert_eq!(
         cap.authorization.as_deref(),
         Some("Bearer sk-openrouter-pool"),
@@ -1028,6 +1027,67 @@ async fn v1_messages_body_model_fails_over_on_the_anthropic_wire() {
     assert!(
         got.contains(r#""model":"anthropic/claude-opus-4.8""#),
         "the fallback must be asked for its own id: {got}"
+    );
+}
+
+/// Anthropic 5xx → OpenRouter Chat Completions: the original Messages body is re-translated
+/// onto the serving candidate (not forwarded as Messages), and billing follows that candidate.
+#[tokio::test]
+async fn anthropic_5xx_fails_over_to_openrouter_chat_with_a_chat_body() {
+    let nats_port = unused_nats_port();
+    let (pubkey, sk) = test_keypair(1);
+    let primary = MockUpstream::start(Mode::AnthropicStatus(500)).await;
+    let fallback = MockUpstream::start(Mode::Json).await;
+    let gw = Gateway::builder(nats_port, &primary.authority(), &b64(&pubkey))
+        .providers(&["anthropic", "openrouter"])
+        .provider_authority("openrouter", &fallback.authority())
+        .start()
+        .await;
+
+    let resp = test_client()
+        .post(format!("{}/v1/messages", gw.url()))
+        .header("x-api-key", vkey(&sk))
+        .header("content-type", "application/json")
+        .body(r#"{"model":"claude-opus-4-8","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "{}",
+        resp.text().await.unwrap()
+    );
+    assert!(
+        primary.hits() >= 1,
+        "Anthropic must have been attempted before failover"
+    );
+
+    let cap = fallback
+        .captured()
+        .expect("OpenRouter Chat Completions served after the 5xx");
+    assert_eq!(cap.path, "/api/v1/chat/completions");
+    assert_eq!(cap.anthropic_version, None);
+    let got = String::from_utf8(cap.body).unwrap();
+    assert!(
+        got.contains(r#""model":"anthropic/claude-opus-4.8""#),
+        "{got}"
+    );
+    assert!(
+        got.contains(r#""messages""#) && got.contains(r#""hi""#),
+        "original client body must be spliced into Chat Completions: {got}"
+    );
+    assert!(
+        !got.contains("stream_options"),
+        "non-stream Chat Completions must not grow include_usage: {got}"
+    );
+
+    let line = gw
+        .wait_for_log_line(&["ai.usage", r#""provider":"openrouter""#])
+        .await;
+    assert!(
+        line.contains(r#""input_tokens":11"#),
+        "billing dialect is the serving Chat Completions candidate: {line}"
     );
 }
 

@@ -55,6 +55,26 @@ impl Endpoint {
             Dialect::OpenAi => Endpoint::ChatCompletions,
         }
     }
+
+    /// The endpoint a **candidate path** (or any upstream path) serves. `/messages` is Messages,
+    /// `/responses` is Responses, everything else is Chat Completions — including OpenRouter's
+    /// `/api/v1/chat/completions`. Used per attempt so a mixed row never sends the wrong wire.
+    pub fn of_upstream_path(path: &str) -> Self {
+        if path.ends_with("/messages") {
+            Endpoint::Messages
+        } else if path.contains("/responses") {
+            Endpoint::Responses
+        } else {
+            Endpoint::ChatCompletions
+        }
+    }
+
+    pub fn wire(self) -> Dialect {
+        match self {
+            Endpoint::Messages => Dialect::Anthropic,
+            Endpoint::ChatCompletions | Endpoint::Responses => Dialect::OpenAi,
+        }
+    }
 }
 
 /// The default API prefix OpenAI/Anthropic clients use. A request with no provider segment whose

@@ -576,13 +576,13 @@ async fn auto_v1_messages_translates_gpt() {
     assert_eq!(cap.path, "/v1/chat/completions");
 }
 
-/// Translate state lives across a candidate walk: Anthropic is dead, OpenRouter serves Messages,
-/// the OpenAI client still sees Chat Completions.
+/// Translate state lives across a candidate walk: Anthropic is dead, OpenRouter serves Chat
+/// Completions (mixed-wire), the OpenAI client still sees Chat Completions (same as the fallback).
 #[tokio::test]
 async fn failover_while_translating_still_returns_the_client_dialect() {
     let nats_port = unused_nats_port();
     let (pubkey, sk) = test_keypair(1);
-    let fallback = MockUpstream::start(Mode::AnthropicJson).await;
+    let fallback = MockUpstream::start(Mode::Json).await;
     let gw = Gateway::builder(nats_port, &GatewayBuilder::dead_authority(), &b64(&pubkey))
         .providers(&["anthropic", "openrouter"])
         .provider_authority("openrouter", &fallback.authority())
@@ -600,18 +600,22 @@ async fn failover_while_translating_still_returns_the_client_dialect() {
     assert_eq!(
         resp.status().as_u16(),
         200,
-        "Anthropic is dead; OpenRouter must serve the translated walk"
+        "Anthropic is dead; OpenRouter Chat Completions must serve the walk"
     );
     let text = resp.text().await.unwrap();
     assert!(text.contains("chat.completion"), "{text}");
     assert!(!text.contains(r#""type":"message""#), "{text}");
 
     let cap = fallback.captured().expect("fallback served");
-    assert_eq!(cap.path, "/api/v1/messages");
+    assert_eq!(cap.path, "/api/v1/chat/completions");
     let got = String::from_utf8(cap.body).unwrap();
     assert!(
         got.contains(r#""model":"anthropic/claude-opus-4.8""#),
-        "failover must splice the OpenRouter candidate id after translate: {got}"
+        "failover must splice the OpenRouter candidate id: {got}"
+    );
+    assert!(
+        got.contains(r#""messages""#),
+        "Chat Completions client onto a Chat Completions candidate is a splice, not Messages: {got}"
     );
 }
 
