@@ -5,9 +5,11 @@
 //! the same contract as payload capture. BYO and `/{provider}` passthrough are not cached — those
 //! paths do not have the client body in hand before `upstream_peer`.
 //!
-//! The key is a hash of the **pre-rewrite** body + inbound path + `tenant_id`. Not the pool key,
-//! not the candidate, not the raw virtual key: a 429 that walks to a second key and then 200s is
-//! still one client request and is stored under that request's body hash.
+//! The key is a hash of the **pre-rewrite** body + inbound path + `tenant_id` + the effective
+//! catalog-walk candidate order (provider ids). Not the pool key, not the serving candidate, not
+//! the raw virtual key: a 429 that walks to a second key and then 200s is still one client request.
+//! Split/order permute the walk, so each arm is its own cache entry rather than pinning A/B traffic
+//! to whichever provider filled first.
 
 use crate::usage::Usage;
 use bytes::Bytes;
@@ -17,7 +19,7 @@ use std::hash::Hasher;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-/// 128-bit fingerprint of `(tenant_id, inbound path, pre-rewrite body)`.
+/// 128-bit fingerprint of `(tenant_id, inbound path, pre-rewrite body, candidate provider ids)`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct CacheKey([u8; 16]);
 
@@ -86,8 +88,10 @@ impl ResponseTap {
 }
 
 /// Fingerprint used as the map key. Length prefixes stop `path||body` concatenation collisions.
-pub fn key(tenant_id: u64, inbound_path: &str, body: &[u8]) -> CacheKey {
-    fn sip(seed: u8, tenant_id: u64, path: &str, body: &[u8]) -> u64 {
+/// `providers` is the effective catalog-walk order (`ProviderId::index` bytes) so split/order
+/// cache per arm instead of pinning both to the first fill.
+pub fn key(tenant_id: u64, inbound_path: &str, body: &[u8], providers: &[u8]) -> CacheKey {
+    fn sip(seed: u8, tenant_id: u64, path: &str, body: &[u8], providers: &[u8]) -> u64 {
         let mut h = std::collections::hash_map::DefaultHasher::new();
         h.write(&[seed]);
         h.write(&tenant_id.to_le_bytes());
@@ -95,10 +99,12 @@ pub fn key(tenant_id: u64, inbound_path: &str, body: &[u8]) -> CacheKey {
         h.write(path.as_bytes());
         h.write(&(body.len() as u64).to_le_bytes());
         h.write(body);
+        h.write(&(providers.len() as u64).to_le_bytes());
+        h.write(providers);
         h.finish()
     }
-    let a = sip(0, tenant_id, inbound_path, body).to_le_bytes();
-    let b = sip(1, tenant_id, inbound_path, body).to_le_bytes();
+    let a = sip(0, tenant_id, inbound_path, body, providers).to_le_bytes();
+    let b = sip(1, tenant_id, inbound_path, body, providers).to_le_bytes();
     let mut out = [0u8; 16];
     out[..8].copy_from_slice(&a);
     out[8..].copy_from_slice(&b);
@@ -266,25 +272,44 @@ mod tests {
     }
 
     #[test]
-    fn key_is_tenant_path_and_body_not_a_pool_or_candidate() {
+    fn key_is_tenant_path_body_and_candidate_order() {
         let body = br#"{"model":"gpt-4o","messages":[]}"#;
-        let a = key(1, "/v1/chat/completions", body);
-        assert_eq!(a, key(1, "/v1/chat/completions", body));
-        assert_ne!(a, key(2, "/v1/chat/completions", body), "tenant isolation");
+        let a = key(1, "/v1/chat/completions", body, &[0, 2]);
+        assert_eq!(a, key(1, "/v1/chat/completions", body, &[0, 2]));
         assert_ne!(
             a,
-            key(1, "/auto/chat/completions", body),
+            key(2, "/v1/chat/completions", body, &[0, 2]),
+            "tenant isolation"
+        );
+        assert_ne!(
+            a,
+            key(1, "/auto/chat/completions", body, &[0, 2]),
             "inbound path is part of the key"
         );
         assert_ne!(
             a,
-            key(1, "/v1/chat/completions", br#"{"model":"gpt-4o-mini"}"#),
+            key(
+                1,
+                "/v1/chat/completions",
+                br#"{"model":"gpt-4o-mini"}"#,
+                &[0, 2]
+            ),
             "body is part of the key"
+        );
+        assert_ne!(
+            a,
+            key(1, "/v1/chat/completions", body, &[2, 0]),
+            "candidate order is part of the key — split/order cache per arm"
+        );
+        assert_ne!(
+            a,
+            key(1, "/v1/chat/completions", body, &[0]),
+            "a shorter walk is a different arm"
         );
         // Concatenation must not collide: path "ab" + body "c" vs path "a" + body "bc".
         assert_ne!(
-            key(1, "ab", b"c"),
-            key(1, "a", b"bc"),
+            key(1, "ab", b"c", &[]),
+            key(1, "a", b"bc", &[]),
             "length prefixes stop concatenation collisions"
         );
     }
@@ -292,19 +317,19 @@ mod tests {
     #[test]
     fn insert_then_get_replays_the_stored_bytes() {
         let c = ResponseCache::new(Duration::from_secs(60), 8, 1024);
-        let k = key(1, "/v1/chat/completions", b"{}");
+        let k = key(1, "/v1/chat/completions", b"{}", &[]);
         c.insert(k, entry(b"{\"ok\":true}"));
         let hit = c.get(&k).expect("hit");
         assert_eq!(hit.status, 200);
         assert_eq!(hit.body.as_ref(), br#"{"ok":true}"#);
         assert_eq!(hit.usage, usage(11, 7));
-        assert!(c.get(&key(2, "/v1/chat/completions", b"{}")).is_none());
+        assert!(c.get(&key(2, "/v1/chat/completions", b"{}", &[])).is_none());
     }
 
     #[test]
     fn expired_entry_is_a_miss() {
         let c = ResponseCache::new(Duration::from_millis(1), 8, 1024);
-        let k = key(1, "/v1", b"x");
+        let k = key(1, "/v1", b"x", &[]);
         c.insert(k, entry(b"old"));
         std::thread::sleep(Duration::from_millis(5));
         assert!(c.get(&k).is_none(), "TTL expiry must miss, not serve stale");
@@ -313,9 +338,9 @@ mod tests {
     #[test]
     fn max_entries_evicts_the_oldest() {
         let c = ResponseCache::new(Duration::from_secs(60), 2, 1024);
-        let k1 = key(1, "/v1", b"a");
-        let k2 = key(1, "/v1", b"b");
-        let k3 = key(1, "/v1", b"c");
+        let k1 = key(1, "/v1", b"a", &[]);
+        let k2 = key(1, "/v1", b"b", &[]);
+        let k3 = key(1, "/v1", b"c", &[]);
         c.insert(k1, entry(b"1"));
         c.insert(k2, entry(b"2"));
         c.insert(k3, entry(b"3"));
@@ -327,7 +352,7 @@ mod tests {
     #[test]
     fn oversized_body_is_not_stored() {
         let c = ResponseCache::new(Duration::from_secs(60), 8, 4);
-        let k = key(1, "/v1", b"x");
+        let k = key(1, "/v1", b"x", &[]);
         c.insert(k, entry(b"12345"));
         assert!(c.get(&k).is_none());
         c.insert(k, entry(b"1234"));

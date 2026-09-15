@@ -1212,3 +1212,160 @@ async fn v1_models_lists_the_catalog() {
     assert_eq!(claude["wire"], "anthropic");
     assert_eq!(mock.hits(), 0, "listing must not contact an upstream");
 }
+
+const CLAUDE: &str = "claude-opus-4-8";
+
+fn claude_body() -> &'static str {
+    r#"{"model":"claude-opus-4-8","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}"#
+}
+
+async fn post_claude(
+    client: &reqwest::Client,
+    url: &str,
+    key: &str,
+    extra: &[(&str, &str)],
+) -> reqwest::Response {
+    let mut req = client
+        .post(format!("{url}/auto/v1/messages"))
+        .header("authorization", format!("Bearer {key}"))
+        .header("content-type", "application/json")
+        .header("x-beyond-model", CLAUDE);
+    for (k, v) in extra {
+        req = req.header(*k, *v);
+    }
+    req.body(claude_body()).send().await.unwrap()
+}
+
+/// Catalog is Anthropic-first; `x-beyond-order: bedrock` must hit Bedrock's mount, key, and id.
+#[tokio::test]
+async fn order_header_front_loads_bedrock_on_an_anthropic_first_row() {
+    let nats_port = unused_nats_port();
+    let (pubkey, sk) = test_keypair(1);
+    let anthropic = MockUpstream::start(Mode::AnthropicJson).await;
+    let bedrock = MockUpstream::start(Mode::AnthropicJson).await;
+    let gw = Gateway::builder(nats_port, &anthropic.authority(), &b64(&pubkey))
+        .providers(&["anthropic", "bedrock", "openrouter"])
+        .provider_authority("bedrock", &bedrock.authority())
+        .provider_authority("openrouter", &GatewayBuilder::dead_authority())
+        .start()
+        .await;
+
+    let resp = post_claude(
+        &test_client(),
+        &gw.url(),
+        &vkey(&sk),
+        &[("x-beyond-order", "bedrock")],
+    )
+    .await;
+    assert_eq!(resp.status().as_u16(), 200);
+
+    let cap = bedrock.captured().expect("bedrock served the request");
+    assert_eq!(cap.path, "/anthropic/v1/messages");
+    assert_eq!(cap.x_api_key.as_deref(), Some("sk-bedrock-pool"));
+    assert_eq!(
+        cap.authorization, None,
+        "Bedrock's scheme is x-api-key, not Bearer"
+    );
+    assert_eq!(cap.beyond_order, None, "walk header must not leak upstream");
+    assert_eq!(cap.beyond_model, None);
+    let body = String::from_utf8(cap.body).unwrap();
+    assert!(
+        body.contains(r#""model":"us.anthropic.claude-opus-4-8""#),
+        "bedrock must be asked for its inference-profile id: {body}"
+    );
+    assert_eq!(anthropic.hits(), 0, "anthropic must not be tried first");
+}
+
+/// `only` of a provider the row lists but this gateway has no pool key for is the same 503 as
+/// an unkeyed row.
+#[tokio::test]
+async fn only_of_an_unkeyed_provider_is_503() {
+    let nats_port = unused_nats_port();
+    let (pubkey, sk) = test_keypair(1);
+    let primary = MockUpstream::start(Mode::Json).await;
+    let gw = Gateway::builder(nats_port, &primary.authority(), &b64(&pubkey))
+        .providers(&["openai"])
+        .start()
+        .await;
+
+    let resp = test_client()
+        .post(format!("{}/auto/chat/completions", gw.url()))
+        .header("authorization", format!("Bearer {}", vkey(&sk)))
+        .header("content-type", "application/json")
+        .header("x-beyond-model", MODEL)
+        .header("x-beyond-only", "openrouter")
+        .body(body())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 503);
+    assert_eq!(primary.hits(), 0, "openai was filtered out of the walk");
+}
+
+/// Unparseable walk headers are dropped: catalog order, plus the error counter. Never 4xx.
+#[tokio::test]
+async fn junk_walk_header_keeps_catalog_order_and_is_counted() {
+    let nats_port = unused_nats_port();
+    let (pubkey, sk) = test_keypair(1);
+    let primary = MockUpstream::start(Mode::Json).await;
+    let fallback = MockUpstream::start(Mode::Json).await;
+    let gw = Gateway::builder(nats_port, &primary.authority(), &b64(&pubkey))
+        .providers(&["openai", "openrouter"])
+        .provider_authority("openrouter", &fallback.authority())
+        .start()
+        .await;
+
+    let resp = test_client()
+        .post(format!("{}/auto/chat/completions", gw.url()))
+        .header("authorization", format!("Bearer {}", vkey(&sk)))
+        .header("content-type", "application/json")
+        .header("x-beyond-model", MODEL)
+        .header("x-beyond-split", "nope")
+        .body(body())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200, "junk must not 4xx the request");
+    assert!(primary.hits() >= 1, "default catalog order is openai-first");
+    assert_eq!(fallback.hits(), 0);
+    let metrics = gw.metrics().await;
+    assert!(
+        parse_metric(&metrics, "ai_control_header_errors_total", "") >= 1.0,
+        "junk walk header must be counted:\n{metrics}"
+    );
+}
+
+/// Weighted split over many requests hits both named primaries. Leftover is failover, so a live
+/// primary is enough — we never need the leftover to fire.
+#[tokio::test]
+async fn split_over_n_requests_hits_both_primaries() {
+    let nats_port = unused_nats_port();
+    let (pubkey, sk) = test_keypair(1);
+    let anthropic = MockUpstream::start(Mode::AnthropicJson).await;
+    let bedrock = MockUpstream::start(Mode::AnthropicJson).await;
+    let gw = Gateway::builder(nats_port, &anthropic.authority(), &b64(&pubkey))
+        .providers(&["anthropic", "bedrock", "openrouter"])
+        .provider_authority("bedrock", &bedrock.authority())
+        .provider_authority("openrouter", &GatewayBuilder::dead_authority())
+        .start()
+        .await;
+
+    let client = test_client();
+    let key = vkey(&sk);
+    for _ in 0..40 {
+        let resp = post_claude(
+            &client,
+            &gw.url(),
+            &key,
+            &[("x-beyond-split", "anthropic=70,bedrock=30")],
+        )
+        .await;
+        assert_eq!(resp.status().as_u16(), 200);
+    }
+    assert!(
+        anthropic.hits() >= 1 && bedrock.hits() >= 1,
+        "70/30 split must land on both primaries (anthropic={}, bedrock={})",
+        anthropic.hits(),
+        bedrock.hits()
+    );
+}

@@ -2,18 +2,29 @@
 //!
 //! One parse seam for everything a caller can say about a single request, read once in
 //! `proxy::request_filter` after identity is verified and stripped before the request leaves for the
-//! provider. Three members today:
+//! provider. Members today:
 //!
 //! | Header | Value | Effect |
 //! |---|---|---|
 //! | `x-beyond-metadata` | flat JSON object of scalars | tagged onto `ai.usage` + `ai.payload` |
 //! | `x-beyond-capture` | `on` / `off` | enable or suppress payload capture for this request |
 //! | `x-beyond-cache` | `on` / `off` | enable or skip the exact-match response cache for this request |
+//! | `x-beyond-order` | `bedrock,anthropic` | those providers first (stable), then the rest of the row |
+//! | `x-beyond-only` | `bedrock,openrouter` | drop anyone on the row not named |
+//! | `x-beyond-split` | `anthropic=70,bedrock=30` | pick the primary by those weights; leftover stay failover |
+//!
+//! Walk headers permute a catalog row's candidate list. They never add a provider the row does not
+//! already list, they do not change the wire, and they run **before** `first_usable` / breaker skip
+//! so failover, breakers, and the 429 key-walk see the permuted sequence. Names must match
+//! [`providers::ProviderSpec::name`] on that row; unknown names are dropped. An `only` filter that
+//! leaves nothing usable is a 503 from routing (the same as no pool-keyed candidate) — not a 4xx
+//! from this module.
 //!
 //! **Nothing here can fail a request.** Every malformed, oversize, or unrecognized value is dropped
 //! and counted, and the request proceeds exactly as if the header were absent. An observability
 //! header that can 400 a customer's inference call is a worse bug than the missing observability —
 //! and this is a *proxy*, where the client's own SDK is what generated the header we'd be rejecting.
+//! Unparseable walk headers are that case: default catalog order, plus the error counter.
 //!
 //! **Metadata is re-serialized, never passed through.** We parse the client's JSON, validate it, and
 //! emit JSON we build ourselves from the parsed values. That makes log injection structurally
@@ -26,6 +37,7 @@
 
 use http::header::HeaderName;
 use pingora::http::RequestHeader;
+use providers::{Candidate, MAX_CANDIDATES, by_id};
 use std::sync::LazyLock;
 
 /// Tag set for cost attribution: `{"feature":"summarizer","org":"acme"}`.
@@ -37,7 +49,16 @@ pub const CAPTURE_HEADER: &str = "x-beyond-capture";
 /// Per-request exact-match cache override: `on` or `off`. `off` skips lookup and store.
 pub const CACHE_HEADER: &str = "x-beyond-cache";
 
-/// The same three names as pre-parsed [`HeaderName`]s, which is what [`Control::parse`] actually looks
+/// Catalog-walk preference: named providers first, then the rest of the row, catalog-relative.
+pub const ORDER_HEADER: &str = "x-beyond-order";
+
+/// Catalog-walk filter: keep only the named providers that already sit on the row.
+pub const ONLY_HEADER: &str = "x-beyond-only";
+
+/// Catalog-walk weighted primary: `name=weight` pairs; leftover candidates stay failover.
+pub const SPLIT_HEADER: &str = "x-beyond-split";
+
+/// The same names as pre-parsed [`HeaderName`]s, which is what [`Control::parse`] actually looks
 /// up with.
 ///
 /// `HeaderMap::get(&str)` re-hashes the name on every call; `get(&HeaderName)` uses the hash the
@@ -51,11 +72,21 @@ static METADATA_NAME: LazyLock<HeaderName> =
 static CAPTURE_NAME: LazyLock<HeaderName> =
     LazyLock::new(|| HeaderName::from_static(CAPTURE_HEADER));
 static CACHE_NAME: LazyLock<HeaderName> = LazyLock::new(|| HeaderName::from_static(CACHE_HEADER));
+static ORDER_NAME: LazyLock<HeaderName> = LazyLock::new(|| HeaderName::from_static(ORDER_HEADER));
+static ONLY_NAME: LazyLock<HeaderName> = LazyLock::new(|| HeaderName::from_static(ONLY_HEADER));
+static SPLIT_NAME: LazyLock<HeaderName> = LazyLock::new(|| HeaderName::from_static(SPLIT_HEADER));
 
 /// Every header this module consumes. Stripped in `upstream_request_filter` so a provider never
 /// sees a Beyond control header — they're ours, they'd be meaningless upstream, and a provider that
 /// rejects unknown headers would turn our observability feature into their 400.
-pub const CONTROL_HEADERS: [&str; 3] = [METADATA_HEADER, CAPTURE_HEADER, CACHE_HEADER];
+pub const CONTROL_HEADERS: [&str; 6] = [
+    METADATA_HEADER,
+    CAPTURE_HEADER,
+    CACHE_HEADER,
+    ORDER_HEADER,
+    ONLY_HEADER,
+    SPLIT_HEADER,
+];
 
 /// Longest metadata header we'll even attempt to parse. Checked **before** parsing so a caller
 /// can't make us walk a multi-megabyte JSON document on the request path.
@@ -82,9 +113,57 @@ pub struct Control {
     /// lookup and store. `None` = no opinion. `Cache-Control: no-store` is checked separately and
     /// also skips.
     pub cache: Option<bool>,
+    /// Named providers to front-load, in the order written. `None` when absent or unusable.
+    pub order: Option<Vec<String>>,
+    /// Named providers to keep. `None` when absent or unusable. An empty-after-apply list is a
+    /// routing 503, not a parse failure.
+    pub only: Option<Vec<String>>,
+    /// Weighted primary: `(ProviderSpec::name, weight)`. `None` when absent or unusable.
+    pub split: Option<Vec<(String, u32)>>,
     /// A header was present but unusable. Drives `control_header_errors_total` — without it a
     /// client whose tags silently never appear has no signal to debug against.
     pub malformed: bool,
+}
+
+/// Catalog indices in the order this request will walk them.
+///
+/// Bit `i` of the gateway's `usable` mask refers to walk slot `i`, which maps to
+/// `row.candidates[indices[i]]`. Identity (`indices[i] = i`) when no walk header applied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Walk {
+    pub indices: [u8; MAX_CANDIDATES],
+    pub len: u8,
+}
+
+impl Walk {
+    /// Catalog order, truncated to [`MAX_CANDIDATES`].
+    pub fn identity(n: usize) -> Self {
+        let len = n.min(MAX_CANDIDATES) as u8;
+        let mut indices = [0u8; MAX_CANDIDATES];
+        for i in 0..len {
+            indices[i as usize] = i;
+        }
+        Self { indices, len }
+    }
+
+    /// Original catalog index for walk slot `i`, if that slot exists.
+    pub fn catalog_index(self, i: u8) -> Option<u8> {
+        (i < self.len).then_some(self.indices[i as usize])
+    }
+
+    /// `ProviderId::index` bytes in walk order — the exact-match cache's per-arm discriminator.
+    pub fn provider_ids(self, candidates: &[Candidate]) -> ([u8; MAX_CANDIDATES], u8) {
+        let mut ids = [0u8; MAX_CANDIDATES];
+        let mut n = 0u8;
+        for i in 0..self.len {
+            let Some(c) = candidates.get(usize::from(self.indices[i as usize])) else {
+                continue;
+            };
+            ids[n as usize] = c.provider.index() as u8;
+            n += 1;
+        }
+        (ids, n)
+    }
 }
 
 impl Control {
@@ -115,7 +194,43 @@ impl Control {
             }
         }
 
+        if let Some(raw) = req.headers.get(&*ORDER_NAME) {
+            match raw.to_str().ok().and_then(parse_name_list) {
+                Some(v) => out.order = Some(v),
+                None => out.malformed = true,
+            }
+        }
+
+        if let Some(raw) = req.headers.get(&*ONLY_NAME) {
+            match raw.to_str().ok().and_then(parse_name_list) {
+                Some(v) => out.only = Some(v),
+                None => out.malformed = true,
+            }
+        }
+
+        if let Some(raw) = req.headers.get(&*SPLIT_NAME) {
+            match raw.to_str().ok().and_then(parse_split) {
+                Some(v) => out.split = Some(v),
+                None => out.malformed = true,
+            }
+        }
+
         out
+    }
+
+    /// Catalog indices in the order this request will walk them.
+    ///
+    /// `only` filters, then `order` front-loads named providers, then `split` picks the primary
+    /// from its weighted names (deterministic in `seed`, not `rand`). Unknown names are dropped.
+    /// Does not add a provider the row does not already list.
+    pub fn catalog_walk(&self, candidates: &[Candidate], seed: u64) -> Walk {
+        permute(
+            candidates,
+            self.only.as_deref(),
+            self.order.as_deref(),
+            self.split.as_deref(),
+            seed,
+        )
     }
 }
 
@@ -127,6 +242,166 @@ fn parse_on_off(raw: &str) -> Option<bool> {
         v if v.eq_ignore_ascii_case("on") => Some(true),
         v if v.eq_ignore_ascii_case("off") => Some(false),
         _ => None,
+    }
+}
+
+/// Comma-separated `ProviderSpec::name` tokens. Empty / whitespace-only / no tokens → unusable.
+fn parse_name_list(raw: &str) -> Option<Vec<String>> {
+    let mut names = Vec::new();
+    for part in raw.split(',') {
+        let name = part.trim();
+        if name.is_empty() {
+            continue;
+        }
+        if names.len() == MAX_CANDIDATES {
+            break;
+        }
+        names.push(name.to_string());
+    }
+    (!names.is_empty()).then_some(names)
+}
+
+/// Comma-separated `name=weight` pairs. Weights are unsigned integers; a zero-weight arm is kept
+/// so apply can skip it. No valid pair → unusable (counted, default order).
+fn parse_split(raw: &str) -> Option<Vec<(String, u32)>> {
+    let mut out = Vec::new();
+    for part in raw.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let (name, weight) = part.split_once('=')?;
+        let name = name.trim();
+        let weight = weight.trim();
+        if name.is_empty() || weight.is_empty() || !weight.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        let w: u32 = weight.parse().ok()?;
+        if out.len() == MAX_CANDIDATES {
+            break;
+        }
+        out.push((name.to_string(), w));
+    }
+    out.iter().any(|(_, w)| *w > 0).then_some(out)
+}
+
+/// Stable mix so adjacent `seed` values (a request counter) do not all land on the same side of a
+/// 70/30 cut. Not `std`'s `DefaultHasher`: that carries a per-process key, which is the
+/// rand-per-replica chaos a split header exists to avoid.
+fn mix64(mut x: u64) -> u64 {
+    x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    x ^ (x >> 31)
+}
+
+fn provider_name(c: &Candidate) -> &'static str {
+    by_id(c.provider).name
+}
+
+fn permute(
+    candidates: &[Candidate],
+    only: Option<&[String]>,
+    order: Option<&[String]>,
+    split: Option<&[(String, u32)]>,
+    seed: u64,
+) -> Walk {
+    let n_orig = candidates.len().min(MAX_CANDIDATES) as u8;
+    let mut idx = [0u8; MAX_CANDIDATES];
+    let mut n = 0u8;
+
+    if let Some(only) = only {
+        for i in 0..n_orig {
+            if only
+                .iter()
+                .any(|s| s == provider_name(&candidates[i as usize]))
+            {
+                idx[n as usize] = i;
+                n += 1;
+            }
+        }
+    } else {
+        for i in 0..n_orig {
+            idx[i as usize] = i;
+        }
+        n = n_orig;
+    }
+
+    if let Some(order) = order {
+        let mut out = [0u8; MAX_CANDIDATES];
+        let mut k = 0u8;
+        let mut used = 0u8;
+        for want in order {
+            for j in 0..n {
+                if used & (1 << j) != 0 {
+                    continue;
+                }
+                if provider_name(&candidates[idx[j as usize] as usize]) == want {
+                    out[k as usize] = idx[j as usize];
+                    k += 1;
+                    used |= 1 << j;
+                    break;
+                }
+            }
+        }
+        for j in 0..n {
+            if used & (1 << j) == 0 {
+                out[k as usize] = idx[j as usize];
+                k += 1;
+            }
+        }
+        idx = out;
+        n = k;
+    }
+
+    if let Some(split) = split {
+        let mut arms = [(0u8, 0u32); MAX_CANDIDATES];
+        let mut nw = 0u8;
+        let mut total = 0u32;
+        for (want, w) in split {
+            if *w == 0 {
+                continue;
+            }
+            for j in 0..n {
+                if provider_name(&candidates[idx[j as usize] as usize]) == want
+                    && !arms[..nw as usize].iter().any(|(s, _)| *s == j)
+                {
+                    arms[nw as usize] = (j, *w);
+                    total = total.saturating_add(*w);
+                    nw += 1;
+                    break;
+                }
+            }
+        }
+        if nw > 0 && total > 0 {
+            let r = (mix64(seed) % u64::from(total)) as u32;
+            let mut acc = 0u32;
+            let mut pick_slot = arms[0].0;
+            for &(slot, w) in &arms[..nw as usize] {
+                acc += w;
+                if r < acc {
+                    pick_slot = slot;
+                    break;
+                }
+            }
+            let primary = idx[pick_slot as usize];
+            let mut out = [0u8; MAX_CANDIDATES];
+            out[0] = primary;
+            let mut k = 1u8;
+            for j in 0..n {
+                if idx[j as usize] != primary {
+                    out[k as usize] = idx[j as usize];
+                    k += 1;
+                }
+            }
+            idx = out;
+            n = k;
+        }
+    }
+
+    Walk {
+        indices: idx,
+        len: n,
     }
 }
 
@@ -383,5 +658,144 @@ mod tests {
             assert_eq!(c.cache, None, "{raw}");
             assert!(c.malformed, "{raw}");
         }
+    }
+
+    fn claude_row() -> &'static providers::ModelRoute {
+        providers::catalog::for_model("claude-opus-4-8").expect("catalog row")
+    }
+
+    fn walk_names(walk: Walk, candidates: &[Candidate]) -> Vec<&'static str> {
+        (0..walk.len)
+            .map(|i| provider_name(&candidates[usize::from(walk.indices[i as usize])]))
+            .collect()
+    }
+
+    #[test]
+    fn order_and_only_parse_comma_lists() {
+        let c = Control::parse(&req(&[
+            (ORDER_HEADER, " bedrock, anthropic "),
+            (ONLY_HEADER, "bedrock,openrouter"),
+        ]));
+        assert_eq!(
+            c.order.as_deref(),
+            Some(["bedrock".to_string(), "anthropic".to_string()].as_slice())
+        );
+        assert_eq!(
+            c.only.as_deref(),
+            Some(["bedrock".to_string(), "openrouter".to_string()].as_slice())
+        );
+        assert!(!c.malformed);
+    }
+
+    #[test]
+    fn split_parses_name_weight_pairs() {
+        let c = Control::parse(&req(&[(SPLIT_HEADER, "anthropic=70, bedrock=30")]));
+        assert_eq!(
+            c.split.as_deref(),
+            Some([("anthropic".to_string(), 70), ("bedrock".to_string(), 30)].as_slice())
+        );
+        assert!(!c.malformed);
+    }
+
+    #[test]
+    fn junk_walk_headers_are_dropped_and_counted() {
+        for (header, raw) in [
+            (ORDER_HEADER, ""),
+            (ORDER_HEADER, "   ,  ,"),
+            (ONLY_HEADER, ""),
+            (SPLIT_HEADER, "nope"),
+            (SPLIT_HEADER, "anthropic"),
+            (SPLIT_HEADER, "anthropic="),
+            (SPLIT_HEADER, "=70"),
+            (SPLIT_HEADER, "anthropic=-1"),
+            (SPLIT_HEADER, "anthropic=70.5"),
+            (SPLIT_HEADER, "anthropic=0,bedrock=0"),
+        ] {
+            let c = Control::parse(&req(&[(header, raw)]));
+            assert!(
+                c.order.is_none() && c.only.is_none() && c.split.is_none(),
+                "{header}={raw}"
+            );
+            assert!(c.malformed, "{header}={raw}");
+        }
+    }
+
+    #[test]
+    fn order_front_loads_named_providers_then_the_rest() {
+        let row = claude_row();
+        let c = Control::parse(&req(&[(ORDER_HEADER, "bedrock")]));
+        let walk = c.catalog_walk(row.candidates, 0);
+        assert_eq!(
+            walk_names(walk, row.candidates),
+            ["bedrock", "anthropic", "openrouter"]
+        );
+    }
+
+    #[test]
+    fn only_drops_anyone_not_named() {
+        let row = claude_row();
+        let c = Control::parse(&req(&[(ONLY_HEADER, "bedrock,openrouter")]));
+        let walk = c.catalog_walk(row.candidates, 0);
+        assert_eq!(walk_names(walk, row.candidates), ["bedrock", "openrouter"]);
+    }
+
+    #[test]
+    fn unknown_names_are_dropped_without_adding_off_row_providers() {
+        let row = claude_row();
+        let c = Control::parse(&req(&[(ORDER_HEADER, "openai,bedrock,not-a-provider")]));
+        let walk = c.catalog_walk(row.candidates, 0);
+        // openai is a real provider but not on this row — must not appear.
+        assert_eq!(
+            walk_names(walk, row.candidates),
+            ["bedrock", "anthropic", "openrouter"]
+        );
+        assert!(!c.malformed);
+    }
+
+    #[test]
+    fn only_of_unknown_names_leaves_an_empty_walk() {
+        let row = claude_row();
+        let c = Control::parse(&req(&[(ONLY_HEADER, "openai")]));
+        let walk = c.catalog_walk(row.candidates, 0);
+        assert_eq!(walk.len, 0);
+    }
+
+    #[test]
+    fn split_picks_a_weighted_primary_and_keeps_leftover_in_catalog_order() {
+        let row = claude_row();
+        let c = Control::parse(&req(&[(SPLIT_HEADER, "anthropic=70,bedrock=30")]));
+        let mut saw_anthropic = false;
+        let mut saw_bedrock = false;
+        for seed in 0..256 {
+            let walk = c.catalog_walk(row.candidates, seed);
+            let names = walk_names(walk, row.candidates);
+            assert_eq!(names.len(), 3, "{names:?}");
+            match names[0] {
+                "anthropic" => {
+                    saw_anthropic = true;
+                    assert_eq!(names, ["anthropic", "bedrock", "openrouter"]);
+                }
+                "bedrock" => {
+                    saw_bedrock = true;
+                    assert_eq!(names, ["bedrock", "anthropic", "openrouter"]);
+                }
+                other => panic!("split must pick a named arm, not {other}"),
+            }
+        }
+        assert!(
+            saw_anthropic && saw_bedrock,
+            "a 70/30 split over many seeds must hit both primaries"
+        );
+    }
+
+    #[test]
+    fn default_walk_is_catalog_order() {
+        let row = claude_row();
+        let walk = Control::default().catalog_walk(row.candidates, 0);
+        assert_eq!(
+            walk_names(walk, row.candidates),
+            ["anthropic", "bedrock", "openrouter"]
+        );
+        assert_eq!(walk, Walk::identity(row.candidates.len()));
     }
 }

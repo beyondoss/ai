@@ -341,6 +341,9 @@ pub struct Captured {
     /// an observability opt-in into their 400. Both must always be `None` at the upstream.
     pub beyond_metadata: Option<String>,
     pub beyond_capture: Option<String>,
+    pub beyond_order: Option<String>,
+    pub beyond_only: Option<String>,
+    pub beyond_split: Option<String>,
     pub body: Vec<u8>,
 }
 
@@ -461,7 +464,17 @@ async fn mock_handle(
         .unwrap_or_else(|| req.uri().path())
         .to_string();
     // Pull the headers we record before consuming the body (which moves `req`).
-    let (authorization, x_api_key, host, beyond_model, beyond_metadata, beyond_capture) = {
+    let (
+        authorization,
+        x_api_key,
+        host,
+        beyond_model,
+        beyond_metadata,
+        beyond_capture,
+        beyond_order,
+        beyond_only,
+        beyond_split,
+    ) = {
         let h = req.headers();
         let get = |k: &str| h.get(k).and_then(|v| v.to_str().ok()).map(String::from);
         (
@@ -471,6 +484,9 @@ async fn mock_handle(
             get("x-beyond-model"),
             get("x-beyond-metadata"),
             get("x-beyond-capture"),
+            get("x-beyond-order"),
+            get("x-beyond-only"),
+            get("x-beyond-split"),
         )
     };
     let body = req
@@ -503,6 +519,9 @@ async fn mock_handle(
         beyond_model,
         beyond_metadata,
         beyond_capture,
+        beyond_order,
+        beyond_only,
+        beyond_split,
         body,
     });
     // A slow upstream is still a *working* upstream; the point is to be slower than the client's

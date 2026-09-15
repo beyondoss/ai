@@ -321,12 +321,16 @@ struct RequestControl {
 struct ModelRouting {
     /// The catalog row this request routes over. `&'static`, so it costs a pointer.
     route: &'static route::ModelRoute,
-    /// Index into `route.candidates` of the candidate currently being attempted.
+    /// Walk slot of the candidate currently being attempted. Maps through [`Self::walk`] onto
+    /// `route.candidates`.
     candidate: u8,
-    /// Bit `i` ⇒ `route.candidates[i]` is *usable*: this gateway routes to that provider and holds a
+    /// Bit `i` ⇒ walk slot `i` is *usable*: this gateway routes to that provider and holds a
     /// pool key for it. Computed once in `request_filter` so `upstream_peer` never re-derives it.
     /// Bounded by [`route::MAX_CANDIDATES`], which is why a `u8` suffices.
     usable: u8,
+    /// Catalog indices in walk order. Identity when no `x-beyond-order` / `only` / `split` applied.
+    /// `first_usable` walks this sequence; failover, breakers, and the 429 key-walk see the same.
+    walk: control::Walk,
     /// When the current attempt began. Distinct from `RequestCtx::start` (which times the whole
     /// request) so a candidate that burned `connect_timeout_secs` before failing over does not
     /// charge that time to the provider that actually served — which would render an outage at
@@ -339,6 +343,15 @@ struct ModelRouting {
     replay: Option<Bytes>,
     /// Exact-match cache: fill a miss, or a hit already written to the client.
     cache: Option<cache::Pending>,
+}
+
+impl ModelRouting {
+    /// The catalog candidate at walk slot `i`.
+    fn candidate_at(&self, i: u8) -> Option<&'static route::Candidate> {
+        self.walk
+            .catalog_index(i)
+            .and_then(|orig| self.route.candidates.get(usize::from(orig)))
+    }
 }
 
 impl RequestCtx {
@@ -1440,7 +1453,26 @@ impl ProxyHttp for AiProxy {
             }
         }
 
+        // Per-request control surface (`x-beyond-*`). Managed only: a BYO request carries no verified
+        // identity, so a tag on it would be an unattributable row and a capture would be storing
+        // prompts we can't attribute to an account that asked us to — the same reason `ai.usage`
+        // itself is managed-only.
+        //
+        // Parsed here, before the candidate walk, so `order` / `only` / `split` can permute the
+        // list `first_usable` sees. Nothing here can reject the request: `Control::parse` drops
+        // what it can't use and counts it. See `control`'s module docs.
+        let parsed_control = if managed {
+            let parsed = control::Control::parse(session.req_header());
+            if parsed.malformed {
+                self.state.metrics.control_header_errors_total.inc();
+            }
+            Some(parsed)
+        } else {
+            None
+        };
+
         // Model routing is **managed-only**, and the first candidate is chosen here.
+        let mut walk = control::Walk::identity(0);
         let (provider, usable) = match model_route {
             None => {
                 // Provider-routed, or BYO `/v1` dialect default. Headerless `/auto` always set
@@ -1480,15 +1512,34 @@ impl ProxyHttp for AiProxy {
                     )
                     .await;
                 }
-                // Bit i ⇒ candidate i is registered here *and* has a pool key. Computed once; every
+                // Permute the row before the usable mask / `first_usable`. Failover, breakers, and
+                // the 429 key-walk then see this sequence. Unknown names were already dropped;
+                // an `only` filter that left nobody is the same 503 as an unkeyed row.
+                walk = parsed_control.as_ref().map_or_else(
+                    || control::Walk::identity(row.candidates.len()),
+                    |c| c.catalog_walk(row.candidates, request_seq),
+                );
+                if walk.len == 0 {
+                    self.state.metrics.rejection(Rejection::NoCandidate).inc();
+                    return Self::reject_boxed(
+                        session,
+                        &request_id,
+                        503,
+                        "api_error",
+                        "no provider key available",
+                    )
+                    .await;
+                }
+                // Bit i ⇒ walk slot i is registered here *and* has a pool key. Computed once; every
                 // later attempt reads this instead of re-deriving it.
                 let mut usable = 0u8;
-                for (i, c) in row
-                    .candidates
-                    .iter()
-                    .take(route::MAX_CANDIDATES)
-                    .enumerate()
-                {
+                for i in 0..walk.len {
+                    let Some(orig) = walk.catalog_index(i) else {
+                        continue;
+                    };
+                    let Some(c) = row.candidates.get(usize::from(orig)) else {
+                        continue;
+                    };
                     let keyed = self
                         .state
                         .provider_by_id(c.provider)
@@ -1498,9 +1549,10 @@ impl ProxyHttp for AiProxy {
                     }
                 }
                 let Some(first) = first_usable(usable, 0) else {
-                    // Every candidate is unkeyed. Distinct from `circuit_open`, which means the
-                    // candidates exist and are being skipped while they recover — `doctor`'s
-                    // `model_catalog` check exists to catch this configuration at boot instead.
+                    // Every remaining candidate is unkeyed. Distinct from `circuit_open`, which
+                    // means the candidates exist and are being skipped while they recover —
+                    // `doctor`'s `model_catalog` check exists to catch this configuration at boot
+                    // instead.
                     self.state.metrics.rejection(Rejection::NoCandidate).inc();
                     return Self::reject_boxed(
                         session,
@@ -1511,9 +1563,9 @@ impl ProxyHttp for AiProxy {
                     )
                     .await;
                 };
-                match row
-                    .candidates
-                    .get(usize::from(first))
+                match walk
+                    .catalog_index(first)
+                    .and_then(|orig| row.candidates.get(usize::from(orig)))
                     .and_then(|c| self.state.provider_by_id(c.provider))
                 {
                     Some(p) => (p.clone(), usable),
@@ -1577,24 +1629,12 @@ impl ProxyHttp for AiProxy {
         // streams through untouched. Checked on the forwarded path (suffix), so it's prefix-agnostic.
         let inject_eligible = managed && dialect == Dialect::OpenAi && forward_streamable;
 
-        // Per-request control surface (`x-beyond-*`). Managed only: a BYO request carries no verified
-        // identity, so a tag on it would be an unattributable row and a capture would be storing
-        // prompts we can't attribute to an account that asked us to — the same reason `ai.usage`
-        // itself is managed-only.
-        //
-        // Nothing here can reject the request: `Control::parse` drops what it can't use and counts
-        // it. See `control`'s module docs.
-        let control = if managed {
-            let parsed = control::Control::parse(session.req_header());
-            if parsed.malformed {
-                self.state.metrics.control_header_errors_total.inc();
-            }
-
-            // Capture decision. The header wins in **both** directions over the tenant's
-            // control-plane rule (Cloudflare's `cf-aig-collect-log` semantics), and the two enablers
-            // serve different people: the control plane is the operator's, works retroactively, and
-            // needs no cooperation from a client we don't control; the header is the caller's, for
-            // per-request precision.
+        // Capture decision from the control surface parsed above. The header wins in **both**
+        // directions over the tenant's control-plane rule (Cloudflare's `cf-aig-collect-log`
+        // semantics), and the two enablers serve different people: the control plane is the
+        // operator's, works retroactively, and needs no cooperation from a client we don't control;
+        // the header is the caller's, for per-request precision.
+        let control = if let Some(parsed) = parsed_control {
             let capture = match parsed.capture {
                 // Explicit suppression always wins — "not this one, it has PII".
                 Some(false) => None,
@@ -1632,7 +1672,9 @@ impl ProxyHttp for AiProxy {
             body_complete.as_deref().and_then(|body| {
                 let store = self.state.cache.as_ref()?;
                 let path = session.req_header().uri.path();
-                let ck = cache::key(tenant_id, path, body);
+                let row = model_route?;
+                let (ids, n) = walk.provider_ids(row.candidates);
+                let ck = cache::key(tenant_id, path, body, &ids[..usize::from(n)]);
                 match store.get(&ck) {
                     Some(hit) => Some(Err(hit)),
                     None => Some(Ok((ck, store.max_bytes()))),
@@ -1676,6 +1718,7 @@ impl ProxyHttp for AiProxy {
                             route,
                             candidate: first_usable(usable, 0).unwrap_or(0),
                             usable,
+                            walk,
                             attempt_start: start,
                             replay: None,
                             cache: Some(cache::Pending::Hit(hit)),
@@ -1785,6 +1828,7 @@ impl ProxyHttp for AiProxy {
                     // here on.
                     candidate: first_usable(usable, 0).unwrap_or(0),
                     usable,
+                    walk,
                     // Overwritten per attempt by `upstream_peer`; seeded so the first attempt is
                     // timed even if it fails before the prologue runs.
                     attempt_start: start,
@@ -1854,7 +1898,7 @@ impl ProxyHttp for AiProxy {
         // the ones pingora starts without consulting `fail_to_connect` (its default
         // `error_while_proxy` marks a reused-connection failure retryable on its own). A design that
         // recorded in `fail_to_connect` would miss exactly those.
-        if let Some(row) = rc.auto.as_ref().map(|a| a.route) {
+        if rc.auto.is_some() {
             // Reaching here with a permit outstanding means the previous attempt failed before any
             // response arrived, so the candidate we were on earned the failure. Resolve it before
             // touching anything else; `logging` then only ever sees the final candidate's permit.
@@ -1884,7 +1928,7 @@ impl ProxyHttp for AiProxy {
                     a.candidate = i;
                 }
 
-                let Some(candidate) = row.candidates.get(usize::from(i)) else {
+                let Some(candidate) = rc.auto.as_ref().and_then(|a| a.candidate_at(i)) else {
                     rc.advance_candidate(i);
                     continue;
                 };
@@ -2306,12 +2350,10 @@ impl ProxyHttp for AiProxy {
                 // `inject_at` points just past the root `{` and so always precedes the model value:
                 // rewriting the value cannot move it.
                 let buf = match (rc.auto.as_ref(), scan.model_span) {
-                    (Some(a), Some(span)) => {
-                        match a.route.candidates.get(usize::from(a.candidate)) {
-                            Some(c) => apply_model_rewrite(buf, span, c.upstream_model.as_bytes()),
-                            None => buf,
-                        }
-                    }
+                    (Some(a), Some(span)) => match a.candidate_at(a.candidate) {
+                        Some(c) => apply_model_rewrite(buf, span, c.upstream_model.as_bytes()),
+                        None => buf,
+                    },
                     _ => buf,
                 };
                 // Emit the whole (possibly rewritten) body in one shot; `transfer-encoding: chunked`
