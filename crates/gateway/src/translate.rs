@@ -5,9 +5,10 @@
 //! byte relay. `/{provider}/…` never translates.
 //!
 //! v1 is allowed to be lossy on extras a stock SDK does not need for a tool loop:
-//! - **Dropped:** `thinking` / `redacted_thinking` blocks, `cache_control`, `reasoning_effort`,
-//!   `stream_options` on the Anthropic body, Responses-only fields, image `http(s)` URLs (Anthropic
-//!   wants base64). Base64 data-URI images are converted both ways.
+//! - **Dropped:** Responses-only fields, image `http(s)` URLs (Anthropic wants base64),
+//!   `stream_options` on the Anthropic body. Base64 data-URI images are converted both ways.
+//! - **Passed both ways:** `thinking` / `redacted_thinking` blocks, `cache_control` on tools and
+//!   content, `reasoning_effort` ↔ Anthropic `thinking`. These are what an agent workload sends.
 //! - **Required mapping:** system/messages, `max_tokens`, temperature, stop, stream, tools,
 //!   `tool_choice`, text + tool_use/tool_result, usage. Anthropic requires `max_tokens`; a missing
 //!   OpenAI value becomes 4096.
@@ -161,8 +162,9 @@ fn openai_req_to_anthropic(v: &Value) -> Value {
             openai_tool_choice_to_anthropic(choice),
         );
     }
+    openai_reasoning_to_anthropic(v, &mut out);
 
-    let mut system_parts: Vec<String> = Vec::new();
+    let mut system_parts: Vec<Value> = Vec::new();
     let mut messages: Vec<Value> = Vec::new();
     if let Some(arr) = v.get("messages").and_then(Value::as_array) {
         let mut pending_tool_results: Vec<Value> = Vec::new();
@@ -171,9 +173,7 @@ fn openai_req_to_anthropic(v: &Value) -> Value {
             match role {
                 "system" | "developer" => {
                     flush_tool_results(&mut messages, &mut pending_tool_results);
-                    if let Some(t) = message_text(m) {
-                        system_parts.push(t);
-                    }
+                    system_parts.extend(openai_system_blocks(m));
                 }
                 "tool" => {
                     if let Some(tr) = openai_tool_result(m) {
@@ -194,7 +194,7 @@ fn openai_req_to_anthropic(v: &Value) -> Value {
         flush_tool_results(&mut messages, &mut pending_tool_results);
     }
     if !system_parts.is_empty() {
-        out.insert("system".into(), Value::String(system_parts.join("\n")));
+        out.insert("system".into(), anthropic_system_value(system_parts));
     }
     out.insert("messages".into(), Value::Array(messages));
     Value::Object(out)
@@ -260,7 +260,134 @@ fn openai_tool_to_anthropic(t: &Value) -> Option<Value> {
         .cloned()
         .unwrap_or_else(|| json!({ "type": "object", "properties": {} }));
     m.insert("input_schema".into(), schema);
+    copy_cache_control(&mut m, t);
+    if !m.contains_key("cache_control") {
+        copy_cache_control(&mut m, func);
+    }
     Some(Value::Object(m))
+}
+
+fn openai_reasoning_to_anthropic(v: &Value, out: &mut Map<String, Value>) {
+    // An already-Anthropic `thinking` object wins over `reasoning_effort` so a round-trip that
+    // kept the native shape is not re-bucketed.
+    if let Some(t) = v.get("thinking").filter(|t| t.is_object()) {
+        out.insert("thinking".into(), t.clone());
+        return;
+    }
+    let effort = v
+        .get("reasoning_effort")
+        .and_then(Value::as_str)
+        .or_else(|| v.pointer("/reasoning/effort").and_then(Value::as_str));
+    if let Some(effort) = effort {
+        out.insert("thinking".into(), thinking_from_effort(effort));
+    }
+}
+
+fn thinking_from_effort(effort: &str) -> Value {
+    match effort {
+        "none" | "off" | "disabled" => json!({ "type": "disabled" }),
+        _ => json!({
+            "type": "enabled",
+            "budget_tokens": budget_for_effort(effort),
+        }),
+    }
+}
+
+fn budget_for_effort(effort: &str) -> u64 {
+    match effort {
+        "minimal" | "low" => 1024,
+        "high" => 8192,
+        "xhigh" | "max" => 16384,
+        _ => 4096,
+    }
+}
+
+fn effort_from_thinking(thinking: &Value) -> Option<&'static str> {
+    match thinking.get("type").and_then(Value::as_str) {
+        Some("disabled") => Some("none"),
+        Some("adaptive") => Some(
+            thinking
+                .get("effort")
+                .and_then(Value::as_str)
+                .map(effort_alias)
+                .unwrap_or("high"),
+        ),
+        Some("enabled") => {
+            let budget = thinking
+                .get("budget_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(4096);
+            Some(effort_from_budget(budget))
+        }
+        _ => None,
+    }
+}
+
+fn effort_alias(s: &str) -> &'static str {
+    match s {
+        "none" | "off" | "disabled" => "none",
+        "minimal" | "low" => "low",
+        "high" => "high",
+        "xhigh" | "max" => "xhigh",
+        _ => "medium",
+    }
+}
+
+fn effort_from_budget(budget: u64) -> &'static str {
+    if budget <= 1024 {
+        "low"
+    } else if budget <= 4096 {
+        "medium"
+    } else if budget <= 8192 {
+        "high"
+    } else {
+        "xhigh"
+    }
+}
+
+fn copy_cache_control(out: &mut Map<String, Value>, src: &Value) {
+    if let Some(cc) = src.get("cache_control") {
+        out.insert("cache_control".into(), cc.clone());
+    }
+}
+
+fn openai_system_blocks(m: &Value) -> Vec<Value> {
+    let cc = m.get("cache_control");
+    match m.get("content") {
+        Some(Value::String(s)) => vec![text_block(s, cc)],
+        Some(Value::Array(parts)) => parts
+            .iter()
+            .filter_map(|p| {
+                let t = p
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .or_else(|| p.as_str())?;
+                let part_cc = p.get("cache_control").or(cc);
+                Some(text_block(t, part_cc))
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn text_block(text: &str, cache_control: Option<&Value>) -> Value {
+    let mut m = json!({ "type": "text", "text": text });
+    if let Some(cc) = cache_control
+        && let Some(obj) = m.as_object_mut()
+    {
+        obj.insert("cache_control".into(), cc.clone());
+    }
+    m
+}
+
+fn anthropic_system_value(blocks: Vec<Value>) -> Value {
+    if blocks.len() == 1
+        && blocks[0].get("cache_control").is_none()
+        && let Some(t) = blocks[0].get("text").cloned()
+    {
+        return t;
+    }
+    Value::Array(blocks)
 }
 
 fn openai_tool_choice_to_anthropic(choice: &Value) -> Value {
@@ -301,10 +428,51 @@ fn openai_tool_result(m: &Value) -> Option<Value> {
 
 fn openai_assistant_content(m: &Value) -> Value {
     let mut blocks: Vec<Value> = Vec::new();
-    if let Some(t) = message_text(m)
-        && !t.is_empty()
+    match m.get("content") {
+        Some(Value::String(s)) if !s.is_empty() => {
+            blocks.push(json!({ "type": "text", "text": s }));
+        }
+        Some(Value::Array(parts)) => {
+            for p in parts {
+                match p.get("type").and_then(Value::as_str) {
+                    Some("thinking") => blocks.push(thinking_block_from_openai(p)),
+                    Some("redacted_thinking") => blocks.push(redacted_block_from_openai(p)),
+                    Some("text") | None => {
+                        if let Some(t) =
+                            p.get("text").and_then(Value::as_str).or_else(|| p.as_str())
+                            && !t.is_empty()
+                        {
+                            let mut b = json!({ "type": "text", "text": t });
+                            if let Some(obj) = b.as_object_mut() {
+                                copy_cache_control(obj, p);
+                            }
+                            blocks.push(b);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        _ => {}
+    }
+    if let Some(extra) = m.get("thinking").and_then(Value::as_array) {
+        for p in extra.iter().rev() {
+            let block = match p.get("type").and_then(Value::as_str) {
+                Some("redacted_thinking") => redacted_block_from_openai(p),
+                _ => thinking_block_from_openai(p),
+            };
+            blocks.insert(0, block);
+        }
+    } else if blocks
+        .iter()
+        .all(|b| b.get("type").and_then(Value::as_str) != Some("thinking"))
+        && let Some(reasoning) = m
+            .get("reasoning_content")
+            .and_then(Value::as_str)
+            .or_else(|| m.get("reasoning").and_then(Value::as_str))
+        && !reasoning.is_empty()
     {
-        blocks.push(json!({ "type": "text", "text": t }));
+        blocks.insert(0, json!({ "type": "thinking", "thinking": reasoning }));
     }
     if let Some(calls) = m.get("tool_calls").and_then(Value::as_array) {
         for c in calls {
@@ -332,31 +500,65 @@ fn openai_assistant_content(m: &Value) -> Value {
     Value::Array(blocks)
 }
 
+fn thinking_block_from_openai(p: &Value) -> Value {
+    let mut m = Map::new();
+    m.insert("type".into(), json!("thinking"));
+    let text = p
+        .get("thinking")
+        .and_then(Value::as_str)
+        .or_else(|| p.get("text").and_then(Value::as_str))
+        .unwrap_or("");
+    m.insert("thinking".into(), json!(text));
+    if let Some(sig) = p.get("signature") {
+        m.insert("signature".into(), sig.clone());
+    }
+    Value::Object(m)
+}
+
+fn redacted_block_from_openai(p: &Value) -> Value {
+    json!({
+        "type": "redacted_thinking",
+        "data": p.get("data").cloned().unwrap_or(json!("")),
+    })
+}
+
 fn openai_user_content(m: &Value) -> Value {
+    let msg_cc = m.get("cache_control");
     match m.get("content") {
-        Some(Value::String(s)) => Value::String(s.clone()),
+        Some(Value::String(s)) => {
+            if let Some(cc) = msg_cc {
+                return Value::Array(vec![text_block(s, Some(cc))]);
+            }
+            Value::String(s.clone())
+        }
         Some(Value::Array(parts)) => {
             let mut blocks: Vec<Value> = Vec::new();
             for p in parts {
                 match p.get("type").and_then(Value::as_str) {
                     Some("text") => {
                         if let Some(t) = p.get("text").and_then(Value::as_str) {
-                            blocks.push(json!({ "type": "text", "text": t }));
+                            blocks.push(text_block(t, p.get("cache_control").or(msg_cc)));
                         }
                     }
                     Some("image_url") => {
-                        if let Some(b) = openai_image_to_anthropic(p) {
+                        if let Some(mut b) = openai_image_to_anthropic(p) {
+                            if let Some(obj) = b.as_object_mut() {
+                                copy_cache_control(obj, p);
+                            }
                             blocks.push(b);
                         }
                     }
                     _ => {
                         if let Some(t) = p.get("text").and_then(Value::as_str) {
-                            blocks.push(json!({ "type": "text", "text": t }));
+                            blocks.push(text_block(t, p.get("cache_control").or(msg_cc)));
                         }
                     }
                 }
             }
-            if blocks.len() == 1 && blocks[0].get("type").and_then(Value::as_str) == Some("text") {
+            if blocks.len() == 1
+                && blocks[0].get("type").and_then(Value::as_str) == Some("text")
+                && blocks[0].get("cache_control").is_none()
+            {
                 return blocks[0]
                     .get("text")
                     .cloned()
@@ -457,13 +659,17 @@ fn anthropic_req_to_openai(v: &Value) -> Value {
             anthropic_tool_choice_to_openai(choice),
         );
     }
+    if let Some(t) = v.get("thinking")
+        && let Some(effort) = effort_from_thinking(t)
+    {
+        out.insert("reasoning_effort".into(), json!(effort));
+    }
 
     let mut messages: Vec<Value> = Vec::new();
     if let Some(sys) = v.get("system")
-        && let Some(t) = anthropic_system_text(sys)
-        && !t.is_empty()
+        && let Some(msg) = anthropic_system_to_openai(sys)
     {
-        messages.push(json!({ "role": "system", "content": t }));
+        messages.push(msg);
     }
     if let Some(arr) = v.get("messages").and_then(Value::as_array) {
         for m in arr {
@@ -476,6 +682,39 @@ fn anthropic_req_to_openai(v: &Value) -> Value {
     }
     out.insert("messages".into(), Value::Array(messages));
     Value::Object(out)
+}
+
+fn anthropic_system_to_openai(sys: &Value) -> Option<Value> {
+    match sys {
+        Value::String(s) if !s.is_empty() => Some(json!({ "role": "system", "content": s })),
+        Value::Array(blocks) => {
+            let has_cc = blocks.iter().any(|b| b.get("cache_control").is_some());
+            if has_cc {
+                let parts: Vec<Value> = blocks
+                    .iter()
+                    .filter_map(|b| {
+                        let t = b
+                            .get("text")
+                            .and_then(Value::as_str)
+                            .or_else(|| b.as_str())?;
+                        let mut p = json!({ "type": "text", "text": t });
+                        if let Some(obj) = p.as_object_mut() {
+                            copy_cache_control(obj, b);
+                        }
+                        Some(p)
+                    })
+                    .collect();
+                if parts.is_empty() {
+                    return None;
+                }
+                Some(json!({ "role": "system", "content": parts }))
+            } else {
+                let t = anthropic_system_text(sys)?;
+                (!t.is_empty()).then(|| json!({ "role": "system", "content": t }))
+            }
+        }
+        _ => None,
+    }
 }
 
 fn anthropic_system_text(sys: &Value) -> Option<String> {
@@ -504,7 +743,11 @@ fn anthropic_tool_to_openai(t: &Value) -> Option<Value> {
         .cloned()
         .unwrap_or_else(|| json!({ "type": "object", "properties": {} }));
     func.insert("parameters".into(), params);
-    Some(json!({ "type": "function", "function": Value::Object(func) }))
+    let mut tool = json!({ "type": "function", "function": Value::Object(func) });
+    if let Some(obj) = tool.as_object_mut() {
+        copy_cache_control(obj, t);
+    }
+    Some(tool)
 }
 
 fn anthropic_tool_choice_to_openai(choice: &Value) -> Value {
@@ -521,6 +764,8 @@ fn anthropic_tool_choice_to_openai(choice: &Value) -> Value {
 
 fn anthropic_assistant_to_openai(m: &Value) -> Value {
     let mut text = String::new();
+    let mut thinking_text = String::new();
+    let mut thinking_blocks: Vec<Value> = Vec::new();
     let mut tool_calls: Vec<Value> = Vec::new();
     match m.get("content") {
         Some(Value::String(s)) => text = s.clone(),
@@ -531,6 +776,19 @@ fn anthropic_assistant_to_openai(m: &Value) -> Value {
                         if let Some(t) = b.get("text").and_then(Value::as_str) {
                             text.push_str(t);
                         }
+                    }
+                    Some("thinking") => {
+                        if let Some(t) = b
+                            .get("thinking")
+                            .and_then(Value::as_str)
+                            .or_else(|| b.get("text").and_then(Value::as_str))
+                        {
+                            thinking_text.push_str(t);
+                        }
+                        thinking_blocks.push(b.clone());
+                    }
+                    Some("redacted_thinking") => {
+                        thinking_blocks.push(b.clone());
                     }
                     Some("tool_use") => {
                         let id = b.get("id").and_then(Value::as_str).unwrap_or("call_0");
@@ -545,7 +803,6 @@ fn anthropic_assistant_to_openai(m: &Value) -> Value {
                             "function": { "name": name, "arguments": args },
                         }));
                     }
-                    // thinking / redacted_thinking / cache_control extras: drop
                     _ => {}
                 }
             }
@@ -566,6 +823,12 @@ fn anthropic_assistant_to_openai(m: &Value) -> Value {
             },
         );
         msg.insert("tool_calls".into(), Value::Array(tool_calls));
+    }
+    if !thinking_text.is_empty() {
+        msg.insert("reasoning_content".into(), json!(thinking_text));
+    }
+    if !thinking_blocks.is_empty() {
+        msg.insert("thinking".into(), Value::Array(thinking_blocks));
     }
     Value::Object(msg)
 }
@@ -614,7 +877,10 @@ fn anthropic_user_to_openai(m: &Value) -> Vec<Value> {
                         }));
                     }
                     Some("image") => {
-                        if let Some(part) = anthropic_image_to_openai(b) {
+                        if let Some(mut part) = anthropic_image_to_openai(b) {
+                            if let Some(obj) = part.as_object_mut() {
+                                copy_cache_control(obj, b);
+                            }
                             user_parts.push(part);
                         }
                     }
@@ -622,7 +888,7 @@ fn anthropic_user_to_openai(m: &Value) -> Vec<Value> {
                         if let Some(t) =
                             b.get("text").and_then(Value::as_str).or_else(|| b.as_str())
                         {
-                            user_parts.push(json!({ "type": "text", "text": t }));
+                            user_parts.push(text_block(t, b.get("cache_control")));
                         }
                     }
                     _ => {}
@@ -739,14 +1005,34 @@ fn map_usage_to_openai(usage: Option<&Value>) -> Value {
         "completion_tokens": output,
         "total_tokens": input.saturating_add(output),
     });
-    if let Some(c) = u.get("cache_read_input_tokens").and_then(Value::as_u64)
-        && c > 0
-        && let Some(obj) = m.as_object_mut()
-    {
-        obj.insert(
-            "prompt_tokens_details".into(),
-            json!({ "cached_tokens": c }),
-        );
+    if let Some(obj) = m.as_object_mut() {
+        let cached = u
+            .get("cache_read_input_tokens")
+            .and_then(Value::as_u64)
+            .or_else(|| {
+                u.pointer("/prompt_tokens_details/cached_tokens")
+                    .and_then(Value::as_u64)
+            })
+            .unwrap_or(0);
+        if cached > 0 {
+            obj.insert(
+                "prompt_tokens_details".into(),
+                json!({ "cached_tokens": cached }),
+            );
+        }
+        let reasoning = u
+            .pointer("/output_tokens_details/thinking_tokens")
+            .and_then(Value::as_u64)
+            .or_else(|| {
+                u.pointer("/completion_tokens_details/reasoning_tokens")
+                    .and_then(Value::as_u64)
+            });
+        if let Some(r) = reasoning {
+            obj.insert(
+                "completion_tokens_details".into(),
+                json!({ "reasoning_tokens": r }),
+            );
+        }
     }
     m
 }
@@ -763,7 +1049,36 @@ fn map_usage_to_anthropic(usage: Option<&Value>) -> Value {
         .and_then(Value::as_u64)
         .or_else(|| u.get("output_tokens").and_then(Value::as_u64))
         .unwrap_or(0);
-    json!({ "input_tokens": input, "output_tokens": output })
+    let mut m = json!({ "input_tokens": input, "output_tokens": output });
+    if let Some(obj) = m.as_object_mut() {
+        if let Some(c) = u
+            .pointer("/prompt_tokens_details/cached_tokens")
+            .and_then(Value::as_u64)
+            .or_else(|| u.get("cache_read_input_tokens").and_then(Value::as_u64))
+            && c > 0
+        {
+            obj.insert("cache_read_input_tokens".into(), json!(c));
+        }
+        if let Some(w) = u.get("cache_creation_input_tokens").and_then(Value::as_u64)
+            && w > 0
+        {
+            obj.insert("cache_creation_input_tokens".into(), json!(w));
+        }
+        if let Some(r) = u
+            .pointer("/completion_tokens_details/reasoning_tokens")
+            .and_then(Value::as_u64)
+            .or_else(|| {
+                u.pointer("/output_tokens_details/thinking_tokens")
+                    .and_then(Value::as_u64)
+            })
+        {
+            obj.insert(
+                "output_tokens_details".into(),
+                json!({ "thinking_tokens": r }),
+            );
+        }
+    }
+    m
 }
 
 // --- SSE --------------------------------------------------------------------
@@ -787,6 +1102,7 @@ struct AntToOai {
     next_tool: u32,
     input_tokens: u64,
     cache_read: u64,
+    thinking_tokens: Option<u64>,
     done: bool,
 }
 
@@ -796,6 +1112,7 @@ enum OpenBlock {
     None,
     Text,
     Tool,
+    Thinking,
 }
 
 #[derive(Default)]
@@ -939,7 +1256,16 @@ impl SseBridge {
                             None,
                         )
                     }
-                    // text: OpenAI has no block-start; thinking: drop
+                    Some("redacted_thinking") => {
+                        let data = block.get("data").cloned().unwrap_or(json!(""));
+                        self.emit_oai_delta(
+                            json!({
+                                "thinking": [{ "type": "redacted_thinking", "data": data }]
+                            }),
+                            None,
+                        )
+                    }
+                    // text / thinking: OpenAI has no block-start
                     _ => Vec::new(),
                 }
             }
@@ -969,6 +1295,27 @@ impl SseBridge {
                             None,
                         )
                     }
+                    Some("thinking_delta") => {
+                        let text = delta
+                            .get("thinking")
+                            .and_then(Value::as_str)
+                            .or_else(|| delta.get("text").and_then(Value::as_str))
+                            .unwrap_or("");
+                        if text.is_empty() {
+                            return Vec::new();
+                        }
+                        self.emit_oai_delta(
+                            json!({ "reasoning_content": text, "reasoning": text }),
+                            None,
+                        )
+                    }
+                    Some("signature_delta") => {
+                        let sig = delta.get("signature").and_then(Value::as_str).unwrap_or("");
+                        if sig.is_empty() {
+                            return Vec::new();
+                        }
+                        self.emit_oai_delta(json!({ "thinking_signature": sig }), None)
+                    }
                     _ => Vec::new(),
                 }
             }
@@ -981,19 +1328,31 @@ impl SseBridge {
                 if let Some(u) = v.get("usage")
                     && let Some(o) = u.get("output_tokens").and_then(Value::as_u64)
                 {
+                    if let Some(t) = u
+                        .pointer("/output_tokens_details/thinking_tokens")
+                        .and_then(Value::as_u64)
+                    {
+                        self.ant_to_oai.thinking_tokens = Some(t);
+                    }
                     let mut finish_bytes = self.emit_oai_delta(json!({}), Some(finish));
                     let mut usage = json!({
                         "prompt_tokens": self.ant_to_oai.input_tokens,
                         "completion_tokens": o,
                         "total_tokens": self.ant_to_oai.input_tokens.saturating_add(o),
                     });
-                    if self.ant_to_oai.cache_read > 0
-                        && let Some(obj) = usage.as_object_mut()
-                    {
-                        obj.insert(
-                            "prompt_tokens_details".into(),
-                            json!({ "cached_tokens": self.ant_to_oai.cache_read }),
-                        );
+                    if let Some(obj) = usage.as_object_mut() {
+                        if self.ant_to_oai.cache_read > 0 {
+                            obj.insert(
+                                "prompt_tokens_details".into(),
+                                json!({ "cached_tokens": self.ant_to_oai.cache_read }),
+                            );
+                        }
+                        if let Some(t) = self.ant_to_oai.thinking_tokens {
+                            obj.insert(
+                                "completion_tokens_details".into(),
+                                json!({ "reasoning_tokens": t }),
+                            );
+                        }
                     }
                     finish_bytes.extend(self.emit_oai_usage(usage));
                     return finish_bytes;
@@ -1072,6 +1431,27 @@ impl SseBridge {
             {
                 out.extend(self.oai_to_ant.text_delta(content));
             }
+            let reasoning = delta
+                .get("reasoning_content")
+                .and_then(Value::as_str)
+                .or_else(|| delta.get("reasoning").and_then(Value::as_str));
+            if let Some(r) = reasoning
+                && !r.is_empty()
+            {
+                out.extend(self.oai_to_ant.thinking_delta(r));
+            }
+            if let Some(sig) = delta.get("thinking_signature").and_then(Value::as_str)
+                && !sig.is_empty()
+            {
+                out.extend(self.oai_to_ant.signature_delta(sig));
+            }
+            if let Some(blocks) = delta.get("thinking").and_then(Value::as_array) {
+                for b in blocks {
+                    if b.get("type").and_then(Value::as_str) == Some("redacted_thinking") {
+                        out.extend(self.oai_to_ant.redacted_thinking(b));
+                    }
+                }
+            }
             if let Some(calls) = delta.get("tool_calls").and_then(Value::as_array) {
                 for c in calls {
                     out.extend(self.oai_to_ant.tool_delta(c));
@@ -1131,7 +1511,7 @@ impl OaiToAnt {
 
     fn text_delta(&mut self, text: &str) -> Vec<u8> {
         let mut out = Vec::new();
-        if self.open == OpenBlock::Tool {
+        if self.open == OpenBlock::Tool || self.open == OpenBlock::Thinking {
             out.extend(self.close_open());
         }
         if self.open != OpenBlock::Text {
@@ -1161,7 +1541,7 @@ impl OaiToAnt {
 
     fn tool_delta(&mut self, call: &Value) -> Vec<u8> {
         let mut out = Vec::new();
-        if self.open == OpenBlock::Text {
+        if self.open == OpenBlock::Text || self.open == OpenBlock::Thinking {
             out.extend(self.close_open());
         }
         let id = call.get("id").and_then(Value::as_str);
@@ -1203,6 +1583,75 @@ impl OaiToAnt {
                 })),
             ));
         }
+        out
+    }
+
+    fn thinking_delta(&mut self, text: &str) -> Vec<u8> {
+        let mut out = Vec::new();
+        if self.open == OpenBlock::Text || self.open == OpenBlock::Tool {
+            out.extend(self.close_open());
+        }
+        if self.open != OpenBlock::Thinking {
+            let idx = self.next_block;
+            self.next_block = self.next_block.saturating_add(1);
+            self.open = OpenBlock::Thinking;
+            out.extend(sse_named(
+                "content_block_start",
+                &value_string(&json!({
+                    "type": "content_block_start",
+                    "index": idx,
+                    "content_block": { "type": "thinking", "thinking": "" },
+                })),
+            ));
+        }
+        let idx = self.next_block.saturating_sub(1);
+        out.extend(sse_named(
+            "content_block_delta",
+            &value_string(&json!({
+                "type": "content_block_delta",
+                "index": idx,
+                "delta": { "type": "thinking_delta", "thinking": text },
+            })),
+        ));
+        out
+    }
+
+    fn signature_delta(&mut self, sig: &str) -> Vec<u8> {
+        let mut out = Vec::new();
+        if self.open != OpenBlock::Thinking {
+            out.extend(self.thinking_delta(""));
+        }
+        let idx = self.next_block.saturating_sub(1);
+        out.extend(sse_named(
+            "content_block_delta",
+            &value_string(&json!({
+                "type": "content_block_delta",
+                "index": idx,
+                "delta": { "type": "signature_delta", "signature": sig },
+            })),
+        ));
+        out
+    }
+
+    fn redacted_thinking(&mut self, block: &Value) -> Vec<u8> {
+        let mut out = Vec::new();
+        if self.open != OpenBlock::None {
+            out.extend(self.close_open());
+        }
+        let idx = self.next_block;
+        self.next_block = self.next_block.saturating_add(1);
+        self.open = OpenBlock::Thinking;
+        out.extend(sse_named(
+            "content_block_start",
+            &value_string(&json!({
+                "type": "content_block_start",
+                "index": idx,
+                "content_block": {
+                    "type": "redacted_thinking",
+                    "data": block.get("data").cloned().unwrap_or(json!("")),
+                },
+            })),
+        ));
         out
     }
 
@@ -1633,5 +2082,203 @@ mod tests {
         assert_eq!(back["stop_reason"], "tool_use");
         assert_eq!(back["content"][0]["type"], "tool_use");
         assert_eq!(back["content"][0]["input"]["city"], "SF");
+    }
+
+    #[test]
+    fn openai_cache_control_and_reasoning_reach_anthropic_fields() {
+        let oai = json!({
+            "model": "claude-opus-4-8",
+            "reasoning_effort": "high",
+            "max_tokens": 16,
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "hi", "cache_control": {"type": "ephemeral"}}
+                ]
+            }],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "parameters": {"type": "object", "properties": {}}
+                },
+                "cache_control": {"type": "ephemeral"}
+            }]
+        });
+        let v: Value = serde_json::from_slice(&request(
+            Dialect::OpenAi,
+            Dialect::Anthropic,
+            &serde_json::to_vec(&oai).unwrap(),
+        ))
+        .unwrap();
+        assert_eq!(v["thinking"]["type"], "enabled");
+        assert_eq!(v["thinking"]["budget_tokens"], 8192);
+        assert_eq!(
+            v["messages"][0]["content"][0]["cache_control"]["type"],
+            "ephemeral"
+        );
+        assert_eq!(v["tools"][0]["cache_control"]["type"], "ephemeral");
+        assert!(
+            v.get("reasoning_effort").is_none(),
+            "Anthropic takes thinking, not reasoning_effort: {v}"
+        );
+        assert!(
+            v.get("max_output_tokens").is_none() && v.get("input").is_none(),
+            "Responses-only fields must stay dropped: {v}"
+        );
+    }
+
+    #[test]
+    fn anthropic_thinking_becomes_openai_reasoning_effort() {
+        let anth = json!({
+            "model": "m",
+            "max_tokens": 8,
+            "thinking": {"type": "enabled", "budget_tokens": 1024},
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let v: Value = serde_json::from_slice(&request(
+            Dialect::Anthropic,
+            Dialect::OpenAi,
+            &serde_json::to_vec(&anth).unwrap(),
+        ))
+        .unwrap();
+        assert_eq!(v["reasoning_effort"], "low");
+        assert!(v.get("thinking").is_none(), "{v}");
+    }
+
+    #[test]
+    fn thinking_and_redacted_thinking_round_trip_in_history() {
+        let anth = json!({
+            "model": "m",
+            "max_tokens": 8,
+            "messages": [{
+                "role": "assistant",
+                "content": [
+                    {"type": "thinking", "thinking": "plan", "signature": "sig"},
+                    {"type": "redacted_thinking", "data": "redacted"},
+                    {"type": "text", "text": "hi"}
+                ]
+            }]
+        });
+        let oai: Value = serde_json::from_slice(&request(
+            Dialect::Anthropic,
+            Dialect::OpenAi,
+            &serde_json::to_vec(&anth).unwrap(),
+        ))
+        .unwrap();
+        assert_eq!(oai["messages"][0]["content"], "hi");
+        assert_eq!(oai["messages"][0]["reasoning_content"], "plan");
+        assert_eq!(oai["messages"][0]["thinking"][0]["type"], "thinking");
+        assert_eq!(
+            oai["messages"][0]["thinking"][1]["type"],
+            "redacted_thinking"
+        );
+
+        let back: Value = serde_json::from_slice(&request(
+            Dialect::OpenAi,
+            Dialect::Anthropic,
+            &serde_json::to_vec(&oai).unwrap(),
+        ))
+        .unwrap();
+        let content = &back["messages"][0]["content"];
+        assert_eq!(content[0]["type"], "thinking");
+        assert_eq!(content[0]["thinking"], "plan");
+        assert_eq!(content[0]["signature"], "sig");
+        assert_eq!(content[1]["type"], "redacted_thinking");
+        assert_eq!(content[2]["type"], "text");
+        assert_eq!(content[2]["text"], "hi");
+    }
+
+    #[test]
+    fn http_image_urls_are_still_dropped() {
+        let oai = json!({
+            "model": "m",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "see"},
+                    {"type": "image_url", "image_url": {"url": "https://example.com/x.png"}}
+                ]
+            }]
+        });
+        let v: Value = serde_json::from_slice(&request(
+            Dialect::OpenAi,
+            Dialect::Anthropic,
+            &serde_json::to_vec(&oai).unwrap(),
+        ))
+        .unwrap();
+        assert_eq!(v["messages"][0]["content"], "see");
+    }
+
+    #[test]
+    fn anthropic_thinking_sse_reappears_on_openai_stream() {
+        let mut b = SseBridge::new(Dialect::OpenAi);
+        let src = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_x\",\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":13,\"cache_read_input_tokens\":4}}}\n\n",
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"plan\"}}\n\n",
+            "event: content_block_stop\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":7,\"output_tokens_details\":{\"thinking_tokens\":3}}}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+        let out = String::from_utf8(b.feed(src.as_bytes(), true)).unwrap();
+        assert!(out.contains("\"reasoning_content\":\"plan\""), "{out}");
+        assert!(out.contains("\"hi\""), "{out}");
+        assert!(out.contains("\"reasoning_tokens\":3"), "{out}");
+        assert!(out.contains("\"cached_tokens\":4"), "{out}");
+    }
+
+    #[test]
+    fn openai_reasoning_sse_becomes_anthropic_thinking() {
+        let mut b = SseBridge::new(Dialect::Anthropic);
+        let src = concat!(
+            "data: {\"id\":\"chatcmpl-x\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4o\",\"choices\":[{\"delta\":{\"reasoning_content\":\"plan\"}}]}\n\n",
+            "data: {\"id\":\"chatcmpl-x\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4o\",\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let out = String::from_utf8(b.feed(src.as_bytes(), true)).unwrap();
+        assert!(out.contains("\"type\":\"thinking\""), "{out}");
+        assert!(out.contains("thinking_delta"), "{out}");
+        assert!(out.contains("plan"), "{out}");
+        assert!(out.contains("text_delta"), "{out}");
+        assert!(out.contains("hi"), "{out}");
+    }
+
+    #[test]
+    fn client_usage_maps_cache_and_reasoning_without_changing_shape_of_tools() {
+        let anth = json!({
+            "id": "msg_mock",
+            "type": "message",
+            "model": "claude-opus-4-8",
+            "content": [{"type": "text", "text": "hi"}],
+            "stop_reason": "end_turn",
+            "usage": {
+                "input_tokens": 13,
+                "output_tokens": 7,
+                "cache_read_input_tokens": 4,
+                "output_tokens_details": {"thinking_tokens": 3}
+            }
+        });
+        let oai: Value = serde_json::from_slice(&response_json(
+            Dialect::Anthropic,
+            Dialect::OpenAi,
+            &serde_json::to_vec(&anth).unwrap(),
+        ))
+        .unwrap();
+        assert_eq!(oai["usage"]["prompt_tokens_details"]["cached_tokens"], 4);
+        assert_eq!(
+            oai["usage"]["completion_tokens_details"]["reasoning_tokens"],
+            3
+        );
     }
 }

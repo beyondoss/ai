@@ -263,13 +263,14 @@ body/SSE; `ai.usage.model` is what the provider echoed. Other mismatches (`/v1/e
 Responses) are still a **400** (`claude-opus-4-8 is Anthropic Messages; POST /v1/messages`).
 `/{provider}/…` never translates.
 
-v1 mapping is lossy on extras a stock SDK does not need for a tool loop: `thinking` /
-`redacted_thinking`, `cache_control`, `reasoning_effort`, and `http(s)` image URLs are dropped
-(base64 data-URI images convert). Tools, text, and usage round-trip. Anthropic requires
-`max_tokens`; a missing OpenAI value becomes 4096. OpenAI→Anthropic does not inject
-`stream_options`. Anthropic→OpenAI injects `include_usage` on the translated OpenAI body when
-streaming. A stock OpenAI SDK also does not send `anthropic-version`; the gateway injects
-`2023-06-01` on that walk.
+v1 mapping is lossy on extras a stock SDK does not need for a tool loop: Responses-only
+fields and `http(s)` image URLs are dropped (base64 data-URI images convert). `thinking` /
+`redacted_thinking` blocks, `cache_control`, and `reasoning_effort` (mapped to Anthropic
+`thinking`) pass both ways so an agent workload round-trips. Tools, text, and usage still
+round-trip. Anthropic requires `max_tokens`; a missing OpenAI value becomes 4096. OpenAI→Anthropic
+does not inject `stream_options`. Anthropic→OpenAI injects `include_usage` on the translated
+OpenAI body when streaming. A stock OpenAI SDK also does not send `anthropic-version`; the
+gateway injects `2023-06-01` on that walk. Usage/billing still parse the **upstream** body.
 
 `/{provider}/…` is the escape hatch and does not consult the catalog. This arm is reached only after
 a provider-table miss, so `/{provider}/…` traffic runs exactly the code it always did; `auto` is
@@ -1019,6 +1020,7 @@ Prometheus on the default registry, exposed at `/metrics` on `metrics_listen`.
 | `capture`         | Sparse capture-set (default-off) + head-bounded `CaptureBufs` and 1-in-N sampling                                               | unit ✓ + e2e ✓ |
 | `capture_sink`    | Bounded, lossy `ai.payload` writer — drops on a full queue so a stalled log sink can't backpressure                             | unit ✓         |
 | `control`         | `x-beyond-*` header parse/validate; metadata canonicalized and re-serialized; catalog walk permute (`order` / `only` / `split`) | unit ✓ + e2e ✓ |
+| `translate`       | Chat Completions ↔ Messages mapping for a catalog wire mismatch; SSE event-by-event           | unit ✓ + e2e ✓ |
 | `smart`           | In-process TTFT EWMA table; ranks unpinned catalog walks; probe of unmeasured arms                                              | unit ✓ + e2e ✓ |
 | `cache`           | In-process exact-match response store (TTL + max entries + max bytes/entry); tap, never a buffer                                | unit ✓ + e2e ✓ |
 | `ratelimit`       | Two-tier guardrail: per-credential (count-min sketch, fixed memory, no GC) + global BYO (one atomic)                            | unit ✓         |
@@ -1037,7 +1039,7 @@ Prometheus on the default registry, exposed at `/metrics` on `metrics_listen`.
 ## Verification
 
 - **Unit (`cargo test --lib`):** key, route, peek, usage, deny, secret, config, cache, control,
-  smart. `clippy --all-targets -D warnings` clean.
+  smart, translate. `clippy --all-targets -D warnings` clean.
 - **End-to-end (`tests/e2e.rs`, `mise run test:integration:rs`):** real `beyond-ai` binary + real
   nats-server + mock upstream. Covers managed key-swap + passthrough fidelity + usage metering
   (OpenAI JSON + SSE, **Anthropic `/v1/messages`** with `x-api-key` swap + metering), **BYO
@@ -1060,12 +1062,14 @@ Prometheus on the default registry, exposed at `/metrics` on `metrics_listen`.
   breaker opens while the fallback keeps serving), missing/unknown model → 404 (named), Chat
   Completions ↔ Messages **translate** (OpenAI body + `claude-opus-4-8` on `/v1/chat/completions`
   reaches Anthropic `/v1/messages` with the pool key; client SSE is `chat.completion.chunk`;
-  `ai.usage` has non-zero Anthropic tokens; the reverse with a GPT id on `/v1/messages`; same-wire
-  walks still byte-relay; `/{provider}` still 400s a Claude body to OpenAI; `/v1/embeddings` with
-  a Claude row is still a wire-mismatch 400), `GET /v1/models` lists the catalog, a candidate
-  spelling is an alias, BYO on `/auto` → 400, BYO on `/v1` still forwarded, `/openai/…` ignoring
-  the catalog, a stock SDK shape against `/v1` with only `model` in the body, the routing header
-  never reaching an upstream, `ai.usage` naming the candidate that served, all-candidates-down, a
+  `ai.usage` has non-zero Anthropic tokens including cache/reasoning from the upstream parser;
+  `cache_control` / `reasoning_effort` reach Anthropic fields and thinking blocks reappear on the
+  client stream; the reverse with a GPT id on `/v1/messages`; same-wire walks still byte-relay;
+  `/{provider}` still 400s a Claude body to OpenAI; `/v1/embeddings` with a Claude row is still a
+  wire-mismatch 400), `GET /v1/models` lists the catalog, a candidate spelling is an alias, BYO on
+  `/auto` → 400, BYO on `/v1` still forwarded, `/openai/…` ignoring the catalog, a stock SDK shape
+  against `/v1` with only `model` in the body, the routing header never reaching an upstream,
+  `ai.usage` naming the candidate that served, all-candidates-down, a
   **256 KiB body surviving a failover byte-for-byte**, a **429 walking keys not vendors**,
   provider-routed traffic being unaffected, **`x-beyond-order` hitting Bedrock's mount/key/id on
   an Anthropic-first row**, **`only` of an unkeyed provider → 503**, a junk walk header keeping

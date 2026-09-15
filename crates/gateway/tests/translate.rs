@@ -614,3 +614,59 @@ async fn failover_while_translating_still_returns_the_client_dialect() {
         "failover must splice the OpenRouter candidate id after translate: {got}"
     );
 }
+
+/// A Chat Completions body with `cache_control` / `reasoning_effort` reaches Anthropic's fields;
+/// thinking blocks reappear on the client stream; `ai.usage` still meters the *upstream* parser.
+#[tokio::test]
+async fn openai_sdk_passes_cache_control_and_sees_thinking_on_the_stream() {
+    let nats_port = unused_nats_port();
+    let (pubkey, sk) = test_keypair(1);
+    let mock = MockUpstream::start(Mode::AnthropicThinkingSse).await;
+    let gw = Gateway::builder(nats_port, &mock.authority(), &b64(&pubkey))
+        .providers(&["anthropic", "openai", "openrouter"])
+        .start()
+        .await;
+
+    let body = r#"{"model":"claude-opus-4-8","stream":true,"reasoning_effort":"high","messages":[{"role":"user","content":[{"type":"text","text":"hi","cache_control":{"type":"ephemeral"}}]}],"tools":[{"type":"function","function":{"name":"noop","parameters":{"type":"object","properties":{}}},"cache_control":{"type":"ephemeral"}}]}"#;
+    let resp = test_client()
+        .post(format!("{}/v1/chat/completions", gw.url()))
+        .header("authorization", format!("Bearer {}", vkey(&sk)))
+        .header("content-type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let text = resp.text().await.unwrap();
+    assert!(
+        text.contains("reasoning_content") && text.contains("plan"),
+        "Anthropic thinking must reappear on the Chat Completions stream: {text}"
+    );
+    assert!(text.contains("\"hi\""), "{text}");
+
+    let cap = mock
+        .captured()
+        .expect("translated request reaches Anthropic");
+    let got: Value = serde_json::from_slice(&cap.body).unwrap();
+    assert_eq!(got["thinking"]["type"], "enabled", "{got}");
+    assert_eq!(
+        got["messages"][0]["content"][0]["cache_control"]["type"], "ephemeral",
+        "{got}"
+    );
+    assert_eq!(
+        got["tools"][0]["cache_control"]["type"], "ephemeral",
+        "{got}"
+    );
+
+    let line = gw
+        .wait_for_log_line(&["ai.usage", r#""provider":"anthropic""#])
+        .await;
+    assert!(
+        line.contains(r#""cache_read_tokens":4"#),
+        "billing cache counts come from the upstream Anthropic parser: {line}"
+    );
+    assert!(
+        line.contains("reasoning_tokens") && line.contains('3'),
+        "billing reasoning counts come from the upstream Anthropic parser: {line}"
+    );
+}

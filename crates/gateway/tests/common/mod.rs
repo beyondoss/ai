@@ -317,6 +317,8 @@ pub enum Mode {
     OpenAiToolSse,
     /// Anthropic SSE `event: error`.
     AnthropicErrorSse,
+    /// Anthropic SSE with a `thinking` block, then text, plus cache + thinking token counts.
+    AnthropicThinkingSse,
     /// OpenAI SSE error chunk.
     OpenAiErrorSse,
     /// 429 (with `Retry-After`) when the presented credential contains this secret; 200 otherwise.
@@ -421,6 +423,25 @@ data: [DONE]\n\n";
 const CANNED_ANTHROPIC_ERROR_SSE: &str = "event: error\n\
 data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"try again\"}}\n\n";
 
+const CANNED_ANTHROPIC_THINKING_SSE: &str = "event: message_start\n\
+data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_mock\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-opus-4-8\",\"content\":[],\"usage\":{\"input_tokens\":13,\"output_tokens\":1,\"cache_read_input_tokens\":4,\"cache_creation_input_tokens\":2}}}\n\n\
+event: content_block_start\n\
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"plan\"}}\n\n\
+event: content_block_stop\n\
+data: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+event: content_block_start\n\
+data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n\
+event: content_block_stop\n\
+data: {\"type\":\"content_block_stop\",\"index\":1}\n\n\
+event: message_delta\n\
+data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":7,\"output_tokens_details\":{\"thinking_tokens\":3}}}\n\n\
+event: message_stop\n\
+data: {\"type\":\"message_stop\"}\n\n";
+
 const CANNED_OPENAI_ERROR_SSE: &str =
     "data: {\"error\":{\"message\":\"try again\",\"type\":\"server_error\"}}\n\n";
 
@@ -508,6 +529,10 @@ fn canned_body(mode: Mode) -> (&'static str, Bytes) {
         Mode::AnthropicErrorSse => (
             "text/event-stream",
             Bytes::from_static(CANNED_ANTHROPIC_ERROR_SSE.as_bytes()),
+        ),
+        Mode::AnthropicThinkingSse => (
+            "text/event-stream",
+            Bytes::from_static(CANNED_ANTHROPIC_THINKING_SSE.as_bytes()),
         ),
         Mode::OpenAiErrorSse => (
             "text/event-stream",
