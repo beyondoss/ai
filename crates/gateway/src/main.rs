@@ -18,19 +18,19 @@ use beyond_ai::proxy::AiProxy;
 use beyond_ai::state::GatewayState;
 use beyond_ai::store_watch::{Allowance, Capture, Deny, WatcherService};
 use clap::{Parser, Subcommand};
-use pingora_core::apps::http_app::HttpServer;
 use pingora_core::apps::HttpServerOptions;
-use pingora_core::server::configuration::ServerConf;
+use pingora_core::apps::http_app::HttpServer;
 use pingora_core::server::Server;
+use pingora_core::server::configuration::ServerConf;
 use pingora_core::services::background::background_service;
 use pingora_core::services::listening::Service as ListeningService;
 use pingora_proxy::ProxyServiceBuilder;
 use std::path::Path;
 use std::process::exit;
+use tracing_subscriber::EnvFilter;
 use tracing_subscriber::filter::filter_fn;
 use tracing_subscriber::layer::{Layer, SubscriberExt};
 use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
 #[command(

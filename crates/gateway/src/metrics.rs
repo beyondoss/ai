@@ -4,8 +4,8 @@
 //! exposes them with no extra wiring. `Metrics::new` is called exactly once (in `main`).
 
 use prometheus::{
-    default_registry, Histogram, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge,
-    IntGaugeVec, Opts,
+    Histogram, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Opts,
+    default_registry,
 };
 use std::sync::Arc;
 

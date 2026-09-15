@@ -7,8 +7,8 @@
 use crate::error::{GatewayError, Result};
 use crate::key::{Keyring, Kid};
 use crate::secret::Secret;
-use figment::providers::{Env, Format, Toml};
 use figment::Figment;
+use figment::providers::{Env, Format, Toml};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
@@ -661,18 +661,22 @@ mod tests {
     fn validate_rejects_zero_connect_and_read_timeouts() {
         // A 0 connect/read timeout (a typo'd SSM param) must fail boot loudly, not degrade into a
         // 502 cascade at runtime.
-        assert!(AiConfig {
-            connect_timeout_secs: 0,
-            ..Default::default()
-        }
-        .validate()
-        .is_err());
-        assert!(AiConfig {
-            read_timeout_secs: 0,
-            ..Default::default()
-        }
-        .validate()
-        .is_err());
+        assert!(
+            AiConfig {
+                connect_timeout_secs: 0,
+                ..Default::default()
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            AiConfig {
+                read_timeout_secs: 0,
+                ..Default::default()
+            }
+            .validate()
+            .is_err()
+        );
         // Defaults are valid.
         assert!(AiConfig::default().validate().is_ok());
     }

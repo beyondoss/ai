@@ -273,7 +273,11 @@ impl WatchedSet for Allowance {
         allowanceset_from_entries(entries)
     }
 
-    fn apply_batch(_state: &GatewayState, cur: &AllowanceSet, updates: &[KvUpdate]) -> AllowanceSet {
+    fn apply_batch(
+        _state: &GatewayState,
+        cur: &AllowanceSet,
+        updates: &[KvUpdate],
+    ) -> AllowanceSet {
         apply_allowance_batch(cur, updates)
     }
 

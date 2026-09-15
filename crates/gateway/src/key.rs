@@ -17,8 +17,8 @@
 //! Revocation is out-of-band via the deny-set (`blackhole.{tenant}` and `blackhole.key.{id}`).
 //! Quota exhaust is the same shape on the allowance-set (`allowance.{tenant}` / `allowance.key.{id}`).
 
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use std::collections::HashMap;
 
