@@ -223,6 +223,8 @@ pub struct Metrics {
     /// legitimate zero-token generation — so a provider changing its usage wire shape would silently
     /// zero out billing. This counter (paired with a `warn!`) is the alerting surface for that.
     pub usage_parse_errors_total: IntCounter,
+    /// Exact-match cache hits that replayed a stored 2xx and never reached a provider.
+    pub cache_hits_total: IntCounter,
 }
 
 /// TTFT buckets (seconds). Tuned for LLM latency: sub-second prompts up through the multi-second
@@ -347,6 +349,10 @@ impl Metrics {
             "ai_usage_parse_errors_total",
             "Managed 2xx responses with no parseable usage (emitted as a zero-token billing row)",
         ))?;
+        let cache_hits_total = IntCounter::with_opts(Opts::new(
+            "ai_cache_hits_total",
+            "Exact-match cache hits that replayed a stored 2xx and skipped the provider",
+        ))?;
 
         r.register(Box::new(requests_total.clone()))?;
         r.register(Box::new(candidate_failovers_total.clone()))?;
@@ -370,6 +376,7 @@ impl Metrics {
         r.register(Box::new(capture_dropped_total.clone()))?;
         r.register(Box::new(control_header_errors_total.clone()))?;
         r.register(Box::new(usage_parse_errors_total.clone()))?;
+        r.register(Box::new(cache_hits_total.clone()))?;
 
         Ok(Arc::new(Self {
             requests_total,
@@ -399,6 +406,7 @@ impl Metrics {
             capture_dropped_total,
             control_header_errors_total,
             usage_parse_errors_total,
+            cache_hits_total,
         }))
     }
 

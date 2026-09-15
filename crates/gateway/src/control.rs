@@ -2,12 +2,13 @@
 //!
 //! One parse seam for everything a caller can say about a single request, read once in
 //! `proxy::request_filter` after identity is verified and stripped before the request leaves for the
-//! provider. Two members today:
+//! provider. Three members today:
 //!
 //! | Header | Value | Effect |
 //! |---|---|---|
 //! | `x-beyond-metadata` | flat JSON object of scalars | tagged onto `ai.usage` + `ai.payload` |
 //! | `x-beyond-capture` | `on` / `off` | enable or suppress payload capture for this request |
+//! | `x-beyond-cache` | `on` / `off` | enable or skip the exact-match response cache for this request |
 //!
 //! **Nothing here can fail a request.** Every malformed, oversize, or unrecognized value is dropped
 //! and counted, and the request proceeds exactly as if the header were absent. An observability
@@ -33,7 +34,10 @@ pub const METADATA_HEADER: &str = "x-beyond-metadata";
 /// Per-request capture override: `on` or `off`.
 pub const CAPTURE_HEADER: &str = "x-beyond-capture";
 
-/// The same two names as pre-parsed [`HeaderName`]s, which is what [`Control::parse`] actually looks
+/// Per-request exact-match cache override: `on` or `off`. `off` skips lookup and store.
+pub const CACHE_HEADER: &str = "x-beyond-cache";
+
+/// The same three names as pre-parsed [`HeaderName`]s, which is what [`Control::parse`] actually looks
 /// up with.
 ///
 /// `HeaderMap::get(&str)` re-hashes the name on every call; `get(&HeaderName)` uses the hash the
@@ -46,11 +50,12 @@ static METADATA_NAME: LazyLock<HeaderName> =
     LazyLock::new(|| HeaderName::from_static(METADATA_HEADER));
 static CAPTURE_NAME: LazyLock<HeaderName> =
     LazyLock::new(|| HeaderName::from_static(CAPTURE_HEADER));
+static CACHE_NAME: LazyLock<HeaderName> = LazyLock::new(|| HeaderName::from_static(CACHE_HEADER));
 
 /// Every header this module consumes. Stripped in `upstream_request_filter` so a provider never
 /// sees a Beyond control header — they're ours, they'd be meaningless upstream, and a provider that
 /// rejects unknown headers would turn our observability feature into their 400.
-pub const CONTROL_HEADERS: [&str; 2] = [METADATA_HEADER, CAPTURE_HEADER];
+pub const CONTROL_HEADERS: [&str; 3] = [METADATA_HEADER, CAPTURE_HEADER, CACHE_HEADER];
 
 /// Longest metadata header we'll even attempt to parse. Checked **before** parsing so a caller
 /// can't make us walk a multi-megabyte JSON document on the request path.
@@ -63,7 +68,7 @@ const MAX_METADATA_PAIRS: usize = 16;
 /// Longest single key or rendered value.
 const MAX_METADATA_FIELD: usize = 128;
 
-/// What the caller asked for on this request. Both fields are `None` when the header was absent
+/// What the caller asked for on this request. Each member is `None` when the header was absent
 /// *or* unusable — the two are deliberately indistinguishable to callers of this module, because
 /// the handling is identical.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -73,6 +78,10 @@ pub struct Control {
     /// `Some(true)` = capture this request, `Some(false)` = don't, `None` = no opinion (fall back to
     /// the tenant's control-plane rule).
     pub capture: Option<bool>,
+    /// `Some(true)` = cache this request (the default when the store is on), `Some(false)` = skip
+    /// lookup and store. `None` = no opinion. `Cache-Control: no-store` is checked separately and
+    /// also skips.
+    pub cache: Option<bool>,
     /// A header was present but unusable. Drives `control_header_errors_total` — without it a
     /// client whose tags silently never appear has no signal to debug against.
     pub malformed: bool,
@@ -93,8 +102,15 @@ impl Control {
         }
 
         if let Some(raw) = req.headers.get(&*CAPTURE_NAME) {
-            match raw.to_str().ok().and_then(parse_capture) {
+            match raw.to_str().ok().and_then(parse_on_off) {
                 Some(c) => out.capture = Some(c),
+                None => out.malformed = true,
+            }
+        }
+
+        if let Some(raw) = req.headers.get(&*CACHE_NAME) {
+            match raw.to_str().ok().and_then(parse_on_off) {
+                Some(c) => out.cache = Some(c),
                 None => out.malformed = true,
             }
         }
@@ -105,8 +121,8 @@ impl Control {
 
 /// `on` / `off`, case-insensitively. Deliberately not accepting `true`/`1`/`yes`: a narrow spelling
 /// makes a typo visible on the error counter instead of silently meaning the opposite of what the
-/// caller intended.
-fn parse_capture(raw: &str) -> Option<bool> {
+/// caller intended. Shared by `x-beyond-capture` and `x-beyond-cache`.
+fn parse_on_off(raw: &str) -> Option<bool> {
     match raw.trim() {
         v if v.eq_ignore_ascii_case("on") => Some(true),
         v if v.eq_ignore_ascii_case("off") => Some(false),
@@ -349,5 +365,23 @@ mod tests {
         assert_eq!(c.metadata.as_deref(), Some(r#"{"feature":"chat"}"#));
         assert_eq!(c.capture, None);
         assert!(c.malformed);
+    }
+
+    #[test]
+    fn cache_accepts_on_off_case_insensitively() {
+        for (raw, want) in [("on", true), ("OFF", false), (" Off ", false)] {
+            let c = Control::parse(&req(&[(CACHE_HEADER, raw)]));
+            assert_eq!(c.cache, Some(want), "{raw}");
+            assert!(!c.malformed, "{raw}");
+        }
+    }
+
+    #[test]
+    fn cache_rejects_other_spellings_rather_than_guessing() {
+        for raw in ["true", "1", "yes", ""] {
+            let c = Control::parse(&req(&[(CACHE_HEADER, raw)]));
+            assert_eq!(c.cache, None, "{raw}");
+            assert!(c.malformed, "{raw}");
+        }
     }
 }

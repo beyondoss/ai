@@ -5,6 +5,7 @@
 //! values) — is built once at boot from config (SSM/env), so the auth + key paths have **no runtime
 //! dependency on NATS**.
 
+use crate::cache::{self, ResponseCache};
 use crate::capture::{CaptureRule, CaptureSet};
 use crate::config::AiConfig;
 use crate::deny::DenySet;
@@ -209,6 +210,9 @@ pub struct GatewayState {
     /// entry that doesn't override them (and to a capture requested by header, which has no entry).
     pub capture_defaults: CaptureRule,
 
+    /// Exact-match response cache. `None` when `cache_ttl_secs == 0`.
+    pub cache: Option<ResponseCache>,
+
     /// Per-key request-rate guardrail (see `ratelimit`). `None` when `rate_limit_rps == 0`. Fixed
     /// memory regardless of tenant count, so it lives in the static state with no GC.
     pub rate_limit: Option<RateLimit>,
@@ -294,6 +298,14 @@ impl GatewayState {
             max_bytes: config.capture_max_bytes,
         };
 
+        let cache = (config.cache_ttl_secs > 0).then(|| {
+            cache::ResponseCache::new(
+                Duration::from_secs(config.cache_ttl_secs),
+                config.cache_max_entries,
+                config.cache_max_bytes,
+            )
+        });
+
         Ok(Arc::new(Self {
             metrics,
             keyring,
@@ -302,6 +314,7 @@ impl GatewayState {
             deny: ArcSwap::from_pointee(DenySet::new()),
             capture: ArcSwap::from_pointee(CaptureSet::new()),
             capture_defaults,
+            cache,
             rate_limit,
             dns_cache: ArcSwap::from_pointee(HashMap::new()),
             instance_prefix: {
