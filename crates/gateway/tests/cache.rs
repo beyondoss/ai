@@ -230,3 +230,89 @@ async fn a_429_then_200_is_cacheable_under_the_client_body_hash() {
     );
     wait_for_metric(&gw, "ai_cache_hits_total", "", 1.0).await;
 }
+
+#[tokio::test]
+async fn two_candidate_orders_do_not_cross_hit() {
+    // The cache key includes the effective walk. Pinning both arms to the first fill would make
+    // `order: openrouter` replay openai's 2xx — the opposite of permuting the catalog.
+    let nats = unused_nats_port();
+    let (pubkey, sk) = test_keypair(16);
+    let openai = MockUpstream::start(Mode::Json).await;
+    let openrouter = MockUpstream::start(Mode::Json).await;
+    let gw = Gateway::builder(nats, &openai.authority(), &b64(&pubkey))
+        .providers(&["openai", "openrouter"])
+        .provider_authority("openrouter", &openrouter.authority())
+        .cache_ttl_secs(60)
+        .start()
+        .await;
+    let key = vkey(&sk, 16);
+    let client = test_client();
+    let body = body();
+
+    {
+        let (c, u, k, b) = (client.clone(), gw.url(), key.clone(), body.clone());
+        wait_for_status(200, move || {
+            let (c, u, k, b) = (c.clone(), u.clone(), k.clone(), b.clone());
+            async move { post(&c, &u, &k, b, &[]).await.status().as_u16() }
+        })
+        .await;
+    }
+    let _ = gw.wait_for_log_line(&["ai.usage"]).await;
+    let openai_after_a = openai.hits();
+    assert!(openai_after_a >= 1, "default order fills from openai");
+    assert_eq!(openrouter.hits(), 0);
+
+    // Same body, different walk: must miss.
+    let resp = post(
+        &client,
+        &gw.url(),
+        &key,
+        body.clone(),
+        &[("x-beyond-order", "openrouter")],
+    )
+    .await;
+    assert_eq!(resp.status().as_u16(), 200);
+    assert_eq!(
+        openai.hits(),
+        openai_after_a,
+        "openrouter-first must not replay the openai fill"
+    );
+    assert!(
+        openrouter.hits() >= 1,
+        "openrouter-first must go upstream on a miss"
+    );
+    let _ = gw
+        .wait_for_log_line(&["ai.usage", r#""provider":"openrouter""#])
+        .await;
+    let openrouter_after_b = openrouter.hits();
+
+    // Each arm now hits its own fill.
+    let resp = post(&client, &gw.url(), &key, body.clone(), &[]).await;
+    assert_eq!(resp.status().as_u16(), 200);
+    assert_eq!(
+        openai.hits(),
+        openai_after_a,
+        "default order must cache-hit"
+    );
+    assert_eq!(
+        openrouter.hits(),
+        openrouter_after_b,
+        "default-order hit must not touch the other arm"
+    );
+
+    let resp = post(
+        &client,
+        &gw.url(),
+        &key,
+        body,
+        &[("x-beyond-order", "openrouter")],
+    )
+    .await;
+    assert_eq!(resp.status().as_u16(), 200);
+    assert_eq!(
+        openrouter.hits(),
+        openrouter_after_b,
+        "openrouter-first must cache-hit its own arm"
+    );
+    assert_eq!(openai.hits(), openai_after_a);
+}

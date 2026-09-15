@@ -357,6 +357,9 @@ pub struct Captured {
     /// an observability opt-in into their 400. Both must always be `None` at the upstream.
     pub beyond_metadata: Option<String>,
     pub beyond_capture: Option<String>,
+    pub beyond_order: Option<String>,
+    pub beyond_only: Option<String>,
+    pub beyond_split: Option<String>,
     /// Anthropic (and Bedrock Messages) require this; a stock OpenAI SDK never sends it. Recorded
     /// so a Chat Completions → Messages translate walk can prove the gateway injected it.
     pub anthropic_version: Option<String>,
@@ -566,6 +569,9 @@ async fn mock_handle(
         beyond_model,
         beyond_metadata,
         beyond_capture,
+        beyond_order,
+        beyond_only,
+        beyond_split,
         anthropic_version,
     ) = {
         let h = req.headers();
@@ -577,6 +583,9 @@ async fn mock_handle(
             get("x-beyond-model"),
             get("x-beyond-metadata"),
             get("x-beyond-capture"),
+            get("x-beyond-order"),
+            get("x-beyond-only"),
+            get("x-beyond-split"),
             get("anthropic-version"),
         )
     };
@@ -610,6 +619,9 @@ async fn mock_handle(
         beyond_model,
         beyond_metadata,
         beyond_capture,
+        beyond_order,
+        beyond_only,
+        beyond_split,
         anthropic_version,
         body,
     });
