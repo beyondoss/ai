@@ -722,6 +722,8 @@ pub struct GatewayBuilder {
     capture_max_bytes: Option<u32>,
     /// Override the default capture sampling (1 in N).
     capture_default_sample_n: Option<u32>,
+    /// Exact-match response cache TTL. `None` ⇒ gateway default (off). `Some(0)` disables.
+    cache_ttl_secs: Option<u64>,
     /// Per-provider authority overrides, for a topology with more than one upstream — a failover
     /// test needs a live mock and a dead port at the same time, which the single `authority` cannot
     /// express. Falls back to `authority` for any provider not named here.
@@ -854,6 +856,12 @@ impl GatewayBuilder {
         self
     }
 
+    /// Enable the exact-match response cache for this gateway (`0` disables).
+    pub fn cache_ttl_secs(mut self, secs: u64) -> Self {
+        self.cache_ttl_secs = Some(secs);
+        self
+    }
+
     pub async fn start(self) -> Gateway {
         let port = free_port();
         let metrics_port = free_port();
@@ -892,6 +900,9 @@ impl GatewayBuilder {
         }
         if let Some(n) = self.capture_default_sample_n {
             cfg.push_str(&format!("capture_default_sample_n = {n}\n"));
+        }
+        if let Some(secs) = self.cache_ttl_secs {
+            cfg.push_str(&format!("cache_ttl_secs = {secs}\n"));
         }
         if let Some(threshold) = self.circuit_breaker_threshold {
             // Tight window + reset so the test trips and recovers quickly.
@@ -1066,6 +1077,7 @@ impl Gateway {
             worker_threads: None,
             capture_max_bytes: None,
             capture_default_sample_n: None,
+            cache_ttl_secs: None,
         }
     }
 

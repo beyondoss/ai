@@ -17,6 +17,9 @@
 //! replaying would make Pingora send `Content-Length` bytes with no body and the upstream would hang.
 //! The supported hook is `request_body_filter`, which feeds each chunk to a streaming structural
 //! scanner (`peek::ModelScanner`, O(1) memory) — never withholding it on the ordinary path.
+//! The exact-match cache may continue that same peek past the first `model` for a small complete
+//! body (still inside pingora's retry buffer), so a hit can hash the pre-rewrite bytes; a miss is
+//! still replayed, never withheld.
 //!
 //! One exception that still replays: a **managed** request on the bare `/v1` default (or `/auto`
 //! with no routing header) must resolve a catalog row from the body's root `model` before
@@ -52,6 +55,7 @@
 //! `GET /v1/models` lists the catalog. `/{provider}/…` is the escape hatch and does not consult
 //! the catalog. An unknown first segment is a 404.
 
+use crate::cache;
 use crate::capture::CaptureBufs;
 use crate::key;
 use crate::metrics::Rejection;
@@ -333,6 +337,8 @@ struct ModelRouting {
     /// `model`. `Some` only when pingora's 64 KiB retry buffer truncated and will not replay that
     /// prefix itself — `request_body_filter` prepends it before the remaining chunks.
     replay: Option<Bytes>,
+    /// Exact-match cache: fill a miss, or a hit already written to the client.
+    cache: Option<cache::Pending>,
 }
 
 impl RequestCtx {
@@ -661,6 +667,38 @@ impl AiProxy {
     async fn reply_models_list_boxed(session: &mut Session, request_id: &str) -> Result<bool> {
         Box::pin(Self::reply_models_list(session, request_id)).await
     }
+
+    /// Replay a cached 2xx. Boxed so its write future is not inlined into `request_filter`.
+    async fn reply_cache_hit(
+        session: &mut Session,
+        request_id: &str,
+        hit: &cache::CachedResponse,
+    ) -> Result<bool> {
+        let mut len_buf = ArrayString::<20>::new();
+        let _ = write!(len_buf, "{}", hit.body.len());
+        let mut resp = ResponseHeader::build(hit.status, Some(4))?;
+        let ct = if hit.content_type.is_empty() {
+            "application/json"
+        } else {
+            hit.content_type.as_ref()
+        };
+        resp.insert_header("content-type", ct)?;
+        resp.insert_header("content-length", len_buf.as_str())?;
+        resp.insert_header(REQUEST_ID_HEADER, request_id)?;
+        session.write_response_header(Box::new(resp), false).await?;
+        session
+            .write_response_body(Some(hit.body.clone()), true)
+            .await?;
+        Ok(true)
+    }
+
+    async fn reply_cache_hit_boxed(
+        session: &mut Session,
+        request_id: &str,
+        hit: &cache::CachedResponse,
+    ) -> Result<bool> {
+        Box::pin(Self::reply_cache_hit(session, request_id, hit)).await
+    }
 }
 
 /// Header names carrying a plain static API key (no OAuth/signing), checked in order. Anthropic:
@@ -818,6 +856,8 @@ struct BodyPeek {
     model: Option<String>,
     /// `Some` when pingora's retry buffer truncated and will not replay this prefix.
     replay: Option<Bytes>,
+    /// The full pre-rewrite body, only when the peek consumed it to completion (not truncated).
+    complete: Option<Vec<u8>>,
 }
 
 /// Enable pingora's 64 KiB retry buffer, read until a root `model` appears, the body ends, or the
@@ -830,17 +870,30 @@ struct BodyPeek {
 /// unread bytes on the socket and pingora continues the duplex. A root `model` that has not
 /// appeared by [`BODY_PEEK_LIMIT`] is missing — 404 — so we never admit that truncated-complete
 /// case either.
-async fn peek_body_model(session: &mut Session) -> pingora_core::Result<BodyPeek> {
+///
+/// `drain_complete` continues past the first `model` so an exact-match cache lookup can hash the
+/// whole pre-rewrite body. Only used when the cache is on, the request did not opt out, and
+/// `Content-Length` is known to fit under the cap. A miss still does not withhold — pingora
+/// replays what it buffered. The truncated-buffer break below is a backstop so a lying
+/// Content-Length cannot walk into the hang the stop-at-model rule exists to avoid.
+async fn peek_body_model(
+    session: &mut Session,
+    drain_complete: bool,
+) -> pingora_core::Result<BodyPeek> {
     session.as_mut().enable_retry_buffering();
     let mut buf = Vec::new();
+    let mut found_model = false;
     loop {
-        if buf.len() >= BODY_PEEK_LIMIT {
+        if buf.len() >= BODY_PEEK_LIMIT || session.as_ref().retry_buffer_truncated() {
             break;
         }
         match session.read_request_body().await? {
             Some(chunk) if !chunk.is_empty() => {
                 buf.extend_from_slice(&chunk);
-                if peek::scan_buffered(&buf).model.is_some() {
+                if !found_model {
+                    found_model = peek::scan_buffered(&buf).model.is_some();
+                }
+                if found_model && !drain_complete {
                     break;
                 }
             }
@@ -849,9 +902,19 @@ async fn peek_body_model(session: &mut Session) -> pingora_core::Result<BodyPeek
         }
     }
     let truncated = session.as_ref().retry_buffer_truncated();
+    let done = session.as_mut().is_body_done();
+    let model = peek::scan_buffered(&buf).model;
+    let (replay, complete) = if truncated {
+        (Some(Bytes::from(buf)), None)
+    } else if done {
+        (None, Some(buf))
+    } else {
+        (None, None)
+    };
     Ok(BodyPeek {
-        model: peek::scan_buffered(&buf).model,
-        replay: truncated.then(|| Bytes::from(buf)),
+        model,
+        replay,
+        complete,
     })
 }
 
@@ -1337,6 +1400,8 @@ impl ProxyHttp for AiProxy {
         }
 
         let mut body_replay: Option<Bytes> = None;
+        let mut body_complete: Option<Vec<u8>> = None;
+        let cache_bypass = !managed || cache::request_bypasses(session.req_header());
         if managed && model_route.is_none() && resolve_from_body {
             // Header wins if present (unknown → 404, no fall-through to the body). Absent → peek.
             match catalog_from_header(session) {
@@ -1352,7 +1417,14 @@ impl ProxyHttp for AiProxy {
                     return Self::reject_catalog_miss(session, &request_id, name.as_deref()).await;
                 }
                 CatalogHeader::Absent => {
-                    let peek = Box::pin(peek_body_model(session)).await?;
+                    // Drain the rest of a small body only when a cache lookup can hash it. Cap at
+                    // strictly under the peek limit so we cannot fill pingora's retry buffer to the
+                    // truncated-and-fully-consumed hang (see `peek_body_model`). A miss still does
+                    // not withhold: pingora replays the retry buffer.
+                    let drain = self.state.cache.is_some()
+                        && !cache_bypass
+                        && declared_len.is_some_and(|n| n < BODY_PEEK_LIMIT);
+                    let peek = Box::pin(peek_body_model(session, drain)).await?;
                     let Some(name) = peek.model.filter(|n| !n.is_empty()) else {
                         self.state.metrics.rejection(Rejection::UnknownModel).inc();
                         return Self::reject_catalog_miss(session, &request_id, None).await;
@@ -1363,6 +1435,7 @@ impl ProxyHttp for AiProxy {
                     };
                     model_route = Some(route);
                     body_replay = peek.replay;
+                    body_complete = peek.complete;
                 }
             }
         }
@@ -1552,6 +1625,77 @@ impl ProxyHttp for AiProxy {
             None
         };
 
+        // Exact-match cache: lookup only when the pre-rewrite body is already in hand (headerless
+        // managed catalog walk). A hit writes the stored 2xx and returns before the breaker, the
+        // key-walk, and `upstream_peer`. A miss stays an unbuffered relay; the fill is a tap.
+        let cache_look = if !cache_bypass && model_route.is_some() {
+            body_complete.as_deref().and_then(|body| {
+                let store = self.state.cache.as_ref()?;
+                let path = session.req_header().uri.path();
+                let ck = cache::key(tenant_id, path, body);
+                match store.get(&ck) {
+                    Some(hit) => Some(Err(hit)),
+                    None => Some(Ok((ck, store.max_bytes()))),
+                }
+            })
+        } else {
+            None
+        };
+        let mut pending_cache: Option<cache::Pending> = None;
+        match cache_look {
+            Some(Err(hit)) => {
+                Self::reply_cache_hit_boxed(session, &request_id, &hit).await?;
+                *ctx = Some(RequestCtx {
+                    tenant_id,
+                    vpc_id,
+                    key_id,
+                    dialect,
+                    provider,
+                    forward_path,
+                    managed,
+                    control,
+                    model: String::new(),
+                    model_scanner: peek::ModelScanner::new(),
+                    resp_model_scanner: peek::ModelScanner::for_response(),
+                    // Not an upstream stream — `response_filter` never ran, so `active_streams`
+                    // was never incremented. The stored `hit.streaming` is emitted on `ai.usage`.
+                    streaming: false,
+                    inject_eligible: false,
+                    req_buf: Vec::new(),
+                    resp_tail: UsageTail::default(),
+                    resp_head: Vec::new(),
+                    body_bytes_fed: 0,
+                    upstream_status: Some(hit.status),
+                    start,
+                    attempt: 0,
+                    pool_key: 0,
+                    same_provider_retry: false,
+                    breaker_pending: false,
+                    auto: model_route.map(|route| {
+                        Box::new(ModelRouting {
+                            route,
+                            candidate: first_usable(usable, 0).unwrap_or(0),
+                            usable,
+                            attempt_start: start,
+                            replay: None,
+                            cache: Some(cache::Pending::Hit(hit)),
+                        })
+                    }),
+                    request_id,
+                });
+                self.state.metrics.requests_in_flight.inc();
+                return Ok(true);
+            }
+            Some(Ok((ck, max_bytes))) => {
+                pending_cache = Some(cache::Pending::Fill {
+                    key: ck,
+                    tap: cache::ResponseTap::new(max_bytes),
+                    content_type: None,
+                });
+            }
+            None => {}
+        }
+
         // Circuit breaker (per provider, all traffic — a down provider is down regardless of whose
         // key is used). Checked here, after every other rejection, so claiming a half-open probe
         // permit corresponds to an *actual* upstream attempt — and balanced by exactly one
@@ -1645,6 +1789,7 @@ impl ProxyHttp for AiProxy {
                     // timed even if it fails before the prologue runs.
                     attempt_start: start,
                     replay: body_replay,
+                    cache: pending_cache,
                 })
             }),
             request_id,
@@ -2247,6 +2392,16 @@ impl ProxyHttp for AiProxy {
             // and land on this request's log line. `insert_header` only fails on an invalid value;
             // our id is `[0-9a-f-]`, always valid — but surface a failure rather than silently drop.
             upstream_response.insert_header(REQUEST_ID_HEADER, rc.request_id.as_str())?;
+
+            if let Some(cache::Pending::Fill { content_type, .. }) =
+                rc.auto.as_mut().and_then(|a| a.cache.as_mut())
+            {
+                *content_type = upstream_response
+                    .headers
+                    .get("content-type")
+                    .and_then(|v| v.to_str().ok())
+                    .map(|s| s.to_owned().into_boxed_str());
+            }
         }
         Ok(())
     }
@@ -2306,6 +2461,12 @@ impl ProxyHttp for AiProxy {
             // fine — each is independently bounded.
             if let Some(c) = rc.control.as_mut().and_then(|c| c.capture.as_mut()) {
                 c.push_resp(chunk);
+            }
+
+            if let Some(cache::Pending::Fill { tap, .. }) =
+                rc.auto.as_mut().and_then(|a| a.cache.as_mut())
+            {
+                tap.push(chunk);
             }
         }
         Ok(None)
@@ -2435,27 +2596,45 @@ impl ProxyHttp for AiProxy {
             rc.breaker_pending = false;
         }
 
-        // The last `USAGE_TAIL_CAP` bytes of the response, oldest first (see `UsageTail`). Short
-        // responses are the whole body; long ones are rotated into order here, once.
-        let tail = rc.resp_tail.contiguous();
+        let cache_hit = if matches!(
+            rc.auto.as_ref().and_then(|a| a.cache.as_ref()),
+            Some(cache::Pending::Hit(_))
+        ) {
+            match rc.auto.as_mut().and_then(|a| a.cache.take()) {
+                Some(cache::Pending::Hit(h)) => Some(h),
+                _ => None,
+            }
+        } else {
+            None
+        };
 
-        // Extract usage facts (shape depends on dialect + streaming). Every case reads the tail;
-        // Anthropic streaming *additionally* reads the head, because that's where `message_start`
-        // put the input and cache token counts. The two buffers may overlap on a short response —
-        // harmless, since every field is assigned rather than accumulated.
-        let parsed = match (rc.dialect, rc.streaming) {
-            (Dialect::OpenAi, true) => usage::openai_stream(tail),
-            (Dialect::OpenAi, false) => usage::openai_body(tail),
-            (Dialect::Anthropic, true) => usage::anthropic_stream_parts(&[&rc.resp_head, tail]),
-            (Dialect::Anthropic, false) => usage::anthropic_body(tail),
+        // The last `USAGE_TAIL_CAP` bytes of the response, oldest first (see `UsageTail`). Short
+        // responses are the whole body; long ones are rotated into order here, once. Skipped on a
+        // cache hit — there is no tail; tokens come from the stored entry.
+        let parsed = if cache_hit.is_some() {
+            cache_hit.as_ref().map(|h| h.usage)
+        } else {
+            let tail = rc.resp_tail.contiguous();
+            // Extract usage facts (shape depends on dialect + streaming). Every case reads the tail;
+            // Anthropic streaming *additionally* reads the head, because that's where `message_start`
+            // put the input and cache token counts. The two buffers may overlap on a short response —
+            // harmless, since every field is assigned rather than accumulated.
+            match (rc.dialect, rc.streaming) {
+                (Dialect::OpenAi, true) => usage::openai_stream(tail),
+                (Dialect::OpenAi, false) => usage::openai_body(tail),
+                (Dialect::Anthropic, true) => usage::anthropic_stream_parts(&[&rc.resp_head, tail]),
+                (Dialect::Anthropic, false) => usage::anthropic_body(tail),
+            }
         };
         // A managed 2xx response is *expected* to carry usage; `None` there means the provider's
         // usage block changed shape (a new API version, a wire change) and we're about to emit a
         // zero-token billing row that looks exactly like a (non-existent) legitimate zero-token
         // generation — silently zeroing that tenant's bill. Surface it on a counter + a warn so it
         // can be alerted on. A `None` on a 4xx/5xx (error body has no usage) is normal, not logged.
+        // Cache hits never trip this: they carry the tokens stored from the fill.
         if parsed.is_none()
             && rc.managed
+            && cache_hit.is_none()
             && let Some(s) = rc.upstream_status
             && (200..300).contains(&s)
         {
@@ -2473,6 +2652,9 @@ impl ProxyHttp for AiProxy {
         let usage = parsed.unwrap_or_default();
 
         let m = &self.state.metrics;
+        if cache_hit.is_some() {
+            m.cache_hits_total.inc();
+        }
         // Pre-resolved fixed-label children, and zeros skipped (see `Metrics::record_tokens`). Cache
         // tokens are counted here as well as in the `ai.usage` billing log below, because that log
         // ships with lag — the counter is the alerting surface for a cache-hit-rate cliff after a
@@ -2483,15 +2665,17 @@ impl ProxyHttp for AiProxy {
         // `elapsed()` about forty lines apart, so they reported *different* durations for the same
         // request and could never be reconciled against each other.
         let elapsed = rc.start.elapsed();
-        rc.provider
-            .metrics
-            .upstream_latency_seconds
-            .observe(elapsed.as_secs_f64());
-        // Balance the `active_streams` increment from `response_filter`. `logging` runs exactly once
-        // per request (including on upstream errors / client disconnects), so a stream that opened is
-        // always accounted closed here — the gauge can't leak upward.
-        if rc.streaming {
-            m.active_streams.dec();
+        if cache_hit.is_none() {
+            rc.provider
+                .metrics
+                .upstream_latency_seconds
+                .observe(elapsed.as_secs_f64());
+            // Balance the `active_streams` increment from `response_filter`. `logging` runs exactly once
+            // per request (including on upstream errors / client disconnects), so a stream that opened is
+            // always accounted closed here — the gauge can't leak upward.
+            if rc.streaming {
+                m.active_streams.dec();
+            }
         }
 
         // Emit the usage *fact* on a dedicated target — **managed only**. The event is an
@@ -2510,7 +2694,11 @@ impl ProxyHttp for AiProxy {
             let billed = rc.resp_model_scanner.take_model().map(sanitize_model);
             // The catalog name this request routed on — `None` for a provider-routed request.
             // Derived rather than stored: it is the catalog row's own `&'static` name.
-            let routed_model = rc.auto.as_ref().map(|a| a.route.model);
+            let routed_model = if let Some(h) = cache_hit.as_ref() {
+                h.routed_model
+            } else {
+                rc.auto.as_ref().map(|a| a.route.model)
+            };
 
             // What the client *asked for*.
             //
@@ -2520,7 +2708,11 @@ impl ProxyHttp for AiProxy {
             // so a discarded spelling determines nothing; reporting it as "requested" was a leftover
             // from an earlier design that did not rewrite bodies. On the provider-routed path the
             // body is untouched and is exactly what was asked for, so it stays the answer there.
-            let requested_model = routed_model.unwrap_or(rc.model.as_str());
+            let requested_model = if let Some(h) = cache_hit.as_ref() {
+                h.requested_model.as_ref()
+            } else {
+                routed_model.unwrap_or(rc.model.as_str())
+            };
 
             // A model-routed client should send the same id in the header (when they send one) and
             // the body; nothing enforces it, because the route is chosen from the header before the
@@ -2529,23 +2721,37 @@ impl ProxyHttp for AiProxy {
             // worth being able to see. Counted rather than logged per request: a client that always
             // disagrees would otherwise produce one warn line per request forever. Header still
             // wins; a headerless walk has nothing to disagree with.
-            if routed_model.is_some_and(|r| !rc.model.is_empty() && rc.model != r) {
+            if cache_hit.is_none()
+                && routed_model.is_some_and(|r| !rc.model.is_empty() && rc.model != r)
+            {
                 self.state.metrics.model_header_body_mismatch_total.inc();
             }
 
             // Prefer the id the provider echoed (the pinned snapshot it actually billed); fall back
             // to what was asked for when the response carried none — an error body, say.
-            let billed_model = billed
-                .as_deref()
-                .filter(|m| !m.is_empty())
-                .unwrap_or(requested_model);
+            let billed_model = if let Some(h) = cache_hit.as_ref() {
+                h.billed_model.as_ref()
+            } else {
+                billed
+                    .as_deref()
+                    .filter(|m| !m.is_empty())
+                    .unwrap_or(requested_model)
+            };
+            let usage_provider = cache_hit
+                .as_ref()
+                .map(|h| h.provider.as_ref())
+                .unwrap_or(rc.provider.name.as_str());
+            let usage_stream = cache_hit
+                .as_ref()
+                .map(|h| h.streaming)
+                .unwrap_or(rc.streaming);
             info!(
                 target: "ai.usage",
                 request_id = %rc.request_id,
                 tenant_id = rc.tenant_id,
                 vpc_id = rc.vpc_id,
                 key_id = rc.key_id,
-                provider = rc.provider.name.as_str(),
+                provider = usage_provider,
                 model = billed_model,
                 requested_model,
                 // Present only for a model-routed request, so the billing row says *how* it was
@@ -2553,7 +2759,8 @@ impl ProxyHttp for AiProxy {
                 // path; its value is marking the route, not carrying a second id. `&'static` from
                 // the catalog and charset-checked by a catalog test, so it needs no `sanitize_model`.
                 routed_model,
-                stream = rc.streaming,
+                stream = usage_stream,
+                cache_hit = cache_hit.is_some(),
                 input_tokens = usage.input_tokens,
                 output_tokens = usage.output_tokens,
                 cache_read_tokens = usage.cache_read_tokens,
@@ -2576,7 +2783,9 @@ impl ProxyHttp for AiProxy {
             // Correlated by `request_id`, which is also on the line above and in the response's
             // `x-beyond-request-id` header — so a user quoting that id resolves straight to their
             // conversation with no join table.
-            if let Some(cap) = rc.control.as_ref().and_then(|c| c.capture.as_ref()) {
+            if cache_hit.is_none()
+                && let Some(cap) = rc.control.as_ref().and_then(|c| c.capture.as_ref())
+            {
                 m.captures_total.inc();
                 m.capture_bytes_total.inc_by(cap.bytes() as u64);
                 info!(
@@ -2600,6 +2809,35 @@ impl ProxyHttp for AiProxy {
                     response_truncated = cap.resp_truncated(),
                     complete = e.is_none(),
                     "payload"
+                );
+            }
+
+            // Fill: complete 2xx only. Client abort, 4xx/5xx, and truncation are all skips — a
+            // partial or error body must never be replayed as a success.
+            if e.is_none()
+                && rc.upstream_status.is_some_and(|s| (200..300).contains(&s))
+                && let Some(cache::Pending::Fill {
+                    key,
+                    tap,
+                    content_type,
+                }) = rc.auto.as_mut().and_then(|a| a.cache.take())
+                && !tap.truncated()
+                && let Some(body) = tap.complete_body()
+                && let Some(store) = &self.state.cache
+            {
+                store.insert(
+                    key,
+                    cache::CachedResponse {
+                        status: rc.upstream_status.unwrap_or(200),
+                        content_type: content_type.unwrap_or_else(|| "application/json".into()),
+                        body: Bytes::copy_from_slice(body),
+                        usage,
+                        billed_model: billed_model.to_owned().into_boxed_str(),
+                        requested_model: requested_model.to_owned().into_boxed_str(),
+                        routed_model,
+                        provider: rc.provider.name.clone().into_boxed_str(),
+                        streaming: rc.streaming,
+                    },
                 );
             }
         }

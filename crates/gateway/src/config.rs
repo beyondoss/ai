@@ -313,6 +313,16 @@ pub struct AiConfig {
     /// be able to backpressure the data plane. Deeper absorbs longer sink stalls at the cost of
     /// holding more payload bytes in memory.
     pub capture_queue_depth: usize,
+
+    /// Exact-match response cache TTL (seconds). `0` disables it (the default). Only managed
+    /// catalog walks whose client body is already in hand before `upstream_peer` (`/auto`, managed
+    /// `/v1`) look up or fill. A hit replays the stored 2xx and skips the provider; a miss stays an
+    /// unbuffered relay and fills via a tap. BYO and `/{provider}` passthrough are not cached.
+    pub cache_ttl_secs: u64,
+    /// Cap on stored entries. Oldest insertion is dropped when a new one would exceed it.
+    pub cache_max_entries: usize,
+    /// Cap on a single stored response body (bytes). Oversize 2xxs are relayed but not stored.
+    pub cache_max_bytes: usize,
 }
 
 impl Default for AiConfig {
@@ -381,6 +391,13 @@ impl Default for AiConfig {
             // Absorbs a multi-second sink stall at a healthy capture rate. Past that we drop rather
             // than block — see the field docs and `ai_capture_dropped_total`.
             capture_queue_depth: 1024,
+            // Off. A TTL of 0 is the disable knob; turning it on is an operator choice, not a
+            // surprise change in what the gateway talks to.
+            cache_ttl_secs: 0,
+            cache_max_entries: 1024,
+            // 64 KiB: the same bound as the catalog-walk peek, so a cached response is no larger
+            // than the request that produced it was allowed to be while still being "in hand".
+            cache_max_bytes: 64 * 1024,
         }
     }
 }
