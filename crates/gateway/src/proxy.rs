@@ -3191,17 +3191,20 @@ impl ProxyHttp for AiProxy {
                 && let Some(body) = tap.complete_body()
                 && let Some(store) = &self.state.cache
             {
-                store.insert(key, cache::CachedResponse {
-                    status: rc.upstream_status.unwrap_or(200),
-                    content_type: content_type.unwrap_or_else(|| "application/json".into()),
-                    body: Bytes::copy_from_slice(body),
-                    usage,
-                    billed_model: billed_model.to_owned().into_boxed_str(),
-                    requested_model: requested_model.to_owned().into_boxed_str(),
-                    routed_model,
-                    provider: rc.provider.name.clone().into_boxed_str(),
-                    streaming: rc.streaming,
-                });
+                store.insert(
+                    key,
+                    cache::CachedResponse {
+                        status: rc.upstream_status.unwrap_or(200),
+                        content_type: content_type.unwrap_or_else(|| "application/json".into()),
+                        body: Bytes::copy_from_slice(body),
+                        usage,
+                        billed_model: billed_model.to_owned().into_boxed_str(),
+                        requested_model: requested_model.to_owned().into_boxed_str(),
+                        routed_model,
+                        provider: rc.provider.name.clone().into_boxed_str(),
+                        streaming: rc.streaming,
+                    },
+                );
             }
         }
     }
@@ -3552,10 +3555,10 @@ mod tests {
 
     #[test]
     fn extract_virtual_key_recognizes_openai_bearer() {
-        let req = req_with_headers("/v1/chat/completions", &[(
-            "authorization",
-            "Bearer sk-openai-key",
-        )]);
+        let req = req_with_headers(
+            "/v1/chat/completions",
+            &[("authorization", "Bearer sk-openai-key")],
+        );
         assert_eq!(extract_virtual_key(&req), Some("sk-openai-key"));
     }
 
@@ -3570,10 +3573,10 @@ mod tests {
     #[test]
     fn extract_virtual_key_recognizes_google_goog_api_key_header() {
         // Task #31: Google Gemini authenticates via `x-goog-api-key`.
-        let req = req_with_headers("/v1beta/models/gemini-2.5-pro:generateContent", &[(
-            "x-goog-api-key",
-            "goog-secret",
-        )]);
+        let req = req_with_headers(
+            "/v1beta/models/gemini-2.5-pro:generateContent",
+            &[("x-goog-api-key", "goog-secret")],
+        );
         assert_eq!(extract_virtual_key(&req), Some("goog-secret"));
     }
 
