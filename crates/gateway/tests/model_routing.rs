@@ -883,8 +883,19 @@ async fn a_5xx_candidates_breaker_opens_while_the_fallback_keeps_serving() {
 
     let client = test_client();
     let key = vkey(&sk);
+    // Pin openai-first: after the first 5xx the TTFT ranker would otherwise put the live fallback
+    // first and the 500 primary would stop being attempted, so the breaker would never open.
     for i in 0..6 {
-        let resp = post_auto(&client, &gw.url(), &key, Some(MODEL)).await;
+        let resp = client
+            .post(format!("{}/auto/chat/completions", gw.url()))
+            .header("authorization", format!("Bearer {key}"))
+            .header("content-type", "application/json")
+            .header("x-beyond-model", MODEL)
+            .header("x-beyond-order", "openai")
+            .body(body())
+            .send()
+            .await
+            .unwrap();
         assert_eq!(
             resp.status().as_u16(),
             200,
