@@ -46,9 +46,9 @@ pub enum Rejection {
     /// BYO key presented to the model-routed route, which is managed-only — a BYO token belongs to
     /// one provider, so neither selecting among candidates nor failing over is meaningful for it.
     ByoOnModelRoute,
-    /// Catalog walk whose inbound path implies a different wire than the row (Claude posted to
-    /// Chat Completions, GPT posted to Messages). We do not translate; this is a 400 rather than a
-    /// provider 400 on the wrong JSON shape.
+    /// Catalog walk whose inbound path implies a different wire than the row, on a path we do
+    /// not translate (`/v1/embeddings`, Responses, …). Chat Completions ↔ Messages is translated
+    /// instead of rejected. `/{provider}/…` never hits this — it does not consult the catalog.
     WireMismatch,
 }
 

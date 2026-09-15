@@ -1111,9 +1111,185 @@ async fn explicit_provider_path_ignores_the_catalog() {
     );
 }
 
-/// A Claude model posted to Chat Completions is a 400 from us, not a provider 400 on the wrong JSON.
+/// A Claude catalog id on Chat Completions is translated to Messages, not 400'd.
+/// The client (stock OpenAI SDK) sees `chat.completion.chunk`; billing parses the Anthropic stream.
 #[tokio::test]
-async fn a_wire_mismatch_is_rejected_before_any_upstream() {
+async fn openai_sdk_can_call_claude_via_v1_chat_completions() {
+    let nats_port = unused_nats_port();
+    let (pubkey, sk) = test_keypair(1);
+    let mock = MockUpstream::start(Mode::AnthropicSse).await;
+    let gw = Gateway::builder(nats_port, &mock.authority(), &b64(&pubkey))
+        .providers(&["anthropic", "openai", "openrouter"])
+        .start()
+        .await;
+
+    let resp = test_client()
+        .post(format!("{}/v1/chat/completions", gw.url()))
+        .header("authorization", format!("Bearer {}", vkey(&sk)))
+        .header("content-type", "application/json")
+        .body(r#"{"model":"claude-opus-4-8","stream":true,"messages":[{"role":"user","content":"hi"}]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let text = resp.text().await.unwrap();
+    assert!(
+        text.contains("chat.completion.chunk"),
+        "client must see the inbound Chat Completions dialect: {text}"
+    );
+    assert!(
+        !text.contains("message_start"),
+        "Anthropic SSE must not leak to an OpenAI client: {text}"
+    );
+
+    let cap = mock
+        .captured()
+        .expect("translated request reaches Anthropic");
+    assert_eq!(cap.path, "/v1/messages");
+    assert_eq!(cap.x_api_key.as_deref(), Some("sk-anthropic-pool"));
+    let got = String::from_utf8(cap.body).unwrap();
+    assert!(
+        got.contains(r#""model":"claude-opus-4-8""#) && got.contains(r#""max_tokens""#),
+        "upstream must be Messages-shaped with the candidate id: {got}"
+    );
+    assert!(
+        !got.contains("stream_options"),
+        "OpenAI→Anthropic must not inject stream_options: {got}"
+    );
+    assert_eq!(
+        cap.beyond_model, None,
+        "x-beyond-model must not leak upstream"
+    );
+
+    let line = gw
+        .wait_for_log_line(&["ai.usage", r#""provider":"anthropic""#])
+        .await;
+    assert!(
+        line.contains(r#""input_tokens":13"#) && !line.contains(r#""input_tokens":0"#),
+        "usage must parse the Anthropic upstream stream: {line}"
+    );
+    assert!(
+        line.contains(r#""model":"claude-opus-4-8""#),
+        "ai.usage.model is the provider echo: {line}"
+    );
+}
+
+/// Reverse: a GPT catalog id on Messages is translated to Chat Completions.
+#[tokio::test]
+async fn anthropic_sdk_can_call_gpt_via_v1_messages() {
+    let nats_port = unused_nats_port();
+    let (pubkey, sk) = test_keypair(1);
+    let mock = MockUpstream::start(Mode::Sse).await;
+    let gw = Gateway::builder(nats_port, &mock.authority(), &b64(&pubkey))
+        .providers(&["openai", "openrouter", "anthropic"])
+        .start()
+        .await;
+
+    let resp = test_client()
+        .post(format!("{}/v1/messages", gw.url()))
+        .header("x-api-key", vkey(&sk))
+        .header("content-type", "application/json")
+        .body(r#"{"model":"gpt-4o-mini","max_tokens":16,"stream":true,"messages":[{"role":"user","content":"hi"}]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let text = resp.text().await.unwrap();
+    assert!(
+        text.contains("message_start") || text.contains("content_block_delta"),
+        "client must see the inbound Messages dialect: {text}"
+    );
+    assert!(
+        !text.contains("chat.completion.chunk"),
+        "OpenAI SSE must not leak to an Anthropic client: {text}"
+    );
+
+    let cap = mock.captured().expect("translated request reaches OpenAI");
+    assert_eq!(cap.path, "/v1/chat/completions");
+    assert_eq!(cap.authorization.as_deref(), Some("Bearer sk-pool-secret"));
+    let got = String::from_utf8(cap.body).unwrap();
+    assert!(
+        got.contains(r#""model":"gpt-4o-mini""#),
+        "upstream must be Chat Completions with the candidate id: {got}"
+    );
+    assert!(
+        got.contains(r#""stream_options":{"include_usage":true}"#),
+        "Anthropic→OpenAI streaming must inject include_usage on the translated body: {got}"
+    );
+
+    let line = gw
+        .wait_for_log_line(&["ai.usage", r#""provider":"openai""#])
+        .await;
+    assert!(
+        line.contains(r#""input_tokens":5"#),
+        "usage must parse the OpenAI upstream stream: {line}"
+    );
+}
+
+/// Same-wire catalog walks still byte-relay (no translation of the JSON shape).
+#[tokio::test]
+async fn same_wire_catalog_walk_is_still_a_byte_relay() {
+    let nats_port = unused_nats_port();
+    let (pubkey, sk) = test_keypair(1);
+    let mock = MockUpstream::start(Mode::Json).await;
+    let gw = Gateway::builder(nats_port, &mock.authority(), &b64(&pubkey))
+        .providers(&["openai", "openrouter"])
+        .start()
+        .await;
+
+    let body =
+        r#"{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}],"temperature":0.2}"#;
+    let resp = post_v1(&test_client(), &gw.url(), &vkey(&sk), body.into()).await;
+    assert_eq!(resp.status().as_u16(), 200);
+    let cap = mock.captured().expect("same-wire walk reaches openai");
+    assert_eq!(cap.path, "/v1/chat/completions");
+    let got = String::from_utf8(cap.body).unwrap();
+    assert!(
+        got.contains(r#""temperature":0.2"#) && got.contains(r#""model":"gpt-4o-mini""#),
+        "same-wire must not reshape the body: {got}"
+    );
+    let client_body = resp.text().await.unwrap();
+    assert!(
+        client_body.contains("chat.completion"),
+        "same-wire client bytes are the upstream OpenAI JSON: {client_body}"
+    );
+}
+
+/// `/{provider}/…` never translates: a Messages body posted to OpenAI is forwarded as-is, and
+/// the mock (standing in for OpenAI) 400s it.
+#[tokio::test]
+async fn provider_path_does_not_translate_a_claude_body_to_openai() {
+    let nats_port = unused_nats_port();
+    let (pubkey, sk) = test_keypair(1);
+    let mock = MockUpstream::start(Mode::Status(400)).await;
+    let gw = Gateway::builder(nats_port, &mock.authority(), &b64(&pubkey))
+        .providers(&["openai"])
+        .start()
+        .await;
+
+    let resp = test_client()
+        .post(format!("{}/openai/v1/chat/completions", gw.url()))
+        .header("authorization", format!("Bearer {}", vkey(&sk)))
+        .header("content-type", "application/json")
+        .body(r#"{"model":"claude-opus-4-8","max_tokens":16,"system":"be brief","messages":[{"role":"user","content":"hi"}]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 400);
+    let cap = mock
+        .captured()
+        .expect("provider path must still reach the upstream");
+    assert_eq!(cap.path, "/v1/chat/completions");
+    let got = String::from_utf8(cap.body).unwrap();
+    assert!(
+        got.contains(r#""system":"be brief""#) && got.contains(r#""max_tokens":16"#),
+        "the Messages body must be forwarded untranslated: {got}"
+    );
+}
+
+/// Paths that are not Chat Completions ↔ Messages still 400 on a wire mismatch.
+#[tokio::test]
+async fn embeddings_path_with_a_claude_row_is_still_a_wire_mismatch() {
     let nats_port = unused_nats_port();
     let (pubkey, sk) = test_keypair(1);
     let mock = MockUpstream::start(Mode::Json).await;
@@ -1122,13 +1298,14 @@ async fn a_wire_mismatch_is_rejected_before_any_upstream() {
         .start()
         .await;
 
-    let resp = post_v1(
-        &test_client(),
-        &gw.url(),
-        &vkey(&sk),
-        r#"{"model":"claude-opus-4-8","messages":[{"role":"user","content":"hi"}]}"#.into(),
-    )
-    .await;
+    let resp = test_client()
+        .post(format!("{}/v1/embeddings", gw.url()))
+        .header("authorization", format!("Bearer {}", vkey(&sk)))
+        .header("content-type", "application/json")
+        .body(r#"{"model":"claude-opus-4-8","input":"hi"}"#)
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status().as_u16(), 400);
     let text = resp.text().await.unwrap();
     assert!(

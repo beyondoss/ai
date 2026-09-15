@@ -25,8 +25,9 @@
 //! with no routing header) must resolve a catalog row from the body's root `model` before
 //! `upstream_peer` runs. That peek enables pingora's 64 KiB retry buffer, reads at most that many
 //! bytes, and — if the buffer truncated — prepends our copy in `request_body_filter`. Untruncated
-//! peeks are replayed by pingora itself. Unknown or missing model → 404 naming the miss. Inbound
-//! path vs row wire mismatch → 400. `GET /v1/models` lists the catalog.
+//! peeks are replayed by pingora itself. Unknown or missing model → 404 naming the miss. Chat
+//! Completions ↔ Messages on a managed catalog walk is translated; any other inbound-path vs row
+//! wire mismatch → 400. `GET /v1/models` lists the catalog.
 //!
 //! One deliberate exception to the no-buffer rule: a **managed** OpenAI Chat Completions request is
 //! buffered and gets `stream_options.include_usage` injected when it streams without it — otherwise
@@ -51,9 +52,11 @@
 //! A **managed** request to that default — or to `/auto` — resolves a catalog row from
 //! `x-beyond-model` if present, else the body's root `model`; the catalog is the allowlist
 //! (unknown/missing → 404 naming the miss) and the request walks that row's same-wire candidates.
-//! Candidate spellings are aliases. Inbound path must match the row's wire (else 400).
-//! `GET /v1/models` lists the catalog. `/{provider}/…` is the escape hatch and does not consult
-//! the catalog. An unknown first segment is a 404.
+//! Candidate spellings are aliases. Same-wire catalog walks are a byte relay; Chat Completions ↔
+//! Messages on a managed `/v1` or `/auto` walk is translated so a stock SDK can call the other
+//! dialect. Other inbound-path mismatches are still a 400. `GET /v1/models` lists the catalog.
+//! `/{provider}/…` is the escape hatch, does not consult the catalog, and never translates.
+//! An unknown first segment is a 404.
 
 use crate::cache;
 use crate::capture::CaptureBufs;
@@ -61,7 +64,7 @@ use crate::key;
 use crate::metrics::Rejection;
 use crate::route::{self, Dialect, Provider};
 use crate::state::{GatewayState, RequestId};
-use crate::{control, peek, usage};
+use crate::{control, peek, translate, usage};
 use arrayvec::ArrayString;
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -339,6 +342,9 @@ struct ModelRouting {
     replay: Option<Bytes>,
     /// Exact-match cache: fill a miss, or a hit already written to the client.
     cache: Option<cache::Pending>,
+    /// Inbound wire differs from `route.wire` on Chat Completions ↔ Messages. `None` is the
+    /// same-wire byte-relay, which is still the common catalog-walk case.
+    translate: Option<translate::TranslateState>,
 }
 
 impl RequestCtx {
@@ -386,6 +392,8 @@ impl RequestCtx {
     /// Two reasons a body gets rewritten:
     /// - `inject_eligible`: splicing `stream_options` into a managed OpenAI stream.
     /// - `route`: re-spelling `model` for the candidate serving this attempt.
+    /// - translate: Chat Completions ↔ Messages on a wire-mismatched catalog walk (already on
+    ///   the buffered catalog-walk path).
     ///
     /// Both can apply to the same request, in which case both edits are made to the one buffer.
     fn rewrites_body(&self) -> bool {
@@ -1533,26 +1541,30 @@ impl ProxyHttp for AiProxy {
             }
         };
 
-        // Stock SDK footgun: Claude posted to Chat Completions (or GPT to Messages) would be
-        // forwarded to the row's candidate path with the wrong JSON. We do not translate, so
-        // reject here rather than relaying a provider 400 that looks like the client's.
-        let wire_mismatch = {
+        // Catalog walk: inbound path may name Chat Completions while the row is Messages (a stock
+        // OpenAI SDK calling Claude), or the reverse. Translate those two; any other mismatch is
+        // still a 400 (`/v1/embeddings`, Responses, …). `/{provider}/…` never reaches this — it
+        // has no row.
+        let mut translate_state = None;
+        if let Some(row) = model_route {
             let path = session.req_header().uri.path();
-            model_route.and_then(|row| {
-                let got = route::implied_wire(path)?;
-                (got != row.wire).then_some(row)
-            })
-        };
-        if let Some(row) = wire_mismatch {
-            self.state.metrics.rejection(Rejection::WireMismatch).inc();
-            return Self::reject_message_boxed(
-                session,
-                &request_id,
-                400,
-                "invalid_request_error",
-                format!("{} is {}", row.model, route::wire_post_hint(row.wire)),
-            )
-            .await;
+            match route::catalog_wire_action(path, row.wire) {
+                route::WireAction::Relay => {}
+                route::WireAction::Translate { client } => {
+                    translate_state = Some(translate::TranslateState::new(client));
+                }
+                route::WireAction::Reject => {
+                    self.state.metrics.rejection(Rejection::WireMismatch).inc();
+                    return Self::reject_message_boxed(
+                        session,
+                        &request_id,
+                        400,
+                        "invalid_request_error",
+                        format!("{} is {}", row.model, route::wire_post_hint(row.wire)),
+                    )
+                    .await;
+                }
+            }
         }
 
         // Dialect drives usage parsing and injection eligibility.
@@ -1679,6 +1691,7 @@ impl ProxyHttp for AiProxy {
                             attempt_start: start,
                             replay: None,
                             cache: Some(cache::Pending::Hit(hit)),
+                            translate: None,
                         })
                     }),
                     request_id,
@@ -1790,6 +1803,7 @@ impl ProxyHttp for AiProxy {
                     attempt_start: start,
                     replay: body_replay,
                     cache: pending_cache,
+                    translate: translate_state,
                 })
             }),
             request_id,
@@ -2173,6 +2187,26 @@ impl ProxyHttp for AiProxy {
         // `apply_provider_attribution`).
         apply_provider_attribution(upstream_request, rc.provider.name.as_str(), rc.managed)?;
 
+        // A stock OpenAI SDK does not send `anthropic-version`. Anthropic (and Bedrock Messages)
+        // require it; inject the current version when we translated Chat Completions → Messages.
+        if rc
+            .auto
+            .as_ref()
+            .and_then(|a| a.translate.as_ref())
+            .is_some_and(|t| t.client == Dialect::OpenAi && rc.dialect == Dialect::Anthropic)
+            && upstream_request.headers.get("anthropic-version").is_none()
+        {
+            upstream_request.insert_header("anthropic-version", "2023-06-01")?;
+        }
+        if rc
+            .auto
+            .as_ref()
+            .and_then(|a| a.translate.as_ref())
+            .is_some_and(|t| t.client == Dialect::Anthropic && rc.dialect == Dialect::OpenAi)
+        {
+            upstream_request.remove_header("anthropic-version");
+        }
+
         // Forward the provider-native path (computed in `request_filter`): the client path with the
         // `/{provider}` segment stripped. Sent verbatim — no per-provider rewriting. The body's
         // framing (Content-Length / chunked) is preserved.
@@ -2286,7 +2320,15 @@ impl ProxyHttp for AiProxy {
         if rc.rewrites_body() {
             if end_of_stream {
                 // One structural walk for every answer (see `peek::scan_buffered`).
-                let buf = std::mem::take(&mut rc.req_buf);
+                let mut buf = std::mem::take(&mut rc.req_buf);
+                // Wire mismatch on this catalog walk: map the inbound JSON into the row's wire
+                // *before* the model splice. The candidate id is a property of the upstream, so
+                // it is written after the shape is already right. OpenAI→Anthropic drops
+                // `stream_options` here (Anthropic has no such field); Anthropic→OpenAI leaves
+                // `include_usage` to the inject below, on the translated OpenAI body.
+                if let Some(t) = rc.auto.as_ref().and_then(|a| a.translate.as_ref()) {
+                    buf = translate::request(t.client, rc.dialect, &buf);
+                }
                 let scan = peek::scan_buffered(&buf);
                 if rc.model.is_empty()
                     && let Some(m) = scan.model
@@ -2316,10 +2358,15 @@ impl ProxyHttp for AiProxy {
                 };
                 // Emit the whole (possibly rewritten) body in one shot; `transfer-encoding: chunked`
                 // (set in `upstream_request_filter`) makes the changed length fine.
-                *body = Some(Bytes::from(apply_stream_usage_injection(
-                    buf,
-                    scan.inject_at,
-                )));
+                // `inject_eligible` is the OpenAI-upstream gate: a translated Anthropic body also
+                // carries `"stream":true`, and splicing `stream_options` into it would be a field
+                // that API does not recognize.
+                let buf = if rc.inject_eligible {
+                    apply_stream_usage_injection(buf, scan.inject_at)
+                } else {
+                    buf
+                };
+                *body = Some(Bytes::from(buf));
             } else {
                 // Withhold — the bytes are buffered above; nothing goes upstream until end-of-stream.
                 // Use an *empty* chunk, not `None`: pingora derives end-of-body as
@@ -2402,6 +2449,21 @@ impl ProxyHttp for AiProxy {
                     .and_then(|v| v.to_str().ok())
                     .map(|s| s.to_owned().into_boxed_str());
             }
+
+            // Translate changes the body length (and SSE event count). Drop the upstream
+            // Content-Length so the client is not truncated; H1 needs chunked framing.
+            if rc.auto.as_ref().is_some_and(|a| a.translate.is_some()) {
+                let streaming = rc.streaming;
+                if let Some(t) = rc.auto.as_mut().and_then(|a| a.translate.as_mut())
+                    && streaming
+                {
+                    t.sse = Some(translate::SseBridge::new(t.client));
+                }
+                upstream_response.remove_header("content-length");
+                if upstream_response.version != http::Version::HTTP_2 {
+                    upstream_response.insert_header("transfer-encoding", "chunked")?;
+                }
+            }
         }
         Ok(())
     }
@@ -2410,20 +2472,20 @@ impl ProxyHttp for AiProxy {
         &self,
         _session: &mut Session,
         body: &mut Option<Bytes>,
-        _end_of_stream: bool,
+        end_of_stream: bool,
         ctx: &mut Self::CTX,
     ) -> Result<Option<Duration>>
     where
         Self::CTX: Send + Sync,
     {
-        // Passive tap: copy each chunk into a bounded tail for usage parsing, but never withhold it
-        // — chunks pass straight through, so the stream is relayed with no added buffering.
-        //
-        // We let the tail grow to 2× the cap, then compact once with a single `copy_within` that
-        // keeps the last cap bytes. This bounds memory the same way the old per-chunk `drain` did,
-        // but moves bytes O(stream_len / cap) times instead of once per chunk — for a long stream of
-        // small chunks that's the difference between one memmove per 64 KB and one per chunk.
-        if let (Some(rc), Some(chunk)) = (ctx.as_mut(), body.as_ref()) {
+        // Usage taps read the *upstream* dialect. Cache fill (#68) and capture read the bytes
+        // the client sees — post-translate on a wire-mismatched catalog walk, the relayed
+        // chunk otherwise. SSE is converted event-by-event; the full stream is never buffered.
+        let Some(rc) = ctx.as_mut() else {
+            return Ok(None);
+        };
+        let chunk = body.as_deref().unwrap_or(&[]);
+        if !chunk.is_empty() {
             // Tap the provider-reported (resolved/billed) model from the response *head* — the
             // scanner stops at the first root `model`, so this is O(1) and cheap (it finds the model
             // in the first chunk and ignores the rest). Kept separate from the tail because the model
@@ -2453,7 +2515,43 @@ impl ProxyHttp for AiProxy {
             }
 
             rc.resp_tail.push(chunk);
+        }
 
+        let translating = rc.auto.as_ref().is_some_and(|a| a.translate.is_some());
+        if translating {
+            let streaming = rc.streaming;
+            let dialect = rc.dialect;
+            let out = if let Some(t) = rc.auto.as_mut().and_then(|a| a.translate.as_mut()) {
+                if streaming {
+                    let client = t.client;
+                    t.sse
+                        .get_or_insert_with(|| translate::SseBridge::new(client))
+                        .feed(chunk, end_of_stream)
+                } else {
+                    if !chunk.is_empty() {
+                        t.json_buf.extend_from_slice(chunk);
+                    }
+                    if end_of_stream {
+                        translate::response_json(dialect, t.client, &t.json_buf)
+                    } else {
+                        Vec::new()
+                    }
+                }
+            } else {
+                Vec::new()
+            };
+            if !out.is_empty() {
+                if let Some(c) = rc.control.as_mut().and_then(|c| c.capture.as_mut()) {
+                    c.push_resp(&out);
+                }
+                if let Some(cache::Pending::Fill { tap, .. }) =
+                    rc.auto.as_mut().and_then(|a| a.cache.as_mut())
+                {
+                    tap.push(&out);
+                }
+            }
+            *body = Some(Bytes::from(out));
+        } else if !chunk.is_empty() {
             // Capture tap — same passive-tap contract as the usage tail above (copy, never withhold),
             // differing only in which end it keeps. `resp_tail` keeps the *last* 64 KB because usage
             // rides the final event; capture keeps the *first* `max_bytes` because that's where the

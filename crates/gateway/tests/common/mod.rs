@@ -292,6 +292,8 @@ pub enum Mode {
     Sse,
     /// Anthropic-shaped non-streaming JSON body (`usage.input_tokens`).
     AnthropicJson,
+    /// Anthropic-shaped SSE stream (message_start / content_block_delta / message_delta).
+    AnthropicSse,
     /// OpenAI-shaped SSE stream with >128 KiB of content *before* the usage chunk — forces the
     /// proxy's response-tail compaction path.
     SseLarge,
@@ -357,6 +359,19 @@ const CANNED_SSE: &str = "data: {\"id\":\"chatcmpl-mock\",\"object\":\"chat.comp
 
 const CANNED_ANTHROPIC_JSON: &str = r#"{"id":"msg_mock","type":"message","model":"claude-opus-4-8","content":[{"type":"text","text":"hi"}],"usage":{"input_tokens":13,"output_tokens":7}}"#;
 
+const CANNED_ANTHROPIC_SSE: &str = "event: message_start\n\
+data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_mock\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-opus-4-8\",\"content\":[],\"usage\":{\"input_tokens\":13,\"output_tokens\":1}}}\n\n\
+event: content_block_start\n\
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n\
+event: content_block_stop\n\
+data: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+event: message_delta\n\
+data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":7}}\n\n\
+event: message_stop\n\
+data: {\"type\":\"message_stop\"}\n\n";
+
 /// An OpenAI SSE stream whose first chunk carries ~130 KiB of content, pushing the proxy's response
 /// tail past `2 × USAGE_TAIL_CAP` (128 KiB) so it compacts at least once before the trailing usage
 /// chunk arrives. The usage event must survive in the retained 64 KiB tail.
@@ -417,6 +432,10 @@ fn canned_body(mode: Mode) -> (&'static str, Bytes) {
         Mode::AnthropicJson => (
             "application/json",
             Bytes::from_static(CANNED_ANTHROPIC_JSON.as_bytes()),
+        ),
+        Mode::AnthropicSse => (
+            "text/event-stream",
+            Bytes::from_static(CANNED_ANTHROPIC_SSE.as_bytes()),
         ),
         Mode::SseLarge => ("text/event-stream", Bytes::from(large_sse())),
         Mode::AnthropicSseLarge => ("text/event-stream", Bytes::from(anthropic_sse_large())),

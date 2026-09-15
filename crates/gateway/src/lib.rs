@@ -33,4 +33,5 @@ pub mod route;
 pub mod secret;
 pub mod state;
 pub mod store_watch;
+pub mod translate;
 pub mod usage;
