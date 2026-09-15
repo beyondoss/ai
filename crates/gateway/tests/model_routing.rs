@@ -1141,12 +1141,29 @@ async fn openai_sdk_can_call_claude_via_v1_chat_completions() {
         !text.contains("message_start"),
         "Anthropic SSE must not leak to an OpenAI client: {text}"
     );
+    assert!(
+        text.contains("[DONE]"),
+        "OpenAI stream must terminate with [DONE]: {text}"
+    );
+    assert!(
+        text.contains(r#""finish_reason":"stop""#),
+        "client must see a Chat Completions finish_reason: {text}"
+    );
+    assert!(
+        text.contains(r#""prompt_tokens":13"#) && text.contains(r#""completion_tokens":7"#),
+        "client-visible usage must come from the Anthropic stream: {text}"
+    );
 
     let cap = mock
         .captured()
         .expect("translated request reaches Anthropic");
     assert_eq!(cap.path, "/v1/messages");
     assert_eq!(cap.x_api_key.as_deref(), Some("sk-anthropic-pool"));
+    assert_eq!(
+        cap.anthropic_version.as_deref(),
+        Some("2023-06-01"),
+        "a stock OpenAI SDK does not send anthropic-version; the gateway must inject it"
+    );
     let got = String::from_utf8(cap.body).unwrap();
     assert!(
         got.contains(r#""model":"claude-opus-4-8""#) && got.contains(r#""max_tokens""#),
@@ -1202,6 +1219,18 @@ async fn anthropic_sdk_can_call_gpt_via_v1_messages() {
     assert!(
         !text.contains("chat.completion.chunk"),
         "OpenAI SSE must not leak to an Anthropic client: {text}"
+    );
+    assert!(
+        text.contains("event: message_stop"),
+        "Anthropic stream must close: {text}"
+    );
+    assert!(
+        text.contains(r#""stop_reason":"end_turn""#),
+        "client must see a Messages stop_reason (OpenAI canned SSE now carries finish_reason): {text}"
+    );
+    assert!(
+        text.contains(r#""output_tokens":9"#),
+        "client-visible usage must come from the OpenAI stream: {text}"
     );
 
     let cap = mock.captured().expect("translated request reaches OpenAI");

@@ -775,6 +775,9 @@ pub struct SseBridge {
     buf: Vec<u8>,
     ant_to_oai: AntToOai,
     oai_to_ant: OaiToAnt,
+    /// An `error` event already went to the client. Flush must not invent a success close
+    /// (`message_start`/`message_stop` or a trailing `[DONE]`-only envelope that implies a message).
+    errored: bool,
 }
 
 #[derive(Default)]
@@ -815,6 +818,7 @@ impl SseBridge {
             buf: Vec::new(),
             ant_to_oai: AntToOai::default(),
             oai_to_ant: OaiToAnt::default(),
+            errored: false,
         }
     }
 
@@ -847,6 +851,21 @@ impl SseBridge {
     }
 
     fn flush(&mut self) -> Vec<u8> {
+        if self.errored {
+            return match self.client {
+                // OpenAI clients conventionally see `[DONE]` after a streamed error chunk.
+                Dialect::OpenAi => {
+                    if self.ant_to_oai.done {
+                        Vec::new()
+                    } else {
+                        self.ant_to_oai.done = true;
+                        sse_data("[DONE]")
+                    }
+                }
+                // Anthropic has no `[DONE]`; a `message_start` after `event: error` is a broken stream.
+                Dialect::Anthropic => Vec::new(),
+            };
+        }
         match self.client {
             Dialect::OpenAi => {
                 if self.ant_to_oai.done {
@@ -864,12 +883,16 @@ impl SseBridge {
             return Vec::new();
         }
         if data == "[DONE]" {
+            if self.errored {
+                return Vec::new();
+            }
             return self.flush();
         }
         let Ok(v) = serde_json::from_str::<Value>(data) else {
             return Vec::new();
         };
         if looks_like_error(&v) || event == "error" {
+            self.errored = true;
             return sse_data(&value_string(&map_error(&v, Dialect::OpenAi)));
         }
         let typ = if event.is_empty() {
@@ -1012,12 +1035,16 @@ impl SseBridge {
 
     fn oai_event_to_ant(&mut self, _event: &str, data: &str) -> Vec<u8> {
         if data == "[DONE]" {
+            if self.errored {
+                return Vec::new();
+            }
             return self.oai_to_ant.finish();
         }
         let Ok(v) = serde_json::from_str::<Value>(data) else {
             return Vec::new();
         };
         if looks_like_error(&v) {
+            self.errored = true;
             let err = map_error(&v, Dialect::Anthropic);
             return sse_named("error", &value_string(&err));
         }
@@ -1183,11 +1210,16 @@ impl OaiToAnt {
         if self.finished {
             return Vec::new();
         }
-        if !self.started {
-            let _ = self.start();
-        }
+        // A usage-only / `[DONE]`-only upstream stream never opened a text block. `start()`'s
+        // bytes used to be discarded (`let _ =`), so the client got `message_delta`/`message_stop`
+        // with no `message_start` — which a stock Anthropic SDK treats as a broken stream.
+        let mut out = if self.started {
+            Vec::new()
+        } else {
+            self.start()
+        };
         self.finished = true;
-        let mut out = self.close_open();
+        out.extend(self.close_open());
         let stop = self.pending_stop.unwrap_or("end_turn");
         let output = self.completion_tokens.unwrap_or(0);
         let input = self.prompt_tokens.unwrap_or(0);
@@ -1475,5 +1507,131 @@ mod tests {
             response_json(Dialect::Anthropic, Dialect::Anthropic, body),
             body
         );
+    }
+
+    #[test]
+    fn openai_sse_flush_without_deltas_still_emits_message_start() {
+        let mut b = SseBridge::new(Dialect::Anthropic);
+        let out = String::from_utf8(b.feed(b"", true)).unwrap();
+        assert!(out.contains("event: message_start"), "{out}");
+        assert!(out.contains("event: message_stop"), "{out}");
+    }
+
+    #[test]
+    fn anthropic_tool_sse_becomes_openai_tool_calls() {
+        let mut b = SseBridge::new(Dialect::OpenAi);
+        let src = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_x\",\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":13,\"output_tokens\":1}}}\n\n",
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"get_weather\",\"input\":{}}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"city\\\":\\\"SF\\\"}\"}}\n\n",
+            "event: content_block_stop\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":7}}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+        let mut out = Vec::new();
+        for byte in src.as_bytes() {
+            out.extend(b.feed(&[*byte], false));
+        }
+        out.extend(b.feed(b"", true));
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("\"tool_calls\""), "{text}");
+        assert!(text.contains("get_weather"), "{text}");
+        assert!(text.contains("toolu_1"), "{text}");
+        assert!(text.contains("city"), "{text}");
+        assert!(text.contains("\"finish_reason\":\"tool_calls\""), "{text}");
+        assert!(text.contains("\"prompt_tokens\":13"), "{text}");
+        assert!(text.contains("[DONE]"), "{text}");
+    }
+
+    #[test]
+    fn openai_tool_sse_becomes_anthropic_tool_use() {
+        let mut b = SseBridge::new(Dialect::Anthropic);
+        let src = concat!(
+            "data: {\"id\":\"chatcmpl-x\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4o\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"arguments\":\"\"}}]}}]}\n\n",
+            "data: {\"id\":\"chatcmpl-x\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4o\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"city\\\":\\\"SF\\\"}\"}}]}}]}\n\n",
+            "data: {\"id\":\"chatcmpl-x\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4o\",\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: {\"id\":\"chatcmpl-x\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4o\",\"choices\":[],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":9}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let out = String::from_utf8(b.feed(src.as_bytes(), true)).unwrap();
+        assert!(out.contains("event: message_start"), "{out}");
+        assert!(out.contains("\"type\":\"tool_use\""), "{out}");
+        assert!(out.contains("get_weather"), "{out}");
+        assert!(out.contains("call_1"), "{out}");
+        assert!(out.contains("input_json_delta"), "{out}");
+        assert!(out.contains("\"stop_reason\":\"tool_use\""), "{out}");
+        assert!(out.contains("event: message_stop"), "{out}");
+        assert!(!out.contains("chat.completion.chunk"), "{out}");
+    }
+
+    #[test]
+    fn sse_error_events_map_into_the_client_envelope() {
+        let mut oai = SseBridge::new(Dialect::OpenAi);
+        let anth_err = concat!(
+            "event: error\n",
+            "data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"try again\"}}\n\n",
+        );
+        let out = String::from_utf8(oai.feed(anth_err.as_bytes(), true)).unwrap();
+        assert!(out.contains("\"message\":\"try again\""), "{out}");
+        assert!(out.contains("overloaded_error"), "{out}");
+        assert!(!out.contains("event: error"), "{out}");
+
+        let mut anth = SseBridge::new(Dialect::Anthropic);
+        let oai_err = "data: {\"error\":{\"message\":\"try again\",\"type\":\"server_error\"}}\n\n";
+        let out = String::from_utf8(anth.feed(oai_err.as_bytes(), true)).unwrap();
+        assert!(out.contains("event: error"), "{out}");
+        assert!(out.contains("\"type\":\"error\""), "{out}");
+        assert!(out.contains("try again"), "{out}");
+        assert!(
+            !out.contains("event: message_start"),
+            "error stream must not invent a success close: {out}"
+        );
+    }
+
+    #[test]
+    fn nonstream_tool_json_round_trips() {
+        let anth = json!({
+            "id": "msg_mock",
+            "type": "message",
+            "model": "claude-opus-4-8",
+            "content": [{"type": "tool_use", "id": "toolu_1", "name": "get_weather", "input": {"city": "SF"}}],
+            "stop_reason": "tool_use",
+            "usage": {"input_tokens": 13, "output_tokens": 7}
+        });
+        let oai: Value = serde_json::from_slice(&response_json(
+            Dialect::Anthropic,
+            Dialect::OpenAi,
+            &serde_json::to_vec(&anth).unwrap(),
+        ))
+        .unwrap();
+        assert_eq!(oai["choices"][0]["finish_reason"], "tool_calls");
+        assert_eq!(
+            oai["choices"][0]["message"]["tool_calls"][0]["id"],
+            "toolu_1"
+        );
+        assert_eq!(
+            oai["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
+            "get_weather"
+        );
+        let args = oai["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"]
+            .as_str()
+            .unwrap();
+        assert!(args.contains("SF"), "{args}");
+
+        let back: Value = serde_json::from_slice(&response_json(
+            Dialect::OpenAi,
+            Dialect::Anthropic,
+            &serde_json::to_vec(&oai).unwrap(),
+        ))
+        .unwrap();
+        assert_eq!(back["stop_reason"], "tool_use");
+        assert_eq!(back["content"][0]["type"], "tool_use");
+        assert_eq!(back["content"][0]["input"]["city"], "SF");
     }
 }

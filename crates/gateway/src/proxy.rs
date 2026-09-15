@@ -413,6 +413,14 @@ impl RequestCtx {
     }
 
     fn reset_request_body_phase(&mut self) {
+        // Translate response state belongs to *this* attempt. 5xx vendor-walk aborts in
+        // `upstream_response_filter` before `response_filter` runs, so these are empty in
+        // practice — still clear them so a retry cannot append a leftover JSON/SSE buffer
+        // onto the candidate that actually serves.
+        if let Some(t) = self.auto.as_mut().and_then(|a| a.translate.as_mut()) {
+            t.sse = None;
+            t.json_buf.clear();
+        }
         // The first attempt has nothing to undo, and that is the only attempt the vast majority of
         // requests ever make — so pay one compare rather than three stores on the hot path. A zero
         // `body_bytes_fed` is an exact witness for "no chunk was ever fed": it is incremented for

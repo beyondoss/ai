@@ -303,8 +303,22 @@ pub enum Mode {
     AnthropicSseLarge,
     /// Always reply with this HTTP status and a small JSON error body — for circuit-breaker tests
     /// (5xx trips the breaker; 4xx/429 do not). A 429 also carries `Retry-After` so relay tests can
-    /// assert the gateway forwards it.
+    /// assert the gateway forwards it. OpenAI error envelope.
     Status(u16),
+    /// Like [`Status`], but the body is an Anthropic error envelope (`type: error`).
+    AnthropicStatus(u16),
+    /// Anthropic-shaped non-streaming `tool_use` JSON (`stop_reason: tool_use`).
+    AnthropicToolJson,
+    /// Anthropic-shaped SSE `tool_use` stream (`input_json_delta` + `stop_reason: tool_use`).
+    AnthropicToolSse,
+    /// OpenAI-shaped non-streaming `tool_calls` JSON.
+    OpenAiToolJson,
+    /// OpenAI-shaped SSE `tool_calls` stream.
+    OpenAiToolSse,
+    /// Anthropic SSE `event: error`.
+    AnthropicErrorSse,
+    /// OpenAI SSE error chunk.
+    OpenAiErrorSse,
     /// 429 (with `Retry-After`) when the presented credential contains this secret; 200 otherwise.
     /// Proves a key-walk actually sent the second pool key.
     ThrottleKey(&'static str),
@@ -327,7 +341,7 @@ pub enum Mode {
     Slow(u64),
 }
 
-#[derive(Default, Clone)]
+#[derive(Default, Clone, Debug)]
 pub struct Captured {
     /// The forwarded path **including** any query string, exactly as the upstream received it.
     pub path: String,
@@ -343,6 +357,9 @@ pub struct Captured {
     /// an observability opt-in into their 400. Both must always be `None` at the upstream.
     pub beyond_metadata: Option<String>,
     pub beyond_capture: Option<String>,
+    /// Anthropic (and Bedrock Messages) require this; a stock OpenAI SDK never sends it. Recorded
+    /// so a Chat Completions → Messages translate walk can prove the gateway injected it.
+    pub anthropic_version: Option<String>,
     pub body: Vec<u8>,
 }
 
@@ -355,7 +372,10 @@ pub struct MockUpstream {
 
 const CANNED_JSON: &str = r#"{"id":"chatcmpl-mock","object":"chat.completion","model":"gpt-4o-2024-08-06","choices":[{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}],"usage":{"prompt_tokens":11,"completion_tokens":7,"total_tokens":18}}"#;
 
-const CANNED_SSE: &str = "data: {\"id\":\"chatcmpl-mock\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4o-2024-08-06\",\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: {\"choices\":[],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":9}}\n\ndata: [DONE]\n\n";
+const CANNED_SSE: &str = "data: {\"id\":\"chatcmpl-mock\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4o-2024-08-06\",\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n\
+data: {\"id\":\"chatcmpl-mock\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4o-2024-08-06\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
+data: {\"choices\":[],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":9}}\n\n\
+data: [DONE]\n\n";
 
 const CANNED_ANTHROPIC_JSON: &str = r#"{"id":"msg_mock","type":"message","model":"claude-opus-4-8","content":[{"type":"text","text":"hi"}],"usage":{"input_tokens":13,"output_tokens":7}}"#;
 
@@ -371,6 +391,35 @@ event: message_delta\n\
 data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":7}}\n\n\
 event: message_stop\n\
 data: {\"type\":\"message_stop\"}\n\n";
+
+const CANNED_ANTHROPIC_TOOL_JSON: &str = r#"{"id":"msg_mock","type":"message","role":"assistant","model":"claude-opus-4-8","content":[{"type":"tool_use","id":"toolu_1","name":"get_weather","input":{"city":"SF"}}],"stop_reason":"tool_use","usage":{"input_tokens":13,"output_tokens":7}}"#;
+
+const CANNED_OPENAI_TOOL_JSON: &str = r#"{"id":"chatcmpl-mock","object":"chat.completion","model":"gpt-4o-2024-08-06","choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"get_weather","arguments":"{\"city\":\"SF\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":11,"completion_tokens":7,"total_tokens":18}}"#;
+
+const CANNED_ANTHROPIC_TOOL_SSE: &str = "event: message_start\n\
+data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_mock\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-opus-4-8\",\"content\":[],\"usage\":{\"input_tokens\":13,\"output_tokens\":1}}}\n\n\
+event: content_block_start\n\
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"get_weather\",\"input\":{}}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"city\\\":\\\"SF\\\"}\"}}\n\n\
+event: content_block_stop\n\
+data: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+event: message_delta\n\
+data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":7}}\n\n\
+event: message_stop\n\
+data: {\"type\":\"message_stop\"}\n\n";
+
+const CANNED_OPENAI_TOOL_SSE: &str = "data: {\"id\":\"chatcmpl-mock\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4o-2024-08-06\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"arguments\":\"\"}}]}}]}\n\n\
+data: {\"id\":\"chatcmpl-mock\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4o-2024-08-06\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"city\\\":\\\"SF\\\"}\"}}]}}]}\n\n\
+data: {\"id\":\"chatcmpl-mock\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4o-2024-08-06\",\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n\
+data: {\"choices\":[],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":9}}\n\n\
+data: [DONE]\n\n";
+
+const CANNED_ANTHROPIC_ERROR_SSE: &str = "event: error\n\
+data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"try again\"}}\n\n";
+
+const CANNED_OPENAI_ERROR_SSE: &str =
+    "data: {\"error\":{\"message\":\"try again\",\"type\":\"server_error\"}}\n\n";
 
 /// An OpenAI SSE stream whose first chunk carries ~130 KiB of content, pushing the proxy's response
 /// tail past `2 × USAGE_TAIL_CAP` (128 KiB) so it compacts at least once before the trailing usage
@@ -437,12 +486,42 @@ fn canned_body(mode: Mode) -> (&'static str, Bytes) {
             "text/event-stream",
             Bytes::from_static(CANNED_ANTHROPIC_SSE.as_bytes()),
         ),
+        Mode::AnthropicToolJson => (
+            "application/json",
+            Bytes::from_static(CANNED_ANTHROPIC_TOOL_JSON.as_bytes()),
+        ),
+        Mode::OpenAiToolJson => (
+            "application/json",
+            Bytes::from_static(CANNED_OPENAI_TOOL_JSON.as_bytes()),
+        ),
+        Mode::AnthropicToolSse => (
+            "text/event-stream",
+            Bytes::from_static(CANNED_ANTHROPIC_TOOL_SSE.as_bytes()),
+        ),
+        Mode::OpenAiToolSse => (
+            "text/event-stream",
+            Bytes::from_static(CANNED_OPENAI_TOOL_SSE.as_bytes()),
+        ),
+        Mode::AnthropicErrorSse => (
+            "text/event-stream",
+            Bytes::from_static(CANNED_ANTHROPIC_ERROR_SSE.as_bytes()),
+        ),
+        Mode::OpenAiErrorSse => (
+            "text/event-stream",
+            Bytes::from_static(CANNED_OPENAI_ERROR_SSE.as_bytes()),
+        ),
         Mode::SseLarge => ("text/event-stream", Bytes::from(large_sse())),
         Mode::AnthropicSseLarge => ("text/event-stream", Bytes::from(anthropic_sse_large())),
         // The status is applied by `mock_handle`; the body is a stock error shape.
         Mode::Status(_) => (
             "application/json",
             Bytes::from_static(br#"{"error":{"message":"mock"}}"#),
+        ),
+        Mode::AnthropicStatus(_) => (
+            "application/json",
+            Bytes::from_static(
+                br#"{"type":"error","error":{"type":"api_error","message":"mock"}}"#,
+            ),
         ),
     }
 }
@@ -480,7 +559,15 @@ async fn mock_handle(
         .unwrap_or_else(|| req.uri().path())
         .to_string();
     // Pull the headers we record before consuming the body (which moves `req`).
-    let (authorization, x_api_key, host, beyond_model, beyond_metadata, beyond_capture) = {
+    let (
+        authorization,
+        x_api_key,
+        host,
+        beyond_model,
+        beyond_metadata,
+        beyond_capture,
+        anthropic_version,
+    ) = {
         let h = req.headers();
         let get = |k: &str| h.get(k).and_then(|v| v.to_str().ok()).map(String::from);
         (
@@ -490,6 +577,7 @@ async fn mock_handle(
             get("x-beyond-model"),
             get("x-beyond-metadata"),
             get("x-beyond-capture"),
+            get("anthropic-version"),
         )
     };
     let body = req
@@ -522,6 +610,7 @@ async fn mock_handle(
         beyond_model,
         beyond_metadata,
         beyond_capture,
+        anthropic_version,
         body,
     });
     // A slow upstream is still a *working* upstream; the point is to be slower than the client's
@@ -530,7 +619,7 @@ async fn mock_handle(
         sleep(Duration::from_millis(ms)).await;
     }
     let status = match mode {
-        Mode::Status(s) => s,
+        Mode::Status(s) | Mode::AnthropicStatus(s) => s,
         Mode::ThrottleKey(_) if throttled => 429,
         _ => 200,
     };
