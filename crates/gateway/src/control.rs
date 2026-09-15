@@ -20,6 +20,9 @@
 //! leaves nothing usable is a 503 from routing (the same as no pool-keyed candidate) — not a 4xx
 //! from this module.
 //!
+//! `order` and `split` **pin** the walk: the TTFT ranker in [`crate::smart`] does not run. `only`
+//! is a filter, then the ranker still applies. No walk header at all is also ranked.
+//!
 //! **Nothing here can fail a request.** Every malformed, oversize, or unrecognized value is dropped
 //! and counted, and the request proceeds exactly as if the header were absent. An observability
 //! header that can 400 a customer's inference call is a worse bug than the missing observability —
@@ -216,6 +219,12 @@ impl Control {
         }
 
         out
+    }
+
+    /// True when this request named an explicit walk (`order` or `split`). The TTFT ranker must
+    /// not override a caller who already picked. `only` is a filter, not a pin.
+    pub fn pins_walk(&self) -> bool {
+        self.order.is_some() || self.split.is_some()
     }
 
     /// Catalog indices in the order this request will walk them.
@@ -797,5 +806,16 @@ mod tests {
             ["anthropic", "bedrock", "openrouter"]
         );
         assert_eq!(walk, Walk::identity(row.candidates.len()));
+    }
+
+    #[test]
+    fn order_and_split_pin_the_walk_only_does_not() {
+        let order = Control::parse(&req(&[(ORDER_HEADER, "bedrock")]));
+        assert!(order.pins_walk());
+        let split = Control::parse(&req(&[(SPLIT_HEADER, "anthropic=1")]));
+        assert!(split.pins_walk());
+        let only = Control::parse(&req(&[(ONLY_HEADER, "bedrock")]));
+        assert!(!only.pins_walk());
+        assert!(!Control::default().pins_walk());
     }
 }

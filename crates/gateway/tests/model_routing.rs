@@ -174,8 +174,20 @@ async fn records_the_failed_candidates_breaker_not_the_serving_ones() {
     let client = test_client();
     let key = vkey(&sk);
     // Enough attempts to trip the dead primary's breaker several times over.
+    // Pin openai-first: after the first failover the TTFT ranker would otherwise put the live
+    // fallback first and the dead primary would stop being attempted, so the breaker would never
+    // open. The ledger this test exists to prove is "we keep walking the pinned sequence".
     for _ in 0..6 {
-        let resp = post_auto(&client, &gw.url(), &key, Some(MODEL)).await;
+        let resp = client
+            .post(format!("{}/auto/chat/completions", gw.url()))
+            .header("authorization", format!("Bearer {key}"))
+            .header("content-type", "application/json")
+            .header("x-beyond-model", MODEL)
+            .header("x-beyond-order", "openai")
+            .body(body())
+            .send()
+            .await
+            .unwrap();
         assert_eq!(
             resp.status().as_u16(),
             200,
@@ -1367,5 +1379,62 @@ async fn split_over_n_requests_hits_both_primaries() {
         "70/30 split must land on both primaries (anthropic={}, bedrock={})",
         anthropic.hits(),
         bedrock.hits()
+    );
+}
+
+/// Cold start is catalog order. After a probe samples a faster fallback, later unpinned requests
+/// prefer it. `x-beyond-order` still pins the slow primary.
+#[tokio::test]
+async fn ttft_ranker_prefers_the_faster_candidate_after_a_probe() {
+    let nats_port = unused_nats_port();
+    let (pubkey, sk) = test_keypair(1);
+    let slow = MockUpstream::start(Mode::Slow(80)).await;
+    let fast = MockUpstream::start(Mode::Json).await;
+    let gw = catalog_gateway(
+        nats_port,
+        &b64(&pubkey),
+        &slow.authority(),
+        &fast.authority(),
+    )
+    .await;
+
+    let client = test_client();
+    let key = vkey(&sk);
+
+    let first = post_auto(&client, &gw.url(), &key, Some(MODEL)).await;
+    assert_eq!(first.status().as_u16(), 200);
+    assert_eq!(slow.hits(), 1, "cold start is catalog (openai) first");
+    assert_eq!(fast.hits(), 0, "the fallback is not probed on seq 0");
+
+    // seq 1..=7 still exploit the only sampled arm; seq 8 probes openrouter; seq 9+ rank by EWMA.
+    for _ in 0..15 {
+        let resp = post_auto(&client, &gw.url(), &key, Some(MODEL)).await;
+        assert_eq!(resp.status().as_u16(), 200);
+    }
+    assert!(
+        fast.hits() >= 3,
+        "after the probe the faster arm must serve (slow={}, fast={})",
+        slow.hits(),
+        fast.hits()
+    );
+    let cap = fast.captured().expect("fast arm served at least once");
+    assert_eq!(cap.path, "/api/v1/chat/completions");
+
+    let slow_before_pin = slow.hits();
+    let pinned = client
+        .post(format!("{}/auto/chat/completions", gw.url()))
+        .header("authorization", format!("Bearer {key}"))
+        .header("content-type", "application/json")
+        .header("x-beyond-model", MODEL)
+        .header("x-beyond-order", "openai")
+        .body(body())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(pinned.status().as_u16(), 200);
+    assert_eq!(
+        slow.hits(),
+        slow_before_pin + 1,
+        "x-beyond-order must pin the slow primary even after the ranker learned the fast arm"
     );
 }

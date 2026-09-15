@@ -328,7 +328,8 @@ struct ModelRouting {
     /// pool key for it. Computed once in `request_filter` so `upstream_peer` never re-derives it.
     /// Bounded by [`route::MAX_CANDIDATES`], which is why a `u8` suffices.
     usable: u8,
-    /// Catalog indices in walk order. Identity when no `x-beyond-order` / `only` / `split` applied.
+    /// Catalog indices in walk order. Identity when no header and no TTFT samples; permuted by
+    /// `x-beyond-order` / `only` / `split` and, when those do not pin, by [`crate::smart`].
     /// `first_usable` walks this sequence; failover, breakers, and the 429 key-walk see the same.
     walk: control::Walk,
     /// When the current attempt began. Distinct from `RequestCtx::start` (which times the whole
@@ -826,6 +827,27 @@ fn first_usable(usable: u8, from: u8) -> Option<u8> {
     // Mask off everything below `from`, then take the lowest remaining bit.
     let remaining = usable & !((1u8 << from) - 1);
     (remaining != 0).then(|| remaining.trailing_zeros() as u8)
+}
+
+/// Feed one attempt into the TTFT ranker. No-op when the flag is off, the request is not a catalog
+/// walk, or the current walk slot is gone. `ok` is "the provider answered" (including 429); connect
+/// failure and 5xx pass `false`.
+fn record_walk_ttft(state: &GatewayState, rc: &RequestCtx, ok: bool) {
+    if !state.config.smart_router {
+        return;
+    }
+    let Some(auto) = rc.auto.as_ref() else {
+        return;
+    };
+    let Some(orig) = auto.walk.catalog_index(auto.candidate) else {
+        return;
+    };
+    let us = rc
+        .attempt_start()
+        .elapsed()
+        .as_micros()
+        .min(u128::from(u64::MAX)) as u64;
+    state.smart.observe(auto.route, orig, us, ok);
 }
 
 /// Pingora will only replay a body that has fully arrived and fit in its private 64 KiB buffer.
@@ -1515,10 +1537,20 @@ impl ProxyHttp for AiProxy {
                 // Permute the row before the usable mask / `first_usable`. Failover, breakers, and
                 // the 429 key-walk then see this sequence. Unknown names were already dropped;
                 // an `only` filter that left nobody is the same 503 as an unkeyed row.
+                //
+                // `order` / `split` pin; otherwise the in-process TTFT ranker may reorder. `only`
+                // filters, then ranking still applies. See `smart`.
                 walk = parsed_control.as_ref().map_or_else(
                     || control::Walk::identity(row.candidates.len()),
                     |c| c.catalog_walk(row.candidates, request_seq),
                 );
+                if self.state.config.smart_router
+                    && !parsed_control
+                        .as_ref()
+                        .is_some_and(control::Control::pins_walk)
+                {
+                    walk = self.state.smart.rank(walk, row, request_seq);
+                }
                 if walk.len == 0 {
                     self.state.metrics.rejection(Rejection::NoCandidate).inc();
                     return Self::reject_boxed(
@@ -2139,6 +2171,10 @@ impl ProxyHttp for AiProxy {
             status,
             "upstream returned {status}; trying the next candidate",
         );
+        // `response_filter` does not run for an abandoned attempt, so the ranker would never see
+        // this 5xx unless we record it here. Penalty, not the raw elapsed — a 3ms 500 must not beat
+        // a slower 2xx.
+        record_walk_ttft(&self.state, rc, false);
         // The outgoing candidate's breaker failure is recorded by `upstream_peer`'s prologue, which
         // still sees `breaker_pending` set. A 5xx is a failure by the breaker's own definition, so
         // that is the right outcome — and recording it here as well would double-count.
@@ -2402,14 +2438,14 @@ impl ProxyHttp for AiProxy {
             // dead candidate's `connect_timeout_secs` to the provider that actually answered would
             // render an outage at A as a latency regression at B — inverting the one thing the
             // per-provider label is for.
+            // Per-provider response counter, bucketed by status class — the signal that a provider
+            // is degrading (429/5xx) before it shows up only as latency or a missing usage event.
+            let status = upstream_response.status.as_u16();
             rc.provider
                 .metrics
                 .ttft_seconds
                 .observe(rc.attempt_start().elapsed().as_secs_f64());
-
-            // Per-provider response counter, bucketed by status class — the signal that a provider
-            // is degrading (429/5xx) before it shows up only as latency or a missing usage event.
-            let status = upstream_response.status.as_u16();
+            record_walk_ttft(&self.state, rc, status < 500);
             rc.provider.metrics.record_response(status);
             // Remember the status for the circuit-breaker outcome resolved in `logging` (a response
             // arrived, so the provider is reachable — even a 429/5xx is a real answer, not a connect
@@ -2537,6 +2573,7 @@ impl ProxyHttp for AiProxy {
                 // next candidate, since `logging` would then also resolve the still-pending permit —
                 // which would trip the breaker at half its configured threshold on the last
                 // candidate, exactly where everything lands once the primaries are sick.
+                record_walk_ttft(&self.state, rc, false);
                 rc.provider.metrics.connect_retries_total.inc();
                 warn!(
                     request_id = %rc.request_id,

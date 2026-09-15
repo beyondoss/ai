@@ -14,6 +14,7 @@ use crate::key::Keyring;
 use crate::metrics::{Metrics, ProviderMetrics};
 use crate::ratelimit::RateLimit;
 use crate::route::{self, AuthScheme, Dialect, Provider};
+use crate::smart;
 use arc_swap::ArcSwap;
 use arrayvec::ArrayString;
 use std::collections::HashMap;
@@ -213,6 +214,11 @@ pub struct GatewayState {
     /// Exact-match response cache. `None` when `cache_ttl_secs == 0`.
     pub cache: Option<ResponseCache>,
 
+    /// Per-candidate TTFT EWMA used to rank catalog walks. Always allocated; [`AiConfig::smart_router`]
+    /// gates whether `rank` runs. Observing while the flag is off is wasted work, so the proxy
+    /// skips both.
+    pub smart: smart::Router,
+
     /// Per-key request-rate guardrail (see `ratelimit`). `None` when `rate_limit_rps == 0`. Fixed
     /// memory regardless of tenant count, so it lives in the static state with no GC.
     pub rate_limit: Option<RateLimit>,
@@ -315,6 +321,7 @@ impl GatewayState {
             capture: ArcSwap::from_pointee(CaptureSet::new()),
             capture_defaults,
             cache,
+            smart: smart::Router::new(),
             rate_limit,
             dns_cache: ArcSwap::from_pointee(HashMap::new()),
             instance_prefix: {

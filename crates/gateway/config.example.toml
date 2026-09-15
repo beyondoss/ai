@@ -121,6 +121,11 @@ capture_queue_depth = 1024
 # cache_max_entries = 1024
 # cache_max_bytes = 65536
 
+# Rank managed catalog walks (`/auto`, managed `/v1`) by observed time-to-first-byte. In-process
+# EWMA per catalog candidate; cold start is the row's static order. `x-beyond-order` / `split` pin
+# a sequence; `only` filters then ranks. Set false to always use catalog order.
+# smart_router = true
+
 # Optional per-provider upstream authority (host:port), BY PROVIDER NAME. For a known provider this
 # overrides its built-in default; for an unknown name it ADDS a new provider, then reachable at
 # `/{name}/…` (the provider is the first path segment of the request). Known providers (zero-config
