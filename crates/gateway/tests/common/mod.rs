@@ -1,9 +1,10 @@
-//! e2e harness: a real `beyond-ai` binary, a real `nats-server` (JetStream KV backing the deny-set),
-//! and a mock HTTP upstream that records what the gateway forwarded.
+//! e2e harness: a real `beyond-ai` binary, a real `nats-server` (JetStream KV backing the deny-set
+//! and allowance-set), and a mock HTTP upstream that records what the gateway forwarded.
 //!
 //! Requires `nats-server` on PATH — run via `mise run test:integration:rs`.
-//! Signing keys + pool keys are passed via the gateway's *config* (not NATS); NATS carries only the
-//! deny-set. Every component picks a free port and cleans up on drop, so tests run in parallel.
+//! Signing keys + pool keys are passed via the gateway's *config* (not NATS); NATS carries the
+//! deny-set, allowance-set, and capture-set. Every component picks a free port and cleans up on
+//! drop, so tests run in parallel.
 
 #![allow(dead_code)]
 // Test harness: `.unwrap()`/`.expect()`/`panic!` are assertions, not production code. See e2e.rs.
@@ -12,7 +13,7 @@
 use std::io::Write;
 use std::net::TcpListener as StdTcpListener;
 use std::process::{Child, Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use base64::Engine;
@@ -129,16 +130,49 @@ pub fn free_port() -> u16 {
 /// this bound while always holding the most recent lines — which is what every assertion reads.
 const LOG_CAPTURE_CAP: usize = 512 * 1024;
 
-/// A NATS port for a gateway that never touches the deny-set.
+/// A NATS port for a gateway that does not write deny/allowance keys of its own.
 ///
-/// The deny-set is the *only* thing the gateway reads from NATS, and it fails open — an unreachable
-/// server means an empty deny-set and a retrying background watcher, which is exactly right for a
-/// test that denies nobody. Auth, pool keys and routing all come from config.
-///
-/// Worth having because the alternative is not free: `Nats::start()` spawns a real JetStream server
-/// per test, and a suite that starts twenty of them it never queries is spending a CI runner's
-/// memory and disk on nothing. Tests that *do* exercise the deny-set still use `Nats::start()`.
+/// Allowance is fail-closed until the watcher stores a scan (empty = remaining-ok), so a closed
+/// port would 402 every managed request. This starts **one** JetStream server per test process
+/// (leaked until exit) and returns its port. Tests that *write* KV still use [`Nats::start()`] so
+/// they cannot see each other's `blackhole.*` / `allowance.*` keys.
 pub fn unused_nats_port() -> u16 {
+    static PORT: OnceLock<u16> = OnceLock::new();
+    *PORT.get_or_init(|| {
+        let port = free_port();
+        let store_dir = std::env::temp_dir().join(format!("beyond-ai-nats-shared-{port}"));
+        let _ = std::fs::create_dir_all(&store_dir);
+        let mut child = Command::new("nats-server")
+            .args([
+                "-js",
+                "-a",
+                "127.0.0.1",
+                "-p",
+                &port.to_string(),
+                "-sd",
+                store_dir.to_str().unwrap(),
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn nats-server (on PATH? run via mise)");
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while std::time::Instant::now() < deadline {
+            if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                std::mem::forget(child);
+                std::mem::forget(store_dir);
+                return port;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let _ = child.kill();
+        panic!("shared nats-server did not come up on port {port}");
+    })
+}
+
+/// A TCP port nothing is listening on. The fail-closed allowance test uses this so the watcher
+/// never seeds.
+pub fn closed_port() -> u16 {
     free_port()
 }
 
@@ -869,6 +903,10 @@ pub struct GatewayBuilder {
     capture_default_sample_n: Option<u32>,
     /// Exact-match response cache TTL. `None` ⇒ gateway default (off). `Some(0)` disables.
     cache_ttl_secs: Option<u64>,
+    /// Wait until `ai_allowance_ready==1` after the listeners bind. Default on: allowance is
+    /// fail-closed until the watcher seeds, and a first request that races the scan 402s. Tests that
+    /// prove the unready path skip this.
+    wait_allowance_ready: bool,
     /// Per-provider authority overrides, for a topology with more than one upstream — a failover
     /// test needs a live mock and a dead port at the same time, which the single `authority` cannot
     /// express. Falls back to `authority` for any provider not named here.
@@ -1007,9 +1045,17 @@ impl GatewayBuilder {
         self
     }
 
+    /// Do not wait for the allowance watcher to seed. Only for the fail-closed-unready test —
+    /// every other managed test needs remaining-ok before the first request.
+    pub fn skip_allowance_ready(mut self) -> Self {
+        self.wait_allowance_ready = false;
+        self
+    }
+
     pub async fn start(self) -> Gateway {
         let port = free_port();
         let metrics_port = free_port();
+        let wait_allowance_ready = self.wait_allowance_ready;
         let config_path = std::env::temp_dir().join(format!("beyond-ai-config-{port}.toml"));
         let nats_port = self.nats_port;
         // Scalars first, `[…]` tables last (TOML ordering).
@@ -1189,14 +1235,17 @@ impl GatewayBuilder {
         // the proxy; wait for it too, or a test that probes it right after `start()` races the bind
         // (pre-existing flake in `health_endpoints_report_ready_on_the_metrics_listener`).
         wait_for_port(metrics_port, "beyond-ai-metrics").await;
+        if wait_allowance_ready {
+            wait_for_metric(&gw, "ai_allowance_ready", "", 1.0).await;
+        }
         gw
     }
 }
 
 impl Gateway {
-    /// Start the gateway pointed at `nats` (deny-set) + the mock upstream, configuring the OpenAI
+    /// Start the gateway pointed at `nats` (deny-set + allowance-set) + the mock upstream, configuring the OpenAI
     /// and Fireworks providers. Signing key + pool key come from config (mirrors production: NATS
-    /// holds only the deny-set). For other provider sets use [`Gateway::builder`].
+    /// holds the watched sets). For other provider sets use [`Gateway::builder`].
     pub async fn start(nats_port: u16, openai_authority: &str, signkey_b64: &str) -> Self {
         Gateway::builder(nats_port, openai_authority, signkey_b64)
             .start()
@@ -1223,6 +1272,7 @@ impl Gateway {
             capture_max_bytes: None,
             capture_default_sample_n: None,
             cache_ttl_secs: None,
+            wait_allowance_ready: true,
         }
     }
 

@@ -3,10 +3,11 @@
 //!
 //! Matches the Beyond service convention (cf. `auth`, `objects`): the body is `{"status",
 //! "version"}` and there are two probes. **Both always return HTTP 200** once the process is
-//! answering, because the gateway is **fail-open by design** — auth + key swap come from boot
-//! config, and a NATS outage degrades only the (stale) deny-set, never the ability to serve. So
-//! readiness must *not* gate on NATS: a cold boot with NATS down can still serve correctly, and a
-//! non-200 would pull a healthy gateway out of the load balancer for no reason.
+//! answering, because the gateway is **fail-open by design** for deny/capture — auth + key swap
+//! come from boot config, and a NATS outage degrades only the (stale) deny-set, never liveness. So
+//! readiness must *not* gate on NATS: a cold boot with NATS down can still answer `/readyz` 200,
+//! even while managed traffic 402s fail-closed on an unread allowance-set. A non-200 would pull a
+//! healthy-enough gateway out of the load balancer for no reason.
 //!
 //! `readyz` does, however, carry a distinct *body* signal that `livez` doesn't: when the deny-set
 //! watcher is disconnected from NATS, `readyz` reports `"status":"degraded"` (still 200). This lets

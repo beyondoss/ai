@@ -4,8 +4,8 @@
 //! exposes them with no extra wiring. `Metrics::new` is called exactly once (in `main`).
 
 use prometheus::{
-    Histogram, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Opts,
-    default_registry,
+    default_registry, Histogram, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge,
+    IntGaugeVec, Opts,
 };
 use std::sync::Arc;
 
@@ -50,12 +50,17 @@ pub enum Rejection {
     /// not translate (embeddings-class, …). Chat Completions ↔ Messages ↔ Responses is translated
     /// instead of rejected. `/{provider}/…` never hits this — it does not consult the catalog.
     WireMismatch,
+    /// Allowance-set hit: this tenant or `bai_v2` key is exhausted. 402 before `upstream_peer`.
+    Quota,
+    /// Allowance-set has not been read yet (no successful scan or snapshot). Fail-closed 402,
+    /// unlike the deny-set's fail-open empty map.
+    AllowanceUnavailable,
 }
 
 impl Rejection {
     /// Every variant, in `as_index` order. The array in `Metrics` is built from this, so adding a
     /// variant without adding it here fails the exhaustive `match` in `as_index`.
-    pub(crate) const ALL: [Rejection; 12] = [
+    pub(crate) const ALL: [Rejection; 14] = [
         Rejection::Auth,
         Rejection::DenySpend,
         Rejection::DenyFraud,
@@ -68,6 +73,8 @@ impl Rejection {
         Rejection::NoCandidate,
         Rejection::ByoOnModelRoute,
         Rejection::WireMismatch,
+        Rejection::Quota,
+        Rejection::AllowanceUnavailable,
     ];
 
     /// The `reason=` label value. `RateLimit` keeps the original `"rate_limit"` string so existing
@@ -86,6 +93,8 @@ impl Rejection {
             Rejection::NoCandidate => "no_candidate",
             Rejection::ByoOnModelRoute => "byo_on_model_route",
             Rejection::WireMismatch => "wire_mismatch",
+            Rejection::Quota => "quota",
+            Rejection::AllowanceUnavailable => "allowance_unavailable",
         }
     }
 
@@ -103,6 +112,8 @@ impl Rejection {
             Rejection::NoCandidate => 9,
             Rejection::ByoOnModelRoute => 10,
             Rejection::WireMismatch => 11,
+            Rejection::Quota => 12,
+            Rejection::AllowanceUnavailable => 13,
         }
     }
 }
@@ -117,7 +128,7 @@ pub struct Metrics {
     /// path fires at full request rate under a credential-stuffing flood. Measured 14.3 ns vs 1.3 ns
     /// single-threaded, and 808 ns vs 151 ns with 16 threads contending the same lock.
     /// Indexed by [`Rejection::as_index`]; read it through [`Metrics::rejection`].
-    rejections: [IntCounter; 12],
+    rejections: [IntCounter; 14],
     /// Upstream responses by provider + status class ("2xx"/"4xx"/"5xx"). A provider degrading
     /// (429/5xx) is otherwise invisible until it surfaces as latency or missing usage events —
     /// this is the per-provider error-rate signal an oncall pages on.
@@ -223,6 +234,14 @@ pub struct Metrics {
     /// legitimate zero-token generation — so a provider changing its usage wire shape would silently
     /// zero out billing. This counter (paired with a `warn!`) is the alerting surface for that.
     pub usage_parse_errors_total: IntCounter,
+    /// Current allowance-set cardinality (exhausted tenants + keys). Sparse; a climb that never
+    /// falls means the control plane is writing exhaust bits without deleting them on restore.
+    pub allowance_set_size: IntGauge,
+    /// 1 once the allowance watcher has stored a scan or snapshot (empty is remaining-ok). 0 at
+    /// boot: managed traffic 402s fail-closed until this flips.
+    pub allowance_ready: IntGauge,
+    /// NATS connectivity for the **allowance-set** watcher, separate from deny/capture.
+    pub allowance_nats_connected: IntGauge,
     /// Exact-match cache hits that replayed a stored 2xx and never reached a provider.
     pub cache_hits_total: IntCounter,
     /// Constant `1` with `kind="process"`: the exact-match cache is this pod's table, not a fleet
@@ -336,6 +355,18 @@ impl Metrics {
             "ai_capture_nats_connected",
             "Capture-set watcher NATS connectivity (1=connected, 0=disconnected)",
         ))?;
+        let allowance_set_size = IntGauge::with_opts(Opts::new(
+            "ai_allowance_set_size",
+            "Currently exhausted tenants and keys (allowance-set cardinality)",
+        ))?;
+        let allowance_ready = IntGauge::with_opts(Opts::new(
+            "ai_allowance_ready",
+            "1 after a successful allowance scan or snapshot (empty = remaining-ok); 0 = fail-closed",
+        ))?;
+        let allowance_nats_connected = IntGauge::with_opts(Opts::new(
+            "ai_allowance_nats_connected",
+            "Allowance-set watcher NATS connectivity (1=connected, 0=disconnected)",
+        ))?;
         let captures_total = IntCounter::with_opts(Opts::new(
             "ai_captures_total",
             "Requests whose payloads were captured",
@@ -396,6 +427,9 @@ impl Metrics {
         r.register(Box::new(nats_connected.clone()))?;
         r.register(Box::new(capture_set_size.clone()))?;
         r.register(Box::new(capture_nats_connected.clone()))?;
+        r.register(Box::new(allowance_set_size.clone()))?;
+        r.register(Box::new(allowance_ready.clone()))?;
+        r.register(Box::new(allowance_nats_connected.clone()))?;
         r.register(Box::new(captures_total.clone()))?;
         r.register(Box::new(capture_bytes_total.clone()))?;
         r.register(Box::new(capture_dropped_total.clone()))?;
@@ -428,6 +462,9 @@ impl Metrics {
             nats_connected,
             capture_set_size,
             capture_nats_connected,
+            allowance_set_size,
+            allowance_ready,
+            allowance_nats_connected,
             captures_total,
             capture_bytes_total,
             capture_dropped_total,

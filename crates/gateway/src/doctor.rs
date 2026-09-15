@@ -39,7 +39,7 @@ fn fail(name: &'static str, message: impl Into<String>, hint: &str) -> CheckResu
 pub async fn run_checks(config: &AiConfig) -> Vec<CheckResult> {
     let mut out = Vec::new();
 
-    // NATS / slipstream reachability — without it we can't load signing keys or the deny-set.
+    // NATS / slipstream reachability — without it we can't load the deny-set or allowance-set.
     match store::nats_connect(
         &config.nats_url,
         config.nats_creds.as_ref().map(|s| s.expose()),

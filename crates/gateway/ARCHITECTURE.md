@@ -16,7 +16,7 @@ published `beyond-slipstream` — clones, CI-builds, and publishes anywhere.
 
 | Term                                       | What It Controls / Gates                                                                                                                                                                                                                                                                                                              | NOT                                                                                                                                          |
 | ------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Managed key** (`bai_v1.…` / `bai_v2.…`)  | Ed25519-verified identity; enables key swap, deny-set check, and `ai.usage` billing                                                                                                                                                                                                                                                   | A session token or capability grant — just tenant attribution                                                                                |
+| **Managed key** (`bai_v1.…` / `bai_v2.…`)  | Ed25519-verified identity; enables key swap, deny-set check, allowance check, and `ai.usage` billing                                                                                                                                                                                                                                 | A session token or capability grant — just tenant attribution                                                                                |
 | **BYO key** (anything else)                | Forwarded as-is to the provider; no swap, no billing, no deny-set                                                                                                                                                                                                                                                                     | A lesser tier — same proxy, minus attribution and billing                                                                                    |
 | **Pool key**                               | Real provider API key(s) held by the gateway; swapped in for managed traffic. A 429 walks the next unused key on the _same_ provider                                                                                                                                                                                                  | Per-tenant — keys are per provider, shared by all managed callers                                                                            |
 | **Tenant**                                 | The billing entity from the virtual key payload (`tenant_id: u64`)                                                                                                                                                                                                                                                                    | An org, user, or namespace — an opaque integer the gateway doesn't interpret                                                                 |
@@ -25,13 +25,14 @@ published `beyond-slipstream` — clones, CI-builds, and publishes anywhere.
 | **Model route** (`/auto/…`, managed `/v1`) | Catalog row named by `x-beyond-model` if present, else the body's root `model`; provider, upstream path, and model id come from that row and the body's `model` is rewritten per attempt. Catalog miss → 404. Same-endpoint walks are a byte relay; Chat Completions ↔ Messages ↔ Responses is translated when the inbound path *or this candidate's path* names a different one of those three. | Gemini. Not a per-key grant.                                                                             |
 | **Candidate**                              | One `(provider, upstream model id, path)` a catalog row will accept. Default walk is TTFT-ranked (in-process EWMA); `x-beyond-order` / `split` pin, `only` filters. Cannot add a provider the row does not list.                                                                                                                      | A parallel pool — still a sequence, entered on failure. Not a cost sort.                                                                     |
 | **Deny-set**                               | Sparse maps of denied `tenant_id`s and `key_id`s → reason; gates managed traffic; default-allow; tenant deny kills every key                                                                                                                                                                                                          | An allowlist or ACL — misses are allowed, not blocked                                                                                        |
+| **Allowance-set**                          | Sparse maps of exhausted `tenant_id`s and `key_id`s; remaining-ok vs exhausted; 402 **before** `upstream_peer`. Fail-closed until the watcher stores a scan/snapshot (empty = remaining-ok). v1 tokens: tenant grain only. Not a price table — the control plane writes the bit.                                                     | A price table, remaining-token counter the gateway decrements, or Redis on the miss path                                                     |
 | **Tail tap**                               | Bounded 64KB window kept from the end of the response for usage extraction                                                                                                                                                                                                                                                            | A buffer or copy — the response is relayed unbuffered; only the tail is kept                                                                 |
 | **Capture-set**                            | Sparse map of `tenant_id`s with payload logging on; default-**off**; watched under its own prefix by its own watcher                                                                                                                                                                                                                  | Retention policy — the gateway emits and forgets; the store owns TTL/erasure                                                                 |
 | **Capture tap**                            | Bounded **head**-keeping copy of each body, taken pre-rewrite; relayed bytes are untouched                                                                                                                                                                                                                                            | A buffer — nothing is withheld, so it costs memcpy, never latency                                                                            |
 | **Response cache**                         | **Per-pod** exact-match store: identical managed catalog-walk request (pre-rewrite body + inbound path + `tenant_id` + effective candidate order) replays a stored 2xx on **this process**. Off unless `cache_ttl_secs > 0`. Miss is an unbuffered relay; fill is a tap. Replicas do not share entries.                              | Redis, semantic cache, a pool-key key, or a fleet-wide cache — none of those                                                                 |
 | **Control header** (`x-beyond-*`)          | Per-request caller input: `metadata` tags, `capture` on/off, `cache` on/off, catalog `order` / `only` / `split`. Managed only; stripped before the upstream                                                                                                                                                                           | A way to 4xx a request — unusable values are dropped and counted; an `only` that leaves no keyed candidate is the same 503 as an unkeyed row |
 | **Smart router**                           | **Per-pod** EWMA of TTFT per catalog candidate. Default walk for managed `/auto` and `/v1` when `order`/`split` are absent. Probe of unmeasured arms every 8th request. `smart_router = false` restores static catalog order. Two replicas can rank the same row differently.                                                        | Live Redis, cost sort, or a fleet-wide shared ranking — none of those                                                                        |
-| **Snapshot**                               | On-disk deny-set cache (entries + NATS cursor) for edge/tunnel deployments                                                                                                                                                                                                                                                            | Persistent store — a pure cache; delete it and the gateway re-scans NATS                                                                     |
+| **Snapshot**                               | On-disk deny-set cache (entries + NATS cursor) for edge/tunnel deployments. Allowance uses `{snapshot_path}.allowance`.                                                                                                                                                                                                               | Persistent store — a pure cache; delete it and the gateway re-scans NATS                                                                     |
 | **Virtual key** (`bai_v1` / `bai_v2`)      | Ed25519-signed token: v1 is `tenant_id`+`vpc_id` (16 B); v2 adds unique `key_id` (24 B). Same keyring.                                                                                                                                                                                                                                | A session or auth token — stateless, no server-side lookup                                                                                   |
 
 ---
@@ -67,6 +68,9 @@ Client (stock OpenAI/Anthropic SDK)
   │       │               │                    │
   │       │             401 (bad sig)     402 Spend / 403 Fraud
   │       │                                    │
+  │       │           allowance-set (tenant OR key_id; fail-closed if unread)
+  │       │             remaining-ok ───────────────────────────────────
+  │       │             exhausted / unread ─────────────────────────── 402
   │       │           pool key required ───────────────────────── 503
   │       └─ BYO: pass through (no verify, no deny-set, no billing)
   │  ├─ Managed only: parse x-beyond-* control headers (never 4xx; bad values counted)
@@ -153,38 +157,37 @@ Client (stock OpenAI/Anthropic SDK)
 
 ### Background: Control-Plane Watchers
 
-Two sparse per-tenant sets, watched independently. The seed → watch → batch-apply → reconnect loop
+Three sparse per-tenant sets, watched independently. The seed → watch → batch-apply → reconnect loop
 is written **once**, over the `WatchedSet` trait, and instantiated per set — that loop carries the
 non-obvious correctness properties (revision-0 resume trap, scan→subscribe race, batched `rcu`,
-backoff crediting), and a second copy would be a standing invitation for the two to drift.
+backoff crediting), and a second copy would be a standing invitation for the sets to drift.
 
 ```
-NATS (blackhole.* KV entries)          NATS (aicapture.* KV entries)
-  │                                      │
-  ▼  store_watch.rs::WatcherService<Deny>│  store_watch.rs::WatcherService<Capture>
-  │  (Pingora BackgroundService)         │  (its own connection, cursor, reconnect loop)
-  │  On connect: seed from disk snapshot │  On connect: seed from NATS scan only
-  │  (if snapshot_path) or NATS scan     │  (no snapshot — see below)
-  │  Resume from saved revision          │  Resume from saved revision
-  │  Reconnect backoff: 1s → 30s         │  Reconnect backoff: 1s → 30s
-  │                                      │
-  ▼  ArcSwap<DenySet>  (state.rs)        ▼  ArcSwap<CaptureSet>  (state.rs)
-     Lock-free read, every managed req      Lock-free read, every managed req
+NATS (blackhole.*)     NATS (allowance.*)      NATS (aicapture.*)
+  │                      │                       │
+  ▼  WatcherService<Deny>│  WatcherService<Allowance>
+  │                      │  WatcherService<Capture>
+  │  seed snapshot/scan  │  seed snapshot/scan    │  scan only
+  │                      │  (empty scan = ready)  │
+  ▼  ArcSwap<DenySet>    ▼  ArcSwap<AllowanceSet> ▼  ArcSwap<CaptureSet>
+     fail-open                fail-closed until        fail-open (off)
+                              first successful read
 ```
 
-**One service per set, hence one NATS connection per set.** The extra connection buys independent
+**One service per set, hence one NATS connection per set.** The extra connections buy independent
 failure domains: a capture-set scan that keeps failing backs off on its own schedule and cannot
-slow, stall, or reseed deny enforcement.
+slow, stall, or reseed deny or allowance enforcement.
 
-**Only the deny-set gets an on-disk snapshot.** The snapshot exists so _enforcement_ survives a cold
-start before NATS reconnects. Capture is not enforcement — "captured nothing for the first few
-seconds after a restart" is a non-event — so `Capture::snapshot_path` returns `None`, which makes
-every snapshot path in the module inert for that set without a single conditional elsewhere.
+**Deny and allowance get on-disk snapshots** (`snapshot_path` and `{snapshot_path}.allowance`). The
+snapshot exists so _enforcement_ survives a cold start before NATS reconnects. Capture is not
+enforcement — "captured nothing for the first few seconds after a restart" is a non-event — so
+`Capture::snapshot_path` returns `None`.
 
-Both sets are **fail-open and off the critical path**, which is the property that lets them live
-behind NATS at all: a deny-set outage degrades to stale enforcement, a capture-set outage degrades
-to no capture. Auth, signing keys, and pool keys deliberately stay in boot config so a NATS outage
-can never stop the gateway serving. Do not put must-have config behind a watched set.
+Deny is **fail-open** on an unread store (empty map = allow). Allowance is **fail-closed** until
+`from_entries` has run (even on an empty scan): managed traffic 402s with
+`ai_rejections_total{reason="allowance_unavailable"}`. After seed, a NATS blip keeps the last-known
+set the same way deny does. Auth, signing keys, and pool keys stay in boot config.
+`/readyz` stays 200 with NATS down and does **not** gate on allowance ready.
 
 ---
 
@@ -438,6 +441,18 @@ applies both. Written exclusively via `ArcSwap`; reads on the hot path are lock-
 
 Reasons: `Spend` (→ 402), `Fraud` (→ 403), `Unknown` (→ 403, fail-safe for unrecognized values).
 Restore = explicit delete from NATS KV or TTL expiry — no gateway-side timer.
+
+### Allowance-Set (`allowance.rs`)
+
+Same WatchedSet / ArcSwap shape as deny, inverted fail direction. Membership = exhausted
+(`allowance.{tenant}`, `allowance.key.{id}`). After a successful scan or snapshot — **including
+an empty one** — absence is remaining-ok. Until that read, every managed request 402s
+(`allowance_unavailable`) and does not call `upstream_peer`. v1 tokens have no `key_id`, so only
+the tenant grain applies. The control plane writes the bit; this is not a price table and the
+gateway does not decrement a remaining counter. Restore = delete the KV entry.
+
+Checked after deny, before the exact-match cache, so an exhausted key cannot be served from a
+cached 2xx.
 
 ### Control surface (`control.rs`) and payload capture (`capture.rs`)
 
@@ -878,6 +893,7 @@ to serve.
 - Virtual key signature (Ed25519, stateless — no DB lookup)
 - Virtual key format (`bai_v1` 16-byte payload, `bai_v2` 24-byte payload with `key_id`)
 - Tenant / key not in deny-set (managed traffic only; O(1) HashMap lookup; tenant deny kills every key)
+- Tenant / key remaining-ok on the allowance-set (managed only; fail-closed until the set has been read; 402 before `upstream_peer`)
 - Pool key configured for the requested provider (managed traffic only — else 503). On a catalog
   walk this is per candidate: none keyed → 503, not a request-wide missing openai key.
 - Catalog model on managed `/v1` and `/auto` (unknown or missing → 404 naming the miss). Candidate
@@ -937,7 +953,7 @@ Secret-bearing fields (`pool_keys`, `nats_creds`) are held as `Secret<T>` — st
 | `provider_authorities.<name>`   | _(none)_                          | Override or add a provider's `authority` (host:port). Enables config-added providers beyond `KNOWN_PROVIDERS` with zero code change.                                                                                                                             |
 | `provider_dialects.<name>`      | `"openai"`                        | Wire dialect for a **config-added** provider (`"openai"` or `"anthropic"`, case-insensitive). No effect on a known provider (dialect fixed in code). Unrecognized value → hard boot failure.                                                                     |
 | `provider_auth_schemes.<name>`  | `"bearer"`                        | Managed auth scheme for a **config-added** provider (`"bearer"`, `"x-api-key"`, or `"api-key"` — the last is Azure OpenAI's shape). No effect on a known provider. Unrecognized value → hard boot failure.                                                       |
-| `snapshot_path`                 | _(unset)_                         | Path for the on-disk deny-set cache. Unset → re-scan NATS on every cold boot. Set → load from disk and enforce before NATS reconnects (edge/tunnel deployments).                                                                                                 |
+| `snapshot_path`                 | _(unset)_                         | Path for the on-disk deny-set cache. Allowance uses `{path}.allowance`. Unset → re-scan NATS on every cold boot. Set → load from disk and enforce before NATS reconnects (edge/tunnel deployments).                                                             |
 | `rate_limit_rps`                | `100`                             | Per-credential request ceiling (count-min, keyed on raw key hash). `0` disables. Exceeded → 429. Checked before Ed25519 verify.                                                                                                                                  |
 | `byo_rate_limit_rps`            | `1000`                            | Aggregate ceiling for all BYO traffic (single shared bucket). `0` disables. Managed traffic exempt. Exceeded → 429.                                                                                                                                              |
 | `circuit_breaker_threshold`     | `20`                              | Per-provider upstream failures (5xx / connect; **not** 429) within the window before the breaker opens. While open, requests to that provider fast-fail with 503. `0` disables.                                                                                  |
@@ -956,7 +972,7 @@ Secret-bearing fields (`pool_keys`, `nats_creds`) are held as `Secret<T>` — st
 | `cache_max_entries`             | `1024`                            | Cap on stored cache entries. Oldest insertion is dropped when a new one would exceed it.                                                                                                                                                                         |
 | `cache_max_bytes`               | `65536`                           | Cap on a single stored response body. Oversize complete 2xxs are relayed but not stored.                                                                                                                                                                         |
 | `smart_router`                  | `true`                            | Rank managed catalog walks by **this process's** TTFT EWMA. `false` restores static catalog order. `x-beyond-order` / `split` pin either way. Not a fleet-wide ranking.                                                                                          |
-| `nats_url`                      | `nats://localhost:4222`           | NATS server for both control-plane watchers. Unreachable → fail-open (deny-set stale, capture off).                                                                                                                                                              |
+| `nats_url`                      | `nats://localhost:4222`           | NATS server for the control-plane watchers. Unreachable → deny-set stale (fail-open), capture off, allowance fail-closed until a scan or `{snapshot_path}.allowance` lands.                                                                                      |
 | `nats_creds`                    | _(unset)_                         | NATS credentials file path. Required for authenticated clusters.                                                                                                                                                                                                 |
 | `listen_addr`                   | `0.0.0.0:8080`                    | Proxy listener address (client traffic).                                                                                                                                                                                                                         |
 | `provider_authorities.auto`     | _(rejected)_                      | Reserved: `auto` is the model-routed segment, and a provider of that name would shadow it. Hard boot failure.                                                                                                                                                    |
@@ -968,8 +984,8 @@ Secret-bearing fields (`pool_keys`, `nats_creds`) are held as `Secret<T>` — st
 
 | Failure                                                            | What Actually Happens                                                                                                                                                                                                                                              | Recovery                                                                                                                                                                                                                                                                                                                 |
 | ------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| NATS unreachable at boot                                           | Deny-set starts empty (fail-open). Auth still works — keys from config.                                                                                                                                                                                            | Watcher reconnects; seeds from NATS or disk snapshot on connect.                                                                                                                                                                                                                                                         |
-| NATS disconnects mid-run                                           | Last-known deny-set stays active. New deny entries not applied until reconnect.                                                                                                                                                                                    | Watcher reconnects (1s→30s exponential backoff, reset only after a watch that ran ≥30s — _connecting_ is not success, or a reachable NATS with a broken watch loops at 1 Hz forever) and resumes from the saved revision. Rescans instead when the seed found no entries, since revision 0 is not resumable — see above. |
+| NATS unreachable at boot                                           | Deny-set starts empty (fail-open). Allowance is unread → managed traffic 402s fail-closed. Auth still works — keys from config.                                                                    | Watcher reconnects; seeds from NATS or disk snapshot on connect. Allowance flips remaining-ok once `from_entries` runs (empty scan included). |
+| NATS disconnects mid-run                                           | Last-known deny-set and allowance-set stay active. New entries not applied until reconnect. Unready allowance (never seeded) keeps 402ing managed traffic.                                         | Watcher reconnects (1s→30s exponential backoff, reset only after a watch that ran ≥30s — _connecting_ is not success, or a reachable NATS with a broken watch loops at 1 Hz forever) and resumes from the saved revision. Rescans instead when the seed found no entries, since revision 0 is not resumable — see above. |
 | NATS history compacted past snapshot cursor                        | `CursorExpired` → full re-scan from current NATS state.                                                                                                                                                                                                            | After re-scan, new cursor set; delta watch resumes normally.                                                                                                                                                                                                                                                             |
 | Virtual key tampered or forged                                     | Prefix matches (`bai_v1`) and Ed25519 verify fails → **401**, never BYO. No billing event. The error does not name which part of the token failed.                                                                                                                 | Client retries with a valid key. A public listener that forwarded a failed verify as BYO would open junk-auth egress while the rate guard had already exempted the token from the BYO aggregate.                                                                                                                         |
 | `signing_keys` absent (typo'd/missing SSM)                         | Default: warn; every `bai_v1` token 401s (fail-closed); BYO still works. With `require_signing_keys=true`: hard boot failure.                                                                                                                                      | Set `require_signing_keys=true` on managed deployments so the mis-deploy fails at boot rather than 401-ing every tenant.                                                                                                                                                                                                 |
@@ -996,7 +1012,7 @@ Prometheus on the default registry, exposed at `/metrics` on `metrics_listen`.
 | Metric                                | Type      | Labels               | What It Measures                                                                                                     |
 | ------------------------------------- | --------- | -------------------- | -------------------------------------------------------------------------------------------------------------------- |
 | `ai_requests_total`                   | Counter   | —                    | Total admitted requests                                                                                              |
-| `ai_rejections_total`                 | Counter   | `reason`             | Rejected requests by cause (auth, deny_spend, deny_fraud, rate_limit, circuit_open, unknown_model, wire_mismatch, …) |
+| `ai_rejections_total`                 | Counter   | `reason`             | Rejected requests by cause (auth, deny_spend, quota, allowance_unavailable, deny_fraud, rate_limit, …)               |
 | `ai_upstream_responses_total`         | Counter   | `provider`, `status` | Upstream responses by provider and status class                                                                      |
 | `ai_tokens_total`                     | Counter   | `kind`               | input / output / cache_read / cache_write token counts                                                               |
 | `ai_ttft_seconds`                     | Histogram | `provider`           | Time to first token (50ms–30s buckets)                                                                               |
@@ -1005,6 +1021,9 @@ Prometheus on the default registry, exposed at `/metrics` on `metrics_listen`.
 | `ai_requests_in_flight`               | Gauge     | —                    | All in-flight requests (streaming + non-streaming)                                                                   |
 | `ai_deny_set_size`                    | Gauge     | —                    | Current number of denied tenants                                                                                     |
 | `ai_nats_connected`                   | Gauge     | —                    | 1 if the **deny-set** watcher is connected, 0 otherwise                                                              |
+| `ai_allowance_set_size`               | Gauge     | —                    | Exhausted tenants + keys in the allowance-set                                                                        |
+| `ai_allowance_ready`                  | Gauge     | —                    | 1 after a successful allowance scan/snapshot (empty = remaining-ok); 0 = fail-closed                                 |
+| `ai_allowance_nats_connected`         | Gauge     | —                    | 1 if the **allowance-set** watcher is connected                                                                      |
 | `ai_capture_set_size`                 | Gauge     | —                    | Tenants with payload capture enabled (climbing and never falling ⇒ missing TTLs)                                     |
 | `ai_capture_nats_connected`           | Gauge     | —                    | 1 if the **capture-set** watcher is connected — separate watcher, separate connection                                |
 | `ai_captures_total`                   | Counter   | —                    | Requests whose payloads were captured (post-sampling)                                                                |
@@ -1032,6 +1051,7 @@ Prometheus on the default registry, exposed at `/metrics` on `metrics_listen`.
 | `peek`            | `ModelScanner` — streaming structural scan for the root-level `model`; O(1) memory                                              | unit ✓         |
 | `usage`           | Token extraction (OpenAI / Anthropic, body + SSE)                                                                               | unit ✓         |
 | `deny`            | Sparse deny-set, default-allow, reason → HTTP status                                                                            | unit ✓         |
+| `allowance`       | Sparse remaining-ok / exhausted set; fail-closed until seeded; 402 before `upstream_peer`                                       | unit ✓ + e2e ✓ |
 | `capture`         | Sparse capture-set (default-off) + head-bounded `CaptureBufs` and 1-in-N sampling                                               | unit ✓ + e2e ✓ |
 | `capture_sink`    | Bounded, lossy `ai.payload` writer — drops on a full queue so a stalled log sink can't backpressure                             | unit ✓         |
 | `control`         | `x-beyond-*` header parse/validate; metadata canonicalized and re-serialized; catalog walk permute (`order` / `only` / `split`) | unit ✓ + e2e ✓ |
@@ -1040,20 +1060,20 @@ Prometheus on the default registry, exposed at `/metrics` on `metrics_listen`.
 | `cache`           | Per-pod exact-match response store (TTL + max entries + max bytes/entry); tap, never a buffer; miss does not consult Redis      | unit ✓ + e2e ✓ |
 | `ratelimit`       | Two-tier guardrail: per-credential (count-min sketch, fixed memory, no GC) + global BYO (one atomic)                            | unit ✓         |
 | `circuit_breaker` | Per-provider lock-free breaker (packed `AtomicU64`, windowed policy) — trips on 5xx/connect, not 429                            | unit ✓ + e2e ✓ |
-| `state`           | Keyring + provider registry + watched deny-/capture-sets (ArcSwap) + TTL DNS cache                                              | unit ✓         |
+| `state`           | Keyring + provider registry + watched deny-/allowance-/capture-sets (ArcSwap) + TTL DNS cache                                   | unit ✓         |
 | `store_watch`     | Generic `WatchedSet` driver — gap-free seeding + delta watch, instantiated per set                                              | e2e ✓          |
 | `config`          | Figment config; build keyring; pool keys / authorities by provider name                                                         | unit ✓         |
 | `secret`          | Redacting, zeroize-on-drop `Secret<T>` newtype for pool keys and NATS creds                                                     | unit ✓         |
 | `admin`           | `ServeHttp` on the metrics listener: `/livez`, `/readyz`, `/metrics`                                                            | e2e ✓          |
 | `metrics`         | Prometheus counter/histogram/gauge registration and update helpers                                                              | compile ✓      |
 | `doctor`          | Boot-time diagnostics (`beyond-ai doctor`)                                                                                      | compile ✓      |
-| `main`            | CLI (`run` / `doctor`), rustls init, config load, Pingora server + three services bootstrap                                     | compile ✓      |
+| `main`            | CLI (`run` / `doctor`), rustls init, config load, Pingora server + proxy/watchers/admin bootstrap                               | compile ✓      |
 
 ---
 
 ## Verification
 
-- **Unit (`cargo test --lib`):** key, route, peek, usage, deny, secret, config, cache, control,
+- **Unit (`cargo test --lib`):** key, route, peek, usage, deny, allowance, secret, config, cache, control,
   smart, translate. `clippy --all-targets -D warnings` clean.
 - **End-to-end (`tests/e2e.rs`, `mise run test:integration:rs`):** real `beyond-ai` binary + real
   nats-server + mock upstream. Covers managed key-swap + passthrough fidelity + usage metering
@@ -1062,6 +1082,9 @@ Prometheus on the default registry, exposed at `/metrics` on `metrics_listen`.
   `x-api-key`), and deny-set propagation: spend (write `blackhole.{tenant}` → 402, delete → 200),
   **fraud** (→ 403), and **per-credential** (write `blackhole.key.{id}` → 402 for that `bai_v2`
   key only; a sibling key for the same tenant still serves; tenant deny then 402s both).
+  **Allowance:** exhaust one `bai_v2` key (`allowance.key.{id}`) → 402 for that credential only
+  (sibling still serves; no pool connect on 402); tenant exhaust 402s both; keyed deny still works;
+  unready (NATS never seeded) 402s with `allowance_unavailable` and `mock.hits()==0`.
   Error/edge paths: **missing key → 401**, **oversized `Content-Length` →
   413**, **managed key for an unconfigured provider → 503**, **managed 429 key-walk** (two keys,
   first throttled, second serves; one key and an unreplayable body still relay 429 with

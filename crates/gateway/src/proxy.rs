@@ -1,7 +1,8 @@
 //! The Pingora `ProxyHttp` passthrough service.
 //!
 //! Flow: pick the provider from the **first path segment** (`/{provider}/…`) → verify the virtual
-//! key (stateless) → deny-set check (O(1), default-allow) → swap the auth
+//! key (stateless) → deny-set check (O(1), default-allow) → allowance check (O(1), fail-closed
+//! until seeded) → swap the auth
 //! header to the pool key (managed only) → **stream the request body straight through** (never
 //! buffered; original framing preserved) while feeding it to a structural scanner that extracts the
 //! exact root-level `model` → relay the response **without buffering** → tap usage from a bounded
@@ -458,7 +459,7 @@ impl RequestCtx {
 /// Kept as a table so `reject_bodies_are_valid_json` can walk it and assert each entry parses,
 /// carries the `type` and `message` it claims, and is reachable — a hand-written JSON literal is
 /// exactly the thing that rots silently otherwise.
-pub const REJECT_BODIES: [(&str, &str, &str); 10] = [
+pub const REJECT_BODIES: [(&str, &str, &str); 12] = [
     (
         "invalid_request_error",
         "unknown provider",
@@ -508,6 +509,16 @@ pub const REJECT_BODIES: [(&str, &str, &str); 10] = [
         "api_error",
         "no provider available for model",
         r#"{"error":{"message":"no provider available for model","type":"api_error"}}"#,
+    ),
+    (
+        "insufficient_quota",
+        "quota exhausted",
+        r#"{"error":{"message":"quota exhausted","type":"insufficient_quota"}}"#,
+    ),
+    (
+        "insufficient_quota",
+        "allowance unavailable",
+        r#"{"error":{"message":"allowance unavailable","type":"insufficient_quota"}}"#,
     ),
 ];
 
@@ -1381,10 +1392,10 @@ impl ProxyHttp for AiProxy {
 
         // 5. Identity + key handling. One branch: `bai_v1`/`bai_v2` is fail-closed (prefix match →
         // verify; any verify failure is 401, never BYO). Anything else → BYO: the user's own
-        // provider token, passed through unchanged (no Beyond identity, so no deny-set and no
-        // per-tenant attribution). A public listener without this split would forward a forged
-        // virtual key as BYO — junk-auth egress, and the rate guard already exempted it from the
-        // BYO aggregate.
+        // provider token, passed through unchanged (no Beyond identity, so no deny-set, no
+        // allowance, and no per-tenant attribution). A public listener without this split would
+        // forward a forged virtual key as BYO — junk-auth egress, and the rate guard already
+        // exempted it from the BYO aggregate.
         let (tenant_id, vpc_id, key_id, managed) = if key::is_managed_prefix(raw_key) {
             let Ok(identity) = self.state.keyring.verify(raw_key) else {
                 self.state.metrics.rejection(Rejection::Auth).inc();
@@ -1423,6 +1434,42 @@ impl ProxyHttp for AiProxy {
                     "tenant is over limit or suspended",
                 )
                 .await;
+            }
+            // Allowance: remaining-ok vs exhausted, same WatchedSet shape as deny. Fail-closed
+            // while the set has not been read. 402 before cache and before `upstream_peer`.
+            if let Some(reason) = self
+                .state
+                .allowance
+                .load()
+                .reason_for(identity.tenant_id, identity.key_id)
+            {
+                match reason {
+                    crate::allowance::AllowanceReject::Exhausted => {
+                        self.state.metrics.rejection(Rejection::Quota).inc();
+                        return Self::reject_boxed(
+                            session,
+                            &request_id,
+                            402,
+                            "insufficient_quota",
+                            "quota exhausted",
+                        )
+                        .await;
+                    }
+                    crate::allowance::AllowanceReject::Unavailable => {
+                        self.state
+                            .metrics
+                            .rejection(Rejection::AllowanceUnavailable)
+                            .inc();
+                        return Self::reject_boxed(
+                            session,
+                            &request_id,
+                            402,
+                            "insufficient_quota",
+                            "allowance unavailable",
+                        )
+                        .await;
+                    }
+                }
             }
             // The actual `Bearer …`/`x-api-key` value is precomputed in the provider registry and
             // applied in `upstream_request_filter`; here we only confirm a pool key exists.

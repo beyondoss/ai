@@ -1,13 +1,14 @@
 //! Layered configuration (PATTERNS.md: Figment defaults → TOML → `AI_`-prefixed env).
 //!
-//! Auth + key material come from config (signing public keys, managed pool keys), so the gateway
-//! is fully functional from boot config alone — NATS is only needed for the deny-set.
+//! Auth + key material come from config (signing public keys, managed pool keys). Deny is
+//! fail-open without NATS; allowance is fail-closed until its watcher stores a scan or snapshot,
+//! so managed traffic 402s until that read. BYO still serves from boot config alone.
 
 use crate::error::{GatewayError, Result};
 use crate::key::{Keyring, Kid};
 use crate::secret::Secret;
-use figment::Figment;
 use figment::providers::{Env, Format, Toml};
+use figment::Figment;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
@@ -141,19 +142,21 @@ pub struct AiConfig {
     pub downstream_h2c: bool,
 
     /// NATS / slipstream connection (cf. `_envcommon/ecs-service.hcl`: `tls://connect.ngs.global`).
-    /// Used only for the watched deny-set (`blackhole.*`).
+    /// Used for the watched deny-set (`blackhole.*`), allowance-set (`allowance.*`), and
+    /// capture-set (`aicapture.*`).
     pub nats_url: String,
     /// Base64 `.creds` (ECS via SOPS) — takes priority over `nats_creds_file`. Held in `Secret` so
     /// it can't leak through the `Debug`/`Serialize` this struct derives (a stray `?config` log).
     pub nats_creds: Option<Secret>,
     pub nats_creds_file: Option<String>,
-    /// slipstream bucket holding `blackhole.*` (the deny-set — the only thing in NATS).
+    /// slipstream bucket holding `blackhole.*`, `allowance.*`, and `aicapture.*`.
     pub config_bucket: String,
 
     /// Optional path to an on-disk deny-set snapshot (slipstream's append-log + resume cursor). When
     /// set **and on durable storage** (the edge/tunnel deployment model), a restart seeds the
     /// deny-set from this file and *resumes the NATS watch from the saved revision* — skipping the
-    /// boot scan and surviving a restart with enforcement intact even before NATS reconnects. Unset
+    /// boot scan and surviving a restart with enforcement intact even before NATS reconnects. The
+    /// allowance-set uses `{path}.allowance` so the two files cannot be loaded as each other. Unset
     /// (the default, e.g. ephemeral/Fargate) ⇒ seed from a NATS scan each boot, unchanged. The file
     /// is a pure cache: delete it (or point at scratch) and the gateway falls back to scanning.
     pub snapshot_path: Option<String>,
@@ -658,22 +661,18 @@ mod tests {
     fn validate_rejects_zero_connect_and_read_timeouts() {
         // A 0 connect/read timeout (a typo'd SSM param) must fail boot loudly, not degrade into a
         // 502 cascade at runtime.
-        assert!(
-            AiConfig {
-                connect_timeout_secs: 0,
-                ..Default::default()
-            }
-            .validate()
-            .is_err()
-        );
-        assert!(
-            AiConfig {
-                read_timeout_secs: 0,
-                ..Default::default()
-            }
-            .validate()
-            .is_err()
-        );
+        assert!(AiConfig {
+            connect_timeout_secs: 0,
+            ..Default::default()
+        }
+        .validate()
+        .is_err());
+        assert!(AiConfig {
+            read_timeout_secs: 0,
+            ..Default::default()
+        }
+        .validate()
+        .is_err());
         // Defaults are valid.
         assert!(AiConfig::default().validate().is_ok());
     }

@@ -1,10 +1,12 @@
 //! Shared gateway state.
 //!
-//! Only the **deny-set** is dynamic (watched from NATS, behind `ArcSwap` for lock-free reads).
-//! Everything else — the signing keyring and the resolved provider registry (upstreams + pool auth
-//! values) — is built once at boot from config (SSM/env), so the auth + key paths have **no runtime
-//! dependency on NATS**.
+//! The deny-set, capture-set, and allowance-set are dynamic (watched from NATS, behind `ArcSwap`
+//! for lock-free reads). Everything else — the signing keyring and the resolved provider registry
+//! (upstreams + pool auth values) — is built once at boot from config (SSM/env), so the auth +
+//! key paths have **no runtime dependency on NATS**. Allowance is fail-closed until its watcher
+//! stores a snapshot (empty = remaining-ok); deny is fail-open on the same unread store.
 
+use crate::allowance::AllowanceSet;
 use crate::cache::{self, ResponseCache};
 use crate::capture::{CaptureRule, CaptureSet};
 use crate::config::AiConfig;
@@ -204,6 +206,11 @@ pub struct GatewayState {
     /// Sparse deny-set — watched from NATS. Default-allow on miss; fail-open.
     pub deny: ArcSwap<DenySet>,
 
+    /// Sparse allowance-set — watched from NATS. Membership = exhausted. Unready until the first
+    /// successful scan or snapshot (empty scan is remaining-ok). Fail-closed: a managed request
+    /// 402s while unready, unlike deny.
+    pub allowance: ArcSwap<AllowanceSet>,
+
     /// Sparse capture-set — watched from NATS under its own prefix and its own watcher. Default-off
     /// on miss, so a NATS outage degrades to "capturing nothing", which is the correct thing to lose.
     pub capture: ArcSwap<CaptureSet>,
@@ -319,6 +326,7 @@ impl GatewayState {
             providers,
             by_id,
             deny: ArcSwap::from_pointee(DenySet::new()),
+            allowance: ArcSwap::from_pointee(AllowanceSet::new()),
             capture: ArcSwap::from_pointee(CaptureSet::new()),
             capture_defaults,
             cache,
