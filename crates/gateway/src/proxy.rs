@@ -1644,8 +1644,7 @@ impl ProxyHttp for AiProxy {
         let mut pending_cache: Option<cache::Pending> = None;
         match cache_look {
             Some(Err(hit)) => {
-                self.reply_cache_hit_boxed(session, &request_id, &hit)
-                    .await?;
+                Self::reply_cache_hit_boxed(session, &request_id, &hit).await?;
                 *ctx = Some(RequestCtx {
                     tenant_id,
                     vpc_id,

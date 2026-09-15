@@ -260,7 +260,7 @@ mod tests {
     fn req(headers: &[(&str, &str)]) -> RequestHeader {
         let mut r = RequestHeader::build("POST", b"/v1/chat/completions", None).unwrap();
         for (k, v) in headers {
-            r.insert_header(*k, *v).unwrap();
+            r.insert_header(k.to_string(), *v).unwrap();
         }
         r
     }
