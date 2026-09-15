@@ -47,8 +47,9 @@ pub enum Rejection {
     /// one provider, so neither selecting among candidates nor failing over is meaningful for it.
     ByoOnModelRoute,
     /// Catalog walk whose inbound path implies a different wire than the row, on a path we do
-    /// not translate (embeddings-class, …). Chat Completions ↔ Messages ↔ Responses is translated
-    /// instead of rejected. `/{provider}/…` never hits this — it does not consult the catalog.
+    /// not translate (embeddings-class, …), or Responses session state on a row with no Responses
+    /// arm. Chat Completions ↔ Messages ↔ Responses is translated instead of rejected.
+    /// `/{provider}/…` never hits this — it does not consult the catalog.
     WireMismatch,
     /// Allowance-set hit: this tenant or `bai_v2` key is exhausted. 402 before `upstream_peer`.
     Quota,

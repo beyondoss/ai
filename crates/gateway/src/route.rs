@@ -47,8 +47,7 @@ pub enum Endpoint {
 
 impl Endpoint {
     /// The endpoint a catalog row's `wire` implies. GPT rows speak Chat Completions; Claude rows
-    /// speak Messages. No current row is Responses-native — inbound `/v1/responses` always
-    /// translates onto one of those two.
+    /// speak Messages. GPT rows also list a parallel `/v1/responses` arm for session state.
     pub fn of_wire(d: Dialect) -> Self {
         match d {
             Dialect::Anthropic => Endpoint::Messages,
@@ -133,8 +132,10 @@ pub fn dialect_default(d: Dialect) -> &'static str {
 /// Bare `/v1` and `/auto` (no suffix) do not name an endpoint — the catalog picks the path.
 /// `/v1/messages` and `/auto/v1/messages` imply Anthropic; `/v1/chat/completions`,
 /// `/v1/responses`, and other `/v1/…` paths imply OpenAI. [`catalog_wire_action`] translates
-/// Chat Completions ↔ Messages ↔ Responses; other mismatches (`/v1/embeddings` with a Claude
-/// row) are still a 400.
+/// Chat Completions ↔ Messages ↔ Responses against the row's primary. Inbound Responses with
+/// session state still walks the GPT row's `/v1/responses` arm (or 400s on Claude); a
+/// `store: false` one-shot may translate onto Chat Completions. Other mismatches
+/// (`/v1/embeddings` with a Claude row) are still a 400.
 pub fn implied_wire(path: &str) -> Option<Dialect> {
     let rest = catalog_path_rest(path)?;
     if rest.is_empty() || rest == "/v1" || rest == "/v1/" {
@@ -200,10 +201,16 @@ pub fn is_responses_path(path: &str) -> bool {
 }
 
 fn is_responses_rest(rest: &str) -> bool {
-    rest.starts_with("/v1/responses")
-        || rest == "/responses"
-        || rest.starts_with("/responses/")
-        || rest.ends_with("/responses")
+    let tail = rest
+        .strip_prefix("/v1/")
+        .or_else(|| rest.strip_prefix('/'))
+        .unwrap_or(rest);
+    tail == "responses" || tail.starts_with("responses/")
+}
+
+/// Whether a catalog candidate path is the Responses endpoint.
+pub fn candidate_path_is_responses(path: &str) -> bool {
+    path.ends_with("/responses")
 }
 
 /// What a managed catalog walk should do when the inbound path names a wire that may disagree
@@ -223,8 +230,9 @@ pub enum WireAction {
 /// Catalog-walk decision for an inbound path vs the row's wire.
 ///
 /// The row's `wire` maps to Chat Completions or Messages ([`Endpoint::of_wire`]). Inbound
-/// `/v1/responses` is a third client dialect and always translates onto that row endpoint.
-/// Same-wire Responses is a `/{provider}` byte relay and never reaches here.
+/// `/v1/responses` is a third client dialect vs the row primary; per-candidate translate then
+/// uses the serving path, so a GPT session walk onto `/v1/responses` is a byte relay. Same-wire
+/// Responses on `/{provider}` never reaches here.
 pub fn catalog_wire_action(path: &str, row_wire: Dialect) -> WireAction {
     let Some(got) = implied_wire(path) else {
         return WireAction::Relay;
@@ -369,7 +377,7 @@ mod tests {
     #[test]
     fn every_catalog_candidate_is_a_known_provider() {
         for route in providers::catalog::MODEL_ROUTES {
-            for c in route.candidates {
+            for c in route.candidates.iter().chain(route.responses.iter()) {
                 let spec = providers::by_id(c.provider);
                 assert!(
                     known_providers().any(|p| p.id == c.provider),
@@ -419,6 +427,20 @@ mod tests {
         );
         assert_eq!(implied_wire("/v1/embeddings"), Some(Dialect::OpenAi));
         assert_eq!(implied_wire("/v1/models"), Some(Dialect::OpenAi));
+        assert_eq!(implied_wire("/v1/responses"), Some(Dialect::OpenAi));
+        assert_eq!(implied_wire("/auto/v1/responses"), Some(Dialect::OpenAi));
+    }
+
+    #[test]
+    fn is_responses_path_matches_stock_sdk_and_auto_suffixes() {
+        assert!(is_responses_path("/v1/responses"));
+        assert!(is_responses_path("/auto/v1/responses"));
+        assert!(is_responses_path("/auto/responses"));
+        assert!(!is_responses_path("/v1/chat/completions"));
+        assert!(!is_responses_path("/v1/messages"));
+        assert!(!is_responses_path("/v1/embeddings"));
+        assert!(!is_responses_path("/v1"));
+        assert!(!is_responses_path("/openai/v1/responses"));
     }
 
     #[test]

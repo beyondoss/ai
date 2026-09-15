@@ -27,8 +27,9 @@
 //! `upstream_peer` runs. That peek enables pingora's 64 KiB retry buffer, reads at most that many
 //! bytes, and — if the buffer truncated — prepends our copy in `request_body_filter`. Untruncated
 //! peeks are replayed by pingora itself. Unknown or missing model → 404 naming the miss. Chat
-//! Completions ↔ Messages on a managed catalog walk is translated; any other inbound-path vs row
-//! wire mismatch → 400. `GET /v1/models` lists the catalog.
+//! Completions ↔ Messages on a managed catalog walk is translated; inbound Responses with session
+//! state walks a GPT row's `/v1/responses` arm (byte relay) or 400s if none remain, naming the
+//! field. Any other inbound-path vs row wire mismatch → 400. `GET /v1/models` lists the catalog.
 //!
 //! One deliberate exception to the no-buffer rule: a **managed** OpenAI Chat Completions request is
 //! buffered and gets `stream_options.include_usage` injected when it streams without it — otherwise
@@ -55,9 +56,11 @@
 //! (unknown/missing → 404 naming the miss) and the request walks that row's same-wire candidates.
 //! Candidate spellings are aliases. Same-wire catalog walks are a byte relay; Chat Completions ↔
 //! Messages on a managed `/v1` or `/auto` walk is translated so a stock SDK can call the other
-//! dialect. Other inbound-path mismatches are still a 400. `GET /v1/models` lists the catalog.
-//! `/{provider}/…` is the escape hatch, does not consult the catalog, and never translates.
-//! An unknown first segment is a 404.
+//! dialect. Inbound `/v1/responses` with session state (`previous_response_id`, or `store` not
+//! explicitly false) walks the row's Responses arm or 400s; `store: false` one-shots may still
+//! translate onto Chat Completions. Other inbound-path mismatches are still a 400. `GET /v1/models`
+//! lists the catalog. `/{provider}/…` is the escape hatch, does not consult the catalog, and never
+//! translates. An unknown first segment is a 404.
 
 use crate::cache;
 use crate::capture::CaptureBufs;
@@ -326,7 +329,7 @@ struct ModelRouting {
     /// The catalog row this request routes over. `&'static`, so it costs a pointer.
     route: &'static route::ModelRoute,
     /// Walk slot of the candidate currently being attempted. Maps through [`Self::walk`] onto
-    /// `route.candidates`.
+    /// [`Self::arms`].
     candidate: u8,
     /// Bit `i` ⇒ walk slot `i` is *usable*: this gateway routes to that provider and holds a
     /// pool key for it. Computed once in `request_filter` so `upstream_peer` never re-derives it.
@@ -336,6 +339,12 @@ struct ModelRouting {
     /// `x-beyond-order` / `only` / `split` and, when those do not pin, by [`crate::smart`].
     /// `first_usable` walks this sequence; failover, breakers, and the 429 key-walk see the same.
     walk: control::Walk,
+    /// The candidate slice this walk indexes — [`ModelRoute::candidates`] or
+    /// [`ModelRoute::responses`].
+    arms: &'static [route::Candidate],
+    /// Named session field (`previous_response_id` / `store`) that must not be stripped onto a
+    /// non-Responses candidate. `None` is a one-shot (or not a Responses request).
+    session_field: Option<&'static str>,
     /// When the current attempt began. Distinct from `RequestCtx::start` (which times the whole
     /// request) so a candidate that burned `connect_timeout_secs` before failing over does not
     /// charge that time to the provider that actually served — which would render an outage at
@@ -358,7 +367,7 @@ impl ModelRouting {
     fn candidate_at(&self, i: u8) -> Option<&'static route::Candidate> {
         self.walk
             .catalog_index(i)
-            .and_then(|orig| self.route.candidates.get(usize::from(orig)))
+            .and_then(|orig| self.arms.get(usize::from(orig)))
     }
 }
 
@@ -866,6 +875,11 @@ fn record_walk_ttft(state: &GatewayState, rc: &RequestCtx, ok: bool) {
     let Some(auto) = rc.auto.as_ref() else {
         return;
     };
+    // Responses arms share a ModelRoute with Chat Completions candidates; writing TTFT into
+    // overlapping catalog indices would rerank the Chat Completions walk. Skip.
+    if !std::ptr::eq(auto.arms, auto.route.candidates) {
+        return;
+    }
     let Some(orig) = auto.walk.catalog_index(auto.candidate) else {
         return;
     };
@@ -1539,13 +1553,16 @@ impl ProxyHttp for AiProxy {
                     return Self::reject_catalog_miss(session, &request_id, name.as_deref()).await;
                 }
                 CatalogHeader::Absent => {
-                    // Drain the rest of a small body only when a cache lookup can hash it. Cap at
-                    // strictly under the peek limit so we cannot fill pingora's retry buffer to the
-                    // truncated-and-fully-consumed hang (see `peek_body_model`). A miss still does
-                    // not withhold: pingora replays the retry buffer.
-                    let drain = self.state.cache.is_some()
+                    // Drain the rest of a small body only when a cache lookup can hash it, or when
+                    // inbound Responses needs `store` / `previous_response_id` before the walk.
+                    // Cap at strictly under the peek limit so we cannot fill pingora's retry buffer
+                    // to the truncated-and-fully-consumed hang (see `peek_body_model`). A miss still
+                    // does not withhold: pingora replays the retry buffer.
+                    let responses = route::is_responses_path(session.req_header().uri.path());
+                    let drain = (self.state.cache.is_some()
                         && !cache_bypass
-                        && declared_len.is_some_and(|n| n < BODY_PEEK_LIMIT);
+                        && declared_len.is_some_and(|n| n < BODY_PEEK_LIMIT))
+                        || (responses && declared_len.is_none_or(|n| n < BODY_PEEK_LIMIT));
                     let peek = Box::pin(peek_body_model(session, drain)).await?;
                     let Some(name) = peek.model.filter(|n| !n.is_empty()) else {
                         self.state.metrics.rejection(Rejection::UnknownModel).inc();
@@ -1560,6 +1577,20 @@ impl ProxyHttp for AiProxy {
                     body_complete = peek.complete;
                 }
             }
+        }
+
+        // Header-won catalog walks skip the body peek above. Inbound Responses still needs
+        // `store` / `previous_response_id` before we pick the arm, so drain a small body now.
+        if managed
+            && model_route.is_some()
+            && route::is_responses_path(session.req_header().uri.path())
+            && body_complete.is_none()
+            && body_replay.is_none()
+        {
+            let drain = declared_len.is_none_or(|n| n < BODY_PEEK_LIMIT);
+            let peek = Box::pin(peek_body_model(session, drain)).await?;
+            body_replay = peek.replay;
+            body_complete = peek.complete;
         }
 
         // Per-request control surface (`x-beyond-*`). Managed only: a BYO request carries no verified
@@ -1582,6 +1613,14 @@ impl ProxyHttp for AiProxy {
 
         // Model routing is **managed-only**, and the first candidate is chosen here.
         let mut walk = control::Walk::identity(0);
+        let mut walk_arms: &'static [route::Candidate] = &[];
+        let inbound_responses =
+            model_route.is_some() && route::is_responses_path(session.req_header().uri.path());
+        let session_field = if inbound_responses {
+            translate::responses_session_field(body_complete.as_deref().unwrap_or(&[]))
+        } else {
+            None
+        };
         let (provider, usable) = match model_route {
             None => {
                 // Provider-routed, or BYO `/v1` dialect default. Headerless `/auto` always set
@@ -1621,17 +1660,47 @@ impl ProxyHttp for AiProxy {
                     )
                     .await;
                 }
+                // Session-state Responses must walk the Responses arm, not Chat Completions /
+                // Messages. `store: false` one-shots stay on `candidates` (lossy translate onto
+                // Chat Completions is allowed). TTFT ranking is only for `candidates` — do not
+                // observe Responses attempts into that table.
+                let arms: &'static [route::Candidate] =
+                    if inbound_responses && session_field.is_some() {
+                        row.responses
+                    } else {
+                        row.candidates
+                    };
+                if inbound_responses
+                    && let Some(field) = session_field
+                    && arms.is_empty()
+                {
+                    self.state.metrics.rejection(Rejection::WireMismatch).inc();
+                    return Self::reject_message_boxed(
+                        session,
+                        &request_id,
+                        400,
+                        "invalid_request_error",
+                        format!(
+                            "{field} cannot be honored for {} (no Responses upstream)",
+                            row.model
+                        ),
+                    )
+                    .await;
+                }
+                walk_arms = arms;
                 // Permute the row before the usable mask / `first_usable`. Failover, breakers, and
                 // the 429 key-walk then see this sequence. Unknown names were already dropped;
                 // an `only` filter that left nobody is the same 503 as an unkeyed row.
                 //
                 // `order` / `split` pin; otherwise the in-process TTFT ranker may reorder. `only`
-                // filters, then ranking still applies. See `smart`.
+                // filters, then ranking still applies. See `smart`. Responses walks skip the
+                // ranker so Chat Completions TTFT cells stay untouched.
                 walk = parsed_control.as_ref().map_or_else(
-                    || control::Walk::identity(row.candidates.len()),
-                    |c| c.catalog_walk(row.candidates, request_seq),
+                    || control::Walk::identity(arms.len()),
+                    |c| c.catalog_walk(arms, request_seq),
                 );
                 if self.state.config.smart_router
+                    && std::ptr::eq(arms, row.candidates)
                     && !parsed_control
                         .as_ref()
                         .is_some_and(control::Control::pins_walk)
@@ -1656,7 +1725,7 @@ impl ProxyHttp for AiProxy {
                     let Some(orig) = walk.catalog_index(i) else {
                         continue;
                     };
-                    let Some(c) = row.candidates.get(usize::from(orig)) else {
+                    let Some(c) = arms.get(usize::from(orig)) else {
                         continue;
                     };
                     let keyed = self
@@ -1684,7 +1753,7 @@ impl ProxyHttp for AiProxy {
                 };
                 match walk
                     .catalog_index(first)
-                    .and_then(|orig| row.candidates.get(usize::from(orig)))
+                    .and_then(|orig| arms.get(usize::from(orig)))
                     .and_then(|c| self.state.provider_by_id(c.provider))
                 {
                     Some(p) => (p.clone(), usable),
@@ -1707,7 +1776,9 @@ impl ProxyHttp for AiProxy {
         // Catalog walk: inbound path may name Chat Completions, Messages, or Responses while the
         // serving *candidate* speaks a different one of those three. Always keep the client
         // endpoint so failover can translate onto the next path; embeddings-class mismatches
-        // are still a 400. `/{provider}/…` never reaches this — it has no row.
+        // are still a 400. Inbound Responses with session state already chose the Responses arm
+        // (or 400'd) — same-endpoint is a byte relay (`from == to`). `/{provider}/…` never
+        // reaches this — it has no row.
         let mut translate_state = None;
         if let Some(row) = model_route {
             let path = session.req_header().uri.path();
@@ -1745,9 +1816,10 @@ impl ProxyHttp for AiProxy {
         // which does not error — it trips the dialect-mismatch guard and emits a **zero-token
         // billing row**.
         let dialect = model_route.map_or(provider.dialect, |r| r.wire);
-        if let Some(row) = model_route {
-            forward_streamable = row
-                .candidates
+        if model_route.is_some() {
+            // From the arm this request will actually walk, not the row's Chat Completions primary:
+            // a Responses walk must not inherit `stream_options` injection.
+            forward_streamable = walk_arms
                 .first()
                 .is_some_and(|c| is_streamable_path(c.path));
         }
@@ -1801,8 +1873,7 @@ impl ProxyHttp for AiProxy {
             body_complete.as_deref().and_then(|body| {
                 let store = self.state.cache.as_ref()?;
                 let path = session.req_header().uri.path();
-                let row = model_route?;
-                let (ids, n) = walk.provider_ids(row.candidates);
+                let (ids, n) = walk.provider_ids(walk_arms);
                 let ck = cache::key(tenant_id, path, body, &ids[..usize::from(n)]);
                 match store.get(&ck) {
                     Some(hit) => Some(Err(hit)),
@@ -1848,6 +1919,8 @@ impl ProxyHttp for AiProxy {
                             candidate: first_usable(usable, 0).unwrap_or(0),
                             usable,
                             walk,
+                            arms: walk_arms,
+                            session_field,
                             attempt_start: start,
                             replay: None,
                             cache: Some(cache::Pending::Hit(hit)),
@@ -1959,6 +2032,8 @@ impl ProxyHttp for AiProxy {
                     candidate: first_usable(usable, 0).unwrap_or(0),
                     usable,
                     walk,
+                    arms: walk_arms,
+                    session_field,
                     // Overwritten per attempt by `upstream_peer`; seeded so the first attempt is
                     // timed even if it fails before the prologue runs.
                     attempt_start: start,
@@ -2063,6 +2138,14 @@ impl ProxyHttp for AiProxy {
                     rc.advance_candidate(i);
                     continue;
                 };
+                if rc.auto.as_ref().is_some_and(|a| {
+                    a.session_field.is_some() && !route::candidate_path_is_responses(candidate.path)
+                }) {
+                    // Session state must not walk onto Chat Completions / Messages. The walk is
+                    // already filtered; this is the belt if a 5xx retry cursor drifted.
+                    rc.advance_candidate(i);
+                    continue;
+                }
                 let Some(p) = self.state.provider_by_id(candidate.provider).cloned() else {
                     // Unreachable: `usable` bits are only set for candidates that resolved.
                     rc.advance_candidate(i);
@@ -2490,17 +2573,13 @@ impl ProxyHttp for AiProxy {
             if end_of_stream {
                 // One structural walk for every answer (see `peek::scan_buffered`).
                 let mut buf = std::mem::take(&mut rc.req_buf);
-                // Wire mismatch on this catalog walk: map the inbound JSON into the row's wire
-                // *before* the model splice. The candidate id is a property of the upstream, so
-                // it is written after the shape is already right. OpenAI→Anthropic drops
-                // `stream_options` here (Anthropic has no such field); Anthropic→OpenAI leaves
-                // `include_usage` to the inject below, on the translated OpenAI body.
                 // Wire mismatch on this *candidate*: map the inbound JSON onto this path's
                 // endpoint *before* the model splice. Keep the original client body in `req_buf`
                 // (cleared and replayed per attempt) so a mixed-row failover re-translates rather
                 // than forwarding the previous candidate's wire. OpenAI→Anthropic drops
                 // `stream_options` here; Anthropic→OpenAI leaves `include_usage` to the inject
-                // below, on the translated Chat Completions body.
+                // below, on the translated Chat Completions body. Same-endpoint Responses
+                // (session arm) is `from == to` and is a byte relay.
                 if let Some(a) = rc.auto.as_ref()
                     && let Some(t) = a.translate.as_ref()
                     && let Some(to) = catalog_serving_endpoint(a.as_ref())

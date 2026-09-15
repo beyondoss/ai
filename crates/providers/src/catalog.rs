@@ -30,9 +30,12 @@
 //! by the OpenAI extractor trips the dialect-mismatch guard and emits a **zero-token billing row**,
 //! not an error.
 //!
-//! Candidates in a row may disagree on the endpoint (Messages vs Chat Completions vs Responses).
-//! The gateway translates the original client body onto **this candidate's** path each attempt, so
-//! Claude can fail onto an OpenAI-compat host without sending a Messages body at Chat Completions.
+//! Candidates in a row may disagree on the endpoint (Messages vs Chat Completions). The gateway
+//! translates the original client body onto **this candidate's** path each attempt, so Claude can
+//! fail onto an OpenAI-compat host without sending a Messages body at Chat Completions.
+//! GPT rows also list a parallel [`ModelRoute::responses`] arm (OpenAI `/v1/responses`) used when
+//! the inbound path is Responses **and** the body uses session state; Chat Completions / Messages
+//! inbound, and `store: false` one-shot Responses, still walk [`ModelRoute::candidates`].
 //! `/{provider}/…` never translates.
 //!
 //! # Maintenance
@@ -74,13 +77,22 @@ pub struct ModelRoute {
     pub model: &'static str,
     /// The API shape the *primary* speaks, and the shape a bare `/v1` client is assumed to send.
     /// Failover candidates may speak a different endpoint; the gateway translates the original
-    /// client body onto each candidate's path. Inbound `/v1/responses` is translated onto Chat
-    /// Completions or Messages according to this field for the primary, then per candidate.
+    /// client body onto each candidate's path. Inbound `/v1/responses` without session state is
+    /// translated onto Chat Completions or Messages according to this field for the primary, then
+    /// per candidate. Session-state Responses walks [`Self::responses`] instead.
     /// `/{provider}/…` never translates.
     pub wire: WireFormat,
     /// Preference order: `[0]` is primary, the rest are failover candidates. Non-empty, at most
-    /// [`MAX_CANDIDATES`], no provider repeated.
+    /// [`MAX_CANDIDATES`], no provider repeated. Chat Completions / Messages inbound, and one-shot
+    /// Responses (`store: false`) that may still translate onto Chat Completions, walk this list.
     pub candidates: &'static [Candidate],
+    /// OpenAI `/v1/responses` arms. Walked when the inbound path is Responses **and** the body uses
+    /// session state (`previous_response_id` set, or `store` not explicitly `false`). Empty on
+    /// Claude rows — those have no OpenAI store, so session-state Responses is a 400, not a hollow
+    /// Messages call. Same-endpoint: byte relay (`store` / `previous_response_id` / `include` /
+    /// `truncation` pass through). A Responses 5xx may walk another entry here; it must not walk
+    /// onto [`Self::candidates`] while session fields are in play.
+    pub responses: &'static [Candidate],
 }
 
 /// Upper bound on candidates per row, so the gateway can track which are usable in a single `u8`
@@ -163,8 +175,11 @@ const fn claude_bedrock(
 }
 
 /// OpenAI-native primary, OpenRouter Chat Completions failover. Same Chat Completions mount on
-/// both sides (`/v1` vs `/api/v1`). GPT ids are also served on `/v1/responses`; inbound Responses
-/// translates onto this Chat Completions row rather than mixing endpoints inside one candidate.
+/// OpenAI-native primary, OpenRouter Chat Completions failover. Same Chat Completions mount on
+/// both sides (`/v1` vs `/api/v1`). The matching Responses arm lives on [`ModelRoute::responses`]
+/// rather than here: mixing `/v1/chat/completions` and `/v1/responses` in one walk would break
+/// `stream_options.include_usage` injection. `store: false` one-shot inbound Responses still
+/// translates onto this Chat Completions row.
 const fn openai_chat(native: &'static str, openrouter: &'static str) -> [Candidate; 2] {
     [
         Candidate {
@@ -180,6 +195,17 @@ const fn openai_chat(native: &'static str, openrouter: &'static str) -> [Candida
     ]
 }
 
+/// OpenAI `/v1/responses` for a GPT catalog row. One provider: OpenAI's store is not OpenRouter's,
+/// so a `previous_response_id` failover across vendors would be another hollow call. A second
+/// Responses candidate can be appended when it actually shares that store.
+const fn openai_responses(native: &'static str) -> [Candidate; 1] {
+    [Candidate {
+        provider: ProviderId::OpenAi,
+        upstream_model: native,
+        path: "/v1/responses",
+    }]
+}
+
 /// Every routable model, **sorted by `model`** — [`for_model`] binary-searches it.
 ///
 /// Native ids are the providers' own published aliases (Anthropic Models overview and OpenAI
@@ -189,7 +215,7 @@ const fn openai_chat(native: &'static str, openrouter: &'static str) -> [Candida
 pub const MODEL_ROUTES: &[ModelRoute] = &[
     // Claude on the Anthropic wire.
     //
-    // Default shape is Anthropic first-party, then OpenRouter Messages (`claude()`). OpenRouter
+    // Default shape is Anthropic first-party, then OpenRouter Chat Completions (`claude()`). OpenRouter
     // chooses its own backend per request — observed serving these ids from both Anthropic
     // directly and Amazon Bedrock — so that second candidate is *not* a guaranteed independent
     // supply. It covers failures that are ours: egress blocked, our Anthropic key throttled,
@@ -207,11 +233,13 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         model: "claude-fable-5",
         wire: WireFormat::Anthropic,
         candidates: &claude("claude-fable-5", "anthropic/claude-fable-5"),
+        responses: &[],
     },
     ModelRoute {
         model: "claude-fable-5-1",
         wire: WireFormat::Anthropic,
         candidates: &claude("claude-fable-5-1", "anthropic/claude-fable-5.1"),
+        responses: &[],
     },
     ModelRoute {
         model: "claude-haiku-4-5",
@@ -221,16 +249,19 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
             "us.anthropic.claude-haiku-4-5-20251001-v1:0",
             "anthropic/claude-haiku-4.5",
         ),
+        responses: &[],
     },
     ModelRoute {
         model: "claude-opus-4-6",
         wire: WireFormat::Anthropic,
         candidates: &claude("claude-opus-4-6", "anthropic/claude-opus-4.6"),
+        responses: &[],
     },
     ModelRoute {
         model: "claude-opus-4-7",
         wire: WireFormat::Anthropic,
         candidates: &claude("claude-opus-4-7", "anthropic/claude-opus-4.7"),
+        responses: &[],
     },
     ModelRoute {
         model: "claude-opus-4-8",
@@ -240,98 +271,119 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
             "us.anthropic.claude-opus-4-8",
             "anthropic/claude-opus-4.8",
         ),
+        responses: &[],
     },
     ModelRoute {
         model: "claude-opus-5",
         wire: WireFormat::Anthropic,
         candidates: &claude("claude-opus-5", "anthropic/claude-opus-5"),
+        responses: &[],
     },
     ModelRoute {
         model: "claude-sonnet-4-5",
         wire: WireFormat::Anthropic,
         candidates: &claude("claude-sonnet-4-5", "anthropic/claude-sonnet-4.5"),
+        responses: &[],
     },
     ModelRoute {
         model: "claude-sonnet-4-6",
         wire: WireFormat::Anthropic,
         candidates: &claude("claude-sonnet-4-6", "anthropic/claude-sonnet-4.6"),
+        responses: &[],
     },
     ModelRoute {
         model: "claude-sonnet-5",
         wire: WireFormat::Anthropic,
         candidates: &claude("claude-sonnet-5", "anthropic/claude-sonnet-5"),
+        responses: &[],
     },
     // The same shape on the OpenAI wire, where the two mounts differ as well (`/v1` vs `/api/v1`).
     // Flagships first in the *id* sort: 4.x, then 5 / 5.4 / 5.5 / 5.6, then 6 Astra, then o-series.
+    // `responses` is the arm used when inbound is `/v1/responses` with session state; Chat
+    // Completions / Messages inbound still walks `candidates`.
     ModelRoute {
         model: "gpt-4.1",
         wire: WireFormat::OpenAi,
         candidates: &openai_chat("gpt-4.1", "openai/gpt-4.1"),
+        responses: &openai_responses("gpt-4.1"),
     },
     ModelRoute {
         model: "gpt-4o",
         wire: WireFormat::OpenAi,
         candidates: &openai_chat("gpt-4o", "openai/gpt-4o"),
+        responses: &openai_responses("gpt-4o"),
     },
     ModelRoute {
         model: "gpt-4o-mini",
         wire: WireFormat::OpenAi,
         candidates: &openai_chat("gpt-4o-mini", "openai/gpt-4o-mini"),
+        responses: &openai_responses("gpt-4o-mini"),
     },
     ModelRoute {
         model: "gpt-5",
         wire: WireFormat::OpenAi,
         candidates: &openai_chat("gpt-5", "openai/gpt-5"),
+        responses: &openai_responses("gpt-5"),
     },
     ModelRoute {
         model: "gpt-5-mini",
         wire: WireFormat::OpenAi,
         candidates: &openai_chat("gpt-5-mini", "openai/gpt-5-mini"),
+        responses: &openai_responses("gpt-5-mini"),
     },
     ModelRoute {
         model: "gpt-5.4",
         wire: WireFormat::OpenAi,
         candidates: &openai_chat("gpt-5.4", "openai/gpt-5.4"),
+        responses: &openai_responses("gpt-5.4"),
     },
     ModelRoute {
         model: "gpt-5.4-mini",
         wire: WireFormat::OpenAi,
         candidates: &openai_chat("gpt-5.4-mini", "openai/gpt-5.4-mini"),
+        responses: &openai_responses("gpt-5.4-mini"),
     },
     ModelRoute {
         model: "gpt-5.5",
         wire: WireFormat::OpenAi,
         candidates: &openai_chat("gpt-5.5", "openai/gpt-5.5"),
+        responses: &openai_responses("gpt-5.5"),
     },
     ModelRoute {
         model: "gpt-5.6-luna",
         wire: WireFormat::OpenAi,
         candidates: &openai_chat("gpt-5.6-luna", "openai/gpt-5.6-luna"),
+        responses: &openai_responses("gpt-5.6-luna"),
     },
     ModelRoute {
         model: "gpt-5.6-sol",
         wire: WireFormat::OpenAi,
         candidates: &openai_chat("gpt-5.6-sol", "openai/gpt-5.6-sol"),
+        responses: &openai_responses("gpt-5.6-sol"),
     },
     ModelRoute {
         model: "gpt-5.6-terra",
         wire: WireFormat::OpenAi,
         candidates: &openai_chat("gpt-5.6-terra", "openai/gpt-5.6-terra"),
+        responses: &openai_responses("gpt-5.6-terra"),
     },
     ModelRoute {
         model: "gpt-6-astra",
         wire: WireFormat::OpenAi,
         candidates: &openai_chat("gpt-6-astra", "openai/gpt-6-astra"),
+        responses: &openai_responses("gpt-6-astra"),
     },
     ModelRoute {
         model: "o3",
         wire: WireFormat::OpenAi,
         candidates: &openai_chat("o3", "openai/o3"),
+        responses: &openai_responses("o3"),
     },
     ModelRoute {
         model: "o4-mini",
         wire: WireFormat::OpenAi,
         candidates: &openai_chat("o4-mini", "openai/o4-mini"),
+        responses: &openai_responses("o4-mini"),
     },
 ];
 
@@ -859,6 +911,106 @@ mod tests {
                 assert_eq!(row.candidates[0].upstream_model, native, "{name}");
                 assert_eq!(row.candidates[1].provider, ProviderId::OpenRouter, "{name}");
                 assert_eq!(row.candidates[1].upstream_model, openrouter, "{name}");
+            }
+        }
+    }
+
+    #[test]
+    fn gpt_rows_carry_an_openai_responses_arm() {
+        for route in MODEL_ROUTES.iter().filter(|r| r.wire == WireFormat::OpenAi) {
+            assert_eq!(
+                route.responses.len(),
+                1,
+                "{:?} must list OpenAI /v1/responses",
+                route.model
+            );
+            let c = &route.responses[0];
+            assert_eq!(c.provider, ProviderId::OpenAi, "{:?}", route.model);
+            assert_eq!(c.path, "/v1/responses", "{:?}", route.model);
+            assert_eq!(c.upstream_model, route.model, "{:?}", route.model);
+            assert!(
+                (1..=MAX_CANDIDATES).contains(&route.responses.len()),
+                "{:?}",
+                route.model
+            );
+        }
+    }
+
+    #[test]
+    fn claude_rows_have_no_openai_responses_arm() {
+        for route in MODEL_ROUTES
+            .iter()
+            .filter(|r| r.wire == WireFormat::Anthropic)
+        {
+            assert!(
+                route.responses.is_empty(),
+                "{:?} has no OpenAI store; Responses session state must 400, not list an arm",
+                route.model
+            );
+        }
+    }
+
+    #[test]
+    fn responses_arms_are_routable_absolute_and_openai_wire() {
+        for route in MODEL_ROUTES {
+            for c in route.responses {
+                assert!(
+                    gateway_providers().any(|p| p.id == c.provider),
+                    "route {:?} responses names {:?}",
+                    route.model,
+                    c.provider
+                );
+                assert!(
+                    c.path.starts_with('/') && !c.path.contains("://"),
+                    "{:?} responses path {:?}",
+                    route.model,
+                    c.path
+                );
+                assert_eq!(
+                    wire_of_path(c.path),
+                    WireFormat::OpenAi,
+                    "{:?} responses must be OpenAI-wire",
+                    route.model
+                );
+                assert!(
+                    c.path.ends_with("/responses"),
+                    "{:?} responses path {:?}",
+                    route.model,
+                    c.path
+                );
+                let spec = by_id(c.provider);
+                if let Some(base) = spec.base_url {
+                    let mount = spec.base_path();
+                    assert!(
+                        c.path.starts_with(mount),
+                        "route {:?}: {} serves from {base} (mount {mount:?}), but responses path is \
+                         {:?}",
+                        route.model,
+                        spec.name,
+                        c.path,
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn responses_arms_within_a_row_share_one_endpoint() {
+        for route in MODEL_ROUTES {
+            let endpoint = |p: &str| p.rsplit_once("/v1").map_or(p, |(_, tail)| tail).to_string();
+            let Some(first) = route.responses.first() else {
+                continue;
+            };
+            let want = endpoint(first.path);
+            for c in route.responses {
+                assert_eq!(
+                    endpoint(c.path),
+                    want,
+                    "route {:?}: responses mix {:?} and {:?}",
+                    route.model,
+                    first.path,
+                    c.path
+                );
             }
         }
     }
