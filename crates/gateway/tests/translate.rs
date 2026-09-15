@@ -1,4 +1,4 @@
-//! End-to-end: Chat Completions ↔ Messages translation on a managed catalog walk.
+//! End-to-end: Chat Completions ↔ Messages ↔ Responses translation on a managed catalog walk.
 //!
 //! The existing stream tests in `model_routing.rs` prove the happy path. This file drives the
 //! rest of the contract through the real proxy: non-stream JSON (Pingora withholds until EOS),
@@ -668,5 +668,124 @@ async fn openai_sdk_passes_cache_control_and_sees_thinking_on_the_stream() {
     assert!(
         line.contains("reasoning_tokens") && line.contains('3'),
         "billing reasoning counts come from the upstream Anthropic parser: {line}"
+    );
+}
+
+fn stock_responses(model: &str, stream: bool) -> String {
+    format!(
+        r#"{{"model":"{model}","input":[{{"role":"user","content":[{{"type":"input_text","text":"hi"}}]}}],"max_output_tokens":16,"stream":{stream},"store":false}}"#
+    )
+}
+
+/// Stock Responses body + a GPT catalog id translates onto Chat Completions. Billing still
+/// reads the upstream Chat Completions usage, not the Responses JSON the client sees.
+#[tokio::test]
+async fn stock_responses_gpt_translates_to_chat_completions() {
+    let nats_port = unused_nats_port();
+    let (pubkey, sk) = test_keypair(1);
+    let mock = MockUpstream::start(Mode::Sse).await;
+    let gw = Gateway::builder(nats_port, &mock.authority(), &b64(&pubkey))
+        .providers(&["openai", "openrouter", "anthropic"])
+        .start()
+        .await;
+
+    let resp = test_client()
+        .post(format!("{}/v1/responses", gw.url()))
+        .header("authorization", format!("Bearer {}", vkey(&sk)))
+        .header("content-type", "application/json")
+        .body(stock_responses("gpt-4o-mini", true))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let text = resp.text().await.unwrap();
+    assert!(
+        text.contains("response.output_text.delta") || text.contains("response.completed"),
+        "client must see Responses SSE, not Chat Completions: {text}"
+    );
+    assert!(
+        !text.contains("chat.completion.chunk"),
+        "Chat Completions SSE must not leak: {text}"
+    );
+
+    let cap = mock
+        .captured()
+        .expect("translated request reaches OpenAI Chat Completions");
+    assert_eq!(cap.path, "/v1/chat/completions");
+    let got = String::from_utf8(cap.body).unwrap();
+    assert!(got.contains(r#""messages""#), "{got}");
+    assert!(got.contains(r#""hi""#), "{got}");
+    assert!(
+        !got.contains(r#""store""#),
+        "Responses-only store must be dropped: {got}"
+    );
+    assert!(
+        got.contains("stream_options") && got.contains("include_usage"),
+        "Chat Completions upstream still gets include_usage: {got}"
+    );
+
+    let line = gw
+        .wait_for_log_line(&["ai.usage", r#""provider":"openai""#])
+        .await;
+    assert!(
+        line.contains(r#""input_tokens":5"#) && line.contains(r#""output_tokens":9"#),
+        "billing parses the upstream Chat Completions stream: {line}"
+    );
+}
+
+/// Stock Responses body + a Claude catalog id translates onto Messages. Billing still
+/// reads the upstream Anthropic usage.
+#[tokio::test]
+async fn stock_responses_claude_translates_to_messages() {
+    let nats_port = unused_nats_port();
+    let (pubkey, sk) = test_keypair(1);
+    let mock = MockUpstream::start(Mode::AnthropicSse).await;
+    let gw = Gateway::builder(nats_port, &mock.authority(), &b64(&pubkey))
+        .providers(&["anthropic", "openai", "openrouter"])
+        .start()
+        .await;
+
+    let resp = test_client()
+        .post(format!("{}/v1/responses", gw.url()))
+        .header("authorization", format!("Bearer {}", vkey(&sk)))
+        .header("content-type", "application/json")
+        .body(stock_responses("claude-opus-4-8", true))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let text = resp.text().await.unwrap();
+    assert!(
+        text.contains("response.output_text.delta") || text.contains("response.completed"),
+        "client must see Responses SSE: {text}"
+    );
+
+    let cap = mock
+        .captured()
+        .expect("translated request reaches Anthropic Messages");
+    assert_eq!(cap.path, "/v1/messages");
+    assert_eq!(
+        cap.anthropic_version.as_deref(),
+        Some("2023-06-01"),
+        "Responses→Messages must inject anthropic-version"
+    );
+    let got = String::from_utf8(cap.body).unwrap();
+    assert!(got.contains(r#""messages""#), "{got}");
+    assert!(got.contains(r#""hi""#), "{got}");
+    assert!(
+        !got.contains("stream_options"),
+        "Messages upstream must not get stream_options: {got}"
+    );
+    assert!(
+        !got.contains(r#""store""#),
+        "Responses-only store must be dropped: {got}"
+    );
+
+    let line = gw
+        .wait_for_log_line(&["ai.usage", r#""provider":"anthropic""#])
+        .await;
+    assert!(
+        line.contains(r#""input_tokens":13"#),
+        "billing parses the upstream Anthropic stream: {line}"
     );
 }

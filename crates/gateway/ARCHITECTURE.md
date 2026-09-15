@@ -3,9 +3,9 @@
 Takes HTTP requests carrying an OpenAI- or Anthropic-dialect payload, authenticates the caller via
 Ed25519 virtual key or BYO provider token, swaps in a pool key for managed traffic, relays the
 request and response to the upstream provider (byte-for-byte when the inbound path and the catalog
-row share a wire; translated Chat Completions ↔ Messages when they don't), and emits a token-usage
-billing fact (`ai.usage`) on completion. Usage taps the upstream body; the client sees the inbound
-dialect.
+row share an endpoint; translated Chat Completions ↔ Messages ↔ Responses when they don't), and
+emits a token-usage billing fact (`ai.usage`) on completion. Usage taps the upstream body; the
+client sees the inbound dialect.
 
 **Self-contained:** no `path` deps into the `beyond` repo. Depends only on crates.io + the
 published `beyond-slipstream` — clones, CI-builds, and publishes anywhere.
@@ -22,7 +22,7 @@ published `beyond-slipstream` — clones, CI-builds, and publishes anywhere.
 | **Tenant**                                 | The billing entity from the virtual key payload (`tenant_id: u64`)                                                                                                                                                                                                                                                                    | An org, user, or namespace — an opaque integer the gateway doesn't interpret                                                                 |
 | **Dialect**                                | A provider attribute (OpenAI-wire vs Anthropic-wire) driving usage parsing; for a bare-path request it's derived from the path to pick the default provider                                                                                                                                                                           | The provider — a prefixed request uses its provider's dialect, not the path                                                                  |
 | **Provider**                               | The request's **first path segment** (`/{provider}/…`); a named row in the routing table: authority, dialect, auth scheme                                                                                                                                                                                                             | A vendor relationship — just connection facts and auth wiring                                                                                |
-| **Model route** (`/auto/…`, managed `/v1`) | Catalog row named by `x-beyond-model` if present, else the body's root `model`; provider, upstream path, and model id come from that row and the body's `model` is rewritten per attempt. Catalog miss → 404. Same-wire walks are a byte relay; Chat Completions ↔ Messages is translated when the inbound path names the other wire. | Mixed-wire catalog rows, Responses, Gemini. Not a per-key grant.                                                                             |
+| **Model route** (`/auto/…`, managed `/v1`) | Catalog row named by `x-beyond-model` if present, else the body's root `model`; provider, upstream path, and model id come from that row and the body's `model` is rewritten per attempt. Catalog miss → 404. Same-endpoint walks are a byte relay; Chat Completions ↔ Messages ↔ Responses is translated when the inbound path names a different one of those three. | Mixed-wire catalog rows, Gemini. Not a per-key grant.                                                                             |
 | **Candidate**                              | One `(provider, upstream model id, path)` a catalog row will accept. Default walk is TTFT-ranked (in-process EWMA); `x-beyond-order` / `split` pin, `only` filters. Cannot add a provider the row does not list.                                                                                                                      | A parallel pool — still a sequence, entered on failure. Not a cost sort.                                                                     |
 | **Deny-set**                               | Sparse maps of denied `tenant_id`s and `key_id`s → reason; gates managed traffic; default-allow; tenant deny kills every key                                                                                                                                                                                                          | An allowlist or ACL — misses are allowed, not blocked                                                                                        |
 | **Tail tap**                               | Bounded 64KB window kept from the end of the response for usage extraction                                                                                                                                                                                                                                                            | A buffer or copy — the response is relayed unbuffered; only the tail is kept                                                                 |
@@ -50,8 +50,8 @@ Client (stock OpenAI/Anthropic SDK)
   │  │      → catalog row → candidate list (default: TTFT rank; cold start = the row's static order)
   │  │      x-beyond-order / split pin; only filters; then the ranker (same wire; no new providers)
   │  │      no/unknown model ──────────────────────────────────► 404 (names the miss)
-  │  │      inbound path's wire ≠ row
-  │  │        Chat Completions ↔ Messages ──────────► translate
+  │  │      inbound path's endpoint ≠ row
+  │  │        Chat Completions ↔ Messages ↔ Responses ─► translate
   │  │        other mismatch ────────────────────────► 400
   │  │      GET /v1/models ────────────────────────────────────► catalog list
   │  │      BYO key on `/auto` (managed-only route) ───────────► 400
@@ -111,9 +111,10 @@ Client (stock OpenAI/Anthropic SDK)
   │    span, and the splice offset → inject stream_options.include_usage → re-frame chunked
   │  Model-routed: same buffer, and `model` is spliced to the serving candidate's own id
   │    (rewrite first — the injection offset precedes the value, so it cannot move)
-  │  Wire-mismatched catalog walk (Chat Completions ↔ Messages): map the buffered JSON
-  │    *before* the model splice. OpenAI→Anthropic does not inject `stream_options`.
-  │    Anthropic→OpenAI injects `include_usage` on the translated OpenAI body if it streams.
+  │  Wire-mismatched catalog walk (Chat Completions ↔ Messages ↔ Responses): map the
+  │    buffered JSON *before* the model splice. OpenAI→Anthropic does not inject
+  │    `stream_options`. Anthropic→OpenAI (and Responses→Chat Completions) injects
+  │    `include_usage` on the translated Chat Completions body if it streams.
   │
   ▼  Provider upstream  (OpenAI / Anthropic / Groq / DeepSeek / …)
   │
@@ -256,21 +257,24 @@ body peek, so an empty GET is not a missing-model 404.
 
 A stock OpenAI or Anthropic SDK pointed at `/v1` with `model` in the JSON body is `/auto` without
 the header. Same-wire failover is a byte relay — the gateway rewrites ids, not API shapes, across
-candidates in a row. When the inbound path names the other Chat Completions/Messages wire
-(`POST /v1/chat/completions` with a Claude row, or `/v1/messages` with a GPT row) the gateway
-**translates** both ways so the stock SDK completes. Usage/billing still parse the upstream
-body/SSE; `ai.usage.model` is what the provider echoed. Other mismatches (`/v1/embeddings`,
-Responses) are still a **400** (`claude-opus-4-8 is Anthropic Messages; POST /v1/messages`).
-`/{provider}/…` never translates.
+candidates in a row. When the inbound path names a different Chat Completions / Messages /
+Responses endpoint (`POST /v1/chat/completions` with a Claude row, `/v1/messages` with a GPT row,
+or `/v1/responses` with either) the gateway **translates** so the stock SDK completes. Usage/billing
+still parse the upstream body/SSE; `ai.usage.model` is what the provider echoed. Other mismatches
+(`/v1/embeddings` with a Claude row) are still a **400**. Same-wire Responses
+(`/{provider}/v1/responses`) stays a byte relay. `/{provider}/…` never translates.
 
 v1 mapping is lossy on extras a stock SDK does not need for a tool loop: Responses-only
-fields and `http(s)` image URLs are dropped (base64 data-URI images convert). `thinking` /
+fields (`store`, `previous_response_id`, `include`, `truncation`, …) are dropped when leaving
+Responses; `http(s)` image URLs are dropped (base64 data-URI images convert). `thinking` /
 `redacted_thinking` blocks, `cache_control`, and `reasoning_effort` (mapped to Anthropic
 `thinking`) pass both ways so an agent workload round-trips. Tools, text, and usage still
 round-trip. Anthropic requires `max_tokens`; a missing OpenAI value becomes 4096. OpenAI→Anthropic
 does not inject `stream_options`. Anthropic→OpenAI injects `include_usage` on the translated
-OpenAI body when streaming. A stock OpenAI SDK also does not send `anthropic-version`; the
-gateway injects `2023-06-01` on that walk. Usage/billing still parse the **upstream** body.
+Chat Completions body when streaming; Responses→Chat Completions does the same because injection
+follows the **upstream** endpoint. A stock OpenAI SDK also does not send `anthropic-version`; the
+gateway injects `2023-06-01` on a walk that lands on Messages. Usage/billing still parse the
+**upstream** body. Responses ↔ Messages is composed through Chat Completions.
 
 `/{provider}/…` is the escape hatch and does not consult the catalog. This arm is reached only after
 a provider-table miss, so `/{provider}/…` traffic runs exactly the code it always did; `auto` is
@@ -308,8 +312,8 @@ Catalog rows live in `providers::catalog`, shared with the agent. Every candidat
 share a wire format, enforced by a test: failover rewrites ids but does **not** translate between
 API shapes _across candidates_, so a mixed row would send an Anthropic Messages body to a Chat
 Completions endpoint and then parse the reply with the wrong dialect's usage extractor — a
-zero-token billing row rather than a visible error. The Chat Completions ↔ Messages translate
-above is a client-path vs row mismatch, not a mixed row.
+zero-token billing row rather than a visible error. The Chat Completions ↔ Messages ↔ Responses
+translate above is a client-path vs row mismatch, not a mixed row.
 
 **Wire belongs to the row, not the provider.** `ProviderSpec::wire` is one value per provider and
 that is an approximation: OpenRouter serves the OpenAI wire at `/api/v1/chat/completions` _and_ a
@@ -868,9 +872,9 @@ to serve.
 - Pool key configured for the requested provider (managed traffic only — else 503). On a catalog
   walk this is per candidate: none keyed → 503, not a request-wide missing openai key.
 - Catalog model on managed `/v1` and `/auto` (unknown or missing → 404 naming the miss). Candidate
-  spellings are aliases. Chat Completions ↔ Messages is translated when the inbound path names the
-  other wire; any other inbound-path vs row mismatch is a 400. `/{provider}/…` is not
-  allowlisted and never translates. `GET /v1/models` lists the catalog.
+  spellings are aliases. Chat Completions ↔ Messages ↔ Responses is translated when the inbound
+  path names a different one of those three; any other inbound-path vs row mismatch is a 400.
+  `/{provider}/…` is not allowlisted and never translates. `GET /v1/models` lists the catalog.
 - Request body size ≤ `MAX_REQUEST_BODY` (declared `Content-Length` + streaming running total)
 - Per-credential request rate within ceiling; aggregate BYO rate within ceiling
 
@@ -888,9 +892,9 @@ to serve.
   and there is no per-tenant entitlement check on rows — any managed tenant can route to any row. Not
   price-gameable (billing uses the id the provider echoes back), but worth knowing before rows are
   added whose pool keys differ in cost or contract.
-- Provider response content — relayed byte-for-byte on a same-wire walk; Chat Completions ↔
-  Messages is translated so the client sees the inbound dialect. Usage taps stay on the upstream
-  body.
+- Provider response content — relayed byte-for-byte on a same-endpoint walk; Chat Completions ↔
+  Messages ↔ Responses is translated so the client sees the inbound dialect. Usage taps stay on
+  the upstream body.
 - BYO token validity — forwarded as-is; the provider rejects it if invalid
 - `vpc_id` in the virtual key — decoded and emitted in billing facts, not used for access control
 
@@ -1020,7 +1024,7 @@ Prometheus on the default registry, exposed at `/metrics` on `metrics_listen`.
 | `capture`         | Sparse capture-set (default-off) + head-bounded `CaptureBufs` and 1-in-N sampling                                               | unit ✓ + e2e ✓ |
 | `capture_sink`    | Bounded, lossy `ai.payload` writer — drops on a full queue so a stalled log sink can't backpressure                             | unit ✓         |
 | `control`         | `x-beyond-*` header parse/validate; metadata canonicalized and re-serialized; catalog walk permute (`order` / `only` / `split`) | unit ✓ + e2e ✓ |
-| `translate`       | Chat Completions ↔ Messages mapping for a catalog wire mismatch; SSE event-by-event           | unit ✓ + e2e ✓ |
+| `translate`       | Chat Completions ↔ Messages ↔ Responses mapping for a catalog endpoint mismatch; SSE event-by-event | unit ✓ + e2e ✓ |
 | `smart`           | In-process TTFT EWMA table; ranks unpinned catalog walks; probe of unmeasured arms                                              | unit ✓ + e2e ✓ |
 | `cache`           | In-process exact-match response store (TTL + max entries + max bytes/entry); tap, never a buffer                                | unit ✓ + e2e ✓ |
 | `ratelimit`       | Two-tier guardrail: per-credential (count-min sketch, fixed memory, no GC) + global BYO (one atomic)                            | unit ✓         |
@@ -1066,7 +1070,10 @@ Prometheus on the default registry, exposed at `/metrics` on `metrics_listen`.
   `cache_control` / `reasoning_effort` reach Anthropic fields and thinking blocks reappear on the
   client stream; the reverse with a GPT id on `/v1/messages`; same-wire walks still byte-relay;
   `/{provider}` still 400s a Claude body to OpenAI; `/v1/embeddings` with a Claude row is still a
-  wire-mismatch 400), `GET /v1/models` lists the catalog, a candidate spelling is an alias, BYO on
+  wire-mismatch 400). **Responses** (`tests/translate.rs`): a stock `/v1/responses` body with a GPT
+  catalog id is translated onto Chat Completions; the same body with `claude-*` lands on Messages;
+  `ai.usage` still comes from the upstream parser. `GET /v1/models` lists the catalog, a candidate
+  spelling is an alias, BYO on
   `/auto` → 400, BYO on `/v1` still forwarded, `/openai/…` ignoring the catalog, a stock SDK shape
   against `/v1` with only `model` in the body, the routing header never reaching an upstream,
   `ai.usage` naming the candidate that served, all-candidates-down, a

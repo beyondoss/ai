@@ -1339,7 +1339,7 @@ async fn provider_path_does_not_translate_a_claude_body_to_openai() {
     );
 }
 
-/// Paths that are not Chat Completions ↔ Messages still 400 on a wire mismatch.
+/// Paths that are not Chat Completions ↔ Messages ↔ Responses still 400 on a wire mismatch.
 #[tokio::test]
 async fn embeddings_path_with_a_claude_row_is_still_a_wire_mismatch() {
     let nats_port = unused_nats_port();

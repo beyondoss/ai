@@ -31,9 +31,9 @@
 //!
 //! Every candidate in a row must still agree on the wire (enforced by
 //! `candidates_within_a_row_share_one_endpoint`): failover is same-wire, and mixed-wire rows are
-//! out of scope. The gateway *does* translate Chat Completions ↔ Messages when a managed `/v1` or
-//! `/auto` walk's inbound path names the other wire — that is a client-dialect mismatch, not a
-//! mixed row. `/{provider}/…` never translates.
+//! out of scope. The gateway *does* translate Chat Completions ↔ Messages ↔ Responses when a
+//! managed `/v1` or `/auto` walk's inbound path names a different one of those three — that is a
+//! client-endpoint mismatch, not a mixed row. `/{provider}/…` never translates.
 //!
 //! # Maintenance
 //!
@@ -74,7 +74,8 @@ pub struct ModelRoute {
     pub model: &'static str,
     /// The API shape this row's candidates speak, and the shape the gateway's usage extractor
     /// reads. A managed catalog walk whose inbound path names the other Chat Completions/Messages
-    /// wire is translated into this one; `/{provider}/…` never is.
+    /// wire is translated into this one; inbound `/v1/responses` is translated onto Chat
+    /// Completions or Messages according to `wire`. `/{provider}/…` never is.
     pub wire: WireFormat,
     /// Preference order: `[0]` is primary, the rest are failover candidates. Non-empty, at most
     /// [`MAX_CANDIDATES`], no provider repeated.

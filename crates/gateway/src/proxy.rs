@@ -1633,10 +1633,10 @@ impl ProxyHttp for AiProxy {
             }
         };
 
-        // Catalog walk: inbound path may name Chat Completions while the row is Messages (a stock
-        // OpenAI SDK calling Claude), or the reverse. Translate those two; any other mismatch is
-        // still a 400 (`/v1/embeddings`, Responses, …). `/{provider}/…` never reaches this — it
-        // has no row.
+        // Catalog walk: inbound path may name Chat Completions, Messages, or Responses while the
+        // row speaks a different one of those three (a stock OpenAI SDK calling Claude, a
+        // Responses body on a GPT Chat Completions row, …). Translate those; embeddings-class
+        // mismatches are still a 400. `/{provider}/…` never reaches this — it has no row.
         let mut translate_state = None;
         if let Some(row) = model_route {
             let path = session.req_header().uri.path();
@@ -2276,12 +2276,15 @@ impl ProxyHttp for AiProxy {
         apply_provider_attribution(upstream_request, rc.provider.name.as_str(), rc.managed)?;
 
         // A stock OpenAI SDK does not send `anthropic-version`. Anthropic (and Bedrock Messages)
-        // require it; inject the current version when we translated Chat Completions → Messages.
+        // require it; inject the current version when we translated Chat Completions or Responses
+        // → Messages.
         if rc
             .auto
             .as_ref()
             .and_then(|a| a.translate.as_ref())
-            .is_some_and(|t| t.client == Dialect::OpenAi && rc.dialect == Dialect::Anthropic)
+            .is_some_and(|t| {
+                t.client != route::Endpoint::Messages && rc.dialect == Dialect::Anthropic
+            })
             && upstream_request.headers.get("anthropic-version").is_none()
         {
             upstream_request.insert_header("anthropic-version", "2023-06-01")?;
@@ -2290,7 +2293,7 @@ impl ProxyHttp for AiProxy {
             .auto
             .as_ref()
             .and_then(|a| a.translate.as_ref())
-            .is_some_and(|t| t.client == Dialect::Anthropic && rc.dialect == Dialect::OpenAi)
+            .is_some_and(|_| rc.dialect == Dialect::OpenAi)
         {
             upstream_request.remove_header("anthropic-version");
         }
@@ -2415,7 +2418,7 @@ impl ProxyHttp for AiProxy {
                 // `stream_options` here (Anthropic has no such field); Anthropic→OpenAI leaves
                 // `include_usage` to the inject below, on the translated OpenAI body.
                 if let Some(t) = rc.auto.as_ref().and_then(|a| a.translate.as_ref()) {
-                    buf = translate::request(t.client, rc.dialect, &buf);
+                    buf = translate::request(t.client, route::Endpoint::of_wire(rc.dialect), &buf);
                 }
                 let scan = peek::scan_buffered(&buf);
                 if rc.model.is_empty()
@@ -2543,7 +2546,10 @@ impl ProxyHttp for AiProxy {
                 if let Some(t) = rc.auto.as_mut().and_then(|a| a.translate.as_mut())
                     && streaming
                 {
-                    t.sse = Some(translate::SseBridge::new(t.client));
+                    t.sse = Some(translate::SseBridge::new(
+                        t.client,
+                        route::Endpoint::of_wire(rc.dialect),
+                    ));
                 }
                 upstream_response.remove_header("content-length");
                 if upstream_response.version != http::Version::HTTP_2 {
@@ -2610,15 +2616,20 @@ impl ProxyHttp for AiProxy {
             let out = if let Some(t) = rc.auto.as_mut().and_then(|a| a.translate.as_mut()) {
                 if streaming {
                     let client = t.client;
+                    let upstream = route::Endpoint::of_wire(dialect);
                     t.sse
-                        .get_or_insert_with(|| translate::SseBridge::new(client))
+                        .get_or_insert_with(|| translate::SseBridge::new(client, upstream))
                         .feed(chunk, end_of_stream)
                 } else {
                     if !chunk.is_empty() {
                         t.json_buf.extend_from_slice(chunk);
                     }
                     if end_of_stream {
-                        translate::response_json(dialect, t.client, &t.json_buf)
+                        translate::response_json(
+                            route::Endpoint::of_wire(dialect),
+                            t.client,
+                            &t.json_buf,
+                        )
                     } else {
                         Vec::new()
                     }
