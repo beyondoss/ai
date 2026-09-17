@@ -340,16 +340,28 @@ mod tests {
         );
     }
 
+    /// One dummy pool key per provider the catalog actually names. Derived from the table so a
+    /// new row cannot silently turn a "fully keyed" fixture into a degraded one.
+    fn catalog_pool_keys(except: &[&str]) -> HashMap<String, crate::config::PoolKeyList> {
+        let mut keys = HashMap::new();
+        for route in providers::catalog::MODEL_ROUTES {
+            for c in route.candidates.iter().chain(route.responses.iter()) {
+                let name = providers::by_id(c.provider).name;
+                if except.iter().any(|skip| *skip == name) {
+                    continue;
+                }
+                keys.entry(name.to_string())
+                    .or_insert_with(|| "sk-test".into());
+            }
+        }
+        keys
+    }
+
     /// Every candidate reachable ⇒ a clean pass, with no "reduced failover" caveat.
     #[test]
     fn catalog_coverage_passes_when_every_candidate_is_reachable() {
         let config = AiConfig {
-            pool_keys: HashMap::from([
-                ("openai".to_string(), "sk-openai".into()),
-                ("anthropic".to_string(), "sk-anthropic".into()),
-                ("bedrock".to_string(), "sk-bedrock".into()),
-                ("openrouter".to_string(), "sk-openrouter".into()),
-            ]),
+            pool_keys: catalog_pool_keys(&[]),
             ..Default::default()
         };
         let r = check_catalog_coverage(&config);
@@ -366,11 +378,9 @@ mod tests {
     #[test]
     fn catalog_coverage_reports_reduced_failover_without_failing() {
         let config = AiConfig {
-            pool_keys: HashMap::from([
-                ("openai".to_string(), "sk-openai".into()),
-                ("anthropic".to_string(), "sk-anthropic".into()),
-                // no openrouter key ⇒ gpt-4o-mini keeps its primary, loses its fallback
-            ]),
+            // Every catalog primary is keyed; OpenRouter is not. New rows stay serviceable
+            // instead of becoming unreachable (which would fail the check, not degrade it).
+            pool_keys: catalog_pool_keys(&["openrouter"]),
             ..Default::default()
         };
         let r = check_catalog_coverage(&config);
