@@ -206,12 +206,115 @@ const fn openai_responses(native: &'static str) -> [Candidate; 1] {
     }]
 }
 
+/// OpenAI-compat Chat Completions primary + OpenRouter Chat Completions failover.
+///
+/// Same shape as [`openai_chat`], for every other provider that already has a pool key. `path` is
+/// the primary's absolute mount — Groq is `/openai/v1/chat/completions`, Fireworks
+/// `/inference/v1/chat/completions`, everyone else here `/v1/chat/completions`. No Responses arm:
+/// `previous_response_id` is OpenAI's store, not these vendors'.
+const fn compat_chat(
+    provider: ProviderId,
+    native: &'static str,
+    path: &'static str,
+    openrouter: &'static str,
+) -> [Candidate; 2] {
+    [
+        Candidate {
+            provider,
+            upstream_model: native,
+            path,
+        },
+        Candidate {
+            provider: ProviderId::OpenRouter,
+            upstream_model: openrouter,
+            path: "/api/v1/chat/completions",
+        },
+    ]
+}
+
+const fn xai(native: &'static str, openrouter: &'static str) -> [Candidate; 2] {
+    compat_chat(ProviderId::XAi, native, "/v1/chat/completions", openrouter)
+}
+
+const fn deepseek(native: &'static str, openrouter: &'static str) -> [Candidate; 2] {
+    compat_chat(
+        ProviderId::DeepSeek,
+        native,
+        "/v1/chat/completions",
+        openrouter,
+    )
+}
+
+const fn mistral(native: &'static str, openrouter: &'static str) -> [Candidate; 2] {
+    compat_chat(
+        ProviderId::Mistral,
+        native,
+        "/v1/chat/completions",
+        openrouter,
+    )
+}
+
+const fn groq(native: &'static str, openrouter: &'static str) -> [Candidate; 2] {
+    compat_chat(
+        ProviderId::Groq,
+        native,
+        "/openai/v1/chat/completions",
+        openrouter,
+    )
+}
+
+const fn together(native: &'static str, openrouter: &'static str) -> [Candidate; 2] {
+    compat_chat(
+        ProviderId::Together,
+        native,
+        "/v1/chat/completions",
+        openrouter,
+    )
+}
+
+const fn fireworks(native: &'static str, openrouter: &'static str) -> [Candidate; 2] {
+    compat_chat(
+        ProviderId::Fireworks,
+        native,
+        "/inference/v1/chat/completions",
+        openrouter,
+    )
+}
+
+/// Groq + Together + Fireworks + OpenRouter for the same Llama 3.3 70B instruct. Canonical name is
+/// the Groq id people send; the other three are that vendor's own spelling of the same model.
+const fn llama_3_3() -> [Candidate; 4] {
+    [
+        Candidate {
+            provider: ProviderId::Groq,
+            upstream_model: "llama-3.3-70b-versatile",
+            path: "/openai/v1/chat/completions",
+        },
+        Candidate {
+            provider: ProviderId::Together,
+            upstream_model: "meta-llama/Llama-3.3-70B-Instruct-Turbo",
+            path: "/v1/chat/completions",
+        },
+        Candidate {
+            provider: ProviderId::Fireworks,
+            upstream_model: "accounts/fireworks/models/llama-v3p3-70b-instruct",
+            path: "/inference/v1/chat/completions",
+        },
+        Candidate {
+            provider: ProviderId::OpenRouter,
+            upstream_model: "meta-llama/llama-3.3-70b-instruct",
+            path: "/api/v1/chat/completions",
+        },
+    ]
+}
+
 /// Every routable model, **sorted by `model`** — [`for_model`] binary-searches it.
 ///
-/// Native ids are the providers' own published aliases (Anthropic Models overview and OpenAI
-/// Models catalog, 2026-09-12). OpenRouter spellings were taken from the live
-/// `https://openrouter.ai/api/v1/models` list the same day. `catalog_rows_are_servable` re-verifies
-/// each pair against the real providers whenever the keys are present.
+/// Native ids are the providers' own published aliases (Anthropic Models overview, OpenAI
+/// Models catalog, xAI / DeepSeek / Mistral / Groq / Together / Fireworks catalogs, 2026-09-17).
+/// OpenRouter spellings were taken from the live `https://openrouter.ai/api/v1/models` list the
+/// same day. `catalog_rows_are_servable` re-verifies each pair against the real providers whenever
+/// the keys are present.
 pub const MODEL_ROUTES: &[ModelRoute] = &[
     // Claude on the Anthropic wire.
     //
@@ -297,6 +400,42 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &claude("claude-sonnet-5", "anthropic/claude-sonnet-5"),
         responses: &[],
     },
+    // Mistral `-latest` aliases (GA only). Magistral and Devstral are retired as of 2026-09;
+    // a guessed still-served alias 404s and looks like the client's fault.
+    ModelRoute {
+        model: "codestral-latest",
+        wire: WireFormat::OpenAi,
+        candidates: &mistral("codestral-latest", "mistralai/codestral-2508"),
+        responses: &[],
+    },
+    // DeepSeek. Official current names are `deepseek-flash` / `deepseek-v4-pro`. `deepseek-chat`
+    // and `deepseek-reasoner` are the ids stock SDKs still send; OpenRouter still lists the chat
+    // slug. Reasoner's OpenRouter arm is `deepseek/deepseek-r1` — they never published
+    // `deepseek/deepseek-reasoner`.
+    ModelRoute {
+        model: "deepseek-chat",
+        wire: WireFormat::OpenAi,
+        candidates: &deepseek("deepseek-chat", "deepseek/deepseek-chat"),
+        responses: &[],
+    },
+    ModelRoute {
+        model: "deepseek-flash",
+        wire: WireFormat::OpenAi,
+        candidates: &deepseek("deepseek-flash", "deepseek/deepseek-v4.1-flash"),
+        responses: &[],
+    },
+    ModelRoute {
+        model: "deepseek-reasoner",
+        wire: WireFormat::OpenAi,
+        candidates: &deepseek("deepseek-reasoner", "deepseek/deepseek-r1"),
+        responses: &[],
+    },
+    ModelRoute {
+        model: "deepseek-v4-pro",
+        wire: WireFormat::OpenAi,
+        candidates: &deepseek("deepseek-v4-pro", "deepseek/deepseek-v4-pro"),
+        responses: &[],
+    },
     // The same shape on the OpenAI wire, where the two mounts differ as well (`/v1` vs `/api/v1`).
     // Flagships first in the *id* sort: 4.x, then 5 / 5.4 / 5.5 / 5.6, then 6 Astra, then o-series.
     // `responses` is the arm used when inbound is `/v1/responses` with session state; Chat
@@ -373,6 +512,89 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &openai_chat("gpt-6-astra", "openai/gpt-6-astra"),
         responses: &openai_responses("gpt-6-astra"),
     },
+    // xAI Grok. Native ids from the 2026-09-17 xAI models table; OpenRouter spells them
+    // `x-ai/grok-…`. No Responses arm — session state is OpenAI's store.
+    ModelRoute {
+        model: "grok-4.20",
+        wire: WireFormat::OpenAi,
+        candidates: &xai("grok-4.20", "x-ai/grok-4.20"),
+        responses: &[],
+    },
+    ModelRoute {
+        model: "grok-4.3",
+        wire: WireFormat::OpenAi,
+        candidates: &xai("grok-4.3", "x-ai/grok-4.3"),
+        responses: &[],
+    },
+    ModelRoute {
+        model: "grok-4.5",
+        wire: WireFormat::OpenAi,
+        candidates: &xai("grok-4.5", "x-ai/grok-4.5"),
+        responses: &[],
+    },
+    ModelRoute {
+        model: "grok-4.6",
+        wire: WireFormat::OpenAi,
+        candidates: &xai("grok-4.6", "x-ai/grok-4.6"),
+        responses: &[],
+    },
+    ModelRoute {
+        model: "grok-build-0.1",
+        wire: WireFormat::OpenAi,
+        candidates: &xai("grok-build-0.1", "x-ai/grok-build-0.1"),
+        responses: &[],
+    },
+    // Groq / Together / Fireworks llama + qwen ids people send. No Meta row, so primary is
+    // the host whose id is the catalog name (Groq for the short llama-3.x ids, Fireworks for
+    // Llama 4, Together for Qwen 3.5-9B). OpenRouter (or Groq/Fireworks) is failover.
+    ModelRoute {
+        model: "llama-3.1-8b-instant",
+        wire: WireFormat::OpenAi,
+        candidates: &groq("llama-3.1-8b-instant", "meta-llama/llama-3.1-8b-instruct"),
+        responses: &[],
+    },
+    ModelRoute {
+        model: "llama-3.3-70b-versatile",
+        wire: WireFormat::OpenAi,
+        candidates: &llama_3_3(),
+        responses: &[],
+    },
+    ModelRoute {
+        model: "meta-llama/llama-4-maverick",
+        wire: WireFormat::OpenAi,
+        candidates: &fireworks(
+            "accounts/fireworks/models/llama4-maverick-instruct-basic",
+            "meta-llama/llama-4-maverick",
+        ),
+        responses: &[],
+    },
+    ModelRoute {
+        model: "meta-llama/llama-4-scout",
+        wire: WireFormat::OpenAi,
+        candidates: &fireworks(
+            "accounts/fireworks/models/llama4-scout-instruct-basic",
+            "meta-llama/llama-4-scout",
+        ),
+        responses: &[],
+    },
+    ModelRoute {
+        model: "mistral-large-latest",
+        wire: WireFormat::OpenAi,
+        candidates: &mistral("mistral-large-latest", "mistralai/mistral-large-2512"),
+        responses: &[],
+    },
+    ModelRoute {
+        model: "mistral-medium-latest",
+        wire: WireFormat::OpenAi,
+        candidates: &mistral("mistral-medium-latest", "mistralai/mistral-medium-3-5"),
+        responses: &[],
+    },
+    ModelRoute {
+        model: "mistral-small-latest",
+        wire: WireFormat::OpenAi,
+        candidates: &mistral("mistral-small-latest", "mistralai/mistral-small-2603"),
+        responses: &[],
+    },
     ModelRoute {
         model: "o3",
         wire: WireFormat::OpenAi,
@@ -384,6 +606,24 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         wire: WireFormat::OpenAi,
         candidates: &openai_chat("o4-mini", "openai/o4-mini"),
         responses: &openai_responses("o4-mini"),
+    },
+    ModelRoute {
+        model: "qwen/qwen3.5-9b",
+        wire: WireFormat::OpenAi,
+        candidates: &together("Qwen/Qwen3.5-9B", "qwen/qwen3.5-9b"),
+        responses: &[],
+    },
+    ModelRoute {
+        model: "qwen/qwen3.8-27b",
+        wire: WireFormat::OpenAi,
+        candidates: &groq("qwen/qwen3.8-27b", "qwen/qwen3.8-27b"),
+        responses: &[],
+    },
+    ModelRoute {
+        model: "qwen/qwen3.8-flash",
+        wire: WireFormat::OpenAi,
+        candidates: &together("Qwen/Qwen3.8-Flash", "qwen/qwen3.8-flash"),
+        responses: &[],
     },
 ];
 
@@ -901,6 +1141,34 @@ mod tests {
                 "gpt-5.6-sol",
                 "openai/gpt-5.6-sol",
             ),
+            (
+                "grok-4.6",
+                WireFormat::OpenAi,
+                ProviderId::XAi,
+                "grok-4.6",
+                "x-ai/grok-4.6",
+            ),
+            (
+                "deepseek-chat",
+                WireFormat::OpenAi,
+                ProviderId::DeepSeek,
+                "deepseek-chat",
+                "deepseek/deepseek-chat",
+            ),
+            (
+                "mistral-large-latest",
+                WireFormat::OpenAi,
+                ProviderId::Mistral,
+                "mistral-large-latest",
+                "mistralai/mistral-large-2512",
+            ),
+            (
+                "llama-3.1-8b-instant",
+                WireFormat::OpenAi,
+                ProviderId::Groq,
+                "llama-3.1-8b-instant",
+                "meta-llama/llama-3.1-8b-instruct",
+            ),
         ];
         for (name, wire, primary, native, openrouter) in cases {
             assert!(for_model(name).is_some(), "{name} must be in the catalog");
@@ -915,9 +1183,51 @@ mod tests {
         }
     }
 
+    /// Llama 3.3 is the one row that names every host we already route it on. Groq's id is the
+    /// catalog name; Together / Fireworks / OpenRouter keep their own spellings as aliases.
+    #[test]
+    fn llama_3_3_names_groq_together_fireworks_and_openrouter() {
+        assert!(
+            for_model("llama-3.3-70b-versatile").is_some(),
+            "llama-3.3-70b-versatile must be in the catalog"
+        );
+        if let Some(row) = for_model("llama-3.3-70b-versatile") {
+            assert_eq!(row.wire, WireFormat::OpenAi);
+            assert_eq!(row.candidates.len(), 4);
+            assert_eq!(row.candidates[0].provider, ProviderId::Groq);
+            assert_eq!(row.candidates[0].path, "/openai/v1/chat/completions");
+            assert_eq!(row.candidates[1].provider, ProviderId::Together);
+            assert_eq!(
+                row.candidates[1].upstream_model,
+                "meta-llama/Llama-3.3-70B-Instruct-Turbo"
+            );
+            assert_eq!(row.candidates[2].provider, ProviderId::Fireworks);
+            assert_eq!(
+                row.candidates[2].upstream_model,
+                "accounts/fireworks/models/llama-v3p3-70b-instruct"
+            );
+            assert_eq!(row.candidates[2].path, "/inference/v1/chat/completions");
+            assert_eq!(row.candidates[3].provider, ProviderId::OpenRouter);
+            assert_eq!(
+                for_model("accounts/fireworks/models/llama-v3p3-70b-instruct").map(|r| r.model),
+                Some("llama-3.3-70b-versatile"),
+            );
+            assert_eq!(
+                for_model("meta-llama/Llama-3.3-70B-Instruct-Turbo").map(|r| r.model),
+                Some("llama-3.3-70b-versatile"),
+            );
+        }
+    }
+
+    /// GPT / o-series only. Other OpenAI-wire rows (Grok, DeepSeek, Mistral, llama, qwen) have no
+    /// OpenAI store, so a Responses session-state walk must not list an arm.
     #[test]
     fn gpt_rows_carry_an_openai_responses_arm() {
-        for route in MODEL_ROUTES.iter().filter(|r| r.wire == WireFormat::OpenAi) {
+        for route in MODEL_ROUTES.iter().filter(|r| {
+            r.candidates
+                .first()
+                .is_some_and(|c| c.provider == ProviderId::OpenAi)
+        }) {
             assert_eq!(
                 route.responses.len(),
                 1,
@@ -931,6 +1241,21 @@ mod tests {
             assert!(
                 (1..=MAX_CANDIDATES).contains(&route.responses.len()),
                 "{:?}",
+                route.model
+            );
+        }
+    }
+
+    #[test]
+    fn non_openai_primary_rows_have_no_responses_arm() {
+        for route in MODEL_ROUTES.iter().filter(|r| {
+            !r.candidates
+                .first()
+                .is_some_and(|c| c.provider == ProviderId::OpenAi)
+        }) {
+            assert!(
+                route.responses.is_empty(),
+                "{:?} is not an OpenAI store; Responses session state must not list an arm",
                 route.model
             );
         }

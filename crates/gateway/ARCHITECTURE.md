@@ -352,10 +352,14 @@ to OpenRouter's Chat Completions endpoint under the vendor-slug spelling (`claud
 `anthropic/claude-opus-5`; `claude-opus-4-8` → `anthropic/claude-opus-4.8`). `claude-haiku-4-5` and
 `claude-opus-4-8` insert Amazon Bedrock's Messages API as an independent second source
 (`us.anthropic.claude-haiku-4-5-20251001-v1:0` / `us.anthropic.claude-opus-4-8`) before OpenRouter.
-GPT rows do the same Anthropic/OpenRouter shape on the Chat Completions wire (`gpt-6-astra` →
-`openai/gpt-6-astra`). Every row and candidate is verified against the live providers by
-`catalog_rows_are_servable` in `tests/smoke.rs`, and the failover itself by
-`model_route_fails_over_to_a_real_provider`.
+GPT rows do the same shape on the Chat Completions wire (`gpt-6-astra` → `openai/gpt-6-astra`)
+plus an OpenAI-only `/v1/responses` arm. The same Chat Completions helper covers every other
+pool-keyed host: xAI `grok-*` (`grok-4.6` → `x-ai/grok-4.6`), DeepSeek (`deepseek-chat` →
+`deepseek/deepseek-chat`), Mistral `-latest` aliases, and the Groq/Together/Fireworks llama+qwen
+ids people send (Groq `llama-3.3-70b-versatile` also names Together and Fireworks as aliases).
+Those rows have no Responses arm — `previous_response_id` is OpenAI's store. Every row and
+candidate is verified against the live providers by `catalog_rows_are_servable` in
+`tests/smoke.rs`, and the failover itself by `model_route_fails_over_to_a_real_provider`.
 
 **What that failover does and does not cover.** On the two Bedrock-backed rows, Bedrock is the
 independent second source: a different account, a different network path, and AWS's own serving of
