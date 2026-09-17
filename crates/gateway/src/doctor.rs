@@ -347,7 +347,7 @@ mod tests {
         for route in providers::catalog::MODEL_ROUTES {
             for c in route.candidates.iter().chain(route.responses.iter()) {
                 let name = providers::by_id(c.provider).name;
-                if except.iter().any(|skip| *skip == name) {
+                if except.contains(&name) {
                     continue;
                 }
                 keys.entry(name.to_string())
