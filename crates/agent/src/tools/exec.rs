@@ -100,7 +100,13 @@ pub trait CommandRunner: Send + Sync {
     ) -> std::io::Result<ExecResult>;
 
     /// Like [`run`](CommandRunner::run), but invokes `on_chunk` with each chunk of stdout/stderr as it
-    /// arrives, for live progress. Defaults to the non-streaming `run` (test doubles need not stream).
+    /// arrives, for live progress. Defaults to the non-streaming `run`, which never calls the sink.
+    ///
+    /// Calling the sink at all is a promise that *every* byte of *both* streams went through it: the
+    /// caller (`bash`) takes any chunk as proof the output streamed and never reads
+    /// [`ExecResult::stdout`]/[`ExecResult::stderr`]. A runner with nothing to stream incrementally
+    /// (a test double, a request/response endpoint) inherits this default rather than replaying part
+    /// of its result into the sink.
     async fn run_streaming(
         &self,
         program: &str,
@@ -112,6 +118,32 @@ pub trait CommandRunner: Send + Sync {
         let _ = on_chunk;
         self.run(program, args, cwd, timeout).await
     }
+
+    /// Like [`run`](CommandRunner::run), but with `stdin` written to the command's standard input and
+    /// then closed.
+    ///
+    /// For the filesystem backend's internals only — this is how file *content* reaches a remote
+    /// target without riding in argv, where Linux caps a single entry at 128 KiB. Model-run commands
+    /// never get a stdin: `bash` goes through `run`/`run_streaming`, which keep it closed.
+    ///
+    /// Defaults to [`std::io::ErrorKind::Unsupported`], so a runner that cannot deliver stdin says so
+    /// rather than silently running the command without it. A caller must still not *trust* an `Ok`
+    /// here — a remote endpoint that predates the stdin field ignores it and answers normally — which
+    /// is why `ShellFs` probes for an echo before it writes this way.
+    async fn run_with_stdin(
+        &self,
+        program: &str,
+        args: &[String],
+        cwd: Option<&str>,
+        timeout: Duration,
+        stdin: &[u8],
+    ) -> std::io::Result<ExecResult> {
+        let _ = (program, args, cwd, timeout, stdin);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "this command runner cannot feed a command's stdin",
+        ))
+    }
 }
 
 /// Spawns the command for real, capturing stdout/stderr and enforcing a wall-clock timeout
@@ -120,7 +152,8 @@ pub struct RealRunner;
 
 impl RealRunner {
     /// Shared spawn/capture body. `on_chunk`, when present, is called with each stdout/stderr chunk as
-    /// it streams (live progress); both `run` and `run_streaming` funnel through here.
+    /// it streams (live progress); `run`, `run_streaming` and `run_with_stdin` all funnel through here.
+    /// `stdin` is `None` for everything a model runs — see the `.stdin(..)` comment below.
     async fn exec(
         &self,
         program: &str,
@@ -128,6 +161,7 @@ impl RealRunner {
         cwd: Option<&str>,
         timeout: Duration,
         on_chunk: Option<ChunkSink<'_>>,
+        stdin: Option<&[u8]>,
     ) -> std::io::Result<ExecResult> {
         // No `PATH` manipulation here — `Command` inherits the parent process's environment
         // (including `PATH`) as-is. Pi-parity note: this is a deliberate, documented DIVERGENCE, not
@@ -144,8 +178,14 @@ impl RealRunner {
             // real stdin (a shared terminal in `run`, or `serve`'s NDJSON control pipe). Without this,
             // a command that tries to read stdin (bare `cat`, `read`, a prompt left off `-y`) blocks
             // forever waiting for input that will never come, instead of seeing immediate EOF — matches
-            // pi's own `spawn(..., { stdio: ["ignore", "pipe", "pipe"] })`.
-            .stdin(Stdio::null())
+            // pi's own `spawn(..., { stdio: ["ignore", "pipe", "pipe"] })`. Piped only for
+            // `run_with_stdin`, which carries bytes the *agent* supplied (file content), never the
+            // agent's own stdin.
+            .stdin(if stdin.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
@@ -172,6 +212,8 @@ impl RealRunner {
         let streaming = on_chunk.is_some();
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
+        // Fed concurrently with the drains, not before them — see `feed_stdin`.
+        let feed = feed_stdin(child.stdin.take(), stdin);
         // Drain both pipes *concurrently* with the wait: a child that fills one pipe's OS buffer
         // while we read only the other would deadlock, and an unread pipe stalls the child's exit.
         // `exited` fans the wait's completion out to both drains so each can switch from "block on
@@ -184,7 +226,7 @@ impl RealRunner {
             status
         };
         let collect = async {
-            let (status, out, err) = tokio::join!(
+            let (status, out, err, fed) = tokio::join!(
                 wait,
                 drain_capped(
                     stdout,
@@ -200,22 +242,24 @@ impl RealRunner {
                     on_chunk,
                     exited_rx.clone()
                 ),
+                feed,
             );
-            (status, out, err)
+            (status, out, err, fed)
         };
         match tokio::time::timeout(timeout, collect).await {
             // Lossy on purpose, not by oversight: `bash` (this crate's primary consumer) never reads
             // these two fields for real output — its `run_streaming` sink appends every chunk to its
             // `OutputAccumulator` as raw bytes as they arrive (see `bash.rs`'s `sink` closure), and
-            // only falls back to `stdout`/`stderr` here when nothing streamed (a non-streaming test
-            // double). The live path this struct actually feeds for `bash` never goes through
+            // only falls back to `stdout`/`stderr` here when nothing streamed (a test double, a remote
+            // runner). The live path this struct actually feeds for `bash` never goes through
             // `from_utf8_lossy`. The Beyond platform tools (`fork`/`sync`/`logs`, `beyond.rs`) *do*
             // consume these fields directly as their whole output — but that's the `beyond` CLI's own
             // stdout/stderr, expected to be human-readable text, not arbitrary binary data the way a
             // `bash`-run command's output can be.
-            Ok((status, (stdout, out_trunc), (stderr, err_trunc))) => {
+            Ok((status, (stdout, out_trunc), (stderr, err_trunc), fed)) => {
                 guard.disarm();
                 let status = status?;
+                fed?;
                 Ok(ExecResult {
                     code: status.code(),
                     signal: exit_signal(&status),
@@ -256,6 +300,26 @@ impl RealRunner {
             }
         }
     }
+}
+
+/// Write `bytes` to a child's stdin, then close it (dropping the handle is the EOF).
+///
+/// Must run *concurrently* with draining the child's output, never before it: a child that writes
+/// while it is still reading would fill its stdout pipe and block on it while we block on its stdin.
+/// A broken pipe is not an error — it means the child stopped reading, and its exit status is the
+/// real story (`ShellFs` also checks the byte count that arrived before it commits a write).
+pub(crate) async fn feed_stdin(
+    pipe: Option<tokio::process::ChildStdin>,
+    bytes: Option<&[u8]>,
+) -> std::io::Result<()> {
+    use tokio::io::AsyncWriteExt as _;
+    if let (Some(mut pipe), Some(bytes)) = (pipe, bytes) {
+        match pipe.write_all(bytes).await {
+            Err(e) if e.kind() != std::io::ErrorKind::BrokenPipe => return Err(e),
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 /// Owns a spawned process-group leader; kills the whole group on drop unless [`disarm`](Self::disarm)d
@@ -358,7 +422,7 @@ impl CommandRunner for RealRunner {
         cwd: Option<&str>,
         timeout: Duration,
     ) -> std::io::Result<ExecResult> {
-        self.exec(program, args, cwd, timeout, None).await
+        self.exec(program, args, cwd, timeout, None, None).await
     }
 
     async fn run_streaming(
@@ -369,7 +433,20 @@ impl CommandRunner for RealRunner {
         timeout: Duration,
         on_chunk: ChunkSink<'_>,
     ) -> std::io::Result<ExecResult> {
-        self.exec(program, args, cwd, timeout, Some(on_chunk)).await
+        self.exec(program, args, cwd, timeout, Some(on_chunk), None)
+            .await
+    }
+
+    async fn run_with_stdin(
+        &self,
+        program: &str,
+        args: &[String],
+        cwd: Option<&str>,
+        timeout: Duration,
+        stdin: &[u8],
+    ) -> std::io::Result<ExecResult> {
+        self.exec(program, args, cwd, timeout, None, Some(stdin))
+            .await
     }
 }
 
@@ -609,6 +686,41 @@ mod tests {
         assert_eq!(res.code, Some(0), "got: {res:?}");
         assert!(!res.timed_out, "cat blocked on stdin instead of seeing EOF");
         assert_eq!(res.stdout, "");
+    }
+
+    #[tokio::test]
+    async fn run_with_stdin_feeds_the_bytes_then_closes_the_pipe() {
+        // `cat` exits only on EOF, so a result at all proves the pipe was closed after the write.
+        let res = RealRunner
+            .run_with_stdin("cat", &[], None, Duration::from_secs(10), b"stdin-probe")
+            .await
+            .unwrap();
+        assert_eq!(res.code, Some(0), "got: {res:?}");
+        assert_eq!(res.stdout, "stdin-probe");
+    }
+
+    #[tokio::test]
+    async fn run_with_stdin_feeds_while_draining_so_big_input_and_output_cannot_deadlock() {
+        // 4 MiB through `cat` is far past both pipe buffers: written before draining (or drained
+        // before writing), the child blocks on a full stdout while we block on its full stdin.
+        let input = vec![b'x'; 4 * 1024 * 1024];
+        let res = RealRunner
+            .run_with_stdin("cat", &[], None, Duration::from_secs(30), &input)
+            .await
+            .unwrap();
+        assert!(!res.timed_out, "deadlocked until the timeout");
+        assert_eq!(res.code, Some(0));
+        assert!(res.truncated, "4 MiB of output must still be capped");
+
+        let res = RealRunner
+            .run_with_stdin("wc", &["-c".into()], None, Duration::from_secs(30), &input)
+            .await
+            .unwrap();
+        assert_eq!(
+            res.stdout.trim(),
+            input.len().to_string(),
+            "every byte arrived"
+        );
     }
 
     // Both tests below race a `kill -KILL -<pgid>` against a backgrounded grandchild's own delayed

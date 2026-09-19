@@ -187,6 +187,59 @@ fn bash_runs_on_the_target_not_this_host() {
 }
 
 #[test]
+fn a_write_past_the_argv_limit_round_trips_through_the_target() {
+    // A remote write used to ship the whole file as one argv entry, which Linux caps at 128 KiB, so
+    // anything over ~96 KiB failed. CI's `docker exec` has no `-i` — the far side gets no stdin, the
+    // probe sees that — so this runs the chunked fallback on busybox, the path most likely to trip on
+    // a shell difference. Behind `ssh` or `docker exec -i` it runs the stdin path instead.
+    use sha2::Digest as _;
+    let flags = target_or_skip!();
+    let dir = workdir();
+    let path = format!("{dir}/big-written-by-agent.txt");
+    let line = "chunk boundary check — ünïcödé, a $dollar and a 'quote'\n";
+    // Unique per run, so a file left by an earlier run cannot satisfy the digest check.
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let content = format!("run {nonce}\n{}", line.repeat(200 * 1024 / line.len() + 1));
+    let digest = hex::encode(sha2::Sha256::digest(content.as_bytes()));
+    // The check runs on the target, whose shell is POSIX `sh` — Alpine has no `/bin/bash`.
+    let flags = [flags, vec!["--bash-shell-path".into(), "/bin/sh".into()]].concat();
+    let (stdout, stderr) = run_agent(
+        &flags,
+        vec![
+            common::turn_tool_use(
+                "t1",
+                "write",
+                &json!({ "path": &path, "content": &content }).to_string(),
+            ),
+            common::turn_tool_use(
+                "t2",
+                "bash",
+                &json!({ "command": format!("sha256sum < {path}; ls {dir}") }).to_string(),
+            ),
+            common::turn_text("done"),
+        ],
+    );
+    // The tail only: the head of stdout echoes the 200 KiB `write` input back.
+    let tail: String = {
+        let chars: Vec<char> = stdout.chars().collect();
+        chars[chars.len().saturating_sub(2000)..].iter().collect()
+    };
+    assert!(
+        stdout.contains(&digest),
+        "the {} bytes written must be the bytes on the target.\n--- stdout (tail) ---\n{tail}\n\
+         --- stderr ---\n{stderr}",
+        content.len()
+    );
+    assert!(
+        !stdout.contains(".tmp."),
+        "a completed write must not leave its temp file behind.\n--- stdout (tail) ---\n{tail}"
+    );
+}
+
+#[test]
 fn write_then_read_round_trips_through_the_target() {
     let flags = target_or_skip!();
     let dir = workdir();

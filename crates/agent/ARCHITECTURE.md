@@ -81,17 +81,21 @@ The harness layers several capabilities over the bare tools + loop:
   reference and the reconnect flow. Two supervisor-level daemon facilities sit above the per-session
   protocol: **`list_daemon_sessions`** — intercepted in the read loop (never forwarded to a session)
   and answered by unioning the live `session id → running session` map with an on-disk scan of
-  `<session-dir>/*.jsonl`, each entry tagged `live: true|false`; and the **idle reaper**
-  (`--session-idle-timeout <secs>`, default 3600, `0` disables) — a background ticker that reclaims
-  sessions whose task has already ended (a closed `input_tx`: pure garbage, reaped on sight) plus those
-  with no attached connection, idle past the timeout, and not mid-run (a per-session `running` flag
-  `serve_session` flips around a `prompt`), dropping the retained `input_tx` so the session persists and
-  exits exactly as graceful shutdown does per-entry (both share `join_handles`, which polls
-  `JoinHandle::is_finished` under a grace period rather than parking on an unfinished task, so a wedged
-  session can't hang shutdown for the daemon's life). The default has to be finite: a connection
-  that omits `?session_id=` mints a fresh id, and every id owns a runtime task, an `Agent`, and (unless
-  the HTTP pool is shared) a gateway client until something reclaims it. A reconnect to a just-reaped
-  id respawns it from disk, and the `catchup`
+  `<session-dir>/*.jsonl`, each entry tagged `live: true|false` (a `Stopping` session reports
+  `false`); and the **idle reaper** (`--session-idle-timeout <secs>`, default 3600, `0` disables) — a
+  background ticker that stops sessions whose loop has already ended (a closed input: stopped on sight)
+  plus those with no attached connection, idle past the timeout, and not mid-run (a per-session
+  `running` flag `serve_session` flips around a `prompt`). Stopping is the same transition graceful
+  shutdown makes per entry: the retained input is dropped so the session persists and exits, and the
+  entry stays in the map, `Stopping`, until the task itself has gone (see
+  [the daemon session state machine](#state-machine--daemon-session-slot-starting--live--stopping)) —
+  that is what stops a reconnect from spawning a second writer on a file the old task is still
+  persisting to. The reaper waits on nothing; graceful shutdown waits on every task's exit latch under
+  a grace period (`JOIN_GRACE`), so a wedged session can't hang it for the daemon's life. The default
+  has to be finite: a connection that omits `?session_id=` mints a fresh id, and every id owns a runtime
+  task, an `Agent`, and (unless the HTTP pool is shared) a gateway client until something reclaims it.
+  A reconnect to a just-reaped id respawns it from disk (after the reaped task has exited), and the
+  `catchup`
   frame seeded on attach replays its restored history. That respawn works because the routing key is
   handed to the session as `--session-id`, which _addresses_ an ordinary repo session — so the key
   survives a full process restart, not just a reap. `session_cfg` used to rewrite each session into
@@ -1566,7 +1570,9 @@ container. Two divergences are asserted **by name** rather than described: with 
 `grep -r` gains `.gitignore`d matches and _loses_ files containing non-UTF-8 bytes (`grep -I`
 classifies them as binary). `tests/fs_backend_cost.rs` counts backend operations per tool
 (`grep` 1, `ls`/`find` 2, `read`/`write`/`edit` 3) so the latency of any future remote backend can be
-estimated from a measured multiplier rather than a guess.
+estimated from a measured multiplier rather than a guess. Those are backend operations, not commands:
+over `ShellFs` a `write_bytes` is one command when the target delivers stdin, and one per 48 KiB when
+it does not (see the exec protocol below).
 
 ### Running the tools against a remote exec endpoint
 
@@ -1603,9 +1609,82 @@ place that pairs them:
 `kubectl exec`, any CLI) via an argv template whose `{}` expands to _separate argv entries_ — never
 into a shell string, so a model-supplied path cannot be reparsed as syntax on the far side.
 
+Neither runner streams: each returns the whole result at once, so both inherit
+`CommandRunner::run_streaming`'s default, which never calls the chunk sink, and `bash` builds its
+output from the final `stdout` and `stderr`. A runner that calls the sink at all claims to have
+delivered every byte of both streams through it — `HttpExecRunner` once fed it stdout alone, and
+every remote command that printed to stdout lost its stderr.
+
 `tests/exec_endpoint.rs` drives all of this against a ~30-line mock provider — the same shim someone
 would write in front of a real one. If standing up a fake provider took more than that, the protocol
 would be too big.
+
+#### The protocol (v1.1)
+
+One `POST` per command:
+
+```jsonc
+// request — `cwd` and `stdin_base64` are optional
+{ "command": "cat", "args": [], "cwd": "/work", "timeout_ms": 120000, "stdin_base64": "aGVsbG8=" }
+// response — 200
+{ "exit_code": 0, "stdout": "hello", "stderr": "" }
+```
+
+v1.1 is v1 plus one optional request field, **`stdin_base64`**: standard base64 of the bytes to write
+to the command's stdin, which is then closed. Absent, the command gets no stdin: v1 behavior. A v1
+endpoint keeps working unchanged. It just never gets stdin.
+
+**Why stdin exists: the 128 KiB argv limit.** A remote write used to ship the whole file as _one_
+base64 argv entry, and Linux caps a single argv string at 128 KiB (`MAX_ARG_STRLEN`), so every
+remote `write`/`edit` of a file over ~96 KiB failed with `Argument list too long`. The content now
+travels one of two ways, chosen by `Capabilities::stdin`:
+
+- **stdin** — one command, `cat > <temp>`, then a size check and `mv -f` over the target.
+- **argv chunks** — for a target without stdin: 48 KiB of raw bytes per command (64 KiB of base64,
+  half the per-entry cap), appended to a temp, with the last command committing via `mv -f`. One
+  command per 48 KiB, so a small file costs the same single round trip as before.
+
+Both paths keep the write atomic from a reader's view. The target changes only at the `mv`, so it is
+the old file or the new one, never a partial. The temp gets an unpredictable name (the same
+`temp_suffix` `LocalFs` uses) and is created under `set -C`, the shell's `create_new`, so a planted
+symlink cannot redirect the write. The temp is removed on any failure: by the script for failures it
+sees, and by a best-effort `rm -f` from the host for the ones it cannot see, such as a transport error
+between chunks.
+
+**The probe is what keeps old endpoints safe.** A v1 endpoint ignores the unknown `stdin_base64` like
+any other extra field and runs the command with empty input. So does `docker exec` without `-i`.
+Trusting stdin there would turn every write into an _empty file_, so `ShellFs::connect` proves it
+instead of assuming it: it runs `cat` with stdin `stdin-probe`, and the capability holds only if
+`stdin-probe` comes back. `CommandRunner::run_with_stdin` defaults to `ErrorKind::Unsupported`, so a
+runner without stdin support probes as absent too. Because a probe is only one sample (a
+load-balanced endpoint mid-rollout can pass it on one replica and take the write on another), both
+write scripts also check that the temp holds exactly `bytes.len()` bytes before the `mv`. A lost
+stdin is then a `short write` error, and the old file is left intact.
+
+stdin exists for `ShellFs`'s writes and nothing else. `bash` still runs every model command with
+stdin closed (`Stdio::null()`).
+
+**The response is capped.** `HttpExecRunner` reads the body incrementally, up to
+`DEFAULT_MAX_RESPONSE_BYTES` (16 MiB; `--exec-max-response-bytes` on `run` and `serve`, where it
+also applies to every per-session `set_exec_endpoint`). It stops reading at the cap, and a declared
+`Content-Length` over the cap fails before any of the body is read. **An oversized response is an
+error, not a truncated result.** The body is one JSON object, so a prefix cannot be parsed. There is
+no honest partial `ExecResult` to hand back (the exit code may come after the output), and passing
+off whatever fit as the command's output would be a confident wrong answer. The error says the
+command _ran_, so the model narrows its output (`| head`) rather than blindly re-running something
+that may not be idempotent. The cap bounds memory in a process that may serve many tenants, and it
+sits far above anything a tool consumes (`bash` keeps ~30 KB), so legitimate output never meets it.
+
+The endpoint must accept request bodies as large as the files the agent writes (≈4/3 of the file
+size with `stdin_base64`).
+
+`tests/exec_endpoint_writes.rs` covers 200 KiB writes through both a v1.1 and a v1 mock (the v1 one
+must fall back to chunks, and never produce an empty file), the size check under a probe that lied,
+every chunk boundary, and templates that forward stdin and ones that swallow it.
+`tests/exec_endpoint_response_cap.rs` streams an endless body and a lying `Content-Length` at the
+runner. `fs_backend_parity.rs` diffs both write paths against `LocalFs`: the ripgrep rung probes
+stdin as present, and the POSIX rung pins it absent. The CI `exec-live` shard runs the chunked path
+for real on busybox, since its `docker exec` has no `-i`.
 
 ### Run lifecycle
 
@@ -1988,6 +2067,44 @@ spawn ──► Booting ──writer task up + "ready" frame sent──► Ready
 | Ready             | invalid JSON / unknown `type`                                                                                                         | Ready       | —                             | `response{success:false, error}`; loop continues, no state change                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
 | Ready/RunningTurn | stdin EOF                                                                                                                             | Closed      | —                             | `out_tx` dropped → writer drains its queue → awaited → process returns `Ok(())`                                                                                                                                                                                                                                                                                                                                                                                                                                              |
 | any               | stdout write fails (broken pipe)                                                                                                      | Closed      | —                             | writer task `break`s its receive loop; the next `emit!` send fails → main loop `break`s                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+
+## State Machine — daemon session slot (Starting / Live / Stopping)
+
+The daemon (`serve_ws`) keeps one map entry per session id, and that entry lives exactly as long as
+the id's session task: "the id has an entry" means "a task owns this id's session file". It used to
+mean only "attachable": the reaper removed an entry and _then_ its task persisted and exited, so a
+reconnect landing in between found the id free and spawned a second `serve_session` on the same
+append-only file while the first was still writing it — and the store's `append_new` is count-keyed,
+so two writers corrupt the transcript rather than conflict. Graceful shutdown racing a new connection,
+and `pin` replacing a handle whose loop had ended, had the same shape.
+
+```
+            pin, id free
+(absent) ─────────────────► Starting ──── task runs: go_live ────► Live
+   ▲                           │                                    │
+   │           reap / shutdown │                  reap / shutdown / │
+   │         (before go_live)  ▼          pin finds its input closed│
+   │                        Stopping ◄──────────────────────────────┘
+   │                           │
+   └── task ends: ExitGuard removes its own incarnation's entry, then fires `exited`
+```
+
+| From            | Event                                                                | To        | What Actually Happens                                                                                                                                                                                                                                                                                                |
+| --------------- | -------------------------------------------------------------------- | --------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| absent          | `pin`                                                                | Starting  | next incarnation stamped; input channel, fan-out, and `exited` latch created; entry inserted under the map lock, task spawned after it is released; the caller is attached (`attached = 1`)                                                                                                                          |
+| Starting        | the task first runs (`go_live`)                                      | Live      | the task runs its body (`serve_session`). Start-up work that must finish before the session touches storage (e.g. a lock on its session file) goes just before `go_live`, awaited on the task with the map lock **not** held — the `Starting` entry already keeps a concurrent `pin` from spawning a rival meanwhile |
+| Starting / Live | `pin`                                                                | unchanged | attached: `attached += 1`, detach clock cleared. Commands queue on the input channel even while `Starting`, exactly as they do while `serve_session` opens persistence                                                                                                                                               |
+| Starting / Live | idle reaper (`is_reapable`), or `pin` finding the input closed       | Stopping  | the retained input sender is dropped → the session observes EOF (once no attached connection holds a clone), cancels any in-flight run, persists, and exits. `list_daemon_sessions` now reports it `live: false`                                                                                                     |
+| Starting        | `go_live` finds the entry already `Stopping`                         | (removed) | the body never runs: a session stopped before going live never touches storage                                                                                                                                                                                                                                       |
+| Stopping        | `pin`                                                                | unchanged | the pin waits on `exited`, bounded by `JOIN_GRACE` (10 s), then looks again — normally finding the id free and spawning the next incarnation. Past the grace (a wedged task) the attach is refused — WebSocket close `1013 Try Again Later`, HTTP `503` — never doubled                                              |
+| any             | graceful shutdown                                                    | Stopping  | the table is closed first (every later `pin` is refused), every entry is stopped, and shutdown waits on every `exited` latch under `JOIN_GRACE` — including sessions the reaper had already stopped                                                                                                                  |
+| any             | the task ends (body returned, panicked, or dropped with the runtime) | (removed) | `ExitGuard` removes the entry **only if it is still this incarnation's**, and only then fires `exited`, so whoever that wakes finds the id free                                                                                                                                                                      |
+
+`unpin` is incarnation-scoped for the same reason: a connection that outlived its session (the loop
+ended, and a reconnect has since spawned the next incarnation) must not decrement the new session's
+attach count, or the reaper would take a session with a connection still attached. The regression is
+pinned deterministically at the supervisor level (`serve_ws.rs` tests), with a test-only session body
+standing in for `serve_session` so the test decides exactly when an exiting task finishes.
 
 ---
 

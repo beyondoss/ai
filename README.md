@@ -129,11 +129,14 @@ AI_GATEWAY_URL=… AI_AGENT_KEY=… \
     "find the TODOs under /srv/app and fix the one in main.rs"
 ```
 
-The protocol is one POST, deliberately the smallest thing that carries a command and its result:
+The protocol (v1.1) is one POST, deliberately the smallest thing that carries a command and its
+result:
 
 ```jsonc
 // request
 { "command": "rg", "args": ["--files"], "cwd": "/work", "timeout_ms": 120000 }
+// request with stdin (optional): standard base64, written to the command's stdin, which is then closed
+{ "command": "cat", "args": [], "timeout_ms": 10000, "stdin_base64": "c3RkaW4tcHJvYmU=" }
 // response — 200
 { "exit_code": 0, "stdout": "…", "stderr": "…" }
 ```
@@ -141,6 +144,19 @@ The protocol is one POST, deliberately the smallest thing that carries a command
 Putting that in front of a provider's SDK is a few dozen lines on your side, and that shim is where
 vendor specifics belong. `--exec-header` is repeatable and is where auth goes; which scheme the
 endpoint wants is the endpoint's business.
+
+`cwd` and `stdin_base64` are optional, and an endpoint that doesn't know `stdin_base64` (v1) keeps
+working. The agent uses stdin only to write files, and only after a probe at attach proves it works:
+it runs `cat` with stdin `stdin-probe`, and anything other than `stdin-probe` coming back means no
+stdin. Without stdin, a write is sent as argv-sized chunks (48 KiB each, one command per chunk)
+assembled in a temp file and renamed into place. Either way, a reader sees the old file or the new
+one, never a partial one, and the size is checked before the rename, so a transport that drops stdin
+fails the write instead of emptying the file. Size your endpoint's request limit for the files the
+agent writes: with stdin, a request is about 4/3 of the file.
+
+The agent reads at most 16 MiB of any one response (`--exec-max-response-bytes`). A bigger response
+is an **error**, not a truncated result, because a cut-off JSON body can't be parsed honestly. The
+error says the command ran, so the model narrows the output rather than re-running it.
 
 #### Multi-tenant `serve`
 
@@ -176,6 +192,10 @@ command:
 
 `{}` expands to **separate argv entries**, never into a shell string, so a path containing spaces,
 quotes or `;` stays one argument on the far side and cannot be reparsed as syntax.
+
+`ssh` forwards stdin, so file writes go in one command. `docker exec` and `kubectl exec` forward it
+only with `-i` (`docker exec -i my-container {}`). Without `-i`, writes still work, but they fall
+back to one command per 48 KiB.
 
 **Install `ripgrep` on the target if you can.** With `rg` present, results are byte-identical to
 running locally. Without it the fallback is POSIX `grep`, which diverges in two measured ways: it
