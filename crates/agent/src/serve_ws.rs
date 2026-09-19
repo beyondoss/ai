@@ -117,6 +117,20 @@ use crate::session_store::{is_valid_session_id, new_id, scan_listings, scan_sess
 /// path on the loopback listener; any other path is rejected at the handshake.
 const WS_PATH: &str = "/_beyond/agent";
 
+/// Liveness: is this process serving at all? Answered unconditionally, so a hung shard cannot get the
+/// replica killed and restarted into the same hung shard.
+const LIVEZ_PATH: &str = "/livez";
+
+/// Readiness: should this replica be sent work right now?
+const READYZ_PATH: &str = "/readyz";
+
+/// How long a `/readyz` answer is reused. A readiness probe arrives on a fixed cadence from every
+/// orchestrator and load balancer watching the replica, and the check behind it is filesystem I/O on a
+/// network mount — so memoize it. Two seconds is far inside any probe period, so the answer a caller
+/// gets is at most one period stale, and a burst of probes (or a client looping on a 503) costs one
+/// round-trip rather than one each.
+const READY_CACHE_TTL: Duration = Duration::from_secs(2);
+
 /// How often the server sends an unsolicited `Ping` so an idle mobile connection isn't reaped by
 /// NAT/proxies. Also the granularity at which a wholly-dead socket is noticed (the ping send fails).
 const PING_INTERVAL: Duration = Duration::from_secs(30);
@@ -303,6 +317,9 @@ struct Supervisor {
 struct ServiceSupervisor {
     verifier: Arc<crate::grant::GrantVerifier>,
     shards: Arc<Shards>,
+    /// The memoized `/readyz` shard probe. Only service mode has one: without `--shard` there is
+    /// nothing readiness can check beyond the listener, which is already proven by the request.
+    ready: ReadyCache,
 }
 
 /// Derive a per-session config from the daemon's: address the session by its routing key and drop
@@ -1184,6 +1201,7 @@ pub async fn serve_ws(
         Some(ServiceSupervisor {
             verifier,
             shards: cfg.shards.clone(),
+            ready: ReadyCache::default(),
         })
     } else {
         None
@@ -1316,6 +1334,14 @@ where
     // carries sealed credentials, and the upgrade's own headers are handed on to `create_response`.
     let grant = head.take_grant();
 
+    // Health probes, before the path check and before any grant is demanded: `/livez` and `/readyz`
+    // are the orchestrator's, not a tenant's. A probe that had to carry a session grant could never
+    // be issued by the thing whose job is to decide whether this replica may have sessions at all.
+    if matches!(head.path.as_str(), LIVEZ_PATH | READYZ_PATH) {
+        let _ = handle_health(supervisor, &mut stream, &head).await;
+        return Ok(());
+    }
+
     if head.path != WS_PATH {
         let _ = write_http_err(&mut stream, &HttpError::NotFound, None).await;
         return Ok(());
@@ -1376,6 +1402,104 @@ where
             let _ = write_http_err(&mut stream, &HttpError::MethodNotAllowed, None).await;
             Ok(())
         }
+    }
+}
+
+/// Answer `/livez` or `/readyz`.
+///
+/// Both exist on every `serve --listen`/`--listen-uds` daemon, in service mode or not, and neither
+/// reads a grant — see the call site. Neither touches the session table or any tenant directory, so a
+/// probe costs nothing a busy replica will notice.
+///
+/// - **`/livez` → 200** once the process is serving. Reaching this function *is* the proof: the
+///   listener accepted a connection and the runtime read a request off it. Liveness deliberately
+///   ignores the shards — a mount that has gone away is not fixed by killing the process, and a
+///   liveness probe that failed on it would turn one bad mount into a restart loop.
+/// - **`/readyz` → 200** when this replica can take a session: the listener is bound (again, proven
+///   by the request), the grant verifier is loaded (a type-level invariant — `serve` refuses to start
+///   `--service` without one, so `service.is_some()` *is* "verified keyring present"), and every
+///   `--shard` is a directory this process can write to. Otherwise **503** with a one-line reason.
+async fn handle_health<S: AsyncWrite + Unpin>(
+    supervisor: &Arc<Supervisor>,
+    stream: &mut S,
+    head: &HttpHead,
+) -> Result<(), HttpError> {
+    if head.method != "GET" {
+        return write_http_err(stream, &HttpError::MethodNotAllowed, None).await;
+    }
+    if head.path == LIVEZ_PATH {
+        return write_http_ok(stream, 200, "OK", None, br#"{"status":"alive"}"#).await;
+    }
+    // No `--shard` means no service mode, and then "the listener is up" is the whole of readiness.
+    let reason = match &supervisor.service {
+        Some(svc) => svc.ready.check(&svc.shards).await,
+        None => None,
+    };
+    match reason {
+        None => write_http_ok(stream, 200, "OK", None, br#"{"status":"ready"}"#).await,
+        Some(reason) => {
+            let body = json!({ "status": "not ready", "reason": reason }).to_string();
+            write_http_ok(stream, 503, "Service Unavailable", None, body.as_bytes()).await
+        }
+    }
+}
+
+/// The `/readyz` shard probe, memoized for [`READY_CACHE_TTL`]. `None` means ready.
+#[derive(Default)]
+struct ReadyCache(Mutex<Option<(Instant, Option<String>)>>);
+
+impl ReadyCache {
+    async fn check(&self, shards: &Arc<Shards>) -> Option<String> {
+        let cached = match lock_ignoring_poison(&self.0).as_ref() {
+            Some((at, reason)) if at.elapsed() < READY_CACHE_TTL => Some(reason.clone()),
+            _ => None,
+        };
+        if let Some(reason) = cached {
+            return reason;
+        }
+        // Off the runtime thread. The process runs a single-threaded runtime, and this is a `stat`
+        // plus a create/unlink on a network filesystem — exactly the I/O that stalls when an EFS
+        // mount hiccups. Blocking here would wedge every session on the replica on behalf of a probe.
+        let shards = shards.clone();
+        let reason = tokio::task::spawn_blocking(move || probe_shards(&shards))
+            .await
+            .unwrap_or_else(|_| Some("shard probe did not complete".to_string()));
+        *lock_ignoring_poison(&self.0) = Some((Instant::now(), reason.clone()));
+        reason
+    }
+}
+
+/// `None` if every mount is a directory this process can write to; otherwise the first failure.
+///
+/// The reason names the **shard**, never its path. A readiness body is readable by anything that can
+/// reach the port, and the replica's mount layout is not a caller's business — the shard name is
+/// already public (it prefixes every session id), and it is the only half an operator needs to know
+/// which mount to look at.
+fn probe_shards(shards: &Shards) -> Option<String> {
+    shards.iter().find_map(|(name, path)| {
+        probe_shard(path)
+            .err()
+            .map(|why| format!("shard {name}: {why}"))
+    })
+}
+
+fn probe_shard(path: &std::path::Path) -> Result<(), &'static str> {
+    match std::fs::metadata(path) {
+        Err(_) => return Err("not mounted"),
+        Ok(meta) if !meta.is_dir() => return Err("not a directory"),
+        Ok(_) => {}
+    }
+    // A permission-bit check (`access(W_OK)`) would be one syscall, but it answers about the bits,
+    // and the failures that actually happen here — a read-only remount, a full or unreachable mount —
+    // only surface on a real write. So write. The name carries the pid so two replicas sharing a
+    // mount cannot unlink each other's probe, and it is removed immediately either way.
+    let probe = path.join(format!(".readyz.{}", std::process::id()));
+    match std::fs::File::create(&probe) {
+        Ok(_) => {
+            let _ = std::fs::remove_file(&probe);
+            Ok(())
+        }
+        Err(_) => Err("not writable"),
     }
 }
 
