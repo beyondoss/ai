@@ -73,9 +73,17 @@
 //!
 //! ## Auth
 //!
-//! There is none here, by design: the agent authenticates no caller. Bind **loopback/internal only**
+//! By default there is none here: the agent authenticates no caller. Bind **loopback/internal only**
 //! and trust the front door (the edge, in another repo) to have validated the client before forwarding
 //! the upgrade. This module never sees or parses a user token.
+//!
+//! `serve --service` is the exception, and the reason is multi-tenancy rather than a change of heart:
+//! one replica serving many tenants cannot infer from a loopback socket *whose* session a connection
+//! is for. So every connection carries a [session grant](crate::grant) in `x-beyond-grant`, verified
+//! here — before the method branch, so WebSocket and POST cannot diverge — and turned into the
+//! [`ServiceSession`](crate::service::ServiceSession) that fixes that session's tenant, storage,
+//! sandbox and credentials. The refusals are HTTP statuses (401/400/403/421), answered *before* the
+//! upgrade; see `crate::service` and ARCHITECTURE.md's "Service mode".
 
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
@@ -94,8 +102,7 @@ use tokio::sync::mpsc;
 use tokio::time::{Duration, MissedTickBehavior};
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::handshake::server::create_response;
-use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
-use tokio_tungstenite::tungstenite::protocol::{CloseFrame, Role, WebSocketConfig};
+use tokio_tungstenite::tungstenite::protocol::{Role, WebSocketConfig};
 use tokio_tungstenite::tungstenite::{Message, Utf8Bytes};
 use tokio_util::sync::CancellationToken;
 
@@ -103,6 +110,7 @@ use crate::serve::{
     OutFanout, OutFrame, OutSink, ServeConfig, SharedOutConn, Signal, UpstreamHttp2, frame_to_line,
     lock_ignoring_poison, serve_session,
 };
+use crate::service::{Refusal, ServiceSession, Shards};
 use crate::session_store::{is_valid_session_id, new_id, scan_listings, scan_session_dir};
 
 /// The fixed URL path a WebSocket upgrade must target. The front door maps a service subdomain to this
@@ -215,6 +223,11 @@ struct SessionHandle {
     /// Every attached connection feeds the one input channel held here (its `mpsc` is multi-sender), so
     /// any device can drive the session.
     phase: Phase,
+    /// Whose session this is, in service mode. A session id is an address, and an address alone must
+    /// never be enough: a grant for tenant B naming tenant A's live id is refused (403) at the slot
+    /// rather than being allowed to attach to — and drive — a task running under A's sandbox and
+    /// credentials. `None` outside service mode, where there is one tenant by construction.
+    tenant: Option<String>,
     /// The session's set of attached connections — its output is **broadcast** to all of them, so a
     /// phone and a TUI (or any N of the user's devices) on one session all see the live stream at once
     /// (see [`crate::serve::OutFanout`]). Each connection registers its sink on attach and removes it on
@@ -257,8 +270,18 @@ struct Table {
 /// What a session task runs once it goes live, given its id, input, output fan-out, and `running`
 /// flag: [`serve_session`] in production ([`serve_session_body`]). A seam, so a test can substitute a
 /// body it controls — deciding exactly when an exiting session finishes — with no gateway behind it.
+///
+/// The `Option<Arc<ServiceSession>>` is the **spawning** connection's verified grant: it fixes this
+/// session's tenant, storage, sandbox and credentials for the task's life. A later attach still
+/// presents its own grant (checked against the slot's tenant), but does not re-point any of that.
 type SessionBody = Box<
-    dyn Fn(&str, mpsc::Receiver<String>, SharedOutConn, Arc<AtomicBool>) -> BoxFuture<'static, ()>
+    dyn Fn(
+            &str,
+            Option<Arc<ServiceSession>>,
+            mpsc::Receiver<String>,
+            SharedOutConn,
+            Arc<AtomicBool>,
+        ) -> BoxFuture<'static, ()>
         + Send
         + Sync,
 >;
@@ -266,9 +289,20 @@ type SessionBody = Box<
 /// Owns the `session id → session task` table and what each task runs.
 struct Supervisor {
     table: Arc<Mutex<Table>>,
-    /// `--session-dir`, for `list_daemon_sessions`' on-disk half.
+    /// `--session-dir`, for `list_daemon_sessions`' on-disk half. `None` in service mode, where a
+    /// listing is per-tenant and comes from [`Self::service`]'s shards instead.
     session_dir: Option<String>,
+    /// Set by `serve --service`: this daemon authenticates every connection. `None` is the
+    /// single-tenant daemon, unchanged — no grant is read and no tenant exists.
+    service: Option<ServiceSupervisor>,
     body: SessionBody,
+}
+
+/// What service mode needs at the *supervisor* level, as opposed to per session: the keyring every
+/// connection is verified against, and the mounts a tenant's sessions can live on.
+struct ServiceSupervisor {
+    verifier: Arc<crate::grant::GrantVerifier>,
+    shards: Arc<Shards>,
 }
 
 /// Derive a per-session config from the daemon's: address the session by its routing key and drop
@@ -282,8 +316,12 @@ struct Supervisor {
 /// it fixes what it cost: daemon files were named `<id>.jsonl` where the repo names its own
 /// `<created_at>_<id>.jsonl`, so `find_path`'s `_<id>.jsonl` lookup couldn't see them — a daemon
 /// session appeared in `list_sessions` but `switch_session` reported it missing.
-fn session_cfg(base: &ServeConfig, id: &str) -> ServeConfig {
+fn session_cfg(base: &ServeConfig, id: &str, service: Option<Arc<ServiceSession>>) -> ServeConfig {
     let mut c = base.clone();
+    // This session's verified grant — its tenant, storage, sandbox and gateway credential. The
+    // daemon's own config never carries one (at startup there is no connection), so this is the only
+    // place it is set, and `Persistence::open` refuses to run in service mode without it.
+    c.service = service;
     c.listen = None;
     // A spawned session must never itself re-bind a transport listener — it's driven purely
     // through its `input_rx`/`out_conn` channels by the supervisor.
@@ -309,12 +347,22 @@ fn session_cfg(base: &ServeConfig, id: &str) -> ServeConfig {
 /// `serve_session`, not shared. The process runtime itself is `current_thread` by default (see
 /// `main.rs::build_runtime`).
 fn serve_session_body(base: ServeConfig) -> SessionBody {
-    Box::new(move |id, input_rx, out_conn, running| {
-        let cfg = session_cfg(&base, id);
+    Box::new(move |id, service, input_rx, out_conn, running| {
+        let cfg = session_cfg(&base, id, service);
         let id = id.to_owned();
+        // Kept past the move into `serve_session` so a session that fails to *start* can still be
+        // reported: without this the only trace of "your sandbox is unreachable" was a line on the
+        // replica's stderr, and the client saw a socket that accepted its commands and answered
+        // nothing.
+        let out_err = out_conn.clone();
         Box::pin(async move {
             if let Err(e) = serve_session(cfg, input_rx, out_conn, running).await {
                 eprintln!("serve: session {id} ended: {e}");
+                lock_ignoring_poison(&out_err).broadcast(OutFrame::Value(json!({
+                    "type": "error",
+                    "session_id": id,
+                    "error": e.to_string(),
+                })));
             }
         })
     })
@@ -390,8 +438,33 @@ enum TryPin {
     Attached(u64, mpsc::Sender<String>, SharedOutConn),
     /// The id's previous task is still exiting. Wait for this latch, then look again.
     Wait(CancellationToken),
+    /// A live session owns this id, and it belongs to another tenant.
+    Forbidden,
     /// The daemon is shutting down.
     Closed,
+}
+
+/// Why [`Supervisor::pin`] refused. An enum rather than a message because the three cases are three
+/// different HTTP statuses, and the WebSocket path answers with one **before** the upgrade — a 403
+/// after a 101 would only be readable as a close code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PinError {
+    /// 403: this id is live under another tenant.
+    Forbidden,
+    /// 503: the id's previous task is still exiting, or is wedged on its way out. Retryable.
+    Unavailable(&'static str),
+    /// 503: the daemon is shutting down.
+    Closed,
+}
+
+impl From<PinError> for HttpError {
+    fn from(e: PinError) -> Self {
+        match e {
+            PinError::Forbidden => HttpError::Forbidden("that session belongs to another tenant"),
+            PinError::Unavailable(why) => HttpError::Unavailable(why),
+            PinError::Closed => HttpError::Unavailable("the daemon is shutting down"),
+        }
+    }
 }
 
 impl Supervisor {
@@ -407,20 +480,25 @@ impl Supervisor {
     /// The caller **must** [`unpin`](Self::unpin) when the attachment ends — a WebSocket on socket
     /// close, an HTTP POST when its response has been written — so the idle reaper's clock starts
     /// once nobody is attached.
-    async fn pin(&self, requested_id: Option<String>) -> Result<Pinned, &'static str> {
-        self.pin_within(requested_id, JOIN_GRACE).await
+    async fn pin(
+        &self,
+        requested_id: Option<String>,
+        service: Option<Arc<ServiceSession>>,
+    ) -> Result<Pinned, PinError> {
+        self.pin_within(requested_id, service, JOIN_GRACE).await
     }
 
     /// [`Self::pin`], with the wait for a stopping predecessor as a parameter so it can be tested.
     async fn pin_within(
         &self,
         requested_id: Option<String>,
+        service: Option<Arc<ServiceSession>>,
         grace: Duration,
-    ) -> Result<Pinned, &'static str> {
+    ) -> Result<Pinned, PinError> {
         let id = requested_id.unwrap_or_else(new_id);
         let deadline = tokio::time::Instant::now() + grace;
         loop {
-            match self.try_pin(&id) {
+            match self.try_pin(&id, service.as_ref()) {
                 TryPin::Attached(incarnation, input_tx, out_conn) => {
                     return Ok(Pinned {
                         id,
@@ -429,7 +507,8 @@ impl Supervisor {
                         out_conn,
                     });
                 }
-                TryPin::Closed => return Err("the daemon is shutting down"),
+                TryPin::Forbidden => return Err(PinError::Forbidden),
+                TryPin::Closed => return Err(PinError::Closed),
                 TryPin::Wait(exited) => {
                     if tokio::time::timeout_at(deadline, exited.cancelled())
                         .await
@@ -440,7 +519,9 @@ impl Supervisor {
                              start another alongside it",
                             grace.as_millis()
                         );
-                        return Err("the session is still stopping; retry");
+                        return Err(PinError::Unavailable(
+                            "the session is still stopping; retry",
+                        ));
                     }
                 }
             }
@@ -450,12 +531,19 @@ impl Supervisor {
     /// One look at the table for `id`, synchronously (the lock is a std `Mutex`, never held across an
     /// `.await`): attach to its session — spawning it, `Starting`, if the id is free — or report that
     /// its previous task is still exiting.
-    fn try_pin(&self, id: &str) -> TryPin {
+    fn try_pin(&self, id: &str, service: Option<&Arc<ServiceSession>>) -> TryPin {
+        let tenant = service.map(|svc| svc.tenant().to_owned());
         let mut table = lock_ignoring_poison(&self.table);
         if table.closed {
             return TryPin::Closed;
         }
         if let Some(h) = table.sessions.get_mut(id) {
+            // Checked before anything else about the slot: an id alone never grants access to a
+            // running session. A `Stopping` slot is refused just the same — its successor would
+            // otherwise be spawned by, and inherit the grant of, the wrong tenant.
+            if h.tenant != tenant {
+                return TryPin::Forbidden;
+            }
             return match h.phase.input() {
                 // Register, don't evict: one more attached connection, and clear any detach timestamp
                 // so the reaper's clock only runs while genuinely detached (`attached == 0`).
@@ -489,6 +577,7 @@ impl Supervisor {
             SessionHandle {
                 incarnation,
                 phase: Phase::Starting(input_tx.clone()),
+                tenant,
                 out_conn: out_conn.clone(),
                 exited: exited.clone(),
                 attached: 1,
@@ -507,7 +596,7 @@ impl Supervisor {
             incarnation,
             exited,
         };
-        let body = (self.body)(id, input_rx, out_conn.clone(), running);
+        let body = (self.body)(id, service.cloned(), input_rx, out_conn.clone(), running);
         tokio::spawn(async move {
             if exit.go_live() {
                 body.await;
@@ -535,11 +624,19 @@ impl Supervisor {
         }
     }
 
-    /// Attach `ws` to the session named `requested_id` (minting a fresh id if `None`), spawning the
-    /// session if it isn't already live. Drives this socket until it closes — the session itself
+    /// Drive `ws` against an **already pinned** session until the socket closes — the session itself
     /// keeps running either way.
-    async fn attach<S>(self: &Arc<Self>, requested_id: Option<String>, mut ws: WebSocketStream<S>)
-    where
+    ///
+    /// The pin happens before the upgrade (see [`handle_websocket_upgrade`]), not here: a refusal has
+    /// to be a real HTTP status. A 403 or 503 delivered as a close code on an accepted WebSocket is a
+    /// successful handshake followed by a hang-up, which no HTTP client, proxy, or retry policy can
+    /// read as "wrong tenant" or "try again".
+    async fn attach<S>(
+        self: &Arc<Self>,
+        pinned: Pinned,
+        service: Option<Arc<ServiceSession>>,
+        ws: WebSocketStream<S>,
+    ) where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
         let Pinned {
@@ -547,19 +644,7 @@ impl Supervisor {
             incarnation,
             input_tx,
             out_conn,
-        } = match self.pin(requested_id).await {
-            Ok(pinned) => pinned,
-            Err(why) => {
-                // 1013 Try Again Later: nothing is wrong with the request, only its timing.
-                let _ = ws
-                    .close(Some(CloseFrame {
-                        code: CloseCode::Again,
-                        reason: why.into(),
-                    }))
-                    .await;
-                return;
-            }
-        };
+        } = pinned;
 
         // Register this connection's send channel as one of the session's output sinks — the session
         // broadcasts every frame to all registered sinks. Keep the `sink_id` to remove it on disconnect.
@@ -655,7 +740,9 @@ impl Supervisor {
                                             .get("id")
                                             .and_then(serde_json::Value::as_str)
                                             .map(str::to_owned);
-                                        let frame = self.list_daemon_sessions(client_id).await;
+                                        let frame = self
+                                            .list_daemon_sessions(client_id, service.as_deref())
+                                            .await;
                                         let _ = reply_tx.try_send(frame);
                                         continue;
                                     }
@@ -723,15 +810,24 @@ impl Supervisor {
     /// live in-memory map (`live:true`) and every `*.jsonl` under the base `--session-dir` (whose
     /// `live` flag says whether that persisted id also has a running task right now). The reply is a
     /// single `response` frame the caller sends back on the originating connection.
-    async fn list_daemon_sessions(&self, client_id: Option<String>) -> OutFrame {
+    /// **Tenant-scoped in service mode**, on both halves: only this tenant's live handles, and only
+    /// `<every mounted shard>/<tenant>/sessions` on disk. The supervisor sees every session on the
+    /// replica, so without the scope this one command would enumerate the whole fleet-mate set.
+    async fn list_daemon_sessions(
+        &self,
+        client_id: Option<String>,
+        service: Option<&ServiceSession>,
+    ) -> OutFrame {
         // Snapshot the live ids under the lock, then drop it — the on-disk scan below must not run while
         // holding the map mutex. Live means attachable with a loop still reading its input: a
         // `Stopping` entry is on its way out, so it reports `live:false` although its task still exists.
+        let tenant = service.map(|svc| svc.tenant());
         let live: HashSet<String> = {
             let table = lock_ignoring_poison(&self.table);
             table
                 .sessions
                 .iter()
+                .filter(|(_, h)| h.tenant.as_deref() == tenant)
                 .filter(|(_, h)| h.phase.input().is_some_and(|tx| !tx.is_closed()))
                 .map(|(id, _)| id.clone())
                 .collect()
@@ -739,14 +835,19 @@ impl Supervisor {
 
         // On-disk listings, if this daemon persists at all. `scan_listings` is CPU-bound and uses
         // `thread::scope`, so it runs on the blocking pool rather than stalling this async task.
-        let metas = match &self.session_dir {
-            Some(dir) => {
-                let paths = scan_session_dir(std::path::Path::new(dir));
-                tokio::task::spawn_blocking(move || scan_listings(paths, &|_, _| {}))
-                    .await
-                    .unwrap_or_default()
-            }
-            None => Vec::new(),
+        let dirs: Vec<std::path::PathBuf> = match (service, &self.session_dir) {
+            (Some(svc), _) => svc.tenant_session_dirs(),
+            (None, Some(dir)) => vec![std::path::PathBuf::from(dir)],
+            (None, None) => Vec::new(),
+        };
+        let metas = if dirs.is_empty() {
+            Vec::new()
+        } else {
+            let paths: Vec<std::path::PathBuf> =
+                dirs.iter().flat_map(|d| scan_session_dir(d)).collect();
+            tokio::task::spawn_blocking(move || scan_listings(paths, &|_, _| {}))
+                .await
+                .unwrap_or_default()
         };
 
         let mut seen: HashSet<&str> = HashSet::with_capacity(metas.len());
@@ -1065,9 +1166,35 @@ pub async fn serve_ws(
     // whether the operator opted out of reaping altogether).
     let idle_timeout = resolve_idle_timeout(cfg.session_idle_timeout);
 
+    // Service mode: every connection is verified against this keyring, and a tenant's sessions live
+    // on these mounts. `main.rs` has already refused `--service` without both, so a `None` verifier
+    // here would be a wiring bug — and one that fails **open**, so it refuses to serve instead.
+    let service = if cfg.service_mode {
+        let verifier = cfg.grant_verifier.clone().ok_or(
+            "--service needs a session-grant verifier (--grant-key and --seal-key)".to_string(),
+        )?;
+        eprintln!(
+            "serve: service mode — every connection must present a verified session grant; shards: {}",
+            cfg.shards
+                .iter()
+                .map(|(name, _)| name)
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        Some(ServiceSupervisor {
+            verifier,
+            shards: cfg.shards.clone(),
+        })
+    } else {
+        None
+    };
     let supervisor = Arc::new(Supervisor {
         table: Arc::default(),
-        session_dir: cfg.session_dir.clone(),
+        // Service mode lists per tenant, from the shards, never from one process-wide directory.
+        session_dir: (!cfg.service_mode)
+            .then(|| cfg.session_dir.clone())
+            .flatten(),
+        service,
         body: serve_session_body(cfg),
     });
     let mut shutdown = crate::serve::ShutdownSignal::new()?;
@@ -1178,13 +1305,16 @@ async fn handle_connection<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let (head, leftover) = match read_http_head(&mut stream).await {
+    let (mut head, leftover) = match read_http_head(&mut stream).await {
         Ok(v) => v,
         Err(e) => {
             let _ = write_http_err(&mut stream, &e, None).await;
             return Ok(());
         }
     };
+    // Taken out of the head immediately, before anything else can read, log, or forward it: a grant
+    // carries sealed credentials, and the upgrade's own headers are handed on to `create_response`.
+    let grant = head.take_grant();
 
     if head.path != WS_PATH {
         let _ = write_http_err(&mut stream, &HttpError::NotFound, None).await;
@@ -1204,16 +1334,44 @@ where
         return Ok(());
     }
 
+    // Before the method branch, so the WebSocket and POST paths cannot diverge on who is allowed in.
+    let service = match &supervisor.service {
+        None => None,
+        Some(svc) => match crate::service::authorize(
+            &svc.verifier,
+            &svc.shards,
+            grant.as_deref(),
+            requested_id.as_deref(),
+            crate::service::now_unix(),
+        ) {
+            Ok(session) => Some(Arc::new(session)),
+            Err(refusal) => {
+                let _ = write_http_err(&mut stream, &HttpError::from(refusal), None).await;
+                return Ok(());
+            }
+        },
+    };
+
     match head.method.as_str() {
         "POST" => {
-            if let Err(e) =
-                handle_http_post(supervisor, &mut stream, &head, leftover, requested_id).await
+            if let Err(e) = handle_http_post(
+                supervisor,
+                &mut stream,
+                &head,
+                leftover,
+                requested_id,
+                service,
+            )
+            .await
             {
                 let _ = write_http_err(&mut stream, &e, None).await;
             }
             Ok(())
         }
-        "GET" => handle_websocket_upgrade(supervisor, stream, &head, leftover, requested_id).await,
+        "GET" => {
+            handle_websocket_upgrade(supervisor, stream, &head, leftover, requested_id, service)
+                .await
+        }
         _ => {
             let _ = write_http_err(&mut stream, &HttpError::MethodNotAllowed, None).await;
             Ok(())
@@ -1230,6 +1388,7 @@ async fn handle_websocket_upgrade<S>(
     head: &HttpHead,
     leftover: Vec<u8>,
     requested_id: Option<String>,
+    service: Option<Arc<ServiceSession>>,
 ) -> Result<(), Box<dyn std::error::Error>>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -1241,21 +1400,35 @@ where
             return Ok(());
         }
     };
+    // Pin **before** writing the 101: the session slot is where the tenant check and the
+    // still-stopping wait live, and both of their answers are HTTP statuses (403, 503). Past the
+    // upgrade the only vocabulary left is a close code.
+    let pinned = match supervisor.pin(requested_id, service.clone()).await {
+        Ok(pinned) => pinned,
+        Err(e) => {
+            let _ = write_http_err(&mut stream, &HttpError::from(e), None).await;
+            return Ok(());
+        }
+    };
     let response = match create_response(&request) {
         Ok(r) => r,
         Err(_) => {
+            supervisor.unpin(&pinned.id, pinned.incarnation);
             let _ = write_http_err(&mut stream, &HttpError::UpgradeRequired, None).await;
             return Ok(());
         }
     };
-    write_raw_http_response(&mut stream, &response).await?;
+    if let Err(e) = write_raw_http_response(&mut stream, &response).await {
+        supervisor.unpin(&pinned.id, pinned.incarnation);
+        return Err(e.into());
+    }
 
     let config = WebSocketConfig::default()
         .max_message_size(Some(MAX_INBOUND_MESSAGE_BYTES))
         .max_frame_size(Some(MAX_INBOUND_MESSAGE_BYTES));
     let ws =
         WebSocketStream::from_partially_read(stream, leftover, Role::Server, Some(config)).await;
-    supervisor.attach(requested_id, ws).await;
+    supervisor.attach(pinned, service, ws).await;
     Ok(())
 }
 
@@ -1266,6 +1439,7 @@ async fn handle_http_post<S>(
     head: &HttpHead,
     leftover: Vec<u8>,
     requested_id: Option<String>,
+    service: Option<Arc<ServiceSession>>,
 ) -> Result<(), HttpError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -1312,7 +1486,7 @@ where
 
     if command == "list_daemon_sessions" {
         let frame = supervisor
-            .list_daemon_sessions(Some(client_id.clone()))
+            .list_daemon_sessions(Some(client_id.clone()), service.as_deref())
             .await;
         let Some(line) = frame_to_line(frame) else {
             return Err(HttpError::BadRequest("failed to serialize response"));
@@ -1330,9 +1504,9 @@ where
         input_tx,
         out_conn,
     } = supervisor
-        .pin(requested_id)
+        .pin(requested_id, service)
         .await
-        .map_err(HttpError::Unavailable)?;
+        .map_err(HttpError::from)?;
     let (conn_tx, mut conn_rx) = mpsc::channel::<OutFrame>(OUT_CHANNEL_BOUND);
     // No catch-up: a POST is one command's reply, not a streaming attach. Seeding history here
     // would dump the transcript into a buffer the waiter has to skip, and could fill it before the
@@ -1426,6 +1600,27 @@ struct HttpHead {
     headers: Vec<(String, String)>,
 }
 
+impl HttpHead {
+    /// Remove and return the `x-beyond-grant` header.
+    ///
+    /// **Removing** it is the point. A grant carries sealed credentials, and this head is handed to
+    /// `create_response`, which echoes the request's headers into the handshake — so a grant left in
+    /// place would be reflected straight back to the client, and would sit in the `Debug` of any
+    /// head logged on an error path. Read once, here, and gone.
+    ///
+    /// A value over [`MAX_GRANT_BYTES`](crate::service::MAX_GRANT_BYTES) is dropped rather than
+    /// returned: it cannot be a grant this fleet minted, and there is no reason to run crypto over
+    /// it. The caller then sees "no grant" — a 401, which is what an unusable token deserves.
+    fn take_grant(&mut self) -> Option<String> {
+        let idx = self
+            .headers
+            .iter()
+            .position(|(name, _)| name.eq_ignore_ascii_case(crate::service::GRANT_HEADER))?;
+        let (_, value) = self.headers.remove(idx);
+        (value.len() <= crate::service::MAX_GRANT_BYTES).then_some(value)
+    }
+}
+
 fn session_id_from_query(query: Option<&str>) -> Option<String> {
     let query = query?;
     url::form_urlencoded::parse(query.as_bytes())
@@ -1445,14 +1640,36 @@ enum HttpError {
     /// The supervisor won't attach right now ([`Supervisor::pin`]): the daemon is shutting down, or the
     /// id's previous session task is still exiting. Retryable.
     Unavailable(&'static str),
+    /// Service mode: no session grant, or one that doesn't verify.
+    Unauthorized(&'static str),
+    /// Service mode: the grant verifies but isn't for this session or this tenant.
+    Forbidden(&'static str),
+    /// Service mode: the grant is well-formed, but this replica doesn't mount its shard. The client
+    /// should be routed elsewhere rather than retried here.
+    Misdirected(&'static str),
     Io,
+}
+
+impl From<Refusal> for HttpError {
+    fn from(r: Refusal) -> Self {
+        match r {
+            Refusal::Unauthorized(m) => HttpError::Unauthorized(m),
+            Refusal::BadRequest(m) => HttpError::BadRequest(m),
+            Refusal::Forbidden(m) => HttpError::Forbidden(m),
+            Refusal::Misdirected(m) => HttpError::Misdirected(m),
+        }
+    }
 }
 
 impl std::fmt::Display for HttpError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             HttpError::Incomplete => write!(f, "incomplete request"),
-            HttpError::BadRequest(m) | HttpError::Unavailable(m) => write!(f, "{m}"),
+            HttpError::BadRequest(m)
+            | HttpError::Unavailable(m)
+            | HttpError::Unauthorized(m)
+            | HttpError::Forbidden(m)
+            | HttpError::Misdirected(m) => write!(f, "{m}"),
             HttpError::NotFound => write!(f, "not found: expected {WS_PATH}"),
             HttpError::MethodNotAllowed => write!(f, "method not allowed"),
             HttpError::UpgradeRequired => write!(f, "WebSocket upgrade required"),
@@ -1474,6 +1691,9 @@ impl HttpError {
             HttpError::LengthRequired => (411, "Length Required"),
             HttpError::Timeout => (504, "Gateway Timeout"),
             HttpError::Unavailable(_) => (503, "Service Unavailable"),
+            HttpError::Unauthorized(_) => (401, "Unauthorized"),
+            HttpError::Forbidden(_) => (403, "Forbidden"),
+            HttpError::Misdirected(_) => (421, "Misdirected Request"),
             HttpError::Incomplete | HttpError::BadRequest(_) | HttpError::Io => {
                 (400, "Bad Request")
             }
@@ -1682,6 +1902,7 @@ mod tests {
         let h = SessionHandle {
             incarnation: 0,
             phase: Phase::Live(input_tx),
+            tenant: None,
             out_conn: Arc::new(Mutex::new(OutFanout::default())),
             exited: CancellationToken::new(),
             attached,
@@ -1822,7 +2043,8 @@ mod tests {
         Arc::new(Supervisor {
             table: Arc::default(),
             session_dir: None,
-            body: Box::new(move |_id, mut input_rx, _out, _running| {
+            service: None,
+            body: Box::new(move |_id, _service, mut input_rx, _out, _running| {
                 let probe = probe.clone();
                 Box::pin(async move {
                     let now = probe.running_now.fetch_add(1, Ordering::SeqCst) + 1;
@@ -1861,7 +2083,7 @@ mod tests {
 
     /// Attach to `id`, then detach, leaving an idle session a zero-timeout reap takes at once.
     async fn attach_and_detach(sup: &Supervisor, id: &str) -> u64 {
-        let p = sup.pin(Some(id.into())).await.unwrap();
+        let p = sup.pin(Some(id.into()), None).await.unwrap();
         sup.unpin(&p.id, p.incarnation);
         p.incarnation
     }
@@ -1882,7 +2104,7 @@ mod tests {
 
         let reconnect = tokio::spawn({
             let sup = sup.clone();
-            async move { sup.pin(Some("s1".into())).await }
+            async move { sup.pin(Some("s1".into()), None).await }
         });
         settle().await;
         assert_eq!(
@@ -1912,7 +2134,7 @@ mod tests {
         until("the reaped session sees EOF", || probe.exiting() == 1).await;
 
         let refused = sup
-            .pin_within(Some("s1".into()), Duration::from_millis(50))
+            .pin_within(Some("s1".into()), None, Duration::from_millis(50))
             .await;
         assert!(refused.is_err(), "a wedged predecessor refuses the attach");
         assert_eq!(probe.started(), 1, "and never starts a rival");
@@ -1926,13 +2148,13 @@ mod tests {
     async fn a_reconnect_to_a_session_whose_loop_ended_waits_for_its_task() {
         let probe = Arc::new(Probe::default());
         let sup = probe_supervisor(&probe, true);
-        let first = sup.pin(Some("s1".into())).await.unwrap();
+        let first = sup.pin(Some("s1".into()), None).await.unwrap();
         until("the loop ends", || probe.exiting() == 1).await;
         assert!(first.input_tx.is_closed());
 
         let reconnect = tokio::spawn({
             let sup = sup.clone();
-            async move { sup.pin(Some("s1".into())).await }
+            async move { sup.pin(Some("s1".into()), None).await }
         });
         settle().await;
         assert_eq!(probe.started(), 1, "no respawn beside a task still exiting");
@@ -1963,7 +2185,7 @@ mod tests {
         let sup = probe_supervisor(&probe, false);
         attach_and_detach(&sup, "reaped").await;
         let (idle_tx, idle) = {
-            let p = sup.pin(Some("idle".into())).await.unwrap();
+            let p = sup.pin(Some("idle".into()), None).await.unwrap();
             (p.input_tx, p.id)
         };
         until("both sessions start", || probe.started() == 2).await;
@@ -1980,9 +2202,9 @@ mod tests {
         drop(idle_tx);
         until("both are exiting", || probe.exiting() == 2).await;
 
-        assert!(sup.pin(Some(idle)).await.is_err());
-        assert!(sup.pin(Some("fresh".into())).await.is_err());
-        assert!(sup.pin(None).await.is_err());
+        assert!(sup.pin(Some(idle), None).await.is_err());
+        assert!(sup.pin(Some("fresh".into()), None).await.is_err());
+        assert!(sup.pin(None, None).await.is_err());
         settle().await;
         assert_eq!(probe.started(), 2, "nothing spawned during shutdown");
         assert!(!shutdown.is_finished(), "shutdown waits for every exit");

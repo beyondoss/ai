@@ -175,6 +175,10 @@ pub enum RunEvent {
     Started {
         run_id: String,
         session_id: String,
+        /// The tenant this run belongs to — present only in service mode, where one replica emits
+        /// for many of them and a consumer has to be able to tell them apart.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        tenant: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         command_id: Option<String>,
         ts: u64,
@@ -183,6 +187,10 @@ pub enum RunEvent {
     Progress {
         run_id: String,
         session_id: String,
+        /// The tenant this run belongs to — present only in service mode, where one replica emits
+        /// for many of them and a consumer has to be able to tell them apart.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        tenant: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         command_id: Option<String>,
         ts: u64,
@@ -199,6 +207,10 @@ pub enum RunEvent {
     Succeeded {
         run_id: String,
         session_id: String,
+        /// The tenant this run belongs to — present only in service mode, where one replica emits
+        /// for many of them and a consumer has to be able to tell them apart.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        tenant: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         command_id: Option<String>,
         ts: u64,
@@ -213,6 +225,10 @@ pub enum RunEvent {
     Failed {
         run_id: String,
         session_id: String,
+        /// The tenant this run belongs to — present only in service mode, where one replica emits
+        /// for many of them and a consumer has to be able to tell them apart.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        tenant: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         command_id: Option<String>,
         ts: u64,
@@ -228,6 +244,10 @@ pub enum RunEvent {
     Aborted {
         run_id: String,
         session_id: String,
+        /// The tenant this run belongs to — present only in service mode, where one replica emits
+        /// for many of them and a consumer has to be able to tell them apart.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        tenant: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         command_id: Option<String>,
         ts: u64,
@@ -268,6 +288,7 @@ pub struct Run {
     sink: Arc<dyn RunLifecycle>,
     run_id: String,
     session_id: String,
+    tenant: Option<String>,
     command_id: Option<String>,
     model: String,
     /// 0 = idle, 1 = in flight, 2 = terminal emitted.
@@ -294,6 +315,7 @@ impl Run {
     pub fn begin(
         sink: Arc<dyn RunLifecycle>,
         session_id: impl Into<String>,
+        tenant: Option<String>,
         command_id: Option<String>,
         model: impl Into<String>,
     ) -> Arc<Self> {
@@ -301,6 +323,7 @@ impl Run {
             sink,
             run_id: crate::session_store::new_id(),
             session_id: session_id.into(),
+            tenant,
             command_id,
             model: model.into(),
             state: std::sync::atomic::AtomicU8::new(0),
@@ -331,6 +354,7 @@ impl Run {
         self.sink.emit(RunEvent::Started {
             run_id: self.run_id.clone(),
             session_id: self.session_id.clone(),
+            tenant: self.tenant.clone(),
             command_id: self.command_id.clone(),
             ts: now_ts(),
             model: self.model.clone(),
@@ -402,6 +426,7 @@ impl Run {
         self.sink.emit(RunEvent::Progress {
             run_id: self.run_id.clone(),
             session_id: self.session_id.clone(),
+            tenant: self.tenant.clone(),
             command_id: self.command_id.clone(),
             ts: now_ts(),
             steps: s.steps,
@@ -422,6 +447,7 @@ impl Run {
         self.terminal(RunEvent::Succeeded {
             run_id: self.run_id.clone(),
             session_id: self.session_id.clone(),
+            tenant: self.tenant.clone(),
             command_id: self.command_id.clone(),
             ts: now_ts(),
             steps,
@@ -442,6 +468,7 @@ impl Run {
         self.terminal(RunEvent::Failed {
             run_id: self.run_id.clone(),
             session_id: self.session_id.clone(),
+            tenant: self.tenant.clone(),
             command_id: self.command_id.clone(),
             ts: now_ts(),
             steps,
@@ -456,6 +483,7 @@ impl Run {
         self.terminal(RunEvent::Aborted {
             run_id: self.run_id.clone(),
             session_id: self.session_id.clone(),
+            tenant: self.tenant.clone(),
             command_id: self.command_id.clone(),
             ts: now_ts(),
             steps,
@@ -738,8 +766,47 @@ mod tests {
 
     fn rec_run() -> (Arc<RecordingLifecycle>, Arc<Run>) {
         let rec = RecordingLifecycle::new();
-        let run = Run::begin(rec.clone(), "sess-1", Some("cmd-1".into()), "claude-test");
+        let run = Run::begin(
+            rec.clone(),
+            "sess-1",
+            None,
+            Some("cmd-1".into()),
+            "claude-test",
+        );
         (rec, run)
+    }
+
+    /// One replica emits for many tenants in service mode, so every event has to say whose run it
+    /// is — and, outside service mode, say nothing at all rather than a null field every existing
+    /// consumer would have to learn to ignore.
+    #[test]
+    fn tenant_rides_every_event_in_service_mode_and_is_absent_otherwise() {
+        let rec = RecordingLifecycle::new();
+        let run = Run::begin(
+            rec.clone(),
+            "sess-1",
+            Some("00tenant1".into()),
+            None,
+            "claude-test",
+        );
+        run.observe(&AgentEvent::TurnEnd {
+            stop_reason: agent_core::StopReason::EndTurn,
+            step: 1,
+        });
+        run.succeeded(1, false, None, None);
+        let events = rec.snapshot();
+        assert_eq!(events.len(), 3, "{events:#?}");
+        for event in &events {
+            let wire = serde_json::to_value(event).unwrap();
+            assert_eq!(wire["tenant"], "00tenant1", "{wire}");
+        }
+
+        let (rec, run) = rec_run();
+        run.succeeded(1, false, None, None);
+        for event in &rec.snapshot() {
+            let wire = serde_json::to_value(event).unwrap();
+            assert!(wire.get("tenant").is_none(), "{wire}");
+        }
     }
 
     #[test]
@@ -1074,7 +1141,13 @@ mod tests {
         let hits = Arc::new(AtomicUsize::new(0));
         let url = collect_posts(Duration::ZERO, 200, seen.clone(), hits.clone()).await;
         let sink = open(Some(&url), &["X-Tenant: acme".into()]).unwrap();
-        let run = Run::begin(Arc::clone(&sink), "s", Some("p1".into()), "claude-test");
+        let run = Run::begin(
+            Arc::clone(&sink),
+            "s",
+            None,
+            Some("p1".into()),
+            "claude-test",
+        );
         run.succeeded(2, false, Some("hello".into()), None);
         run.drain().await;
         let bodies: Vec<Value> = lock(&seen)
@@ -1105,12 +1178,13 @@ mod tests {
         let url = collect_posts(Duration::from_millis(50), 200, seen.clone(), hits.clone()).await;
         let http = Arc::new(HttpLifecycle::spawn(&url, vec![]).unwrap());
         for i in 0..3 {
-            let run = Run::begin(http.clone(), "s", None, "m");
+            let run = Run::begin(http.clone(), "s", None, None, "m");
             let run_id = run.run_id().to_string();
             run.succeeded(1, false, Some(format!("done-{i}")), None);
             http.emit(RunEvent::Progress {
                 run_id,
                 session_id: "s".into(),
+                tenant: None,
                 command_id: None,
                 ts: 0,
                 steps: 99,
@@ -1149,7 +1223,13 @@ mod tests {
         let hits = Arc::new(AtomicUsize::new(0));
         let (url, _dir) = collect_unix_posts(Duration::ZERO, 200, seen.clone(), hits.clone()).await;
         let sink = open(Some(&url), &[]).unwrap();
-        let run = Run::begin(Arc::clone(&sink), "s", Some("p1".into()), "claude-test");
+        let run = Run::begin(
+            Arc::clone(&sink),
+            "s",
+            None,
+            Some("p1".into()),
+            "claude-test",
+        );
         run.succeeded(1, false, Some("hello".into()), None);
         run.drain().await;
         let bodies: Vec<Value> = lock(&seen)
@@ -1171,7 +1251,7 @@ mod tests {
         let hits = Arc::new(AtomicUsize::new(0));
         let url = collect_posts(Duration::from_secs(3), 200, seen, hits).await;
         let sink = open(Some(&url), &[]).unwrap();
-        let run = Run::begin(Arc::clone(&sink), "s", None, "m");
+        let run = Run::begin(Arc::clone(&sink), "s", None, None, "m");
         let start = std::time::Instant::now();
         run.succeeded(1, false, None, None);
         assert!(
@@ -1188,7 +1268,7 @@ mod tests {
         // Hold the first POST (started) long enough that several progress samples coalesce.
         let url = collect_posts(Duration::from_millis(80), 200, seen.clone(), hits).await;
         let sink = open(Some(&url), &[]).unwrap();
-        let run = Run::begin(Arc::clone(&sink), "s", None, "m");
+        let run = Run::begin(Arc::clone(&sink), "s", None, None, "m");
         for name in ["read", "edit", "bash"] {
             run.observe(&AgentEvent::ToolStart {
                 id: name.into(),

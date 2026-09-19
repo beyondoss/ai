@@ -130,6 +130,10 @@ pub struct SubagentCtx {
     pub tool_cfg: ChildToolConfig,
     pub cwd: PathBuf,
     pub project_trusted: bool,
+    /// Whether an on-disk `SYSTEM.md`/`APPEND_SYSTEM.md` may override a child's base prompt — see
+    /// [`crate::resources::PromptOptions::disk_overrides`]. Inherited from the parent, so a service
+    /// session's children are as fail-closed about the replica's filesystem as it is.
+    pub disk_overrides: bool,
     pub prompt_guidelines: Vec<String>,
     /// The model a child inherits when its definition names none.
     pub parent_model: String,
@@ -1029,6 +1033,7 @@ impl Subagent {
                     &[]
                 },
                 project_trusted: self.ctx.project_trusted,
+                disk_overrides: self.ctx.disk_overrides,
             },
             context_files,
         )

@@ -804,6 +804,30 @@ pub struct ServeConfig {
     /// into each session is a cheap pointer bump. `None` (the default, and always on the stdio/`run`
     /// path) preserves the per-session-client behavior.
     pub shared_http: Option<reqwest::Client>,
+    /// `serve --service`: this daemon is a **fail-closed multi-tenant service**. Every connection
+    /// must present a verified [`bsg_v1` grant](crate::grant), every session runs against that
+    /// grant's sandbox and tenant-rooted storage, and nothing tenant-specific is read from or
+    /// written to the replica host. See [`crate::service`]. `false` is everything `serve` was
+    /// before.
+    pub service_mode: bool,
+    /// The tenant-data mounts (`--shard <name>=</abs/path>`, repeatable). Empty outside service
+    /// mode; `Arc` so every per-session copy of this config shares one map.
+    pub shards: Arc<crate::service::Shards>,
+    /// **This** session's verified grant and everything derived from it, handed down by the
+    /// connection that spawned the session (`serve_ws::session_cfg`). `main.rs` never sets it: at
+    /// startup there is no connection and so no tenant. `None` outside service mode — and, if
+    /// [`Self::service_mode`] is set, a `None` here is a bug that fails the session rather than
+    /// silently falling back to a host default.
+    pub service: Option<Arc<crate::service::ServiceSession>>,
+    /// Cap on live sessions this replica will hold at once. Two open descriptors per live session
+    /// keeps the default comfortably inside EFS's documented per-instance limits. Not enforced yet
+    /// — the session-lock PR is what can refuse an attach with a 503; the field lands here now so
+    /// that PR adds no field of its own to this struct.
+    pub max_live_sessions: usize,
+    /// The process-wide `reqwest::Client` per-session MCP connectors dial through — ALPN, and
+    /// deliberately *not* the gateway's h2c pool (a tenant's connector is not the gateway). Built
+    /// once by the daemon; `None` until the per-session MCP PR uses it.
+    pub mcp_http: Option<reqwest::Client>,
 }
 
 /// Resolve whether a project is trusted for this session, from already-gathered inputs — shared by
@@ -1080,6 +1104,22 @@ impl Persistence {
     /// Open persistence and select the active session: in repo mode per [`SessionSelect`], in file mode
     /// by opening the named file (or creating it).
     fn open(cfg: &ServeConfig) -> std::io::Result<(Self, Session)> {
+        // Service mode first, and with no fallback: the tenant's own directory or nothing. A
+        // `service_mode` config that reached a session without a grant would otherwise land in the
+        // per-cwd default repo below — the replica's own disk, shared across tenants.
+        if cfg.service_mode {
+            let service = cfg.service.as_ref().ok_or_else(|| {
+                std::io::Error::other(
+                    "service mode: this session has no verified grant, so it has nowhere to persist",
+                )
+            })?;
+            return Self::open_repo(
+                &service.session_dir,
+                service.workspace_root(),
+                &cfg.model,
+                SessionSelect::from_cfg(cfg),
+            );
+        }
         let cwd = crate::session_store::canonical_cwd(&std::env::current_dir().unwrap_or_default())
             .to_string_lossy()
             .into_owned();
@@ -1421,18 +1461,74 @@ impl Persistence {
     /// preview a fork point before committing to it.
     fn fork_messages(
         &self,
+        service: Option<&crate::service::ServiceSession>,
         session_id: &str,
         upto: usize,
         entry_id: Option<&str>,
         before: bool,
     ) -> std::io::Result<Vec<agent_core::Message>> {
-        let repo = self.repo.as_ref().ok_or_else(not_in_repo_mode)?;
+        let repo = self.repo_for(service, session_id)?;
+        Self::require_exactly(service, &repo, session_id)?;
         if let Some(entry_id) = entry_id {
             return repo.fork_at_entry_messages(session_id, entry_id, before);
         }
         let (_, session) = repo.open_id(session_id)?;
         let upto = upto.min(session.messages.len());
         Ok(session.messages[..upto].to_vec())
+    }
+
+    /// The repo a command naming *another* session acts on.
+    ///
+    /// Outside service mode that is always this session's own. In service mode a session id carries
+    /// its shard, so it is `<that id's shard>/<tenant>/sessions`: one tenant's sessions can live on
+    /// several mounts, and a command must reach the one it actually named rather than quietly
+    /// operating on whichever mount this connection happened to land on. A shard this replica
+    /// doesn't serve is an error, not an empty result.
+    fn repo_for(
+        &self,
+        service: Option<&crate::service::ServiceSession>,
+        id: &str,
+    ) -> std::io::Result<SessionRepo> {
+        let Some(service) = service else {
+            return self.repo.clone().ok_or_else(not_in_repo_mode);
+        };
+        let dir = service.session_dir_for(id).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("session {id} is on a shard this replica does not serve"),
+            )
+        })?;
+        SessionRepo::open(dir)
+    }
+
+    /// Service mode only: refuse an id that doesn't name a session **exactly**.
+    ///
+    /// [`SessionRepo::find_path`](crate::session_store::SessionRepo::find_path)'s unique-prefix
+    /// fallback is a convenience for an id a human typed. A tenant's ids are minted, never typed, so
+    /// there a prefix match turns "that session is gone" into "here is a neighbour of it" — and, for
+    /// `delete`, turns a miss into a silent `Ok`. Exact or error.
+    fn require_exactly(
+        service: Option<&crate::service::ServiceSession>,
+        repo: &SessionRepo,
+        id: &str,
+    ) -> std::io::Result<()> {
+        if service.is_none() {
+            return Ok(());
+        }
+        let suffix = format!("_{id}.jsonl");
+        let found = std::fs::read_dir(repo.dir()).is_ok_and(|mut entries| {
+            entries.any(|e| {
+                e.is_ok_and(|e| e.file_name().to_str().is_some_and(|n| n.ends_with(&suffix)))
+            })
+        });
+        if found {
+            Ok(())
+        } else {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("no session {id}"),
+            ))
+        }
     }
 
     /// Delete a session by id (repo mode only) — [`SessionRepo::delete`](crate::session_store::SessionRepo::delete)'s
@@ -1442,29 +1538,53 @@ impl Persistence {
     /// file left to persist the next turn into — a footgun no legitimate caller needs, since `list_
     /// sessions`/`list_all_sessions` responses report which id is current. A client that genuinely wants
     /// that must `new_session`/`switch_session` away first.
-    fn delete(&self, id: &str) -> std::io::Result<()> {
-        let repo = self.repo.as_ref().ok_or_else(not_in_repo_mode)?;
+    fn delete(
+        &self,
+        service: Option<&crate::service::ServiceSession>,
+        id: &str,
+    ) -> std::io::Result<()> {
+        let repo = self.repo_for(service, id)?;
         if id == self.session_id() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "cannot delete the currently active session — switch to another session first",
             ));
         }
+        Self::require_exactly(service, &repo, id)?;
         repo.delete(id)
     }
 
     /// List every session sitting in this repo's `.trash/` subdirectory (repo mode only) — see
     /// [`crate::session_store::SessionRepo::list_trash`].
-    fn list_trash(&self) -> std::io::Result<Vec<crate::session_store::TrashEntry>> {
+    ///
+    /// In service mode the trash of **every** mounted shard's tenant directory is merged, so a
+    /// session deleted on one mount is restorable from any connection this tenant holds.
+    fn list_trash(
+        &self,
+        service: Option<&crate::service::ServiceSession>,
+    ) -> std::io::Result<Vec<crate::session_store::TrashEntry>> {
+        if let Some(service) = service {
+            let mut all = Vec::new();
+            for dir in service.tenant_session_dirs() {
+                if dir.is_dir() {
+                    all.extend(SessionRepo::open(dir)?.list_trash()?);
+                }
+            }
+            all.sort_by(|a, b| b.deleted_at.cmp(&a.deleted_at));
+            return Ok(all);
+        }
         let repo = self.repo.as_ref().ok_or_else(not_in_repo_mode)?;
         repo.list_trash()
     }
 
     /// Restore a session by id out of `.trash/` back to its original location (repo mode only) — see
     /// [`crate::session_store::SessionRepo::restore_session`].
-    fn restore_session(&self, id: &str) -> std::io::Result<bool> {
-        let repo = self.repo.as_ref().ok_or_else(not_in_repo_mode)?;
-        repo.restore_session(id)
+    fn restore_session(
+        &self,
+        service: Option<&crate::service::ServiceSession>,
+        id: &str,
+    ) -> std::io::Result<bool> {
+        self.repo_for(service, id)?.restore_session(id)
     }
 
     /// This process's own cwd's sessions, newest first (empty unless in repo mode).
@@ -1484,10 +1604,18 @@ impl Persistence {
     /// loop while a model turn is in flight (unlike `persist_blocking`'s dedicated task, this one
     /// would otherwise stall that same task's turn-event delivery, `abort` handling, and checkpoint
     /// persistence for however long a large, unpruned session directory takes to scan).
+    ///
+    /// **Service mode drops the cwd filter.** There the cwd is the tenant's sandbox `workspace_root`
+    /// and the directory is already `<shard>/<tenant>/sessions` — scoped by construction — so
+    /// filtering would only hide a tenant's own sessions whose workspace path happens to have moved.
     async fn list_with_progress(
         &self,
+        service: Option<&crate::service::ServiceSession>,
         on_progress: impl Fn(usize, usize) + Send + Sync + 'static,
     ) -> Vec<SessionMeta> {
+        if let Some(service) = service {
+            return scan_session_dirs(vec![service.session_dir.clone()], on_progress).await;
+        }
         let Some(repo) = self.repo.clone() else {
             return Vec::new();
         };
@@ -1517,10 +1645,18 @@ impl Persistence {
     /// Runs on `spawn_blocking` — see [`Self::list_with_progress`]'s identical doc comment for why a
     /// cross-project scan (bigger than a single repo's own) must not run directly on the caller's own
     /// task.
+    ///
+    /// **Service mode's "everything" is the tenant's own, across every mounted shard** — a session
+    /// minted on another shard is still this tenant's, and still listable here. Never another
+    /// tenant's, and never the sibling-project walk (that root is the replica's).
     async fn list_all_with_progress(
         &self,
+        service: Option<&crate::service::ServiceSession>,
         on_progress: impl Fn(usize, usize) + Send + Sync + 'static,
     ) -> std::io::Result<Vec<SessionMeta>> {
+        if let Some(service) = service {
+            return Ok(scan_session_dirs(service.tenant_session_dirs(), on_progress).await);
+        }
         let repo = self.repo.as_ref().ok_or_else(not_in_repo_mode)?;
         let root = repo
             .dir()
@@ -1945,11 +2081,63 @@ impl Persistence {
     }
 }
 
+/// Strip replica-host paths out of a failed `response` frame's `error` text.
+///
+/// Only service mode redacts, and only a `response` with `success: false` and a string `error` is
+/// even inspected — an `OutFrame::Raw` (every streamed event, the hot path) short-circuits on its
+/// variant, and a successful response on one map lookup. Error text is where host paths actually
+/// leak: `std::io::Error` from the session store names the file it failed on.
+fn redact_frame(service: Option<&crate::service::ServiceSession>, frame: OutFrame) -> OutFrame {
+    let Some(service) = service else {
+        return frame;
+    };
+    let OutFrame::Value(mut v) = frame else {
+        return frame;
+    };
+    if let Some(map) = v.as_object_mut()
+        && map.get("success") == Some(&Value::Bool(false))
+        && let Some(Value::String(error)) = map.get("error")
+    {
+        let redacted = service.redact(error);
+        map.insert("error".into(), Value::String(redacted));
+    }
+    OutFrame::Value(v)
+}
+
 fn not_in_repo_mode() -> std::io::Error {
     std::io::Error::new(
         std::io::ErrorKind::Unsupported,
         "not in repo mode (start serve with --session-dir)",
     )
+}
+
+/// Listing metadata for every session under `dirs`, newest first — the same `scan_listings` walk a
+/// `SessionRepo` does, over several directories at once and **without creating any of them** (a
+/// listing must not mint a tenant directory on every mounted shard just by being asked). A directory
+/// that doesn't exist contributes nothing.
+///
+/// Runs on `spawn_blocking` for the same reason `Persistence::list_with_progress` does: the scan is
+/// synchronous file I/O reachable from the busy loop while a turn is in flight.
+async fn scan_session_dirs(
+    dirs: Vec<std::path::PathBuf>,
+    on_progress: impl Fn(usize, usize) + Send + Sync + 'static,
+) -> Vec<SessionMeta> {
+    match tokio::task::spawn_blocking(move || {
+        let paths: Vec<std::path::PathBuf> = dirs
+            .iter()
+            .flat_map(|dir| crate::session_store::scan_session_dir(dir))
+            .collect();
+        let mut metas = crate::session_store::scan_listings(paths, &on_progress);
+        metas.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        metas
+    })
+    .await
+    {
+        Ok(metas) => metas,
+        // Neither `scan_session_dir` nor `scan_listings` panics, and this task is never cancelled —
+        // same re-raise as every other `spawn_blocking` in this file.
+        Err(e) => std::panic::resume_unwind(e.into_panic()),
+    }
 }
 
 /// Whether a session's recorded `cwd` no longer reflects reality for this process: the directory has
@@ -2166,24 +2354,55 @@ pub(crate) async fn serve_session(
     // half (this discovery-based block — expensive, rebuilt only on `set_model`/`set_thinking`/`reload`)
     // and a cheap dynamic footer (current date/cwd, recomputed before every `prompt` via `full_system`)
     // so a long-running `serve` process doesn't re-walk the filesystem every turn just for the date.
-    let cwd = crate::session_store::canonical_cwd(&std::env::current_dir().unwrap_or_default());
-    let has_gated_resources = crate::trust_store::has_trust_gated_resources(&cwd);
-    let mut project_trusted = resolve_project_trust(
-        cfg.trust_project,
-        cfg.force_untrusted,
-        cfg.default_project_trust,
-        crate::trust_store::TrustStore::open_default().lookup(&cwd),
-        has_gated_resources,
-    );
+    //
+    // In service mode the "working directory" is the tenant's own `workspace_root` **inside its
+    // sandbox** — a path on the other side of the exec endpoint, which this process never stats.
+    // Everything below that would otherwise walk it (trust resolution, the worktree sweep, skill
+    // and agent discovery) is skipped rather than pointed at the replica's cwd: that disk belongs
+    // to no tenant.
+    let service = cfg.service.clone();
+    let cwd = match &service {
+        Some(svc) => std::path::PathBuf::from(svc.workspace_root()),
+        None => crate::session_store::canonical_cwd(&std::env::current_dir().unwrap_or_default()),
+    };
+    let has_gated_resources =
+        service.is_none() && crate::trust_store::has_trust_gated_resources(&cwd);
+    // Both off in service mode: `AGENTS.md`/`CLAUDE.md` and an on-disk `SYSTEM.md`/`APPEND_SYSTEM.md`
+    // would be read from the *replica's* filesystem — the tenant's own live under `workspace_root`,
+    // on the far side of the exec endpoint, which sandbox discovery reaches in a later PR. An
+    // explicit `--system-prompt`/`--append-system-prompt` is the operator's own and still applies.
+    let context_files = cfg.context_files && service.is_none();
+    let disk_overrides = service.is_none();
+    // Sandbox content is the tenant's own, so it counts as trusted — there is no second party for
+    // the trust gate to protect against inside one tenant's own box.
+    let mut project_trusted = match &service {
+        Some(_) => true,
+        None => resolve_project_trust(
+            cfg.trust_project,
+            cfg.force_untrusted,
+            cfg.default_project_trust,
+            crate::trust_store::TrustStore::open_default().lookup(&cwd),
+            has_gated_resources,
+        ),
+    };
     // Agent definitions are trust-gated exactly like skills (a project-local `.claude/agents/*.md` body
     // is injected verbatim as a child's system prompt), so they're discovered here — after trust is
     // resolved — not by `main.rs` at `ServeConfig`-construction time, where the interactive trust grant
     // hasn't happened yet. Stored on `cfg` so `build_agent`/`build_tools` (which take only `&cfg`) can
     // reach them on every rebuild without re-walking. The `reload` arm re-discovers below, since trust
     // (and the on-disk definitions) can change mid-process.
-    cfg.agents = crate::agents::discover(&cwd, project_trusted);
-    // Reap any subagent worktree orphaned by a previous crash of a process against this repo.
-    crate::worktree::sweep(&cwd);
+    cfg.agents = match &service {
+        // Sandbox discovery isn't wired yet: an empty list is the fail-closed answer, and the
+        // alternative — walking the replica's own `~/.claude/agents` — is exactly what must not
+        // happen. The service seam is where a later PR fills this from the sandbox.
+        Some(svc) => svc.resources().agents,
+        None => crate::agents::discover(&cwd, project_trusted),
+    };
+    // Reap any subagent worktree orphaned by a previous crash of a process against this repo. Not
+    // in service mode: the only repo this could sweep is the replica's own checkout.
+    if service.is_none() {
+        crate::worktree::sweep(&cwd);
+    }
 
     // Track L32 (pi-parity fix): mirrors `main.rs`'s identical warning for `run` — an untrusted
     // project with a `SYSTEM.md`/skills/prompts on disk silently skipped all of them with no signal at
@@ -2227,19 +2446,26 @@ pub(crate) async fn serve_session(
     // explicit `--skill`/`--prompt-template` extra path is still honored even so — pi's own
     // `noSkills`/`noPromptTemplates` do the same (a documented, tested combination; see
     // `skills::discover_extra_only`'s doc comment — pi-parity fix, M2).
-    let (mut prompt_templates, mut prompt_collisions) = if cfg.no_prompt_templates {
-        crate::prompts::discover_extra_only(&cfg.extra_prompt_template_paths)
-    } else {
-        crate::prompts::discover_with_diagnostics(
+    //
+    // Service mode discovers neither, for now: both roots would be the replica's filesystem. See
+    // `service::ServiceSession::resources`.
+    let (mut prompt_templates, mut prompt_collisions) = match &service {
+        Some(svc) => (svc.resources().prompt_templates, Vec::new()),
+        None if cfg.no_prompt_templates => {
+            crate::prompts::discover_extra_only(&cfg.extra_prompt_template_paths)
+        }
+        None => crate::prompts::discover_with_diagnostics(
             &cwd,
             project_trusted,
             &cfg.extra_prompt_template_paths,
-        )
+        ),
     };
-    let (mut skills, mut skill_collisions) = if cfg.no_skills {
-        crate::skills::discover_extra_only(&cfg.extra_skill_paths)
-    } else {
-        crate::skills::discover_with_diagnostics(&cwd, project_trusted, &cfg.extra_skill_paths)
+    let (mut skills, mut skill_collisions) = match &service {
+        Some(svc) => (svc.resources().skills, Vec::new()),
+        None if cfg.no_skills => crate::skills::discover_extra_only(&cfg.extra_skill_paths),
+        None => {
+            crate::skills::discover_with_diagnostics(&cwd, project_trusted, &cfg.extra_skill_paths)
+        }
     };
     timing.mark("discover prompt templates/skills");
 
@@ -2248,7 +2474,13 @@ pub(crate) async fn serve_session(
     // (a restricted `--tools`/`--exclude-tools` invocation) just adds dead weight (pi-parity fix).
     // Tools are fixed for the whole process (see `build_agent`'s doc comment), so this one check is
     // reused verbatim by `reload`'s own rebuild below rather than re-deriving it.
-    let exec_cell = crate::exec_endpoint::ExecCell::new();
+    // Strict in service mode: an empty cell is an error, never this host. The fallback that makes a
+    // local session convenient (`RealRunner`/`LocalFs`) is, on a replica, a tenant's tool running on
+    // the machine every other tenant shares.
+    let exec_cell = match &service {
+        Some(_) => crate::exec_endpoint::ExecCell::strict(),
+        None => crate::exec_endpoint::ExecCell::new(),
+    };
     // Per-session MCP kit gate (which configured servers' tools are advertised). Defaults to all
     // enabled — matching prior behavior — and is cleared on session switch so tenants cannot inherit
     // each other's enablement the way they must not inherit each other's exec endpoint.
@@ -2256,22 +2488,39 @@ pub(crate) async fn serve_session(
     // A process-wide default, if configured. Per-session `set_exec_endpoint` overrides it, and a
     // session switch re-derives from that session's own record — so this is a starting point, not a
     // floor.
-    match (&cfg.exec_url, &cfg.exec_cmd) {
-        (Some(u), _) => match crate::exec_endpoint::ExecTarget::http(
-            u,
-            &cfg.exec_header,
-            cfg.exec_max_response_bytes,
-        )
-        .await
-        {
-            Ok(t) => exec_cell.set(Some(t)),
-            Err(e) => eprintln!("warning: --exec-url ignored: {e}"),
+    //
+    // Service mode has neither flag (both are refused at startup) and no "starting point" either:
+    // the grant names the sandbox, and a sandbox that doesn't answer the probe **ends the session**
+    // rather than leaving it running with nowhere for its tools to go. That error propagates out of
+    // `serve_session`, which the daemon turns into an error frame on every attached connection.
+    match &service {
+        Some(svc) => {
+            let target = svc
+                .connect_exec(cfg.exec_max_response_bytes)
+                .await
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                    format!("service: this session's sandbox is unreachable: {e}").into()
+                })?;
+            exec_cell.set(Some(target));
+            timing.mark("probe sandbox");
+        }
+        None => match (&cfg.exec_url, &cfg.exec_cmd) {
+            (Some(u), _) => match crate::exec_endpoint::ExecTarget::http(
+                u,
+                &cfg.exec_header,
+                cfg.exec_max_response_bytes,
+            )
+            .await
+            {
+                Ok(t) => exec_cell.set(Some(t)),
+                Err(e) => eprintln!("warning: --exec-url ignored: {e}"),
+            },
+            (None, Some(c)) => match crate::exec_endpoint::ExecTarget::template(c).await {
+                Ok(t) => exec_cell.set(Some(t)),
+                Err(e) => eprintln!("warning: --exec-cmd ignored: {e}"),
+            },
+            (None, None) => {}
         },
-        (None, Some(c)) => match crate::exec_endpoint::ExecTarget::template(c).await {
-            Ok(t) => exec_cell.set(Some(t)),
-            Err(e) => eprintln!("warning: --exec-cmd ignored: {e}"),
-        },
-        (None, None) => {}
     }
     let startup_tools = build_tools(&cfg, cfg.image_auto_resize, &exec_cell, &mcp_enabled);
     let has_read = startup_tools.get("read").is_some();
@@ -2282,14 +2531,17 @@ pub(crate) async fn serve_session(
     // doesn't drop it). `--no-memory` disables it; a bad backend DSN is fatal at startup, before any
     // session runs. The `MEMORY.md` index is read once and injected into the system prompt — a session's
     // memory is surfaced from its start (Claude Code's auto-memory model).
+    //
+    // In service mode the backend is the tenant's own `<home shard>/<tenant>/memory` — never a DSN
+    // (`--memory` is refused) and never a path derived from the replica's cwd.
     let memory_backend: Option<Arc<dyn crate::memory::MemoryBackend>> =
-        if cfg.no_memory || cfg.no_tools {
-            None
-        } else {
-            Some(
+        match (cfg.no_memory || cfg.no_tools, &service) {
+            (true, _) => None,
+            (false, Some(svc)) => Some(svc.memory_backend()),
+            (false, None) => Some(
                 crate::memory::open(cfg.memory.as_deref(), &cwd)
                     .map_err(Box::<dyn std::error::Error + Send + Sync>::from)?,
-            )
+            ),
         };
     let has_memory = memory_backend.is_some();
     // The per-session working-memory mount (`/session`) rides a *shared, swappable* directory cell: a
@@ -2354,7 +2606,16 @@ pub(crate) async fn serve_session(
             // Clear first, unconditionally: whatever the incoming session turns out to want, it must
             // never keep the outgoing session's target even briefly.
             exec_cell.set(None);
-            if let Some(spec) = persistence.meta.exec_endpoint.clone() {
+            // Service mode re-applies the **grant's** target, never a persisted one: the recorded
+            // spec belongs to whichever grant last ran this session, and its credentials are not
+            // persisted at all (see below). The probe already ran at startup, so this is a rebuild
+            // of the same target, not a second round trip's worth of discovery.
+            if let Some(svc) = &service {
+                match svc.connect_exec(cfg.exec_max_response_bytes).await {
+                    Ok(t) => exec_cell.set(Some(t)),
+                    Err(e) => eprintln!("serve: failed to re-attach this session's sandbox: {e}"),
+                }
+            } else if let Some(spec) = persistence.meta.exec_endpoint.clone() {
                 let url = spec.get("url").and_then(Value::as_str).map(str::to_string);
                 let cmd = spec.get("command").and_then(Value::as_str).map(str::to_string);
                 let headers: Vec<String> = spec
@@ -2439,7 +2700,7 @@ pub(crate) async fn serve_session(
             default_base: &cfg.system,
             append: cfg.append_system.as_deref(),
             cwd: &cwd,
-            include_context_files: cfg.context_files,
+            include_context_files: context_files,
             skills: &skills,
             has_read,
             has_todo,
@@ -2448,6 +2709,7 @@ pub(crate) async fn serve_session(
             memory_sections: &memory_sections,
             project_trusted,
             agents: &cfg.agents,
+            disk_overrides,
         });
     timing.mark("build static system prompt");
 
@@ -2553,12 +2815,32 @@ pub(crate) async fn serve_session(
     // `settings::Settings::compaction_enabled`'s own doc comment), finally defaulting to enabled.
     // `settings_store` is kept open for the rest of this process so `set_auto_compaction`, below, can
     // write a later runtime toggle straight back through to the same file.
-    let mut settings_store = crate::settings::SettingsStore::open_default();
+    //
+    // In service mode the store is **not opened at all**: it lives under the replica's `$HOME`, so
+    // reading it would let the operator's machine configure a tenant, and writing it would let one
+    // tenant's toggle reach every other session on the replica. Every `set_*` toggle below stays
+    // session-local there (see `persist_setting!`), and the starting value is the built-in default.
+    let mut settings_store = (!cfg.service_mode).then(crate::settings::SettingsStore::open_default);
     let mut current_auto_compaction = if cfg.no_compaction {
         false
     } else {
-        settings_store.get().compaction_enabled.unwrap_or(true)
+        settings_store
+            .as_ref()
+            .and_then(|s| s.get().compaction_enabled)
+            .unwrap_or(true)
     };
+    // A runtime toggle writes through to the persisted defaults — except in service mode, where the
+    // in-memory change above is the whole effect (it applies for this session's life and nothing
+    // else sees it).
+    macro_rules! persist_setting {
+        ($what:literal, $call:ident ( $($arg:expr),* )) => {
+            if let Some(store) = settings_store.as_mut()
+                && let Err(e) = store.$call($($arg),*)
+            {
+                eprintln!(concat!("serve: failed to persist ", $what, " setting: {}"), e);
+            }
+        };
+    }
     // Mid-stream transport-failure retry (`agent_core::Agent::with_auto_retry`) — on by default;
     // `set_auto_retry` lets an operator debugging a flaky network hop disable it to see the raw failure
     // on the very first hiccup instead of after several silent retries.
@@ -2707,9 +2989,16 @@ pub(crate) async fn serve_session(
 
     // Sends a frame through the writer; if the writer has shut down (stdout closed), stop the control
     // loop — there is no way to deliver any further response, so continuing would only swallow output.
+    //
+    // Every frame passes through `redact_frame` on the way out. It is the one funnel that sees every
+    // idle-path response, which is where a storage error — and so a replica mount path — would
+    // otherwise reach a tenant verbatim.
     macro_rules! emit {
         ($frame:expr) => {
-            if out_tx.send($frame).is_err() {
+            if out_tx
+                .send(redact_frame(service.as_deref(), $frame))
+                .is_err()
+            {
                 break;
             }
         };
@@ -3286,6 +3575,16 @@ pub(crate) async fn serve_session(
             .unwrap_or("")
             .to_string();
 
+        // Service mode refuses a handful of commands outright (see `service::refused_command`).
+        // Checked here, ahead of the dispatch — and again at each busy-loop intercept below, so a
+        // command that is going to be refused never gets there by cancelling a running prompt first.
+        if service.is_some()
+            && let Some(why) = crate::service::refused_command(&ctype)
+        {
+            emit!(response(id, &ctype, false, None, Some(why)));
+            continue;
+        }
+
         match ctype.as_str() {
             "prompt" => {
                 // `output_schema` makes this prompt a callable function: the model must fill the schema
@@ -3327,7 +3626,7 @@ pub(crate) async fn serve_session(
                                 default_base: &cfg.system,
                                 append: cfg.append_system.as_deref(),
                                 cwd: &cwd,
-                                include_context_files: cfg.context_files,
+                                include_context_files: context_files,
                                 skills: &skills,
                                 has_read,
                                 has_todo,
@@ -3336,6 +3635,7 @@ pub(crate) async fn serve_session(
                                 memory_sections: &memory_sections,
                                 project_trusted,
                                 agents: &cfg.agents,
+                                disk_overrides,
                             },
                         );
                         agent = build_agent(
@@ -3405,6 +3705,9 @@ pub(crate) async fn serve_session(
                     crate::lifecycle::Run::begin(
                         Arc::clone(&cfg.lifecycle),
                         persistence.session_id().to_string(),
+                        // One replica emits for many tenants in service mode, so every event says
+                        // whose run it is. Absent (and omitted on the wire) otherwise.
+                        service.as_ref().map(|svc| svc.tenant().to_owned()),
                         id.clone(),
                         current_model.clone(),
                     )
@@ -3701,7 +4004,18 @@ pub(crate) async fn serve_session(
                                             }
                                         };
                                         let cid = c.get("id").and_then(Value::as_str).map(str::to_string);
-                                        match c.get("type").and_then(Value::as_str).unwrap_or("") {
+                                        let ctype = c.get("type").and_then(Value::as_str).unwrap_or("");
+                                        // Service mode gates here too, *ahead* of the self-abort arm
+                                        // below: `fork`/`clone`/`new_session`/`switch_session` cancel
+                                        // the running prompt before they defer, so refusing them only
+                                        // at the idle dispatch would let a refused command kill a run.
+                                        if service.is_some()
+                                            && let Some(why) = crate::service::refused_command(ctype)
+                                        {
+                                            let _ = out_tx.send(response(cid, ctype, false, None, Some(why)));
+                                            continue;
+                                        }
+                                        match ctype {
                                             // Fix 4 (pi-parity gap): the ack is *not* sent here — see
                                             // the flush right after this busy-loop exits, below. Sending
                                             // it immediately (the instant `cancel.cancel()` is called)
@@ -3845,7 +4159,7 @@ pub(crate) async fn serve_session(
                                             "get_state" => {
                                                 let mut data = live_stats.snapshot();
                                                 if let Value::Object(m) = &mut data {
-                                                    insert_session_identity(m, &persistence);
+                                                    insert_session_identity(m, &persistence, service.as_deref());
                                                     m.insert("model".into(), json!(current_model));
                                                     m.insert("message_count".into(), Value::Null);
                                                     m.insert("title".into(), json!(persistence.meta.title));
@@ -3903,7 +4217,7 @@ pub(crate) async fn serve_session(
                                                 // aside.
                                                 let mut data = live_stats.snapshot();
                                                 if let Value::Object(m) = &mut data {
-                                                    insert_session_identity(m, &persistence);
+                                                    insert_session_identity(m, &persistence, service.as_deref());
                                                     for field in [
                                                         "context_usage",
                                                         "user_messages",
@@ -3967,7 +4281,7 @@ pub(crate) async fn serve_session(
                                                 let progress_tx = out_tx.clone();
                                                 let query = c.get("query").and_then(Value::as_str);
                                                 let sessions = persistence
-                                                    .list_with_progress(move |scanned, total| {
+                                                    .list_with_progress(service.as_deref(), move |scanned, total| {
                                                         if should_report_scan_progress(scanned, total) {
                                                             let _ = progress_tx.send(list_progress_frame(progress_id.clone(), "list_sessions", scanned, total));
                                                         }
@@ -3983,7 +4297,7 @@ pub(crate) async fn serve_session(
                                                 let progress_id = cid.clone();
                                                 let progress_tx = out_tx.clone();
                                                 let query = c.get("query").and_then(Value::as_str);
-                                                match persistence.list_all_with_progress(move |scanned, total| {
+                                                match persistence.list_all_with_progress(service.as_deref(), move |scanned, total| {
                                                     if should_report_scan_progress(scanned, total) {
                                                         let _ = progress_tx.send(list_progress_frame(progress_id.clone(), "list_all_sessions", scanned, total));
                                                     }
@@ -4187,6 +4501,14 @@ pub(crate) async fn serve_session(
                                             };
                                             let cid = c.get("id").and_then(Value::as_str).map(str::to_string);
                                             let cmd_type = c.get("type").and_then(Value::as_str).unwrap_or("");
+                                            // Same gate as the live-run loop above: a refused command
+                                            // must not end the retry sequence a run is waiting on.
+                                            if service.is_some()
+                                                && let Some(why) = crate::service::refused_command(cmd_type)
+                                            {
+                                                let _ = out_tx.send(response(cid, cmd_type, false, None, Some(why)));
+                                                continue;
+                                            }
                                             match cmd_type {
                                                 "abort" | "abort_retry" => {
                                                     retry_cancelled = true;
@@ -4678,13 +5000,15 @@ pub(crate) async fn serve_session(
             "get_state" => {
                 let mut data = session_stats(&session, &current_model);
                 if let Value::Object(m) = &mut data {
-                    insert_session_identity(m, &persistence);
+                    insert_session_identity(m, &persistence, service.as_deref());
                     m.insert("model".into(), json!(current_model));
                     m.insert("message_count".into(), json!(session.messages.len()));
                     m.insert("title".into(), json!(persistence.meta.title));
+                    // Never stale in service mode: the recorded cwd *is* `workspace_root`, and the
+                    // staleness check stats the path — on the replica, where it doesn't exist.
                     m.insert(
                         "cwd_stale".into(),
-                        json!(cwd_is_stale(&persistence.meta.cwd, &cwd)),
+                        json!(service.is_none() && cwd_is_stale(&persistence.meta.cwd, &cwd)),
                     );
                     // Task #25 (pi-parity fix): the directory (and, best-effort, branch) the agent's
                     // tools are actually operating against — the live process `cwd`, not
@@ -4693,7 +5017,16 @@ pub(crate) async fn serve_session(
                     // know. See `git_branch`'s own doc comment for why a lookup failure is `null`, not
                     // an error.
                     m.insert("cwd".into(), json!(cwd.display().to_string()));
-                    m.insert("git_branch".into(), json!(git_branch(&cwd).await));
+                    // `null` in service mode: `cwd` is a sandbox path, so running `git` against it
+                    // here would either fail or — worse — answer about the replica's own checkout.
+                    // A later PR runs the lookup through the session's runner instead.
+                    m.insert(
+                        "git_branch".into(),
+                        match &service {
+                            Some(_) => Value::Null,
+                            None => json!(git_branch(&cwd).await),
+                        },
+                    );
                     // Both hardcoded, not stale placeholders: no `prompt`/compaction can possibly be
                     // in flight here at all — this arm only ever runs from the idle main loop, which
                     // processes one command to completion before reading the next, so there is no
@@ -4736,7 +5069,7 @@ pub(crate) async fn serve_session(
                 let progress_tx = out_tx.clone();
                 let query = cmd.get("query").and_then(Value::as_str);
                 let sessions = persistence
-                    .list_with_progress(move |scanned, total| {
+                    .list_with_progress(service.as_deref(), move |scanned, total| {
                         if should_report_scan_progress(scanned, total) {
                             let _ = progress_tx.send(list_progress_frame(
                                 progress_id.clone(),
@@ -4764,7 +5097,7 @@ pub(crate) async fn serve_session(
                 let progress_tx = out_tx.clone();
                 let query = cmd.get("query").and_then(Value::as_str);
                 match persistence
-                    .list_all_with_progress(move |scanned, total| {
+                    .list_all_with_progress(service.as_deref(), move |scanned, total| {
                         if should_report_scan_progress(scanned, total) {
                             let _ = progress_tx.send(list_progress_frame(
                                 progress_id.clone(),
@@ -4803,7 +5136,7 @@ pub(crate) async fn serve_session(
             // `Persistence::delete`'s doc comment. Idempotent: deleting an absent (or already-deleted)
             // session id is a successful no-op.
             "delete_session" => match cmd.get("session_id").and_then(Value::as_str) {
-                Some(target) => match persistence.delete(target) {
+                Some(target) => match persistence.delete(service.as_deref(), target) {
                     Ok(()) => emit!(response(id, "delete_session", true, None, None)),
                     Err(e) => emit!(response(
                         id,
@@ -4827,14 +5160,24 @@ pub(crate) async fn serve_session(
             // (id/deleted_at/original_path — see `session_store::TrashEntry`); `restore_session` moves an
             // entry back out. Deliberately not a full trash-management UI (no bulk purge, no age-based
             // pruning) — a low-priority nice-to-have, not a core session-lifecycle feature.
-            "list_trash" => match persistence.list_trash() {
-                Ok(trash) => emit!(response(
-                    id,
-                    "list_trash",
-                    true,
-                    Some(json!({ "trash": trash })),
-                    None,
-                )),
+            "list_trash" => match persistence.list_trash(service.as_deref()) {
+                Ok(mut trash) => {
+                    // `original_path` is a replica mount path. The id is what `restore_session`
+                    // takes, so the path was only ever informational — redacted rather than dropped
+                    // so the shape of the response doesn't change per mode.
+                    if let Some(svc) = &service {
+                        for entry in &mut trash {
+                            entry.original_path = svc.redact(&entry.original_path);
+                        }
+                    }
+                    emit!(response(
+                        id,
+                        "list_trash",
+                        true,
+                        Some(json!({ "trash": trash })),
+                        None,
+                    ));
+                }
                 Err(e) => emit!(response(
                     id,
                     "list_trash",
@@ -4844,7 +5187,7 @@ pub(crate) async fn serve_session(
                 )),
             },
             "restore_session" => match cmd.get("session_id").and_then(Value::as_str) {
-                Some(target) => match persistence.restore_session(target) {
+                Some(target) => match persistence.restore_session(service.as_deref(), target) {
                     Ok(true) => emit!(response(id, "restore_session", true, None, None)),
                     Ok(false) => emit!(response(
                         id,
@@ -4922,7 +5265,13 @@ pub(crate) async fn serve_session(
                 // Same default as `fork` itself, above — a preview must match what `fork` would
                 // actually produce.
                 let before = cmd.get("before").and_then(Value::as_bool).unwrap_or(true);
-                match persistence.fork_messages(&target_id, upto, entry_id, before) {
+                match persistence.fork_messages(
+                    service.as_deref(),
+                    &target_id,
+                    upto,
+                    entry_id,
+                    before,
+                ) {
                     Ok(messages) => emit!(response(
                         id,
                         "preview_fork",
@@ -4958,6 +5307,42 @@ pub(crate) async fn serve_session(
                     cache_read_tokens: session.cache_read_tokens,
                     cache_write_tokens: session.cache_write_tokens,
                 };
+                // Service mode returns the document **inline**: writing a file would put a whole
+                // transcript on the replica's disk (and hand the caller a host path to read it
+                // back), and there is no per-tenant filesystem here to write it to instead. An
+                // explicit `output_path` is refused rather than silently ignored.
+                if service.is_some() {
+                    if output_path.is_some() {
+                        emit!(response(
+                            id,
+                            "export_html",
+                            false,
+                            None,
+                            Some(
+                                "refused in service mode: `output_path` writes to the replica's \
+                                  disk — omit it and read `data.html` from this response"
+                            ),
+                        ));
+                        continue;
+                    }
+                    let html = crate::export::render_html_full(
+                        &persistence.meta,
+                        &session.messages,
+                        &branches,
+                        Some(usage),
+                        events,
+                        Some(&system_prompt),
+                        Some(&tool_defs),
+                    );
+                    emit!(response(
+                        id,
+                        "export_html",
+                        true,
+                        Some(json!({ "html": html })),
+                        None,
+                    ));
+                    continue;
+                }
                 match crate::export::export_html_full(
                     &persistence.meta,
                     &session.messages,
@@ -5157,7 +5542,7 @@ pub(crate) async fn serve_session(
                 // different field sets for the same command.
                 let mut data = session_stats(&session, &current_model);
                 if let Value::Object(m) = &mut data {
-                    insert_session_identity(m, &persistence);
+                    insert_session_identity(m, &persistence, service.as_deref());
                     m.insert("pending_tool_ids".into(), json!(Vec::<String>::new()));
                 }
                 emit!(response(id, "get_session_stats", true, Some(data), None));
@@ -5278,7 +5663,7 @@ pub(crate) async fn serve_session(
                         default_base: &cfg.system,
                         append: cfg.append_system.as_deref(),
                         cwd: &cwd,
-                        include_context_files: cfg.context_files,
+                        include_context_files: context_files,
                         skills: &skills,
                         has_read,
                         has_todo,
@@ -5287,6 +5672,7 @@ pub(crate) async fn serve_session(
                         memory_sections: &memory_sections,
                         project_trusted,
                         agents: &cfg.agents,
+                        disk_overrides,
                     },
                 );
                 // A full rebuild, not just `agent.set_system(...)`: `reload` may have changed the agent
@@ -5767,9 +6153,7 @@ pub(crate) async fn serve_session(
                     // `default_project_trust`). Best-effort: a failed write still applies for the rest
                     // of *this* process (the in-memory toggle above already took effect), it just won't
                     // survive a restart.
-                    if let Err(e) = settings_store.set_compaction_enabled(Some(enabled)) {
-                        eprintln!("serve: failed to persist auto-compaction setting: {e}");
-                    }
+                    persist_setting!("auto-compaction", set_compaction_enabled(Some(enabled)));
                     agent = build_agent(
                         &exec_cell,
                         client.clone(),
@@ -5858,9 +6242,7 @@ pub(crate) async fn serve_session(
             "set_block_images" => match cmd.get("enabled").and_then(Value::as_bool) {
                 Some(enabled) => {
                     current_block_images = enabled;
-                    if let Err(e) = settings_store.set_block_images(Some(enabled)) {
-                        eprintln!("serve: failed to persist block-images setting: {e}");
-                    }
+                    persist_setting!("block-images", set_block_images(Some(enabled)));
                     agent = build_agent(
                         &exec_cell,
                         client.clone(),
@@ -5902,9 +6284,7 @@ pub(crate) async fn serve_session(
             "set_image_auto_resize" => match cmd.get("enabled").and_then(Value::as_bool) {
                 Some(enabled) => {
                     current_image_auto_resize = enabled;
-                    if let Err(e) = settings_store.set_image_auto_resize(Some(enabled)) {
-                        eprintln!("serve: failed to persist image-auto-resize setting: {e}");
-                    }
+                    persist_setting!("image-auto-resize", set_image_auto_resize(Some(enabled)));
                     agent = build_agent(
                         &exec_cell,
                         client.clone(),
@@ -5960,9 +6340,7 @@ pub(crate) async fn serve_session(
                     // `set_auto_compaction` above uses — a failed write just won't survive a restart.
                     // See `settings::Settings::steering_mode`'s own doc comment: this RPC handler is
                     // exactly where that persistence is expected to happen.
-                    if let Err(e) = settings_store.set_steering_mode(Some(mode.to_string())) {
-                        eprintln!("serve: failed to persist steering_mode setting: {e}");
-                    }
+                    persist_setting!("steering_mode", set_steering_mode(Some(mode.to_string())));
                     emit!(response(
                         id,
                         "set_steering_mode",
@@ -5988,9 +6366,7 @@ pub(crate) async fn serve_session(
                     } else {
                         agent_core::QueueMode::OneAtATime
                     });
-                    if let Err(e) = settings_store.set_follow_up_mode(Some(mode.to_string())) {
-                        eprintln!("serve: failed to persist follow_up_mode setting: {e}");
-                    }
+                    persist_setting!("follow_up_mode", set_follow_up_mode(Some(mode.to_string())));
                     emit!(response(
                         id,
                         "set_follow_up_mode",
@@ -6837,16 +7213,26 @@ fn model_override_extra_headers(model: &str) -> std::collections::HashMap<String
 /// no bearing on a GitHub Copilot one). This is the fix for the credential/routing having previously
 /// been resolved exactly once, before `serve` even started, and then silently reused — stale provider,
 /// stale routing — by every later model switch for the rest of the process's life.
+/// **Service mode takes the credential from the grant and nothing else.** `resolve_gateway_credential`
+/// is a ladder of host sources — `--key`, `AI_AGENT_KEY`, the ambient provider env
+/// (`ANTHROPIC_API_KEY`, …), a `models.json` override, the operator's OAuth store — and every rung
+/// of it belongs to the replica, not to the tenant. So the whole ladder (and the `models.json`
+/// headers below it) is skipped: the grant's sealed `gateway_key` is the session's only credential,
+/// and if it is wrong the session fails rather than silently billing whoever the replica is logged
+/// in as. The retry / shared-client / idle-timeout chain is unchanged either way.
 fn build_gateway_client(cfg: &ServeConfig, model: &str) -> Result<GatewayClient, String> {
-    let credential = resolve_gateway_credential(cfg.key.clone(), model, &cfg.provider_env)?;
-    let client = match credential {
-        GatewayCredential::Static(key) => {
-            GatewayClient::new(cfg.gateway.clone(), key).map_err(|e| e.to_string())?
-        }
-        GatewayCredential::Oauth(source) => {
-            GatewayClient::with_credential_source(cfg.gateway.clone(), source)
-                .map_err(|e| e.to_string())?
-        }
+    let service_key = cfg.service.as_ref().map(|svc| svc.gateway_key().to_owned());
+    let client = match service_key {
+        Some(key) => GatewayClient::new(cfg.gateway.clone(), key).map_err(|e| e.to_string())?,
+        None => match resolve_gateway_credential(cfg.key.clone(), model, &cfg.provider_env)? {
+            GatewayCredential::Static(key) => {
+                GatewayClient::new(cfg.gateway.clone(), key).map_err(|e| e.to_string())?
+            }
+            GatewayCredential::Oauth(source) => {
+                GatewayClient::with_credential_source(cfg.gateway.clone(), source)
+                    .map_err(|e| e.to_string())?
+            }
+        },
     }
     .with_retry(
         cfg.retry_max_retries
@@ -6864,7 +7250,12 @@ fn build_gateway_client(cfg: &ServeConfig, model: &str) -> Result<GatewayClient,
     // sites: chained right after `with_retry`, matching `run_task`'s own ordering — harmless (a no-op)
     // when no override configures any headers, since an empty map is also `GatewayClient::new`'s own
     // default.
-    .with_extra_headers(model_override_extra_headers(model));
+    // Empty in service mode: `models.json` is the replica operator's own file.
+    .with_extra_headers(if cfg.service_mode {
+        std::collections::HashMap::new()
+    } else {
+        model_override_extra_headers(model)
+    });
     // Task #30 (pi-parity feature): `run`'s identical `--retry-max-backoff-ms` wiring (`main.rs::
     // run_task`'s own `with_max_backoff` call site) previously had no `serve` counterpart — called on
     // every model switch, same as `with_retry` above, so the override survives a mid-run switch.
@@ -6981,6 +7372,9 @@ fn build_subagent_ctx(
         },
         cwd: cwd.to_path_buf(),
         project_trusted,
+        // A child is as fail-closed about the replica's filesystem as its parent (see
+        // `PromptOptions::disk_overrides`) — otherwise delegating would be a way around it.
+        disk_overrides: !cfg.service_mode,
         prompt_guidelines: Vec::new(),
         parent_model: parent_model.to_string(),
         parent_cache_key: parent_model.to_string(),
@@ -7824,11 +8218,21 @@ fn message_type_breakdown(session: &Session) -> MessageTypeBreakdown {
 /// previously omitted both in its idle response, and its entire busy response, unlike `get_state`'s own
 /// sibling arms, which already backfilled them from these same two sources). Shared so the two RPC
 /// types can't drift out of shape with each other again.
-fn insert_session_identity(m: &mut Map<String, Value>, persistence: &Persistence) {
+/// `service` is `Some` in service mode, where `session_file` reports `null`: the path is a mount on
+/// the replica, which is this tenant's storage but not its filesystem — nothing on the other end can
+/// open it, and publishing it would leak the fleet's layout. The id is the address that matters.
+fn insert_session_identity(
+    m: &mut Map<String, Value>,
+    persistence: &Persistence,
+    service: Option<&crate::service::ServiceSession>,
+) {
     m.insert("session_id".into(), json!(persistence.session_id()));
     m.insert(
         "session_file".into(),
-        json!(persistence.session_file().map(|p| p.display().to_string())),
+        match service {
+            Some(_) => Value::Null,
+            None => json!(persistence.session_file().map(|p| p.display().to_string())),
+        },
     );
 }
 
@@ -10259,13 +10663,13 @@ mod tests {
             meta: SessionMeta::new("/w", "claude-test"),
         };
         let err = persistence
-            .list_trash()
+            .list_trash(None)
             .expect_err("must fail clearly outside repo mode");
         assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
         assert!(err.to_string().contains("not in repo mode"), "got: {err}");
 
         let err = persistence
-            .restore_session("some-id")
+            .restore_session(None, "some-id")
             .expect_err("must fail clearly outside repo mode");
         assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
     }
@@ -10279,15 +10683,15 @@ mod tests {
         let other = repo.create(SessionMeta::new("/w", "claude-test")).unwrap();
         let other_id = other.meta().id.clone();
 
-        assert!(persistence.list_trash().unwrap().is_empty());
-        persistence.delete(&other_id).unwrap();
-        let trash = persistence.list_trash().unwrap();
+        assert!(persistence.list_trash(None).unwrap().is_empty());
+        persistence.delete(None, &other_id).unwrap();
+        let trash = persistence.list_trash(None).unwrap();
         assert_eq!(trash.len(), 1);
         assert_eq!(trash[0].id, other_id);
 
-        assert!(persistence.restore_session(&other_id).unwrap());
-        assert!(persistence.list_trash().unwrap().is_empty());
-        assert!(!persistence.restore_session("never-existed").unwrap());
+        assert!(persistence.restore_session(None, &other_id).unwrap());
+        assert!(persistence.list_trash(None).unwrap().is_empty());
+        assert!(!persistence.restore_session(None, "never-existed").unwrap());
     }
 
     #[test]
