@@ -365,8 +365,9 @@ fn provider_env_var(id: providers::ProviderId) -> Option<&'static str> {
 /// Skips any candidate whose key is absent, so a partial keyring smokes what it can.
 ///
 /// Every catalog pair is in this walk — Claude, GPT, Grok, DeepSeek, Mistral, and the
-/// Groq/Together/Fireworks llama+qwen rows. A new row is hit automatically when its
-/// provider key is in the environment; do not add a parallel allowlist here.
+/// Groq/Together/Fireworks llama / qwen / Kimi / GLM / MiniMax / gpt-oss rows. A new row is
+/// hit automatically when its provider key is in the environment; do not add a parallel
+/// allowlist here.
 #[tokio::test]
 #[ignore = "hits real providers and bills tiny requests; run via `mise run test:smoke`"]
 async fn catalog_rows_are_servable() {
