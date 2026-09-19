@@ -1566,7 +1566,9 @@ container. Two divergences are asserted **by name** rather than described: with 
 `grep -r` gains `.gitignore`d matches and _loses_ files containing non-UTF-8 bytes (`grep -I`
 classifies them as binary). `tests/fs_backend_cost.rs` counts backend operations per tool
 (`grep` 1, `ls`/`find` 2, `read`/`write`/`edit` 3) so the latency of any future remote backend can be
-estimated from a measured multiplier rather than a guess.
+estimated from a measured multiplier rather than a guess. Those are backend operations, not commands:
+over `ShellFs` a `write_bytes` is one command when the target delivers stdin, and one per 48 KiB when
+it does not (see the exec protocol below).
 
 ### Running the tools against a remote exec endpoint
 
@@ -1606,6 +1608,73 @@ into a shell string, so a model-supplied path cannot be reparsed as syntax on th
 `tests/exec_endpoint.rs` drives all of this against a ~30-line mock provider — the same shim someone
 would write in front of a real one. If standing up a fake provider took more than that, the protocol
 would be too big.
+
+#### The protocol (v1.1)
+
+One `POST` per command:
+
+```jsonc
+// request — `cwd` and `stdin_base64` are optional
+{ "command": "cat", "args": [], "cwd": "/work", "timeout_ms": 120000, "stdin_base64": "aGVsbG8=" }
+// response — 200
+{ "exit_code": 0, "stdout": "hello", "stderr": "" }
+```
+
+v1.1 is v1 plus one optional request field, **`stdin_base64`**: standard base64 of the bytes to write
+to the command's stdin, which is then closed. Absent, the command gets no stdin: v1 behavior. A v1
+endpoint keeps working unchanged. It just never gets stdin.
+
+**Why stdin exists: the 128 KiB argv limit.** A remote write used to ship the whole file as _one_
+base64 argv entry, and Linux caps a single argv string at 128 KiB (`MAX_ARG_STRLEN`), so every
+remote `write`/`edit` of a file over ~96 KiB failed with `Argument list too long`. The content now
+travels one of two ways, chosen by `Capabilities::stdin`:
+
+- **stdin** — one command, `cat > <temp>`, then a size check and `mv -f` over the target.
+- **argv chunks** — for a target without stdin: 48 KiB of raw bytes per command (64 KiB of base64,
+  half the per-entry cap), appended to a temp, with the last command committing via `mv -f`. One
+  command per 48 KiB, so a small file costs the same single round trip as before.
+
+Both paths keep the write atomic from a reader's view. The target changes only at the `mv`, so it is
+the old file or the new one, never a partial. The temp gets an unpredictable name (the same
+`temp_suffix` `LocalFs` uses) and is created under `set -C`, the shell's `create_new`, so a planted
+symlink cannot redirect the write. The temp is removed on any failure: by the script for failures it
+sees, and by a best-effort `rm -f` from the host for the ones it cannot see, such as a transport error
+between chunks.
+
+**The probe is what keeps old endpoints safe.** A v1 endpoint ignores the unknown `stdin_base64` like
+any other extra field and runs the command with empty input. So does `docker exec` without `-i`.
+Trusting stdin there would turn every write into an _empty file_, so `ShellFs::connect` proves it
+instead of assuming it: it runs `cat` with stdin `stdin-probe`, and the capability holds only if
+`stdin-probe` comes back. `CommandRunner::run_with_stdin` defaults to `ErrorKind::Unsupported`, so a
+runner without stdin support probes as absent too. Because a probe is only one sample (a
+load-balanced endpoint mid-rollout can pass it on one replica and take the write on another), both
+write scripts also check that the temp holds exactly `bytes.len()` bytes before the `mv`. A lost
+stdin is then a `short write` error, and the old file is left intact.
+
+stdin exists for `ShellFs`'s writes and nothing else. `bash` still runs every model command with
+stdin closed (`Stdio::null()`).
+
+**The response is capped.** `HttpExecRunner` reads the body incrementally, up to
+`DEFAULT_MAX_RESPONSE_BYTES` (16 MiB; `--exec-max-response-bytes` on `run` and `serve`, where it
+also applies to every per-session `set_exec_endpoint`). It stops reading at the cap, and a declared
+`Content-Length` over the cap fails before any of the body is read. **An oversized response is an
+error, not a truncated result.** The body is one JSON object, so a prefix cannot be parsed. There is
+no honest partial `ExecResult` to hand back (the exit code may come after the output), and passing
+off whatever fit as the command's output would be a confident wrong answer. The error says the
+command _ran_, so the model narrows its output (`| head`) rather than blindly re-running something
+that may not be idempotent. The cap bounds memory in a process that may serve many tenants, and it
+sits far above anything a tool consumes (`bash` keeps ~30 KB), so legitimate output never meets it.
+
+The endpoint must accept request bodies as large as the files the agent writes (≈4/3 of the file
+size with `stdin_base64`).
+
+`tests/exec_endpoint_writes.rs` covers 200 KiB writes through both a v1.1 and a v1 mock (the v1 one
+must fall back to chunks, and never produce an empty file), the size check under a probe that lied,
+every chunk boundary, and templates that forward stdin and ones that swallow it.
+`tests/exec_endpoint_response_cap.rs` streams an endless body and a lying `Content-Length` at the
+runner. `fs_backend_parity.rs` diffs both write paths against `LocalFs`: the ripgrep rung probes
+stdin as present, and the POSIX rung pins it absent. The CI `exec-live` shard runs the chunked path
+for real on busybox, since its `docker exec` has no `-i`.
 
 ### Run lifecycle
 

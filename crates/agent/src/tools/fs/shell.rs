@@ -36,6 +36,12 @@ use crate::tools::exec::{CommandRunner, ExecResult};
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
 /// Capability probes answer in milliseconds or not at all; they must never hold up an attach.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+/// What the stdin probe feeds `cat`, and must read back.
+const STDIN_PROBE: &str = "stdin-probe";
+/// Raw bytes per argv chunk when stdin is unavailable: 48 KiB, which base64s to exactly 64 KiB — half
+/// of Linux's 128 KiB cap on a single argv string (`MAX_ARG_STRLEN`), leaving the whole argv far under
+/// the kernel's total `ARG_MAX` as well.
+const WRITE_CHUNK: usize = 48 * 1024;
 
 /// What the target actually has, probed once at attach.
 ///
@@ -54,6 +60,14 @@ pub struct Capabilities {
     pub grep_null: bool,
     /// `find -printf` — type and size in one pass. GNU find and `bfs` have it; **busybox does not**.
     pub find_printf: bool,
+    /// The runner demonstrably delivers stdin: `cat` echoed a probe string back. File writes then send
+    /// their content on stdin in one call. Without it they go as argv-sized chunks, because an argv
+    /// entry is capped at 128 KiB and a whole file does not fit in one.
+    ///
+    /// **Proven, never assumed.** A v1 exec endpoint ignores the stdin field it does not know and
+    /// runs `cat` on empty input; `docker exec` without `-i` does the same. Writing through either as
+    /// though stdin arrived would replace the file with an *empty* one.
+    pub stdin: bool,
 }
 
 /// Which program a search will actually use — the fallback ladder, named so it can be logged.
@@ -108,10 +122,16 @@ impl Capabilities {
             &["/dev/null", "-maxdepth", "0", "-printf", "%y"],
         )
         .await;
+        // An echo, not an `Ok`: only the bytes coming back prove they went in. See `Self::stdin`.
+        let stdin = runner
+            .run_with_stdin("cat", &[], None, PROBE_TIMEOUT, STDIN_PROBE.as_bytes())
+            .await
+            .is_ok_and(|r| r.code == Some(0) && r.stdout == STDIN_PROBE);
         Self {
             rg,
             grep_null,
             find_printf,
+            stdin,
         }
     }
 
@@ -279,20 +299,48 @@ impl FsBackend for ShellFs {
             .map_err(|e| FsError::Backend(format!("read {}: {e}", path.display())))
     }
 
+    /// Write-temp-then-`mv`, the same shape [`crate::tools::write_atomic`] uses locally, so a reader or
+    /// a crash sees the old file or the new one and never a partial. The content travels on stdin when
+    /// the target has proven it delivers stdin ([`Capabilities::stdin`]) and as argv-sized base64
+    /// chunks otherwise — never as one argv entry, which Linux caps at 128 KiB.
+    ///
+    /// Either way the temp's size is checked against `bytes.len()` before the `mv`, so a transport
+    /// that silently dropped or cut short the content fails the write instead of committing it.
     async fn write_bytes(&self, path: &Path, bytes: &[u8]) -> Result<(), FsError> {
-        let args = sh_script(
-            WRITE_ATOMIC_SCRIPT,
-            &[path.to_string_lossy().into_owned(), encode_base64(bytes)],
-        );
-        let result = self.exec("sh", &args).await?;
-        if result.code != Some(0) {
-            return Err(FsError::Backend(format!(
-                "write {}: {}",
-                path.display(),
-                first_line_or(&result.stderr, "command failed")
-            )));
+        let target = path.to_string_lossy().into_owned();
+        // Chosen here rather than by the script's `$$` because the chunked path spans several shells,
+        // and unpredictable for the reason `LocalFs`'s is: a preplanted name cannot redirect the write.
+        let tmp = format!("{target}.tmp.{}", crate::tools::temp_suffix());
+        let outcome = if self.caps.stdin {
+            let args = sh_script(
+                WRITE_STDIN_SCRIPT,
+                &[target, tmp.clone(), bytes.len().to_string()],
+            );
+            self.runner
+                .run_with_stdin("sh", &args, None, self.timeout, bytes)
+                .await
+                .map_err(|e| FsError::Backend(format!("sh: {e}")))
+        } else {
+            self.write_chunks(&target, &tmp, bytes).await
+        };
+        match outcome {
+            Ok(result) if result.code == Some(0) => Ok(()),
+            failed => {
+                // The compensating action. The scripts remove the temp on every failure *they* see;
+                // this covers the ones they cannot — a transport error or a timeout between chunks.
+                let _ = self
+                    .exec("rm", &["-f".to_string(), "--".to_string(), tmp])
+                    .await;
+                Err(match failed {
+                    Ok(result) => FsError::Backend(format!(
+                        "write {}: {}",
+                        path.display(),
+                        first_line_or(&result.stderr, "command failed")
+                    )),
+                    Err(e) => e,
+                })
+            }
         }
-        Ok(())
     }
 
     async fn write_if_unchanged(
@@ -645,6 +693,42 @@ impl ShellFs {
             .await
             .map_err(|e| FsError::Backend(format!("{program}: {e}")))
     }
+
+    /// Assemble `bytes` into `tmp` one argv-sized chunk per command, committing to `target` with the
+    /// last. Returns the first failed command's result, or the committing one's.
+    ///
+    /// The fallback for a target without stdin: `WRITE_CHUNK` raw bytes per round trip, so a file
+    /// costs one command per 48 KiB — the same single command as before for anything smaller.
+    async fn write_chunks(
+        &self,
+        target: &str,
+        tmp: &str,
+        bytes: &[u8],
+    ) -> Result<ExecResult, FsError> {
+        let size = bytes.len().to_string();
+        let mut chunks = bytes.chunks(WRITE_CHUNK).peekable();
+        let mut first = true;
+        loop {
+            // An empty file is one empty chunk: the temp must still be created and committed.
+            let chunk = chunks.next().unwrap_or_default();
+            let last = chunks.peek().is_none();
+            let args = sh_script(
+                WRITE_CHUNK_SCRIPT,
+                &[
+                    tmp.to_string(),
+                    encode_base64(chunk),
+                    if first { "new" } else { "append" }.to_string(),
+                    if last { target } else { "" }.to_string(),
+                    size.clone(),
+                ],
+            );
+            let result = self.exec("sh", &args).await?;
+            if result.code != Some(0) || last {
+                return Ok(result);
+            }
+            first = false;
+        }
+    }
 }
 
 /// Compile the glob with exactly the settings [`super::local::LocalFs`] uses, so the two backends
@@ -888,11 +972,13 @@ fn decode_base64(s: &str) -> Result<Vec<u8>, String> {
 //
 // 1. `ExecResult::stdout` is a `String`, so any byte a command emits that isn't valid UTF-8 is
 //    lossily replaced before this code ever sees it. Reading a PNG through it would silently corrupt
-//    the image. Every operation that moves file *content* therefore base64s it on the target — pure
-//    ASCII, losslessly survivable — and decodes host-side.
+//    the image. Every operation that moves file *content* through a string therefore base64s it —
+//    pure ASCII, losslessly survivable. (A write whose target delivers stdin sends raw bytes there
+//    instead; stdin is bytes, not a string, so the problem never arises.)
 // 2. A byte *window* (`read_bytes(path, offset, max)`) has no argv-only spelling: `head -c` cannot
-//    skip, `base64` cannot window. These are the module's only pipelines, and they use the sanctioned
-//    form — a **fixed** script with paths passed as positional parameters, never interpolated.
+//    skip, `base64` cannot window; and a write must be assembled in a temp and renamed. These are the
+//    module's only pipelines, and they use the sanctioned form — a **fixed** script with paths passed
+//    as positional parameters, never interpolated.
 
 /// Build argv for `sh -c <fixed script> sh <arg>...`.
 ///
@@ -955,15 +1041,46 @@ if [ ! -r "$1" ]; then
 fi
 exec dd if="$1" iflag=skip_bytes,count_bytes skip="$2" count="$3" status=none | base64 -w0"#;
 
-/// Decode base64 into a sibling temp file and `mv` it over the target — the same
-/// write-temp-then-rename shape [`crate::tools::write_atomic`] uses locally, so a reader or a crash
-/// sees the old file or the new one and never a partial. The temp is removed on any failure.
-const WRITE_ATOMIC_SCRIPT: &str = r#"tmp="$1.tmp.$$"
-if printf %s "$2" | base64 -d > "$tmp"; then
-  mv -f "$tmp" "$1" || { rm -f "$tmp"; exit 1; }
+/// Write stdin to the temp `$2`, check it holds exactly `$3` bytes, and `mv` it over the target `$1`.
+/// The temp is removed on any failure.
+///
+/// **The size check is what makes a lost stdin a failed write rather than an empty file.** The probe
+/// already refuses this path to a transport that drops stdin, but a probe is one sample: an endpoint
+/// behind a load balancer mid-rollout can pass it on one replica and answer the write from another.
+/// `set -C` is the shell's `create_new` — it refuses to follow anything preplanted at the temp name.
+/// `$n` is unquoted on purpose: some `wc` implementations pad the count with spaces.
+const WRITE_STDIN_SCRIPT: &str = r#"set -C
+if cat > "$2"; then
+  n=$(wc -c < "$2")
+  if [ $n -eq "$3" ]; then
+    mv -f "$2" "$1" && exit 0
+  else
+    echo "short write: $n of $3 bytes arrived on stdin" >&2
+  fi
+fi
+rm -f "$2"
+exit 1"#;
+
+/// One argv-sized piece of a write, for a target without stdin: decode base64 `$2` into the temp `$1`
+/// (`new` in `$3` creates it, anything else appends). When `$4` names the target this is the last
+/// piece: check the temp holds exactly `$5` bytes and `mv` it into place. The temp is removed on any
+/// failure; the target is untouched until the `mv`, so a reader never sees a partial file.
+/// POSIX `sh` and busybox alike — this is the path Alpine targets without `-i` take.
+const WRITE_CHUNK_SCRIPT: &str = r#"if [ "$3" = new ]; then
+  set -C
+  printf %s "$2" | base64 -d > "$1"
 else
-  rm -f "$tmp"; exit 1
-fi"#;
+  printf %s "$2" | base64 -d >> "$1"
+fi || { rm -f "$1"; exit 1; }
+[ -z "$4" ] && exit 0
+n=$(wc -c < "$1")
+if [ $n -eq "$5" ]; then
+  mv -f "$1" "$4" && exit 0
+else
+  echo "short write: $n of $5 bytes assembled" >&2
+fi
+rm -f "$1"
+exit 1"#;
 
 /// stderr from a *successful* search — an unreadable path, typically. Empty stderr means nothing to
 /// report, which is the common case.

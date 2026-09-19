@@ -644,6 +644,10 @@ pub struct ServeConfig {
     pub exec_url: Option<String>,
     pub exec_header: Vec<String>,
     pub exec_cmd: Option<String>,
+    /// `--exec-max-response-bytes`: the most any one HTTP exec response may be, for the default
+    /// endpoint *and* every per-session `set_exec_endpoint` — the cap protects this process, which
+    /// every tenant shares. [`crate::exec_endpoint::DEFAULT_MAX_RESPONSE_BYTES`] when unset.
+    pub exec_max_response_bytes: usize,
     /// Run-lifecycle emitter. [`crate::lifecycle::NoLifecycle`] when unconfigured — zero I/O, no
     /// worker. Constructed once at process startup (`lifecycle::open`) so a malformed URL fails
     /// before any session runs, and cloned (the `Arc`) into every daemon session so they share one
@@ -2248,7 +2252,13 @@ pub(crate) async fn serve_session(
     // session switch re-derives from that session's own record — so this is a starting point, not a
     // floor.
     match (&cfg.exec_url, &cfg.exec_cmd) {
-        (Some(u), _) => match crate::exec_endpoint::ExecTarget::http(u, &cfg.exec_header).await {
+        (Some(u), _) => match crate::exec_endpoint::ExecTarget::http(
+            u,
+            &cfg.exec_header,
+            cfg.exec_max_response_bytes,
+        )
+        .await
+        {
             Ok(t) => exec_cell.set(Some(t)),
             Err(e) => eprintln!("warning: --exec-url ignored: {e}"),
         },
@@ -2352,7 +2362,11 @@ pub(crate) async fn serve_session(
                     })
                     .unwrap_or_default();
                 let restored = match (url.as_deref(), cmd.as_deref()) {
-                    (Some(u), _) => crate::exec_endpoint::ExecTarget::http(u, &headers).await.ok(),
+                    (Some(u), _) => {
+                        crate::exec_endpoint::ExecTarget::http(u, &headers, cfg.exec_max_response_bytes)
+                            .await
+                            .ok()
+                    }
                     (None, Some(c)) => crate::exec_endpoint::ExecTarget::template(c).await.ok(),
                     (None, None) => None,
                 };
@@ -4417,9 +4431,13 @@ pub(crate) async fn serve_session(
                     .unwrap_or_default();
                 let outcome = match (url, exec_cmd) {
                     (Some(_), Some(_)) => Err("give `url` or `command`, not both".to_string()),
-                    (Some(u), None) => crate::exec_endpoint::ExecTarget::http(u, &headers)
-                        .await
-                        .map(Some),
+                    (Some(u), None) => crate::exec_endpoint::ExecTarget::http(
+                        u,
+                        &headers,
+                        cfg.exec_max_response_bytes,
+                    )
+                    .await
+                    .map(Some),
                     (None, Some(c)) => crate::exec_endpoint::ExecTarget::template(c)
                         .await
                         .map(Some),
