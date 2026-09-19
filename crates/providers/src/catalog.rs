@@ -308,13 +308,126 @@ const fn llama_3_3() -> [Candidate; 4] {
     ]
 }
 
+/// Groq + Together + OpenRouter for GPT-OSS 20B. Same shared id on every host; Fireworks was not
+/// live-verified for the 20B spelling the way 120B was.
+const fn gpt_oss_20b() -> [Candidate; 3] {
+    [
+        Candidate {
+            provider: ProviderId::Groq,
+            upstream_model: "openai/gpt-oss-20b",
+            path: "/openai/v1/chat/completions",
+        },
+        Candidate {
+            provider: ProviderId::Together,
+            upstream_model: "openai/gpt-oss-20b",
+            path: "/v1/chat/completions",
+        },
+        Candidate {
+            provider: ProviderId::OpenRouter,
+            upstream_model: "openai/gpt-oss-20b",
+            path: "/api/v1/chat/completions",
+        },
+    ]
+}
+
+/// Groq + Together + Fireworks + OpenRouter for GPT-OSS 120B. Catalog name is the shared
+/// `openai/gpt-oss-120b` Groq/Together/OpenRouter id; Fireworks keeps its own spelling as an alias.
+/// Cerebras's bare `gpt-oss-120b` is not listed — `for_model_id` prefix-matches `gpt-` to OpenAI.
+const fn gpt_oss_120b() -> [Candidate; 4] {
+    [
+        Candidate {
+            provider: ProviderId::Groq,
+            upstream_model: "openai/gpt-oss-120b",
+            path: "/openai/v1/chat/completions",
+        },
+        Candidate {
+            provider: ProviderId::Together,
+            upstream_model: "openai/gpt-oss-120b",
+            path: "/v1/chat/completions",
+        },
+        Candidate {
+            provider: ProviderId::Fireworks,
+            upstream_model: "accounts/fireworks/models/gpt-oss-120b",
+            path: "/inference/v1/chat/completions",
+        },
+        Candidate {
+            provider: ProviderId::OpenRouter,
+            upstream_model: "openai/gpt-oss-120b",
+            path: "/api/v1/chat/completions",
+        },
+    ]
+}
+
+/// Together + Fireworks + OpenRouter for Kimi K3. Canonical name is the OpenRouter slug people send.
+const fn kimi_k3() -> [Candidate; 3] {
+    [
+        Candidate {
+            provider: ProviderId::Together,
+            upstream_model: "moonshotai/Kimi-K3",
+            path: "/v1/chat/completions",
+        },
+        Candidate {
+            provider: ProviderId::Fireworks,
+            upstream_model: "accounts/fireworks/models/kimi-k3",
+            path: "/inference/v1/chat/completions",
+        },
+        Candidate {
+            provider: ProviderId::OpenRouter,
+            upstream_model: "moonshotai/kimi-k3",
+            path: "/api/v1/chat/completions",
+        },
+    ]
+}
+
+/// Together + Fireworks + OpenRouter for GLM-5.2. Fireworks spells the version separator as `p`.
+const fn glm_5_2() -> [Candidate; 3] {
+    [
+        Candidate {
+            provider: ProviderId::Together,
+            upstream_model: "zai-org/GLM-5.2",
+            path: "/v1/chat/completions",
+        },
+        Candidate {
+            provider: ProviderId::Fireworks,
+            upstream_model: "accounts/fireworks/models/glm-5p2",
+            path: "/inference/v1/chat/completions",
+        },
+        Candidate {
+            provider: ProviderId::OpenRouter,
+            upstream_model: "z-ai/glm-5.2",
+            path: "/api/v1/chat/completions",
+        },
+    ]
+}
+
+/// Together + Fireworks + OpenRouter for MiniMax M3.
+const fn minimax_m3() -> [Candidate; 3] {
+    [
+        Candidate {
+            provider: ProviderId::Together,
+            upstream_model: "MiniMaxAI/MiniMax-M3",
+            path: "/v1/chat/completions",
+        },
+        Candidate {
+            provider: ProviderId::Fireworks,
+            upstream_model: "accounts/fireworks/models/minimax-m3",
+            path: "/inference/v1/chat/completions",
+        },
+        Candidate {
+            provider: ProviderId::OpenRouter,
+            upstream_model: "minimax/minimax-m3",
+            path: "/api/v1/chat/completions",
+        },
+    ]
+}
+
 /// Every routable model, **sorted by `model`** — [`for_model`] binary-searches it.
 ///
 /// Native ids are the providers' own published aliases (Anthropic Models overview, OpenAI
-/// Models catalog, xAI / DeepSeek / Mistral / Groq / Together / Fireworks catalogs, 2026-09-17).
+/// Models catalog, xAI / DeepSeek / Mistral / Groq / Together / Fireworks catalogs, 2026-09-19).
 /// OpenRouter spellings were taken from the live `https://openrouter.ai/api/v1/models` list the
-/// same day. `catalog_rows_are_servable` re-verifies each pair against the real providers whenever
-/// the keys are present.
+/// same day (446 models). `catalog_rows_are_servable` re-verifies each pair against the real
+/// providers whenever the keys are present.
 pub const MODEL_ROUTES: &[ModelRoute] = &[
     // Claude on the Anthropic wire.
     //
@@ -332,6 +445,12 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
     //
     // Current lineup (Fable 5.1 / Opus 5 / Sonnet 5 / Haiku 4.5) plus the still-served 4.x
     // snapshots Anthropic lists as legacy. Dateless 4.6+ ids are pinned snapshots, not aliases.
+    ModelRoute {
+        model: "claude-3-haiku",
+        wire: WireFormat::Anthropic,
+        candidates: &claude("claude-3-haiku", "anthropic/claude-3-haiku"),
+        responses: &[],
+    },
     ModelRoute {
         model: "claude-fable-5",
         wire: WireFormat::Anthropic,
@@ -352,6 +471,24 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
             "us.anthropic.claude-haiku-4-5-20251001-v1:0",
             "anthropic/claude-haiku-4.5",
         ),
+        responses: &[],
+    },
+    ModelRoute {
+        model: "claude-opus-4",
+        wire: WireFormat::Anthropic,
+        candidates: &claude("claude-opus-4", "anthropic/claude-opus-4"),
+        responses: &[],
+    },
+    ModelRoute {
+        model: "claude-opus-4-1",
+        wire: WireFormat::Anthropic,
+        candidates: &claude("claude-opus-4-1", "anthropic/claude-opus-4.1"),
+        responses: &[],
+    },
+    ModelRoute {
+        model: "claude-opus-4-5",
+        wire: WireFormat::Anthropic,
+        candidates: &claude("claude-opus-4-5", "anthropic/claude-opus-4.5"),
         responses: &[],
     },
     ModelRoute {
@@ -380,6 +517,12 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         model: "claude-opus-5",
         wire: WireFormat::Anthropic,
         candidates: &claude("claude-opus-5", "anthropic/claude-opus-5"),
+        responses: &[],
+    },
+    ModelRoute {
+        model: "claude-sonnet-4",
+        wire: WireFormat::Anthropic,
+        candidates: &claude("claude-sonnet-4", "anthropic/claude-sonnet-4"),
         responses: &[],
     },
     ModelRoute {
@@ -436,15 +579,47 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &deepseek("deepseek-v4-pro", "deepseek/deepseek-v4-pro"),
         responses: &[],
     },
+    // Gemma 4 on Together (vision table, `google/gemma-4-31B-it`) with OpenRouter failover.
+    // Not a Gemini dialect — Chat Completions like every other third-party row.
+    ModelRoute {
+        model: "google/gemma-4-31b-it",
+        wire: WireFormat::OpenAi,
+        candidates: &together("google/gemma-4-31B-it", "google/gemma-4-31b-it"),
+        responses: &[],
+    },
     // The same shape on the OpenAI wire, where the two mounts differ as well (`/v1` vs `/api/v1`).
     // Flagships first in the *id* sort: 4.x, then 5 / 5.4 / 5.5 / 5.6, then 6 Astra, then o-series.
     // `responses` is the arm used when inbound is `/v1/responses` with session state; Chat
     // Completions / Messages inbound still walks `candidates`.
     ModelRoute {
+        model: "gpt-4",
+        wire: WireFormat::OpenAi,
+        candidates: &openai_chat("gpt-4", "openai/gpt-4"),
+        responses: &openai_responses("gpt-4"),
+    },
+    ModelRoute {
+        model: "gpt-4-turbo",
+        wire: WireFormat::OpenAi,
+        candidates: &openai_chat("gpt-4-turbo", "openai/gpt-4-turbo"),
+        responses: &openai_responses("gpt-4-turbo"),
+    },
+    ModelRoute {
         model: "gpt-4.1",
         wire: WireFormat::OpenAi,
         candidates: &openai_chat("gpt-4.1", "openai/gpt-4.1"),
         responses: &openai_responses("gpt-4.1"),
+    },
+    ModelRoute {
+        model: "gpt-4.1-mini",
+        wire: WireFormat::OpenAi,
+        candidates: &openai_chat("gpt-4.1-mini", "openai/gpt-4.1-mini"),
+        responses: &openai_responses("gpt-4.1-mini"),
+    },
+    ModelRoute {
+        model: "gpt-4.1-nano",
+        wire: WireFormat::OpenAi,
+        candidates: &openai_chat("gpt-4.1-nano", "openai/gpt-4.1-nano"),
+        responses: &openai_responses("gpt-4.1-nano"),
     },
     ModelRoute {
         model: "gpt-4o",
@@ -471,6 +646,72 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         responses: &openai_responses("gpt-5-mini"),
     },
     ModelRoute {
+        model: "gpt-5-nano",
+        wire: WireFormat::OpenAi,
+        candidates: &openai_chat("gpt-5-nano", "openai/gpt-5-nano"),
+        responses: &openai_responses("gpt-5-nano"),
+    },
+    ModelRoute {
+        model: "gpt-5-pro",
+        wire: WireFormat::OpenAi,
+        candidates: &openai_chat("gpt-5-pro", "openai/gpt-5-pro"),
+        responses: &openai_responses("gpt-5-pro"),
+    },
+    ModelRoute {
+        model: "gpt-5.1",
+        wire: WireFormat::OpenAi,
+        candidates: &openai_chat("gpt-5.1", "openai/gpt-5.1"),
+        responses: &openai_responses("gpt-5.1"),
+    },
+    ModelRoute {
+        model: "gpt-5.1-codex",
+        wire: WireFormat::OpenAi,
+        candidates: &openai_chat("gpt-5.1-codex", "openai/gpt-5.1-codex"),
+        responses: &openai_responses("gpt-5.1-codex"),
+    },
+    ModelRoute {
+        model: "gpt-5.1-codex-max",
+        wire: WireFormat::OpenAi,
+        candidates: &openai_chat("gpt-5.1-codex-max", "openai/gpt-5.1-codex-max"),
+        responses: &openai_responses("gpt-5.1-codex-max"),
+    },
+    ModelRoute {
+        model: "gpt-5.1-codex-mini",
+        wire: WireFormat::OpenAi,
+        candidates: &openai_chat("gpt-5.1-codex-mini", "openai/gpt-5.1-codex-mini"),
+        responses: &openai_responses("gpt-5.1-codex-mini"),
+    },
+    ModelRoute {
+        model: "gpt-5.2",
+        wire: WireFormat::OpenAi,
+        candidates: &openai_chat("gpt-5.2", "openai/gpt-5.2"),
+        responses: &openai_responses("gpt-5.2"),
+    },
+    ModelRoute {
+        model: "gpt-5.2-chat",
+        wire: WireFormat::OpenAi,
+        candidates: &openai_chat("gpt-5.2-chat", "openai/gpt-5.2-chat"),
+        responses: &openai_responses("gpt-5.2-chat"),
+    },
+    ModelRoute {
+        model: "gpt-5.2-codex",
+        wire: WireFormat::OpenAi,
+        candidates: &openai_chat("gpt-5.2-codex", "openai/gpt-5.2-codex"),
+        responses: &openai_responses("gpt-5.2-codex"),
+    },
+    ModelRoute {
+        model: "gpt-5.2-pro",
+        wire: WireFormat::OpenAi,
+        candidates: &openai_chat("gpt-5.2-pro", "openai/gpt-5.2-pro"),
+        responses: &openai_responses("gpt-5.2-pro"),
+    },
+    ModelRoute {
+        model: "gpt-5.3-codex",
+        wire: WireFormat::OpenAi,
+        candidates: &openai_chat("gpt-5.3-codex", "openai/gpt-5.3-codex"),
+        responses: &openai_responses("gpt-5.3-codex"),
+    },
+    ModelRoute {
         model: "gpt-5.4",
         wire: WireFormat::OpenAi,
         candidates: &openai_chat("gpt-5.4", "openai/gpt-5.4"),
@@ -483,10 +724,28 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         responses: &openai_responses("gpt-5.4-mini"),
     },
     ModelRoute {
+        model: "gpt-5.4-nano",
+        wire: WireFormat::OpenAi,
+        candidates: &openai_chat("gpt-5.4-nano", "openai/gpt-5.4-nano"),
+        responses: &openai_responses("gpt-5.4-nano"),
+    },
+    ModelRoute {
+        model: "gpt-5.4-pro",
+        wire: WireFormat::OpenAi,
+        candidates: &openai_chat("gpt-5.4-pro", "openai/gpt-5.4-pro"),
+        responses: &openai_responses("gpt-5.4-pro"),
+    },
+    ModelRoute {
         model: "gpt-5.5",
         wire: WireFormat::OpenAi,
         candidates: &openai_chat("gpt-5.5", "openai/gpt-5.5"),
         responses: &openai_responses("gpt-5.5"),
+    },
+    ModelRoute {
+        model: "gpt-5.5-pro",
+        wire: WireFormat::OpenAi,
+        candidates: &openai_chat("gpt-5.5-pro", "openai/gpt-5.5-pro"),
+        responses: &openai_responses("gpt-5.5-pro"),
     },
     ModelRoute {
         model: "gpt-5.6-luna",
@@ -495,10 +754,22 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         responses: &openai_responses("gpt-5.6-luna"),
     },
     ModelRoute {
+        model: "gpt-5.6-luna-pro",
+        wire: WireFormat::OpenAi,
+        candidates: &openai_chat("gpt-5.6-luna-pro", "openai/gpt-5.6-luna-pro"),
+        responses: &openai_responses("gpt-5.6-luna-pro"),
+    },
+    ModelRoute {
         model: "gpt-5.6-sol",
         wire: WireFormat::OpenAi,
         candidates: &openai_chat("gpt-5.6-sol", "openai/gpt-5.6-sol"),
         responses: &openai_responses("gpt-5.6-sol"),
+    },
+    ModelRoute {
+        model: "gpt-5.6-sol-pro",
+        wire: WireFormat::OpenAi,
+        candidates: &openai_chat("gpt-5.6-sol-pro", "openai/gpt-5.6-sol-pro"),
+        responses: &openai_responses("gpt-5.6-sol-pro"),
     },
     ModelRoute {
         model: "gpt-5.6-terra",
@@ -507,17 +778,36 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         responses: &openai_responses("gpt-5.6-terra"),
     },
     ModelRoute {
+        model: "gpt-5.6-terra-pro",
+        wire: WireFormat::OpenAi,
+        candidates: &openai_chat("gpt-5.6-terra-pro", "openai/gpt-5.6-terra-pro"),
+        responses: &openai_responses("gpt-5.6-terra-pro"),
+    },
+    ModelRoute {
         model: "gpt-6-astra",
         wire: WireFormat::OpenAi,
         candidates: &openai_chat("gpt-6-astra", "openai/gpt-6-astra"),
         responses: &openai_responses("gpt-6-astra"),
     },
-    // xAI Grok. Native ids from the 2026-09-17 xAI models table; OpenRouter spells them
-    // `x-ai/grok-…`. No Responses arm — session state is OpenAI's store.
+    ModelRoute {
+        model: "gpt-6-astra-pro",
+        wire: WireFormat::OpenAi,
+        candidates: &openai_chat("gpt-6-astra-pro", "openai/gpt-6-astra-pro"),
+        responses: &openai_responses("gpt-6-astra-pro"),
+    },
+    // xAI Grok. Native ids from the 2026-09-17 xAI models table plus `grok-4.20-multi-agent`
+    // (OpenRouter `x-ai/grok-4.20-multi-agent`, 2026-09-19). No Responses arm — session state
+    // is OpenAI's store.
     ModelRoute {
         model: "grok-4.20",
         wire: WireFormat::OpenAi,
         candidates: &xai("grok-4.20", "x-ai/grok-4.20"),
+        responses: &[],
+    },
+    ModelRoute {
+        model: "grok-4.20-multi-agent",
+        wire: WireFormat::OpenAi,
+        candidates: &xai("grok-4.20-multi-agent", "x-ai/grok-4.20-multi-agent"),
         responses: &[],
     },
     ModelRoute {
@@ -544,9 +834,11 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &xai("grok-build-0.1", "x-ai/grok-build-0.1"),
         responses: &[],
     },
-    // Groq / Together / Fireworks llama + qwen ids people send. No Meta row, so primary is
-    // the host whose id is the catalog name (Groq for the short llama-3.x ids, Fireworks for
-    // Llama 4, Together for Qwen 3.5-9B). OpenRouter (or Groq/Fireworks) is failover.
+    // Groq / Together / Fireworks llama + qwen + open-weight ids people send. No Meta row, so
+    // primary is the host whose id is the catalog name (Groq for the short llama-3.x ids,
+    // Fireworks for Llama 4, Together for Qwen / Kimi / GLM / MiniMax / Gemma / Inkling).
+    // OpenRouter (or Groq/Fireworks) is failover. Llama 3.3 and GPT-OSS 120B name every host
+    // we already route them on.
     ModelRoute {
         model: "llama-3.1-8b-instant",
         wire: WireFormat::OpenAi,
@@ -578,6 +870,42 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         responses: &[],
     },
     ModelRoute {
+        model: "meta/muse-glimmer-30b",
+        wire: WireFormat::OpenAi,
+        candidates: &together("meta-models/Muse-Glimmer-30B", "meta/muse-glimmer-30b"),
+        responses: &[],
+    },
+    ModelRoute {
+        model: "minimax/minimax-m3",
+        wire: WireFormat::OpenAi,
+        candidates: &minimax_m3(),
+        responses: &[],
+    },
+    ModelRoute {
+        model: "minimaxai/minimax-m2.7",
+        wire: WireFormat::OpenAi,
+        candidates: &groq("minimaxai/minimax-m2.7", "minimax/minimax-m2.7"),
+        responses: &[],
+    },
+    ModelRoute {
+        model: "ministral-14b-latest",
+        wire: WireFormat::OpenAi,
+        candidates: &mistral("ministral-14b-latest", "mistralai/ministral-14b-2512"),
+        responses: &[],
+    },
+    ModelRoute {
+        model: "ministral-3b-latest",
+        wire: WireFormat::OpenAi,
+        candidates: &mistral("ministral-3b-latest", "mistralai/ministral-3b-2512"),
+        responses: &[],
+    },
+    ModelRoute {
+        model: "ministral-8b-latest",
+        wire: WireFormat::OpenAi,
+        candidates: &mistral("ministral-8b-latest", "mistralai/ministral-8b-2512"),
+        responses: &[],
+    },
+    ModelRoute {
         model: "mistral-large-latest",
         wire: WireFormat::OpenAi,
         candidates: &mistral("mistral-large-latest", "mistralai/mistral-large-2512"),
@@ -590,10 +918,49 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         responses: &[],
     },
     ModelRoute {
+        model: "mistral-nemo",
+        wire: WireFormat::OpenAi,
+        candidates: &mistral("mistral-nemo", "mistralai/mistral-nemo"),
+        responses: &[],
+    },
+    ModelRoute {
         model: "mistral-small-latest",
         wire: WireFormat::OpenAi,
         candidates: &mistral("mistral-small-latest", "mistralai/mistral-small-2603"),
         responses: &[],
+    },
+    ModelRoute {
+        model: "moonshotai/kimi-k2.6",
+        wire: WireFormat::OpenAi,
+        candidates: &fireworks(
+            "accounts/fireworks/models/kimi-k2p6",
+            "moonshotai/kimi-k2.6",
+        ),
+        responses: &[],
+    },
+    ModelRoute {
+        model: "moonshotai/kimi-k2.7-code",
+        wire: WireFormat::OpenAi,
+        candidates: &together("moonshotai/Kimi-K2.7-Code", "moonshotai/kimi-k2.7-code"),
+        responses: &[],
+    },
+    ModelRoute {
+        model: "moonshotai/kimi-k3",
+        wire: WireFormat::OpenAi,
+        candidates: &kimi_k3(),
+        responses: &[],
+    },
+    ModelRoute {
+        model: "o1",
+        wire: WireFormat::OpenAi,
+        candidates: &openai_chat("o1", "openai/o1"),
+        responses: &openai_responses("o1"),
+    },
+    ModelRoute {
+        model: "o1-pro",
+        wire: WireFormat::OpenAi,
+        candidates: &openai_chat("o1-pro", "openai/o1-pro"),
+        responses: &openai_responses("o1-pro"),
     },
     ModelRoute {
         model: "o3",
@@ -602,15 +969,81 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         responses: &openai_responses("o3"),
     },
     ModelRoute {
+        model: "o3-mini",
+        wire: WireFormat::OpenAi,
+        candidates: &openai_chat("o3-mini", "openai/o3-mini"),
+        responses: &openai_responses("o3-mini"),
+    },
+    ModelRoute {
+        model: "o3-pro",
+        wire: WireFormat::OpenAi,
+        candidates: &openai_chat("o3-pro", "openai/o3-pro"),
+        responses: &openai_responses("o3-pro"),
+    },
+    ModelRoute {
         model: "o4-mini",
         wire: WireFormat::OpenAi,
         candidates: &openai_chat("o4-mini", "openai/o4-mini"),
         responses: &openai_responses("o4-mini"),
     },
     ModelRoute {
+        model: "openai/gpt-oss-120b",
+        wire: WireFormat::OpenAi,
+        candidates: &gpt_oss_120b(),
+        responses: &[],
+    },
+    ModelRoute {
+        model: "openai/gpt-oss-20b",
+        wire: WireFormat::OpenAi,
+        candidates: &gpt_oss_20b(),
+        responses: &[],
+    },
+    ModelRoute {
+        model: "openai/gpt-oss-safeguard-20b",
+        wire: WireFormat::OpenAi,
+        candidates: &groq(
+            "openai/gpt-oss-safeguard-20b",
+            "openai/gpt-oss-safeguard-20b",
+        ),
+        responses: &[],
+    },
+    ModelRoute {
+        model: "qwen/qwen-2.5-7b-instruct",
+        wire: WireFormat::OpenAi,
+        candidates: &together(
+            "Qwen/Qwen2.5-7B-Instruct-Turbo",
+            "qwen/qwen-2.5-7b-instruct",
+        ),
+        responses: &[],
+    },
+    ModelRoute {
         model: "qwen/qwen3.5-9b",
         wire: WireFormat::OpenAi,
         candidates: &together("Qwen/Qwen3.5-9B", "qwen/qwen3.5-9b"),
+        responses: &[],
+    },
+    ModelRoute {
+        model: "qwen/qwen3.6-plus",
+        wire: WireFormat::OpenAi,
+        candidates: &together("Qwen/Qwen3.6-Plus", "qwen/qwen3.6-plus"),
+        responses: &[],
+    },
+    ModelRoute {
+        model: "qwen/qwen3.7-max",
+        wire: WireFormat::OpenAi,
+        candidates: &together("Qwen/Qwen3.7-Max", "qwen/qwen3.7-max"),
+        responses: &[],
+    },
+    ModelRoute {
+        model: "qwen/qwen3.7-plus",
+        wire: WireFormat::OpenAi,
+        candidates: &together("Qwen/Qwen3.7-Plus", "qwen/qwen3.7-plus"),
+        responses: &[],
+    },
+    ModelRoute {
+        model: "qwen/qwen3.8-2.4t-a95b",
+        wire: WireFormat::OpenAi,
+        candidates: &together("Qwen/Qwen3.8-2.4T-A95B", "qwen/qwen3.8-2.4t-a95b"),
         responses: &[],
     },
     ModelRoute {
@@ -623,6 +1056,36 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         model: "qwen/qwen3.8-flash",
         wire: WireFormat::OpenAi,
         candidates: &together("Qwen/Qwen3.8-Flash", "qwen/qwen3.8-flash"),
+        responses: &[],
+    },
+    ModelRoute {
+        model: "thinkingmachines/inkling",
+        wire: WireFormat::OpenAi,
+        candidates: &together("thinkingmachines/Inkling", "thinkingmachines/inkling"),
+        responses: &[],
+    },
+    ModelRoute {
+        model: "z-ai/glm-5.1",
+        wire: WireFormat::OpenAi,
+        candidates: &fireworks("accounts/fireworks/models/glm-5p1", "z-ai/glm-5.1"),
+        responses: &[],
+    },
+    ModelRoute {
+        model: "z-ai/glm-5.2",
+        wire: WireFormat::OpenAi,
+        candidates: &glm_5_2(),
+        responses: &[],
+    },
+    ModelRoute {
+        model: "z-ai/glm-5.3",
+        wire: WireFormat::OpenAi,
+        candidates: &together("zai-org/GLM-5.3", "z-ai/glm-5.3"),
+        responses: &[],
+    },
+    ModelRoute {
+        model: "z-ai/glm-5.3-flash",
+        wire: WireFormat::OpenAi,
+        candidates: &together("zai-org/GLM-5.3-Flash", "z-ai/glm-5.3-flash"),
         responses: &[],
     },
 ];
@@ -682,6 +1145,17 @@ pub fn models_list_json() -> &'static str {
 mod tests {
     use super::*;
     use crate::{by_id, gateway_providers};
+
+    /// Product floor: managed `/v1` should list a full current generation, not a handful of
+    /// flagships. Count is the guard; new rows still have to pass the uniqueness / wire tests below.
+    #[test]
+    fn catalog_lists_at_least_100_models() {
+        assert!(
+            MODEL_ROUTES.len() >= 100,
+            "MODEL_ROUTES has {} rows; keep the managed catalog at 100+",
+            MODEL_ROUTES.len(),
+        );
+    }
 
     /// The binary search in `for_model` is only correct on a sorted table, and duplicate names would
     /// make which row wins depend on where the search landed.
@@ -1179,6 +1653,80 @@ mod tests {
                 assert_eq!(row.candidates[0].upstream_model, native, "{name}");
                 assert_eq!(row.candidates[1].provider, ProviderId::OpenRouter, "{name}");
                 assert_eq!(row.candidates[1].upstream_model, openrouter, "{name}");
+            }
+        }
+    }
+
+    /// GPT-OSS 120B is the other four-host row. Catalog name is the shared Groq/Together/OpenRouter
+    /// id; Fireworks keeps `accounts/fireworks/models/gpt-oss-120b` as an alias.
+    #[test]
+    fn gpt_oss_120b_names_groq_together_fireworks_and_openrouter() {
+        assert!(
+            for_model("openai/gpt-oss-120b").is_some(),
+            "openai/gpt-oss-120b must be in the catalog"
+        );
+        if let Some(row) = for_model("openai/gpt-oss-120b") {
+            assert_eq!(row.wire, WireFormat::OpenAi);
+            assert_eq!(row.candidates.len(), 4);
+            assert_eq!(row.candidates[0].provider, ProviderId::Groq);
+            assert_eq!(row.candidates[1].provider, ProviderId::Together);
+            assert_eq!(row.candidates[2].provider, ProviderId::Fireworks);
+            assert_eq!(
+                row.candidates[2].upstream_model,
+                "accounts/fireworks/models/gpt-oss-120b"
+            );
+            assert_eq!(row.candidates[3].provider, ProviderId::OpenRouter);
+            assert_eq!(
+                for_model("accounts/fireworks/models/gpt-oss-120b").map(|r| r.model),
+                Some("openai/gpt-oss-120b"),
+            );
+        }
+    }
+
+    #[test]
+    fn kimi_k3_names_together_fireworks_and_openrouter() {
+        assert!(
+            for_model("moonshotai/kimi-k3").is_some(),
+            "moonshotai/kimi-k3 must be in the catalog"
+        );
+        if let Some(row) = for_model("moonshotai/kimi-k3") {
+            assert_eq!(row.candidates.len(), 3);
+            assert_eq!(row.candidates[0].provider, ProviderId::Together);
+            assert_eq!(row.candidates[0].upstream_model, "moonshotai/Kimi-K3");
+            assert_eq!(row.candidates[1].provider, ProviderId::Fireworks);
+            assert_eq!(
+                row.candidates[1].upstream_model,
+                "accounts/fireworks/models/kimi-k3"
+            );
+            assert_eq!(row.candidates[2].provider, ProviderId::OpenRouter);
+        }
+    }
+
+    #[test]
+    fn glm_5_2_and_minimax_m3_name_together_fireworks_and_openrouter() {
+        for (name, together_id, fireworks_id, openrouter) in [
+            (
+                "z-ai/glm-5.2",
+                "zai-org/GLM-5.2",
+                "accounts/fireworks/models/glm-5p2",
+                "z-ai/glm-5.2",
+            ),
+            (
+                "minimax/minimax-m3",
+                "MiniMaxAI/MiniMax-M3",
+                "accounts/fireworks/models/minimax-m3",
+                "minimax/minimax-m3",
+            ),
+        ] {
+            assert!(for_model(name).is_some(), "{name} must be in the catalog");
+            if let Some(row) = for_model(name) {
+                assert_eq!(row.candidates.len(), 3, "{name}");
+                assert_eq!(row.candidates[0].provider, ProviderId::Together, "{name}");
+                assert_eq!(row.candidates[0].upstream_model, together_id, "{name}");
+                assert_eq!(row.candidates[1].provider, ProviderId::Fireworks, "{name}");
+                assert_eq!(row.candidates[1].upstream_model, fireworks_id, "{name}");
+                assert_eq!(row.candidates[2].provider, ProviderId::OpenRouter, "{name}");
+                assert_eq!(row.candidates[2].upstream_model, openrouter, "{name}");
             }
         }
     }
