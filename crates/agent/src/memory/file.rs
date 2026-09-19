@@ -19,9 +19,9 @@ use std::time::{Duration, Instant, SystemTime};
 
 use async_trait::async_trait;
 
+use super::docs;
 use super::{
-    Entry, Hit, INDEX_FILE, INDEX_MAX_BYTES, INDEX_MAX_LINES, MEMORY_ROOT, MemPath, MemoryBackend,
-    MemoryError, SESSION_ROOT, View,
+    Entry, Hit, INDEX_FILE, MEMORY_ROOT, MemPath, MemoryBackend, MemoryError, SESSION_ROOT, View,
 };
 
 /// Where a [`FileBackend`]'s directory comes from. A durable store lives at a `Fixed` path for its whole
@@ -217,33 +217,12 @@ impl FileBackend {
     }
 }
 
-/// Keep the first [`INDEX_MAX_LINES`] lines / [`INDEX_MAX_BYTES`] bytes of the index — whichever bites
-/// first — so the always-injected prefix stays bounded.
-fn cap_index(raw: &str) -> String {
-    let mut out = String::new();
-    for (i, line) in raw.lines().enumerate() {
-        if i >= INDEX_MAX_LINES {
-            out.push_str("\n[index truncated: showing the first ");
-            out.push_str(&INDEX_MAX_LINES.to_string());
-            out.push_str(" lines]");
-            break;
-        }
-        if out.len() + line.len() + 1 > INDEX_MAX_BYTES {
-            out.push_str("\n[index truncated at ~25 KB]");
-            break;
-        }
-        out.push_str(line);
-        out.push('\n');
-    }
-    out
-}
-
 #[async_trait]
 impl MemoryBackend for FileBackend {
     async fn index(&self) -> Result<String, MemoryError> {
         let path = self.dir().join(INDEX_FILE);
         match fs::read_to_string(&path) {
-            Ok(raw) => Ok(cap_index(&raw)),
+            Ok(raw) => Ok(docs::cap_index(&raw)),
             Err(e) if e.kind() == ErrorKind::NotFound => Ok(String::new()),
             Err(e) => {
                 tracing::warn!(path = %path.display(), error = %e, "could not read MEMORY.md index, treating it as empty");
@@ -266,25 +245,10 @@ impl MemoryBackend for FileBackend {
             }
             return Ok(View::Listing(self.listing(&real)?));
         }
-        let text = self.read_doc(path)?;
-        match range {
-            None => Ok(View::Document(text)),
-            Some((start, end)) => {
-                // 1-indexed, inclusive, clamped — matching the text-editor `view_range` semantics.
-                let start = start.max(1);
-                let lines: Vec<&str> = text.lines().collect();
-                if start > lines.len() {
-                    return Ok(View::Document(String::new()));
-                }
-                let end = end.min(lines.len());
-                let slice = if end >= start {
-                    lines[start - 1..end].join("\n")
-                } else {
-                    String::new()
-                };
-                Ok(View::Document(slice))
-            }
-        }
+        Ok(View::Document(docs::slice_range(
+            &self.read_doc(path)?,
+            range,
+        )))
     }
 
     async fn create(&self, path: &MemPath, text: &str) -> Result<(), MemoryError> {
@@ -316,34 +280,14 @@ impl MemoryBackend for FileBackend {
         let _lock = self.lock()?;
         // Re-read fresh under the lock, mutate, write back — the store discipline.
         let text = self.read_doc(path)?;
-        let count = text.matches(old).count();
-        if count != 1 {
-            return Err(MemoryError::NotUnique {
-                path: path.display(),
-                old: old.to_string(),
-                count,
-            });
-        }
-        let replaced = text.replacen(old, new, 1);
+        let replaced = docs::str_replace_once(&text, old, new, &path.display())?;
         self.write_doc(path, &replaced)
     }
 
     async fn insert(&self, path: &MemPath, line: usize, text: &str) -> Result<(), MemoryError> {
         let _lock = self.lock()?;
         let existing = self.read_doc(path)?;
-        let mut lines: Vec<&str> = existing.lines().collect();
-        let at = line.min(lines.len());
-        // Insert text (which may itself be multi-line) as its own lines after `at`.
-        let inserted: Vec<&str> = text.split('\n').collect();
-        for (offset, l) in inserted.into_iter().enumerate() {
-            lines.insert(at + offset, l);
-        }
-        let mut joined = lines.join("\n");
-        // Preserve a trailing newline if the original had one (or was empty and we appended content).
-        if existing.ends_with('\n') || existing.is_empty() {
-            joined.push('\n');
-        }
-        self.write_doc(path, &joined)
+        self.write_doc(path, &docs::insert_at_line(&existing, line, text))
     }
 
     async fn delete(&self, path: &MemPath) -> Result<(), MemoryError> {
@@ -404,31 +348,17 @@ impl MemoryBackend for FileBackend {
         let dir = self.dir();
         let entries = self.listing(&dir)?;
         let mut hits = Vec::new();
-        // The logical-root prefix is the same for every entry; build it once.
         let prefix = format!("{}/", self.root);
-        // Reused across every line of every file so the case-insensitive test allocates once, not per line.
-        let mut lower = String::new();
         for entry in entries {
             if entry.is_dir {
                 continue;
             }
-            // Re-derive the real path from the logical one.
             let rel = entry.path.strip_prefix(&prefix).unwrap_or(&entry.path);
             let real = dir.join(rel);
             let Ok(text) = fs::read_to_string(&real) else {
                 continue;
             };
-            for (i, line) in text.lines().enumerate() {
-                lower.clear();
-                lower.extend(line.chars().flat_map(char::to_lowercase));
-                if lower.contains(&needle) {
-                    hits.push(Hit {
-                        path: entry.path.clone(),
-                        line: i + 1,
-                        text: line.to_string(),
-                    });
-                }
-            }
+            hits.extend(docs::search_in(&entry.path, &text, &needle));
         }
         Ok(hits)
     }
@@ -687,15 +617,5 @@ mod tests {
             panic!()
         };
         assert!(entries.is_empty());
-    }
-
-    #[test]
-    fn cap_index_bounds_lines() {
-        let big: String = (0..500).map(|i| format!("line {i}\n")).collect();
-        let capped = cap_index(&big);
-        // The kept content is bounded to INDEX_MAX_LINES; the truncation marker adds a couple of lines.
-        assert!(capped.lines().count() <= INDEX_MAX_LINES + 3);
-        assert!(capped.lines().filter(|l| l.starts_with("line ")).count() <= INDEX_MAX_LINES);
-        assert!(capped.contains("index truncated"));
     }
 }

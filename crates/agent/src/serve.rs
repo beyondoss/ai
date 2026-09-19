@@ -2273,6 +2273,7 @@ pub(crate) async fn serve_session(
         } else {
             Some(
                 crate::memory::open(cfg.memory.as_deref(), &cwd)
+                    .await
                     .map_err(Box::<dyn std::error::Error + Send + Sync>::from)?,
             )
         };

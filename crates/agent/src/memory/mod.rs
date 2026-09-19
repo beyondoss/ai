@@ -8,9 +8,10 @@
 //!
 //! - It addresses a **logical namespace** (`/memories/foo.md`), not a filesystem path — so the model
 //!   never confuses a note-to-self with the checkout it's editing.
-//! - Its backend is **pluggable**: local `*.md` files today (see [`file::FileBackend`]), a networked
-//!   `redis://` / `postgres://` store later. Nothing above [`MemoryBackend`] may assume a filesystem —
-//!   pointing `read`/`write` at a memory dir would weld memory to local disk forever.
+//! - Its backend is **pluggable**: local `*.md` files ([`file::FileBackend`]), an in-process map
+//!   ([`map::MapBackend`]), Redis ([`redis::RedisBackend`]), or Postgres ([`postgres::PostgresBackend`]).
+//!   Nothing above [`MemoryBackend`] may assume a filesystem — pointing `read`/`write` at a memory
+//!   dir would weld memory to local disk forever.
 //! - It carries an **index** ([`MemoryBackend::index`], the `MEMORY.md` file) that the host injects into
 //!   the system prompt at session start, so a durable memory is never silently forgotten.
 //!
@@ -23,10 +24,15 @@
 //! Per-project, keyed by cwd, under `~/.claude/projects/<encoded-cwd>/memory/` — the same scoping
 //! sessions use ([`crate::session_store::encode_cwd`]), so all worktrees of one repo share one memory.
 //! A backend is selected by [`open`], which dispatches on a DSN scheme (bare path / `file://` → files;
-//! `redis://` / `postgres://` are recognized but not yet implemented, so the seam exists without the
-//! impl).
+//! `memory://` → in-process; `redis://` / `rediss://` → Redis HASH; `postgres://` / `postgresql://`
+//! → a Postgres table).
 
+pub(crate) mod docs;
 pub mod file;
+pub mod map;
+pub mod postgres;
+pub mod redis;
+mod tls;
 
 use std::path::Path;
 use std::sync::Arc;
@@ -256,8 +262,10 @@ pub trait MemoryBackend: Send + Sync {
         range: Option<(usize, usize)>,
     ) -> Result<View, MemoryError>;
 
-    /// Create or overwrite a document with `text` (matching `memory_20250818`'s `create`, which
-    /// overwrites — the model edits with `str_replace`/`insert` and replaces wholesale with `create`).
+    /// Create a *new* document with `text`. Fails with [`MemoryError::AlreadyExists`] if the path is
+    /// already occupied — the model edits with `str_replace`/`insert` and replaces wholesale by
+    /// `delete` then `create`. Silently overwriting durable knowledge is the failure this store
+    /// exists to prevent.
     async fn create(&self, path: &MemPath, text: &str) -> Result<(), MemoryError>;
 
     /// Replace the single occurrence of `old` with `new` in a document. Errors ([`MemoryError::NotUnique`])
@@ -273,8 +281,9 @@ pub trait MemoryBackend: Send + Sync {
     /// Move `from` to `to`. Refused if `to` is already occupied.
     async fn rename(&self, from: &MemPath, to: &MemPath) -> Result<(), MemoryError>;
 
-    /// Case-insensitive substring search across every document, newest-relevant first. A file backend
-    /// scans; a SQL backend can push this down to full-text search.
+    /// Case-insensitive substring search across every document, newest-relevant first. A file
+    /// backend walks files; Redis `HGETALL`s; Postgres filters with `position(lower(needle) in
+    /// lower(body))` so non-matching documents are not loaded.
     async fn search(&self, query: &str) -> Result<Vec<Hit>, MemoryError>;
 }
 
@@ -282,11 +291,15 @@ pub trait MemoryBackend: Send + Sync {
 ///
 /// - `None` (the default) → a per-project [`file::FileBackend`] under `~/.claude/projects/<cwd>/memory/`.
 /// - a bare path or `file://<path>` → a [`file::FileBackend`] at that directory.
-/// - `redis://…` / `postgres://…` → recognized, but **not yet implemented**: returns a clear error so
-///   the seam is real without the impl (the trait makes them a drop-in later).
+/// - `memory://` → an in-process [`map::MapBackend`] (lost when the process exits).
+/// - `redis://…` / `rediss://` → a [`redis::RedisBackend`] HASH, namespaced by encoded cwd
+///   (override with `?prefix=`).
+/// - `postgres://…` / `postgresql://` → a [`postgres::PostgresBackend`] table (default
+///   `agent_memory`; override with `?table=` / `?prefix=`).
 ///
+/// Networked backends connect and ping here so a down store fails before a model call is billed.
 /// `Err` is meant to be printed to the operator who passed `--memory`.
-pub fn open(dsn: Option<&str>, cwd: &Path) -> Result<Arc<dyn MemoryBackend>, String> {
+pub async fn open(dsn: Option<&str>, cwd: &Path) -> Result<Arc<dyn MemoryBackend>, String> {
     match dsn.map(str::trim).filter(|s| !s.is_empty()) {
         None => Ok(Arc::new(file::FileBackend::for_project(cwd))),
         Some(spec) => {
@@ -294,21 +307,28 @@ pub fn open(dsn: Option<&str>, cwd: &Path) -> Result<Arc<dyn MemoryBackend>, Str
                 Ok(Arc::new(file::FileBackend::at(std::path::PathBuf::from(
                     path,
                 ))))
+            } else if spec == "memory://" || spec == "mem://" {
+                Ok(Arc::new(map::MapBackend::new()))
             } else if spec.starts_with("redis://") || spec.starts_with("rediss://") {
-                Err(
-                    "redis:// memory backend is not yet supported (only local files today)"
-                        .to_string(),
-                )
+                let (cleaned, extras) = take_dsn_extras(spec)?;
+                redis::RedisBackend::connect(&cleaned, &extras.prefix_or(cwd), MEMORY_ROOT)
+                    .await
+                    .map(|b| Arc::new(b) as Arc<dyn MemoryBackend>)
             } else if spec.starts_with("postgres://") || spec.starts_with("postgresql://") {
-                Err(
-                    "postgres:// memory backend is not yet supported (only local files today)"
-                        .to_string(),
+                let (cleaned, extras) = take_dsn_extras(spec)?;
+                postgres::PostgresBackend::connect(
+                    &cleaned,
+                    &extras.prefix_or(cwd),
+                    extras.table.as_deref(),
+                    MEMORY_ROOT,
                 )
+                .await
+                .map(|b| Arc::new(b) as Arc<dyn MemoryBackend>)
             } else if spec.contains("://") {
                 let scheme = spec.split("://").next().unwrap_or(spec);
                 Err(format!(
                     "unsupported memory backend `{scheme}://` (supported: a local path, file://, \
-                     and — soon — redis://, postgres://)"
+                     memory://, redis://, postgres://)"
                 ))
             } else {
                 // A bare filesystem path.
@@ -318,6 +338,53 @@ pub fn open(dsn: Option<&str>, cwd: &Path) -> Result<Arc<dyn MemoryBackend>, Str
             }
         }
     }
+}
+
+/// Extra query params we peel off a networked DSN so the leftover URL is something the store
+/// client will accept (`table` is not a Postgres connection option).
+struct DsnExtras {
+    prefix: Option<String>,
+    table: Option<String>,
+}
+
+impl DsnExtras {
+    fn prefix_or(&self, cwd: &Path) -> String {
+        self.prefix.clone().unwrap_or_else(|| project_key(cwd))
+    }
+}
+
+fn project_key(cwd: &Path) -> String {
+    let canonical = crate::session_store::canonical_cwd(cwd);
+    crate::session_store::encode_cwd(&canonical.to_string_lossy())
+}
+
+fn take_dsn_extras(spec: &str) -> Result<(String, DsnExtras), String> {
+    let mut url = url::Url::parse(spec).map_err(|e| format!("invalid memory DSN: {e}"))?;
+    let mut extras = DsnExtras {
+        prefix: None,
+        table: None,
+    };
+    let pairs: Vec<(String, String)> = url
+        .query_pairs()
+        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+        .collect();
+    {
+        let mut qp = url.query_pairs_mut();
+        qp.clear();
+        for (k, v) in pairs {
+            match k.as_str() {
+                "prefix" | "project" => extras.prefix = Some(v),
+                "table" => extras.table = Some(v),
+                _ => {
+                    qp.append_pair(&k, &v);
+                }
+            }
+        }
+    }
+    if url.query() == Some("") {
+        url.set_query(None);
+    }
+    Ok((url.to_string(), extras))
 }
 
 /// A single mounted store: a [`MemoryBackend`] surfaced at the root its [`MountKind`] dictates. The
@@ -542,16 +609,45 @@ mod tests {
         );
     }
 
-    #[test]
-    fn open_recognizes_but_defers_network_backends() {
+    #[tokio::test]
+    async fn open_dispatches_known_schemes() {
         let cwd = std::path::Path::new("/tmp");
-        assert!(open(Some("redis://localhost"), cwd).is_err());
-        assert!(open(Some("postgres://localhost/db"), cwd).is_err());
-        assert!(open(Some("mysql://x"), cwd).is_err());
+        assert!(open(Some("memory://"), cwd).await.is_ok());
+        assert!(open(Some("mysql://x"), cwd).await.is_err());
         // A bare path and file:// both resolve to a file backend.
-        assert!(open(Some("/tmp/mem"), cwd).is_ok());
-        assert!(open(Some("file:///tmp/mem"), cwd).is_ok());
-        assert!(open(None, cwd).is_ok());
+        assert!(open(Some("/tmp/mem"), cwd).await.is_ok());
+        assert!(open(Some("file:///tmp/mem"), cwd).await.is_ok());
+        assert!(open(None, cwd).await.is_ok());
+        // A down redis/postgres fails fast with a connect error, not "not yet supported".
+        let r = match open(Some("redis://127.0.0.1:1"), cwd).await {
+            Ok(_) => panic!("unreachable redis must fail"),
+            Err(e) => e,
+        };
+        assert!(
+            !r.contains("not yet supported"),
+            "redis is implemented: {r}"
+        );
+        let p = match open(
+            Some("postgres://postgres@127.0.0.1:1/postgres?sslmode=disable"),
+            cwd,
+        )
+        .await
+        {
+            Ok(_) => panic!("unreachable postgres must fail"),
+            Err(e) => e,
+        };
+        assert!(!p.contains("not yet supported"));
+    }
+
+    #[test]
+    fn take_dsn_extras_strips_our_params() {
+        let (cleaned, extras) =
+            take_dsn_extras("postgres://u@h/db?sslmode=disable&table=mem&prefix=p").unwrap();
+        assert_eq!(extras.table.as_deref(), Some("mem"));
+        assert_eq!(extras.prefix.as_deref(), Some("p"));
+        assert!(cleaned.contains("sslmode=disable"));
+        assert!(!cleaned.contains("table="));
+        assert!(!cleaned.contains("prefix="));
     }
 
     #[test]
