@@ -1718,14 +1718,16 @@ mod tests {
                 "minimax/minimax-m3",
             ),
         ] {
-            let row = for_model(name).unwrap_or_else(|| panic!("{name} must be in the catalog"));
-            assert_eq!(row.candidates.len(), 3, "{name}");
-            assert_eq!(row.candidates[0].provider, ProviderId::Together, "{name}");
-            assert_eq!(row.candidates[0].upstream_model, together_id, "{name}");
-            assert_eq!(row.candidates[1].provider, ProviderId::Fireworks, "{name}");
-            assert_eq!(row.candidates[1].upstream_model, fireworks_id, "{name}");
-            assert_eq!(row.candidates[2].provider, ProviderId::OpenRouter, "{name}");
-            assert_eq!(row.candidates[2].upstream_model, openrouter, "{name}");
+            assert!(for_model(name).is_some(), "{name} must be in the catalog");
+            if let Some(row) = for_model(name) {
+                assert_eq!(row.candidates.len(), 3, "{name}");
+                assert_eq!(row.candidates[0].provider, ProviderId::Together, "{name}");
+                assert_eq!(row.candidates[0].upstream_model, together_id, "{name}");
+                assert_eq!(row.candidates[1].provider, ProviderId::Fireworks, "{name}");
+                assert_eq!(row.candidates[1].upstream_model, fireworks_id, "{name}");
+                assert_eq!(row.candidates[2].provider, ProviderId::OpenRouter, "{name}");
+                assert_eq!(row.candidates[2].upstream_model, openrouter, "{name}");
+            }
         }
     }
 
