@@ -13,6 +13,16 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
+/// The agent binary under test.
+pub const BIN: &str = env!("CARGO_BIN_EXE_beyond-ai-agent");
+
+/// A stand-in exec endpoint (the sandbox side of the exec protocol).
+pub mod exec_mock;
+/// A `bsg_v1` session-grant minter, written independently of `src/grant.rs`.
+pub mod grant;
+/// A running `serve --service` replica, for the service-mode suites.
+pub mod service;
+
 /// Deterministic dev signing public key (standard base64), for a gateway `[signing_keys] 1 = …`.
 pub const DEV_PUBKEY_B64: &str = "6kpsY+KcUgq+9VB7Ey7F+ZVHdq6+vnuSQh7qaRRG0iw=";
 /// The matching dev `bai_v1` token (tenant 1 / vpc 1, kid 1).
@@ -344,8 +354,11 @@ pub fn spawn_model_server_with_stalled_response(
     thread::spawn(move || {
         for resp in fast {
             if let Ok((mut stream, _)) = listener.accept() {
-                let mut buf = [0u8; 4096];
-                let _ = stream.read(&mut buf);
+                // Drain the *whole* request before answering. Closing a socket with unread data
+                // in its receive buffer makes the kernel send an RST instead of a FIN, which
+                // discards whatever the peer had not yet read — including the response just
+                // written. That is how a perfectly good mock turns into "error sending request".
+                let _ = read_http_request(&mut stream);
                 let http = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{resp}"
                 );
@@ -354,8 +367,7 @@ pub fn spawn_model_server_with_stalled_response(
             }
         }
         if let Ok((mut stream, _)) = listener.accept() {
-            let mut buf = [0u8; 4096];
-            let _ = stream.read(&mut buf);
+            let _ = read_http_request(&mut stream);
             let preamble = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n\
                 data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":5,\"output_tokens\":1}}}\n\n";
             let _ = stream.write_all(preamble.as_bytes());
@@ -374,8 +386,11 @@ pub fn spawn_model_server_with_stalled_response(
         }
         for resp in after {
             if let Ok((mut stream, _)) = listener.accept() {
-                let mut buf = [0u8; 4096];
-                let _ = stream.read(&mut buf);
+                // Drain the *whole* request before answering. Closing a socket with unread data
+                // in its receive buffer makes the kernel send an RST instead of a FIN, which
+                // discards whatever the peer had not yet read — including the response just
+                // written. That is how a perfectly good mock turns into "error sending request".
+                let _ = read_http_request(&mut stream);
                 let http = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{resp}"
                 );
@@ -610,6 +625,74 @@ pub const WS_PATH: &str = "/_beyond/agent";
 /// A connected test WebSocket client (over plain `ws://`, so `MaybeTlsStream` is always the plain arm).
 pub type TestWs =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+/// Connect with extra request headers — `x-beyond-grant`, for `serve --service`.
+///
+/// Returns the **HTTP status** on failure rather than a message: service mode's whole refusal
+/// contract is a status table (401 / 400 / 403 / 421), and the statuses are answered *before* the
+/// upgrade precisely so a client can read them. A test that asserted on an error string would not
+/// be checking that.
+pub async fn ws_connect_with_headers(
+    port: u16,
+    session_id: Option<&str>,
+    headers: &[(&str, &str)],
+) -> Result<TestWs, u16> {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    let url = match session_id {
+        Some(id) => format!("ws://127.0.0.1:{port}{WS_PATH}?session_id={id}"),
+        None => format!("ws://127.0.0.1:{port}{WS_PATH}"),
+    };
+    let mut request = url.into_client_request().expect("build ws request");
+    for (name, value) in headers {
+        request.headers_mut().insert(
+            tokio_tungstenite::tungstenite::http::header::HeaderName::from_bytes(name.as_bytes())
+                .expect("header name"),
+            value.parse().expect("header value"),
+        );
+    }
+    match tokio_tungstenite::connect_async(request).await {
+        Ok((ws, _resp)) => Ok(ws),
+        Err(tokio_tungstenite::tungstenite::Error::Http(resp)) => Err(resp.status().as_u16()),
+        Err(e) => panic!("websocket connect failed without an HTTP status: {e}"),
+    }
+}
+
+/// A `serve --service` child: a grant verifier, one or more `--shard <name>=<path>` mounts, and a
+/// listener. Deliberately *not* built on [`serve_cmd`] — that passes `--key` and `--session-file`,
+/// both of which service mode refuses at startup.
+pub fn serve_service_cmd(
+    bin: &str,
+    base: &str,
+    port: u16,
+    grant_key_flag: &str,
+    seal_key: &std::path::Path,
+    shards: &[(&str, &std::path::Path)],
+) -> Command {
+    let mut c = Command::new(bin);
+    isolate_provider_env(&mut c);
+    c.args([
+        "serve",
+        "--service",
+        "--gateway-url",
+        base,
+        "--model",
+        "claude-test",
+        "--listen",
+        &format!("127.0.0.1:{port}"),
+        "--grant-key",
+        grant_key_flag,
+        "--seal-key",
+        &seal_key.to_string_lossy(),
+    ]);
+    for (name, path) in shards {
+        c.arg("--shard").arg(format!("{name}={}", path.display()));
+    }
+    c.env("HOME", ISOLATED_HOME)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    c
+}
 
 /// Connect a WebSocket client to a `serve --listen` port, optionally naming a session via the URL.
 pub async fn ws_connect(port: u16, session_id: Option<&str>) -> TestWs {

@@ -153,6 +153,13 @@ pub struct ShellFs {
     /// The target's `$HOME`, for expanding a leading `~`. `None` leaves `~` untouched rather than
     /// guessing — a wrong home silently produces a plausible path for the wrong user.
     home: Option<String>,
+    /// Memoized "is this root inside a git repository", answered **on the target** — see
+    /// [`ShellFs::root_in_git_repo`].
+    ///
+    /// A `Mutex<HashMap>` rather than anything fancier because the map holds one entry per distinct
+    /// search root a session ever uses (in practice: one), and the lock is never held across an
+    /// `await`. Probing per search would otherwise add a round trip to every `grep` and `find`.
+    git_roots: std::sync::Mutex<std::collections::HashMap<PathBuf, bool>>,
 }
 
 impl ShellFs {
@@ -171,6 +178,7 @@ impl ShellFs {
             caps,
             timeout: DEFAULT_TIMEOUT,
             home: None,
+            git_roots: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -204,7 +212,9 @@ impl FsBackend for ShellFs {
     async fn search(&self, q: &SearchQuery) -> Result<SearchOutcome, FsError> {
         let engine = self.caps.search_engine();
         let args = match engine {
-            SearchEngine::Ripgrep => rg_args(q),
+            // The git-repo question is asked only on the rung that can act on it: `--no-require-git`
+            // is a ripgrep flag, and the POSIX rungs honor no `.gitignore` at all.
+            SearchEngine::Ripgrep => rg_args(q, self.root_in_git_repo(&q.root).await),
             SearchEngine::PosixGrep => posix_grep_args(q, true),
             SearchEngine::BusyboxGrep => posix_grep_args(q, false),
         };
@@ -506,7 +516,8 @@ impl FsBackend for ShellFs {
                     "--null".to_string(),
                     "--hidden".to_string(),
                 ];
-                if !crate::tools::root_is_inside_git_repo(&q.root) {
+                // The target's answer, not this host's — see `ShellFs::root_in_git_repo`.
+                if !self.root_in_git_repo(&q.root).await {
                     a.push("--no-require-git".to_string());
                 }
                 a.push("--".to_string());
@@ -686,6 +697,36 @@ impl FsBackend for ShellFs {
 }
 
 impl ShellFs {
+    /// Whether `root` — or any of its ancestors — holds a `.git`, asked **on the target** and cached.
+    ///
+    /// [`crate::tools::root_is_inside_git_repo`] answers the same question with host `stat`s, which is
+    /// right for [`super::local::LocalFs`] and meaningless here: the replica's `/work` is not the
+    /// sandbox's, so the host answer is a coin flip that decides whether `rg` gets `--no-require-git`
+    /// and therefore whether `.gitignore` is honored at all. Getting it wrong is invisible — a search
+    /// that quietly walks `node_modules/`, or one that quietly doesn't.
+    ///
+    /// Cached per root: the answer changes only if someone runs `git init` mid-session, and paying a
+    /// round trip on every `grep` to catch that would be the wrong trade. A transport failure answers
+    /// `false`, matching what the local version reports for a root it cannot stat.
+    async fn root_in_git_repo(&self, root: &Path) -> bool {
+        if let Ok(cache) = self.git_roots.lock()
+            && let Some(hit) = cache.get(root)
+        {
+            return *hit;
+        }
+        let answer = self
+            .exec(
+                "sh",
+                &sh_script(GIT_REPO_SCRIPT, &[root.to_string_lossy().into_owned()]),
+            )
+            .await
+            .is_ok_and(|r| r.code == Some(0));
+        if let Ok(mut cache) = self.git_roots.lock() {
+            cache.insert(root.to_path_buf(), answer);
+        }
+        answer
+    }
+
     /// One command, one place: every operation's timeout, error wrapping and argv discipline.
     async fn exec(&self, program: &str, args: &[String]) -> Result<ExecResult, FsError> {
         self.runner
@@ -1013,6 +1054,24 @@ stat -c '%s	%Y' -- "$1" 2>/dev/null || printf '0	0'
 printf '
 '"#;
 
+/// Walk `$1` and its ancestors looking for a `.git`, exiting 0 the moment one is found — the
+/// target-side twin of [`crate::tools::root_is_inside_git_repo`], step for step, so the two backends
+/// make the same `--no-require-git` decision about the same tree.
+///
+/// Built from `dirname` and `[ -e ]` rather than `git rev-parse`: git is a *development* tool and a
+/// sandbox that has none is ordinary, whereas a missing `.git` genuinely means "not a repository"
+/// here. The `[ "$n" = "$d" ]` guard is the loop's only termination proof — `dirname /` is `/`, and
+/// `dirname` of a bare relative name is `.`, both fixed points.
+const GIT_REPO_SCRIPT: &str = r#"d="$1"
+[ -d "$d" ] || d="$(dirname "$d")"
+while [ -n "$d" ]; do
+  [ -e "$d/.git" ] && exit 0
+  n="$(dirname "$d")"
+  [ "$n" = "$d" ] && break
+  d="$n"
+done
+exit 1"#;
+
 /// Read a byte window and base64 it. `dd`'s `skip_bytes`/`count_bytes` are what make an arbitrary
 /// offset expressible at all.
 ///
@@ -1099,7 +1158,10 @@ fn incomplete_note(result: &ExecResult) -> Option<String> {
 /// `--hidden` mirrors `WalkBuilder::hidden(false)`, and `--no-require-git` mirrors the
 /// `require_git(false)` applied outside a real repository so a plain checkout still honors its
 /// `.gitignore`.
-fn rg_args(q: &SearchQuery) -> Vec<String> {
+///
+/// `in_git_repo` is the target's answer (see [`ShellFs::root_in_git_repo`]), not this host's — the
+/// host's would be about a different tree.
+fn rg_args(q: &SearchQuery, in_git_repo: bool) -> Vec<String> {
     let mut args = vec![
         "--null".to_string(),
         "--line-number".to_string(),
@@ -1107,7 +1169,7 @@ fn rg_args(q: &SearchQuery) -> Vec<String> {
         "--color=never".to_string(),
         "--hidden".to_string(),
     ];
-    if !crate::tools::root_is_inside_git_repo(&q.root) {
+    if !in_git_repo {
         args.push("--no-require-git".to_string());
     }
     if q.ignore_case {
@@ -1339,7 +1401,7 @@ mod tests {
     fn rg_args_put_the_pattern_behind_dash_e_and_the_path_behind_dash_dash() {
         // A pattern or path starting with `-` must never be read as a flag.
         let q = query("-v", PathBuf::from("-weird-dir"), 100);
-        let args = rg_args(&q);
+        let args = rg_args(&q, false);
         let e = args.iter().position(|a| a == "-e").unwrap();
         assert_eq!(args[e + 1], "-v");
         let dd = args.iter().position(|a| a == "--").unwrap();
@@ -1350,7 +1412,7 @@ mod tests {
     fn a_negated_glob_becomes_a_bang_prefixed_rg_glob() {
         let mut q = query("x", PathBuf::from("."), 100);
         q.glob = Some(("*.test.rs".into(), true));
-        let args = rg_args(&q);
+        let args = rg_args(&q, false);
         let g = args.iter().position(|a| a == "--glob").unwrap();
         assert_eq!(args[g + 1], "!*.test.rs");
     }

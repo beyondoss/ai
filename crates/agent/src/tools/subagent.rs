@@ -130,6 +130,10 @@ pub struct SubagentCtx {
     pub tool_cfg: ChildToolConfig,
     pub cwd: PathBuf,
     pub project_trusted: bool,
+    /// Whether an on-disk `SYSTEM.md`/`APPEND_SYSTEM.md` may override a child's base prompt — see
+    /// [`crate::resources::PromptOptions::disk_overrides`]. Inherited from the parent, so a service
+    /// session's children are as fail-closed about the replica's filesystem as it is.
+    pub disk_overrides: bool,
     pub prompt_guidelines: Vec<String>,
     /// The model a child inherits when its definition names none.
     pub parent_model: String,
@@ -936,6 +940,12 @@ impl Subagent {
             bash_timeout_ms: self.ctx.tool_cfg.bash_timeout_ms,
             bash_shell_path: self.ctx.tool_cfg.bash_shell_path.as_deref(),
             bash_command_prefix: self.ctx.tool_cfg.bash_command_prefix.as_deref(),
+            // A child in the remote world falls back to the default remote shell unless the operator
+            // named one explicitly, which `bash_shell_path` above already inherits. Threading the
+            // *probed* shell down instead belongs with the serve-side plumbing that learns it, and
+            // costs only bashisms in the meantime — never a failed spawn, since the fallback is the
+            // `sh` every POSIX target has.
+            remote_shell: None,
             image_auto_resize: self.ctx.tool_cfg.image_auto_resize,
             root: root.to_path_buf(),
             code_mode: self.ctx.tool_cfg.code_mode,
@@ -1023,6 +1033,7 @@ impl Subagent {
                     &[]
                 },
                 project_trusted: self.ctx.project_trusted,
+                disk_overrides: self.ctx.disk_overrides,
             },
             context_files,
         )

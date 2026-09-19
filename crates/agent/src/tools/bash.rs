@@ -20,6 +20,8 @@ use regex::Regex;
 use serde_json::{Value, json};
 
 use super::exec::{ChunkSink, CommandRunner, RealRunner};
+use super::fs::local::LocalFs;
+use super::fs::{FsBackend, PathWorld};
 use super::output::{OutputAccumulator, OutputSnapshot, TruncatedBy, format_output};
 
 /// Default command timeout (ms) when the model doesn't specify one. The reference agent has no default
@@ -40,12 +42,25 @@ const MAX_TIMEOUT_MS: u64 = 2_147_483_647;
 /// command from flooding the event stream; the final snapshot is always emitted regardless.
 const UPDATE_THROTTLE: Duration = Duration::from_millis(100);
 
+/// The shell used when the commands run somewhere other than this host and nobody said which shell
+/// that target has (see [`Bash::with_remote_shell`]).
+///
+/// `sh`, not `bash`: the whole point of not running [`resolve_shell`] remotely is that this host's
+/// filesystem answers a question about the wrong machine, and guessing `bash` would be the same
+/// mistake in a different spelling — a busybox sandbox (Alpine, which is a large share of real ones)
+/// has no `bash` at all, so every command would die on the shell rather than on its own merits.
+/// Losing `[[` and `pipefail` degrades a command; losing the shell fails all of them.
+const DEFAULT_REMOTE_SHELL: &str = "sh";
+
 /// Resolve the shell commands run through: `/bin/bash` if present, else `bash` on `$PATH`, else `sh` —
 /// pi's `shell.ts` resolution order (minus the Windows/WSL branches, which don't apply on this
 /// platform). Bash's associative arrays, `[[`, `pipefail`, and process substitution are common enough
 /// in model-generated commands that silently falling back to a POSIX `sh` (which may be `dash`, and
 /// rejects all of the above) is a real correctness gap, not just a style preference. Cached: the
 /// filesystem/PATH answer can't change mid-process.
+///
+/// **Host-only.** Every probe here reads *this* machine's filesystem and `$PATH`, so it is reached
+/// only in [`PathWorld::Local`]; see [`DEFAULT_REMOTE_SHELL`] for the other side.
 fn resolve_shell() -> &'static str {
     static SHELL: OnceLock<String> = OnceLock::new();
     SHELL.get_or_init(|| {
@@ -69,6 +84,9 @@ pub struct Bash {
     default_timeout_ms: u64,
     /// Overrides `resolve_shell()`'s auto-detection when set — see [`with_shell_path`](Self::with_shell_path).
     shell_path: Option<String>,
+    /// The shell to use when [`Self::backend`] reports a remote world — see
+    /// [`with_remote_shell`](Self::with_remote_shell).
+    remote_shell: Option<String>,
     /// Prepended to every command, on its own line, when set — see
     /// [`with_command_prefix`](Self::with_command_prefix).
     command_prefix: Option<String>,
@@ -87,6 +105,16 @@ pub struct Bash {
     /// [`Tool::conservative_exclusive`]). Pointing its cwd at a per-child worktree is what keeps those
     /// commands from colliding.
     root: std::path::PathBuf,
+    /// Which filesystem this tool's `cwd`, `~` and spilled output belong to.
+    ///
+    /// Held as the **backend itself**, not as a captured [`PathWorld`], and asked per call: an
+    /// `ExecCell` re-pointed by `set_exec_endpoint` takes effect on the next tool call with no
+    /// registry rebuild, so a snapshot taken at construction would keep answering for the machine the
+    /// session just left — exactly the silent, plausible-looking wrong answer [`PathWorld`] exists to
+    /// prevent. It is the same `Arc` the filesystem tools hold, which is what makes "`bash` and `edit`
+    /// are on one machine" structural here rather than a comment; see
+    /// [`ToolConfig::command_runner`](super::ToolConfig::command_runner).
+    backend: Arc<dyn FsBackend>,
 }
 
 /// Build the model-facing tool description, stating the *actual* default timeout (a model omitting
@@ -113,9 +141,11 @@ impl Bash {
             runner: Arc::new(RealRunner),
             default_timeout_ms: DEFAULT_TIMEOUT_MS,
             shell_path: None,
+            remote_shell: None,
             command_prefix: None,
             description: describe(DEFAULT_TIMEOUT_MS),
             root: std::path::PathBuf::new(),
+            backend: Arc::new(LocalFs::new()),
         }
     }
 
@@ -137,9 +167,13 @@ impl Bash {
     /// itself, else `None` (inherit the process cwd). Returned as an owned `String` because both the
     /// validation below and the runner need it, and it may be a freshly-joined path rather than a
     /// borrow of the input.
-    fn resolve_cwd(&self, cwd: Option<&str>) -> Option<String> {
+    ///
+    /// `world` decides only what a leading `~` expands against: this process's `$HOME` locally, the
+    /// target's remotely (and nothing at all when the target's home isn't known, rather than a guess).
+    /// The join onto `root` is pure string work and identical either way.
+    fn resolve_cwd(&self, cwd: Option<&str>, world: &PathWorld) -> Option<String> {
         match cwd {
-            Some(dir) => Some(super::resolve_against(&self.root, dir)),
+            Some(dir) => Some(super::resolve_against_in(&self.root, dir, world)),
             None if !self.root.as_os_str().is_empty() => Some(self.root.display().to_string()),
             None => None,
         }
@@ -178,18 +212,43 @@ impl Bash {
             runner,
             default_timeout_ms: DEFAULT_TIMEOUT_MS,
             shell_path: None,
+            remote_shell: None,
             command_prefix: None,
             description: describe(DEFAULT_TIMEOUT_MS),
             root: std::path::PathBuf::new(),
+            backend: Arc::new(LocalFs::new()),
         }
     }
 
+    /// Builder-style: take this tool's [`PathWorld`] from `backend`, which must be the backend the
+    /// filesystem tools were built with. See [`Bash::backend`].
+    pub fn with_backend(mut self, backend: Arc<dyn FsBackend>) -> Self {
+        self.backend = backend;
+        self
+    }
+
+    /// Builder-style: the shell to run through when the target is remote — see
+    /// [`ToolConfig::remote_shell`](super::ToolConfig::remote_shell).
+    pub fn with_remote_shell(mut self, shell: impl Into<String>) -> Self {
+        self.remote_shell = Some(shell.into());
+        self
+    }
+
     /// The shell `exec()` invokes: the override from [`with_shell_path`](Self::with_shell_path) if
-    /// set, else the auto-resolved default.
-    fn shell(&self) -> &str {
-        self.shell_path
-            .as_deref()
-            .unwrap_or_else(|| resolve_shell())
+    /// set, else — on this host — the auto-resolved default, and otherwise the target's shell
+    /// ([`with_remote_shell`](Self::with_remote_shell), defaulting to [`DEFAULT_REMOTE_SHELL`]).
+    ///
+    /// The world matters because [`resolve_shell`] answers by probing *this* machine's filesystem and
+    /// `$PATH`. Off-host that is not merely unhelpful, it is wrong in the most expensive direction: it
+    /// hands the sandbox a `/bin/bash` path that exists here, and every single command fails to spawn.
+    fn shell(&self, world: &PathWorld) -> &str {
+        if let Some(explicit) = self.shell_path.as_deref() {
+            return explicit;
+        }
+        if world.is_remote() {
+            return self.remote_shell.as_deref().unwrap_or(DEFAULT_REMOTE_SHELL);
+        }
+        resolve_shell()
     }
 
     /// Shared body for [`Tool::run`] and [`Tool::run_streaming`]. Raw output feeds one accumulator; when
@@ -214,7 +273,11 @@ impl Bash {
         // relative one is joined onto it. Everything below — the validation, the error text, and what
         // the runner is handed — uses the *resolved* directory, since that is the one the child will
         // actually chdir into and the one whose non-existence would fail the spawn.
-        let cwd = self.resolve_cwd(input.get("cwd").and_then(Value::as_str));
+        //
+        // Asked once per call and threaded through everything below that could otherwise consult the
+        // wrong machine: tilde expansion, the `cwd` pre-check, the shell, and the spill file.
+        let world = self.backend.world();
+        let cwd = self.resolve_cwd(input.get("cwd").and_then(Value::as_str), &world);
         let cwd = cwd.as_deref();
         // Fail with a clear message instead of the raw spawn-error wrapping ("spawn failed: No such
         // file or directory") a bad `cwd` would otherwise surface as — matches pi's own pre-check, plus
@@ -224,7 +287,15 @@ impl Bash {
         // and "exists but isn't a directory" must be told apart explicitly (pi-parity task 51): a path
         // that exists (a file, a broken permission on an ancestor notwithstanding) must not be reported
         // as nonexistent.
-        if let Some(dir) = cwd {
+        //
+        // Host-only, and deliberately not re-expressed as a remote `stat`. Off-host, `is_dir`/`exists`
+        // answer for the replica — where a sandbox path is typically *absent*, so the check would
+        // reject every perfectly good `cwd` — and paying a round trip to ask the target the same
+        // question buys nothing the shell doesn't already tell us: `run_streaming` with a bad `cwd`
+        // comes back as a failed spawn naming the directory.
+        if let Some(dir) = cwd
+            && !world.is_remote()
+        {
             let p = Path::new(dir);
             if !p.is_dir() {
                 let msg = if p.exists() {
@@ -271,7 +342,16 @@ impl Bash {
         let args = vec!["-c".to_string(), resolved_command];
         let dur = Duration::from_millis(timeout_ms);
 
-        let acc = Arc::new(Mutex::new(OutputAccumulator::new()));
+        // The spill file is written on *this* host. When the command ran somewhere else that is the
+        // one machine whose filesystem the model cannot reach, so `Full output: /tmp/pi-bash-….log`
+        // would name a path it can never read — and, on a replica serving other tenants, would put a
+        // tenant's command output on the host besides. No file is created at all; the marker tells the
+        // model to redirect the output into its own sandbox instead.
+        let acc = Arc::new(Mutex::new(if world.is_remote() {
+            OutputAccumulator::new().without_spill()
+        } else {
+            OutputAccumulator::new()
+        }));
         let streamed = Arc::new(AtomicBool::new(false));
         let last_emit = Arc::new(Mutex::new(Instant::now()));
 
@@ -318,7 +398,7 @@ impl Bash {
         let sink: ChunkSink<'_> = &sink;
         let run_fut = self
             .runner
-            .run_streaming(self.shell(), &args, cwd, dur, sink);
+            .run_streaming(self.shell(&world), &args, cwd, dur, sink);
 
         // Races the runner against this call's own cancellation — the same token a caller trips via
         // `abort_bash`/SIGTERM/etc (e.g. `serve`'s host `bash` RPC) — rather than being cancellable only
@@ -616,6 +696,7 @@ mod tests {
             full_output_path: Some("/tmp/pi-bash-abc.log".into()),
             full_output_capped: false,
             full_output_bytes: 12345,
+            spill_disabled: false,
             last_line_bytes: 4,
         };
         let details = truncation_details(&snap).expect("truncated snapshot must carry details");
@@ -657,6 +738,7 @@ mod tests {
             full_output_path: Some("/tmp/pi-bash-abc.log".into()),
             full_output_capped: true,
             full_output_bytes: 134_217_728,
+            spill_disabled: false,
             last_line_bytes: 4,
         };
         let details = truncation_details(&snap).expect("truncated snapshot must carry details");
@@ -683,6 +765,7 @@ mod tests {
             full_output_path: None,
             full_output_capped: false,
             full_output_bytes: 0,
+            spill_disabled: false,
             last_line_bytes: 3,
         };
         assert!(truncation_details(&snap).is_none());

@@ -743,6 +743,29 @@ enum Command {
         /// key. Read once, at startup. Requires `--grant-key`.
         #[usage(long, env = "AI_AGENT_SEAL_KEY")]
         seal_key: Option<std::path::PathBuf>,
+        /// Run as a **fail-closed multi-tenant service**: every connection must present a verified
+        /// `bsg_v1` session grant in the `x-beyond-grant` header, each session runs against that
+        /// grant's sandbox, tenant-rooted storage and gateway key, and nothing tenant-specific is
+        /// read from or written to this replica — no `~/.claude`, no stored settings, no
+        /// `models.json`/`auth.json`, no local exec fallback. Requires `--grant-key`/`--seal-key`,
+        /// at least one `--shard`, and a listener (`--listen`, `--listen-uds`, or systemd socket
+        /// activation); stdio `serve --service` is refused. Many single-tenant flags are refused
+        /// alongside it — the error names the one you passed.
+        #[usage(long, env = "AI_AGENT_SERVICE")]
+        service: bool,
+        /// A tenant-data mount this replica serves: `<name>=</absolute/path>`, repeatable. A shard
+        /// holds `<path>/<tenant>/sessions` and `<path>/<tenant>/memory`, and a session id carries
+        /// its shard as a `<shard>.` prefix, so an id alone says which mount to open. A grant naming
+        /// a shard this replica doesn't mount is answered `421 Misdirected Request`, so the edge can
+        /// route it to a replica that does. Only meaningful with `--service`, which requires at
+        /// least one.
+        #[usage(long, env = "AI_AGENT_SHARD", delimiter = ',')]
+        shard: Vec<String>,
+        /// Service mode: refuse a new session once this many are live on this replica (503). Two
+        /// open file descriptors per live session keeps the default comfortably inside a network
+        /// filesystem's per-instance limits. Not enforced yet.
+        #[usage(long, env = "AI_AGENT_MAX_LIVE_SESSIONS", default = "20000")]
+        max_live_sessions: usize,
         /// Address this exact session: reattach to it if it already exists, or create it under exactly
         /// this id if it doesn't. Gives a caller a known, predictable name to route on rather than
         /// parsing an id back out of `get_state`/the startup `{"kind":"session", id, …}` banner.
@@ -1823,6 +1846,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             upstream_http2,
             grant_key,
             seal_key,
+            service,
+            shard,
+            max_live_sessions,
             session_id,
             r#continue: continue_session,
             no_session_persistence,
@@ -1916,6 +1942,75 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             let grant_verifier =
                 beyond_ai_agent::grant::GrantVerifier::from_flags(&grant_key, seal_key.as_deref())?
                     .map(Arc::new);
+            // Service mode: validated here, before anything is bound or opened, because every one
+            // of these is a way for the replica to reach a tenant (or the reverse). A refusal names
+            // the flag, so an operator fixes the deployment rather than discovering at runtime that
+            // a flag was silently ignored.
+            let shards = Arc::new(beyond_ai_agent::service::Shards::parse(&shard)?);
+            let systemd_activated = cfg!(unix)
+                && listen.is_none()
+                && listen_uds.is_none()
+                && std::env::var_os("LISTEN_FDS").is_some();
+            if service {
+                if grant_verifier.is_none() {
+                    return Err(
+                        "--service requires --grant-key and --seal-key: every connection must \
+                         present a verified session grant"
+                            .into(),
+                    );
+                }
+                if shards.is_empty() {
+                    return Err(
+                        "--service requires at least one --shard <name>=</absolute/path>: tenant \
+                         data has nowhere to live"
+                            .into(),
+                    );
+                }
+                if listen.is_none() && listen_uds.is_none() && !systemd_activated {
+                    return Err(
+                        "--service requires --listen, --listen-uds, or systemd socket activation: \
+                         stdio has no place to carry a per-connection session grant"
+                            .into(),
+                    );
+                }
+                // Every flag here is either a *host* resource a tenant must not reach, or a
+                // per-process setting a grant now supplies per session. Refused rather than
+                // ignored: silently dropping `--key` would leave an operator believing the
+                // replica's own credential was in use.
+                //
+                // Worktree isolation isn't in this table because it isn't a flag: a subagent asks
+                // for it in its own `.claude/agents/*.md` (`isolation: worktree`). Service mode
+                // discovers no agent definitions at all, so nothing can request it, and the
+                // subagent PR refuses it explicitly when discovery lands.
+                let refused: [(&str, bool); 19] = [
+                    ("--key", key.is_some()),
+                    ("--session-file", session_file.is_some()),
+                    ("--session-dir", session_dir.is_some()),
+                    ("--session-id", session_id.is_some()),
+                    ("--continue", continue_session),
+                    ("--name", name.is_some()),
+                    ("--no-session-persistence", no_session_persistence),
+                    ("--memory", memory.is_some()),
+                    ("--trust-project", trust_project),
+                    ("--force-untrusted", force_untrusted),
+                    ("--exec-url", exec_url.is_some()),
+                    ("--exec-cmd", exec_cmd.is_some()),
+                    ("--exec-header", !exec_header.is_empty()),
+                    ("--web-allow-private", web_allow_private),
+                    ("--web-allow-host", !web_allow_host.is_empty()),
+                    ("--code-mode", code_mode),
+                    ("--skill", !extra_skill_paths.is_empty()),
+                    ("--prompt-template", !extra_prompt_template_paths.is_empty()),
+                    ("--bash-shell-path", bash_shell_path.is_some()),
+                ];
+                if let Some((flag, _)) = refused.iter().find(|(_, given)| *given) {
+                    return Err(format!(
+                        "{flag} is refused with --service: in service mode the session grant \
+                         supplies this, and the replica's own must never reach a tenant"
+                    )
+                    .into());
+                }
+            }
             // `--system-prompt`/`--append-system-prompt` may each name an existing, readable file
             // instead of literal text (pi-parity fix — matches pi's own `resolvePromptInput`). `run`'s
             // identical resolution (`main.rs::resolve_prompt_input`).
@@ -1949,8 +2044,19 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             // Feature 2 (Round 3, pi-parity): merges a trusted project's own
             // `<cwd>/.claude/settings.json` tier on top of the global one first — see
             // `settings::effective_settings_for_cwd`'s own doc comment for the trust-gating rationale.
+            //
+            // **Not in service mode.** These are the replica operator's own settings — its
+            // `~/.claude/settings.json` and whatever project happens to be its cwd — and every one
+            // of the defaults below (a shell path, skill and template paths, the memory backend, a
+            // session directory, a model, a gateway URL) would otherwise configure someone else's
+            // tenant. An empty `Settings` makes every `or_else` fall through to this crate's own
+            // built-in default, exactly as it does on a machine with no settings file.
             let cwd = canonical_cwd(&std::env::current_dir().unwrap_or_default());
-            let stored_settings = beyond_ai_agent::settings::effective_settings_for_cwd(&cwd);
+            let stored_settings = if service {
+                beyond_ai_agent::settings::Settings::default()
+            } else {
+                beyond_ai_agent::settings::effective_settings_for_cwd(&cwd)
+            };
             // Round 3 (pi-parity fix): same "explicit flag/env, then stored setting, then built-in
             // default" precedence as every other `stored_settings`-backed fallback here — see
             // `run_task`'s identical block, just below in this file, for the full set.
@@ -2104,15 +2210,25 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             // skipped with a warning, matching `has_gated_resources`'s own "warn, don't block the run"
             // convention in the `run` path above. `stored_settings.mcp_servers` is already trust-gated —
             // see that field's own doc comment.
-            let (mcp_tools, mcp_catalog, mcp_warnings) = tools::mcp::connect_all(
-                stored_settings.mcp_servers.as_deref().unwrap_or(&[]),
-                mcp_idle_reap_after(),
-                mcp_manifest_dir().as_ref(),
-            )
-            .await;
-            for warning in &mcp_warnings {
-                eprintln!("warning: {warning}");
-            }
+            //
+            // Skipped entirely in service mode: these are the operator's own configured servers,
+            // connected once process-wide and shared by every session — the exact opposite of what
+            // a tenant needs. A tenant's connectors come from its grant, per session (a later PR);
+            // until then it has none rather than the replica's.
+            let (mcp_tools, mcp_catalog) = if service {
+                (Vec::new(), tools::mcp::McpCatalog::default())
+            } else {
+                let (mcp_tools, mcp_catalog, mcp_warnings) = tools::mcp::connect_all(
+                    stored_settings.mcp_servers.as_deref().unwrap_or(&[]),
+                    mcp_idle_reap_after(),
+                    mcp_manifest_dir().as_ref(),
+                )
+                .await;
+                for warning in &mcp_warnings {
+                    eprintln!("warning: {warning}");
+                }
+                (mcp_tools, mcp_catalog)
+            };
             // Parse the UDS socket mode from its octal string (`0o660`, `660`, `0660` all work) up
             // front so a bad value fails fast with a clear message rather than deep in the listener.
             let listen_uds_mode: Option<u32> = match &listen_uds_mode {
@@ -2129,9 +2245,17 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .or_else(|| stored_settings.default_gateway_url.clone())
                 .or_else(|| key.is_some().then(|| DEFAULT_GATEWAY.to_string()));
             let serve_cfg = serve::ServeConfig {
-                provider_env: beyond_ai_agent::gateway_credential::ProviderEnv::from_process_env(
-                    configured_gateway.is_some(),
-                ),
+                // Service mode reads no ambient provider env at all: `AI_DIRECT`/`AI_PROVIDER`/
+                // `ANTHROPIC_API_KEY` and friends are this replica's environment, and a session's
+                // only credential is the one sealed in its grant (see `serve::build_gateway_client`).
+                // An empty `ProviderEnv` keeps every later `resolve_gateway_credential` call inert.
+                provider_env: if service {
+                    beyond_ai_agent::gateway_credential::ProviderEnv::default()
+                } else {
+                    beyond_ai_agent::gateway_credential::ProviderEnv::from_process_env(
+                        configured_gateway.is_some(),
+                    )
+                },
                 gateway: configured_gateway.unwrap_or_else(|| DEFAULT_GATEWAY.to_string()),
                 key,
                 model: resolved_model,
@@ -2159,6 +2283,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 // The daemon path (`serve_ws`) fills this from `upstream_http2` before spawning any
                 // session; the stdio/`run` path leaves it `None` and never pools.
                 shared_http: None,
+                service_mode: service,
+                shards,
+                // Per connection, never per process: filled in by `serve_ws::session_cfg` from the
+                // grant that spawned the session.
+                service: None,
+                max_live_sessions,
+                mcp_http: None,
                 session_id,
                 continue_session,
                 no_session_persistence,
@@ -2244,11 +2375,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             // systemd socket activation: if systemd started us with a passed socket (`LISTEN_FDS`) and
             // no explicit listen flag was given, adopt that socket instead of binding — the socket then
             // outlives a `systemctl restart` (connections queue in the kernel). Unix/systemd only, and
-            // deferred to `--listen`/`--listen-uds` when either is set.
-            let systemd_activated = cfg!(unix)
-                && serve_cfg.listen.is_none()
-                && serve_cfg.listen_uds.is_none()
-                && std::env::var_os("LISTEN_FDS").is_some();
+            // deferred to `--listen`/`--listen-uds` when either is set. Computed once, up with the
+            // `--service` validation, since that refuses stdio and so has to know.
             let use_ws =
                 serve_cfg.listen.is_some() || serve_cfg.listen_uds.is_some() || systemd_activated;
             let shutdown_cause = if use_ws {
@@ -4275,6 +4403,7 @@ async fn run_task(
             },
             cwd: cwd.clone(),
             project_trusted,
+            disk_overrides: true,
             prompt_guidelines: prompt_guidelines.clone(),
             parent_model: model.clone(),
             parent_cache_key: model.clone(),
@@ -4334,6 +4463,7 @@ async fn run_task(
             memory_sections: &memory_sections,
             project_trusted,
             agents: &agent_defs,
+            disk_overrides: true,
         },
     );
     timing.mark("build system prompt");
@@ -4587,6 +4717,8 @@ async fn run_task(
         beyond_ai_agent::lifecycle::Run::begin(
             std::sync::Arc::clone(&lifecycle),
             meta.id.clone(),
+            // `run` is single-tenant by construction: no grant, so no tenant to report.
+            None,
             None,
             meta.model.clone(),
         )

@@ -575,7 +575,22 @@ impl ExecTarget {
 
     /// Wrap an already-built runner, probing it for the capability rung.
     pub async fn over(runner: std::sync::Arc<dyn CommandRunner>) -> Self {
+        Self::over_with_home(runner, None).await
+    }
+
+    /// [`Self::over`], told the target's `$HOME` up front so a model-supplied `~/notes.md` expands
+    /// against the sandbox's own home instead of being left alone. Service mode learns the home from
+    /// its startup probe (`crate::service::ServiceSession::connect_exec`), which is the only caller
+    /// that can know it before the first tool call.
+    pub async fn over_with_home(
+        runner: std::sync::Arc<dyn CommandRunner>,
+        home: Option<String>,
+    ) -> Self {
         let backend = crate::tools::fs::shell::ShellFs::connect(runner.clone()).await;
+        let backend = match home {
+            Some(home) => backend.with_home(home),
+            None => backend,
+        };
         let caps = backend.capabilities();
         Self {
             runner,
@@ -611,24 +626,59 @@ impl ExecTarget {
 /// re-point takes effect immediately and cannot be missed by a skipped rebuild. It is the same shape
 /// `memory::file::SessionDir` already uses for the per-session `/session` mount, for the same reason.
 ///
-/// An empty cell means the host, so one registry serves both local and remote sessions.
+/// An empty cell means the host, so one registry serves both local and remote sessions — unless the
+/// cell is [strict](Self::strict), in which case an empty cell is an error and there is no host to
+/// fall back to.
 #[derive(Clone, Default)]
-pub struct ExecCell(std::sync::Arc<std::sync::RwLock<Option<ExecTarget>>>);
+pub struct ExecCell {
+    target: std::sync::Arc<std::sync::RwLock<Option<ExecTarget>>>,
+    /// Fail closed: an empty cell errors instead of running on this host. Service mode
+    /// (`serve --service`) sets it, because there the host is the *replica* — a tenant's `bash`
+    /// landing on it is not a stale-config bug but a breach. Fixed at construction.
+    strict: bool,
+}
+
+/// What a strict cell answers when nothing is configured. Static text: it reaches the model as a
+/// tool error, so it says what to do, not what went wrong internally.
+const NO_TARGET: &str = "no sandbox is attached to this session";
 
 impl ExecCell {
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// A cell with **no host fallback**: until a target is set, every command and every filesystem
+    /// call fails, rather than running on this host. Service mode (`serve --service`) uses this,
+    /// because there "this host" is the *replica* — a tenant's `bash` landing on it is not a
+    /// stale-config bug but a breach.
+    pub fn strict() -> Self {
+        Self {
+            target: std::sync::Arc::default(),
+            strict: true,
+        }
+    }
+
     /// Re-point at `target`, or back to the host with `None`. Takes effect on the next tool call.
     pub fn set(&self, target: Option<ExecTarget>) {
         // Recover a poisoned lock rather than panicking: the cell holds a single value with no
         // invariant a panicked writer could leave half-updated, and the workspace forbids `unwrap`.
-        *self.0.write().unwrap_or_else(|e| e.into_inner()) = target;
+        *self.target.write().unwrap_or_else(|e| e.into_inner()) = target;
     }
 
     pub fn get(&self) -> Option<ExecTarget> {
-        self.0.read().unwrap_or_else(|e| e.into_inner()).clone()
+        self.target
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// The target to dispatch to, or — in strict mode with an empty cell — the refusal.
+    fn resolve(&self) -> Result<Option<ExecTarget>, &'static str> {
+        match (self.get(), self.strict) {
+            (Some(t), _) => Ok(Some(t)),
+            (None, false) => Ok(None),
+            (None, true) => Err(NO_TARGET),
+        }
     }
 
     /// A [`CommandRunner`] that always dispatches to whatever this cell currently holds.
@@ -655,7 +705,7 @@ impl CommandRunner for CellRunner {
         cwd: Option<&str>,
         timeout: Duration,
     ) -> std::io::Result<ExecResult> {
-        match self.0.get() {
+        match self.0.resolve().map_err(std::io::Error::other)? {
             Some(t) => t.runner().run(program, args, cwd, timeout).await,
             None => {
                 crate::tools::exec::RealRunner
@@ -673,7 +723,7 @@ impl CommandRunner for CellRunner {
         timeout: Duration,
         on_chunk: ChunkSink<'_>,
     ) -> std::io::Result<ExecResult> {
-        match self.0.get() {
+        match self.0.resolve().map_err(std::io::Error::other)? {
             Some(t) => {
                 t.runner()
                     .run_streaming(program, args, cwd, timeout, on_chunk)
@@ -695,7 +745,7 @@ impl CommandRunner for CellRunner {
         timeout: Duration,
         stdin: &[u8],
     ) -> std::io::Result<ExecResult> {
-        match self.0.get() {
+        match self.0.resolve().map_err(std::io::Error::other)? {
             Some(t) => {
                 t.runner()
                     .run_with_stdin(program, args, cwd, timeout, stdin)
@@ -714,30 +764,39 @@ impl CommandRunner for CellRunner {
 struct CellFs(ExecCell);
 
 impl CellFs {
-    fn inner(&self) -> std::sync::Arc<dyn crate::tools::fs::FsBackend> {
-        match self.0.get() {
-            Some(t) => t.backend(),
-            None => std::sync::Arc::new(crate::tools::fs::local::LocalFs::new()),
+    fn inner(
+        &self,
+    ) -> Result<std::sync::Arc<dyn crate::tools::fs::FsBackend>, crate::tools::fs::FsError> {
+        match self.0.resolve() {
+            Ok(Some(t)) => Ok(t.backend()),
+            Ok(None) => Ok(std::sync::Arc::new(crate::tools::fs::local::LocalFs::new())),
+            Err(e) => Err(crate::tools::fs::FsError::Backend(e.to_owned())),
         }
     }
 }
 
 #[async_trait]
 impl crate::tools::fs::FsBackend for CellFs {
+    /// Not fallible, so a strict empty cell answers with the world it *will* have: remote, with no
+    /// home known yet. Never `Local` — a tenant's path must not resolve against the replica even in
+    /// the window before its sandbox is attached.
     fn world(&self) -> crate::tools::fs::PathWorld {
-        self.inner().world()
+        match self.inner() {
+            Ok(b) => b.world(),
+            Err(_) => crate::tools::fs::PathWorld::Remote { home: None },
+        }
     }
     async fn search(
         &self,
         q: &crate::tools::fs::SearchQuery,
     ) -> Result<crate::tools::fs::SearchOutcome, crate::tools::fs::FsError> {
-        self.inner().search(q).await
+        self.inner()?.search(q).await
     }
     async fn stat(
         &self,
         path: &std::path::Path,
     ) -> Result<Option<crate::tools::fs::Meta>, crate::tools::fs::FsError> {
-        self.inner().stat(path).await
+        self.inner()?.stat(path).await
     }
     async fn read_bytes(
         &self,
@@ -745,14 +804,14 @@ impl crate::tools::fs::FsBackend for CellFs {
         offset: u64,
         max: usize,
     ) -> Result<Vec<u8>, crate::tools::fs::FsError> {
-        self.inner().read_bytes(path, offset, max).await
+        self.inner()?.read_bytes(path, offset, max).await
     }
     async fn write_bytes(
         &self,
         path: &std::path::Path,
         bytes: &[u8],
     ) -> Result<(), crate::tools::fs::FsError> {
-        self.inner().write_bytes(path, bytes).await
+        self.inner()?.write_bytes(path, bytes).await
     }
     async fn write_if_unchanged(
         &self,
@@ -760,13 +819,15 @@ impl crate::tools::fs::FsBackend for CellFs {
         bytes: &[u8],
         expected: Option<std::time::SystemTime>,
     ) -> Result<bool, crate::tools::fs::FsError> {
-        self.inner().write_if_unchanged(path, bytes, expected).await
+        self.inner()?
+            .write_if_unchanged(path, bytes, expected)
+            .await
     }
     async fn create_dir_all(
         &self,
         path: &std::path::Path,
     ) -> Result<(), crate::tools::fs::FsError> {
-        self.inner().create_dir_all(path).await
+        self.inner()?.create_dir_all(path).await
     }
     async fn list_dir(
         &self,
@@ -774,12 +835,12 @@ impl crate::tools::fs::FsBackend for CellFs {
         cap: usize,
         include_hidden: bool,
     ) -> Result<Vec<crate::tools::fs::DirEntry>, crate::tools::fs::FsError> {
-        self.inner().list_dir(path, cap, include_hidden).await
+        self.inner()?.list_dir(path, cap, include_hidden).await
     }
     async fn glob(
         &self,
         q: &crate::tools::fs::GlobQuery,
     ) -> Result<crate::tools::fs::GlobOutcome, crate::tools::fs::FsError> {
-        self.inner().glob(q).await
+        self.inner()?.glob(q).await
     }
 }

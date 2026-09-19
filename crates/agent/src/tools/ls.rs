@@ -118,7 +118,9 @@ impl Tool for Ls {
 
     async fn run(&self, input: Value) -> Result<ToolOutput, ToolError> {
         let path = input.get("path").and_then(Value::as_str).unwrap_or(".");
-        let path = super::resolve_against(&self.root, path);
+        // Against the backend's world, so a `~` expands against the home of the filesystem this
+        // listing will actually run on rather than this process's.
+        let path = super::resolve_against_in(&self.root, path, &self.backend.world());
         let all = input.get("all").and_then(Value::as_bool).unwrap_or(false);
         let limit = input
             .get("limit")
