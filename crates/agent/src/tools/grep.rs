@@ -106,7 +106,9 @@ impl Tool for Grep {
             .and_then(Value::as_str)
             .ok_or_else(|| ToolError::InvalidInput("missing `pattern`".into()))?;
         let root = input.get("path").and_then(Value::as_str).unwrap_or(".");
-        let root = &super::resolve_against(&self.root, root);
+        // Against the backend's world, so a `~` expands against the home of the filesystem the search
+        // will actually run on rather than this process's.
+        let root = &super::resolve_against_in(&self.root, root, &self.backend.world());
         let ignore_case = input
             .get("ignore_case")
             .and_then(Value::as_bool)
@@ -193,6 +195,15 @@ impl Tool for Grep {
             (matches.len().saturating_mul(64)).min(super::output::MAX_LISTING_BYTES),
         );
         let mut lines_truncated = false;
+        // Whether the search root is a directory, decided from the hits themselves rather than with a
+        // host `is_dir` that would be answering about the wrong filesystem for a remote backend — and
+        // without the round trip a backend `stat` would cost (`grep` is deliberately one operation per
+        // call; see `tests/fs_backend_cost.rs`). It is exact, not an approximation: a hit's path can
+        // equal the root only when the root is the single file being searched, and every hit of such a
+        // search has that path. `matches` is non-empty here — the empty case returned above.
+        let root_is_dir = matches
+            .first()
+            .is_none_or(|h| h.path.as_ref() != root.as_path());
         for hit in &matches {
             let (path, line, text, is_match) = (&hit.path, hit.line, &hit.text, hit.is_match);
             // Write straight into `out` instead of allocating a `format!` temp String per line — same
@@ -203,7 +214,7 @@ impl Tool for Grep {
             if text.ends_with(LINE_TRUNCATED_SUFFIX) {
                 lines_truncated = true;
             }
-            let display_path = format_path(path, &root);
+            let display_path = format_path(path, &root, root_is_dir);
             let _ = if is_match {
                 writeln!(out, "{display_path}:{line}: {text}")
             } else {

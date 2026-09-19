@@ -95,7 +95,9 @@ impl Tool for Find {
             .and_then(Value::as_str)
             .ok_or_else(|| ToolError::InvalidInput("missing `pattern`".into()))?;
         let root = input.get("path").and_then(Value::as_str).unwrap_or(".");
-        let root = &super::resolve_against(&self.root, root);
+        // Against the backend's world, so a `~` expands against the home of the filesystem the walk
+        // will actually run on rather than this process's.
+        let root = &super::resolve_against_in(&self.root, root, &self.backend.world());
         let limit = input
             .get("limit")
             .and_then(Value::as_u64)
@@ -125,7 +127,8 @@ impl Tool for Find {
         // clearly the moment the search path isn't a directory. Checked via `metadata` (not
         // `is_dir()`) so a path that doesn't exist at all still falls through to the walk below, which
         // already reports that case via `walk_error`.
-        if let Some(meta) = self.backend.stat(&root).await?
+        let root_meta = self.backend.stat(&root).await?;
+        if let Some(meta) = &root_meta
             && meta.kind != FileKind::Dir
         {
             return Err(ToolError::Execution(format!(
@@ -133,6 +136,11 @@ impl Tool for Find {
                 root.display()
             )));
         }
+        // The same `stat` also answers `format_path`'s "is the root a directory", which used to be a
+        // second, host-only `is_dir` — a question about the wrong machine whenever the walk is remote.
+        // A `None` here is a path that doesn't exist, which is exactly what `is_dir` reported as
+        // `false`, so the rendering is unchanged locally.
+        let root_is_dir = matches!(&root_meta, Some(m) if m.kind == FileKind::Dir);
         let outcome = self
             .backend
             .glob(&GlobQuery {
@@ -174,7 +182,7 @@ impl Tool for Find {
                 .min(super::output::MAX_LISTING_BYTES),
         );
         for (path, is_dir) in &paths {
-            let rendered = format_path(path, &root);
+            let rendered = format_path(path, &root, root_is_dir);
             if *is_dir {
                 let _ = writeln!(out, "{rendered}/");
             } else {

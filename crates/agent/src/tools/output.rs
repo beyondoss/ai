@@ -99,6 +99,11 @@ pub struct OutputSnapshot {
     /// How many bytes actually landed in the spill file. Equals `truncation.total_bytes` unless
     /// `full_output_capped`.
     pub full_output_bytes: u64,
+    /// No spill file was written, and none was attempted, because the command did not run on this
+    /// host — see [`OutputAccumulator::without_spill`]. Distinct from a spill that *failed*: there is
+    /// nothing wrong here and nothing to retry, so [`format_output`] renders actionable guidance
+    /// (redirect the output into a file the model can actually read) instead of an empty path.
+    pub spill_disabled: bool,
     /// Full byte size of the current (last) line — used for the partial-line marker.
     pub last_line_bytes: u64,
 }
@@ -171,11 +176,19 @@ pub fn cap_listing_bytes(out: &mut String, guidance: &str) -> bool {
 /// reporting the full (possibly deeply-nested, possibly absolute) path root-first costs the model extra
 /// tokens per line for a prefix it already knows (it's whatever `path` it just asked to search), and
 /// diverges from pi's documented "relative to search directory" contract.
+///
+/// `root_is_dir` is **passed in** rather than read off the filesystem here, because this function is
+/// pure rendering and the answer belongs to whichever machine the search ran on: a `root.is_dir()`
+/// here asks the host about a path that may only exist inside a sandbox, and would quietly re-render
+/// every hit as a bare basename the moment the answer came back `false`. Both callers already know it
+/// for free — `find` from the `stat` it must do anyway, `grep` from whether its first hit *is* the
+/// root — so nobody pays a syscall or a round trip for it either.
 pub fn format_path<'a>(
     path: &'a std::path::Path,
     root: &std::path::Path,
+    root_is_dir: bool,
 ) -> std::borrow::Cow<'a, str> {
-    if !root.is_dir() {
+    if !root_is_dir {
         return match path.file_name() {
             Some(name) => name.to_string_lossy(),
             None => path.to_string_lossy(),
@@ -288,6 +301,10 @@ pub struct OutputAccumulator {
     spill_budget: u64,
     spill_bytes: u64,
     spill_capped: bool,
+    /// Spilling is off entirely — see [`OutputAccumulator::without_spill`]. Suppresses the temp file
+    /// *and* the pre-spill `raw_buffer`, which without a file to flush into would otherwise grow with
+    /// the whole stream: the point of the flag is that memory stays bounded by the rolling tail alone.
+    spill_disabled: bool,
 
     finished: bool,
 }
@@ -327,8 +344,21 @@ impl OutputAccumulator {
             spill_budget: MAX_SPILL_BYTES,
             spill_bytes: 0,
             spill_capped: false,
+            spill_disabled: false,
             finished: false,
         }
+    }
+
+    /// Builder-style: never create a spill file, and never touch the host filesystem at all.
+    ///
+    /// For a command that ran somewhere else. The spill file's entire value is that the model can go
+    /// read it later, and a file on the replica is one the model has no path to — so writing it would
+    /// buy nothing while putting a tenant's output on a shared host and sweeping a shared temp dir to
+    /// do it. The accumulator is otherwise unchanged: the rolling tail and the running totals still
+    /// make the truncation markers honest about the bytes that were dropped.
+    pub fn without_spill(mut self) -> Self {
+        self.spill_disabled = true;
+        self
     }
 
     /// Builder-style: shrink the spill file's byte budget. Test-only — production always runs the
@@ -360,7 +390,7 @@ impl OutputAccumulator {
         if self.spilled {
             // Post-spill: stream straight to the file so memory stays bounded — up to the budget.
             self.write_spill(data);
-        } else if !self.spill_failed {
+        } else if !self.spill_failed && !self.spill_disabled {
             // Pre-spill: keep the complete bytes in memory so a later spill can flush them whole.
             self.raw_buffer.extend_from_slice(data);
             // Spill once the buffered output outgrows the rolling cap *or* the line count outgrows the
@@ -443,6 +473,7 @@ impl OutputAccumulator {
             // as "no full output", not as a prefix a reader can trust.
             full_output_capped: self.spill_capped && self.temp_path.is_some(),
             full_output_bytes: self.spill_bytes,
+            spill_disabled: self.spill_disabled,
             last_line_bytes: self.current_line_bytes,
         }
     }
@@ -555,7 +586,7 @@ impl OutputAccumulator {
     /// freeing the in-memory buffer. On any filesystem error we mark `spill_failed`, free the buffer
     /// to stay bounded, and continue tail-only — the full output is lost but nothing panics.
     fn ensure_temp_file(&mut self) {
-        if self.spilled || self.spill_failed {
+        if self.spilled || self.spill_failed || self.spill_disabled {
             return;
         }
         // Sweep abandoned spill files from earlier commands before adding a new one — see
@@ -793,6 +824,16 @@ fn truncate_str_to_bytes_from_end(s: &str, max_bytes: usize) -> &str {
 /// The totals in the same marker (`of {total_lines}`) already describe the *complete* stream, so this
 /// segment names what's actually on disk against it.
 fn full_output_segment(snapshot: &OutputSnapshot) -> String {
+    // No file was written because writing one here would have put it on a machine the model cannot
+    // reach (see `OutputAccumulator::without_spill`). The marker's job is to be *actionable*, and the
+    // action is one the model can take unaided: re-run with the output redirected into its own
+    // filesystem, then `read` that. Phrased as an instruction, not as a missing path, because an empty
+    // `Full output: ` reads as a bug and invites a retry of the same truncated command.
+    if snapshot.spill_disabled {
+        return "Full output not saved — re-run redirecting it to a file you can read, e.g. \
+                `<command> > out.log 2>&1`, then read that file"
+            .to_string();
+    }
     // pi interpolates the path directly; when there is none we render an empty string rather than the
     // literal "undefined" JS would produce.
     let path = snapshot.full_output_path.as_deref().unwrap_or("");
@@ -1160,6 +1201,47 @@ mod tests {
     }
 
     #[test]
+    fn a_spill_disabled_accumulator_writes_nothing_to_the_host_and_says_what_to_do_instead() {
+        // For a command that ran somewhere else. A file here would be one the model has no path to,
+        // and on a shared replica it is a tenant's output left on the host — so there must be no file
+        // at all, not merely an unadvertised one. A prefix unique to this process makes the
+        // directory scan below an exact check rather than one that races every other spilling test.
+        let prefix = format!("nospill-probe-{}", std::process::id());
+        let mut acc = OutputAccumulator::with_prefix(&prefix).without_spill();
+        feed_firehose(&mut acc, 4 * 1024 * 1024); // 80x the display budget
+        acc.finish();
+        let snap = acc.snapshot(true);
+
+        assert!(snap.truncation.truncated, "the stream really did overflow");
+        assert!(snap.spill_disabled);
+        assert!(snap.full_output_path.is_none());
+        let leaked: Vec<_> = std::fs::read_dir(std::env::temp_dir())
+            .expect("read the temp dir")
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with(&format!("{prefix}-")))
+            .collect();
+        assert!(
+            leaked.is_empty(),
+            "a spill file was created anyway: {leaked:?}"
+        );
+
+        // The totals still describe the complete stream, so the marker stays honest about what was
+        // dropped — the accumulator is unchanged apart from where the bytes go.
+        assert!(snap.truncation.total_bytes > 4 * 1024 * 1024);
+        let text = format_output(&snap, "");
+        assert!(
+            text.ends_with(
+                "Full output not saved — re-run redirecting it to a file you can read, e.g. \
+                 `<command> > out.log 2>&1`, then read that file]"
+            ),
+            "got: {:?}",
+            text.lines().last()
+        );
+        assert!(!text.contains("Full output: "));
+    }
+
+    #[test]
     fn truncation_metadata_stays_honest_after_the_spill_budget_is_hit() {
         // Stopping the writes must not stop the accumulator: the tail the model reads, the totals it
         // reasons about, and the marker that admits how much was dropped all have to survive the
@@ -1361,6 +1443,7 @@ mod tests {
             full_output_path: Some("/tmp/pi-bash-abc.log".to_string()),
             full_output_capped: false,
             full_output_bytes: 12345,
+            spill_disabled: false,
             last_line_bytes: 4,
         };
         assert_eq!(

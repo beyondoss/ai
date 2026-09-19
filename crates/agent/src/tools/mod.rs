@@ -281,7 +281,9 @@ pub(crate) fn canonical_write_target(root: &Path, path: &str) -> String {
     if let Ok(real) = std::fs::canonicalize(path) {
         return real.display().to_string();
     }
-    lexical_write_target(root, path)
+    // `canonicalize` is a host syscall, so reaching here at all means the path is being keyed against
+    // this host — the only world in which joining the process cwd is a true answer.
+    lexical_write_target(root, path, &fs::PathWorld::Local)
 }
 
 /// The purely lexical half of [`canonical_write_target`]: fold away `.` and `..` and join a relative
@@ -298,9 +300,15 @@ pub(crate) fn canonical_write_target(root: &Path, path: &str) -> String {
 /// differ and the wrong one in the recommended configuration is the worst possible failure mode, so
 /// the choice is made explicitly by [`write_key`] rather than left to whether a syscall happened to
 /// fail.
-pub(crate) fn lexical_write_target(root: &Path, path: &str) -> String {
+///
+/// The `world` is consulted for one thing only: an **empty root**, which means "the process cwd".
+/// That is a true answer on this host and a fabricated one anywhere else — the replica's cwd is not
+/// the sandbox's — so a remote path with no root stays relative rather than being rooted at a
+/// directory the target has never heard of. Every other branch is pure string work, identical in
+/// both worlds.
+pub(crate) fn lexical_write_target(root: &Path, path: &str, world: &fs::PathWorld) -> String {
     let p = std::path::Path::new(path);
-    let mut normalized = if p.is_absolute() {
+    let mut normalized = if p.is_absolute() || (root.as_os_str().is_empty() && world.is_remote()) {
         PathBuf::new()
     } else if root.as_os_str().is_empty() {
         std::env::current_dir().unwrap_or_default()
@@ -342,7 +350,7 @@ pub(crate) fn write_key(root: &Path, path: &str, world: &fs::PathWorld) -> Strin
         // from racing on one file.
         fs::PathWorld::Local => canonical_write_target(root, &resolved),
         // Elsewhere, it can only lie. See [`lexical_write_target`].
-        fs::PathWorld::Remote { .. } => lexical_write_target(root, &resolved),
+        fs::PathWorld::Remote { .. } => lexical_write_target(root, &resolved, world),
     }
 }
 
@@ -365,17 +373,27 @@ pub(crate) fn write_key(root: &Path, path: &str, world: &fs::PathWorld) -> Strin
 /// offer. The guarantee is that two cooperating children fanned out in parallel don't silently stomp each
 /// other, not that a determined one is jailed.
 pub(crate) fn resolve_against(root: &Path, path: &str) -> String {
-    resolve_against_in(root, path, &fs::PathWorld::Local)
+    join_against(root, normalize_path(path))
 }
 
 /// [`resolve_against`], but expanding `~` against the home of whichever filesystem `world` names —
 /// this host's `$HOME` for [`fs::PathWorld::Local`], the target's for a remote one. The join itself is
 /// pure string work and identical either way; only tilde expansion is world-sensitive.
+///
+/// This is what every filesystem tool calls, `bash` included. [`resolve_against`] is the local world
+/// spelled out, and the local arm below *is* that call, so the two can never drift.
 pub(crate) fn resolve_against_in(root: &Path, path: &str, world: &fs::PathWorld) -> String {
-    let normalized = match world {
-        fs::PathWorld::Local => normalize_path(path),
-        fs::PathWorld::Remote { home } => normalize_path_with_home(path, home.as_deref()),
-    };
+    match world {
+        fs::PathWorld::Local => resolve_against(root, path),
+        fs::PathWorld::Remote { home } => {
+            join_against(root, normalize_path_with_home(path, home.as_deref()))
+        }
+    }
+}
+
+/// Join an already-normalized path onto `root` when it is still relative. The one definition of the
+/// join, shared by both worlds — it touches no filesystem and so cannot differ between them.
+fn join_against(root: &Path, normalized: String) -> String {
     if root.as_os_str().is_empty() || Path::new(&normalized).is_absolute() {
         return normalized;
     }
@@ -472,6 +490,18 @@ pub struct ToolConfig<'a> {
     /// A line prepended to every `bash` command in the same shell invocation
     /// (`--bash-command-prefix`, matching pi's `shellCommandPrefix`).
     pub bash_command_prefix: Option<&'a str>,
+    /// Which shell `bash` runs commands through when [`ToolConfig::fs_backend`] is **remote**.
+    ///
+    /// The local resolution order (`/bin/bash`, else `bash` on `$PATH`, else `sh`) is a set of host
+    /// filesystem probes, and their answer is about the wrong machine: a `/bin/bash` here says nothing
+    /// about a sandbox that may well be Alpine, where there is none. So in the remote world the host is
+    /// never probed and this value is used instead — whoever stood the sandbox up is the one who can
+    /// ask it (`command -v bash`). Unset falls back to `sh`, which every POSIX target has, rather than
+    /// to a `bash` a busybox image would fail every single command on.
+    ///
+    /// Ignored in the local world, and ignored anywhere when `bash_shell_path` is set: an explicit
+    /// operator override outranks both.
+    pub remote_shell: Option<&'a str>,
     /// Whether `read` downscales an oversized image to fit the inline budget (pi's
     /// `ImageSettings.autoResize`). `Default` is `false` here but every constructor below sets it
     /// `true` — see [`ToolConfig::new`], which is the only way this struct should be built.
@@ -612,8 +642,22 @@ pub fn default_registry_with_config(cfg: &ToolConfig<'_>) -> ToolRegistry {
         (None, None) => bash::Bash::real(),
     };
     bash = bash.with_root(root);
+    // `bash` asks the filesystem backend which world it is in, rather than being told once, because
+    // `ExecCell` can be re-pointed mid-session (`set_exec_endpoint`) with no registry rebuild — a
+    // captured world would keep resolving `~` and validating `cwd` against the machine the session
+    // just left. Only when a `command_runner` is present too: that pairing is what makes the backend's
+    // world `bash`'s world (see [`ToolConfig::command_runner`]), and without it `bash` really is on
+    // this host however remote the files are.
+    if cfg.command_runner.is_some()
+        && let Some(b) = &cfg.fs_backend
+    {
+        bash = bash.with_backend(b.clone());
+    }
     if let Some(path) = cfg.bash_shell_path {
         bash = bash.with_shell_path(path);
+    }
+    if let Some(shell) = cfg.remote_shell {
+        bash = bash.with_remote_shell(shell);
     }
     if let Some(prefix) = cfg.bash_command_prefix {
         bash = bash.with_command_prefix(prefix);
@@ -1562,6 +1606,27 @@ mod tests {
             let after = write_key(root, spelling, &PathWorld::Local);
             assert_eq!(before, after, "spelling {spelling:?}");
         }
+    }
+
+    #[test]
+    fn write_key_with_no_root_does_not_root_a_remote_path_at_this_hosts_cwd() {
+        // An empty root means "the process cwd", which is a true answer here and a fabricated one
+        // anywhere else. Rooting a sandbox path at the replica's cwd would hand `--deny-path` and the
+        // approval scope a key for a file on the wrong machine — and one that changes if the replica
+        // is ever started from a different directory.
+        let here = std::env::current_dir().unwrap().display().to_string();
+        let remote = write_key(
+            std::path::Path::new(""),
+            "notes.md",
+            &PathWorld::Remote { home: None },
+        );
+        assert_eq!(remote, "notes.md");
+        assert!(!remote.starts_with(&here));
+        // Unchanged on this host, where the cwd is exactly what an empty root means.
+        assert_eq!(
+            write_key(std::path::Path::new(""), "notes.md", &PathWorld::Local),
+            format!("{here}/notes.md"),
+        );
     }
 
     #[test]
