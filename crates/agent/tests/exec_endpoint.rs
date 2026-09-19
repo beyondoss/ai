@@ -171,6 +171,25 @@ async fn bash_runs_on_the_endpoint_not_the_host() {
 }
 
 #[tokio::test]
+async fn bash_over_the_endpoint_keeps_stderr_alongside_stdout() {
+    // The endpoint answers with both streams at once. A compiler warning, a failing assertion's
+    // message, a `set -x` trace: all stderr, and all invisible to the model if only stdout survives —
+    // which it used to, whenever the command also printed to stdout.
+    let dir = tempfile::tempdir().unwrap();
+    let (url, _) = mock_provider(dir.path().to_path_buf(), Arc::new(AtomicUsize::new(0))).await;
+    let reg = registry_over(Arc::new(HttpExecRunner::new(&url).unwrap())).await;
+
+    let out = call(
+        &reg,
+        "bash",
+        json!({ "command": "echo OUT-7d2a; echo ERR-91be >&2" }),
+    )
+    .await;
+    assert!(out.contains("OUT-7d2a"), "stdout was lost: {out}");
+    assert!(out.contains("ERR-91be"), "stderr was lost: {out}");
+}
+
+#[tokio::test]
 async fn write_then_bash_see_the_same_filesystem() {
     // The coherence property: one machine, one filesystem. This is what a split toolset breaks.
     let dir = tempfile::tempdir().unwrap();
