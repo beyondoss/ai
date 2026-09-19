@@ -2938,8 +2938,65 @@ elicitation and sampling route to the session that asked.
 
 ### Health and image
 
-_Landing separately._ `/livez` and `/readyz` (no grant), and a static musl image whose entrypoint is
-`serve --service`.
+Two endpoints on the same listener as the agent protocol, answered in `handle_connection` **before**
+the `/_beyond/agent` path check and before any grant is demanded. That ordering is the design: the
+thing asking is the orchestrator deciding whether this replica may hold sessions at all, and it has
+no session grant to present and no way to obtain one. The `x-beyond-grant` header is still stripped
+off the head first, and a health response is built from scratch rather than from request headers, so
+a grant sent here is neither required, nor read, nor echoed.
+
+| Endpoint  | 200                                       | 503                                   |
+| --------- | ----------------------------------------- | ------------------------------------- |
+| `/livez`  | the process is serving                    | never                                 |
+| `/readyz` | this replica can take a session right now | `{"status":"not ready","reason":"…"}` |
+
+**`/livez` is unconditional.** Reaching the handler is the proof: the listener accepted a connection
+and the runtime read a request off it. It deliberately ignores the shards — a mount that has gone
+away is not fixed by killing the process, and a liveness probe that failed on one would turn a bad
+mount into a restart loop.
+
+**`/readyz` checks what can be taken away underneath a running replica.** Three conditions:
+
+- the listener is bound — again, proven by the request having arrived;
+- the grant verifier is loaded — a type-level invariant rather than a runtime check, since `serve`
+  refuses to start `--service` without one, so a service supervisor existing _is_ a loaded keyring;
+- every `--shard` is a directory this process can write to.
+
+Only the third can fail, and it fails per shard. The body is
+`{"status":"not ready","reason":"shard a07-s2: <why>"}`, where `<why>` is `not mounted`,
+`not a directory` or `not writable`. The reason names the **shard, never its path** —
+a readiness body is readable by anything that can reach the port, the replica's mount layout is not a
+caller's business, and the shard name is already public (it prefixes every session id) while being
+the only half an operator needs to know which mount to look at.
+
+The probe **writes**. `access(W_OK)` would be one syscall, but it answers about permission bits, and
+the two failures that actually happen on EFS — a read-only remount, and a mount that is full or
+unreachable — only surface on a real write. So it creates and unlinks `.readyz.<pid>` in each shard
+root (the pid so two replicas sharing a mount cannot unlink each other's). No tenant directory is
+walked; the cost is O(shards), not O(sessions).
+
+That write runs on `spawn_blocking` and its answer is **memoized for two seconds**. The process runs
+a single-threaded runtime, and filesystem I/O on a network mount is exactly what stalls when EFS
+hiccups — blocking the runtime thread would wedge every session on the replica on behalf of a probe.
+The memo keeps a fixed-cadence probe (and a client looping on a 503) to one round-trip per window,
+which is well inside any probe period.
+
+**In non-service mode** both endpoints still exist: `/livez` the same, and `/readyz` always ready
+once the listener is up. With no shards and no verifier there is nothing else readiness could mean,
+and a daemon that answered 404 would need a second code path in every deployment that ever turns
+`--service` on.
+
+**The image** is [`Dockerfile.agent`](../../Dockerfile.agent) at the repo root — the gateway's
+`Dockerfile` is the same cargo-chef layering for a different workspace member. It builds a static
+musl `beyond-ai-agent` (non-PIE, matching the release workflow; not PGO, which is per-architecture
+and worth its three-stage build only for a published artifact) into an Alpine runtime holding the
+binary and a CA store. `ENTRYPOINT` is `serve --service` behind a two-line wrapper that does
+`ulimit -c 0` and `exec`s: a replica holds every live tenant's unsealed DEK, gateway credential and
+exec headers in memory, so a core file would write all of them to disk in plaintext — and the limit
+has to be dropped by a parent, because this crate forbids `unsafe` and so cannot `prctl` itself. The
+`HEALTHCHECK` hits `/readyz` (a scheduler's health status is the readiness question, not the liveness
+one). Shards mount at `/mnt/efs/<shard>`, writable by uid 10001; everything else the container reads
+is read-only, and a tenant's workspace is never on this filesystem at all.
 
 ---
 
