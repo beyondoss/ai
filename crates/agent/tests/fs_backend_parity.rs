@@ -145,6 +145,10 @@ fn shell_posix_backend() -> Arc<dyn FsBackend> {
             // here would only test the flag plumbing, not the tool it stands in for.
             grep_null: true,
             find_printf: true,
+            // The chunked write fallback — what a v1 endpoint or `docker exec` without `-i` gets —
+            // so every `write`/`edit` parity case covers it too. The ripgrep rung is `connect`ed and
+            // probes stdin as present, so between them both write paths are diffed against `LocalFs`.
+            stdin: false,
         },
     ))
 }

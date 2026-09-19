@@ -16,13 +16,15 @@
 //! requires the agent to sit on the compute node beside the workloads it is meant to be isolated from,
 //! which is backwards.
 //!
-//! ## The protocol
+//! ## The protocol (v1.1)
 //!
 //! One `POST` to the configured URL:
 //!
 //! ```jsonc
 //! // request
 //! { "command": "rg", "args": ["--files"], "cwd": "/work", "timeout_ms": 120000 }
+//! // request carrying stdin (v1.1, optional) — standard base64, fed to the command, then closed
+//! { "command": "cat", "args": [], "timeout_ms": 10000, "stdin_base64": "c3RkaW4tcHJvYmU=" }
 //! // response — 200
 //! { "exit_code": 0, "stdout": "…", "stderr": "…" }
 //! ```
@@ -31,6 +33,20 @@
 //! front of a vendor's SDK is a few dozen lines on their side, and that seam is where vendor
 //! specifics belong — not in here.
 //!
+//! **v1.1 is backward compatible.** `stdin_base64` is the only addition, and only `ShellFs`'s file
+//! writes send it — after a probe (`cat` must echo `stdin-probe`) has shown the endpoint honors it. A
+//! v1 endpoint ignores the unknown field and answers the probe with empty stdout, so writes fall back
+//! to argv-sized chunks. The field is never trusted blindly: writing through an endpoint that dropped
+//! it would silently produce *empty files*.
+//!
+//! **The response is capped** ([`DEFAULT_MAX_RESPONSE_BYTES`], `--exec-max-response-bytes`). The body
+//! is read incrementally and reading stops at the cap; an oversized response is an **error**, never a
+//! partial result. The body is one JSON object, so a prefix of it cannot be parsed — there is no
+//! honest partial `ExecResult` to return (not even the exit code, which may come after the output),
+//! and presenting whatever fit as the command's output would be a confident wrong answer. The error
+//! says the command *did run*, so the caller narrows its output instead of blindly repeating a
+//! command that may not be idempotent.
+//!
 //! For targets that have no HTTP surface at all (`ssh`, `docker exec`, `kubectl exec`, any CLI), see
 //! [`TemplateRunner`], which is the same idea expressed as an argv template.
 
@@ -38,6 +54,7 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 
 use crate::tools::exec::{ChunkSink, CommandRunner, ExecResult};
@@ -50,6 +67,9 @@ struct ExecRequest<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     cwd: Option<&'a str>,
     timeout_ms: u64,
+    /// v1.1: bytes for the command's stdin, standard base64. Absent means no stdin — v1 behavior.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stdin_base64: Option<String>,
 }
 
 /// What the agent expects back. Extra fields are ignored, so an endpoint may return more.
@@ -62,6 +82,14 @@ struct ExecResponse {
     stderr: String,
 }
 
+/// The default response-body cap for [`HttpExecRunner`]: 16 MiB.
+///
+/// Far above anything a tool consumes — `bash` keeps ~30 KB of output and the local runner keeps
+/// 256 KiB per stream — so a legitimate response never meets it. What it bounds is the response that
+/// isn't legitimate: a `cat` of a multi-gigabyte file must not be buffered whole into a process that
+/// may be serving other sessions.
+pub const DEFAULT_MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+
 /// A [`CommandRunner`] that POSTs each command to a URL.
 ///
 /// Holds a `reqwest::Client` so connections are pooled across calls, but no session and no state — a
@@ -71,6 +99,7 @@ pub struct HttpExecRunner {
     url: String,
     client: reqwest::Client,
     headers: Vec<(String, String)>,
+    max_response_bytes: usize,
 }
 
 impl HttpExecRunner {
@@ -94,7 +123,15 @@ impl HttpExecRunner {
                 reqwest::Client::new()
             },
             headers: Vec::new(),
+            max_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
         })
+    }
+
+    /// Cap how much of a response body is read before the call fails. See the module doc for why an
+    /// oversized response is an error rather than a truncated result.
+    pub fn with_max_response_bytes(mut self, max: usize) -> Self {
+        self.max_response_bytes = max;
+        self
     }
 
     /// Add a header sent with every request — an `Authorization`, an API key, a tenant id. Every real
@@ -119,22 +156,22 @@ impl HttpExecRunner {
     pub fn url(&self) -> &str {
         &self.url
     }
-}
 
-#[async_trait]
-impl CommandRunner for HttpExecRunner {
-    async fn run(
+    /// One request, one response: the whole protocol.
+    async fn post(
         &self,
         program: &str,
         args: &[String],
         cwd: Option<&str>,
         timeout: Duration,
-    ) -> std::io::Result<ExecResult> {
+        stdin: Option<&[u8]>,
+    ) -> std::io::Result<ExecResponse> {
         let body = ExecRequest {
             command: program,
             args,
             cwd,
             timeout_ms: timeout.as_millis().min(u64::MAX as u128) as u64,
+            stdin_base64: stdin.map(|b| base64::engine::general_purpose::STANDARD.encode(b)),
         };
         let mut req = self.client.post(&self.url).json(&body);
         for (name, value) in &self.headers {
@@ -158,10 +195,14 @@ impl CommandRunner for HttpExecRunner {
             })?;
 
         let status = resp.status();
-        let text = resp
-            .text()
-            .await
-            .map_err(|e| std::io::Error::other(format!("exec endpoint {}: {e}", self.url)))?;
+        let (body, over_cap) = self.read_capped(resp).await?;
+        let excerpt = || {
+            String::from_utf8_lossy(&body)
+                .trim()
+                .chars()
+                .take(400)
+                .collect::<String>()
+        };
         if !status.is_success() {
             // The endpoint refused the *request* — a bad URL, auth, a dead sandbox. Distinct from the
             // command running and exiting non-zero, which is an ordinary result.
@@ -169,16 +210,80 @@ impl CommandRunner for HttpExecRunner {
                 "exec endpoint {} returned {}: {}",
                 self.url,
                 status.as_u16(),
-                text.trim().chars().take(400).collect::<String>()
+                excerpt()
             )));
         }
-        let parsed: ExecResponse = serde_json::from_str(&text).map_err(|e| {
+        if over_cap {
+            return Err(std::io::Error::other(format!(
+                "exec endpoint {}: the response exceeded the {}-byte cap and was discarded — the \
+                 command ran, but its output is too large to return; narrow it (e.g. pipe through \
+                 `head`) rather than re-running it unchanged",
+                self.url, self.max_response_bytes
+            )));
+        }
+        serde_json::from_slice(&body).map_err(|e| {
             std::io::Error::other(format!(
                 "exec endpoint {} returned unparseable JSON ({e}): {}",
                 self.url,
-                text.trim().chars().take(400).collect::<String>()
+                excerpt()
             ))
-        })?;
+        })
+    }
+
+    /// Read the body incrementally, stopping at the cap instead of buffering whatever the endpoint
+    /// sends. `true` means the cap was hit and the bytes returned are only a prefix.
+    async fn read_capped(&self, mut resp: reqwest::Response) -> std::io::Result<(Vec<u8>, bool)> {
+        let cap = self.max_response_bytes;
+        // A declared length over the cap fails before a byte of it is read.
+        let declared = resp.content_length().unwrap_or(0);
+        if declared > cap as u64 {
+            return Ok((Vec::new(), true));
+        }
+        let mut body = Vec::with_capacity(declared as usize);
+        while let Some(chunk) = resp
+            .chunk()
+            .await
+            .map_err(|e| std::io::Error::other(format!("exec endpoint {}: {e}", self.url)))?
+        {
+            if chunk.len() > cap - body.len() {
+                // Dropping `resp` abandons the rest of the body along with its connection.
+                return Ok((body, true));
+            }
+            body.extend_from_slice(&chunk);
+        }
+        Ok((body, false))
+    }
+}
+
+#[async_trait]
+impl CommandRunner for HttpExecRunner {
+    async fn run_with_stdin(
+        &self,
+        program: &str,
+        args: &[String],
+        cwd: Option<&str>,
+        timeout: Duration,
+        stdin: &[u8],
+    ) -> std::io::Result<ExecResult> {
+        // Sent as `stdin_base64`. A v1 endpoint ignores it and runs the command with no input, so an
+        // `Ok` here is not proof of delivery — see the module doc on the probe.
+        let parsed = self.post(program, args, cwd, timeout, Some(stdin)).await?;
+        Ok(ExecResult {
+            code: Some(parsed.exit_code),
+            stdout: parsed.stdout,
+            stderr: parsed.stderr,
+            ..Default::default()
+        })
+    }
+
+    async fn run(
+        &self,
+        program: &str,
+        args: &[String],
+        cwd: Option<&str>,
+        timeout: Duration,
+    ) -> std::io::Result<ExecResult> {
+        let parsed = self.post(program, args, cwd, timeout, None).await?;
         Ok(ExecResult {
             code: Some(parsed.exit_code),
             signal: None,
@@ -255,6 +360,34 @@ impl CommandRunner for TemplateRunner {
         cwd: Option<&str>,
         timeout: Duration,
     ) -> std::io::Result<ExecResult> {
+        self.exec(program, args, cwd, timeout, None).await
+    }
+
+    /// Piped into the *transport* process. Whether it reaches the far side is the transport's
+    /// business: `ssh` forwards stdin, but `docker exec`/`kubectl exec` do so only with `-i`. Without
+    /// it the far command reads nothing, which `ShellFs`'s probe detects — writes then use argv-sized
+    /// chunks instead.
+    async fn run_with_stdin(
+        &self,
+        program: &str,
+        args: &[String],
+        cwd: Option<&str>,
+        timeout: Duration,
+        stdin: &[u8],
+    ) -> std::io::Result<ExecResult> {
+        self.exec(program, args, cwd, timeout, Some(stdin)).await
+    }
+}
+
+impl TemplateRunner {
+    async fn exec(
+        &self,
+        program: &str,
+        args: &[String],
+        cwd: Option<&str>,
+        timeout: Duration,
+        stdin: Option<&[u8]>,
+    ) -> std::io::Result<ExecResult> {
         // `cwd` is expressed by wrapping the command, not by setting the *local* process's directory —
         // the directory belongs to the far side. Positional parameters to a fixed script, never
         // substituted text.
@@ -276,13 +409,27 @@ impl CommandRunner for TemplateRunner {
 
         let mut cmd = tokio::process::Command::new(&argv[0]);
         cmd.args(&argv[1..])
-            .stdin(Stdio::null())
+            .stdin(if stdin.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+        let mut child = cmd.spawn()?;
+        let feed = crate::tools::exec::feed_stdin(child.stdin.take(), stdin);
 
-        let out = match tokio::time::timeout(timeout, cmd.output()).await {
-            Ok(r) => r?,
+        let out = match tokio::time::timeout(timeout, async {
+            tokio::join!(child.wait_with_output(), feed)
+        })
+        .await
+        {
+            Ok((out, fed)) => {
+                let out = out?;
+                fed?;
+                out
+            }
             Err(_) => {
                 return Ok(ExecResult {
                     code: None,
@@ -406,9 +553,14 @@ pub struct ExecTarget {
 }
 
 impl ExecTarget {
-    /// Build from an HTTP endpoint plus `Name: value` headers.
-    pub async fn http(url: &str, headers: &[String]) -> Result<Self, String> {
-        let mut runner = HttpExecRunner::new(url)?;
+    /// Build from an HTTP endpoint plus `Name: value` headers, reading at most `max_response_bytes` of
+    /// any one response ([`DEFAULT_MAX_RESPONSE_BYTES`] unless configured).
+    pub async fn http(
+        url: &str,
+        headers: &[String],
+        max_response_bytes: usize,
+    ) -> Result<Self, String> {
+        let mut runner = HttpExecRunner::new(url)?.with_max_response_bytes(max_response_bytes);
         for raw in headers {
             let (name, value) = HttpExecRunner::parse_header(raw)?;
             runner = runner.with_header(name, value);
@@ -530,6 +682,28 @@ impl CommandRunner for CellRunner {
             None => {
                 crate::tools::exec::RealRunner
                     .run_streaming(program, args, cwd, timeout, on_chunk)
+                    .await
+            }
+        }
+    }
+
+    async fn run_with_stdin(
+        &self,
+        program: &str,
+        args: &[String],
+        cwd: Option<&str>,
+        timeout: Duration,
+        stdin: &[u8],
+    ) -> std::io::Result<ExecResult> {
+        match self.0.get() {
+            Some(t) => {
+                t.runner()
+                    .run_with_stdin(program, args, cwd, timeout, stdin)
+                    .await
+            }
+            None => {
+                crate::tools::exec::RealRunner
+                    .run_with_stdin(program, args, cwd, timeout, stdin)
                     .await
             }
         }

@@ -453,6 +453,10 @@ enum Command {
         /// goes; which scheme the endpoint wants is the endpoint's business.
         #[usage(long, env = "AI_AGENT_EXEC_HEADER")]
         exec_header: Vec<String>,
+        /// The most bytes of one exec-endpoint response to read. Default 16 MiB. A larger response
+        /// is an error, never a silently truncated result. `serve`'s identical flag.
+        #[usage(long, env = "AI_AGENT_EXEC_MAX_RESPONSE_BYTES")]
+        exec_max_response_bytes: Option<u64>,
         /// For targets with no HTTP surface: an argv template whose `{}` is replaced by the command,
         /// e.g. `--exec-cmd 'ssh build-host -- {}'` or `--exec-cmd 'docker exec ctr {}'`. The command
         /// expands to separate argv entries, never into a shell string.
@@ -927,6 +931,11 @@ enum Command {
         /// A header sent with every exec request, `Name: value`. Repeatable.
         #[usage(long, env = "AI_AGENT_EXEC_HEADER")]
         exec_header: Vec<String>,
+        /// The most bytes of one exec-endpoint response to read — for the default endpoint and every
+        /// per-session `set_exec_endpoint`. Default 16 MiB. A larger response is an error, never a
+        /// silently truncated result. `run`'s identical flag.
+        #[usage(long, env = "AI_AGENT_EXEC_MAX_RESPONSE_BYTES")]
+        exec_max_response_bytes: Option<u64>,
         /// An argv template for targets with no HTTP surface, e.g. `ssh host -- {}`.
         #[usage(long, env = "AI_AGENT_EXEC_CMD", conflicts = "exec_url")]
         exec_cmd: Option<String>,
@@ -1681,6 +1690,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             web_timeout_ms,
             exec_url,
             exec_header,
+            exec_max_response_bytes,
             exec_cmd,
             lifecycle_url,
             lifecycle_header,
@@ -1752,6 +1762,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 web_timeout_ms,
                 exec_url,
                 exec_header,
+                exec_max_response_bytes,
                 exec_cmd,
                 lifecycle_url,
                 lifecycle_header,
@@ -1837,6 +1848,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             web_timeout_ms,
             exec_url,
             exec_header,
+            exec_max_response_bytes,
             exec_cmd,
             lifecycle_url,
             lifecycle_header,
@@ -2155,6 +2167,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 web_timeout_ms,
                 exec_url,
                 exec_header,
+                exec_max_response_bytes: exec_max_response_bytes.map_or(
+                    beyond_ai_agent::exec_endpoint::DEFAULT_MAX_RESPONSE_BYTES,
+                    |n| usize::try_from(n).unwrap_or(usize::MAX),
+                ),
                 exec_cmd,
                 lifecycle: beyond_ai_agent::lifecycle::open(
                     lifecycle_url.as_deref(),
@@ -3496,6 +3512,7 @@ async fn run_task(
     web_timeout_ms: Option<u64>,
     exec_url: Option<String>,
     exec_header: Vec<String>,
+    exec_max_response_bytes: Option<u64>,
     exec_cmd: Option<String>,
     lifecycle_url: Option<String>,
     lifecycle_header: Vec<String>,
@@ -3893,6 +3910,10 @@ async fn run_task(
             (Some(url), _) => {
                 let mut runner = beyond_ai_agent::exec_endpoint::HttpExecRunner::new(url.clone())
                     .map_err(std::io::Error::other)?;
+                if let Some(max) = exec_max_response_bytes {
+                    runner =
+                        runner.with_max_response_bytes(usize::try_from(max).unwrap_or(usize::MAX));
+                }
                 for raw in &exec_header {
                     let (name, value) =
                         beyond_ai_agent::exec_endpoint::HttpExecRunner::parse_header(raw)

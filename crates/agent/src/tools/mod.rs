@@ -244,7 +244,7 @@ fn resolve_symlink_target(path: &std::path::Path) -> Option<std::path::PathBuf> 
 /// under a symlink before the call happens. Same salt-plus-counter construction as
 /// `session_store::new_id`: `RandomState` draws OS entropy once per process, and a monotonic counter
 /// keeps same-process calls distinct — no need for a `rand`/`uuid` dependency just for this.
-fn temp_suffix() -> String {
+pub(crate) fn temp_suffix() -> String {
     use std::collections::hash_map::RandomState;
     use std::hash::BuildHasher;
     use std::sync::OnceLock;
