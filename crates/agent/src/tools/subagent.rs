@@ -118,6 +118,11 @@ pub struct SubagentCtx {
     /// Already-connected MCP tools. `Arc` clones share the live stdio child / HTTP connection, which is
     /// the entire reason an in-process child beats a subprocess.
     pub mcp_tools: Vec<Arc<dyn Tool>>,
+    /// The parent session's **live** MCP kit gate, not a filtered snapshot of [`Self::mcp_tools`].
+    /// The ctx is built once per session and reused by every child after it, so a list filtered at
+    /// build time would go stale the moment `set_mcp_enabled` ran — and a server the operator
+    /// disabled would stay reachable by delegating to a subagent.
+    pub mcp_enabled: crate::tools::mcp::McpEnabledSet,
     /// The **parent's** memory mounts, shared by `Arc` clone so a child reads and writes the *same*
     /// stores — the durable `/memories` project store *and* the `/session` working memory for this task.
     /// A subagent grounds its work in what the project already learned and in the parent's live session
@@ -936,6 +941,10 @@ impl Subagent {
     /// The child's tool set: rooted at `root`, restricted to its effective tools, and carrying a
     /// depth-incremented `subagent` only when the definition asked for one *and* the cap allows it.
     fn build_child_registry(&self, def: &AgentDef, root: &Path) -> ToolRegistry {
+        // Read through the gate *now*, not when the ctx was built: `set_mcp_enabled` is a live
+        // session command, and a child must see the kit its parent has at this moment.
+        let mcp_tools =
+            crate::tools::mcp::filter_by_enabled(&self.ctx.mcp_tools, &self.ctx.mcp_enabled);
         let mut registry = super::default_registry_with_config(&super::ToolConfig {
             bash_timeout_ms: self.ctx.tool_cfg.bash_timeout_ms,
             bash_shell_path: self.ctx.tool_cfg.bash_shell_path.as_deref(),
@@ -951,7 +960,7 @@ impl Subagent {
             code_mode: self.ctx.tool_cfg.code_mode,
             nested_exclude: &self.ctx.tool_cfg.exclude_tools,
             nested_deny: &self.ctx.deny_tool,
-            mcp_tools: &self.ctx.mcp_tools,
+            mcp_tools: &mcp_tools,
             web_allow_private: self.ctx.tool_cfg.web_allow_private,
             web_allow_hosts: &self.ctx.tool_cfg.web_allow_hosts,
             web_timeout_ms: self.ctx.tool_cfg.web_timeout_ms,

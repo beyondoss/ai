@@ -12,8 +12,8 @@
 //! - [`ServiceSession`] then answers every "where does this session's *X* live?" question `serve`
 //!   used to answer from the replica host: persistence ([`ServiceSession::session_dir`]), durable
 //!   memory ([`ServiceSession::memory_backend`]), the exec target every tool runs in
-//!   ([`ServiceSession::connect_exec`]), and the gateway credential
-//!   ([`ServiceSession::gateway_key`]).
+//!   ([`ServiceSession::connect_exec`]), the gateway credential ([`ServiceSession::gateway_key`]),
+//!   and the MCP connectors this session may reach ([`ServiceSession::mcp`]).
 //!
 //! **The no-host rule.** In service mode the replica's own `$HOME`, cwd, and stored settings are not
 //! a fallback for anything: no `~/.claude` skills/prompts/agents/`SYSTEM.md`, no `models.json` or
@@ -22,10 +22,10 @@
 //! [`refused_command`] and [`ExecCell::strict`](crate::exec_endpoint::ExecCell::strict). Everything a
 //! tenant can see comes from its grant or its sandbox.
 //!
-//! Sandbox *discovery* (skills, context files, agents, prompt templates) and per-session MCP are not
-//! wired yet: [`Resources`] is empty and [`ServiceSession::mcp`] returns nothing, so the features
-//! that would otherwise silently read the replica host are simply off. Later PRs fill those two seams
-//! in; this module is where they land, so the rest of `serve` does not move again.
+//! Sandbox *discovery* (skills, context files, agents, prompt templates) is not wired yet:
+//! [`Resources`] is empty, so the features that would otherwise silently read the replica host are
+//! simply off. A later PR fills that seam in; this module is where it lands, so the rest of `serve`
+//! does not move again.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -376,15 +376,53 @@ impl ServiceSession {
         Resources::default()
     }
 
-    /// The tenant's MCP connectors. Empty until per-session MCP lands — the grant carries the
-    /// connector list and its headers, but nothing dials them yet.
-    pub fn mcp(
+    /// Dial this session's own MCP connectors — the ones its grant names, with the credentials its
+    /// grant sealed — and return their tools and catalog.
+    ///
+    /// Per session, not per process: the replica's configured servers are the operator's and are
+    /// never connected in service mode at all, and two sessions on this replica share no MCP state.
+    /// `host` is this session's own [`McpHost`](crate::tools::mcp_host::McpHost), so an elicitation
+    /// or a sampling request from one of these servers is answered by the session that asked.
+    ///
+    /// `egress` is the daemon's process-wide, SSRF-checked client (`ServeConfig::mcp_http`). Without
+    /// one there is nothing safe to dial through, so the session simply has no connectors — the same
+    /// fail-closed answer as a connector whose URL is refused.
+    pub async fn mcp(
         &self,
+        egress: Option<&crate::tools::mcp::McpEgress>,
+        host: Arc<crate::tools::mcp_host::McpHost>,
     ) -> (
         Vec<Arc<dyn agent_core::Tool>>,
         crate::tools::mcp::McpCatalog,
+        Vec<String>,
     ) {
-        (Vec::new(), crate::tools::mcp::McpCatalog::default())
+        let empty = || (Vec::new(), crate::tools::mcp::McpCatalog::default());
+        if self.grant.mcp.is_empty() {
+            let (tools, catalog) = empty();
+            return (tools, catalog, Vec::new());
+        }
+        let Some(egress) = egress else {
+            // Never in a real service replica (`main.rs` builds one whenever `--service` is set),
+            // so this says so rather than dropping the connectors silently.
+            let (tools, catalog) = empty();
+            return (
+                tools,
+                catalog,
+                vec![
+                    "this replica has no MCP egress client, so the grant's connectors were not \
+                     dialed"
+                        .to_owned(),
+                ],
+            );
+        };
+        crate::tools::mcp::connect_granted(
+            &self.grant.mcp,
+            &self.grant.secrets.mcp_headers,
+            egress,
+            host,
+            crate::tools::mcp::idle_reap_after_from_env(),
+        )
+        .await
     }
 
     /// Strip replica-host paths out of `text` — an error from the storage layer names the file it

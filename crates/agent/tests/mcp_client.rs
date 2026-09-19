@@ -7,21 +7,19 @@
 //! Fixture: `mcp_fixture_stdio_server` (`src/bin/mcp_fixture_stdio_server.rs`, a sibling `[[bin]]` of
 //! this same package) is a ~150-line hand-rolled MCP server — no `rmcp` dependency, just newline-
 //! delimited JSON-RPC over stdin/stdout — with six tools (`echo`, `add`, `ping`, `fail`, `echo_env`,
-//! `image`) each proving a distinct behavior. The streamable-HTTP tests reimplement a small subset of
-//! the same dispatch directly in this file (a plain blocking `TcpListener` thread, matching
-//! `common::spawn_model_server`'s own idiom) since that transport can't be a subprocess.
+//! `image`) each proving a distinct behavior. The streamable-HTTP tests drive `common::mcp_fixture`,
+//! a small in-process reimplementation of the same dispatch (a plain blocking `TcpListener` thread,
+//! matching `common::spawn_model_server`'s own idiom) since that transport can't be a subprocess.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 mod common;
 
-use std::io::{BufReader, Read, Write};
-use std::net::TcpListener;
+use std::io::{BufReader, Write};
 use std::path::Path;
 use std::process::Command;
-use std::sync::{Arc, Mutex};
-use std::thread;
 use std::time::{Duration, Instant};
 
+use common::mcp_fixture::spawn_http_mcp_fixture;
 use common::{
     SpawnGuarded, read_until_response, run_cmd, serve_cmd, spawn_model_server, turn_text,
     turn_tool_use,
@@ -603,169 +601,12 @@ fn mcp_project_settings_json_servers_apply_once_the_project_is_persistently_trus
 // Streamable-HTTP transport
 // ============================================================================================
 
-/// A minimal streamable-HTTP MCP fixture: a plain blocking `TcpListener` thread (matching
-/// `common::spawn_model_server`'s own idiom — this transport has no subprocess to spawn, so a hand-
-/// rolled server has to live somewhere, and duplicating a few lines of dispatch here is simpler than
-/// sharing code with the separate `mcp_fixture_stdio_server` *binary* crate). Handles exactly what one
-/// client handshake + one `echo` call needs: `initialize`, the `notifications/initialized` notification
-/// (replied to with a bodyless `202 Accepted`, matching `StreamableHttpPostResponse::Accepted`),
-/// `tools/list`, and `tools/call`. Relies on `rmcp`'s client defaulting to `allow_stateless: true` (no
-/// `Mcp-Session-Id` handshake needed).
-///
-/// Returns the server's URL and a handle recording every `x-test-header` value it ever saw — proving
-/// `McpTransport::Http`'s configured headers actually leave the client process and land on the wire.
-fn spawn_http_mcp_fixture() -> (String, Arc<Mutex<Vec<String>>>) {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap();
-    let seen_headers = Arc::new(Mutex::new(Vec::new()));
-    let seen_headers_writer = seen_headers.clone();
-    thread::spawn(move || {
-        for stream in listener.incoming() {
-            let Ok(mut stream) = stream else { continue };
-            let mut buf = Vec::new();
-            let mut tmp = [0u8; 8192];
-            let mut header_end = None;
-            while header_end.is_none() {
-                let n = stream.read(&mut tmp).unwrap_or(0);
-                if n == 0 {
-                    break;
-                }
-                buf.extend_from_slice(&tmp[..n]);
-                header_end = buf.windows(4).position(|w| w == b"\r\n\r\n");
-            }
-            let Some(pos) = header_end else { continue };
-            let headers_text = String::from_utf8_lossy(&buf[..pos]).into_owned();
-            let content_length: usize = headers_text
-                .lines()
-                .find_map(|l| {
-                    l.to_ascii_lowercase()
-                        .strip_prefix("content-length:")
-                        .map(|v| v.trim().parse().unwrap_or(0))
-                })
-                .unwrap_or(0);
-            let body_start = pos + 4;
-            while buf.len() < body_start + content_length {
-                let n = stream.read(&mut tmp).unwrap_or(0);
-                if n == 0 {
-                    break;
-                }
-                buf.extend_from_slice(&tmp[..n]);
-            }
-            if let Some(value) = headers_text.lines().find_map(|l| {
-                let lower = l.to_ascii_lowercase();
-                lower.strip_prefix("x-test-header:").map(|_| {
-                    l.split_once(':')
-                        .map(|(_, v)| v)
-                        .unwrap_or("")
-                        .trim()
-                        .to_string()
-                })
-            }) {
-                seen_headers_writer.lock().unwrap().push(value);
-            }
-
-            let body = &buf[body_start..buf.len().min(body_start + content_length)];
-            let request: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
-            let is_notification = request.get("id").is_none();
-            if is_notification {
-                let _ = stream.write_all(
-                    b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                );
-                continue;
-            }
-            let id = request.get("id").cloned().unwrap_or(Value::Null);
-            let method = request.get("method").and_then(Value::as_str).unwrap_or("");
-            let result = match method {
-                "server/discover" => json!({
-                    "resultType": "complete",
-                    "supportedVersions": ["2026-07-28", "2025-11-25"],
-                    "capabilities": { "tools": {} },
-                    "ttlMs": 0,
-                    "cacheScope": "private",
-                    "_meta": {
-                        "io.modelcontextprotocol/serverInfo": {
-                            "name": "mcp-fixture-http-server",
-                            "version": "0.0.0",
-                        }
-                    }
-                }),
-                "initialize" => json!({
-                    "protocolVersion": "2025-11-25",
-                    "capabilities": { "tools": {} },
-                    "serverInfo": { "name": "mcp-fixture-http-server", "version": "0.0.0" },
-                }),
-                "tools/list" => json!({ "tools": [
-                    {
-                        "name": "echo",
-                        "description": "Echoes back its `text` argument.",
-                        "inputSchema": {
-                            "type": "object",
-                            "properties": { "text": { "type": "string" } },
-                            "required": ["text"],
-                        },
-                    },
-                    {
-                        "name": "fail",
-                        "description": "Always fails, with an error message.",
-                        "inputSchema": { "type": "object", "properties": {} },
-                    },
-                ] }),
-                "tools/call" => {
-                    let name = request
-                        .pointer("/params/name")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default();
-                    if name == "fail" {
-                        json!({
-                            "content": [{ "type": "text", "text": "intentional http failure" }],
-                            "isError": true,
-                        })
-                    } else {
-                        let text = request
-                            .pointer("/params/arguments/text")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default();
-                        json!({ "content": [{ "type": "text", "text": text }], "isError": false })
-                    }
-                }
-                _ => {
-                    // Method not found — keep Auto discover→initialize fallback fast if discover
-                    // is ever removed from this fixture again.
-                    let envelope = json!({
-                        "jsonrpc": "2.0",
-                        "id": id,
-                        "error": { "code": -32601, "message": format!("Method not found: {method}") },
-                    });
-                    let encoded = serde_json::to_vec(&envelope).unwrap();
-                    let http_header = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                        encoded.len()
-                    );
-                    let _ = stream.write_all(http_header.as_bytes());
-                    let _ = stream.write_all(&encoded);
-                    let _ = stream.flush();
-                    continue;
-                }
-            };
-            let envelope = json!({ "jsonrpc": "2.0", "id": id, "result": result });
-            let encoded = serde_json::to_vec(&envelope).unwrap();
-            let http_header = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                encoded.len()
-            );
-            let _ = stream.write_all(http_header.as_bytes());
-            let _ = stream.write_all(&encoded);
-            let _ = stream.flush();
-        }
-    });
-    (format!("http://{addr}/mcp"), seen_headers)
-}
-
 #[test]
 fn mcp_http_streamable_tool_is_discovered_and_callable() {
     let home = tempfile::tempdir().unwrap();
     let cwd = tempfile::tempdir().unwrap();
-    let (url, _seen_headers) = spawn_http_mcp_fixture();
+    let fixture = spawn_http_mcp_fixture();
+    let url = fixture.url.clone();
     write_global_settings(
         home.path(),
         json!([{
@@ -804,7 +645,8 @@ fn mcp_http_streamable_tool_is_discovered_and_callable() {
 fn mcp_http_streamable_configured_headers_reach_the_wire() {
     let home = tempfile::tempdir().unwrap();
     let cwd = tempfile::tempdir().unwrap();
-    let (url, seen_headers) = spawn_http_mcp_fixture();
+    let fixture = spawn_http_mcp_fixture();
+    let url = fixture.url.clone();
     write_global_settings(
         home.path(),
         json!([{
@@ -822,7 +664,7 @@ fn mcp_http_streamable_configured_headers_reach_the_wire() {
         vec![turn_text("hi")],
     );
     assert!(ok, "run failed: {stderr}");
-    let seen = seen_headers.lock().unwrap();
+    let seen = fixture.header_values("x-test-header");
     assert!(
         seen.iter().any(|v| v == "configured-header-value"),
         "a header configured on an http mcp server must actually be sent on every request: {seen:?}"
@@ -836,7 +678,8 @@ fn mcp_http_streamable_tool_error_propagates_as_an_error_tool_result() {
     // of transport, but this proves it end to end over streamable-HTTP too, not just stdio.
     let home = tempfile::tempdir().unwrap();
     let cwd = tempfile::tempdir().unwrap();
-    let (url, _seen_headers) = spawn_http_mcp_fixture();
+    let fixture = spawn_http_mcp_fixture();
+    let url = fixture.url.clone();
     write_global_settings(
         home.path(),
         json!([{ "name": "remote", "transport": "http", "url": url, "headers": {} }]),
@@ -874,7 +717,8 @@ fn mcp_http_streamable_a_server_that_refuses_the_connection_is_skipped_fail_soft
     // A free port nothing is listening on — connecting to it fails fast with connection-refused, unlike
     // an unroutable address, which would hang until a timeout.
     let dead_port = common::free_port();
-    let (url, _seen_headers) = spawn_http_mcp_fixture();
+    let fixture = spawn_http_mcp_fixture();
+    let url = fixture.url.clone();
     write_global_settings(
         home.path(),
         json!([

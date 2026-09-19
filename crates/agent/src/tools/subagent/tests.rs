@@ -104,6 +104,7 @@ fn ctx(defs: Vec<AgentDef>, factory: Factory) -> (Arc<SubagentCtx>, tempfile::Te
         skills: Arc::new(Vec::new()),
         write_locks: Arc::new(agent_core::WriteLockRegistry::new()),
         mcp_tools: Vec::new(),
+        mcp_enabled: Default::default(),
         memory_mounts: Vec::new(),
         tool_cfg: ChildToolConfig {
             image_auto_resize: true,
@@ -584,6 +585,7 @@ fn ctx_with_gate(
         skills: Arc::new(Vec::new()),
         write_locks: Arc::new(agent_core::WriteLockRegistry::new()),
         mcp_tools: Vec::new(),
+        mcp_enabled: Default::default(),
         memory_mounts: Vec::new(),
         tool_cfg: ChildToolConfig {
             image_auto_resize: true,
