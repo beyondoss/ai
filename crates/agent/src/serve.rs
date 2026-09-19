@@ -777,6 +777,11 @@ pub struct ServeConfig {
     /// The octal permission mode to `chmod` the [`Self::listen_uds`] socket to after binding (default
     /// `0o600` — owner-only; use `0o660` for a shared group). Ignored when `listen_uds` is `None`.
     pub listen_uds_mode: Option<u32>,
+    /// The session-grant verifier (`--grant-key` + `--seal-key`; see [`crate::grant`]), built and
+    /// validated once at startup. `None` when neither flag is given. The connection path doesn't
+    /// consult it yet. `Arc` so every per-session copy of this config shares one keyring and one
+    /// fleet secret rather than duplicating the secret per session.
+    pub grant_verifier: Option<Arc<crate::grant::GrantVerifier>>,
     /// When set (daemon mode only), the supervisor reaps a session that has had **no attached
     /// connection** for at least this long and isn't mid-run — dropping its retained `input_tx` so it
     /// persists and exits, exactly like graceful shutdown does per-session (see [`crate::serve_ws`]).

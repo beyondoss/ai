@@ -83,6 +83,22 @@ url = "2"
 # version `agent_core::client::ApiKey` already uses for the identical purpose.
 zeroize = "1"
 
+# Session grants (`grant.rs`, `bsg_v1`): verify the control plane's Ed25519 signature, then open the
+# X25519-sealed secrets (HKDF-SHA256 → XChaCha20-Poly1305). All from the RustCrypto/dalek generation
+# the workspace already resolves (`digest` 0.10, `curve25519-dalek` 4, shared with `crates/gateway`'s
+# `ed25519-dalek`), so the only new crates are the AEAD stack and `hkdf`/`hmac`.
+# `default-features = false`: no `alloc` — `grant.rs` opens the ciphertext in place, inside the
+# decoded blob it already owns — and no `getrandom`, since a replica never seals anything.
+chacha20poly1305 = { version = "0.10", default-features = false }
+# Verify-only: `default-features = false` drops `fast` (curve25519's precomputed basepoint tables —
+# much faster signing, slightly faster verifying) and `std`. One verify per connection needs neither.
+ed25519-dalek = { version = "2.2", default-features = false }
+hkdf = "0.12"
+# `static_secrets` for the long-lived fleet key; `zeroize` so it is scrubbed on drop. No
+# `precomputed-tables`: the X25519 ladder never touches them, and the one fixed-base multiply (the
+# fleet public key, at startup) doesn't need them.
+x25519-dalek = { version = "2", default-features = false, features = ["static_secrets", "zeroize"] }
+
 # Global allocator — mimalloc, the fleet default (cf. `edge`). Floor bumped to 0.1.52 so we pull
 # libmimalloc-sys >= 0.1.49, which bundles and defaults to mimalloc **v3** (the `v2` feature is an
 # opt-*out*; we don't set it). Also sidesteps musl's slow multithreaded malloc for the static build.

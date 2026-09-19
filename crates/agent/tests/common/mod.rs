@@ -540,6 +540,10 @@ fn isolate_provider_env(cmd: &mut Command) {
         "AI_AGENT_LIFECYCLE_URL",
         "AI_AGENT_LIFECYCLE_HEADER",
         "AI_AGENT_LIFECYCLE_HEARTBEAT_SECS",
+        // Session-grant trust names a key file; an exported one must not make every test's startup
+        // depend on it.
+        "AI_AGENT_GRANT_KEY",
+        "AI_AGENT_SEAL_KEY",
     ] {
         cmd.env_remove(key);
     }

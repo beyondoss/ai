@@ -727,6 +727,18 @@ enum Command {
         /// ignored on the stdio path.
         #[usage(long, env = "AI_AGENT_UPSTREAM_HTTP2", default = "auto")]
         upstream_http2: serve::UpstreamHttp2,
+        /// Trust session grants (`bsg_v1`) signed by this control-plane key: `<kid>=<Ed25519 public
+        /// key>`, the key as standard or url-safe base64. Repeatable (comma-separated in
+        /// `AI_AGENT_GRANT_KEY`), so a key rotates by trusting the new kid alongside the old until
+        /// every grant minted under the old one has expired. Requires `--seal-key`. Validated at
+        /// startup; see `grant.rs`.
+        #[usage(long, env = "AI_AGENT_GRANT_KEY", delimiter = ',')]
+        grant_key: Vec<String>,
+        /// A file holding this fleet's X25519 secret as base64 of 32 bytes (`wg genkey` writes exactly
+        /// that), which opens the secrets every session grant carries sealed to the fleet's public
+        /// key. Read once, at startup. Requires `--grant-key`.
+        #[usage(long, env = "AI_AGENT_SEAL_KEY")]
+        seal_key: Option<std::path::PathBuf>,
         /// Address this exact session: reattach to it if it already exists, or create it under exactly
         /// this id if it doesn't. Gives a caller a known, predictable name to route on rather than
         /// parsing an id back out of `get_state`/the startup `{"kind":"session", id, …}` banner.
@@ -1798,6 +1810,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             listen_uds_mode,
             session_idle_timeout,
             upstream_http2,
+            grant_key,
+            seal_key,
             session_id,
             r#continue: continue_session,
             no_session_persistence,
@@ -1885,6 +1899,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     )
                     .into());
             }
+            // Session-grant trust: a bad key or seal-key file fails the process here, not on the first
+            // connection. Neither flag ⇒ `None`, and `serve` behaves exactly as before.
+            let grant_verifier =
+                beyond_ai_agent::grant::GrantVerifier::from_flags(&grant_key, seal_key.as_deref())?
+                    .map(Arc::new);
             // `--system-prompt`/`--append-system-prompt` may each name an existing, readable file
             // instead of literal text (pi-parity fix — matches pi's own `resolvePromptInput`). `run`'s
             // identical resolution (`main.rs::resolve_prompt_input`).
@@ -2122,6 +2141,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 listen,
                 listen_uds: listen_uds.clone(),
                 listen_uds_mode,
+                grant_verifier,
                 session_idle_timeout: session_idle_timeout.map(std::time::Duration::from_secs),
                 upstream_http2,
                 // The daemon path (`serve_ws`) fills this from `upstream_http2` before spawning any
