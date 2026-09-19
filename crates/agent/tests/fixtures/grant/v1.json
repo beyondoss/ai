@@ -1,0 +1,144 @@
+{
+  "_comment": [
+    "bsg_v1 session grant golden vectors. Owned by crates/agent (src/grant.rs; spec in ARCHITECTURE.md, 'Session grant (bsg_v1)').",
+    "The control plane's minter must reproduce `token` byte for byte from the inputs: signing_seed_hex, kid, fleet_public_hex, ephemeral_secret_hex, nonce_hex, claims, secrets.",
+    "Intermediates (shared_secret_hex, seal_key_hex, secrets_json, sealed, payload_json) locate the first step a second implementation disagrees on.",
+    "Every `negative` token must be rejected, at its `now`, with the named GrantError variant.",
+    "Regenerate only for a deliberate change: UPDATE_FIXTURES=1 cargo test -p beyond-ai-agent grant::, then dprint fmt."
+  ],
+  "kid": 1,
+  "signing_seed_hex": "0707070707070707070707070707070707070707070707070707070707070707",
+  "verifying_key_hex": "ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c",
+  "grant_key_flag": "1=6kpsY+KcUgq+9VB7Ey7F+ZVHdq6+vnuSQh7qaRRG0iw=",
+  "fleet_secret_hex": "1111111111111111111111111111111111111111111111111111111111111111",
+  "fleet_public_hex": "7b4e909bbe7ffe44c465a220037d608ee35897d31ef972f07f74892cb0f73f13",
+  "seal_key_file": "ERERERERERERERERERERERERERERERERERERERERERE=\n",
+  "ephemeral_secret_hex": "2222222222222222222222222222222222222222222222222222222222222222",
+  "ephemeral_public_hex": "0faa684ed28867b97f4a6a2dee5df8ce974e76b7018e3f22a1c4cf2678570f20",
+  "nonce_hex": "333333333333333333333333333333333333333333333333",
+  "now": 1900000000,
+  "claims": {
+    "tenant": "00tenant1",
+    "session_id": "sess_01J8ZK3Q9V",
+    "home_shard": "shard-a3",
+    "workspace_root": "/workspaces/00tenant1/sess_01J8ZK3Q9V",
+    "exec_url": "https://exec.internal/v1/sandboxes/sbx_42",
+    "mcp": [
+      {
+        "name": "github",
+        "url": "https://mcp.github.example/mcp"
+      },
+      {
+        "name": "linear",
+        "url": "https://mcp.linear.example/sse?team=eng&scope=read"
+      }
+    ],
+    "exp": 1900000300
+  },
+  "secrets": {
+    "exec_headers": [
+      {
+        "name": "Authorization",
+        "value": "Bearer exec-token-abc"
+      }
+    ],
+    "mcp_headers": {
+      "github": [
+        {
+          "name": "Authorization",
+          "value": "Bearer ghp_test_0000"
+        }
+      ],
+      "linear": [
+        {
+          "name": "Authorization",
+          "value": "Bearer lin_test_0000"
+        },
+        {
+          "name": "X-Workspace",
+          "value": "ws-eng-7f3a"
+        }
+      ]
+    },
+    "gateway_key": "bai_v2.1.test-gateway-key",
+    "dek": "VVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVU="
+  },
+  "shared_secret_hex": "9e004098efc091d4ec2663b4e9f5cfd4d7064571690b4bea97ab146ab9f35056",
+  "seal_key_hex": "9a0e266a53622fa649f48f865e36e46ba1a814c5389d5b74cbb45157ac88238c",
+  "secrets_json": "{\"exec_headers\":[{\"name\":\"Authorization\",\"value\":\"Bearer exec-token-abc\"}],\"mcp_headers\":{\"github\":[{\"name\":\"Authorization\",\"value\":\"Bearer ghp_test_0000\"}],\"linear\":[{\"name\":\"Authorization\",\"value\":\"Bearer lin_test_0000\"},{\"name\":\"X-Workspace\",\"value\":\"ws-eng-7f3a\"}]},\"gateway_key\":\"bai_v2.1.test-gateway-key\",\"dek\":\"VVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVU=\"}",
+  "sealed": "D6poTtKIZ7l_Smot7l34zpdOdrcBjj8iocTPJnhXDyAzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzPcIZF5Kn-HMO1-pqhaqvXbAPllWOISA3EYOx52fbqG2PNB_DUAFz5-ryEkCf4oRamDkX9TskFKsv1k2LR0BCJ4DJQttl36MrcD3XJyJh0Q8s0l4lLG-hC0fGQEV-tfVOEI74Jr7RdQo6xcsIT7ZY_P1T8uuA48PBVVlbrgpsdtj7sHGqiUJaPtGaEKG3dc-6Nuqj7qUmV979zFOIYIW2GPSRLkVcARgV_45fzx0ebHqFrCYLvITy5VSETKT04L51zC2-1qVJQtfwry8um-wFqBGAlKCxx6jPiAHcf1-Oty3z0pvqAZjuTfCrbDxW0oeEPnI_fpm3YIEiPc6YW1OfBrOgokTuuuP4J-3WwCQgDat3rTU3x0ATjYzQAyvzrsW4Tq2-doov8Ag3rnr7iXoMHhYWw962DETTe5xqbj2GpRTWPE0A6gzqN0f025m7zBctwDGZ5AYwqpJbnkd1FFzZ5UWzZu858a4qKA1z_4tPCum2mZTosTUs6CVIfJ1Pw",
+  "payload_json": "{\"tenant\":\"00tenant1\",\"session_id\":\"sess_01J8ZK3Q9V\",\"home_shard\":\"shard-a3\",\"workspace_root\":\"/workspaces/00tenant1/sess_01J8ZK3Q9V\",\"exec_url\":\"https://exec.internal/v1/sandboxes/sbx_42\",\"mcp\":[{\"name\":\"github\",\"url\":\"https://mcp.github.example/mcp\"},{\"name\":\"linear\",\"url\":\"https://mcp.linear.example/sse?team=eng&scope=read\"}],\"exp\":1900000300,\"sealed\":\"D6poTtKIZ7l_Smot7l34zpdOdrcBjj8iocTPJnhXDyAzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzPcIZF5Kn-HMO1-pqhaqvXbAPllWOISA3EYOx52fbqG2PNB_DUAFz5-ryEkCf4oRamDkX9TskFKsv1k2LR0BCJ4DJQttl36MrcD3XJyJh0Q8s0l4lLG-hC0fGQEV-tfVOEI74Jr7RdQo6xcsIT7ZY_P1T8uuA48PBVVlbrgpsdtj7sHGqiUJaPtGaEKG3dc-6Nuqj7qUmV979zFOIYIW2GPSRLkVcARgV_45fzx0ebHqFrCYLvITy5VSETKT04L51zC2-1qVJQtfwry8um-wFqBGAlKCxx6jPiAHcf1-Oty3z0pvqAZjuTfCrbDxW0oeEPnI_fpm3YIEiPc6YW1OfBrOgokTuuuP4J-3WwCQgDat3rTU3x0ATjYzQAyvzrsW4Tq2-doov8Ag3rnr7iXoMHhYWw962DETTe5xqbj2GpRTWPE0A6gzqN0f025m7zBctwDGZ5AYwqpJbnkd1FFzZ5UWzZu858a4qKA1z_4tPCum2mZTosTUs6CVIfJ1Pw\"}",
+  "token": "bsg_v1.1.eyJ0ZW5hbnQiOiIwMHRlbmFudDEiLCJzZXNzaW9uX2lkIjoic2Vzc18wMUo4WkszUTlWIiwiaG9tZV9zaGFyZCI6InNoYXJkLWEzIiwid29ya3NwYWNlX3Jvb3QiOiIvd29ya3NwYWNlcy8wMHRlbmFudDEvc2Vzc18wMUo4WkszUTlWIiwiZXhlY191cmwiOiJodHRwczovL2V4ZWMuaW50ZXJuYWwvdjEvc2FuZGJveGVzL3NieF80MiIsIm1jcCI6W3sibmFtZSI6ImdpdGh1YiIsInVybCI6Imh0dHBzOi8vbWNwLmdpdGh1Yi5leGFtcGxlL21jcCJ9LHsibmFtZSI6ImxpbmVhciIsInVybCI6Imh0dHBzOi8vbWNwLmxpbmVhci5leGFtcGxlL3NzZT90ZWFtPWVuZyZzY29wZT1yZWFkIn1dLCJleHAiOjE5MDAwMDAzMDAsInNlYWxlZCI6IkQ2cG9UdEtJWjdsX1Ntb3Q3bDM0enBkT2RyY0Jqajhpb2NUUEpuaFhEeUF6TXpNek16TXpNek16TXpNek16TXpNek16TXpNek16UGNJWkY1S24tSE1PMS1wcWhhcXZYYkFQbGxXT0lTQTNFWU94NTJmYnFHMlBOQl9EVUFGejUtcnlFa0NmNG9SYW1Ea1g5VHNrRktzdjFrMkxSMEJDSjRESlF0dGwzNk1yY0QzWEp5SmgwUThzMGw0bExHLWhDMGZHUUVWLXRmVk9FSTc0SnI3UmRRbzZ4Y3NJVDdaWV9QMVQ4dXVBNDhQQlZWbGJyZ3BzZHRqN3NIR3FpVUphUHRHYUVLRzNkYy02TnVxajdxVW1WOTc5ekZPSVlJVzJHUFNSTGtWY0FSZ1ZfNDVmengwZWJIcUZyQ1lMdklUeTVWU0VUS1QwNEw1MXpDMi0xcVZKUXRmd3J5OHVtLXdGcUJHQWxLQ3h4NmpQaUFIY2YxLU90eTN6MHB2cUFaanVUZkNyYkR4VzBvZUVQbklfZnBtM1lJRWlQYzZZVzFPZkJyT2dva1R1dXVQNEotM1d3Q1FnRGF0M3JUVTN4MEFUall6UUF5dnpyc1c0VHEyLWRvb3Y4QWczcm5yN2lYb01IaFlXdzk2MkRFVFRlNXhxYmoyR3BSVFdQRTBBNmd6cU4wZjAyNW03ekJjdHdER1o1QVl3cXBKYm5rZDFGRnpaNVVXelp1ODU4YTRxS0Exel80dFBDdW0ybVpUb3NUVXM2Q1ZJZkoxUHcifQ.4U3DMNzTZSn2MgPv4lObnoCkL6NbFEeHEyld6ifRPLURdiF2eTtwj7I5n5EHwB6SnISmcS2RFd8hEERXkYbgDA",
+  "negative": [
+    {
+      "name": "wrong_prefix",
+      "how": "the valid token with its prefix changed to bsg_v2",
+      "token": "bsg_v2.1.eyJ0ZW5hbnQiOiIwMHRlbmFudDEiLCJzZXNzaW9uX2lkIjoic2Vzc18wMUo4WkszUTlWIiwiaG9tZV9zaGFyZCI6InNoYXJkLWEzIiwid29ya3NwYWNlX3Jvb3QiOiIvd29ya3NwYWNlcy8wMHRlbmFudDEvc2Vzc18wMUo4WkszUTlWIiwiZXhlY191cmwiOiJodHRwczovL2V4ZWMuaW50ZXJuYWwvdjEvc2FuZGJveGVzL3NieF80MiIsIm1jcCI6W3sibmFtZSI6ImdpdGh1YiIsInVybCI6Imh0dHBzOi8vbWNwLmdpdGh1Yi5leGFtcGxlL21jcCJ9LHsibmFtZSI6ImxpbmVhciIsInVybCI6Imh0dHBzOi8vbWNwLmxpbmVhci5leGFtcGxlL3NzZT90ZWFtPWVuZyZzY29wZT1yZWFkIn1dLCJleHAiOjE5MDAwMDAzMDAsInNlYWxlZCI6IkQ2cG9UdEtJWjdsX1Ntb3Q3bDM0enBkT2RyY0Jqajhpb2NUUEpuaFhEeUF6TXpNek16TXpNek16TXpNek16TXpNek16TXpNek16UGNJWkY1S24tSE1PMS1wcWhhcXZYYkFQbGxXT0lTQTNFWU94NTJmYnFHMlBOQl9EVUFGejUtcnlFa0NmNG9SYW1Ea1g5VHNrRktzdjFrMkxSMEJDSjRESlF0dGwzNk1yY0QzWEp5SmgwUThzMGw0bExHLWhDMGZHUUVWLXRmVk9FSTc0SnI3UmRRbzZ4Y3NJVDdaWV9QMVQ4dXVBNDhQQlZWbGJyZ3BzZHRqN3NIR3FpVUphUHRHYUVLRzNkYy02TnVxajdxVW1WOTc5ekZPSVlJVzJHUFNSTGtWY0FSZ1ZfNDVmengwZWJIcUZyQ1lMdklUeTVWU0VUS1QwNEw1MXpDMi0xcVZKUXRmd3J5OHVtLXdGcUJHQWxLQ3h4NmpQaUFIY2YxLU90eTN6MHB2cUFaanVUZkNyYkR4VzBvZUVQbklfZnBtM1lJRWlQYzZZVzFPZkJyT2dva1R1dXVQNEotM1d3Q1FnRGF0M3JUVTN4MEFUall6UUF5dnpyc1c0VHEyLWRvb3Y4QWczcm5yN2lYb01IaFlXdzk2MkRFVFRlNXhxYmoyR3BSVFdQRTBBNmd6cU4wZjAyNW03ekJjdHdER1o1QVl3cXBKYm5rZDFGRnpaNVVXelp1ODU4YTRxS0Exel80dFBDdW0ybVpUb3NUVXM2Q1ZJZkoxUHcifQ.4U3DMNzTZSn2MgPv4lObnoCkL6NbFEeHEyld6ifRPLURdiF2eTtwj7I5n5EHwB6SnISmcS2RFd8hEERXkYbgDA",
+      "now": 1900000000,
+      "error": "Malformed"
+    },
+    {
+      "name": "tampered_payload",
+      "how": "the valid token's payload re-encoded with tenant 00tenant2, original signature kept",
+      "token": "bsg_v1.1.eyJ0ZW5hbnQiOiIwMHRlbmFudDIiLCJzZXNzaW9uX2lkIjoic2Vzc18wMUo4WkszUTlWIiwiaG9tZV9zaGFyZCI6InNoYXJkLWEzIiwid29ya3NwYWNlX3Jvb3QiOiIvd29ya3NwYWNlcy8wMHRlbmFudDEvc2Vzc18wMUo4WkszUTlWIiwiZXhlY191cmwiOiJodHRwczovL2V4ZWMuaW50ZXJuYWwvdjEvc2FuZGJveGVzL3NieF80MiIsIm1jcCI6W3sibmFtZSI6ImdpdGh1YiIsInVybCI6Imh0dHBzOi8vbWNwLmdpdGh1Yi5leGFtcGxlL21jcCJ9LHsibmFtZSI6ImxpbmVhciIsInVybCI6Imh0dHBzOi8vbWNwLmxpbmVhci5leGFtcGxlL3NzZT90ZWFtPWVuZyZzY29wZT1yZWFkIn1dLCJleHAiOjE5MDAwMDAzMDAsInNlYWxlZCI6IkQ2cG9UdEtJWjdsX1Ntb3Q3bDM0enBkT2RyY0Jqajhpb2NUUEpuaFhEeUF6TXpNek16TXpNek16TXpNek16TXpNek16TXpNek16UGNJWkY1S24tSE1PMS1wcWhhcXZYYkFQbGxXT0lTQTNFWU94NTJmYnFHMlBOQl9EVUFGejUtcnlFa0NmNG9SYW1Ea1g5VHNrRktzdjFrMkxSMEJDSjRESlF0dGwzNk1yY0QzWEp5SmgwUThzMGw0bExHLWhDMGZHUUVWLXRmVk9FSTc0SnI3UmRRbzZ4Y3NJVDdaWV9QMVQ4dXVBNDhQQlZWbGJyZ3BzZHRqN3NIR3FpVUphUHRHYUVLRzNkYy02TnVxajdxVW1WOTc5ekZPSVlJVzJHUFNSTGtWY0FSZ1ZfNDVmengwZWJIcUZyQ1lMdklUeTVWU0VUS1QwNEw1MXpDMi0xcVZKUXRmd3J5OHVtLXdGcUJHQWxLQ3h4NmpQaUFIY2YxLU90eTN6MHB2cUFaanVUZkNyYkR4VzBvZUVQbklfZnBtM1lJRWlQYzZZVzFPZkJyT2dva1R1dXVQNEotM1d3Q1FnRGF0M3JUVTN4MEFUall6UUF5dnpyc1c0VHEyLWRvb3Y4QWczcm5yN2lYb01IaFlXdzk2MkRFVFRlNXhxYmoyR3BSVFdQRTBBNmd6cU4wZjAyNW03ekJjdHdER1o1QVl3cXBKYm5rZDFGRnpaNVVXelp1ODU4YTRxS0Exel80dFBDdW0ybVpUb3NUVXM2Q1ZJZkoxUHcifQ.4U3DMNzTZSn2MgPv4lObnoCkL6NbFEeHEyld6ifRPLURdiF2eTtwj7I5n5EHwB6SnISmcS2RFd8hEERXkYbgDA",
+      "now": 1900000000,
+      "error": "BadSignature"
+    },
+    {
+      "name": "tampered_signature",
+      "how": "the valid token with the first signature byte XORed with 0x01",
+      "token": "bsg_v1.1.eyJ0ZW5hbnQiOiIwMHRlbmFudDEiLCJzZXNzaW9uX2lkIjoic2Vzc18wMUo4WkszUTlWIiwiaG9tZV9zaGFyZCI6InNoYXJkLWEzIiwid29ya3NwYWNlX3Jvb3QiOiIvd29ya3NwYWNlcy8wMHRlbmFudDEvc2Vzc18wMUo4WkszUTlWIiwiZXhlY191cmwiOiJodHRwczovL2V4ZWMuaW50ZXJuYWwvdjEvc2FuZGJveGVzL3NieF80MiIsIm1jcCI6W3sibmFtZSI6ImdpdGh1YiIsInVybCI6Imh0dHBzOi8vbWNwLmdpdGh1Yi5leGFtcGxlL21jcCJ9LHsibmFtZSI6ImxpbmVhciIsInVybCI6Imh0dHBzOi8vbWNwLmxpbmVhci5leGFtcGxlL3NzZT90ZWFtPWVuZyZzY29wZT1yZWFkIn1dLCJleHAiOjE5MDAwMDAzMDAsInNlYWxlZCI6IkQ2cG9UdEtJWjdsX1Ntb3Q3bDM0enBkT2RyY0Jqajhpb2NUUEpuaFhEeUF6TXpNek16TXpNek16TXpNek16TXpNek16TXpNek16UGNJWkY1S24tSE1PMS1wcWhhcXZYYkFQbGxXT0lTQTNFWU94NTJmYnFHMlBOQl9EVUFGejUtcnlFa0NmNG9SYW1Ea1g5VHNrRktzdjFrMkxSMEJDSjRESlF0dGwzNk1yY0QzWEp5SmgwUThzMGw0bExHLWhDMGZHUUVWLXRmVk9FSTc0SnI3UmRRbzZ4Y3NJVDdaWV9QMVQ4dXVBNDhQQlZWbGJyZ3BzZHRqN3NIR3FpVUphUHRHYUVLRzNkYy02TnVxajdxVW1WOTc5ekZPSVlJVzJHUFNSTGtWY0FSZ1ZfNDVmengwZWJIcUZyQ1lMdklUeTVWU0VUS1QwNEw1MXpDMi0xcVZKUXRmd3J5OHVtLXdGcUJHQWxLQ3h4NmpQaUFIY2YxLU90eTN6MHB2cUFaanVUZkNyYkR4VzBvZUVQbklfZnBtM1lJRWlQYzZZVzFPZkJyT2dva1R1dXVQNEotM1d3Q1FnRGF0M3JUVTN4MEFUall6UUF5dnpyc1c0VHEyLWRvb3Y4QWczcm5yN2lYb01IaFlXdzk2MkRFVFRlNXhxYmoyR3BSVFdQRTBBNmd6cU4wZjAyNW03ekJjdHdER1o1QVl3cXBKYm5rZDFGRnpaNVVXelp1ODU4YTRxS0Exel80dFBDdW0ybVpUb3NUVXM2Q1ZJZkoxUHcifQ.4E3DMNzTZSn2MgPv4lObnoCkL6NbFEeHEyld6ifRPLURdiF2eTtwj7I5n5EHwB6SnISmcS2RFd8hEERXkYbgDA",
+      "now": 1900000000,
+      "error": "BadSignature"
+    },
+    {
+      "name": "unknown_kid",
+      "how": "the valid payload signed under kid 2 by the key from signing seed 0x09 repeated, which this keyring does not trust",
+      "token": "bsg_v1.2.eyJ0ZW5hbnQiOiIwMHRlbmFudDEiLCJzZXNzaW9uX2lkIjoic2Vzc18wMUo4WkszUTlWIiwiaG9tZV9zaGFyZCI6InNoYXJkLWEzIiwid29ya3NwYWNlX3Jvb3QiOiIvd29ya3NwYWNlcy8wMHRlbmFudDEvc2Vzc18wMUo4WkszUTlWIiwiZXhlY191cmwiOiJodHRwczovL2V4ZWMuaW50ZXJuYWwvdjEvc2FuZGJveGVzL3NieF80MiIsIm1jcCI6W3sibmFtZSI6ImdpdGh1YiIsInVybCI6Imh0dHBzOi8vbWNwLmdpdGh1Yi5leGFtcGxlL21jcCJ9LHsibmFtZSI6ImxpbmVhciIsInVybCI6Imh0dHBzOi8vbWNwLmxpbmVhci5leGFtcGxlL3NzZT90ZWFtPWVuZyZzY29wZT1yZWFkIn1dLCJleHAiOjE5MDAwMDAzMDAsInNlYWxlZCI6IkQ2cG9UdEtJWjdsX1Ntb3Q3bDM0enBkT2RyY0Jqajhpb2NUUEpuaFhEeUF6TXpNek16TXpNek16TXpNek16TXpNek16TXpNek16UGNJWkY1S24tSE1PMS1wcWhhcXZYYkFQbGxXT0lTQTNFWU94NTJmYnFHMlBOQl9EVUFGejUtcnlFa0NmNG9SYW1Ea1g5VHNrRktzdjFrMkxSMEJDSjRESlF0dGwzNk1yY0QzWEp5SmgwUThzMGw0bExHLWhDMGZHUUVWLXRmVk9FSTc0SnI3UmRRbzZ4Y3NJVDdaWV9QMVQ4dXVBNDhQQlZWbGJyZ3BzZHRqN3NIR3FpVUphUHRHYUVLRzNkYy02TnVxajdxVW1WOTc5ekZPSVlJVzJHUFNSTGtWY0FSZ1ZfNDVmengwZWJIcUZyQ1lMdklUeTVWU0VUS1QwNEw1MXpDMi0xcVZKUXRmd3J5OHVtLXdGcUJHQWxLQ3h4NmpQaUFIY2YxLU90eTN6MHB2cUFaanVUZkNyYkR4VzBvZUVQbklfZnBtM1lJRWlQYzZZVzFPZkJyT2dva1R1dXVQNEotM1d3Q1FnRGF0M3JUVTN4MEFUall6UUF5dnpyc1c0VHEyLWRvb3Y4QWczcm5yN2lYb01IaFlXdzk2MkRFVFRlNXhxYmoyR3BSVFdQRTBBNmd6cU4wZjAyNW03ekJjdHdER1o1QVl3cXBKYm5rZDFGRnpaNVVXelp1ODU4YTRxS0Exel80dFBDdW0ybVpUb3NUVXM2Q1ZJZkoxUHcifQ.bPWDZREsCs_Ed2jXMPxaEgRYPqYhaRvZouJUaW4DKgqO0W-P5di16SwuzwSEUnMD8VHZ7MderzUijmgnoVq_BQ",
+      "now": 1900000000,
+      "error": "UnknownKid"
+    },
+    {
+      "name": "expired",
+      "how": "the valid grant re-minted with exp = now: a grant is valid strictly before exp",
+      "token": "bsg_v1.1.eyJ0ZW5hbnQiOiIwMHRlbmFudDEiLCJzZXNzaW9uX2lkIjoic2Vzc18wMUo4WkszUTlWIiwiaG9tZV9zaGFyZCI6InNoYXJkLWEzIiwid29ya3NwYWNlX3Jvb3QiOiIvd29ya3NwYWNlcy8wMHRlbmFudDEvc2Vzc18wMUo4WkszUTlWIiwiZXhlY191cmwiOiJodHRwczovL2V4ZWMuaW50ZXJuYWwvdjEvc2FuZGJveGVzL3NieF80MiIsIm1jcCI6W3sibmFtZSI6ImdpdGh1YiIsInVybCI6Imh0dHBzOi8vbWNwLmdpdGh1Yi5leGFtcGxlL21jcCJ9LHsibmFtZSI6ImxpbmVhciIsInVybCI6Imh0dHBzOi8vbWNwLmxpbmVhci5leGFtcGxlL3NzZT90ZWFtPWVuZyZzY29wZT1yZWFkIn1dLCJleHAiOjE5MDAwMDAwMDAsInNlYWxlZCI6IkQ2cG9UdEtJWjdsX1Ntb3Q3bDM0enBkT2RyY0Jqajhpb2NUUEpuaFhEeUF6TXpNek16TXpNek16TXpNek16TXpNek16TXpNek16UGNJWkY1S24tSE1PMS1wcWhhcXZYYkFQbGxXT0lTQTNFWU94NTJmYnFHMlBOQl9EVUFGejUtcnlFa0NmNG9SYW1Ea1g5VHNrRktzdjFrMkxSMEJDSjRESlF0dGwzNk1yY0QzWEp5SmgwUThzMGw0bExHLWhDMGZHUUVWLXRmVk9FSTc0SnI3UmRRbzZ4Y3NJVDdaWV9QMVQ4dXVBNDhQQlZWbGJyZ3BzZHRqN3NIR3FpVUphUHRHYUVLRzNkYy02TnVxajdxVW1WOTc5ekZPSVlJVzJHUFNSTGtWY0FSZ1ZfNDVmengwZWJIcUZyQ1lMdklUeTVWU0VUS1QwNEw1MXpDMi0xcVZKUXRmd3J5OHVtLXdGcUJHQWxLQ3h4NmpQaUFIY2YxLU90eTN6MHB2cUFaanVUZkNyYkR4VzBvZUVQbklfZnBtM1lJRWlQYzZZVzFPZkJyT2dva1R1dXVQNEotM1d3Q1FnRGF0M3JUVTN4MEFUall6UUF5dnpyc1c0VHEyLWRvb3Y4QWczcm5yN2lYb01IaFlXdzk2MkRFVFRlNXhxYmoyR3BSVFdQRTBBNmd6cU4wZjAyNW03ekJjdHdER1o1QVl3cXBKYm5rZDFGRnpaNVVXelp1ODU4YTRxS0Exel80dFBDdW0ybVpUb3NUVXM2Q1ZJZkoxUHcifQ.1RPD_bVTO8OkHxMaIJZlRy5HvHm-EKC59Q7p8qSt34AbmbcdzBm_2EbjC6oBh7SNMHfxMPzWGgYlYT0CNTp3CQ",
+      "now": 1900000000,
+      "error": "Expired"
+    },
+    {
+      "name": "wrong_seal_key",
+      "how": "the valid secrets sealed to the fleet secret 0x44 repeated instead, re-signed",
+      "token": "bsg_v1.1.eyJ0ZW5hbnQiOiIwMHRlbmFudDEiLCJzZXNzaW9uX2lkIjoic2Vzc18wMUo4WkszUTlWIiwiaG9tZV9zaGFyZCI6InNoYXJkLWEzIiwid29ya3NwYWNlX3Jvb3QiOiIvd29ya3NwYWNlcy8wMHRlbmFudDEvc2Vzc18wMUo4WkszUTlWIiwiZXhlY191cmwiOiJodHRwczovL2V4ZWMuaW50ZXJuYWwvdjEvc2FuZGJveGVzL3NieF80MiIsIm1jcCI6W3sibmFtZSI6ImdpdGh1YiIsInVybCI6Imh0dHBzOi8vbWNwLmdpdGh1Yi5leGFtcGxlL21jcCJ9LHsibmFtZSI6ImxpbmVhciIsInVybCI6Imh0dHBzOi8vbWNwLmxpbmVhci5leGFtcGxlL3NzZT90ZWFtPWVuZyZzY29wZT1yZWFkIn1dLCJleHAiOjE5MDAwMDAzMDAsInNlYWxlZCI6IkQ2cG9UdEtJWjdsX1Ntb3Q3bDM0enBkT2RyY0Jqajhpb2NUUEpuaFhEeUF6TXpNek16TXpNek16TXpNek16TXpNek16TXpNek16TU1SR1NBdFFzNWZNTktkZDJUYnpfQkFBUllBZDNkR2JVMGtOckhqNFNhaHJTaWJISDRaVEpaRmR1RVMwcDRSSE16bEdOTUYxMGczNHdhRkFkUkpmUlJhRjB0R0U4bExROFR6eUd4NGRIbWxtRHlubHIwQ1RuTmtsZWRqcUU4UUFKTC11OVZ5cGNFRFZpQjlKenJQYkhjUWZRV1RWRTJiUERhZ1dscXhWMlVlaEhTWkt1aUlXbUNjY0oxNGtUMk12enpQTkNFV05XczJUUGpNTGM5TzRFREkybUpuTkFYa1BZMWw0Rm9haG1fczF5aHZGVWFPMWNXVHoyZ1Q0akhHdkxZZTB2MXhkSkhjWFkzS1JlZUJsb3dDMElTVXVJdE5HcnJoNFQ3azhlYzVNTDJ0ZGhzekdvelp4R253RUZDNElWUEkyeVBoT25lY0pLSjYwX3dPb0FnVTZEdDdKakJYM2VTenFMeG5XeTFMNS1XNnJMaXJSVzRFbnV3a3ZjSTNQMEgyeWtYZzBidHVRbnl4VmRlRmpwS0ROYkpDMGxkRjFWYTkwMXB2TjNRVWljNWdOZDkzbU10YXp5d2Noa2NVc1JoM2NPa3JLM2hvRDNaUExiNWNkNVo2NkVQVlNQbm04SVdBV1d2YzRqSDZrdk5OWnB1TUtHVUF0aDFQdnMifQ.eU3_Y8U95NShqS12VdfcV8RjhkjIk_eCyPK7J36XMyS74hfHP2DIGteJGJAlCHMPgYZHc3r5BeArAmEqWHHEBg",
+      "now": 1900000000,
+      "error": "SealOpenFailed"
+    },
+    {
+      "name": "truncated_sealed",
+      "how": "the valid sealed blob cut to 71 bytes, one short of eph_pk + nonce + tag, re-signed",
+      "token": "bsg_v1.1.eyJ0ZW5hbnQiOiIwMHRlbmFudDEiLCJzZXNzaW9uX2lkIjoic2Vzc18wMUo4WkszUTlWIiwiaG9tZV9zaGFyZCI6InNoYXJkLWEzIiwid29ya3NwYWNlX3Jvb3QiOiIvd29ya3NwYWNlcy8wMHRlbmFudDEvc2Vzc18wMUo4WkszUTlWIiwiZXhlY191cmwiOiJodHRwczovL2V4ZWMuaW50ZXJuYWwvdjEvc2FuZGJveGVzL3NieF80MiIsIm1jcCI6W3sibmFtZSI6ImdpdGh1YiIsInVybCI6Imh0dHBzOi8vbWNwLmdpdGh1Yi5leGFtcGxlL21jcCJ9LHsibmFtZSI6ImxpbmVhciIsInVybCI6Imh0dHBzOi8vbWNwLmxpbmVhci5leGFtcGxlL3NzZT90ZWFtPWVuZyZzY29wZT1yZWFkIn1dLCJleHAiOjE5MDAwMDAzMDAsInNlYWxlZCI6IkQ2cG9UdEtJWjdsX1Ntb3Q3bDM0enBkT2RyY0Jqajhpb2NUUEpuaFhEeUF6TXpNek16TXpNek16TXpNek16TXpNek16TXpNek16UGNJWkY1S24tSE1PMS1wcWhhcXZVIn0.p036ng2-A9xX198SwMDqpXH8Eryg6pQe3lkJ-u94zXSbsA0uIoPJP0ymP2zrKpOdz84Txv3WKz-gkgH9FyKqDQ",
+      "now": 1900000000,
+      "error": "SealMalformed"
+    },
+    {
+      "name": "low_order_ephemeral",
+      "how": "the valid sealed blob with eph_pk replaced by 32 zero bytes (a low-order point), re-signed",
+      "token": "bsg_v1.1.eyJ0ZW5hbnQiOiIwMHRlbmFudDEiLCJzZXNzaW9uX2lkIjoic2Vzc18wMUo4WkszUTlWIiwiaG9tZV9zaGFyZCI6InNoYXJkLWEzIiwid29ya3NwYWNlX3Jvb3QiOiIvd29ya3NwYWNlcy8wMHRlbmFudDEvc2Vzc18wMUo4WkszUTlWIiwiZXhlY191cmwiOiJodHRwczovL2V4ZWMuaW50ZXJuYWwvdjEvc2FuZGJveGVzL3NieF80MiIsIm1jcCI6W3sibmFtZSI6ImdpdGh1YiIsInVybCI6Imh0dHBzOi8vbWNwLmdpdGh1Yi5leGFtcGxlL21jcCJ9LHsibmFtZSI6ImxpbmVhciIsInVybCI6Imh0dHBzOi8vbWNwLmxpbmVhci5leGFtcGxlL3NzZT90ZWFtPWVuZyZzY29wZT1yZWFkIn1dLCJleHAiOjE5MDAwMDAzMDAsInNlYWxlZCI6IkFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUF6TXpNek16TXpNek16TXpNek16TXpNek16TXpNek16UGNJWkY1S24tSE1PMS1wcWhhcXZYYkFQbGxXT0lTQTNFWU94NTJmYnFHMlBOQl9EVUFGejUtcnlFa0NmNG9SYW1Ea1g5VHNrRktzdjFrMkxSMEJDSjRESlF0dGwzNk1yY0QzWEp5SmgwUThzMGw0bExHLWhDMGZHUUVWLXRmVk9FSTc0SnI3UmRRbzZ4Y3NJVDdaWV9QMVQ4dXVBNDhQQlZWbGJyZ3BzZHRqN3NIR3FpVUphUHRHYUVLRzNkYy02TnVxajdxVW1WOTc5ekZPSVlJVzJHUFNSTGtWY0FSZ1ZfNDVmengwZWJIcUZyQ1lMdklUeTVWU0VUS1QwNEw1MXpDMi0xcVZKUXRmd3J5OHVtLXdGcUJHQWxLQ3h4NmpQaUFIY2YxLU90eTN6MHB2cUFaanVUZkNyYkR4VzBvZUVQbklfZnBtM1lJRWlQYzZZVzFPZkJyT2dva1R1dXVQNEotM1d3Q1FnRGF0M3JUVTN4MEFUall6UUF5dnpyc1c0VHEyLWRvb3Y4QWczcm5yN2lYb01IaFlXdzk2MkRFVFRlNXhxYmoyR3BSVFdQRTBBNmd6cU4wZjAyNW03ekJjdHdER1o1QVl3cXBKYm5rZDFGRnpaNVVXelp1ODU4YTRxS0Exel80dFBDdW0ybVpUb3NUVXM2Q1ZJZkoxUHcifQ.ty7Ei7mEYmfSeJQLXa5cQ7gKiRwJEH0CxHjkgVE0J9OSRH6KD3aW3zymOHIMooN67rVBTd3NaLWp9lhUWowcDw",
+      "now": 1900000000,
+      "error": "SealMalformed"
+    },
+    {
+      "name": "unknown_claim",
+      "how": "the valid payload with an extra \"scope\":\"admin\" claim appended, re-signed",
+      "token": "bsg_v1.1.eyJ0ZW5hbnQiOiIwMHRlbmFudDEiLCJzZXNzaW9uX2lkIjoic2Vzc18wMUo4WkszUTlWIiwiaG9tZV9zaGFyZCI6InNoYXJkLWEzIiwid29ya3NwYWNlX3Jvb3QiOiIvd29ya3NwYWNlcy8wMHRlbmFudDEvc2Vzc18wMUo4WkszUTlWIiwiZXhlY191cmwiOiJodHRwczovL2V4ZWMuaW50ZXJuYWwvdjEvc2FuZGJveGVzL3NieF80MiIsIm1jcCI6W3sibmFtZSI6ImdpdGh1YiIsInVybCI6Imh0dHBzOi8vbWNwLmdpdGh1Yi5leGFtcGxlL21jcCJ9LHsibmFtZSI6ImxpbmVhciIsInVybCI6Imh0dHBzOi8vbWNwLmxpbmVhci5leGFtcGxlL3NzZT90ZWFtPWVuZyZzY29wZT1yZWFkIn1dLCJleHAiOjE5MDAwMDAzMDAsInNlYWxlZCI6IkQ2cG9UdEtJWjdsX1Ntb3Q3bDM0enBkT2RyY0Jqajhpb2NUUEpuaFhEeUF6TXpNek16TXpNek16TXpNek16TXpNek16TXpNek16UGNJWkY1S24tSE1PMS1wcWhhcXZYYkFQbGxXT0lTQTNFWU94NTJmYnFHMlBOQl9EVUFGejUtcnlFa0NmNG9SYW1Ea1g5VHNrRktzdjFrMkxSMEJDSjRESlF0dGwzNk1yY0QzWEp5SmgwUThzMGw0bExHLWhDMGZHUUVWLXRmVk9FSTc0SnI3UmRRbzZ4Y3NJVDdaWV9QMVQ4dXVBNDhQQlZWbGJyZ3BzZHRqN3NIR3FpVUphUHRHYUVLRzNkYy02TnVxajdxVW1WOTc5ekZPSVlJVzJHUFNSTGtWY0FSZ1ZfNDVmengwZWJIcUZyQ1lMdklUeTVWU0VUS1QwNEw1MXpDMi0xcVZKUXRmd3J5OHVtLXdGcUJHQWxLQ3h4NmpQaUFIY2YxLU90eTN6MHB2cUFaanVUZkNyYkR4VzBvZUVQbklfZnBtM1lJRWlQYzZZVzFPZkJyT2dva1R1dXVQNEotM1d3Q1FnRGF0M3JUVTN4MEFUall6UUF5dnpyc1c0VHEyLWRvb3Y4QWczcm5yN2lYb01IaFlXdzk2MkRFVFRlNXhxYmoyR3BSVFdQRTBBNmd6cU4wZjAyNW03ekJjdHdER1o1QVl3cXBKYm5rZDFGRnpaNVVXelp1ODU4YTRxS0Exel80dFBDdW0ybVpUb3NUVXM2Q1ZJZkoxUHciLCJzY29wZSI6ImFkbWluIn0.IGU3X5nk1cJ0pFy19sPSIHwbImWQq6JHw9TnltimYmMDjTvcb1PRyZXQnmOVT1aqL9FvZq3pb7v4hXWcSNXvCQ",
+      "now": 1900000000,
+      "error": "BadClaims"
+    },
+    {
+      "name": "short_dek",
+      "how": "the valid secrets with a 31-byte dek, sealed and signed as usual",
+      "token": "bsg_v1.1.eyJ0ZW5hbnQiOiIwMHRlbmFudDEiLCJzZXNzaW9uX2lkIjoic2Vzc18wMUo4WkszUTlWIiwiaG9tZV9zaGFyZCI6InNoYXJkLWEzIiwid29ya3NwYWNlX3Jvb3QiOiIvd29ya3NwYWNlcy8wMHRlbmFudDEvc2Vzc18wMUo4WkszUTlWIiwiZXhlY191cmwiOiJodHRwczovL2V4ZWMuaW50ZXJuYWwvdjEvc2FuZGJveGVzL3NieF80MiIsIm1jcCI6W3sibmFtZSI6ImdpdGh1YiIsInVybCI6Imh0dHBzOi8vbWNwLmdpdGh1Yi5leGFtcGxlL21jcCJ9LHsibmFtZSI6ImxpbmVhciIsInVybCI6Imh0dHBzOi8vbWNwLmxpbmVhci5leGFtcGxlL3NzZT90ZWFtPWVuZyZzY29wZT1yZWFkIn1dLCJleHAiOjE5MDAwMDAzMDAsInNlYWxlZCI6IkQ2cG9UdEtJWjdsX1Ntb3Q3bDM0enBkT2RyY0Jqajhpb2NUUEpuaFhEeUF6TXpNek16TXpNek16TXpNek16TXpNek16TXpNek16UGNJWkY1S24tSE1PMS1wcWhhcXZYYkFQbGxXT0lTQTNFWU94NTJmYnFHMlBOQl9EVUFGejUtcnlFa0NmNG9SYW1Ea1g5VHNrRktzdjFrMkxSMEJDSjRESlF0dGwzNk1yY0QzWEp5SmgwUThzMGw0bExHLWhDMGZHUUVWLXRmVk9FSTc0SnI3UmRRbzZ4Y3NJVDdaWV9QMVQ4dXVBNDhQQlZWbGJyZ3BzZHRqN3NIR3FpVUphUHRHYUVLRzNkYy02TnVxajdxVW1WOTc5ekZPSVlJVzJHUFNSTGtWY0FSZ1ZfNDVmengwZWJIcUZyQ1lMdklUeTVWU0VUS1QwNEw1MXpDMi0xcVZKUXRmd3J5OHVtLXdGcUJHQWxLQ3h4NmpQaUFIY2YxLU90eTN6MHB2cUFaanVUZkNyYkR4VzBvZUVQbklfZnBtM1lJRWlQYzZZVzFPZkJyT2dva1R1dXVQNEotM1d3Q1FnRGF0M3JUVTN4MEFUall6UUF5dnpyc1c0VHEyLWRvb3Y4QWczcm5yN2lYb01IaFlXdzk2MkRFVFRlNXhxYmoyR3BSVFdQRTBBNmd6cU4wZjAyNW03ekJjdHdER1o1QVl3cXBKYm5rZDFGRnpaNVVXelp1ODU4YTRxS0h2el80dE10eG9ycTR2X3NQOEJOUENmd3I3S2MifQ.kZ_Bk_TAooDh7k726i2FgCz_4SZoJaiLpExgBQiFj4m-GU-gagVN3VzjiyiWJlMOBynTpWMpdhugEGqTbEuFBA",
+      "now": 1900000000,
+      "error": "BadClaims"
+    }
+  ]
+}
