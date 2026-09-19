@@ -5,17 +5,27 @@
 //! beside — and is scoped exactly like — its sessions. All worktrees of one repo share it.
 //!
 //! Durability follows this crate's established store discipline (`auth_store`/`trust_store`): every
-//! mutation runs under a cross-process advisory [`FileLock`] and writes through
+//! mutation runs under a cross-process advisory [`StoreLock`] and writes through
 //! [`crate::tools::write_atomic`] (temp file + atomic rename), so a crash mid-write can't leave a
 //! half-written document. Reads are resilient — a missing store is simply empty, an unreadable file
-//! `warn!`s and is skipped rather than panicking. The [`FileLock`] is duplicated here rather than shared,
-//! matching the convention documented in `auth_store.rs`: each store's lock is small and self-contained.
+//! `warn!`s and is skipped rather than panicking.
+//!
+//! Two properties the multi-tenant service needs, both optional and both invisible to a local run:
+//!
+//! - **Sealing.** Given a [`TenantCodec`], every document is sealed whole-file on the way out and
+//!   opened on the way back in, so a shared filesystem holds no tenant plaintext. The AAD is the
+//!   tenant, deliberately *not* the path: [`MemoryBackend::rename`] moves a document without
+//!   rewriting it, and a path-bound AAD would make every rename a re-seal (and a crash mid-rename a
+//!   data loss).
+//! - **Off the runtime thread.** Every operation here is blocking filesystem work, and the lock below
+//!   can wait seconds for a competing writer. The bodies run on `spawn_blocking`, so a slow or
+//!   contended store stalls one blocking thread instead of the whole single-threaded runtime.
 
 use std::fs;
 use std::io::{self, ErrorKind};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 
@@ -23,6 +33,7 @@ use super::{
     Entry, Hit, INDEX_FILE, INDEX_MAX_BYTES, INDEX_MAX_LINES, MEMORY_ROOT, MemPath, MemoryBackend,
     MemoryError, SESSION_ROOT, View,
 };
+use crate::session_store::TenantCodec;
 
 /// Where a [`FileBackend`]'s directory comes from. A durable store lives at a `Fixed` path for its whole
 /// life; a session working-memory store points at a `Shared`, atomically-swappable path so a serve
@@ -71,6 +82,8 @@ pub struct FileBackend {
     /// affects the paths reported back to the model (listings, search hits) — the on-disk layout is the
     /// same regardless — so one backend type serves either mount.
     root: &'static str,
+    /// Set for a tenant whose documents must not sit in plaintext on shared storage.
+    codec: Option<Arc<TenantCodec>>,
 }
 
 impl FileBackend {
@@ -82,62 +95,106 @@ impl FileBackend {
             .join("projects")
             .join(encoded)
             .join("memory");
-        Self {
-            dir: DirSource::Fixed(dir),
-            root: MEMORY_ROOT,
-        }
+        Self::new(DirSource::Fixed(dir), MEMORY_ROOT)
     }
 
     /// A durable store at an explicit directory (a `--memory <path>` / `file://` override).
     pub fn at(dir: PathBuf) -> Self {
-        Self {
-            dir: DirSource::Fixed(dir),
-            root: MEMORY_ROOT,
-        }
+        Self::new(DirSource::Fixed(dir), MEMORY_ROOT)
     }
 
     /// A session working-memory store at a fixed `dir`, surfaced under [`SESSION_ROOT`] (`/session`). For
     /// hosts with a single, non-switching session (`run`) and for tests.
     pub fn session_at(dir: PathBuf) -> Self {
-        Self {
-            dir: DirSource::Fixed(dir),
-            root: SESSION_ROOT,
-        }
+        Self::new(DirSource::Fixed(dir), SESSION_ROOT)
     }
 
     /// A session working-memory store whose directory tracks a shared [`SessionDir`] cell — for a host
     /// (`serve`) that switches between sessions in one process.
     pub fn session_shared(cell: SessionDir) -> Self {
+        Self::new(DirSource::Shared(cell), SESSION_ROOT)
+    }
+
+    fn new(dir: DirSource, root: &'static str) -> Self {
         Self {
-            dir: DirSource::Shared(cell),
-            root: SESSION_ROOT,
+            dir,
+            root,
+            codec: None,
         }
     }
 
-    /// The store's current base directory.
-    fn dir(&self) -> PathBuf {
-        self.dir.get()
+    /// Seal every document this store writes with `codec`, and open every one it reads.
+    pub fn sealed(mut self, codec: Arc<TenantCodec>) -> Self {
+        self.codec = Some(codec);
+        self
     }
 
+    /// The blocking half of this backend, resolved for one operation. Owned and `'static`, so it moves
+    /// straight into `spawn_blocking` — and it pins the directory for the whole operation, which a
+    /// `Shared` cell re-pointed mid-flight would otherwise change between the read and the write.
+    fn store(&self) -> Store {
+        Store {
+            dir: self.dir.get(),
+            root: self.root,
+            codec: self.codec.clone(),
+        }
+    }
+}
+
+/// Run one store operation off the async runtime. A panicked or cancelled blocking task surfaces as a
+/// backend error rather than taking the caller down with it.
+async fn blocking<T, F>(f: F) -> Result<T, MemoryError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, MemoryError> + Send + 'static,
+{
+    match tokio::task::spawn_blocking(f).await {
+        Ok(r) => r,
+        Err(e) => Err(MemoryError::Backend(format!(
+            "memory operation failed: {e}"
+        ))),
+    }
+}
+
+/// One resolved store directory, and everything the blocking work needs.
+struct Store {
+    dir: PathBuf,
+    root: &'static str,
+    codec: Option<Arc<TenantCodec>>,
+}
+
+impl Store {
     /// The real filesystem path for a logical [`MemPath`].
     fn resolve(&self, path: &MemPath) -> PathBuf {
         if path.is_root() {
-            self.dir()
+            self.dir.clone()
         } else {
-            self.dir().join(path.rel())
+            self.dir.join(path.rel())
         }
     }
 
     /// The store-wide lock path guarding every mutation (one lock for the whole store keeps cross-file
     /// operations like `rename` and index updates consistent).
     fn lock_path(&self) -> PathBuf {
-        self.dir().join(".memory.lock")
+        self.dir.join(".memory.lock")
     }
 
     /// Acquire the store lock, having ensured the store directory exists.
-    fn lock(&self) -> Result<FileLock, MemoryError> {
-        fs::create_dir_all(self.dir()).map_err(|e| MemoryError::Backend(e.to_string()))?;
-        FileLock::acquire(&self.lock_path()).map_err(|e| MemoryError::Backend(e.to_string()))
+    fn lock(&self) -> Result<StoreLock, MemoryError> {
+        fs::create_dir_all(&self.dir).map_err(|e| MemoryError::Backend(e.to_string()))?;
+        StoreLock::acquire(&self.lock_path()).map_err(|e| MemoryError::Backend(e.to_string()))
+    }
+
+    /// Decode what a document's bytes say — sealed or not.
+    fn decode(&self, raw: Vec<u8>) -> Result<String, MemoryError> {
+        let plain = match &self.codec {
+            Some(c) => c.open_doc(&raw).map_err(|e| {
+                MemoryError::Backend(format!("memory document could not be opened: {e}"))
+            })?,
+            None => raw,
+        };
+        String::from_utf8(plain)
+            .map_err(|_| MemoryError::Backend("memory document is not valid UTF-8".to_string()))
     }
 
     /// Read a document's text, distinguishing "no such file" ([`MemoryError::NotFound`]) from a real IO
@@ -149,7 +206,10 @@ impl FileBackend {
                 "{} is a directory, not a document",
                 path.display()
             ))),
-            Ok(_) => fs::read_to_string(&real).map_err(|e| MemoryError::Backend(e.to_string())),
+            Ok(_) => {
+                let raw = fs::read(&real).map_err(|e| MemoryError::Backend(e.to_string()))?;
+                self.decode(raw)
+            }
             Err(e) if e.kind() == ErrorKind::NotFound => Err(MemoryError::NotFound(path.display())),
             Err(e) => Err(MemoryError::Backend(e.to_string())),
         }
@@ -165,7 +225,13 @@ impl FileBackend {
         let real_str = real
             .to_str()
             .ok_or_else(|| MemoryError::Backend(format!("non-UTF-8 path: {}", real.display())))?;
-        crate::tools::write_atomic(real_str, text.as_bytes())
+        let bytes = match &self.codec {
+            Some(c) => c
+                .seal_doc(text.as_bytes())
+                .map_err(|e| MemoryError::Backend(e.to_string()))?,
+            None => text.as_bytes().to_vec(),
+        };
+        crate::tools::write_atomic(real_str, &bytes)
             .map_err(|e| MemoryError::Backend(e.to_string()))
     }
 
@@ -184,9 +250,6 @@ impl FileBackend {
             Err(e) if e.kind() == ErrorKind::NotFound => return Ok(()),
             Err(e) => return Err(MemoryError::Backend(e.to_string())),
         };
-        // The base dir is invariant for this walk; resolve it once (a clone / short read lock) rather
-        // than per directory entry.
-        let base = self.dir();
         for entry in entries.flatten() {
             let name = entry.file_name();
             let name = name.to_string_lossy();
@@ -195,7 +258,7 @@ impl FileBackend {
                 continue;
             }
             let real = entry.path();
-            let Ok(logical) = real.strip_prefix(&base) else {
+            let Ok(logical) = real.strip_prefix(&self.dir) else {
                 continue;
             };
             let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
@@ -215,48 +278,27 @@ impl FileBackend {
         }
         Ok(())
     }
-}
 
-/// Keep the first [`INDEX_MAX_LINES`] lines / [`INDEX_MAX_BYTES`] bytes of the index — whichever bites
-/// first — so the always-injected prefix stays bounded.
-fn cap_index(raw: &str) -> String {
-    let mut out = String::new();
-    for (i, line) in raw.lines().enumerate() {
-        if i >= INDEX_MAX_LINES {
-            out.push_str("\n[index truncated: showing the first ");
-            out.push_str(&INDEX_MAX_LINES.to_string());
-            out.push_str(" lines]");
-            break;
-        }
-        if out.len() + line.len() + 1 > INDEX_MAX_BYTES {
-            out.push_str("\n[index truncated at ~25 KB]");
-            break;
-        }
-        out.push_str(line);
-        out.push('\n');
-    }
-    out
-}
-
-#[async_trait]
-impl MemoryBackend for FileBackend {
-    async fn index(&self) -> Result<String, MemoryError> {
-        let path = self.dir().join(INDEX_FILE);
-        match fs::read_to_string(&path) {
-            Ok(raw) => Ok(cap_index(&raw)),
-            Err(e) if e.kind() == ErrorKind::NotFound => Ok(String::new()),
+    fn index(&self) -> Result<String, MemoryError> {
+        let path = self.dir.join(INDEX_FILE);
+        let raw = match fs::read(&path) {
+            Ok(raw) => raw,
+            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(String::new()),
             Err(e) => {
                 tracing::warn!(path = %path.display(), error = %e, "could not read MEMORY.md index, treating it as empty");
+                return Ok(String::new());
+            }
+        };
+        match self.decode(raw) {
+            Ok(text) => Ok(cap_index(&text)),
+            Err(e) => {
+                tracing::warn!(path = %path.display(), error = %e, "could not decode MEMORY.md index, treating it as empty");
                 Ok(String::new())
             }
         }
     }
 
-    async fn view(
-        &self,
-        path: &MemPath,
-        range: Option<(usize, usize)>,
-    ) -> Result<View, MemoryError> {
+    fn view(&self, path: &MemPath, range: Option<(usize, usize)>) -> Result<View, MemoryError> {
         let real = self.resolve(path);
         let is_dir = path.is_root() || fs::metadata(&real).map(|m| m.is_dir()).unwrap_or(false);
         if is_dir {
@@ -287,7 +329,7 @@ impl MemoryBackend for FileBackend {
         }
     }
 
-    async fn create(&self, path: &MemPath, text: &str) -> Result<(), MemoryError> {
+    fn create(&self, path: &MemPath, text: &str) -> Result<(), MemoryError> {
         if path.is_root() {
             return Err(MemoryError::InvalidPath(
                 "cannot create the memory root itself".to_string(),
@@ -312,7 +354,7 @@ impl MemoryBackend for FileBackend {
         self.write_doc(path, text)
     }
 
-    async fn str_replace(&self, path: &MemPath, old: &str, new: &str) -> Result<(), MemoryError> {
+    fn str_replace(&self, path: &MemPath, old: &str, new: &str) -> Result<(), MemoryError> {
         let _lock = self.lock()?;
         // Re-read fresh under the lock, mutate, write back — the store discipline.
         let text = self.read_doc(path)?;
@@ -328,7 +370,7 @@ impl MemoryBackend for FileBackend {
         self.write_doc(path, &replaced)
     }
 
-    async fn insert(&self, path: &MemPath, line: usize, text: &str) -> Result<(), MemoryError> {
+    fn insert(&self, path: &MemPath, line: usize, text: &str) -> Result<(), MemoryError> {
         let _lock = self.lock()?;
         let existing = self.read_doc(path)?;
         let mut lines: Vec<&str> = existing.lines().collect();
@@ -346,7 +388,7 @@ impl MemoryBackend for FileBackend {
         self.write_doc(path, &joined)
     }
 
-    async fn delete(&self, path: &MemPath) -> Result<(), MemoryError> {
+    fn delete(&self, path: &MemPath) -> Result<(), MemoryError> {
         if path.is_root() {
             return Err(MemoryError::InvalidPath(
                 "cannot delete the memory root".to_string(),
@@ -375,7 +417,7 @@ impl MemoryBackend for FileBackend {
         }
     }
 
-    async fn rename(&self, from: &MemPath, to: &MemPath) -> Result<(), MemoryError> {
+    fn rename(&self, from: &MemPath, to: &MemPath) -> Result<(), MemoryError> {
         if from.is_root() || to.is_root() {
             return Err(MemoryError::InvalidPath(
                 "cannot rename the memory root".to_string(),
@@ -393,16 +435,17 @@ impl MemoryBackend for FileBackend {
         if let Some(parent) = dst.parent() {
             fs::create_dir_all(parent).map_err(|e| MemoryError::Backend(e.to_string()))?;
         }
+        // A sealed document is bound to its tenant, not its path, so this stays a pure `rename` — no
+        // re-seal, and nothing to lose if the process dies mid-move.
         fs::rename(&src, &dst).map_err(|e| MemoryError::Backend(e.to_string()))
     }
 
-    async fn search(&self, query: &str) -> Result<Vec<Hit>, MemoryError> {
+    fn search(&self, query: &str) -> Result<Vec<Hit>, MemoryError> {
         let needle = query.to_lowercase();
         if needle.is_empty() {
             return Ok(Vec::new());
         }
-        let dir = self.dir();
-        let entries = self.listing(&dir)?;
+        let entries = self.listing(&self.dir)?;
         let mut hits = Vec::new();
         // The logical-root prefix is the same for every entry; build it once.
         let prefix = format!("{}/", self.root);
@@ -414,10 +457,9 @@ impl MemoryBackend for FileBackend {
             }
             // Re-derive the real path from the logical one.
             let rel = entry.path.strip_prefix(&prefix).unwrap_or(&entry.path);
-            let real = dir.join(rel);
-            let Ok(text) = fs::read_to_string(&real) else {
-                continue;
-            };
+            let real = self.dir.join(rel);
+            let Ok(raw) = fs::read(&real) else { continue };
+            let Ok(text) = self.decode(raw) else { continue };
             for (i, line) in text.lines().enumerate() {
                 lower.clear();
                 lower.extend(line.chars().flat_map(char::to_lowercase));
@@ -434,39 +476,112 @@ impl MemoryBackend for FileBackend {
     }
 }
 
-// ---- FileLock: a cross-process advisory lock, duplicated per this crate's store convention ----------
+/// Keep the first [`INDEX_MAX_LINES`] lines / [`INDEX_MAX_BYTES`] bytes of the index — whichever bites
+/// first — so the always-injected prefix stays bounded.
+fn cap_index(raw: &str) -> String {
+    let mut out = String::new();
+    for (i, line) in raw.lines().enumerate() {
+        if i >= INDEX_MAX_LINES {
+            out.push_str("\n[index truncated: showing the first ");
+            out.push_str(&INDEX_MAX_LINES.to_string());
+            out.push_str(" lines]");
+            break;
+        }
+        if out.len() + line.len() + 1 > INDEX_MAX_BYTES {
+            out.push_str("\n[index truncated at ~25 KB]");
+            break;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
+#[async_trait]
+impl MemoryBackend for FileBackend {
+    async fn index(&self) -> Result<String, MemoryError> {
+        let s = self.store();
+        blocking(move || s.index()).await
+    }
+
+    async fn view(
+        &self,
+        path: &MemPath,
+        range: Option<(usize, usize)>,
+    ) -> Result<View, MemoryError> {
+        let (s, path) = (self.store(), path.clone());
+        blocking(move || s.view(&path, range)).await
+    }
+
+    async fn create(&self, path: &MemPath, text: &str) -> Result<(), MemoryError> {
+        let (s, path, text) = (self.store(), path.clone(), text.to_string());
+        blocking(move || s.create(&path, &text)).await
+    }
+
+    async fn str_replace(&self, path: &MemPath, old: &str, new: &str) -> Result<(), MemoryError> {
+        let (s, path, old, new) = (self.store(), path.clone(), old.to_string(), new.to_string());
+        blocking(move || s.str_replace(&path, &old, &new)).await
+    }
+
+    async fn insert(&self, path: &MemPath, line: usize, text: &str) -> Result<(), MemoryError> {
+        let (s, path, text) = (self.store(), path.clone(), text.to_string());
+        blocking(move || s.insert(&path, line, &text)).await
+    }
+
+    async fn delete(&self, path: &MemPath) -> Result<(), MemoryError> {
+        let (s, path) = (self.store(), path.clone());
+        blocking(move || s.delete(&path)).await
+    }
+
+    async fn rename(&self, from: &MemPath, to: &MemPath) -> Result<(), MemoryError> {
+        let (s, from, to) = (self.store(), from.clone(), to.clone());
+        blocking(move || s.rename(&from, &to)).await
+    }
+
+    async fn search(&self, query: &str) -> Result<Vec<Hit>, MemoryError> {
+        let (s, query) = (self.store(), query.to_string());
+        blocking(move || s.search(&query)).await
+    }
+}
+
+// ---- StoreLock: a cross-process advisory lock, duplicated per this crate's store convention --------
 
 const LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 const LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(20);
-const STALE_LOCK_AGE: Duration = Duration::from_secs(10);
 
-/// Released by deleting the lock file on `Drop`, so a panicked or early-returning holder still frees it.
-struct FileLock {
-    path: PathBuf,
+/// Held for the length of one mutation. Released by closing the descriptor on `Drop`, so a panicked or
+/// early-returning holder frees it — and so does a holder that is killed outright.
+///
+/// The lock is the file descriptor, not the file's existence. The previous `create_new`-as-a-mutex
+/// scheme had to guess when an abandoned lock file was stale (a fixed 10-second age), which is both a
+/// stall for anyone waiting and a silent lock break for anyone slower than the guess. `flock` has no
+/// such ambiguity: the kernel releases it when the holder's descriptor closes, crash included. The lock
+/// file itself is left behind deliberately — unlinking it while holding the lock is the classic race,
+/// where a waiter ends up locking an inode that is no longer the one at the path.
+struct StoreLock {
+    _file: fs::File,
 }
 
-impl FileLock {
+impl StoreLock {
     fn acquire(lock_path: &Path) -> io::Result<Self> {
         if let Some(parent) = lock_path.parent() {
             fs::create_dir_all(parent)?;
         }
+        // Read+write, because a network filesystem may emulate `flock` with POSIX record locks, which
+        // require a writable descriptor.
+        let mut opts = fs::OpenOptions::new();
+        opts.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let file = opts.open(lock_path)?;
         let deadline = Instant::now() + LOCK_TIMEOUT;
         loop {
-            match fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(lock_path)
-            {
-                Ok(_) => {
-                    return Ok(Self {
-                        path: lock_path.to_path_buf(),
-                    });
-                }
-                Err(e) if e.kind() == ErrorKind::AlreadyExists => {
-                    if is_stale(lock_path) {
-                        let _ = fs::remove_file(lock_path);
-                        continue;
-                    }
+            match file.try_lock() {
+                Ok(()) => return Ok(Self { _file: file }),
+                Err(fs::TryLockError::WouldBlock) => {
                     if Instant::now() >= deadline {
                         return Err(io::Error::new(
                             ErrorKind::TimedOut,
@@ -478,27 +593,10 @@ impl FileLock {
                     }
                     std::thread::sleep(LOCK_RETRY_INTERVAL);
                 }
-                Err(e) => return Err(e),
+                Err(fs::TryLockError::Error(e)) => return Err(e),
             }
         }
     }
-}
-
-impl Drop for FileLock {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
-    }
-}
-
-fn is_stale(lock_path: &Path) -> bool {
-    fs::metadata(lock_path)
-        .and_then(|m| m.modified())
-        .and_then(|modified| {
-            SystemTime::now()
-                .duration_since(modified)
-                .map_err(io::Error::other)
-        })
-        .is_ok_and(|age| age > STALE_LOCK_AGE)
 }
 
 #[cfg(test)]

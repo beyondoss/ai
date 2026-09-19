@@ -2493,6 +2493,168 @@ deliberate change regenerates the file with `UPDATE_FIXTURES=1 cargo test -p bey
 
 ---
 
+## Session storage — single file, or epoch segments
+
+> PR 5's "Service mode" section is not in this file yet. This section is written standalone;
+> fold it in as the storage subsection once that skeleton lands.
+
+`session_store.rs` writes a session through one private seam, `Log`, which has two shapes. The tree
+logic above it — ids, branches, compaction, labels — never learns which one it is on.
+
+|               | `Layout::File` (default)           | `Layout::Segmented`                          |
+| ------------- | ---------------------------------- | -------------------------------------------- |
+| on disk       | `<dir>/<created_at>_<id>.jsonl`    | `<dir>/<id>/`                                |
+| append        | `O_APPEND` write, `fsync`          | append into the segment this process created |
+| replace       | temp file + `rename` + dir `fsync` | a new **base** segment                       |
+| memory        | `<...>.memory/` sibling            | `<id>/memory`                                |
+| who may write | whoever holds the file             | whoever created the newest epoch             |
+
+`SessionRepo::open` gives the single-file layout with no id prefix, and is byte-for-byte what it
+always was. `SessionRepo::open_with(dir, RepoOptions { layout, id_prefix })` selects the other.
+`SessionStore::open(path)` probes with `is_dir()`, so `main.rs`, `fork_from_path` and export keep
+handing a bare path over without knowing which shape it names.
+
+### The segmented layout
+
+```text
+<dir>/<id>/
+  lock            advisory, liveness only
+  000001.jsonl    epoch 1 — created with O_EXCL; the session's existence fence
+  000002.jsonl    epoch 2 — created by the next owner, sealing epoch 1 where it stopped reading
+  ...
+  memory/         this session's /session working memory
+```
+
+**Segment header** — the plaintext first line of every segment:
+
+```json
+{ "type": "segment", "epoch": 2, "sealed": { "1": 728 }, "base": false }
+```
+
+`sealed` maps an epoch to the byte offset it is readable up to; it carries **every** seal since the
+last base, so a reader starting at that base can bound each segment between without opening headers
+it may no longer be able to read. `base` says the segment's content is a full rewrite.
+
+**Base trailer** — the plaintext line that closes a base's own content:
+
+```json
+{ "type": "base_complete" }
+```
+
+A base counts only once its trailer is on disk. Lines after the trailer are ordinary appends. Epoch 1
+is written as a complete base holding the session header, so a replay always has somewhere to start.
+
+**Sealed transcript line** — every other line, when a codec is configured:
+
+```text
+e1.<kfp8>:<base64url(nonce(24) ‖ ciphertext ‖ tag(16))>
+```
+
+`kfp8` is eight hex digits of key fingerprint, for rotation. A plaintext line starts with `{`; a
+sealed one never does, which is how a reader tells them apart with no state.
+
+### Effective view
+
+1. Start at the newest **complete** base (header says `base`, and its trailer is present), else at
+   the oldest segment there is.
+2. Read each segment from just past its header up to its seal; the newest reads to the length the
+   scan observed.
+3. A segment whose header is torn or missing counts as empty, sealed at 0. A `base` segment newer
+   than the start never had its trailer land, so its content — a partial rewrite of the whole
+   transcript — is skipped entirely, while its header's seals still count.
+4. A torn final line is dropped, but only at the end of a segment's range. A sealed line that fails
+   to open anywhere is a hard error: the bytes are not this session's, and presenting a truncated
+   view would let the next write overwrite real history.
+5. Every descriptor is opened up front, so an unlink underneath the reader is harmless; `ENOENT`/
+   `ESTALE` restarts the whole read.
+
+### Ownership: the epoch fence
+
+There is no lease and no clock. A writer owns a session because it created a file nobody else could
+have created.
+
+- **Create** — `create_dir_all(<id>)` (idempotent, so the lock can live there), then O_EXCL
+  `000001.jsonl` at mode 0600, `fsync` of the file, its directory and the parent. A directory with
+  no segments is not a session.
+- **Open** — record the newest epoch `N` and the offset `L` the replay consumed. Nothing is created
+  until the first write.
+- **First write** — if `len(N) ≠ L`, `Superseded`. Otherwise O_EXCL-create `N+1` with the seals so
+  far plus `{N: L}`; `EEXIST` is also `Superseded`. A store that just created a segment (a fresh
+  create, a fork, a base) appends into it rather than rolling another.
+- **`Superseded` poisons the store.** Every later write fails, whatever kind — a title, a label, a
+  model change, a rewrite. `SessionStore::superseded()` is what an owner checks after each write;
+  `session_store::is_superseded(&err)` classifies the error.
+- **A stale writer's bytes are harmless.** They land past the seal the new epoch recorded, so no
+  replay ever reaches them.
+- **An append that fails** seals the segment at its last good offset and rolls on the next write, so
+  one `ENOSPC` can't brick a session with an unbounded torn line mid-segment.
+
+### Bases, consolidation and deletion
+
+`replace_all` (compaction's path) O_EXCL-creates a new base segment, writes the seals, the content
+and the trailer, and `fsync`s. That segment becomes the append target. Above **K = 8** segments since
+the last base, the next persist writes a base instead of rolling — which bounds the growth a
+reap-and-reattach cycle causes. Consolidation copies the current view's bytes rather than
+re-serializing the in-memory tree, so the model/title/label/leaf records that live only on disk
+survive it.
+
+A new base deletes only the segments **older than the base it supersedes**, so a reader that already
+started at that base still has every file it needs. Epoch 1 is never deleted: it is the O_EXCL fence
+that says the session exists.
+
+### Sealing
+
+`TenantCodec { tenant, dek }` holds one tenant's keys — not one session's. A listing, a fork and a
+preview all open _other_ ids, so the session id is mixed in as associated data per call instead of
+being baked into a key. Three HKDF-SHA256 subkeys, XChaCha20-Poly1305, nonces from `getrandom::fill`:
+
+| surface          | HKDF `info`         | AAD                          | shape      |
+| ---------------- | ------------------- | ---------------------------- | ---------- |
+| transcript lines | `bsg_v1 transcript` | `tenant ‖ 0x00 ‖ session_id` | per line   |
+| `.listings.json` | `bsg_v1 listing`    | `tenant`                     | whole file |
+| memory documents | `bsg_v1 memory`     | `tenant`                     | whole file |
+
+Segment headers and base trailers stay plaintext, so a reader can bound a file it cannot open.
+Memory documents are bound to the tenant and **not** to their path, because `rename` moves a document
+without rewriting it. The grant's `dek` is per-tenant and stable, which is what makes all of this
+coherent across a tenant's sessions.
+
+### Locks
+
+`acquire_session_lock(path)` opens `<id>/lock` (or `<file>.lock`) read+write+create and takes
+`File::try_lock`. `Ok(None)` means someone holds it right now. It is **liveness only** — correctness
+is the epoch fence, which needs no lock — so a lock lost to a crash or a partition costs a retry,
+never history. Three details that matter on EFS:
+
+- read+write, because NFS emulates `flock` with POSIX record locks, which need a writable descriptor;
+- after locking, `fstat` on the held descriptor is compared with `stat` of the path, catching a
+  directory renamed into `.trash/` between the open and the lock;
+- a session is opened **once per process**, because closing any descriptor to a POSIX-locked file
+  drops the lock.
+
+`SessionRepo::delete` on a segmented repo takes that lock first and refuses if it is held, then
+renames `<id>/` → `.trash/<id>.<unix_ns>`. The timestamp suffix is what makes repeated deletes of one
+id work, and the rename carries `memory/` along with the segments.
+
+### Listings
+
+The sidecar `.listings.json` cache is keyed by a stamp: `(size, mtime)` for a file, and
+`(total bytes, newest mtime, newest epoch, base epoch)` for a segmented session, so a roll, an
+append, a base or a prune all invalidate it. It is a cache and only a cache — a blob that will not
+open is treated as no cache at all.
+
+### Derived ids
+
+`RepoOptions.id_prefix` makes every id the repo _mints_ — a fork, a clone, an archive —
+`<prefix>.<opaque>`, so a derived session stays on its parent's shard and every path built from it
+is still rooted at the same tenant. An id the caller supplies is never rewritten.
+
+`SessionStore::memory_dir()` is the only correct way to find a session's `/session` directory:
+`memory::session_dir`'s `with_extension` would turn a dotted `<shard>.<opaque>` id into one shared
+`<shard>.memory` directory for every session on the shard.
+
+---
+
 ## Trust Boundaries
 
 **What this crate checks before acting:**
