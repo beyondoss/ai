@@ -146,18 +146,46 @@ async fn deleting_a_session_that_is_not_there_is_an_error() {
 #[tokio::test]
 async fn a_session_on_another_shard_deletes_and_restores_by_its_own_shard() {
     let (base, _requests) = spawn_model_server(vec![]);
-    let svc = Service::start(&base, &["s1", "s2"]).await;
+    // A short idle timeout so the reaped session actually lets go of its storage: a session's owner
+    // holds its lock for its whole life, and a delete that renamed the directory out from under a
+    // live writer is exactly what that lock exists to prevent.
+    let svc = Service::start_with(
+        &base,
+        &["s1", "s2"],
+        common::service::Options {
+            extra_args: vec!["--session-idle-timeout".into(), "1".into()],
+            ..Default::default()
+        },
+    )
+    .await;
     // Open and close it, so nothing holds it while it is deleted.
     drop(open(&svc, "tenant-a", "s2.doomed").await);
     let mut a = open(&svc, "tenant-a", "s1.alpha").await;
 
-    ws_send(
-        &mut a,
-        json!({"type":"delete_session","id":"d1","session_id":"s2.doomed"}),
-    )
-    .await;
-    let frames = ws_read_until_response(&mut a, "delete_session").await;
-    assert_eq!(frames.last().unwrap()["success"], true, "{frames:#?}");
+    // Retried until the reaper has let the detached session go — a live session is refused, which is
+    // the contract, not a flake.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let response = loop {
+        ws_send(
+            &mut a,
+            json!({"type":"delete_session","id":"d1","session_id":"s2.doomed"}),
+        )
+        .await;
+        let frames = ws_read_until_response(&mut a, "delete_session").await;
+        let response = frames.last().unwrap().clone();
+        if response["success"] == true || std::time::Instant::now() > deadline {
+            break response;
+        }
+        assert!(
+            response["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("in use"),
+            "{response}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    };
+    assert_eq!(response["success"], true, "{response}");
     assert!(svc.sessions_dir("s2", "tenant-a").join(".trash").is_dir());
 
     // `list_trash` merges every mounted shard's trash, so the entry is visible from this session…
@@ -188,8 +216,10 @@ async fn a_session_on_another_shard_deletes_and_restores_by_its_own_shard() {
 }
 
 /// `fork`/`clone`/`new_session`/`switch_session` self-abort a running prompt to make room for
-/// themselves. In service mode they are refused — so the refusal has to happen *before* that arm, or
-/// a client could kill its own run by asking for something it was never going to get.
+/// themselves. In service mode `switch_session` and `reload` are refused outright, and `fork`/`clone`
+/// derive a session without switching this one — so neither has any business ending a run. Both
+/// answers have to land *before* that self-abort arm, or a client could kill its own turn by asking
+/// for something it was never going to get.
 #[tokio::test]
 async fn a_refused_command_during_a_run_does_not_abort_it() {
     let base = spawn_model_server_with_stalled_response(
@@ -212,7 +242,7 @@ async fn a_refused_command_during_a_run_does_not_abort_it() {
         }
     }
 
-    for command in ["fork", "clone", "new_session", "switch_session", "reload"] {
+    for command in ["fork", "clone", "switch_session", "reload"] {
         ws_send(&mut ws, json!({"type": command, "id": command})).await;
     }
 
@@ -232,10 +262,7 @@ async fn a_refused_command_during_a_run_does_not_abort_it() {
         }
     }
     refused.sort();
-    assert_eq!(
-        refused,
-        vec!["clone", "fork", "new_session", "reload", "switch_session"]
-    );
+    assert_eq!(refused, vec!["clone", "fork", "reload", "switch_session"]);
     let prompt = prompt.unwrap();
     assert_eq!(
         prompt["success"], true,

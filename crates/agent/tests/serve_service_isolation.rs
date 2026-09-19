@@ -10,32 +10,13 @@ mod common;
 
 use std::path::Path;
 
-use common::service::{EXEC_HEADER, GATEWAY_KEY, Options, Service};
+use beyond_ai_agent::memory::{MemPath, MemoryBackend, View};
+use common::service::{EXEC_HEADER, GATEWAY_KEY, Options, Service, files_under};
 use common::{
     spawn_model_server, turn_text, turn_tool_use, ws_connect_with_headers, ws_next_frame,
     ws_read_until_response, ws_send,
 };
 use serde_json::json;
-
-/// Every regular file under `dir`, recursively.
-fn files_under(dir: &Path) -> Vec<std::path::PathBuf> {
-    let mut out = Vec::new();
-    let mut stack = vec![dir.to_path_buf()];
-    while let Some(next) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&next) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                stack.push(path);
-            } else {
-                out.push(path);
-            }
-        }
-    }
-    out
-}
 
 /// A model turn that runs one `bash` command in the sandbox, then answers.
 fn bash_turn(command: &str, cwd: &Path) -> Vec<String> {
@@ -344,23 +325,15 @@ async fn the_persisted_session_records_the_sandbox_workspace_as_its_cwd() {
     ws_send(&mut ws, json!({"type":"get_state","id":"g1"})).await;
     let _ = ws_read_until_response(&mut ws, "get_state").await;
 
-    let files = files_under(&svc.sessions_dir("s1", "00tenant1"));
-    let transcript = files
-        .iter()
-        .find(|p| p.to_string_lossy().ends_with(".jsonl"))
-        .expect("a transcript");
-    let header: serde_json::Value = serde_json::from_str(
-        std::fs::read_to_string(transcript)
-            .unwrap()
-            .lines()
-            .next()
-            .unwrap(),
-    )
-    .unwrap();
+    // Read back the way the next owner of this shard would: the tenant's own segmented, sealed repo.
+    // The transcript itself is unreadable without that key, which is the point.
+    let (store, _session) = svc
+        .tenant_repo("s1", "00tenant1")
+        .open_id_read_only("s1.alpha")
+        .unwrap();
     assert_eq!(
-        header["cwd"],
-        svc.workspace.to_string_lossy().into_owned(),
-        "{header}"
+        store.meta().cwd,
+        svc.workspace.to_string_lossy().into_owned()
     );
 }
 
@@ -393,10 +366,23 @@ async fn durable_memory_lands_in_the_tenants_own_directory() {
 
     // The session lives on its id's shard …
     assert!(svc.sessions_dir("s2", "00tenant1").is_dir());
-    // … and durable memory on the grant's *home* shard, which is `s1` here.
+    // … and durable memory on the grant's *home* shard, which is `s1` here, sealed with the tenant's
+    // own key (the mount is shared with every other tenant on the shard).
+    let doc = svc.memory_dir("s1", "00tenant1").join("note.md");
+    assert!(
+        !std::fs::read_to_string(&doc).unwrap().contains("kept"),
+        "a memory document must not sit in plaintext on a shared mount"
+    );
+    let View::Document(text) = svc
+        .tenant_memory("s1", "00tenant1")
+        .view(&MemPath::parse("/memories/note.md").unwrap(), None)
+        .await
+        .unwrap()
+    else {
+        panic!("expected a document at {}", doc.display());
+    };
     assert_eq!(
-        std::fs::read_to_string(svc.memory_dir("s1", "00tenant1").join("note.md")).unwrap(),
-        "kept\n",
+        text, "kept\n",
         "durable memory must be rooted at <home shard>/<tenant>/memory"
     );
     assert!(

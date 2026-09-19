@@ -11,6 +11,10 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use beyond_ai_agent::memory::file::FileBackend;
+use beyond_ai_agent::session_store::{Layout, RepoOptions, SessionRepo, TenantCodec};
 
 use super::exec_mock::ExecMock;
 use super::grant::{Claims, Minter, Secrets};
@@ -35,8 +39,18 @@ pub struct Service {
     /// `<shard name>` → directory, in `--shard` flag order.
     pub shards: Vec<(String, PathBuf)>,
     pub child: ChildGuard,
+    /// The model server this replica was pointed at, so a [`Peer`] can share it.
+    pub model_base: String,
     /// Held so every directory above outlives the replica.
     pub dir: tempfile::TempDir,
+}
+
+/// A **second** replica on the same mounts, exec endpoint and grant keys — what makes storage
+/// fencing observable: two processes, one shard directory, exactly the deployment the epoch fence
+/// and the session lock exist for.
+pub struct Peer {
+    pub port: u16,
+    pub child: ChildGuard,
 }
 
 /// How the replica is started, for the cases that need something other than the default.
@@ -103,8 +117,32 @@ impl Service {
             sandbox_home,
             shards,
             child,
+            model_base: model_base.to_string(),
             dir,
         }
+    }
+
+    /// Start a second replica against the same shards and the same keyring — the two-process case.
+    /// Grants minted by `self` are valid on it, and both write the same mounted directories.
+    pub fn start_peer(&self, extra_args: &[&str]) -> Peer {
+        let flag_shards: Vec<(&str, &Path)> = self
+            .shards
+            .iter()
+            .map(|(n, p)| (n.as_str(), p.as_path()))
+            .collect();
+        let port = free_port();
+        let mut cmd = serve_service_cmd(
+            super::BIN,
+            &self.model_base,
+            port,
+            &self.minter.grant_key_flag(),
+            self.minter.seal_key(),
+            &flag_shards,
+        );
+        cmd.args(extra_args);
+        let child = cmd.spawn_guarded();
+        wait_for_port(port);
+        Peer { port, child }
     }
 
     pub fn shard(&self, name: &str) -> &Path {
@@ -123,6 +161,31 @@ impl Service {
     /// Where a tenant's durable memory lands on `shard`.
     pub fn memory_dir(&self, shard: &str, tenant: &str) -> PathBuf {
         self.shard(shard).join(tenant).join("memory")
+    }
+
+    /// The tenant's sealing keys, derived from the `dek` every grant here carries — what the next
+    /// owner of a shard holds, and the only way to read anything this replica wrote.
+    pub fn codec(&self, tenant: &str) -> Arc<TenantCodec> {
+        Arc::new(TenantCodec::new(tenant, &self.secrets().dek))
+    }
+
+    /// A tenant's session repo on `shard`, opened the way a replica opens it: epoch segments, sealed.
+    pub fn tenant_repo(&self, shard: &str, tenant: &str) -> SessionRepo {
+        SessionRepo::open_with(
+            self.sessions_dir(shard, tenant),
+            RepoOptions {
+                layout: Layout::Segmented {
+                    codec: Some(self.codec(tenant)),
+                },
+                id_prefix: Some(shard.to_string()),
+            },
+        )
+        .unwrap()
+    }
+
+    /// A tenant's durable memory store on `shard`, sealed with its own key.
+    pub fn tenant_memory(&self, shard: &str, tenant: &str) -> FileBackend {
+        FileBackend::at(self.memory_dir(shard, tenant)).sealed(self.codec(tenant))
     }
 
     pub fn claims(&self, tenant: &str, session_id: &str, home_shard: &str) -> Claims {
@@ -171,6 +234,27 @@ impl Service {
     pub fn header<'a>(&self, token: &'a str) -> [(&'static str, &'a str); 1] {
         [("x-beyond-grant", token)]
     }
+}
+
+/// Every regular file under `dir`, recursively — what a test that asserts "nothing readable sits on
+/// this mount" walks.
+pub fn files_under(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(next) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&next) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else {
+                out.push(path);
+            }
+        }
+    }
+    out
 }
 
 /// Far enough out that these tests never expire, near enough to stay a plausible unix second.

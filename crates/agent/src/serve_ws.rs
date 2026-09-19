@@ -98,7 +98,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 #[cfg(unix)]
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::time::{Duration, MissedTickBehavior};
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::handshake::server::create_response;
@@ -111,7 +111,10 @@ use crate::serve::{
     lock_ignoring_poison, serve_session,
 };
 use crate::service::{Refusal, ServiceSession, Shards};
-use crate::session_store::{is_valid_session_id, new_id, scan_listings, scan_session_dir};
+use crate::session_store::{
+    Layout, SessionLock, acquire_session_lock, is_valid_session_id, new_id, scan_listings_in,
+    scan_session_dir_in,
+};
 
 /// The fixed URL path a WebSocket upgrade must target. The front door maps a service subdomain to this
 /// path on the loopback listener; any other path is rejected at the handshake.
@@ -189,10 +192,11 @@ const JOIN_GRACE: Duration = Duration::from_secs(10);
 enum Phase {
     /// Spawned, not yet running its body. Attachable: a command queues on the input channel exactly as
     /// it does while `serve_session` opens persistence. This is the slot for start-up work that must
-    /// finish before the session touches storage (e.g. taking an exclusive lock on its session file).
-    /// The task does that work itself, awaited, with the map lock **not** held; the `Starting` entry is
-    /// what keeps a concurrent pin from spawning a rival meanwhile. Today there is no such work and the
-    /// task goes straight to `Live` ([`ExitGuard::go_live`]).
+    /// finish before the session touches storage — in service mode, taking the session's advisory
+    /// lock. The task does that work itself, awaited, with the map lock **not** held; the `Starting`
+    /// entry is what keeps a concurrent pin from spawning a rival meanwhile, and the pin that spawned
+    /// it waits on the outcome so "held on another replica" is a real HTTP status rather than a
+    /// session that comes up and immediately dies ([`ExitGuard::go_live`]).
     Starting(mpsc::Sender<String>),
     /// Running its body ([`serve_session`]).
     Live(mpsc::Sender<String>),
@@ -299,10 +303,16 @@ struct Supervisor {
 }
 
 /// What service mode needs at the *supervisor* level, as opposed to per session: the keyring every
-/// connection is verified against, and the mounts a tenant's sessions can live on.
+/// connection is verified against, the mounts a tenant's sessions can live on, and how many sessions
+/// this replica will hold at once.
 struct ServiceSupervisor {
     verifier: Arc<crate::grant::GrantVerifier>,
     shards: Arc<Shards>,
+    /// `--max-live-sessions`, or `None` when the operator passed `0` to turn the cap off. A live
+    /// session costs two open descriptors (its newest segment and its lock), and a network
+    /// filesystem caps both open files and locks per instance — so the default is a guard against
+    /// hitting that ceiling as an unexplained I/O error deep inside a tenant's turn.
+    max_live_sessions: Option<usize>,
 }
 
 /// Derive a per-session config from the daemon's: address the session by its routing key and drop
@@ -366,6 +376,51 @@ fn serve_session_body(base: ServeConfig) -> SessionBody {
             }
         })
     })
+}
+
+/// Take the advisory lock on a session directory, off the runtime: both the `create_dir_all` and the
+/// lock itself are blocking filesystem calls, and on a network filesystem neither is fast.
+///
+/// The directory is created first, and that ordering is the whole point: the lock lives *inside* the
+/// session directory, and [`acquire_session_lock`] falls back to a `<path>.lock` sibling for a path
+/// that isn't a directory — so a replica that skipped this on a brand-new session would lock a
+/// different file than the replica that found the directory already there. `create_dir_all` is
+/// idempotent, and a directory with no segments is not a session, so this mints nothing.
+async fn take_session_lock(path: std::path::PathBuf) -> std::io::Result<Option<SessionLock>> {
+    match tokio::task::spawn_blocking(move || {
+        std::fs::create_dir_all(&path)?;
+        acquire_session_lock(&path)
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(e) => Err(std::io::Error::other(e)),
+    }
+}
+
+/// Report a session that never started: to the pin that spawned it (which turns it into an HTTP
+/// status), to any connection that attached in the meantime, and to the replica's own log.
+fn report_start_failure(
+    started: oneshot::Sender<Result<(), PinError>>,
+    out_conn: &SharedOutConn,
+    id: &str,
+    error: PinError,
+    why: &str,
+) {
+    eprintln!("serve: session {id} {why}");
+    let message = match error {
+        PinError::Forbidden => "that session belongs to another tenant",
+        PinError::Unavailable(m) => m,
+        PinError::Closed => "the daemon is shutting down",
+    };
+    // The spawning connection is answered by `started`; this reaches anyone who attached to the
+    // `Starting` slot while the lock was being taken.
+    lock_ignoring_poison(out_conn).broadcast(OutFrame::Value(json!({
+        "type": "error",
+        "session_id": id,
+        "error": message,
+    })));
+    let _ = started.send(Err(error));
 }
 
 /// A session task's hold on its own table entry — and the only thing that ever removes one. However
@@ -432,14 +487,22 @@ struct Pinned {
     out_conn: SharedOutConn,
 }
 
+/// A freshly spawned session task's report to the pin that spawned it, sent before it goes live: it
+/// owns the session's storage, or another owner holds it and nothing was started.
+type Started = oneshot::Receiver<Result<(), PinError>>;
+
 /// What one look at the table found for an id ([`Supervisor::try_pin`]).
 enum TryPin {
-    /// Attached (spawning the session if the id was free): its incarnation, input, and output.
-    Attached(u64, mpsc::Sender<String>, SharedOutConn),
+    /// Attached (spawning the session if the id was free): its incarnation, input, and output. The
+    /// `Started` receiver is present exactly when this look *spawned* the session and that spawn has
+    /// start-up work to finish first — the pin awaits it, so a refusal is still an HTTP status.
+    Attached(u64, mpsc::Sender<String>, SharedOutConn, Option<Started>),
     /// The id's previous task is still exiting. Wait for this latch, then look again.
     Wait(CancellationToken),
     /// A live session owns this id, and it belongs to another tenant.
     Forbidden,
+    /// This replica already holds `--max-live-sessions`.
+    AtCapacity,
     /// The daemon is shutting down.
     Closed,
 }
@@ -499,7 +562,18 @@ impl Supervisor {
         let deadline = tokio::time::Instant::now() + grace;
         loop {
             match self.try_pin(&id, service.as_ref()) {
-                TryPin::Attached(incarnation, input_tx, out_conn) => {
+                TryPin::Attached(incarnation, input_tx, out_conn, started) => {
+                    // A spawn with start-up work reports before it goes live. Waiting here is what
+                    // turns "another replica holds this session" into a 503 the client can act on;
+                    // the task frees the id itself on the way out, so there is nothing to unpin.
+                    if let Some(started) = started {
+                        match started.await {
+                            Ok(Ok(())) => {}
+                            Ok(Err(e)) => return Err(e),
+                            // The task was dropped before it reported — the runtime is going away.
+                            Err(_) => return Err(PinError::Closed),
+                        }
+                    }
                     return Ok(Pinned {
                         id,
                         incarnation,
@@ -508,6 +582,11 @@ impl Supervisor {
                     });
                 }
                 TryPin::Forbidden => return Err(PinError::Forbidden),
+                TryPin::AtCapacity => {
+                    return Err(PinError::Unavailable(
+                        "this replica is at its live-session limit; retry",
+                    ));
+                }
                 TryPin::Closed => return Err(PinError::Closed),
                 TryPin::Wait(exited) => {
                     if tokio::time::timeout_at(deadline, exited.cancelled())
@@ -551,7 +630,9 @@ impl Supervisor {
                     let input_tx = tx.clone();
                     h.attached += 1;
                     h.last_detached_at = None;
-                    TryPin::Attached(h.incarnation, input_tx, h.out_conn.clone())
+                    // No `Started`: this task is already running (or already past its own lock), so
+                    // there is nothing for the caller to wait on.
+                    TryPin::Attached(h.incarnation, input_tx, h.out_conn.clone(), None)
                 }
                 // Stopping — or attachable in name only: a closed input means its loop already ended on
                 // its own (SIGTERM, an internal error) and the task is on its way out, possibly still
@@ -562,6 +643,15 @@ impl Supervisor {
                     TryPin::Wait(h.exited.clone())
                 }
             };
+        }
+
+        // Nothing owns this id, so this look is about to spawn one. Checked here, under the same lock
+        // the insert happens under, so two simultaneous connections can't both see room for the last
+        // slot.
+        if let Some(max) = self.service.as_ref().and_then(|s| s.max_live_sessions)
+            && table.sessions.len() >= max
+        {
+            return TryPin::AtCapacity;
         }
 
         let incarnation = table.next_incarnation;
@@ -596,17 +686,61 @@ impl Supervisor {
             incarnation,
             exited,
         };
+        // Service mode: this task must own the session's storage before it goes live. The lock is
+        // liveness only — correctness is the epoch fence — so it is what keeps two replicas sharing a
+        // mount from both replaying and then fencing each other turn after turn.
+        let lock_path = service.map(|svc| svc.session_path());
+        let (started_tx, started_rx) = oneshot::channel();
+        let started = lock_path.is_some().then_some(started_rx);
         let body = (self.body)(id, service.cloned(), input_rx, out_conn.clone(), running);
+        let session_id = id.to_owned();
+        // For the failure paths below: whoever attached to the `Starting` slot while the lock was
+        // being taken is told why nothing started.
+        let starting_conn = out_conn.clone();
         tokio::spawn(async move {
+            let mut lock = None;
+            if let Some(path) = lock_path {
+                match take_session_lock(path).await {
+                    Ok(Some(held)) => lock = Some(held),
+                    Ok(None) => {
+                        report_start_failure(
+                            started_tx,
+                            &starting_conn,
+                            &session_id,
+                            PinError::Unavailable("that session is open on another replica; retry"),
+                            "is held elsewhere",
+                        );
+                        drop(body);
+                        drop(exit);
+                        return;
+                    }
+                    Err(e) => {
+                        report_start_failure(
+                            started_tx,
+                            &starting_conn,
+                            &session_id,
+                            PinError::Unavailable("that session's storage is unavailable; retry"),
+                            &format!("could not be locked: {e}"),
+                        );
+                        drop(body);
+                        drop(exit);
+                        return;
+                    }
+                }
+            }
+            let _ = started_tx.send(Ok(()));
             if exit.go_live() {
                 body.await;
             } else {
                 drop(body);
             }
+            // Before the `ExitGuard`: that guard frees the id and wakes whoever is waiting for it, and
+            // the next owner's first move is to take this very lock.
+            drop(lock);
             // Only once the body's state is gone: free the id, then wake whoever waits on it.
             drop(exit);
         });
-        TryPin::Attached(incarnation, input_tx, out_conn)
+        TryPin::Attached(incarnation, input_tx, out_conn, started)
     }
 
     /// One fewer attached connection; if that was the last, start the idle reaper's clock. A no-op for
@@ -840,12 +974,17 @@ impl Supervisor {
             (None, Some(dir)) => vec![std::path::PathBuf::from(dir)],
             (None, None) => Vec::new(),
         };
+        // A tenant's sessions are epoch segments sealed with its own key; the daemon's own
+        // `--session-dir` is the single-file layout it always was.
+        let layout = service.map_or(Layout::File, ServiceSession::layout);
         let metas = if dirs.is_empty() {
             Vec::new()
         } else {
-            let paths: Vec<std::path::PathBuf> =
-                dirs.iter().flat_map(|d| scan_session_dir(d)).collect();
-            tokio::task::spawn_blocking(move || scan_listings(paths, &|_, _| {}))
+            let paths: Vec<std::path::PathBuf> = dirs
+                .iter()
+                .flat_map(|d| scan_session_dir_in(d, &layout))
+                .collect();
+            tokio::task::spawn_blocking(move || scan_listings_in(paths, &layout, &|_, _| {}))
                 .await
                 .unwrap_or_default()
         };
@@ -1184,6 +1323,8 @@ pub async fn serve_ws(
         Some(ServiceSupervisor {
             verifier,
             shards: cfg.shards.clone(),
+            // `0` turns the cap off, matching `--session-idle-timeout`'s own convention.
+            max_live_sessions: (cfg.max_live_sessions > 0).then_some(cfg.max_live_sessions),
         })
     } else {
         None
@@ -1867,6 +2008,12 @@ async fn write_http_ok<S: AsyncWrite + Unpin>(
     }
     if status == 426 {
         out.push_str("Upgrade: websocket\r\n");
+    }
+    // Every 503 this server sends is retryable and short-lived — a session still stopping, one open
+    // on another replica, or a replica at its live-session cap — so say so in the one header a proxy,
+    // a client library or a retry policy already knows how to read.
+    if status == 503 {
+        out.push_str("Retry-After: 1\r\n");
     }
     out.push_str("\r\n");
     stream

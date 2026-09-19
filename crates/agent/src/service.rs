@@ -32,6 +32,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 use crate::grant::{Grant, GrantVerifier};
+use crate::session_store::{Layout, RepoOptions, TenantCodec};
 
 /// Cap on the `x-beyond-grant` header's value. The whole header block is capped at 16 KiB
 /// (`serve_ws::MAX_HEADER_BYTES`), so a token larger than this could never arrive beside a `Host`
@@ -225,11 +226,15 @@ pub fn authorize(
 
     let session_dir = session_root.join(&grant.tenant).join("sessions");
     let memory_dir = home_root.join(&grant.tenant).join("memory");
+    // Derived once per connection, from a key that never leaves this struct: `Debug` on the codec
+    // shows only the tenant and the key fingerprint, and nothing ever writes the DEK itself down.
+    let codec = Arc::new(TenantCodec::new(&grant.tenant, grant.secrets.dek.expose()));
     Ok(ServiceSession {
         grant: Arc::new(grant),
         shards: Arc::clone(shards),
         session_dir,
         memory_dir,
+        codec,
         sandbox: OnceLock::new(),
     })
 }
@@ -263,6 +268,9 @@ pub struct ServiceSession {
     pub session_dir: PathBuf,
     /// `<home shard>/<tenant>/memory` — the tenant's durable memory, shared by all of its sessions.
     pub memory_dir: PathBuf,
+    /// This tenant's sealing keys, derived from the grant's per-tenant `dek`. Every transcript,
+    /// listing cache and memory document this connection writes goes through it.
+    codec: Arc<TenantCodec>,
     /// Filled by [`Self::connect_exec`] at session start; read by the tool builds after it.
     sandbox: OnceLock<Sandbox>,
 }
@@ -307,12 +315,50 @@ impl ServiceSession {
         Some(self.shards.get(shard)?.join(self.tenant()).join("sessions"))
     }
 
+    /// The shard this session's transcript lives on — its id's own `<shard>.` prefix, or the grant's
+    /// home shard for an id minted before ids carried one.
+    pub fn shard(&self) -> &str {
+        shard_of(self.session_id(), &self.grant.home_shard)
+    }
+
+    /// This tenant's sealing keys. Shared rather than re-derived: a listing, a fork and a preview all
+    /// open *other* ids, and they all seal under the same per-tenant key.
+    pub fn codec(&self) -> &Arc<TenantCodec> {
+        &self.codec
+    }
+
+    /// The on-disk shape of every session this tenant owns: epoch segments (so two replicas sharing a
+    /// mount fence each other rather than interleaving), sealed with this tenant's keys.
+    pub fn layout(&self) -> Layout {
+        Layout::Segmented {
+            codec: Some(Arc::clone(&self.codec)),
+        }
+    }
+
+    /// How to open the repo holding `id`. The id prefix is `id`'s **own** shard, so a session derived
+    /// from it (a fork, a clone, an archive) is minted onto the mount its parent already lives on and
+    /// stays routable by its id alone.
+    pub fn repo_options_for(&self, id: &str) -> RepoOptions {
+        RepoOptions {
+            layout: self.layout(),
+            id_prefix: Some(shard_of(id, &self.grant.home_shard).to_owned()),
+        }
+    }
+
+    /// This session's own directory — the unit [`acquire_session_lock`](crate::session_store::acquire_session_lock)
+    /// takes a lock on, and the parent of its segments and its `/session` memory.
+    pub fn session_path(&self) -> PathBuf {
+        self.session_dir.join(self.session_id())
+    }
+
     /// Durable memory, rooted at the tenant's own directory rather than resolved from the replica's
-    /// cwd or `--memory` DSN.
+    /// cwd or `--memory` DSN, and sealed with the tenant's own key — the mount is shared with every
+    /// other tenant on the shard.
     pub fn memory_backend(&self) -> Arc<dyn crate::memory::MemoryBackend> {
-        Arc::new(crate::memory::file::FileBackend::at(
-            self.memory_dir.clone(),
-        ))
+        Arc::new(
+            crate::memory::file::FileBackend::at(self.memory_dir.clone())
+                .sealed(Arc::clone(&self.codec)),
+        )
     }
 
     /// Build this session's exec target from the grant, **strictly**: the endpoint is probed before
@@ -430,15 +476,15 @@ pub struct Resources {
 
 /// Why a control command is refused in service mode, or `None` if it is allowed.
 ///
-/// Two groups. The first are host operations that have no tenant meaning at all and would, if left
-/// on, reach the replica: re-pointing the exec endpoint (the grant decides that), the whole
-/// interactive login surface (an operator's own credential store), switching to a session this
-/// connection has no grant for, and `reload` (which re-walks the replica's filesystem — re-enabled
-/// once discovery reads the sandbox instead).
+/// These are host operations that have no tenant meaning at all and would, if left on, reach the
+/// replica: re-pointing the exec endpoint (the grant decides that), the whole interactive login
+/// surface (an operator's own credential store), switching to a session this connection has no grant
+/// for, and `reload` (which re-walks the replica's filesystem — re-enabled once discovery reads the
+/// sandbox instead).
 ///
-/// The second group — `fork`, `clone`, `new_session` — is refused only until derived ids carry their
-/// shard prefix. Minting an unprefixed id on a multi-shard replica would create a session nothing
-/// could route back to, which is worse than refusing the command.
+/// `fork`, `clone` and `new_session` are **not** here: a repo opened for a tenant mints derived ids
+/// as `<shard>.<opaque>` ([`ServiceSession::repo_options_for`]), so a derived session stays routable
+/// on the mount its parent lives on.
 pub fn refused_command(command: &str) -> Option<&'static str> {
     Some(match command {
         "set_exec_endpoint" => {
@@ -451,9 +497,6 @@ pub fn refused_command(command: &str) -> Option<&'static str> {
             "refused in service mode: connect at ?session_id=<id> with a grant for that session"
         }
         "reload" => "refused in service mode: resource discovery is not available yet",
-        "fork" | "clone" | "new_session" => {
-            "refused in service mode: derived sessions are not available yet"
-        }
         _ => return None,
     })
 }
@@ -521,9 +564,6 @@ mod tests {
             "auth_status",
             "switch_session",
             "reload",
-            "fork",
-            "clone",
-            "new_session",
         ] {
             assert!(refused_command(command).is_some(), "{command}");
         }
@@ -533,36 +573,81 @@ mod tests {
             "list_sessions",
             "export_html",
             "bash",
+            // Derived sessions are minted onto their parent's shard, so these are allowed.
+            "fork",
+            "clone",
+            "new_session",
         ] {
             assert!(refused_command(command).is_none(), "{command}");
         }
     }
 
-    #[test]
-    fn redaction_removes_the_mount_layout_from_an_error() {
-        let s = shards(&[("a", "/mnt/efs/a")]);
-        let session = ServiceSession {
-            grant: Arc::new(Grant {
-                tenant: "t1".into(),
-                session_id: "a.x".into(),
-                home_shard: "a".into(),
-                workspace_root: "/w".into(),
-                exec_url: "http://x/".into(),
-                mcp: Vec::new(),
-                exp: 0,
-                secrets: serde_json::from_str(
-                    r#"{"exec_headers":[],"mcp_headers":{},"gateway_key":"k","dek":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="}"#,
-                )
-                .unwrap(),
-            }),
-            shards: s,
+    /// A `ServiceSession` with no connection behind it, for the derivations that are pure functions
+    /// of the grant.
+    fn session(mounts: &[(&str, &str)], session_id: &str) -> ServiceSession {
+        let grant = Grant {
+            tenant: "t1".into(),
+            session_id: session_id.into(),
+            home_shard: "a".into(),
+            workspace_root: "/w".into(),
+            exec_url: "http://x/".into(),
+            mcp: Vec::new(),
+            exp: 0,
+            secrets: serde_json::from_str(
+                r#"{"exec_headers":[],"mcp_headers":{},"gateway_key":"k","dek":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="}"#,
+            )
+            .unwrap(),
+        };
+        let codec = Arc::new(TenantCodec::new(&grant.tenant, grant.secrets.dek.expose()));
+        ServiceSession {
+            grant: Arc::new(grant),
+            shards: shards(mounts),
             session_dir: PathBuf::from("/mnt/efs/a/t1/sessions"),
             memory_dir: PathBuf::from("/mnt/efs/a/t1/memory"),
+            codec,
             sandbox: OnceLock::new(),
-        };
+        }
+    }
+
+    #[test]
+    fn redaction_removes_the_mount_layout_from_an_error() {
+        let session = session(&[("a", "/mnt/efs/a")], "a.x");
         let redacted =
             session.redact("failed to open /mnt/efs/a/t1/sessions/1_x.jsonl: No such file");
         assert!(!redacted.contains("/mnt/efs"), "{redacted}");
         assert!(redacted.contains("<store>/t1/sessions"), "{redacted}");
+    }
+
+    #[test]
+    fn a_repo_mints_derived_ids_onto_the_shard_the_parent_lives_on() {
+        let session = session(&[("a", "/mnt/efs/a"), ("b", "/mnt/efs/b")], "a.x");
+        assert_eq!(session.shard(), "a");
+        assert_eq!(
+            session.repo_options_for("a.x").id_prefix.as_deref(),
+            Some("a")
+        );
+        // A command naming a session on another mount derives onto *that* mount.
+        assert_eq!(
+            session.repo_options_for("b.y").id_prefix.as_deref(),
+            Some("b")
+        );
+        // An id with no prefix at all belongs to the grant's home shard.
+        assert_eq!(
+            session.repo_options_for("bare").id_prefix.as_deref(),
+            Some("a")
+        );
+        assert!(matches!(
+            session.layout(),
+            Layout::Segmented { codec: Some(_) }
+        ));
+    }
+
+    #[test]
+    fn the_session_lock_is_taken_on_the_sessions_own_directory() {
+        let session = session(&[("a", "/mnt/efs/a")], "a.x");
+        assert_eq!(
+            session.session_path(),
+            PathBuf::from("/mnt/efs/a/t1/sessions/a.x"),
+        );
     }
 }
