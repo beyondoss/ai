@@ -5,8 +5,10 @@
 //! prefixes; see [`crate::memory::docs`].
 //!
 //! The client is `tokio-postgres`, TLS via `tokio-postgres-rustls` (`ring` + native roots) so a
-//! `sslmode=require` URL stays on the workspace rustls stack. The table is created idempotently
-//! on connect (`CREATE TABLE IF NOT EXISTS`).
+//! `sslmode=require` URL stays on the workspace rustls stack. The table is the agent's: created
+//! idempotently on connect, then probed so an existing table with the wrong columns fails fast.
+//! Payload stays `TEXT` (markdown; `str_replace` can span lines). Paths use `COLLATE "C"` so
+//! order matches the in-process map, plus `CHECK`s that encode [`MemPath`], and `updated_at`.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -121,7 +123,7 @@ impl PostgresBackend {
             self.table
         );
         let update = format!(
-            "UPDATE {} SET body = $3 WHERE project = $1 AND rel = $2",
+            "UPDATE {} SET body = $3, updated_at = now() WHERE project = $1 AND rel = $2",
             self.table
         );
         let delete = format!("DELETE FROM {} WHERE project = $1 AND rel = $2", self.table);
@@ -184,23 +186,47 @@ async fn dial(config: &Config, use_tls: bool) -> Result<Client, MemoryError> {
     }
 }
 
-async fn bootstrap(client: &Client, table: &str) -> Result<(), MemoryError> {
-    let sql = format!(
+/// DDL for a new table. `TEXT` for the document (not `BYTEA`/`JSONB`/`TEXT[]` — see the module
+/// doc). `COLLATE "C"` so `rel` order is locale-independent. `CHECK`s match [`MemPath`].
+fn create_table_sql(table: &str) -> String {
+    format!(
         "CREATE TABLE IF NOT EXISTS {table} (\
-             project TEXT NOT NULL, \
-             rel TEXT NOT NULL, \
+             project TEXT NOT NULL COLLATE \"C\", \
+             rel TEXT NOT NULL COLLATE \"C\", \
              body TEXT NOT NULL, \
-             PRIMARY KEY (project, rel)\
+             updated_at TIMESTAMPTZ NOT NULL DEFAULT now(), \
+             PRIMARY KEY (project, rel), \
+             CONSTRAINT {table}_rel_nonempty CHECK (rel <> ''), \
+             CONSTRAINT {table}_rel_components CHECK (\
+                 rel !~ '(^|/)(\\.|\\.\\.)(/|$)' AND rel NOT LIKE '%//%'\
+             ), \
+             CONSTRAINT {table}_rel_nul CHECK (position(chr(0) in rel) = 0)\
          )"
+    )
+}
+
+async fn bootstrap(client: &Client, table: &str) -> Result<(), MemoryError> {
+    client
+        .simple_query(&create_table_sql(table))
+        .await
+        .map_err(|e| MemoryError::Backend(e.to_string()))?;
+    // A table that already existed under this name may predate `updated_at`. Add it if missing,
+    // then probe the contract so a same-name table with the wrong columns fails at open.
+    let add_updated = format!(
+        "ALTER TABLE {table} ADD COLUMN IF NOT EXISTS \
+         updated_at TIMESTAMPTZ NOT NULL DEFAULT now()"
     );
     client
-        .simple_query(&sql)
+        .simple_query(&add_updated)
         .await
         .map_err(|e| MemoryError::Backend(e.to_string()))?;
-    client
-        .simple_query("SELECT 1")
-        .await
-        .map_err(|e| MemoryError::Backend(e.to_string()))?;
+    let probe = format!("SELECT project, rel, body, updated_at FROM {table} WHERE false");
+    client.query(&probe, &[]).await.map_err(|e| {
+        MemoryError::Backend(format!(
+            "postgres table `{table}` does not match the memory schema \
+                 (need project, rel, body, updated_at): {e}"
+        ))
+    })?;
     Ok(())
 }
 
@@ -292,6 +318,19 @@ mod tests {
         assert!(validate_ident("agent-memory").is_err());
         assert!(validate_ident("mem;drop").is_err());
         assert!(validate_ident("").is_err());
+    }
+
+    #[test]
+    fn create_table_sql_is_the_owned_row_type() {
+        let sql = create_table_sql("agent_memory");
+        assert!(sql.contains("COLLATE \"C\""));
+        assert!(sql.contains("updated_at TIMESTAMPTZ"));
+        assert!(sql.contains("PRIMARY KEY (project, rel)"));
+        assert!(sql.contains("agent_memory_rel_nonempty"));
+        assert!(sql.contains("agent_memory_rel_components"));
+        assert!(sql.contains("chr(0)"));
+        assert!(!sql.contains("BYTEA"));
+        assert!(!sql.contains("JSONB"));
     }
 
     #[tokio::test]
