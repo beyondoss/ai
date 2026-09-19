@@ -489,6 +489,13 @@ pub fn live_prompt_tokens(usage: &agent_core::message::TokenUsage) -> u32 {
 ///   [`crate::session_store`]).
 /// - Without one (`--no-session-persistence`), an ephemeral tempdir keyed by the session id, reaped at
 ///   teardown.
+///
+/// **Only valid for the single-file layout.** `with_extension` replaces whatever follows the last `.`,
+/// so a session addressed by a dotted id — `<shard>.<opaque>`, which is what the service mode mints —
+/// would collapse to one shared `<shard>.memory` directory for every session on that shard. A caller
+/// holding a [`crate::session_store::SessionStore`] should ask it
+/// ([`SessionStore::memory_dir`](crate::session_store::SessionStore::memory_dir)) rather than deriving
+/// the path here; that answers correctly for both layouts.
 pub fn session_dir(session_file: Option<&Path>, session_id: &str) -> std::path::PathBuf {
     match session_file {
         Some(file) => file.with_extension("memory"),

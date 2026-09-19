@@ -8,7 +8,7 @@
 //!   replica holds only the *public* key, by `kid`, so it can check a grant offline — no lookup, no
 //!   control-plane round trip — but a compromised replica still cannot mint one. Same shape as the
 //!   gateway's `bai_v1` virtual key and the control plane's `bagt_v1`.
-//! - **X25519** seals the secrets (exec/MCP headers, the gateway key, the session's DEK) to the
+//! - **X25519** seals the secrets (exec/MCP headers, the gateway key, the tenant's DEK) to the
 //!   fleet's public key: an ephemeral key agreement, HKDF-SHA256, then XChaCha20-Poly1305. The edge
 //!   that relays a grant never sees what's inside it, and a grant captured in transit or in a log
 //!   is useless without the fleet secret.
@@ -116,7 +116,10 @@ pub struct GrantSecrets {
     pub mcp_headers: BTreeMap<String, Vec<SecretHeader>>,
     /// The session's gateway credential.
     pub gateway_key: Secret,
-    /// The session's data-encryption key.
+    /// The tenant's data-encryption key: **per-tenant and stable**, not per-session. Every session a
+    /// tenant owns is sealed under keys derived from this one
+    /// ([`crate::session_store::TenantCodec`]), because a listing, a fork and a preview all open
+    /// *other* sessions' files — the session id is mixed in as associated data instead.
     pub dek: Dek,
 }
 
@@ -129,8 +132,9 @@ pub struct SecretHeader {
     pub value: Secret,
 }
 
-/// A session's 32-byte data-encryption key. `Debug` redacts it; it is zeroized on drop. On the wire
-/// it is standard base64 (padded), and anything but exactly 32 bytes is [`GrantError::BadClaims`].
+/// A **tenant's** 32-byte data-encryption key — stable across that tenant's sessions, not minted per
+/// session. `Debug` redacts it; it is zeroized on drop. On the wire it is standard base64 (padded),
+/// and anything but exactly 32 bytes is [`GrantError::BadClaims`].
 pub struct Dek([u8; 32]);
 
 impl Dek {

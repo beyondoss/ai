@@ -45,9 +45,9 @@
 //! `parent`) — the headless-relevant slice of pi's session tree. (A "fork" is a *new file*, a
 //! session-level split; the tree above is *within* one file — the two are independent mechanisms.)
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -55,8 +55,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use agent_core::compaction::{CompactionProvenance, CompactionReason};
 use agent_core::{ContentBlock, Message, Role, Session};
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use chacha20poly1305::aead::{AeadInPlace, KeyInit};
+use chacha20poly1305::{Key, Tag, XChaCha20Poly1305, XNonce};
+use hkdf::Hkdf;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
+use zeroize::Zeroizing;
 
 /// On-disk format version, written into every header. The load path refuses any header whose version
 /// is *newer* than this — a forward-compat guard so an older binary never silently mis-parses a shape
@@ -775,7 +782,10 @@ fn path_from_root(nodes: &HashMap<String, Node>, tip: Option<&str>) -> Vec<Strin
 /// ever changes (a future multi-process feature), add a `flock`-based lock in `open`/`create` then —
 /// not before, per this project's minimum-effective-abstraction standard.
 pub struct SessionStore {
-    path: PathBuf,
+    /// Where this session's entries actually live — one file, or a directory of epoch segments. The
+    /// tree logic below never looks inside it: every read goes through `log.lines()` and every write
+    /// through `log.append`/`log.replace_all`.
+    log: Log,
     meta: SessionMeta,
     /// How many messages are already on disk (on the active path) — the append cursor.
     persisted: usize,
@@ -832,45 +842,21 @@ impl SessionStore {
     /// gone" convention). A genuinely non-empty file at `path` is real, possibly conflicting data, and
     /// is never silently clobbered.
     pub fn create(path: PathBuf, meta: SessionMeta) -> std::io::Result<Self> {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let open = |truncate_existing: bool| -> std::io::Result<File> {
-            let mut opts = OpenOptions::new();
-            opts.write(true);
-            if truncate_existing {
-                opts.truncate(true);
-            } else {
-                opts.create_new(true);
-            }
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                opts.mode(0o600);
-            }
-            opts.open(&path)
-        };
-        let mut f = match open(false) {
-            Ok(f) => f,
-            // The atomic fast path failed because *something* is already there — only initialize in
-            // place if it's genuinely empty; otherwise propagate the original error rather than risk
-            // clobbering real data on a race.
-            Err(e)
-                if e.kind() == std::io::ErrorKind::AlreadyExists
-                    && fs::metadata(&path).is_ok_and(|m| m.len() == 0) =>
-            {
-                open(true)?
-            }
-            Err(e) => return Err(e),
-        };
-        write_line(&mut f, &Entry::Session(meta.clone()))?;
-        // Durability: get the header bytes (and the new file's directory entry) onto stable storage
-        // before returning, so a crash right after `create` can't lose the session entirely.
-        f.flush()?;
-        f.sync_all()?;
-        fsync_dir(&path)?;
+        Self::create_with(path, meta, &Layout::File)
+    }
+
+    /// [`create`](Self::create) in a specific [`Layout`] — what [`SessionRepo::create`] calls once its
+    /// repo is configured for the segmented, per-tenant-sealed shape.
+    pub(crate) fn create_with(
+        path: PathBuf,
+        meta: SessionMeta,
+        layout: &Layout,
+    ) -> std::io::Result<Self> {
+        let mut header = Vec::new();
+        write_line(&mut header, &Entry::Session(meta.clone()))?;
+        let log = Log::create(path, &meta.id, layout, &header)?;
         Ok(Self {
-            path,
+            log,
             meta,
             persisted: 0,
             nodes: HashMap::new(),
@@ -888,7 +874,33 @@ impl SessionStore {
     /// Open an existing session file, returning the store and the restored [`Session`] (the active
     /// path's messages). A torn final line (crash mid-append) is skipped; a header is required.
     pub fn open(path: PathBuf) -> std::io::Result<(Self, Session)> {
-        let file = File::open(&path)?;
+        Self::open_with(path, None, &Layout::File, false)
+    }
+
+    /// [`open`](Self::open), but read-only: every write on the returned store errors instead of
+    /// touching the log. What a fork source, a preview, an export and the archive source get — none of
+    /// them owns the session, and in service mode a stray write from one would steal an epoch from
+    /// whoever does.
+    pub fn open_read_only(path: PathBuf) -> std::io::Result<(Self, Session)> {
+        Self::open_with(path, None, &Layout::File, true)
+    }
+
+    /// Whether this store refuses writes (see [`open_read_only`](Self::open_read_only)).
+    pub fn read_only(&self) -> bool {
+        self.log.read_only()
+    }
+
+    /// The real open. `layout` forces the segmented shape (and supplies the codec); otherwise the
+    /// layout is probed with `is_dir`, so a caller holding only a path — `main.rs`, `fork_from_path`,
+    /// export — needs to know nothing about either shape.
+    pub(crate) fn open_with(
+        path: PathBuf,
+        id_hint: Option<&str>,
+        layout: &Layout,
+        read_only: bool,
+    ) -> std::io::Result<(Self, Session)> {
+        let mut log = Log::open(path, id_hint, layout, read_only)?;
+        let path = log.path().to_path_buf();
         let mut meta: Option<SessionMeta> = None;
         let mut nodes: HashMap<String, Node> = HashMap::new();
         // The active tip, updated in *file order* by whichever kind of entry sets it: a `Message`
@@ -912,7 +924,7 @@ impl SessionStore {
         let mut compaction_provenance: Option<CompactionProvenance> = None;
         let mut events: Vec<ExportEvent> = Vec::new();
 
-        let mut reader = BufReader::new(file);
+        let mut reader = log.lines()?;
         let mut raw = Vec::new();
         loop {
             // A genuine I/O read failure stops the load, keeping whatever was valid so far (only the
@@ -921,9 +933,13 @@ impl SessionStore {
             // that one and keep scanning, rather than discarding every good entry after it (which used
             // to happen here: a single bit-rotted or hand-edited line anywhere in the file silently
             // truncated the whole session).
-            let oversized = match read_capped_line(&mut reader, &mut raw) {
+            let oversized = match reader.next_line(&mut raw) {
                 Ok(None) => break,
                 Ok(Some(oversized)) => oversized,
+                // A sealed line that will not open is never recoverable by reading on: the bytes are
+                // not this session's, and a partial view would be silently overwritten by the next
+                // write. Every other read failure keeps whatever was valid so far.
+                Err(e) if is_seal_failure(&e) => return Err(e),
                 Err(_) => break,
             };
             if oversized {
@@ -1140,6 +1156,10 @@ impl SessionStore {
                 }
             }
         }
+        // How far the replay actually got is the other half of the epoch fence: the first write
+        // refuses unless the newest segment is still exactly this long.
+        log.observe(&reader);
+        drop(reader);
         let meta = meta.ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -1221,7 +1241,7 @@ impl SessionStore {
         }
         Ok((
             Self {
-                path,
+                log,
                 meta,
                 persisted,
                 nodes,
@@ -1243,10 +1263,33 @@ impl SessionStore {
         &self.meta
     }
 
-    /// The on-disk path this session's JSONL file lives at — pi's `sessionFile`, surfaced via
-    /// `get_state` for a client that wants to know exactly what's being written to.
+    /// The on-disk path this session lives at — pi's `sessionFile`, surfaced via `get_state` for a
+    /// client that wants to know exactly what's being written to. The `.jsonl` file in the single-file
+    /// layout; the session's own directory in the segmented one.
     pub fn path(&self) -> &Path {
-        &self.path
+        self.log.path()
+    }
+
+    /// Where this session's `/session` working memory belongs — a `<...>.memory/` sibling of the
+    /// `.jsonl`, or `<id>/memory` inside the session directory. Always ask the store rather than
+    /// deriving it from [`path`](Self::path): `with_extension` on a dotted id (`<shard>.<opaque>`)
+    /// would hand every session on a shard the same `<shard>.memory` directory.
+    pub fn memory_dir(&self) -> PathBuf {
+        self.log.memory_dir()
+    }
+
+    /// Whether a write has already found another owner in possession (see [`Superseded`]). Once true
+    /// it stays true, and every later write fails — the owner checks this after each write and ends
+    /// the session rather than pretending it still holds it.
+    pub fn superseded(&self) -> bool {
+        self.log.superseded()
+    }
+
+    /// Append one already-framed entry to the log.
+    fn append_entry(&mut self, entry: &Entry) -> std::io::Result<()> {
+        let mut buf = Vec::new();
+        write_line(&mut buf, entry)?;
+        self.log.append(&buf)
     }
 
     /// Ids of the active path's messages, root-first — parallel to the `Session.messages` this store
@@ -1311,13 +1354,7 @@ impl SessionStore {
             ));
             parent = Some(id);
         }
-        let mut f = OpenOptions::new().append(true).open(&self.path)?;
-        f.write_all(&buf)?;
-        // `flush` only pushes past our buffer into the OS; `sync_all` forces the bytes to disk, which
-        // is what the module's crash-safety claim actually requires. The parent dir is unchanged on an
-        // append (same inode, same dentry), so no directory fsync is needed here.
-        f.flush()?;
-        f.sync_all()?;
+        self.log.append(&buf)?;
         for (id, node) in staged {
             self.active.push(id.clone());
             self.nodes.insert(id, node);
@@ -1377,7 +1414,7 @@ impl SessionStore {
             kind: kind.clone(),
             data: data.clone(),
         };
-        append_line(&self.path, &entry)?;
+        self.append_entry(&entry)?;
         self.events.push(ExportEvent::Custom {
             kind: kind.clone(),
             data: data.clone(),
@@ -1470,31 +1507,13 @@ impl SessionStore {
             parent = Some(id);
         }
 
-        let tmp = self.path.with_extension("jsonl.tmp");
-        let mut f = create_private(&tmp)?;
-
-        // Cleans up `tmp` if any step below returns early via `?` — a genuine in-process error (disk
-        // full, a permission error mid-write), not a hard crash: the process is still alive here and can
-        // just remove it, unlike the crash case (already safe on its own — a stray `.tmp` is never read
-        // back as a session, see `read_listing`'s extension filter — and the next `rewrite` call reuses
-        // this same deterministic path anyway, so leaving it behind was never a correctness hazard, just
-        // litter). Disarmed once the rename actually succeeds, since `tmp` no longer exists under that
-        // name by then.
-        struct RemoveTmpOnError<'a> {
-            path: &'a Path,
-            armed: bool,
-        }
-        impl Drop for RemoveTmpOnError<'_> {
-            fn drop(&mut self) {
-                if self.armed {
-                    let _ = fs::remove_file(self.path);
-                }
-            }
-        }
-        let mut cleanup = RemoveTmpOnError {
-            path: &tmp,
-            armed: true,
-        };
+        // Serialized whole, then handed to the log as one replacement. Buffering first is what lets
+        // either layout implement "replace everything" the way it can do so atomically — a temp file
+        // and a rename for the single file, a fresh base segment with a trailer for the segmented one
+        // — without this function knowing which. A rewrite is already O(transcript) in time; it is now
+        // O(transcript) in memory for the duration of the swap too.
+        let mut buf = Vec::new();
+        let mut f = &mut buf;
 
         write_line(&mut f, &Entry::Session(self.meta.clone()))?;
         for (id, node) in preserved.iter().chain(new_nodes.iter()) {
@@ -1530,14 +1549,7 @@ impl SessionStore {
                 )?,
             }
         }
-        // Sync the temp file's contents, then rename (atomic), then fsync the parent directory so the
-        // rename itself is durable: without the dir fsync a crash could surface the old file — or, in the
-        // window between, neither — even though the new bytes had reached disk.
-        f.flush()?;
-        f.sync_all()?;
-        fs::rename(&tmp, &self.path)?;
-        cleanup.armed = false;
-        fsync_dir(&self.path)?;
+        self.log.replace_all(&buf)?;
 
         self.nodes = preserved.into_iter().collect();
         self.nodes.extend(new_nodes);
@@ -1828,12 +1840,7 @@ impl SessionStore {
                 )?,
             }
         }
-        let mut f = OpenOptions::new().append(true).open(&self.path)?;
-        f.write_all(&buf)?;
-        // The parent dir is unchanged on an append (same inode, same dentry) — no directory fsync
-        // needed, exactly like `append_new`.
-        f.flush()?;
-        f.sync_all()?;
+        self.log.append(&buf)?;
 
         self.nodes.extend(new_nodes);
         self.active = new_active;
@@ -2159,10 +2166,7 @@ impl SessionStore {
         };
         let mut buf = Vec::new();
         write_line(&mut buf, &leaf)?;
-        let mut f = OpenOptions::new().append(true).open(&self.path)?;
-        f.write_all(&buf)?;
-        f.flush()?;
-        f.sync_all()?;
+        self.log.append(&buf)?;
 
         let active = path_from_root(&self.nodes, Some(target_id));
         let messages: Vec<Message> = active
@@ -2235,12 +2239,7 @@ impl SessionStore {
         let mut buf = Vec::new();
         write_line(&mut buf, &Entry::Session(self.meta.clone()))?;
         write_line(&mut buf, &entry)?;
-        let mut f = OpenOptions::new().append(true).open(&self.path)?;
-        f.write_all(&buf)?;
-        // The parent dir is unchanged on an append (same inode, same dentry) — no directory fsync
-        // needed, exactly like `append_new`.
-        f.flush()?;
-        f.sync_all()?;
+        self.log.append(&buf)?;
 
         self.nodes.insert(
             entry_id.clone(),
@@ -2297,10 +2296,7 @@ impl SessionStore {
         };
         let mut buf = Vec::new();
         write_line(&mut buf, &leaf)?;
-        let mut f = OpenOptions::new().append(true).open(&self.path)?;
-        f.write_all(&buf)?;
-        f.flush()?;
-        f.sync_all()?;
+        self.log.append(&buf)?;
 
         self.persisted = 0;
         self.active = Vec::new();
@@ -2339,10 +2335,7 @@ impl SessionStore {
         let mut buf = Vec::new();
         write_line(&mut buf, &Entry::Session(self.meta.clone()))?;
         write_line(&mut buf, &entry)?;
-        let mut f = OpenOptions::new().append(true).open(&self.path)?;
-        f.write_all(&buf)?;
-        f.flush()?;
-        f.sync_all()?;
+        self.log.append(&buf)?;
 
         self.nodes.insert(
             entry_id.clone(),
@@ -2396,7 +2389,7 @@ impl SessionStore {
             parent_id: anchor.clone(),
             model: model.to_string(),
         };
-        append_line(&self.path, &entry)?;
+        self.append_entry(&entry)?;
         self.events
             .push(ExportEvent::ModelChange(model.to_string()));
         self.model_changes.insert(anchor, model.to_string());
@@ -2413,7 +2406,7 @@ impl SessionStore {
             parent_id: anchor.clone(),
             level: level.to_string(),
         };
-        append_line(&self.path, &entry)?;
+        self.append_entry(&entry)?;
         self.events
             .push(ExportEvent::ThinkingLevelChange(level.to_string()));
         self.level_changes.insert(anchor, level.to_string());
@@ -2441,7 +2434,7 @@ impl SessionStore {
             parent_id: None,
             level: level.to_string(),
         };
-        append_line(&self.path, &entry)?;
+        self.append_entry(&entry)?;
         self.events
             .push(ExportEvent::ThinkingLevelChange(level.to_string()));
         self.level_changes.insert(None, level.to_string());
@@ -2556,7 +2549,7 @@ impl SessionStore {
         endpoint: Option<serde_json::Value>,
     ) -> std::io::Result<()> {
         self.meta.exec_endpoint = endpoint;
-        append_line(&self.path, &Entry::Session(self.meta.clone()))
+        self.append_entry(&Entry::Session(self.meta.clone()))
     }
 
     pub fn set_title(&mut self, title: impl Into<String>) -> std::io::Result<()> {
@@ -2567,7 +2560,7 @@ impl SessionStore {
             parent_id: anchor.clone(),
             title: title.clone(),
         };
-        append_line(&self.path, &entry)?;
+        self.append_entry(&entry)?;
         let resolved = title_or_clear(title);
         self.meta.title = resolved.clone();
         self.title_changes.insert(anchor, resolved);
@@ -2599,7 +2592,7 @@ impl SessionStore {
             target_id: target_id.to_string(),
             label: label.map(str::to_string),
         };
-        append_line(&self.path, &entry)?;
+        self.append_entry(&entry)?;
         self.events.push(ExportEvent::Label {
             target_id: target_id.to_string(),
             label: label.map(str::to_string),
@@ -2706,19 +2699,60 @@ fn remove_sibling_memory(session_jsonl: &Path) {
 #[derive(Clone)]
 pub struct SessionRepo {
     dir: PathBuf,
+    opts: RepoOptions,
 }
 
 impl SessionRepo {
-    /// Open (creating if needed) a repository rooted at `dir`.
+    /// Open (creating if needed) a repository rooted at `dir`, in the single-file layout with no id
+    /// prefix — what every local invocation uses.
     pub fn open(dir: impl Into<PathBuf>) -> std::io::Result<Self> {
+        Self::open_with(dir, RepoOptions::default())
+    }
+
+    /// [`open`](Self::open) with an explicit [`Layout`] and id prefix — the service-mode entry point.
+    pub fn open_with(dir: impl Into<PathBuf>, opts: RepoOptions) -> std::io::Result<Self> {
         let dir = dir.into();
         fs::create_dir_all(&dir)?;
-        Ok(Self { dir })
+        Ok(Self { dir, opts })
     }
 
     /// The directory this repo is rooted at.
     pub fn dir(&self) -> &Path {
         &self.dir
+    }
+
+    fn layout(&self) -> &Layout {
+        &self.opts.layout
+    }
+
+    fn segmented(&self) -> bool {
+        self.opts.layout.is_segmented()
+    }
+
+    /// A fresh id for a session this repo *derives* — a fork, a clone, an archive. With an
+    /// `id_prefix` configured it comes out as `<prefix>.<opaque>`, so a derived session stays on the
+    /// shard its parent lives on and every path built from it is still rooted at the same tenant.
+    pub fn mint_id(&self) -> String {
+        match &self.opts.id_prefix {
+            Some(prefix) => format!("{prefix}.{}", new_id()),
+            None => new_id(),
+        }
+    }
+
+    /// Fresh metadata carrying an id this repo minted (see [`mint_id`](Self::mint_id)).
+    fn derived_meta(&self, cwd: impl Into<String>, model: impl Into<String>) -> SessionMeta {
+        SessionMeta::with_id(self.mint_id(), cwd, model)
+    }
+
+    /// Open a session this repo owns, for writing.
+    fn open_path(&self, path: PathBuf, id: &str) -> std::io::Result<(SessionStore, Session)> {
+        SessionStore::open_with(path, Some(id), self.layout(), false)
+    }
+
+    /// Open a session as a *source* — a fork's origin, a preview, an export. Read-only: none of these
+    /// owns the session, and a stray write from one would take an epoch off whoever does.
+    fn open_source(&self, path: PathBuf, id: &str) -> std::io::Result<(SessionStore, Session)> {
+        SessionStore::open_with(path, Some(id), self.layout(), true)
     }
 
     /// Open the session named `id`, or create it under exactly that id if it doesn't exist yet.
@@ -2740,7 +2774,7 @@ impl SessionRepo {
         model: &str,
     ) -> std::io::Result<(SessionStore, Session)> {
         match self.find_path_exact(id)? {
-            Some(path) => SessionStore::open(path),
+            Some(path) => self.open_path(path, id),
             None => Ok((
                 self.create(SessionMeta::with_id(id.to_string(), cwd, model))?,
                 Session::new(),
@@ -2826,13 +2860,22 @@ impl SessionRepo {
     /// *other* project's own repo (a `SessionRepo` opened just long enough to compute the path, not to
     /// hold onto).
     pub(crate) fn path_for(&self, meta: &SessionMeta) -> PathBuf {
-        self.dir
-            .join(format!("{}_{}.jsonl", meta.created_at, meta.id))
+        self.path_for_id(&meta.id, meta.created_at)
+    }
+
+    /// The path an id resolves to. The segmented layout needs no creation timestamp in the name — the
+    /// directory *is* the id — which is also what makes a lookup a single `stat` rather than a scan.
+    fn path_for_id(&self, id: &str, created_at: u64) -> PathBuf {
+        if self.segmented() {
+            self.dir.join(id)
+        } else {
+            self.dir.join(format!("{created_at}_{id}.jsonl"))
+        }
     }
 
     /// Create a new, empty session and return its store.
     pub fn create(&self, meta: SessionMeta) -> std::io::Result<SessionStore> {
-        SessionStore::create(self.path_for(&meta), meta)
+        SessionStore::create_with(self.path_for(&meta), meta, self.layout())
     }
 
     /// All sessions' metadata, most-recently-active first (by `updated_at` — matches pi's own session
@@ -2859,13 +2902,26 @@ impl SessionRepo {
         let mut paths = Vec::new();
         for entry in fs::read_dir(&self.dir)? {
             let path = entry?.path();
-            if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
+            if self.is_session_path(&path) {
                 paths.push(path);
             }
         }
-        let mut metas = scan_listings(paths, &on_progress);
+        let mut metas = scan_listings_in(paths, self.layout(), &on_progress);
         metas.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
         Ok(metas)
+    }
+
+    /// Whether a directory entry names a session in this repo's layout: a `*.jsonl` file, or a
+    /// directory holding at least one segment (which excludes `.trash/` and a half-created id).
+    fn is_session_path(&self, path: &Path) -> bool {
+        if self.segmented() {
+            path.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| !n.starts_with('.'))
+                && segment_dir_is_session(path)
+        } else {
+            path.extension().and_then(|e| e.to_str()) == Some("jsonl")
+        }
     }
 
     /// Open a session by id.
@@ -2873,7 +2929,17 @@ impl SessionRepo {
         let path = self.find_path(id)?.ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::NotFound, format!("no session {id}"))
         })?;
-        SessionStore::open(path)
+        self.open_path(path, id)
+    }
+
+    /// Open a session by id as a read-only *source* — a fork's origin, a preview, an export. None
+    /// of these owns the session, and in the segmented layout a stray write from one would take an
+    /// epoch off whoever does.
+    pub fn open_id_read_only(&self, id: &str) -> std::io::Result<(SessionStore, Session)> {
+        let path = self.find_path(id)?.ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotFound, format!("no session {id}"))
+        })?;
+        self.open_source(path, id)
     }
 
     /// Delete a session by id. Idempotent per the repo invariant "check before destroy; don't error if
@@ -2891,6 +2957,9 @@ impl SessionRepo {
         let Some(path) = self.find_path(id)? else {
             return Ok(());
         };
+        if self.segmented() {
+            return self.delete_segmented(&path, id);
+        }
         if let Some(file_name) = path.file_name() {
             let trash_dir = self.dir.join(".trash");
             if fs::create_dir_all(&trash_dir).is_ok()
@@ -2911,6 +2980,39 @@ impl SessionRepo {
             // no-op success — the post-condition ("no session with this id") holds either way.
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(e),
+        }
+    }
+
+    /// Soft-delete a segmented session: take its lock (so a live owner's session is never yanked out
+    /// from under it), then rename the whole directory — segments, lock and `memory/` together — to
+    /// `.trash/<id>.<unix_ns>`. The timestamp suffix is what makes repeated deletes of the same id
+    /// work: each lands on its own name instead of colliding with the last one.
+    fn delete_segmented(&self, path: &Path, id: &str) -> std::io::Result<()> {
+        let Some(_lock) = acquire_session_lock(path)? else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                format!("session {id} is in use and cannot be deleted"),
+            ));
+        };
+        let trash_dir = self.dir.join(".trash");
+        fs::create_dir_all(&trash_dir)?;
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        match fs::rename(path, trash_dir.join(format!("{id}.{stamp}"))) {
+            Ok(()) => Ok(()),
+            // Raced with another deleter: it is already gone, which is the post-condition.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            // Losing the undo is better than losing the delete (a read-only `.trash`, a cross-device
+            // rename) — same fallback the single-file layout takes.
+            Err(_) => fs::remove_dir_all(path).or_else(|e| {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    Ok(())
+                } else {
+                    Err(e)
+                }
+            }),
         }
     }
 
@@ -2935,17 +3037,25 @@ impl SessionRepo {
         for entry in read_dir {
             let entry = entry?;
             let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
-                continue;
-            }
             let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
                 continue;
             };
-            let Some(rest) = name.strip_suffix(".jsonl") else {
-                continue;
-            };
-            let Some((_, id)) = rest.split_once('_') else {
-                continue;
+            // The segmented layout trashes a whole directory as `<id>.<unix_ns>`; the single-file one
+            // keeps the original `<created_at>_<id>.jsonl` name.
+            let (id, original) = if self.segmented() {
+                let Some((id, stamp)) = name.rsplit_once('.') else {
+                    continue;
+                };
+                if id.is_empty() || !stamp.bytes().all(|b| b.is_ascii_digit()) {
+                    continue;
+                }
+                (id.to_string(), self.dir.join(id))
+            } else {
+                if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                    continue;
+                }
+                let Some(id) = file_id(&path) else { continue };
+                (id.to_string(), self.dir.join(name))
             };
             // Best-effort: a filesystem that can't report an mtime (rare) just leaves this `None` rather
             // than failing the whole listing over one unreadable timestamp.
@@ -2956,9 +3066,9 @@ impl SessionRepo {
                 .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
                 .map(|d| d.as_secs());
             entries.push(TrashEntry {
-                id: id.to_string(),
+                id,
                 deleted_at,
-                original_path: self.dir.join(name).to_string_lossy().into_owned(),
+                original_path: original.to_string_lossy().into_owned(),
             });
         }
         entries.sort_by(|a, b| b.deleted_at.cmp(&a.deleted_at));
@@ -2982,32 +3092,48 @@ impl SessionRepo {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
             Err(e) => return Err(e),
         };
-        let exact_suffix = format!("_{id}.jsonl");
-        let mut matched: Option<PathBuf> = None;
+        // Match the id *component*, never an `_<id>.jsonl` suffix: an id may legally contain `_`
+        // ([`is_valid_session_id`]), so a suffix test would let a restore of `b` pick up the session
+        // actually named `a_b`. The segmented layout's `<id>.<unix_ns>` names are matched the same
+        // way, newest first, so restoring an id twice-deleted brings back the most recent copy.
+        let mut matched: Option<(PathBuf, u128)> = None;
         for entry in read_dir {
             let path = entry?.path();
-            if path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| n.ends_with(&exact_suffix))
-            {
-                matched = Some(path);
-                break;
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            let stamp = if self.segmented() {
+                match name.rsplit_once('.') {
+                    Some((found, stamp)) if found == id => stamp.parse().unwrap_or(0),
+                    _ => continue,
+                }
+            } else {
+                if file_id(&path) != Some(id) {
+                    continue;
+                }
+                0
+            };
+            if matched.as_ref().is_none_or(|(_, best)| stamp >= *best) {
+                matched = Some((path, stamp));
             }
         }
-        let Some(path) = matched else {
+        let Some((path, _)) = matched else {
             return Ok(false);
         };
-        // `path` was just built from a real directory entry's own file name, so this is always `Some`
-        // in practice — but production code here stays panic-free regardless (workspace lint), so a
-        // `None` (which should never happen) is a clear error instead of a panic.
-        let Some(file_name) = path.file_name() else {
-            return Err(std::io::Error::other(format!(
-                "trash entry for {id} has no file name: {}",
-                path.display()
-            )));
+        let dest = if self.segmented() {
+            self.dir.join(id)
+        } else {
+            // `path` was just built from a real directory entry's own file name, so this is always
+            // `Some` in practice — but production code here stays panic-free regardless (workspace
+            // lint), so a `None` (which should never happen) is a clear error instead of a panic.
+            let Some(file_name) = path.file_name() else {
+                return Err(std::io::Error::other(format!(
+                    "trash entry for {id} has no file name: {}",
+                    path.display()
+                )));
+            };
+            self.dir.join(file_name)
         };
-        let dest = self.dir.join(file_name);
         if dest.exists() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::AlreadyExists,
@@ -3018,9 +3144,12 @@ impl SessionRepo {
             ));
         }
         fs::rename(&path, &dest)?;
-        // Bring the session's `/session` working-memory dir back out of `.trash/` too (best-effort — a
-        // missing dir just means the session had no working memory, or an older delete predates this).
-        move_sibling_memory(&path, &self.dir);
+        if !self.segmented() {
+            // Bring the session's `/session` working-memory dir back out of `.trash/` too (best-effort
+            // — a missing dir just means the session had no working memory, or an older delete predates
+            // this). A segmented session's memory lives *inside* its directory and already moved.
+            move_sibling_memory(&path, &self.dir);
+        }
         Ok(true)
     }
 
@@ -3028,7 +3157,7 @@ impl SessionRepo {
     /// messages of the original, linked back via `parent`. `upto` is clamped to the source length, so
     /// `usize::MAX` clones the whole session. Returns the new store and its restored session.
     pub fn fork(&self, id: &str, upto: usize) -> std::io::Result<(SessionStore, Session)> {
-        let (src, src_session) = self.open_id(id)?;
+        let (src, src_session) = self.open_id_read_only(id)?;
         let upto = upto.min(src_session.messages.len());
         // Task #18 (pi-parity fix): the model actually active at the copied prefix's own last message
         // — not `src.meta.model` (the source's creation-time value, blindly copied here previously) —
@@ -3039,7 +3168,7 @@ impl SessionRepo {
             .flatten()
             .map(String::as_str);
         let model = src.model_at_or_created(target_id).to_string();
-        let mut meta = SessionMeta::new(src.meta.cwd.clone(), model);
+        let mut meta = self.derived_meta(src.meta.cwd.clone(), model);
         // The source's own resolved id, not the caller's raw `id` argument — since `open_id` now accepts
         // a unique prefix, blindly echoing `id` back would persist the *prefix* as `parent` instead of
         // the real full id it resolved to.
@@ -3093,7 +3222,8 @@ impl SessionRepo {
         target_cwd: &str,
         upto: usize,
     ) -> std::io::Result<(SessionStore, Session)> {
-        let (src, src_session) = SessionStore::open(source_path.to_path_buf())?;
+        let (src, src_session) =
+            SessionStore::open_with(source_path.to_path_buf(), None, self.layout(), true)?;
         let upto = upto.min(src_session.messages.len());
         // Task #18 (pi-parity fix): same reasoning as `fork`'s identical resolution just above.
         let target_id = (upto > 0)
@@ -3101,7 +3231,7 @@ impl SessionRepo {
             .flatten()
             .map(String::as_str);
         let model = src.model_at_or_created(target_id).to_string();
-        let mut meta = SessionMeta::new(target_cwd.to_string(), model);
+        let mut meta = self.derived_meta(target_cwd.to_string(), model);
         meta.parent = Some(src.meta.id.clone());
         // Pass 15 (pi-parity fix): same reasoning as `fork`'s identical resolution just above.
         meta.title = src.title_at_or_root(target_id).map(str::to_string);
@@ -3219,7 +3349,7 @@ impl SessionRepo {
         entry_id: &str,
         before: bool,
     ) -> std::io::Result<ForkPrefix> {
-        let (src, _src_session) = self.open_id(id)?;
+        let (src, _src_session) = self.open_id_read_only(id)?;
         if !src.nodes.contains_key(entry_id) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
@@ -3258,7 +3388,7 @@ impl SessionRepo {
         let model = src
             .model_at_or_created(path.last().map(String::as_str))
             .to_string();
-        let mut meta = SessionMeta::new(src.meta.cwd.clone(), model);
+        let mut meta = self.derived_meta(src.meta.cwd.clone(), model);
         // The source's own resolved id, not the caller's raw `id` argument — see `fork`'s identical fix
         // for why: `open_id` now accepts a unique prefix, so `id` itself may not be the real full id.
         meta.parent = Some(src.meta.id.clone());
@@ -3317,9 +3447,23 @@ impl SessionRepo {
     /// lookup below already treats as "no match" rather than a failure.
     fn session_paths(&self) -> std::io::Result<Vec<PathBuf>> {
         match fs::read_dir(&self.dir) {
-            Ok(entries) => Ok(entries.flatten().map(|e| e.path()).collect()),
+            Ok(entries) => Ok(entries
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| !self.segmented() || self.is_session_path(p))
+                .collect()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
             Err(e) => Err(e),
+        }
+    }
+
+    /// The id a directory entry names, in this repo's layout: the `<id>` component of a
+    /// `<created_at>_<id>.jsonl`, or the session directory's own name.
+    fn entry_id<'a>(&self, path: &'a Path) -> Option<&'a str> {
+        if self.segmented() {
+            path.file_name()?.to_str()
+        } else {
+            file_id(path)
         }
     }
 
@@ -3330,8 +3474,11 @@ impl SessionRepo {
     /// ([`is_valid_session_id`]), so a suffix test lets a lookup for `b` match a session actually named
     /// `a_b`. Harmless while this only backed a convenience lookup; not harmless now that it decides
     /// which session an address resolves to.
-    fn exact_match(entries: &[PathBuf], id: &str) -> Option<PathBuf> {
-        entries.iter().find(|p| file_id(p) == Some(id)).cloned()
+    fn exact_match(&self, entries: &[PathBuf], id: &str) -> Option<PathBuf> {
+        entries
+            .iter()
+            .find(|p| self.entry_id(p) == Some(id))
+            .cloned()
     }
 
     /// Resolve `id` to its on-disk path by **exact** match only, with no unique-prefix fallback.
@@ -3343,7 +3490,13 @@ impl SessionRepo {
     /// happen to share a prefix would silently collapse onto whichever landed first. Exact-or-absent
     /// keeps "open it, else create it under this exact name" total and unambiguous.
     fn find_path_exact(&self, id: &str) -> std::io::Result<Option<PathBuf>> {
-        Ok(Self::exact_match(&self.session_paths()?, id))
+        if self.segmented() {
+            // The directory *is* the id, so an address resolves with one `stat` — no directory scan,
+            // however many sessions the shard holds.
+            let path = self.dir.join(id);
+            return Ok(segment_dir_is_session(&path).then_some(path));
+        }
+        Ok(self.exact_match(&self.session_paths()?, id))
     }
 
     /// Resolve `id` to its on-disk path in this repo: an exact match first (cheap, unambiguous), then a
@@ -3354,15 +3507,15 @@ impl SessionRepo {
     /// candidate instead of a guess. `Ok(None)` when nothing matches at all — not found is not an error
     /// here, matching every existing caller's own "session may not exist" handling.
     fn find_path(&self, id: &str) -> std::io::Result<Option<PathBuf>> {
-        let entries = self.session_paths()?;
-        if let Some(path) = Self::exact_match(&entries, id) {
+        if let Some(path) = self.find_path_exact(id)? {
             return Ok(Some(path));
         }
+        let entries = self.session_paths()?;
         // No exact match: fall back to a unique-prefix match over each file's own `<id>` component.
         let matches: Vec<(&str, &PathBuf)> = entries
             .iter()
             .filter_map(|path| {
-                let file_id = file_id(path)?;
+                let file_id = self.entry_id(path)?;
                 file_id.starts_with(id).then_some((file_id, path))
             })
             .collect();
@@ -3619,13 +3772,29 @@ fn migrate(meta: SessionMeta, path: &Path) -> std::io::Result<SessionMeta> {
 /// an unreadable directory (or a missing one) yields an empty list rather than erroring, matching the
 /// skip-and-continue semantics of the listing scans that consume it.
 pub(crate) fn scan_session_dir(dir: &Path) -> Vec<PathBuf> {
+    scan_session_dir_in(dir, &Layout::File)
+}
+
+/// [`scan_session_dir`] for a specific [`Layout`]: `*.jsonl` files, or the subdirectories that hold
+/// at least one segment (which skips `.trash/` and any half-created id).
+pub(crate) fn scan_session_dir_in(dir: &Path, layout: &Layout) -> Vec<PathBuf> {
     let Ok(entries) = fs::read_dir(dir) else {
         return Vec::new();
     };
+    let segmented = layout.is_segmented();
     entries
         .flatten()
         .map(|e| e.path())
-        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("jsonl"))
+        .filter(|p| {
+            if segmented {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| !n.starts_with('.'))
+                    && segment_dir_is_session(p)
+            } else {
+                p.extension().and_then(|e| e.to_str()) == Some("jsonl")
+            }
+        })
         .collect()
 }
 
@@ -3685,9 +3854,15 @@ struct ListingIndexRef<'a> {
 /// derived field is a compile error in this struct rather than a silent hole in the cache.
 #[derive(Clone, Serialize, Deserialize)]
 struct ListingIndexEntry {
-    /// The `(size, mtime)` the cached listing was computed from. Both must match for it to be used.
+    /// The stamp the cached listing was computed from. Every field must match for it to be used.
     size: u64,
     mtime_ns: u128,
+    /// The newest and base epochs, for the segmented layout only — absent (and so `0`) for a
+    /// single-file entry, which keeps that layout's index byte-identical to what it always wrote.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    epoch: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    base_epoch: u64,
     /// The persisted header fields (everything `SessionMeta` does serialize).
     meta: SessionMeta,
     updated_at: u64,
@@ -3696,16 +3871,31 @@ struct ListingIndexEntry {
     search_text: String,
 }
 
+fn is_zero(v: &u64) -> bool {
+    *v == 0
+}
+
 impl ListingIndexEntry {
-    fn new(size: u64, mtime_ns: u128, meta: &SessionMeta) -> Self {
+    fn new(stamp: Stamp, meta: &SessionMeta) -> Self {
         Self {
-            size,
-            mtime_ns,
+            size: stamp.size,
+            mtime_ns: stamp.mtime_ns,
+            epoch: stamp.epoch,
+            base_epoch: stamp.base_epoch,
             meta: meta.clone(),
             updated_at: meta.updated_at,
             message_count: meta.message_count,
             preview: meta.preview.clone(),
             search_text: meta.search_text.clone(),
+        }
+    }
+
+    fn stamp(&self) -> Stamp {
+        Stamp {
+            size: self.size,
+            mtime_ns: self.mtime_ns,
+            epoch: self.epoch,
+            base_epoch: self.base_epoch,
         }
     }
 
@@ -3722,23 +3912,26 @@ impl ListingIndexEntry {
     }
 }
 
-/// A file's cache validity stamp. Nanosecond mtime rather than the whole-second [`mtime_secs`] used for
-/// display: two appends inside the same second are ordinary during a live session, and a
-/// second-resolution stamp would happily serve a stale listing for one of them. Size is carried too, so
-/// even a filesystem with a coarse clock still invalidates on any append.
-fn file_stamp(path: &Path) -> Option<(u64, u128)> {
-    let m = fs::metadata(path).ok()?;
-    let mtime = m.modified().ok()?.duration_since(UNIX_EPOCH).ok()?;
-    Some((m.len(), mtime.as_nanos()))
-}
-
 /// Best-effort load. Any problem at all yields an empty index and a full rescan.
-fn load_listing_index(dir: &Path) -> HashMap<String, ListingIndexEntry> {
-    let raw = match fs::read_to_string(dir.join(LISTING_INDEX_FILE)) {
+fn load_listing_index(
+    dir: &Path,
+    codec: Option<&TenantCodec>,
+) -> HashMap<String, ListingIndexEntry> {
+    let raw = match fs::read(dir.join(LISTING_INDEX_FILE)) {
         Ok(raw) => raw,
         Err(_) => return HashMap::new(),
     };
-    match serde_json::from_str::<ListingIndex>(&raw) {
+    // The index holds titles, previews and up to 50 KiB of every session's text, so it is sealed
+    // exactly like the transcripts it summarizes. A blob that won't open is treated as no cache at
+    // all (the same as a corrupt one) — it is only ever a cache.
+    let raw = match codec {
+        Some(c) => match c.open_listing(&raw) {
+            Ok(plain) => plain,
+            Err(_) => return HashMap::new(),
+        },
+        None => raw,
+    };
+    match serde_json::from_slice::<ListingIndex>(&raw) {
         Ok(idx) if idx.version == LISTING_INDEX_VERSION => idx.entries,
         _ => HashMap::new(),
     }
@@ -3752,7 +3945,11 @@ fn load_listing_index(dir: &Path) -> HashMap<String, ListingIndexEntry> {
 ///
 /// Every error is swallowed deliberately. A read-only or unwritable session directory must still *list*;
 /// it just doesn't get to keep a cache.
-fn store_listing_index(dir: &Path, entries: &HashMap<String, ListingIndexEntry>) {
+fn store_listing_index(
+    dir: &Path,
+    entries: &HashMap<String, ListingIndexEntry>,
+    codec: Option<&TenantCodec>,
+) {
     let idx = ListingIndexRef {
         version: LISTING_INDEX_VERSION,
         entries,
@@ -3760,8 +3957,17 @@ fn store_listing_index(dir: &Path, entries: &HashMap<String, ListingIndexEntry>)
     let Ok(bytes) = serde_json::to_vec(&idx) else {
         return;
     };
-    // Unique per process so two concurrent listers can't tear each other's temp file.
-    let tmp = dir.join(format!(".listings.{}.tmp", std::process::id()));
+    let bytes = match codec {
+        Some(c) => match c.seal_listing(&bytes) {
+            Ok(sealed) => sealed,
+            Err(_) => return,
+        },
+        None => bytes,
+    };
+    // Unpredictable per call, not just per process: a deterministic sibling temp name is something
+    // anything able to plant a symlink in this directory could aim elsewhere, and two listers inside
+    // one process would tear each other's file.
+    let tmp = dir.join(format!(".listings.{}.tmp", crate::tools::temp_suffix()));
     let write = (|| -> std::io::Result<()> {
         let mut f = create_private(&tmp)?;
         f.write_all(&bytes)?;
@@ -3788,6 +3994,18 @@ pub(crate) fn scan_listings(
     paths: Vec<PathBuf>,
     on_progress: &(impl Fn(usize, usize) + Send + Sync),
 ) -> Vec<SessionMeta> {
+    scan_listings_in(paths, &Layout::File, on_progress)
+}
+
+/// [`scan_listings`] for a specific [`Layout`] — the segmented paths are session *directories*, and
+/// the sidecar index is sealed with the same tenant codec its transcripts are.
+pub(crate) fn scan_listings_in(
+    paths: Vec<PathBuf>,
+    layout: &Layout,
+    on_progress: &(impl Fn(usize, usize) + Send + Sync),
+) -> Vec<SessionMeta> {
+    let codec = layout.codec().map(Arc::as_ref);
+    let segmented = layout.is_segmented();
     let total = paths.len();
     if total == 0 {
         return Vec::new();
@@ -3800,7 +4018,7 @@ pub(crate) fn scan_listings(
         if let Some(dir) = p.parent()
             && !indexes.contains_key(dir)
         {
-            indexes.insert(dir.to_path_buf(), load_listing_index(dir));
+            indexes.insert(dir.to_path_buf(), load_listing_index(dir, codec));
         }
     }
 
@@ -3812,7 +4030,7 @@ pub(crate) fn scan_listings(
     // from — and so `read_listing` can reuse the mtime this scan already `stat`'d instead of
     // re-`stat`ing the same file. Stamping after the parse instead would race an append landing
     // mid-scan and cache a listing against a file state it never saw.
-    let mut miss_stamps: HashMap<PathBuf, (u64, u128)> = HashMap::new();
+    let mut miss_stamps: HashMap<PathBuf, Stamp> = HashMap::new();
     // The file names this scan actually produced a listing for, per directory — the oracle for dropping
     // an index entry whose session file has since been deleted. Names only, never the (up-to-50 KB)
     // meta: a cache hit reuses the entry already sitting in `indexes` rather than rebuilding it, so the
@@ -3826,13 +4044,13 @@ pub(crate) fn scan_listings(
     let mut scanned = 0usize;
 
     for p in &paths {
-        let stamp = file_stamp(p);
+        let stamp = log_stamp(p, segmented);
         let cached = (|| {
-            let (size, mtime_ns) = stamp?;
+            let stamp = stamp?;
             let dir = p.parent()?;
             let name = p.file_name()?.to_str()?;
             let e = indexes.get(dir)?.get(name)?;
-            (e.size == size && e.mtime_ns == mtime_ns).then(|| e.to_meta())
+            (e.stamp() == stamp).then(|| e.to_meta())
         })();
         match cached {
             Some(meta) => {
@@ -3858,11 +4076,11 @@ pub(crate) fn scan_listings(
 
     let mut metas = hits;
     metas.reserve(misses.len());
-    for (path, meta) in scan_uncached(&misses, &miss_stamps, scanned, total, on_progress) {
+    for (path, meta) in scan_uncached(&misses, &miss_stamps, layout, scanned, total, on_progress) {
         // Only a file we managed to stamp *before* reading can be cached — otherwise there's nothing to
         // validate a future hit against. The stamped entry lands straight in `indexes` (owned, so the
         // meta is moved in, not re-cloned), which *is* the index this scan will persist.
-        if let (Some(dir), Some(name), Some(&(size, mtime_ns))) = (
+        if let (Some(dir), Some(name), Some(&stamp)) = (
             path.parent(),
             path.file_name().and_then(|n| n.to_str()),
             miss_stamps.get(&path),
@@ -3871,10 +4089,10 @@ pub(crate) fn scan_listings(
             seen.entry(dir.clone())
                 .or_default()
                 .insert(name.to_string());
-            indexes.entry(dir).or_default().insert(
-                name.to_string(),
-                ListingIndexEntry::new(size, mtime_ns, &meta),
-            );
+            indexes
+                .entry(dir)
+                .or_default()
+                .insert(name.to_string(), ListingIndexEntry::new(stamp, &meta));
         }
         metas.push(meta);
     }
@@ -3892,7 +4110,7 @@ pub(crate) fn scan_listings(
         entries.retain(|name, _| names.contains(name));
         let shrank = orig_lens.get(dir).is_some_and(|&old| old != entries.len());
         if !misses.is_empty() || shrank {
-            store_listing_index(dir, entries);
+            store_listing_index(dir, entries, codec);
         }
     }
     metas
@@ -3902,7 +4120,8 @@ pub(crate) fn scan_listings(
 /// already served from cache, so `on_progress` keeps counting up to `total` across both halves.
 fn scan_uncached(
     paths: &[PathBuf],
-    stamps: &HashMap<PathBuf, (u64, u128)>,
+    stamps: &HashMap<PathBuf, Stamp>,
+    layout: &Layout,
     base: usize,
     total: usize,
     on_progress: &(impl Fn(usize, usize) + Send + Sync),
@@ -3920,7 +4139,7 @@ fn scan_uncached(
             .iter()
             .enumerate()
             .filter_map(|(i, path)| {
-                let meta = read_listing(path, mtime_from_stamps(stamps, path));
+                let meta = read_listing(path, mtime_from_stamps(stamps, path), layout);
                 on_progress(base + i + 1, total);
                 meta.map(|m| (path.clone(), m))
             })
@@ -3936,7 +4155,8 @@ fn scan_uncached(
         for chunk in paths.chunks(chunk_size) {
             scope.spawn(move || {
                 for path in chunk {
-                    if let Some(meta) = read_listing(path, mtime_from_stamps(stamps, path)) {
+                    if let Some(meta) = read_listing(path, mtime_from_stamps(stamps, path), layout)
+                    {
                         metas_ref
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -3964,11 +4184,17 @@ fn scan_uncached(
 /// Whole-second mtime derived from a `(size, mtime_ns)` stamp the caller already `stat`'d — nanos → the
 /// same floor-to-seconds `mtime_secs` computes — so [`read_listing`] can skip re-`stat`ing a file the
 /// listing scan just stamped. `None` when the file wasn't stamped, leaving the read path to `stat` it.
-fn mtime_from_stamps(stamps: &HashMap<PathBuf, (u64, u128)>, path: &Path) -> Option<u64> {
-    stamps.get(path).map(|&(_, ns)| (ns / 1_000_000_000) as u64)
+fn mtime_from_stamps(stamps: &HashMap<PathBuf, Stamp>, path: &Path) -> Option<u64> {
+    stamps
+        .get(path)
+        .map(|s| (s.mtime_ns / 1_000_000_000) as u64)
 }
 
-pub(crate) fn read_listing(path: &Path, mtime: Option<u64>) -> Option<SessionMeta> {
+pub(crate) fn read_listing(
+    path: &Path,
+    mtime: Option<u64>,
+    layout: &Layout,
+) -> Option<SessionMeta> {
     // `mtime` is the file's whole-second modified time when a caller already `stat`'d it (a cache-miss
     // scan stamps every file it parses — see [`mtime_from_stamps`]), so threading it here avoids the
     // second `stat` `mtime_secs` would otherwise do. It's only ever consulted as the `updated_at`
@@ -3976,12 +4202,12 @@ pub(crate) fn read_listing(path: &Path, mtime: Option<u64>) -> Option<SessionMet
     // interchangeable — the supplied one is if anything *more* consistent, being the state the rest of
     // this scan was computed against. `None` falls back to a `stat` here.
     let mtime = mtime.unwrap_or_else(|| mtime_secs(path));
-    let file = File::open(path).ok()?;
-    let mut reader = BufReader::new(file);
-    let mut header = String::new();
+    let mut reader = Log::reader_at(path, layout).ok()?;
+    let mut raw = Vec::new();
 
-    // The header is the first line.
-    reader.read_line(&mut header).ok()?;
+    // The header is the first line of the effective view.
+    reader.next_line(&mut raw).ok()??;
+    let header = std::str::from_utf8(&raw).ok()?;
     let mut meta = match serde_json::from_str::<Entry>(header.trim()).ok()? {
         Entry::Session(m) => migrate(m, path).ok()?,
         Entry::Message { .. } | Entry::Leaf { .. } | Entry::BranchSummary { .. } => return None,
@@ -4005,13 +4231,12 @@ pub(crate) fn read_listing(path: &Path, mtime: Option<u64>) -> Option<SessionMet
     // "no stamped message seen" (an all-legacy file, or one with no message lines at all), in which
     // case `mtime` is the only signal available.
     let mut max_message_timestamp = 0u64;
-    let mut raw = Vec::new();
     loop {
         // Same lenient, skip-just-this-line recovery as `SessionStore::open` (see its comment):
         // `read_capped_line` lets an oversized or invalid-UTF-8 line be skipped without losing the
         // count/preview derived from every good line after it, and only a genuine I/O failure stops
         // the scan early.
-        let oversized = match read_capped_line(&mut reader, &mut raw) {
+        let oversized = match reader.next_line(&mut raw) {
             Ok(None) => break,
             Ok(Some(oversized)) => oversized,
             Err(_) => break,
@@ -4285,14 +4510,50 @@ const MAX_CUSTOM_ENTRY_BYTES: usize = 256 * 1024;
 /// still consumed from `reader` (so it lands correctly on the next line) but discarded, and the
 /// returned flag reports whether that happened. `Ok(None)` at EOF with no more lines.
 fn read_capped_line(reader: &mut impl BufRead, buf: &mut Vec<u8>) -> std::io::Result<Option<bool>> {
+    let mut unbounded = None;
+    Ok(read_capped_line_limited(reader, buf, &mut unbounded)?.map(|line| line.oversized))
+}
+
+/// What one [`read_capped_line_limited`] call actually read.
+struct LineRead {
+    /// The line was longer than [`MAX_LINE_BYTES`]; `buf` holds only its prefix.
+    oversized: bool,
+    /// The line ended with a `\n` rather than running into the end of the range. A `false` here at
+    /// the end of a segment's range is a torn write (see [`SegReader::next_line`]).
+    terminated: bool,
+    /// Bytes taken off `reader`, newline included — how far the range cursor advanced.
+    consumed: u64,
+}
+
+/// [`read_capped_line`] bounded to `limit` more bytes (`None` = to EOF). Decrementing the caller's
+/// budget here, rather than wrapping the reader in a fresh `Take` per line, is what lets one buffered
+/// reader walk several ranges of one file without re-buffering at every boundary.
+fn read_capped_line_limited(
+    reader: &mut impl BufRead,
+    buf: &mut Vec<u8>,
+    limit: &mut Option<u64>,
+) -> std::io::Result<Option<LineRead>> {
     buf.clear();
     let mut total = 0usize;
+    let mut consumed_total = 0u64;
     let mut saw_any_byte = false;
+    let mut terminated = false;
     loop {
+        if *limit == Some(0) {
+            break;
+        }
         let available = reader.fill_buf()?;
         if available.is_empty() {
             break;
         }
+        let available = match *limit {
+            Some(rem) => {
+                &available[..available
+                    .len()
+                    .min(usize::try_from(rem).unwrap_or(usize::MAX))]
+            }
+            None => available,
+        };
         saw_any_byte = true;
         let (chunk, hit_newline) = match available.iter().position(|&b| b == b'\n') {
             Some(pos) => (&available[..pos], true),
@@ -4308,14 +4569,23 @@ fn read_capped_line(reader: &mut impl BufRead, buf: &mut Vec<u8>) -> std::io::Re
             chunk.len()
         };
         reader.consume(consumed);
+        consumed_total += consumed as u64;
+        if let Some(rem) = limit {
+            *rem = rem.saturating_sub(consumed as u64);
+        }
         if hit_newline {
+            terminated = true;
             break;
         }
     }
     if !saw_any_byte {
         return Ok(None);
     }
-    Ok(Some(total > MAX_LINE_BYTES))
+    Ok(Some(LineRead {
+        oversized: total > MAX_LINE_BYTES,
+        terminated,
+        consumed: consumed_total,
+    }))
 }
 
 /// Create (or truncate) `path` for exclusive access: `0600` on Unix, set atomically at creation
@@ -4390,18 +4660,6 @@ enum EntryRef<'a> {
 fn write_line_ref(w: &mut impl Write, entry: &EntryRef<'_>) -> std::io::Result<()> {
     serde_json::to_writer(&mut *w, entry).map_err(std::io::Error::other)?;
     w.write_all(b"\n")
-}
-
-/// Append one entry to the session file — an O(1) write, not a rewrite. Same durability posture as
-/// every other append in this module (flush + `sync_all`; the parent directory's own dentry is
-/// unchanged by an append, so no directory fsync is needed here either).
-fn append_line(path: &Path, entry: &Entry) -> std::io::Result<()> {
-    let mut buf = Vec::new();
-    write_line(&mut buf, entry)?;
-    let mut f = OpenOptions::new().append(true).open(path)?;
-    f.write_all(&buf)?;
-    f.flush()?;
-    f.sync_all()
 }
 
 /// Look up the most recent entry in `changes` (keyed by anchor message id, `None` = before the first
@@ -4495,6 +4753,1426 @@ pub fn is_valid_session_id(id: &str) -> bool {
     }
 }
 
+// =====================================================================================================
+// Storage layout — one session as a single file, or as a directory of epoch segments
+// =====================================================================================================
+//
+// The single-file layout ([`Layout::File`]) is what every local invocation uses and is the default:
+// one `<created_at>_<id>.jsonl` per session, appended to in place. It is unchanged, byte for byte,
+// by everything below — `Log::File` is a path and the same `OpenOptions::append` write.
+//
+// The segmented layout ([`Layout::Segmented`]) exists for a multi-replica service on shared storage
+// (EFS), where "this process owns this session" cannot be assumed and a lock is at best a liveness
+// hint. A session becomes a **directory of epoch segments**:
+//
+// ```text
+// <dir>/<id>/
+//   lock              advisory, liveness only (see `acquire_session_lock`)
+//   000001.jsonl      epoch 1 — created with O_EXCL; this is the session's existence fence
+//   000002.jsonl      epoch 2 — created by the next owner, sealing epoch 1 at the offset it read
+//   ...
+//   memory/           this session's `/session` working memory
+// ```
+//
+// Ownership is established by **creating a file nobody else could have created**: each new owner
+// O_EXCL-creates the next epoch, and its header records how far it consumed each predecessor. A
+// losing writer finds the epoch already taken (`EEXIST`) or its predecessor longer than it read, and
+// is [`Superseded`] — permanently, for that store. No lease, no clock, no heartbeat.
+
+/// How many segments may pile up above the last base before the next persist writes a new base.
+/// Bounds the growth a reap-and-reattach cycle causes: each attach rolls one segment, so without
+/// this a long-lived session would accumulate one file per attach forever.
+const CONSOLIDATION_K: usize = 8;
+
+/// Closes a base segment's own content. A base counts as complete — and so as a valid starting point
+/// for a replay — only once this line is on disk; lines after it are ordinary appends.
+const BASE_TRAILER: &[u8] = br#"{"type":"base_complete"}"#;
+
+/// Sealed-blob framing: `e1.<kfp8>:` then base64url of `nonce(24) ‖ ciphertext ‖ tag(16)`.
+const SEAL_FRAME: &str = "e1.";
+const SEAL_NONCE_LEN: usize = 24;
+const SEAL_TAG_LEN: usize = 16;
+
+/// How many times a segmented read restarts when the segment set moves under it — a consolidation
+/// unlinking an older segment, or an NFS file handle going stale.
+const SEG_READ_RETRIES: usize = 5;
+
+/// How many times [`acquire_session_lock`] re-opens after finding it locked a file that is no longer
+/// the one at the path (a session directory renamed into `.trash/` mid-acquire).
+const LOCK_RETRIES: usize = 5;
+
+/// `ESTALE`. Not an `io::ErrorKind` variant, so it is matched on the raw errno.
+const ESTALE: i32 = 116;
+
+/// One epoch's file name: `000001.jsonl`. Zero-padded so a plain directory listing sorts by epoch.
+fn segment_name(epoch: u64) -> String {
+    format!("{epoch:06}.jsonl")
+}
+
+/// The epoch a file name encodes, or `None` for anything that isn't a segment.
+fn segment_epoch(name: &str) -> Option<u64> {
+    let digits = name.strip_suffix(".jsonl")?;
+    (digits.len() >= 6 && digits.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| digits.parse().ok())
+        .flatten()
+}
+
+/// Whether an error means "the segment set moved under us" rather than a real failure.
+fn is_transient_read_error(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::NotFound || e.raw_os_error() == Some(ESTALE)
+}
+
+// ---- Sealing -----------------------------------------------------------------------------------
+
+/// Per-tenant sealing keys, derived once from the grant's DEK.
+///
+/// One codec serves a whole tenant, not one session: a listing, a fork and a preview all open *other*
+/// ids through the same codec, so the session id is mixed in as **associated data** per call rather
+/// than baked into the key. That keeps one key per tenant (cheap to hold, simple to rotate) while
+/// still binding every transcript line to the exact session it was written for — moving a sealed line
+/// from one session's file into another's makes it fail to open.
+///
+/// Three independent subkeys, so a compromise of one surface can't read another:
+///
+/// | surface | HKDF info | AAD |
+/// |---|---|---|
+/// | transcript lines | `bsg_v1 transcript` | `tenant ‖ 0x00 ‖ session_id` |
+/// | `.listings.json` | `bsg_v1 listing` | `tenant` |
+/// | memory documents | `bsg_v1 memory` | `tenant` |
+///
+/// Memory documents are **not** bound to their path: `rename` moves a document without rewriting it,
+/// and a path-bound AAD would turn every rename into a re-seal (and a crash mid-rename into data
+/// loss).
+pub struct TenantCodec {
+    tenant: String,
+    /// `e1.<kfp8>` — the framing every blob this codec writes carries, so a reader can tell which key
+    /// sealed it across a rotation.
+    frame: String,
+    transcript: Zeroizing<[u8; 32]>,
+    listing: Zeroizing<[u8; 32]>,
+    memory: Zeroizing<[u8; 32]>,
+}
+
+impl std::fmt::Debug for TenantCodec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TenantCodec")
+            .field("tenant", &self.tenant)
+            .field("key", &self.frame)
+            .finish()
+    }
+}
+
+impl TenantCodec {
+    /// Derive a tenant's sealing keys from its data-encryption key (`grant.dek`).
+    pub fn new(tenant: impl Into<String>, dek: &[u8; 32]) -> Self {
+        let fp = Self::subkey(dek, b"bsg_v1 kfp");
+        Self {
+            tenant: tenant.into(),
+            frame: format!("{SEAL_FRAME}{}", hex::encode(&fp[..4])),
+            transcript: Self::subkey(dek, b"bsg_v1 transcript"),
+            listing: Self::subkey(dek, b"bsg_v1 listing"),
+            memory: Self::subkey(dek, b"bsg_v1 memory"),
+        }
+    }
+
+    /// The tenant this codec seals for.
+    pub fn tenant(&self) -> &str {
+        &self.tenant
+    }
+
+    /// HKDF-SHA256 with no salt — the DEK is already a uniformly random 32 bytes, so a salt would add
+    /// nothing; `info` is what separates the three surfaces.
+    fn subkey(dek: &[u8; 32], info: &[u8]) -> Zeroizing<[u8; 32]> {
+        let mut out = Zeroizing::new([0u8; 32]);
+        // `expand` fails only for an output longer than 255 × 32 bytes, so 32 never does. The branch
+        // is unreachable; it exists because leaving `out` at its all-zero initial value would be a
+        // silent downgrade to a fixed key, and this crate refuses to `expect` its way past that.
+        if Hkdf::<Sha256>::new(None, dek)
+            .expand(info, out.as_mut())
+            .is_err()
+        {
+            out.copy_from_slice(&Sha256::digest([&dek[..], info].concat().as_slice()));
+        }
+        out
+    }
+
+    /// `tenant ‖ 0x00 ‖ session_id` — the transcript AAD, built per opened id.
+    fn line_aad(&self, id: &str) -> Vec<u8> {
+        let mut aad = Vec::with_capacity(self.tenant.len() + 1 + id.len());
+        aad.extend_from_slice(self.tenant.as_bytes());
+        aad.push(0);
+        aad.extend_from_slice(id.as_bytes());
+        aad
+    }
+
+    fn seal(&self, key: &[u8; 32], aad: &[u8], plaintext: &[u8]) -> std::io::Result<Vec<u8>> {
+        let mut nonce = [0u8; SEAL_NONCE_LEN];
+        getrandom::fill(&mut nonce).map_err(std::io::Error::other)?;
+        let mut body = Vec::with_capacity(SEAL_NONCE_LEN + plaintext.len() + SEAL_TAG_LEN);
+        body.extend_from_slice(&nonce);
+        body.extend_from_slice(plaintext);
+        let tag = XChaCha20Poly1305::new(Key::from_slice(&key[..]))
+            .encrypt_in_place_detached(XNonce::from_slice(&nonce), aad, &mut body[SEAL_NONCE_LEN..])
+            .map_err(|_| std::io::Error::other("sealing failed"))?;
+        body.extend_from_slice(&tag);
+        let mut out = Vec::with_capacity(self.frame.len() + 1 + body.len().div_ceil(3) * 4);
+        out.extend_from_slice(self.frame.as_bytes());
+        out.push(b':');
+        out.extend_from_slice(URL_SAFE_NO_PAD.encode(&body).as_bytes());
+        Ok(out)
+    }
+
+    fn open(&self, key: &[u8; 32], aad: &[u8], blob: &[u8]) -> std::io::Result<Vec<u8>> {
+        let bad = || seal_error("sealed blob is malformed");
+        let rest = blob.strip_prefix(SEAL_FRAME.as_bytes()).ok_or_else(bad)?;
+        let sep = rest.iter().position(|&b| b == b':').ok_or_else(bad)?;
+        let mut body = URL_SAFE_NO_PAD
+            .decode(&rest[sep + 1..])
+            .map_err(|_| bad())?;
+        if body.len() < SEAL_NONCE_LEN + SEAL_TAG_LEN {
+            return Err(bad());
+        }
+        let (nonce, tail) = body.split_at_mut(SEAL_NONCE_LEN);
+        let nonce = XNonce::from_slice(nonce).to_owned();
+        let (ct, tag) = tail.split_at_mut(tail.len() - SEAL_TAG_LEN);
+        let tag = Tag::from_slice(tag).to_owned();
+        XChaCha20Poly1305::new(Key::from_slice(&key[..]))
+            .decrypt_in_place_detached(&nonce, aad, ct, &tag)
+            .map_err(|_| {
+                seal_error("sealed data failed to open (wrong key or wrong associated data)")
+            })?;
+        let len = body.len() - SEAL_NONCE_LEN - SEAL_TAG_LEN;
+        body.drain(..SEAL_NONCE_LEN);
+        body.truncate(len);
+        Ok(body)
+    }
+
+    /// Seal one transcript line for session `id`. The result never starts with `{`, which is how a
+    /// reader tells a sealed line from a plaintext one.
+    pub(crate) fn seal_line(&self, id: &str, line: &[u8]) -> std::io::Result<Vec<u8>> {
+        self.seal(&self.transcript, &self.line_aad(id), line)
+    }
+
+    /// Open one sealed transcript line for session `id`.
+    pub(crate) fn open_line(&self, id: &str, line: &[u8]) -> std::io::Result<Vec<u8>> {
+        self.open(&self.transcript, &self.line_aad(id), line)
+    }
+
+    /// Seal the whole `.listings.json` cache.
+    pub(crate) fn seal_listing(&self, bytes: &[u8]) -> std::io::Result<Vec<u8>> {
+        self.seal(&self.listing, self.tenant.as_bytes(), bytes)
+    }
+
+    /// Open the whole `.listings.json` cache.
+    pub(crate) fn open_listing(&self, bytes: &[u8]) -> std::io::Result<Vec<u8>> {
+        self.open(&self.listing, self.tenant.as_bytes(), bytes)
+    }
+
+    /// Seal one memory document (durable or `/session`) as a whole file.
+    pub fn seal_doc(&self, bytes: &[u8]) -> std::io::Result<Vec<u8>> {
+        self.seal(&self.memory, self.tenant.as_bytes(), bytes)
+    }
+
+    /// Open one memory document. Content that isn't framed as sealed is returned verbatim, so a store
+    /// that predates sealing still reads.
+    pub fn open_doc(&self, bytes: &[u8]) -> std::io::Result<Vec<u8>> {
+        if !bytes.starts_with(SEAL_FRAME.as_bytes()) {
+            return Ok(bytes.to_vec());
+        }
+        self.open(&self.memory, self.tenant.as_bytes(), bytes)
+    }
+}
+
+// ---- Layout and repo options --------------------------------------------------------------------
+
+/// Which on-disk shape a [`SessionRepo`]'s sessions take.
+#[derive(Clone, Default)]
+pub enum Layout {
+    /// One `<created_at>_<id>.jsonl` per session. The default, and what every local invocation uses.
+    #[default]
+    File,
+    /// One `<id>/` directory of epoch segments per session, optionally sealed per tenant.
+    Segmented { codec: Option<Arc<TenantCodec>> },
+}
+
+impl Layout {
+    fn codec(&self) -> Option<&Arc<TenantCodec>> {
+        match self {
+            Layout::File => None,
+            Layout::Segmented { codec } => codec.as_ref(),
+        }
+    }
+
+    fn is_segmented(&self) -> bool {
+        matches!(self, Layout::Segmented { .. })
+    }
+}
+
+/// How a [`SessionRepo`] addresses and stores its sessions.
+#[derive(Clone, Default)]
+pub struct RepoOptions {
+    pub layout: Layout,
+    /// Prefixes every id this repo *mints* (a fork, a clone, an archive) with `<prefix>.`, so a
+    /// derived session stays addressable on the shard its parent lives on. Ids the caller supplies
+    /// are never rewritten.
+    pub id_prefix: Option<String>,
+}
+
+/// Returned by every write once another owner has taken the session over — see [`Log`]'s module
+/// comment. Not a transient failure: the store is poisoned and every later write fails too.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Superseded;
+
+impl std::fmt::Display for Superseded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("session was taken over by another writer")
+    }
+}
+
+impl std::error::Error for Superseded {}
+
+fn superseded_error() -> std::io::Error {
+    std::io::Error::other(Superseded)
+}
+
+/// A sealed line or file that would not open. Distinct from an ordinary read failure, because it
+/// does not mean "the read stopped early" — it means these bytes are not what they claim to be, and
+/// a reader that shrugged and carried on would present a *truncated* session as a complete one, which
+/// the next write would then durably overwrite.
+#[derive(Debug, Clone, Copy)]
+struct SealFailure(&'static str);
+
+impl std::fmt::Display for SealFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+impl std::error::Error for SealFailure {}
+
+fn seal_error(what: &'static str) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, SealFailure(what))
+}
+
+fn is_seal_failure(e: &std::io::Error) -> bool {
+    e.get_ref().is_some_and(|inner| inner.is::<SealFailure>())
+}
+
+/// Whether an error is the takeover signal rather than an I/O failure — what a service-mode owner
+/// checks to decide "end this session" instead of "retry".
+pub fn is_superseded(e: &std::io::Error) -> bool {
+    e.get_ref().is_some_and(|inner| inner.is::<Superseded>())
+}
+
+// ---- Segment metadata ---------------------------------------------------------------------------
+
+/// A segment's first line: which epoch it is, how far each predecessor was consumed before this one
+/// was created, and whether its own content is a full rewrite.
+///
+/// The seal map carries **every** seal since the last base, not just the immediate predecessor's, so
+/// a reader that starts at that base can bound every segment between without walking headers it may
+/// no longer be able to open.
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "type", rename = "segment")]
+struct SegmentHeader {
+    epoch: u64,
+    /// `epoch → byte offset`, as decimal-string keys so the map round-trips through JSON.
+    sealed: BTreeMap<String, u64>,
+    base: bool,
+}
+
+impl SegmentHeader {
+    fn seals(&self) -> BTreeMap<u64, u64> {
+        self.sealed
+            .iter()
+            .filter_map(|(k, v)| k.parse().ok().map(|k| (k, *v)))
+            .collect()
+    }
+
+    fn line(epoch: u64, seals: &BTreeMap<u64, u64>, base: bool) -> std::io::Result<Vec<u8>> {
+        let header = SegmentHeader {
+            epoch,
+            sealed: seals.iter().map(|(k, v)| (k.to_string(), *v)).collect(),
+            base,
+        };
+        let mut out = serde_json::to_vec(&header).map_err(std::io::Error::other)?;
+        out.push(b'\n');
+        Ok(out)
+    }
+}
+
+/// One segment as the directory reports it, before anything is read from it.
+struct SegmentStat {
+    epoch: u64,
+    path: PathBuf,
+    len: u64,
+    mtime_ns: u128,
+}
+
+/// Every segment in `dir`, oldest first. A directory with none counts as no session at all.
+fn scan_segments(dir: &Path) -> std::io::Result<Vec<SegmentStat>> {
+    let entries = match fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(epoch) = name.to_str().and_then(segment_epoch) else {
+            continue;
+        };
+        let Ok(meta) = entry.metadata() else { continue };
+        if !meta.is_file() {
+            continue;
+        }
+        let mtime_ns = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        out.push(SegmentStat {
+            epoch,
+            path: dir.join(name),
+            len: meta.len(),
+            mtime_ns,
+        });
+    }
+    out.sort_by_key(|s| s.epoch);
+    Ok(out)
+}
+
+/// Whether `dir` holds a session at all. Fast path: `000001.jsonl` is created with O_EXCL before
+/// anything else and is never deleted (see [`SegLog::prune`]), so its presence answers the question
+/// without a directory read in every ordinary case.
+fn segment_dir_is_session(dir: &Path) -> bool {
+    if dir.join(segment_name(1)).is_file() {
+        return true;
+    }
+    scan_segments(dir).is_ok_and(|s| !s.is_empty())
+}
+
+/// Read a segment's header line off an already-open descriptor, leaving the cursor just past it.
+/// A torn or unparseable header means the segment counts as empty and sealed at 0 — the crash-mid-
+/// create case, where the file exists but says nothing trustworthy about itself.
+fn read_segment_header(file: &mut File) -> std::io::Result<Option<(SegmentHeader, u64)>> {
+    use std::io::Seek;
+    file.seek(std::io::SeekFrom::Start(0))?;
+    let mut reader = BufReader::new(&mut *file);
+    let mut raw = Vec::new();
+    let mut limit = None;
+    let Some(read) = read_capped_line_limited(&mut reader, &mut raw, &mut limit)? else {
+        return Ok(None);
+    };
+    if read.oversized || !read.terminated {
+        return Ok(None);
+    }
+    Ok(serde_json::from_slice::<SegmentHeader>(&raw)
+        .ok()
+        .map(|h| (h, read.consumed)))
+}
+
+/// Whether a base segment's trailer is on disk — the only thing that makes it a valid replay start.
+/// A raw byte scan of the line, not a parse: nothing here needs to decode content, and a base can be
+/// the whole transcript.
+fn segment_has_trailer(file: &mut File, start: u64, end: u64) -> std::io::Result<bool> {
+    use std::io::Seek;
+    if end <= start {
+        return Ok(false);
+    }
+    file.seek(std::io::SeekFrom::Start(start))?;
+    let mut reader = BufReader::new(file.take(end - start));
+    let mut raw = Vec::new();
+    let mut limit = None;
+    while let Some(read) = read_capped_line_limited(&mut reader, &mut raw, &mut limit)? {
+        if read.terminated && !read.oversized && raw == BASE_TRAILER {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+// ---- The log seam -------------------------------------------------------------------------------
+
+/// Where a [`SessionStore`]'s entries live. Replaces the bare `PathBuf` the store used to hold, so
+/// every write goes through one place and the tree logic above never learns which layout it is on.
+enum Log {
+    File { path: PathBuf, read_only: bool },
+    Segmented(Box<SegLog>),
+}
+
+/// The writer state for one segmented session: what this process observed when it opened, and what it
+/// has created since.
+struct SegLog {
+    /// `<repo>/<id>`.
+    dir: PathBuf,
+    id: String,
+    codec: Option<Arc<TenantCodec>>,
+    read_only: bool,
+    /// The newest segment at open, and how many of its bytes this process consumed. The pair is the
+    /// fence: the first write refuses unless the file is still exactly `consumed` bytes long.
+    newest: u64,
+    consumed: u64,
+    /// Seals to carry into the next header — every seal since the last base.
+    seals: BTreeMap<u64, u64>,
+    /// The newest complete base. Its predecessors become deletable the moment a newer base lands.
+    base: Option<u64>,
+    /// Segments above the last base. Past [`CONSOLIDATION_K`], the next persist writes a base.
+    since_base: usize,
+    /// The segment this store appends to, once it has created one, and its current length.
+    target: Option<u64>,
+    target_len: u64,
+    /// Set after an append fails: the target is sealed at its last good offset and the next write
+    /// rolls, without re-checking a predecessor this process already owns.
+    force_roll: bool,
+    superseded: bool,
+}
+
+impl Log {
+    /// The path this session is addressed by: the `.jsonl` file, or the session directory.
+    fn path(&self) -> &Path {
+        match self {
+            Log::File { path, .. } => path,
+            Log::Segmented(s) => &s.dir,
+        }
+    }
+
+    /// Where this session's `/session` working memory lives.
+    ///
+    /// For the segmented layout that is `<id>/memory`, *inside* the session directory — not a
+    /// sibling derived with `with_extension`, which would turn a dotted id (`<shard>.<opaque>`, what
+    /// service mode mints) into `<shard>.memory` and hand every session on a shard the same
+    /// directory.
+    fn memory_dir(&self) -> PathBuf {
+        match self {
+            Log::File { path, .. } => path.with_extension("memory"),
+            Log::Segmented(s) => s.dir.join("memory"),
+        }
+    }
+
+    fn read_only(&self) -> bool {
+        match self {
+            Log::File { read_only, .. } => *read_only,
+            Log::Segmented(s) => s.read_only,
+        }
+    }
+
+    fn superseded(&self) -> bool {
+        match self {
+            // There is no takeover to lose: a single-file session has no epoch to be outbid for.
+            Log::File { .. } => false,
+            Log::Segmented(s) => s.superseded,
+        }
+    }
+
+    /// Create a new session, writing `first_line` (the header entry) as its first content.
+    fn create(
+        path: PathBuf,
+        id: &str,
+        layout: &Layout,
+        first_line: &[u8],
+    ) -> std::io::Result<Self> {
+        match layout {
+            Layout::File => {
+                Self::create_file(&path, first_line)?;
+                Ok(Log::File {
+                    path,
+                    read_only: false,
+                })
+            }
+            Layout::Segmented { codec } => Ok(Log::Segmented(Box::new(SegLog::create(
+                path,
+                id,
+                codec.clone(),
+                first_line,
+            )?))),
+        }
+    }
+
+    /// The single-file create, unchanged: `create_new` with mode 0600, initializing a zero-byte file
+    /// in place rather than failing, then fsync of the file and its directory.
+    fn create_file(path: &Path, first_line: &[u8]) -> std::io::Result<()> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let open = |truncate_existing: bool| -> std::io::Result<File> {
+            let mut opts = OpenOptions::new();
+            opts.write(true);
+            if truncate_existing {
+                opts.truncate(true);
+            } else {
+                opts.create_new(true);
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(0o600);
+            }
+            opts.open(path)
+        };
+        let mut f = match open(false) {
+            Ok(f) => f,
+            // The atomic fast path failed because *something* is already there — only initialize in
+            // place if it's genuinely empty; otherwise propagate the original error rather than risk
+            // clobbering real data on a race.
+            Err(e)
+                if e.kind() == std::io::ErrorKind::AlreadyExists
+                    && fs::metadata(path).is_ok_and(|m| m.len() == 0) =>
+            {
+                open(true)?
+            }
+            Err(e) => return Err(e),
+        };
+        f.write_all(first_line)?;
+        // Durability: get the header bytes (and the new file's directory entry) onto stable storage
+        // before returning, so a crash right after `create` can't lose the session entirely.
+        f.flush()?;
+        f.sync_all()?;
+        fsync_dir(path)
+    }
+
+    /// Open an existing session for reading, and (unless `read_only`) for writing.
+    fn open(
+        path: PathBuf,
+        id_hint: Option<&str>,
+        layout: &Layout,
+        read_only: bool,
+    ) -> std::io::Result<Self> {
+        // `is_dir` is the layout probe: it lets `main.rs`, `fork_from_path` and export keep handing
+        // this a bare path without knowing which shape it names.
+        if layout.is_segmented() || path.is_dir() {
+            let id = id_hint
+                .map(str::to_string)
+                .or_else(|| path.file_name()?.to_str().map(str::to_string))
+                .unwrap_or_default();
+            let seg = SegLog::open(path, id, layout.codec().cloned(), read_only)?;
+            Ok(Log::Segmented(Box::new(seg)))
+        } else {
+            // A missing file must surface as `NotFound` here, exactly as `File::open` used to.
+            drop(File::open(&path)?);
+            Ok(Log::File { path, read_only })
+        }
+    }
+
+    /// The effective view, line by line — the same contract as [`read_capped_line`]: `Ok(None)` at the
+    /// end, `Ok(Some(oversized))` per line, the bytes in `buf`.
+    fn lines(&self) -> std::io::Result<LogReader> {
+        match self {
+            Log::File { path, .. } => Ok(LogReader::File(BufReader::new(File::open(path)?))),
+            Log::Segmented(s) => Ok(LogReader::Seg(s.open_reader()?)),
+        }
+    }
+
+    /// A reader over a session nobody has opened a [`Log`] for — the listing scan, which only ever
+    /// reads and would otherwise pay for a store's worth of setup per session.
+    fn reader_at(path: &Path, layout: &Layout) -> std::io::Result<LogReader> {
+        match layout {
+            Layout::File => Ok(LogReader::File(BufReader::new(File::open(path)?))),
+            Layout::Segmented { codec } => {
+                let id = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let seg = SegLog::open(path.to_path_buf(), id, codec.clone(), true)?;
+                Ok(LogReader::Seg(seg.open_reader()?))
+            }
+        }
+    }
+
+    /// Adopt the writer state a just-finished read discovered: which segment is newest, how far it
+    /// was consumed (the other half of the fence), which seals carry forward, and where the last base
+    /// is. Nothing is written before this runs.
+    fn observe(&mut self, reader: &LogReader) {
+        if let (Log::Segmented(s), LogReader::Seg(r)) = (self, reader) {
+            s.newest = r.newest;
+            s.consumed = r.consumed;
+            s.seals = r.seals.clone();
+            s.base = r.base;
+            s.since_base = r.since_base;
+        }
+    }
+
+    fn guard_writable(&self) -> std::io::Result<()> {
+        if self.read_only() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "session was opened read-only",
+            ));
+        }
+        if self.superseded() {
+            return Err(superseded_error());
+        }
+        Ok(())
+    }
+
+    /// Append already-serialized entry lines. O(bytes written), never O(transcript).
+    fn append(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        self.guard_writable()?;
+        match self {
+            Log::File { path, .. } => {
+                let mut f = OpenOptions::new().append(true).open(path)?;
+                f.write_all(bytes)?;
+                // `flush` only pushes past our buffer into the OS; `sync_all` forces the bytes to
+                // disk, which is what the module's crash-safety claim actually requires. The parent
+                // dir is unchanged on an append (same inode, same dentry), so no directory fsync.
+                f.flush()?;
+                f.sync_all()
+            }
+            Log::Segmented(s) => s.append(bytes),
+        }
+    }
+
+    /// Replace the whole log with `bytes`. Atomic: a reader sees the old content or the new one.
+    fn replace_all(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        self.guard_writable()?;
+        match self {
+            Log::File { path, .. } => {
+                let tmp = path.with_extension("jsonl.tmp");
+                let mut f = create_private(&tmp)?;
+                let write = (|| -> std::io::Result<()> {
+                    f.write_all(bytes)?;
+                    // Sync the temp file's contents, then rename (atomic), then fsync the parent
+                    // directory so the rename itself is durable: without the dir fsync a crash could
+                    // surface the old file — or, in the window between, neither — even though the new
+                    // bytes had reached disk.
+                    f.flush()?;
+                    f.sync_all()?;
+                    fs::rename(&tmp, &*path)?;
+                    fsync_dir(path)
+                })();
+                if write.is_err() {
+                    // A genuine in-process error (disk full, a permission error mid-write), not a hard
+                    // crash: the process is still alive and can just remove the temp file.
+                    let _ = fs::remove_file(&tmp);
+                }
+                write
+            }
+            Log::Segmented(s) => {
+                // A base's content is transcript, so it is sealed line by line exactly like an
+                // append. Only the header and the trailer stay plaintext.
+                let (codec, id) = (s.codec.clone(), s.id.clone());
+                s.write_base(|f| {
+                    let mut out = Vec::with_capacity(bytes.len() + 64);
+                    append_sealed(&mut out, codec.as_deref(), &id, bytes)?;
+                    f.write_all(&out)
+                })
+            }
+        }
+    }
+}
+
+impl SegLog {
+    /// O_EXCL-create `000001.jsonl` — **the fence**. Two processes racing to create the same id both
+    /// reach this; exactly one gets the file, the other gets `AlreadyExists` and never writes a byte.
+    ///
+    /// Epoch 1 is written as a complete base (header, the session header entry, trailer), so a replay
+    /// always has a base to start from and `replace_all` has an append target to roll off.
+    fn create(
+        dir: PathBuf,
+        id: &str,
+        codec: Option<Arc<TenantCodec>>,
+        first_line: &[u8],
+    ) -> std::io::Result<Self> {
+        // Idempotent, so the lock file (and a retried create) can live alongside the segments.
+        fs::create_dir_all(&dir)?;
+        if segment_dir_is_session(&dir) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!("session {id} already exists"),
+            ));
+        }
+        let path = dir.join(segment_name(1));
+        let mut opts = OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut f = opts.open(&path)?;
+        let mut buf = SegmentHeader::line(1, &BTreeMap::new(), true)?;
+        append_sealed(&mut buf, codec.as_deref(), id, first_line)?;
+        buf.extend_from_slice(BASE_TRAILER);
+        buf.push(b'\n');
+        f.write_all(&buf)?;
+        f.flush()?;
+        f.sync_all()?;
+        // The file, its directory, and the repo directory the new session directory appeared in.
+        fsync_dir(&path)?;
+        fsync_dir(&dir)?;
+        Ok(Self {
+            dir,
+            id: id.to_string(),
+            codec,
+            read_only: false,
+            newest: 1,
+            consumed: buf.len() as u64,
+            seals: BTreeMap::new(),
+            base: Some(1),
+            since_base: 0,
+            target: Some(1),
+            target_len: buf.len() as u64,
+            force_roll: false,
+            superseded: false,
+        })
+    }
+
+    fn open(
+        dir: PathBuf,
+        id: String,
+        codec: Option<Arc<TenantCodec>>,
+        read_only: bool,
+    ) -> std::io::Result<Self> {
+        let segments = scan_segments(&dir)?;
+        if segments.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("no session segments in {}", dir.display()),
+            ));
+        }
+        Ok(Self {
+            dir,
+            id,
+            codec,
+            read_only,
+            // Filled in for real by `Log::observe` once the caller's replay says how far it got; these
+            // are the pre-read defaults, and nothing writes before a read.
+            newest: segments.last().map(|s| s.epoch).unwrap_or(1),
+            consumed: segments.last().map(|s| s.len).unwrap_or(0),
+            seals: BTreeMap::new(),
+            base: None,
+            since_base: segments.len(),
+            target: None,
+            target_len: 0,
+            force_roll: false,
+            superseded: false,
+        })
+    }
+
+    fn poison(&mut self) -> std::io::Error {
+        self.superseded = true;
+        superseded_error()
+    }
+
+    /// Build the effective view: open every segment up front, fold the seals, find the last complete
+    /// base, and hand back a reader bounded to each segment's sealed range.
+    fn open_reader(&self) -> std::io::Result<SegReader> {
+        let mut last: Option<std::io::Error> = None;
+        for _ in 0..SEG_READ_RETRIES {
+            match self.try_open_reader() {
+                Ok(r) => return Ok(r),
+                // The segment set moved under us — a consolidation unlinked an older segment, or an
+                // NFS handle went stale. Rescan and read it again from scratch.
+                Err(e) if is_transient_read_error(&e) => last = Some(e),
+                Err(e) => return Err(e),
+            }
+        }
+        Err(last.unwrap_or_else(|| {
+            std::io::Error::other(format!(
+                "session {} kept changing while being read",
+                self.dir.display()
+            ))
+        }))
+    }
+
+    fn try_open_reader(&self) -> std::io::Result<SegReader> {
+        let stats = scan_segments(&self.dir)?;
+        if stats.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("no session segments in {}", self.dir.display()),
+            ));
+        }
+        // Every descriptor up front: once open, an unlink underneath us is harmless on POSIX.
+        struct Opened {
+            epoch: u64,
+            file: File,
+            len: u64,
+            header: Option<SegmentHeader>,
+            header_len: u64,
+        }
+        let mut opened = Vec::with_capacity(stats.len());
+        for s in &stats {
+            let mut file = File::open(&s.path)?;
+            let (header, header_len) = match read_segment_header(&mut file)? {
+                Some((h, n)) => (Some(h), n),
+                // Torn or missing header: the segment counts as empty, sealed at 0.
+                None => (None, s.len),
+            };
+            opened.push(Opened {
+                epoch: s.epoch,
+                file,
+                len: s.len,
+                header,
+                header_len,
+            });
+        }
+
+        // Every seal any header declares; a newer header wins, since it saw more.
+        let mut seals: BTreeMap<u64, u64> = BTreeMap::new();
+        for o in &opened {
+            if let Some(h) = &o.header {
+                seals.extend(h.seals());
+            }
+        }
+
+        // The start: the newest base whose trailer actually landed, else the oldest segment present.
+        let mut start = opened.first().map(|o| o.epoch).unwrap_or(1);
+        let mut base = None;
+        for o in opened.iter_mut().rev() {
+            let Some(h) = &o.header else { continue };
+            if !h.base {
+                continue;
+            }
+            let end = seals.get(&o.epoch).copied().unwrap_or(o.len).min(o.len);
+            if !segment_has_trailer(&mut o.file, o.header_len, end)? {
+                continue;
+            }
+            base = Some(o.epoch);
+            start = o.epoch;
+            break;
+        }
+
+        let newest = opened.last().map(|o| o.epoch).unwrap_or(1);
+        let newest_len = opened.last().map(|o| o.len).unwrap_or(0);
+        let since_base = opened.iter().filter(|o| o.epoch > start).count();
+        // What the next header carries forward: every seal recorded above the starting base. Seals
+        // for segments the view no longer reaches are dropped — that is what keeps the header bounded.
+        let carry: BTreeMap<u64, u64> = opened
+            .iter()
+            .filter(|o| o.epoch > start)
+            .filter_map(|o| o.header.as_ref())
+            .flat_map(|h| h.seals())
+            .collect();
+
+        let mut segs = Vec::with_capacity(opened.len());
+        for o in opened {
+            if o.epoch < start {
+                continue;
+            }
+            // A base newer than the start is one whose trailer never landed — a crash mid-rewrite.
+            // Its content is a partial replacement of the whole transcript and must never be replayed;
+            // its header's seals still count, and were folded in above.
+            let is_torn_base = o.header.as_ref().is_some_and(|h| h.base) && o.epoch != start;
+            if o.header.is_none() || is_torn_base {
+                continue;
+            }
+            let end = seals.get(&o.epoch).copied().unwrap_or(o.len).min(o.len);
+            if end <= o.header_len {
+                continue;
+            }
+            let mut file = o.file;
+            use std::io::Seek;
+            file.seek(std::io::SeekFrom::Start(o.header_len))?;
+            segs.push(SegOpen {
+                reader: BufReader::new(file),
+                remaining: Some(end - o.header_len),
+            });
+        }
+
+        Ok(SegReader {
+            segs,
+            idx: 0,
+            codec: self.codec.clone(),
+            id: self.id.clone(),
+            newest,
+            consumed: newest_len,
+            seals: carry,
+            base,
+            since_base,
+        })
+    }
+
+    /// The segment this store appends to, creating it if this is its first write.
+    ///
+    /// Creating it is the takeover: the predecessor must still be exactly as long as this process
+    /// read it, and the new epoch must not already exist. Either check failing means another owner
+    /// got there first.
+    fn ensure_target(&mut self) -> std::io::Result<PathBuf> {
+        if let Some(epoch) = self.target {
+            return Ok(self.dir.join(segment_name(epoch)));
+        }
+        let predecessor = self.dir.join(segment_name(self.newest));
+        if !self.force_roll {
+            let len = fs::metadata(&predecessor).map(|m| m.len()).unwrap_or(0);
+            if len != self.consumed {
+                return Err(self.poison());
+            }
+        }
+        let mut seals = std::mem::take(&mut self.seals);
+        seals.insert(self.newest, self.consumed);
+        let epoch = self.newest + 1;
+        let path = self.dir.join(segment_name(epoch));
+        let mut opts = OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut f = match opts.open(&path) {
+            Ok(f) => f,
+            // Someone else already claimed this epoch. That is the whole fence: they are the owner
+            // now, and this store never writes again.
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                self.seals = seals;
+                return Err(self.poison());
+            }
+            Err(e) => {
+                self.seals = seals;
+                return Err(e);
+            }
+        };
+        let header = SegmentHeader::line(epoch, &seals, false)?;
+        let written = (|| -> std::io::Result<()> {
+            f.write_all(&header)?;
+            f.flush()?;
+            f.sync_all()?;
+            fsync_dir(&path)
+        })();
+        self.seals = seals;
+        if let Err(e) = written {
+            // The epoch is ours but its header never landed, so a reader counts it as empty. Step
+            // over it on the next attempt rather than retrying a name that now exists (which would
+            // read as a takeover and poison a store that is in fact still the rightful owner).
+            self.newest = epoch;
+            self.consumed = 0;
+            self.force_roll = true;
+            self.since_base += 1;
+            return Err(e);
+        }
+        self.target = Some(epoch);
+        self.target_len = header.len() as u64;
+        self.since_base += 1;
+        self.force_roll = false;
+        Ok(path)
+    }
+
+    fn consolidation_due(&self) -> bool {
+        self.since_base > CONSOLIDATION_K
+    }
+
+    fn append(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        // Past the segment budget, the next persist writes a base instead of rolling yet another
+        // segment — one base replaces the whole chain and resets the count.
+        if self.consolidation_due() {
+            self.consolidate()?;
+        }
+        let path = self.ensure_target()?;
+        let mut buf = Vec::with_capacity(bytes.len() + 64);
+        append_sealed(&mut buf, self.codec.as_deref(), &self.id, bytes)?;
+        let before = self.target_len;
+        let write = (|| -> std::io::Result<()> {
+            let mut f = OpenOptions::new().append(true).open(&path)?;
+            f.write_all(&buf)?;
+            f.flush()?;
+            f.sync_all()
+        })();
+        match write {
+            Ok(()) => {
+                self.target_len += buf.len() as u64;
+                Ok(())
+            }
+            Err(e) => {
+                // Seal at the last offset known good and roll on the next write, so one ENOSPC can't
+                // brick the session with a torn line in the middle of a segment nobody can bound.
+                if let Some(epoch) = self.target.take() {
+                    self.seals.insert(epoch, before);
+                    self.newest = epoch;
+                    self.consumed = before;
+                    self.force_roll = true;
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// Write a new base segment, whose content `fill` produces, and retire what it replaces.
+    fn write_base(
+        &mut self,
+        fill: impl FnOnce(&mut File) -> std::io::Result<()>,
+    ) -> std::io::Result<()> {
+        // A base supersedes whatever this process was appending to, so seal that too.
+        let (pred, pred_len) = match self.target {
+            Some(epoch) => (epoch, self.target_len),
+            None => {
+                if !self.force_roll {
+                    let len = fs::metadata(self.dir.join(segment_name(self.newest)))
+                        .map(|m| m.len())
+                        .unwrap_or(0);
+                    if len != self.consumed {
+                        return Err(self.poison());
+                    }
+                }
+                (self.newest, self.consumed)
+            }
+        };
+        let mut seals = std::mem::take(&mut self.seals);
+        seals.insert(pred, pred_len);
+        let epoch = pred + 1;
+        let path = self.dir.join(segment_name(epoch));
+        let mut opts = OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut f = match opts.open(&path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                self.seals = seals;
+                return Err(self.poison());
+            }
+            Err(e) => {
+                self.seals = seals;
+                return Err(e);
+            }
+        };
+        let written = (|| -> std::io::Result<u64> {
+            let header = SegmentHeader::line(epoch, &seals, true)?;
+            f.write_all(&header)?;
+            fill(&mut f)?;
+            // The trailer is what makes this base count. Until it is on disk a reader ignores this
+            // segment's content entirely and replays from the previous base.
+            f.write_all(BASE_TRAILER)?;
+            f.write_all(b"\n")?;
+            f.flush()?;
+            f.sync_all()?;
+            f.metadata().map(|m| m.len())
+        })();
+        let len = match written {
+            Ok(len) => len,
+            Err(e) => {
+                // Nothing committed: the trailer never landed, so a reader ignores this segment's
+                // content entirely and replays from the previous base. It is ours, though, so the
+                // next attempt must step *over* it rather than retry the same name — retrying would
+                // hit `EEXIST` against our own debris and read as a takeover.
+                self.seals = seals;
+                self.target = None;
+                self.newest = epoch;
+                self.consumed = 0;
+                self.since_base += 1;
+                self.force_roll = true;
+                return Err(e);
+            }
+        };
+        fsync_dir(&path)?;
+        // Everything below the base this one supersedes. That base itself survives, so a reader that
+        // already started there keeps a complete view.
+        self.prune(self.base);
+        self.base = Some(epoch);
+        self.seals = BTreeMap::new();
+        self.target = Some(epoch);
+        self.target_len = len;
+        self.newest = epoch;
+        self.consumed = len;
+        self.since_base = 0;
+        self.force_roll = false;
+        Ok(())
+    }
+
+    /// Rewrite the effective view into a fresh base, then retire the segments it replaced.
+    ///
+    /// The content is a **byte copy of the current view**, not a re-serialization of the in-memory
+    /// tree: a base must reproduce the log exactly, including the model/title/label/leaf records that
+    /// live only on disk, and copying is the only way to be sure it does.
+    fn consolidate(&mut self) -> std::io::Result<()> {
+        let mut reader = self.open_reader()?;
+        let codec = self.codec.clone();
+        let id = self.id.clone();
+        self.write_base(move |f| {
+            let mut line = Vec::new();
+            let mut out = Vec::new();
+            loop {
+                match reader.next_line(&mut line)? {
+                    None => break,
+                    Some(true) => continue,
+                    Some(false) => {}
+                }
+                out.clear();
+                append_sealed(&mut out, codec.as_deref(), &id, &line)?;
+                f.write_all(&out)?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Delete segments older than `floor` — the base a new base just superseded. Nothing a live
+    /// reader could still be starting from is ever removed, and epoch 1 stays forever: it is the
+    /// O_EXCL fence that says this session exists at all.
+    fn prune(&self, floor: Option<u64>) {
+        let Some(floor) = floor else { return };
+        let Ok(segments) = scan_segments(&self.dir) else {
+            return;
+        };
+        for s in segments {
+            if s.epoch > 1 && s.epoch < floor {
+                let _ = fs::remove_file(&s.path);
+            }
+        }
+    }
+}
+
+/// Serialize `bytes` (one or more `\n`-terminated entry lines) into `out`, sealing each line when a
+/// codec is present. Without one this is a single `extend_from_slice` — the unsealed path costs
+/// nothing.
+fn append_sealed(
+    out: &mut Vec<u8>,
+    codec: Option<&TenantCodec>,
+    id: &str,
+    bytes: &[u8],
+) -> std::io::Result<()> {
+    let Some(codec) = codec else {
+        out.extend_from_slice(bytes);
+        if !bytes.is_empty() && !bytes.ends_with(b"\n") {
+            out.push(b'\n');
+        }
+        return Ok(());
+    };
+    for line in bytes.split_inclusive(|b| *b == b'\n') {
+        let body = line.strip_suffix(b"\n").unwrap_or(line);
+        if body.is_empty() {
+            continue;
+        }
+        out.extend_from_slice(&codec.seal_line(id, body)?);
+        out.push(b'\n');
+    }
+    Ok(())
+}
+
+// ---- Reading --------------------------------------------------------------------------------
+
+/// One open segment, bounded to the range the effective view reads from it.
+struct SegOpen {
+    reader: BufReader<File>,
+    /// Bytes left in this segment's range.
+    remaining: Option<u64>,
+}
+
+/// The effective view of a segmented session, as a line source.
+struct SegReader {
+    segs: Vec<SegOpen>,
+    idx: usize,
+    codec: Option<Arc<TenantCodec>>,
+    id: String,
+    newest: u64,
+    /// How far the newest segment was consumed — the offset the next header seals it at. It is the
+    /// newest segment's length as the scan observed it, which is also exactly where the bounded read
+    /// stops: bytes a stale writer appends after that point are outside the range and never read, and
+    /// sealing there is what makes them unreachable on every later replay too.
+    consumed: u64,
+    seals: BTreeMap<u64, u64>,
+    base: Option<u64>,
+    since_base: usize,
+}
+
+/// A line source over either layout. `next_line` keeps [`read_capped_line`]'s contract exactly, so the
+/// replay loops above are identical for both.
+enum LogReader {
+    File(BufReader<File>),
+    Seg(SegReader),
+}
+
+impl LogReader {
+    fn next_line(&mut self, buf: &mut Vec<u8>) -> std::io::Result<Option<bool>> {
+        match self {
+            LogReader::File(r) => read_capped_line(r, buf),
+            LogReader::Seg(r) => r.next_line(buf),
+        }
+    }
+}
+
+impl SegReader {
+    fn next_line(&mut self, buf: &mut Vec<u8>) -> std::io::Result<Option<bool>> {
+        loop {
+            let Some(cur) = self.segs.get_mut(self.idx) else {
+                buf.clear();
+                return Ok(None);
+            };
+            // Read straight into the caller's buffer: a plaintext line — the whole unsealed layout,
+            // and every framing line — is then already where it needs to be.
+            let Some(read) = read_capped_line_limited(&mut cur.reader, buf, &mut cur.remaining)?
+            else {
+                self.idx += 1;
+                continue;
+            };
+            if !read.terminated {
+                // A torn final line — a crash mid-append, or a stale writer's bytes past the seal.
+                // Tolerated only here, at the very end of a segment's range; anywhere else the range
+                // would have ended on a newline.
+                self.idx += 1;
+                continue;
+            }
+            if read.oversized {
+                buf.clear();
+                return Ok(Some(true));
+            }
+            // Framing belongs to the log, not the session.
+            if buf.as_slice() == BASE_TRAILER {
+                continue;
+            }
+            // A plaintext line starts with `{`; a sealed one never does. That is the whole test — no
+            // per-store mode to get wrong, and a store written before sealing still reads.
+            let Some(codec) = self.codec.as_ref().filter(|_| buf.first() != Some(&b'{')) else {
+                return Ok(Some(false));
+            };
+            *buf = codec.open_line(&self.id, buf)?;
+            return Ok(Some(false));
+        }
+    }
+}
+
+// ---- Listing stamps --------------------------------------------------------------------------
+
+/// A session's cache-validity stamp. For the single-file layout that is the file's `(size, mtime)`;
+/// for the segmented layout it is the whole directory's — total bytes, newest mtime, newest epoch and
+/// the base epoch — so a roll, an append, a base or a prune all invalidate a cached listing.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+struct Stamp {
+    size: u64,
+    mtime_ns: u128,
+    epoch: u64,
+    base_epoch: u64,
+}
+
+fn log_stamp(path: &Path, segmented: bool) -> Option<Stamp> {
+    if !segmented {
+        let m = fs::metadata(path).ok()?;
+        let mtime = m.modified().ok()?.duration_since(UNIX_EPOCH).ok()?;
+        return Some(Stamp {
+            size: m.len(),
+            mtime_ns: mtime.as_nanos(),
+            epoch: 0,
+            base_epoch: 0,
+        });
+    }
+    let segments = scan_segments(path).ok()?;
+    if segments.is_empty() {
+        return None;
+    }
+    let mut stamp = Stamp::default();
+    for s in &segments {
+        stamp.size = stamp.size.saturating_add(s.len);
+        stamp.mtime_ns = stamp.mtime_ns.max(s.mtime_ns);
+        stamp.epoch = stamp.epoch.max(s.epoch);
+        if let Ok(mut f) = File::open(&s.path)
+            && let Ok(Some((h, _))) = read_segment_header(&mut f)
+            && h.base
+        {
+            stamp.base_epoch = stamp.base_epoch.max(s.epoch);
+        }
+    }
+    Some(stamp)
+}
+
+// ---- The session lock --------------------------------------------------------------------------
+
+/// A held advisory lock on one session. Dropping it closes the descriptor (releasing the lock) and
+/// frees the in-process registration.
+pub struct SessionLock {
+    _file: File,
+    _registration: LockRegistration,
+}
+
+/// "This process already has this session open." Closing *any* descriptor to a POSIX-locked file
+/// drops the lock, so a second open in the same process would quietly release the first one's hold —
+/// this makes the second attempt report "held" instead.
+struct LockRegistration(PathBuf);
+
+impl Drop for LockRegistration {
+    fn drop(&mut self) {
+        held_session_locks()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.0);
+    }
+}
+
+fn held_session_locks() -> &'static Mutex<HashSet<PathBuf>> {
+    static HELD: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+    HELD.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// Take the advisory lock for the session at `session_path` — the session directory for the segmented
+/// layout, the `.jsonl` file otherwise. `Ok(None)` means someone else holds it *right now*.
+///
+/// The lock is **liveness only**: it says a process is alive and working on this session, nothing
+/// more. Correctness comes from the epoch fence, which needs no lock at all — so a lock lost to a
+/// crash, a network partition or a stuck NFS client costs a retry, never history.
+///
+/// Three details that matter on EFS:
+/// - the descriptor is opened **read+write**, because NFS emulates `flock` with POSIX record locks and
+///   those need a writable descriptor;
+/// - after locking, `fstat` on the held descriptor is compared with `stat` of the path, so a directory
+///   renamed into `.trash/` between the open and the lock is caught rather than silently "locked";
+/// - a session is opened **once per process**, because closing *any* descriptor to a POSIX-locked file
+///   drops the lock — a second open in the same process would quietly release the first one's hold.
+pub fn acquire_session_lock(session_path: &Path) -> std::io::Result<Option<SessionLock>> {
+    let lock_path = if session_path.is_dir() {
+        session_path.join("lock")
+    } else {
+        let mut name = session_path.as_os_str().to_os_string();
+        name.push(".lock");
+        PathBuf::from(name)
+    };
+    {
+        let mut held = held_session_locks()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !held.insert(lock_path.clone()) {
+            return Ok(None);
+        }
+    }
+    // Registered from here on, so every path out of this function frees the entry.
+    let registration = LockRegistration(lock_path.clone());
+    for _ in 0..LOCK_RETRIES {
+        let mut opts = OpenOptions::new();
+        opts.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let file = opts.open(&lock_path)?;
+        match file.try_lock() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => return Ok(None),
+            Err(std::fs::TryLockError::Error(e)) => return Err(e),
+        }
+        if same_file(&file, &lock_path)? {
+            return Ok(Some(SessionLock {
+                _file: file,
+                _registration: registration,
+            }));
+        }
+        // The file we locked is no longer the file at that path — the session directory moved (a
+        // delete into `.trash/`) between the open and the lock. Drop it and look again.
+        drop(file);
+    }
+    Ok(None)
+}
+
+/// Whether the open descriptor and `path` still name the same inode.
+fn same_file(file: &File, path: &Path) -> std::io::Result<bool> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let a = file.metadata()?;
+        let Ok(b) = fs::metadata(path) else {
+            return Ok(false);
+        };
+        Ok(a.dev() == b.dev() && a.ino() == b.ino())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (file, path);
+        Ok(true)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4541,7 +6219,7 @@ mod tests {
         // Transcripts carry whatever `read` pulled off disk — never group/world-readable, on a
         // shared host in particular, regardless of the process umask.
         assert_eq!(
-            mode_of(&store.path),
+            mode_of(store.path()),
             0o600,
             "create() must set 0600 atomically"
         );
@@ -4551,14 +6229,14 @@ mod tests {
         session.user("b");
         store.append_new(&session.messages).unwrap();
         assert_eq!(
-            mode_of(&store.path),
+            mode_of(store.path()),
             0o600,
             "append must not loosen permissions"
         );
 
         store.rewrite(&[Message::user("summary")]).unwrap();
         assert_eq!(
-            mode_of(&store.path),
+            mode_of(store.path()),
             0o600,
             "rewrite's temp-file-then-rename must not loosen permissions"
         );
@@ -5113,7 +6791,7 @@ mod tests {
         session.user("second good message");
         store.append_new(&session.messages).unwrap();
 
-        let listed = read_listing(&path, None).unwrap();
+        let listed = read_listing(&path, None, &Layout::File).unwrap();
         assert_eq!(
             listed.message_count, 2,
             "both good messages must be counted, not just the one before the corruption"
@@ -5162,7 +6840,7 @@ mod tests {
         // still succeeds (it's a different filename), but the final `fs::rename(&tmp, &self.path)`
         // must fail — a file can never be renamed onto an existing directory. A genuine in-process
         // error, not a crash, so `rewrite` gets the chance to clean up after itself.
-        let path = store.path.clone();
+        let path = store.path().to_path_buf();
         fs::remove_file(&path).unwrap();
         fs::create_dir(&path).unwrap();
 
@@ -5310,7 +6988,7 @@ mod tests {
 
         // Parse every line and find the two entries of interest, rather than substring-sniffing raw
         // JSON (id ordering across the file isn't guaranteed).
-        let raw = fs::read_to_string(&reopened.path).unwrap();
+        let raw = fs::read_to_string(reopened.path()).unwrap();
         let lines: Vec<Value> = raw
             .lines()
             .filter(|l| !l.trim().is_empty())
@@ -5508,7 +7186,7 @@ mod tests {
             .unwrap();
 
         // Strip the field back out of the on-disk record, exactly as a pre-`todos` build left it.
-        let path = store.path.clone();
+        let path = store.path().to_path_buf();
         let stripped = fs::read_to_string(&path)
             .unwrap()
             .lines()
@@ -5813,7 +7491,7 @@ mod tests {
         );
 
         // Exactly two `Entry::Compaction` provenance records — one per round, independently readable.
-        let raw = fs::read_to_string(&reopened.path).unwrap();
+        let raw = fs::read_to_string(reopened.path()).unwrap();
         let lines: Vec<Value> = raw
             .lines()
             .filter(|l| !l.trim().is_empty())
@@ -5887,7 +7565,7 @@ mod tests {
         assert_eq!(text.as_ref(), "one (rewritten)");
 
         // No `Entry::Compaction` record at all.
-        let raw = fs::read_to_string(&reopened.path).unwrap();
+        let raw = fs::read_to_string(reopened.path()).unwrap();
         let compaction_entries = raw
             .lines()
             .filter(|l| !l.trim().is_empty())
@@ -6736,9 +8414,9 @@ mod tests {
         session.user("hi");
         store.append_new(&session.messages).unwrap();
 
-        let before = std::fs::read(&store.path).unwrap();
+        let before = std::fs::read(store.path()).unwrap();
         store.set_title("Renamed").unwrap();
-        let after = std::fs::read(&store.path).unwrap();
+        let after = std::fs::read(store.path()).unwrap();
 
         assert!(
             after.starts_with(&before),
@@ -6764,7 +8442,7 @@ mod tests {
         let (reopened, _session) = SessionStore::open(path.clone()).unwrap();
         assert_eq!(reopened.meta().title.as_deref(), Some("Second"));
 
-        let listed = read_listing(&path, None).unwrap();
+        let listed = read_listing(&path, None, &Layout::File).unwrap();
         assert_eq!(listed.title.as_deref(), Some("Second"));
     }
 
@@ -6781,7 +8459,7 @@ mod tests {
 
         let (reopened, _session) = SessionStore::open(path.clone()).unwrap();
         assert_eq!(reopened.meta().title.as_deref(), Some("hello world again"));
-        let listed = read_listing(&path, None).unwrap();
+        let listed = read_listing(&path, None, &Layout::File).unwrap();
         assert_eq!(listed.title.as_deref(), Some("hello world again"));
     }
 
@@ -6800,7 +8478,7 @@ mod tests {
 
         let (reopened, _session) = SessionStore::open(path.clone()).unwrap();
         assert_eq!(reopened.meta().title, None);
-        let listed = read_listing(&path, None).unwrap();
+        let listed = read_listing(&path, None, &Layout::File).unwrap();
         assert_eq!(listed.title, None);
     }
 
@@ -6835,7 +8513,7 @@ mod tests {
         let repo = SessionRepo::open(dir.path()).unwrap();
         let store = repo.create(SessionMeta::new("/w", "m")).unwrap();
         let id = store.meta().id.clone();
-        let original_path = store.path.clone();
+        let original_path = store.path().to_path_buf();
 
         repo.delete(&id).unwrap();
 
@@ -6917,7 +8595,7 @@ mod tests {
         let repo = SessionRepo::open(dir.path()).unwrap();
         let store = repo.create(SessionMeta::new("/w", "m")).unwrap();
         let id = store.meta().id.clone();
-        let jsonl = store.path.clone();
+        let jsonl = store.path().to_path_buf();
         // Simulate `/session` working memory written during the session — the `<...>.memory/` sibling.
         let mem_dir = jsonl.with_extension("memory");
         fs::create_dir_all(&mem_dir).unwrap();
@@ -6959,7 +8637,7 @@ mod tests {
         let repo = SessionRepo::open(dir.path()).unwrap();
         let store = repo.create(SessionMeta::new("/w", "m")).unwrap();
         let id = store.meta().id.clone();
-        let original_path = store.path.clone();
+        let original_path = store.path().to_path_buf();
 
         repo.delete(&id).unwrap();
         // Something else now occupies the original path (e.g. a new session using a colliding id is
@@ -7643,7 +9321,7 @@ mod tests {
         // The label entry's own id is never returned by any public method — recovered here only by
         // parsing the raw file, which no real client does either (see `tree()`'s own doc comment: it
         // reports the label as the *target* node's `label` field, never as its own addressable entry).
-        let raw = fs::read_to_string(&store.path).unwrap();
+        let raw = fs::read_to_string(store.path()).unwrap();
         let label_entry_id = raw
             .lines()
             .filter(|l| !l.trim().is_empty())
@@ -8272,7 +9950,7 @@ mod tests {
         assert_eq!(store.active_ids().len(), 1);
 
         // `beta`'s content is still physically on disk, even though it's unreachable from the new tip.
-        let raw = fs::read_to_string(&store.path).unwrap();
+        let raw = fs::read_to_string(store.path()).unwrap();
         assert!(
             raw.contains("\"beta\""),
             "off-branch message was deleted:\n{raw}"
@@ -8457,7 +10135,7 @@ mod tests {
         assert_eq!(reopened.meta().branch_summaries, 1);
         assert_eq!(reopened.meta().summarized_branch_messages, 1);
         assert_eq!(restored.messages.len(), 2);
-        let raw = fs::read_to_string(&reopened.path).unwrap();
+        let raw = fs::read_to_string(reopened.path()).unwrap();
         assert!(
             raw.contains("\"beta\""),
             "off-branch message was lost:\n{raw}"
@@ -8468,7 +10146,7 @@ mod tests {
         {
             use std::os::unix::fs::PermissionsExt;
             assert_eq!(
-                fs::metadata(&reopened.path).unwrap().permissions().mode() & 0o777,
+                fs::metadata(reopened.path()).unwrap().permissions().mode() & 0o777,
                 0o600,
                 "switch_active_with_summary's temp-file-then-rename must not loosen permissions"
             );
@@ -8696,7 +10374,7 @@ mod tests {
         assert!(store.active_ids().is_empty());
 
         // No `Leaf` entry appended — the file only ever gained the header line.
-        let raw = fs::read_to_string(&store.path).unwrap();
+        let raw = fs::read_to_string(store.path()).unwrap();
         assert!(!raw.contains("\"leaf\""), "expected no Leaf entry: {raw}");
     }
 
@@ -8962,7 +10640,7 @@ mod tests {
             .unwrap();
         assert_eq!(store.meta().branch_summaries, 2);
 
-        let raw = fs::read_to_string(&store.path).unwrap();
+        let raw = fs::read_to_string(store.path()).unwrap();
         assert!(raw.contains("first recap"));
         assert!(raw.contains("second recap"));
 
@@ -9051,7 +10729,7 @@ mod tests {
         store.rewrite(&[Message::user("summary")]).unwrap();
         assert_eq!(store.active_ids().len(), 1);
 
-        let raw = fs::read_to_string(&store.path).unwrap();
+        let raw = fs::read_to_string(store.path()).unwrap();
         assert!(
             raw.contains("\"c\""),
             "orphaned branch content was deleted:\n{raw}"
@@ -9369,7 +11047,7 @@ mod tests {
         assert!(ok.is_ok(), "an ordinary payload must still be accepted");
 
         let before = store.active_ids().len();
-        let bytes_before = std::fs::metadata(&store.path).unwrap().len();
+        let bytes_before = std::fs::metadata(store.path()).unwrap().len();
 
         let huge = json!({ "v": "x".repeat(MAX_CUSTOM_ENTRY_BYTES + 1) });
         let err = store
@@ -9385,7 +11063,7 @@ mod tests {
             "a refused entry must not occupy a slot on the active chain"
         );
         assert_eq!(
-            std::fs::metadata(&store.path).unwrap().len(),
+            std::fs::metadata(store.path()).unwrap().len(),
             bytes_before,
             "a refused entry must not have reached the file either"
         );
@@ -9596,7 +11274,7 @@ mod tests {
             .unwrap();
         assert_eq!(store.active_ids().len(), 1);
 
-        let raw = fs::read_to_string(&store.path).unwrap();
+        let raw = fs::read_to_string(store.path()).unwrap();
         let lines: Vec<Value> = raw
             .lines()
             .filter(|l| !l.trim().is_empty())
@@ -9798,7 +11476,7 @@ mod tests {
 
         // The materialized message content is unaffected (custom entries contribute nothing to
         // `Session.messages`) — still exactly [summary, "three", "four"].
-        let (_repo2, session) = SessionStore::open(store.path.clone()).unwrap();
+        let (_repo2, session) = SessionStore::open(store.path().to_path_buf()).unwrap();
         assert_eq!(session.messages.len(), 3);
         assert!(
             matches!(&session.messages[1].content[0], ContentBlock::Text { text, .. } if text.as_ref() == "three")
@@ -9806,5 +11484,236 @@ mod tests {
         assert!(
             matches!(&session.messages[2].content[0], ContentBlock::Text { text, .. } if text.as_ref() == "four")
         );
+    }
+
+    // ---- Storage layout internals ---------------------------------------------------------------
+
+    #[test]
+    fn segment_names_round_trip_and_reject_everything_else() {
+        assert_eq!(segment_name(1), "000001.jsonl");
+        assert_eq!(segment_name(1_234_567), "1234567.jsonl");
+        assert_eq!(segment_epoch("000001.jsonl"), Some(1));
+        assert_eq!(segment_epoch("1234567.jsonl"), Some(1_234_567));
+        // Anything that isn't a zero-padded decimal is not a segment — including the names the
+        // listing cache, the lock and a stray temp file take.
+        for name in [
+            "lock",
+            ".listings.json",
+            "1.jsonl",
+            "00001.jsonl",
+            "00000a.jsonl",
+            "000001.jsonl.tmp",
+            "000001",
+            "",
+        ] {
+            assert_eq!(
+                segment_epoch(name),
+                None,
+                "{name} must not parse as a segment"
+            );
+        }
+    }
+
+    #[test]
+    fn a_segment_header_carries_every_seal_since_the_last_base() {
+        let seals: BTreeMap<u64, u64> = [(3, 120), (4, 40)].into_iter().collect();
+        let line = SegmentHeader::line(5, &seals, false).unwrap();
+        assert_eq!(
+            String::from_utf8(line.clone()).unwrap(),
+            "{\"type\":\"segment\",\"epoch\":5,\"sealed\":{\"3\":120,\"4\":40},\"base\":false}\n",
+            "the header is plaintext, stable and first"
+        );
+        let parsed: SegmentHeader = serde_json::from_slice(line.trim_ascii_end()).unwrap();
+        assert_eq!(parsed.epoch, 5);
+        assert!(!parsed.base);
+        assert_eq!(parsed.seals(), seals);
+        // A line that isn't a segment header is not mistaken for one.
+        assert!(serde_json::from_slice::<SegmentHeader>(BASE_TRAILER).is_err());
+    }
+
+    #[test]
+    fn the_codec_binds_a_line_to_its_tenant_and_session() {
+        let codec = TenantCodec::new("tenant-a", &[9u8; 32]);
+        let sealed = codec.seal_line("s1", br#"{"type":"message"}"#).unwrap();
+        assert!(
+            sealed.starts_with(b"e1.") && sealed.contains(&b':'),
+            "framed as e1.<kfp8>:<blob>"
+        );
+        assert_ne!(sealed.first(), Some(&b'{'), "never mistaken for plaintext");
+        assert_eq!(
+            codec.open_line("s1", &sealed).unwrap(),
+            br#"{"type":"message"}"#
+        );
+
+        // Wrong session, wrong tenant, wrong key: all refused, none silently empty.
+        assert!(codec.open_line("s2", &sealed).is_err());
+        assert!(
+            TenantCodec::new("tenant-b", &[9u8; 32])
+                .open_line("s1", &sealed)
+                .is_err()
+        );
+        assert!(
+            TenantCodec::new("tenant-a", &[8u8; 32])
+                .open_line("s1", &sealed)
+                .is_err()
+        );
+        // And a flipped bit in the ciphertext, which is what the tag is for.
+        let mut tampered = sealed.clone();
+        let last = tampered.len() - 1;
+        tampered[last] ^= 0x01;
+        assert!(codec.open_line("s1", &tampered).is_err());
+
+        // The failure is the kind a replay must not walk past.
+        let err = codec.open_line("s2", &sealed).unwrap_err();
+        assert!(is_seal_failure(&err), "a decode failure must be hard");
+    }
+
+    #[test]
+    fn the_codec_separates_its_three_surfaces() {
+        let codec = TenantCodec::new("t", &[3u8; 32]);
+        let line = codec.seal_line("s1", b"payload").unwrap();
+        let listing = codec.seal_listing(b"payload").unwrap();
+        let doc = codec.seal_doc(b"payload").unwrap();
+        // One surface's key never opens another's.
+        assert!(codec.open_listing(&line).is_err());
+        assert!(codec.open_doc(&listing).is_err());
+        assert!(codec.open_line("s1", &doc).is_err());
+        assert_eq!(codec.open_listing(&listing).unwrap(), b"payload");
+        assert_eq!(codec.open_doc(&doc).unwrap(), b"payload");
+        // The nonce is fresh per call, so identical plaintext never seals identically.
+        assert_ne!(codec.seal_doc(b"payload").unwrap(), doc);
+        // Content that was never sealed reads back verbatim, so a store predating sealing still works.
+        assert_eq!(codec.open_doc(b"plain").unwrap(), b"plain");
+    }
+
+    #[test]
+    fn sealing_a_buffer_frames_one_line_at_a_time() {
+        let codec = TenantCodec::new("t", &[1u8; 32]);
+        let mut out = Vec::new();
+        append_sealed(&mut out, Some(&codec), "s1", b"{\"a\":1}\n{\"b\":2}\n").unwrap();
+        let lines: Vec<&[u8]> = out
+            .split(|b| *b == b'\n')
+            .filter(|l| !l.is_empty())
+            .collect();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(codec.open_line("s1", lines[0]).unwrap(), b"{\"a\":1}");
+        assert_eq!(codec.open_line("s1", lines[1]).unwrap(), b"{\"b\":2}");
+
+        // Without a codec it is a straight copy — the unsealed path costs nothing.
+        let mut plain = Vec::new();
+        append_sealed(&mut plain, None, "s1", b"{\"a\":1}\n").unwrap();
+        assert_eq!(plain, b"{\"a\":1}\n");
+    }
+
+    #[test]
+    fn a_bounded_line_read_reports_where_it_stopped() {
+        let data = b"one\ntwo\nthr";
+        let mut reader = std::io::BufReader::new(&data[..]);
+        let mut buf = Vec::new();
+        let mut limit = None;
+
+        let r = read_capped_line_limited(&mut reader, &mut buf, &mut limit)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (buf.as_slice(), r.terminated, r.consumed),
+            (&b"one"[..], true, 4)
+        );
+
+        // A budget cuts the range short, and the truncated line reports itself unterminated.
+        let mut limit = Some(2u64);
+        let r = read_capped_line_limited(&mut reader, &mut buf, &mut limit)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (buf.as_slice(), r.terminated, limit),
+            (&b"tw"[..], false, Some(0))
+        );
+
+        // Reading on past a spent budget is the end of the range, not the end of the file.
+        assert!(
+            read_capped_line_limited(&mut reader, &mut buf, &mut limit)
+                .unwrap()
+                .is_none()
+        );
+
+        // Unbounded again, the reader picks up mid-line exactly where the budget left it.
+        let mut rest = None;
+        let r = read_capped_line_limited(&mut reader, &mut buf, &mut rest)
+            .unwrap()
+            .unwrap();
+        assert_eq!((buf.as_slice(), r.terminated), (&b"o"[..], true));
+
+        // A file that ends without a newline is the torn-write case.
+        let r = read_capped_line_limited(&mut reader, &mut buf, &mut rest)
+            .unwrap()
+            .unwrap();
+        assert_eq!((buf.as_slice(), r.terminated), (&b"thr"[..], false));
+        assert!(
+            read_capped_line_limited(&mut reader, &mut buf, &mut rest)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_stamp_moves_for_every_kind_of_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = SessionRepo::open_with(
+            dir.path(),
+            RepoOptions {
+                layout: Layout::Segmented { codec: None },
+                id_prefix: None,
+            },
+        )
+        .unwrap();
+        let mut store = repo.create(SessionMeta::with_id("s1", "/w", "m")).unwrap();
+        let session_dir = store.path().to_path_buf();
+        let first = log_stamp(&session_dir, true).unwrap();
+        assert_eq!((first.epoch, first.base_epoch), (1, 1));
+
+        store.append_new(&[Message::user("one")]).unwrap();
+        let appended = log_stamp(&session_dir, true).unwrap();
+        assert!(appended.size > first.size);
+        drop(store);
+
+        let (mut store, _) = repo.open_or_create_id("s1", "/w", "m").unwrap();
+        store
+            .append_new(&[Message::user("one"), Message::user("two")])
+            .unwrap();
+        let rolled = log_stamp(&session_dir, true).unwrap();
+        assert_eq!(rolled.epoch, 2, "a roll moves the newest epoch");
+        assert_eq!(rolled.base_epoch, 1);
+
+        store.rewrite(&[Message::user("small")]).unwrap();
+        let based = log_stamp(&session_dir, true).unwrap();
+        assert_eq!(based.base_epoch, 3, "a base moves the base epoch");
+
+        // A directory with no segments has no stamp at all — it is not a session.
+        assert!(log_stamp(&dir.path().join("nothing"), true).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn same_file_catches_a_path_whose_inode_moved() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lock");
+        fs::write(&path, b"").unwrap();
+        let held = File::open(&path).unwrap();
+        assert!(same_file(&held, &path).unwrap());
+
+        // Another file takes the path — what a session directory renamed into `.trash/` looks like
+        // from the lock's point of view.
+        let other = dir.path().join("other");
+        fs::write(&other, b"").unwrap();
+        fs::rename(&other, &path).unwrap();
+        assert!(
+            !same_file(&held, &path).unwrap(),
+            "the descriptor no longer names the file at that path"
+        );
+
+        // And a path that is simply gone is not the same file either.
+        fs::remove_file(&path).unwrap();
+        assert!(!same_file(&held, &path).unwrap());
     }
 }
