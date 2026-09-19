@@ -2,8 +2,8 @@
 //! server — no mock, no in-process `Agent`. Proves the whole stack end to end: the `memory` tool is
 //! registered and advertised, a `create` call lands a file on real disk under the per-project memory
 //! dir, a *later* run injects that `MEMORY.md` index back into the system prompt it sends to the model,
-//! and the model can recall a stored document. Also covers `--no-memory` and the not-yet-implemented
-//! backend seam.
+//! and the model can recall a stored document. Also covers `--no-memory`, `memory://`, and an
+//! unknown-scheme DSN failing fast.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 mod common;
@@ -195,10 +195,9 @@ fn no_memory_omits_the_tool_and_the_section() {
 }
 
 #[test]
-fn an_unsupported_backend_scheme_fails_fast() {
+fn an_unknown_backend_scheme_fails_fast() {
     let home = tempfile::tempdir().unwrap();
     let work = tempfile::tempdir().unwrap();
-    // A redis backend is recognized but not implemented — the run must refuse before any model call.
     let (base, _bodies) = spawn_model_server(vec![turn_text("unused")]);
     let mut cmd = run_cmd(BIN);
     cmd.env("HOME", home.path());
@@ -213,17 +212,57 @@ fn an_unsupported_backend_scheme_fails_fast() {
         "claude-test",
         "--no-session-persistence",
         "--memory",
-        "redis://localhost:6379",
+        "mysql://localhost/db",
     ])
     .current_dir(work.path());
     let output = cmd.output().expect("spawn binary");
     assert!(
         !output.status.success(),
-        "an unsupported backend must fail the run"
+        "an unknown scheme must fail the run"
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("redis://") && stderr.contains("not yet supported"),
+        stderr.contains("mysql://") && stderr.contains("unsupported"),
         "stderr should explain the unsupported backend: {stderr}"
     );
+}
+
+#[test]
+fn memory_url_round_trips_in_one_process() {
+    let home = tempfile::tempdir().unwrap();
+    let work = tempfile::tempdir().unwrap();
+    let (events, _bodies, ok) = run_in(
+        home.path(),
+        work.path(),
+        vec![
+            mem_turn(
+                "toolu_1",
+                serde_json::json!({
+                    "command": "create",
+                    "path": "/memories/notes.md",
+                    "file_text": "in-process only\n"
+                }),
+            ),
+            mem_turn(
+                "toolu_2",
+                serde_json::json!({ "command": "view", "path": "/memories/notes.md" }),
+            ),
+            turn_text("recalled it"),
+        ],
+        &["--memory", "memory://"],
+    );
+    assert!(ok, "memory:// run should exit 0");
+    let ends = tool_ends(&events, "memory");
+    assert_eq!(ends.len(), 2);
+    assert_eq!(ends[0]["is_error"], false);
+    assert!(
+        ends[1]["result"]
+            .as_str()
+            .unwrap()
+            .contains("in-process only"),
+        "view must return the in-process document: {:?}",
+        ends[1]["result"]
+    );
+    // Nothing durable was written under HOME.
+    assert!(!home.path().join(".claude/projects").exists());
 }

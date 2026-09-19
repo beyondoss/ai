@@ -57,8 +57,8 @@ pub struct Settings {
     pub default_session_dir: Option<String>,
     /// The persistent-memory backend DSN, used when neither `--memory` nor `AI_AGENT_MEMORY_URL` is
     /// given. `None` (the default) resolves to a per-project local-file store under
-    /// `~/.claude/projects/<cwd>/memory/`; a bare path or `file://` names a specific directory; a
-    /// `redis://`/`postgres://` URL selects a networked backend (recognized, not yet implemented). See
+    /// `~/.claude/projects/<cwd>/memory/`; a bare path or `file://` names a specific directory;
+    /// `memory://` is in-process; a `redis://`/`postgres://` URL selects a networked store. See
     /// [`crate::memory::open`]. Follows `default_session_dir`'s convention exactly.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_memory_backend: Option<String>,

@@ -512,8 +512,13 @@ The harness layers several capabilities over the bare tools + loop:
   Each mount is a `(kind, backend)` `Mount`; the tool routes a path to the owning root via
   `MemPath::classify` and rejects a path under no known root. `MountKind` decides the root, the
   system-prompt guidance, and (for the host) the on-disk location. Storage is behind the `MemoryBackend`
-  trait so it isn't welded to local disk; `redis://`/`postgres://` DSNs are recognized by `memory::open`
-  but return a clear "not yet supported" (the seam exists without the impl). Each root's `MEMORY.md` index
+  trait so it isn't welded to local disk. `memory::open` dispatches on the DSN: a bare path / `file://`
+  is [`file::FileBackend`], `memory://` is an in-process map (lost with the process), `redis://` /
+  `rediss://` is a Redis HASH via the `redis` crate (`ConnectionManager`, one HASH per project), and
+  `postgres://` / `postgresql://` is a Postgres table via `tokio-postgres` (default `agent_memory`,
+  `CREATE TABLE IF NOT EXISTS` on connect). Networked backends connect and ping at open so a down
+  store fails before a model call is billed; `?prefix=` / `?table=` override the project key and
+  table. Each root's `MEMORY.md` index
   is read at session start (bounded to ~200 lines/25 KB) and injected into the system prompt as its own
   guidance subsection (`resources::PromptOptions::memory_sections`, rendered by `memory::render_sections`)
   — Claude Code's auto-memory model. Two host-side steers bracket a compaction so the model prepares for

@@ -635,8 +635,8 @@ enum Command {
         no_session_persistence: bool,
         /// Persistent-memory backend DSN. Absent ⇒ the stored `default_memory_backend` setting, else a
         /// per-project local-file store under `~/.claude/projects/<cwd>/memory/`. A bare path or
-        /// `file://` names a directory; `redis://`/`postgres://` select a networked backend (recognized,
-        /// not yet implemented). See [`beyond_ai_agent::memory`].
+        /// `file://` names a directory; `memory://` is in-process; `redis://`/`rediss://` and
+        /// `postgres://`/`postgresql://` select a networked store. See [`beyond_ai_agent::memory`].
         #[usage(long, env = "AI_AGENT_MEMORY_URL")]
         memory: Option<String>,
         /// Disable persistent memory entirely: don't register the `memory` tool or inject the MEMORY.md
@@ -753,8 +753,8 @@ enum Command {
         #[usage(long)]
         no_session_persistence: bool,
         /// Persistent-memory backend DSN. Absent ⇒ the stored `default_memory_backend` setting, else a
-        /// per-project local-file store. A bare path or `file://` names a directory; `redis://`/
-        /// `postgres://` select a networked backend (recognized, not yet implemented).
+        /// per-project local-file store. A bare path or `file://` names a directory; `memory://` is
+        /// in-process; `redis://`/`rediss://` and `postgres://`/`postgresql://` select a networked store.
         #[usage(long, env = "AI_AGENT_MEMORY_URL")]
         memory: Option<String>,
         /// Disable persistent memory entirely: don't register the `memory` tool or inject the index.
@@ -4096,10 +4096,13 @@ async fn run_task(
         } else {
             let dsn = memory.or_else(|| stored_settings.default_memory_backend.clone());
             Some(
-                beyond_ai_agent::memory::open(dsn.as_deref(), &cwd).unwrap_or_else(|e| {
-                    eprintln!("{e}");
-                    std::process::exit(2);
-                }),
+                match beyond_ai_agent::memory::open(dsn.as_deref(), &cwd).await {
+                    Ok(b) => b,
+                    Err(e) => {
+                        eprintln!("{e}");
+                        std::process::exit(2);
+                    }
+                },
             )
         };
     // Build the mount list: durable `/memories`, plus (unless `--no-session-memory`) a per-session
