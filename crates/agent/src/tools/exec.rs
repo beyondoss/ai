@@ -100,7 +100,13 @@ pub trait CommandRunner: Send + Sync {
     ) -> std::io::Result<ExecResult>;
 
     /// Like [`run`](CommandRunner::run), but invokes `on_chunk` with each chunk of stdout/stderr as it
-    /// arrives, for live progress. Defaults to the non-streaming `run` (test doubles need not stream).
+    /// arrives, for live progress. Defaults to the non-streaming `run`, which never calls the sink.
+    ///
+    /// Calling the sink at all is a promise that *every* byte of *both* streams went through it: the
+    /// caller (`bash`) takes any chunk as proof the output streamed and never reads
+    /// [`ExecResult::stdout`]/[`ExecResult::stderr`]. A runner with nothing to stream incrementally
+    /// (a test double, a request/response endpoint) inherits this default rather than replaying part
+    /// of its result into the sink.
     async fn run_streaming(
         &self,
         program: &str,
@@ -207,8 +213,8 @@ impl RealRunner {
             // Lossy on purpose, not by oversight: `bash` (this crate's primary consumer) never reads
             // these two fields for real output — its `run_streaming` sink appends every chunk to its
             // `OutputAccumulator` as raw bytes as they arrive (see `bash.rs`'s `sink` closure), and
-            // only falls back to `stdout`/`stderr` here when nothing streamed (a non-streaming test
-            // double). The live path this struct actually feeds for `bash` never goes through
+            // only falls back to `stdout`/`stderr` here when nothing streamed (a test double, a remote
+            // runner). The live path this struct actually feeds for `bash` never goes through
             // `from_utf8_lossy`. The Beyond platform tools (`fork`/`sync`/`logs`, `beyond.rs`) *do*
             // consume these fields directly as their whole output — but that's the `beyond` CLI's own
             // stdout/stderr, expected to be human-readable text, not arbitrary binary data the way a

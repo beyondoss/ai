@@ -282,8 +282,8 @@ impl Bash {
 
         // Feed every raw chunk (both stdout and stderr, in arrival order) into the one accumulator, and
         // emit a throttled snapshot as it grows. Always via the streaming path so the temp-file spill
-        // sees the *complete* output; a non-streaming runner (test double) delivers no chunks and is
-        // handled by the fallback below.
+        // sees the *complete* output; a non-streaming runner (a test double, a remote endpoint)
+        // delivers no chunks and is handled by the fallback below.
         //
         // `sink` is declared at this scope (not nested in its own block) because `run_fut` borrows it
         // and, unlike before this fix, is no longer awaited to completion in the same expression that
@@ -360,7 +360,8 @@ impl Bash {
             )));
         };
 
-        // Fallback for a non-streaming runner (test double): feed its final captured output.
+        // Fallback for a non-streaming runner (a test double, a remote endpoint): feed its final
+        // captured output, both streams.
         if !streamed.load(Ordering::Relaxed) {
             let mut a = lock(&acc);
             a.append(result.stdout.as_bytes());
