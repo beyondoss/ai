@@ -1686,6 +1686,58 @@ runner. `fs_backend_parity.rs` diffs both write paths against `LocalFs`: the rip
 stdin as present, and the POSIX rung pins it absent. The CI `exec-live` shard runs the chunked path
 for real on busybox, since its `docker exec` has no `-i`.
 
+#### What the remote world changes, tool by tool
+
+> Service mode (the agent running outside the sandbox, one replica serving many tenants) is what
+> makes this load-bearing; when that section lands, this belongs under it.
+
+`PathWorld` is not only about where the _bytes_ are. Once a backend is `Remote`, **no tool may
+consult this host to decide anything** — not because a host syscall fails, but because it succeeds.
+`is_dir` on a sandbox path, `$HOME`, `/bin/bash`, `canonicalize`, a `.git` in an ancestor: each
+returns a confident, plausible answer about the wrong machine, and the mistake is invisible in the
+output. On a replica serving many tenants it is worse than invisible — it is the host leaking into a
+tenant's session.
+
+Every tool takes its world from the backend (`FsBackend::world()`), asked **per call** rather than
+captured, because `ExecCell` can be re-pointed by `set_exec_endpoint` with no registry rebuild.
+
+| Decision                                                                       | Local                                          | Remote                                                                                    |
+| ------------------------------------------------------------------------------ | ---------------------------------------------- | ----------------------------------------------------------------------------------------- |
+| `~` in a path (`read`/`write`/`edit`/`ls`/`grep`/`find`) and in `bash`'s `cwd` | this process's `$HOME`                         | the target's home, or left as `~` when it isn't known                                     |
+| a relative path with no tool root (`write_key`)                                | joined onto the process cwd                    | left relative — the replica's cwd is not the target's                                     |
+| `write`/`edit`'s same-file key                                                 | `canonicalize` (unifies symlink aliases)       | lexical only                                                                              |
+| `bash`'s `cwd` pre-check                                                       | `is_dir`, with pi's two messages               | none; the remote shell reports a bad `cwd`                                                |
+| `bash`'s shell                                                                 | `/bin/bash`, else `bash` on `$PATH`, else `sh` | `ToolConfig::remote_shell`, else `sh`                                                     |
+| `bash`'s oversized output                                                      | spilled to a temp file, `Full output: <path>`  | no file; the marker says to redirect into the sandbox and read that                       |
+| `rg --no-require-git` (`ShellFs`)                                              | `.git` in an ancestor, host `stat`s            | the same walk run **on the target**, cached per root                                      |
+| `format_path`'s "is the root a directory"                                      | —                                              | the caller's answer: `find`'s `stat`, or, for `grep`, whether its first hit _is_ the root |
+
+Two of those deserve their reasoning spelled out.
+
+**`sh`, not `bash`, is the remote default.** Guessing `bash` would be the same mistake in a different
+spelling: a busybox sandbox (Alpine — a large share of real ones) has no `bash` at all, so every
+command would die on the shell rather than on its own merits. Losing `[[` and `pipefail` degrades a
+command; losing the shell fails all of them. Whoever stands the sandbox up is the one who can ask it
+(`command -v bash`) and pass the answer in.
+
+**`grep` derives `root_is_dir` from its own hits rather than paying a `stat`.** A hit's path can equal
+the search root only when the root _is_ the single file being searched, and every hit of such a search
+has that path — so the first hit answers it exactly, for free. `grep` is deliberately one backend
+operation per call (`tests/fs_backend_cost.rs` pins that), and a second round trip to re-learn
+something the result already implies is the kind of cost that makes a remote backend look worse than
+it is.
+
+The git-repo probe is the one place this PR _adds_ a round trip: one `sh` script per distinct search
+root, memoized on the backend, walking ancestors for a `.git` with `dirname` and `[ -e ]` (not `git
+rev-parse` — a sandbox with no git installed is ordinary, while a missing `.git` genuinely means "not
+a repository"). It runs only on the ripgrep rung, since `--no-require-git` is a ripgrep flag and the
+POSIX rungs honor no `.gitignore` at all.
+
+`tests/fs_backend_remote_world.rs` and `tests/bash_remote_world.rs` make the host and the target
+_disagree_ — a `$HOME` that isn't the sandbox's, a root inside a git repo here and not there, a
+directory that exists there and not here — and assert the target's answer won, with the local half of
+each behavior asserted alongside it.
+
 ### Run lifecycle
 
 A run's plan, current tool, closing prose and outcome are otherwise only visible on a session

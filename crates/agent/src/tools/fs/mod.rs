@@ -72,6 +72,16 @@ pub enum PathWorld {
     Remote { home: Option<String> },
 }
 
+impl PathWorld {
+    /// Whether the files in question are somewhere other than this host — the one question most
+    /// callers actually have, since what changes is *whether a host syscall may be consulted at all*
+    /// rather than which home a `~` expands against. Spelled once here so no caller has to open-code
+    /// a `matches!` that a future third variant would silently get wrong.
+    pub fn is_remote(&self) -> bool {
+        matches!(self, Self::Remote { .. })
+    }
+}
+
 /// One reported line: its path, line number, text, and whether it is a match (vs a context line). The
 /// path is an `Arc<Path>` so a file with many matches allocates the path **once** and each hit is a
 /// refcount bump, not a fresh `PathBuf` per hit.
