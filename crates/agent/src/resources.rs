@@ -217,6 +217,15 @@ pub struct PromptOptions<'a> {
     /// a process (or a child) that has no `subagent` tool passes `&[]` and the section simply doesn't
     /// appear. Discovery is the caller's job, mirroring `skills` above.
     pub agents: &'a [crate::agents::AgentDef],
+    /// Whether an on-disk `SYSTEM.md`/`APPEND_SYSTEM.md` may override the base prompt at all.
+    ///
+    /// `true` everywhere the filesystem under `cwd` (and the operator's own `~/.claude`) *is* the
+    /// agent's world — `run`, stdio `serve`, subagents of either. `false` in service mode: the only
+    /// disk those overrides could be read from is the **replica's**, and one tenant's prompt must
+    /// never be set by another tenant's replica-mate or by the operator's own home directory. The
+    /// operator can still pass `--system-prompt`/`--append-system-prompt` explicitly, which arrive
+    /// as [`base`](Self::base)/[`append`](Self::append) and are unaffected.
+    pub disk_overrides: bool,
 }
 
 /// Build the full system prompt for a session: the static base (see [`build_static_system_prompt`])
@@ -270,15 +279,23 @@ pub(crate) fn build_static_system_prompt_with_context(
     // trusted project's on-disk `SYSTEM.md` (project `<cwd>/.claude/`, else user `~/.claude/`) get a
     // chance to replace the built-in base — that's how a project pins its own agent identity (pi's
     // resource-loader does the same) — and only when *that's* absent too does `default_base` apply.
+    //
+    // `disk_overrides: false` skips both lookups outright: in service mode the only disk they could
+    // read is the replica's own, which no tenant may set its prompt from.
     let mut s = opts
         .base
         .map(str::to_string)
-        .or_else(|| system_prompt_override(opts.cwd, opts.project_trusted))
+        .or_else(|| {
+            opts.disk_overrides
+                .then(|| system_prompt_override(opts.cwd, opts.project_trusted))
+                .flatten()
+        })
         .unwrap_or_else(|| opts.default_base.to_string());
-    let append = opts
-        .append
-        .map(str::to_string)
-        .or_else(|| append_system_prompt_override(opts.cwd, opts.project_trusted));
+    let append = opts.append.map(str::to_string).or_else(|| {
+        opts.disk_overrides
+            .then(|| append_system_prompt_override(opts.cwd, opts.project_trusted))
+            .flatten()
+    });
     if let Some(extra) = append {
         s.push_str("\n\n");
         s.push_str(&extra);
@@ -1148,6 +1165,44 @@ mod tests {
         assert!(joined.contains("mixed-case rules"));
     }
 
+    /// Service mode: the only disk an on-disk override could be read from is the **replica's**, so
+    /// `disk_overrides: false` turns both lookups off outright. Trust is not the lever here — a
+    /// service session's project *is* trusted (it is the tenant's own sandbox); what must not happen
+    /// is reading someone else's machine.
+    #[test]
+    fn disk_overrides_off_skips_system_md_and_append_system_md_entirely() {
+        let tmp = tempfile::tempdir().unwrap();
+        let claude_dir = tmp.path().join(".claude");
+        fs::create_dir_all(&claude_dir).unwrap();
+        fs::write(claude_dir.join("SYSTEM.md"), "HOST IDENTITY").unwrap();
+        fs::write(claude_dir.join("APPEND_SYSTEM.md"), "HOST APPENDIX").unwrap();
+
+        let opts = |disk_overrides| PromptOptions {
+            base: None,
+            default_base: "DEFAULT IDENTITY",
+            append: None,
+            cwd: tmp.path(),
+            include_context_files: false,
+            skills: &[],
+            has_read: true,
+            has_todo: false,
+            has_structured_output: false,
+            has_memory: false,
+            memory_sections: &[],
+            project_trusted: true,
+            agents: &[],
+            disk_overrides,
+        };
+        // Both files apply with overrides on — otherwise this test would pass for the wrong reason.
+        let with = build_system_prompt(&opts(true));
+        assert!(with.contains("HOST IDENTITY") && with.contains("HOST APPENDIX"));
+
+        let without = build_system_prompt(&opts(false));
+        assert!(without.contains("DEFAULT IDENTITY"), "{without}");
+        assert!(!without.contains("HOST IDENTITY"), "{without}");
+        assert!(!without.contains("HOST APPENDIX"), "{without}");
+    }
+
     #[test]
     fn system_md_overrides_the_computed_default_base_when_trusted_and_no_explicit_flag_was_given() {
         // No explicit `--system-prompt` here (`base: None`) — a trusted project's on-disk `SYSTEM.md`
@@ -1173,6 +1228,7 @@ mod tests {
             memory_sections: &[],
             project_trusted: true,
             agents: &[],
+            disk_overrides: true,
         });
         assert!(prompt.contains("OVERRIDE IDENTITY"));
         assert!(
@@ -1208,6 +1264,7 @@ mod tests {
             memory_sections: &[],
             project_trusted: true,
             agents: &[],
+            disk_overrides: true,
         });
         assert!(prompt.contains("EXPLICIT IDENTITY"));
         assert!(
@@ -1240,6 +1297,7 @@ mod tests {
             memory_sections: &[],
             project_trusted: false,
             agents: &[],
+            disk_overrides: true,
         });
         assert!(prompt.contains("DEFAULT IDENTITY"));
         assert!(!prompt.contains("MALICIOUS OVERRIDE"));
@@ -1275,6 +1333,7 @@ mod tests {
             memory_sections: &[],
             project_trusted: true,
             agents: &[],
+            disk_overrides: true,
         });
         assert!(
             prompt.contains("already-discovered") && prompt.contains("found by the caller"),
@@ -1311,6 +1370,7 @@ mod tests {
             memory_sections: &[],
             project_trusted: true,
             agents: &[],
+            disk_overrides: true,
         });
         assert!(
             !prompt.contains("available_skills"),
@@ -1346,6 +1406,7 @@ mod tests {
             memory_sections: &[],
             project_trusted: true,
             agents: &[],
+            disk_overrides: true,
         });
         assert!(
             !prompt.contains("available_skills") && !prompt.contains("visible-but-unusable"),
@@ -1374,6 +1435,7 @@ mod tests {
             memory_sections: &[],
             project_trusted: true,
             agents: &[],
+            disk_overrides: true,
         });
         assert!(prompt.contains("DEFAULT IDENTITY"));
         assert!(
@@ -1403,6 +1465,7 @@ mod tests {
             memory_sections: &[],
             project_trusted: false,
             agents: &[],
+            disk_overrides: true,
         });
         assert!(!prompt.contains("MALICIOUS EXTRA RULES"));
     }
@@ -1428,6 +1491,7 @@ mod tests {
             memory_sections: &[],
             project_trusted: true,
             agents: &[],
+            disk_overrides: true,
         });
         assert!(prompt.contains("CLI APPEND"));
         assert!(
@@ -1500,6 +1564,7 @@ mod tests {
             memory_sections: &[],
             project_trusted: false,
             agents: &[],
+            disk_overrides: true,
         }
     }
 
@@ -1600,6 +1665,7 @@ mod tests {
             memory_sections: &[],
             project_trusted: false,
             agents: &[],
+            disk_overrides: true,
         });
         assert!(prompt.contains("You are an agent."));
         assert!(prompt.contains("Stay terse."));
@@ -1633,6 +1699,7 @@ mod tests {
             memory_sections: &[],
             project_trusted: false,
             agents: &[],
+            disk_overrides: true,
         };
         let full = build_system_prompt(&opts);
         let static_part = build_static_system_prompt(&opts);
@@ -1667,6 +1734,7 @@ mod tests {
             memory_sections: &[],
             project_trusted: false,
             agents: &[],
+            disk_overrides: true,
         });
         assert!(!prompt.contains("<project_context>"));
     }

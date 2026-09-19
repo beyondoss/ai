@@ -11,15 +11,17 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-use base64::Engine as _;
 use beyond_ai_agent::exec_endpoint::{ExecCell, ExecTarget, HttpExecRunner, TemplateRunner};
 use beyond_ai_agent::tools::exec::{CommandRunner, ExecResult, RealRunner};
 use beyond_ai_agent::tools::fs::FsBackend;
 use beyond_ai_agent::tools::fs::shell::{Capabilities, ShellFs};
 use beyond_ai_agent::tools::{ToolConfig, default_registry_with_config};
+use common::exec_mock::ExecMock;
 use serde_json::{Value, json};
+
+mod common;
 
 /// 200 KiB — comfortably past the 128 KiB single-argv cap even before base64's 4/3 growth.
 const BIG: usize = 200 * 1024;
@@ -37,122 +39,6 @@ fn pattern(len: usize) -> Vec<u8> {
             (x >> 24) as u8
         })
         .collect()
-}
-
-/// A stand-in exec endpoint. `honors_stdin: false` is a **v1** endpoint: it has never heard of
-/// `stdin_base64`, ignores it like any unknown field, and runs the command with no input — exactly
-/// what a real pre-v1.1 shim does. Every request body is recorded.
-struct Mock {
-    url: String,
-    requests: Arc<Mutex<Vec<Value>>>,
-}
-
-impl Mock {
-    async fn start(root: &Path, honors_stdin: bool) -> Self {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}/exec", listener.local_addr().unwrap());
-        let requests = Arc::new(Mutex::new(Vec::new()));
-        let (root, seen) = (root.to_path_buf(), requests.clone());
-        tokio::spawn(async move {
-            while let Ok((sock, _)) = listener.accept().await {
-                let (root, seen) = (root.clone(), seen.clone());
-                tokio::spawn(serve_one(sock, root, seen, honors_stdin));
-            }
-        });
-        Self { url, requests }
-    }
-
-    fn requests(&self) -> Vec<Value> {
-        self.requests.lock().unwrap().clone()
-    }
-}
-
-async fn serve_one(
-    mut sock: tokio::net::TcpStream,
-    root: std::path::PathBuf,
-    seen: Arc<Mutex<Vec<Value>>>,
-    honors_stdin: bool,
-) {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let (mut buf, mut chunk) = (Vec::new(), [0u8; 64 * 1024]);
-    let (mut need, mut head_end) = (0usize, None);
-    loop {
-        let Ok(n) = sock.read(&mut chunk).await else {
-            return;
-        };
-        if n == 0 {
-            break;
-        }
-        buf.extend_from_slice(&chunk[..n]);
-        if head_end.is_none()
-            && let Some(p) = buf.windows(4).position(|w| w == b"\r\n\r\n")
-        {
-            head_end = Some(p + 4);
-            let head = String::from_utf8_lossy(&buf[..p]).to_lowercase();
-            need = head
-                .lines()
-                .find_map(|l| l.strip_prefix("content-length:"))
-                .and_then(|v| v.trim().parse().ok())
-                .unwrap_or(0);
-        }
-        if head_end.is_some_and(|h| buf.len() >= h + need) {
-            break;
-        }
-    }
-    let req: Value =
-        serde_json::from_slice(&buf[head_end.unwrap_or(buf.len())..]).unwrap_or(json!({}));
-    seen.lock().unwrap().push(req.clone());
-
-    let args: Vec<String> = req["args"]
-        .as_array()
-        .map(|a| {
-            a.iter()
-                .filter_map(|v| v.as_str().map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default();
-    let stdin = req["stdin_base64"]
-        .as_str()
-        .filter(|_| honors_stdin)
-        .map(|b| base64::engine::general_purpose::STANDARD.decode(b).unwrap());
-
-    let mut cmd = tokio::process::Command::new(req["command"].as_str().unwrap_or("true"));
-    cmd.args(&args)
-        .current_dir(req["cwd"].as_str().map_or(root, Into::into))
-        .stdin(if stdin.is_some() {
-            std::process::Stdio::piped()
-        } else {
-            std::process::Stdio::null()
-        })
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true);
-    let payload = match cmd.spawn() {
-        Ok(mut child) => {
-            let pipe = child.stdin.take();
-            let feed = async move {
-                if let (Some(mut pipe), Some(bytes)) = (pipe, stdin) {
-                    let _ = pipe.write_all(&bytes).await;
-                }
-            };
-            let (out, ()) = tokio::join!(child.wait_with_output(), feed);
-            let o = out.unwrap();
-            json!({
-                "exit_code": o.status.code().unwrap_or(-1),
-                "stdout": String::from_utf8_lossy(&o.stdout),
-                "stderr": String::from_utf8_lossy(&o.stderr),
-            })
-        }
-        // `Argument list too long` lands here — the defect v1.1 exists to fix.
-        Err(e) => json!({ "exit_code": 127, "stdout": "", "stderr": e.to_string() }),
-    };
-    let body = payload.to_string();
-    let resp = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.len()
-    );
-    let _ = sock.write_all(resp.as_bytes()).await;
-    let _ = sock.shutdown().await;
 }
 
 /// No `<name>.tmp.*` may survive a write, successful or not.
@@ -192,7 +78,7 @@ fn summary(reqs: &[Value]) -> Vec<String> {
 #[tokio::test]
 async fn a_200k_write_through_a_stdin_endpoint_is_one_call_and_byte_exact() {
     let dir = tempfile::tempdir().unwrap();
-    let mock = Mock::start(dir.path(), true).await;
+    let mock = ExecMock::start(dir.path(), true).await;
     let fs = ShellFs::connect(Arc::new(HttpExecRunner::new(&mock.url).unwrap())).await;
     assert!(
         fs.capabilities().stdin,
@@ -201,10 +87,10 @@ async fn a_200k_write_through_a_stdin_endpoint_is_one_call_and_byte_exact() {
 
     let path = dir.path().join("big.bin");
     let bytes = pattern(BIG);
-    let before = mock.requests().len();
+    let before = mock.bodies().len();
     fs.write_bytes(&path, &bytes).await.unwrap();
 
-    let writes = mock.requests().split_off(before);
+    let writes = mock.bodies().split_off(before);
     assert_eq!(writes.len(), 1, "one round trip: {:?}", summary(&writes));
     assert!(
         writes[0]["stdin_base64"].is_string(),
@@ -218,7 +104,7 @@ async fn a_200k_write_through_a_stdin_endpoint_is_one_call_and_byte_exact() {
 #[tokio::test]
 async fn a_200k_write_through_a_v1_endpoint_goes_in_chunks_and_is_byte_exact() {
     let dir = tempfile::tempdir().unwrap();
-    let mock = Mock::start(dir.path(), false).await;
+    let mock = ExecMock::start(dir.path(), false).await;
     let fs = ShellFs::connect(Arc::new(HttpExecRunner::new(&mock.url).unwrap())).await;
     assert!(
         !fs.capabilities().stdin,
@@ -228,10 +114,10 @@ async fn a_200k_write_through_a_v1_endpoint_goes_in_chunks_and_is_byte_exact() {
     let path = dir.path().join("big.bin");
     std::fs::write(&path, "old content\n").unwrap();
     let bytes = pattern(BIG);
-    let before = mock.requests().len();
+    let before = mock.bodies().len();
     fs.write_bytes(&path, &bytes).await.unwrap();
 
-    let writes = mock.requests().split_off(before);
+    let writes = mock.bodies().split_off(before);
     assert_eq!(
         writes.len(),
         BIG.div_ceil(CHUNK),
@@ -263,7 +149,7 @@ async fn a_write_whose_stdin_never_arrives_fails_instead_of_emptying_the_file() 
     // balancer mid-rollout it can pass on one replica while the write lands on another. Forcing the
     // capability on against a v1 endpoint is that case. The write must fail — not commit zero bytes.
     let dir = tempfile::tempdir().unwrap();
-    let mock = Mock::start(dir.path(), false).await;
+    let mock = ExecMock::start(dir.path(), false).await;
     let fs = ShellFs::with_capabilities(
         Arc::new(HttpExecRunner::new(&mock.url).unwrap()),
         Capabilities {
@@ -316,7 +202,7 @@ async fn both_write_paths_are_byte_exact_at_every_chunk_boundary() {
 async fn the_write_and_edit_tools_handle_a_200k_file_on_a_v1_endpoint() {
     // The tools the model actually calls, end to end: the defect surfaced as `write`/`edit` failing.
     let dir = tempfile::tempdir().unwrap();
-    let mock = Mock::start(dir.path(), false).await;
+    let mock = ExecMock::start(dir.path(), false).await;
     let runner: Arc<dyn CommandRunner> = Arc::new(HttpExecRunner::new(&mock.url).unwrap());
     let reg = default_registry_with_config(&ToolConfig {
         fs_backend: Some(Arc::new(ShellFs::connect(runner.clone()).await) as Arc<dyn FsBackend>),
