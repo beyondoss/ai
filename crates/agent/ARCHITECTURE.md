@@ -1607,6 +1607,12 @@ place that pairs them:
 `kubectl exec`, any CLI) via an argv template whose `{}` expands to _separate argv entries_ — never
 into a shell string, so a model-supplied path cannot be reparsed as syntax on the far side.
 
+Neither runner streams: each returns the whole result at once, so both inherit
+`CommandRunner::run_streaming`'s default, which never calls the chunk sink, and `bash` builds its
+output from the final `stdout` and `stderr`. A runner that calls the sink at all claims to have
+delivered every byte of both streams through it — `HttpExecRunner` once fed it stdout alone, and
+every remote command that printed to stdout lost its stderr.
+
 `tests/exec_endpoint.rs` drives all of this against a ~30-line mock provider — the same shim someone
 would write in front of a real one. If standing up a fake provider took more than that, the protocol
 would be too big.

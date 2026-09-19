@@ -189,23 +189,11 @@ impl CommandRunner for HttpExecRunner {
         })
     }
 
-    async fn run_streaming(
-        &self,
-        program: &str,
-        args: &[String],
-        cwd: Option<&str>,
-        timeout: Duration,
-        on_chunk: ChunkSink<'_>,
-    ) -> std::io::Result<ExecResult> {
-        // One request, one response — there is nothing to stream incrementally, so the whole result
-        // reaches the sink at once. Overridden rather than inherited so this is stated rather than
-        // implied by a default that looks like it streams.
-        let result = self.run(program, args, cwd, timeout).await?;
-        if !result.stdout.is_empty() {
-            on_chunk(result.stdout.as_bytes());
-        }
-        Ok(result)
-    }
+    // No `run_streaming` override, deliberately. One request, one response: there is nothing to
+    // stream, so the default — which never calls the sink — is the honest answer, and `bash` then
+    // builds its output from the final `stdout` *and* `stderr`. An override that fed the sink stdout
+    // alone told `bash` the output had streamed, and every remote command that printed to stdout lost
+    // its stderr.
 }
 
 /// A [`CommandRunner`] that runs each command through a caller-supplied **argv template**, for targets
