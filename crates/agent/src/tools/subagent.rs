@@ -936,6 +936,12 @@ impl Subagent {
             bash_timeout_ms: self.ctx.tool_cfg.bash_timeout_ms,
             bash_shell_path: self.ctx.tool_cfg.bash_shell_path.as_deref(),
             bash_command_prefix: self.ctx.tool_cfg.bash_command_prefix.as_deref(),
+            // A child in the remote world falls back to the default remote shell unless the operator
+            // named one explicitly, which `bash_shell_path` above already inherits. Threading the
+            // *probed* shell down instead belongs with the serve-side plumbing that learns it, and
+            // costs only bashisms in the meantime — never a failed spawn, since the fallback is the
+            // `sh` every POSIX target has.
+            remote_shell: None,
             image_auto_resize: self.ctx.tool_cfg.image_auto_resize,
             root: root.to_path_buf(),
             code_mode: self.ctx.tool_cfg.code_mode,
