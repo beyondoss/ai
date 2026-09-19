@@ -1,8 +1,11 @@
 //! [`PostgresBackend`] — agent memory in a Postgres table. Selected by `--memory postgres://…`.
 //!
-//! One row per document, keyed by `(project, rel)`. Mutations run in a single transaction with
-//! `SELECT … FOR UPDATE` so two agents cannot clobber each other. Directories are implicit
-//! prefixes; see [`crate::memory::docs`].
+//! One row per document, keyed by `(project, rel)`. Reads are point lookups: `index` is
+//! `MEMORY.md` only, `view` of a document is one `SELECT`, a listing is `rel` + `length(body)`.
+//! Single-document edits lock that row (`FOR UPDATE`). Prefix `create`/`delete`/`rename` take a
+//! per-project advisory lock and consult the key set — they do not pull every body. Search
+//! filters in SQL (`position(lower(needle) in lower(body))`) so non-matching documents stay put.
+//! Directories are implicit prefixes; see [`crate::memory::docs`].
 //!
 //! The client is `tokio-postgres`, TLS via `tokio-postgres-rustls` (`ring` + native roots) so a
 //! `sslmode=require` URL stays on the workspace rustls stack. The table is the agent's: created
@@ -10,7 +13,7 @@
 //! Payload stays `TEXT` (markdown; `str_replace` can span lines). Paths use `COLLATE "C"` so
 //! order matches the in-process map, plus `CHECK`s that encode [`MemPath`], and `updated_at`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -18,10 +21,10 @@ use async_trait::async_trait;
 use tokio::sync::Mutex;
 use tokio_postgres::config::SslMode;
 use tokio_postgres::tls::NoTls;
-use tokio_postgres::{Client, Config, IsolationLevel};
+use tokio_postgres::{Client, Config, Transaction};
 
 use super::docs;
-use super::{Hit, MemPath, MemoryBackend, MemoryError, View};
+use super::{Hit, INDEX_FILE, MemPath, MemoryBackend, MemoryError, View};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_TABLE: &str = "agent_memory";
@@ -82,77 +85,14 @@ impl PostgresBackend {
         Ok(guard)
     }
 
-    async fn snapshot(&self) -> Result<BTreeMap<String, String>, MemoryError> {
+    async fn get_body(&self, rel: &str) -> Result<Option<String>, MemoryError> {
         let client = self.client().await?;
-        load_docs(&client, &self.table, &self.project).await
+        get_body(&client, &self.table, &self.project, rel).await
     }
 
-    async fn transact<T>(
-        &self,
-        f: impl FnOnce(&mut BTreeMap<String, String>) -> Result<T, MemoryError>,
-    ) -> Result<T, MemoryError> {
-        let mut client = self.client().await?;
-        let tx = client
-            .build_transaction()
-            .isolation_level(IsolationLevel::ReadCommitted)
-            .start()
-            .await
-            .map_err(|e| MemoryError::Backend(e.to_string()))?;
-        let select = format!(
-            "SELECT rel, body FROM {} WHERE project = $1 FOR UPDATE",
-            self.table
-        );
-        let rows = tx
-            .query(&select, &[&self.project])
-            .await
-            .map_err(|e| MemoryError::Backend(e.to_string()))?;
-        let mut before = BTreeMap::new();
-        for row in rows {
-            before.insert(row.get::<_, String>(0), row.get::<_, String>(1));
-        }
-        let mut after = before.clone();
-        let result = match f(&mut after) {
-            Ok(r) => r,
-            Err(e) => {
-                let _ = tx.rollback().await;
-                return Err(e);
-            }
-        };
-        let insert = format!(
-            "INSERT INTO {} (project, rel, body) VALUES ($1, $2, $3)",
-            self.table
-        );
-        let update = format!(
-            "UPDATE {} SET body = $3, updated_at = now() WHERE project = $1 AND rel = $2",
-            self.table
-        );
-        let delete = format!("DELETE FROM {} WHERE project = $1 AND rel = $2", self.table);
-        for (rel, body) in &after {
-            match before.get(rel) {
-                Some(old) if old == body => {}
-                Some(_) => {
-                    tx.execute(&update, &[&self.project, rel, body])
-                        .await
-                        .map_err(|e| MemoryError::Backend(e.to_string()))?;
-                }
-                None => {
-                    tx.execute(&insert, &[&self.project, rel, body])
-                        .await
-                        .map_err(|e| MemoryError::Backend(e.to_string()))?;
-                }
-            }
-        }
-        for rel in before.keys() {
-            if !after.contains_key(rel) {
-                tx.execute(&delete, &[&self.project, rel])
-                    .await
-                    .map_err(|e| MemoryError::Backend(e.to_string()))?;
-            }
-        }
-        tx.commit()
-            .await
-            .map_err(|e| MemoryError::Backend(e.to_string()))?;
-        Ok(result)
+    async fn sizes_under(&self, under: &str) -> Result<BTreeMap<String, u64>, MemoryError> {
+        let client = self.client().await?;
+        sizes_under(&client, &self.table, &self.project, under).await
     }
 }
 
@@ -230,21 +170,104 @@ async fn bootstrap(client: &Client, table: &str) -> Result<(), MemoryError> {
     Ok(())
 }
 
-async fn load_docs(
+async fn get_body(
     client: &Client,
     table: &str,
     project: &str,
-) -> Result<BTreeMap<String, String>, MemoryError> {
-    let sql = format!("SELECT rel, body FROM {table} WHERE project = $1");
-    let rows = client
+    rel: &str,
+) -> Result<Option<String>, MemoryError> {
+    let sql = format!("SELECT body FROM {table} WHERE project = $1 AND rel = $2");
+    let row = client
+        .query_opt(&sql, &[&project, &rel])
+        .await
+        .map_err(|e| MemoryError::Backend(e.to_string()))?;
+    Ok(row.map(|r| r.get(0)))
+}
+
+async fn sizes_under(
+    client: &Client,
+    table: &str,
+    project: &str,
+    under: &str,
+) -> Result<BTreeMap<String, u64>, MemoryError> {
+    let rows = if under.is_empty() {
+        let sql = format!("SELECT rel, length(body)::bigint FROM {table} WHERE project = $1");
+        client
+            .query(&sql, &[&project])
+            .await
+            .map_err(|e| MemoryError::Backend(e.to_string()))?
+    } else {
+        let prefix = format!("{under}/");
+        let sql = format!(
+            "SELECT rel, length(body)::bigint FROM {table} \
+             WHERE project = $1 AND strpos(rel, $2) = 1"
+        );
+        client
+            .query(&sql, &[&project, &prefix])
+            .await
+            .map_err(|e| MemoryError::Backend(e.to_string()))?
+    };
+    let mut out = BTreeMap::new();
+    for row in rows {
+        let rel: String = row.get(0);
+        let n: i64 = row.get(1);
+        out.insert(rel, n.max(0) as u64);
+    }
+    Ok(out)
+}
+
+async fn lock_project(tx: &Transaction<'_>, project: &str) -> Result<(), MemoryError> {
+    tx.execute(
+        "SELECT pg_advisory_xact_lock(hashtext('beyond-ai-memory'), hashtext($1))",
+        &[&project],
+    )
+    .await
+    .map_err(|e| MemoryError::Backend(e.to_string()))?;
+    Ok(())
+}
+
+async fn list_keys(
+    tx: &Transaction<'_>,
+    table: &str,
+    project: &str,
+) -> Result<BTreeSet<String>, MemoryError> {
+    let sql = format!("SELECT rel FROM {table} WHERE project = $1");
+    let rows = tx
         .query(&sql, &[&project])
         .await
         .map_err(|e| MemoryError::Backend(e.to_string()))?;
-    let mut out = BTreeMap::new();
-    for row in rows {
-        out.insert(row.get::<_, String>(0), row.get::<_, String>(1));
+    Ok(rows.into_iter().map(|r| r.get(0)).collect())
+}
+
+async fn has_children(
+    tx: &Transaction<'_>,
+    table: &str,
+    project: &str,
+    rel: &str,
+) -> Result<bool, MemoryError> {
+    let prefix = format!("{rel}/");
+    let sql = format!("SELECT 1 FROM {table} WHERE project = $1 AND strpos(rel, $2) = 1 LIMIT 1");
+    let row = tx
+        .query_opt(&sql, &[&project, &prefix])
+        .await
+        .map_err(|e| MemoryError::Backend(e.to_string()))?;
+    Ok(row.is_some())
+}
+
+async fn not_a_document(
+    tx: &Transaction<'_>,
+    table: &str,
+    project: &str,
+    path: &MemPath,
+) -> Result<MemoryError, MemoryError> {
+    if has_children(tx, table, project, path.rel()).await? {
+        Ok(MemoryError::InvalidPath(format!(
+            "{} is a directory, not a document",
+            path.display()
+        )))
+    } else {
+        Ok(MemoryError::NotFound(path.display()))
     }
-    Ok(out)
 }
 
 /// A SQL identifier used as a table name — reject anything that would need quoting so the name
@@ -269,7 +292,11 @@ fn validate_ident(name: &str) -> Result<&str, String> {
 #[async_trait]
 impl MemoryBackend for PostgresBackend {
     async fn index(&self) -> Result<String, MemoryError> {
-        Ok(docs::index(&self.snapshot().await?))
+        Ok(self
+            .get_body(INDEX_FILE)
+            .await?
+            .map(|raw| docs::cap_index(&raw))
+            .unwrap_or_default())
     }
 
     async fn view(
@@ -277,32 +304,312 @@ impl MemoryBackend for PostgresBackend {
         path: &MemPath,
         range: Option<(usize, usize)>,
     ) -> Result<View, MemoryError> {
-        docs::view(&self.snapshot().await?, path, range, self.root)
+        if path.is_root() {
+            let sizes = self.sizes_under("").await?;
+            return Ok(View::Listing(docs::listing_with_sizes(
+                sizes.iter().map(|(rel, n)| (rel.as_str(), *n)),
+                "",
+                self.root,
+            )));
+        }
+        if let Some(text) = self.get_body(path.rel()).await? {
+            return Ok(View::Document(docs::slice_range(&text, range)));
+        }
+        let sizes = self.sizes_under(path.rel()).await?;
+        if sizes.is_empty() {
+            return Err(MemoryError::NotFound(path.display()));
+        }
+        Ok(View::Listing(docs::listing_with_sizes(
+            sizes.iter().map(|(rel, n)| (rel.as_str(), *n)),
+            path.rel(),
+            self.root,
+        )))
     }
 
     async fn create(&self, path: &MemPath, text: &str) -> Result<(), MemoryError> {
-        self.transact(|d| docs::create(d, path, text)).await
+        if path.is_root() {
+            return Err(MemoryError::InvalidPath(
+                "cannot create the memory root itself".to_string(),
+            ));
+        }
+        let mut client = self.client().await?;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|e| MemoryError::Backend(e.to_string()))?;
+        lock_project(&tx, &self.project).await?;
+        let keys = list_keys(&tx, &self.table, &self.project).await?;
+        if let Err(e) = docs::create_conflict_keys(&keys, path) {
+            let _ = tx.rollback().await;
+            return Err(e);
+        }
+        let insert = format!(
+            "INSERT INTO {} (project, rel, body) VALUES ($1, $2, $3)",
+            self.table
+        );
+        if let Err(e) = tx
+            .execute(&insert, &[&self.project, &path.rel(), &text])
+            .await
+        {
+            let _ = tx.rollback().await;
+            return Err(MemoryError::Backend(e.to_string()));
+        }
+        tx.commit()
+            .await
+            .map_err(|e| MemoryError::Backend(e.to_string()))?;
+        Ok(())
     }
 
     async fn str_replace(&self, path: &MemPath, old: &str, new: &str) -> Result<(), MemoryError> {
-        self.transact(|d| docs::str_replace(d, path, old, new))
+        let mut client = self.client().await?;
+        let tx = client
+            .transaction()
             .await
+            .map_err(|e| MemoryError::Backend(e.to_string()))?;
+        let select = format!(
+            "SELECT body FROM {} WHERE project = $1 AND rel = $2 FOR UPDATE",
+            self.table
+        );
+        let row = match tx.query_opt(&select, &[&self.project, &path.rel()]).await {
+            Ok(r) => r,
+            Err(e) => {
+                let _ = tx.rollback().await;
+                return Err(MemoryError::Backend(e.to_string()));
+            }
+        };
+        let Some(row) = row else {
+            let err = not_a_document(&tx, &self.table, &self.project, path).await;
+            let _ = tx.rollback().await;
+            return Err(err?);
+        };
+        let text: String = row.get(0);
+        let replaced = match docs::str_replace_once(&text, old, new, &path.display()) {
+            Ok(r) => r,
+            Err(e) => {
+                let _ = tx.rollback().await;
+                return Err(e);
+            }
+        };
+        let update = format!(
+            "UPDATE {} SET body = $3, updated_at = now() WHERE project = $1 AND rel = $2",
+            self.table
+        );
+        if let Err(e) = tx
+            .execute(&update, &[&self.project, &path.rel(), &replaced])
+            .await
+        {
+            let _ = tx.rollback().await;
+            return Err(MemoryError::Backend(e.to_string()));
+        }
+        tx.commit()
+            .await
+            .map_err(|e| MemoryError::Backend(e.to_string()))?;
+        Ok(())
     }
 
     async fn insert(&self, path: &MemPath, line: usize, text: &str) -> Result<(), MemoryError> {
-        self.transact(|d| docs::insert(d, path, line, text)).await
+        let mut client = self.client().await?;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|e| MemoryError::Backend(e.to_string()))?;
+        let select = format!(
+            "SELECT body FROM {} WHERE project = $1 AND rel = $2 FOR UPDATE",
+            self.table
+        );
+        let row = match tx.query_opt(&select, &[&self.project, &path.rel()]).await {
+            Ok(r) => r,
+            Err(e) => {
+                let _ = tx.rollback().await;
+                return Err(MemoryError::Backend(e.to_string()));
+            }
+        };
+        let Some(row) = row else {
+            let err = not_a_document(&tx, &self.table, &self.project, path).await;
+            let _ = tx.rollback().await;
+            return Err(err?);
+        };
+        let existing: String = row.get(0);
+        let update = format!(
+            "UPDATE {} SET body = $3, updated_at = now() WHERE project = $1 AND rel = $2",
+            self.table
+        );
+        if let Err(e) = tx
+            .execute(
+                &update,
+                &[
+                    &self.project,
+                    &path.rel(),
+                    &docs::insert_at_line(&existing, line, text),
+                ],
+            )
+            .await
+        {
+            let _ = tx.rollback().await;
+            return Err(MemoryError::Backend(e.to_string()));
+        }
+        tx.commit()
+            .await
+            .map_err(|e| MemoryError::Backend(e.to_string()))?;
+        Ok(())
     }
 
     async fn delete(&self, path: &MemPath) -> Result<(), MemoryError> {
-        self.transact(|d| docs::delete(d, path)).await
+        if path.is_root() {
+            return Err(MemoryError::InvalidPath(
+                "cannot delete the memory root".to_string(),
+            ));
+        }
+        let mut client = self.client().await?;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|e| MemoryError::Backend(e.to_string()))?;
+        lock_project(&tx, &self.project).await?;
+        let delete = format!("DELETE FROM {} WHERE project = $1 AND rel = $2", self.table);
+        let n = match tx.execute(&delete, &[&self.project, &path.rel()]).await {
+            Ok(n) => n,
+            Err(e) => {
+                let _ = tx.rollback().await;
+                return Err(MemoryError::Backend(e.to_string()));
+            }
+        };
+        if n > 0 {
+            tx.commit()
+                .await
+                .map_err(|e| MemoryError::Backend(e.to_string()))?;
+            return Ok(());
+        }
+        let children = match has_children(&tx, &self.table, &self.project, path.rel()).await {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = tx.rollback().await;
+                return Err(e);
+            }
+        };
+        let _ = tx.rollback().await;
+        if children {
+            Err(MemoryError::InvalidPath(format!(
+                "{} is a non-empty directory; delete its contents first",
+                path.display()
+            )))
+        } else {
+            Err(MemoryError::NotFound(path.display()))
+        }
     }
 
     async fn rename(&self, from: &MemPath, to: &MemPath) -> Result<(), MemoryError> {
-        self.transact(|d| docs::rename(d, from, to)).await
+        if from.is_root() || to.is_root() {
+            return Err(MemoryError::InvalidPath(
+                "cannot rename the memory root".to_string(),
+            ));
+        }
+        if from.rel() == to.rel() {
+            return Ok(());
+        }
+        let mut client = self.client().await?;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|e| MemoryError::Backend(e.to_string()))?;
+        lock_project(&tx, &self.project).await?;
+        let keys = match list_keys(&tx, &self.table, &self.project).await {
+            Ok(k) => k,
+            Err(e) => {
+                let _ = tx.rollback().await;
+                return Err(e);
+            }
+        };
+        let from_is_file = keys.contains(from.rel());
+        let from_is_dir = docs::is_dir_keys(keys.iter(), from.rel());
+        if !from_is_file && !from_is_dir {
+            let _ = tx.rollback().await;
+            return Err(MemoryError::NotFound(from.display()));
+        }
+        if keys.contains(to.rel()) || docs::is_dir_keys(keys.iter(), to.rel()) {
+            let _ = tx.rollback().await;
+            return Err(MemoryError::AlreadyExists(to.display()));
+        }
+        if from_is_dir
+            && (to.rel() == from.rel() || to.rel().starts_with(&format!("{}/", from.rel())))
+        {
+            let _ = tx.rollback().await;
+            return Err(MemoryError::InvalidPath(format!(
+                "cannot rename {} into itself",
+                from.display()
+            )));
+        }
+        if let Err(e) = docs::ancestor_is_file_keys(&keys, to.rel(), to) {
+            let _ = tx.rollback().await;
+            return Err(e);
+        }
+
+        if from_is_file {
+            let update = format!(
+                "UPDATE {} SET rel = $3, updated_at = now() WHERE project = $1 AND rel = $2",
+                self.table
+            );
+            if let Err(e) = tx
+                .execute(&update, &[&self.project, &from.rel(), &to.rel()])
+                .await
+            {
+                let _ = tx.rollback().await;
+                return Err(MemoryError::Backend(e.to_string()));
+            }
+            tx.commit()
+                .await
+                .map_err(|e| MemoryError::Backend(e.to_string()))?;
+            return Ok(());
+        }
+
+        let prefix = format!("{}/", from.rel());
+        let moving: Vec<String> = keys
+            .iter()
+            .filter(|k| k.starts_with(&prefix))
+            .cloned()
+            .collect();
+        let update = format!(
+            "UPDATE {} SET rel = $3, updated_at = now() WHERE project = $1 AND rel = $2",
+            self.table
+        );
+        for rel in moving {
+            let tail = &rel[prefix.len()..];
+            let dest = format!("{}/{tail}", to.rel());
+            if let Err(e) = tx.execute(&update, &[&self.project, &rel, &dest]).await {
+                let _ = tx.rollback().await;
+                return Err(MemoryError::Backend(e.to_string()));
+            }
+        }
+        tx.commit()
+            .await
+            .map_err(|e| MemoryError::Backend(e.to_string()))?;
+        Ok(())
     }
 
     async fn search(&self, query: &str) -> Result<Vec<Hit>, MemoryError> {
-        Ok(docs::search(&self.snapshot().await?, query, self.root))
+        let needle = query.to_lowercase();
+        if needle.is_empty() {
+            return Ok(Vec::new());
+        }
+        let client = self.client().await?;
+        let sql = format!(
+            "SELECT rel, body FROM {} \
+             WHERE project = $1 AND position(lower($2) in lower(body)) > 0 \
+             ORDER BY rel",
+            self.table
+        );
+        let rows = client
+            .query(&sql, &[&self.project, &needle])
+            .await
+            .map_err(|e| MemoryError::Backend(e.to_string()))?;
+        let mut hits = Vec::new();
+        for row in rows {
+            let rel: String = row.get(0);
+            let body: String = row.get(1);
+            let path = format!("{}/{rel}", self.root);
+            hits.extend(docs::search_in(&path, &body, &needle));
+        }
+        Ok(hits)
     }
 }
 
@@ -368,6 +675,12 @@ mod tests {
             panic!("expected a document");
         };
         assert_eq!(t, "hello\n");
+        assert_eq!(b.index().await.unwrap(), "");
+        b.create(&p("/memories/MEMORY.md"), "# notes.md\n")
+            .await
+            .unwrap();
+        assert!(b.index().await.unwrap().contains("notes.md"));
         b.delete(&p("/memories/notes.md")).await.unwrap();
+        b.delete(&p("/memories/MEMORY.md")).await.unwrap();
     }
 }

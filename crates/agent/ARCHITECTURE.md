@@ -519,9 +519,13 @@ The harness layers several capabilities over the bare tools + loop:
   The agent owns the row type — `(project, rel) TEXT COLLATE "C"`, `body TEXT`, `updated_at
   TIMESTAMPTZ`, plus `CHECK`s that encode `MemPath` — created with `CREATE TABLE IF NOT EXISTS` and
   probed on connect so a same-name table with the wrong columns fails fast. Networked backends
-  connect and ping at open so a down store fails before a model call is billed; `?prefix=` /
-  `?table=` override the project key and table. The operator picks the database; they do not pick
-  the columns. Each root's `MEMORY.md` index
+  connect and ping at open so a down store fails before a model call is billed; they do **not**
+  load the project into process memory. `index` and a document `view` are one-key reads
+  (`HGET` / `SELECT body WHERE rel = $1`); a directory listing is keys + sizes (`HKEYS`+`HSTRLEN`
+  / `length(body)`); `str_replace`/`insert` lock that one document; prefix `create`/`rename`/`delete`
+  consult the key set under a project lock; only `search` scans bodies (Postgres filters in SQL).
+  `?prefix=` / `?table=` override the project key and table. The operator picks the database; they
+  do not pick the columns. Each root's `MEMORY.md` index
   is read at session start (bounded to ~200 lines/25 KB) and injected into the system prompt as its own
   guidance subsection (`resources::PromptOptions::memory_sections`, rendered by `memory::render_sections`)
   — Claude Code's auto-memory model. Two host-side steers bracket a compaction so the model prepares for

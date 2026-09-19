@@ -2,9 +2,12 @@
 //!
 //! A store is a `rel → body` map. Directories are implicit prefixes of those keys, not first-class
 //! entries — there is nothing to persist for an empty folder, and a `view` of a prefix synthesizes
-//! the listing. That is the natural model for a hash, a SQL table, or an in-process map, and it is
-//! what [`super::map`], [`super::redis`], and [`super::postgres`] all implement by calling these
-//! functions inside a single atomic snapshot/transaction.
+//! the listing. That is the natural model for a hash, a SQL table, or an in-process map.
+//!
+//! [`super::map`] holds the map in process. [`super::redis`] and [`super::postgres`] use the same
+//! helpers, but they fetch **one document** (or keys + sizes) rather than the whole project — a
+//! `view` of `notes.md` is one `HGET` / `SELECT`, and the injected index is `MEMORY.md` only.
+//! Search still scans bodies; prefix `create`/`rename`/`delete` consult the key set.
 //!
 //! Text helpers ([`cap_index`], [`slice_range`], [`str_replace_once`], [`insert_at_line`],
 //! [`search_in`]) are also used by [`super::file::FileBackend`] so a `str_replace` means the same
@@ -111,11 +114,20 @@ pub fn search_in(path: &str, text: &str, needle_lower: &str) -> Vec<Hit> {
 
 /// Whether `rel` is a directory prefix of at least one stored document.
 pub fn is_dir(docs: &BTreeMap<String, String>, rel: &str) -> bool {
+    is_dir_keys(docs.keys(), rel)
+}
+
+/// [`is_dir`] against a key set — networked backends check prefixes without loading bodies.
+pub fn is_dir_keys<'a, I, S>(keys: I, rel: &str) -> bool
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str> + 'a,
+{
     if rel.is_empty() {
         return true;
     }
     let prefix = format!("{rel}/");
-    docs.keys().any(|k| k.starts_with(&prefix))
+    keys.into_iter().any(|k| k.as_ref().starts_with(&prefix))
 }
 
 /// The index document, already bounded. Empty when `MEMORY.md` is absent.
@@ -309,6 +321,20 @@ fn create_conflict(docs: &BTreeMap<String, String>, path: &MemPath) -> Result<()
     ancestor_is_file(docs, path.rel(), path)
 }
 
+/// [`create`] conflict checks against a key set — networked backends do not load bodies.
+pub fn create_conflict_keys(keys: &BTreeSet<String>, path: &MemPath) -> Result<(), MemoryError> {
+    if keys.contains(path.rel()) {
+        return Err(MemoryError::AlreadyExists(path.display()));
+    }
+    if is_dir_keys(keys.iter(), path.rel()) {
+        return Err(MemoryError::InvalidPath(format!(
+            "{} is a directory",
+            path.display()
+        )));
+    }
+    ancestor_is_file_keys(keys, path.rel(), path)
+}
+
 /// A path cannot live under a document (`a.md/b` when `a.md` exists) — there is no directory there.
 fn ancestor_is_file(
     docs: &BTreeMap<String, String>,
@@ -331,10 +357,45 @@ fn ancestor_is_file(
     Ok(())
 }
 
+/// [`ancestor_is_file`] against a key set.
+pub fn ancestor_is_file_keys(
+    keys: &BTreeSet<String>,
+    rel: &str,
+    path: &MemPath,
+) -> Result<(), MemoryError> {
+    let mut acc = String::new();
+    for comp in rel.split('/') {
+        if !acc.is_empty() && keys.contains(&acc) {
+            return Err(MemoryError::InvalidPath(format!(
+                "{} sits under document `{acc}`, which is not a directory",
+                path.display()
+            )));
+        }
+        if !acc.is_empty() {
+            acc.push('/');
+        }
+        acc.push_str(comp);
+    }
+    Ok(())
+}
+
 /// Recursive listing of every document under `under` plus a directory entry for each implicit
 /// prefix — matching [`super::file::FileBackend`]'s walk (the whole subtree, not just immediate
 /// children).
 fn listing(docs: &BTreeMap<String, String>, under: &str, root: &str) -> Vec<Entry> {
+    listing_with_sizes(
+        docs.iter()
+            .map(|(rel, body)| (rel.as_str(), body.len() as u64)),
+        under,
+        root,
+    )
+}
+
+/// [`listing`] from `(rel, byte-size)` pairs — a directory view does not need document bodies.
+pub fn listing_with_sizes<'a, I>(docs: I, under: &str, root: &str) -> Vec<Entry>
+where
+    I: IntoIterator<Item = (&'a str, u64)>,
+{
     let prefix = if under.is_empty() {
         String::new()
     } else {
@@ -342,7 +403,7 @@ fn listing(docs: &BTreeMap<String, String>, under: &str, root: &str) -> Vec<Entr
     };
     let mut dirs = BTreeSet::new();
     let mut out = Vec::new();
-    for (rel, body) in docs {
+    for (rel, size) in docs {
         if !under.is_empty() && rel != under && !rel.starts_with(&prefix) {
             continue;
         }
@@ -350,14 +411,14 @@ fn listing(docs: &BTreeMap<String, String>, under: &str, root: &str) -> Vec<Entr
             continue;
         }
         let rest = if under.is_empty() {
-            rel.as_str()
+            rel
         } else {
             &rel[prefix.len()..]
         };
         out.push(Entry {
             path: format!("{root}/{rel}"),
             is_dir: false,
-            size: body.len() as u64,
+            size,
         });
         let mut acc = under.to_string();
         for comp in rest.split('/') {
@@ -366,7 +427,7 @@ fn listing(docs: &BTreeMap<String, String>, under: &str, root: &str) -> Vec<Entr
             } else {
                 acc = format!("{acc}/{comp}");
             }
-            if acc != *rel {
+            if acc != rel {
                 dirs.insert(acc.clone());
             }
         }
@@ -460,5 +521,32 @@ mod tests {
             delete(&mut docs, &p("/memories/sub")),
             Err(MemoryError::NotFound(_))
         ));
+    }
+
+    #[test]
+    fn prefix_checks_and_listings_work_from_keys_alone() {
+        let keys: BTreeSet<String> = ["notes.md".into(), "sub/a.md".into()].into();
+        assert!(is_dir_keys(keys.iter(), "sub"));
+        assert!(!is_dir_keys(keys.iter(), "notes.md"));
+        assert!(matches!(
+            create_conflict_keys(&keys, &p("/memories/notes.md")),
+            Err(MemoryError::AlreadyExists(_))
+        ));
+        assert!(matches!(
+            create_conflict_keys(&keys, &p("/memories/sub")),
+            Err(MemoryError::InvalidPath(_))
+        ));
+        create_conflict_keys(&keys, &p("/memories/fresh.md")).unwrap();
+        let entries = listing_with_sizes([("notes.md", 3u64), ("sub/a.md", 10)], "", MEMORY_ROOT);
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.path == "/memories/notes.md" && e.size == 3 && !e.is_dir)
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.path == "/memories/sub" && e.is_dir && e.size == 0)
+        );
     }
 }

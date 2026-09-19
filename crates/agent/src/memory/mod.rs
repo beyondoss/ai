@@ -281,8 +281,9 @@ pub trait MemoryBackend: Send + Sync {
     /// Move `from` to `to`. Refused if `to` is already occupied.
     async fn rename(&self, from: &MemPath, to: &MemPath) -> Result<(), MemoryError>;
 
-    /// Case-insensitive substring search across every document, newest-relevant first. A file backend
-    /// scans; a SQL backend can push this down to full-text search.
+    /// Case-insensitive substring search across every document, newest-relevant first. A file
+    /// backend walks files; Redis `HGETALL`s; Postgres filters with `position(lower(needle) in
+    /// lower(body))` so non-matching documents are not loaded.
     async fn search(&self, query: &str) -> Result<Vec<Hit>, MemoryError>;
 }
 
