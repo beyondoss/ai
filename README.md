@@ -245,6 +245,10 @@ docker run --rm -p 8080:8080 \
   `<shard>.` prefix, so an id alone says which mount serves it. Credentials mount read-only. A
   tenant's workspace is **not** here — it is in that tenant's sandbox, behind the exec endpoint in
   its grant.
+- **Metrics:** `--metrics-listen 127.0.0.1:9095` serves `GET /metrics` on a listener of its own.
+  Loopback addresses only — the scrape describes every tenant on the replica and the replica is
+  reachable by tenants, so a routable bind is refused rather than warned about. Run the scraper
+  beside it. No tenant or session identifier appears in any label.
 - **Health**, on the same listener, no grant needed:
 
   ```sh

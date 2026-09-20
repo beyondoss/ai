@@ -281,12 +281,24 @@ struct SessionHandle {
     /// `true` exactly while the session's [`serve_session`] loop is running a `prompt`. The reaper reads
     /// it so a detached-but-mid-run background session is never reaped out from under an in-flight turn.
     running: Arc<AtomicBool>,
+    /// Why this session ended, shared with its [`ExitGuard`]. Written by whoever stops it, read once
+    /// as the task exits — so the reason is recorded by the code that knows it, rather than guessed
+    /// at the point of exit where every ending looks alike.
+    end_reason: Arc<Mutex<crate::metrics::SessionEnd>>,
 }
 
 impl SessionHandle {
     /// → `Stopping`: drop the retained input so the session observes EOF (once no connection holds a
     /// clone either), persists, and exits. Idempotent. The entry stays until the task has gone.
-    fn stop(&mut self) {
+    fn stop(&mut self, reason: crate::metrics::SessionEnd) {
+        // First writer wins: a session the reaper already claimed that then meets a shutdown ended
+        // because it was idle, not because of the deploy. Idempotent, like the phase change itself.
+        {
+            let mut slot = lock_ignoring_poison(&self.end_reason);
+            if *slot == crate::metrics::SessionEnd::Client {
+                *slot = reason;
+            }
+        }
         self.phase = Phase::Stopping;
     }
 }
@@ -331,6 +343,10 @@ struct Supervisor {
     /// Set by `serve --service`: this daemon authenticates every connection. `None` is the
     /// single-tenant daemon, unchanged — no grant is read and no tenant exists.
     service: Option<ServiceSupervisor>,
+    /// `--metrics-listen`'s instruments, or `None` when no scrape endpoint was asked for. Held here
+    /// rather than passed down because the supervisor is what every refusal and every session
+    /// transition already flows through.
+    metrics: Option<Arc<crate::metrics::Metrics>>,
     body: SessionBody,
 }
 
@@ -536,6 +552,11 @@ struct ExitGuard {
     id: String,
     incarnation: u64,
     exited: CancellationToken,
+    /// Counted down here rather than at any of the places a session can end, because this guard is
+    /// the one thing that runs on every path out — including a panic.
+    metrics: Option<Arc<crate::metrics::Metrics>>,
+    /// Why this session ended, set by whoever ended it; `Client` unless something else claims it.
+    end_reason: Arc<Mutex<crate::metrics::SessionEnd>>,
 }
 
 impl ExitGuard {
@@ -568,6 +589,10 @@ impl ExitGuard {
 
 impl Drop for ExitGuard {
     fn drop(&mut self) {
+        if let Some(m) = &self.metrics {
+            m.sessions_live.dec();
+            m.session_ended(*lock_ignoring_poison(&self.end_reason));
+        }
         {
             let mut table = lock_ignoring_poison(&self.table);
             if table
@@ -624,6 +649,22 @@ enum PinError {
     Closed,
 }
 
+impl HttpError {
+    /// Which refusal bucket this answer belongs in, or `None` when it is not a refusal at all (a
+    /// timeout, a 405 from a probe). Derived from the status rather than the variant so a new
+    /// variant lands in the right bucket by construction.
+    fn refusal(&self) -> Option<crate::metrics::Refusal> {
+        use crate::metrics::Refusal;
+        match self.status().0 {
+            401 | 403 => Some(Refusal::Auth),
+            421 => Some(Refusal::Misdirected),
+            503 => Some(Refusal::Unavailable),
+            400 => Some(Refusal::BadRequest),
+            _ => None,
+        }
+    }
+}
+
 impl From<PinError> for HttpError {
     fn from(e: PinError) -> Self {
         match e {
@@ -635,6 +676,19 @@ impl From<PinError> for HttpError {
 }
 
 impl Supervisor {
+    /// Count a refusal, then answer it.
+    ///
+    /// One function so a refusal path added later cannot quietly skip the counter — the alternative
+    /// is a counter beside each of seven `write_http_err` calls, which is exactly the shape that
+    /// goes stale. Errors that are not refusals (a 405 from a probe, a timeout) are answered without
+    /// being counted; [`HttpError::refusal`] decides which is which.
+    async fn refuse<S: AsyncWrite + Unpin>(&self, stream: &mut S, err: &HttpError) {
+        if let (Some(m), Some(r)) = (&self.metrics, err.refusal()) {
+            m.refused(r);
+        }
+        let _ = write_http_err(stream, err, None).await;
+    }
+
     /// Attach to the session named `requested_id` (minting a fresh id if `None`), spawning it if no task
     /// owns the id. No eviction: multiple attachments coexist on one session (WebSocket connections
     /// and in-flight HTTP POSTs), so a phone, a TUI, and a `curl` can watch/drive it together.
@@ -743,7 +797,7 @@ impl Supervisor {
                 // persisting. Respawning now would put two writers on one session file; mark it
                 // stopping (idempotent) and wait for it to be gone.
                 _ => {
-                    h.stop();
+                    h.stop(crate::metrics::SessionEnd::Error);
                     TryPin::Wait(h.exited.clone())
                 }
             };
@@ -761,6 +815,9 @@ impl Supervisor {
         let incarnation = table.next_incarnation;
         table.next_incarnation += 1;
         let (input_tx, input_rx) = mpsc::channel::<String>(crate::serve::IN_CHANNEL_BOUND);
+        // Made before the entry so the handle and the exit guard share one slot: whoever ends the
+        // session writes the reason here, and the guard reports it on the way out.
+        let end_reason = Arc::new(Mutex::new(crate::metrics::SessionEnd::Client));
         let out_conn: SharedOutConn = Arc::new(Mutex::new(OutFanout::default()));
         // Shared with the session loop: `true` only while it's running a `prompt`. The reaper reads
         // this handle-side clone to never reclaim a mid-run background session.
@@ -777,6 +834,7 @@ impl Supervisor {
                 attached: 1,
                 last_detached_at: None,
                 running: running.clone(),
+                end_reason: Arc::clone(&end_reason),
             },
         );
         // The entry now owns the id; everything below runs unlocked. That includes the spawn itself: a
@@ -784,11 +842,20 @@ impl Supervisor {
         // this lock.
         drop(table);
 
+        // Counted at the moment the id is owned, not when the body starts: from here on this
+        // session is one of the things a crash of this replica would strand until its lock lapses,
+        // which is what the gauge is for.
+        if let Some(m) = &self.metrics {
+            m.sessions_live.inc();
+            m.sessions_spawned.inc();
+        }
         let exit = ExitGuard {
             table: Arc::clone(&self.table),
             id: id.to_owned(),
             incarnation,
             exited,
+            metrics: self.metrics.clone(),
+            end_reason: Arc::clone(&end_reason),
         };
         // Service mode: this task must own the session's storage before it goes live. The lock is
         // liveness only — correctness is the epoch fence — so it is what keeps two replicas sharing a
@@ -801,10 +868,28 @@ impl Supervisor {
         // For the failure paths below: whoever attached to the `Starting` slot while the lock was
         // being taken is told why nothing started.
         let starting_conn = out_conn.clone();
+        let metrics_for_lock = self.metrics.clone();
         tokio::spawn(async move {
             let mut lock = None;
             if let Some(path) = lock_path.clone() {
-                match take_session_lock(path).await {
+                // Timed because this is where a dead owner's lease shows up. A `kill -9` does not
+                // release an NFS lock — it lapses — so after a replica dies its sessions wait here
+                // rather than failing, and the wait is the whole failover story. `lock_failures`
+                // separates "another live replica holds it" (ordinary, a 503 and a retry) from a
+                // mount that stopped answering.
+                let began = std::time::Instant::now();
+                let outcome = take_session_lock(path).await;
+                if let Some(m) = &metrics_for_lock {
+                    match &outcome {
+                        Ok(Some(_)) => m.lock_wait_seconds.observe(began.elapsed().as_secs_f64()),
+                        Ok(None) => m.lock_failed(crate::metrics::LockFailure::Held),
+                        Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                            m.lock_failed(crate::metrics::LockFailure::Timeout);
+                        }
+                        Err(_) => m.lock_failed(crate::metrics::LockFailure::Io),
+                    }
+                }
+                match outcome {
                     Ok(Some(held)) => lock = Some(held),
                     Ok(None) => {
                         report_start_failure(
@@ -1037,7 +1122,7 @@ impl Supervisor {
                 .sessions
                 .values_mut()
                 .map(|h| {
-                    h.stop();
+                    h.stop(crate::metrics::SessionEnd::Drain);
                     h.exited.clone()
                 })
                 .collect()
@@ -1128,7 +1213,7 @@ impl Supervisor {
         let mut table = lock_ignoring_poison(&self.table);
         for h in table.sessions.values_mut() {
             if is_reapable(h, timeout) {
-                h.stop();
+                h.stop(crate::metrics::SessionEnd::IdleReap);
             }
         }
     }
@@ -1440,6 +1525,7 @@ pub async fn serve_ws(
             .then(|| cfg.session_dir.clone())
             .flatten(),
         service,
+        metrics: cfg.metrics.clone(),
         body: serve_session_body(cfg),
     });
     let mut shutdown = crate::serve::ShutdownSignal::new()?;
@@ -1553,7 +1639,7 @@ where
     let (mut head, leftover) = match read_http_head(&mut stream).await {
         Ok(v) => v,
         Err(e) => {
-            let _ = write_http_err(&mut stream, &e, None).await;
+            supervisor.refuse(&mut stream, &e).await;
             return Ok(());
         }
     };
@@ -1623,7 +1709,7 @@ where
             )
             .await
             {
-                let _ = write_http_err(&mut stream, &e, None).await;
+                supervisor.refuse(&mut stream, &e).await;
             }
             Ok(())
         }
@@ -1665,7 +1751,17 @@ async fn handle_health<S: AsyncWrite + Unpin>(
     }
     // No `--shard` means no service mode, and then "the listener is up" is the whole of readiness.
     let reason = match &supervisor.service {
-        Some(svc) => svc.ready.check(&svc.shards).await,
+        Some(svc) => {
+            // Timed here rather than inside the probe: a cache hit is microseconds and a hit is most
+            // of them, so the histogram's shape is exactly "how often did a caller have to wait for
+            // the mount, and how long". That is the question a degrading mount is answered by.
+            let began = std::time::Instant::now();
+            let answer = svc.ready.check(&svc.shards).await;
+            if let Some(m) = &supervisor.metrics {
+                m.ready_probe_seconds.observe(began.elapsed().as_secs_f64());
+            }
+            answer
+        }
         None => None,
     };
     match reason {
@@ -1824,7 +1920,7 @@ where
     let request = match http_request_from_head(head) {
         Ok(r) => r,
         Err(e) => {
-            let _ = write_http_err(&mut stream, &e, None).await;
+            supervisor.refuse(&mut stream, &e).await;
             return Ok(());
         }
     };
@@ -1834,7 +1930,7 @@ where
     let pinned = match supervisor.pin(requested_id, service.clone()).await {
         Ok(pinned) => pinned,
         Err(e) => {
-            let _ = write_http_err(&mut stream, &HttpError::from(e), None).await;
+            supervisor.refuse(&mut stream, &HttpError::from(e)).await;
             return Ok(());
         }
     };
@@ -1842,7 +1938,9 @@ where
         Ok(r) => r,
         Err(_) => {
             supervisor.unpin(&pinned.id, pinned.incarnation);
-            let _ = write_http_err(&mut stream, &HttpError::UpgradeRequired, None).await;
+            supervisor
+                .refuse(&mut stream, &HttpError::UpgradeRequired)
+                .await;
             return Ok(());
         }
     };
@@ -2383,6 +2481,7 @@ mod tests {
             attached,
             last_detached_at: detached_ago.and_then(|d| Instant::now().checked_sub(d)),
             running: Arc::new(AtomicBool::new(false)),
+            end_reason: Arc::new(Mutex::new(crate::metrics::SessionEnd::Client)),
         };
         (h, input_rx)
     }
@@ -2445,7 +2544,7 @@ mod tests {
         );
 
         let (mut stopping, _rx) = handle(0, Some(Duration::from_secs(120)));
-        stopping.stop();
+        stopping.stop(crate::metrics::SessionEnd::Client);
         assert!(
             !is_reapable(&stopping, timeout),
             "already on its way out: nothing left to reap"
@@ -2516,6 +2615,7 @@ mod tests {
     fn probe_supervisor(probe: &Arc<Probe>, first_ends_itself: bool) -> Arc<Supervisor> {
         let probe = probe.clone();
         Arc::new(Supervisor {
+            metrics: None,
             table: Arc::default(),
             session_dir: None,
             service: None,
@@ -2722,6 +2822,8 @@ mod tests {
             id: "s1".into(),
             incarnation: 6,
             exited: stale_exited.clone(),
+            metrics: None,
+            end_reason: Arc::new(Mutex::new(crate::metrics::SessionEnd::Client)),
         });
         assert!(stale_exited.is_cancelled());
         assert!(lock_ignoring_poison(&table).sessions.contains_key("s1"));
@@ -2731,6 +2833,8 @@ mod tests {
             id: "s1".into(),
             incarnation: 7,
             exited: CancellationToken::new(),
+            metrics: None,
+            end_reason: Arc::new(Mutex::new(crate::metrics::SessionEnd::Client)),
         });
         assert!(!lock_ignoring_poison(&table).sessions.contains_key("s1"));
     }

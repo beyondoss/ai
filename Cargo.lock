@@ -437,6 +437,7 @@ dependencies = [
  "listenfd",
  "mimalloc",
  "percent-encoding",
+ "prometheus",
  "pulldown-cmark",
  "regex",
  "reqwest",

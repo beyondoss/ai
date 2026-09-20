@@ -19,6 +19,7 @@ pub mod grant;
 pub mod lifecycle;
 pub mod mcp_auth_store;
 pub mod memory;
+pub mod metrics;
 pub mod oauth;
 pub(crate) mod path_utils;
 pub mod policy;
