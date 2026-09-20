@@ -416,6 +416,7 @@ dependencies = [
  "base64 0.22.1",
  "beyond-ai-agent-core",
  "beyond-ai-providers",
+ "beyond-ai-test-support",
  "bytes",
  "chacha20poly1305",
  "divan",
@@ -493,6 +494,13 @@ dependencies = [
 [[package]]
 name = "beyond-ai-providers"
 version = "0.1.0"
+
+[[package]]
+name = "beyond-ai-test-support"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+]
 
 [[package]]
 name = "beyond-slipstream"

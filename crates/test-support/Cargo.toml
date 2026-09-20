@@ -1,0 +1,14 @@
+[package]
+name = "beyond-ai-test-support"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish = false
+rust-version.workspace = true
+description = "Test doubles shared by the agent's integration tests and the fleet simulator — not published"
+
+[lints]
+workspace = true
+
+[dependencies]
+serde_json.workspace = true

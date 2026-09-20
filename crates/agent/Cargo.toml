@@ -224,6 +224,9 @@ path = "tests/code_mode_eval.rs"
 required-features = ["code-mode"]
 
 [dev-dependencies]
+# The mock model server and turn builders, shared with `crates/fleet-sim` — see that crate for why
+# they no longer live in `tests/common`.
+beyond-ai-test-support = { path = "../test-support" }
 # The client side of the WebSocket transport, for `tests/serve_websocket.rs` and the live WS smokes:
 # `connect_async` to a `ws://127.0.0.1` listener (no TLS). Same crate/version as the non-dev dep above.
 # Scratch files/dirs for the file-tool tests.
