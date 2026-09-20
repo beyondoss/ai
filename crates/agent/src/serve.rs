@@ -4065,7 +4065,14 @@ pub(crate) async fn serve_session(
                 // between ack and `run_events_steered` (and the retry-backoff window between
                 // attempts) is still "a prompt is in flight" — reaping here would drop a run the
                 // client was just told had started. Cleared after the terminal `prompt` response.
-                running.store(true, Ordering::Relaxed);
+                // `swap`, not `store`: the gauge must follow *transitions*. The retry path below
+                // re-asserts this flag while a run is already in flight, and an unconditional `inc`
+                // there would count one prompt twice and never come back down.
+                if !running.swap(true, Ordering::Relaxed)
+                    && let Some(m) = &cfg.metrics
+                {
+                    m.runs_in_flight.inc();
+                }
                 // One run_id for the whole prompt, including whole-run retries. Minted here, next to
                 // the ack the client just got, so a crash between accept and the loop still has a
                 // `started` in flight. Unconfigured (`NoLifecycle`) skips construction entirely.
@@ -4208,7 +4215,11 @@ pub(crate) async fn serve_session(
                     // the ack above; re-asserted here so a retry attempt is still protected if anything
                     // cleared it. The matching clear is *after* the whole prompt, not after this
                     // attempt — retry backoff is still mid-run.
-                    running.store(true, Ordering::Relaxed);
+                    if !running.swap(true, Ordering::Relaxed)
+                        && let Some(m) = &cfg.metrics
+                    {
+                        m.runs_in_flight.inc();
+                    }
                     if let Some(life) = &life {
                         life.set_attempt(retry_attempt);
                     }
@@ -5039,7 +5050,11 @@ pub(crate) async fn serve_session(
                     }
                 }
                 emit!(frame);
-                running.store(false, Ordering::Relaxed);
+                if running.swap(false, Ordering::Relaxed)
+                    && let Some(m) = &cfg.metrics
+                {
+                    m.runs_in_flight.dec();
+                }
                 // pi-parity (Task 4): this run has now actually gone idle (same guarantee
                 // `pending_abort_acks` relies on above) and its own terminal response has just been
                 // sent — run each command that arrived mid-run and self-aborted-and-proceeded through
