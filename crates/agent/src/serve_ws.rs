@@ -207,6 +207,27 @@ const SESSION_ID_HEADER: &str = "X-Session-Id";
 /// way out, and reconnecting to its id respawns it and replays from disk.
 const DEFAULT_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 
+/// The same window in **service mode**, where an hour is not conservative but harmful.
+///
+/// The reasoning above is a single-user daemon's: re-attaching to a still-running run means
+/// reconnecting to *this process*, so the window has to outlast a tunnel or a lunch break. On a
+/// replica that is not what re-attaching means. The session lives on shared storage, so any replica
+/// respawns it from disk and replays — and a session mid-run is never reaped at all
+/// ([`is_reapable`] requires `!running`), so what the window actually governs is how long a
+/// **detached, idle** session keeps its lock.
+///
+/// Holding that lock for an hour is how a failed-over session gets stranded. After a failover the
+/// session is live on the replica that took it, which is not the one the edge's hash chooses; the
+/// hash target answers 503 on every attempt until this window expires and the lock frees. The fleet
+/// simulator reproduced exactly that: sessions intact, replayable, and unreachable from where the
+/// edge looks — for as long as this constant says.
+///
+/// A minute instead. Long enough to ride out a page reload or a brief network blip without paying
+/// for a respawn; short enough that a stranded session frees in a minute rather than an hour. Being
+/// wrong in the short direction costs one read of the transcript from shared storage, which is the
+/// cheap direction: being wrong in the long direction costs availability.
+const DEFAULT_SERVICE_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// How often a drain re-checks whether any run is still in flight.
 ///
 /// Short enough that a drain of idle sessions is over in well under a second, long enough that the
@@ -1329,14 +1350,19 @@ async fn await_exits_within(exits: Vec<CancellationToken>, grace: Duration) {
     }
 }
 
-/// Resolve the idle reaper's window from [`ServeConfig::session_idle_timeout`]: unset ⇒
-/// [`DEFAULT_SESSION_IDLE_TIMEOUT`] (the reaper is *on* by default — the map has no other way to shrink,
-/// see the const), and `0` ⇒ `None`, the explicit opt-out for an operator who genuinely wants every
-/// session pinned for the daemon's lifetime.
-fn resolve_idle_timeout(configured: Option<Duration>) -> Option<Duration> {
+/// Resolve the idle reaper's window from [`ServeConfig::session_idle_timeout`]: unset ⇒ the default
+/// for this mode ([`DEFAULT_SESSION_IDLE_TIMEOUT`], or
+/// [`DEFAULT_SERVICE_SESSION_IDLE_TIMEOUT`] on a replica — see that const for why an hour is the
+/// wrong number there), and `0` ⇒ `None`, the explicit opt-out for an operator who genuinely wants
+/// every session pinned for the daemon's lifetime.
+///
+/// An operator who passes a value still gets exactly it, in either mode. The mode only chooses what
+/// *silence* means.
+fn resolve_idle_timeout(configured: Option<Duration>, service_mode: bool) -> Option<Duration> {
     match configured {
         Some(t) if t.is_zero() => None,
         Some(t) => Some(t),
+        None if service_mode => Some(DEFAULT_SERVICE_SESSION_IDLE_TIMEOUT),
         None => Some(DEFAULT_SESSION_IDLE_TIMEOUT),
     }
 }
@@ -1564,7 +1590,7 @@ pub async fn serve_ws(
 
     // Read before `cfg` is moved into the supervisor: how aggressively to reap idle sessions (and
     // whether the operator opted out of reaping altogether).
-    let idle_timeout = resolve_idle_timeout(cfg.session_idle_timeout);
+    let idle_timeout = resolve_idle_timeout(cfg.session_idle_timeout, cfg.service_mode);
 
     // Service mode: every connection is verified against this keyring, and a tenant's sessions live
     // on these mounts. `main.rs` has already refused `--service` without both, so a `None` verifier
@@ -2594,19 +2620,44 @@ mod tests {
     #[test]
     fn idle_timeout_defaults_to_a_finite_window_and_zero_opts_out() {
         assert_eq!(
-            resolve_idle_timeout(None),
+            resolve_idle_timeout(None, false),
             Some(DEFAULT_SESSION_IDLE_TIMEOUT),
             "no --session-idle-timeout must still reap: the map has no other way to shrink"
         );
         assert_eq!(
-            resolve_idle_timeout(Some(Duration::ZERO)),
+            resolve_idle_timeout(Some(Duration::ZERO), false),
             None,
             "0 opts out"
         );
         assert_eq!(
-            resolve_idle_timeout(Some(Duration::from_secs(5))),
+            resolve_idle_timeout(Some(Duration::from_secs(5)), false),
             Some(Duration::from_secs(5))
         );
+    }
+
+    #[test]
+    fn service_mode_holds_a_detached_session_for_a_minute_not_an_hour() {
+        // The hour is a single-user daemon's number: there, re-attaching means reconnecting to *this
+        // process*. On a replica the session is on shared storage and any replica respawns it, so
+        // what the window really governs is how long a detached session keeps its lock — and an hour
+        // of that is how a failed-over session stays unreachable from the replica the edge's hash
+        // chooses.
+        assert_eq!(
+            resolve_idle_timeout(None, true),
+            Some(DEFAULT_SERVICE_SESSION_IDLE_TIMEOUT)
+        );
+        assert!(
+            DEFAULT_SERVICE_SESSION_IDLE_TIMEOUT < DEFAULT_SESSION_IDLE_TIMEOUT,
+            "the replica's window must be the shorter one"
+        );
+
+        // The mode only decides what *silence* means. An operator who names a window gets it, and
+        // `0` still pins every session, in either mode.
+        assert_eq!(
+            resolve_idle_timeout(Some(Duration::from_secs(5)), true),
+            Some(Duration::from_secs(5))
+        );
+        assert_eq!(resolve_idle_timeout(Some(Duration::ZERO), true), None);
     }
 
     #[test]
