@@ -111,7 +111,6 @@ jobs:
           - name: agent-rest
             filter: package(beyond-ai-agent) and kind(test) and not binary(~serve) and not binary(exec_endpoint_live)
             extra: ""
-
           # The daemon and service-mode integration suite: WebSocket/UDS transports, session
           # lifecycle, grants, tenant isolation, sealed storage. Every one of these spawns at least one
           # real `beyond-ai-agent` process, so it is the shard most sensitive to the `test-threads` cap.
