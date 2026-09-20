@@ -97,3 +97,11 @@ run = "cargo bench -p beyond-ai-agent --bench serve_runtime"
 [tasks."bench"]
 description = "Run both bench harnesses (unit micro + e2e macro)."
 depends = ["bench:unit", "bench:e2e"]
+
+[tasks."sim:matrix"]
+description = "Fleet simulator conformance matrix. `--substrate nfs` needs root + nfs-kernel-server; the default local-dir substrate skips the claims that only a shared mount can show."
+run = "cargo run -q -p beyond-ai-fleet-sim --bin fleet-sim -- matrix"
+
+[tasks."sim:list"]
+description = "List the fleet simulator's scenarios and which substrate each one needs."
+run = "cargo run -q -p beyond-ai-fleet-sim --bin fleet-sim -- list"
