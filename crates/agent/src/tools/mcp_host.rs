@@ -2,8 +2,9 @@
 //!
 //! Same shape as [`crate::approval::ApprovalGate`]: an abstract trait with one implementation per
 //! host. `serve` broadcasts a frame and parks a oneshot; the default declines so `run` (no UI) never
-//! hangs. Installed into process-scoped hubs that every MCP [`ClientHandler`](rmcp::ClientHandler)
-//! consults — connect happens before `serve`'s gate exists, so the hub is the late-binding seam.
+//! hangs. Every MCP [`ClientHandler`](rmcp::ClientHandler) holds the [`McpHost`] of whoever dialed
+//! its connection and consults it — connect happens before `serve`'s gate exists, so the hub is the
+//! late-binding seam.
 
 #![expect(deprecated)] // Sampling: SEP-2577-deprecated but still on the wire.
 
@@ -171,8 +172,13 @@ impl SamplingHub {
     }
 }
 
-/// Process-scoped hubs every MCP client handler shares. Connect runs before `serve` can install
-/// gates; hubs are the seam.
+/// The hubs one MCP connection's server→client requests reach. Connect runs before `serve` can
+/// install gates; hubs are the seam.
+///
+/// **Whose** hubs depends on who dialed. A session that dials its own connectors (service mode)
+/// holds its own, so a server's question is answered by the session that asked it. The servers
+/// connected once at startup from the operator's settings are shared by every session, and hold the
+/// process-wide one (`tools::mcp::host`) — there is no single session to route those to.
 #[derive(Clone, Default)]
 pub struct McpHost {
     pub elicitation: ElicitationHub,

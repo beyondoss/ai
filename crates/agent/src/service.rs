@@ -12,8 +12,8 @@
 //! - [`ServiceSession`] then answers every "where does this session's *X* live?" question `serve`
 //!   used to answer from the replica host: persistence ([`ServiceSession::session_dir`]), durable
 //!   memory ([`ServiceSession::memory_backend`]), the exec target every tool runs in
-//!   ([`ServiceSession::connect_exec`]), and the gateway credential
-//!   ([`ServiceSession::gateway_key`]).
+//!   ([`ServiceSession::connect_exec`]), the gateway credential ([`ServiceSession::gateway_key`]),
+//!   and the MCP connectors this session may reach ([`ServiceSession::mcp`]).
 //!
 //! **The no-host rule.** In service mode the replica's own `$HOME`, cwd, and stored settings are not
 //! a fallback for anything: no `~/.claude` skills/prompts/agents/`SYSTEM.md`, no `models.json` or
@@ -28,15 +28,16 @@
 //! the model is one the model's own `read` can open, and no walk ever touches the replica. Session
 //! start and `reload` call that one function, which is why `reload` is allowed here at all.
 //!
-//! Per-session MCP is the one seam still unwired: [`ServiceSession::mcp`] returns nothing, so the
-//! grant's connector list is carried but not dialed. A later PR fills it in; this module is where it
-//! lands, so the rest of `serve` does not move again.
+//! **Its connectors come from its grant.** [`ServiceSession::mcp`] dials the grant's MCP list with the
+//! sealed per-connector headers, per session, so one tenant's servers — and one tenant's elicitations
+//! — never reach another's.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 use crate::grant::{Grant, GrantVerifier};
+use crate::session_store::{Layout, RepoOptions, TenantCodec};
 
 /// Cap on the `x-beyond-grant` header's value. The whole header block is capped at 16 KiB
 /// (`serve_ws::MAX_HEADER_BYTES`), so a token larger than this could never arrive beside a `Host`
@@ -230,11 +231,15 @@ pub fn authorize(
 
     let session_dir = session_root.join(&grant.tenant).join("sessions");
     let memory_dir = home_root.join(&grant.tenant).join("memory");
+    // Derived once per connection, from a key that never leaves this struct: `Debug` on the codec
+    // shows only the tenant and the key fingerprint, and nothing ever writes the DEK itself down.
+    let codec = Arc::new(TenantCodec::new(&grant.tenant, grant.secrets.dek.expose()));
     Ok(ServiceSession {
         grant: Arc::new(grant),
         shards: Arc::clone(shards),
         session_dir,
         memory_dir,
+        codec,
         sandbox: OnceLock::new(),
     })
 }
@@ -268,6 +273,9 @@ pub struct ServiceSession {
     pub session_dir: PathBuf,
     /// `<home shard>/<tenant>/memory` — the tenant's durable memory, shared by all of its sessions.
     pub memory_dir: PathBuf,
+    /// This tenant's sealing keys, derived from the grant's per-tenant `dek`. Every transcript,
+    /// listing cache and memory document this connection writes goes through it.
+    codec: Arc<TenantCodec>,
     /// Filled by [`Self::connect_exec`] at session start; read by the tool builds after it.
     sandbox: OnceLock<Sandbox>,
 }
@@ -312,12 +320,50 @@ impl ServiceSession {
         Some(self.shards.get(shard)?.join(self.tenant()).join("sessions"))
     }
 
+    /// The shard this session's transcript lives on — its id's own `<shard>.` prefix, or the grant's
+    /// home shard for an id minted before ids carried one.
+    pub fn shard(&self) -> &str {
+        shard_of(self.session_id(), &self.grant.home_shard)
+    }
+
+    /// This tenant's sealing keys. Shared rather than re-derived: a listing, a fork and a preview all
+    /// open *other* ids, and they all seal under the same per-tenant key.
+    pub fn codec(&self) -> &Arc<TenantCodec> {
+        &self.codec
+    }
+
+    /// The on-disk shape of every session this tenant owns: epoch segments (so two replicas sharing a
+    /// mount fence each other rather than interleaving), sealed with this tenant's keys.
+    pub fn layout(&self) -> Layout {
+        Layout::Segmented {
+            codec: Some(Arc::clone(&self.codec)),
+        }
+    }
+
+    /// How to open the repo holding `id`. The id prefix is `id`'s **own** shard, so a session derived
+    /// from it (a fork, a clone, an archive) is minted onto the mount its parent already lives on and
+    /// stays routable by its id alone.
+    pub fn repo_options_for(&self, id: &str) -> RepoOptions {
+        RepoOptions {
+            layout: self.layout(),
+            id_prefix: Some(shard_of(id, &self.grant.home_shard).to_owned()),
+        }
+    }
+
+    /// This session's own directory — the unit [`acquire_session_lock`](crate::session_store::acquire_session_lock)
+    /// takes a lock on, and the parent of its segments and its `/session` memory.
+    pub fn session_path(&self) -> PathBuf {
+        self.session_dir.join(self.session_id())
+    }
+
     /// Durable memory, rooted at the tenant's own directory rather than resolved from the replica's
-    /// cwd or `--memory` DSN.
+    /// cwd or `--memory` DSN, and sealed with the tenant's own key — the mount is shared with every
+    /// other tenant on the shard.
     pub fn memory_backend(&self) -> Arc<dyn crate::memory::MemoryBackend> {
-        Arc::new(crate::memory::file::FileBackend::at(
-            self.memory_dir.clone(),
-        ))
+        Arc::new(
+            crate::memory::file::FileBackend::at(self.memory_dir.clone())
+                .sealed(Arc::clone(&self.codec)),
+        )
     }
 
     /// Build this session's exec target from the grant, **strictly**: the endpoint is probed before
@@ -425,15 +471,53 @@ impl ServiceSession {
         }
     }
 
-    /// The tenant's MCP connectors. Empty until per-session MCP lands — the grant carries the
-    /// connector list and its headers, but nothing dials them yet.
-    pub fn mcp(
+    /// Dial this session's own MCP connectors — the ones its grant names, with the credentials its
+    /// grant sealed — and return their tools and catalog.
+    ///
+    /// Per session, not per process: the replica's configured servers are the operator's and are
+    /// never connected in service mode at all, and two sessions on this replica share no MCP state.
+    /// `host` is this session's own [`McpHost`](crate::tools::mcp_host::McpHost), so an elicitation
+    /// or a sampling request from one of these servers is answered by the session that asked.
+    ///
+    /// `egress` is the daemon's process-wide, SSRF-checked client (`ServeConfig::mcp_http`). Without
+    /// one there is nothing safe to dial through, so the session simply has no connectors — the same
+    /// fail-closed answer as a connector whose URL is refused.
+    pub async fn mcp(
         &self,
+        egress: Option<&crate::tools::mcp::McpEgress>,
+        host: Arc<crate::tools::mcp_host::McpHost>,
     ) -> (
         Vec<Arc<dyn agent_core::Tool>>,
         crate::tools::mcp::McpCatalog,
+        Vec<String>,
     ) {
-        (Vec::new(), crate::tools::mcp::McpCatalog::default())
+        let empty = || (Vec::new(), crate::tools::mcp::McpCatalog::default());
+        if self.grant.mcp.is_empty() {
+            let (tools, catalog) = empty();
+            return (tools, catalog, Vec::new());
+        }
+        let Some(egress) = egress else {
+            // Never in a real service replica (`main.rs` builds one whenever `--service` is set),
+            // so this says so rather than dropping the connectors silently.
+            let (tools, catalog) = empty();
+            return (
+                tools,
+                catalog,
+                vec![
+                    "this replica has no MCP egress client, so the grant's connectors were not \
+                     dialed"
+                        .to_owned(),
+                ],
+            );
+        };
+        crate::tools::mcp::connect_granted(
+            &self.grant.mcp,
+            &self.grant.secrets.mcp_headers,
+            egress,
+            host,
+            crate::tools::mcp::idle_reap_after_from_env(),
+        )
+        .await
     }
 
     /// Strip replica-host paths out of `text` — an error from the storage layer names the file it
@@ -521,9 +605,9 @@ pub struct Resources {
 /// [`ServiceSession::resources`], which walks the tenant's sandbox, so it means here exactly what it
 /// means anywhere else.
 ///
-/// The second group — `fork`, `clone`, `new_session` — is refused only until derived ids carry their
-/// shard prefix. Minting an unprefixed id on a multi-shard replica would create a session nothing
-/// could route back to, which is worse than refusing the command.
+/// `fork`, `clone` and `new_session` are **not** here: a repo opened for a tenant mints derived ids
+/// as `<shard>.<opaque>` ([`ServiceSession::repo_options_for`]), so a derived session stays routable
+/// on the mount its parent lives on.
 pub fn refused_command(command: &str) -> Option<&'static str> {
     Some(match command {
         "set_exec_endpoint" => {
@@ -534,9 +618,6 @@ pub fn refused_command(command: &str) -> Option<&'static str> {
         }
         "switch_session" => {
             "refused in service mode: connect at ?session_id=<id> with a grant for that session"
-        }
-        "fork" | "clone" | "new_session" => {
-            "refused in service mode: derived sessions are not available yet"
         }
         _ => return None,
     })
@@ -604,9 +685,6 @@ mod tests {
             "logout",
             "auth_status",
             "switch_session",
-            "fork",
-            "clone",
-            "new_session",
         ] {
             assert!(refused_command(command).is_some(), "{command}");
         }
@@ -616,6 +694,10 @@ mod tests {
             "list_sessions",
             "export_html",
             "bash",
+            // Derived sessions are minted onto their parent's shard, so these are allowed.
+            "fork",
+            "clone",
+            "new_session",
             // Re-enabled by sandbox discovery: it re-walks the *tenant's* filesystem now.
             "reload",
         ] {
@@ -623,31 +705,72 @@ mod tests {
         }
     }
 
-    #[test]
-    fn redaction_removes_the_mount_layout_from_an_error() {
-        let s = shards(&[("a", "/mnt/efs/a")]);
-        let session = ServiceSession {
-            grant: Arc::new(Grant {
-                tenant: "t1".into(),
-                session_id: "a.x".into(),
-                home_shard: "a".into(),
-                workspace_root: "/w".into(),
-                exec_url: "http://x/".into(),
-                mcp: Vec::new(),
-                exp: 0,
-                secrets: serde_json::from_str(
-                    r#"{"exec_headers":[],"mcp_headers":{},"gateway_key":"k","dek":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="}"#,
-                )
-                .unwrap(),
-            }),
-            shards: s,
+    /// A `ServiceSession` with no connection behind it, for the derivations that are pure functions
+    /// of the grant.
+    fn session(mounts: &[(&str, &str)], session_id: &str) -> ServiceSession {
+        let grant = Grant {
+            tenant: "t1".into(),
+            session_id: session_id.into(),
+            home_shard: "a".into(),
+            workspace_root: "/w".into(),
+            exec_url: "http://x/".into(),
+            mcp: Vec::new(),
+            exp: 0,
+            secrets: serde_json::from_str(
+                r#"{"exec_headers":[],"mcp_headers":{},"gateway_key":"k","dek":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="}"#,
+            )
+            .unwrap(),
+        };
+        let codec = Arc::new(TenantCodec::new(&grant.tenant, grant.secrets.dek.expose()));
+        ServiceSession {
+            grant: Arc::new(grant),
+            shards: shards(mounts),
             session_dir: PathBuf::from("/mnt/efs/a/t1/sessions"),
             memory_dir: PathBuf::from("/mnt/efs/a/t1/memory"),
+            codec,
             sandbox: OnceLock::new(),
-        };
+        }
+    }
+
+    #[test]
+    fn redaction_removes_the_mount_layout_from_an_error() {
+        let session = session(&[("a", "/mnt/efs/a")], "a.x");
         let redacted =
             session.redact("failed to open /mnt/efs/a/t1/sessions/1_x.jsonl: No such file");
         assert!(!redacted.contains("/mnt/efs"), "{redacted}");
         assert!(redacted.contains("<store>/t1/sessions"), "{redacted}");
+    }
+
+    #[test]
+    fn a_repo_mints_derived_ids_onto_the_shard_the_parent_lives_on() {
+        let session = session(&[("a", "/mnt/efs/a"), ("b", "/mnt/efs/b")], "a.x");
+        assert_eq!(session.shard(), "a");
+        assert_eq!(
+            session.repo_options_for("a.x").id_prefix.as_deref(),
+            Some("a")
+        );
+        // A command naming a session on another mount derives onto *that* mount.
+        assert_eq!(
+            session.repo_options_for("b.y").id_prefix.as_deref(),
+            Some("b")
+        );
+        // An id with no prefix at all belongs to the grant's home shard.
+        assert_eq!(
+            session.repo_options_for("bare").id_prefix.as_deref(),
+            Some("a")
+        );
+        assert!(matches!(
+            session.layout(),
+            Layout::Segmented { codec: Some(_) }
+        ));
+    }
+
+    #[test]
+    fn the_session_lock_is_taken_on_the_sessions_own_directory() {
+        let session = session(&[("a", "/mnt/efs/a")], "a.x");
+        assert_eq!(
+            session.session_path(),
+            PathBuf::from("/mnt/efs/a/t1/sessions/a.x"),
+        );
     }
 }

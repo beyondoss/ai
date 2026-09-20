@@ -20,6 +20,8 @@ pub const BIN: &str = env!("CARGO_BIN_EXE_beyond-ai-agent");
 pub mod exec_mock;
 /// A `bsg_v1` session-grant minter, written independently of `src/grant.rs`.
 pub mod grant;
+/// A streamable-HTTP MCP server that records every request header it is sent.
+pub mod mcp_fixture;
 /// A running `serve --service` replica, for the service-mode suites.
 pub mod service;
 
@@ -637,6 +639,38 @@ pub async fn ws_connect_with_headers(
     session_id: Option<&str>,
     headers: &[(&str, &str)],
 ) -> Result<TestWs, u16> {
+    match tokio_tungstenite::connect_async(ws_request(port, session_id, headers)).await {
+        Ok((ws, _resp)) => Ok(ws),
+        Err(tokio_tungstenite::tungstenite::Error::Http(resp)) => Err(resp.status().as_u16()),
+        Err(e) => panic!("websocket connect failed without an HTTP status: {e}"),
+    }
+}
+
+/// Connect expecting to be **refused**, and return the status with its `Retry-After` value — the two
+/// things a client or a proxy acts on for a 503. Panics if the connection is accepted.
+pub async fn ws_refusal(
+    port: u16,
+    session_id: Option<&str>,
+    headers: &[(&str, &str)],
+) -> (u16, Option<String>) {
+    match tokio_tungstenite::connect_async(ws_request(port, session_id, headers)).await {
+        Ok(_) => panic!("expected the connection to be refused"),
+        Err(tokio_tungstenite::tungstenite::Error::Http(resp)) => (
+            resp.status().as_u16(),
+            resp.headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string),
+        ),
+        Err(e) => panic!("websocket connect failed without an HTTP status: {e}"),
+    }
+}
+
+fn ws_request(
+    port: u16,
+    session_id: Option<&str>,
+    headers: &[(&str, &str)],
+) -> tokio_tungstenite::tungstenite::handshake::client::Request {
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
     let url = match session_id {
         Some(id) => format!("ws://127.0.0.1:{port}{WS_PATH}?session_id={id}"),
@@ -650,11 +684,7 @@ pub async fn ws_connect_with_headers(
             value.parse().expect("header value"),
         );
     }
-    match tokio_tungstenite::connect_async(request).await {
-        Ok((ws, _resp)) => Ok(ws),
-        Err(tokio_tungstenite::tungstenite::Error::Http(resp)) => Err(resp.status().as_u16()),
-        Err(e) => panic!("websocket connect failed without an HTTP status: {e}"),
-    }
+    request
 }
 
 /// A `serve --service` child: a grant verifier, one or more `--shard <name>=<path>` mounts, and a
