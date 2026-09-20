@@ -218,6 +218,22 @@ impl SessionMemory {
         self.lock().insert(key.to_string(), allow);
     }
 
+    /// Forget every remembered decision — what a session switch owes this memory, since it is
+    /// **session**-scoped and the session is exactly what just changed. An "always allow
+    /// `rm -rf build`" granted in one conversation must not silently pre-approve the next one's.
+    ///
+    /// Cleared **in place, through the shared `Arc`**, never by swapping a fresh `SessionMemory` in:
+    /// [`ApprovalRuntime`] is cloned *by value* into every subagent child, and `build_agent` is
+    /// skipped entirely on a same-model `switch_session`, so a swap would leave live clones still
+    /// answering out of the old map. Taking `&self` is what makes "one memory per session tree"
+    /// structural rather than a thing every call site has to remember.
+    ///
+    /// Harmless mid-session by construction: nothing calls this except a switch, and the only cost
+    /// of clearing is that a decision gets asked again.
+    pub fn clear(&self) {
+        self.lock().clear();
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, bool>> {
         self.decisions.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -574,6 +590,32 @@ mod tests {
 
         m.remember(&memory_key("bash", "cmd:rm"), false);
         assert_eq!(m.lookup(&memory_key("bash", "cmd:rm")), Some(false));
+    }
+
+    /// `clear` mutates through the shared `Arc` — so every clone of an `ApprovalRuntime` (each
+    /// subagent holds one by value) sees it, which is what makes a session switch actually end a
+    /// remembered decision rather than only ending it for whoever called.
+    #[test]
+    fn clearing_the_session_memory_is_seen_through_every_clone() {
+        // The gate is never consulted here — only the memory beside it.
+        let runtime = ApprovalRuntime::new(
+            FakeGate::new(Err(ApprovalError::NoClient)),
+            GatedSet::Writes,
+        );
+        let subagent = runtime.clone();
+        runtime.memory.remember(&memory_key("bash", "cmd:ls"), true);
+        assert_eq!(
+            subagent.memory.lookup(&memory_key("bash", "cmd:ls")),
+            Some(true)
+        );
+
+        runtime.memory.clear();
+        assert_eq!(
+            subagent.memory.lookup(&memory_key("bash", "cmd:ls")),
+            None,
+            "a clone kept answering out of the memory that was cleared"
+        );
+        assert_eq!(runtime.memory.lookup(&memory_key("bash", "cmd:ls")), None);
     }
 
     // ---- the decision table -----------------------------------------------------------------------

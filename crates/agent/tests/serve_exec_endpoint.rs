@@ -289,3 +289,100 @@ fn a_resumed_session_reattaches_its_endpoint_and_a_sibling_does_not_inherit_it()
     send(json!({ "id": "7", "type": "shutdown" }));
     let _ = out.read_line(&mut String::new());
 }
+
+/// A **cold** restart: the process is stopped, started again, and the session reopened by its id.
+///
+/// This is the claim the README makes — "resuming a session reattaches its endpoint, so a restart
+/// doesn't silently move a tenant's work onto the server" — and the one nothing actually covered. The
+/// test above only exercises `switch_session` *within one live process*, where the record is restored
+/// by `reset_exec_endpoint!` and the target never left memory. At process start the record was simply
+/// not read: the cell was wired from the grant or from `--exec-url`/`--exec-cmd` and from nothing
+/// else, so a daemon restart followed by a reconnect to the same id ran that session's tools on the
+/// host.
+///
+/// The second half pins the precedence: the session's own record outranks the process-wide default.
+/// A flag is "a starting point, not a floor" — what a session with no record of its own gets — so a
+/// daemon started with one default must not drag every resumed session onto it.
+#[test]
+fn a_cold_restart_reattaches_the_session_endpoint_and_outranks_the_process_default() {
+    let a = tenant("SECRET-AAAA");
+    let b = tenant("SECRET-BBBB");
+    let sessions = tempfile::tempdir().unwrap();
+
+    let (base, _bodies) = spawn_model_server(vec![
+        turn_tool_use("t1", "read", &json!({ "path": "secret.txt" }).to_string()),
+        turn_text("before"),
+        turn_tool_use("t2", "read", &json!({ "path": "secret.txt" }).to_string()),
+        turn_text("after"),
+    ]);
+
+    // ---- First process: attach tenant A, prove it works, note the id, stop. ----------------------
+    let first_id = {
+        let mut child =
+            serve_dir_cmd(BIN, &base, sessions.path().to_str().unwrap()).spawn_guarded();
+        let mut stdin = child.stdin.take().unwrap();
+        let mut out = BufReader::new(child.stdout.take().unwrap());
+        let mut send = |v: Value| {
+            writeln!(stdin, "{v}").unwrap();
+            stdin.flush().unwrap();
+        };
+
+        send(json!({ "id": "1", "type": "set_exec_endpoint", "command": target_cmd(a.path()) }));
+        assert_eq!(
+            response(&read_until_response(&mut out, "set_exec_endpoint"))["success"],
+            json!(true)
+        );
+        send(json!({ "id": "2", "type": "prompt", "message": "read" }));
+        let live = all(&read_until_response(&mut out, "prompt"));
+        assert!(live.contains("SECRET-AAAA"), "{live}");
+
+        send(json!({ "id": "3", "type": "get_state" }));
+        let state = response(&read_until_response(&mut out, "get_state")).clone();
+        let id = state["data"]["session_id"]
+            .as_str()
+            .expect("session_id")
+            .to_string();
+
+        send(json!({ "id": "4", "type": "shutdown" }));
+        let _ = out.read_line(&mut String::new());
+        id
+    };
+
+    // ---- Second process: same store, same id, and a *different* process-wide default. -----------
+    let mut child = serve_dir_cmd(BIN, &base, sessions.path().to_str().unwrap())
+        .args([
+            "--session-id",
+            &first_id,
+            "--exec-cmd",
+            &target_cmd(b.path()),
+        ])
+        .spawn_guarded();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut out = BufReader::new(child.stdout.take().unwrap());
+    let mut send = |v: Value| {
+        writeln!(stdin, "{v}").unwrap();
+        stdin.flush().unwrap();
+    };
+
+    send(json!({ "id": "1", "type": "get_state" }));
+    let state = response(&read_until_response(&mut out, "get_state")).clone();
+    assert_eq!(
+        state["data"]["session_id"].as_str(),
+        Some(first_id.as_str()),
+        "the restart must reopen the same session: {state}"
+    );
+
+    send(json!({ "id": "2", "type": "prompt", "message": "read" }));
+    let resumed = all(&read_until_response(&mut out, "prompt"));
+    assert!(
+        resumed.contains("SECRET-AAAA"),
+        "a cold restart lost the session's endpoint and ran its tools elsewhere: {resumed}"
+    );
+    assert!(
+        !resumed.contains("SECRET-BBBB"),
+        "the process-wide default overrode the session's own record: {resumed}"
+    );
+
+    send(json!({ "id": "3", "type": "shutdown" }));
+    let _ = out.read_line(&mut String::new());
+}
