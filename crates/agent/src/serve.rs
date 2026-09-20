@@ -994,12 +994,24 @@ impl ShutdownSignal {
 }
 
 /// Runs [`Persistence::persist`]'s blocking file I/O (`sync_all`, directory `fsync`) on tokio's
-/// blocking thread pool instead of `serve`'s single async control-loop task. `persist` runs after
-/// every turn (and every manual `compact`), so on a slow or network-backed session directory, a
-/// multi-ms-to-100ms `sync_all` would otherwise stall that task directly — delaying its stdin
-/// `select!` loop, and so `abort`/`steer` responsiveness, for the duration. `persistence` and `session`
-/// are moved in and handed back so the caller can keep using them (`Session` is cheap to clone: its
-/// `messages` field is an `Arc`, so this is a pointer clone, not a deep copy of the transcript).
+/// blocking thread pool instead of the runtime thread the session task is running on. `persist` runs
+/// after every turn (and every manual `compact`), so on a slow or network-backed session directory a
+/// multi-ms-to-100ms `sync_all` would otherwise pin that thread — and **every other session's task,
+/// the accept loop and the idle reaper are on it too**: the process runtime is `current_thread` by
+/// default (`main.rs::build_runtime`) and `serve_ws` `tokio::spawn`s every session onto it. Awaiting
+/// the blocking task suspends *this* session at the await point either way, so the win is never its
+/// own responsiveness — it is that the rest of the replica keeps running while this one writes.
+///
+/// **The ownership invariant, for anything added here.** There is exactly one [`Persistence`] per
+/// session, on that session task's own stack. It is moved **by value** into the blocking task and
+/// handed back out, so while the task holds it the session cannot reach it — that ownership *is* the
+/// per-session serialization of session writes. So: never `tokio::spawn` a persist (its handle
+/// outlives the await, which is exactly what lets a second write start), and never put `Persistence`
+/// behind a shared lock. [`SessionStore::append_new`]'s dedup guard is count-keyed
+/// (`messages.len() <= self.persisted`), so it cannot see a *shrink* — two writers that desync it
+/// silently drop history rather than erroring. `session` is moved in for the same mechanical reason
+/// and is cheap to clone at the call site (its `messages` field is an `Arc`, so a caller's clone is a
+/// pointer copy, not a deep copy of the transcript).
 async fn persist_blocking(
     mut persistence: Persistence,
     session: Session,
@@ -1034,6 +1046,37 @@ async fn persist_messages_blocking(
     })
     .await
     {
+        Ok(result) => result,
+        Err(e) => std::panic::resume_unwind(e.into_panic()),
+    }
+}
+
+/// [`persist_blocking`]'s move-in/move-out arrangement applied to [`Persistence::open`] — and this is
+/// the one that matters most, because it is the *only* session write path whose cost is unbounded by
+/// anything the client did: opening a session resolves a directory and then replays its whole
+/// transcript, so it is O(the conversation so far) before the session has served a single command.
+///
+/// It is also the reconnect path, and reconnects are **correlated**: a deploy or a load-balancer
+/// rehash lands N simultaneous opens on one replica at once. Run inline they serialize on the single
+/// runtime thread, each session's replay added to every other session's latency and to the accept
+/// loop's. On a network-backed session directory (the EFS mount service mode persists to) the
+/// directory resolve alone can take tens of milliseconds before any transcript bytes are read.
+///
+/// `cfg` is moved in and handed back rather than cloned: `open` only borrows it, but the blocking
+/// task has to own everything it touches, and the caller needs it for the rest of session start-up.
+/// The [`Persistence`] that comes back out obeys the same ownership invariant `persist_blocking`
+/// documents — it lands on the session task's stack and stays there.
+async fn open_persistence_blocking(
+    cfg: ServeConfig,
+) -> (ServeConfig, std::io::Result<(Persistence, Session)>) {
+    match tokio::task::spawn_blocking(move || {
+        let r = Persistence::open(&cfg);
+        (cfg, r)
+    })
+    .await
+    {
+        // `open` reports every failure as an `Err` and this task is never cancelled, so a `JoinError`
+        // can only be a panic — same re-raise, for the same reason, as `persist_blocking`'s.
         Ok(result) => result,
         Err(e) => std::panic::resume_unwind(e.into_panic()),
     }
@@ -1109,10 +1152,35 @@ struct Persistence {
     pinned_id: Option<String>,
 }
 
+/// The latency a network-backed session directory adds to [`Persistence::open`], simulated: sleeps
+/// `BEYOND_AI_AGENT_TEST_SLOW_SESSION_OPEN_MS` milliseconds if that variable is set.
+///
+/// A seam, because the property worth pinning here is not how long an open takes but *where* it
+/// takes it: `tests/serve_startup_stall.rs` stalls one session's open for seconds and asserts that a
+/// different session's RPC still answers in milliseconds — which is only a meaningful assertion if
+/// the stall is large and deterministic, and a real transcript big enough to cost seconds is neither
+/// cheap to build nor stable across machines. `#[cfg]`-gated rather than merely undocumented, so a
+/// release binary contains no latency-injection path at all.
+#[cfg(debug_assertions)]
+fn simulated_slow_open() {
+    if let Ok(ms) = std::env::var("BEYOND_AI_AGENT_TEST_SLOW_SESSION_OPEN_MS")
+        && let Ok(ms) = ms.parse::<u64>()
+    {
+        std::thread::sleep(std::time::Duration::from_millis(ms));
+    }
+}
+
+#[cfg(not(debug_assertions))]
+fn simulated_slow_open() {}
+
 impl Persistence {
     /// Open persistence and select the active session: in repo mode per [`SessionSelect`], in file mode
     /// by opening the named file (or creating it).
+    ///
+    /// Synchronous, and deliberately so — it is the thing [`open_persistence_blocking`] wraps, not the
+    /// wrapper. Every caller on a session task must go through that.
     fn open(cfg: &ServeConfig) -> std::io::Result<(Self, Session)> {
+        simulated_slow_open();
         // Service mode first, and with no fallback: the tenant's own directory or nothing. A
         // `service_mode` config that reached a session without a grant would otherwise land in the
         // per-cwd default repo below — the replica's own disk, shared across tenants.
@@ -2200,8 +2268,12 @@ fn not_in_repo_mode() -> std::io::Error {
 /// that doesn't exist contributes nothing.
 ///
 /// Runs on `spawn_blocking` for the same reason `Persistence::list_with_progress` does: the scan is
-/// synchronous file I/O reachable from the busy loop while a turn is in flight.
-async fn scan_session_dirs(
+/// synchronous file I/O reachable from the busy loop while a turn is in flight — and, through the
+/// supervisor's `list_daemon_sessions`, from a connection task that has not attached to any session
+/// at all. **Both** halves of the walk are inside the closure: a `spawn_blocking` that wraps only the
+/// per-file listing parse leaves the `read_dir` on the runtime thread, and on a network mount that is
+/// the half with the latency.
+pub(crate) async fn scan_session_dirs(
     dirs: Vec<std::path::PathBuf>,
     layout: crate::session_store::Layout,
     on_progress: impl Fn(usize, usize) + Send + Sync + 'static,
@@ -2261,10 +2333,11 @@ fn current_todos(session: &Session) -> Option<Value> {
 /// raw commit), `git` itself isn't installed, or the lookup fails for any other reason: a client polling
 /// `get_state` shouldn't have an unrelated git hiccup fail the whole call. Spawned via
 /// `tokio::process::Command` (not a blocking `std::process::Command`) so this never stalls the control
-/// loop's own task the way a blocking subprocess wait would — see `persist_blocking`'s doc comment for
-/// the same "don't block this task" reasoning applied to disk I/O instead of a subprocess. No
-/// filesystem watcher or caching: a plain request/response poll has nothing to invalidate, and a `git`
-/// invocation is cheap enough to just redo every call.
+/// loop's own task the way a blocking subprocess wait would. That is a strictly stronger property than
+/// [`persist_blocking`]'s: an inline `std::process::Command` has no await point at all, so it pins this
+/// task *and* the shared runtime thread, whereas awaiting a `spawn_blocking` suspends the caller either
+/// way and only ever frees the thread. No filesystem watcher or caching: a plain request/response poll
+/// has nothing to invalidate, and a `git` invocation is cheap enough to just redo every call.
 async fn git_branch(cwd: &std::path::Path) -> Option<String> {
     let output = tokio::process::Command::new("git")
         .args(["symbolic-ref", "--short", "HEAD"])
@@ -2478,7 +2551,7 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
 /// daemon can `tokio::spawn` it onto the process-wide runtime instead of pinning a thread and a
 /// current-thread executor per session.
 pub(crate) async fn serve_session(
-    mut cfg: ServeConfig,
+    cfg: ServeConfig,
     mut input_rx: mpsc::Receiver<String>,
     out_conn: SharedOutConn,
     // Set `true` for the duration of a `prompt` run, `false` otherwise. The daemon supervisor's idle
@@ -2487,7 +2560,11 @@ pub(crate) async fn serve_session(
     running: Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<Option<Signal>, Box<dyn std::error::Error + Send + Sync>> {
     let mut timing = crate::timing::StartupTiming::new();
-    let (mut persistence, mut session) = Persistence::open(&cfg)?;
+    // On the blocking pool, not here: this is the replica's worst head-of-line blocker (a full
+    // transcript replay, on the reconnect path, correlated across sessions). See
+    // [`open_persistence_blocking`].
+    let (mut cfg, opened) = open_persistence_blocking(cfg).await;
+    let (mut persistence, mut session) = opened?;
     timing.mark("open persistence");
 
     // `--name`: only for a genuinely fresh session (no messages, no title yet) — a resumed session
@@ -7142,7 +7219,9 @@ pub(crate) async fn serve_session(
                     "{label}\n$ {command}\n\n{status_line}{}{result_text}",
                     if is_error { "(error)\n" } else { "" }
                 )));
-                if let Err(e) = persistence.persist(&session, None) {
+                let (p, r) = persist_blocking(persistence, session.clone(), None).await;
+                persistence = p;
+                if let Err(e) = r {
                     eprintln!("serve: failed to persist host bash result: {e}");
                 }
                 emit!(response(

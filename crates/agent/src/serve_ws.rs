@@ -112,8 +112,7 @@ use crate::serve::{
 };
 use crate::service::{Refusal, ServiceSession, Shards};
 use crate::session_store::{
-    Layout, SessionLock, acquire_session_lock, is_valid_session_id, new_id, scan_listings_in,
-    scan_session_dir_in,
+    Layout, SessionLock, acquire_session_lock, is_valid_session_id, new_id,
 };
 
 /// The fixed URL path a WebSocket upgrade must target. The front door maps a service subdomain to this
@@ -1048,8 +1047,10 @@ impl Supervisor {
 
     /// Answer a `list_daemon_sessions` command: the union of every session the daemon knows about — the
     /// live in-memory map (`live:true`) and every `*.jsonl` under the base `--session-dir` (whose
-    /// `live` flag says whether that persisted id also has a running task right now). The reply is a
-    /// single `response` frame the caller sends back on the originating connection.
+    /// `live` flag says whether that persisted id also has a running task right now). Persisted
+    /// entries come back newest first (`scan_session_dirs`, the same order `list_sessions` and
+    /// `list_all_sessions` use); a live session with nothing on disk yet is appended after them. The
+    /// reply is a single `response` frame the caller sends back on the originating connection.
     /// **Tenant-scoped in service mode**, on both halves: only this tenant's live handles, and only
     /// `<every mounted shard>/<tenant>/sessions` on disk. The supervisor sees every session on the
     /// replica, so without the scope this one command would enumerate the whole fleet-mate set.
@@ -1073,8 +1074,10 @@ impl Supervisor {
                 .collect()
         };
 
-        // On-disk listings, if this daemon persists at all. `scan_listings` is CPU-bound and uses
-        // `thread::scope`, so it runs on the blocking pool rather than stalling this async task.
+        // On-disk listings, if this daemon persists at all. Through `scan_session_dirs`, so the
+        // `read_dir` goes to the blocking pool along with the listing parse — this is the supervisor,
+        // answering on a connection task that shares the one runtime thread with every live session,
+        // so a shard that is slow to enumerate must not be enumerated here.
         let dirs: Vec<std::path::PathBuf> = match (service, &self.session_dir) {
             (Some(svc), _) => svc.tenant_session_dirs(),
             (None, Some(dir)) => vec![std::path::PathBuf::from(dir)],
@@ -1086,13 +1089,7 @@ impl Supervisor {
         let metas = if dirs.is_empty() {
             Vec::new()
         } else {
-            let paths: Vec<std::path::PathBuf> = dirs
-                .iter()
-                .flat_map(|d| scan_session_dir_in(d, &layout))
-                .collect();
-            tokio::task::spawn_blocking(move || scan_listings_in(paths, &layout, &|_, _| {}))
-                .await
-                .unwrap_or_default()
+            crate::serve::scan_session_dirs(dirs, layout, |_, _| {}).await
         };
 
         let mut seen: HashSet<&str> = HashSet::with_capacity(metas.len());
