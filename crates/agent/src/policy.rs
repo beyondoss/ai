@@ -106,6 +106,19 @@ impl ToolPolicy {
         self
     }
 
+    /// Builder-style: take the world straight from the backend the gated tools were built with.
+    ///
+    /// Preferred over calling [`with_remote`](Self::with_remote) from a branch the caller writes
+    /// itself: *the backend* is the authority on which filesystem a tool call lands on, and a policy
+    /// that decides separately can disagree with it — which is a silently non-firing deny-list, not a
+    /// visible error. Every policy construction site that has a backend on hand uses this.
+    pub fn in_world(self, world: crate::tools::fs::PathWorld) -> Self {
+        match world {
+            crate::tools::fs::PathWorld::Local => self,
+            crate::tools::fs::PathWorld::Remote { home } => self.with_remote(home),
+        }
+    }
+
     /// The world this policy resolves paths in — the same one the gated tools use.
     pub fn world(&self) -> crate::tools::fs::PathWorld {
         if self.remote {

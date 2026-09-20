@@ -225,6 +225,11 @@ pub struct PromptOptions<'a> {
     /// never be set by another tenant's replica-mate or by the operator's own home directory. The
     /// operator can still pass `--system-prompt`/`--append-system-prompt` explicitly, which arrive
     /// as [`base`](Self::base)/[`append`](Self::append) and are unaffected.
+    ///
+    /// A service session's *own* `SYSTEM.md`/`APPEND_SYSTEM.md` — the ones inside its sandbox — reach
+    /// the prompt through those same two fields, fetched by [`claude_file_via`] before this runs. So
+    /// this flag never means "no overrides"; it means "not from this host", which is why it stays
+    /// `false` there even once sandbox discovery is wired.
     pub disk_overrides: bool,
 }
 
@@ -494,6 +499,89 @@ fn load_context_files_with_home(cwd: &Path, home: Option<&Path>) -> Vec<(String,
         }
     }
     out
+}
+
+/// Cap on one backend-side `AGENTS.md`/`CLAUDE.md`/`SYSTEM.md`/`APPEND_SYSTEM.md` — the same value
+/// (and the same reasoning) as `skills::MAX_SKILL_FILE_LEN`: these are instruction files, and
+/// anything approaching a megabyte is a build artifact that landed on the wrong name. The on-host
+/// loaders have no such cap because there is no round trip to protect there.
+const MAX_CONTEXT_FILE_LEN: u64 = 1024 * 1024; // 1 MiB
+
+/// [`load_context_files`] against an [`FsBackend`](crate::tools::fs::FsBackend) rather than this
+/// host: the tenant's own `AGENTS.md`/`CLAUDE.md`, read from inside its sandbox.
+///
+/// Same shape as the on-host walk — `<home>/.claude` first, then every ancestor of `root` root-most
+/// last, at most one file per directory with `AGENTS.md` winning over `CLAUDE.md`, an empty file
+/// treated as absent — with two differences a network hop forces:
+///
+/// - the two candidate names are tried **by name** rather than by listing the directory and matching
+///   case-insensitively. A workspace root can hold ten thousand entries, and moving that listing per
+///   ancestor to answer a two-file question is not a trade worth making; the filenames pi's own
+///   resource-loader checks are these two spellings anyway.
+/// - de-duplication is lexical (no `canonicalize`, which would answer about the replica), so `~` and
+///   an ancestor spelled differently are only deduped when the strings agree.
+pub async fn load_context_files_via(
+    backend: &dyn crate::tools::fs::FsBackend,
+    root: &Path,
+    home: Option<&Path>,
+) -> Vec<(String, String)> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    if let Some(home) = home {
+        dirs.push(home.join(".claude"));
+    }
+    let mut ancestors: Vec<&Path> = root.ancestors().collect();
+    ancestors.reverse(); // root-most first, so the deepest (the workspace) lands last
+    dirs.extend(ancestors.into_iter().map(Path::to_path_buf));
+
+    let mut out = Vec::new();
+    let mut seen: HashSet<PathBuf> = HashSet::new();
+    for dir in dirs {
+        if !seen.insert(dir.clone()) {
+            continue;
+        }
+        for name in ["AGENTS.md", "CLAUDE.md"] {
+            let path = dir.join(name);
+            match crate::tools::fs::read_text_capped(backend, &path, MAX_CONTEXT_FILE_LEN).await {
+                Ok(body) if !body.trim().is_empty() => {
+                    out.push((path.display().to_string(), body));
+                    break;
+                }
+                // Absent, empty, oversized or unreadable: try the next candidate, exactly as the
+                // on-host loader does. A missing file is the overwhelmingly common answer here.
+                _ => {}
+            }
+        }
+    }
+    out
+}
+
+/// A `SYSTEM.md`/`APPEND_SYSTEM.md` override read from inside a sandbox: `<root>/.claude/<filename>`
+/// first, then `<home>/.claude/<filename>` — the same project-then-user precedence
+/// [`discover_claude_file`] applies on this host, minus the trust gate, because both directories
+/// belong to the one tenant whose prompt this is.
+///
+/// Fed back into [`PromptOptions::base`]/[`PromptOptions::append`] rather than through
+/// [`PromptOptions::disk_overrides`], which stays `false` in service mode: that flag governs whether
+/// the *replica's* disk may set a tenant's prompt, and the answer to that is never yes.
+pub async fn claude_file_via(
+    backend: &dyn crate::tools::fs::FsBackend,
+    root: &Path,
+    home: Option<&Path>,
+    filename: &str,
+) -> Option<String> {
+    let mut candidates = vec![root.join(".claude").join(filename)];
+    if let Some(home) = home {
+        candidates.push(home.join(".claude").join(filename));
+    }
+    for path in candidates {
+        if let Ok(body) =
+            crate::tools::fs::read_text_capped(backend, &path, MAX_CONTEXT_FILE_LEN).await
+            && !body.trim().is_empty()
+        {
+            return Some(body);
+        }
+    }
+    None
 }
 
 /// Pick this directory's context file: `AGENTS.md` if it reads cleanly and is non-empty, else
@@ -1318,6 +1406,7 @@ mod tests {
             path: tmp.path().join("SKILL.md"),
             disable_model_invocation: false,
             scope: "user",
+            body: None,
         };
         let prompt = build_system_prompt(&PromptOptions {
             base: Some("DEFAULT IDENTITY"),
@@ -1355,6 +1444,7 @@ mod tests {
             path: tmp.path().join("SKILL.md"),
             disable_model_invocation: true,
             scope: "user",
+            body: None,
         };
         let prompt = build_system_prompt(&PromptOptions {
             base: Some("DEFAULT IDENTITY"),
@@ -1391,6 +1481,7 @@ mod tests {
             path: tmp.path().join("SKILL.md"),
             disable_model_invocation: false,
             scope: "user",
+            body: None,
         };
         let prompt = build_system_prompt(&PromptOptions {
             base: Some("DEFAULT IDENTITY"),
@@ -1737,5 +1828,67 @@ mod tests {
             disk_overrides: true,
         });
         assert!(!prompt.contains("<project_context>"));
+    }
+
+    #[tokio::test]
+    async fn load_context_files_via_walks_home_then_every_ancestor_nearest_last() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let repo = tmp.path().join("box/repo");
+        let ws = repo.join("app");
+        fs::create_dir_all(home.join(".claude")).unwrap();
+        fs::create_dir_all(&ws).unwrap();
+        fs::write(home.join(".claude/CLAUDE.md"), "HOME RULES").unwrap();
+        fs::write(repo.join("AGENTS.md"), "REPO RULES").unwrap();
+        // `AGENTS.md` wins over a sibling `CLAUDE.md` in the same directory.
+        fs::write(ws.join("AGENTS.md"), "APP RULES").unwrap();
+        fs::write(ws.join("CLAUDE.md"), "SHOULD NOT APPEAR").unwrap();
+
+        let backend = crate::tools::fs::local::LocalFs::new();
+        let found = load_context_files_via(&backend, &ws, Some(&home)).await;
+        let bodies: Vec<&str> = found.iter().map(|(_, b)| b.as_str()).collect();
+        assert_eq!(bodies, vec!["HOME RULES", "REPO RULES", "APP RULES"]);
+        assert_eq!(found[2].0, ws.join("AGENTS.md").display().to_string());
+    }
+
+    #[tokio::test]
+    async fn load_context_files_via_treats_an_empty_file_as_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().join("ws");
+        fs::create_dir_all(&ws).unwrap();
+        fs::write(ws.join("AGENTS.md"), "   \n").unwrap();
+        fs::write(ws.join("CLAUDE.md"), "THE FALLBACK").unwrap();
+
+        let backend = crate::tools::fs::local::LocalFs::new();
+        let found = load_context_files_via(&backend, &ws, None).await;
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].1, "THE FALLBACK");
+    }
+
+    #[tokio::test]
+    async fn claude_file_via_prefers_the_workspace_over_the_sandbox_home() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let ws = tmp.path().join("ws");
+        fs::create_dir_all(home.join(".claude")).unwrap();
+        fs::create_dir_all(ws.join(".claude")).unwrap();
+        fs::write(home.join(".claude/SYSTEM.md"), "HOME IDENTITY").unwrap();
+        fs::write(ws.join(".claude/SYSTEM.md"), "WORKSPACE IDENTITY").unwrap();
+
+        let backend = crate::tools::fs::local::LocalFs::new();
+        assert_eq!(
+            claude_file_via(&backend, &ws, Some(&home), "SYSTEM.md").await,
+            Some("WORKSPACE IDENTITY".to_string())
+        );
+        fs::remove_file(ws.join(".claude/SYSTEM.md")).unwrap();
+        assert_eq!(
+            claude_file_via(&backend, &ws, Some(&home), "SYSTEM.md").await,
+            Some("HOME IDENTITY".to_string()),
+            "falls through to the sandbox's own home, which is still the tenant's"
+        );
+        assert_eq!(
+            claude_file_via(&backend, &ws, Some(&home), "APPEND_SYSTEM.md").await,
+            None
+        );
     }
 }

@@ -85,6 +85,86 @@ pub fn discover_extra_only(extra_roots: &[String]) -> (Vec<PromptTemplate>, Vec<
     discover_with_diagnostics_impl(Path::new(""), false, extra_roots, false)
 }
 
+/// How many `*.md` entries one backend-side root may contribute — same reasoning (and value) as
+/// `agents::MAX_REMOTE_AGENTS_PER_ROOT`.
+const MAX_REMOTE_TEMPLATES_PER_ROOT: usize = 200;
+
+/// Discover prompt templates through an [`FsBackend`](crate::tools::fs::FsBackend) rather than this
+/// host's filesystem — service mode's counterpart to [`discover`], where the roots live inside the
+/// tenant's sandbox. `roots` are `(directory, scope)` in ascending specificity; a later root's
+/// same-named template wins. Mirrors [`crate::agents::discover_via`], including its one narrowing:
+/// no ignore-file awareness, since the `ignore` crate's walker has no backend equivalent.
+pub async fn discover_via(
+    backend: &dyn crate::tools::fs::FsBackend,
+    roots: &[(PathBuf, &'static str)],
+) -> (Vec<PromptTemplate>, Vec<Collision>) {
+    let mut found: Vec<PromptTemplate> = Vec::new();
+    let mut collisions: Vec<Collision> = Vec::new();
+    for (root, scope) in roots {
+        // A missing root is the normal case, reported by the backend as an ordinary command failure.
+        let entries = backend
+            .list_dir(root, MAX_REMOTE_TEMPLATES_PER_ROOT, false)
+            .await
+            .unwrap_or_default();
+        for entry in entries {
+            if entry.kind != crate::tools::fs::FileKind::File || !entry.name.ends_with(".md") {
+                continue;
+            }
+            let path = root.join(&entry.name);
+            let Some(name) = path.file_stem().map(|s| s.to_string_lossy().into_owned()) else {
+                continue;
+            };
+            let text = match crate::tools::fs::read_text_capped(
+                backend,
+                &path,
+                MAX_PROMPT_TEMPLATE_FILE_LEN,
+            )
+            .await
+            {
+                Ok(text) => text,
+                Err(message) => {
+                    let message = format!("prompt template {message}");
+                    tracing::warn!("{message}");
+                    collisions.push(Collision::message_only("prompt", message));
+                    continue;
+                }
+            };
+            let (argument_hint, description, body) = parse(&text);
+            let template = PromptTemplate {
+                name: name.clone(),
+                argument_hint,
+                description,
+                body,
+                path: path.clone(),
+                scope,
+            };
+            match found.iter_mut().find(|t| t.name == name) {
+                Some(existing) => {
+                    let message = format!(
+                        "prompt template \"{name}\" defined at both {} and {} — the latter wins",
+                        existing.path.display(),
+                        path.display()
+                    );
+                    tracing::warn!("{message}");
+                    collisions.push(Collision {
+                        resource_type: "prompt",
+                        name,
+                        winner_path: Some(path),
+                        loser_path: Some(existing.path.clone()),
+                        winner_source: None,
+                        loser_source: None,
+                        message,
+                    });
+                    *existing = template;
+                }
+                None => found.push(template),
+            }
+        }
+    }
+    found.sort_by(|a, b| a.name.cmp(&b.name));
+    (found, collisions)
+}
+
 fn discover_with_diagnostics_impl(
     cwd: &Path,
     project_trusted: bool,
@@ -1559,6 +1639,36 @@ mod tests {
             found.iter().any(|t| t.name == "solo"),
             "an individually-named file entry must still be discovered alongside a pattern entry: \
              {found:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn discover_via_reads_each_root_and_a_later_one_shadows_an_earlier_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home/.claude/prompts");
+        let project = tmp.path().join("ws/.claude/prompts");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&project).unwrap();
+        fs::write(home.join("ship.md"), "Home ship steps.").unwrap();
+        fs::write(home.join("only-home.md"), "Only at home.").unwrap();
+        fs::write(
+            project.join("ship.md"),
+            "---\ndescription: workspace ship\n---\nWorkspace ship steps.",
+        )
+        .unwrap();
+
+        let backend = crate::tools::fs::local::LocalFs::new();
+        let (found, collisions) =
+            discover_via(&backend, &[(home, "user"), (project, "project")]).await;
+        let names: Vec<&str> = found.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, vec!["only-home", "ship"]);
+        let ship = found.iter().find(|t| t.name == "ship").unwrap();
+        assert_eq!(ship.body, "Workspace ship steps.");
+        assert_eq!(ship.description, "workspace ship");
+        assert_eq!(ship.scope, "project");
+        assert!(
+            collisions.iter().any(|c| c.name == "ship"),
+            "the shadowed name is reported: {collisions:?}"
         );
     }
 }
