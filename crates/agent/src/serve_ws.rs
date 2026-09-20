@@ -1479,12 +1479,17 @@ where
     // are the orchestrator's, not a tenant's. A probe that had to carry a session grant could never
     // be issued by the thing whose job is to decide whether this replica may have sessions at all.
     if matches!(head.path.as_str(), LIVEZ_PATH | READYZ_PATH) {
+        // A non-GET probe is answered 405 without its body being parsed, so drain it for the same
+        // reason the wrong-path 404 below does.
+        if head.method != "GET" {
+            drain_http_body(&mut stream, &head, &leftover).await;
+        }
         let _ = handle_health(supervisor, &mut stream, &head).await;
         return Ok(());
     }
 
     if head.path != WS_PATH {
-        let _ = write_http_err(&mut stream, &HttpError::NotFound, None).await;
+        refuse(&mut stream, &head, &leftover, HttpError::NotFound).await;
         return Ok(());
     }
 
@@ -1492,10 +1497,11 @@ where
     if let Some(id) = &requested_id
         && !is_valid_session_id(id)
     {
-        let _ = write_http_err(
+        refuse(
             &mut stream,
-            &HttpError::BadRequest("invalid session_id"),
-            None,
+            &head,
+            &leftover,
+            HttpError::BadRequest("invalid session_id"),
         )
         .await;
         return Ok(());
@@ -1513,7 +1519,7 @@ where
         ) {
             Ok(session) => Some(Arc::new(session)),
             Err(refusal) => {
-                let _ = write_http_err(&mut stream, &HttpError::from(refusal), None).await;
+                refuse(&mut stream, &head, &leftover, HttpError::from(refusal)).await;
                 return Ok(());
             }
         },
@@ -1540,7 +1546,7 @@ where
                 .await
         }
         _ => {
-            let _ = write_http_err(&mut stream, &HttpError::MethodNotAllowed, None).await;
+            refuse(&mut stream, &head, &leftover, HttpError::MethodNotAllowed).await;
             Ok(())
         }
     }
@@ -2146,6 +2152,47 @@ async fn write_http_ok<S: AsyncWrite + Unpin>(
         .map_err(|_| HttpError::Io)?;
     stream.write_all(body).await.map_err(|_| HttpError::Io)?;
     stream.flush().await.map_err(|_| HttpError::Io)
+}
+
+/// Answer a request this connection refuses **before** parsing its body: drain the body, then write
+/// the error. Every early refusal goes through this, so none of them can be the one that forgets
+/// ([`drain_http_body`] explains what forgetting costs).
+async fn refuse<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+    head: &HttpHead,
+    leftover: &[u8],
+    err: HttpError,
+) {
+    drain_http_body(stream, head, leftover).await;
+    let _ = write_http_err(stream, &err, None).await;
+}
+
+/// Read and discard a request body this connection is never going to parse, before answering with an
+/// error and closing.
+///
+/// Closing a socket that still holds unread bytes makes the kernel send RST instead of FIN, and an RST
+/// **discards data already queued for the peer** — including the error response just written. A client
+/// that POSTs to the wrong path would see `ECONNRESET` rather than the `404` explaining what it got
+/// wrong, and would have no way to tell that from the replica dying mid-request.
+///
+/// Bounded by [`MAX_INBOUND_MESSAGE_BYTES`]: past that the body is not worth reading to be polite
+/// about, and the oversize case already has its own answer ([`HttpError::PayloadTooLarge`]).
+async fn drain_http_body<S: AsyncRead + Unpin>(stream: &mut S, head: &HttpHead, leftover: &[u8]) {
+    let Some(len) = head.content_length else {
+        return;
+    };
+    if len > MAX_INBOUND_MESSAGE_BYTES {
+        return;
+    }
+    let mut left = len.saturating_sub(leftover.len());
+    let mut tmp = [0u8; 8192];
+    while left > 0 {
+        let want = left.min(tmp.len());
+        match stream.read(&mut tmp[..want]).await {
+            Ok(0) | Err(_) => return,
+            Ok(n) => left -= n,
+        }
+    }
 }
 
 async fn write_http_err<S: AsyncWrite + Unpin>(
