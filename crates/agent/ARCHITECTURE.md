@@ -3201,6 +3201,30 @@ them would publish series pinned at zero — which reads as "this never happens"
 measured". Wiring them means threading a handle through `RepoOptions`, which belongs in its own
 change.
 
+### The idle window is shorter on a replica
+
+`--session-idle-timeout` governs how long a **detached** session stays live before the reaper
+reclaims it. Unset, the in-VM daemon uses an hour and a replica uses a minute, and the difference is
+not a tuning preference.
+
+The hour is a single-user daemon's number, and its reasoning says so: re-attaching to a still-running
+run means reconnecting to _this process_, so the window has to outlast a tunnel, a locked screen or a
+lunch break. On a replica that is not what re-attaching means — the session is on shared storage, so
+any replica respawns it from disk and replays. And a session mid-run is never reaped at all
+(`is_reapable` requires `!running`), so what the window actually governs is how long a **detached,
+idle** session keeps its lock.
+
+Holding that lock for an hour is how a failed-over session gets stranded. After a failover the
+session is live on whichever replica took it, which is not the one the edge's hash chooses; the hash
+target answers `503` on every attempt until the window expires and the lock frees. The fleet
+simulator reproduced exactly that — sessions intact, replayable, and unreachable from where the edge
+looks, for as long as the constant said.
+
+Being wrong in the short direction costs one read of the transcript from shared storage. Being wrong
+in the long direction costs availability. The default is a minute; an operator who passes a value
+gets exactly it in either mode, and `0` still pins every session — the mode only decides what silence
+means.
+
 ### Draining
 
 `--drain-grace <seconds>` turns a signal from "stop now" into "stop taking new work, finish what is in

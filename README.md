@@ -249,6 +249,10 @@ docker run --rm -p 8080:8080 \
   Loopback addresses only — the scrape describes every tenant on the replica and the replica is
   reachable by tenants, so a routable bind is refused rather than warned about. Run the scraper
   beside it. No tenant or session identifier appears in any label.
+- **Idle sessions:** `--session-idle-timeout` defaults to **60s in service mode** (an hour for the
+  single-user daemon). A detached session holds its session lock until it is reaped, and on a replica
+  that lock is what a failed-over session's new connections wait on — so the window is short, and
+  being wrong costs a respawn from shared storage rather than availability.
 - **Draining:** `--drain-grace <seconds>` makes SIGTERM stop taking _new_ sessions while finishing
   what is in flight — `/readyz` goes 503 so the load balancer stops choosing this replica, `/livez`
   stays 200 so the orchestrator doesn't kill it mid-drain, and reconnects to sessions this replica
