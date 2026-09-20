@@ -206,6 +206,38 @@ impl Fleet {
         })
     }
 
+    /// Bring replica `idx` back on a fresh port, and put it back in the ring — a deploy replacing a
+    /// task, not a process resurrecting.
+    pub async fn restart(&mut self, idx: usize) -> Result<(), String> {
+        let name = self.replicas[idx].name.clone();
+        let port = free_port()?;
+        let shard_args = self.substrate.shard_args();
+        let replica = Replica::start(&crate::replica::Launch {
+            name: &name,
+            bin: &agent_binary()?,
+            gateway_url: &self.gateway_url,
+            port,
+            grant_key_flag: &self.edge.grant_key_flag(),
+            seal_key: self.edge.seal_key(),
+            shards: &shard_args,
+            drain_grace: Some(30),
+            max_live_sessions: None,
+            metrics_port: None,
+        })?;
+        self.replicas[idx] = replica;
+        let targets = self
+            .replicas
+            .iter()
+            .filter(|r| r.is_running())
+            .map(|r| Target {
+                name: r.name.clone(),
+                port: r.port,
+            })
+            .collect();
+        self.edge.set_targets(targets);
+        Ok(())
+    }
+
     /// Drop a replica from the edge's ring — what an orchestrator does when a task dies.
     pub fn retarget_excluding(&mut self, name: &str) {
         let targets = self

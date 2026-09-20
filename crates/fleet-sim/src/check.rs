@@ -159,6 +159,44 @@ pub fn no_acknowledged_message_lost(history: &[Value], replayed: &[Value]) -> Fi
     )
 }
 
+/// The ordinary case: the session is where its hash says it is.
+pub fn reachable_by_hash(session: &str) -> Finding {
+    Finding::ok(
+        "reachable",
+        format!("{session} answered on its hash target"),
+    )
+}
+
+/// The session is alive and intact, but its hash target is not the replica holding it.
+///
+/// **Not a correctness failure** — nothing was lost, and the checker says so separately. It is an
+/// availability one, and a contract note for the edge: after a failover the session is live on the
+/// substitute, and the replica the hash chooses answers 503 until the substitute's copy is
+/// idle-reaped, which defaults to an hour. A strict hash-and-retry edge waits that long; one that
+/// walks the ring after repeated 503s finds it immediately.
+pub fn stranded_from_its_hash_target(session: &str) -> Finding {
+    Finding {
+        claim: "reachable",
+        ok: false,
+        detail: format!(
+            "{session} is intact but lives on a replica its hash does not choose — a hash-only edge \
+             cannot reach it until the idle reaper frees the lock. The edge needs a ring-walk \
+             fallback after repeated 503s."
+        ),
+    }
+}
+
+/// A session that could not be reached at all once the chaos stopped.
+///
+/// Distinct from a lost write: the history is intact, but a session nobody can open is an outage,
+/// and after the last replica has come back there is no legitimate reason for one.
+pub fn unreachable_after_soak(session: &str) -> Finding {
+    Finding::violated(
+        "reachable",
+        format!("{session} could not be opened on any replica after the chaos ended"),
+    )
+}
+
 /// Print a run's findings and say whether it passed.
 pub fn report(scenario: &str, findings: &[Finding]) -> bool {
     let passed = findings.iter().all(|f| f.ok);

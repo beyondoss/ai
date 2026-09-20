@@ -5,6 +5,7 @@
 //!
 //! ```text
 //! fleet-sim matrix [--substrate local-dir|nfs]   every scenario, once, deterministic — the gate
+//! fleet-sim soak [--duration S] [--seed N]      randomized chaos, then the checker — the burn-in
 //! fleet-sim list                                 the scenarios and which substrate each needs
 //! ```
 //!
@@ -22,6 +23,7 @@ mod edge;
 mod history;
 mod replica;
 mod scenarios;
+mod soak;
 mod substrate;
 mod workload;
 
@@ -57,6 +59,22 @@ async fn main() -> std::process::ExitCode {
             std::process::ExitCode::SUCCESS
         }
         "matrix" => run_matrix(kind).await,
+        "soak" => {
+            let secs = flag(&args, "--duration")
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(120);
+            let seed = flag(&args, "--seed")
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(1);
+            let sessions = flag(&args, "--sessions")
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(4);
+            if soak::run(kind, std::time::Duration::from_secs(secs), seed, sessions).await {
+                std::process::ExitCode::SUCCESS
+            } else {
+                std::process::ExitCode::FAILURE
+            }
+        }
         other => {
             eprintln!("fleet-sim: unknown command {other:?} (expected `matrix` or `list`)");
             std::process::ExitCode::from(2)

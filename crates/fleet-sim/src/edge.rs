@@ -33,6 +33,22 @@ pub struct Target {
     pub port: u16,
 }
 
+/// Virtual nodes per replica on the ring. Enough that removing one replica spreads its keys across
+/// the others rather than dumping them all on its neighbour.
+const VNODES_PER_TARGET: usize = 64;
+
+/// FNV-1a. Small, stable across releases, and the ring's positions have to be reproducible — a hash
+/// that changed between builds would move every session on deploy, which is the failure this ring
+/// exists to avoid.
+fn hash(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in bytes {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
 pub struct Edge {
     pub minter: Minter,
     targets: Vec<Target>,
@@ -54,6 +70,11 @@ impl Edge {
         self.minter.seal_key()
     }
 
+    /// The replicas currently in the ring.
+    pub fn targets(&self) -> &[Target] {
+        &self.targets
+    }
+
     /// Replace the routable set — a deploy, a scale-in, a replica that died.
     pub fn set_targets(&mut self, targets: Vec<Target>) {
         self.targets = targets;
@@ -61,24 +82,33 @@ impl Edge {
 
     /// Which replica this session id hashes to.
     ///
-    /// A ring hash, not round-robin: the retry after a `503` has to come back to the **same**
-    /// replica, so it waits for that session's lock to free rather than wandering the group and
-    /// collecting a 503 from each member in turn. Deterministic on (id, target set) alone — no
-    /// shared state, no lookup, which is exactly why the agent needs to know nothing about it.
+    /// **Consistent hashing, not `hash % len`** — and the difference is not a refinement, it is the
+    /// property the design depends on. With a modulo the ring is renumbered whenever the replica set
+    /// changes size, so *every* session moves when one replica leaves or rejoins. A session that
+    /// moves while its previous owner still holds the lock is answered 503 by its new hash target,
+    /// and the retry — which is deterministic, and so returns to that same target — waits for a lock
+    /// that will not free until the old owner's session is idle-reaped. The soak found exactly that:
+    /// sessions unreachable after a replica came back, because the arithmetic had reshuffled them.
+    ///
+    /// A ring of virtual nodes moves only the keys belonging to the replica that changed, which is
+    /// what keeps a session on the replica that owns it across a scale-out.
     pub fn route(&self, session_id: &str) -> Option<&Target> {
-        if self.targets.is_empty() {
-            return None;
+        let point = hash(session_id.as_bytes());
+        // The first virtual node at or after this point, wrapping — the textbook ketama lookup.
+        let mut best: Option<(u64, usize)> = None;
+        let mut lowest: Option<(u64, usize)> = None;
+        for (idx, target) in self.targets.iter().enumerate() {
+            for vnode in 0..VNODES_PER_TARGET {
+                let at = hash(format!("{}#{vnode}", target.name).as_bytes());
+                if lowest.is_none_or(|(low, _)| at < low) {
+                    lowest = Some((at, idx));
+                }
+                if at >= point && best.is_none_or(|(b, _)| at < b) {
+                    best = Some((at, idx));
+                }
+            }
         }
-        // FNV-1a over the id, then modulo the ring. Small and stable; a production edge would use
-        // ketama for smoother movement when the set changes, which affects *how many* keys move on a
-        // deploy, not whether the retry is deterministic.
-        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-        for b in session_id.as_bytes() {
-            h ^= u64::from(*b);
-            h = h.wrapping_mul(0x0000_0100_0000_01b3);
-        }
-        let idx = (h % self.targets.len() as u64) as usize;
-        self.targets.get(idx)
+        best.or(lowest).and_then(|(_, idx)| self.targets.get(idx))
     }
 
     /// Mint a grant for `tenant`'s `session_id`, homed on `home_shard` and pointed at `exec_url`.
@@ -167,4 +197,66 @@ pub async fn place(edge: &Edge, session_id: &str, grant: &str, budget: Duration)
         last_status,
         waited: began.elapsed(),
     }
+}
+
+/// Place a connection against a fixed target set, for a caller that holds its own copy of the ring.
+///
+/// A soak worker routes itself: it knows the edge's *rule*, not the edge's current state, which is
+/// exactly the position a real client is in while a deploy moves replicas underneath it.
+pub async fn place_among(
+    targets: &[Target],
+    session_id: &str,
+    grant: &str,
+    budget: Duration,
+) -> Placement {
+    if targets.is_empty() {
+        return Placement::NoTarget;
+    }
+    let began = Instant::now();
+    let mut last_status = 0;
+    while began.elapsed() < budget {
+        // Walk the ring from the hashed position: during chaos the chosen replica may be gone, and a
+        // real edge's health checks would have dropped it. Starting from the hash keeps a session
+        // sticky to one replica whenever that replica is up.
+        for candidate in ring_order(targets, session_id) {
+            let port = candidate.port;
+            match crate::workload::probe_session(port, session_id, grant).await {
+                Ok(status) if status < 400 => {
+                    return Placement::Served {
+                        port,
+                        waited: began.elapsed(),
+                    };
+                }
+                Ok(status) => last_status = status,
+                Err(_) => last_status = 0,
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    Placement::Exhausted {
+        last_status,
+        waited: began.elapsed(),
+    }
+}
+
+/// The targets in ring order for `session_id`: its owner first, then the rest.
+///
+/// A client walks this during chaos because the replica it belongs on may be down. Starting at the
+/// ring position keeps it sticky to one replica whenever that replica is up, which is what makes the
+/// 503-and-retry behaviour converge instead of oscillating.
+fn ring_order<'a>(targets: &'a [Target], session_id: &str) -> Vec<&'a Target> {
+    let point = hash(session_id.as_bytes());
+    let mut scored: Vec<(u64, &Target)> = targets
+        .iter()
+        .map(|t| {
+            let best = (0..VNODES_PER_TARGET)
+                .map(|v| hash(format!("{}#{v}", t.name).as_bytes()))
+                .map(|at| at.wrapping_sub(point))
+                .min()
+                .unwrap_or(u64::MAX);
+            (best, t)
+        })
+        .collect();
+    scored.sort_by_key(|(d, _)| *d);
+    scored.into_iter().map(|(_, t)| t).collect()
 }
