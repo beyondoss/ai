@@ -173,10 +173,17 @@ impl Substrate {
         // `no_root_squash` so the replicas (running as this user) own what they write, and
         // `no_subtree_check` because the export is a temporary directory rather than a real
         // filesystem. `fsid` is required for an NFSv4 export of a non-device directory.
+        // `insecure` is not laxity, it is what makes the *client* options faithful. EFS's documented
+        // mount includes `noresvport` — the client uses an ordinary high port rather than a reserved
+        // one, which is how it survives a reconnect without exhausting the privileged range. A Linux
+        // kernel export defaults to `secure`, which requires a reserved source port, so the two
+        // together produce `EPERM` at mount time. Dropping `noresvport` would "fix" it by testing
+        // mount options no replica will ever use; marking the export `insecure` keeps the client
+        // exactly as EFS recommends. The export is bound to 127.0.0.1 regardless.
         sudo(&[
             "exportfs",
             "-o",
-            "rw,sync,no_subtree_check,no_root_squash,fsid=8421",
+            "rw,sync,no_subtree_check,no_root_squash,insecure,fsid=8421",
             &format!("127.0.0.1:{}", export.display()),
         ])?;
 

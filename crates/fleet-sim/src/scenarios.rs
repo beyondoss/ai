@@ -487,7 +487,27 @@ pub async fn takeover_after_hard_kill(kind: Kind, history_path: &std::path::Path
         ),
     });
 
-    // The new owner must have opened its own epoch, leaving A's sealed behind it.
+    // Make the new owner *write* before asking whether it opened its own epoch. A takeover that has
+    // only read has nothing to seal yet: the roll happens when the new owner first persists, so
+    // checking before that measures the scenario's own impatience rather than the fence.
+    match workload::connect(new_port, session, &grant).await {
+        Ok(mut ws2) => {
+            if let Err(e) = workload::prompt(&mut ws2, "after-the-takeover").await {
+                findings.push(Finding {
+                    claim: "C2",
+                    ok: false,
+                    detail: format!("the new owner could not commit a turn: {e}"),
+                });
+            }
+        }
+        Err(e) => findings.push(Finding {
+            claim: "C2",
+            ok: false,
+            detail: format!("could not reach the new owner to make it write: {e}"),
+        }),
+    }
+
+    // Now it must have opened its own epoch, leaving A's sealed behind it.
     findings.push(check::takeover_sealed_the_previous_segment(
         &session_dir,
         epoch_before,
