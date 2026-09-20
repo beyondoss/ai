@@ -145,6 +145,25 @@ impl Service {
         Peer { port, child }
     }
 
+    /// Plant a file inside the tenant's workspace, creating parents. The replica can only reach it
+    /// through the exec endpoint, so anything a test finds in the prompt afterwards came from there.
+    pub fn write_in_workspace(&self, rel: &str, contents: &str) -> PathBuf {
+        write_at(&self.workspace.join(rel), contents)
+    }
+
+    /// Plant a file under the sandbox's own `$HOME` — the tenant's home, not the replica's.
+    pub fn write_in_sandbox_home(&self, rel: &str, contents: &str) -> PathBuf {
+        write_at(&self.sandbox_home.join(rel), contents)
+    }
+
+    /// A `SKILL.md` in the tenant's workspace: `<workspace>/<root>/<name>/SKILL.md`.
+    pub fn write_sandbox_skill(&self, root: &str, name: &str, description: &str, body: &str) {
+        self.write_in_workspace(
+            &format!("{root}/{name}/SKILL.md"),
+            &format!("---\nname: {name}\ndescription: {description}\n---\n{body}\n"),
+        );
+    }
+
     pub fn shard(&self, name: &str) -> &Path {
         self.shards
             .iter()
@@ -255,6 +274,47 @@ pub fn files_under(dir: &Path) -> Vec<PathBuf> {
         }
     }
     out
+}
+
+fn write_at(path: &Path, contents: &str) -> PathBuf {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).unwrap();
+    }
+    std::fs::write(path, contents).unwrap();
+    path.to_path_buf()
+}
+
+/// A replica `HOME` stocked with the full `~/.claude` surface a tenant must never see: a `SYSTEM.md`,
+/// an `APPEND_SYSTEM.md`, a `CLAUDE.md`, a skill, a prompt template and an agent definition, each
+/// carrying its own marker string. Returns the directory (hold it: dropping it deletes the tree) and
+/// the markers, so a test can assert every one of them is absent from the prompt.
+pub fn host_claude_home() -> (tempfile::TempDir, Vec<&'static str>) {
+    const MARKERS: &[&str] = &[
+        "HOST-SYSTEM-MARKER",
+        "HOST-APPEND-MARKER",
+        "HOST-CONTEXT-MARKER",
+        "host-only-skill",
+        "host-only-prompt",
+        "host-only-agent",
+    ];
+    let home = tempfile::tempdir().unwrap();
+    let claude = home.path().join(".claude");
+    write_at(&claude.join("SYSTEM.md"), "You are HOST-SYSTEM-MARKER.");
+    write_at(&claude.join("APPEND_SYSTEM.md"), "HOST-APPEND-MARKER.");
+    write_at(&claude.join("CLAUDE.md"), "HOST-CONTEXT-MARKER");
+    write_at(
+        &claude.join("skills/host-only-skill/SKILL.md"),
+        "---\nname: host-only-skill\ndescription: the replica's own skill\n---\nbody\n",
+    );
+    write_at(
+        &claude.join("prompts/host-only-prompt.md"),
+        "The replica's own prompt template.",
+    );
+    write_at(
+        &claude.join("agents/host-only-agent.md"),
+        "---\nname: host-only-agent\ndescription: the replica's own agent\n---\nbody\n",
+    );
+    (home, MARKERS.to_vec())
 }
 
 /// Far enough out that these tests never expire, near enough to stay a plausible unix second.

@@ -1,0 +1,169 @@
+# syntax=docker/dockerfile:1.7-labs
+#
+# The agent (`beyond-ai-agent`) as a `serve --service` replica: one process, many tenants, each
+# connection carrying a verified session grant. Built from the workspace root:
+#
+#     docker build -f Dockerfile.agent -t beyond-ai-agent .
+#
+# Companion to `Dockerfile`, which builds the gateway — same cargo-chef layering, different member.
+#
+# ## Running one
+#
+#     docker run --rm \
+#       -v /mnt/efs/a07-s1:/mnt/efs/a07-s1 \
+#       -v /mnt/efs/a07-s2:/mnt/efs/a07-s2 \
+#       -v /etc/beyond/grant:/etc/beyond/grant:ro \
+#       -p 8080:8080 beyond-ai-agent \
+#       --listen 0.0.0.0:8080 \
+#       --gateway-url https://gateway.internal \
+#       --grant-key k1=/etc/beyond/grant/k1.pub \
+#       --seal-key /etc/beyond/grant/seal.key \
+#       --shard a07-s1=/mnt/efs/a07-s1 \
+#       --shard a07-s2=/mnt/efs/a07-s2
+#
+# `serve --service` is already in the entrypoint, so the arguments above are the whole command.
+#
+# **Mounts.** One bind mount per shard at `/mnt/efs/<shard>`, and the `--shard` name must match the
+# last path component by convention only — the flag is what binds them, so keep them equal and an
+# operator can read a session id (`<shard>.<opaque>`) straight off a mount table. Each mount must be
+# a directory writable by uid 10001; `/readyz` checks exactly that, by writing, on every probe.
+# Credentials (the grant public keys and the seal key) mount read-only and are never written to.
+#
+# **Nothing else is a mount point.** A tenant's workspace lives in its own sandbox, reached over the
+# exec endpoint in its grant — never on this filesystem. The container needs no writable layer.
+#
+# **Health.** `/livez` and `/readyz` on the same listener as the agent protocol, no grant required —
+# see ARCHITECTURE.md, "Service mode → Health and image". `/readyz` is 503 while a shard is missing
+# or read-only, which is what should take a replica out of rotation; `/livez` ignores the shards,
+# because restarting the process does not put a mount back.
+
+# Latest stable 1.x. The crate's MSRV is 1.85, but cargo-chef's own build pulls deps that need a
+# newer rustc, so the image toolchain must lead the MSRV.
+ARG RUST_VERSION=1
+ARG ALPINE_VERSION=3.22
+
+# ---------------------------------------------------------------------------
+# Stage 1: chef — base with cargo-chef and a musl toolchain.
+#
+# The binary is static musl so the runtime image can be a bare Alpine with nothing but the CA store:
+# no glibc version to match, no dynamic loader, and a `COPY` that cannot arrive half-linked.
+# ---------------------------------------------------------------------------
+FROM rust:${RUST_VERSION}-bookworm AS chef
+ARG TARGETARCH
+# `musl-tools` installs a *native* `musl-gcc` (x86_64 on an amd64 builder, aarch64 on arm64), so a
+# native build needs no cross-linker — the same arrangement `.github/workflows/release-agent.yml`
+# relies on by giving each arch its own runner. Building for a foreign arch needs `--platform` (and
+# emulation), not a cross toolchain here.
+RUN apt-get update && apt-get install -y --no-install-recommends musl-tools \
+    && rm -rf /var/lib/apt/lists/*
+RUN case "$TARGETARCH" in \
+      amd64) echo x86_64-unknown-linux-musl ;; \
+      arm64) echo aarch64-unknown-linux-musl ;; \
+      *) echo "unsupported TARGETARCH=$TARGETARCH" >&2; exit 1 ;; \
+    esac > /etc/cargo-target \
+    && rustup target add "$(cat /etc/cargo-target)"
+RUN cargo install cargo-chef --locked --version ^0.1
+WORKDIR /app
+
+# Non-PIE, matching the release workflow. A position-independent executable carries ~1.4 MB of
+# `.rela.dyn`, and processing those relocations at startup *dirties* the ~1 MB `.data.rel.ro` they
+# write into — anonymous pages, per process, before `main` runs. On the shipped binary that is
+# 8.30 → 6.31 MB idle RSS and 2.6 → 1.6 ms startup. The cost is userspace ASLR, and it is only
+# acceptable because the `web` tool parses attacker-controlled HTML in a seccomp-confined child that
+# holds no credentials (`tools::web::isolate`). If that isolation ever goes, this flag goes with it.
+#
+# Set before `cook` as well as `build` so the cached dependency layer is compiled with the same flags
+# the binary is — otherwise cargo rebuilds everything and the cache buys nothing.
+#
+# Deliberately *not* PGO, unlike the release workflow. Profiles are architecture-specific and are
+# generated fresh per release by a three-stage instrument/train/rebuild, which needs `llvm-profdata`
+# and the training harness and roughly triples build time; it is worth it for a published artifact
+# and not for an image build. A deployment that wants it should build the image `FROM` a release
+# tarball instead of from source.
+ENV RUSTFLAGS="-C relocation-model=static"
+
+# ---------------------------------------------------------------------------
+# Stage 2: planner — compute a dependency-only recipe.
+# ---------------------------------------------------------------------------
+FROM chef AS planner
+COPY . .
+RUN cargo chef prepare --recipe-path recipe.json
+
+# ---------------------------------------------------------------------------
+# Stage 3: builder — cook dependencies from the recipe, then build the binary.
+# ---------------------------------------------------------------------------
+FROM chef AS builder
+COPY --from=planner /app/recipe.json recipe.json
+# Cook only `beyond-ai-agent`'s dependencies — cached until the dependency graph changes. Scoping to
+# the package matters: the workspace also holds the gateway, whose pingora tree would drag a cmake
+# build of zlib-ng into an image that never runs it. Cache mounts keep the registry warm across
+# builds; `ring` and `mimalloc` build their C bits with the musl toolchain already installed.
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    target="$(cat /etc/cargo-target)" \
+    && linker_env="CARGO_TARGET_$(echo "$target" | tr 'a-z-' 'A-Z_')_LINKER" \
+    && cc_env="CC_$(echo "$target" | tr '-' '_')" \
+    && export "$linker_env=musl-gcc" "$cc_env=musl-gcc" \
+    && cargo chef cook --release --target "$target" -p beyond-ai-agent --recipe-path recipe.json
+
+# Now the full source, and just the agent binary. Deliberately NOT `--features code-mode`: QuickJS is
+# ~1 MB of `.text` resident in every replica even when `--code-mode` is never passed, and the
+# published binary does not carry it either.
+COPY . .
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    target="$(cat /etc/cargo-target)" \
+    && linker_env="CARGO_TARGET_$(echo "$target" | tr 'a-z-' 'A-Z_')_LINKER" \
+    && cc_env="CC_$(echo "$target" | tr '-' '_')" \
+    && export "$linker_env=musl-gcc" "$cc_env=musl-gcc" \
+    && cargo build --release --target "$target" -p beyond-ai-agent --bin beyond-ai-agent \
+    && cp "target/$target/release/beyond-ai-agent" /usr/local/bin/beyond-ai-agent
+
+# ---------------------------------------------------------------------------
+# Stage 4: runtime — Alpine with the binary, a CA store, and nothing else.
+#
+# Alpine rather than `scratch`/distroless because two things in this image need a shell: `ulimit -c 0`
+# (below) and the HEALTHCHECK. Both are worth ~6 MB.
+# ---------------------------------------------------------------------------
+FROM alpine:${ALPINE_VERSION} AS runtime
+# The CA store is for outbound TLS: the gateway, each tenant's exec endpoint, and its MCP connectors.
+RUN apk add --no-cache ca-certificates
+
+# Non-root, no home, no shell. Nothing tenant-specific is ever read from or written to this
+# filesystem, so the user needs write access to exactly one thing: the shard mounts.
+RUN addgroup -S -g 10001 beyond \
+    && adduser -S -u 10001 -G beyond -H -s /sbin/nologin beyond \
+    && mkdir -p /mnt/efs \
+    && chown beyond:beyond /mnt/efs
+
+COPY --from=builder /usr/local/bin/beyond-ai-agent /usr/local/bin/beyond-ai-agent
+
+# Core dumps off, from the entrypoint. A replica holds, in memory, every live tenant's unsealed data
+# key, gateway credential and exec headers — a core file would put all of them on disk in plaintext,
+# readable by whatever collects crash dumps. The limit has to be dropped by a parent process: the
+# crate forbids `unsafe`, so it cannot call `prctl(PR_SET_DUMPABLE)` on itself, and `--ulimit core=0`
+# is the operator's flag rather than the image's. Hence a two-line wrapper that `exec`s, so the agent
+# is still PID 1 and still receives SIGTERM directly.
+COPY <<'SH' /usr/local/bin/agent-entrypoint
+#!/bin/sh
+ulimit -c 0 2>/dev/null || true
+exec /usr/local/bin/beyond-ai-agent "$@"
+SH
+RUN chmod 0755 /usr/local/bin/agent-entrypoint
+
+USER beyond
+
+# The data plane: the agent protocol (WebSocket + POST) and the health endpoints share one listener.
+# Pass `--listen 0.0.0.0:8080` to match; set AGENT_PORT if you bind somewhere else, so the health
+# check follows.
+ENV AGENT_PORT=8080
+EXPOSE 8080/tcp
+
+# `/readyz`, not `/livez`: Docker's health status is what a scheduler reads to decide whether to send
+# this replica work, and that is the readiness question. Liveness is a separate concern with a
+# separate answer (restarting does not remount a shard), so it is not wired to anything here.
+# BusyBox `wget` exits non-zero on a 503, which is the whole mechanism.
+HEALTHCHECK --interval=10s --timeout=2s --start-period=10s --retries=3 \
+    CMD wget -q -O /dev/null "http://127.0.0.1:${AGENT_PORT}/readyz" || exit 1
+
+ENTRYPOINT ["/usr/local/bin/agent-entrypoint", "serve", "--service"]

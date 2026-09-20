@@ -8,6 +8,11 @@
 //! the loose-single-`.md`-file shape `.claude/skills` does — only `SKILL.md`-per-directory counts), and
 //! inject only their name/description/location into the system prompt — the body is read on demand (by
 //! the `read` tool) when a task matches, so skills cost almost no context until used.
+//!
+//! [`discover_via`] is the same discovery against an [`FsBackend`](crate::tools::fs::FsBackend)
+//! instead of this host — service mode, where the roots are inside the tenant's sandbox. It differs
+//! in exactly one visible way: it prefetches each skill's body, because `/skill:name` expansion is
+//! synchronous and cannot `await` a backend read later. See [`Skill::body`].
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
@@ -37,6 +42,14 @@ pub struct Skill {
     /// a fresh `Skill` picks *some* value here — never left meaningfully unset — even though the exact
     /// value is always overwritten immediately by that per-root pass.
     pub scope: &'static str,
+    /// The manifest's body (everything past the frontmatter fence), already fetched.
+    ///
+    /// `None` for a skill on this host — the whole progressive-disclosure point is that the body
+    /// stays on disk until a task actually matches, and [`expand_if_skill_invocation`] reads it then.
+    /// `Some` when the manifest lives on the far side of an [`FsBackend`](crate::tools::fs::FsBackend):
+    /// reading it there is `async`, and `/skill:name` expansion is a synchronous step on the prompt
+    /// path with five call sites, so discovery is the one moment the body can be fetched at all.
+    pub body: Option<String>,
 }
 
 /// A single diagnostic surfaced by [`discover_with_diagnostics`] / [`crate::prompts::discover_with_diagnostics`]
@@ -157,6 +170,83 @@ pub fn discover_with_diagnostics(
 /// roots" switch.
 pub fn discover_extra_only(extra_roots: &[String]) -> (Vec<Skill>, Vec<Collision>) {
     discover_with_diagnostics_impl(Path::new(""), false, extra_roots, false)
+}
+
+/// How many `SKILL.md` manifests one backend-side root may contribute. A root holding more than this
+/// is not a skills directory, and every manifest past it costs a round trip to read.
+const MAX_REMOTE_SKILLS_PER_ROOT: usize = 200;
+
+/// Discover skills through an [`FsBackend`](crate::tools::fs::FsBackend) rather than this host's
+/// filesystem — service mode's counterpart to [`discover`], where the roots live inside the tenant's
+/// sandbox and the only way to reach them is the session's exec backend.
+///
+/// `roots` are `(directory, scope)` in **ascending specificity**: a later root's same-named skill
+/// wins, exactly as the standard-root fold does here. The caller supplies them (`service.rs`), since
+/// which directories a sandbox contributes is that seam's decision, not this module's.
+///
+/// Two deliberate narrowings against the on-host walk, both because a round trip is not a `stat`:
+///
+/// - only the `SKILL.md`-per-directory shape is recognized, never `.claude/skills`'s loose single
+///   `.md` file — one gitignore-aware `glob` per root answers the former for free and the latter
+///   would need its own listing pass;
+/// - every accepted skill's **body is fetched here**, because `/skill:name` expansion
+///   ([`expand_if_skill_invocation`]) is synchronous and has no way to `await` a read later.
+///
+/// Advertised paths are the sandbox's own, which is what makes them usable: the model reads a skill
+/// by handing that path back to `read`, and `read` runs through the same backend.
+pub async fn discover_via(
+    backend: &dyn crate::tools::fs::FsBackend,
+    roots: &[(PathBuf, &'static str)],
+) -> (Vec<Skill>, Vec<Collision>) {
+    let mut found: Vec<Skill> = Vec::new();
+    let mut collisions: Vec<Collision> = Vec::new();
+    for (root, scope) in roots {
+        let mut diagnostics = Vec::new();
+        let mut skills = Vec::new();
+        // A missing root is the normal case (most sandboxes ship none of these directories), and the
+        // backend reports it as an ordinary command failure — so it is silence here, not a diagnostic.
+        let found_manifests = backend
+            .glob(&crate::tools::fs::GlobQuery {
+                pattern: "SKILL.md".to_string(),
+                basename_only: true,
+                case_insensitive: false,
+                root: root.clone(),
+                limit: MAX_REMOTE_SKILLS_PER_ROOT,
+            })
+            .await
+            .map(|outcome| outcome.paths)
+            .unwrap_or_default();
+        for (manifest, is_dir) in found_manifests {
+            if is_dir {
+                continue;
+            }
+            let text =
+                match crate::tools::fs::read_text_capped(backend, &manifest, MAX_SKILL_FILE_LEN)
+                    .await
+                {
+                    Ok(text) => text,
+                    Err(message) => {
+                        let message = format!("skill manifest {message}");
+                        tracing::warn!("{message}");
+                        diagnostics.push(message);
+                        continue;
+                    }
+                };
+            if let Some((mut skill, body)) = parse_skill_text(&manifest, &text, &mut diagnostics) {
+                skill.scope = scope;
+                skill.body = Some(body);
+                skills.push(skill);
+            }
+        }
+        collisions.extend(
+            diagnostics
+                .into_iter()
+                .map(|m| Collision::message_only("skill", m)),
+        );
+        fold_skills_later_wins(&mut found, skills, &mut collisions);
+    }
+    found.sort_by(|a, b| a.name.cmp(&b.name));
+    (found, collisions)
 }
 
 fn discover_with_diagnostics_impl(
@@ -691,7 +781,22 @@ fn parse_skill(manifest: &Path, diagnostics: &mut Vec<String>) -> Option<Skill> 
             return None;
         }
     };
-    let (fm, _body) = parse_frontmatter(&text);
+    // The body is dropped here on purpose: a host skill is read on demand by the model, so holding
+    // every discovered manifest's prose in memory for the process's life would buy nothing. A
+    // backend-side skill has no such option — see [`Skill::body`] and [`discover_via`].
+    parse_skill_text(manifest, &text, diagnostics).map(|(skill, _body)| skill)
+}
+
+/// [`parse_skill`]'s pure half: everything that depends only on the manifest's *text*, so the same
+/// frontmatter rules, the same diagnostics and the same `name`/`description` fallbacks apply whether
+/// the bytes came from `fs::read_to_string` here or from an [`FsBackend`](crate::tools::fs::FsBackend)
+/// on another machine. Returns the parsed skill alongside its body, which the caller keeps or drops.
+fn parse_skill_text(
+    manifest: &Path,
+    text: &str,
+    diagnostics: &mut Vec<String>,
+) -> Option<(Skill, String)> {
+    let (fm, body) = parse_frontmatter(text);
     let description = match fm.get("description") {
         Some(d) if !d.trim().is_empty() => d.clone(),
         _ => {
@@ -720,15 +825,21 @@ fn parse_skill(manifest: &Path, diagnostics: &mut Vec<String>) -> Option<Skill> 
     for issue in validate_skill_description(&description) {
         tracing::warn!(skill = %name, path = %manifest.display(), "{issue}");
     }
-    Some(Skill {
-        name,
-        description,
-        path: manifest.to_path_buf(),
-        disable_model_invocation,
-        // Always overwritten by the caller — see `Skill::scope`'s own doc comment for why `parse_skill`
-        // itself has no way to know which root this manifest was actually reached through.
-        scope: "temporary",
-    })
+    Some((
+        Skill {
+            name,
+            description,
+            path: manifest.to_path_buf(),
+            disable_model_invocation,
+            // Always overwritten by the caller — see `Skill::scope`'s own doc comment for why
+            // `parse_skill` itself has no way to know which root this manifest was actually reached
+            // through.
+            scope: "temporary",
+            // Likewise the caller's call: only a backend-side discovery keeps it. See `Skill::body`.
+            body: None,
+        },
+        body,
+    ))
 }
 
 /// Cap matching the reference agent's `MAX_NAME_LENGTH`.
@@ -963,10 +1074,18 @@ pub fn expand_if_skill_invocation(message: &str, skills: &[Skill]) -> String {
     let Some(skill) = find_by_name(skills, name) else {
         return message.to_string();
     };
-    let Ok(text) = fs::read_to_string(&skill.path) else {
-        return message.to_string();
+    // A skill discovered through a backend carries its body already (see `Skill::body`): this
+    // function is synchronous and five call sites deep on the prompt path, so there is no read to do
+    // here. A host skill is read now, which is the progressive disclosure the design is built on.
+    let body = match &skill.body {
+        Some(body) => Cow::Borrowed(body.as_str()),
+        None => {
+            let Ok(text) = fs::read_to_string(&skill.path) else {
+                return message.to_string();
+            };
+            Cow::Owned(parse_frontmatter(&text).1)
+        }
     };
-    let (_, body) = parse_frontmatter(&text);
     let dir = skill
         .path
         .parent()
@@ -2802,6 +2921,7 @@ name: "caf\x65 é"
             path: PathBuf::from("/x/.claude/skills/lint/SKILL.md"),
             disable_model_invocation: false,
             scope: "user",
+            body: None,
         }];
         let rendered = format_available(&skills);
         assert!(rendered.contains("<available_skills>"));
@@ -2829,6 +2949,7 @@ name: "caf\x65 é"
             path: PathBuf::from("/x/.claude/skills/lint/SKILL.md"),
             disable_model_invocation: false,
             scope: "user",
+            body: None,
         }];
         let rendered = format_available(&skills);
         let expected_guidance = "The following skills provide specialized instructions for specific \
@@ -2871,6 +2992,7 @@ name: "caf\x65 é"
             path: PathBuf::from("/x/.claude/skills/hidden/SKILL.md"),
             disable_model_invocation: true,
             scope: "user",
+            body: None,
         }];
         assert_eq!(format_available(&skills), "");
         assert_eq!(format_available(&[]), "");
@@ -2885,6 +3007,7 @@ name: "caf\x65 é"
                 path: PathBuf::from("/x/.claude/skills/visible/SKILL.md"),
                 disable_model_invocation: false,
                 scope: "user",
+                body: None,
             },
             Skill {
                 name: "hidden".into(),
@@ -2892,6 +3015,7 @@ name: "caf\x65 é"
                 path: PathBuf::from("/x/.claude/skills/hidden/SKILL.md"),
                 disable_model_invocation: true,
                 scope: "user",
+                body: None,
             },
         ];
         let rendered = format_available(&skills);
@@ -2911,6 +3035,7 @@ name: "caf\x65 é"
             path: PathBuf::from("/x/.claude/skills/innocuous/SKILL.md"),
             disable_model_invocation: false,
             scope: "user",
+            body: None,
         }];
         let rendered = format_available(&skills);
         assert!(
@@ -2931,6 +3056,7 @@ name: "caf\x65 é"
             path: PathBuf::from("/x/<injected>/SKILL.md"),
             disable_model_invocation: false,
             scope: "user",
+            body: None,
         }];
         let rendered = format_available(&skills);
         assert!(!rendered.contains("<b>bold</b>"));
@@ -3146,6 +3272,103 @@ name: "caf\x65 é"
             found.iter().any(|s| s.name == "solo"),
             "an individually-named file entry must still be discovered alongside a pattern entry: \
              {found:?}"
+        );
+    }
+
+    /// A whole skill directory, for the backend-discovery tests below.
+    fn write_skill_at(root: &Path, name: &str, description: &str, body: &str) {
+        write_skill(
+            root,
+            name,
+            &format!("---\nname: {name}\ndescription: {description}\n---\n{body}\n"),
+        );
+    }
+
+    #[tokio::test]
+    async fn discover_via_reads_every_root_and_a_later_one_shadows_an_earlier_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home/.claude/skills");
+        let project = tmp.path().join("ws/.claude/skills");
+        write_skill_at(&home, "shared", "the home one", "home body");
+        write_skill_at(&home, "home-only", "only at home", "x");
+        write_skill_at(&project, "shared", "the workspace one", "workspace body");
+
+        let backend = crate::tools::fs::local::LocalFs::new();
+        let (found, _) = discover_via(&backend, &[(home, "user"), (project, "project")]).await;
+
+        let names: Vec<&str> = found.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["home-only", "shared"], "sorted by name");
+        let shared = find_by_name(&found, "shared").unwrap();
+        assert_eq!(
+            shared.description, "the workspace one",
+            "the later (more specific) root wins"
+        );
+        assert_eq!(shared.scope, "project");
+        assert_eq!(
+            find_by_name(&found, "home-only").unwrap().scope,
+            "user",
+            "each root tags its own skills"
+        );
+    }
+
+    #[tokio::test]
+    async fn discover_via_prefetches_the_body_so_expansion_needs_no_read() {
+        // The load-bearing property: `expand_if_skill_invocation` is synchronous and cannot `await` a
+        // backend read, so a skill discovered through one has to arrive with its body already. Deleting
+        // the manifest after discovery is the only way to prove the expansion never reads it.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join(".claude/skills");
+        write_skill_at(&root, "deploy", "ship it", "RUN THE DEPLOY");
+
+        let backend = crate::tools::fs::local::LocalFs::new();
+        let (found, _) = discover_via(&backend, &[(root.clone(), "project")]).await;
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].body.as_deref(), Some("RUN THE DEPLOY\n"));
+
+        fs::remove_dir_all(&root).unwrap();
+        let expanded = expand_if_skill_invocation("/skill:deploy now", &found);
+        assert!(expanded.contains("RUN THE DEPLOY"), "{expanded}");
+        assert!(
+            expanded.contains(&found[0].path.display().to_string()),
+            "the advertised location is the backend's own path: {expanded}"
+        );
+        assert!(
+            expanded.ends_with("now"),
+            "trailing text is kept: {expanded}"
+        );
+    }
+
+    #[tokio::test]
+    async fn discover_via_reports_an_oversized_manifest_and_skips_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("skills");
+        let dir = root.join("huge");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("SKILL.md"),
+            "x".repeat(MAX_SKILL_FILE_LEN as usize + 1),
+        )
+        .unwrap();
+
+        let backend = crate::tools::fs::local::LocalFs::new();
+        let (found, collisions) = discover_via(&backend, &[(root, "project")]).await;
+        assert!(found.is_empty());
+        assert!(
+            collisions.iter().any(|c| c.message.contains("exceeds")),
+            "{collisions:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn discover_via_on_a_missing_root_is_silent_and_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let backend = crate::tools::fs::local::LocalFs::new();
+        let (found, collisions) =
+            discover_via(&backend, &[(tmp.path().join("nothing/here"), "project")]).await;
+        assert!(found.is_empty());
+        assert!(
+            collisions.is_empty(),
+            "a sandbox with no skills directory is the normal case, not a diagnostic: {collisions:?}"
         );
     }
 }
