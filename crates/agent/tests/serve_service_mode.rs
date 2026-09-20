@@ -234,8 +234,9 @@ async fn get_state_reports_the_sandbox_workspace_and_no_host_paths() {
     );
 }
 
-/// Every command that could reach the replica — or that needs a prefixed derived id — answers with a
-/// refusal rather than doing something surprising.
+/// Every command that could reach the replica answers with a refusal rather than doing something
+/// surprising. (`fork`/`clone`/`new_session` are *not* here: they mint ids on the session's own
+/// shard — see `serve_service_derived.rs`.)
 #[tokio::test]
 async fn the_refused_commands_answer_with_an_error() {
     let (base, _requests) = spawn_model_server(vec![]);
@@ -253,9 +254,6 @@ async fn the_refused_commands_answer_with_an_error() {
         "logout",
         "auth_status",
         "switch_session",
-        "fork",
-        "clone",
-        "new_session",
     ] {
         ws_send(&mut ws, json!({"type": command, "id": command})).await;
         let frames = ws_read_until_response(&mut ws, command).await;

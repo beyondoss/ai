@@ -114,7 +114,10 @@
 //!   - `{type:"fork", upto?, target_id?, before?}` (repo mode) copy a prefix into a new session, switch
 //!     to it. `target_id` (any tree entry, on or off the active path) wins over `upto` (a message-count
 //!     prefix of just the active path) when given; `before:true` excludes `target_id` itself from the
-//!     copied prefix (fork right before it), the default `true` excludes it.
+//!     copied prefix (fork right before it), the default `true` excludes it. **In service mode it
+//!     does not switch**: the new `<shard>.<opaque>` id comes back with `switched:false`, and the
+//!     client opens it with a grant of its own (this session's id is what its slot, lock and grant
+//!     are keyed on). A `fork` arriving mid-run is answered "busy" rather than aborting the run.
 //!   - `{type:"clone"}` (repo mode) `fork` with no arguments — the current session's active path in
 //!     full, at its current tip. pi's own `clone`: a thin, argument-free alias, not a separate code
 //!     path (pi needs it because pi's own `fork` requires an explicit entry id; this crate's `fork`
@@ -322,7 +325,10 @@
 //! command:"set_session_name", title}`, pushed once per successful `set_session_name` (pi's own
 //! `session_info_changed`; see `set_session_name` above) — or `{type:"login_progress", id?,
 //! command:"login", provider, step, url?, user_code?, verification_uri?, expires_in?, message?}`,
-//! zero or more unsolicited updates for an in-flight `login`, correlated via `id` (see `login` above).
+//! zero or more unsolicited updates for an in-flight `login`, correlated via `id` (see `login` above)
+//! — or `{type:"session_superseded", session_id, tenant?}`, the last frame of a session whose storage
+//! another owner has taken over (service mode's shared mounts): reconnect to the same id, which lands
+//! on whoever owns it now.
 //!
 //! `{type:"catchup", data:{messages, leaf_id}, turn_in_flight, turn_truncated}` is pushed **once,
 //! unsolicited, on attach** over the WebSocket/UDS transports (nothing is sent to a fresh session with
@@ -820,10 +826,10 @@ pub struct ServeConfig {
     /// [`Self::service_mode`] is set, a `None` here is a bug that fails the session rather than
     /// silently falling back to a host default.
     pub service: Option<Arc<crate::service::ServiceSession>>,
-    /// Cap on live sessions this replica will hold at once. Two open descriptors per live session
-    /// keeps the default comfortably inside EFS's documented per-instance limits. Not enforced yet
-    /// — the session-lock PR is what can refuse an attach with a 503; the field lands here now so
-    /// that PR adds no field of its own to this struct.
+    /// Cap on live sessions this replica will hold at once; `0` turns it off. Two open descriptors
+    /// per live session (its newest segment and its lock) keeps the default comfortably inside EFS's
+    /// documented 65,536 open files and 65,536 locks per instance. Enforced where a session is
+    /// spawned (`serve_ws::Supervisor::try_pin`), which answers 503 rather than starting one.
     pub max_live_sessions: usize,
     /// The process-wide client per-session MCP connectors dial through — ALPN and the `web` tool's
     /// SSRF resolver, and deliberately *not* the gateway's h2c pool (a tenant's connector is not the
@@ -1116,11 +1122,15 @@ impl Persistence {
                     "service mode: this session has no verified grant, so it has nowhere to persist",
                 )
             })?;
-            return Self::open_repo(
+            // Epoch segments, sealed with the tenant's own keys, and minting derived ids onto this
+            // session's shard: the layout a mount shared by many replicas needs (see
+            // `session_store`'s "Ownership: the epoch fence").
+            return Self::open_repo_with(
                 &service.session_dir,
                 service.workspace_root(),
                 &cfg.model,
                 SessionSelect::from_cfg(cfg),
+                service.repo_options_for(service.session_id()),
             );
         }
         let cwd = crate::session_store::canonical_cwd(&std::env::current_dir().unwrap_or_default())
@@ -1192,7 +1202,25 @@ impl Persistence {
         model: &str,
         select: SessionSelect<'_>,
     ) -> std::io::Result<(Self, Session)> {
-        let repo = SessionRepo::open(dir)?;
+        Self::open_repo_with(
+            dir,
+            cwd,
+            model,
+            select,
+            crate::session_store::RepoOptions::default(),
+        )
+    }
+
+    /// [`Self::open_repo`] with an explicit on-disk shape — the service-mode entry point, where the
+    /// repo is segmented, sealed per tenant, and mints derived ids onto the session's own shard.
+    fn open_repo_with(
+        dir: impl Into<std::path::PathBuf>,
+        cwd: &str,
+        model: &str,
+        select: SessionSelect<'_>,
+        opts: crate::session_store::RepoOptions,
+    ) -> std::io::Result<(Self, Session)> {
+        let repo = SessionRepo::open_with(dir, opts)?;
         let (store, session) = match select {
             SessionSelect::Id(id) => repo.open_or_create_id(id, cwd, model)?,
             SessionSelect::Latest => repo.resume_latest_or_create(cwd, model)?,
@@ -1224,6 +1252,24 @@ impl Persistence {
     /// modes both populate `store`, so this covers either without needing to distinguish them.
     fn session_file(&self) -> Option<&Path> {
         self.store.as_ref().map(SessionStore::path)
+    }
+
+    /// Where this session's `/session` working memory belongs. Always asked of the store, which is
+    /// the only thing that knows the layout: deriving it from the path would hand every session on a
+    /// shard one shared `<shard>.memory` directory (see [`crate::memory::session_dir`]). Without a
+    /// store there is no session file to sit beside, so it falls back to the id-keyed tempdir.
+    fn memory_dir(&self) -> std::path::PathBuf {
+        match &self.store {
+            Some(store) => store.memory_dir(),
+            None => crate::memory::session_dir(None, self.session_id()),
+        }
+    }
+
+    /// Whether this session's storage has been taken over by another owner — a newer epoch on a
+    /// shared mount. Once true nothing this process writes can ever land again, so the session ends
+    /// rather than accepting turns it cannot persist.
+    fn superseded(&self) -> bool {
+        self.store.as_ref().is_some_and(SessionStore::superseded)
     }
 
     /// Persist the session after a turn: non-destructively rewrite the transcript (see
@@ -1419,6 +1465,31 @@ impl Persistence {
         Ok((session, restored_model, restored_level))
     }
 
+    /// Fork the current session and **stay on it** — service mode's shape for `fork`/`clone`.
+    ///
+    /// A daemon session is addressed by its id: the supervisor's slot, the session's advisory lock,
+    /// and the grant every attached connection presents are all keyed on it. Swapping `self.store`
+    /// onto a different session would leave this task writing a session nothing routes to, while
+    /// holding the lock on the one it left. So the derived id — `<shard>.<opaque>`, minted by the
+    /// repo — goes back to the client instead, which opens it with a grant of its own.
+    ///
+    /// Reads the source from disk, like [`SessionRepo::fork`](crate::session_store::SessionRepo::fork)
+    /// always has, which is why service mode answers a `fork` arriving mid-run with "busy" rather
+    /// than copying a prefix the running turn hasn't persisted yet.
+    fn fork_detached(
+        &self,
+        upto: usize,
+        entry_id: Option<&str>,
+        before: bool,
+    ) -> std::io::Result<String> {
+        let repo = self.repo.as_ref().ok_or_else(not_in_repo_mode)?;
+        let (store, _session) = match entry_id {
+            Some(entry_id) => repo.fork_at_entry(&self.meta.id, entry_id, before)?,
+            None => repo.fork(&self.meta.id, upto)?,
+        };
+        Ok(store.meta().id.clone())
+    }
+
     /// The model/thinking-level actually active at what a would-be [`Self::fork`] targets — see that
     /// method's own doc comment for why this must be computed against the *source* tree before the fork
     /// swaps `self.store` to the freshly created one. Mirrors `fork`'s own `entry_id`/`before`-vs-`upto`
@@ -1501,7 +1572,7 @@ impl Persistence {
                 format!("session {id} is on a shard this replica does not serve"),
             )
         })?;
-        SessionRepo::open(dir)
+        SessionRepo::open_with(dir, service.repo_options_for(id))
     }
 
     /// Service mode only: refuse an id that doesn't name a session **exactly**.
@@ -1518,13 +1589,7 @@ impl Persistence {
         if service.is_none() {
             return Ok(());
         }
-        let suffix = format!("_{id}.jsonl");
-        let found = std::fs::read_dir(repo.dir()).is_ok_and(|mut entries| {
-            entries.any(|e| {
-                e.is_ok_and(|e| e.file_name().to_str().is_some_and(|n| n.ends_with(&suffix)))
-            })
-        });
-        if found {
+        if repo.has_exact(id)? {
             Ok(())
         } else {
             Err(std::io::Error::new(
@@ -1568,9 +1633,14 @@ impl Persistence {
     ) -> std::io::Result<Vec<crate::session_store::TrashEntry>> {
         if let Some(service) = service {
             let mut all = Vec::new();
+            // Read-only across every mount, so no id prefix: nothing here mints a session.
+            let opts = crate::session_store::RepoOptions {
+                layout: service.layout(),
+                id_prefix: None,
+            };
             for dir in service.tenant_session_dirs() {
                 if dir.is_dir() {
-                    all.extend(SessionRepo::open(dir)?.list_trash()?);
+                    all.extend(SessionRepo::open_with(dir, opts.clone())?.list_trash()?);
                 }
             }
             all.sort_by(|a, b| b.deleted_at.cmp(&a.deleted_at));
@@ -1617,7 +1687,12 @@ impl Persistence {
         on_progress: impl Fn(usize, usize) + Send + Sync + 'static,
     ) -> Vec<SessionMeta> {
         if let Some(service) = service {
-            return scan_session_dirs(vec![service.session_dir.clone()], on_progress).await;
+            return scan_session_dirs(
+                vec![service.session_dir.clone()],
+                service.layout(),
+                on_progress,
+            )
+            .await;
         }
         let Some(repo) = self.repo.clone() else {
             return Vec::new();
@@ -1658,7 +1733,12 @@ impl Persistence {
         on_progress: impl Fn(usize, usize) + Send + Sync + 'static,
     ) -> std::io::Result<Vec<SessionMeta>> {
         if let Some(service) = service {
-            return Ok(scan_session_dirs(service.tenant_session_dirs(), on_progress).await);
+            return Ok(scan_session_dirs(
+                service.tenant_session_dirs(),
+                service.layout(),
+                on_progress,
+            )
+            .await);
         }
         let repo = self.repo.as_ref().ok_or_else(not_in_repo_mode)?;
         let root = repo
@@ -2123,14 +2203,15 @@ fn not_in_repo_mode() -> std::io::Error {
 /// synchronous file I/O reachable from the busy loop while a turn is in flight.
 async fn scan_session_dirs(
     dirs: Vec<std::path::PathBuf>,
+    layout: crate::session_store::Layout,
     on_progress: impl Fn(usize, usize) + Send + Sync + 'static,
 ) -> Vec<SessionMeta> {
     match tokio::task::spawn_blocking(move || {
         let paths: Vec<std::path::PathBuf> = dirs
             .iter()
-            .flat_map(|dir| crate::session_store::scan_session_dir(dir))
+            .flat_map(|dir| crate::session_store::scan_session_dir_in(dir, &layout))
             .collect();
-        let mut metas = crate::session_store::scan_listings(paths, &on_progress);
+        let mut metas = crate::session_store::scan_listings_in(paths, &layout, &on_progress);
         metas.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
         metas
     })
@@ -2570,10 +2651,7 @@ pub(crate) async fn serve_session(
     // `switch_session`/`new_session`/`fork` re-points the cell (below) and every holder — this session's
     // `memory` tool and every subagent sharing it by `Arc` — follows with no tool/agent rebuild. Off when
     // memory is disabled or `--no-session-memory` was passed. See `crate::memory::session_dir`.
-    let session_dir_cell = crate::memory::file::SessionDir::new(crate::memory::session_dir(
-        persistence.session_file(),
-        persistence.session_id(),
-    ));
+    let session_dir_cell = crate::memory::file::SessionDir::new(persistence.memory_dir());
     let mounts: Vec<crate::memory::Mount> = {
         let mut v = Vec::new();
         if let Some(backend) = &memory_backend {
@@ -2582,11 +2660,17 @@ pub(crate) async fn serve_session(
                 backend: backend.clone(),
             });
             if !cfg.no_session_memory {
+                // Sealed with the tenant's key in service mode, exactly like the durable mount and
+                // the transcript beside it: `<id>/memory/` lives on the same shared mount they do.
+                let session_backend =
+                    crate::memory::file::FileBackend::session_shared(session_dir_cell.clone());
+                let session_backend = match &service {
+                    Some(svc) => session_backend.sealed(Arc::clone(svc.codec())),
+                    None => session_backend,
+                };
                 v.push(crate::memory::Mount {
                     kind: crate::memory::MountKind::Session,
-                    backend: Arc::new(crate::memory::file::FileBackend::session_shared(
-                        session_dir_cell.clone(),
-                    )),
+                    backend: Arc::new(session_backend),
                 });
             }
         }
@@ -2675,10 +2759,7 @@ pub(crate) async fn serve_session(
 
     macro_rules! repoint_session_memory {
         () => {
-            session_dir_cell.set(crate::memory::session_dir(
-                persistence.session_file(),
-                persistence.session_id(),
-            ));
+            session_dir_cell.set(persistence.memory_dir());
         };
     }
 
@@ -3283,6 +3364,26 @@ pub(crate) async fn serve_session(
                     .and_then(|i| session.messages.get(i))
                     .and_then(message_text),
             };
+            // Service mode derives without switching: this task keeps its own id, its lock and its
+            // grant, and the client gets the new id to connect to. See `fork_detached`.
+            if service.is_some() {
+                let frame = match persistence.fork_detached(upto, target_id, before) {
+                    Ok(new_id) => response(
+                        $id,
+                        "fork",
+                        true,
+                        Some(json!({
+                            "session_id": new_id,
+                            "switched": false,
+                            "text": fork_text,
+                        })),
+                        None,
+                    ),
+                    Err(e) => response($id, "fork", false, None, Some(&e.to_string())),
+                };
+                let _ = out_tx.send(redact_frame(service.as_deref(), frame));
+                continue;
+            }
             match persistence.fork(upto, target_id, before, starting_level) {
                 Ok((s, restored_model, restored_level)) => {
                     session = s;
@@ -3360,6 +3461,21 @@ pub(crate) async fn serve_session(
     macro_rules! do_clone {
         ($cmd:expr, $id:expr) => {{
             // pi's own `clone` — fork the current session at its current tip, with no arguments.
+            // Service mode derives without switching, exactly like `fork` above.
+            if service.is_some() {
+                let frame = match persistence.fork_detached(usize::MAX, None, false) {
+                    Ok(new_id) => response(
+                        $id,
+                        "clone",
+                        true,
+                        Some(json!({ "session_id": new_id, "switched": false })),
+                        None,
+                    ),
+                    Err(e) => response($id, "clone", false, None, Some(&e.to_string())),
+                };
+                let _ = out_tx.send(redact_frame(service.as_deref(), frame));
+                continue;
+            }
             match persistence.fork(usize::MAX, None, false, starting_level) {
                 Ok((s, restored_model, restored_level)) => {
                     session = s;
@@ -3570,6 +3686,19 @@ pub(crate) async fn serve_session(
         // very first snapshot, from the history `Persistence::open` restored off disk, so a client
         // attaching to a resumed session is caught up before it has issued a single command.
         sync_history!();
+        // Checked here because every write path — a run's persist, a mid-run checkpoint, a title, a
+        // label, a compaction rewrite — comes back through this loop before the next command is read.
+        // Another owner has created a newer epoch on this session's storage, so nothing this process
+        // writes can land again: end the session with an event that tells the client to reconnect
+        // (which respawns against the new epoch) rather than silently accepting turns that are lost.
+        if persistence.superseded() {
+            emit!(OutFrame::Value(json!({
+                "type": "session_superseded",
+                "session_id": persistence.session_id(),
+                "tenant": service.as_ref().map(|svc| svc.tenant()),
+            })));
+            break;
+        }
         let line = tokio::select! {
             biased;
             // Idle between commands: nothing is in flight, so a shutdown request needs no drain —
@@ -4369,6 +4498,13 @@ pub(crate) async fn serve_session(
                                             "abort_retry" => {
                                                 let _ = out_tx.send(response(cid, "abort_retry", true, None, None));
                                             }
+                                            // In service mode these two derive a *new* session and
+                                            // leave this one running (see `fork_detached`), so there
+                                            // is nothing here worth a run for: "busy" costs the
+                                            // client a retry, cancelling would cost it the turn.
+                                            busy @ ("fork" | "clone") if service.is_some() => {
+                                                let _ = out_tx.send(response(cid, busy, false, None, Some("busy: a prompt is running; fork/clone copy what is on disk, so retry once the run has finished")));
+                                            }
                                             // pi-parity (Task 4): pi's real product has no busy/idle
                                             // gating at all for these — `compact()`/`switchSession`/
                                             // `newSession`/`fork` all call `abort()` unconditionally
@@ -4559,6 +4695,12 @@ pub(crate) async fn serve_session(
                                                     retry_cancelled = true;
                                                     let _ = out_tx.send(response(cid, cmd_type, true, None, None));
                                                     break;
+                                                }
+                                                // Same as the live-run loop's arm: in service mode a
+                                                // `fork`/`clone` has no reason to end the retry
+                                                // sequence this run is waiting on.
+                                                busy @ ("fork" | "clone") if service.is_some() => {
+                                                    let _ = out_tx.send(response(cid, busy, false, None, Some("busy: a prompt is retrying; fork/clone copy what is on disk, so retry once the run has finished")));
                                                 }
                                                 // pi-parity (Task 4): same self-abort-and-proceed
                                                 // treatment as the live-run busy-loop's own arm above —

@@ -2924,6 +2924,13 @@ impl SessionRepo {
         }
     }
 
+    /// Whether `id` names a session here, matched **exactly** — no unique-prefix fallback (see
+    /// [`Self::find_path_exact`]). What a caller addressing a minted id asks before acting on it, so
+    /// "that session is gone" cannot resolve to a neighbour of it.
+    pub fn has_exact(&self, id: &str) -> std::io::Result<bool> {
+        Ok(self.find_path_exact(id)?.is_some())
+    }
+
     /// Open a session by id.
     pub fn open_id(&self, id: &str) -> std::io::Result<(SessionStore, Session)> {
         let path = self.find_path(id)?.ok_or_else(|| {
@@ -3767,16 +3774,12 @@ fn migrate(meta: SessionMeta, path: &Path) -> std::io::Result<SessionMeta> {
     }
 }
 
-/// Gather the `*.jsonl` files directly under `dir` — the flat, extension-filtered candidate set the
-/// daemon's `list_daemon_sessions` feeds to [`scan_listings`]. A single non-recursive `read_dir`;
-/// an unreadable directory (or a missing one) yields an empty list rather than erroring, matching the
-/// skip-and-continue semantics of the listing scans that consume it.
-pub(crate) fn scan_session_dir(dir: &Path) -> Vec<PathBuf> {
-    scan_session_dir_in(dir, &Layout::File)
-}
-
-/// [`scan_session_dir`] for a specific [`Layout`]: `*.jsonl` files, or the subdirectories that hold
-/// at least one segment (which skips `.trash/` and any half-created id).
+/// Gather the sessions directly under `dir` — the flat candidate set the daemon's
+/// `list_daemon_sessions` feeds to [`scan_listings_in`]: `*.jsonl` files in the single-file layout,
+/// or the subdirectories holding at least one segment (which skips `.trash/` and any half-created id)
+/// in the segmented one. A single non-recursive `read_dir`; an unreadable directory (or a missing
+/// one) yields an empty list rather than erroring, matching the skip-and-continue semantics of the
+/// listing scans that consume it.
 pub(crate) fn scan_session_dir_in(dir: &Path, layout: &Layout) -> Vec<PathBuf> {
     let Ok(entries) = fs::read_dir(dir) else {
         return Vec::new();

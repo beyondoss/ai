@@ -761,9 +761,10 @@ enum Command {
         /// least one.
         #[usage(long, env = "AI_AGENT_SHARD", delimiter = ',')]
         shard: Vec<String>,
-        /// Service mode: refuse a new session once this many are live on this replica (503). Two
-        /// open file descriptors per live session keeps the default comfortably inside a network
-        /// filesystem's per-instance limits. Not enforced yet.
+        /// Service mode: refuse a new session once this many are live on this replica (503, with a
+        /// `Retry-After`). Two open file descriptors per live session — its newest segment and its
+        /// lock — keeps the default comfortably inside a network filesystem's per-instance limits.
+        /// `0` turns the cap off.
         #[usage(long, env = "AI_AGENT_MAX_LIVE_SESSIONS", default = "20000")]
         max_live_sessions: usize,
         /// Service mode: let a session grant's MCP connectors reach loopback/private/link-local
