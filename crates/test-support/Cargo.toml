@@ -20,4 +20,6 @@ getrandom = { version = "0.3", features = ["std"] }
 hkdf = "0.12"
 serde_json.workspace = true
 sha2 = "0.10"
+# The exec-endpoint double serves real HTTP and runs real processes.
+tokio = { version = "1", features = ["full"] }
 x25519-dalek = { version = "2", features = ["static_secrets"] }
