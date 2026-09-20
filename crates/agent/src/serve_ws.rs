@@ -207,6 +207,12 @@ const SESSION_ID_HEADER: &str = "X-Session-Id";
 /// way out, and reconnecting to its id respawns it and replays from disk.
 const DEFAULT_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 
+/// How often a drain re-checks whether any run is still in flight.
+///
+/// Short enough that a drain of idle sessions is over in well under a second, long enough that the
+/// poll never contends meaningfully for the table mutex the sessions themselves need.
+const DRAIN_POLL: Duration = Duration::from_millis(100);
+
 /// How long a stopped session task gets to persist and exit before whoever is waiting on it stops
 /// waiting: graceful shutdown, for the whole batch; a reconnect, for its id's previous incarnation.
 const JOIN_GRACE: Duration = Duration::from_secs(10);
@@ -303,6 +309,26 @@ impl SessionHandle {
     }
 }
 
+/// What this replica will still accept.
+///
+/// Three states, not two, and the middle one is the whole point of a drain: a replica that has been
+/// told to go away must stop taking **new** sessions while still serving the ones it already holds.
+/// Collapsing `Draining` into `Closed` is what makes a rolling deploy cut live conversations.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Lifecycle {
+    /// Serving normally.
+    #[default]
+    Open,
+    /// SIGTERM arrived. New sessions are refused (503, so the edge retries elsewhere), `/readyz`
+    /// answers 503 so the load balancer stops choosing this replica, and `/livez` stays 200 so the
+    /// orchestrator does not kill it mid-drain. **Reconnects to sessions this replica still owns are
+    /// accepted** — those clients have nowhere else to go until this replica lets the session's lock
+    /// go, and refusing them is precisely the outage a drain exists to avoid.
+    Draining,
+    /// Sessions are being stopped. Nothing attaches.
+    Closed,
+}
+
 /// The supervisor's `session id → session task` map, with the state that must change atomically
 /// alongside it.
 #[derive(Default)]
@@ -312,7 +338,7 @@ struct Table {
     next_incarnation: u64,
     /// Set once, by graceful shutdown: from then on nothing is spawned or attached, so the sessions
     /// shutdown is waiting on are the last ones.
-    closed: bool,
+    lifecycle: Lifecycle,
 }
 
 /// What a session task runs once it goes live, given its id, input, output fan-out, and `running`
@@ -385,7 +411,10 @@ fn session_cfg(base: &ServeConfig, id: &str, service: Option<Arc<ServiceSession>
     c.service = service;
     c.listen = None;
     // A spawned session must never itself re-bind a transport listener — it's driven purely
-    // through its `input_rx`/`out_conn` channels by the supervisor.
+    // through its `input_rx`/`out_conn` channels by the supervisor. For the same reason it must not
+    // act on OS signals: the supervisor decides when this session stops, and a session that cancels
+    // its own run on SIGTERM cancels the very work a drain is counting down its grace to protect.
+    c.supervised = true;
     c.listen_uds = None;
     c.listen_uds_mode = None;
     c.session_id = Some(id.to_string());
@@ -771,7 +800,7 @@ impl Supervisor {
     fn try_pin(&self, id: &str, service: Option<&Arc<ServiceSession>>) -> TryPin {
         let tenant = service.map(|svc| svc.tenant().to_owned());
         let mut table = lock_ignoring_poison(&self.table);
-        if table.closed {
+        if table.lifecycle == Lifecycle::Closed {
             return TryPin::Closed;
         }
         if let Some(h) = table.sessions.get_mut(id) {
@@ -803,9 +832,17 @@ impl Supervisor {
             };
         }
 
-        // Nothing owns this id, so this look is about to spawn one. Checked here, under the same lock
-        // the insert happens under, so two simultaneous connections can't both see room for the last
-        // slot.
+        // Nothing owns this id, so this look is about to spawn one. Everything from here is a
+        // *new-session* gate, which is why the drain check sits here and not at the top of this
+        // function: a draining replica still owns live sessions, and a reconnect to one of those
+        // took the `get_mut` branch above and never reaches this line. Refusing at the top — which
+        // an earlier draft did — would refuse exactly the clients the drain exists to protect.
+        if table.lifecycle != Lifecycle::Open {
+            return TryPin::Closed;
+        }
+
+        // Checked here, under the same lock the insert happens under, so two simultaneous
+        // connections can't both see room for the last slot.
         if let Some(max) = self.service.as_ref().and_then(|s| s.max_live_sessions)
             && table.sessions.len() >= max
         {
@@ -1108,6 +1145,42 @@ impl Supervisor {
         self.unpin(&id, incarnation);
     }
 
+    /// Drain: stop taking new work, let what is in flight finish, then shut down.
+    ///
+    /// The sequence, and why each step is where it is:
+    ///
+    /// 1. **`Draining` immediately.** `/readyz` starts answering 503 on the next probe, so the load
+    ///    balancer stops choosing this replica within one probe interval, while `/livez` stays 200 so
+    ///    the orchestrator doesn't decide the process is wedged and kill it mid-drain. New sessions
+    ///    get a 503 and the edge's retry finds another replica; **reconnects to sessions this replica
+    ///    still owns keep working**, because those clients cannot be served anywhere else until this
+    ///    replica releases the session's lock.
+    /// 2. **Wait for in-flight runs**, bounded by `grace`. The wait is on each session's `running`
+    ///    flag — true exactly while a prompt is executing. It is deliberately **not** `is_reapable`,
+    ///    which additionally requires `attached == 0`: a client watching its own run keeps a socket
+    ///    attached throughout, so a drain gated on that would burn its entire grace every time and
+    ///    then kill the run anyway.
+    /// 3. **Then the ordinary shutdown**, which stops every session and waits for the tasks.
+    ///
+    /// `grace` of zero skips step 2 entirely, which is the behaviour a single-user daemon had before
+    /// this existed: Ctrl-C ends it now, not in thirty seconds.
+    fn begin_drain(&self) {
+        lock_ignoring_poison(&self.table).lifecycle = Lifecycle::Draining;
+    }
+
+    /// Is any session still executing a prompt?
+    ///
+    /// Reads each session's `running` flag — true exactly while a prompt is executing. Deliberately
+    /// **not** `is_reapable`, which additionally requires `attached == 0`: a client watching its own
+    /// run holds a socket open throughout, so a drain gated on that would burn its whole grace every
+    /// time and then cut the run anyway.
+    fn any_run_in_flight(&self) -> bool {
+        lock_ignoring_poison(&self.table)
+            .sessions
+            .values()
+            .any(|h| h.running.load(Ordering::Relaxed))
+    }
+
     /// Graceful shutdown: close the table to new attachments, stop every session (dropping each
     /// retained input, which closes that session's input channel → it cancels any in-flight run,
     /// persists, and exits), then wait for every session task to be gone so persistence is durable
@@ -1117,7 +1190,7 @@ impl Supervisor {
     async fn shutdown(&self) {
         let exits: Vec<CancellationToken> = {
             let mut table = lock_ignoring_poison(&self.table);
-            table.closed = true;
+            table.lifecycle = Lifecycle::Closed;
             table
                 .sessions
                 .values_mut()
@@ -1518,6 +1591,8 @@ pub async fn serve_ws(
     } else {
         None
     };
+    // Read before `cfg` is moved into the session body factory inside this initializer.
+    let cfg_drain_grace = cfg.drain_grace;
     let supervisor = Arc::new(Supervisor {
         table: Arc::default(),
         // Service mode lists per tenant, from the shards, never from one process-wide directory.
@@ -1561,10 +1636,20 @@ pub async fn serve_ws(
         })
     });
 
+    // Set once a signal has arrived: which signal to report on exit, and when the grace runs out.
+    // Holding this instead of returning from the signal arm is the whole of the drain — **the accept
+    // loop has to keep running while draining**, or the replica can answer neither the `/readyz`
+    // probe that tells the load balancer to stop choosing it, nor a reconnect from a client whose
+    // session this replica still owns. Draining inline and returning, which the obvious
+    // implementation does, makes the contract unimplementable: nothing is left listening to honour it.
+    let mut draining: Option<(Signal, Instant)> = None;
+    let mut drain_tick = tokio::time::interval(DRAIN_POLL);
+    drain_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
     loop {
         tokio::select! {
-            sig = shutdown.wait() => {
-                eprintln!("serve: shutting down websocket listener");
+            sig = shutdown.wait(), if draining.is_none() => {
+                eprintln!("serve: draining websocket listener");
                 // Stop the idle reaper: past this point every session is stopping anyway (both paths
                 // make the same idempotent transition, so this is tidiness, not a race).
                 if let Some(reaper) = &reaper {
@@ -1575,12 +1660,23 @@ pub async fn serve_ws(
                 if let Some(path) = &uds_path {
                     let _ = std::fs::remove_file(path);
                 }
-                // Drive shutdown deterministically from here rather than relying on each session's own
-                // signal handler: refuse new attachments, stop every session (its retained input
-                // dropped, so it observes EOF and cancels+persists+exits), then wait for each task to
-                // be gone so persistence actually completes before the caller's `process::exit`.
-                supervisor.shutdown().await;
-                return Ok(Some(sig));
+                // New sessions refused and `/readyz` 503 from here on; sessions this replica already
+                // owns keep running, and keep accepting reconnects, until the grace is spent.
+                supervisor.begin_drain();
+                draining = Some((sig, Instant::now() + cfg_drain_grace));
+            }
+            _ = drain_tick.tick(), if draining.is_some() => {
+                // The `if` guard already proved this is `Some`; destructured rather than unwrapped so
+                // the guard and the read cannot drift apart.
+                if let Some((sig, deadline)) = draining
+                    && (Instant::now() >= deadline || !supervisor.any_run_in_flight())
+                {
+                    // Stop every session (its retained input dropped, so it observes EOF and
+                    // cancels+persists+exits), then wait for each task to be gone so persistence
+                    // actually completes before the caller's `process::exit`.
+                    supervisor.shutdown().await;
+                    return Ok(Some(sig));
+                }
             }
             Some(stream) = accept_tcp(&tcp_listener) => {
                 let supervisor = supervisor.clone();
@@ -1748,6 +1844,15 @@ async fn handle_health<S: AsyncWrite + Unpin>(
     }
     if head.path == LIVEZ_PATH {
         return write_http_ok(stream, 200, "OK", None, br#"{"status":"alive"}"#).await;
+    }
+    // A draining replica is not ready, whatever its mounts say, and it must say so on the very first
+    // probe after SIGTERM — that answer is the entire mechanism by which the load balancer stops
+    // sending it new sessions. Read before the probe, and out of the lock, so a slow mount cannot
+    // delay the one answer that has to be immediate.
+    let draining = lock_ignoring_poison(&supervisor.table).lifecycle != Lifecycle::Open;
+    if draining {
+        let body = json!({ "status": "not ready", "reason": "draining" }).to_string();
+        return write_http_ok(stream, 503, "Service Unavailable", None, body.as_bytes()).await;
     }
     // No `--shard` means no service mode, and then "the listener is up" is the whole of readiness.
     let reason = match &supervisor.service {

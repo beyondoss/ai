@@ -3201,6 +3201,47 @@ them would publish series pinned at zero — which reads as "this never happens"
 measured". Wiring them means threading a handle through `RepoOptions`, which belongs in its own
 change.
 
+### Draining
+
+`--drain-grace <seconds>` turns a signal from "stop now" into "stop taking new work, finish what is in
+flight, then stop". Zero — the default — is behaviour-identical to life before it existed, so Ctrl-C
+on a laptop daemon still ends it at once.
+
+The table has **three** states, not two, and the middle one is the entire point:
+
+| State      | New sessions | Reconnect to a session this replica owns | `/readyz` | `/livez` |
+| ---------- | ------------ | ---------------------------------------- | --------- | -------- |
+| `Open`     | accepted     | accepted                                 | 200       | 200      |
+| `Draining` | **503**      | **accepted**                             | **503**   | 200      |
+| `Closed`   | 503          | 503                                      | 503       | 200      |
+
+Collapsing `Draining` into `Closed` is what makes a rolling deploy cut live conversations. A client
+whose session this replica still owns **has nowhere else to go** until the lock is released, so
+refusing its reconnect is precisely the outage a drain exists to prevent.
+
+Three things had to be right, and each was wrong in an earlier draft:
+
+- **The closed check belongs on the spawn path, not at the top of `try_pin`.** Checking before the map
+  lookup refuses reconnects to exactly the sessions the drain is protecting. It now sits after the
+  lookup, next to the `--max-live-sessions` check, where every other new-session gate lives.
+- **The wait is on each session's `running` flag, not `is_reapable`.** That helper also requires
+  `attached == 0`, which is never true while a client watches its own run — a drain gated on it burns
+  its whole grace every time and then cuts the run anyway.
+- **The accept loop keeps running.** Draining inline and returning from the signal arm leaves nothing
+  listening, so the replica can answer neither the `/readyz` probe that takes it out of the load
+  balancer nor the reconnects it is supposed to keep serving. The signal arm now records a deadline
+  and the loop continues; a ticker arm ends the process once the grace is spent or every run has
+  finished.
+
+**A supervised session no longer acts on signals itself.** `serve_session` installed its own
+`ShutdownSignal` and cancelled its in-flight run the instant SIGTERM landed — so the supervisor would
+count down a grace protecting a run that had already been aborted. Sessions spawned by `serve_ws` now
+get `ShutdownSignal::inert()`, whose `wait` never resolves; the supervisor is authoritative, exactly as
+that path's comment always claimed. Stdio `serve` and `run` are unaffected and still handle their own
+signals.
+
+`agent_sessions_ended_total{reason="drain"}` counts what the drain stopped.
+
 ### Health and image
 
 Two endpoints on the same listener as the agent protocol, answered in `handle_connection` **before**

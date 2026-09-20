@@ -842,6 +842,13 @@ pub struct ServeConfig {
     /// nothing. Never carries a tenant or session identifier into a label — see
     /// [`crate::metrics`].
     pub metrics: Option<Arc<crate::metrics::Metrics>>,
+    /// True for a session `serve_ws` spawned, false for stdio `serve` and `run`. A supervised
+    /// session leaves OS signals to its supervisor; see [`ShutdownSignal::inert`].
+    pub supervised: bool,
+    /// How long a drain waits for in-flight runs before stopping every session (`--drain-grace`).
+    /// `Duration::ZERO` — the default — means a signal shuts the daemon down at once, exactly as it
+    /// did before drain existed, so Ctrl-C on a laptop daemon is still instant.
+    pub drain_grace: std::time::Duration,
 }
 
 /// Resolve whether a project is trusted for this session, from already-gathered inputs — shared by
@@ -925,10 +932,18 @@ pub fn resolve_project_trust(
 /// own `rpc-mode.ts`, which treats SIGHUP identically to SIGTERM (graceful shutdown, not a reload
 /// trigger — unlike this crate's own `reload` RPC command, which is unrelated and client-driven).
 pub struct ShutdownSignal {
+    /// Set for a **supervised** session: one spawned by `serve_ws`, where the supervisor — not this
+    /// session — decides when to stop, so [`wait`](ShutdownSignal::wait) must never resolve.
+    ///
+    /// Without this, a daemon session installs its own handler and cancels its in-flight run the
+    /// instant SIGTERM lands, which is precisely the work a drain exists to protect: the supervisor
+    /// would still be counting down its grace while the run it was protecting had already been
+    /// aborted out from under it. Inert here, authoritative there.
+    inert: bool,
     #[cfg(unix)]
-    sigterm: tokio::signal::unix::Signal,
+    sigterm: Option<tokio::signal::unix::Signal>,
     #[cfg(unix)]
-    sighup: tokio::signal::unix::Signal,
+    sighup: Option<tokio::signal::unix::Signal>,
 }
 
 /// Which OS signal [`ShutdownSignal::wait`] actually observed — Task #41 (pi-parity fix): previously
@@ -965,28 +980,52 @@ impl Signal {
 }
 
 impl ShutdownSignal {
+    /// A signal source that never fires, for a session whose supervisor owns its lifecycle.
+    pub fn inert() -> Self {
+        Self {
+            inert: true,
+            #[cfg(unix)]
+            sigterm: None,
+            #[cfg(unix)]
+            sighup: None,
+        }
+    }
+
     pub fn new() -> std::io::Result<Self> {
         #[cfg(unix)]
         {
             Ok(Self {
-                sigterm: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?,
-                sighup: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?,
+                inert: false,
+                sigterm: Some(tokio::signal::unix::signal(
+                    tokio::signal::unix::SignalKind::terminate(),
+                )?),
+                sighup: Some(tokio::signal::unix::signal(
+                    tokio::signal::unix::SignalKind::hangup(),
+                )?),
             })
         }
         #[cfg(not(unix))]
         {
-            Ok(Self {})
+            Ok(Self { inert: false })
         }
     }
 
     /// Resolves once a shutdown signal arrives, naming which one. Safe to call fresh on every loop
     /// iteration — every `Signal::recv` and `tokio::signal::ctrl_c` are re-armable, not one-shot.
     pub async fn wait(&mut self) -> Signal {
+        if self.inert {
+            std::future::pending::<()>().await;
+        }
         #[cfg(unix)]
         {
+            let (Some(sigterm), Some(sighup)) = (self.sigterm.as_mut(), self.sighup.as_mut())
+            else {
+                std::future::pending::<()>().await;
+                unreachable!("an inert signal source never resolves")
+            };
             tokio::select! {
-                _ = self.sigterm.recv() => Signal::Term,
-                _ = self.sighup.recv() => Signal::Hup,
+                _ = sigterm.recv() => Signal::Term,
+                _ = sighup.recv() => Signal::Hup,
                 _ = tokio::signal::ctrl_c() => Signal::Int,
             }
         }
@@ -3813,7 +3852,13 @@ pub(crate) async fn serve_session(
         return Ok(None);
     }
 
-    let mut shutdown = ShutdownSignal::new()?;
+    // A supervised session never acts on a signal itself: `serve_ws` drives the drain, and a session
+    // that cancelled its own run on SIGTERM would defeat the grace the supervisor is counting down.
+    let mut shutdown = if cfg.supervised {
+        ShutdownSignal::inert()
+    } else {
+        ShutdownSignal::new()?
+    };
     // Task #41 (pi-parity fix): which signal (if any) actually triggered shutdown, so the caller can
     // exit with the matching POSIX code (`Signal::exit_code`) instead of always `0` — every graceful
     // path previously returned bare `Ok(())` with no way to tell a clean stdin-EOF apart from a real
