@@ -175,11 +175,13 @@ Three properties this guarantees, each covered by a test:
   "runs in the previous tenant's sandbox" is not.
 - **Subagents act on their parent's machine.** A child whose tools ran on the host while its parent
   was sandboxed would let the model escape by delegating.
-- **Resuming a session reattaches its endpoint**, so a restart doesn't silently move a tenant's work
-  onto the server. A fork does _not_ inherit it — a sandbox belongs to the session it was made for.
+- **Resuming a session reattaches its endpoint**, warm or cold — switching back to it, and reopening
+  it in a brand-new process — so a restart doesn't silently move a tenant's work onto the server. A
+  fork does _not_ inherit it: a sandbox belongs to the session it was made for.
 
-`--exec-url`/`--exec-cmd` also work on `serve` as a process-wide default for the single-tenant case;
-a per-session `set_exec_endpoint` always wins.
+`--exec-url`/`--exec-cmd` also work on `serve` as a process-wide default for the single-tenant case.
+It is a starting point, not a floor: a session with no endpoint of its own gets it, and a session
+that has one keeps its own — whether it was set on this connection or recorded on a previous run.
 
 For targets with no HTTP surface, `--exec-cmd` takes an argv template whose `{}` is replaced by the
 command:

@@ -12,7 +12,7 @@
 use std::path::Path;
 
 use agent_core::Message;
-use beyond_ai_agent::session_store::{SessionMeta, SessionRepo};
+use beyond_ai_agent::session_store::{Layout, RepoOptions, SessionMeta, SessionRepo};
 use tempfile::TempDir;
 
 const INDEX: &str = ".listings.json";
@@ -151,13 +151,88 @@ fn an_index_at_an_unknown_version_is_discarded() {
     let expected = repo.list().unwrap();
 
     // A well-formed index, correct in every way except that it claims a version we don't speak — and
-    // whose payload is deliberately wrong, so trusting it would be visible.
+    // whose payload is deliberately wrong, so trusting it would be visible. Derived from whatever
+    // version this build writes rather than a literal, so the assertion survives a version bump.
     let raw = std::fs::read_to_string(dir.path().join(INDEX)).unwrap();
-    let bumped = raw.replacen("\"version\":1", "\"version\":2", 1);
-    assert_ne!(raw, bumped, "expected to find the index version field");
-    std::fs::write(dir.path().join(INDEX), bumped).unwrap();
+    let mut index: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    let version = index["version"]
+        .as_u64()
+        .expect("the index carries a version");
+    index["version"] = serde_json::json!(version + 1);
+    std::fs::write(dir.path().join(INDEX), index.to_string()).unwrap();
 
     assert_same(&expected, &repo.list().unwrap());
+}
+
+/// The segmented layout's stamp is the **newest segment's** `(len, mtime, epoch)` plus the segment
+/// count — cheap enough to run on every candidate path of every listing, warm or cold, which is what
+/// it has to be: it is the validator, so a warm 100%-hit listing pays it in full. (It used to open
+/// and header-parse every segment of every session just to find the base epoch.)
+///
+/// So this walks a segmented session through every shape of change the stamp has to notice, and after
+/// each one asserts the cached listing still equals a from-scratch scan.
+#[test]
+fn a_segmented_listing_is_invalidated_by_an_append_a_roll_and_a_base() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = SessionRepo::open_with(
+        dir.path(),
+        RepoOptions {
+            layout: Layout::Segmented { codec: None },
+            id_prefix: None,
+        },
+    )
+    .unwrap();
+
+    let mut store = repo
+        .create(SessionMeta::with_id("s1", "/repo", "claude-sonnet-5"))
+        .unwrap();
+    let session_dir = store.path().to_path_buf();
+    // Warms the index. The sidecar sits beside the session *directories* it describes, one per
+    // directory that holds sessions — asserted here so the rest of this test cannot pass by
+    // comparing two uncached scans.
+    assert_eq!(repo.list().unwrap().len(), 1);
+    assert!(
+        dir.path().join(INDEX).is_file(),
+        "the segmented layout must write a sidecar index too"
+    );
+
+    // An append grows the newest segment.
+    store.append_new(&[Message::user("hello")]).unwrap();
+    assert_same(&uncached_in(dir.path(), &repo), &repo.list().unwrap());
+
+    // A roll starts a new segment: a different newest epoch, and one more of them.
+    drop(store);
+    let (mut store, _) = repo
+        .open_or_create_id("s1", "/repo", "claude-sonnet-5")
+        .unwrap();
+    store
+        .append_new(&[Message::user("hello"), Message::user("again")])
+        .unwrap();
+    assert_same(&uncached_in(dir.path(), &repo), &repo.list().unwrap());
+
+    // A base rewrite — the change the dropped `base_epoch` field used to be carried for. A base is
+    // always a *new* segment (`pred + 1`, `create_new`), so the newest epoch moves and the stamp with
+    // it; a listing served from the pre-base cache here would be the regression.
+    store.rewrite(&[Message::user("compacted")]).unwrap();
+    let warm = repo.list().unwrap();
+    assert_same(&uncached_in(dir.path(), &repo), &warm);
+    assert_eq!(warm.len(), 1);
+    assert_eq!(warm[0].message_count, 1, "the base is what is listed now");
+
+    // And a prune, the one change that shrinks rather than grows — caught by the count alone.
+    drop(store);
+    std::fs::remove_file(session_dir.join("000001.jsonl")).unwrap();
+    assert_same(&uncached_in(dir.path(), &repo), &repo.list().unwrap());
+}
+
+/// [`uncached`] for a repo whose sidecar lives inside each session's own directory rather than beside
+/// the `.jsonl` files — the segmented layout keeps one index per session-holding directory.
+fn uncached_in(root: &Path, repo: &SessionRepo) -> Vec<SessionMeta> {
+    for entry in std::fs::read_dir(root).unwrap().flatten() {
+        let _ = std::fs::remove_file(entry.path().join(INDEX));
+    }
+    let _ = std::fs::remove_file(root.join(INDEX));
+    repo.list().unwrap()
 }
 
 /// A deleted session must fall out of the index rather than lingering in it forever.

@@ -1616,9 +1616,42 @@ output from the final `stdout` and `stderr`. A runner that calls the sink at all
 delivered every byte of both streams through it — `HttpExecRunner` once fed it stdout alone, and
 every remote command that printed to stdout lost its stderr.
 
+Both are **bounded**, by different mechanisms, because they are bounding different things.
+`HttpExecRunner` caps the response body and treats an over-cap body as an error (below): a response
+envelope that has to parse as a whole is worthless truncated. `TemplateRunner` drives a local child
+process, so it drains both pipes with `tools::exec`'s `drain_capped` — the same streaming head+tail
+accumulator the local runner uses, keeping the first and last 128 KiB of each stream and discarding
+the middle as it arrives — and reports `truncated: true` when it did. Long output is still the
+answer for a command, so it must not become "the command failed"; what must not happen is a `cat` on
+the far side sizing this process's memory. (It previously used `wait_with_output`, which buffers
+everything, and then reported `truncated: false` regardless.)
+
 `tests/exec_endpoint.rs` drives all of this against a ~30-line mock provider — the same shim someone
 would write in front of a real one. If standing up a fake provider took more than that, the protocol
 would be too big.
+
+#### Which endpoint a session gets
+
+Resolved once at session start, most specific first:
+
+1. **The grant**, in service mode. It _is_ the sandbox; nothing else is consulted, and a sandbox that
+   fails the probe ends the session rather than leaving its tools with nowhere to go.
+2. **The session's own record** — `meta.exec_endpoint`, written by `set_exec_endpoint` — if it still
+   resolves. A session pointed at a sandbox stays pointed at it across a **process restart**, exactly
+   as `reset_exec_endpoint!` keeps it across a session switch. Both call the same
+   `restore_persisted_exec_endpoint`; they used to differ, and the difference was the bug: only the
+   warm path read the record, so a daemon restart followed by a reconnect at the same `?session_id=`
+   silently ran that session's tools on the host.
+3. **`--exec-url`/`--exec-cmd`**, the process-wide default. A starting point, not a floor: it is what
+   a session with no record of its own gets, and it never overrides one that has. A daemon started
+   with one default must not drag every resumed session onto it.
+4. Nothing — this host.
+
+A record that no longer resolves falls through to (3) rather than failing the start: the sandbox may
+simply be gone, and a session that cannot be opened at all is worse than one that has to be
+re-pointed. Only header **names** are persisted, never their values. `tests/serve_exec_endpoint.rs`
+covers the warm switch and the cold restart separately — the cold one stops the process, starts a new
+one with a _different_ `--exec-cmd`, reconnects by id, and asserts the session's own record won.
 
 #### The protocol (v1.1)
 
@@ -1720,6 +1753,14 @@ spelling: a busybox sandbox (Alpine — a large share of real ones) has no `bash
 command would die on the shell rather than on its own merits. Losing `[[` and `pipefail` degrades a
 command; losing the shell fails all of them. Whoever stands the sandbox up is the one who can ask it
 (`command -v bash`) and pass the answer in.
+
+**The spill file is conditional, and `bash`'s description says so** rather than promising one. The
+world is asked per call, and `Tool::description` returns a `&str` — so a flag resolved in `new()`
+would be a stale snapshot for exactly the session that attaches a sandbox mid-life, which is the
+session that most needs the right answer. The description therefore states the condition ("whether
+the complete output was saved to a temp file, or has to be re-run redirected to a file") and the
+runtime marker (`output.rs`'s `full_output_segment`) says which case actually happened, with the
+action to take when there is no file.
 
 **`grep` derives `root_is_dir` from its own hits rather than paying a `stat`.** A hit's path can equal
 the search root only when the root _is_ the single file being searched, and every hit of such a search
@@ -1926,6 +1967,16 @@ tree** — an "always allow" granted to one child applies to its siblings and th
 the session. Intended, and load-bearing for "don't re-ask", but a real property. Each child stamps its
 own `origin: {agent, spawn_id}` so a UI can say _reviewer#7 wants to run bash_ rather than _something
 does_.
+
+**The scope really is the session.** `new_session` and `switch_session` clear the `SessionMemory`,
+alongside the `/session` memory re-point, the exec-endpoint detach and the MCP-kit reset they already
+did. Without that, a decision the operator made about one conversation's commands and paths silently
+pre-approved the next conversation's and the gate never asked. It is cleared **in place, through the
+shared `Arc`** rather than swapped for a fresh one: the `ApprovalRuntime` is cloned by value into
+every subagent, and a same-model `switch_session` skips `build_agent` entirely, so a swap would leave
+live clones answering out of the old map. `fork`/`clone` deliberately do **not** clear it — unlike
+exec and MCP, this is not a cross-tenant rule (a fork cannot cross a tenant), and a fork carries the
+same conversation forward, so its remembered decisions still describe what is on screen.
 
 ## `structured_output` — the agent as a callable function
 
@@ -2732,10 +2783,23 @@ id work, and the rename carries `memory/` along with the segments.
 
 ### Listings
 
-The sidecar `.listings.json` cache is keyed by a stamp: `(size, mtime)` for a file, and
-`(total bytes, newest mtime, newest epoch, base epoch)` for a segmented session, so a roll, an
+The sidecar `.listings.json` cache is keyed by a stamp: `(size, mtime)` for a file, and the **newest
+segment's** `(len, mtime, epoch)` plus the **segment count** for a segmented session, so a roll, an
 append, a base or a prune all invalidate it. It is a cache and only a cache — a blob that will not
 open is treated as no cache at all.
+
+The stamp has to be cheap, because it is the validator: the scan computes it for **every** candidate
+path, on a cache hit as much as a miss, so it is the floor on the cost of listing a shard. It is one
+`readdir`. It used to also `File::open` and header-parse every segment of every session just to learn
+which one carried the base, which made a 100%-warm cache pay O(shards × sessions × segments) opens
+for an answer it then threw away. Dropping the base epoch is safe because a base is never written in
+place — `SegLog::write_base` creates `pred + 1` with `create_new`, so a base always _advances_ the
+newest epoch, and the prune that retires what it superseded moves the count. Narrowing the size from
+the directory total to the newest segment's length is safe for the same kind of reason: an older
+segment only ever changes by a stale writer appending past its seal, and those bytes are ignored by
+every reader, so the listing they would invalidate is still correct. `LISTING_INDEX_VERSION` is
+bumped whenever the stamp's meaning changes (it is at **2**), since an index at an unknown version is
+discarded wholesale rather than validated against a stamp that means something else.
 
 ### Derived ids
 
@@ -3002,6 +3066,29 @@ meanwhile gets an `error` frame. The lock is liveness only — correctness is th
 lost lock costs a retry, never history. Its one visible consequence: `delete_session` on a session
 some task still holds is refused rather than renaming a directory out from under a live writer.
 
+Acquiring it is **bounded at ten seconds**, and past that the connection is answered 503 with
+`Retry-After` like any other transient refusal. The directory create plus the lock are filesystem
+calls on the same mount as the session, so an unreachable mount would otherwise hold the HTTP
+connection open indefinitely. Because `spawn_blocking` cannot be cancelled, the abandoned attempt may
+still acquire the lock afterwards — so the result is delivered over a `oneshot`, and once the waiter
+has given up, `send` hands it back to the blocking thread where the `SessionLock` **drops on the
+spot**, closing the descriptor that holds it. The lock is never handed to the next attempt: that
+would mean a registry of orphans, a second place to leak, and a second rule about who owns a lock.
+The retry after the 503 simply takes it the ordinary way.
+
+**Empty session directories.** `take_session_lock` has to create `<id>/` before it can know this
+replica will own the session, because the lock lives inside it. A session that then never wrote a
+segment gives that directory back on **its own exit path**, where it still holds the lock: if the
+directory holds nothing but `lock`, the lock file is unlinked and `remove_dir` is attempted —
+`ENOTEMPTY` being the atomic "someone got a segment in after all, leave it alone" check, since
+`000001.jsonl` is created with `O_EXCL` before anything else and never deleted. This is the only
+place the delete is safe. A would-be _creator_ evaluating the same predicate would race another
+replica's `create_dir_all` + `O_EXCL`, and on NFS/EFS attribute staleness would let it delete a
+directory whose fresh segment it had not yet seen. Everything outside that path — a lock that could
+not be taken at all, a replica that died mid-start — is deliberately left to an **out-of-band sweep**
+that does not exist yet; a leftover empty directory costs an inode and is not a session (nothing
+lists it, and the next start reuses it).
+
 **`--max-live-sessions`** (default 20,000; `0` turns it off) is checked under the table lock at the
 moment a session would be spawned, so two simultaneous connections cannot both take the last slot.
 Over the limit is a 503. Two descriptors per live session — its newest segment and its lock — keeps
@@ -3116,6 +3203,20 @@ a single-threaded runtime, and filesystem I/O on a network mount is exactly what
 hiccups — blocking the runtime thread would wedge every session on the replica on behalf of a probe.
 The memo keeps a fixed-cadence probe (and a client looping on a 503) to one round-trip per window,
 which is well inside any probe period.
+
+**The probe is single-flight and bounded.** At most one runs at a time: a caller that arrives while a
+probe is in flight waits on **that** probe's result rather than starting its own, and every caller —
+the one that started it included — gives up after one second and answers "not ready" without starting
+a second. Both halves matter because the failure they guard against compounds. `/readyz` takes no
+grant (an orchestrator deciding whether this replica may hold sessions at all could never present
+one), a hard-mounted network filesystem that stops answering blocks in uninterruptible sleep rather
+than erroring, and `spawn_blocking` tasks **cannot be cancelled**. Memoizing only completed answers
+therefore meant one leaked blocking thread per request: a 10-second `HEALTHCHECK` plus a
+load-balancer probe drains tokio's 512-thread pool in under two hours, after which every
+`spawn_blocking` in the process — session listing included — queues behind dead threads, while
+`/livez` keeps the replica alive because it is deliberately unconditional. The hung probe's own
+thread is still lost (nothing can reclaim it); the point is that it stays **one** thread, and its
+answer, whenever it lands, still populates the memo for the next caller.
 
 **In non-service mode** both endpoints still exist: `/livez` the same, and `/readyz` always ready
 once the listener is up. With no shards and no verifier there is nothing else readiness could mean,

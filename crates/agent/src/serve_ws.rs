@@ -133,6 +133,25 @@ const READYZ_PATH: &str = "/readyz";
 /// round-trip rather than one each.
 const READY_CACHE_TTL: Duration = Duration::from_secs(2);
 
+/// How long a `/readyz` caller waits for the shard probe before answering "not ready" on its own.
+///
+/// A healthy mount answers a `stat` plus a create/unlink in single-digit milliseconds, so this is
+/// ~100× headroom; a mount that has not answered in a second is not one this replica should be given
+/// a session on. It is also comfortably inside the probe's own deadline (`Dockerfile.agent`'s
+/// `HEALTHCHECK --timeout=2s`), so the orchestrator reads a 503 rather than a timeout — the
+/// difference between "this replica says it isn't ready" and "this replica said nothing".
+const READY_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// How long taking a session's advisory lock may take before the connection is answered 503.
+///
+/// The lock lives on the same network filesystem as the session, so acquiring it is exactly the I/O
+/// that stops answering when a mount goes away — and without a bound the HTTP connection that asked
+/// for the session simply stays open forever. Ten seconds is far longer than any healthy acquisition
+/// (a `create_dir_all` plus an `open` and a `flock`) and short enough that a client learns to retry
+/// while its request is still relevant. The refusal is a 503 carrying `Retry-After`, the same answer
+/// every other transient session refusal gives.
+const SESSION_LOCK_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// How often the server sends an unsolicited `Ping` so an idle mobile connection isn't reaped by
 /// NAT/proxies. Also the granularity at which a wholly-dead socket is noticed (the ping send fails).
 const PING_INTERVAL: Duration = Duration::from_secs(30);
@@ -402,16 +421,85 @@ fn serve_session_body(base: ServeConfig) -> SessionBody {
 /// that isn't a directory — so a replica that skipped this on a brand-new session would lock a
 /// different file than the replica that found the directory already there. `create_dir_all` is
 /// idempotent, and a directory with no segments is not a session, so this mints nothing.
+///
+/// Bounded by [`SESSION_LOCK_TIMEOUT`]: see [`take_session_lock_within`] for what happens to a lock
+/// that is acquired after the deadline has already passed.
 async fn take_session_lock(path: std::path::PathBuf) -> std::io::Result<Option<SessionLock>> {
-    match tokio::task::spawn_blocking(move || {
+    take_session_lock_within(SESSION_LOCK_TIMEOUT, move || {
         std::fs::create_dir_all(&path)?;
         acquire_session_lock(&path)
     })
     .await
-    {
-        Ok(result) => result,
-        Err(e) => Err(std::io::Error::other(e)),
+}
+
+/// [`take_session_lock`] with the blocking work and the deadline injected, so a test can drive both.
+///
+/// **The orphan is dropped, not handed on.** `spawn_blocking` is uncancellable, so a probe that
+/// misses the deadline keeps running and may well acquire the lock afterwards — at which point
+/// nobody is serving that session. Handing the acquired lock to the next attempt would mean keeping
+/// a per-path registry of orphans, a second place that can leak and a second rule about who owns a
+/// lock. Instead the result is delivered through a `oneshot`: once the waiter has given up, `send`
+/// hands the value back to the blocking thread, where the [`SessionLock`] drops on the spot —
+/// closing the descriptor (which is what releases a POSIX lock) and freeing the in-process
+/// registration. The retry that follows the 503 then takes the lock the ordinary way.
+async fn take_session_lock_within<F>(
+    deadline: Duration,
+    take: F,
+) -> std::io::Result<Option<SessionLock>>
+where
+    F: FnOnce() -> std::io::Result<Option<SessionLock>> + Send + 'static,
+{
+    let (tx, rx) = oneshot::channel();
+    tokio::task::spawn_blocking(move || {
+        // `send` returning `Err` *is* the release: the value comes back here and drops before this
+        // thread returns.
+        let _ = tx.send(take());
+    });
+    match tokio::time::timeout(deadline, rx).await {
+        Ok(Ok(result)) => result,
+        // The blocking task was dropped without answering — the runtime is going away.
+        Ok(Err(e)) => Err(std::io::Error::other(e)),
+        Err(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!("taking the session lock did not finish within {deadline:?}"),
+        )),
     }
+}
+
+/// Release a session's lock and, if the session never got far enough to write a segment, take the
+/// directory [`take_session_lock`] had to create in order to hold that lock.
+///
+/// This runs **only on the creator's own failure path** — this task holds the lock, and the session
+/// body has already ended — which is what makes it safe. A would-be creator evaluating a delete
+/// predicate could not do this: its `rmdir` races another replica's `create_dir_all` + `O_EXCL`
+/// segment create, and on NFS/EFS attribute staleness would let it delete a directory whose fresh
+/// segment it simply had not seen yet. Anything this misses (a lock that could not be taken at all,
+/// a replica that died mid-start) is left for an out-of-band sweep; see ARCHITECTURE.md.
+///
+/// `remove_dir` *is* the emptiness check, and an atomic one: `000001.jsonl` is created with `O_EXCL`
+/// before anything else and never deleted, so a directory holding nothing but `lock` has never been
+/// a session — and if a racing replica got one written in between, `ENOTEMPTY` leaves everything
+/// alone. The `lock` file is unlinked first because `remove_dir` would otherwise always fail; the
+/// window that opens between that unlink and this task's own release is harmless, since the lock is
+/// liveness-only (correctness is the epoch fence) and this replica is already done with the session.
+async fn release_session_lock(lock: Option<SessionLock>, path: Option<std::path::PathBuf>) {
+    let (Some(lock), Some(path)) = (lock, path) else {
+        return;
+    };
+    // Off the runtime thread: three network-filesystem calls and a descriptor close.
+    let _ = tokio::task::spawn_blocking(move || {
+        let only_lock = std::fs::read_dir(&path).is_ok_and(|entries| {
+            entries
+                .flatten()
+                .all(|e| e.file_name() == std::ffi::OsStr::new("lock"))
+        });
+        if only_lock {
+            let _ = std::fs::remove_file(path.join("lock"));
+            let _ = std::fs::remove_dir(&path);
+        }
+        drop(lock);
+    })
+    .await;
 }
 
 /// Report a session that never started: to the pin that spawned it (which turns it into an HTTP
@@ -715,7 +803,7 @@ impl Supervisor {
         let starting_conn = out_conn.clone();
         tokio::spawn(async move {
             let mut lock = None;
-            if let Some(path) = lock_path {
+            if let Some(path) = lock_path.clone() {
                 match take_session_lock(path).await {
                     Ok(Some(held)) => lock = Some(held),
                     Ok(None) => {
@@ -751,8 +839,9 @@ impl Supervisor {
                 drop(body);
             }
             // Before the `ExitGuard`: that guard frees the id and wakes whoever is waiting for it, and
-            // the next owner's first move is to take this very lock.
-            drop(lock);
+            // the next owner's first move is to take this very lock. A session that never wrote a
+            // segment also gives its directory back here — the one path where that is safe.
+            release_session_lock(lock, lock_path).await;
             // Only once the body's state is gone: free the id, then wake whoever waits on it.
             drop(exit);
         });
@@ -1588,28 +1677,99 @@ async fn handle_health<S: AsyncWrite + Unpin>(
     }
 }
 
-/// The `/readyz` shard probe, memoized for [`READY_CACHE_TTL`]. `None` means ready.
+/// The answer a probe produces: `None` is ready, `Some(reason)` is not.
+type ReadyAnswer = Option<String>;
+
+/// What [`ReadyCache`] holds between probes: the last answer, and the probe currently running.
 #[derive(Default)]
-struct ReadyCache(Mutex<Option<(Instant, Option<String>)>>);
+struct ReadyState {
+    /// The last completed answer and when it landed, reused for [`READY_CACHE_TTL`].
+    cached: Option<(Instant, ReadyAnswer)>,
+    /// The probe in flight, if one is. `None` in the watched value means "still running"; every
+    /// caller that arrives while it is set waits on this instead of starting a probe of its own.
+    inflight: Option<tokio::sync::watch::Receiver<Option<ReadyAnswer>>>,
+}
+
+/// The `/readyz` shard probe: **single-flight**, memoized for [`READY_CACHE_TTL`], and bounded by
+/// [`READY_PROBE_TIMEOUT`]. `None` means ready.
+///
+/// Both properties exist for the same failure. `/readyz` is unauthenticated by design (an
+/// orchestrator deciding whether this replica may hold sessions has no session grant and could never
+/// obtain one — see [`handle_connection`]), and its probe is filesystem I/O on a hard-mounted network
+/// filesystem, where "unreachable" is an uninterruptible sleep rather than an error. Writing the memo
+/// only *after* the probe returned meant every request arriving during a probe missed the cache and
+/// spawned another one; `spawn_blocking` tasks are uncancellable, so each of those permanently
+/// consumed a blocking-pool thread. A 10-second `HEALTHCHECK` plus a load-balancer probe then leaked
+/// roughly a thread every 10 seconds into a pool that caps at 512, after which *every* `spawn_blocking`
+/// in the process — session listing included — queued behind dead threads, while `/livez` (deliberately
+/// unconditional) kept the replica alive.
+///
+/// So: at most one probe runs at a time and every waiter shares its result, and a waiter that hits the
+/// deadline answers "not ready" **without** starting a second probe. The timed-out probe's thread is
+/// still gone — nothing can reclaim it — but it is one thread per hung mount rather than one per
+/// request, and its eventual answer still lands in the memo for whoever asks next.
+#[derive(Default)]
+struct ReadyCache(Arc<Mutex<ReadyState>>);
 
 impl ReadyCache {
-    async fn check(&self, shards: &Arc<Shards>) -> Option<String> {
-        let cached = match lock_ignoring_poison(&self.0).as_ref() {
-            Some((at, reason)) if at.elapsed() < READY_CACHE_TTL => Some(reason.clone()),
-            _ => None,
-        };
-        if let Some(reason) = cached {
-            return reason;
-        }
-        // Off the runtime thread. The process runs a single-threaded runtime, and this is a `stat`
-        // plus a create/unlink on a network filesystem — exactly the I/O that stalls when an EFS
-        // mount hiccups. Blocking here would wedge every session on the replica on behalf of a probe.
+    async fn check(&self, shards: &Arc<Shards>) -> ReadyAnswer {
         let shards = shards.clone();
-        let reason = tokio::task::spawn_blocking(move || probe_shards(&shards))
+        self.check_with(move || probe_shards(&shards), READY_PROBE_TIMEOUT)
             .await
-            .unwrap_or_else(|_| Some("shard probe did not complete".to_string()));
-        *lock_ignoring_poison(&self.0) = Some((Instant::now(), reason.clone()));
-        reason
+    }
+
+    /// [`check`](Self::check) with the probe and the deadline injected, so a test can drive both.
+    async fn check_with<F>(&self, probe: F, deadline: Duration) -> ReadyAnswer
+    where
+        F: FnOnce() -> ReadyAnswer + Send + 'static,
+    {
+        let mut rx = {
+            let mut state = lock_ignoring_poison(&self.0);
+            if let Some((at, reason)) = &state.cached
+                && at.elapsed() < READY_CACHE_TTL
+            {
+                return reason.clone();
+            }
+            match &state.inflight {
+                Some(rx) => rx.clone(),
+                None => {
+                    let (tx, rx) = tokio::sync::watch::channel(None);
+                    state.inflight = Some(rx.clone());
+                    let shared = Arc::clone(&self.0);
+                    // The join lives on a task of its own rather than on the caller, so *every*
+                    // caller — the one that started this probe included — waits on the watch under
+                    // the same deadline, and a caller that gives up leaves the probe running for the
+                    // next one rather than abandoning its result.
+                    //
+                    // Off the runtime thread, as before: the process runs a single-threaded runtime,
+                    // and this is a `stat` plus a create/unlink on a network filesystem — exactly the
+                    // I/O that stalls when an EFS mount hiccups. Blocking here would wedge every
+                    // session on the replica on behalf of a probe.
+                    tokio::spawn(async move {
+                        let reason = tokio::task::spawn_blocking(probe)
+                            .await
+                            .unwrap_or_else(|_| Some("shard probe did not complete".to_string()));
+                        // Memo and in-flight slot move together under one lock, so a caller can never
+                        // observe "no probe running" alongside a stale answer and start a second one.
+                        {
+                            let mut state = lock_ignoring_poison(&shared);
+                            state.cached = Some((Instant::now(), reason.clone()));
+                            state.inflight = None;
+                        }
+                        let _ = tx.send(Some(reason));
+                    });
+                    rx
+                }
+            }
+        };
+        match tokio::time::timeout(deadline, rx.wait_for(Option::is_some)).await {
+            Ok(Ok(answer)) => answer.clone().unwrap_or(None),
+            // The probe task was dropped before it answered (the runtime is shutting down). Not
+            // ready, and nothing to memoize.
+            Ok(Err(_)) => Some("shard probe did not complete".to_string()),
+            // Deliberately *not* memoized: the probe is still running and its real answer will land.
+            Err(_) => Some("shard probe timed out".to_string()),
+        }
     }
 }
 
@@ -2621,5 +2781,174 @@ mod tests {
         assert!(!reply_matches(&other, "prompt", "p1"));
         assert!(!reply_matches(&event, "prompt", "p1"));
         assert!(!reply_matches(&ack, "get_state", "p1"));
+    }
+
+    // ---- `/readyz`: one probe at a time, and a bounded wait ---------------------------------------
+
+    /// The single-flight property. Before this, the memo was written only *after* a probe returned, so
+    /// every request that arrived during one missed the cache and spawned another uncancellable
+    /// `spawn_blocking` — which is how a hung mount plus a 10-second probe cadence drains tokio's
+    /// 512-thread blocking pool and takes session listing down with it.
+    #[tokio::test]
+    async fn concurrent_readyz_probes_share_a_single_run() {
+        let cache = ReadyCache::default();
+        let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let answers = futures::future::join_all((0..8).map(|_| {
+            let runs = runs.clone();
+            cache.check_with(
+                move || {
+                    runs.fetch_add(1, Ordering::SeqCst);
+                    // Long enough that every caller is waiting on the same probe, short enough that
+                    // the test's own deadline is never the thing being measured.
+                    std::thread::sleep(Duration::from_millis(150));
+                    None
+                },
+                Duration::from_secs(30),
+            )
+        }))
+        .await;
+
+        assert_eq!(runs.load(Ordering::SeqCst), 1, "one probe, eight callers");
+        assert!(answers.iter().all(Option::is_none), "{answers:?}");
+
+        // And the successful answer is still memoized for the TTL, so the next caller probes nothing.
+        assert_eq!(
+            cache
+                .check_with(
+                    || panic!("a memoized answer must not probe"),
+                    Duration::from_secs(30)
+                )
+                .await,
+            None
+        );
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+    }
+
+    /// A probe that never answers must cost one blocking thread, not one per request: past the
+    /// deadline the caller says "not ready" on its own and starts nothing.
+    #[tokio::test]
+    async fn a_readyz_probe_past_its_deadline_is_not_ready_and_starts_no_second_probe() {
+        let cache = ReadyCache::default();
+        let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let release = Arc::new(AtomicBool::new(false));
+
+        for _ in 0..4 {
+            let runs = runs.clone();
+            let release = release.clone();
+            let answer = cache
+                .check_with(
+                    move || {
+                        runs.fetch_add(1, Ordering::SeqCst);
+                        while !release.load(Ordering::SeqCst) {
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        None
+                    },
+                    Duration::from_millis(50),
+                )
+                .await;
+            assert_eq!(answer.as_deref(), Some("shard probe timed out"));
+        }
+        assert_eq!(runs.load(Ordering::SeqCst), 1, "one hung probe, not four");
+
+        // The timed-out probe's own answer still lands, so the replica recovers without a new one.
+        release.store(true, Ordering::SeqCst);
+        for _ in 0..1000 {
+            if lock_ignoring_poison(&cache.0).inflight.is_none() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            cache
+                .check_with(
+                    || panic!("the finished probe's answer must be reused"),
+                    Duration::from_millis(50)
+                )
+                .await,
+            None
+        );
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+    }
+
+    // ---- The session lock: bounded, and no directory left behind ----------------------------------
+
+    /// `spawn_blocking` cannot be cancelled, so a lock taken after the deadline has passed belongs to
+    /// nobody. It must be released rather than held for a session no connection is waiting on.
+    #[tokio::test]
+    async fn a_session_lock_taken_past_the_deadline_is_released_not_leaked() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("s1.alpha");
+
+        let slow = path.clone();
+        let start = Instant::now();
+        let timed_out = take_session_lock_within(Duration::from_millis(50), move || {
+            std::thread::sleep(Duration::from_millis(300));
+            std::fs::create_dir_all(&slow)?;
+            acquire_session_lock(&slow)
+        })
+        .await;
+
+        let Err(err) = timed_out else {
+            panic!("the deadline must win")
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut, "{err}");
+        assert!(
+            start.elapsed() < Duration::from_millis(250),
+            "the caller must not wait out the blocking task: {:?}",
+            start.elapsed()
+        );
+
+        // The orphan goes on to take the lock — and must then let it go. `acquire_session_lock`
+        // reports a lock this process already holds as "held", so succeeding here is proof it did.
+        for _ in 0..200 {
+            if acquire_session_lock(&path).ok().flatten().is_some() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("the orphaned lock was never released");
+    }
+
+    /// A start that never wrote a segment gives back the directory `take_session_lock` had to create
+    /// in order to hold the lock at all — otherwise every refused or failed start leaves an empty
+    /// `<id>/` plus its `lock` on the shard forever.
+    #[tokio::test]
+    async fn an_empty_session_directory_is_taken_back_with_its_lock() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("s1.alpha");
+
+        let lock = take_session_lock(path.clone()).await.unwrap();
+        assert!(lock.is_some() && path.is_dir());
+        release_session_lock(lock, Some(path.clone())).await;
+        assert!(
+            !path.exists(),
+            "an empty session directory must not outlive its start"
+        );
+    }
+
+    /// The other half of the same rule: a directory that holds a segment is a real session, so it is
+    /// left exactly as it is — `remove_dir` on a non-empty directory is the atomic check that says so.
+    #[tokio::test]
+    async fn a_session_directory_with_a_segment_is_left_alone() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("s1.alpha");
+
+        let lock = take_session_lock(path.clone()).await.unwrap();
+        assert!(lock.is_some());
+        std::fs::write(path.join("000001.jsonl"), b"{}\n").unwrap();
+        release_session_lock(lock, Some(path.clone())).await;
+
+        assert!(
+            path.join("000001.jsonl").is_file(),
+            "the segment must survive"
+        );
+        assert!(
+            path.join("lock").is_file(),
+            "so must the lock file it is locked through"
+        );
+        // The lock itself is released, so the next owner can take it.
+        assert!(acquire_session_lock(&path).unwrap().is_some());
     }
 }

@@ -2383,6 +2383,48 @@ async fn git_branch_in(exec: &crate::exec_endpoint::ExecCell, cwd: &str) -> Opti
     (!branch.is_empty()).then(|| branch.to_string())
 }
 
+/// Rebuild the exec target a session recorded on its own header (`meta.exec_endpoint`, written by
+/// `set_exec_endpoint`). `None` if it recorded none, or if what it recorded no longer resolves.
+///
+/// One function, two call sites, on purpose: a **warm** re-point (`switch_session`/`new_session`/
+/// fork/clone, via `reset_exec_endpoint!`) and a **cold** one (process start, below). They used to
+/// differ — only the warm path restored the record — so a daemon restart followed by a reconnect to
+/// the same `?session_id=` silently ran that session's tools on the host instead of in its sandbox,
+/// which is precisely the "moves a tenant's work onto the server" failure the record exists to
+/// prevent.
+///
+/// A target that no longer resolves leaves the session on the host with the record still on its
+/// header, rather than failing the start: the sandbox may simply be gone, and a session that cannot
+/// be opened at all is worse than one that has to be re-pointed.
+///
+/// Never used in service mode — the grant names the sandbox there, and `set_exec_endpoint` is refused
+/// outright (see [`crate::service::refused_command`]), so no service session can have a record of its
+/// own to restore. Credentials are not part of the record either: only the header *names* are
+/// persisted, never their values.
+async fn restore_persisted_exec_endpoint(
+    spec: &Value,
+    max_response_bytes: usize,
+) -> Option<crate::exec_endpoint::ExecTarget> {
+    let url = spec.get("url").and_then(Value::as_str);
+    let cmd = spec.get("command").and_then(Value::as_str);
+    let headers: Vec<String> = spec
+        .get("headers")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    match (url, cmd) {
+        (Some(u), _) => crate::exec_endpoint::ExecTarget::http(u, &headers, max_response_bytes)
+            .await
+            .ok(),
+        (None, Some(c)) => crate::exec_endpoint::ExecTarget::template(c).await.ok(),
+        (None, None) => None,
+    }
+}
+
 /// Resolve the model/thinking-level `serve` actually starts with (Task #5, pi-parity fix). An explicit
 /// `--model`/`--reasoning-effort` for *this* invocation (`model_explicit`/`reasoning_effort_explicit` —
 /// see [`ServeConfig::model_explicit`]'s doc comment) always wins for its own half; otherwise the
@@ -2636,9 +2678,17 @@ pub(crate) async fn serve_session(
         cfg.mcp_catalog = catalog;
         timing.mark("connect session MCP connectors");
     }
-    // A process-wide default, if configured. Per-session `set_exec_endpoint` overrides it, and a
-    // session switch re-derives from that session's own record — so this is a starting point, not a
-    // floor.
+    // Where this session's tools run, resolved once at start. The precedence, most specific first:
+    //
+    //   1. **the grant**, in service mode. It *is* the sandbox; nothing else is consulted.
+    //   2. **this session's own record** (`meta.exec_endpoint`, written by `set_exec_endpoint`), if
+    //      it still resolves. A session that was pointed at a sandbox stays pointed at it across a
+    //      process restart, exactly as `reset_exec_endpoint!` keeps it across a session switch —
+    //      which is what makes a cold reconnect at the same `?session_id=` behave like a warm one
+    //      instead of quietly moving that session's work onto the server.
+    //   3. **`--exec-url`/`--exec-cmd`**, the process-wide default. "A starting point, not a floor":
+    //      it is what a session with no record of its own gets, and it never overrides one that has.
+    //   4. nothing — this host.
     //
     // Service mode has neither flag (both are refused at startup) and no "starting point" either:
     // the grant names the sandbox, and a sandbox that doesn't answer the probe **ends the session**
@@ -2655,23 +2705,38 @@ pub(crate) async fn serve_session(
             exec_cell.set(Some(target));
             timing.mark("probe sandbox");
         }
-        None => match (&cfg.exec_url, &cfg.exec_cmd) {
-            (Some(u), _) => match crate::exec_endpoint::ExecTarget::http(
-                u,
-                &cfg.exec_header,
-                cfg.exec_max_response_bytes,
-            )
-            .await
-            {
-                Ok(t) => exec_cell.set(Some(t)),
-                Err(e) => eprintln!("warning: --exec-url ignored: {e}"),
-            },
-            (None, Some(c)) => match crate::exec_endpoint::ExecTarget::template(c).await {
-                Ok(t) => exec_cell.set(Some(t)),
-                Err(e) => eprintln!("warning: --exec-cmd ignored: {e}"),
-            },
-            (None, None) => {}
-        },
+        None => {
+            let restored = match persistence.meta.exec_endpoint.clone() {
+                Some(spec) => {
+                    restore_persisted_exec_endpoint(&spec, cfg.exec_max_response_bytes).await
+                }
+                None => None,
+            };
+            match restored {
+                Some(target) => exec_cell.set(Some(target)),
+                // Either this session never recorded an endpoint, or the one it recorded is gone.
+                // Fall through to the process-wide default rather than to this host: a flag the
+                // operator passed is a better guess than nothing, and a session whose sandbox has
+                // genuinely vanished can still be re-pointed with `set_exec_endpoint`.
+                None => match (&cfg.exec_url, &cfg.exec_cmd) {
+                    (Some(u), _) => match crate::exec_endpoint::ExecTarget::http(
+                        u,
+                        &cfg.exec_header,
+                        cfg.exec_max_response_bytes,
+                    )
+                    .await
+                    {
+                        Ok(t) => exec_cell.set(Some(t)),
+                        Err(e) => eprintln!("warning: --exec-url ignored: {e}"),
+                    },
+                    (None, Some(c)) => match crate::exec_endpoint::ExecTarget::template(c).await {
+                        Ok(t) => exec_cell.set(Some(t)),
+                        Err(e) => eprintln!("warning: --exec-cmd ignored: {e}"),
+                    },
+                    (None, None) => {}
+                },
+            }
+        }
     }
 
     // Slash-command prompt templates (`/name args`), discoverable skills, agent definitions and this
@@ -2799,29 +2864,11 @@ pub(crate) async fn serve_session(
                     Err(e) => eprintln!("serve: failed to re-attach this session's sandbox: {e}"),
                 }
             } else if let Some(spec) = persistence.meta.exec_endpoint.clone() {
-                let url = spec.get("url").and_then(Value::as_str).map(str::to_string);
-                let cmd = spec.get("command").and_then(Value::as_str).map(str::to_string);
-                let headers: Vec<String> = spec
-                    .get("headers")
-                    .and_then(Value::as_array)
-                    .map(|a| {
-                        a.iter()
-                            .filter_map(|v| v.as_str().map(str::to_string))
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                let restored = match (url.as_deref(), cmd.as_deref()) {
-                    (Some(u), _) => {
-                        crate::exec_endpoint::ExecTarget::http(u, &headers, cfg.exec_max_response_bytes)
-                            .await
-                            .ok()
-                    }
-                    (None, Some(c)) => crate::exec_endpoint::ExecTarget::template(c).await.ok(),
-                    (None, None) => None,
-                };
                 // A target that no longer resolves leaves the session on the host with the header
                 // still recorded, rather than failing the switch — the sandbox may simply be gone.
-                exec_cell.set(restored);
+                exec_cell.set(
+                    restore_persisted_exec_endpoint(&spec, cfg.exec_max_response_bytes).await,
+                );
             }
         };
     }
@@ -2856,6 +2903,26 @@ pub(crate) async fn serve_session(
         let runtime = crate::approval::ApprovalRuntime::new(gate, cfg.approve.clone());
         (Some(runtime), Some(pending))
     };
+
+    /// The approval memory is session-scoped (see [`crate::approval::SessionMemory`]), so an
+    /// "always allow" granted in the outgoing conversation must not carry into the incoming one —
+    /// the gate would never ask, and the operator who granted it was answering about a different
+    /// session's commands and paths. Cleared through the shared `Arc`, never swapped: the
+    /// `ApprovalRuntime` is already cloned by value into every subagent, and a same-model
+    /// `switch_session` skips `build_agent` entirely.
+    ///
+    /// `fork`/`clone` deliberately do **not** call this, unlike the exec and MCP resets beside it.
+    /// Those two are cross-tenant rules — an incoming session's *machine* and *tools* must never be
+    /// inherited — and a fork cannot cross a tenant, since it derives from the session already open.
+    /// It also carries this same conversation forward, so its remembered decisions still describe
+    /// exactly the commands and paths on screen; re-asking for them would be noise, not safety.
+    macro_rules! reset_approval_memory {
+        () => {{
+            if let Some(runtime) = approval.as_ref() {
+                runtime.memory.clear();
+            }
+        }};
+    }
 
     let (elicit_gate, pending_elicitations) = ServeElicitationGate::new(
         out_conn.clone(),
@@ -3261,6 +3328,7 @@ pub(crate) async fn serve_session(
                     repoint_session_memory!();
                     reset_exec_endpoint!();
                     reset_mcp_enabled!();
+                    reset_approval_memory!();
                     steering.clear();
                     // Fresh session defaults to all MCP servers enabled — rebuild so a previous
                     // session's allowlist cannot linger on this process's Agent.
@@ -3318,6 +3386,7 @@ pub(crate) async fn serve_session(
                         repoint_session_memory!();
                         reset_exec_endpoint!();
                         reset_mcp_enabled!();
+                        reset_approval_memory!();
                         steering.clear();
                         // Restore whichever model/thinking-level this session was actually last
                         // running on, the same way `switch_branch` already does — without this, the

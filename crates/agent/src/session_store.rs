@@ -3823,10 +3823,15 @@ pub(crate) fn scan_session_dir_in(dir: &Path, layout: &Layout) -> Vec<PathBuf> {
 /// beyond the atomic rename below.
 const LISTING_INDEX_FILE: &str = ".listings.json";
 
-/// Bumped whenever a change to the derived fields would make previously-cached entries wrong (a new
-/// field, a different preview rule). An index at any other version is ignored wholesale and rebuilt,
-/// so an upgrade can never serve stale-shaped metadata.
-const LISTING_INDEX_VERSION: u32 = 1;
+/// Bumped whenever a change to the derived fields **or to [`Stamp`]** would make previously-cached
+/// entries wrong (a new field, a different preview rule, a stamp that means something else). An index
+/// at any other version is ignored wholesale and rebuilt, so an upgrade can never serve stale-shaped
+/// metadata — or, worse, validate a v1 stamp against a v2 one and serve a listing for a session that
+/// has since moved on.
+///
+/// v2: [`Stamp`] became the newest segment's `(len, mtime, epoch)` plus the segment count, where v1
+/// held the directory's total bytes, newest mtime, newest epoch and base epoch.
+const LISTING_INDEX_VERSION: u32 = 2;
 
 #[derive(Deserialize)]
 struct ListingIndex {
@@ -3860,12 +3865,13 @@ struct ListingIndexEntry {
     /// The stamp the cached listing was computed from. Every field must match for it to be used.
     size: u64,
     mtime_ns: u128,
-    /// The newest and base epochs, for the segmented layout only — absent (and so `0`) for a
-    /// single-file entry, which keeps that layout's index byte-identical to what it always wrote.
+    /// The newest segment's epoch and how many segments there were, for the segmented layout only —
+    /// absent (and so `0`) for a single-file entry, which keeps that layout's index byte-identical to
+    /// what it always wrote.
     #[serde(default, skip_serializing_if = "is_zero")]
     epoch: u64,
     #[serde(default, skip_serializing_if = "is_zero")]
-    base_epoch: u64,
+    segments: u64,
     /// The persisted header fields (everything `SessionMeta` does serialize).
     meta: SessionMeta,
     updated_at: u64,
@@ -3884,7 +3890,7 @@ impl ListingIndexEntry {
             size: stamp.size,
             mtime_ns: stamp.mtime_ns,
             epoch: stamp.epoch,
-            base_epoch: stamp.base_epoch,
+            segments: stamp.segments,
             meta: meta.clone(),
             updated_at: meta.updated_at,
             message_count: meta.message_count,
@@ -3898,7 +3904,7 @@ impl ListingIndexEntry {
             size: self.size,
             mtime_ns: self.mtime_ns,
             epoch: self.epoch,
-            base_epoch: self.base_epoch,
+            segments: self.segments,
         }
     }
 
@@ -6031,14 +6037,30 @@ impl SegReader {
 // ---- Listing stamps --------------------------------------------------------------------------
 
 /// A session's cache-validity stamp. For the single-file layout that is the file's `(size, mtime)`;
-/// for the segmented layout it is the whole directory's — total bytes, newest mtime, newest epoch and
-/// the base epoch — so a roll, an append, a base or a prune all invalidate a cached listing.
+/// for the segmented layout it is the **newest segment's** `(len, mtime, epoch)` plus how many
+/// segments there are — so a roll, an append, a base or a prune all invalidate a cached listing.
+///
+/// Every field is a `readdir` away. That is the point: this is the validator [`scan_listings_in`]
+/// runs against *every* candidate path on a cache hit as well as a miss, so its cost is the floor on
+/// listing a shard. It used to `File::open` and header-parse **every segment of every session** just
+/// to learn which one was the base, making a 100%-warm cache pay O(shards × sessions × segments)
+/// opens for an answer it then threw away.
+///
+/// Dropping `base_epoch` is safe because a base is never written in place: [`SegLog::write_base`]
+/// creates `segment_name(pred + 1)` with `create_new`, so a new base *always* advances the newest
+/// epoch (which this stamp carries), and the `prune` that retires what it superseded changes the
+/// segment count (which it also carries). There is no rewrite that leaves both untouched, so there
+/// is nothing left for a base epoch to catch.
+///
+/// The `size` narrowing is deliberate too. Total bytes could only detect a change in a segment that
+/// is *not* the newest, and an older segment only ever changes by a stale writer appending past its
+/// seal — bytes every reader ignores. So the listing those bytes would invalidate is still correct.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 struct Stamp {
     size: u64,
     mtime_ns: u128,
     epoch: u64,
-    base_epoch: u64,
+    segments: u64,
 }
 
 fn log_stamp(path: &Path, segmented: bool) -> Option<Stamp> {
@@ -6049,26 +6071,18 @@ fn log_stamp(path: &Path, segmented: bool) -> Option<Stamp> {
             size: m.len(),
             mtime_ns: mtime.as_nanos(),
             epoch: 0,
-            base_epoch: 0,
+            segments: 0,
         });
     }
     let segments = scan_segments(path).ok()?;
-    if segments.is_empty() {
-        return None;
-    }
-    let mut stamp = Stamp::default();
-    for s in &segments {
-        stamp.size = stamp.size.saturating_add(s.len);
-        stamp.mtime_ns = stamp.mtime_ns.max(s.mtime_ns);
-        stamp.epoch = stamp.epoch.max(s.epoch);
-        if let Ok(mut f) = File::open(&s.path)
-            && let Ok(Some((h, _))) = read_segment_header(&mut f)
-            && h.base
-        {
-            stamp.base_epoch = stamp.base_epoch.max(s.epoch);
-        }
-    }
-    Some(stamp)
+    // Sorted by epoch, so the last is the newest — the only one being appended to.
+    let newest = segments.last()?;
+    Some(Stamp {
+        size: newest.len,
+        mtime_ns: newest.mtime_ns,
+        epoch: newest.epoch,
+        segments: segments.len() as u64,
+    })
 }
 
 // ---- The session lock --------------------------------------------------------------------------
@@ -11673,11 +11687,14 @@ mod tests {
         let mut store = repo.create(SessionMeta::with_id("s1", "/w", "m")).unwrap();
         let session_dir = store.path().to_path_buf();
         let first = log_stamp(&session_dir, true).unwrap();
-        assert_eq!((first.epoch, first.base_epoch), (1, 1));
+        assert_eq!((first.epoch, first.segments), (1, 1));
 
         store.append_new(&[Message::user("one")]).unwrap();
         let appended = log_stamp(&session_dir, true).unwrap();
-        assert!(appended.size > first.size);
+        assert!(
+            appended.size > first.size,
+            "an append grows the newest segment"
+        );
         drop(store);
 
         let (mut store, _) = repo.open_or_create_id("s1", "/w", "m").unwrap();
@@ -11686,11 +11703,22 @@ mod tests {
             .unwrap();
         let rolled = log_stamp(&session_dir, true).unwrap();
         assert_eq!(rolled.epoch, 2, "a roll moves the newest epoch");
-        assert_eq!(rolled.base_epoch, 1);
+        assert_eq!(rolled.segments, 2, "…and the segment count");
 
+        // A base is what `base_epoch` used to be carried for, and the reason it no longer has to be:
+        // `write_base` always creates `pred + 1` with `create_new`, so it can only ever *advance* the
+        // newest epoch. There is no in-place rewrite for the stamp to miss.
         store.rewrite(&[Message::user("small")]).unwrap();
         let based = log_stamp(&session_dir, true).unwrap();
-        assert_eq!(based.base_epoch, 3, "a base moves the base epoch");
+        assert_eq!(based.epoch, 3, "a base moves the newest epoch");
+        assert_ne!(based, rolled);
+
+        // A prune is the one change that shrinks rather than grows: the count catches it.
+        fs::remove_file(session_dir.join(segment_name(1))).unwrap();
+        let pruned = log_stamp(&session_dir, true).unwrap();
+        assert_eq!(pruned.epoch, based.epoch);
+        assert_eq!(pruned.segments, based.segments - 1);
+        assert_ne!(pruned, based, "a prune must invalidate a cached listing");
 
         // A directory with no segments has no stamp at all — it is not a session.
         assert!(log_stamp(&dir.path().join("nothing"), true).is_none());

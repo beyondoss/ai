@@ -16,8 +16,8 @@ use tokio::sync::watch;
 /// `yes`, `cat huge.bin`) holds at most ~`HEAD+TAIL` per stream in memory instead of the whole
 /// firehose. Sized well above `bash`'s own 30 KB output cap so any capture-level drop still leaves
 /// `bash` plenty to head/tail-truncate (with its own marker) on top.
-const STREAM_HEAD: usize = 128 * 1024;
-const STREAM_TAIL: usize = 128 * 1024;
+pub(crate) const STREAM_HEAD: usize = 128 * 1024;
+pub(crate) const STREAM_TAIL: usize = 128 * 1024;
 
 /// How long a pipe may sit silent, once the direct child has exited, before we stop waiting on it.
 /// Without this, a detached grandchild that inherits the stdout/stderr fd (e.g. `cmd &` backgrounding
@@ -459,7 +459,7 @@ impl CommandRunner for RealRunner {
 /// polling). Once the child has exited, a read that doesn't complete within [`POST_EXIT_IDLE_GRACE`]
 /// means only a *detached* descendant is holding this pipe open — release rather than block on it
 /// indefinitely; a real EOF or actively-arriving output is still captured either way.
-async fn drain_capped<R: AsyncRead + Unpin>(
+pub(crate) async fn drain_capped<R: AsyncRead + Unpin>(
     reader: Option<R>,
     head_cap: usize,
     tail_cap: usize,
