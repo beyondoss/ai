@@ -20,6 +20,8 @@ pub const BIN: &str = env!("CARGO_BIN_EXE_beyond-ai-agent");
 pub mod exec_mock;
 /// A `bsg_v1` session-grant minter, written independently of `src/grant.rs`.
 pub mod grant;
+/// A streamable-HTTP MCP server that records every request header it is sent.
+pub mod mcp_fixture;
 /// A running `serve --service` replica, for the service-mode suites.
 pub mod service;
 

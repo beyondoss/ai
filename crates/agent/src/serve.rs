@@ -825,10 +825,12 @@ pub struct ServeConfig {
     /// — the session-lock PR is what can refuse an attach with a 503; the field lands here now so
     /// that PR adds no field of its own to this struct.
     pub max_live_sessions: usize,
-    /// The process-wide `reqwest::Client` per-session MCP connectors dial through — ALPN, and
-    /// deliberately *not* the gateway's h2c pool (a tenant's connector is not the gateway). Built
-    /// once by the daemon; `None` until the per-session MCP PR uses it.
-    pub mcp_http: Option<reqwest::Client>,
+    /// The process-wide client per-session MCP connectors dial through — ALPN and the `web` tool's
+    /// SSRF resolver, and deliberately *not* the gateway's h2c pool (a tenant's connector is not the
+    /// gateway). Built once by `main.rs` in service mode and shared by every session on the replica;
+    /// `None` everywhere else, which makes a grant's connectors simply unavailable rather than
+    /// dialed unchecked. See [`crate::tools::mcp::McpEgress`].
+    pub mcp_http: Option<crate::tools::mcp::McpEgress>,
 }
 
 /// Resolve whether a project is trusted for this session, from already-gathered inputs — shared by
@@ -2453,6 +2455,29 @@ pub(crate) async fn serve_session(
     // enabled — matching prior behavior — and is cleared on session switch so tenants cannot inherit
     // each other's enablement the way they must not inherit each other's exec endpoint.
     let mcp_enabled = crate::tools::mcp::McpEnabledSet::new();
+    // Where this session's MCP servers send their *questions* (elicitation, sampling). In service
+    // mode the connectors below are dialed by this session alone, so the hub they consult is this
+    // session's own and a server's question reaches the session that asked it. Outside service mode
+    // the servers were connected once at startup and are shared by every session, so there is no
+    // one session to route to: those keep consulting the process-wide hub.
+    let mcp_host = match &service {
+        Some(_) => Arc::new(crate::tools::mcp_host::McpHost::new()),
+        None => crate::tools::mcp::host(),
+    };
+    // This session's own MCP connectors, named and credentialed by its grant, dialed now — not at
+    // process startup, which is where the *operator's* configured servers would have come from.
+    // Fail-soft per connector (a dead server costs its own tools, not the session), and the
+    // warnings stay on the replica: they name the tenant's own connectors, but the client asked for
+    // a session, not a connect report.
+    if let Some(svc) = &service {
+        let (tools, catalog, warnings) = svc.mcp(cfg.mcp_http.as_ref(), mcp_host.clone()).await;
+        for warning in &warnings {
+            eprintln!("warning: session {}: {warning}", persistence.session_id());
+        }
+        cfg.mcp_tools = tools;
+        cfg.mcp_catalog = catalog;
+        timing.mark("connect session MCP connectors");
+    }
     // A process-wide default, if configured. Per-session `set_exec_endpoint` overrides it, and a
     // session switch re-derives from that session's own record — so this is a starting point, not a
     // floor.
@@ -2679,7 +2704,7 @@ pub(crate) async fn serve_session(
         cfg.approval_timeout,
         persistence.session_id(),
     );
-    crate::tools::mcp::host().elicitation.install(elicit_gate);
+    mcp_host.elicitation.install(elicit_gate);
 
     // `structured_output` is installed per-`prompt` (see that arm's `output_schema` handling), not at
     // startup: one session can answer one request in prose and the next as typed JSON. The `OutputSlot`
@@ -2883,6 +2908,7 @@ pub(crate) async fn serve_session(
                 service.is_some().then_some(context_files.as_slice()),
                 mounts.clone(),
                 approval.as_ref(),
+                &mcp_enabled,
             ))
         };
     // A multi-step run (several tool round-trips) is otherwise only ever durable once it *fully*
@@ -5673,6 +5699,7 @@ pub(crate) async fn serve_session(
                         service.is_some().then_some(context_files.as_slice()),
                         mounts.clone(),
                         approval.as_ref(),
+                        &mcp_enabled,
                     ))
                 };
                 memory_sections = crate::memory::mount_sections(&mounts).await;
@@ -7343,6 +7370,8 @@ fn build_subagent_ctx(
     memory_mounts: Vec<crate::memory::Mount>,
     // Shared with the parent, not rebuilt — see `SubagentCtx::approval`.
     approval: Option<&crate::approval::ApprovalRuntime>,
+    // The parent's live MCP kit gate, shared rather than snapshotted — see `SubagentCtx::mcp_enabled`.
+    mcp_enabled: &crate::tools::mcp::McpEnabledSet,
 ) -> Arc<crate::tools::subagent::SubagentCtx> {
     use crate::tools::subagent;
     let cfg_for_factory = cfg.clone();
@@ -7376,6 +7405,7 @@ fn build_subagent_ctx(
         skills: Arc::new(skills.to_vec()),
         write_locks: write_locks.clone(),
         mcp_tools: cfg.mcp_tools.clone(),
+        mcp_enabled: mcp_enabled.clone(),
         memory_mounts,
         tool_cfg: subagent::ChildToolConfig {
             bash_timeout_ms: cfg.bash_timeout_ms,
@@ -8932,8 +8962,8 @@ impl Drop for PendingElicitGuard {
 /// `serve`'s MCP elicitation gate — same ack-now/respond-later shape as [`ServeApprovalGate`].
 ///
 /// Holds a [`std::sync::Weak`] to the session out-fanout (not a strong [`SharedOutConn`]) so installing
-/// this gate into the process-scoped MCP host hub cannot keep a session's connection graph alive or
-/// create lock-order surprises against the live writer.
+/// this gate into an MCP host hub — this session's own, or the process-wide one — cannot keep a
+/// session's connection graph alive or create lock-order surprises against the live writer.
 struct ServeElicitationGate {
     out: std::sync::Weak<std::sync::Mutex<OutFanout>>,
     pending: PendingElicitations,
