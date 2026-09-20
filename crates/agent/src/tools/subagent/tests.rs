@@ -111,6 +111,8 @@ fn ctx(defs: Vec<AgentDef>, factory: Factory) -> (Arc<SubagentCtx>, tempfile::Te
             ..Default::default()
         },
         cwd: dir.path().to_path_buf(),
+        context_files: None,
+        include_context_files: true,
         project_trusted: true,
         disk_overrides: true,
         prompt_guidelines: Vec::new(),
@@ -592,6 +594,8 @@ fn ctx_with_gate(
             ..Default::default()
         },
         cwd: dir.path().to_path_buf(),
+        context_files: None,
+        include_context_files: true,
         project_trusted: true,
         disk_overrides: true,
         prompt_guidelines: Vec::new(),

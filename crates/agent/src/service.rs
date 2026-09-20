@@ -22,10 +22,15 @@
 //! [`refused_command`] and [`ExecCell::strict`](crate::exec_endpoint::ExecCell::strict). Everything a
 //! tenant can see comes from its grant or its sandbox.
 //!
-//! Sandbox *discovery* (skills, context files, agents, prompt templates) is not wired yet:
-//! [`Resources`] is empty, so the features that would otherwise silently read the replica host are
-//! simply off. A later PR fills that seam in; this module is where it lands, so the rest of `serve`
-//! does not move again.
+//! **Everything a tenant's prompt is made of comes from its sandbox.** [`ServiceSession::resources`]
+//! reads skills, prompt templates, agent definitions, `AGENTS.md`/`CLAUDE.md` and
+//! `SYSTEM.md`/`APPEND_SYSTEM.md` through the session's own exec backend, so every path advertised to
+//! the model is one the model's own `read` can open, and no walk ever touches the replica. Session
+//! start and `reload` call that one function, which is why `reload` is allowed here at all.
+//!
+//! **Its connectors come from its grant.** [`ServiceSession::mcp`] dials the grant's MCP list with the
+//! sealed per-connector headers, per session, so one tenant's servers — and one tenant's elicitations
+//! — never reach another's.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -369,11 +374,55 @@ impl ServiceSession {
         Ok(ExecTarget::over_with_home(runner, Some(home)).await)
     }
 
-    /// What a tenant's own sandbox contributes to the prompt. Empty until sandbox discovery lands:
-    /// the replica host's skills, agents, prompt templates, and context files must never reach a
-    /// tenant, so "not discovered yet" fails closed as "none".
-    pub fn resources(&self) -> Resources {
-        Resources::default()
+    /// What a tenant's own sandbox contributes to the prompt: its skills, prompt templates, agent
+    /// definitions, `AGENTS.md`/`CLAUDE.md` and `SYSTEM.md`/`APPEND_SYSTEM.md` — every one of them
+    /// read **through `backend`**, which is the session's exec endpoint, so every path named is a
+    /// sandbox path and no walk touches the replica.
+    ///
+    /// This is the seam both session start and `reload` call, so the two cannot drift: `reload` is
+    /// re-enabled in service mode precisely because "re-walk the filesystem" now means the tenant's
+    /// own, and re-running this is the whole of it.
+    ///
+    /// The roots are the sandbox spellings of the ones [`skills::discover`](crate::skills::discover)
+    /// uses, in ascending specificity — the tenant's `$HOME` first, then its workspace, so a
+    /// workspace-local definition shadows a home-wide one of the same name. They are **not**
+    /// trust-gated: on this host that gate protects an operator from a checkout they did not write,
+    /// and inside one tenant's own box there is no second party to protect from.
+    ///
+    /// `context_files` is the caller's `--no-context-files` answer, honored here rather than after
+    /// the fact so a session that does not want them pays no round trips for them.
+    pub async fn resources(
+        &self,
+        backend: &dyn crate::tools::fs::FsBackend,
+        context_files: bool,
+    ) -> Resources {
+        let root = Path::new(self.workspace_root());
+        let home = self.sandbox().map(|s| Path::new(s.home.as_str()));
+        let (skills, skill_collisions) =
+            crate::skills::discover_via(backend, &skill_roots(root, home)).await;
+        let (prompt_templates, prompt_collisions) =
+            crate::prompts::discover_via(backend, &claude_roots(root, home, "prompts")).await;
+        let (agents, _agent_collisions) =
+            crate::agents::discover_via(backend, &claude_roots(root, home, "agents")).await;
+        Resources {
+            skills,
+            skill_collisions,
+            prompt_templates,
+            prompt_collisions,
+            agents,
+            context_files: match context_files {
+                true => crate::resources::load_context_files_via(backend, root, home).await,
+                false => Vec::new(),
+            },
+            system: crate::resources::claude_file_via(backend, root, home, "SYSTEM.md").await,
+            append_system: crate::resources::claude_file_via(
+                backend,
+                root,
+                home,
+                "APPEND_SYSTEM.md",
+            )
+            .await,
+        }
     }
 
     /// Dial this session's own MCP connectors — the ones its grant names, with the credentials its
@@ -452,14 +501,49 @@ impl ServiceSession {
     }
 }
 
+/// The sandbox discovery roots for skills, in ascending specificity (a later root's same-named skill
+/// wins). `.agents/skills` before `.claude/skills` for the same reason the on-host walk orders them
+/// that way: the tool-specific directory is the one written deliberately for this agent.
+fn skill_roots(root: &Path, home: Option<&Path>) -> Vec<(PathBuf, &'static str)> {
+    let mut roots = Vec::with_capacity(3);
+    if let Some(home) = home {
+        roots.push((home.join(".claude/skills"), "user"));
+    }
+    roots.push((root.join(".agents/skills"), "project"));
+    roots.push((root.join(".claude/skills"), "project"));
+    roots
+}
+
+/// The sandbox discovery roots for a flat `.claude/<leaf>` resource kind (`agents`, `prompts`), in
+/// the same ascending order.
+fn claude_roots(root: &Path, home: Option<&Path>, leaf: &str) -> Vec<(PathBuf, &'static str)> {
+    let mut roots = Vec::with_capacity(2);
+    if let Some(home) = home {
+        roots.push((home.join(".claude").join(leaf), "user"));
+    }
+    roots.push((root.join(".claude").join(leaf), "project"));
+    roots
+}
+
 /// Everything sandbox discovery contributes to a session, as one value so the wiring is written
-/// once. Empty today; a later PR fills it from the sandbox through the exec backend.
+/// once — and so `reload` refreshes exactly the same set session start built.
 #[derive(Default)]
 pub struct Resources {
     pub skills: Vec<crate::skills::Skill>,
+    /// Shadowed skill names and unreadable manifests, surfaced through `get_commands` exactly as the
+    /// on-host walk's are — a tenant debugging its own sandbox gets the same signal.
+    pub skill_collisions: Vec<crate::skills::Collision>,
     pub prompt_templates: Vec<crate::prompts::PromptTemplate>,
+    pub prompt_collisions: Vec<crate::skills::Collision>,
     pub agents: Vec<crate::agents::AgentDef>,
-    pub context_files: bool,
+    /// The tenant's own `AGENTS.md`/`CLAUDE.md`, already read: `(path, body)` in prompt order.
+    pub context_files: Vec<(String, String)>,
+    /// `<workspace>/.claude/SYSTEM.md`, else `<sandbox home>/.claude/SYSTEM.md`. Delivered as
+    /// [`PromptOptions::base`](crate::resources::PromptOptions::base), never through
+    /// `disk_overrides` — see that field's doc comment.
+    pub system: Option<String>,
+    /// `APPEND_SYSTEM.md`, same lookup. An explicit `--append-system-prompt` outranks it.
+    pub append_system: Option<String>,
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -470,9 +554,10 @@ pub struct Resources {
 ///
 /// Two groups. The first are host operations that have no tenant meaning at all and would, if left
 /// on, reach the replica: re-pointing the exec endpoint (the grant decides that), the whole
-/// interactive login surface (an operator's own credential store), switching to a session this
-/// connection has no grant for, and `reload` (which re-walks the replica's filesystem — re-enabled
-/// once discovery reads the sandbox instead).
+/// interactive login surface (an operator's own credential store), and switching to a session this
+/// connection has no grant for. `reload` is **not** among them any more — it re-runs
+/// [`ServiceSession::resources`], which walks the tenant's sandbox, so it means here exactly what it
+/// means anywhere else.
 ///
 /// The second group — `fork`, `clone`, `new_session` — is refused only until derived ids carry their
 /// shard prefix. Minting an unprefixed id on a multi-shard replica would create a session nothing
@@ -488,7 +573,6 @@ pub fn refused_command(command: &str) -> Option<&'static str> {
         "switch_session" => {
             "refused in service mode: connect at ?session_id=<id> with a grant for that session"
         }
-        "reload" => "refused in service mode: resource discovery is not available yet",
         "fork" | "clone" | "new_session" => {
             "refused in service mode: derived sessions are not available yet"
         }
@@ -558,7 +642,6 @@ mod tests {
             "logout",
             "auth_status",
             "switch_session",
-            "reload",
             "fork",
             "clone",
             "new_session",
@@ -571,6 +654,8 @@ mod tests {
             "list_sessions",
             "export_html",
             "bash",
+            // Re-enabled by sandbox discovery: it re-walks the *tenant's* filesystem now.
+            "reload",
         ] {
             assert!(refused_command(command).is_none(), "{command}");
         }

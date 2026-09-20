@@ -74,7 +74,8 @@
 //!     is its only way to learn which directory (and branch) the agent's tools are actually operating
 //!     against. `git_branch` is a lazily-resolved, best-effort `git symbolic-ref --short HEAD` — `null`
 //!     (never a failed call) outside a git repo, on detached `HEAD`, or if the lookup fails for any
-//!     other reason.
+//!     other reason. In service mode it runs **in the sandbox**, through that session's own runner,
+//!     since the workspace is not on this machine.
 //!   - `{type:"get_messages", since?}`   → `data: {messages: [...], leaf_id}` (each message tagged with
 //!     its tree `id` when persistence is configured, so a client can fork from any point via
 //!     `switch_branch`; `leaf_id` is the same active-tip id `get_tree`'s own response carries — pi's own
@@ -2198,6 +2199,36 @@ async fn git_branch(cwd: &std::path::Path) -> Option<String> {
     (!branch.is_empty()).then(|| branch.to_string())
 }
 
+/// How long the sandbox gets to answer [`git_branch_in`]. `get_state` is a poll a client makes
+/// constantly; a sandbox that is slow, paused or gone must make it answer `null`, not hang it.
+const GIT_BRANCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// [`git_branch`] for a session whose workspace is **not on this host**: the same
+/// `symbolic-ref --short HEAD` lookup, run where the files actually are, through the session's own
+/// runner.
+///
+/// Running the host version against a sandbox path is worse than useless — it either fails, or
+/// succeeds by walking up to the *replica's* own checkout and reports that branch as the tenant's.
+/// Same `None`-on-anything-unexpected contract as [`git_branch`], plus a timeout, since this one
+/// crosses a network hop.
+async fn git_branch_in(exec: &crate::exec_endpoint::ExecCell, cwd: &str) -> Option<String> {
+    let args = [
+        "symbolic-ref".to_string(),
+        "--short".to_string(),
+        "HEAD".to_string(),
+    ];
+    let result = exec
+        .runner()
+        .run("git", &args, Some(cwd), GIT_BRANCH_TIMEOUT)
+        .await
+        .ok()?;
+    if result.code != Some(0) {
+        return None;
+    }
+    let branch = result.stdout.trim();
+    (!branch.is_empty()).then(|| branch.to_string())
+}
+
 /// Resolve the model/thinking-level `serve` actually starts with (Task #5, pi-parity fix). An explicit
 /// `--model`/`--reasoning-effort` for *this* invocation (`model_explicit`/`reasoning_effort_explicit` —
 /// see [`ServeConfig::model_explicit`]'s doc comment) always wins for its own half; otherwise the
@@ -2359,9 +2390,10 @@ pub(crate) async fn serve_session(
     //
     // In service mode the "working directory" is the tenant's own `workspace_root` **inside its
     // sandbox** — a path on the other side of the exec endpoint, which this process never stats.
-    // Everything below that would otherwise walk it (trust resolution, the worktree sweep, skill
-    // and agent discovery) is skipped rather than pointed at the replica's cwd: that disk belongs
-    // to no tenant.
+    // Everything below that would otherwise walk it is either skipped (trust resolution, the
+    // worktree sweep — the only repo they could see is the replica's) or re-aimed at the sandbox
+    // through the session's own backend (`discover_resources` below). What must never happen is the
+    // third option: walking the replica's cwd and calling the result a tenant's.
     let service = cfg.service.clone();
     let cwd = match &service {
         Some(svc) => std::path::PathBuf::from(svc.workspace_root()),
@@ -2369,11 +2401,9 @@ pub(crate) async fn serve_session(
     };
     let has_gated_resources =
         service.is_none() && crate::trust_store::has_trust_gated_resources(&cwd);
-    // Both off in service mode: `AGENTS.md`/`CLAUDE.md` and an on-disk `SYSTEM.md`/`APPEND_SYSTEM.md`
-    // would be read from the *replica's* filesystem — the tenant's own live under `workspace_root`,
-    // on the far side of the exec endpoint, which sandbox discovery reaches in a later PR. An
-    // explicit `--system-prompt`/`--append-system-prompt` is the operator's own and still applies.
-    let context_files = cfg.context_files && service.is_none();
+    // `disk_overrides` stays off in service mode: it governs whether the **replica's** filesystem
+    // may set a tenant's base prompt, and the answer to that is never yes. The tenant's own
+    // `SYSTEM.md`/`APPEND_SYSTEM.md` arrive instead as `base`/`append` below, read from its sandbox.
     let disk_overrides = service.is_none();
     // Sandbox content is the tenant's own, so it counts as trusted — there is no second party for
     // the trust gate to protect against inside one tenant's own box.
@@ -2386,19 +2416,6 @@ pub(crate) async fn serve_session(
             crate::trust_store::TrustStore::open_default().lookup(&cwd),
             has_gated_resources,
         ),
-    };
-    // Agent definitions are trust-gated exactly like skills (a project-local `.claude/agents/*.md` body
-    // is injected verbatim as a child's system prompt), so they're discovered here — after trust is
-    // resolved — not by `main.rs` at `ServeConfig`-construction time, where the interactive trust grant
-    // hasn't happened yet. Stored on `cfg` so `build_agent`/`build_tools` (which take only `&cfg`) can
-    // reach them on every rebuild without re-walking. The `reload` arm re-discovers below, since trust
-    // (and the on-disk definitions) can change mid-process.
-    cfg.agents = match &service {
-        // Sandbox discovery isn't wired yet: an empty list is the fail-closed answer, and the
-        // alternative — walking the replica's own `~/.claude/agents` — is exactly what must not
-        // happen. The service seam is where a later PR fills this from the sandbox.
-        Some(svc) => svc.resources().agents,
-        None => crate::agents::discover(&cwd, project_trusted),
     };
     // Reap any subagent worktree orphaned by a previous crash of a process against this repo. Not
     // in service mode: the only repo this could sweep is the replica's own checkout.
@@ -2421,55 +2438,6 @@ pub(crate) async fn serve_session(
             cwd.display()
         );
     }
-
-    // Slash-command prompt templates (`/name args`) and discoverable skills, for `get_commands`, for
-    // expanding a `/name`/`/skill:name` prompt before it reaches the model, and — for skills — to
-    // advertise in the system prompt below. Discovered *before* building the system prompt (rather
-    // than after, as this and the `reload` arm's own discovery used to be ordered) so
-    // `build_static_system_prompt` can take the already-discovered list instead of re-walking the same
-    // skills directories a second time itself.
-    //
-    // Prompt templates are gated on trust wholesale: an untrusted repo's `.claude/prompts` is
-    // attacker-controlled instructions, so it's neither advertised nor invocable until the directory is
-    // trusted — otherwise `/name` would inject arbitrary content into context regardless of trust.
-    //
-    // Skills are *not* gated wholesale — only the project-local root is (`skills::discover_with_diagnostics`'s
-    // own `project_trusted` param): the user-global root (`~/.claude/skills`) is the operator's own
-    // machine, not something the current project checkout controls, so an untrusted project must not
-    // blank out the user's own skills along with its own.
-    //
-    // The `_with_diagnostics` variant also reports name collisions (the same `/name` or skill name
-    // shadowed across roots), surfaced via `get_commands`'s `collisions` field rather than silently
-    // resolved with no way for a client to notice.
-    //
-    // `--no-skills`/`--no-prompt-templates` skip *standard-root* discovery outright rather than
-    // discovering and then discarding — matching `run`'s identical flags (`main.rs`), and avoiding a
-    // needless filesystem walk when the operator has already said neither standard root is wanted. An
-    // explicit `--skill`/`--prompt-template` extra path is still honored even so — pi's own
-    // `noSkills`/`noPromptTemplates` do the same (a documented, tested combination; see
-    // `skills::discover_extra_only`'s doc comment — pi-parity fix, M2).
-    //
-    // Service mode discovers neither, for now: both roots would be the replica's filesystem. See
-    // `service::ServiceSession::resources`.
-    let (mut prompt_templates, mut prompt_collisions) = match &service {
-        Some(svc) => (svc.resources().prompt_templates, Vec::new()),
-        None if cfg.no_prompt_templates => {
-            crate::prompts::discover_extra_only(&cfg.extra_prompt_template_paths)
-        }
-        None => crate::prompts::discover_with_diagnostics(
-            &cwd,
-            project_trusted,
-            &cfg.extra_prompt_template_paths,
-        ),
-    };
-    let (mut skills, mut skill_collisions) = match &service {
-        Some(svc) => (svc.resources().skills, Vec::new()),
-        None if cfg.no_skills => crate::skills::discover_extra_only(&cfg.extra_skill_paths),
-        None => {
-            crate::skills::discover_with_diagnostics(&cwd, project_trusted, &cfg.extra_skill_paths)
-        }
-    };
-    timing.mark("discover prompt templates/skills");
 
     // Skills are discovered by path, not inlined into the prompt — invoking one relies on the model
     // being able to open its `SKILL.md` itself, so advertising them at all when `read` isn't registered
@@ -2547,6 +2515,35 @@ pub(crate) async fn serve_session(
             (None, None) => {}
         },
     }
+
+    // Slash-command prompt templates (`/name args`), discoverable skills, agent definitions and this
+    // project's own instruction files — for `get_commands`, for expanding a `/name`/`/skill:name`
+    // prompt before it reaches the model, and to advertise in the system prompt below. Discovered
+    // *before* the system prompt is built (rather than after, as this and the `reload` arm's own
+    // discovery used to be ordered) so `build_static_system_prompt_with_context` takes the
+    // already-discovered lists instead of re-walking the same directories itself.
+    //
+    // Deliberately **after** the exec probe: in service mode every one of these lives in the
+    // tenant's sandbox and is read through the backend the probe just set up. See
+    // `discover_resources`.
+    let mut discovered =
+        discover_resources(&cfg, &exec_cell, &cwd, project_trusted, service.as_deref()).await;
+    // Agent definitions are trust-gated exactly like skills (a project-local `.claude/agents/*.md`
+    // body is injected verbatim as a child's system prompt), so they're discovered here — after trust
+    // is resolved — not by `main.rs` at `ServeConfig`-construction time, where the interactive trust
+    // grant hasn't happened yet. Stored on `cfg` so `build_agent`/`build_tools` (which take only
+    // `&cfg`) can reach them on every rebuild without re-walking. The `reload` arm re-discovers
+    // below, since trust (and the definitions themselves) can change mid-process.
+    cfg.agents = std::mem::take(&mut discovered.agents);
+    let mut skills = std::mem::take(&mut discovered.skills);
+    let mut skill_collisions = std::mem::take(&mut discovered.skill_collisions);
+    let mut prompt_templates = std::mem::take(&mut discovered.prompt_templates);
+    let mut prompt_collisions = std::mem::take(&mut discovered.prompt_collisions);
+    let mut context_files = std::mem::take(&mut discovered.context_files);
+    let mut sandbox_system = discovered.system.take();
+    let mut sandbox_append = discovered.append_system.take();
+    timing.mark("discover prompt templates/skills");
+
     let startup_tools = build_tools(&cfg, cfg.image_auto_resize, &exec_cell, &mcp_enabled);
     let has_read = startup_tools.get("read").is_some();
     let has_todo = startup_tools.get(crate::tools::todo::NAME).is_some();
@@ -2719,13 +2716,20 @@ pub(crate) async fn serve_session(
         None;
     let mut current_output_spec: Option<(Value, Option<String>)> = None;
 
-    let mut static_system =
-        crate::resources::build_static_system_prompt(&crate::resources::PromptOptions {
-            base: None,
+    // `_with_context`, not the walking `build_static_system_prompt`: the project-instruction files
+    // were already read by `discover_resources` — from the sandbox in service mode, where re-walking
+    // here would read the replica's own filesystem instead.
+    //
+    // `base`/`append` carry a service session's own `SYSTEM.md`/`APPEND_SYSTEM.md`, read from its
+    // sandbox (`None` on this host, where `disk_overrides` finds them the way it always has). An
+    // explicit `--append-system-prompt` still outranks the file, matching the on-disk precedence.
+    let mut static_system = crate::resources::build_static_system_prompt_with_context(
+        &crate::resources::PromptOptions {
+            base: sandbox_system.as_deref(),
             default_base: &cfg.system,
-            append: cfg.append_system.as_deref(),
+            append: cfg.append_system.as_deref().or(sandbox_append.as_deref()),
             cwd: &cwd,
-            include_context_files: context_files,
+            include_context_files: cfg.context_files,
             skills: &skills,
             has_read,
             has_todo,
@@ -2735,7 +2739,9 @@ pub(crate) async fn serve_session(
             project_trusted,
             agents: &cfg.agents,
             disk_overrides,
-        });
+        },
+        &context_files,
+    );
     timing.mark("build static system prompt");
 
     // Task #50: the same two operator-supplied overrides also drive the *whole-run* retry loop
@@ -2899,6 +2905,7 @@ pub(crate) async fn serve_session(
                 &current_model,
                 &write_locks,
                 &skills,
+                service.is_some().then_some(context_files.as_slice()),
                 mounts.clone(),
                 approval.as_ref(),
                 &mcp_enabled,
@@ -2975,11 +2982,15 @@ pub(crate) async fn serve_session(
     // is `None`), but `--deny-tool`/`--deny-bash-pattern`/`--deny-path` didn't, a side door around an
     // operator's own restriction for any client speaking the wire protocol directly instead of through
     // the model.
+    // Rooted/worlded like `build_agent`'s own gate, for the same reason: the RPC `bash` runs through
+    // the same registry the model's calls do, so the policy must resolve paths the same way.
     let bash_policy = crate::policy::ToolPolicy::from_lists(
         &cfg.deny_tool,
         &cfg.deny_bash_pattern,
         &cfg.deny_path,
-    );
+    )
+    .with_root(tool_root(&cfg))
+    .in_world(exec_cell.backend().world());
     // Distinguishes successive host `bash` calls in their `tool_start`/`tool_progress`/`tool_end` event
     // ids — only ever one in flight at a time (see the `bash` command arm), but a stable, incrementing
     // id per call still lets a client correlate a run's own three events without ambiguity.
@@ -3646,13 +3657,13 @@ pub(crate) async fn serve_session(
                         };
                         current_output_spec = spec;
                         memory_sections = crate::memory::mount_sections(&mounts).await;
-                        static_system = crate::resources::build_static_system_prompt(
+                        static_system = crate::resources::build_static_system_prompt_with_context(
                             &crate::resources::PromptOptions {
-                                base: None,
+                                base: sandbox_system.as_deref(),
                                 default_base: &cfg.system,
-                                append: cfg.append_system.as_deref(),
+                                append: cfg.append_system.as_deref().or(sandbox_append.as_deref()),
                                 cwd: &cwd,
-                                include_context_files: context_files,
+                                include_context_files: cfg.context_files,
                                 skills: &skills,
                                 has_read,
                                 has_todo,
@@ -3663,6 +3674,7 @@ pub(crate) async fn serve_session(
                                 agents: &cfg.agents,
                                 disk_overrides,
                             },
+                            &context_files,
                         );
                         agent = build_agent(
                             &exec_cell,
@@ -4183,6 +4195,13 @@ pub(crate) async fn serve_session(
                                             // report exactly, and a stale/guessed number would be worse
                                             // than an honest "not available mid-run".
                                             "get_state" => {
+                                                // Resolved before the borrow below: in service mode it
+                                                // is a round trip into the sandbox, which cannot happen
+                                                // while `data` is mutably borrowed.
+                                                let branch = match &service {
+                                                    Some(svc) => git_branch_in(&exec_cell, svc.workspace_root()).await,
+                                                    None => git_branch(&cwd).await,
+                                                };
                                                 let mut data = live_stats.snapshot();
                                                 if let Value::Object(m) = &mut data {
                                                     insert_session_identity(m, &persistence, service.as_deref());
@@ -4192,7 +4211,7 @@ pub(crate) async fn serve_session(
                                                     m.insert("cwd_stale".into(), json!(cwd_is_stale(&persistence.meta.cwd, &cwd)));
                                                     // Task #25 (pi-parity fix): same fields, same reasoning, as the idle `get_state` arm below.
                                                     m.insert("cwd".into(), json!(cwd.display().to_string()));
-                                                    m.insert("git_branch".into(), json!(git_branch(&cwd).await));
+                                                    m.insert("git_branch".into(), json!(branch));
                                                     m.insert("is_streaming".into(), json!(true));
                                                     m.insert("is_compacting".into(), json!(is_compacting.load(Ordering::Relaxed)));
                                                     if let Value::Object(rt) = runtime_settings(current_level, current_auto_compaction, current_auto_retry, current_block_images, current_image_auto_resize, &steering) {
@@ -5043,13 +5062,15 @@ pub(crate) async fn serve_session(
                     // know. See `git_branch`'s own doc comment for why a lookup failure is `null`, not
                     // an error.
                     m.insert("cwd".into(), json!(cwd.display().to_string()));
-                    // `null` in service mode: `cwd` is a sandbox path, so running `git` against it
-                    // here would either fail or — worse — answer about the replica's own checkout.
-                    // A later PR runs the lookup through the session's runner instead.
+                    // In service mode the lookup runs **in the sandbox**, through this session's own
+                    // runner: `cwd` is a sandbox path, so asking this host about it would either fail
+                    // or — worse — answer about the replica's own checkout.
                     m.insert(
                         "git_branch".into(),
                         match &service {
-                            Some(_) => Value::Null,
+                            Some(svc) => {
+                                json!(git_branch_in(&exec_cell, svc.workspace_root()).await)
+                            }
                             None => json!(git_branch(&cwd).await),
                         },
                     );
@@ -5614,59 +5635,56 @@ pub(crate) async fn serve_session(
                 ));
             }
             "reload" => {
-                // Re-run the full (expensive) discovery pi's `/reload` triggers: trust may have
-                // changed (`agent trust`/`--trust-project` since startup), and project instructions,
-                // `SYSTEM.md`, and skills/prompt templates may have changed on disk. The per-turn
-                // `full_system` refresh alone only ever picks up the cheap date/cwd footer.
-                let has_gated_resources = crate::trust_store::has_trust_gated_resources(&cwd);
-                project_trusted = resolve_project_trust(
-                    cfg.trust_project,
-                    cfg.force_untrusted,
-                    cfg.default_project_trust,
-                    crate::trust_store::TrustStore::open_default().lookup(&cwd),
-                    has_gated_resources,
-                );
-                // Track L32 (pi-parity fix): same warning as startup, above — trust may have just
-                // changed to untrusted (or gated resources may have just appeared on disk) as of this
-                // very `reload`, and an operator watching stderr deserves the same signal they'd have
-                // gotten from a fresh `serve` invocation instead of silence.
-                if !project_trusted && has_gated_resources {
-                    eprintln!(
-                        "warning: {} has a project-local SYSTEM.md/APPEND_SYSTEM.md, skills, prompt \
-                         templates, or a settings.json on disk, but the project isn't trusted, so they \
-                         were skipped — pass --trust-project or run `agent trust {}` to enable them (a \
-                         project's own settings.json additionally requires a *persisted* `agent trust`, \
-                         not just a one-off --trust-project)",
-                        cwd.display(),
-                        cwd.display()
+                // Re-run the full (expensive) discovery pi's `/reload` triggers: project
+                // instructions, `SYSTEM.md`, skills, prompt templates and agent definitions may all
+                // have changed since startup — and, on this host, so may trust (`agent trust`/
+                // `--trust-project`). The per-turn `full_system` refresh alone only ever picks up the
+                // cheap date/cwd footer.
+                //
+                // Allowed in service mode precisely because this re-walks the **tenant's** sandbox
+                // through the same seam startup used, not the replica's filesystem. Trust plays no
+                // part there: a sandbox's contents are the one tenant's own (see `resolve_project_trust`'s
+                // startup call site).
+                if service.is_none() {
+                    let has_gated_resources = crate::trust_store::has_trust_gated_resources(&cwd);
+                    project_trusted = resolve_project_trust(
+                        cfg.trust_project,
+                        cfg.force_untrusted,
+                        cfg.default_project_trust,
+                        crate::trust_store::TrustStore::open_default().lookup(&cwd),
+                        has_gated_resources,
                     );
+                    // Track L32 (pi-parity fix): same warning as startup, above — trust may have just
+                    // changed to untrusted (or gated resources may have just appeared on disk) as of
+                    // this very `reload`, and an operator watching stderr deserves the same signal
+                    // they'd have gotten from a fresh `serve` invocation instead of silence.
+                    if !project_trusted && has_gated_resources {
+                        eprintln!(
+                            "warning: {} has a project-local SYSTEM.md/APPEND_SYSTEM.md, skills, \
+                             prompt templates, or a settings.json on disk, but the project isn't \
+                             trusted, so they were skipped — pass --trust-project or run `agent trust \
+                             {}` to enable them (a project's own settings.json additionally requires a \
+                             *persisted* `agent trust`, not just a one-off --trust-project)",
+                            cwd.display(),
+                            cwd.display()
+                        );
+                    }
                 }
-                // `--no-skills`/`--no-prompt-templates` still honor an explicit `--skill`/
-                // `--prompt-template` extra path (pi-parity fix, M2) — see the identical reasoning at
-                // this function's startup discovery, above.
-                (prompt_templates, prompt_collisions) = if cfg.no_prompt_templates {
-                    crate::prompts::discover_extra_only(&cfg.extra_prompt_template_paths)
-                } else {
-                    crate::prompts::discover_with_diagnostics(
-                        &cwd,
-                        project_trusted,
-                        &cfg.extra_prompt_template_paths,
-                    )
-                };
-                (skills, skill_collisions) = if cfg.no_skills {
-                    crate::skills::discover_extra_only(&cfg.extra_skill_paths)
-                } else {
-                    crate::skills::discover_with_diagnostics(
-                        &cwd,
-                        project_trusted,
-                        &cfg.extra_skill_paths,
-                    )
-                };
+                let mut discovered =
+                    discover_resources(&cfg, &exec_cell, &cwd, project_trusted, service.as_deref())
+                        .await;
+                skills = std::mem::take(&mut discovered.skills);
+                skill_collisions = std::mem::take(&mut discovered.skill_collisions);
+                prompt_templates = std::mem::take(&mut discovered.prompt_templates);
+                prompt_collisions = std::mem::take(&mut discovered.prompt_collisions);
+                context_files = std::mem::take(&mut discovered.context_files);
+                sandbox_system = discovered.system.take();
+                sandbox_append = discovered.append_system.take();
                 // Agent definitions are trust-gated like skills, so a `reload` after a trust change (or
                 // an edit to `.claude/agents/`) must re-discover them and rebuild the subagent context —
                 // otherwise `<available_agents>` and the `subagent` tool would advertise a stale set until
                 // restart. The `set_model` arm below then rebuilds the agent with the refreshed ctx.
-                cfg.agents = crate::agents::discover(&cwd, project_trusted);
+                cfg.agents = std::mem::take(&mut discovered.agents);
                 subagent_ctx = if cfg.agents.is_empty() {
                     None
                 } else {
@@ -5678,19 +5696,20 @@ pub(crate) async fn serve_session(
                         &current_model,
                         &write_locks,
                         &skills,
+                        service.is_some().then_some(context_files.as_slice()),
                         mounts.clone(),
                         approval.as_ref(),
                         &mcp_enabled,
                     ))
                 };
                 memory_sections = crate::memory::mount_sections(&mounts).await;
-                static_system = crate::resources::build_static_system_prompt(
+                static_system = crate::resources::build_static_system_prompt_with_context(
                     &crate::resources::PromptOptions {
-                        base: None,
+                        base: sandbox_system.as_deref(),
                         default_base: &cfg.system,
-                        append: cfg.append_system.as_deref(),
+                        append: cfg.append_system.as_deref().or(sandbox_append.as_deref()),
                         cwd: &cwd,
-                        include_context_files: context_files,
+                        include_context_files: cfg.context_files,
                         skills: &skills,
                         has_read,
                         has_todo,
@@ -5701,6 +5720,7 @@ pub(crate) async fn serve_session(
                         agents: &cfg.agents,
                         disk_overrides,
                     },
+                    &context_files,
                 );
                 // A full rebuild, not just `agent.set_system(...)`: `reload` may have changed the agent
                 // *definitions* (a new `.claude/agents/*.md`, or trust newly granted), and the `subagent`
@@ -7340,6 +7360,10 @@ fn build_subagent_ctx(
     parent_model: &str,
     write_locks: &Arc<agent_core::WriteLockRegistry>,
     skills: &[crate::skills::Skill],
+    // The parent's own project-instruction files when it fetched them through a backend (service
+    // mode), so a child reuses them instead of walking a `cwd` that isn't on this machine. `None`
+    // leaves each fan-out walking the host `cwd`, as before. See `SubagentCtx::context_files`.
+    context_files: Option<&[(String, String)]>,
     // The parent's memory mounts, shared by `Arc` clone so the whole subagent tree reads/writes the very
     // same stores — including the `/session` cell that re-points on a session switch. See
     // `SubagentCtx::memory_mounts`.
@@ -7387,6 +7411,11 @@ fn build_subagent_ctx(
             bash_timeout_ms: cfg.bash_timeout_ms,
             bash_shell_path: cfg.bash_shell_path.clone(),
             bash_command_prefix: cfg.bash_command_prefix.clone(),
+            remote_shell: cfg
+                .service
+                .as_ref()
+                .and_then(|svc| svc.sandbox())
+                .map(|sandbox| sandbox.shell),
             web_allow_private: cfg.web_allow_private,
             web_allow_hosts: cfg.web_allow_hosts.clone(),
             web_timeout_ms: cfg.web_timeout_ms,
@@ -7401,6 +7430,8 @@ fn build_subagent_ctx(
             exclude_tools: cfg.exclude_tools.clone().unwrap_or_default(),
         },
         cwd: cwd.to_path_buf(),
+        context_files: context_files.map(<[(String, String)]>::to_vec),
+        include_context_files: cfg.context_files,
         project_trusted,
         // A child is as fail-closed about the replica's filesystem as its parent (see
         // `PromptOptions::disk_overrides`) — otherwise delegating would be a way around it.
@@ -7546,11 +7577,17 @@ fn build_agent(
     if block_images {
         agent = agent.with_block_images(true);
     }
+    // Rooted and worlded exactly like the registry just built (`build_tools`): the hook resolves a
+    // `write`/`edit` path the same way the tool that runs it will, so `--deny-path` and a remembered
+    // approval `scope_key` key on the path actually about to be written — a sandbox path, resolved
+    // lexically against the sandbox's own `$HOME`, never `canonicalize`d on this host.
     let policy = crate::policy::ToolPolicy::from_lists(
         &cfg.deny_tool,
         &cfg.deny_bash_pattern,
         &cfg.deny_path,
-    );
+    )
+    .with_root(tool_root(cfg))
+    .in_world(exec.backend().world());
     // Fix 9 (pi-parity gap): always installed now — unlike the bare `ToolPolicy` this used to install
     // only when non-empty, `ServeHooks::before_provider_request` (the `bash` RPC's
     // `exclude_from_context` filter) is needed unconditionally, and `Agent::with_hooks` only ever holds
@@ -7668,6 +7705,108 @@ fn is_excluded_from_model_context(m: &agent_core::Message) -> bool {
 /// than `cfg`'s frozen startup value; the other call sites here only ever check tool
 /// presence/definitions, which don't depend on this flag either way, so they just pass
 /// `cfg.image_auto_resize` straight through.
+/// Everything a session's prompt is assembled from that has to be *found* rather than passed in.
+/// One value, because session start and `reload` must produce exactly the same set or the two drift.
+#[derive(Default)]
+struct Discovered {
+    agents: Vec<crate::agents::AgentDef>,
+    skills: Vec<crate::skills::Skill>,
+    skill_collisions: Vec<crate::skills::Collision>,
+    prompt_templates: Vec<crate::prompts::PromptTemplate>,
+    prompt_collisions: Vec<crate::skills::Collision>,
+    /// `AGENTS.md`/`CLAUDE.md` as `(path, body)`, already read — empty when `--no-context-files`.
+    context_files: Vec<(String, String)>,
+    /// A `SYSTEM.md`/`APPEND_SYSTEM.md` override, but only in service mode: on this host the two are
+    /// still found inside `build_static_system_prompt` under `PromptOptions::disk_overrides`, where
+    /// they have always been. See that field's doc comment for why service mode routes around it.
+    system: Option<String>,
+    append_system: Option<String>,
+}
+
+/// Find this session's skills, prompt templates, agent definitions and project-instruction files.
+///
+/// The one seam startup and `reload` share, and the one place the two worlds diverge:
+///
+/// - **On this host** — the ordinary `serve` — each resource walks its own standard roots.
+///   Prompt templates are gated on trust wholesale (an untrusted repo's `.claude/prompts` is
+///   attacker-controlled instructions, and `/name` injects them straight into context). Skills are
+///   gated only at the *project* root: `~/.claude/skills` is the operator's own machine, and an
+///   untrusted checkout must not blank out the operator's own skills along with its own.
+///   `--no-skills`/`--no-prompt-templates` skip standard-root discovery outright rather than
+///   discovering and then discarding, while still honoring an explicit `--skill`/`--prompt-template`
+///   path (pi's own `noSkills`/`noPromptTemplates` do the same — pi-parity fix, M2).
+/// - **In service mode** — every one of them comes from the tenant's sandbox, through the session's
+///   own exec backend ([`crate::service::ServiceSession::resources`]). Nothing here reads the
+///   replica: not its `~/.claude`, not its cwd, not a `--skill` path pointing at either (both flags
+///   are refused at startup).
+///
+/// Collisions (a skill or `/name` shadowed across roots) come back either way, surfaced through
+/// `get_commands` rather than silently resolved.
+async fn discover_resources(
+    cfg: &ServeConfig,
+    exec: &crate::exec_endpoint::ExecCell,
+    cwd: &Path,
+    project_trusted: bool,
+    service: Option<&crate::service::ServiceSession>,
+) -> Discovered {
+    if let Some(svc) = service {
+        let r = svc
+            .resources(exec.backend().as_ref(), cfg.context_files)
+            .await;
+        return Discovered {
+            agents: r.agents,
+            skills: r.skills,
+            skill_collisions: r.skill_collisions,
+            prompt_templates: r.prompt_templates,
+            prompt_collisions: r.prompt_collisions,
+            context_files: r.context_files,
+            system: r.system,
+            append_system: r.append_system,
+        };
+    }
+    let (prompt_templates, prompt_collisions) = if cfg.no_prompt_templates {
+        crate::prompts::discover_extra_only(&cfg.extra_prompt_template_paths)
+    } else {
+        crate::prompts::discover_with_diagnostics(
+            cwd,
+            project_trusted,
+            &cfg.extra_prompt_template_paths,
+        )
+    };
+    let (skills, skill_collisions) = if cfg.no_skills {
+        crate::skills::discover_extra_only(&cfg.extra_skill_paths)
+    } else {
+        crate::skills::discover_with_diagnostics(cwd, project_trusted, &cfg.extra_skill_paths)
+    };
+    Discovered {
+        agents: crate::agents::discover(cwd, project_trusted),
+        skills,
+        skill_collisions,
+        prompt_templates,
+        prompt_collisions,
+        context_files: match cfg.context_files {
+            true => crate::resources::load_context_files(cwd),
+            false => Vec::new(),
+        },
+        system: None,
+        append_system: None,
+    }
+}
+
+/// The directory this session's filesystem tools resolve a relative path against, and its policy
+/// checks a `write`/`edit` target against. The two must agree or the deny-list is evaluating a path
+/// nothing is going to write, so both read it from here.
+///
+/// In service mode it is the grant's `workspace_root` — a path inside the sandbox this process never
+/// stats. Empty otherwise, which [`tools::ToolConfig::root`] reads as "the process cwd": the
+/// behavior every non-service caller had before roots existed.
+fn tool_root(cfg: &ServeConfig) -> std::path::PathBuf {
+    cfg.service
+        .as_ref()
+        .map(|svc| std::path::PathBuf::from(svc.workspace_root()))
+        .unwrap_or_default()
+}
+
 fn build_tools(
     cfg: &ServeConfig,
     image_auto_resize: bool,
@@ -7706,7 +7845,18 @@ fn build_tools(
         // the cell per call, so a re-point cannot be missed by a rebuild that never happens.
         fs_backend: Some(exec.backend()),
         command_runner: Some(exec.runner()),
-        ..tools::ToolConfig::new()
+        // In service mode a relative path the model writes belongs in the tenant's workspace, not
+        // wherever this replica's process happens to have been started. Empty (= the process cwd)
+        // for every other caller, which is the pre-service behavior.
+        root: tool_root(cfg),
+        // What the startup probe found on the far side (`bash` or `sh`). Ignored in the local world
+        // and whenever `--bash-shell-path` is set; `None` falls back to `sh`, never a `bash` a
+        // busybox sandbox would fail every command on.
+        remote_shell: cfg
+            .service
+            .as_ref()
+            .and_then(|svc| svc.sandbox())
+            .map(|sandbox| sandbox.shell),
     });
     tools::apply_filter(
         &mut registry,

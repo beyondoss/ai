@@ -23,6 +23,9 @@
 //! **Parallel writers need worktrees.** `bash` reports no `write_target`, so a shared
 //! [`WriteLockRegistry`] provably cannot serialize two children's shell commands. A parallel task whose
 //! agent can write must therefore declare `isolation: worktree`; the call is rejected otherwise.
+//! A worktree is a host `git` checkout of the parent's cwd, so when the child's filesystem is remote
+//! ([`ChildToolConfig::fs_backend`]) that cwd is not on this machine and the isolation is **refused**
+//! rather than downgraded — silently sharing the root is the exact thing the field prevents.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -84,6 +87,10 @@ pub struct ChildToolConfig {
     pub bash_timeout_ms: Option<u64>,
     pub bash_shell_path: Option<String>,
     pub bash_command_prefix: Option<String>,
+    /// The parent's probed remote shell (`bash` or `sh`), inherited so a child's `bash` asks the
+    /// sandbox for the same shell its parent got — see [`crate::tools::ToolConfig::remote_shell`].
+    /// Ignored in the local world and whenever `bash_shell_path` is set.
+    pub remote_shell: Option<&'static str>,
     pub image_auto_resize: bool,
     /// The parent's `web` egress policy, inherited so a child can't reach internal URLs the parent was
     /// forbidden — the same bypass class the deny-list/approval inheritance already guards.
@@ -134,6 +141,17 @@ pub struct SubagentCtx {
     pub memory_mounts: Vec<crate::memory::Mount>,
     pub tool_cfg: ChildToolConfig,
     pub cwd: PathBuf,
+    /// The parent's already-read `AGENTS.md`/`CLAUDE.md` for [`cwd`](Self::cwd), when it has them.
+    ///
+    /// `None` means "walk `cwd` per fan-out", which is every host caller. `Some` is mandatory —
+    /// not merely cheaper — whenever `cwd` is on the far side of
+    /// [`ChildToolConfig::fs_backend`]: reading it here would read *this* machine's `cwd`, which on a
+    /// replica belongs to no tenant. Reusing the parent's fetched set is also what makes a child's
+    /// project context identical to its parent's, rather than a second read that could disagree.
+    pub context_files: Option<Vec<(String, String)>>,
+    /// The parent's `--no-context-files` answer. A child inherits it: delegating must not be a way to
+    /// pull project instructions into context that the parent was told to leave out.
+    pub include_context_files: bool,
     pub project_trusted: bool,
     /// Whether an on-disk `SYSTEM.md`/`APPEND_SYSTEM.md` may override a child's base prompt — see
     /// [`crate::resources::PromptOptions::disk_overrides`]. Inherited from the parent, so a service
@@ -568,8 +586,34 @@ impl Subagent {
     /// see those writes, so it recomputes per step.
     async fn shared_child_setup(&self) -> SharedChildSetup {
         SharedChildSetup {
-            context_files: crate::resources::load_context_files(&self.ctx.cwd),
+            context_files: self.parent_context_files(),
             memory_sections: crate::memory::mount_sections(&self.ctx.memory_mounts).await,
+        }
+    }
+
+    /// The filesystem the children act on, taken from the inherited backend rather than decided
+    /// here — see [`ChildToolConfig::fs_backend`], which is what makes a child's world the parent's
+    /// by construction. `Local` when no backend was handed down, which is the host case.
+    fn child_world(&self) -> crate::tools::fs::PathWorld {
+        self.ctx
+            .tool_cfg
+            .fs_backend
+            .as_ref()
+            .map_or(crate::tools::fs::PathWorld::Local, |b| b.world())
+    }
+
+    /// The parent cwd's `AGENTS.md`/`CLAUDE.md`, honoring `--no-context-files`.
+    ///
+    /// Reuses the parent's own already-read set when it has one ([`SubagentCtx::context_files`]) —
+    /// mandatory, not an optimization, when those files live on the far side of a backend: walking
+    /// them here would read *this host's* `cwd`, which in a service session is the replica.
+    fn parent_context_files(&self) -> Vec<(String, String)> {
+        if !self.ctx.include_context_files {
+            return Vec::new();
+        }
+        match &self.ctx.context_files {
+            Some(files) => files.to_vec(),
+            None => crate::resources::load_context_files(&self.ctx.cwd),
         }
     }
 
@@ -719,6 +763,23 @@ impl Subagent {
         // exactly what should happen if the parent cancels us mid-run.
         let (root, worktree) = match def.isolation {
             Isolation::None => (self.ctx.cwd.clone(), None),
+            // Every step of worktree isolation — `git worktree add`, the diff, `git apply` on the way
+            // back — is a host `git` invocation against `ctx.cwd`. When the child's filesystem is on
+            // the far side of a backend, that cwd is not on this machine: the preflight would either
+            // fail confusingly or, worse, succeed against the replica's own checkout and merge a
+            // tenant's patch into it. Refused with the reason, rather than silently downgraded to
+            // `Isolation::None`, which would hand a write-capable child the shared root — exactly
+            // what the field exists to prevent.
+            Isolation::Worktree if self.child_world().is_remote() => {
+                return Err(format!(
+                    "agent {:?} declares `isolation: worktree`, which is not available when the \
+                     agent's filesystem is remote — a worktree is a git checkout on the machine \
+                     running this process, and the child's files are not there. Use `chain`/`single` \
+                     (which run one at a time), or give it an agent definition without worktree \
+                     isolation.",
+                    def.name
+                ));
+            }
             Isolation::Worktree => {
                 let repo_root = worktree::preflight(&self.ctx.cwd).await?;
                 let wt = Worktree::create(&repo_root, &format!("{}-{index}", def.name)).await?;
@@ -791,12 +852,16 @@ impl Subagent {
         // `--deny-tool`/`--deny-bash-pattern`/`--deny-path` the parent was launched with, and `subagent`
         // becomes a policy bypass. Rooted at the child's own root so a relative path is checked as the
         // path that will actually be written.
+        // Worlded from the inherited backend as well as rooted: a child acting inside a sandbox whose
+        // policy resolved paths on *this* host would compare a string no tool is going to write, and
+        // a deny-list that quietly stops firing is the bypass this whole block exists to prevent.
         let policy = ToolPolicy::from_lists(
             &self.ctx.deny_tool,
             &self.ctx.deny_bash_pattern,
             &self.ctx.deny_path,
         )
-        .with_root(&root);
+        .with_root(&root)
+        .in_world(self.child_world());
         // The interactive gate is inherited for exactly the same reason the deny-lists are: a child that
         // could run `bash` without the human's approval *is* the bypass. `Agent::with_hooks` holds one
         // object, so the two compose here rather than stacking.
@@ -949,12 +1014,7 @@ impl Subagent {
             bash_timeout_ms: self.ctx.tool_cfg.bash_timeout_ms,
             bash_shell_path: self.ctx.tool_cfg.bash_shell_path.as_deref(),
             bash_command_prefix: self.ctx.tool_cfg.bash_command_prefix.as_deref(),
-            // A child in the remote world falls back to the default remote shell unless the operator
-            // named one explicitly, which `bash_shell_path` above already inherits. Threading the
-            // *probed* shell down instead belongs with the serve-side plumbing that learns it, and
-            // costs only bashisms in the meantime — never a failed spawn, since the fallback is the
-            // `sh` every POSIX target has.
-            remote_shell: None,
+            remote_shell: self.ctx.tool_cfg.remote_shell,
             image_auto_resize: self.ctx.tool_cfg.image_auto_resize,
             root: root.to_path_buf(),
             code_mode: self.ctx.tool_cfg.code_mode,
@@ -1011,8 +1071,17 @@ impl Subagent {
         let owned_context_files;
         let context_files: &[(String, String)] = match shared {
             Some(shared) if root == self.ctx.cwd.as_path() => &shared.context_files,
+            // A worktree child's own root. Never reached in the remote world — worktree isolation is
+            // refused there — so this walk is always of a host directory, as it was before.
+            _ if root != self.ctx.cwd.as_path() => {
+                owned_context_files = match self.ctx.include_context_files {
+                    true => crate::resources::load_context_files(root),
+                    false => Vec::new(),
+                };
+                &owned_context_files
+            }
             _ => {
-                owned_context_files = crate::resources::load_context_files(root);
+                owned_context_files = self.parent_context_files();
                 &owned_context_files
             }
         };
@@ -1022,7 +1091,9 @@ impl Subagent {
                 default_base: &default_base,
                 append: (!body.is_empty()).then_some(body),
                 cwd: root,
-                include_context_files: true,
+                // Follows the parent's `--no-context-files`, which the `context_files` slice above
+                // already reflects; kept honest here so the two can't disagree.
+                include_context_files: self.ctx.include_context_files,
                 skills: &self.ctx.skills,
                 has_read: registry.get("read").is_some(),
                 has_todo: registry.get(crate::tools::todo::NAME).is_some(),

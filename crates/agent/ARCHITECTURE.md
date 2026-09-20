@@ -2813,10 +2813,10 @@ skill/template paths, memory backend, session directory, model or gateway URL), 
 - **Credentials.** `build_gateway_client` uses the grant's sealed `gateway_key` and skips the whole
   host ladder (`--key`, ambient provider env, `models.json` overrides, the OAuth store). The retry,
   shared-client and idle-timeout chain is unchanged.
-- **Prompt, fail-closed.** Context files off; skills, prompt templates and agents empty; a new
-  `PromptOptions.disk_overrides = false` that also skips `SYSTEM.md`/`APPEND_SYSTEM.md` and is
-  inherited by the subagent prompt. No worktree sweep, no trust store, no untrusted-project warning —
-  sandbox content is the tenant's own, so it counts as trusted.
+- **Prompt.** `PromptOptions.disk_overrides = false` — the replica's own `SYSTEM.md`/
+  `APPEND_SYSTEM.md` never apply, and a subagent inherits that. Everything the prompt _is_ made of
+  comes from the sandbox instead; see "Sandbox discovery". No worktree sweep, no trust store, no
+  untrusted-project warning — sandbox content is the tenant's own, so it counts as trusted.
 - **Memory** is `FileBackend::at(service.memory_dir)`.
 
 ### Commands
@@ -2827,9 +2827,9 @@ command that was going to be refused must not get that far.
 
 **Refused:** `set_exec_endpoint` (the grant fixes the endpoint), the whole login surface (`login`,
 `submit_code`, `abort_login`, `logout`, `auth_status` — an operator credential store),
-`switch_session` (connect at `?session_id=` with a grant for that session), `reload` (re-walks the
-replica's filesystem), and — until derived ids carry their shard prefix — `fork`, `clone`,
-`new_session`.
+`switch_session` (connect at `?session_id=` with a grant for that session), and — until derived ids
+carry their shard prefix — `fork`, `clone`, `new_session`. `reload` was refused too until sandbox
+discovery re-aimed it at the tenant's own filesystem (see below).
 
 **Changed:**
 
@@ -2845,8 +2845,9 @@ replica's filesystem), and — until derived ids carry their shard prefix — `f
   shard**, and match the id **exactly**: the repo's unique-prefix fallback is a convenience for an id
   a human typed, and a tenant's ids are minted — a miss must be an error, not a neighbour (and, for
   `delete`, not a silent `Ok`).
-- `get_state` reports `cwd = workspace_root`, `git_branch = null` (the lookup would answer about the
-  replica's checkout) and `cwd_stale = false`.
+- `get_state` reports `cwd = workspace_root` and `cwd_stale = false`; `git_branch` runs in the
+  sandbox through the session's runner (see "Sandbox discovery"), never against the replica's own
+  checkout.
 - Redacted: `session_file` is `null`, and `TrashEntry.original_path` plus every failed response's
   `error` have replica mount paths stripped (`ServiceSession::redact`, applied on the one frame
   funnel).
@@ -2863,9 +2864,60 @@ host spill file for oversized output.
 
 ### Sandbox discovery
 
-_Landing separately._ Skills, context files, agent definitions and prompt templates read **from the
-sandbox** through the exec backend, which re-enables `reload`, moves `get_state.git_branch` onto the
-runner, and sets the tool root to `workspace_root`.
+Everything a tenant's prompt is made of comes from the tenant's own box, read through the session's
+exec backend. `ServiceSession::resources` is the single seam that does it — session start and
+`reload` both call it, which is exactly why `reload` is allowed here at all: "re-walk the filesystem"
+now means the tenant's.
+
+| Resource                            | Sandbox roots (ascending specificity — a later one shadows an earlier)              |
+| ----------------------------------- | ----------------------------------------------------------------------------------- |
+| skills                              | `<home>/.claude/skills`, `<workspace>/.agents/skills`, `<workspace>/.claude/skills` |
+| agent definitions, prompt templates | `<home>/.claude/{agents,prompts}`, `<workspace>/.claude/{agents,prompts}`           |
+| `AGENTS.md`/`CLAUDE.md`             | `<home>/.claude`, then every ancestor of `<workspace>`, nearest last                |
+| `SYSTEM.md`/`APPEND_SYSTEM.md`      | `<workspace>/.claude`, else `<home>/.claude`                                        |
+
+`<home>` is the sandbox's own `$HOME`, from the startup probe — the tenant's home, not the
+replica's. None of it is trust-gated: on this host that gate protects an operator from a checkout
+they did not write, and inside one tenant's own box there is no second party to protect from.
+
+The prompt overrides arrive as `PromptOptions::base`/`append`, **not** through
+`PromptOptions::disk_overrides`, which stays `false`. That flag answers "may the replica's disk set
+this prompt?", and the answer is never yes; routing the sandbox's own files around it keeps the two
+questions from collapsing into one. An explicit `--append-system-prompt` still outranks the file,
+matching the on-disk precedence.
+
+**Skill bodies are prefetched at discovery.** `/skill:name` expansion (`expand_if_skill_invocation`)
+is synchronous and sits five call sites deep on the prompt path, so there is no read to `await`
+later; `Skill::body` carries the text for a backend-side skill and stays `None` for a host one, whose
+progressive disclosure is the whole point. Advertised locations are sandbox paths — which is what
+makes them usable, since the model opens one by handing the path back to `read`, and `read` runs
+through the same backend.
+
+Two deliberate narrowings against the on-host walks, both because a round trip is not a `stat`: only
+the `SKILL.md`-per-directory shape is recognized (never `.claude/skills`'s loose single `.md` file),
+and context files are tried by name rather than by listing each ancestor — a workspace root can hold
+ten thousand entries, and moving that listing to answer a two-file question is not a trade worth
+making. `tools::fs::read_text_capped` is the one stat-check-read spelling all of them share, so the
+1 MiB cap lands before the bytes move in every case.
+
+**Root, policy and shell.** `build_tools` sets `root = workspace_root`, so a relative path the model
+writes lands in the tenant's workspace rather than wherever this replica's process was started, and
+`remote_shell` to what `command -v bash` found. Every `ToolPolicy` construction site
+(`build_agent`'s gate, the RPC `bash` gate, a subagent's) is rooted the same way and takes its world
+from the backend via `ToolPolicy::in_world` — the backend is the authority on which filesystem a call
+lands on, and a policy that decides separately is a deny-list that silently stops firing rather than
+a visible error.
+
+**Subagents** inherit all of it: the parent's `workspace_root` as their root, the parent's
+already-fetched context files and skills (mandatory, not an optimization — walking `cwd` in a child
+would read the replica), the probed `remote_shell`, and `--no-context-files`. `isolation: worktree`
+is **refused** in the remote world: every step of it is a host `git` invocation against a cwd that is
+not on this machine, and silently downgrading to `Isolation::None` would hand a write-capable child
+the shared root, which is the one thing the field exists to prevent.
+
+`get_state.git_branch` runs `git symbolic-ref --short HEAD` through the session's runner, in the
+sandbox, with a 5 s timeout and `null` on anything unexpected — a slow or absent sandbox must make a
+poll answer `null`, never hang it, and must certainly never answer about the replica's own checkout.
 
 ### Storage: segmented, sealed sessions
 
@@ -2930,8 +2982,65 @@ shared by every session, where there is no one session to route to.
 
 ### Health and image
 
-_Landing separately._ `/livez` and `/readyz` (no grant), and a static musl image whose entrypoint is
-`serve --service`.
+Two endpoints on the same listener as the agent protocol, answered in `handle_connection` **before**
+the `/_beyond/agent` path check and before any grant is demanded. That ordering is the design: the
+thing asking is the orchestrator deciding whether this replica may hold sessions at all, and it has
+no session grant to present and no way to obtain one. The `x-beyond-grant` header is still stripped
+off the head first, and a health response is built from scratch rather than from request headers, so
+a grant sent here is neither required, nor read, nor echoed.
+
+| Endpoint  | 200                                       | 503                                   |
+| --------- | ----------------------------------------- | ------------------------------------- |
+| `/livez`  | the process is serving                    | never                                 |
+| `/readyz` | this replica can take a session right now | `{"status":"not ready","reason":"…"}` |
+
+**`/livez` is unconditional.** Reaching the handler is the proof: the listener accepted a connection
+and the runtime read a request off it. It deliberately ignores the shards — a mount that has gone
+away is not fixed by killing the process, and a liveness probe that failed on one would turn a bad
+mount into a restart loop.
+
+**`/readyz` checks what can be taken away underneath a running replica.** Three conditions:
+
+- the listener is bound — again, proven by the request having arrived;
+- the grant verifier is loaded — a type-level invariant rather than a runtime check, since `serve`
+  refuses to start `--service` without one, so a service supervisor existing _is_ a loaded keyring;
+- every `--shard` is a directory this process can write to.
+
+Only the third can fail, and it fails per shard. The body is
+`{"status":"not ready","reason":"shard a07-s2: <why>"}`, where `<why>` is `not mounted`,
+`not a directory` or `not writable`. The reason names the **shard, never its path** —
+a readiness body is readable by anything that can reach the port, the replica's mount layout is not a
+caller's business, and the shard name is already public (it prefixes every session id) while being
+the only half an operator needs to know which mount to look at.
+
+The probe **writes**. `access(W_OK)` would be one syscall, but it answers about permission bits, and
+the two failures that actually happen on EFS — a read-only remount, and a mount that is full or
+unreachable — only surface on a real write. So it creates and unlinks `.readyz.<pid>` in each shard
+root (the pid so two replicas sharing a mount cannot unlink each other's). No tenant directory is
+walked; the cost is O(shards), not O(sessions).
+
+That write runs on `spawn_blocking` and its answer is **memoized for two seconds**. The process runs
+a single-threaded runtime, and filesystem I/O on a network mount is exactly what stalls when EFS
+hiccups — blocking the runtime thread would wedge every session on the replica on behalf of a probe.
+The memo keeps a fixed-cadence probe (and a client looping on a 503) to one round-trip per window,
+which is well inside any probe period.
+
+**In non-service mode** both endpoints still exist: `/livez` the same, and `/readyz` always ready
+once the listener is up. With no shards and no verifier there is nothing else readiness could mean,
+and a daemon that answered 404 would need a second code path in every deployment that ever turns
+`--service` on.
+
+**The image** is [`Dockerfile.agent`](../../Dockerfile.agent) at the repo root — the gateway's
+`Dockerfile` is the same cargo-chef layering for a different workspace member. It builds a static
+musl `beyond-ai-agent` (non-PIE, matching the release workflow; not PGO, which is per-architecture
+and worth its three-stage build only for a published artifact) into an Alpine runtime holding the
+binary and a CA store. `ENTRYPOINT` is `serve --service` behind a two-line wrapper that does
+`ulimit -c 0` and `exec`s: a replica holds every live tenant's unsealed DEK, gateway credential and
+exec headers in memory, so a core file would write all of them to disk in plaintext — and the limit
+has to be dropped by a parent, because this crate forbids `unsafe` and so cannot `prctl` itself. The
+`HEALTHCHECK` hits `/readyz` (a scheduler's health status is the readiness question, not the liveness
+one). Shards mount at `/mnt/efs/<shard>`, writable by uid 10001; everything else the container reads
+is read-only, and a tenant's workspace is never on this filesystem at all.
 
 ---
 

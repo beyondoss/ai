@@ -207,6 +207,54 @@ One thing to know: **paths are the target's.** Point the endpoint at a machine w
 at the same absolute path as the host's, or paths the agent reads from skills and the system prompt
 won't resolve.
 
+### Deploying a service-mode replica
+
+`serve --service` is the multi-tenant deployment of the above: one replica, many tenants, every
+connection carrying a verified session grant (`x-beyond-grant`) that says which tenant and session it
+is, where its sandbox is, and — sealed — the credentials to reach them. Nothing of the replica's
+reaches a tenant: not its `$HOME`, its settings, its cwd, or its filesystem. See
+[crates/agent/ARCHITECTURE.md](crates/agent/ARCHITECTURE.md#service-mode--one-replica-many-tenants).
+
+`Dockerfile.agent` builds it — a static musl binary in an Alpine runtime, entrypoint
+`serve --service`, non-root (uid 10001):
+
+```sh
+docker build -f Dockerfile.agent -t beyond-ai-agent .
+
+docker run --rm -p 8080:8080 \
+  -v /mnt/efs/a07-s1:/mnt/efs/a07-s1 \
+  -v /mnt/efs/a07-s2:/mnt/efs/a07-s2 \
+  -v /etc/beyond/grant:/etc/beyond/grant:ro \
+  beyond-ai-agent \
+  --listen 0.0.0.0:8080 \
+  --gateway-url https://gateway.internal \
+  --grant-key k1=/etc/beyond/grant/k1.pub \
+  --seal-key /etc/beyond/grant/seal.key \
+  --shard a07-s1=/mnt/efs/a07-s1 \
+  --shard a07-s2=/mnt/efs/a07-s2
+```
+
+- **Required:** the grant verifier (`--grant-key`, repeatable, plus `--seal-key`), at least one
+  `--shard <name>=</abs/path>`, and a listener (`--listen`, `--listen-uds`, or systemd activation).
+  Stdio `--service` is refused, as are `--key`, `--session-dir`, `--exec-url` and the other flags
+  that would make one tenant's setting everybody's — see ARCHITECTURE.md for the list.
+- **Mounts:** one per shard at `/mnt/efs/<shard>`, each a directory writable by uid 10001. Tenant
+  data lives at `<shard>/<tenant>/{sessions,memory}/`; a session id carries its shard as a
+  `<shard>.` prefix, so an id alone says which mount serves it. Credentials mount read-only. A
+  tenant's workspace is **not** here — it is in that tenant's sandbox, behind the exec endpoint in
+  its grant.
+- **Health**, on the same listener, no grant needed:
+
+  ```sh
+  curl -fsS http://127.0.0.1:8080/livez   # 200 once the process is serving
+  curl -isS http://127.0.0.1:8080/readyz  # 200 ready, or 503 {"reason":"shard a07-s2: not writable"}
+  ```
+
+  Wire `/readyz` to the readiness probe and `/livez` to the liveness one, never the reverse:
+  `/readyz` fails while a shard is missing or read-only, which should take the replica out of
+  rotation — restarting it would not put the mount back. The image's `HEALTHCHECK` already hits
+  `/readyz` (set `AGENT_PORT` if you bind anywhere but 8080).
+
 ## What It Does
 
 - **Managed keys** (`bai_v1…`) — Ed25519-verified, stateless. Swaps to the pool key. Attributes usage to tenant + VPC. Deny-set checked (spend/fraud).
