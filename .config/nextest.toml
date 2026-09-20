@@ -20,3 +20,10 @@ global-timeout = "10m"
 # way — so a flaky hang is surfaced, not silently masked.
 retries = 1
 fail-fast = false
+# Cap concurrency. nextest defaults to one test thread per core, and an *agent* test is not one
+# process: each spawns `beyond-ai-agent` children, a mock model server, sometimes an MCP fixture. On a
+# 4-core / 7 GB hosted runner that multiplies into memory the runner does not have, and the failure is
+# not a test failure — the runner itself dies, so neither the per-test terminate-after nor the
+# `global-timeout` below ever gets to fire, and the job sits until GitHub cancels it at 30 minutes with
+# no log. Four keeps the shards well under a minute each while leaving headroom for the children.
+test-threads = 4
