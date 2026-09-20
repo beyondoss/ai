@@ -430,6 +430,14 @@ fn session_cfg(base: &ServeConfig, id: &str, service: Option<Arc<ServiceSession>
     // daemon's own config never carries one (at startup there is no connection), so this is the only
     // place it is set, and `Persistence::open` refuses to run in service mode without it.
     c.service = service;
+    // Code Mode is a per-process flag everywhere else (`--code-mode`), which service mode refuses for
+    // exactly that reason: on a replica one tenant's setting would be every tenant's. Here it is a
+    // per-session capability the grant carries. It only means anything in an image built with the
+    // `code-mode` feature — without it the interpreter isn't compiled in and the tool is never
+    // registered, so the claim is inert rather than wrong.
+    if let Some(svc) = &c.service {
+        c.code_mode = svc.code_mode();
+    }
     c.listen = None;
     // A spawned session must never itself re-bind a transport listener — it's driven purely
     // through its `input_rx`/`out_conn` channels by the supervisor. For the same reason it must not

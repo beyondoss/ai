@@ -3202,6 +3202,35 @@ them would publish series pinned at zero — which reads as "this never happens"
 measured". Wiring them means threading a handle through `RepoOptions`, which belongs in its own
 change.
 
+### Code Mode, per session
+
+`--code-mode` is a **process** flag, and service mode refuses it for the reason it refuses every other
+flag in that table: on a replica one tenant's setting would be every tenant's. So Code Mode was simply
+unreachable for a tenant — the flag was refused and no claim carried it.
+
+The `bsg_v1` grant now has a `code_mode` claim, and `serve_ws::session_cfg` applies it per session
+alongside the tenant's storage, sandbox and connectors.
+
+Two properties are load-bearing:
+
+- **Omitted when false, never emitted as `false`.** The signature covers the exact claim bytes, so a
+  grant that does not ask for the capability mints byte-for-byte as it did before the field existed.
+  Every golden vector — and the Go twin they were cross-checked against — is unchanged, and a test
+  asserts a pre-claim grant still verifies with the capability off. A new claim that flipped an old
+  grant's behaviour would be a silent capability grant to every tenant already in flight.
+- **Agents roll before the edge does.** `Payload` is `deny_unknown_fields`, so a replica refuses a
+  grant carrying a claim it does not understand — deliberately, since an ignored _restriction_ would
+  fail open. That makes the ordering a hard requirement rather than a preference: every replica must
+  accept `code_mode` before any issuer emits it.
+
+The claim only means something in an image built with the `code-mode` feature. `Dockerfile.agent`
+leaves it off by default (QuickJS is ~1 MB of `.text` resident in every replica whether or not any
+session uses it) and takes `--build-arg AGENT_FEATURES=code-mode` for a fleet that offers it. Without
+the feature the interpreter is not compiled in and the tool is never registered, so the claim is inert
+rather than wrong.
+
+### Worktree isolation in the sandbox
+
 ### The idle window is shorter on a replica
 
 `--session-idle-timeout` governs how long a **detached** session stays live before the reaper

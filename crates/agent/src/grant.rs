@@ -92,6 +92,19 @@ pub struct Grant {
     pub mcp: Vec<McpConnector>,
     /// Unix seconds; the grant is valid strictly before this.
     pub exp: u64,
+    /// May this session use Code Mode?
+    ///
+    /// Off unless the grant says otherwise, so a grant minted before the claim existed — or by an
+    /// issuer that doesn't set it — gets today's behaviour. Outside service mode this is the
+    /// `--code-mode` flag, which service mode refuses: it is a per-process switch, and on a replica
+    /// one tenant's setting must not be everybody's.
+    ///
+    /// **A replica must accept this claim before any edge emits it.** [`Payload`] is
+    /// `deny_unknown_fields`, so a grant carrying a claim a replica doesn't know is refused outright
+    /// — agents roll first, the control plane follows. The claim also only means something in an
+    /// image built with the `code-mode` feature; without it the interpreter isn't compiled in and the
+    /// tool simply isn't registered.
+    pub code_mode: bool,
     pub secrets: GrantSecrets,
 }
 
@@ -184,7 +197,27 @@ struct Payload {
     exec_url: String,
     mcp: Vec<McpConnector>,
     exp: u64,
+    /// Absent in a grant minted before this claim existed, which must keep verifying — so `default`,
+    /// not a required field. The `deny_unknown_fields` reasoning above is about a claim a replica
+    /// does not *know*; this is one it knows and the issuer simply didn't set.
+    ///
+    /// **Omitted when false, never emitted as `false`.** The signature covers the exact claim bytes,
+    /// so a grant that does not ask for the capability has to mint byte-for-byte as it did before
+    /// this field existed — otherwise every golden vector, and the Go twin they were cross-checked
+    /// against, would have to change to add a field that means "as before".
+    #[serde(default, skip_serializing_if = "is_false")]
+    code_mode: bool,
     sealed: String,
+}
+
+/// `true` for the default of a boolean claim, so `skip_serializing_if` can leave it off the wire.
+///
+/// Only the test-side `Serialize` uses it — a replica verifies grants, it never mints them — so it is
+/// compiled only where it is referenced.
+#[cfg(test)]
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 /// Verifies and unseals `bsg_v1` grants: the trusted Ed25519 keys by kid, plus the fleet's X25519
@@ -273,6 +306,7 @@ impl GrantVerifier {
             exec_url: payload.exec_url,
             mcp: payload.mcp,
             exp: payload.exp,
+            code_mode: payload.code_mode,
             secrets,
         })
     }
@@ -444,6 +478,8 @@ mod tests {
         exec_url: String,
         mcp: Vec<McpConnector>,
         exp: u64,
+        #[serde(default, skip_serializing_if = "is_false")]
+        code_mode: bool,
     }
 
     impl Claims {
@@ -456,6 +492,7 @@ mod tests {
                 exec_url: self.exec_url,
                 mcp: self.mcp,
                 exp: self.exp,
+                code_mode: self.code_mode,
                 sealed,
             }
         }
@@ -469,6 +506,7 @@ mod tests {
                 exec_url: grant.exec_url.clone(),
                 mcp: grant.mcp.clone(),
                 exp: grant.exp,
+                code_mode: grant.code_mode,
             }
         }
     }
@@ -757,6 +795,39 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&built).unwrap(),
             serde_json::to_value(&fx).unwrap()
+        );
+    }
+
+    #[test]
+    fn a_grant_minted_before_the_code_mode_claim_existed_still_verifies_with_it_off() {
+        // The golden vectors predate the claim. They must keep verifying unchanged, and the
+        // capability they never asked for must come back off — a new claim that flipped an old
+        // grant's behaviour would be a silent capability grant to every tenant already in flight.
+        let fx = fixture();
+        let grant = verifier(&fx).verify(&fx.token, fx.now).unwrap();
+        assert!(
+            !grant.code_mode,
+            "a grant with no code_mode claim must not confer it"
+        );
+    }
+
+    #[test]
+    fn a_grant_that_asks_for_code_mode_carries_it_and_changes_only_that() {
+        // And the claim is load-bearing when it *is* set: same fixture, one field, verified through
+        // the real signing path rather than by constructing a `Grant` directly.
+        let mut inputs = fixture();
+        inputs.claims.code_mode = true;
+        let built = build(&inputs);
+        let grant = verifier(&built).verify(&built.token, built.now).unwrap();
+        assert!(grant.code_mode, "the claim must reach the session");
+        // Nothing else moved.
+        assert_eq!(grant.tenant, fixture().claims.tenant);
+        assert_eq!(grant.session_id, fixture().claims.session_id);
+        // And it is genuinely on the wire, not defaulted back in.
+        assert!(
+            built.payload_json.contains("code_mode"),
+            "the signed payload must carry the claim: {}",
+            built.payload_json
         );
     }
 

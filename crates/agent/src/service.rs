@@ -289,6 +289,13 @@ impl ServiceSession {
         &self.grant.session_id
     }
 
+    /// May this session use Code Mode? From the grant — outside service mode this is `--code-mode`,
+    /// a per-process flag that service mode refuses because one tenant's setting must not be
+    /// everybody's.
+    pub fn code_mode(&self) -> bool {
+        self.grant.code_mode
+    }
+
     /// The tenant's workspace inside the sandbox — this session's `cwd` everywhere `serve` reports
     /// or records one.
     pub fn workspace_root(&self) -> &str {
@@ -716,6 +723,7 @@ mod tests {
             exec_url: "http://x/".into(),
             mcp: Vec::new(),
             exp: 0,
+            code_mode: false,
             secrets: serde_json::from_str(
                 r#"{"exec_headers":[],"mcp_headers":{},"gateway_key":"k","dek":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="}"#,
             )

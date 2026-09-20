@@ -93,6 +93,9 @@ RUN cargo chef prepare --recipe-path recipe.json
 # Stage 3: builder — cook dependencies from the recipe, then build the binary.
 # ---------------------------------------------------------------------------
 FROM chef AS builder
+# Extra cargo features for the agent binary; empty by default. See the build step below for why
+# `code-mode` is not on by default.
+ARG AGENT_FEATURES=""
 COPY --from=planner /app/recipe.json recipe.json
 # Cook only `beyond-ai-agent`'s dependencies — cached until the dependency graph changes. Scoping to
 # the package matters: the workspace also holds the gateway, whose pingora tree would drag a cmake
@@ -104,11 +107,17 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     && linker_env="CARGO_TARGET_$(echo "$target" | tr 'a-z-' 'A-Z_')_LINKER" \
     && cc_env="CC_$(echo "$target" | tr '-' '_')" \
     && export "$linker_env=musl-gcc" "$cc_env=musl-gcc" \
-    && cargo chef cook --release --target "$target" -p beyond-ai-agent --recipe-path recipe.json
+    && cargo chef cook --release --target "$target" -p beyond-ai-agent --recipe-path recipe.json \
+        ${AGENT_FEATURES:+--features "$AGENT_FEATURES"}
 
-# Now the full source, and just the agent binary. Deliberately NOT `--features code-mode`: QuickJS is
-# ~1 MB of `.text` resident in every replica even when `--code-mode` is never passed, and the
-# published binary does not carry it either.
+# Now the full source, and just the agent binary. `AGENT_FEATURES` is empty by default, and
+# deliberately so for `code-mode`: QuickJS is ~1 MB of `.text` resident in every replica even when no
+# session uses it, and the published binary does not carry it either.
+#
+# A fleet that offers Code Mode to tenants builds with `--build-arg AGENT_FEATURES=code-mode`. The
+# grant's `code_mode` claim is what decides it *per session*; without the feature compiled in the
+# interpreter does not exist, so the claim is inert rather than wrong — a replica built without it
+# simply never registers the tool.
 COPY . .
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
@@ -117,6 +126,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     && cc_env="CC_$(echo "$target" | tr '-' '_')" \
     && export "$linker_env=musl-gcc" "$cc_env=musl-gcc" \
     && cargo build --release --target "$target" -p beyond-ai-agent --bin beyond-ai-agent \
+        ${AGENT_FEATURES:+--features "$AGENT_FEATURES"} \
     && cp "target/$target/release/beyond-ai-agent" /usr/local/bin/beyond-ai-agent
 
 # ---------------------------------------------------------------------------
