@@ -602,6 +602,24 @@ impl Subagent {
             .map_or(crate::tools::fs::PathWorld::Local, |b| b.world())
     }
 
+    /// Where a child's `git` should run: in the session's sandbox when its filesystem is there,
+    /// on this machine otherwise.
+    fn child_git(&self) -> worktree::Git {
+        match (
+            self.child_world().is_remote(),
+            &self.ctx.tool_cfg.command_runner,
+            &self.ctx.tool_cfg.fs_backend,
+        ) {
+            (true, Some(runner), Some(backend)) => {
+                worktree::Git::remote(runner.clone(), backend.clone())
+            }
+            // A remote world with no runner cannot happen on a configured replica (`ExecCell::strict`
+            // fails the session first), and `Local` is the safe reading of it either way: it runs
+            // against this process's own cwd, which in that configuration is not a tenant's.
+            _ => worktree::Git::Local,
+        }
+    }
+
     /// The parent cwd's `AGENTS.md`/`CLAUDE.md`, honoring `--no-context-files`.
     ///
     /// Reuses the parent's own already-read set when it has one ([`SubagentCtx::context_files`]) —
@@ -763,26 +781,18 @@ impl Subagent {
         // exactly what should happen if the parent cancels us mid-run.
         let (root, worktree) = match def.isolation {
             Isolation::None => (self.ctx.cwd.clone(), None),
-            // Every step of worktree isolation — `git worktree add`, the diff, `git apply` on the way
-            // back — is a host `git` invocation against `ctx.cwd`. When the child's filesystem is on
-            // the far side of a backend, that cwd is not on this machine: the preflight would either
-            // fail confusingly or, worse, succeed against the replica's own checkout and merge a
-            // tenant's patch into it. Refused with the reason, rather than silently downgraded to
-            // `Isolation::None`, which would hand a write-capable child the shared root — exactly
-            // what the field exists to prevent.
-            Isolation::Worktree if self.child_world().is_remote() => {
-                return Err(format!(
-                    "agent {:?} declares `isolation: worktree`, which is not available when the \
-                     agent's filesystem is remote — a worktree is a git checkout on the machine \
-                     running this process, and the child's files are not there. Use `chain`/`single` \
-                     (which run one at a time), or give it an agent definition without worktree \
-                     isolation.",
-                    def.name
-                ));
-            }
+            // Every step of worktree isolation — `git worktree add`, the diff, `git apply` on the
+            // way back — has to run *where the child's files are*. That used to mean this machine,
+            // full stop, so a remote filesystem was refused: running them here would either fail
+            // confusingly or, far worse, succeed against the replica's own checkout and merge one
+            // tenant's patch into it. `worktree::Git` now carries that choice, so the same sequence
+            // runs in the session's sandbox and a write-capable child can fan out in `parallel`
+            // there too.
             Isolation::Worktree => {
-                let repo_root = worktree::preflight(&self.ctx.cwd).await?;
-                let wt = Worktree::create(&repo_root, &format!("{}-{index}", def.name)).await?;
+                let git = self.child_git();
+                let repo_root = worktree::preflight(&git, &self.ctx.cwd).await?;
+                let wt =
+                    Worktree::create(&git, &repo_root, &format!("{}-{index}", def.name)).await?;
                 (wt.path().to_path_buf(), Some((wt, repo_root)))
             }
         };
@@ -969,7 +979,7 @@ impl Subagent {
         };
         if delta.is_empty() {
             // "Auto-cleaned if unchanged" — the same contract Claude Code's worktree isolation offers.
-            let _ = wt.remove();
+            let _ = wt.remove().await;
             return;
         }
         // Serialize the actual apply. `child_delta` above is per-worktree and safe to run concurrently,
@@ -978,9 +988,9 @@ impl Subagent {
         // conflicted cleanly). The shared `WriteLockRegistry` (the same one every child's file writes
         // key on) serializes them on a sentinel key that no real path can collide with.
         let _merge_guard = self.ctx.write_locks.lock("\0subagent-merge-back").await;
-        match worktree::apply_patch(repo_root, &delta, policy.denied_paths()).await {
+        match worktree::apply_patch(wt.git(), repo_root, &delta, policy.denied_paths()).await {
             Ok(ApplyOutcome::Clean) => {
-                let _ = wt.remove();
+                let _ = wt.remove().await;
             }
             Ok(ApplyOutcome::Conflicted { files }) => {
                 let path = wt.preserve();

@@ -3202,6 +3202,34 @@ them would publish series pinned at zero — which reads as "this never happens"
 measured". Wiring them means threading a handle through `RepoOptions`, which belongs in its own
 change.
 
+### Worktree isolation in the sandbox
+
+A subagent declaring `isolation: worktree` gets a private checkout so parallel writers cannot race.
+Until now that was refused whenever the filesystem was remote, and the knock-on was larger than it
+looked: `subagent.rs`'s `check_parallel_write_safety` **requires** worktree isolation for any
+write-capable agent in `parallel` — `bash` reports no write target, so no lock can serialize two
+children's shell commands — which meant **a replica could not run write-capable subagents in parallel
+at all**. That was the one structural parity gap.
+
+`worktree::Git` now carries where `git` runs: `Local` (this machine) or `Remote` (the session's
+sandbox, via its exec endpoint and filesystem backend). The refusal is gone; the sequence is the same
+in both. Three things differ on the remote side:
+
+- **Patch output goes through base64.** `ExecResult::stdout` is a `String`. `--binary` renders binary
+  files as ASCII, but a text hunk carries the file's own bytes, and a non-UTF-8 source file survives a
+  lossy conversion as U+FFFD — a patch that fails to apply, or applies corruption.
+- **The owner key is not a PID.** The replica's process is not in the sandbox's `/proc`; that number
+  names something unrelated there, or with a recycled value something live, which is the direction
+  that deletes a running child's work. A sandbox belongs to one session, so the key need only differ
+  between incarnations.
+- **`Drop` cannot clean up**, because every removal step is a round trip and `Drop` cannot await. A
+  remote worktree is reaped by the next incarnation, which sweeps the base directory before creating
+  its own — so only sessions that use isolation pay for it.
+
+Tested against the remote arm directly: `RealRunner` and `LocalFs` drive a local temp repo through
+`Git::Remote`, so the seeding, the base64 patch transport, `run_with_stdin` and the sweep are all
+exercised — including a patch carrying Latin-1 bytes, which is the case base64 exists for.
+
 ### Code Mode, per session
 
 `--code-mode` is a **process** flag, and service mode refuses it for the reason it refuses every other
