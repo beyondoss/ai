@@ -120,3 +120,33 @@ pub async fn transcript(ws: &mut Ws) -> Result<Vec<Value>, String> {
         .cloned()
         .unwrap_or_default())
 }
+
+/// One bare HTTP GET against a replica: `/livez`, `/readyz`, or a metrics listener's `/metrics`.
+///
+/// Hand-rolled for the same reason the mock model server is: a client with no framework of its own
+/// has nothing to agree with the thing under test about, and these are three-line requests.
+pub async fn http_get(port: u16, path: &str) -> Result<(u16, String), String> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut s = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .map_err(|e| format!("connect {port}: {e}"))?;
+    s.write_all(format!("GET {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").as_bytes())
+        .await
+        .map_err(|e| format!("write: {e}"))?;
+    let mut out = Vec::new();
+    // A peer that closes while we are still reading surfaces as a reset rather than EOF; what it
+    // already sent is still a valid response.
+    if let Err(e) = s.read_to_end(&mut out).await
+        && out.is_empty()
+    {
+        return Err(format!("read {path}: {e}"));
+    }
+    let text = String::from_utf8_lossy(&out).into_owned();
+    let status = text
+        .split_whitespace()
+        .nth(1)
+        .and_then(|c| c.parse().ok())
+        .unwrap_or(0);
+    let body = text.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("");
+    Ok((status, body.to_owned()))
+}

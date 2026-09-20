@@ -95,6 +95,11 @@ async fn run_matrix(kind: Kind) -> std::process::ExitCode {
         let outcome = match s.name {
             "owner-refuses-non-owner" => scenarios::owner_refuses_non_owner(kind, &history).await,
             "takeover-after-hard-kill" => scenarios::takeover_after_hard_kill(kind, &history).await,
+            "drain-keeps-serving-what-it-owns" => {
+                scenarios::drain_keeps_serving_what_it_owns(kind, &history).await
+            }
+            "live-session-cap-refuses" => scenarios::live_session_cap_refuses(kind, &history).await,
+            "metrics-name-no-tenant" => scenarios::metrics_name_no_tenant(kind, &history).await,
             other => scenarios::Outcome::Skipped(format!("no runner for {other:?}")),
         };
         match outcome {

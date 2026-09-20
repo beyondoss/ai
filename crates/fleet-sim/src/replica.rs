@@ -23,6 +23,10 @@ pub struct Launch<'a> {
     pub shards: &'a [(&'a str, &'a Path)],
     /// `--drain-grace`, when the scenario is about a drain.
     pub drain_grace: Option<u64>,
+    /// `--max-live-sessions`, when the scenario is about the cap.
+    pub max_live_sessions: Option<usize>,
+    /// `--metrics-listen`, when the scenario reads the scrape.
+    pub metrics_port: Option<u16>,
 }
 
 /// A running replica.
@@ -30,6 +34,16 @@ pub struct Replica {
     pub name: String,
     pub port: u16,
     child: Option<Child>,
+    /// Held for the replica's whole life, and that is load-bearing rather than tidy.
+    ///
+    /// Taking the pipe and letting the handle drop closes its read end, and the child then dies of
+    /// `SIGPIPE` on its next write to stderr. The drain's first act is to log that it has begun — so
+    /// a harness that dropped this killed the replica at precisely the moment a drain scenario needed
+    /// it alive, and the failure looked exactly like "drain does not work in service mode".
+    ///
+    /// It is also the evidence: when a replica ends a scenario by disappearing, what it said on the
+    /// way out is all there is.
+    stderr: Option<std::process::ChildStderr>,
 }
 
 impl Replica {
@@ -44,6 +58,8 @@ impl Replica {
             seal_key,
             shards,
             drain_grace,
+            max_live_sessions,
+            metrics_port,
         } = *launch;
         let mut c = Command::new(bin);
         c.args([
@@ -66,6 +82,13 @@ impl Replica {
         if let Some(secs) = drain_grace {
             c.arg("--drain-grace").arg(secs.to_string());
         }
+        if let Some(max) = max_live_sessions {
+            c.arg("--max-live-sessions").arg(max.to_string());
+        }
+        if let Some(port) = metrics_port {
+            // Loopback only, which the flag enforces — the scrape describes every tenant here.
+            c.arg("--metrics-listen").arg(format!("127.0.0.1:{port}"));
+        }
         // The replica's own `$HOME` must not be reachable: in service mode a host default is a
         // tenancy bug, and pointing it at a path that does not exist is how the integration tests
         // prove the replica never falls back to one.
@@ -81,16 +104,10 @@ impl Replica {
             name: name.to_string(),
             port,
             child: Some(child),
+            stderr,
         };
         if let Err(e) = replica.wait_until_listening() {
-            let said = stderr
-                .map(|mut s| {
-                    let mut buf = String::new();
-                    use std::io::Read as _;
-                    let _ = s.read_to_string(&mut buf);
-                    buf
-                })
-                .unwrap_or_default();
+            let said = replica.said();
             let _ = replica.kill_hard();
             return Err(if said.trim().is_empty() {
                 e
@@ -110,6 +127,18 @@ impl Replica {
             std::thread::sleep(Duration::from_millis(25));
         }
         Err(format!("replica {} never bound {}", self.name, self.port))
+    }
+
+    /// Whatever the replica has written to stderr. Consumes the pipe, so it is read once — at the
+    /// point a scenario has already gone wrong and needs to explain why.
+    pub fn said(&mut self) -> String {
+        let Some(mut s) = self.stderr.take() else {
+            return String::new();
+        };
+        let mut buf = String::new();
+        use std::io::Read as _;
+        let _ = s.read_to_string(&mut buf);
+        buf
     }
 
     pub fn pid(&self) -> Option<u32> {

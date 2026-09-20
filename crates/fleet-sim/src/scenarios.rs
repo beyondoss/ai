@@ -8,7 +8,9 @@
 use std::time::Duration;
 
 use beyond_ai_test_support::exec_mock::ExecMock;
-use beyond_ai_test_support::{spawn_model_server, turn_text};
+use beyond_ai_test_support::{
+    spawn_model_server, spawn_model_server_with_stalled_response, turn_text,
+};
 use serde_json::json;
 
 use crate::check::{self, Finding};
@@ -34,6 +36,21 @@ pub struct Scenario {
 
 pub const ALL: &[Scenario] = &[
     Scenario {
+        name: "drain-keeps-serving-what-it-owns",
+        claims: "C7",
+        needs_shared_fs: false,
+    },
+    Scenario {
+        name: "live-session-cap-refuses",
+        claims: "C9",
+        needs_shared_fs: false,
+    },
+    Scenario {
+        name: "metrics-name-no-tenant",
+        claims: "C11",
+        needs_shared_fs: false,
+    },
+    Scenario {
         name: "owner-refuses-non-owner",
         claims: "C4, C1",
         needs_shared_fs: false,
@@ -55,6 +72,8 @@ pub struct Fleet {
     /// The sandbox every session's tools run in. One per fleet: the scenarios here are about storage
     /// and ownership, not isolation between sandboxes, which the service suites already cover.
     pub exec: ExecMock,
+    /// Each replica's metrics listener, in the same order as `replicas`.
+    pub metrics_ports: Vec<Option<u16>>,
     _keys: tempfile::TempDir,
     _sandbox: tempfile::TempDir,
 }
@@ -65,6 +84,64 @@ impl Fleet {
         kind: Kind,
         replicas: usize,
         history_path: &std::path::Path,
+    ) -> Result<Self, String> {
+        Self::start_with(kind, replicas, history_path, None, false).await
+    }
+
+    /// As [`start`](Self::start), with the two per-replica knobs some scenarios need: a live-session
+    /// cap, and a metrics listener to scrape.
+    pub async fn start_with(
+        kind: Kind,
+        replicas: usize,
+        history_path: &std::path::Path,
+        max_live_sessions: Option<usize>,
+        with_metrics: bool,
+    ) -> Result<Self, String> {
+        // Enough plain turns for every session a scenario runs; the mock replays them in order.
+        let turns: Vec<String> = (0..64).map(|i| turn_text(&format!("turn-{i}"))).collect();
+        Self::start_with_turns(
+            kind,
+            replicas,
+            history_path,
+            max_live_sessions,
+            with_metrics,
+            turns,
+        )
+        .await
+    }
+
+    /// As [`start_with`](Self::start_with), with the model's replies chosen by the caller — for a
+    /// scenario that needs a turn to still be *running* when something happens to the replica.
+    pub async fn start_with_turns(
+        kind: Kind,
+        replicas: usize,
+        history_path: &std::path::Path,
+        max_live_sessions: Option<usize>,
+        with_metrics: bool,
+        turns: Vec<String>,
+    ) -> Result<Self, String> {
+        let (gateway_url, _bodies) = spawn_model_server(turns);
+        Self::start_against(
+            kind,
+            replicas,
+            history_path,
+            max_live_sessions,
+            with_metrics,
+            gateway_url,
+        )
+        .await
+    }
+
+    /// As above, against a model server the caller already has — for a scenario that needs the model
+    /// to *stall*, which is the only way to hold a run in flight without depending on how fast a
+    /// sandbox happens to be.
+    pub async fn start_against(
+        kind: Kind,
+        replicas: usize,
+        history_path: &std::path::Path,
+        max_live_sessions: Option<usize>,
+        with_metrics: bool,
+        gateway_url: String,
     ) -> Result<Self, String> {
         let substrate = Substrate::prepare(kind, 1)?;
         let keys = tempfile::tempdir().map_err(|e| format!("keys: {e}"))?;
@@ -77,19 +154,21 @@ impl Fleet {
         // exactly like a broken sandbox.
         let exec = ExecMock::start_with_home(sandbox.path(), Some(&sandbox_home), true).await;
 
-        // Enough turns for every session any scenario runs; the mock replays them in order.
-        let turns: Vec<String> = (0..64).map(|i| turn_text(&format!("turn-{i}"))).collect();
-        let (gateway_url, _bodies) = spawn_model_server(turns);
-
         let mut edge = Edge::new(keys.path(), Vec::new());
         let agent = agent_binary()?;
 
         let shard_args = substrate.shard_args();
         let mut started = Vec::new();
         let mut targets = Vec::new();
+        let mut metrics_ports = Vec::new();
         for i in 0..replicas {
             let name = format!("r{}", i + 1);
             let port = free_port()?;
+            let metrics_port = if with_metrics {
+                Some(free_port()?)
+            } else {
+                None
+            };
             let replica = Replica::start(&crate::replica::Launch {
                 name: &name,
                 bin: &agent,
@@ -99,8 +178,11 @@ impl Fleet {
                 seal_key: edge.seal_key(),
                 shards: &shard_args,
                 drain_grace: Some(30),
+                max_live_sessions,
+                metrics_port,
             })?;
             targets.push(Target { name, port });
+            metrics_ports.push(metrics_port);
             started.push(replica);
         }
         edge.set_targets(targets);
@@ -113,6 +195,7 @@ impl Fleet {
             history,
             gateway_url,
             exec,
+            metrics_ports,
             _keys: keys,
             _sandbox: sandbox,
         })
@@ -396,6 +479,238 @@ pub async fn takeover_after_hard_kill(kind: Kind, history_path: &std::path::Path
     }
 
     if check::report("takeover-after-hard-kill", &findings) {
+        Outcome::Passed
+    } else {
+        Outcome::Failed
+    }
+}
+
+/// **C7** — a draining replica refuses new sessions, keeps the ones it owns, and says so on
+/// `/readyz` while staying alive on `/livez`.
+///
+/// The contract a rolling deploy depends on, checked from the outside: the load balancer learns to
+/// stop choosing this replica, the orchestrator learns not to kill it, and a client whose session
+/// lives here — which cannot be served anywhere else until the lock is released — keeps working.
+pub async fn drain_keeps_serving_what_it_owns(
+    kind: Kind,
+    history_path: &std::path::Path,
+) -> Outcome {
+    // A run that is still in flight when the signal lands. Without one there is nothing to drain:
+    // the replica has no work to finish, shuts down at once, and every property below is
+    // unobservable — correct behaviour, and a drain scenario with an idle session is a test of
+    // nothing.
+    //
+    // The *model* stalls rather than a tool, because a tool's duration depends on the sandbox and a
+    // request/response exec endpoint streams nothing while it runs, so "the command has started" is
+    // not observable from here. A model that has not answered keeps the run in flight by definition.
+    let gateway = spawn_model_server_with_stalled_response(
+        Vec::new(),
+        Duration::from_secs(6),
+        vec![turn_text("finished after the signal")],
+    );
+    let mut fleet = match Fleet::start_against(kind, 1, history_path, None, false, gateway).await {
+        Ok(f) => f,
+        Err(e) => return Outcome::failed_with(e),
+    };
+    let (tenant, session) = ("t1", "s1.draining");
+    let exec_url = fleet.exec.url.clone();
+    let grant = fleet.edge.grant(tenant, session, "s1", "/", &exec_url);
+    let port = fleet.replicas[0].port;
+
+    let mut ws = match workload::connect(port, session, &grant).await {
+        Ok(ws) => ws,
+        Err(e) => return Outcome::failed_with(format!("connect: {e}")),
+    };
+    // Start the run and wait until the tool is provably executing, so the drain has work to protect.
+    if let Err(e) = workload::send(&mut ws, json!({ "type": "prompt", "message": "go" })).await {
+        return Outcome::failed_with(format!("prompt: {e}"));
+    }
+    // The first event proves the run has begun; the model will not answer for several seconds, so
+    // the run is in flight for the whole of the window this scenario asserts on.
+    if let Err(e) = workload::read_until(&mut ws, |f| f["type"] == "event").await {
+        return Outcome::failed_with(format!("waiting for the run to start: {e}"));
+    }
+
+    if let Err(e) = fleet.replicas[0].signal_term() {
+        return Outcome::failed_with(format!("SIGTERM: {e}"));
+    }
+    fleet
+        .history
+        .record("drain_started", json!({ "port": port }));
+
+    let mut findings = Vec::new();
+
+    // `/readyz` has to flip within a probe interval — that answer *is* the mechanism by which the
+    // load balancer stops sending new sessions here.
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    let mut readyz = 0;
+    while std::time::Instant::now() < deadline {
+        if let Ok((status, _)) = workload::http_get(port, "/readyz").await {
+            readyz = status;
+            if status == 503 {
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    findings.push(Finding {
+        claim: "C7",
+        ok: readyz == 503,
+        detail: format!("/readyz answered {readyz} while draining (503 takes it out of the pool)"),
+    });
+
+    let livez = workload::http_get(port, "/livez").await.map(|(s, _)| s);
+    findings.push(Finding {
+        claim: "C7",
+        ok: livez.as_ref().is_ok_and(|s| *s == 200),
+        detail: format!(
+            "/livez answered {:?} (200 keeps the orchestrator from killing it mid-drain)",
+            livez.unwrap_or(0)
+        ),
+    });
+
+    // A *new* session is refused; the one this replica owns still answers.
+    let fresh = fleet
+        .edge
+        .grant(tenant, "s1.brand-new", "s1", "/", &exec_url);
+    let refused = workload::probe_session(port, "s1.brand-new", &fresh).await;
+    findings.push(Finding {
+        claim: "C7",
+        ok: matches!(refused, Ok(503)),
+        detail: format!(
+            "a new session got {refused:?} (503 sends the edge to a replica that stays)"
+        ),
+    });
+
+    // Asked on a *fresh* connection to the same session rather than on the socket already draining
+    // the run's event stream: a reconnect is the case the contract is about, and it is the one an
+    // earlier draft of the drain got wrong by checking the closed flag before the map lookup.
+    let owned = match workload::connect(port, session, &grant).await {
+        Ok(mut again) => {
+            workload::command(&mut again, json!({ "type": "get_state" }), "get_state").await
+        }
+        Err(e) => Err(format!("reconnect refused: {e}")),
+    };
+    findings.push(Finding {
+        claim: "C7",
+        ok: owned.is_ok(),
+        detail: match &owned {
+            Ok(_) => {
+                "the session it already owns still answers — the outage a drain exists to avoid"
+                    .to_string()
+            }
+            Err(e) => format!("the owned session stopped answering: {e}"),
+        },
+    });
+
+    if !findings.iter().all(|f| f.ok) {
+        let said = fleet.replicas[0].said();
+        if !said.trim().is_empty() {
+            println!("  replica said: {}", said.trim());
+        }
+    }
+    if check::report("drain-keeps-serving-what-it-owns", &findings) {
+        Outcome::Passed
+    } else {
+        Outcome::Failed
+    }
+}
+
+/// **C9** — a replica at `--max-live-sessions` refuses the next one rather than exceeding its
+/// descriptor and lock budget.
+pub async fn live_session_cap_refuses(kind: Kind, history_path: &std::path::Path) -> Outcome {
+    // One live session allowed, so the second is the interesting one.
+    let fleet = match Fleet::start_with(kind, 1, history_path, Some(1), false).await {
+        Ok(f) => f,
+        Err(e) => return Outcome::failed_with(e),
+    };
+    let exec_url = fleet.exec.url.clone();
+    let port = fleet.replicas[0].port;
+    let first = fleet.edge.grant("t1", "s1.first", "s1", "/", &exec_url);
+    let second = fleet.edge.grant("t1", "s1.second", "s1", "/", &exec_url);
+
+    let mut held = match workload::connect(port, "s1.first", &first).await {
+        Ok(ws) => ws,
+        Err(e) => return Outcome::failed_with(format!("first session: {e}")),
+    };
+    if let Err(e) = workload::command(&mut held, json!({ "type": "get_state" }), "get_state").await
+    {
+        return Outcome::failed_with(format!("first get_state: {e}"));
+    }
+
+    let over = workload::probe_session(port, "s1.second", &second).await;
+    let findings = vec![Finding {
+        claim: "C9",
+        ok: matches!(over, Ok(503)),
+        detail: format!(
+            "at the cap, the next session got {over:?} — 503 so the edge places it elsewhere rather \
+             than this replica running past its lock and descriptor budget"
+        ),
+    }];
+
+    if check::report("live-session-cap-refuses", &findings) {
+        Outcome::Passed
+    } else {
+        Outcome::Failed
+    }
+}
+
+/// **C11** — nothing in the scrape names a tenant, a session, a shard or a workspace.
+///
+/// Checked against a **live replica that has actually served a session**, not against a freshly
+/// constructed registry: a unit test can only prove the labels defined today are clean, while this
+/// proves nothing leaked into one at runtime.
+pub async fn metrics_name_no_tenant(kind: Kind, history_path: &std::path::Path) -> Outcome {
+    let fleet = match Fleet::start_with(kind, 1, history_path, None, true).await {
+        Ok(f) => f,
+        Err(e) => return Outcome::failed_with(e),
+    };
+    let Some(Some(metrics_port)) = fleet.metrics_ports.first().copied() else {
+        return Outcome::failed_with("the replica has no metrics listener".into());
+    };
+    let exec_url = fleet.exec.url.clone();
+    let grant = fleet.edge.grant(
+        "tenant-should-not-appear",
+        "s1.secret-session",
+        "s1",
+        "/",
+        &exec_url,
+    );
+    let mut ws = match workload::connect(fleet.replicas[0].port, "s1.secret-session", &grant).await
+    {
+        Ok(ws) => ws,
+        Err(e) => return Outcome::failed_with(format!("connect: {e}")),
+    };
+    let _ = workload::command(&mut ws, json!({ "type": "get_state" }), "get_state").await;
+
+    let scrape = match workload::http_get(metrics_port, "/metrics").await {
+        Ok((200, body)) => body,
+        other => return Outcome::failed_with(format!("scrape: {other:?}")),
+    };
+
+    let mut findings = Vec::new();
+    for needle in [
+        "tenant-should-not-appear",
+        "secret-session",
+        "tenant=",
+        "session_id=",
+        "shard=",
+        "workspace=",
+    ] {
+        findings.push(Finding {
+            claim: "C11",
+            ok: !scrape.contains(needle),
+            detail: format!("{needle:?} does not appear in the scrape"),
+        });
+    }
+    // And the scrape is real, not empty — an empty body would pass every check above.
+    findings.push(Finding {
+        claim: "C11",
+        ok: scrape.contains("agent_sessions_live"),
+        detail: "the scrape carries the replica's own instruments".into(),
+    });
+
+    if check::report("metrics-name-no-tenant", &findings) {
         Outcome::Passed
     } else {
         Outcome::Failed
