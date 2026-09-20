@@ -532,6 +532,47 @@ pub fn read_until_response(reader: &mut impl BufRead, command: &str) -> Vec<Valu
     frames
 }
 
+/// Read stdout frames from a `serve` child until an `event` frame whose body satisfies `matches`
+/// arrives; return all frames seen, that event last.
+///
+/// This is the deterministic replacement for sleeping a fixed duration and hoping the run has reached
+/// a particular point. A wall-clock guess ("150ms should land mid the tool call's own `sleep 0.5`")
+/// holds only while the machine is idle. Under a loaded shard — every test spawning a real
+/// `beyond-ai-agent` plus a mock model server, four at a time — the probe lands *before* the turn
+/// reaches its `bash` call, or *after* that call finished, and the assertion fails for a reason with
+/// nothing to do with the behaviour under test. Asking the run where it is has no such window.
+///
+/// `matches` receives the event body (the `kind`-tagged [`beyond_ai_agent_core::AgentEvent`]), because
+/// what counts as "there yet" differs per test: `kind == "tool_start"` is "the call is running now",
+/// the first `tool_progress` is "output has already streamed", and a turn that calls the same tool
+/// twice has to key on the tool-use `id` the test itself authored.
+///
+/// Frames read on the way are returned rather than dropped, so a caller that still needs them can
+/// chain: `frames.extend(read_until_response(&mut stdout, "prompt"))`.
+pub fn read_until_event(
+    reader: &mut impl BufRead,
+    mut matches: impl FnMut(&Value) -> bool,
+) -> Vec<Value> {
+    let mut frames = Vec::new();
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if reader.read_line(&mut line).unwrap() == 0 {
+            break;
+        }
+        let Ok(v) = serde_json::from_str::<Value>(line.trim()) else {
+            continue;
+        };
+        let done = v.get("type").and_then(Value::as_str) == Some("event")
+            && v.get("event").is_some_and(&mut matches);
+        frames.push(v);
+        if done {
+            break;
+        }
+    }
+    frames
+}
+
 /// Strip ambient provider-routing env so a mock `--gateway-url` actually wins, and strip
 /// run-lifecycle env so an unconfigured test never POSTs to a URL the developer happened to export.
 ///

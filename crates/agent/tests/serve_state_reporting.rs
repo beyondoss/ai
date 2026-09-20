@@ -6,8 +6,8 @@ mod common;
 use std::io::{BufRead, BufReader, Write};
 
 use common::{
-    SpawnGuarded, read_until_response, serve_cmd, serve_dir_cmd, spawn_model_server, turn_text,
-    turn_tool_use,
+    SpawnGuarded, read_until_event, read_until_response, serve_cmd, serve_dir_cmd,
+    spawn_model_server, turn_text, turn_tool_use,
 };
 use serde_json::{Value, json};
 
@@ -19,7 +19,6 @@ fn serve_get_session_stats_reports_the_same_field_set_idle_or_mid_turn() {
     // either. Values may differ (busy fields not derivable mid-run are `null`), but the *set* of top-level
     // keys must not.
     use std::collections::BTreeSet;
-    use std::time::Duration;
 
     fn keys(v: &Value) -> BTreeSet<String> {
         v.as_object()
@@ -56,7 +55,11 @@ fn serve_get_session_stats_reports_the_same_field_set_idle_or_mid_turn() {
 
     writeln!(stdin, "{}", json!({ "type": "prompt", "message": "go" })).unwrap();
     stdin.flush().unwrap();
-    std::thread::sleep(Duration::from_millis(150)); // mid the tool call's own `sleep 0.5`
+    // Land mid-turn by waiting for the run to say it got there, not by guessing at a duration:
+    // `tool_start` means the tool's own `sleep` is executing right now (see `read_until_event`).
+    read_until_event(&mut stdout, |e| {
+        e["kind"] == "tool_start" && e["name"] == "bash"
+    });
     writeln!(
         stdin,
         "{}",
@@ -92,8 +95,6 @@ fn serve_get_session_stats_reports_the_same_field_set_idle_or_mid_turn() {
 
 #[test]
 fn serve_get_state_and_get_session_stats_answer_live_during_a_prompt() {
-    use std::time::Duration;
-
     // A tool-heavy turn (a `bash` sleep keeps it in flight) must still answer read-only progress
     // queries instead of rejecting them as busy — the whole point of H-4: a client polling for a live
     // "tokens/steps so far" indicator shouldn't have to wait for the turn to finish.
@@ -112,7 +113,11 @@ fn serve_get_state_and_get_session_stats_answer_live_during_a_prompt() {
 
     writeln!(stdin, "{}", json!({ "type": "prompt", "message": "go" })).unwrap();
     stdin.flush().unwrap();
-    std::thread::sleep(Duration::from_millis(150)); // let the first turn's usage land, mid-`sleep 0.5`
+    // Land mid-turn by waiting for the run to say it got there, not by guessing at a duration:
+    // `tool_start` means the tool's own `sleep` is executing right now (see `read_until_event`).
+    read_until_event(&mut stdout, |e| {
+        e["kind"] == "tool_start" && e["name"] == "bash"
+    });
 
     writeln!(
         stdin,
@@ -148,8 +153,6 @@ fn serve_get_state_and_get_session_stats_answer_live_during_a_prompt() {
 
 #[test]
 fn serve_get_tree_since_works_from_the_busy_loop_mid_prompt() {
-    use std::time::Duration;
-
     // Task #48 (pi-parity gap): `get_tree`'s new `since` filtering is wired into two separate call
     // sites — the busy-loop arm (exercised here, answered live mid-run, same as `get_state`/
     // `get_session_stats` above) and the idle-loop arm (see
@@ -192,7 +195,11 @@ fn serve_get_tree_since_works_from_the_busy_loop_mid_prompt() {
     )
     .unwrap();
     stdin.flush().unwrap();
-    std::thread::sleep(Duration::from_millis(150)); // mid the tool call's own `sleep 0.5`
+    // Land mid-turn by waiting for the run to say it got there, not by guessing at a duration:
+    // `tool_start` means the tool's own `sleep` is executing right now (see `read_until_event`).
+    read_until_event(&mut stdout, |e| {
+        e["kind"] == "tool_start" && e["name"] == "bash"
+    });
     writeln!(
         stdin,
         "{}",
@@ -223,8 +230,6 @@ fn serve_get_tree_since_works_from_the_busy_loop_mid_prompt() {
 
 #[test]
 fn serve_get_state_reports_pending_tool_ids_while_a_tool_is_running() {
-    use std::time::Duration;
-
     // B-L1 pi-parity gap (fixed): pi's `agent.state.pendingToolCalls` (a live, in-process reactive
     // set) has no RPC equivalent — a client had to reconstruct "which calls are still in flight"
     // itself from the raw event stream. `get_state` now mirrors it directly, live, mid-run.
@@ -243,7 +248,11 @@ fn serve_get_state_reports_pending_tool_ids_while_a_tool_is_running() {
 
     writeln!(stdin, "{}", json!({ "type": "prompt", "message": "go" })).unwrap();
     stdin.flush().unwrap();
-    std::thread::sleep(Duration::from_millis(150)); // mid-`sleep 0.5`, the bash call is in flight
+    // Land mid-turn by waiting for the run to say it got there, not by guessing at a duration:
+    // `tool_start` means the tool's own `sleep` is executing right now (see `read_until_event`).
+    read_until_event(&mut stdout, |e| {
+        e["kind"] == "tool_start" && e["name"] == "bash"
+    });
 
     writeln!(stdin, "{}", json!({ "type": "get_state", "id": "mid" })).unwrap();
     stdin.flush().unwrap();
@@ -783,7 +792,6 @@ fn get_state_reports_session_file_and_is_streaming_idle_vs_mid_run() {
     // proven directly at the `agent-core` level instead; this test still confirms it reads back
     // `false` in both idle and this (non-compacting) mid-run case, i.e. it never falsely reports
     // `true` for an ordinary run.
-    use std::time::Duration;
 
     let dir = tempfile::tempdir().unwrap();
     let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
@@ -818,7 +826,11 @@ fn get_state_reports_session_file_and_is_streaming_idle_vs_mid_run() {
     // the busy-loop's own (architecturally distinct) handler.
     writeln!(stdin, "{}", json!({ "type": "prompt", "message": "go" })).unwrap();
     stdin.flush().unwrap();
-    std::thread::sleep(Duration::from_millis(300));
+    // Land mid-turn by waiting for the run to say it got there, not by guessing at a duration:
+    // `tool_start` means the tool's own `sleep` is executing right now (see `read_until_event`).
+    read_until_event(&mut stdout, |e| {
+        e["kind"] == "tool_start" && e["name"] == "bash"
+    });
     writeln!(stdin, "{}", json!({ "type": "get_state" })).unwrap();
     stdin.flush().unwrap();
 

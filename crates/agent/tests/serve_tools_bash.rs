@@ -7,7 +7,8 @@ use std::io::{BufReader, Read, Write};
 use std::process::Stdio;
 
 use common::{
-    SpawnGuarded, read_until_response, serve_cmd, spawn_model_server, sse, turn_text, turn_tool_use,
+    SpawnGuarded, read_until_event, read_until_response, serve_cmd, spawn_model_server, sse,
+    turn_text, turn_tool_use,
 };
 use serde_json::json;
 
@@ -580,17 +581,29 @@ fn serve_abort_bash_returns_the_partial_output_streamed_before_cancellation() {
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
-    let cmd = "printf 'partial-output-line\\n'; sleep 30";
+    // Two writes: `bash` throttles progress snapshots to one per `UPDATE_THROTTLE` (100ms) after an
+    // initial empty update, so a lone `printf` microseconds later never streams and the next snapshot
+    // would not arrive until the command ended. The second write clears the throttle and carries the
+    // first one's output with it.
+    let cmd = "printf 'partial-output-line\\n'; sleep 0.2; printf 'ready\\n'; sleep 30";
     writeln!(stdin, "{}", json!({ "type": "bash", "command": cmd })).unwrap();
     stdin.flush().unwrap();
-    // Give the printed output time to cross the `UPDATE_THROTTLE` (100ms) into at least one streamed
-    // `tool_progress` snapshot before cancelling.
-    std::thread::sleep(Duration::from_millis(300));
+    // Cancel only once a snapshot has actually streamed, because that — not a duration — is this
+    // test's precondition: it asserts the abort result keeps the output streamed before it. A fixed
+    // 300ms had to cover process spawn plus the `UPDATE_THROTTLE` (100ms) on a loaded machine, and
+    // under a full shard it did not (see `read_until_event`). The frames consumed while waiting
+    // are kept, since the `tool_progress` assertion below reads them.
+    let mut frames = read_until_event(&mut stdout, |e| {
+        e["kind"] == "tool_progress"
+            && e["snapshot"]
+                .as_str()
+                .is_some_and(|s| s.contains("partial-output-line"))
+    });
     writeln!(stdin, "{}", json!({ "type": "abort_bash" })).unwrap();
     stdin.flush().unwrap();
 
     let start = Instant::now();
-    let frames = read_until_response(&mut stdout, "bash");
+    frames.extend(read_until_response(&mut stdout, "bash"));
     assert!(
         start.elapsed() < Duration::from_secs(10),
         "abort_bash should cancel promptly, not wait out the full sleep"

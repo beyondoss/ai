@@ -11,11 +11,10 @@ mod common;
 
 use std::io::{BufRead, BufReader, Write};
 use std::process::ChildStdin;
-use std::time::Duration;
 
 use common::{
-    ChildGuard, SpawnGuarded, read_until_response, serve_cmd, spawn_model_server, turn_text,
-    turn_tool_use,
+    ChildGuard, SpawnGuarded, read_until_event, read_until_response, serve_cmd, spawn_model_server,
+    turn_text, turn_tool_use,
 };
 use serde_json::{Value, json};
 
@@ -129,8 +128,13 @@ fn get_todos_answers_from_the_live_mirror_while_a_run_is_still_in_flight() {
         &mut stdin,
         json!({ "type": "prompt", "message": "plan then work" }),
     );
-    // Long enough for the `todo` call to land and the `sleep 2` to start.
-    std::thread::sleep(Duration::from_millis(600));
+    // Wait for the `bash` call to start rather than timing it: that is the turn's *second* tool, so
+    // its `tool_start` proves the `todo` call already landed and the `sleep 2` holding the run open is
+    // executing now. A fixed duration had to be long enough for two model round trips on a loaded
+    // machine, and 600ms was not (see `read_until_event`).
+    read_until_event(&mut stdout, |e| {
+        e["kind"] == "tool_start" && e["name"] == "bash"
+    });
 
     send(&mut stdin, json!({ "type": "get_todos", "id": "gt" }));
     let frames = read_until_response(&mut stdout, "get_todos");

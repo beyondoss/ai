@@ -8,8 +8,8 @@ use std::process::{Command, Stdio};
 
 use beyond_ai_agent::session_store::{SessionMeta, SessionRepo};
 use common::{
-    ISOLATED_HOME, SpawnGuarded, message_ids, read_until_response, serve_cmd, serve_dir_cmd,
-    spawn_model_server, turn_text, turn_tool_use,
+    ISOLATED_HOME, SpawnGuarded, message_ids, read_until_event, read_until_response, serve_cmd,
+    serve_dir_cmd, spawn_model_server, turn_text, turn_tool_use,
 };
 use serde_json::{Value, json};
 
@@ -534,7 +534,8 @@ fn serve_exits_gracefully_on_sigterm_mid_run() {
     let turn1 = turn_tool_use(
         "toolu_b",
         "bash",
-        &json!({ "command": "sleep 30" }).to_string(),
+        &json!({ "command": "printf mid-run-marker; sleep 0.2; printf ready; sleep 120" })
+            .to_string(),
     );
     let (base, _bodies) = spawn_model_server(vec![turn1]);
 
@@ -552,9 +553,22 @@ fn serve_exits_gracefully_on_sigterm_mid_run() {
     .unwrap();
     stdin.flush().unwrap();
 
-    // Give the run time to reach the tool before signaling, so this exercises the mid-run
-    // cancellation path (the harder one) rather than racing the idle-between-commands one.
-    std::thread::sleep(Duration::from_millis(500));
+    // Signal only once the command is provably *running*, so this exercises the mid-run cancellation
+    // path (the harder one) rather than racing the idle-between-commands one. The marker's own output
+    // is the proof: `tool_start` fires before `bash` spawns the child, so signalling on it can land in
+    // that gap and leave an uncancelled `sleep 30` holding shutdown open past the deadline below. A
+    // snapshot containing the marker can only come from the spawned child.
+    //
+    // The command writes twice on purpose. `bash` emits an initial empty update and then throttles
+    // snapshots to one per `UPDATE_THROTTLE` (100ms), so a `printf` landing microseconds after that
+    // update is swallowed and nothing further streams until the command *ends* — here, 30s later. The
+    // second write clears the throttle and carries the marker with it.
+    read_until_event(&mut stdout, |e| {
+        e["kind"] == "tool_progress"
+            && e["snapshot"]
+                .as_str()
+                .is_some_and(|s| s.contains("mid-run-marker"))
+    });
 
     let status = Command::new("kill")
         .args(["-TERM", &pid.to_string()])
@@ -562,9 +576,15 @@ fn serve_exits_gracefully_on_sigterm_mid_run() {
         .unwrap();
     assert!(status.success(), "failed to send SIGTERM to serve");
 
-    // Must exit on its own well under the 30s sleep the in-flight tool call was running — not need
+    // Must exit on its own well under the 120s sleep the in-flight tool call was running — not need
     // a hard `child.kill()` to reap it.
-    let deadline = Instant::now() + Duration::from_secs(10);
+    //
+    // The deadline and that sleep are a matched pair: the deadline has to be loose enough that a
+    // healthy shutdown on a badly loaded host never trips it (at 10s this failed on a box with 10 of
+    // 16 cores spinning), and still far enough below the sleep that "exited gracefully" stays
+    // distinguishable from "waited the tool out". Widening one without the other would have made the
+    // assertion either flaky or meaningless.
+    let deadline = Instant::now() + Duration::from_secs(45);
     let exit = loop {
         if let Some(status) = child.try_wait().unwrap() {
             break status;
@@ -618,7 +638,8 @@ fn serve_exits_gracefully_on_sighup_mid_run() {
     let turn1 = turn_tool_use(
         "toolu_b",
         "bash",
-        &json!({ "command": "sleep 30" }).to_string(),
+        &json!({ "command": "printf mid-run-marker; sleep 0.2; printf ready; sleep 120" })
+            .to_string(),
     );
     let (base, _bodies) = spawn_model_server(vec![turn1]);
 
@@ -636,7 +657,13 @@ fn serve_exits_gracefully_on_sighup_mid_run() {
     .unwrap();
     stdin.flush().unwrap();
 
-    std::thread::sleep(Duration::from_millis(500));
+    // Signal only once the command is provably running — see the SIGTERM case above.
+    read_until_event(&mut stdout, |e| {
+        e["kind"] == "tool_progress"
+            && e["snapshot"]
+                .as_str()
+                .is_some_and(|s| s.contains("mid-run-marker"))
+    });
 
     let status = Command::new("kill")
         .args(["-HUP", &pid.to_string()])
@@ -644,7 +671,7 @@ fn serve_exits_gracefully_on_sighup_mid_run() {
         .unwrap();
     assert!(status.success(), "failed to send SIGHUP to serve");
 
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(45);
     let exit = loop {
         if let Some(status) = child.try_wait().unwrap() {
             break status;
@@ -691,7 +718,8 @@ fn serve_exits_with_130_on_sigint_mid_run() {
     let turn1 = turn_tool_use(
         "toolu_b",
         "bash",
-        &json!({ "command": "sleep 30" }).to_string(),
+        &json!({ "command": "printf mid-run-marker; sleep 0.2; printf ready; sleep 120" })
+            .to_string(),
     );
     let (base, _bodies) = spawn_model_server(vec![turn1]);
 
@@ -709,7 +737,13 @@ fn serve_exits_with_130_on_sigint_mid_run() {
     .unwrap();
     stdin.flush().unwrap();
 
-    std::thread::sleep(Duration::from_millis(500));
+    // Signal only once the command is provably running — see the SIGTERM case above.
+    read_until_event(&mut stdout, |e| {
+        e["kind"] == "tool_progress"
+            && e["snapshot"]
+                .as_str()
+                .is_some_and(|s| s.contains("mid-run-marker"))
+    });
 
     let status = Command::new("kill")
         .args(["-INT", &pid.to_string()])
@@ -717,7 +751,7 @@ fn serve_exits_with_130_on_sigint_mid_run() {
         .unwrap();
     assert!(status.success(), "failed to send SIGINT to serve");
 
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(45);
     let exit = loop {
         if let Some(status) = child.try_wait().unwrap() {
             break status;
@@ -833,8 +867,6 @@ fn serve_streams_events_and_reattaches() {
 
 #[test]
 fn serve_survives_a_hard_crash_mid_run_with_both_round_trips_tool_use_already_durable() {
-    use std::time::Duration;
-
     // A genuine crash (SIGKILL — no signal handler, no graceful drain, nothing like the SIGTERM path
     // above) partway through a *second* tool round-trip must still leave the *first* round-trip's
     // messages durable on disk: proof that incremental mid-run persistence (H-6), not the final
@@ -865,12 +897,17 @@ fn serve_survives_a_hard_crash_mid_run_with_both_round_trips_tool_use_already_du
 
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
     writeln!(stdin, "{}", json!({ "type": "prompt", "message": "go" })).unwrap();
     stdin.flush().unwrap();
 
-    // The first round-trip (a fast `printf`) should complete and checkpoint well within this window;
-    // the second turn's `sleep 5` is still running when we kill the process.
-    std::thread::sleep(Duration::from_millis(800));
+    // Crash once the *second* round-trip is actually in flight: `toolu_2`'s `tool_start` proves the
+    // first (a fast `printf`) completed and checkpointed, and that the `sleep 5` is running now. Both
+    // turns call `bash`, so this keys on the tool-use id rather than the tool name. A fixed 800ms had
+    // to cover two model round trips plus a process spawn, which a loaded shard does not guarantee.
+    read_until_event(&mut stdout, |e| {
+        e["kind"] == "tool_start" && e["id"] == "toolu_2"
+    });
     child.kill().unwrap(); // SIGKILL — no destructors, no signal handler, an actual hard crash
     child.wait().unwrap();
 
