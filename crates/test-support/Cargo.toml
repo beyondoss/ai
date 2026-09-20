@@ -1,0 +1,25 @@
+[package]
+name = "beyond-ai-test-support"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish = false
+rust-version.workspace = true
+description = "Test doubles shared by the agent's integration tests and the fleet simulator — not published"
+
+[lints]
+workspace = true
+
+[dependencies]
+# The `bsg_v1` minter — the edge's half of the grant contract, written from the spec rather than
+# shared with the verifier, so a mistake in one cannot cancel out in the other.
+base64 = "0.22"
+chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }
+ed25519-dalek = { version = "2.2", features = ["rand_core"] }
+getrandom = { version = "0.3", features = ["std"] }
+hkdf = "0.12"
+serde_json.workspace = true
+sha2 = "0.10"
+# The exec-endpoint double serves real HTTP and runs real processes.
+tokio = { version = "1", features = ["full"] }
+x25519-dalek = { version = "2", features = ["static_secrets"] }
