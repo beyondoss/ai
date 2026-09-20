@@ -1,7 +1,17 @@
 //! Shared test helpers: a mock model server speaking Anthropic SSE, port helpers, a locator for
 //! the gateway binary, and a process-lifetime JetStream for managed-gateway tests (allowance is
 //! fail-closed until the watcher seeds).
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, dead_code)]
+// `dead_code` and `unused_imports` for the same reason: this module is compiled into *every* test
+// binary, and no single binary uses all of it. That was already true of the helpers defined here; it
+// is now also true of the re-exports from `beyond-ai-test-support`, which are `pub use` in a module
+// that is private to each test crate and so are flagged per binary that happens not to need them.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    dead_code,
+    unused_imports
+)]
 
 use std::io::{BufRead, Read, Write};
 use std::net::{TcpListener, TcpStream};

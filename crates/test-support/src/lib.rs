@@ -8,6 +8,12 @@
 //! The mock model server speaks Anthropic SSE over a hand-rolled HTTP/1.1 socket — deliberately, so
 //! it has no async runtime and no framework of its own to agree with the thing under test.
 
+// Panicking *is* the failure mode here. These are test doubles: one that cannot bind a socket has
+// no useful degraded behaviour, and returning a `Result` from every constructor would push that
+// handling into hundreds of call sites whose response would be `.unwrap()` anyway. The crate is
+// `publish = false` and reachable only from tests and the simulator.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 pub mod exec_mock;
 pub mod grant;
 

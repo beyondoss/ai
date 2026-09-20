@@ -492,18 +492,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "beyond-ai-fleet-sim"
-version = "0.1.0"
-dependencies = [
- "beyond-ai-test-support",
- "futures",
- "serde_json",
- "tempfile",
- "tokio",
- "tokio-tungstenite",
-]
-
-[[package]]
 name = "beyond-ai-providers"
 version = "0.1.0"
 
