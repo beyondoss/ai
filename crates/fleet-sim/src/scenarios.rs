@@ -259,12 +259,16 @@ impl Outcome {
 
 /// **C1, C2, C6** — a hard kill, then a takeover.
 ///
-/// Needs a shared filesystem, and skips without one for a reason worth stating: on a local directory
-/// a dead process's lock is released by the kernel the instant it dies, so a takeover is immediate
-/// and the scenario would prove the opposite of what it claims to. The whole question — how long a
-/// lease keeps a dead owner's lock, and whether the edge's retry budget covers it — only exists
-/// across clients.
-pub async fn takeover_after_hard_kill(kind: Kind, _history: &std::path::Path) -> Outcome {
+/// The scenario the whole storage design exists for. A session is live on A and its turn has been
+/// acknowledged to the client; A is killed with no chance to release its lock or seal its segment;
+/// B must eventually take the session over, seal what A wrote, open a new epoch, and replay a
+/// transcript that still contains the acknowledged turn.
+///
+/// Needs a shared filesystem, and skips without one rather than passing: on a local directory the
+/// kernel releases a dead process's lock immediately, so the takeover is instant and the scenario
+/// would be measuring the kernel instead of a lease. The interesting number — **how long B waits**,
+/// and whether that fits inside the edge's retry budget — only exists across clients.
+pub async fn takeover_after_hard_kill(kind: Kind, history_path: &std::path::Path) -> Outcome {
     if !kind.is_shared_filesystem() {
         return Outcome::Skipped(
             "needs `--substrate nfs`: on a local directory a dead process's lock is released \
@@ -272,5 +276,128 @@ pub async fn takeover_after_hard_kill(kind: Kind, _history: &std::path::Path) ->
                 .to_string(),
         );
     }
-    Outcome::Skipped("the nfs substrate is not wired up yet".to_string())
+
+    let mut fleet = match Fleet::start(kind, 2, history_path).await {
+        Ok(f) => f,
+        Err(e) => return Outcome::failed_with(e),
+    };
+    let (tenant, session) = ("t1", "s1.takeover");
+    let exec_url = fleet.exec.url.clone();
+    let grant = fleet.edge.grant(tenant, session, "s1", "/", &exec_url);
+
+    // Place it, and commit a turn the client is told about. That acknowledgement is the promise the
+    // rest of this scenario has to keep.
+    let placed = crate::edge::place(&fleet.edge, session, &grant, Duration::from_secs(30)).await;
+    let Placement::Served { port, .. } = placed else {
+        return Outcome::failed_with(format!("could not place the session: {placed:?}"));
+    };
+    let mut ws = match workload::connect(port, session, &grant).await {
+        Ok(ws) => ws,
+        Err(e) => return Outcome::failed_with(format!("owner connect: {e}")),
+    };
+    let marker = "committed-before-the-kill";
+    if let Err(e) = workload::prompt(&mut ws, marker).await {
+        return Outcome::failed_with(format!("prompt: {e}"));
+    }
+    fleet
+        .history
+        .record("message_committed", json!({ "text": marker }));
+
+    let dirs = fleet.substrate.session_dirs("s1", tenant);
+    let Some(session_dir) = dirs.first().cloned() else {
+        return Outcome::failed_with("the session wrote no directory".into());
+    };
+    let epoch_before = check::segments(&session_dir)
+        .last()
+        .map(|(e, _)| *e)
+        .unwrap_or(0);
+
+    // Kill the owner outright: no signal handler, no destructors, nothing released. Its lock now
+    // survives on the server's lease, which is the whole point.
+    let owner_name = match fleet.replicas.iter_mut().find(|r| r.port == port) {
+        Some(r) => {
+            let name = r.name.clone();
+            if let Err(e) = r.kill_hard() {
+                return Outcome::failed_with(format!("kill: {e}"));
+            }
+            name
+        }
+        None => return Outcome::failed_with("the placed port matches no replica".into()),
+    };
+    drop(ws);
+    fleet
+        .history
+        .record("owner_killed", json!({ "replica": owner_name }));
+    fleet.retarget_excluding(&owner_name);
+
+    // The edge re-places, and keeps retrying: every attempt is refused until the dead owner's lease
+    // lapses and the survivor can take the lock.
+    let began = std::time::Instant::now();
+    let replaced =
+        crate::edge::place(&fleet.edge, session, &grant, crate::edge::RETRY_BUDGET).await;
+    let waited = began.elapsed();
+    let mut findings = Vec::new();
+
+    let Placement::Served { port: new_port, .. } = replaced else {
+        findings.push(Finding {
+            claim: "C6",
+            ok: false,
+            detail: format!(
+                "no replica took the session over inside the edge's {:?} retry budget ({replaced:?}). \
+                 The fence means nothing was lost — but for that long, the tenant saw an outage.",
+                crate::edge::RETRY_BUDGET
+            ),
+        });
+        return if check::report("takeover-after-hard-kill", &findings) {
+            Outcome::Passed
+        } else {
+            Outcome::Failed
+        };
+    };
+    fleet.history.record(
+        "taken_over",
+        json!({ "port": new_port, "waited_ms": waited.as_millis() }),
+    );
+    findings.push(Finding {
+        claim: "C6",
+        ok: true,
+        detail: format!(
+            "a survivor took the session over after {waited:?} — the lock cost a wait, not a line \
+             of history"
+        ),
+    });
+
+    // The new owner must have opened its own epoch, leaving A's sealed behind it.
+    findings.push(check::takeover_sealed_the_previous_segment(
+        &session_dir,
+        epoch_before,
+    ));
+    findings.push(check::one_writer_per_session(&session_dir));
+
+    // And the promise: what the client was told committed is still in the transcript it replays.
+    match workload::connect(new_port, session, &grant).await {
+        Ok(mut ws2) => match workload::transcript(&mut ws2).await {
+            Ok(replayed) => {
+                let history =
+                    crate::history::History::read(fleet.history.path()).unwrap_or_default();
+                findings.push(check::no_acknowledged_message_lost(&history, &replayed));
+            }
+            Err(e) => findings.push(Finding {
+                claim: "no-lost-write",
+                ok: false,
+                detail: format!("could not read the transcript back: {e}"),
+            }),
+        },
+        Err(e) => findings.push(Finding {
+            claim: "no-lost-write",
+            ok: false,
+            detail: format!("could not reattach after the takeover: {e}"),
+        }),
+    }
+
+    if check::report("takeover-after-hard-kill", &findings) {
+        Outcome::Passed
+    } else {
+        Outcome::Failed
+    }
 }
