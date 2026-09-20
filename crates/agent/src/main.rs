@@ -4390,6 +4390,9 @@ async fn run_task(
                 bash_timeout_ms,
                 bash_shell_path: bash_shell_path.clone(),
                 bash_command_prefix: bash_command_prefix.clone(),
+                // `run` never probes a target for its shell (only `serve --service` does), so a
+                // remote child falls back to the `sh` every POSIX target has.
+                remote_shell: None,
                 web_allow_private,
                 web_allow_hosts: web_allow_host.clone(),
                 web_timeout_ms,
@@ -4402,6 +4405,9 @@ async fn run_task(
                 exclude_tools: tools_exclude.clone().unwrap_or_default(),
             },
             cwd: cwd.clone(),
+            // `run`'s cwd is this host's, so each fan-out walks it as it always has.
+            context_files: None,
+            include_context_files: !no_context_files,
             project_trusted,
             disk_overrides: true,
             prompt_guidelines: prompt_guidelines.clone(),

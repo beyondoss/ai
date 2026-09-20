@@ -181,6 +181,68 @@ pub fn discover_with_diagnostics(
     (found, collisions)
 }
 
+/// How many `*.md` entries one backend-side root may contribute. A directory holding more than this
+/// is not an agents directory, and every file past it costs a round trip to read.
+const MAX_REMOTE_AGENTS_PER_ROOT: usize = 200;
+
+/// Discover agent definitions through an [`FsBackend`](crate::tools::fs::FsBackend) rather than this
+/// host's filesystem — service mode's counterpart to [`discover`], where the roots live inside the
+/// tenant's sandbox.
+///
+/// `roots` are `(directory, scope)` in ascending specificity, same fold as [`discover_with_diagnostics`]:
+/// a later root's same-named definition wins. Which directories a sandbox contributes is `service.rs`'s
+/// decision, not this module's.
+///
+/// One listing per root plus one read per `*.md`, and no ignore-file awareness — the host walk gets
+/// that free from the `ignore` crate's own walker, which has no backend equivalent; a `.gitignore`d
+/// definition file under a sandbox's `.claude/agents` is loaded here where it would be skipped
+/// locally. That is a definition the tenant itself put there, in its own box.
+pub async fn discover_via(
+    backend: &dyn crate::tools::fs::FsBackend,
+    roots: &[(PathBuf, &'static str)],
+) -> (Vec<AgentDef>, Vec<Collision>) {
+    let mut found: Vec<AgentDef> = Vec::new();
+    let mut collisions: Vec<Collision> = Vec::new();
+    for (root, scope) in roots {
+        let mut diagnostics = Vec::new();
+        let mut defs = Vec::new();
+        // A missing root is the normal case, reported by the backend as an ordinary command failure.
+        let entries = backend
+            .list_dir(root, MAX_REMOTE_AGENTS_PER_ROOT, false)
+            .await
+            .unwrap_or_default();
+        for entry in entries {
+            if entry.kind != crate::tools::fs::FileKind::File || !entry.name.ends_with(".md") {
+                continue;
+            }
+            let path = root.join(&entry.name);
+            let text = match crate::tools::fs::read_text_capped(backend, &path, MAX_AGENT_FILE_LEN)
+                .await
+            {
+                Ok(text) => text,
+                Err(message) => {
+                    let message = format!("agent definition {message}");
+                    tracing::warn!("{message}");
+                    diagnostics.push(message);
+                    continue;
+                }
+            };
+            if let Some(mut def) = parse_agent_text(&path, &text, &mut diagnostics) {
+                def.scope = scope;
+                defs.push(def);
+            }
+        }
+        collisions.extend(
+            diagnostics
+                .into_iter()
+                .map(|m| Collision::message_only("agent", m)),
+        );
+        fold_later_wins(&mut found, defs, &mut collisions);
+    }
+    found.sort_by(|a, b| a.name.cmp(&b.name));
+    (found, collisions)
+}
+
 /// Fold `defs` into `found`, later-wins on a name collision — the shared tie-break every root group
 /// applies, mirroring `skills::fold_skills_later_wins`.
 fn fold_later_wins(
@@ -269,7 +331,15 @@ fn parse_agent(path: &Path, diagnostics: &mut Vec<String>) -> Option<AgentDef> {
             return None;
         }
     };
-    let (fm, body) = parse_frontmatter(&text);
+    parse_agent_text(path, &text, diagnostics)
+}
+
+/// [`parse_agent`]'s pure half: everything that depends only on the definition's *text*, so the same
+/// frontmatter rules and diagnostics apply whether the bytes came from `fs::read_to_string` here or
+/// from an [`FsBackend`](crate::tools::fs::FsBackend) on another machine. Mirrors
+/// `skills::parse_skill_text`.
+fn parse_agent_text(path: &Path, text: &str, diagnostics: &mut Vec<String>) -> Option<AgentDef> {
+    let (fm, body) = parse_frontmatter(text);
 
     let description = match fm.get("description") {
         Some(d) if !d.trim().is_empty() => d.clone(),
@@ -657,5 +727,46 @@ mod tests {
         let mut session = Session::new();
         session.user("go");
         assert_eq!(last_assistant_text(&session), "");
+    }
+
+    #[tokio::test]
+    async fn discover_via_reads_each_root_and_a_later_one_shadows_an_earlier_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home/.claude/agents");
+        let project = tmp.path().join("ws/.claude/agents");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&project).unwrap();
+        fs::write(
+            home.join("reviewer.md"),
+            "---\nname: reviewer\ndescription: the home reviewer\n---\nHome prompt.",
+        )
+        .unwrap();
+        fs::write(
+            project.join("reviewer.md"),
+            "---\nname: reviewer\ndescription: the workspace reviewer\ntools: read\n---\nWorkspace prompt.",
+        )
+        .unwrap();
+        // Not a definition: skipped without a diagnostic, exactly as the host walk skips it.
+        fs::write(project.join("notes.txt"), "ignore me").unwrap();
+
+        let backend = crate::tools::fs::local::LocalFs::new();
+        let (found, _) =
+            discover_via(&backend, &[(home, "user"), (project.clone(), "project")]).await;
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].description, "the workspace reviewer");
+        assert_eq!(found[0].system, "Workspace prompt.");
+        assert_eq!(found[0].tools.as_deref(), Some(&["read".to_string()][..]));
+        assert_eq!(found[0].scope, "project");
+        assert_eq!(found[0].path, project.join("reviewer.md"));
+    }
+
+    #[tokio::test]
+    async fn discover_via_on_a_missing_root_is_silent_and_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let backend = crate::tools::fs::local::LocalFs::new();
+        let (found, collisions) =
+            discover_via(&backend, &[(tmp.path().join("nope"), "project")]).await;
+        assert!(found.is_empty());
+        assert!(collisions.is_empty(), "{collisions:?}");
     }
 }
