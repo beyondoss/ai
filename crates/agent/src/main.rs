@@ -775,6 +775,14 @@ enum Command {
         /// no metrics listener at all.
         #[usage(long, env = "AI_AGENT_METRICS_LISTEN")]
         metrics_listen: Option<String>,
+        /// On SIGTERM/SIGHUP/SIGINT, wait up to this many seconds for in-flight runs to finish before
+        /// stopping sessions. Throughout, new sessions are refused with a 503 (the edge retries
+        /// elsewhere), `/readyz` answers 503 so the load balancer stops choosing this replica, and
+        /// `/livez` stays 200 so the orchestrator doesn't kill it mid-drain — while reconnects to
+        /// sessions this replica already owns keep working. `0` (the default) shuts down at once, as
+        /// before. Set a deployment's `terminationGracePeriodSeconds` above this.
+        #[usage(long, env = "AI_AGENT_DRAIN_GRACE", default = "0")]
+        drain_grace: u64,
         /// Service mode: let a session grant's MCP connectors reach loopback/private/link-local
         /// addresses. Off by default, and deliberately not something a grant can ask for: a
         /// connector URL is refused unless it resolves to a public address, so a tenant's connector
@@ -1852,6 +1860,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             shard,
             max_live_sessions,
             metrics_listen,
+            drain_grace,
             mcp_allow_private,
             session_id,
             r#continue: continue_session,
@@ -2319,6 +2328,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 max_live_sessions,
                 mcp_http,
                 metrics: metrics.clone(),
+                // The process `main` built: it owns the signal handler. `serve_ws::session_cfg`
+                // flips this for each session it spawns.
+                supervised: false,
+                drain_grace: std::time::Duration::from_secs(drain_grace),
                 session_id,
                 continue_session,
                 no_session_persistence,
