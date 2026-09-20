@@ -156,9 +156,32 @@ async fn idle_sessions_do_not_take_a_thread_each() {
 
     const N: usize = 8;
     let sockets = attach_idle(port, N).await;
-    // Let session tasks finish Persistence::open / agent build.
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    let loaded = proc_snap(pid);
+    // Sample the *steady* state, not the attach burst. Each session's `Persistence::open` runs on a
+    // `spawn_blocking` thread, so N sessions attaching at once can add up to N pool threads that have
+    // nothing to do with thread-per-session — and on a loaded host they overlap, so all N show up at
+    // once and this test failed for measuring the burst. Tokio retires an idle blocking thread after
+    // its 10s keep-alive (this binary configures no other), so the number only means what the
+    // assertion below says it means once that window has passed and the count has stopped moving.
+    //
+    // This does not weaken the test: a genuine thread-per-session regression holds *session task*
+    // threads, which no keep-alive reclaims, so they are still there when the pool threads are gone.
+    let settle_by = std::time::Instant::now() + Duration::from_secs(45);
+    let pool_drained_by = std::time::Instant::now() + Duration::from_secs(12);
+    let mut loaded = proc_snap(pid);
+    loop {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let next = proc_snap(pid);
+        let stable = next.threads == loaded.threads;
+        loaded = next;
+        if stable && std::time::Instant::now() >= pool_drained_by {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < settle_by,
+            "thread count never settled: still moving at {} threads",
+            loaded.threads
+        );
+    }
 
     let extra_threads = loaded.threads.saturating_sub(baseline.threads);
     assert!(

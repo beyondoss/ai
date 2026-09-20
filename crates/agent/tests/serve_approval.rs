@@ -610,6 +610,14 @@ fn serve_ws_approving(base: &str, session_dir: &str, port: u16, extra: &[&str]) 
         .spawn_guarded()
 }
 
+/// How long any single frame may take to arrive before the test calls the socket stuck.
+///
+/// A safety net, not a pass/fail threshold: [`Client::take`] returns the moment its frame arrives, so
+/// a generous bound costs a healthy run nothing and only sets how long a genuinely stuck socket takes
+/// to report. At 10s it was failing runs that were merely slow — a loaded host (four test threads,
+/// each with a real `beyond-ai-agent` plus a mock model server) can take longer than that to answer.
+const FRAME_WAIT: Duration = Duration::from_secs(60);
+
 /// A WebSocket client that *buffers* frames it wasn't looking for.
 ///
 /// Frames a session broadcasts race each other — an `approval_resolved` and the `approve` command's own
@@ -641,7 +649,7 @@ where
             return self.seen.remove(i);
         }
         loop {
-            let frame = tokio::time::timeout(Duration::from_secs(10), ws_next_frame(&mut self.ws))
+            let frame = tokio::time::timeout(FRAME_WAIT, ws_next_frame(&mut self.ws))
                 .await
                 .unwrap_or_else(|_| {
                     panic!("timed out waiting for {what}; buffered: {:#?}", self.seen)
@@ -764,13 +772,47 @@ async fn a_question_with_no_client_left_to_answer_it_is_denied_rather_than_hung(
     ws.take_type("ack").await;
     drop(ws); // the phone goes into a tunnel, mid-run
 
-    // Wait out the `sleep 1` plus the run's tail.
-    tokio::time::sleep(Duration::from_secs(4)).await;
+    // Wait for the denial *itself* to be recorded, not for a duration: the session file gains a
+    // `tool_result` saying no client is attached, which is precisely the behaviour under test. A fixed
+    // 4s had to cover `sleep 1`, two model round trips and the run's tail, which a loaded shard does
+    // not guarantee. It also has to be an out-of-band signal — re-attaching to poll would hand the
+    // question a client to answer and destroy the premise.
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let denial_landed = |dir: &std::path::Path| {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .find(|p| p.extension().is_some_and(|x| x == "jsonl"))
+            .is_some_and(|p| {
+                tool_results(p.to_str().unwrap())
+                    .iter()
+                    .any(|r| r.contains("no client is attached"))
+            })
+    };
+    while !denial_landed(dir.path()) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the question was never denied: no `no client is attached` tool_result appeared"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 
-    // Reattach: the write was denied, and the session is idle rather than stuck.
+    // Reattach: the write was denied, and the session is idle rather than stuck. Safe to attach now —
+    // the question has already been answered, so this cannot be the client that answers it.
     let mut ws = Client::new(ws_connect(port, Some(SID)).await);
-    ws.send(json!({ "type": "get_state" })).await;
-    let state = ws.take_response("get_state").await;
+    let state = loop {
+        ws.send(json!({ "type": "get_state" })).await;
+        let state = ws.take_response("get_state").await;
+        if state["data"]["is_streaming"] == false {
+            break state;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the run never finished after the denial: {state:#?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
     assert_eq!(
         state["data"]["is_streaming"], false,
         "the run must have finished"
