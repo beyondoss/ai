@@ -2,10 +2,11 @@
 //! combined output.
 //!
 //! Output handling mirrors pi: raw stdout+stderr feed one [`OutputAccumulator`] (tail-truncated for
-//! display, full stream spilled to a temp file → `Full output: <path>`), and while the command runs
-//! the tool emits an initial empty update then **throttled snapshots** (the whole output so far, every
-//! [`UPDATE_THROTTLE`]) via its [`ToolProgress`] sink. Non-zero exit / timeout become errors carrying
-//! the output — same as pi's throw.
+//! display, full stream spilled to a temp file → `Full output: <path>`, except when the command ran
+//! on a machine this process cannot write a readable file to — see [`describe`]), and while the
+//! command runs the tool emits an initial empty update then **throttled snapshots** (the whole
+//! output so far, every [`UPDATE_THROTTLE`]) via its [`ToolProgress`] sink. Non-zero exit / timeout
+//! become errors carrying the output — same as pi's throw.
 
 use std::borrow::Cow;
 use std::path::Path;
@@ -122,12 +123,25 @@ pub struct Bash {
 /// truncation budget below, which is at least self-discoverable via the `"Full output: <path>"` marker
 /// once it actually happens) and the output truncation budget (matching pi's own bash tool description,
 /// which documents both) — the model shouldn't have to learn either from a failed run.
+///
+/// The spill file is **conditional**, and the description says so rather than promising one. When the
+/// command runs somewhere else — an `ExecCell` pointed at a sandbox — spilling is off (see
+/// `OutputAccumulator::without_spill`), because the only filesystem this process could write to is one
+/// the model cannot read and, on a shared replica, belongs to everybody.
+///
+/// Deliberately *not* resolved at construction from the world. This tool holds the **backend** and
+/// asks it per call, so an `ExecCell` re-pointed by `set_exec_endpoint` takes effect on the very next
+/// tool call with no registry rebuild — and `Tool::description` returns `&str`, so a flag captured in
+/// `new()` would be a stale snapshot for exactly the session that attaches a sandbox mid-life. The
+/// runtime marker (`output.rs`'s `full_output_segment`) already tells the model what to do in each
+/// case; this only has to stop promising the case that may not happen.
 fn describe(default_timeout_ms: u64) -> String {
     format!(
         "Run a shell command via a resolved bash (falls back to sh) and return its combined \
          stdout/stderr. Supports an optional `cwd` and `timeout_ms` (defaults to {default_timeout_ms} ms \
          / {} minutes if omitted). Output is truncated to the last {} lines or {}, whichever is hit \
-         first; if truncated, the complete output is saved to a temp file you can read.",
+         first; when it is truncated, the output says whether the complete output was saved to a temp \
+         file you can read, or has to be re-run redirected to a file.",
         default_timeout_ms / 60_000,
         super::output::DEFAULT_MAX_LINES,
         super::output::format_size(super::output::DEFAULT_MAX_BYTES as u64),
@@ -922,6 +936,18 @@ mod tests {
             desc.contains(&DEFAULT_MAX_LINES.to_string())
                 && desc.contains(&format_size(DEFAULT_MAX_BYTES as u64)),
             "description should state the truncation budget, got: {desc}"
+        );
+
+        // The spill file is conditional — it is not written when the command ran somewhere this
+        // process cannot write a readable file to (`OutputAccumulator::without_spill`). Promising one
+        // unconditionally sent the model looking for a path that was never going to be there.
+        assert!(
+            !desc.contains("the complete output is saved to a temp file"),
+            "description must not promise a temp file the remote path never writes, got: {desc}"
+        );
+        assert!(
+            desc.contains("whether the complete output was saved to a temp file"),
+            "description should state the condition, got: {desc}"
         );
 
         // A customized default must show up too — a stale literal wouldn't reflect it.

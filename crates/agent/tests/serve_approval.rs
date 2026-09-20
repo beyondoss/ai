@@ -790,3 +790,130 @@ async fn a_question_with_no_client_left_to_answer_it_is_denied_rather_than_hung(
     );
     kill(child);
 }
+
+// ---- session scope ---------------------------------------------------------------------------------
+
+/// Read until either an `approval_request` or the `prompt` response arrives, whichever comes first.
+///
+/// Both outcomes have to be readable here: a gate that *failed* to ask would otherwise run the tool,
+/// answer the prompt, and leave a `read_until_type("approval_request")` blocked on a stream nobody is
+/// going to write to again — a hang instead of an assertion.
+fn read_until_asked_or_done(reader: &mut impl BufRead) -> Vec<Value> {
+    let mut frames = Vec::new();
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if reader.read_line(&mut line).unwrap() == 0 {
+            panic!("stream closed before the run asked or finished; saw: {frames:#?}");
+        }
+        let Ok(v) = serde_json::from_str::<Value>(line.trim()) else {
+            continue;
+        };
+        let done = v["type"] == "approval_request"
+            || (v["type"] == "response" && v["command"] == "prompt");
+        frames.push(v);
+        if done {
+            return frames;
+        }
+    }
+}
+
+/// An "always allow" is remembered for **this session**, and a session switch is exactly what ends
+/// that scope.
+///
+/// `SessionMemory` is built once per `serve_session` and documented as session-scoped, but it was
+/// absent from the reset list `new_session`/`switch_session` run (which already re-point the
+/// `/session` memory, detach the exec endpoint and clear the MCP kit). So a decision the operator
+/// made about one conversation's commands and paths silently pre-approved the next conversation's
+/// and the gate never asked — the one failure mode an approval gate cannot have.
+#[test]
+fn an_always_allow_does_not_survive_a_new_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let sessions = tempfile::tempdir().unwrap();
+    let target = dir.path().join("out.txt");
+    let path = target.to_str().unwrap();
+    let (base, _b) = spawn_model_server(vec![
+        write_turn("tu_1", path),
+        turn_text("wrote it"),
+        write_turn("tu_2", path),
+        turn_text("wrote it again"),
+    ]);
+
+    let mut child = Command::new(BIN)
+        .args([
+            "serve",
+            "--gateway-url",
+            &base,
+            "--key",
+            "bai_v1.test",
+            "--model",
+            "claude-test",
+            "--session-dir",
+            sessions.path().to_str().unwrap(),
+            "--approve",
+            "writes",
+        ])
+        .env("HOME", ISOLATED_HOME)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn_guarded();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    // Grant it for the whole session — the strongest remembered decision there is.
+    send(
+        &mut stdin,
+        json!({ "type": "prompt", "id": "p1", "message": "write the file" }),
+    );
+    let req = last(&read_until_type(&mut stdout, "approval_request")).clone();
+    let key = req["scope_key"].as_str().unwrap().to_string();
+    approve(
+        &mut stdin,
+        req["request_id"].as_str().unwrap(),
+        "allow",
+        "session",
+    );
+    assert_eq!(
+        last(&read_until_response(&mut stdout, "prompt"))["success"],
+        true
+    );
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "written\n");
+
+    // A same-model `new_session`, which does not rebuild the agent — the exact case where a stale
+    // clone of the `ApprovalRuntime` would keep answering out of the old memory.
+    send(&mut stdin, json!({ "type": "new_session", "id": "n1" }));
+    assert_eq!(
+        last(&read_until_response(&mut stdout, "new_session"))["success"],
+        true
+    );
+
+    // The identical write, in the new session: it must be asked about again.
+    send(
+        &mut stdin,
+        json!({ "type": "prompt", "id": "p2", "message": "write the file" }),
+    );
+    let frames = read_until_asked_or_done(&mut stdout);
+    let asked = last(&frames).clone();
+    assert_eq!(
+        asked["type"], "approval_request",
+        "the new session inherited the previous one's \"always allow\": {frames:#?}"
+    );
+    assert_eq!(
+        asked["scope_key"].as_str(),
+        Some(key.as_str()),
+        "same tool, same path — so this is the very decision that must not have carried over"
+    );
+
+    approve(
+        &mut stdin,
+        asked["request_id"].as_str().unwrap(),
+        "allow",
+        "once",
+    );
+    assert_eq!(
+        last(&read_until_response(&mut stdout, "prompt"))["success"],
+        true
+    );
+    kill(child);
+}

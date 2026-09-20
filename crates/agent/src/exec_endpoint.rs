@@ -57,7 +57,9 @@ use async_trait::async_trait;
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 
-use crate::tools::exec::{ChunkSink, CommandRunner, ExecResult};
+use crate::tools::exec::{
+    ChunkSink, CommandRunner, ExecResult, STREAM_HEAD, STREAM_TAIL, drain_capped, feed_stdin,
+};
 
 /// What the agent sends.
 #[derive(Debug, Serialize)]
@@ -418,37 +420,62 @@ impl TemplateRunner {
             .stderr(Stdio::piped())
             .kill_on_drop(true);
         let mut child = cmd.spawn()?;
-        let feed = crate::tools::exec::feed_stdin(child.stdin.take(), stdin);
-
-        let out = match tokio::time::timeout(timeout, async {
-            tokio::join!(child.wait_with_output(), feed)
-        })
-        .await
-        {
-            Ok((out, fed)) => {
-                let out = out?;
-                fed?;
-                out
-            }
-            Err(_) => {
-                return Ok(ExecResult {
-                    code: None,
-                    signal: None,
-                    stdout: String::new(),
-                    stderr: format!("exec template timed out after {timeout:?}"),
-                    timed_out: true,
-                    truncated: false,
-                });
-            }
+        let stdout = child.stdout.take();
+        let stderr = child.stderr.take();
+        // Fed concurrently with the drains, never before them — see `feed_stdin`.
+        let feed = feed_stdin(child.stdin.take(), stdin);
+        // `wait_with_output` used to collect both pipes here, which buffers *everything* the far side
+        // prints into this process — a `cat` of a large file on the target, or a build's log, sized
+        // the replica's memory rather than the command. Worse, it then reported `truncated: false`
+        // unconditionally, so a caller had no way to know output had been lost when it was.
+        //
+        // `drain_capped` is the same streaming head+tail accumulator the local runner uses: memory
+        // is bounded at `STREAM_HEAD + STREAM_TAIL` per stream regardless of how much arrives, and
+        // it says honestly whether a middle was dropped. Not `HttpExecRunner::read_capped` — that
+        // *discards* an over-cap body and errors, which is right for a response envelope that must
+        // parse as a whole, and wrong here: a long-running command's output is still the answer.
+        //
+        // Both pipes are drained *concurrently* with the wait. A child that fills one pipe's OS
+        // buffer while we read only the other deadlocks, and an unread pipe stalls its exit.
+        let (exited_tx, exited_rx) = tokio::sync::watch::channel(false);
+        let wait = async {
+            let status = child.wait().await;
+            let _ = exited_tx.send(true);
+            status
         };
-        Ok(ExecResult {
-            code: out.status.code(),
-            signal: None,
-            stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
-            timed_out: false,
-            truncated: false,
-        })
+        let collect = async {
+            tokio::join!(
+                wait,
+                drain_capped(stdout, STREAM_HEAD, STREAM_TAIL, None, exited_rx.clone()),
+                drain_capped(stderr, STREAM_HEAD, STREAM_TAIL, None, exited_rx.clone()),
+                feed,
+            )
+        };
+        match tokio::time::timeout(timeout, collect).await {
+            Ok((status, (stdout, out_truncated), (stderr, err_truncated), fed)) => {
+                let status = status?;
+                fed?;
+                Ok(ExecResult {
+                    code: status.code(),
+                    // The transport's own exit signal, not the far command's — `ssh` reports a
+                    // remote signal as an exit code, and a local `docker exec` killed by one says
+                    // nothing about what ran inside. Left `None` rather than guessing.
+                    signal: None,
+                    stdout: String::from_utf8_lossy(&stdout).into_owned(),
+                    stderr: String::from_utf8_lossy(&stderr).into_owned(),
+                    timed_out: false,
+                    truncated: out_truncated || err_truncated,
+                })
+            }
+            Err(_) => Ok(ExecResult {
+                code: None,
+                signal: None,
+                stdout: String::new(),
+                stderr: format!("exec template timed out after {timeout:?}"),
+                timed_out: true,
+                truncated: false,
+            }),
+        }
     }
 }
 
@@ -534,6 +561,52 @@ mod tests {
             .unwrap();
         assert_eq!(out.code, Some(0));
         assert!(out.stdout.contains("marker.txt"), "{out:?}");
+    }
+
+    /// The transport's output is bounded by the capture window and truncation is reported honestly.
+    /// `wait_with_output` buffered the whole thing and hardcoded `truncated: false`, so a command
+    /// that printed a gigabyte sized this process — and said nothing about what it had lost.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn a_template_runner_caps_its_output_and_says_when_it_truncated() {
+        let r = TemplateRunner::parse("sh -c {}").unwrap();
+        let bytes = 2 * (STREAM_HEAD + STREAM_TAIL);
+        let out = r
+            .run(
+                &format!("head -c {bytes} /dev/zero | tr '\\0' 'a'"),
+                &[],
+                None,
+                Duration::from_secs(30),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(out.code, Some(0), "{out:?}");
+        assert!(out.truncated, "the middle was dropped, so say so: {out:?}");
+        assert!(
+            out.stdout.len() <= STREAM_HEAD + STREAM_TAIL,
+            "kept {} bytes of a {bytes}-byte stream",
+            out.stdout.len()
+        );
+    }
+
+    /// …and output that fits is returned whole, still flagged untruncated.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn a_template_runner_leaves_output_under_the_cap_alone() {
+        let r = TemplateRunner::parse("sh -c {}").unwrap();
+        let out = r
+            .run(
+                "printf 'hello\\n'; printf 'oops\\n' >&2",
+                &[],
+                None,
+                Duration::from_secs(10),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.stdout, "hello\n");
+        assert_eq!(out.stderr, "oops\n");
+        assert!(!out.truncated, "{out:?}");
     }
 }
 
