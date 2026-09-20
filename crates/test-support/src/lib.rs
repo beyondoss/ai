@@ -8,6 +8,8 @@
 //! The mock model server speaks Anthropic SSE over a hand-rolled HTTP/1.1 socket — deliberately, so
 //! it has no async runtime and no framework of its own to agree with the thing under test.
 
+pub mod grant;
+
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
