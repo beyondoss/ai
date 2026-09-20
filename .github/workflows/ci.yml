@@ -64,12 +64,20 @@ jobs:
     # groups are stable, reproducible locally with the same `-E` expression, and a red shard names
     # the area outright.
     #
-    # agent-serve is deliberately not in this matrix. On this PR every harness for
-    # `binary(~serve)` compiled in ~2–4m then froze the runner: the test step stayed
-    # `in_progress` past job/step timeouts, logs never uploaded, and `needs.test`
-    # became `cancelled` so Check went red. The same 32 binaries pass under
-    # sequential `cargo test` locally in ~4 minutes. Leaving them in the required
-    # fan-in only reproduces the 30:00 death.
+    # agent-serve was excluded for a long time: every harness for `binary(~serve)` compiled in ~2-4m
+    # and then froze the runner — the test step stayed `in_progress` past job/step timeouts, logs never
+    # uploaded, and `needs.test` became `cancelled` so Check went red. The same binaries passed under
+    # sequential `cargo test` locally in ~4 minutes.
+    #
+    # It is back, because that diagnosis was "the runner died", not "a test hangs" — and the cause has
+    # since been removed. `.config/nextest.toml` now caps `test-threads = 4`: nextest previously ran one
+    # test thread per core, and an agent test is not one process (each spawns `beyond-ai-agent`
+    # children, a mock model server, sometimes an MCP fixture), which multiplied into memory a hosted
+    # runner does not have. The identical signature — a silent wedge to exactly 30:00, no logs, three
+    # times running — was observed on `agent-rest` and fixed outright by that cap; the shard then ran in
+    # 2m8s. These 337 tests cover the daemon and the whole multi-tenant service path, so running them
+    # nowhere was the single largest coverage gap in the repo. If this wedges again, the cap was not the
+    # cause: drop the shard back out and say so here.
     name: test (${{ matrix.name }})
     runs-on: ubuntu-latest
     timeout-minutes: 25
@@ -102,6 +110,13 @@ jobs:
             extra: "--features code-mode"
           - name: agent-rest
             filter: package(beyond-ai-agent) and kind(test) and not binary(~serve) and not binary(exec_endpoint_live)
+            extra: ""
+
+          # The daemon and service-mode integration suite: WebSocket/UDS transports, session
+          # lifecycle, grants, tenant isolation, sealed storage. Every one of these spawns at least one
+          # real `beyond-ai-agent` process, so it is the shard most sensitive to the `test-threads` cap.
+          - name: agent-serve
+            filter: package(beyond-ai-agent) and binary(~serve)
             extra: ""
           - name: core-providers
             filter: package(beyond-ai-agent-core) or package(beyond-ai-providers)
