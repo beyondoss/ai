@@ -132,6 +132,15 @@ pub struct Metrics {
     /// and the one that decides a failure's blast radius: everything counted here waits for a lock
     /// lease to expire if this replica dies.
     pub sessions_live: IntGauge,
+    /// Prompts executing right now, across every session on this replica.
+    ///
+    /// The companion to `sessions_live`, and the one that predicts memory. A live session that is
+    /// merely attached costs a few hundred KB; a session *running a turn* additionally holds its
+    /// replay buffer, capped at `TURN_REPLAY_MAX_BYTES` (4 MiB). So this gauge — not the session
+    /// count — is what multiplies into a replica's working set, and `--max-live-sessions` admits on
+    /// the count rather than on this. An operator sizing a task, or explaining an OOM, needs both
+    /// numbers and previously had only one.
+    pub runs_in_flight: IntGauge,
     /// Sessions spawned since boot. With `sessions_ended_total` this gives churn, which is what
     /// separates "20,000 steady sessions" from "20,000 sessions a minute".
     pub sessions_spawned: IntCounter,
@@ -168,6 +177,10 @@ impl Metrics {
         let sessions_live = IntGauge::with_opts(Opts::new(
             "agent_sessions_live",
             "Sessions this replica currently owns.",
+        ))?;
+        let runs_in_flight = IntGauge::with_opts(Opts::new(
+            "agent_runs_in_flight",
+            "Prompts executing right now across every session on this replica.",
         ))?;
         let sessions_spawned = IntCounter::with_opts(Opts::new(
             "agent_sessions_spawned_total",
@@ -208,6 +221,7 @@ impl Metrics {
         )?;
 
         registry.register(Box::new(sessions_live.clone()))?;
+        registry.register(Box::new(runs_in_flight.clone()))?;
         registry.register(Box::new(sessions_spawned.clone()))?;
         registry.register(Box::new(sessions_ended.clone()))?;
         registry.register(Box::new(lock_wait_seconds.clone()))?;
@@ -242,6 +256,7 @@ impl Metrics {
         Ok(Arc::new(Self {
             registry,
             sessions_live,
+            runs_in_flight,
             sessions_spawned,
             sessions_ended,
             lock_wait_seconds,
@@ -436,6 +451,30 @@ mod tests {
         // `/livez` and `/readyz` belong to the tenant-facing listener. This one knows one path.
         let other = request(addr, "/livez").await;
         assert!(other.starts_with("HTTP/1.1 404"), "{other}");
+    }
+
+    #[test]
+    fn the_in_flight_gauge_follows_transitions_not_assertions() {
+        // The retry path re-asserts a run's `running` flag while the run is already in flight. A
+        // gauge that counted assertions would double it and never come back down — which is worse
+        // than no gauge, because the number an operator sizes a task against would drift upward with
+        // every retry and never recover.
+        let m = Metrics::new().unwrap();
+        let running = std::sync::atomic::AtomicBool::new(false);
+        let bump = |m: &Metrics| {
+            if !running.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                m.runs_in_flight.inc();
+            }
+        };
+        bump(&m);
+        bump(&m); // the retry's re-assertion
+        bump(&m);
+        assert_eq!(m.runs_in_flight.get(), 1, "one prompt is one run in flight");
+
+        if running.swap(false, std::sync::atomic::Ordering::Relaxed) {
+            m.runs_in_flight.dec();
+        }
+        assert_eq!(m.runs_in_flight.get(), 0, "and it comes back down");
     }
 
     #[test]
