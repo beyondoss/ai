@@ -306,6 +306,32 @@ async fn http_post_list_daemon_sessions_does_not_require_a_session() {
     let _ = child.wait();
 }
 
+/// A refused request whose body is still in flight must still get its answer.
+///
+/// The server answers a wrong path without parsing the body. If it closed on top of those unread
+/// bytes the kernel would send RST rather than FIN, and an RST discards whatever is already queued
+/// for the peer — including the response. The client would see `ECONNRESET` instead of a `404`, and
+/// could not tell that from the replica falling over mid-request. A body far larger than a socket
+/// buffer guarantees bytes are still unread when the answer is written.
+#[tokio::test]
+async fn a_refused_request_still_gets_its_answer_with_a_large_body_in_flight() {
+    let (base, _requests) = spawn_model_server(vec![turn_text("unused")]);
+    let dir = tempfile::tempdir().unwrap();
+    let port = free_port();
+    let mut child = serve_ws_child(&base, dir.path().to_str().unwrap(), port);
+    wait_for_port(port);
+
+    let body = vec![b'x'; 256 * 1024];
+
+    let (status, _headers, _body) = http_exchange(port, "POST", "/nope", Some(&body)).await;
+    assert_eq!(status, 404, "a wrong path with a body in flight");
+
+    let (status, _headers, _body) = http_exchange(port, "PUT", WS_PATH, Some(&body)).await;
+    assert_eq!(status, 405, "a wrong method with a body in flight");
+
+    let _ = child.kill();
+}
+
 #[tokio::test]
 async fn http_wrong_path_is_404_and_wrong_method_is_405() {
     let (base, _requests) = spawn_model_server(vec![turn_text("unused")]);
