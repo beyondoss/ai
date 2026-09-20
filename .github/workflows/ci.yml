@@ -64,20 +64,32 @@ jobs:
     # groups are stable, reproducible locally with the same `-E` expression, and a red shard names
     # the area outright.
     #
-    # agent-serve was excluded for a long time: every harness for `binary(~serve)` compiled in ~2-4m
-    # and then froze the runner — the test step stayed `in_progress` past job/step timeouts, logs never
-    # uploaded, and `needs.test` became `cancelled` so Check went red. The same binaries passed under
-    # sequential `cargo test` locally in ~4 minutes.
+    # agent-serve is NOT in this matrix, and the obvious fix has been tried and does not work.
     #
-    # It is back, because that diagnosis was "the runner died", not "a test hangs" — and the cause has
-    # since been removed. `.config/nextest.toml` now caps `test-threads = 4`: nextest previously ran one
-    # test thread per core, and an agent test is not one process (each spawns `beyond-ai-agent`
-    # children, a mock model server, sometimes an MCP fixture), which multiplied into memory a hosted
-    # runner does not have. The identical signature — a silent wedge to exactly 30:00, no logs, three
-    # times running — was observed on `agent-rest` and fixed outright by that cap; the shard then ran in
-    # 2m8s. These 337 tests cover the daemon and the whole multi-tenant service path, so running them
-    # nowhere was the single largest coverage gap in the repo. If this wedges again, the cap was not the
-    # cause: drop the shard back out and say so here.
+    # The symptom: every harness for `binary(~serve)` compiles fine (~2–4m), then the test step sits
+    # `in_progress` forever — no logs, `needs.test` cancelled, Check red. The same 337 tests pass
+    # locally in ~138s under the identical `--profile ci`.
+    #
+    # Tested 2026-09-20 and REFUTED: the theory that this was the `test-threads` problem. `agent-rest`
+    # had the identical signature (silent wedge to exactly 30:00, three times running) and
+    # `test-threads = 4` in `.config/nextest.toml` fixed it outright — 2m8s afterwards. Restoring this
+    # shard with that cap in force wedged anyway: the test step ran 25+ minutes and the job blew past
+    # both nextest's `global-timeout = "10m"` AND its own `timeout-minutes: 25` without either firing.
+    #
+    # That result is worth more than the shard, because it rules out the two cheap explanations. Not a
+    # hung test: nextest's `terminate-after` would have killed it *by name* in ~3 minutes. Not
+    # thread-count memory pressure: the cap was active. A runner that will not honour GitHub's own job
+    # timeout is a VM that has stopped responding, so whatever this is happens below nextest.
+    #
+    # Next hypothesis for whoever picks it up: leaked child processes. These binaries each spawn real
+    # `beyond-ai-agent` children plus a mock model server, and this repo has prior form (`spawn_guarded`
+    # exists for exactly this, and bulk process-group kills have proven unreliable here). Audit that
+    # before re-enabling — re-enabling blind now costs ~25 runner-minutes and yields no new information.
+    #
+    # Until then these 337 tests — the daemon, both transports, grants, tenant isolation and sealed
+    # segmented storage — run only locally, which is the largest coverage gap in the repo. Run them
+    # before merging anything that touches `serve`:
+    #   cargo nextest run --profile ci -E 'package(beyond-ai-agent) and binary(~serve)'
     name: test (${{ matrix.name }})
     runs-on: ubuntu-latest
     timeout-minutes: 25
@@ -110,12 +122,6 @@ jobs:
             extra: "--features code-mode"
           - name: agent-rest
             filter: package(beyond-ai-agent) and kind(test) and not binary(~serve) and not binary(exec_endpoint_live)
-            extra: ""
-          # The daemon and service-mode integration suite: WebSocket/UDS transports, session
-          # lifecycle, grants, tenant isolation, sealed storage. Every one of these spawns at least one
-          # real `beyond-ai-agent` process, so it is the shard most sensitive to the `test-threads` cap.
-          - name: agent-serve
-            filter: package(beyond-ai-agent) and binary(~serve)
             extra: ""
           - name: core-providers
             filter: package(beyond-ai-agent-core) or package(beyond-ai-providers)
