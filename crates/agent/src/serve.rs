@@ -837,6 +837,11 @@ pub struct ServeConfig {
     /// `None` everywhere else, which makes a grant's connectors simply unavailable rather than
     /// dialed unchecked. See [`crate::tools::mcp::McpEgress`].
     pub mcp_http: Option<crate::tools::mcp::McpEgress>,
+    /// This replica's instruments, when `--metrics-listen` gave it a scrape endpoint. `None`
+    /// everywhere else, so every call site is an `if let` and a replica without metrics pays
+    /// nothing. Never carries a tenant or session identifier into a label — see
+    /// [`crate::metrics`].
+    pub metrics: Option<Arc<crate::metrics::Metrics>>,
 }
 
 /// Resolve whether a project is trusted for this session, from already-gathered inputs — shared by
@@ -3838,6 +3843,11 @@ pub(crate) async fn serve_session(
         // writes can land again: end the session with an event that tells the client to reconnect
         // (which respawns against the new epoch) rather than silently accepting turns that are lost.
         if persistence.superseded() {
+            // Rare by design: an owner discovering it was fenced. A rising rate means sessions are
+            // changing hands when nothing asked them to.
+            if let Some(m) = &cfg.metrics {
+                m.sessions_superseded.inc();
+            }
             emit!(OutFrame::Value(json!({
                 "type": "session_superseded",
                 "session_id": persistence.session_id(),

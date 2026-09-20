@@ -3159,6 +3159,48 @@ that asked it; `serve` installs its `elicitation_request` gate into that hub. Th
 remains for the connections that genuinely are process-wide — the operator's configured servers,
 shared by every session, where there is no one session to route to.
 
+### Metrics
+
+`--metrics-listen <addr>` starts a second listener that answers `GET /metrics` in the Prometheus text
+format and 404s everything else. Everything about it is shaped by one fact: **the tenant-facing
+listener is reachable by tenants, and a scrape is not tenant-scoped.**
+
+- **Loopback only.** `metrics::parse_listen_addr` refuses a routable bind outright rather than
+  warning, because a warning in a log is not read before the port is already open. A scraper runs
+  beside the replica — an ECS `awsvpc` task shares a network namespace across its containers, so a
+  sidecar reaches `127.0.0.1` without the port existing anywhere else.
+- **Its own registry.** Not prometheus' default one. `gateway/src/metrics.rs` uses the default
+  because Pingora exposes exactly that; here it would mean anything a dependency happens to register
+  turns up on a tenant-facing replica's scrape. The gateway's module is also typed against gateway
+  types (`&crate::usage::Usage`, `crate::route::Provider`), so this copies the shape and shares no
+  code.
+- **No tenant, session, shard or workspace identifier in any label, ever.** Two problems at once:
+  unbounded cardinality, and one tenant's session ids readable by whoever holds the scrape. Every
+  label is a closed set fixed at compile time, resolved to its child once at boot so the hot paths
+  take no map lookup. A unit test asserts no forbidden label name survives into an encoded scrape.
+- **Every child exists at zero before first use.** "No data" and "zero" page differently.
+
+| Instrument                        | Type      | What it answers                                                                                                                                                              |
+| --------------------------------- | --------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `agent_sessions_live`             | gauge     | What `--max-live-sessions` is checked against — and the blast radius if this replica dies                                                                                    |
+| `agent_sessions_spawned_total`    | counter   | With `ended`, churn: 20,000 steady sessions vs 20,000 a minute                                                                                                               |
+| `agent_sessions_ended_total`      | counter   | By reason: `idle_reap`, `drain`, `client`, `error`                                                                                                                           |
+| `agent_lock_wait_seconds`         | histogram | Successful lock acquisition. **Where a dead owner's lease shows up** — a `kill -9` does not release an NFS lock, it lapses, so failover is latency here rather than an error |
+| `agent_lock_failures_total`       | counter   | By reason: `held` (ordinary, a 503 and a retry), `timeout` (a mount that stopped answering), `io`                                                                            |
+| `agent_refusals_total`            | counter   | By reason: `auth`, `misdirected`, `unavailable`, `bad_request`                                                                                                               |
+| `agent_ready_probe_seconds`       | histogram | How often a `/readyz` caller waited on the mount, and for how long                                                                                                           |
+| `agent_sessions_superseded_total` | counter   | Owners that discovered they had been fenced                                                                                                                                  |
+
+Refusals are counted in exactly one place — `Supervisor::refuse`, which counts then answers — so a
+refusal path added later cannot quietly skip the counter. `HttpError::refusal` buckets by status
+rather than by variant, so a new variant lands in the right bucket by construction.
+
+**Deliberately absent:** the storage-side counters (appends, bytes, segment seals). They live below
+`session_store`'s `Log` seam, which has no handle on the metrics, and defining them without wiring
+them would publish series pinned at zero — which reads as "this never happens" rather than "nobody
+measured". Wiring them means threading a handle through `RepoOptions`, which belongs in its own
+change.
+
 ### Health and image
 
 Two endpoints on the same listener as the agent protocol, answered in `handle_connection` **before**
