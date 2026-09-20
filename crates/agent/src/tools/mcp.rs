@@ -85,10 +85,91 @@ use serde_json::{Map, Value, json};
 use crate::settings::{McpServerConfig, McpTransport};
 use crate::tools::mcp_host::{ElicitationAsk, McpHost};
 
-/// Process-scoped host callbacks (elicitation / sampling). `serve` installs gates after connect.
-pub fn host() -> &'static McpHost {
-    static HOST: std::sync::OnceLock<McpHost> = std::sync::OnceLock::new();
-    HOST.get_or_init(McpHost::new)
+/// Process-scoped host callbacks (elicitation / sampling) for the servers connected **once, at
+/// startup** from the operator's own settings: those connections are shared by every session, so
+/// there is no one session to route a server's question to.
+///
+/// A session that dials its *own* connectors (service mode — see [`connect_granted`]) passes its own
+/// [`McpHost`] instead, and a question from one of those reaches the session that asked.
+pub fn host() -> Arc<McpHost> {
+    static HOST: std::sync::OnceLock<Arc<McpHost>> = std::sync::OnceLock::new();
+    HOST.get_or_init(|| Arc::new(McpHost::new())).clone()
+}
+
+/// An HTTP header whose value is a credential, **taken exactly as given**.
+///
+/// The settings path resolves a configured `headers` value through
+/// [`resolve_config_value`](crate::settings) first — a `!command` runs a shell command and `$VAR`
+/// reads the process environment. That is right for a value an operator typed into their own
+/// `settings.json`, and catastrophic for one that arrived over the wire: a session grant's
+/// `!echo …` header would execute on the replica, and a `$AWS_SECRET_ACCESS_KEY` one would exfiltrate
+/// the replica's environment to whoever minted the grant. A `SecretHeader` never goes near that
+/// resolution, and `Debug` shows only the name.
+#[derive(Clone)]
+pub struct SecretHeader {
+    name: HeaderName,
+    value: HeaderValue,
+}
+
+impl SecretHeader {
+    /// Validate one pre-resolved header. The error names the header, never its value.
+    pub fn new(name: &str, value: &str) -> Result<Self, String> {
+        let header = HeaderName::from_bytes(name.as_bytes())
+            .map_err(|_| format!("`{name}` is not a valid header name"))?;
+        let mut value = HeaderValue::from_str(value)
+            .map_err(|_| format!("the value for `{name}` is not a valid header value"))?;
+        // Keeps it out of hyper's HPACK index and out of `HeaderValue`'s own `Debug`.
+        value.set_sensitive(true);
+        Ok(Self {
+            name: header,
+            value,
+        })
+    }
+}
+
+impl std::fmt::Debug for SecretHeader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "SecretHeader({}: ***)", self.name)
+    }
+}
+
+/// A grant connector's pre-resolved HTTP dial: the process-wide client it goes out on, and its own
+/// credential headers. Kept on the [`McpConnection`] so a redial after an idle reap is identical to
+/// the first dial — the grant that carried these is long out of scope by then.
+#[derive(Clone, Debug)]
+struct HttpDial {
+    /// The daemon's `mcp_http` client: ALPN, the `web` tool's SSRF resolver, and deliberately not
+    /// the gateway's h2c pool — a tenant's connector is not the gateway.
+    client: reqwest::Client,
+    headers: Vec<SecretHeader>,
+}
+
+/// Everything about dialing one server that isn't in its [`McpServerConfig`]: which host hub its
+/// server→client requests reach, and — for a grant connector — how to reach it.
+#[derive(Clone)]
+struct Dial {
+    host: Arc<McpHost>,
+    /// `None` for a settings-configured server: it resolves its own headers and may carry an OAuth
+    /// bearer token from this host's store. A grant connector has neither.
+    http: Option<HttpDial>,
+}
+
+impl Default for Dial {
+    fn default() -> Self {
+        Self {
+            host: host(),
+            http: None,
+        }
+    }
+}
+
+/// A connector URL with its query string stripped, for an error or a log line. A grant's connector
+/// URL is the control plane's to shape and can carry a credential in a query parameter.
+fn redact_url(url: &str) -> String {
+    match url.split_once('?') {
+        Some((head, _)) => format!("{head}?<redacted>"),
+        None => url.to_owned(),
+    }
 }
 
 fn client_lifecycle() -> ClientLifecycleMode {
@@ -123,18 +204,36 @@ fn client_info() -> ClientInfo {
 #[derive(Clone)]
 struct McpHandler {
     server_name: String,
+    /// Where this connection's server→client requests (elicitation, sampling) go. Held per
+    /// connection rather than read from a process-wide global, so a session that dialed its own
+    /// connectors answers their questions itself instead of whichever session installed a gate last.
+    host: Arc<McpHost>,
     sinks: Arc<std::sync::Mutex<HashMap<ProgressToken, ToolProgress>>>,
     /// In-flight tool-call progress sinks (LIFO). See [`Self::push_active`].
     active: Arc<std::sync::Mutex<Vec<ToolProgress>>>,
 }
 
 impl McpHandler {
-    fn new(server_name: impl Into<String>) -> Self {
+    fn new(server_name: impl Into<String>, host: Arc<McpHost>) -> Self {
         Self {
             server_name: server_name.into(),
+            host,
             sinks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             active: Arc::new(std::sync::Mutex::new(Vec::new())),
         }
+    }
+
+    /// Where a server→client elicitation goes: **this connection's** host, never a process-wide
+    /// one. Split out of the `ClientHandler` method so the routing is testable without standing up
+    /// an rmcp `RequestContext`.
+    async fn elicit(&self, params: ElicitRequestParams) -> ElicitResult {
+        self.host
+            .elicitation
+            .elicit(ElicitationAsk {
+                server: self.server_name.clone(),
+                params,
+            })
+            .await
     }
 
     fn push_active(&self, progress: ToolProgress) -> ActiveProgressGuard {
@@ -194,13 +293,7 @@ impl ClientHandler for McpHandler {
         request: ElicitRequestParams,
         _context: RequestContext<RoleClient>,
     ) -> Result<ElicitResult, McpError> {
-        Ok(host()
-            .elicitation
-            .elicit(ElicitationAsk {
-                server: self.server_name.clone(),
-                params: request,
-            })
-            .await)
+        Ok(self.elicit(request).await)
     }
 
     async fn create_message(
@@ -208,7 +301,7 @@ impl ClientHandler for McpHandler {
         params: CreateMessageRequestParams,
         _context: RequestContext<RoleClient>,
     ) -> Result<CreateMessageResult, McpError> {
-        host().sampling.create_message(params).await
+        self.host.sampling.create_message(params).await
     }
 }
 
@@ -367,6 +460,9 @@ struct Live {
 
 struct McpConnection {
     config: McpServerConfig,
+    /// How this server was dialed the first time — its host hub, and (for a grant connector) the
+    /// client and credential headers. Kept so a redial after a reap cannot drift from it.
+    dial: Dial,
     /// `None` once reaped (or before the first reconnect). A `tokio::sync::Mutex` rather than a
     /// `std` one because reconnecting is `await`-ing I/O while holding it — two concurrent tool calls
     /// arriving on a reaped connection must produce one process, not two.
@@ -393,6 +489,20 @@ struct McpConnection {
 /// `Duration::ZERO` disables reaping entirely — every configured server stays resident for the
 /// process's life, which is the behavior that existed before this.
 pub const DEFAULT_IDLE_REAP_AFTER: Duration = Duration::from_secs(120);
+
+/// The idle window after which an unused MCP server's process is reaped, re-spawned on the next
+/// call: [`DEFAULT_IDLE_REAP_AFTER`], or whatever `BEYOND_AI_AGENT_MCP_IDLE_SECS` says (`0` disables
+/// reaping and keeps every server resident for the process's life).
+///
+/// Read here rather than in one binary's argument parsing, so the `run` path, the daemon's own
+/// configured servers, and a service session's grant connectors all honour the same knob.
+pub fn idle_reap_after_from_env() -> Duration {
+    std::env::var("BEYOND_AI_AGENT_MCP_IDLE_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(DEFAULT_IDLE_REAP_AFTER)
+}
 
 /// Every live connection, weakly. The reaper sweeps this rather than owning the connections, so a
 /// connection disappears from it as soon as the tools holding it are dropped — a `serve` registry
@@ -510,12 +620,14 @@ fn register_for_reaping(conn: &Arc<McpConnection>, idle: Duration) {
 impl McpConnection {
     fn new(
         config: McpServerConfig,
+        dial: Dial,
         client: McpClient,
         pgid: Option<u32>,
         idle_after: Duration,
     ) -> Self {
         Self {
             config,
+            dial,
             client: tokio::sync::Mutex::new(Some(Live {
                 client: Arc::new(client),
                 pgid,
@@ -527,9 +639,10 @@ impl McpConnection {
 
     /// A connection with no process behind it yet, for tools rebuilt from a cached manifest. The
     /// first `tools/call` dials; a boot that never calls one never starts a server at all.
-    fn dormant(config: McpServerConfig, idle_after: Duration) -> Self {
+    fn dormant(config: McpServerConfig, dial: Dial, idle_after: Duration) -> Self {
         Self {
             config,
+            dial,
             client: tokio::sync::Mutex::new(None),
             last_used: std::sync::atomic::AtomicU64::new(now_secs()),
             idle_after,
@@ -544,7 +657,7 @@ impl McpConnection {
         if let Some(live) = guard.as_ref() {
             return Ok(live.client.clone());
         }
-        let (client, pgid) = connect_one_client(&self.config).await?;
+        let (client, pgid) = connect_one_client(&self.config, &self.dial).await?;
         let client = Arc::new(client);
         *guard = Some(Live {
             client: client.clone(),
@@ -691,6 +804,7 @@ async fn drive_tool_call(
             CallToolResponse::Complete(result) => return Ok(result),
             CallToolResponse::InputRequired(required) => {
                 let responses = fulfill_input_requests(
+                    &client.service().host,
                     server_name,
                     required.input_requests.unwrap_or_default(),
                 )
@@ -713,8 +827,10 @@ async fn drive_tool_call(
     )))
 }
 
-/// Fulfill SEP-2322 / in-task `inputRequests` through process-scoped host hubs.
+/// Fulfill SEP-2322 / in-task `inputRequests` through the hubs of the host that owns this
+/// connection — the session's own in service mode, the process-wide one otherwise.
 async fn fulfill_input_requests(
+    host: &McpHost,
     server_name: &str,
     requests: InputRequests,
 ) -> Result<InputResponses, ToolError> {
@@ -722,7 +838,7 @@ async fn fulfill_input_requests(
     for (key, request) in requests {
         let value = match request {
             InputRequest::Elicitation(req) => {
-                let result = host()
+                let result = host
                     .elicitation
                     .elicit(ElicitationAsk {
                         server: server_name.to_string(),
@@ -734,7 +850,7 @@ async fn fulfill_input_requests(
                 })?
             }
             InputRequest::CreateMessage(req) => {
-                let result = host()
+                let result = host
                     .sampling
                     .create_message(req.params)
                     .await
@@ -855,7 +971,9 @@ async fn await_task(
         match detailed.payload {
             TaskPayload::Working => {}
             TaskPayload::InputRequired { input_requests } => {
-                let responses = fulfill_input_requests(server_name, input_requests).await?;
+                let responses =
+                    fulfill_input_requests(&client.service().host, server_name, input_requests)
+                        .await?;
                 peer.update_task(UpdateTaskParams::new(task_id.clone(), responses))
                     .await
                     .map_err(|e| tool_call_err(server_name, remote_name, e))?;
@@ -961,16 +1079,92 @@ pub async fn connect_all(
     idle_reap_after: Duration,
     manifest_dir: Option<&crate::tools::mcp_manifest::ManifestDir>,
 ) -> (Vec<Arc<dyn Tool>>, McpCatalog, Vec<String>) {
+    let jobs: Vec<(McpServerConfig, Dial)> = configs
+        .iter()
+        .map(|config| (config.clone(), Dial::default()))
+        .collect();
+    connect_many(&jobs, idle_reap_after, manifest_dir).await
+}
+
+/// Connect **one session's own** MCP connectors, named and credentialed by its
+/// [session grant](crate::grant), and isolated from every other session on this replica.
+///
+/// Four differences from [`connect_all`], each a way a host-wide assumption would otherwise leak
+/// across tenants:
+///
+/// - **Headers are pre-resolved.** `secrets` come straight off the grant into [`SecretHeader`] and
+///   never through `resolve_config_value` — see that type's doc comment for what a `!command` header
+///   would do on a replica.
+/// - **No OAuth.** [`oauth_bearer_token`] keys the host's own credential store *by server name*, so a
+///   tenant connector named after an operator's login would inherit the operator's token.
+/// - **No manifest cache.** That cache is keyed by name + url and shared by the whole replica.
+/// - **Egress is checked.** The URL goes through the `web` tool's SSRF layer (and so does every
+///   address it resolves to, via the client's resolver), so a connector cannot name the instance
+///   metadata service, an EFS mount target, or a peer replica.
+///
+/// Fail-soft per connector, like `connect_all`: a bad URL or a dead server costs its own tools, not
+/// the session. The warnings are for the replica's log — they are not sent to the tenant.
+pub async fn connect_granted(
+    connectors: &[crate::grant::McpConnector],
+    secrets: &BTreeMap<String, Vec<crate::grant::SecretHeader>>,
+    egress: &McpEgress,
+    host: Arc<McpHost>,
+    idle_reap_after: Duration,
+) -> (Vec<Arc<dyn Tool>>, McpCatalog, Vec<String>) {
+    let mut jobs = Vec::with_capacity(connectors.len());
+    let mut warnings = Vec::new();
+    for connector in connectors {
+        if let Err(e) = egress.check(&connector.url) {
+            warnings.push(format!("mcp connector `{}`: {e}", connector.name));
+            continue;
+        }
+        let mut headers = Vec::new();
+        for header in secrets.get(&connector.name).into_iter().flatten() {
+            match SecretHeader::new(&header.name, header.value.expose()) {
+                Ok(h) => headers.push(h),
+                // The value is never in the message, and never logged.
+                Err(e) => warnings.push(format!("mcp connector `{}`: {e}", connector.name)),
+            }
+        }
+        jobs.push((
+            McpServerConfig {
+                name: connector.name.clone(),
+                transport: McpTransport::Http {
+                    url: connector.url.clone(),
+                    headers: BTreeMap::new(),
+                },
+            },
+            Dial {
+                host: host.clone(),
+                http: Some(HttpDial {
+                    client: egress.client.clone(),
+                    headers,
+                }),
+            },
+        ));
+    }
+    let (tools, catalog, connect_warnings) = connect_many(&jobs, idle_reap_after, None).await;
+    warnings.extend(connect_warnings);
+    (tools, catalog, warnings)
+}
+
+/// Dial every job concurrently and fold the results — each connect is independent I/O with no data
+/// dependency on any other, so connecting one at a time would add every server's latency to startup
+/// instead of paying only the slowest.
+async fn connect_many(
+    jobs: &[(McpServerConfig, Dial)],
+    idle_reap_after: Duration,
+    manifest_dir: Option<&crate::tools::mcp_manifest::ManifestDir>,
+) -> (Vec<Arc<dyn Tool>>, McpCatalog, Vec<String>) {
     let results = futures::future::join_all(
-        configs
-            .iter()
-            .map(|config| connect_one(config, idle_reap_after, manifest_dir)),
+        jobs.iter()
+            .map(|(config, dial)| connect_one(config, dial, idle_reap_after, manifest_dir)),
     )
     .await;
     let mut tools: Vec<Arc<dyn Tool>> = Vec::new();
     let mut catalogs = Vec::new();
     let mut warnings = Vec::new();
-    for (config, result) in configs.iter().zip(results) {
+    for ((config, _), result) in jobs.iter().zip(results) {
         match result {
             Ok((server_tools, catalog)) => {
                 tools.extend(server_tools);
@@ -994,12 +1188,41 @@ pub async fn connect_all(
 /// not drift from the original connect.
 /// A live client, plus the process group to sweep when it is dropped. HTTP servers have no group —
 /// there is no process of ours to reap.
-async fn connect_one_client(config: &McpServerConfig) -> Result<(McpClient, Option<u32>), String> {
+async fn connect_one_client(
+    config: &McpServerConfig,
+    dial: &Dial,
+) -> Result<(McpClient, Option<u32>), String> {
     match &config.transport {
-        McpTransport::Stdio { command, args, .. } => connect_stdio(config, command, args).await,
-        McpTransport::Http { url, .. } => connect_http(config, url).await.map(|c| (c, None)),
+        McpTransport::Stdio { command, args, .. } => {
+            connect_stdio(config, dial, command, args).await
+        }
+        McpTransport::Http { url, .. } => {
+            let dialing = connect_http(config, dial, url);
+            let client = match dial.http.is_some() {
+                // A grant connector is a third-party endpoint on a replica that serves everyone:
+                // one that accepts a connection and then says nothing must not hold a session start
+                // — or, on a redial after a reap, a tool call — open forever. An operator's own
+                // configured server keeps the unbounded wait it always had.
+                true => tokio::time::timeout(GRANT_HANDSHAKE_TIMEOUT, dialing)
+                    .await
+                    .map_err(|_| {
+                        format!(
+                            "MCP handshake to {} timed out after {}s",
+                            redact_url(url),
+                            GRANT_HANDSHAKE_TIMEOUT.as_secs()
+                        )
+                    })?,
+                false => dialing.await,
+            }?;
+            Ok((client, None))
+        }
     }
 }
+
+/// How long a grant connector gets to finish a handshake. Generous for a round trip to a service
+/// that has to be awake anyway, short enough that a dead one fails its own tools rather than the
+/// session.
+const GRANT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Rebuild a server's tools from its cached manifest, starting nothing.
 ///
@@ -1007,10 +1230,15 @@ async fn connect_one_client(config: &McpServerConfig) -> Result<(McpClient, Opti
 /// never asked to browse now spawns no browser server at any point.
 fn tools_from_manifest(
     config: &McpServerConfig,
+    dial: &Dial,
     manifest: crate::tools::mcp_manifest::ServerManifest,
     idle_reap_after: Duration,
 ) -> (Vec<Arc<dyn Tool>>, McpServerCatalog) {
-    let conn = Arc::new(McpConnection::dormant(config.clone(), idle_reap_after));
+    let conn = Arc::new(McpConnection::dormant(
+        config.clone(),
+        dial.clone(),
+        idle_reap_after,
+    ));
     register_for_reaping(&conn, idle_reap_after);
 
     let mut tools: Vec<Arc<dyn Tool>> = manifest
@@ -1076,6 +1304,7 @@ fn tools_from_manifest(
 
 async fn connect_one(
     config: &McpServerConfig,
+    dial: &Dial,
     idle_reap_after: Duration,
     manifest_dir: Option<&crate::tools::mcp_manifest::ManifestDir>,
 ) -> Result<(Vec<Arc<dyn Tool>>, McpServerCatalog), String> {
@@ -1086,10 +1315,10 @@ async fn connect_one(
             tools = manifest.tools.len(),
             "advertising MCP tools from the cached manifest; not starting the server"
         );
-        return Ok(tools_from_manifest(config, manifest, idle_reap_after));
+        return Ok(tools_from_manifest(config, dial, manifest, idle_reap_after));
     }
-    let (client, pgid) = connect_one_client(config).await?;
-    tools_from_client(config, client, pgid, idle_reap_after, manifest_dir).await
+    let (client, pgid) = connect_one_client(config, dial).await?;
+    tools_from_client(config, dial, client, pgid, idle_reap_after, manifest_dir).await
 }
 
 /// Spawns `command` as its own process-group leader (`process_group(0)`), the same way
@@ -1120,6 +1349,7 @@ async fn connect_one(
 /// stderr) immediately, the same way a connect failure's `tracing::warn!` does.
 async fn connect_stdio(
     config: &McpServerConfig,
+    dial: &Dial,
     command: &str,
     args: &[String],
 ) -> Result<(McpClient, Option<u32>), String> {
@@ -1144,7 +1374,7 @@ async fn connect_stdio(
     // Read before the transport is consumed; this is also the group id, since the child leads it.
     let pgid = child.id();
 
-    let client = McpHandler::new(&config.name)
+    let client = McpHandler::new(&config.name, dial.host.clone())
         .serve_with_lifecycle(child, client_lifecycle())
         .await
         .map_err(|e| format!("MCP handshake over stdio failed: {e}"))?;
@@ -1184,53 +1414,138 @@ fn sweep_process_group(pgid: Option<u32>) {
     std::thread::spawn(move || crate::tools::exec::kill_process_group(pgid));
 }
 
-async fn connect_http(config: &McpServerConfig, url: &str) -> Result<McpClient, String> {
+/// Dial an HTTP server. Two shapes, decided by `dial.http`:
+///
+/// - **A grant connector** (`Some`): the caller's client (the daemon's SSRF-checked `mcp_http`) and
+///   the grant's own pre-resolved headers. No settings resolution, no OAuth store.
+/// - **A configured server** (`None`): its own client, its `settings.json` headers resolved through
+///   `resolve_config_value`, and this host's OAuth token for it, if `agent mcp-login` established
+///   one.
+async fn connect_http(
+    config: &McpServerConfig,
+    dial: &Dial,
+    url: &str,
+) -> Result<McpClient, String> {
     let mut custom_headers: HashMap<HeaderName, HeaderValue> = HashMap::new();
-    for (k, v) in config.resolved_headers() {
-        let name = match HeaderName::from_bytes(k.as_bytes()) {
-            Ok(name) => name,
-            Err(e) => {
-                tracing::warn!(header = %k, error = %e, "skipping an MCP server header with an invalid name");
-                continue;
+    let mut bearer_token = None;
+    let client = match &dial.http {
+        Some(http) => {
+            for header in &http.headers {
+                custom_headers.insert(header.name.clone(), header.value.clone());
             }
-        };
-        let value = match HeaderValue::from_str(&v) {
-            Ok(value) => value,
-            Err(e) => {
-                tracing::warn!(header = %k, error = %e, "skipping an MCP server header with an invalid value");
-                continue;
+            http.client.clone()
+        }
+        None => {
+            for (k, v) in config.resolved_headers() {
+                let name = match HeaderName::from_bytes(k.as_bytes()) {
+                    Ok(name) => name,
+                    Err(e) => {
+                        tracing::warn!(header = %k, error = %e, "skipping an MCP server header with an invalid name");
+                        continue;
+                    }
+                };
+                let value = match HeaderValue::from_str(&v) {
+                    Ok(value) => value,
+                    Err(e) => {
+                        tracing::warn!(header = %k, error = %e, "skipping an MCP server header with an invalid value");
+                        continue;
+                    }
+                };
+                custom_headers.insert(name, value);
             }
-        };
-        custom_headers.insert(name, value);
-    }
+            // A previously `agent mcp-login`'d server gets its (auto-refreshed, if needed) bearer
+            // token attached; a server nobody has logged into (the common case — most MCP servers
+            // need no auth at all, or use `headers` above for a static credential) connects exactly
+            // as before.
+            bearer_token = oauth_bearer_token(&config.name, url).await;
+            agent_core::ensure_provider();
+            reqwest::Client::new()
+        }
+    };
 
-    // A previously `agent mcp-login`'d server gets its (auto-refreshed, if needed) bearer token
-    // attached; a server nobody has logged into (the common case — most MCP servers need no auth at
-    // all, or use `headers` above for a static credential) connects exactly as before.
-    let bearer_token = oauth_bearer_token(&config.name, url).await;
     let mut transport_config = StreamableHttpClientTransportConfig::with_uri(url.to_string())
         .custom_headers(custom_headers);
     if let Some(token) = &bearer_token {
         transport_config = transport_config.auth_header(token.clone());
     }
-    agent_core::ensure_provider();
-    let transport =
-        StreamableHttpClientTransport::with_client(reqwest::Client::new(), transport_config);
+    let transport = StreamableHttpClientTransport::with_client(client, transport_config);
 
-    McpHandler::new(&config.name)
+    McpHandler::new(&config.name, dial.host.clone())
         .serve_with_lifecycle(transport, client_lifecycle())
         .await
         .map_err(|e| {
-            let hint = if bearer_token.is_none() {
-                format!(
+            let hint = match (&dial.http, &bearer_token) {
+                // A grant connector has no login to run: its credentials are in the grant.
+                (Some(_), _) | (None, Some(_)) => String::new(),
+                (None, None) => format!(
                     " (if this server requires login, run `agent mcp-login {}` first)",
                     config.name
-                )
-            } else {
-                String::new()
+                ),
             };
-            format!("MCP handshake over streamable-HTTP to {url} failed: {e}{hint}")
+            format!(
+                "MCP handshake over streamable-HTTP to {} failed: {e}{hint}",
+                redact_url(url)
+            )
         })
+}
+
+/// The process-wide egress every **grant** MCP connector goes out through, built once by the daemon
+/// and shared by every session on the replica.
+///
+/// One client, not one per session: a `reqwest::Client` is a connection pool, and a replica holding
+/// tens of thousands of sessions cannot afford one each. It is deliberately *not* the gateway's
+/// shared client — that one is pinned to h2c prior knowledge for one known hop, and a tenant's
+/// connector is an arbitrary third-party endpoint.
+///
+/// Both SSRF layers the `web` tool uses are here, for the same reason they are there: the URL is not
+/// this process's to choose. [`SsrfResolver`](crate::tools::web::ssrf::SsrfResolver) validates every
+/// address the client actually connects to, and [`Self::check`] rejects a literal internal IP (and a
+/// non-`http(s)` scheme) before any DNS happens. Redirects are refused outright: reqwest resolves a
+/// redirect target itself, and a redirect to a literal IP would never reach the resolver.
+#[derive(Clone)]
+pub struct McpEgress {
+    client: reqwest::Client,
+    policy: Arc<crate::tools::web::ssrf::EgressPolicy>,
+}
+
+impl McpEgress {
+    pub fn new(policy: crate::tools::web::ssrf::EgressPolicy) -> Result<Self, String> {
+        // Before *any* builder call: with reqwest's `rustls-no-provider` a missing process-wide
+        // provider panics inside `build()` rather than returning an error.
+        agent_core::ensure_provider();
+        let client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .pool_idle_timeout(Duration::from_secs(90))
+            .redirect(reqwest::redirect::Policy::none())
+            .dns_resolver(crate::tools::web::ssrf::SsrfResolver::new(policy.clone()))
+            .build()
+            .map_err(|e| format!("failed to build the MCP connector client: {e}"))?;
+        Ok(Self {
+            client,
+            policy: Arc::new(policy),
+        })
+    }
+
+    /// Whether a connector URL may be dialed at all. The message names the URL without its query
+    /// string and never mentions the `web` tool's own flags, which have no effect here.
+    fn check(&self, url: &str) -> Result<(), String> {
+        use crate::tools::web::ssrf::Blocked;
+        let parsed: reqwest::Url = url
+            .parse()
+            .map_err(|e| format!("`{}` is not a valid url: {e}", redact_url(url)))?;
+        crate::tools::web::ssrf::validate_url(&parsed, &self.policy).map_err(
+            |blocked| match blocked {
+                Blocked::Scheme(scheme) => {
+                    format!("`{scheme}:` is not an MCP transport; use http or https")
+                }
+                Blocked::NoHost => format!("`{}` has no host", redact_url(url)),
+                Blocked::Address { addr, class, .. } => format!(
+                    "refusing to dial `{}`: {addr} is a {class} address",
+                    redact_url(url)
+                ),
+            },
+        )
+    }
 }
 
 /// A currently-valid bearer access token for `server_name`'s MCP OAuth login, if one exists —
@@ -1550,6 +1865,7 @@ impl McpCatalog {
 
 async fn tools_from_client(
     config: &McpServerConfig,
+    dial: &Dial,
     client: McpClient,
     // The server's process group, so a reap can take its children too; `None` for HTTP.
     pgid: Option<u32>,
@@ -1581,6 +1897,7 @@ async fn tools_from_client(
 
     let conn = Arc::new(McpConnection::new(
         config.clone(),
+        dial.clone(),
         client,
         pgid,
         idle_reap_after,
@@ -1749,6 +2066,124 @@ mod tests {
         assert_eq!(server_name_from_registered("bash"), None);
         assert_eq!(server_name_from_registered("mcp__"), None);
         assert_eq!(server_name_from_registered("mcp__only"), None);
+    }
+
+    #[test]
+    fn a_secret_header_keeps_its_value_out_of_debug_output() {
+        let header = SecretHeader::new("Authorization", "Bearer tenant-token-do-not-log").unwrap();
+        let debug = format!("{header:?}");
+        assert!(!debug.contains("tenant-token"), "{debug}");
+        assert!(debug.contains("authorization"), "{debug}");
+        // And through the struct that carries it onto a connection.
+        agent_core::ensure_provider();
+        let dial = HttpDial {
+            client: reqwest::Client::new(),
+            headers: vec![header],
+        };
+        assert!(!format!("{dial:?}").contains("tenant-token"));
+    }
+
+    #[test]
+    fn a_secret_header_is_taken_literally_and_a_bad_one_never_names_its_value() {
+        // `!cmd` and `$VAR` are settings syntax. A grant's header is bytes, not a template.
+        let header = SecretHeader::new("X-Token", "!echo pwned").unwrap();
+        assert_eq!(header.value.as_bytes(), b"!echo pwned");
+        assert_eq!(
+            SecretHeader::new("X-Token", "$HOME").unwrap().value,
+            "$HOME"
+        );
+        let err = SecretHeader::new("X-Token", "a\nb").unwrap_err();
+        assert!(err.contains("X-Token"), "{err}");
+        assert!(!err.contains("a\nb"), "{err}");
+        assert!(SecretHeader::new("bad name", "v").is_err());
+    }
+
+    #[test]
+    fn a_connector_url_loses_its_query_string_in_messages() {
+        assert_eq!(
+            redact_url("https://mcp.example.com/sse?token=abc123"),
+            "https://mcp.example.com/sse?<redacted>"
+        );
+        assert_eq!(
+            redact_url("https://mcp.example.com/sse"),
+            "https://mcp.example.com/sse"
+        );
+    }
+
+    #[test]
+    fn grant_connector_egress_refuses_internal_and_non_http_urls() {
+        let egress = McpEgress::new(crate::tools::web::ssrf::EgressPolicy::default()).unwrap();
+        for url in [
+            "http://169.254.169.254/latest/meta-data/",
+            "http://10.1.2.3/mcp",
+            "http://127.0.0.1:9/mcp",
+            "http://[::1]:9/mcp",
+        ] {
+            let err = egress.check(url).unwrap_err();
+            assert!(err.contains("refusing to dial"), "{url}: {err}");
+        }
+        let err = egress.check("file:///etc/passwd").unwrap_err();
+        assert!(err.contains("http"), "{err}");
+        // A public endpoint is fine, and its query string never reaches the message.
+        assert!(egress.check("https://mcp.example.com/sse?t=secret").is_ok());
+        // Opened up (a dev replica), loopback is reachable again.
+        let open = McpEgress::new(crate::tools::web::ssrf::EgressPolicy::new(true, &[])).unwrap();
+        assert!(open.check("http://127.0.0.1:9/mcp").is_ok());
+    }
+
+    /// An elicitation gate that answers with a fixed marker, so a test can tell *which* host
+    /// answered a question.
+    struct MarkerGate(&'static str);
+
+    #[async_trait]
+    impl crate::tools::mcp_host::ElicitationGate for MarkerGate {
+        async fn elicit(
+            &self,
+            _ask: ElicitationAsk,
+        ) -> Result<ElicitResult, crate::tools::mcp_host::ElicitationError> {
+            Ok(ElicitResult::new(rmcp::model::ElicitationAction::Accept)
+                .with_content(json!({ "answered_by": self.0 })))
+        }
+    }
+
+    fn answered_by(result: &ElicitResult) -> String {
+        serde_json::to_value(result)
+            .ok()
+            .and_then(|v| v.pointer("/content/answered_by").cloned())
+            .and_then(|v| v.as_str().map(str::to_string))
+            .unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn an_elicitation_is_answered_by_its_own_connections_host() {
+        // Two sessions, each with its own hub and its own gate installed into it — the shape
+        // service mode builds. Before this was per connection, the process-wide hub was
+        // last-writer-wins and B's gate answered A's server.
+        let session_a = Arc::new(McpHost::new());
+        let session_b = Arc::new(McpHost::new());
+        session_a
+            .elicitation
+            .install(Arc::new(MarkerGate("session-a")));
+        session_b
+            .elicitation
+            .install(Arc::new(MarkerGate("session-b")));
+        // Installed last, and deliberately never the answer: it is what a connection that isn't
+        // any one session's would have consulted.
+        host().elicitation.install(Arc::new(MarkerGate("process")));
+
+        let a = McpHandler::new("linear", session_a);
+        let b = McpHandler::new("linear", session_b);
+        let params = ElicitRequestParams::UrlElicitationParams {
+            meta: None,
+            message: "which session?".into(),
+            url: "https://example.com/ask".into(),
+            elicitation_id: "e1".into(),
+        };
+        assert_eq!(answered_by(&a.elicit(params.clone()).await), "session-a");
+        assert_eq!(answered_by(&b.elicit(params.clone()).await), "session-b");
+        // And a connection built the process-wide way still reaches the process-wide hub.
+        let shared = McpHandler::new("linear", host());
+        assert_eq!(answered_by(&shared.elicit(params).await), "process");
     }
 
     #[test]

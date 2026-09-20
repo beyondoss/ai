@@ -767,6 +767,14 @@ enum Command {
         /// `0` turns the cap off.
         #[usage(long, env = "AI_AGENT_MAX_LIVE_SESSIONS", default = "20000")]
         max_live_sessions: usize,
+        /// Service mode: let a session grant's MCP connectors reach loopback/private/link-local
+        /// addresses. Off by default, and deliberately not something a grant can ask for: a
+        /// connector URL is refused unless it resolves to a public address, so a tenant's connector
+        /// cannot name the instance metadata service, a storage mount target, or a peer replica.
+        /// Pass this only on a dev replica whose connectors run beside it (this repo's own tests
+        /// do); a production replica never should.
+        #[usage(long, env = "AI_AGENT_MCP_ALLOW_PRIVATE")]
+        mcp_allow_private: bool,
         /// Address this exact session: reattach to it if it already exists, or create it under exactly
         /// this id if it doesn't. Gives a caller a known, predictable name to route on rather than
         /// parsing an id back out of `get_state`/the startup `{"kind":"session", id, …}` banner.
@@ -1586,21 +1594,6 @@ fn mcp_manifest_dir() -> Option<tools::mcp_manifest::ManifestDir> {
     tools::mcp_manifest::ManifestDir::from_home()
 }
 
-/// The idle window after which an unused MCP server's process is reaped, re-spawned on the next call.
-///
-/// An MCP server is a language runtime sitting idle waiting to be asked something — on the vps
-/// primitive `@playwright/mcp` holds 63.9 MB of anonymous memory having never opened a browser — so
-/// the default is minutes, not hours. `BEYOND_AI_AGENT_MCP_IDLE_SECS` overrides it for an operator
-/// who wants a different trade between re-spawn latency and idle memory; `0` disables reaping and
-/// keeps every configured server resident for the process's life.
-fn mcp_idle_reap_after() -> std::time::Duration {
-    std::env::var("BEYOND_AI_AGENT_MCP_IDLE_SECS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .map(std::time::Duration::from_secs)
-        .unwrap_or(tools::mcp::DEFAULT_IDLE_REAP_AFTER)
-}
-
 /// The `web` tool's isolated HTML parser, dispatched *before* anything else exists.
 ///
 /// Not a `Command` variant, and deliberately not routed through the CLI parser: the point of this
@@ -1850,6 +1843,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             service,
             shard,
             max_live_sessions,
+            mcp_allow_private,
             session_id,
             r#continue: continue_session,
             no_session_persistence,
@@ -2221,7 +2215,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 let (mcp_tools, mcp_catalog, mcp_warnings) = tools::mcp::connect_all(
                     stored_settings.mcp_servers.as_deref().unwrap_or(&[]),
-                    mcp_idle_reap_after(),
+                    tools::mcp::idle_reap_after_from_env(),
                     mcp_manifest_dir().as_ref(),
                 )
                 .await;
@@ -2229,6 +2223,19 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     eprintln!("warning: {warning}");
                 }
                 (mcp_tools, mcp_catalog)
+            };
+            // The one client every *session's own* connectors dial through, in service mode. Built
+            // here, once: a `reqwest::Client` is a connection pool, and a replica holding many
+            // thousands of sessions cannot afford one each. Deliberately its own client rather than
+            // the gateway's shared h2c pool — that one is pinned to one known hop, and a tenant's
+            // connector is an arbitrary third-party endpoint. Its egress policy is fixed at build
+            // time, which is why it is a process flag rather than anything a grant can ask for.
+            let mcp_http = if service {
+                Some(tools::mcp::McpEgress::new(
+                    tools::web::ssrf::EgressPolicy::new(mcp_allow_private, &[]),
+                )?)
+            } else {
+                None
             };
             // Parse the UDS socket mode from its octal string (`0o660`, `660`, `0660` all work) up
             // front so a bad value fails fast with a clear message rather than deep in the listener.
@@ -2290,7 +2297,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 // grant that spawned the session.
                 service: None,
                 max_live_sessions,
-                mcp_http: None,
+                mcp_http,
                 session_id,
                 continue_session,
                 no_session_persistence,
@@ -4043,7 +4050,7 @@ async fn run_task(
     // all when `effective_settings_for_cwd` found `cwd` trusted; the global tier always applies).
     let (mcp_tools, _mcp_catalog, mcp_warnings) = tools::mcp::connect_all(
         stored_settings.mcp_servers.as_deref().unwrap_or(&[]),
-        mcp_idle_reap_after(),
+        tools::mcp::idle_reap_after_from_env(),
         mcp_manifest_dir().as_ref(),
     )
     .await;
@@ -4386,6 +4393,9 @@ async fn run_task(
             skills: Arc::new(skills.clone()),
             write_locks: write_locks.clone(),
             mcp_tools: mcp_tools.clone(),
+            // `run` has no `set_mcp_enabled` command, so the gate never moves: every configured
+            // server stays enabled for the life of the process, which is what the default means.
+            mcp_enabled: tools::mcp::McpEnabledSet::new(),
             memory_mounts: mounts.clone(),
             tool_cfg: subagent::ChildToolConfig {
                 bash_timeout_ms,
