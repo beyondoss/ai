@@ -88,11 +88,15 @@ async fn a_sandbox_defined_subagent_writes_into_the_sandbox() {
     }
 }
 
-/// `isolation: worktree` is a host `git worktree` against the parent's cwd. In service mode that cwd
-/// is inside the sandbox, so the call is refused with the reason — never silently downgraded to the
-/// shared root, which would hand a write-capable child exactly what the field exists to prevent.
+/// `isolation: worktree` used to be refused in service mode, because every step of it was a host
+/// `git` invocation against a cwd that is inside the sandbox. It is available now — `worktree::Git`
+/// runs the same sequence through the session's exec endpoint — and this asserts the refusal is gone.
+///
+/// What it deliberately does *not* assert is that the worktree was created: the sandbox in this test
+/// fixture has no git repository in it, so the attempt fails at the preflight instead. That failure
+/// names a missing repo, which is the point — the old code never got far enough to look.
 #[tokio::test]
-async fn worktree_isolation_is_refused_when_the_childs_filesystem_is_remote() {
+async fn worktree_isolation_is_no_longer_refused_outright_when_the_filesystem_is_remote() {
     let (base, _requests) = spawn_model_server(vec![
         turn_tool_use(
             "call-1",
@@ -121,11 +125,7 @@ async fn worktree_isolation_is_refused_when_the_childs_filesystem_is_remote() {
 
     let text = serde_json::to_string(&frames).unwrap();
     assert!(
-        text.contains("isolation: worktree"),
-        "the refusal must name the reason: {text}"
-    );
-    assert!(
-        text.contains("remote"),
-        "the refusal must say why it is unavailable: {text}"
+        !text.contains("not available when the agent's filesystem is remote"),
+        "worktree isolation must no longer be refused for being remote: {text}"
     );
 }

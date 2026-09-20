@@ -33,6 +33,32 @@
 //!
 //! PID liveness is checked via `/proc`, and a *reused* PID makes the sweep skip a directory it could
 //! have reaped. That is the safe direction to be wrong in: a leak, never a deletion.
+//!
+//! # Where `git` runs
+//!
+//! Every step above is a `git` invocation, and each one has to happen **where the child's files
+//! actually are**. On a laptop that is this machine. In service mode it is the session's sandbox, and
+//! running them here instead would either fail confusingly or — far worse — succeed against the
+//! replica's own checkout and merge one tenant's patch into it. That is why worktree isolation was
+//! refused outright whenever the filesystem was remote, which in turn meant a write-capable subagent
+//! could never run in `parallel` on a replica: [`crate::tools::subagent`] requires worktree isolation
+//! for parallel writers, because `bash` reports no write target and no lock can serialize two
+//! children's shell commands.
+//!
+//! [`Git`] carries that choice. `Git::Local` is `tokio::process` and `std::fs`; `Git::Remote` runs
+//! the same sequence through the session's exec endpoint and filesystem backend. Three things differ
+//! on the remote side, each for a reason worth knowing:
+//!
+//! - **Patch output goes through base64.** `ExecResult::stdout` is a `String`, and while `--binary`
+//!   renders binary files as ASCII, an ordinary text hunk carries the file's own bytes — which for a
+//!   non-UTF-8 source file are not valid UTF-8. A lossy conversion there yields a patch that fails to
+//!   apply, or applies corruption.
+//! - **The owner key is not a PID.** This process is not in the sandbox's `/proc`; a PID looked up
+//!   there names something unrelated, or with a recycled number something live. A sandbox belongs to
+//!   exactly one session, so the key only has to differ between incarnations.
+//! - **`Drop` cannot clean up.** Every removal step is a round trip and `Drop` cannot await one. A
+//!   remote worktree is instead reaped by the next incarnation, which sweeps its base directory
+//!   before creating its own — so the cost falls only on sessions that use isolation at all.
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -109,7 +135,15 @@ fn base_dirs(repo_root: &Path) -> Vec<PathBuf> {
 /// whose base can actually be created. Falls through to the last candidate (`temp_dir`) so a caller
 /// always gets *a* path — if even that fails, the error surfaces at the `git worktree add` that follows,
 /// with a clear message, rather than here.
-fn ensure_base_dir(repo_root: &Path) -> PathBuf {
+async fn ensure_base_dir(git: &Git, repo_root: &Path) -> PathBuf {
+    if git.is_remote() {
+        // One fixed root in the sandbox. The host's `$XDG_CACHE_HOME`/`$HOME` describe the replica,
+        // not the tenant's world, and a worktree placed inside the workspace would show up in the
+        // tenant's own repository. `/tmp` is writable in every sandbox image this runs against.
+        let base = Path::new("/tmp/beyond-agent/worktrees").join(repo_id(repo_root));
+        let _ = git.create_dir_all(&base).await;
+        return base;
+    }
     let mut last = None;
     for root in cache_roots() {
         let base = base_dir_under(&root, repo_root);
@@ -125,6 +159,382 @@ fn ensure_base_dir(repo_root: &Path) -> PathBuf {
     })
 }
 
+/// How long a single `git` invocation gets when it runs in a sandbox. Generous — a worktree add on a
+/// cold checkout is real work — but finite, so an exec endpoint that stops answering fails the task
+/// rather than hanging the parent's fan-out.
+const REMOTE_GIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Where `git` runs for a worktree.
+///
+/// Worktree isolation is a sequence of `git` invocations against a checkout — `worktree add`, a diff,
+/// an apply. Every one of them must happen **wherever the child's files actually are**. On a laptop
+/// that is this machine. In service mode it is the session's sandbox, and running them here instead
+/// would either fail confusingly or, far worse, succeed against the replica's own checkout and merge
+/// one tenant's patch into it.
+///
+/// So this is not an abstraction for its own sake: it is the difference between `isolation: worktree`
+/// working in service mode and being refused there, which is what it was until now.
+#[derive(Clone)]
+pub enum Git {
+    /// This machine: `tokio::process::Command` and `std::fs`.
+    Local,
+    /// A sandbox, reached through the session's exec endpoint.
+    Remote {
+        runner: std::sync::Arc<dyn crate::tools::exec::CommandRunner>,
+        /// The same sandbox's filesystem. Seeding copies the parent's untracked files into the new
+        /// checkout, and those bytes have to move within the sandbox, not through this process.
+        backend: std::sync::Arc<dyn crate::tools::fs::FsBackend>,
+        /// Identifies the owner of the worktrees this runner creates, in place of a PID.
+        ///
+        /// A PID is meaningless across the boundary: the process that created the worktree runs on a
+        /// replica, not in the sandbox, and `/proc/<pid>` in the sandbox would answer about an
+        /// unrelated process — or, with a recycled number, about a live one, which is the direction
+        /// that deletes work. A sandbox belongs to exactly one session, so "this session's current
+        /// incarnation" is both available and sufficient: anything carrying a different owner is an
+        /// orphan by construction.
+        owner: String,
+    },
+}
+
+impl std::fmt::Debug for Git {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Local => f.write_str("Git::Local"),
+            Self::Remote { owner, .. } => write!(f, "Git::Remote({owner})"),
+        }
+    }
+}
+
+impl Git {
+    /// The prefix every worktree directory this runner creates is named with, and the key
+    /// [`sweep`] reaps by.
+    fn owner(&self) -> String {
+        match self {
+            Self::Local => std::process::id().to_string(),
+            Self::Remote { owner, .. } => owner.clone(),
+        }
+    }
+
+    fn is_remote(&self) -> bool {
+        matches!(self, Self::Remote { .. })
+    }
+
+    /// Build the runner for a session whose filesystem is in a sandbox.
+    pub fn remote(
+        runner: std::sync::Arc<dyn crate::tools::exec::CommandRunner>,
+        backend: std::sync::Arc<dyn crate::tools::fs::FsBackend>,
+    ) -> Self {
+        Self::Remote {
+            runner,
+            backend,
+            owner: remote_owner(),
+        }
+    }
+
+    async fn create_dir_all(&self, path: &Path) -> Result<(), String> {
+        match self {
+            Self::Local => {
+                std::fs::create_dir_all(path).map_err(|e| format!("mkdir {}: {e}", path.display()))
+            }
+            Self::Remote { backend, .. } => backend
+                .create_dir_all(path)
+                .await
+                .map_err(|e| format!("mkdir {}: {e}", path.display())),
+        }
+    }
+
+    /// Is `path` a regular file? Used to skip a symlink or a path that vanished between `ls-files`
+    /// and the copy — a spawn must not fail over one.
+    async fn is_file(&self, path: &Path) -> bool {
+        match self {
+            Self::Local => path.is_file(),
+            Self::Remote { backend, .. } => matches!(
+                backend.stat(path).await,
+                Ok(Some(m)) if m.kind == crate::tools::fs::FileKind::File
+            ),
+        }
+    }
+
+    /// Like [`run_stdin`](Self::run_stdin), but hands back the outcome instead of turning a non-zero
+    /// exit into an error.
+    ///
+    /// `git apply --3way` exits non-zero for **both** "applied, with conflict markers" and "could not
+    /// apply at all", and the two are told apart by its stderr. A helper that collapsed the exit into
+    /// `Err` would make a conflicted merge — the case the whole `ApplyOutcome::Conflicted` path
+    /// exists for — indistinguishable from a failed one.
+    async fn run_stdin_full(
+        &self,
+        dir: &Path,
+        args: &[&str],
+        stdin: &[u8],
+    ) -> Result<(bool, Vec<u8>, String), String> {
+        match self {
+            Self::Local => {
+                let out = command_output_with_stdin(dir, args, stdin).await?;
+                let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+                Ok((out.status.success(), out.stdout, stderr))
+            }
+            Self::Remote { runner, .. } => {
+                let owned: Vec<String> = args.iter().map(|a| (*a).to_string()).collect();
+                let res = runner
+                    .run_with_stdin(
+                        "git",
+                        &owned,
+                        Some(&dir.display().to_string()),
+                        REMOTE_GIT_TIMEOUT,
+                        stdin,
+                    )
+                    .await
+                    .map_err(|e| format!("git {}: {e}", args.join(" ")))?;
+                Ok((res.code == Some(0), res.stdout.into_bytes(), res.stderr))
+            }
+        }
+    }
+
+    /// Run a shell command in the sandbox. Only for the two things git cannot express: removing a
+    /// directory tree, and listing one.
+    async fn sh(&self, dir: &Path, script: &str) -> Result<String, String> {
+        match self {
+            Self::Local => Err("sh is only used on the remote path".to_string()),
+            Self::Remote { runner, .. } => {
+                let owned = vec!["-c".to_string(), script.to_string()];
+                let res = runner
+                    .run(
+                        "sh",
+                        &owned,
+                        Some(&dir.display().to_string()),
+                        REMOTE_GIT_TIMEOUT,
+                    )
+                    .await
+                    .map_err(|e| format!("sh: {e}"))?;
+                Ok(res.stdout)
+            }
+        }
+    }
+
+    /// Remove a worktree, tolerating every "already gone" shape.
+    ///
+    /// Errors are ignored throughout: the directory may already be gone, or never have been fully
+    /// created, and a cleanup that fails the task it was cleaning up after is worse than a leak the
+    /// sweep will collect.
+    async fn remove_worktree(&self, repo_root: &Path, path: &Path) {
+        match self {
+            Self::Local => remove_worktree_blocking(repo_root, path),
+            Self::Remote { .. } => {
+                let p = path.display().to_string();
+                // `--force` because the child almost certainly left the checkout dirty, which
+                // `git worktree remove` otherwise refuses.
+                let _ = self
+                    .run_text(repo_root, &["worktree", "remove", "--force", &p])
+                    .await;
+                // `git worktree remove` deletes the directory on success; if it refused (metadata
+                // already pruned, say), the checkout can still be sitting there.
+                let _ = self
+                    .sh(repo_root, &format!("rm -rf {}", shell_quote(&p)))
+                    .await;
+                let _ = self.run_text(repo_root, &["worktree", "prune"]).await;
+            }
+        }
+    }
+
+    /// Reap sandbox worktrees left by a previous incarnation, just before creating a new one.
+    ///
+    /// The local path sweeps once at startup, keyed on PID liveness. A sandbox has neither: this
+    /// process is not in its `/proc`, and there is no startup hook inside the sandbox to hang a sweep
+    /// on. But it has something better — **a sandbox belongs to exactly one session**, so any
+    /// worktree under our own base directory carrying a different owner is, by construction, from an
+    /// incarnation that is gone. Sweeping here rather than at session start also means the cost is
+    /// paid only by a session that actually uses worktree isolation.
+    async fn sweep_siblings(&self, repo_root: &Path, base: &Path) {
+        if !self.is_remote() {
+            return;
+        }
+        let mine = self.owner();
+        // `-1` one per line; failure (no such directory) is the ordinary first-run case.
+        let Ok(listing) = self
+            .sh(
+                repo_root,
+                &format!(
+                    "ls -1 {} 2>/dev/null",
+                    shell_quote(&base.display().to_string())
+                ),
+            )
+            .await
+        else {
+            return;
+        };
+        for leaf in listing.lines().map(str::trim).filter(|l| !l.is_empty()) {
+            let Some((owner, _)) = leaf.split_once('-') else {
+                // Not a name we wrote — leave it alone.
+                continue;
+            };
+            if owner == mine {
+                continue;
+            }
+            tracing::debug!(
+                worktree = %base.join(leaf).display(),
+                owner,
+                "reaping a sandbox worktree left by a previous incarnation"
+            );
+            self.remove_worktree(repo_root, &base.join(leaf)).await;
+        }
+    }
+
+    /// Copy one file. Within one filesystem in both modes — for a sandbox the bytes go out and back
+    /// through the backend rather than through this process's own disk.
+    async fn copy_file(&self, src: &Path, dst: &Path) -> Result<(), String> {
+        match self {
+            Self::Local => std::fs::copy(src, dst)
+                .map(|_| ())
+                .map_err(|e| format!("copy {}: {e}", src.display())),
+            Self::Remote { backend, .. } => {
+                let bytes = backend
+                    .read_bytes(src, 0, usize::MAX)
+                    .await
+                    .map_err(|e| format!("read {}: {e}", src.display()))?;
+                backend
+                    .write_bytes(dst, &bytes)
+                    .await
+                    .map_err(|e| format!("write {}: {e}", dst.display()))
+            }
+        }
+    }
+
+    /// Run `git -C <dir> <args>`, returning stdout as text.
+    ///
+    /// For everything whose output is a path, a ref, or nothing at all. Patch output goes through
+    /// [`run_bytes`](Self::run_bytes) instead — see there for why.
+    async fn run_text(&self, dir: &Path, args: &[&str]) -> Result<String, String> {
+        match self {
+            Self::Local => {
+                let out = local_git(dir, args).await?;
+                Ok(String::from_utf8_lossy(&out).into_owned())
+            }
+            Self::Remote { runner, .. } => {
+                let owned: Vec<String> = args.iter().map(|a| (*a).to_string()).collect();
+                let res = runner
+                    .run(
+                        "git",
+                        &owned,
+                        Some(&dir.display().to_string()),
+                        REMOTE_GIT_TIMEOUT,
+                    )
+                    .await
+                    .map_err(|e| format!("git {}: {e}", args.join(" ")))?;
+                if res.code != Some(0) {
+                    return Err(format!(
+                        "git {} failed: {}",
+                        args.join(" "),
+                        res.stderr.trim()
+                    ));
+                }
+                Ok(res.stdout)
+            }
+        }
+    }
+
+    /// Run `git -C <dir> <args>`, returning stdout as **bytes**.
+    ///
+    /// Only `git diff` needs this, and it needs it badly. `ExecResult::stdout` is a `String`, so a
+    /// remote run would put the patch through a lossy UTF-8 conversion — and while `--binary` renders
+    /// *binary* files as ASCII base85, an ordinary text hunk carries the file's own bytes, which for a
+    /// Latin-1 or otherwise non-UTF-8 source file are not valid UTF-8. Lossy conversion there replaces
+    /// them with U+FFFD, and the patch that comes back either fails to apply or applies corruption.
+    /// So the remote path pipes the patch through `base64` in the sandbox and decodes it here.
+    async fn run_bytes(&self, dir: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
+        match self {
+            Self::Local => local_git(dir, args).await,
+            Self::Remote { runner, .. } => {
+                let script = format!(
+                    "git {} | base64 | tr -d '\n'",
+                    args.iter()
+                        .map(|a| shell_quote(a))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                );
+                let owned = vec!["-c".to_string(), script];
+                let res = runner
+                    .run(
+                        "sh",
+                        &owned,
+                        Some(&dir.display().to_string()),
+                        REMOTE_GIT_TIMEOUT,
+                    )
+                    .await
+                    .map_err(|e| format!("git {}: {e}", args.join(" ")))?;
+                if res.code != Some(0) {
+                    return Err(format!(
+                        "git {} failed: {}",
+                        args.join(" "),
+                        res.stderr.trim()
+                    ));
+                }
+                use base64::Engine as _;
+                base64::engine::general_purpose::STANDARD
+                    .decode(res.stdout.trim())
+                    .map_err(|e| format!("git {}: undecodable output: {e}", args.join(" ")))
+            }
+        }
+    }
+
+    /// Run `git -C <dir> <args>` with `stdin` fed to it — `git apply`, which takes its patch there
+    /// rather than from a temp file this would then have to clean up.
+    async fn run_stdin(&self, dir: &Path, args: &[&str], stdin: &[u8]) -> Result<(), String> {
+        match self {
+            Self::Local => local_git_with_stdin(dir, args, stdin).await.map(|_| ()),
+            Self::Remote { runner, .. } => {
+                let owned: Vec<String> = args.iter().map(|a| (*a).to_string()).collect();
+                // `run_with_stdin` is the v1.1 exec addition; a shim that predates it answers
+                // `Unsupported`, which surfaces here as a task failure naming the endpoint rather
+                // than a silently empty patch.
+                let res = runner
+                    .run_with_stdin(
+                        "git",
+                        &owned,
+                        Some(&dir.display().to_string()),
+                        REMOTE_GIT_TIMEOUT,
+                        stdin,
+                    )
+                    .await
+                    .map_err(|e| format!("git {}: {e}", args.join(" ")))?;
+                if res.code != Some(0) {
+                    return Err(format!(
+                        "git {} failed: {}",
+                        args.join(" "),
+                        res.stderr.trim()
+                    ));
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+/// This process's identity as the owner of worktrees it creates in a sandbox.
+///
+/// Not a PID: the sandbox's `/proc` describes processes in the sandbox, and this process is not one
+/// of them — a PID looked up there names something unrelated, or with a recycled number something
+/// live, which is the direction that deletes a running child's work. A sandbox belongs to exactly one
+/// session, so all this has to do is differ from every previous incarnation that used it: anything
+/// carrying another owner is an orphan by construction. Hex, and hyphen-free, because the leaf name
+/// is `<owner>-<label>` and the sweep splits it on the first hyphen.
+fn remote_owner() -> String {
+    static OWNER: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    OWNER
+        .get_or_init(|| {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos());
+            format!("{:x}", (nanos as u64) ^ u64::from(std::process::id()) << 32)
+        })
+        .clone()
+}
+
+/// Wrap `s` for a POSIX shell in single quotes, which quote everything but a single quote itself.
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
+}
+
 /// Whether `pid` is a live process. `/proc/<pid>` is Linux's answer; this crate targets Linux (see
 /// `tools::exec`'s process-group handling, which is equally POSIX-specific).
 fn pid_is_alive(pid: u32) -> bool {
@@ -132,7 +542,7 @@ fn pid_is_alive(pid: u32) -> bool {
 }
 
 /// Run `git` in `dir`, returning stdout on success and a message naming the failing command on failure.
-async fn git(dir: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
+async fn local_git(dir: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
     let out = Command::new("git")
         .arg("-C")
         .arg(dir)
@@ -153,14 +563,16 @@ async fn git(dir: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
 
 /// Like [`git`], but feeds `stdin` to the command — for `git apply`, which reads a patch from stdin
 /// rather than taking a temp file we would then have to clean up.
-async fn git_with_stdin(dir: &Path, args: &[&str], stdin: &[u8]) -> Result<(), String> {
-    git_stdout_with_stdin(dir, args, stdin).await.map(|_| ())
+async fn local_git_with_stdin(dir: &Path, args: &[&str], stdin: &[u8]) -> Result<Vec<u8>, String> {
+    git_stdout_with_stdin(dir, args, stdin).await
 }
 
 /// The enclosing git repository's top-level directory, or `None` when `cwd` isn't inside one.
-pub async fn repo_root(cwd: &Path) -> Option<PathBuf> {
-    let out = git(cwd, &["rev-parse", "--show-toplevel"]).await.ok()?;
-    let path = String::from_utf8(out).ok()?;
+pub async fn repo_root(git: &Git, cwd: &Path) -> Option<PathBuf> {
+    let path = git
+        .run_text(cwd, &["rev-parse", "--show-toplevel"])
+        .await
+        .ok()?;
     let path = path.trim();
     (!path.is_empty()).then(|| PathBuf::from(path))
 }
@@ -170,15 +582,16 @@ pub async fn repo_root(cwd: &Path) -> Option<PathBuf> {
 ///
 /// Checked up front rather than letting `git worktree add` fail: "fatal: not a git repository" reaching
 /// a model as a tool error is a worse experience than being told the agent definition requires a repo.
-pub async fn preflight(cwd: &Path) -> Result<PathBuf, String> {
-    let Some(root) = repo_root(cwd).await else {
+pub async fn preflight(git: &Git, cwd: &Path) -> Result<PathBuf, String> {
+    let Some(root) = repo_root(git, cwd).await else {
         return Err(format!(
             "`isolation: worktree` requires a git repository, but {} is not inside one",
             cwd.display()
         ));
     };
     // `git worktree add … HEAD` needs a HEAD to check out; a repo with no commits has an unborn one.
-    if git(&root, &["rev-parse", "--verify", "HEAD"])
+    if git
+        .run_text(&root, &["rev-parse", "--verify", "HEAD"])
         .await
         .is_err()
     {
@@ -198,6 +611,9 @@ pub struct Worktree {
     /// Set once the worktree has been removed, so `Drop` doesn't try again (and so a preserved
     /// conflict worktree is never reaped out from under the developer who needs to look at it).
     detached: bool,
+    /// Where this worktree's `git` runs. Carried so every later operation on it — the delta, the
+    /// removal — lands on the same filesystem the checkout is actually on.
+    git: Git,
 }
 
 impl Worktree {
@@ -205,22 +621,24 @@ impl Worktree {
     /// seeded with the parent's uncommitted work and a throwaway baseline commit.
     ///
     /// `repo_root` must come from [`preflight`].
-    pub async fn create(repo_root: &Path, label: &str) -> Result<Self, String> {
+    pub async fn create(git: &Git, repo_root: &Path, label: &str) -> Result<Self, String> {
         // Picks (and creates) the first writable candidate root — so an unwritable `$HOME/.cache`
         // degrades to `temp_dir` rather than failing worktree isolation outright.
-        let base = ensure_base_dir(repo_root);
+        let base = ensure_base_dir(git, repo_root).await;
+        // Before adding ours, clear out any left by an incarnation that is gone. A no-op locally,
+        // where the startup `sweep` already did it against PID liveness.
+        git.sweep_siblings(repo_root, &base).await;
 
         // The leaf basename becomes git's own name for the worktree, so it must be unique within the
-        // repo. The PID prefix does double duty: uniqueness across concurrent agent processes, and the
-        // liveness key `sweep` reaps by.
-        let leaf = format!("{}-{}", std::process::id(), sanitize(label));
+        // repo. The owner prefix does double duty: uniqueness across concurrent agents, and the key
+        // `sweep` reaps by — a PID locally, this session's incarnation in a sandbox, where a PID would
+        // name a process on the wrong machine.
+        let leaf = format!("{}-{}", git.owner(), sanitize(label));
         let path = base.join(leaf);
-        if path.exists() {
-            // Idempotent per CLAUDE.md: a retry after a crash must not fail on its own leftovers.
-            remove_worktree_blocking(repo_root, &path);
-        }
+        // Idempotent per CLAUDE.md: a retry after a crash must not fail on its own leftovers.
+        git.remove_worktree(repo_root, &path).await;
 
-        git(
+        git.run_text(
             repo_root,
             &[
                 "worktree",
@@ -237,10 +655,11 @@ impl Worktree {
             path,
             repo_root: repo_root.to_path_buf(),
             detached: false,
+            git: git.clone(),
         };
         // From here on, any failure must not leak the checkout we just made.
         if let Err(e) = wt.seed_from_parent().await {
-            wt.remove_now();
+            wt.git.remove_worktree(&wt.repo_root, &wt.path).await;
             return Err(e);
         }
         Ok(wt)
@@ -252,60 +671,69 @@ impl Worktree {
         // Tracked modifications, staged and unstaged alike (`diff HEAD`, not `diff`). `--binary` so a
         // changed image or fixture survives the round trip instead of becoming a "binary files differ"
         // stub that `git apply` then refuses.
-        let patch = git(&self.repo_root, &["diff", "--binary", "HEAD"]).await?;
+        let patch = self
+            .git
+            .run_bytes(&self.repo_root, &["diff", "--binary", "HEAD"])
+            .await?;
         if !patch.is_empty() {
-            git_with_stdin(&self.path, &["apply", "--whitespace=nowarn"], &patch).await?;
+            self.git
+                .run_stdin(&self.path, &["apply", "--whitespace=nowarn"], &patch)
+                .await?;
         }
 
         // Untracked-but-not-ignored files: `git diff` never sees these, but a file the developer just
         // created is exactly the thing they are most likely to be asking a subagent about. `-z` because
         // a path may legally contain a newline.
-        let listed = git(
-            &self.repo_root,
-            &["ls-files", "--others", "--exclude-standard", "-z"],
-        )
-        .await?;
+        let listed = self
+            .git
+            .run_bytes(
+                &self.repo_root,
+                &["ls-files", "--others", "--exclude-standard", "-z"],
+            )
+            .await?;
         for raw in listed.split(|b| *b == 0).filter(|s| !s.is_empty()) {
             let rel =
                 Path::new(std::str::from_utf8(raw).map_err(|e| format!("non-utf8 path: {e}"))?);
             let src = self.repo_root.join(rel);
             let dst = self.path.join(rel);
             // A symlink or a file deleted between `ls-files` and now: skip rather than fail the spawn.
-            if !src.is_file() {
+            if !self.git.is_file(&src).await {
                 continue;
             }
             if let Some(parent) = dst.parent() {
-                std::fs::create_dir_all(parent)
-                    .map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
+                self.git.create_dir_all(parent).await?;
             }
-            std::fs::copy(&src, &dst).map_err(|e| format!("copy {}: {e}", rel.display()))?;
+            self.git.copy_file(&src, &dst).await?;
         }
 
         // The baseline. `-A` stages the copied untracked files too, so the child's later delta is
         // measured against the tree the parent actually had, not against HEAD.
-        git(&self.path, &["add", "-A"]).await?;
+        self.git.run_text(&self.path, &["add", "-A"]).await?;
         // A repo whose working tree is clean has nothing to commit, and `git commit` exits non-zero on
         // an empty commit — so only commit when `add` produced something staged. (`diff --cached
         // --quiet` exits non-zero, i.e. `Err` here, precisely when there *are* staged changes.)
-        if git(&self.path, &["diff", "--cached", "--quiet"])
+        if self
+            .git
+            .run_text(&self.path, &["diff", "--cached", "--quiet"])
             .await
             .is_err()
         {
-            git(
-                &self.path,
-                &[
-                    "-c",
-                    "user.name=beyond-agent",
-                    "-c",
-                    "user.email=agent@beyond.local",
-                    "commit",
-                    "--quiet",
-                    "--no-verify",
-                    "-m",
-                    "subagent baseline (throwaway)",
-                ],
-            )
-            .await?;
+            self.git
+                .run_text(
+                    &self.path,
+                    &[
+                        "-c",
+                        "user.name=beyond-agent",
+                        "-c",
+                        "user.email=agent@beyond.local",
+                        "commit",
+                        "--quiet",
+                        "--no-verify",
+                        "-m",
+                        "subagent baseline (throwaway)",
+                    ],
+                )
+                .await?;
         }
         Ok(())
     }
@@ -322,16 +750,24 @@ impl Worktree {
     /// untracked file). Diffed against the baseline commit, so the parent's own uncommitted work — which
     /// is already present in the parent — is excluded rather than replayed onto it.
     pub async fn child_delta(&self) -> Result<Vec<u8>, String> {
-        git(&self.path, &["add", "-A"]).await?;
-        git(&self.path, &["diff", "--cached", "--binary", "HEAD"]).await
+        self.git.run_text(&self.path, &["add", "-A"]).await?;
+        self.git
+            .run_bytes(&self.path, &["diff", "--cached", "--binary", "HEAD"])
+            .await
     }
 
     /// Remove the checkout and its git metadata. Consumes `self` — a removed worktree has no path worth
     /// holding. Idempotent: removing one that's already gone succeeds.
-    pub fn remove(mut self) -> Result<(), String> {
+    pub async fn remove(mut self) -> Result<(), String> {
         self.detached = true;
-        remove_worktree_blocking(&self.repo_root, &self.path);
+        self.git.remove_worktree(&self.repo_root, &self.path).await;
         Ok(())
+    }
+
+    /// Where this worktree's `git` runs — for the merge-back, which touches the *parent* tree and so
+    /// has to land on the same filesystem the child's did.
+    pub fn git(&self) -> &Git {
+        &self.git
     }
 
     /// Give up ownership *without* deleting the checkout — for a child whose patch conflicted, whose
@@ -339,11 +775,6 @@ impl Worktree {
     pub fn preserve(mut self) -> PathBuf {
         self.detached = true;
         self.path.clone()
-    }
-
-    /// Remove without consuming, for the failure paths inside `create`.
-    fn remove_now(&self) {
-        remove_worktree_blocking(&self.repo_root, &self.path);
     }
 }
 
@@ -356,6 +787,18 @@ impl Drop for Worktree {
         // cancelled subagent's future, and a detached cleanup thread would not survive `process::exit`
         // (PR #13). `git worktree remove` is a fast local operation; the alternative — leaking until the
         // next `sweep` — is strictly worse for the common Ctrl-C case.
+        //
+        // A sandbox worktree cannot be removed here at all: every step is a round trip to the exec
+        // endpoint and `Drop` cannot await one. That is what `sweep` is for, and why a remote owner is
+        // keyed to this incarnation rather than to a PID — the next session to use the sandbox reaps
+        // whatever this one left. `Worktree::remove` on the ordinary paths still cleans up promptly.
+        if self.git.is_remote() {
+            tracing::debug!(
+                worktree = %self.path.display(),
+                "leaving a sandbox worktree for the next sweep: Drop cannot await its removal"
+            );
+            return;
+        }
         remove_worktree_blocking(&self.repo_root, &self.path);
     }
 }
@@ -404,7 +847,7 @@ pub enum ApplyOutcome {
 /// Every path a patch touches, as repo-relative strings. Uses `git apply --numstat`, which parses the
 /// patch and reports `<added>\t<deleted>\t<path>` **without modifying anything** — a hand-rolled patch
 /// parser here would be a second, subtly-different implementation of a format git already understands.
-async fn patch_paths(repo_root: &Path, patch: &[u8]) -> Result<Vec<String>, String> {
+async fn patch_paths(git: &Git, repo_root: &Path, patch: &[u8]) -> Result<Vec<String>, String> {
     // `-z` is load-bearing, not cosmetic. Without it, git **C-quotes** any path containing non-ASCII
     // or special bytes: `sécrets.env` is reported as `"s\303\251crets.env"` (wrapping quotes + octal
     // escapes). That quoted form then slips past the deny-glob re-check in `apply_patch` — a glob like
@@ -412,7 +855,12 @@ async fn patch_paths(repo_root: &Path, patch: &[u8]) -> Result<Vec<String>, Stri
     // parent repo. `-z` emits each record as `<added>\t<deleted>\t<raw-path>\0`, NUL-terminated and
     // unquoted (renames already normalized to their destination path, same as without `-z`), so the
     // deny check sees the real filename.
-    let out = git_stdout_with_stdin(repo_root, &["apply", "--numstat", "-z", "-"], patch).await?;
+    let (ok, out, stderr) = git
+        .run_stdin_full(repo_root, &["apply", "--numstat", "-z", "-"], patch)
+        .await?;
+    if !ok {
+        return Err(format!("git apply --numstat failed: {}", stderr.trim()));
+    }
     Ok(String::from_utf8_lossy(&out)
         .split('\0')
         .filter(|record| !record.is_empty())
@@ -435,6 +883,7 @@ async fn patch_paths(repo_root: &Path, patch: &[u8]) -> Result<Vec<String>, Stri
 /// Refusal is all-or-nothing: a patch touching one denied path is rejected whole, rather than partially
 /// applied. A half-applied patch is exactly the un-observable intermediate state CLAUDE.md forbids.
 pub async fn apply_patch(
+    git: &Git,
     repo_root: &Path,
     patch: &[u8],
     denied_paths: &[globset::GlobMatcher],
@@ -443,7 +892,7 @@ pub async fn apply_patch(
         return Ok(ApplyOutcome::Clean);
     }
     if !denied_paths.is_empty() {
-        for rel in patch_paths(repo_root, patch).await? {
+        for rel in patch_paths(git, repo_root, patch).await? {
             let absolute = repo_root.join(&rel);
             let absolute = absolute.display().to_string();
             if let Some(m) = denied_paths
@@ -461,19 +910,19 @@ pub async fn apply_patch(
     // `--3way` falls back to a three-way merge when a hunk doesn't apply cleanly, leaving ordinary
     // conflict markers rather than refusing. Both blobs are in the shared object database (the child's
     // worktree writes there), so the merge base is always available.
-    let out = command_output_with_stdin(
-        repo_root,
-        &["apply", "--3way", "--whitespace=nowarn", "-"],
-        patch,
-    )
-    .await?;
-    if out.status.success() {
+    let (ok, _stdout, stderr) = git
+        .run_stdin_full(
+            repo_root,
+            &["apply", "--3way", "--whitespace=nowarn", "-"],
+            patch,
+        )
+        .await?;
+    if ok {
         return Ok(ApplyOutcome::Clean);
     }
     // `git apply --3way` exits non-zero for *both* "applied with conflicts" and "could not apply at
     // all". It prints a `U <path>` line per conflicted file in the first case and nothing of the sort in
     // the second, which is how the two are told apart.
-    let stderr = String::from_utf8_lossy(&out.stderr);
     let files: Vec<String> = stderr
         .lines()
         .filter_map(|l| l.strip_prefix("U "))
@@ -636,24 +1085,39 @@ mod tests {
     async fn repo() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path();
-        git(p, &["init", "--quiet", "-b", "main"]).await.unwrap();
-        git(p, &["config", "user.name", "t"]).await.unwrap();
-        git(p, &["config", "user.email", "t@t"]).await.unwrap();
+        Git::Local
+            .run_text(p, &["init", "--quiet", "-b", "main"])
+            .await
+            .unwrap();
+        Git::Local
+            .run_text(p, &["config", "user.name", "t"])
+            .await
+            .unwrap();
+        Git::Local
+            .run_text(p, &["config", "user.email", "t@t"])
+            .await
+            .unwrap();
         std::fs::write(p.join("tracked.txt"), "original\n").unwrap();
-        git(p, &["add", "-A"]).await.unwrap();
-        git(p, &["commit", "--quiet", "-m", "init"]).await.unwrap();
+        Git::Local.run_text(p, &["add", "-A"]).await.unwrap();
+        Git::Local
+            .run_text(p, &["commit", "--quiet", "-m", "init"])
+            .await
+            .unwrap();
         dir
     }
 
     #[tokio::test]
     async fn preflight_rejects_a_non_repo_and_a_repo_with_no_commits() {
         let plain = tempfile::tempdir().unwrap();
-        let err = preflight(plain.path()).await.unwrap_err();
+        let err = preflight(&Git::Local, plain.path()).await.unwrap_err();
         assert!(err.contains("not inside one"), "{err}");
 
         let empty = tempfile::tempdir().unwrap();
-        git(empty.path(), &["init", "--quiet"]).await.unwrap();
-        let err = preflight(empty.path()).await.unwrap_err();
+        Git::Local
+            .run_text(empty.path(), &["init", "--quiet"])
+            .await
+            .unwrap();
+        let err = preflight(&Git::Local, empty.path()).await.unwrap_err();
         assert!(
             err.contains("no commits") || err.contains("none yet"),
             "{err}"
@@ -666,8 +1130,10 @@ mod tests {
         let repo = repo().await;
         std::fs::write(repo.path().join("tracked.txt"), "work in progress\n").unwrap();
 
-        let root = preflight(repo.path()).await.unwrap();
-        let wt = Worktree::create(&root, "scout-0").await.unwrap();
+        let root = preflight(&Git::Local, repo.path()).await.unwrap();
+        let wt = Worktree::create(&Git::Local, &root, "scout-0")
+            .await
+            .unwrap();
         assert_eq!(
             std::fs::read_to_string(wt.path().join("tracked.txt")).unwrap(),
             "work in progress\n"
@@ -681,8 +1147,10 @@ mod tests {
         std::fs::write(repo.path().join("brand-new.rs"), "fn main() {}\n").unwrap();
         std::fs::write(repo.path().join("secret.txt"), "nope\n").unwrap();
 
-        let root = preflight(repo.path()).await.unwrap();
-        let wt = Worktree::create(&root, "scout-0").await.unwrap();
+        let root = preflight(&Git::Local, repo.path()).await.unwrap();
+        let wt = Worktree::create(&Git::Local, &root, "scout-0")
+            .await
+            .unwrap();
         assert!(
             wt.path().join("brand-new.rs").exists(),
             "untracked file must carry over"
@@ -700,8 +1168,10 @@ mod tests {
         let repo = repo().await;
         std::fs::write(repo.path().join("tracked.txt"), "parent wip\n").unwrap();
 
-        let root = preflight(repo.path()).await.unwrap();
-        let wt = Worktree::create(&root, "worker-0").await.unwrap();
+        let root = preflight(&Git::Local, repo.path()).await.unwrap();
+        let wt = Worktree::create(&Git::Local, &root, "worker-0")
+            .await
+            .unwrap();
         std::fs::write(wt.path().join("child.txt"), "child made this\n").unwrap();
 
         let patch = String::from_utf8(wt.child_delta().await.unwrap()).unwrap();
@@ -718,16 +1188,20 @@ mod tests {
     #[tokio::test]
     async fn child_delta_is_empty_when_the_child_changed_nothing() {
         let repo = repo().await;
-        let root = preflight(repo.path()).await.unwrap();
-        let wt = Worktree::create(&root, "scout-0").await.unwrap();
+        let root = preflight(&Git::Local, repo.path()).await.unwrap();
+        let wt = Worktree::create(&Git::Local, &root, "scout-0")
+            .await
+            .unwrap();
         assert!(wt.child_delta().await.unwrap().is_empty());
     }
 
     #[tokio::test]
     async fn child_delta_captures_a_modification_to_a_tracked_file() {
         let repo = repo().await;
-        let root = preflight(repo.path()).await.unwrap();
-        let wt = Worktree::create(&root, "worker-0").await.unwrap();
+        let root = preflight(&Git::Local, repo.path()).await.unwrap();
+        let wt = Worktree::create(&Git::Local, &root, "worker-0")
+            .await
+            .unwrap();
         std::fs::write(wt.path().join("tracked.txt"), "changed by child\n").unwrap();
 
         let patch = String::from_utf8(wt.child_delta().await.unwrap()).unwrap();
@@ -738,19 +1212,23 @@ mod tests {
     #[tokio::test]
     async fn remove_is_idempotent_and_drop_cleans_up() {
         let repo = repo().await;
-        let root = preflight(repo.path()).await.unwrap();
+        let root = preflight(&Git::Local, repo.path()).await.unwrap();
 
-        let wt = Worktree::create(&root, "scout-0").await.unwrap();
+        let wt = Worktree::create(&Git::Local, &root, "scout-0")
+            .await
+            .unwrap();
         let path = wt.path().to_path_buf();
         assert!(path.exists());
-        wt.remove().unwrap();
+        wt.remove().await.unwrap();
         assert!(!path.exists());
         // Removing what's already gone must not error — a retry after a crash lands here.
         remove_worktree_blocking(&root, &path);
 
         // And a dropped (never-explicitly-removed) worktree cleans itself up.
         let path2 = {
-            let wt = Worktree::create(&root, "scout-1").await.unwrap();
+            let wt = Worktree::create(&Git::Local, &root, "scout-1")
+                .await
+                .unwrap();
             wt.path().to_path_buf()
         };
         assert!(!path2.exists(), "Drop must remove the checkout");
@@ -759,9 +1237,11 @@ mod tests {
     #[tokio::test]
     async fn preserve_keeps_the_checkout_for_inspection() {
         let repo = repo().await;
-        let root = preflight(repo.path()).await.unwrap();
+        let root = preflight(&Git::Local, repo.path()).await.unwrap();
         let path = {
-            let wt = Worktree::create(&root, "worker-0").await.unwrap();
+            let wt = Worktree::create(&Git::Local, &root, "worker-0")
+                .await
+                .unwrap();
             std::fs::write(wt.path().join("conflicted.txt"), "x").unwrap();
             wt.preserve()
         };
@@ -773,13 +1253,17 @@ mod tests {
     #[tokio::test]
     async fn create_is_idempotent_over_a_leftover_directory_at_the_same_path() {
         let repo = repo().await;
-        let root = preflight(repo.path()).await.unwrap();
-        let wt = Worktree::create(&root, "scout-0").await.unwrap();
+        let root = preflight(&Git::Local, repo.path()).await.unwrap();
+        let wt = Worktree::create(&Git::Local, &root, "scout-0")
+            .await
+            .unwrap();
         let path = wt.path().to_path_buf();
         std::mem::forget(wt); // simulate a crash: no Drop, checkout and metadata left behind
 
         // Same PID, same label ⇒ same path. A retry must reclaim it rather than fail.
-        let wt2 = Worktree::create(&root, "scout-0").await.unwrap();
+        let wt2 = Worktree::create(&Git::Local, &root, "scout-0")
+            .await
+            .unwrap();
         assert_eq!(wt2.path(), path);
         assert!(path.join("tracked.txt").exists());
     }
@@ -791,9 +1275,9 @@ mod tests {
         base: PathBuf,
     }
     impl SweepFixture {
-        fn new() -> Self {
+        async fn new() -> Self {
             let repo = tempfile::tempdir().unwrap();
-            let base = ensure_base_dir(repo.path());
+            let base = ensure_base_dir(&Git::Local, repo.path()).await;
             Self { repo, base }
         }
     }
@@ -803,11 +1287,132 @@ mod tests {
         }
     }
 
-    #[test]
-    fn sweep_leaves_a_live_processes_worktree_alone() {
+    /// A `Git::Remote` that reaches a *local* temp repo, through the same `CommandRunner` and
+    /// `FsBackend` interfaces a sandbox is reached by.
+    ///
+    /// This is not a mock: `RealRunner` spawns real `git`, `LocalFs` does real I/O, and every call
+    /// goes through the remote arm — `run` rather than `tokio::process`, the base64 patch transport,
+    /// `run_with_stdin`, `sh` for the sweep. What it does not exercise is the network between a
+    /// replica and a sandbox, which is the exec endpoint's own conformance suite's job. What it does
+    /// exercise is every line of this module that only runs when the filesystem is somewhere else.
+    fn remote_git() -> Git {
+        Git::Remote {
+            runner: std::sync::Arc::new(crate::tools::exec::RealRunner),
+            backend: std::sync::Arc::new(crate::tools::fs::local::LocalFs::new()),
+            owner: remote_owner(),
+        }
+    }
+
+    #[tokio::test]
+    async fn the_remote_path_seeds_a_worktree_and_merges_the_childs_work_back() {
+        // The whole reason this PR exists: on a replica this sequence used to be refused outright,
+        // because every step of it ran host `git` against a cwd that was not the child's.
+        let git = remote_git();
+        let repo = repo().await;
+        let root = preflight(&git, repo.path()).await.unwrap();
+
+        // The parent has uncommitted work — the child must see it.
+        std::fs::write(
+            root.join("wip.txt"),
+            "parent wip
+",
+        )
+        .unwrap();
+
+        let wt = Worktree::create(&git, &root, "remote-child").await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(wt.path().join("wip.txt")).unwrap(),
+            "parent wip
+",
+            "a worktree seeded through the remote path must carry the parent's untracked work"
+        );
+
+        std::fs::write(
+            wt.path().join("child.txt"),
+            "from the child
+",
+        )
+        .unwrap();
+        let delta = wt.child_delta().await.unwrap();
+        assert!(!delta.is_empty(), "the child changed a file");
+
+        assert_eq!(
+            apply_patch(&git, &root, &delta, &[]).await.unwrap(),
+            ApplyOutcome::Clean
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("child.txt")).unwrap(),
+            "from the child
+"
+        );
+        wt.remove().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_patch_over_the_remote_path_survives_bytes_that_are_not_utf8() {
+        // Why `run_bytes` pipes through base64 rather than taking `ExecResult::stdout` as-is. That
+        // field is a `String`; a text hunk carries the file's own bytes, and a lossy conversion of a
+        // Latin-1 source file replaces them with U+FFFD — producing a patch that either fails to
+        // apply or applies corruption. Neither is something a tenant should discover.
+        let git = remote_git();
+        let repo = repo().await;
+        let root = preflight(&git, repo.path()).await.unwrap();
+
+        let wt = Worktree::create(&git, &root, "latin1-child").await.unwrap();
+        // 0xE9 is `é` in Latin-1 and invalid on its own in UTF-8.
+        std::fs::write(wt.path().join("latin1.txt"), b"caf\xe9 latin1\n").unwrap();
+        let delta = wt.child_delta().await.unwrap();
+
+        assert!(
+            !delta.windows(3).any(|w| w == [0xEF, 0xBF, 0xBD]),
+            "the patch came back with U+FFFD in it — the byte path is lossy"
+        );
+        assert_eq!(
+            apply_patch(&git, &root, &delta, &[]).await.unwrap(),
+            ApplyOutcome::Clean
+        );
+        assert_eq!(
+            std::fs::read(root.join("latin1.txt")).unwrap(),
+            b"caf\xe9 latin1\n",
+            "the merged file must be byte-identical to what the child wrote"
+        );
+        wt.remove().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_remote_sweep_reaps_another_incarnation_but_never_our_own() {
+        // The sandbox has no PID to check liveness against, so the key is the owner: a sandbox
+        // belongs to one session, and anything carrying a different owner is from an incarnation
+        // that is gone. Getting this backwards would delete a running child's work.
+        let git = remote_git();
+        let repo = repo().await;
+        let root = preflight(&git, repo.path()).await.unwrap();
+
+        let mine = Worktree::create(&git, &root, "keep-me").await.unwrap();
+        let base = mine.path().parent().unwrap().to_path_buf();
+        // A worktree that looks like it came from a previous incarnation.
+        let stale = base.join("deadbeef-gone");
+        std::fs::create_dir_all(&stale).unwrap();
+        std::fs::write(stale.join("marker"), "old").unwrap();
+
+        git.sweep_siblings(&root, &base).await;
+
+        assert!(
+            !stale.exists(),
+            "a previous incarnation's worktree must be reaped"
+        );
+        assert!(
+            mine.path().exists(),
+            "our own live worktree must never be swept"
+        );
+        mine.remove().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn sweep_leaves_a_live_processes_worktree_alone() {
         // Jared runs several agents against one repo at once; a sweep that reaped by name rather than by
         // PID liveness would delete a running session's work.
-        let fx = SweepFixture::new();
+        let fx = SweepFixture::new().await;
         let mine = fx
             .base
             .join(format!("{}-sweep-live-check", std::process::id()));
@@ -817,9 +1422,9 @@ mod tests {
         assert!(mine.exists(), "a live PID's worktree must never be reaped");
     }
 
-    #[test]
-    fn sweep_reaps_a_dead_processes_worktree() {
-        let fx = SweepFixture::new();
+    #[tokio::test]
+    async fn sweep_reaps_a_dead_processes_worktree() {
+        let fx = SweepFixture::new().await;
         // PID 0 is never a live userspace process, so `/proc/0` never exists.
         let orphan = fx.base.join("0-sweep-dead-check");
         std::fs::create_dir_all(&orphan).unwrap();
@@ -828,9 +1433,9 @@ mod tests {
         assert!(!orphan.exists(), "an orphaned worktree must be reaped");
     }
 
-    #[test]
-    fn sweep_ignores_directories_it_did_not_name() {
-        let fx = SweepFixture::new();
+    #[tokio::test]
+    async fn sweep_ignores_directories_it_did_not_name() {
+        let fx = SweepFixture::new().await;
         let foreign = fx.base.join("not-a-pid-prefix");
         std::fs::create_dir_all(&foreign).unwrap();
 
@@ -881,14 +1486,16 @@ mod tests {
     #[tokio::test]
     async fn a_clean_child_patch_applies_to_the_parent_tree() {
         let repo = repo().await;
-        let root = preflight(repo.path()).await.unwrap();
-        let wt = Worktree::create(&root, "worker-0").await.unwrap();
+        let root = preflight(&Git::Local, repo.path()).await.unwrap();
+        let wt = Worktree::create(&Git::Local, &root, "worker-0")
+            .await
+            .unwrap();
         std::fs::write(wt.path().join("tracked.txt"), "child edit\n").unwrap();
         std::fs::write(wt.path().join("new.txt"), "brand new\n").unwrap();
         let patch = wt.child_delta().await.unwrap();
 
         assert_eq!(
-            apply_patch(&root, &patch, &[]).await.unwrap(),
+            apply_patch(&Git::Local, &root, &patch, &[]).await.unwrap(),
             ApplyOutcome::Clean
         );
         assert_eq!(
@@ -904,9 +1511,9 @@ mod tests {
     #[tokio::test]
     async fn an_empty_patch_is_clean_and_touches_nothing() {
         let repo = repo().await;
-        let root = preflight(repo.path()).await.unwrap();
+        let root = preflight(&Git::Local, repo.path()).await.unwrap();
         assert_eq!(
-            apply_patch(&root, b"", &[]).await.unwrap(),
+            apply_patch(&Git::Local, &root, b"", &[]).await.unwrap(),
             ApplyOutcome::Clean
         );
     }
@@ -916,25 +1523,33 @@ mod tests {
         // The parallel-writer happy path: disjoint edits merge without conflict.
         let repo = repo().await;
         std::fs::write(repo.path().join("b.txt"), "b original\n").unwrap();
-        git(repo.path(), &["add", "-A"]).await.unwrap();
-        git(repo.path(), &["commit", "--quiet", "-m", "add b"])
+        Git::Local
+            .run_text(repo.path(), &["add", "-A"])
             .await
             .unwrap();
-        let root = preflight(repo.path()).await.unwrap();
+        Git::Local
+            .run_text(repo.path(), &["commit", "--quiet", "-m", "add b"])
+            .await
+            .unwrap();
+        let root = preflight(&Git::Local, repo.path()).await.unwrap();
 
-        let wt_a = Worktree::create(&root, "worker-0").await.unwrap();
-        let wt_b = Worktree::create(&root, "worker-1").await.unwrap();
+        let wt_a = Worktree::create(&Git::Local, &root, "worker-0")
+            .await
+            .unwrap();
+        let wt_b = Worktree::create(&Git::Local, &root, "worker-1")
+            .await
+            .unwrap();
         std::fs::write(wt_a.path().join("tracked.txt"), "from a\n").unwrap();
         std::fs::write(wt_b.path().join("b.txt"), "from b\n").unwrap();
 
         let pa = wt_a.child_delta().await.unwrap();
         let pb = wt_b.child_delta().await.unwrap();
         assert_eq!(
-            apply_patch(&root, &pa, &[]).await.unwrap(),
+            apply_patch(&Git::Local, &root, &pa, &[]).await.unwrap(),
             ApplyOutcome::Clean
         );
         assert_eq!(
-            apply_patch(&root, &pb, &[]).await.unwrap(),
+            apply_patch(&Git::Local, &root, &pb, &[]).await.unwrap(),
             ApplyOutcome::Clean
         );
         assert_eq!(
@@ -952,20 +1567,24 @@ mod tests {
         // Optimistic concurrency: the first patch wins, the second conflicts. We do not abort — the
         // parent resolves the markers with read/edit, holding both children's task descriptions.
         let repo = repo().await;
-        let root = preflight(repo.path()).await.unwrap();
+        let root = preflight(&Git::Local, repo.path()).await.unwrap();
 
-        let wt_a = Worktree::create(&root, "worker-0").await.unwrap();
-        let wt_b = Worktree::create(&root, "worker-1").await.unwrap();
+        let wt_a = Worktree::create(&Git::Local, &root, "worker-0")
+            .await
+            .unwrap();
+        let wt_b = Worktree::create(&Git::Local, &root, "worker-1")
+            .await
+            .unwrap();
         std::fs::write(wt_a.path().join("tracked.txt"), "written by a\n").unwrap();
         std::fs::write(wt_b.path().join("tracked.txt"), "written by b\n").unwrap();
         let pa = wt_a.child_delta().await.unwrap();
         let pb = wt_b.child_delta().await.unwrap();
 
         assert_eq!(
-            apply_patch(&root, &pa, &[]).await.unwrap(),
+            apply_patch(&Git::Local, &root, &pa, &[]).await.unwrap(),
             ApplyOutcome::Clean
         );
-        let outcome = apply_patch(&root, &pb, &[]).await.unwrap();
+        let outcome = apply_patch(&Git::Local, &root, &pb, &[]).await.unwrap();
         let ApplyOutcome::Conflicted { files } = outcome else {
             panic!("second overlapping patch must conflict, got {outcome:?}");
         };
@@ -983,8 +1602,8 @@ mod tests {
     #[tokio::test]
     async fn a_patch_that_cannot_apply_at_all_is_a_hard_error_not_a_conflict() {
         let repo = repo().await;
-        let root = preflight(repo.path()).await.unwrap();
-        let err = apply_patch(&root, b"this is not a patch\n", &[])
+        let root = preflight(&Git::Local, repo.path()).await.unwrap();
+        let err = apply_patch(&Git::Local, &root, b"this is not a patch\n", &[])
             .await
             .unwrap_err();
         assert!(
@@ -1000,13 +1619,17 @@ mod tests {
         // absolute deny glob does not match, the worktree path being different — and merge-back lands it
         // at the denied location in the real repo.
         let repo = repo().await;
-        let root = preflight(repo.path()).await.unwrap();
-        let wt = Worktree::create(&root, "worker-0").await.unwrap();
+        let root = preflight(&Git::Local, repo.path()).await.unwrap();
+        let wt = Worktree::create(&Git::Local, &root, "worker-0")
+            .await
+            .unwrap();
         std::fs::write(wt.path().join("secrets.env"), "TOKEN=leaked\n").unwrap();
         let patch = wt.child_delta().await.unwrap();
 
         let denied = [glob("**/secrets.env")];
-        let err = apply_patch(&root, &patch, &denied).await.unwrap_err();
+        let err = apply_patch(&Git::Local, &root, &patch, &denied)
+            .await
+            .unwrap_err();
         assert!(err.contains("denied by policy"), "{err}");
         assert!(err.contains("secrets.env"), "{err}");
         assert!(
@@ -1020,13 +1643,15 @@ mod tests {
         // All-or-nothing: a partially applied patch is exactly the un-observable intermediate state
         // CLAUDE.md forbids.
         let repo = repo().await;
-        let root = preflight(repo.path()).await.unwrap();
-        let wt = Worktree::create(&root, "worker-0").await.unwrap();
+        let root = preflight(&Git::Local, repo.path()).await.unwrap();
+        let wt = Worktree::create(&Git::Local, &root, "worker-0")
+            .await
+            .unwrap();
         std::fs::write(wt.path().join("allowed.txt"), "fine\n").unwrap();
         std::fs::write(wt.path().join("secrets.env"), "TOKEN=leaked\n").unwrap();
         let patch = wt.child_delta().await.unwrap();
 
-        let err = apply_patch(&root, &patch, &[glob("**/*.env")])
+        let err = apply_patch(&Git::Local, &root, &patch, &[glob("**/*.env")])
             .await
             .unwrap_err();
         assert!(err.contains("denied by policy"), "{err}");
@@ -1039,12 +1664,14 @@ mod tests {
     #[tokio::test]
     async fn merge_back_allows_a_patch_that_matches_no_denied_glob() {
         let repo = repo().await;
-        let root = preflight(repo.path()).await.unwrap();
-        let wt = Worktree::create(&root, "worker-0").await.unwrap();
+        let root = preflight(&Git::Local, repo.path()).await.unwrap();
+        let wt = Worktree::create(&Git::Local, &root, "worker-0")
+            .await
+            .unwrap();
         std::fs::write(wt.path().join("allowed.txt"), "fine\n").unwrap();
         let patch = wt.child_delta().await.unwrap();
 
-        let outcome = apply_patch(&root, &patch, &[glob("**/*.env")])
+        let outcome = apply_patch(&Git::Local, &root, &patch, &[glob("**/*.env")])
             .await
             .unwrap();
         assert_eq!(outcome, ApplyOutcome::Clean);
@@ -1054,13 +1681,15 @@ mod tests {
     #[tokio::test]
     async fn patch_paths_reports_every_touched_file_without_modifying_the_tree() {
         let repo = repo().await;
-        let root = preflight(repo.path()).await.unwrap();
-        let wt = Worktree::create(&root, "worker-0").await.unwrap();
+        let root = preflight(&Git::Local, repo.path()).await.unwrap();
+        let wt = Worktree::create(&Git::Local, &root, "worker-0")
+            .await
+            .unwrap();
         std::fs::write(wt.path().join("tracked.txt"), "edited\n").unwrap();
         std::fs::write(wt.path().join("added.txt"), "new\n").unwrap();
         let patch = wt.child_delta().await.unwrap();
 
-        let mut paths = patch_paths(&root, &patch).await.unwrap();
+        let mut paths = patch_paths(&Git::Local, &root, &patch).await.unwrap();
         paths.sort();
         assert_eq!(
             paths,
