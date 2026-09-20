@@ -46,6 +46,11 @@ pub const ALL: &[Scenario] = &[
         needs_shared_fs: false,
     },
     Scenario {
+        name: "unmounted-shard-is-misdirected",
+        claims: "C5",
+        needs_shared_fs: false,
+    },
+    Scenario {
         name: "metrics-name-no-tenant",
         claims: "C11",
         needs_shared_fs: false,
@@ -711,6 +716,93 @@ pub async fn metrics_name_no_tenant(kind: Kind, history_path: &std::path::Path) 
     });
 
     if check::report("metrics-name-no-tenant", &findings) {
+        Outcome::Passed
+    } else {
+        Outcome::Failed
+    }
+}
+
+/// **C5** — a replica asked for a shard it does not mount answers `421`, never a cross-slice hop.
+///
+/// The distinction is the whole reason the shard is written into the session id: `421` tells the edge
+/// "you sent this to the wrong slice", which is a routing fact it can act on, while a `404` would say
+/// "no such session" about a session that exists perfectly well somewhere else. A replica that
+/// forwarded instead would be doing service discovery, which is the thing this design deliberately
+/// keeps out of the agent.
+pub async fn unmounted_shard_is_misdirected(kind: Kind, history_path: &std::path::Path) -> Outcome {
+    // Two shards, and a replica that mounts only the first.
+    let substrate = match Substrate::prepare(kind, 2) {
+        Ok(s) => s,
+        Err(e) => return Outcome::failed_with(e),
+    };
+    let keys = match tempfile::tempdir() {
+        Ok(d) => d,
+        Err(e) => return Outcome::failed_with(format!("keys: {e}")),
+    };
+    let sandbox = match tempfile::tempdir() {
+        Ok(d) => d,
+        Err(e) => return Outcome::failed_with(format!("sandbox: {e}")),
+    };
+    let exec = ExecMock::start_with_home(sandbox.path(), Some(sandbox.path()), true).await;
+    let (gateway_url, _bodies) = spawn_model_server(vec![turn_text("unused")]);
+
+    let mut edge = Edge::new(keys.path(), Vec::new());
+    let agent = match agent_binary() {
+        Ok(a) => a,
+        Err(e) => return Outcome::failed_with(e),
+    };
+    let port = match free_port() {
+        Ok(p) => p,
+        Err(e) => return Outcome::failed_with(e),
+    };
+    let all = substrate.shard_args();
+    let only_first = &all[..1];
+    let replica = match Replica::start(&crate::replica::Launch {
+        name: "r1",
+        bin: &agent,
+        gateway_url: &gateway_url,
+        port,
+        grant_key_flag: &edge.grant_key_flag(),
+        seal_key: edge.seal_key(),
+        shards: only_first,
+        drain_grace: None,
+        max_live_sessions: None,
+        metrics_port: None,
+    }) {
+        Ok(r) => r,
+        Err(e) => return Outcome::failed_with(e),
+    };
+    edge.set_targets(vec![Target {
+        name: "r1".into(),
+        port: replica.port,
+    }]);
+
+    // A session homed on the shard this replica does *not* mount.
+    let elsewhere = edge.grant("t1", "s2.somewhere-else", "s2", "/", &exec.url);
+    let answered = workload::probe_session(port, "s2.somewhere-else", &elsewhere).await;
+
+    // And the control: the same replica serves its own shard, so a 421 above is about the shard and
+    // not about the replica being broken.
+    let mine = edge.grant("t1", "s1.mine", "s1", "/", &exec.url);
+    let served = workload::probe_session(port, "s1.mine", &mine).await;
+
+    let findings = vec![
+        Finding {
+            claim: "C5",
+            ok: matches!(answered, Ok(421)),
+            detail: format!(
+                "a shard this replica does not mount got {answered:?} — 421 is a routing fact the \
+                 edge can act on, where 404 would claim the session does not exist"
+            ),
+        },
+        Finding {
+            claim: "C5",
+            ok: matches!(served, Ok(101)),
+            detail: format!("the shard it does mount was served ({served:?})"),
+        },
+    ];
+
+    if check::report("unmounted-shard-is-misdirected", &findings) {
         Outcome::Passed
     } else {
         Outcome::Failed

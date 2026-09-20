@@ -100,6 +100,9 @@ async fn run_matrix(kind: Kind) -> std::process::ExitCode {
             }
             "live-session-cap-refuses" => scenarios::live_session_cap_refuses(kind, &history).await,
             "metrics-name-no-tenant" => scenarios::metrics_name_no_tenant(kind, &history).await,
+            "unmounted-shard-is-misdirected" => {
+                scenarios::unmounted_shard_is_misdirected(kind, &history).await
+            }
             other => scenarios::Outcome::Skipped(format!("no runner for {other:?}")),
         };
         match outcome {
