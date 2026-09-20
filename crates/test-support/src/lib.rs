@@ -1,4 +1,5 @@
 //! Test doubles shared by more than one crate.
+
 //!
 //! These lived in `crates/agent/tests/common` until the fleet simulator needed them too, and a
 //! simulator is a binary in its own crate — it cannot reach another crate's test module. Nothing

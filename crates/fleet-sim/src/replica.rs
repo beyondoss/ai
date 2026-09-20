@@ -9,6 +9,22 @@ use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+/// Everything a replica is launched with. One struct rather than eight positional arguments, which
+/// is both what clippy asks for and what stops a caller silently swapping two `&str`s that happen to
+/// typecheck — `grant_key_flag` and `gateway_url` are both strings, and getting them the wrong way
+/// round would fail as a mysterious verification error at the first connection.
+pub struct Launch<'a> {
+    pub name: &'a str,
+    pub bin: &'a str,
+    pub gateway_url: &'a str,
+    pub port: u16,
+    pub grant_key_flag: &'a str,
+    pub seal_key: &'a Path,
+    pub shards: &'a [(&'a str, &'a Path)],
+    /// `--drain-grace`, when the scenario is about a drain.
+    pub drain_grace: Option<u64>,
+}
+
 /// A running replica.
 pub struct Replica {
     pub name: String,
@@ -18,16 +34,17 @@ pub struct Replica {
 
 impl Replica {
     /// Launch a replica serving `shards`, verified against `grant_key_flag`/`seal_key`.
-    pub fn start(
-        name: &str,
-        bin: &str,
-        gateway_url: &str,
-        port: u16,
-        grant_key_flag: &str,
-        seal_key: &Path,
-        shards: &[(&str, &Path)],
-        drain_grace: Option<u64>,
-    ) -> Result<Self, String> {
+    pub fn start(launch: &Launch<'_>) -> Result<Self, String> {
+        let Launch {
+            name,
+            bin,
+            gateway_url,
+            port,
+            grant_key_flag,
+            seal_key,
+            shards,
+            drain_grace,
+        } = *launch;
         let mut c = Command::new(bin);
         c.args([
             "serve",

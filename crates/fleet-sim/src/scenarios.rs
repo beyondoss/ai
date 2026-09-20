@@ -90,16 +90,16 @@ impl Fleet {
         for i in 0..replicas {
             let name = format!("r{}", i + 1);
             let port = free_port()?;
-            let replica = Replica::start(
-                &name,
-                &agent,
-                &gateway_url,
+            let replica = Replica::start(&crate::replica::Launch {
+                name: &name,
+                bin: &agent,
+                gateway_url: &gateway_url,
                 port,
-                &edge.grant_key_flag(),
-                edge.seal_key(),
-                &shard_args,
-                Some(30),
-            )?;
+                grant_key_flag: &edge.grant_key_flag(),
+                seal_key: edge.seal_key(),
+                shards: &shard_args,
+                drain_grace: Some(30),
+            })?;
             targets.push(Target { name, port });
             started.push(replica);
         }
