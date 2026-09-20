@@ -253,7 +253,6 @@ async fn the_refused_commands_answer_with_an_error() {
         "logout",
         "auth_status",
         "switch_session",
-        "reload",
         "fork",
         "clone",
         "new_session",
@@ -270,6 +269,12 @@ async fn the_refused_commands_answer_with_an_error() {
             "{command}: {response}"
         );
     }
+
+    // `reload` is *not* among them: sandbox discovery re-aimed it at the tenant's own filesystem,
+    // which is the whole reason it could come back (see `serve_service_discovery.rs`).
+    ws_send(&mut ws, json!({"type":"reload","id":"reload"})).await;
+    let frames = ws_read_until_response(&mut ws, "reload").await;
+    assert_eq!(frames.last().unwrap()["success"], true, "{frames:#?}");
 
     // The session is still perfectly usable afterwards.
     ws_send(&mut ws, json!({"type":"get_state","id":"after"})).await;

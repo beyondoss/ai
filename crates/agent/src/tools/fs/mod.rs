@@ -322,6 +322,45 @@ pub trait FsBackend: Send + Sync {
     }
 }
 
+/// Read a whole small text file through `backend`, refusing an oversized one **before** its bytes
+/// move.
+///
+/// Every resource loader that reads through a backend — skills, agent definitions, prompt templates,
+/// `AGENTS.md`/`CLAUDE.md`, `SYSTEM.md` — wants the same three steps: stat, check the cap, read
+/// exactly that many bytes. Their on-host halves do it with `fs::metadata` + `fs::read_to_string`;
+/// this is the one backend spelling of it, so the cap stays where it belongs (before a megabyte
+/// crosses a network hop) in all of them rather than in four near-copies.
+///
+/// A missing path is an `Err`, unlike [`FsBackend::stat`]'s `Ok(None)`: every caller here is opening
+/// a file it has already been told about, so "absent" is a diagnostic, not a branch. The message is
+/// written to be surfaced verbatim as a discovery diagnostic.
+pub async fn read_text_capped(
+    backend: &dyn FsBackend,
+    path: &Path,
+    max: u64,
+) -> Result<String, String> {
+    let meta = backend
+        .stat(path)
+        .await
+        .map_err(|e| format!("{}: {e}", path.display()))?
+        .ok_or_else(|| format!("{}: no such file", path.display()))?;
+    if meta.kind != FileKind::File {
+        return Err(format!("{}: not a regular file", path.display()));
+    }
+    if meta.len > max {
+        return Err(format!(
+            "{} exceeds {max} bytes ({} bytes) — skipped without reading",
+            path.display(),
+            meta.len
+        ));
+    }
+    let bytes = backend
+        .read_bytes(path, 0, meta.len as usize)
+        .await
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    String::from_utf8(bytes).map_err(|_| format!("{}: not valid UTF-8", path.display()))
+}
+
 /// Strip a trailing `\n` and then a trailing `\r` (a searcher hands us the line terminator), plus —
 /// pi-parity fix — any further embedded `\r` the trailing strip doesn't reach. `grep-searcher` only
 /// splits on `\n`, so a file using old-Mac-style bare-`\r` line endings (or one with stray corrupted
