@@ -767,6 +767,14 @@ enum Command {
         /// `0` turns the cap off.
         #[usage(long, env = "AI_AGENT_MAX_LIVE_SESSIONS", default = "20000")]
         max_live_sessions: usize,
+        /// Serve Prometheus metrics on this address, on a listener of their own. **Loopback only** —
+        /// the scrape describes every tenant on this replica, and the replica is reachable by
+        /// tenants, so a routable bind would publish it. A scraper that needs it runs beside the
+        /// replica (an ECS `awsvpc` task shares a network namespace across its containers). Only
+        /// `GET /metrics` is answered; the tenant-facing listener still 404s that path. Unset means
+        /// no metrics listener at all.
+        #[usage(long, env = "AI_AGENT_METRICS_LISTEN")]
+        metrics_listen: Option<String>,
         /// Service mode: let a session grant's MCP connectors reach loopback/private/link-local
         /// addresses. Off by default, and deliberately not something a grant can ask for: a
         /// connector URL is refused unless it resolves to a public address, so a tenant's connector
@@ -1843,6 +1851,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             service,
             shard,
             max_live_sessions,
+            metrics_listen,
             mcp_allow_private,
             session_id,
             r#continue: continue_session,
@@ -1942,6 +1951,17 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             // the flag, so an operator fixes the deployment rather than discovering at runtime that
             // a flag was silently ignored.
             let shards = Arc::new(beyond_ai_agent::service::Shards::parse(&shard)?);
+            // Parsed before anything is bound or opened, like the shard list: a refusal names the
+            // flag so an operator fixes the deployment rather than discovering at runtime that the
+            // scrape never came up.
+            let metrics_addr = match metrics_listen.as_deref() {
+                Some(s) => Some(beyond_ai_agent::metrics::parse_listen_addr(s)?),
+                None => None,
+            };
+            let metrics = match metrics_addr {
+                Some(_) => Some(beyond_ai_agent::metrics::Metrics::new()?),
+                None => None,
+            };
             let systemd_activated = cfg!(unix)
                 && listen.is_none()
                 && listen_uds.is_none()
@@ -2298,6 +2318,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 service: None,
                 max_live_sessions,
                 mcp_http,
+                metrics: metrics.clone(),
                 session_id,
                 continue_session,
                 no_session_persistence,
@@ -2391,6 +2412,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 #[cfg(not(unix))]
                 if listen_uds.is_some() {
                     return Err("--listen-uds is only supported on unix targets".into());
+                }
+                // Bound here, before the agent's own listeners, so a port clash fails startup
+                // rather than leaving a replica serving tenants with no way to observe it. Its task
+                // is detached: a scrape endpoint must never be able to end the process it reports on.
+                if let (Some(addr), Some(metrics)) = (metrics_addr, metrics.clone()) {
+                    let listener = tokio::net::TcpListener::bind(addr)
+                        .await
+                        .map_err(|e| format!("--metrics-listen {addr}: {e}"))?;
+                    tokio::spawn(beyond_ai_agent::metrics::serve_metrics(listener, metrics));
                 }
                 let listeners = serve_ws::ServeListeners {
                     tcp: serve_cfg.listen,

@@ -14,6 +14,10 @@ path = "src/main.rs"
 workspace = true
 
 [dependencies]
+# Metrics for `serve --service`, on their own registry and their own listener (`metrics.rs`). Same
+# crate and version the gateway uses, but no shared code: that one registers on the *default*
+# registry because Pingora exposes exactly that, which is the one thing a tenant-facing replica must
+# not do.
 # The harness core. Depended on by package name; imported as `agent_core` (its lib name).
 async-trait.workspace = true
 beyond-ai-agent-core = { path = "../agent-core" }
@@ -28,6 +32,7 @@ futures.workspace = true
 # Validates the `structured_output` tool's payload against the caller-supplied schema. See the
 # workspace manifest for why `default-features = false` matters here.
 jsonschema.workspace = true
+prometheus = "0.13"
 # The shared provider table: where each provider lives, which wire it speaks, which header its key goes
 # in, and which env var conventionally holds it. The same rows `crates/gateway` proxies on — so the
 # agent's direct route and the gateway's proxy route can never disagree about a provider.
