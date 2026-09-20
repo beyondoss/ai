@@ -249,6 +249,11 @@ docker run --rm -p 8080:8080 \
   Loopback addresses only — the scrape describes every tenant on the replica and the replica is
   reachable by tenants, so a routable bind is refused rather than warned about. Run the scraper
   beside it. No tenant or session identifier appears in any label.
+- **Draining:** `--drain-grace <seconds>` makes SIGTERM stop taking _new_ sessions while finishing
+  what is in flight — `/readyz` goes 503 so the load balancer stops choosing this replica, `/livez`
+  stays 200 so the orchestrator doesn't kill it mid-drain, and reconnects to sessions this replica
+  already owns keep working. Set `terminationGracePeriodSeconds` above it. `0` (default) shuts down
+  at once.
 - **Health**, on the same listener, no grant needed:
 
   ```sh
