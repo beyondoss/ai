@@ -729,7 +729,12 @@ pub async fn metrics_name_no_tenant(kind: Kind, history_path: &std::path::Path) 
 /// "no such session" about a session that exists perfectly well somewhere else. A replica that
 /// forwarded instead would be doing service discovery, which is the thing this design deliberately
 /// keeps out of the agent.
-pub async fn unmounted_shard_is_misdirected(kind: Kind, history_path: &std::path::Path) -> Outcome {
+pub async fn unmounted_shard_is_misdirected(
+    kind: Kind,
+    // No history: this scenario asserts on two immediate answers rather than on anything that
+    // accumulated over a run, so there is nothing to compare against afterwards.
+    _history_path: &std::path::Path,
+) -> Outcome {
     // Two shards, and a replica that mounts only the first.
     let substrate = match Substrate::prepare(kind, 2) {
         Ok(s) => s,
