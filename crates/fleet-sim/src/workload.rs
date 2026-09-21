@@ -131,6 +131,43 @@ pub async fn read_until(
     }
 }
 
+/// Read frames until `matches`, the socket closes, or `within` elapses — returning what was seen
+/// **either way**.
+///
+/// [`read_until`] throws its frames away when it gives up, which is fine when the frame it wants is
+/// the whole answer. It is not fine when the question is "what did the replica say *instead*": a
+/// fenced owner answers its prompt first and reports the supersession on its way out, so a scenario
+/// has to see both frames to tell "refused, then ended" from "acknowledged, then ended".
+pub async fn collect_until(
+    ws: &mut Ws,
+    within: Duration,
+    mut matches: impl FnMut(&Value) -> bool,
+) -> (bool, Vec<Value>) {
+    let deadline = tokio::time::Instant::now() + within;
+    let mut seen = Vec::new();
+    loop {
+        let Ok(frame) = tokio::time::timeout_at(deadline, ws.next()).await else {
+            return (false, seen);
+        };
+        // Only a closed or broken socket ends this; a `Ping` is not an answer, and treating one as
+        // the end of the conversation made this report that a replica had said nothing at all.
+        let Some(Ok(msg)) = frame else {
+            return (false, seen);
+        };
+        let Message::Text(text) = msg else {
+            continue;
+        };
+        let Ok(v) = serde_json::from_str::<Value>(text.as_str()) else {
+            continue;
+        };
+        let hit = matches(&v);
+        seen.push(v);
+        if hit {
+            return (true, seen);
+        }
+    }
+}
+
 /// Send a command and wait for its `response`.
 pub async fn command(ws: &mut Ws, cmd: Value, name: &str) -> Result<Value, String> {
     send(ws, cmd).await?;
