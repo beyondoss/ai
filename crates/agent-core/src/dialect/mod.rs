@@ -278,6 +278,23 @@ impl Dialect {
         }
     }
 
+    /// The same body, already serialized — skipping the `Value` tree where the dialect can.
+    ///
+    /// Only Anthropic streams today (see `anthropic::build_body_bytes`); every other dialect builds
+    /// its tree and serializes that, which is exactly what the caller did before this existed. The
+    /// output is identical either way, so a caller that does not need the body *as a tree* — no
+    /// payload hook to hand it to, no wire-level field to patch — should prefer this.
+    pub fn build_body_bytes(
+        &self,
+        req: &ModelRequest,
+        is_oauth: bool,
+    ) -> std::result::Result<Vec<u8>, serde_json::Error> {
+        match self {
+            Dialect::Anthropic => anthropic::build_body_bytes(req, is_oauth),
+            _ => serde_json::to_vec(&self.build_body(req, is_oauth)),
+        }
+    }
+
     /// A fresh streaming decoder for this dialect. `is_oauth`/`tools` are only consulted by the
     /// Anthropic dialect, to reverse a live `tool_use` block's name back out of Claude Code's canonical
     /// casing (see `anthropic::Decoder::new`); every other dialect ignores them.

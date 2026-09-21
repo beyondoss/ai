@@ -641,7 +641,27 @@ impl ModelTransport for GatewayClient {
             .is_some_and(|d| d.aggregator_host == Some(crate::models::AggregatorHost::Anthropic));
         let is_oauth =
             credential.is_oauth && (credential.direct.is_none() || routed_to_anthropic_natively);
-        let mut body = dialect.build_body(&req, is_oauth);
+        // In the ordinary case nothing downstream wants the body *as a tree*: there is no payload
+        // hook to hand it to, no Azure deployment name to patch into it, and no Codex WebSocket to
+        // replay it through. So don't build one — `build_body_bytes` writes the same bytes (held to
+        // that byte-for-byte by `streamed_body_is_byte_identical_to_the_tree`) while allocating a
+        // fraction as much: 104 allocations and 14 KB against 629 and 83 KB on a 36-message
+        // transcript, and the gap grows with the conversation because the tree does.
+        //
+        // Each condition below guards one of the three places that would otherwise read `body`, so
+        // when they are all false it stays `Null` and is never touched.
+        let streamed = self.hooks.is_none()
+            && !req.is_codex
+            && credential
+                .direct
+                .as_ref()
+                .and_then(|d| d.deployment_name.as_deref())
+                .is_none();
+        let mut body = if streamed {
+            Value::Null
+        } else {
+            dialect.build_body(&req, is_oauth)
+        };
         // Pi-parity Fix 2 (Round 2): Azure OpenAI's deployment name (`DirectRouting::deployment_name`)
         // overwrites just the wire-level `"model"` field `build_body` already set — never
         // `req.model`/`ModelRequest::model` itself, which stays keyed on the app-level id the operator
@@ -720,8 +740,12 @@ impl ModelTransport for GatewayClient {
         // HTTP send buffer, the response, and the accumulator. mimalloc then tends to keep those
         // pages. Retries reuse the same `Bytes` (a refcount bump) instead of walking the tree again.
         let body = Bytes::from(
-            serde_json::to_vec(&body)
-                .map_err(|e| Error::Transport(format!("serialize request body: {e}")))?,
+            if streamed {
+                dialect.build_body_bytes(&req, is_oauth)
+            } else {
+                serde_json::to_vec(&body)
+            }
+            .map_err(|e| Error::Transport(format!("serialize request body: {e}")))?,
         );
 
         let tools_for_decoder = req.tools.clone();

@@ -518,6 +518,16 @@ mod encode {
         let req = encode_request(model_for(which), true);
         bencher.bench(|| serde_json::to_vec(&build(which, &req)).expect("serialize body"));
     }
+
+    /// The same bytes, streamed instead of built — `anthropic::build_body_bytes`, which skips the
+    /// `Value` tree when the history needs none of `build_messages`' rewriting passes. Compare against
+    /// `build_and_serialize/anthropic`: same output (asserted byte-for-byte by
+    /// `streamed_body_is_byte_identical_to_the_tree`), so the difference is the tree's own cost.
+    #[divan::bench]
+    fn stream_to_bytes(bencher: Bencher) {
+        let req = encode_request(model_for("anthropic"), true);
+        bencher.bench(|| anthropic::build_body_bytes(&req, false).expect("serialize body"));
+    }
 }
 
 /// A fresh decoder for the named dialect (each bench sample decodes from a clean state).
