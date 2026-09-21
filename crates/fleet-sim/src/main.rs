@@ -86,16 +86,16 @@ async fn main() -> std::process::ExitCode {
             let reconnect_every = flag(&args, "--reconnect-every")
                 .and_then(|s| s.parse::<u64>().ok())
                 .unwrap_or(20);
-            if soak::run(
+            if soak::run(soak::Soak {
                 kind,
-                std::time::Duration::from_secs(secs),
+                duration: std::time::Duration::from_secs(secs),
                 seed,
                 sessions,
                 tenants,
                 shards,
                 reconnect_every,
-                !args.iter().any(|a| a == "--no-chaos"),
-            )
+                chaos: !args.iter().any(|a| a == "--no-chaos"),
+            })
             .await
             {
                 std::process::ExitCode::SUCCESS

@@ -84,17 +84,41 @@ fn assign(tenants: &[Tenant], shards: &[String], sessions: usize) -> Vec<Assignm
         .collect()
 }
 
+/// How a soak run is shaped.
+///
+/// A struct rather than eight positional arguments — which is both what clippy asks for and what
+/// stops a caller silently transposing two of the four `usize`s that happen to typecheck. Swapping
+/// `sessions` and `shards` would run a perfectly green soak that proved something other than what
+/// was asked for.
+pub struct Soak {
+    pub kind: Kind,
+    pub duration: Duration,
+    pub seed: u64,
+    pub sessions: usize,
+    pub tenants: usize,
+    pub shards: usize,
+    /// Turns between a client dropping its socket and coming back. `0` holds it for the whole run;
+    /// `1` reconnects every turn, which charges a TCP handshake, a WebSocket upgrade, a grant
+    /// verification and a session attach to every single turn.
+    pub reconnect_every: u64,
+    /// Whether replicas are killed and redeployed underneath the workload. Off is the **control**:
+    /// see the chaos loop for why a throughput number measured with it on is partly a measurement
+    /// of recovery.
+    pub chaos: bool,
+}
+
 /// Run the soak. Returns true if every invariant held.
-pub async fn run(
-    kind: Kind,
-    duration: Duration,
-    seed: u64,
-    sessions: usize,
-    tenant_count: usize,
-    shard_count: usize,
-    reconnect_every: u64,
-    chaos: bool,
-) -> bool {
+pub async fn run(opts: Soak) -> bool {
+    let Soak {
+        kind,
+        duration,
+        seed,
+        sessions,
+        tenants: tenant_count,
+        shards: shard_count,
+        reconnect_every,
+        chaos,
+    } = opts;
     let dir = match tempfile::tempdir() {
         Ok(d) => d,
         Err(e) => {
@@ -178,7 +202,7 @@ pub async fn run(
                 // Reattach on a cadence anyway, because detach and re-attach is the path the
                 // connection-is-a-view design exists for and a soak that never exercised it would
                 // be testing a client nobody has.
-                if reconnect_every != 0 && turn % reconnect_every == 0 {
+                if reconnect_every != 0 && turn.is_multiple_of(reconnect_every) {
                     held = None;
                 }
                 if held.is_none() {
