@@ -92,7 +92,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use futures::future::BoxFuture;
-use futures::{SinkExt, StreamExt};
+use futures::{FutureExt, SinkExt, StreamExt};
 use serde_json::{Value, json};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -237,6 +237,16 @@ const DRAIN_POLL: Duration = Duration::from_millis(100);
 /// How long a stopped session task gets to persist and exit before whoever is waiting on it stops
 /// waiting: graceful shutdown, for the whole batch; a reconnect, for its id's previous incarnation.
 const JOIN_GRACE: Duration = Duration::from_secs(10);
+
+/// How long a connection whose session ended waits for the client to echo its `Close` frame.
+///
+/// Short, and worth having. Dropping the socket the moment the `Close` is written leaves whatever
+/// the client sent in the meantime unread, and a socket closed with unread bytes is closed with a
+/// TCP `RST` — which an edge or proxy reads as a network fault and may retry, rather than as the
+/// deliberate ending it is. Reading until the peer's `Close` completes the handshake and consumes
+/// anything in flight, so the connection ends in a status the client can interpret. Bounded because
+/// a client that never answers must not hold the task open.
+const CLOSE_HANDSHAKE_WAIT: Duration = Duration::from_secs(2);
 
 /// Where an id's session task is in its life: `Starting → Live → Stopping → (removed)`, one way only.
 ///
@@ -1064,7 +1074,7 @@ impl Supervisor {
         // dropped).
         let send_cancel = CancellationToken::new();
         let send_task_cancel = send_cancel.clone();
-        let send_task = tokio::spawn(async move {
+        let mut send_task = tokio::spawn(async move {
             let mut ping = tokio::time::interval(PING_INTERVAL);
             ping.set_missed_tick_behavior(MissedTickBehavior::Skip);
             loop {
@@ -1103,12 +1113,32 @@ impl Supervisor {
             let _ = sink.close().await;
         });
 
+        // Set when the read loop ends because the *session* went away rather than the client. It
+        // decides whether the send task is flushed or cut, below.
+        let mut session_ended = false;
+
         // Read loop: this socket's inbound messages. Each text message is exactly one command line fed
         // into the session; the session (not this loop) decides what to do with it. Ends when the socket
-        // closes — there's no eviction, so a peer connection never tears this one down.
+        // closes — there's no eviction, so a peer connection never tears this one down — or when the
+        // session this socket is pinned to ends underneath it.
         loop {
             tokio::select! {
                 biased;
+                // The session task is gone: it dropped the receiving half of `input_tx`, so nothing
+                // sent on this socket can ever be answered again.
+                //
+                // Watched here because the only *other* notice is the `send` below failing, and that
+                // is reached only when the client happens to send something else. A client that asked
+                // a question and is waiting for the answer sends nothing else — so without this
+                // branch it waits forever on a socket the server has already finished with. The case
+                // that found it: a session that fails to open its sealed storage (a rotated or wrong
+                // data key) broadcasts one `error` frame and ends, and the client then sat on a live,
+                // silent connection indefinitely. The connection also leaked for as long as the
+                // client held it, since nothing on this side was watching.
+                _ = input_tx.closed() => {
+                    session_ended = true;
+                    break;
+                }
                 msg = stream.next() => {
                     let Some(msg) = msg else { break }; // socket closed
                     let msg = match msg {
@@ -1167,8 +1197,47 @@ impl Supervisor {
         // socket) and stop its send task. The session keeps running — other connections stay attached,
         // and even the last one leaving just detaches (the run lives on for a reconnect).
         lock_ignoring_poison(&out_conn).remove(sink_id);
-        send_cancel.cancel();
-        let _ = send_task.await;
+
+        // A session that ended is flushed, not cut. Its last act was to broadcast *why* it ended, and
+        // that frame is already queued on this connection — cancelling the send task would discard it
+        // (the `biased` select takes the cancel branch first), leaving the client with a closed socket
+        // and no reason for it. Dropping this side's remaining sender instead lets the send task drain
+        // what is queued, observe the channel close, and shut the socket down with a `Close` frame.
+        // `ctrl_tx` is deliberately *not* dropped: its receiver would then yield `None` on every poll
+        // and spin the send task's select.
+        //
+        // The read half keeps being drained while that happens, and skipping it undoes the flush: a
+        // socket closed with unread inbound bytes is closed with a TCP `RST`, and an `RST` discards
+        // whatever the peer has not yet read — including the very frame being flushed. The client's
+        // own command is dropped either way; the session it was addressed to no longer exists.
+        //
+        // Bounded by [`JOIN_GRACE`], because a client that has stopped reading its socket must not be
+        // able to hold this task open: past the deadline it is cut after all.
+        let drained = if session_ended {
+            drop(reply_tx);
+            // Anything the client already sent, cleared without waiting on one that has nothing more
+            // to say: each `now_or_never` polls the socket once and gives up the moment it would
+            // block. A `select!` racing the send task cannot do this — the send task is normally
+            // finished already, so the select returns having never polled the socket at all.
+            while stream.next().now_or_never().flatten().is_some() {}
+            let joined = tokio::time::timeout(JOIN_GRACE, &mut send_task)
+                .await
+                .is_ok();
+            // Then the closing handshake: the send task has written the `Close`, so read until the
+            // client echoes it and the stream ends. See [`CLOSE_HANDSHAKE_WAIT`] for why an `RST` is
+            // worth these two seconds.
+            let _ = tokio::time::timeout(CLOSE_HANDSHAKE_WAIT, async {
+                while stream.next().await.is_some() {}
+            })
+            .await;
+            joined
+        } else {
+            false
+        };
+        if !drained {
+            send_cancel.cancel();
+            let _ = send_task.await;
+        }
 
         // One fewer attached connection; if that was the last, start the idle reaper's clock.
         self.unpin(&id, incarnation);
