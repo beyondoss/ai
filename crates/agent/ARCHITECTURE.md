@@ -3103,6 +3103,19 @@ spot**, closing the descriptor that holds it. The lock is never handed to the ne
 would mean a registry of orphans, a second place to leak, and a second rule about who owns a lock.
 The retry after the 503 simply takes it the ordinary way.
 
+**What the edge must do with that 503, and why "retry the same key" is not enough.** A session is
+pinned to whichever replica holds its lock, and after a failover that is the _substitute_, not the
+replica the session id hashes to. The hash target has nothing to serve and cannot say where the
+session went — deliberately, since an owner record on the mount would be service discovery living in
+this repo, with a stale-record failure mode of its own. So it answers 503, and a strictly
+hash-and-retry edge keeps asking the one replica that will keep refusing, until the substitute's idle
+reaper frees the lock: **60 s** in service mode. That is an outage for every session a deploy moved.
+After repeated 503s on the same key the edge must **walk the ring** — try the other replicas in the
+slice — which finds the substitute on the first or second try and is safe by construction, because
+only the lock holder can serve the session anyway. The fleet simulator routes exactly this way and
+counts how many sessions needed the walk; in a run with rolling deploys it is most of the ones that
+moved, not a rare case.
+
 **Empty session directories.** `take_session_lock` has to create `<id>/` before it can know this
 replica will own the session, because the lock lives inside it. A session that then never wrote a
 segment gives that directory back on **its own exit path**, where it still holds the lock: if the

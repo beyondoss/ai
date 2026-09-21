@@ -9,7 +9,8 @@ use std::time::{Duration, Instant};
 
 use beyond_ai_test_support::exec_mock::ExecMock;
 use beyond_ai_test_support::{
-    spawn_model_server, spawn_model_server_with_stalled_response, turn_text,
+    spawn_model_server, spawn_model_server_routed, spawn_model_server_with_stalled_response,
+    turn_text,
 };
 use serde_json::json;
 
@@ -122,6 +123,48 @@ impl Fleet {
         Self::start_with(kind, replicas, history_path, None, false).await
     }
 
+    /// As [`start`](Self::start), over `shards` shards rather than one.
+    ///
+    /// A real slice mounts up to ten, and which shard a session lives on is carried in its own id —
+    /// so a fleet with one shard cannot show a session being addressed to the wrong place, or two
+    /// tenants' sessions landing in separate subtrees of separate mounts.
+    pub async fn start_sharded(
+        kind: Kind,
+        replicas: usize,
+        shards: usize,
+        history_path: &std::path::Path,
+    ) -> Result<Self, String> {
+        // A soak runs for as long as it is asked to, so its model has to as well.
+        //
+        // `spawn_model_server` answers a fixed list of replies **and then stops accepting**, which
+        // silently capped every run at exactly as many turns as there were canned replies — two
+        // soaks in a row reported "64 turns committed", which is the length of that list rather
+        // than anything about the fleet. Every chaos event after the cap landed on sessions that
+        // could no longer write, and the reckoning graded promises all made in the first minute.
+        // The routed server answers an unbounded number of requests from its fallback, and serves
+        // each connection on its own thread instead of one at a time.
+        let (gateway_url, _bodies) = spawn_model_server_routed(Vec::new(), turn_text("ok"));
+        Self::start_against(
+            kind,
+            replicas,
+            shards,
+            history_path,
+            None,
+            false,
+            gateway_url,
+        )
+        .await
+    }
+
+    /// The shard names this fleet's replicas mount, in `--shard` order.
+    pub fn shard_names(&self) -> Vec<String> {
+        self.substrate
+            .shards
+            .iter()
+            .map(|(n, _)| n.clone())
+            .collect()
+    }
+
     /// As [`start`](Self::start), with the two per-replica knobs some scenarios need: a live-session
     /// cap, and a metrics listener to scrape.
     pub async fn start_with(
@@ -158,6 +201,7 @@ impl Fleet {
         Self::start_against(
             kind,
             replicas,
+            1,
             history_path,
             max_live_sessions,
             with_metrics,
@@ -172,12 +216,13 @@ impl Fleet {
     pub async fn start_against(
         kind: Kind,
         replicas: usize,
+        shards: usize,
         history_path: &std::path::Path,
         max_live_sessions: Option<usize>,
         with_metrics: bool,
         gateway_url: String,
     ) -> Result<Self, String> {
-        let substrate = Substrate::prepare(kind, 1, replicas)?;
+        let substrate = Substrate::prepare(kind, shards, replicas)?;
         let keys = tempfile::tempdir().map_err(|e| format!("keys: {e}"))?;
         let sandbox = tempfile::tempdir().map_err(|e| format!("sandbox: {e}"))?;
         let sandbox_home = sandbox.path().join("home");
@@ -593,7 +638,7 @@ pub async fn drain_keeps_serving_what_it_owns(
         Duration::from_secs(6),
         vec![turn_text("finished after the signal")],
     );
-    let fleet = match Fleet::start_against(kind, 1, history_path, None, false, gateway).await {
+    let fleet = match Fleet::start_against(kind, 1, 1, history_path, None, false, gateway).await {
         Ok(f) => f,
         Err(e) => return Outcome::failed_with(e),
     };
