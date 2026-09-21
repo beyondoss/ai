@@ -193,6 +193,31 @@ pub fn spawn_model_server_routed(
     routes: Vec<(String, String)>,
     fallback: String,
 ) -> (String, Arc<Mutex<Vec<String>>>) {
+    spawn_model_server_routed_inner(routes, fallback, true)
+}
+
+/// As [`spawn_model_server_routed`], but it does **not** keep the requests.
+///
+/// The recorder holds every raw request, and a request to an agent carries the entire conversation —
+/// so its memory grows with the *square* of the turn count. That is exactly right for a test that
+/// issues a handful of requests and then asserts on them, and exactly wrong for anything long
+/// running: a 60-session soak drove this to **23.9 GB** and took the host out of memory with it,
+/// having looked like an agent-side leak right up until the simulator itself turned out to be the
+/// process holding the memory.
+///
+/// A caller that never reads the recorder should use this.
+pub fn spawn_model_server_routed_unrecorded(
+    routes: Vec<(String, String)>,
+    fallback: String,
+) -> String {
+    spawn_model_server_routed_inner(routes, fallback, false).0
+}
+
+fn spawn_model_server_routed_inner(
+    routes: Vec<(String, String)>,
+    fallback: String,
+    record: bool,
+) -> (String, Arc<Mutex<Vec<String>>>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     let requests = Arc::new(Mutex::new(Vec::new()));
@@ -212,7 +237,9 @@ pub fn spawn_model_server_routed(
                     .find(|(needle, _)| req.contains(needle.as_str()))
                     .map(|(_, r)| r.clone())
                     .unwrap_or(fallback);
-                recorder.lock().unwrap().push(req);
+                if record {
+                    recorder.lock().unwrap().push(req);
+                }
                 let http = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{resp}"
                 );

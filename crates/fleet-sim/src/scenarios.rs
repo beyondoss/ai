@@ -9,8 +9,8 @@ use std::time::{Duration, Instant};
 
 use beyond_ai_test_support::exec_mock::ExecMock;
 use beyond_ai_test_support::{
-    spawn_model_server, spawn_model_server_routed, spawn_model_server_with_stalled_response,
-    turn_text,
+    spawn_model_server, spawn_model_server_routed_unrecorded,
+    spawn_model_server_with_stalled_response, turn_text,
 };
 use serde_json::json;
 
@@ -143,7 +143,11 @@ impl Fleet {
         // could no longer write, and the reckoning graded promises all made in the first minute.
         // The routed server answers an unbounded number of requests from its fallback, and serves
         // each connection on its own thread instead of one at a time.
-        let (gateway_url, _bodies) = spawn_model_server_routed(Vec::new(), turn_text("ok"));
+        // Unrecorded: the recorder keeps every raw request, and a request carries the whole
+        // transcript, so its memory grows with the square of the turn count. A soak issues hundreds
+        // of thousands — it reached 23.9 GB and took the host out of memory, while looking for all
+        // the world like an agent-side leak. Nothing here ever reads those bodies.
+        let gateway_url = spawn_model_server_routed_unrecorded(Vec::new(), turn_text("ok"));
         Self::start_against(
             kind,
             replicas,
