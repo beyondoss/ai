@@ -523,10 +523,14 @@ mod encode {
     /// `Value` tree when the history needs none of `build_messages`' rewriting passes. Compare against
     /// `build_and_serialize/anthropic`: same output (asserted byte-for-byte by
     /// `streamed_body_is_byte_identical_to_the_tree`), so the difference is the tree's own cost.
-    #[divan::bench]
-    fn stream_to_bytes(bencher: Bencher) {
-        let req = encode_request(model_for("anthropic"), true);
-        bencher.bench(|| anthropic::build_body_bytes(&req, false).expect("serialize body"));
+    #[divan::bench(args = ["anthropic", "openai", "responses"])]
+    fn stream_to_bytes(bencher: Bencher, which: &str) {
+        let req = encode_request(model_for(which), true);
+        bencher.bench(|| match which {
+            "anthropic" => anthropic::build_body_bytes(&req, false).expect("serialize body"),
+            "openai" => openai::build_body_bytes(&req).expect("serialize body"),
+            _ => openai_responses::build_body_bytes(&req).expect("serialize body"),
+        });
     }
 }
 

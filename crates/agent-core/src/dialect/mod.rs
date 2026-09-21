@@ -172,6 +172,48 @@ fn routes_to_anthropic_by_default(
     bare_default || is_fireworks_anthropic_wire_model(&m)
 }
 
+/// Where one wire item goes: a `Vec<Value>` on the tree path, a serializer on the streamed one.
+///
+/// The dialects hand this typed views rather than `Value`s, so one construction path serves both
+/// encoders — on the tree path a view becomes exactly the `Value` the `json!` it replaced built, and
+/// on the streamed path it writes bytes without building anything at all.
+pub(super) trait Items {
+    type Error;
+    fn item<T: serde::Serialize>(&mut self, item: T) -> std::result::Result<(), Self::Error>;
+
+    /// For an item that is *already* a `Value` — a pre-parsed reasoning item, or a message whose
+    /// field names are only known at runtime. Handing it to [`Items::item`] would deep-clone it on
+    /// the tree path; this moves it instead.
+    fn item_value(&mut self, item: Value) -> std::result::Result<(), Self::Error>;
+}
+
+impl Items for Vec<Value> {
+    type Error = serde_json::Error;
+    fn item<T: serde::Serialize>(&mut self, item: T) -> std::result::Result<(), Self::Error> {
+        self.push(serde_json::to_value(item)?);
+        Ok(())
+    }
+
+    fn item_value(&mut self, item: Value) -> std::result::Result<(), Self::Error> {
+        self.push(item);
+        Ok(())
+    }
+}
+
+/// An [`Items`] that writes straight into a sequence serializer.
+pub(super) struct SeqItems<S>(pub S);
+
+impl<S: serde::ser::SerializeSeq> Items for SeqItems<S> {
+    type Error = S::Error;
+    fn item<T: serde::Serialize>(&mut self, item: T) -> std::result::Result<(), Self::Error> {
+        self.0.serialize_element(&item)
+    }
+
+    fn item_value(&mut self, item: Value) -> std::result::Result<(), Self::Error> {
+        self.0.serialize_element(&item)
+    }
+}
+
 impl Dialect {
     /// Pick the dialect for a model id, with no host signal available — equivalent to
     /// [`Self::for_model_with_host`]`(model, None)`. Claude → Anthropic; a handful of known
@@ -291,7 +333,8 @@ impl Dialect {
     ) -> std::result::Result<Vec<u8>, serde_json::Error> {
         match self {
             Dialect::Anthropic => anthropic::build_body_bytes(req, is_oauth),
-            _ => serde_json::to_vec(&self.build_body(req, is_oauth)),
+            Dialect::OpenAiResponses => openai_responses::build_body_bytes(req),
+            Dialect::OpenAi => openai::build_body_bytes(req),
         }
     }
 
