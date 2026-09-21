@@ -88,11 +88,23 @@ fn a_takeover_seals_the_old_epoch_and_a_stale_writers_later_bytes_never_replay()
         .append_new(&[Message::user("one"), Message::user("two")])
         .unwrap();
 
-    // The old owner is still alive and still holds an open append target. Its writes land on disk —
-    // nothing can stop them — but they are past the seal the new epoch's header recorded, so no
-    // reader ever sees them again.
-    old.append_new(&[Message::user("one"), Message::user("stale")])
-        .unwrap();
+    // The old owner is still alive and still holds an open append target, so nothing stops its bytes
+    // reaching the disk. Two separate things have to be true about them.
+    //
+    // It must be **told**. The write is refused with `Superseded`, so the owner ends the session
+    // instead of reporting a turn committed that no reader will ever replay — which is what it used
+    // to do, because an owner holding a target appends without re-checking. The check happens after
+    // the bytes land, which is why the assertions below about what is on disk are unchanged.
+    let refused = old
+        .append_new(&[Message::user("one"), Message::user("stale")])
+        .expect_err("a fenced owner must not report a successful write");
+    assert!(
+        beyond_ai_agent::session_store::is_superseded(&refused),
+        "and it must be the takeover signal, not an I/O error: {refused:?}"
+    );
+    assert!(old.superseded(), "poisoned: every later write fails too");
+
+    // And they must be **unreadable**: past the seal the new epoch's header recorded.
 
     let sealed_at = headers(&dir.path().join("s1"))[1]["sealed"]["1"]
         .as_u64()

@@ -2741,8 +2741,23 @@ have created.
 - **`Superseded` poisons the store.** Every later write fails, whatever kind — a title, a label, a
   model change, a rewrite. `SessionStore::superseded()` is what an owner checks after each write;
   `session_store::is_superseded(&err)` classifies the error.
-- **A stale writer's bytes are harmless.** They land past the seal the new epoch recorded, so no
-  replay ever reaches them.
+- **A stale writer's bytes are harmless to a reader.** They land past the seal the new epoch
+  recorded, so no replay reaches them. They are _not_ harmless to the writer's own client, which is
+  a separate problem with a separate fix — see below.
+- **Every committed batch re-checks.** The rules above fence an owner that is _rolling_. An owner
+  that already holds an open target appends straight to it, so without a second check it never
+  learns it was fenced: its appends keep succeeding (they are ordinary appends to a file it can
+  still write), the successor sealed that segment at the offset it read, and the owner goes on
+  telling its client that turns committed which no reader will ever replay. So after each committed
+  batch — once per turn, not per line, next to an `fsync` that costs far more — the segmented log
+  `stat`s the epoch after its own. If it exists, someone else claimed it and the store is poisoned.
+  This does not close the window entirely: a successor that reads this segment's length and creates
+  its epoch _after_ the check has passed still seals away an acknowledged line, and a network
+  filesystem's negative-lookup cache bounds detection from below. It reduces the exposure from
+  unbounded to one round trip; closing it completely needs a fencing token in the write itself,
+  which the format has no room for today. Measured with a partitioned owner against a real NFSv4
+  lease: the successor took over at 102 s, and before this check the old owner then committed a turn,
+  answered `success`, and that turn was absent from the transcript the successor replayed.
 - **An append that fails** seals the segment at its last good offset and rolls on the next write, so
   one `ENOSPC` can't brick a session with an unbounded torn line mid-segment.
 

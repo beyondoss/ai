@@ -5782,6 +5782,9 @@ impl SegLog {
         match write {
             Ok(()) => {
                 self.target_len += buf.len() as u64;
+                // Before the caller may acknowledge this batch: has anyone claimed the epoch after
+                // ours while we were writing?
+                self.guard_not_superseded()?;
                 Ok(())
             }
             Err(e) => {
@@ -5796,6 +5799,42 @@ impl SegLog {
                 Err(e)
             }
         }
+    }
+
+    /// Has another owner claimed the epoch after this one?
+    ///
+    /// The gap this closes. [`Self::ensure_target`] checks for a rival *when it rolls* — the
+    /// predecessor's length, then an `O_EXCL` create — and that is a complete fence for an owner
+    /// that is starting a segment. But an owner that already **has** one open appends straight to
+    /// it and re-checks nothing, so an owner fenced while it holds a target never finds out. Its
+    /// appends keep succeeding, because they are ordinary appends to a file it still has permission
+    /// to write; the successor sealed that segment at the offset it read, so every reader stops
+    /// there and ignores the rest. The owner goes on acknowledging turns that no reader will ever
+    /// replay, which is the "no acknowledged line is lost" guarantee failing in the one situation
+    /// the whole segmented layout exists for.
+    ///
+    /// Measured before this existed, with a partitioned owner and a real NFSv4 lease: the successor
+    /// took the session over after 102 s, and the old owner then committed a turn, told its client
+    /// `success`, and that turn was absent from the transcript the successor replayed.
+    ///
+    /// One `stat` per committed batch — not per line: [`SessionStore::append_new`] buffers a whole
+    /// turn and appends it once, so this is paid once per turn, next to an `fsync` that costs far
+    /// more.
+    ///
+    /// **What it does not close.** A successor that reads this segment's length and creates its own
+    /// epoch *after* this check has passed still seals away a line this owner has acknowledged. The
+    /// window shrinks from unbounded to one round trip, and on a network filesystem it is further
+    /// bounded below by the client's own attribute cache — a negative lookup for the successor's
+    /// name can be served locally for up to `acdirmin`. Closing it completely needs a fencing token
+    /// carried in the write itself, which the storage format has no room for today.
+    fn guard_not_superseded(&mut self) -> std::io::Result<()> {
+        let Some(epoch) = self.target else {
+            return Ok(());
+        };
+        if self.dir.join(segment_name(epoch + 1)).exists() {
+            return Err(self.poison());
+        }
+        Ok(())
     }
 
     /// Write a new base segment, whose content `fill` produces, and retire what it replaces.
@@ -11670,6 +11709,52 @@ mod tests {
             read_capped_line_limited(&mut reader, &mut buf, &mut rest)
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    /// An owner that already holds an open segment must still notice a successor.
+    ///
+    /// The roll-time checks in `ensure_target` do not run here: this store has a target and appends
+    /// straight into it. Before the per-commit check existed, every one of these appends succeeded
+    /// and was acknowledged, while a reader — bounded by the seal the successor recorded — ignored
+    /// all of them. The fleet simulator caught it against a real NFSv4 lease; this pins it in
+    /// milliseconds, by doing to the directory exactly what a successor does: claiming the next
+    /// epoch with `O_EXCL`.
+    #[test]
+    fn an_owner_holding_a_segment_still_notices_a_successor() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = SessionRepo::open_with(
+            dir.path(),
+            RepoOptions {
+                layout: Layout::Segmented { codec: None },
+                id_prefix: None,
+            },
+        )
+        .unwrap();
+        let mut store = repo.create(SessionMeta::with_id("s1", "/w", "m")).unwrap();
+        let session_dir = store.path().to_path_buf();
+
+        store.append_new(&[Message::user("mine")]).unwrap();
+        assert!(!store.superseded(), "nobody else has touched it yet");
+        let target = scan_segments(&session_dir).unwrap().last().unwrap().epoch;
+
+        // What a successor does, and the only part of it that matters here.
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(session_dir.join(segment_name(target + 1)))
+            .unwrap();
+
+        let err = store
+            .append_new(&[Message::user("mine"), Message::user("after the seal")])
+            .expect_err("a fenced owner must not report a successful write");
+        assert!(
+            is_superseded(&err),
+            "and it must be the takeover signal, not an I/O error: {err:?}"
+        );
+        assert!(
+            store.superseded(),
+            "poisoned, so the session ends rather than accepting the next turn too"
         );
     }
 

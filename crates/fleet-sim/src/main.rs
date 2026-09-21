@@ -161,6 +161,12 @@ async fn run_matrix(kind: Kind) -> std::process::ExitCode {
             "one-tenant-cannot-read-another" => {
                 scenarios::one_tenant_cannot_read_another(kind, &history).await
             }
+            "fenced-owner-stops-and-says-so" => {
+                scenarios::fenced_owner_stops_and_says_so(kind, &history).await
+            }
+            "hung-mount-is-reported-not-leaked" => {
+                scenarios::hung_mount_is_reported_not_leaked(kind, &history).await
+            }
             "unmounted-shard-is-misdirected" => {
                 scenarios::unmounted_shard_is_misdirected(kind, &history).await
             }

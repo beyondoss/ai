@@ -5,7 +5,7 @@
 //! that exercised nothing is worse than a skip that explains itself, because it is the one a reader
 //! will trust.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use beyond_ai_test_support::exec_mock::ExecMock;
 use beyond_ai_test_support::{
@@ -70,7 +70,31 @@ pub const ALL: &[Scenario] = &[
         claims: "C1, C2, C6",
         needs_shared_fs: true,
     },
+    Scenario {
+        name: "hung-mount-is-reported-not-leaked",
+        claims: "C8",
+        needs_shared_fs: true,
+    },
+    Scenario {
+        name: "fenced-owner-stops-and-says-so",
+        claims: "C3",
+        needs_shared_fs: true,
+    },
 ];
+
+impl Drop for Fleet {
+    fn drop(&mut self) {
+        // **Replicas first, explicitly.** Fields drop in declaration order, and `substrate` is
+        // declared first — so without this the mounts, veth pairs and network namespaces went away
+        // while the replicas were still running on them. A replica then sat in an uninterruptible
+        // NFS RPC whose network namespace no longer existed, and the harness hung in `wait()` for
+        // the child it had just killed. Nothing about that is visible in the scenario that
+        // triggers it, which is exactly why it is spelled out here rather than left to field order.
+        for r in &mut self.replicas {
+            let _ = r.kill_hard();
+        }
+    }
+}
 
 /// Everything a scenario needs standing up: shards, an edge, replicas, a history.
 pub struct Fleet {
@@ -153,7 +177,7 @@ impl Fleet {
         with_metrics: bool,
         gateway_url: String,
     ) -> Result<Self, String> {
-        let substrate = Substrate::prepare(kind, 1)?;
+        let substrate = Substrate::prepare(kind, 1, replicas)?;
         let keys = tempfile::tempdir().map_err(|e| format!("keys: {e}"))?;
         let sandbox = tempfile::tempdir().map_err(|e| format!("sandbox: {e}"))?;
         let sandbox_home = sandbox.path().join("home");
@@ -167,7 +191,6 @@ impl Fleet {
         let mut edge = Edge::new(keys.path(), Vec::new());
         let agent = agent_binary()?;
 
-        let shard_args = substrate.shard_args();
         let mut started = Vec::new();
         let mut targets = Vec::new();
         let mut metrics_ports = Vec::new();
@@ -186,7 +209,7 @@ impl Fleet {
                 port,
                 grant_key_flag: &edge.grant_key_flag(),
                 seal_key: edge.seal_key(),
-                shards: &shard_args,
+                shards: &substrate.shard_args_for(i),
                 drain_grace: Some(30),
                 max_live_sessions,
                 metrics_port,
@@ -216,7 +239,7 @@ impl Fleet {
     pub async fn restart(&mut self, idx: usize) -> Result<(), String> {
         let name = self.replicas[idx].name.clone();
         let port = free_port()?;
-        let shard_args = self.substrate.shard_args();
+        let shard_args = self.substrate.shard_args_for(idx);
         let replica = Replica::start(&crate::replica::Launch {
             name: &name,
             bin: &agent_binary()?,
@@ -793,7 +816,7 @@ pub async fn unmounted_shard_is_misdirected(
     _history_path: &std::path::Path,
 ) -> Outcome {
     // Two shards, and a replica that mounts only the first.
-    let substrate = match Substrate::prepare(kind, 2) {
+    let substrate = match Substrate::prepare(kind, 2, 1) {
         Ok(s) => s,
         Err(e) => return Outcome::failed_with(e),
     };
@@ -817,7 +840,7 @@ pub async fn unmounted_shard_is_misdirected(
         Ok(p) => p,
         Err(e) => return Outcome::failed_with(e),
     };
-    let all = substrate.shard_args();
+    let all = substrate.shard_args_for(0);
     let only_first = &all[..1];
     let replica = match Replica::start(&crate::replica::Launch {
         name: "r1",
@@ -1081,4 +1104,385 @@ fn grep_tree(root: &std::path::Path, needle: &str) -> bool {
         }
     }
     false
+}
+
+/// How many OS threads a process has right now.
+///
+/// The measurement C8 is actually about. A `spawn_blocking` probe is **uncancellable**: once it is
+/// stuck in a `stat` on a hard mount that stopped answering, it stays stuck, and the thread it is on
+/// is gone until the mount comes back. Whether that costs one thread or one per request is the whole
+/// difference between a replica that reports itself unhealthy and a replica that exhausts tokio's
+/// 512-thread blocking pool and takes every other `spawn_blocking` in the process down with it.
+fn threads(pid: u32) -> usize {
+    std::fs::read_dir(format!("/proc/{pid}/task"))
+        .map(|d| d.flatten().count())
+        .unwrap_or(0)
+}
+
+/// A bounded `GET`, because the point of the scenario is that the replica answers.
+async fn get_within(port: u16, path: &str, within: Duration) -> Result<u16, String> {
+    match tokio::time::timeout(within, workload::http_get(port, path)).await {
+        Ok(Ok((status, _))) => Ok(status),
+        Ok(Err(e)) => Err(e),
+        Err(_) => Err(format!("{path} did not answer within {within:?}")),
+    }
+}
+
+/// **C8 — a hung mount is reported, not leaked.**
+///
+/// The failure this exists for is specific and quiet. `/readyz` is unauthenticated by design — an
+/// orchestrator deciding whether a replica may hold sessions has no grant and could never obtain
+/// one — and its probe is filesystem I/O on a hard mount. A probe with no deadline and no
+/// single-flight guard spawns a blocking thread per request, each one stuck forever on a mount that
+/// stopped answering, while `/livez` keeps returning 200 so nothing restarts the replica. With a
+/// 10-second container health check that is a thread every ten seconds against tokio's 512-thread
+/// blocking pool, after which *every* `spawn_blocking` in the process — every session's persistence —
+/// queues behind dead threads.
+///
+/// So the mount is really taken away: packets to this replica's NFS server address are dropped, which
+/// is what a lost mount target looks like to a `hard` client. Its peers keep their own mounts, which
+/// is why each replica mounts separately.
+pub async fn hung_mount_is_reported_not_leaked(
+    kind: Kind,
+    history_path: &std::path::Path,
+) -> Outcome {
+    if !kind.is_shared_filesystem() {
+        return Outcome::Skipped(
+            "a local directory cannot be partitioned from itself: there is no client to cut off, \
+             and a `stat` on it cannot block. Needs `--substrate nfs`."
+                .into(),
+        );
+    }
+    let fleet = match Fleet::start(kind, 1, history_path).await {
+        Ok(f) => f,
+        Err(e) => return Outcome::failed_with(e),
+    };
+    let port = fleet.replicas[0].port;
+    let Some(pid) = fleet.replicas[0].pid() else {
+        return Outcome::failed_with("the replica has no pid".to_owned());
+    };
+
+    // Healthy first, or the rest proves nothing.
+    match get_within(port, "/readyz", Duration::from_secs(10)).await {
+        Ok(200) => {}
+        other => return Outcome::failed_with(format!("/readyz before the partition: {other:?}")),
+    }
+    let baseline = threads(pid);
+
+    if let Err(e) = fleet.substrate.partition(0) {
+        return Outcome::failed_with(format!("could not take the mount away: {e}"));
+    }
+
+    // Past the readiness cache before asking anything. `/readyz` memoizes its last *completed*
+    // answer for two seconds, and the healthy probe above filled that cache — so a burst of quick
+    // requests issued now would all be answered "ready" from a snapshot taken while the mount still
+    // worked. The first version of this scenario did exactly that and reported forty healthy probes
+    // against a mount that was gone, which is a harness measuring its own cache.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    // Then hammer it the way a container health check would, only faster. Sequential on purpose: a
+    // concurrent burst would also pass a per-request-thread implementation if the burst happened to
+    // be smaller than the pool, whereas a probe that is *not* single-flight leaks on every one of
+    // these.
+    let mut statuses = Vec::new();
+    let mut slowest = Duration::ZERO;
+    for _ in 0..20 {
+        let began = Instant::now();
+        let status = get_within(port, "/readyz", Duration::from_secs(15)).await;
+        slowest = slowest.max(began.elapsed());
+        statuses.push(status);
+    }
+    let after = threads(pid);
+    let livez = get_within(port, "/livez", Duration::from_secs(10)).await;
+
+    fleet.substrate.heal(0);
+
+    let mut findings = Vec::new();
+
+    let not_ready = statuses
+        .iter()
+        .filter(|s| matches!(s, Ok(code) if *code != 200))
+        .count();
+    findings.push(Finding {
+        claim: "C8",
+        ok: not_ready == statuses.len(),
+        detail: if not_ready == statuses.len() {
+            format!(
+                "every one of {} probes reported not-ready, the slowest in {slowest:?} — the \
+                 orchestrator is told, and told promptly",
+                statuses.len()
+            )
+        } else {
+            format!(
+                "{not_ready}/{} probes reported not-ready (slowest {slowest:?}); a replica that \
+                 cannot reach its shard must not claim it can: {statuses:?}",
+                statuses.len()
+            )
+        },
+    });
+
+    findings.push(Finding {
+        claim: "C8",
+        ok: matches!(livez, Ok(200)),
+        detail: match livez {
+            Ok(200) => {
+                "/livez stayed 200 — the process is alive, so the orchestrator takes it out \
+                        of the pool rather than killing it mid-session"
+                    .to_string()
+            }
+            other => format!("/livez answered {other:?}; a wedged mount is not a dead process"),
+        },
+    });
+
+    // A deadline on the *answer*, separately from the status. An orchestrator that waits an
+    // unbounded time for `/readyz` is an orchestrator that never takes the replica out of the pool,
+    // whatever the eventual answer would have been.
+    findings.push(Finding {
+        claim: "C8",
+        ok: slowest < Duration::from_secs(5),
+        detail: format!("the slowest probe answered in {slowest:?}"),
+    });
+
+    // The bound: the probe is single-flight, so one thread is stuck on the mount however many times
+    // it is asked. Four is slack for tokio growing its pool for unrelated work while this ran; the
+    // failure being caught is a thread *per request*.
+    let grew = after.saturating_sub(baseline);
+    findings.push(Finding {
+        claim: "C8",
+        ok: grew <= 4,
+        detail: format!(
+            "{} thread(s) while the mount was gone ({baseline} → {after}) across {} probes — \
+             single-flight holds; a probe per request would be {}",
+            grew,
+            statuses.len(),
+            statuses.len()
+        ),
+    });
+
+    // And it recovers: not-ready has to be a report on the mount, not a latch.
+    let mut recovered = false;
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while Instant::now() < deadline {
+        if let Ok(200) = get_within(port, "/readyz", Duration::from_secs(10)).await {
+            recovered = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    findings.push(Finding {
+        claim: "C8",
+        ok: recovered,
+        detail: if recovered {
+            "and /readyz went back to 200 once the mount answered again — the replica rejoins the \
+             pool by itself"
+                .to_string()
+        } else {
+            "/readyz never recovered after the mount came back: not-ready latched".to_string()
+        },
+    });
+
+    if check::report("hung-mount-is-reported-not-leaked", &findings) {
+        Outcome::Passed
+    } else {
+        Outcome::Failed
+    }
+}
+
+/// **C3 — a fenced owner stops, and says so.**
+///
+/// The only scenario in the matrix that stages the failure the epoch fence was actually designed
+/// for, and it cannot be staged any other way. Everywhere else a replica stops owning a session
+/// because it died or was asked to stop. Here it goes on believing it owns one while another replica
+/// takes it: the owner is partitioned from its storage, its NFSv4 lease lapses, the server revokes
+/// its open state and releases its lock, and the successor takes over and seals the segment the old
+/// owner still has open.
+///
+/// What must then happen, in order, when the old owner comes back:
+///
+/// 1. Its append fails — the server expired the state that descriptor referred to.
+/// 2. The failed append seals its own segment locally and forces a roll.
+/// 3. The roll's `O_EXCL` create of the next epoch finds the successor already there, which is the
+///    fence: the store is poisoned and never writes again.
+/// 4. The session ends with `session_superseded`, so the client is told rather than left talking to
+///    a replica whose writes go nowhere.
+///
+/// A replica that skipped any of those would be a second writer on one session — silently, because
+/// its own appends would keep succeeding locally. That is the failure this whole storage design
+/// exists to make impossible, and until now nothing ran it.
+pub async fn fenced_owner_stops_and_says_so(kind: Kind, history_path: &std::path::Path) -> Outcome {
+    if !kind.is_shared_filesystem() {
+        return Outcome::Skipped(
+            "needs a lock held on a lease rather than by a process, and a client that can be cut \
+             off from the server. On a local directory the lock dies with the owner and there is \
+             nothing to fence. Needs `--substrate nfs`."
+                .into(),
+        );
+    }
+    let fleet = match Fleet::start(kind, 2, history_path).await {
+        Ok(f) => f,
+        Err(e) => return Outcome::failed_with(e),
+    };
+    let (a, b) = (fleet.replicas[0].port, fleet.replicas[1].port);
+    let session = "s1.fenced";
+    let grant = fleet
+        .edge
+        .grant("t1", session, "s1", "/", &fleet.exec.url.clone());
+
+    // The old owner, addressed directly rather than through the ring: which replica owns this
+    // session is the whole subject, so it is chosen here and not by a hash.
+    let mut owner = match workload::connect(a, session, &grant).await {
+        Ok(ws) => ws,
+        Err(e) => return Outcome::failed_with(format!("the owner could not open it: {e}")),
+    };
+    match workload::prompt(&mut owner, "before-the-partition").await {
+        Ok(r) if r["success"] == true => {}
+        other => return Outcome::failed_with(format!("the owner's first turn: {other:?}")),
+    }
+    eprintln!("  … the owner holds it; cutting it off from its storage");
+
+    if let Err(e) = fleet.substrate.partition(0) {
+        return Outcome::failed_with(format!("could not partition the owner: {e}"));
+    }
+
+    // Now wait out the lease. Nothing here can shorten it: the successor is refused with a 503 for
+    // as long as the *server* still considers the old owner's lock held, which is the honest cost of
+    // a takeover from a partitioned owner and worth reporting as a number.
+    let began = Instant::now();
+    let deadline = began + Duration::from_secs(240);
+    let mut successor = None;
+    let mut refusals = 0u32;
+    while Instant::now() < deadline {
+        match workload::connect(b, session, &grant).await {
+            Ok(ws) => {
+                successor = Some(ws);
+                break;
+            }
+            Err(e) => {
+                refusals += 1;
+                if refusals % 10 == 1 {
+                    eprintln!("  … still refused after {:?}: {e}", began.elapsed());
+                }
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+        }
+    }
+    let took_over_in = began.elapsed();
+    let Some(mut successor) = successor else {
+        fleet.substrate.heal(0);
+        return Outcome::failed_with(format!(
+            "the successor never got the session: still refused {refusals} times after \
+             {took_over_in:?}, so a partitioned owner strands its sessions indefinitely"
+        ));
+    };
+    eprintln!("  … the successor took it over after {took_over_in:?} ({refusals} refusals)");
+
+    // It has to *write*, not just open: the seal is recorded by the roll, not by the replay.
+    let successor_turn = match workload::prompt(&mut successor, "after-the-takeover").await {
+        Ok(r) if r["success"] == true => true,
+        other => {
+            eprintln!("  … the successor could not write: {other:?}");
+            false
+        }
+    };
+
+    fleet.substrate.heal(0);
+    eprintln!("  … storage back; the old owner is about to find out");
+
+    // The old owner, still attached, still believing it owns this session, now tries to write.
+    if let Err(e) = workload::send(
+        &mut owner,
+        json!({ "type": "prompt", "message": "after-the-fence" }),
+    )
+    .await
+    {
+        return Outcome::failed_with(format!("could not prompt the fenced owner: {e}"));
+    }
+    // Everything it says, not just the first thing: the supersession is reported on the way out of
+    // the command loop, which is *after* the prompt's own response.
+    let (said_superseded, frames) =
+        workload::collect_until(&mut owner, Duration::from_secs(120), |f| {
+            f["type"] == "session_superseded"
+        })
+        .await;
+
+    let mut findings = Vec::new();
+
+    findings.push(Finding {
+        claim: "C3",
+        ok: successor_turn,
+        detail: if successor_turn {
+            format!(
+                "the successor took the session over {took_over_in:?} after the owner was cut off \
+                 ({refusals} refusals meanwhile) and committed a turn — the lease is the cost, the \
+                 takeover is not in doubt"
+            )
+        } else {
+            "the successor took the lock but could not write, so nothing sealed the old owner's \
+             segment and the fence was never armed"
+                .to_string()
+        },
+    });
+
+    findings.push(Finding {
+        claim: "C3",
+        ok: said_superseded,
+        detail: if said_superseded {
+            "the fenced owner said `session_superseded` — the client is told to reconnect, rather \
+             than going on talking to a replica whose writes go nowhere"
+                .to_string()
+        } else {
+            format!(
+                "the fenced owner never said `session_superseded`; it said: {:?}",
+                frames
+                    .iter()
+                    .map(|f| f["type"].as_str().unwrap_or("?"))
+                    .collect::<Vec<_>>()
+            )
+        },
+    });
+
+    // The half that decides whether this is a nuisance or a broken promise: if the fenced owner
+    // acknowledged that turn, it has to be in the transcript. A reader bounds each segment at the
+    // offset its successor sealed it to, so anything the old owner appended past that point is
+    // ignored — an acknowledgement for a line no reader will ever replay is precisely the
+    // "no acknowledged line is lost" invariant failing.
+    let acknowledged = frames
+        .iter()
+        .any(|f| f["type"] == "response" && f["command"] == "prompt" && f["success"] == true);
+    let replayed = workload::transcript(&mut successor)
+        .await
+        .map(|msgs| serde_json::to_string(&msgs).unwrap_or_default())
+        .unwrap_or_default();
+    let survived = replayed.contains("after-the-fence");
+    findings.push(Finding {
+        claim: "C3",
+        ok: !acknowledged || survived,
+        detail: if !acknowledged {
+            "the fenced owner acknowledged nothing, so nothing was promised".to_string()
+        } else if survived {
+            "the fenced owner's turn was acknowledged and is in the transcript".to_string()
+        } else {
+            "the fenced owner acknowledged a turn that is **not** in the replayed transcript: it \
+             was appended past the offset its segment was sealed at, so every reader ignores it. \
+             The client was told the turn committed and it did not."
+                .to_string()
+        },
+    });
+
+    // And the structural half, read from the server's own tree rather than through either client.
+    let dirs = fleet.substrate.session_dirs("s1", "t1");
+    for dir in &dirs {
+        findings.push(check::one_writer_per_session(dir));
+    }
+    findings.push(Finding {
+        claim: "C3",
+        ok: !dirs.is_empty(),
+        detail: format!("{} session director(ies) on the shard", dirs.len()),
+    });
+
+    if check::report("fenced-owner-stops-and-says-so", &findings) {
+        Outcome::Passed
+    } else {
+        Outcome::Failed
+    }
 }
