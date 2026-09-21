@@ -137,9 +137,37 @@ static PENDING: Mutex<Vec<Undo>> = Mutex::new(Vec::new());
 /// export. Unmounting something already gone and unexporting something already withdrawn are both
 /// fine, which is what lets this run from `Drop` and from a signal handler without coordinating.
 fn teardown(undo: &Undo) {
-    for m in undo.mounts.iter().rev() {
-        let _ = sudo(&["umount", "-l", &m.display().to_string()]);
+    // **Every link comes up first**, including one a scenario deliberately took down. An NFS client
+    // cannot finish unmounting without reaching its server: it still has opens to close and a lease
+    // to surrender. Unmounting a partitioned client leaves that work outstanding forever.
+    for (ns, host_if) in &undo.nets {
+        let client_if = host_if.replacen("fh", "fc", 1);
+        let _ = sudo(&[
+            "ip", "netns", "exec", ns, "ip", "link", "set", &client_if, "up",
+        ]);
     }
+
+    // Then unmount **synchronously**, and only fall back to a lazy unmount if that fails.
+    //
+    // This was `umount -l` unconditionally, and that is what leaked. A lazy unmount detaches the
+    // tree from the namespace and returns immediately, leaving the superblock — and the NFSv4
+    // client's state manager — alive in the background, still needing the network. The next lines
+    // then deleted the veth and the namespace out from under it, so the state manager was left
+    // retrying against an address that no longer existed, in uninterruptible sleep, forever. A
+    // kernel thread per client named `<server-ip>-manager`, each pinning +1.00 on the host's load
+    // average until it reboots. Three of them accumulated before anyone looked at why an idle
+    // machine showed a load of five.
+    for m in undo.mounts.iter().rev() {
+        let at = m.display().to_string();
+        if sudo(&["umount", &at]).is_err() {
+            // A mount that genuinely will not come down (a server that stopped answering mid-run) is
+            // still better detached than left: `-f` gives the client permission to abandon its RPCs
+            // rather than retry them, which is what makes the lazy detach safe to follow with a
+            // network teardown.
+            let _ = sudo(&["umount", "-f", "-l", &at]);
+        }
+    }
+
     for (ns, host_if) in &undo.nets {
         // Deleting one end of a veth deletes the pair, wherever the peer lives.
         let _ = sudo(&["ip", "link", "del", host_if]);

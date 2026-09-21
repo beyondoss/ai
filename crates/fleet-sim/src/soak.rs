@@ -92,6 +92,8 @@ pub async fn run(
     sessions: usize,
     tenant_count: usize,
     shard_count: usize,
+    reconnect_every: u64,
+    chaos: bool,
 ) -> bool {
     let dir = match tempfile::tempdir() {
         Ok(d) => d,
@@ -166,35 +168,51 @@ pub async fn run(
         let mut rng = Rng::new(seed ^ (i as u64).wrapping_mul(0x9E37_79B9));
         workers.push(tokio::spawn(async move {
             let mut turn = 0u64;
+            // The socket is kept **across turns**, which is what a client actually does: a phone or
+            // a TUI opens one connection and talks over it for as long as the conversation lasts.
+            // Reconnecting per turn made every turn pay a TCP handshake, a WebSocket upgrade, a
+            // grant verification and a session attach, and charged all of it to what looked like
+            // storage throughput.
+            let mut held: Option<workload::Ws> = None;
             while !stop.load(Ordering::Relaxed) {
-                // The worker routes itself, against the edge's *current* view: a real client only
-                // knows the edge's rule, and during chaos the replica it lands on changes underneath
-                // it.
-                let now: Vec<_> = targets
-                    .lock()
-                    .map(|t| t.clone())
-                    .unwrap_or_else(|e| e.into_inner().clone());
-                let placed =
-                    edge::place_among(&now, &session, &grant, Duration::from_secs(20)).await;
-                let Placement::Served { port, .. } = placed else {
-                    refused.fetch_add(1, Ordering::Relaxed);
-                    tokio::time::sleep(Duration::from_millis(200)).await;
-                    continue;
-                };
-                let Ok(mut ws) = workload::connect(port, &session, &grant).await else {
-                    tokio::time::sleep(Duration::from_millis(200)).await;
-                    continue;
-                };
-                // A second connection to the same session, sometimes: the phone and the laptop, which
-                // the fan-out design is for. It must not disturb the first — and it is a second
-                // *view*, never a second writer.
-                let second = if rng.below(4) == 0 {
-                    workload::connect(port, &session, &grant).await.ok()
-                } else {
-                    None
-                };
+                // Reattach on a cadence anyway, because detach and re-attach is the path the
+                // connection-is-a-view design exists for and a soak that never exercised it would
+                // be testing a client nobody has.
+                if reconnect_every != 0 && turn % reconnect_every == 0 {
+                    held = None;
+                }
+                if held.is_none() {
+                    // The worker routes itself, against the edge's *current* view: a real client
+                    // only knows the edge's rule, and during chaos the replica it lands on changes
+                    // underneath it.
+                    let now: Vec<_> = targets
+                        .lock()
+                        .map(|t| t.clone())
+                        .unwrap_or_else(|e| e.into_inner().clone());
+                    let placed =
+                        edge::place_among(&now, &session, &grant, Duration::from_secs(20)).await;
+                    let Placement::Served { port, .. } = placed else {
+                        refused.fetch_add(1, Ordering::Relaxed);
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                        continue;
+                    };
+                    let Ok(ws) = workload::connect(port, &session, &grant).await else {
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                        continue;
+                    };
+                    // A second connection to the same session, sometimes: the phone and the laptop,
+                    // which the fan-out design is for. It must not disturb the first — and it is a
+                    // second *view*, never a second writer.
+                    if rng.below(4) == 0
+                        && let Ok(second) = workload::connect(port, &session, &grant).await
+                    {
+                        drop(second);
+                    }
+                    held = Some(ws);
+                }
+                let Some(ws) = held.as_mut() else { continue };
                 let marker = format!("{session}-turn-{turn}");
-                match workload::prompt(&mut ws, &marker).await {
+                match workload::prompt(ws, &marker).await {
                     Ok(resp) if resp["success"] == true => {
                         history.record(
                             "message_committed",
@@ -205,12 +223,12 @@ pub async fn run(
                     }
                     _ => {
                         // A turn lost to a replica dying mid-flight is allowed: the contract is that
-                        // an *acknowledged* turn survives, not that every attempt succeeds.
+                        // an *acknowledged* turn survives, not that every attempt succeeds. The
+                        // socket goes with it — whatever went wrong, this one is not trusted again.
                         history.record("turn_failed", json!({ "session": session, "turn": turn }));
+                        held = None;
                     }
                 }
-                drop(second);
-                drop(ws);
                 tokio::time::sleep(Duration::from_millis(50 + rng.below(150))).await;
             }
         }));
@@ -222,7 +240,14 @@ pub async fn run(
     let began = Instant::now();
     let mut rng = Rng::new(seed);
     let (mut deploys, mut kills) = (0u32, 0u32);
-    while began.elapsed() < duration {
+    // Chaos off is not a weaker soak, it is the **control**. Under continuous chaos every session a
+    // dying replica held must re-place, re-acquire its lock and replay its whole transcript from
+    // disk — so a throughput number measured with chaos on is partly a measurement of recovery, and
+    // there is no way to tell how much without the arm that has none.
+    if !chaos {
+        tokio::time::sleep(duration).await;
+    }
+    while chaos && began.elapsed() < duration {
         tokio::time::sleep(Duration::from_millis(1500 + rng.below(2500))).await;
         let victim = rng.below(fleet.replicas.len() as u64) as usize;
         if !fleet.replicas[victim].is_running() {

@@ -117,6 +117,13 @@ impl Replica {
         // The replica's own `$HOME` must not be reachable: in service mode a host default is a
         // tenancy bug, and pointing it at a path that does not exist is how the integration tests
         // prove the replica never falls back to one.
+        // Passed through so a run can A/B the replica's runtime flavour. The single-threaded default
+        // was chosen on a benchmark with one session, where nothing contends for the thread; this is
+        // what lets the same question be asked at a hundred sessions per replica, where it is 87% of
+        // all the CPU a replica spends.
+        if let Ok(n) = std::env::var("FLEET_SIM_AGENT_WORKER_THREADS") {
+            c.env("BEYOND_AI_AGENT_TOKIO_WORKER_THREADS", n);
+        }
         c.env("HOME", "/nonexistent-fleet-sim-home")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
