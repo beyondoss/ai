@@ -6,6 +6,7 @@
 //! ```text
 //! fleet-sim matrix [--substrate local-dir|nfs]   every scenario, once, deterministic — the gate
 //! fleet-sim soak [--duration S] [--seed N]      randomized chaos, then the checker — the burn-in
+//!              [--sessions N] [--tenants N] [--shards N]
 //! fleet-sim list                                 the scenarios and which substrate each needs
 //! ```
 //!
@@ -69,8 +70,25 @@ async fn main() -> std::process::ExitCode {
                 .unwrap_or(1);
             let sessions = flag(&args, "--sessions")
                 .and_then(|s| s.parse::<usize>().ok())
-                .unwrap_or(4);
-            if soak::run(kind, std::time::Duration::from_secs(secs), seed, sessions).await {
+                .unwrap_or(6);
+            // More than one of each by default. A single-tenant, single-shard soak exercises the
+            // storage layout and proves nothing about the two properties the layout is *for*.
+            let tenants = flag(&args, "--tenants")
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(3);
+            let shards = flag(&args, "--shards")
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(2);
+            if soak::run(
+                kind,
+                std::time::Duration::from_secs(secs),
+                seed,
+                sessions,
+                tenants,
+                shards,
+            )
+            .await
+            {
                 std::process::ExitCode::SUCCESS
             } else {
                 std::process::ExitCode::FAILURE
