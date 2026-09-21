@@ -1627,19 +1627,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Everything else wants the async runtime. Constructed explicitly so the isolate branch above
-    // can run first, before any worker exists. Default is `current_thread`: see [`build_runtime`].
-    build_runtime()?.block_on(run())
+    // can run first, before any worker exists. The flavour depends on whether this process is a
+    // fleet replica — see [`build_runtime`] — which has to be decided from the raw arguments,
+    // because the runtime must exist before anything can parse them properly.
+    build_runtime(is_service_mode())?.block_on(run())
+}
+
+/// Is this process a `serve --service` replica?
+///
+/// Answered by scanning the raw arguments rather than by parsing them, because the runtime is built
+/// before the parser runs. It only has to be right about one flag, and it deliberately mirrors the
+/// two ways service mode is actually turned on. A false negative costs the old single-threaded
+/// default; a false positive costs a few worker threads on a process that will not use them.
+fn is_service_mode() -> bool {
+    let mut args = std::env::args_os().skip(1);
+    if args.next().is_none_or(|a| a != "serve") {
+        return false;
+    }
+    std::env::args_os().any(|a| a == "--service")
+        || std::env::var("AI_AGENT_SERVICE").is_ok_and(|v| !v.is_empty() && v != "0")
 }
 
 /// How many tokio *async* worker threads the process runtime should run.
 ///
-/// `None` (unset, empty, or `1`) is a `current_thread` runtime — the production default. `Some(0)`
-/// is tokio's multi-thread default (one worker per core). `Some(n)` for `n >= 2` pins that many
-/// workers.
+/// `None` (unset, empty, or `1`) is a `current_thread` runtime. `Some(0)` is tokio's multi-thread
+/// default (one worker per core). `Some(n)` for `n >= 2` pins that many workers.
 ///
-/// Production leaves this unset. `BEYOND_AI_AGENT_TOKIO_WORKER_THREADS` exists so
-/// `benches/serve_runtime.rs` can A/B the two schedulers against the same binary (and so an
-/// operator can restore the old work-stealing runtime without a rebuild).
+/// Set explicitly, it wins over the mode-based default in [`build_runtime`] in both directions — so
+/// `=1` forces a replica back onto the single-threaded scheduler without a rebuild, and `=0` gives a
+/// local daemon work-stealing.
 fn tokio_worker_threads_from_env() -> Result<Option<usize>, Box<dyn std::error::Error>> {
     match std::env::var("BEYOND_AI_AGENT_TOKIO_WORKER_THREADS") {
         Err(_) => Ok(None),
@@ -1656,17 +1672,79 @@ fn tokio_worker_threads_from_env() -> Result<Option<usize>, Box<dyn std::error::
     }
 }
 
-/// The process-wide tokio runtime.
+/// How many workers to run, given the environment and the mode.
 ///
-/// Default is `current_thread`. Session tasks (`serve_ws`), the accept loop, the idle reaper, stdio
-/// `serve`, and one-shot `run` all share it — `serve_session` is `Send`, so there is no per-session
-/// OS thread. CPU-bound tool work (`grep`/`find`/image resize) is `spawn_blocking`, which a
-/// current-thread runtime still has a blocking pool for. Extra work-stealing workers cost per-thread
-/// stacks and mimalloc heaps; `benches/serve_runtime.rs` A/B's that tradeoff now that session work
-/// lives on this runtime. `BEYOND_AI_AGENT_TOKIO_WORKER_THREADS` restores work-stealing without a
-/// rebuild.
-fn build_runtime() -> Result<tokio::runtime::Runtime, Box<dyn std::error::Error>> {
-    let mut builder = match tokio_worker_threads_from_env()? {
+/// Split out from [`build_runtime`] so the decision can be tested without standing up a runtime —
+/// and because the one case that is easy to get wrong is invisible otherwise: `configured` is `None`
+/// both when the variable is unset *and* when it is explicitly `1`, so an operator pinning a replica
+/// back to the single-threaded scheduler looks identical to one who said nothing. `env_set`
+/// distinguishes them.
+fn runtime_workers(configured: Option<usize>, env_set: bool, service: bool) -> Option<usize> {
+    match configured {
+        Some(n) => Some(n),
+        // `Some(0)` is tokio's own default: one worker per core, and `available_parallelism`
+        // respects a cgroup CPU quota — so a replica gets workers in proportion to the CPU its task
+        // was actually given, which is the thing worth scaling with.
+        None if service && !env_set => Some(0),
+        None => None,
+    }
+}
+
+/// What a replica's worker count buys, measured through `crates/fleet-sim` at 120 sessions on 3
+/// replicas over real NFS with chaos off — kept here because the tradeoff is not obvious and the
+/// last decision was made on a benchmark that could not see it:
+///
+/// ```text
+/// workers   turns/s   vs 1     peak RSS   per replica   MB per turn/s
+///    1       274.2    1.00x      649 MB       216 MB        2.37
+///    2       385.1    1.40x      854 MB       285 MB        2.22
+///    4       514.1    1.88x      774 MB       258 MB        1.51
+///    8       619.6    2.26x     1168 MB       389 MB        1.88
+///   16       674.6    2.46x     1362 MB       454 MB        2.02
+/// ```
+///
+/// Memory grows **sub-linearly** in the worker count and stays small in absolute terms: even at one
+/// worker per core on a 16-core host a replica sits at ~454 MB while serving 40 concurrently active
+/// sessions. The per-thread stacks and mimalloc heaps that argued for a single thread are a density
+/// budget from the **in-VM** agent, which shares a 768 MB guest with the tenant's workload. A
+/// replica outside the sandbox has its own task allocation and nothing to share it with, so the same
+/// arithmetic does not apply.
+///
+/// Four workers is the most *efficient* point (1.51 MB per turn/s) if a deployment is genuinely
+/// memory-tight; pin it with `BEYOND_AI_AGENT_TOKIO_WORKER_THREADS=4`.
+const _WORKER_TRADEOFF: () = ();
+
+/// The process-wide tokio runtime: `current_thread` for a local daemon, work-stealing for a fleet
+/// replica.
+///
+/// Session tasks (`serve_ws`), the accept loop, the idle reaper, stdio `serve` and one-shot `run`
+/// all share it — `serve_session` is `Send`, so there is no per-session OS thread. CPU-bound tool
+/// work (`grep`/`find`/image resize) is `spawn_blocking`, which a current-thread runtime still has a
+/// blocking pool for.
+///
+/// **Why the default splits by mode.** A single-threaded runtime was chosen for both, on a benchmark
+/// that showed the two schedulers tying on throughput while work-stealing cost roughly nine times
+/// the RSS. That benchmark ran **one session** — where nothing contends for the thread, so of course
+/// they tied, and per-worker stacks and mimalloc heaps were essentially the whole memory delta. It
+/// was the right answer to the question it asked, and the wrong default for a replica.
+///
+/// Asked again at 120 sessions across 3 replicas, with the fleet simulator driving real sessions
+/// over a real NFS mount: the single thread was **87% of all CPU a replica spent**, a turn costing
+/// ~7 ms of CPU took ~311 ms of wall time because it crosses that thread a dozen times and queues
+/// behind every other session on each crossing, and four workers gave **1.90× the throughput at
+/// identical RSS** (456 MB vs 460 MB). At that scale session state dominates memory and the arenas
+/// disappear into it.
+///
+/// So a replica gets work-stealing and a laptop daemon keeps its one thread, because there the
+/// single-session measurement is the accurate one.
+/// `BEYOND_AI_AGENT_TOKIO_WORKER_THREADS` overrides either direction without a rebuild.
+fn build_runtime(service: bool) -> Result<tokio::runtime::Runtime, Box<dyn std::error::Error>> {
+    let choice = runtime_workers(
+        tokio_worker_threads_from_env()?,
+        std::env::var_os("BEYOND_AI_AGENT_TOKIO_WORKER_THREADS").is_some(),
+        service,
+    );
+    let mut builder = match choice {
         None => tokio::runtime::Builder::new_current_thread(),
         Some(0) => tokio::runtime::Builder::new_multi_thread(),
         Some(n) => {
@@ -6133,5 +6211,30 @@ mod tests {
             None,
             "an override table with only unrecognized keys must resolve to no overrides at all"
         );
+    }
+}
+
+#[cfg(test)]
+mod runtime_tests {
+    use super::runtime_workers;
+
+    /// The decision table, including the case that reads the same as "unset" unless you look.
+    #[test]
+    fn a_replica_gets_workers_and_a_daemon_does_not_unless_told() {
+        // Nothing set: the laptop daemon keeps its one thread; the replica gets a capped worker
+        // count, never more than the cores it actually has.
+        assert_eq!(runtime_workers(None, false, false), None);
+        // `Some(0)` is tokio's own "one worker per core", not a literal zero workers.
+        assert_eq!(runtime_workers(None, false, true), Some(0));
+
+        // `=1` parses to `None`, exactly like unset — but it is an operator pinning a replica back
+        // onto the single-threaded scheduler, and it has to win.
+        assert_eq!(runtime_workers(None, true, true), None);
+        assert_eq!(runtime_workers(None, true, false), None);
+
+        // An explicit count wins in both directions, including work-stealing for a local daemon.
+        assert_eq!(runtime_workers(Some(4), true, false), Some(4));
+        assert_eq!(runtime_workers(Some(0), true, false), Some(0));
+        assert_eq!(runtime_workers(Some(2), true, true), Some(2));
     }
 }

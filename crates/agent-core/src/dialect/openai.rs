@@ -14,6 +14,7 @@ use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
 use super::StreamDecoder;
+use super::{Items, SeqItems};
 use crate::error::{Error, Result};
 use crate::message::{ContentBlock, ImageSource, Role, StopReason, StreamEvent, TokenUsage};
 use crate::transport::{ModelRequest, ToolChoice};
@@ -264,38 +265,200 @@ pub fn build_body(req: &ModelRequest) -> Value {
     // Responses dialect's identical gating (`super::openai_responses::instruction_role`) rather than a
     // second, drifting copy of the same one-line rule.
     let instruction_role = super::openai_responses::instruction_role(&req.model, &caps);
+    // +1 for the optional leading system/instruction entry pushed below; some roles push more than one
+    // entry per source message, so this is a lower-bound hint, not an exact count — still avoids most
+    // of the reallocations a `Vec::new()` start would otherwise pay as the common (1:1) case fills in.
+    let mut messages: Vec<Value> = Vec::with_capacity(req.messages.len() + 1);
+    // Infallible here: `Items for Vec<Value>` can only fail if a view refuses to become a `Value`.
+    let _ = build_messages(req, &caps, supports_vision, instruction_role, &mut messages);
+    let mut map = build_scaffold(req, &caps, saw_tool_history(req));
+    map.insert("messages".into(), Value::Array(messages));
+    Value::Object(map)
+}
+
+/// The scaffolding plus the streamed `messages`, emitted in sorted key order.
+struct WireBody<'a> {
+    scaffold: &'a Map<String, Value>,
+    req: &'a ModelRequest,
+    caps: &'a crate::models::ModelCaps,
+    supports_vision: bool,
+    instruction_role: &'a str,
+}
+
+impl serde::Serialize for WireBody<'_> {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = s.serialize_map(Some(self.scaffold.len() + 1))?;
+        let mut placed = false;
+        for (k, v) in self.scaffold {
+            if !placed && k.as_str() > "messages" {
+                map.serialize_entry("messages", &WireMessages(self))?;
+                placed = true;
+            }
+            map.serialize_entry(k, v)?;
+        }
+        if !placed {
+            map.serialize_entry("messages", &WireMessages(self))?;
+        }
+        map.end()
+    }
+}
+
+/// The `messages` array, streamed straight out of the typed history.
+struct WireMessages<'a>(&'a WireBody<'a>);
+
+impl serde::Serialize for WireMessages<'_> {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq;
+        let b = self.0;
+        let mut sink = SeqItems(s.serialize_seq(None)?);
+        build_messages(
+            b.req,
+            b.caps,
+            b.supports_vision,
+            b.instruction_role,
+            &mut sink,
+        )?;
+        sink.0.end()
+    }
+}
+
+/// The wire body as bytes, without building the `messages` array as a `Value` first.
+///
+/// Like the Responses dialect and unlike Anthropic's, this one never rewrites its items after
+/// building them — it constructs wire shape in a single pass — so there is no condition to gate on.
+/// The one thing the pass used to discover as it went, whether the history carries any tool call or
+/// result, is now a cheap typed pre-scan ([`saw_tool_history`]), because the scaffolding is emitted
+/// around a message array that is never materialized.
+pub fn build_body_bytes(req: &ModelRequest) -> std::result::Result<Vec<u8>, serde_json::Error> {
+    let caps = crate::models::capabilities_for_route_with_host(
+        &req.model,
+        req.is_codex,
+        req.is_azure,
+        req.is_copilot,
+        req.host,
+    );
+    let supports_vision = caps.supports_vision && !req.block_images;
+    let instruction_role = super::openai_responses::instruction_role(&req.model, &caps);
+    let scaffold = build_scaffold(req, &caps, saw_tool_history(req));
+    serde_json::to_vec(&WireBody {
+        scaffold: &scaffold,
+        req,
+        caps: &caps,
+        supports_vision,
+        instruction_role,
+    })
+}
+
+/// Message shapes for this dialect, keys in the order a `serde_json::Map` sorts them — the two
+/// encoders must agree byte for byte, which `streamed_body_is_byte_identical_to_the_tree` checks.
+mod wire {
+    use super::Value;
+    use serde::ser::SerializeMap;
+    use serde::{Serialize, Serializer};
+
+    /// `{role, content}` with a borrowed string body — the system/instruction line.
+    pub(super) struct Entry<'a> {
+        pub role: &'a str,
+        pub content: &'a str,
+    }
+
+    impl Serialize for Entry<'_> {
+        fn serialize<S: Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+            let mut m = s.serialize_map(Some(2))?;
+            m.serialize_entry("content", self.content)?;
+            m.serialize_entry("role", self.role)?;
+            m.end()
+        }
+    }
+
+    /// `{role, content}` where the body is an already-built `Value` — a user turn's text or its
+    /// multimodal parts array, which `user_content` produces.
+    pub(super) struct Msg<'a> {
+        pub role: &'a str,
+        pub content: &'a Value,
+    }
+
+    impl Serialize for Msg<'_> {
+        fn serialize<S: Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+            let mut m = s.serialize_map(Some(2))?;
+            m.serialize_entry("content", self.content)?;
+            m.serialize_entry("role", self.role)?;
+            m.end()
+        }
+    }
+
+    /// One tool result: `{role: "tool", tool_call_id, content}`.
+    pub(super) struct ToolMsg<'a> {
+        pub tool_call_id: &'a str,
+        pub content: &'a str,
+    }
+
+    impl Serialize for ToolMsg<'_> {
+        fn serialize<S: Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+            let mut m = s.serialize_map(Some(3))?;
+            m.serialize_entry("content", self.content)?;
+            m.serialize_entry("role", "tool")?;
+            m.serialize_entry("tool_call_id", self.tool_call_id)?;
+            m.end()
+        }
+    }
+}
+
+/// Does the history carry any tool call or result?
+///
+/// The message loop used to discover this as it went, setting a flag the scaffolding read afterwards.
+/// [`build_body_bytes`] has to emit the scaffolding *around* a message array it never materializes, so
+/// the answer is needed before the walk rather than after it. One cheap typed scan, no `Value`s.
+fn saw_tool_history(req: &ModelRequest) -> bool {
+    req.messages.iter().any(|m| {
+        m.content.iter().any(|b| {
+            matches!(
+                b,
+                ContentBlock::ToolUse { .. } | ContentBlock::ToolResult { .. }
+            )
+        })
+    })
+}
+
+/// Build the `messages` array into `sink` — the part of the body that scales with the transcript.
+fn build_messages<I: Items>(
+    req: &ModelRequest,
+    caps: &crate::models::ModelCaps,
+    supports_vision: bool,
+    instruction_role: &str,
+    messages: &mut I,
+) -> std::result::Result<(), I::Error> {
     // Mistral's real API rejects a `tool_call_id` that isn't exactly 9 alphanumeric characters — only
     // built (and only ever `Some`) when this request actually targets a Mistral model, so every other
     // provider's ids pass through `normalize_mistral_tool_id` untouched.
     let mut mistral_ids =
         crate::models::is_mistral_model(&req.model).then(MistralToolCallIdNormalizer::default);
-    // Defense-in-depth cross-model tool-call-id normalization (see `normalize_cross_model_tool_id`'s own
-    // doc comment) — populated as `tool_use` blocks from a foreign model are visited below, then
+    // Defense-in-depth cross-model tool-call-id normalization (see `normalize_cross_model_tool_id`'s
+    // own doc comment) — populated as `tool_use` blocks from a foreign model are visited below, then
     // consulted when their paired `tool_result` is reached in a later message.
     let mut cross_model_tool_id_remap: HashMap<String, String> = HashMap::new();
-    // +1 for the optional leading system/instruction entry pushed below; some roles push more than one
-    // entry per source message, so this is a lower-bound hint, not an exact count — still avoids most
-    // of the reallocations a `Vec::new()` start would otherwise pay as the common (1:1) case fills in.
-    let mut messages: Vec<Value> = Vec::with_capacity(req.messages.len() + 1);
     if let Some(system) = req.system.as_deref() {
-        messages.push(json!({ "role": instruction_role, "content": system }));
+        messages.item(wire::Entry {
+            role: instruction_role,
+            content: system,
+        })?;
     }
-
-    // Tracks whether the history carries any tool call or result, set inline as tool blocks are
-    // visited below — replaces `has_tool_history`'s separate full O(history) rescan on the no-tools
-    // fallback path (see [T3-F9]).
-    let mut saw_tool_history = false;
 
     for m in req.messages.iter() {
         match m.role {
-            Role::System => {
-                messages.push(json!({ "role": instruction_role, "content": text_of(&m.content) }))
-            }
+            Role::System => messages.item(wire::Entry {
+                role: instruction_role,
+                content: &text_of(&m.content),
+            })?,
             Role::User => {
                 // Text + image blocks form the user message (a multimodal parts array when any image
                 // is present); tool results fan out into individual `role:"tool"` messages below.
                 if let Some(content) = user_content(&m.content, supports_vision) {
-                    messages.push(json!({ "role": "user", "content": content }));
+                    messages.item(wire::Msg {
+                        role: "user",
+                        content: &content,
+                    })?;
                 }
                 // Every tool result in this turn is emitted first, contiguously (`tool`, `tool`, …).
                 // OpenAI's `tool` role can't carry images, so any visual output is collected here and
@@ -318,7 +481,6 @@ pub fn build_body(req: &ModelRequest) -> Value {
                         ..
                     } = b
                     {
-                        saw_tool_history = true;
                         // An image-only result (no text) still needs *some* string in `content` — the
                         // Chat Completions `tool` role requires a string, and pi's own
                         // `convertMessages` defaults to this exact placeholder rather than sending an
@@ -339,7 +501,10 @@ pub fn build_body(req: &ModelRequest) -> Value {
                             .unwrap_or(tool_use_id);
                         let tool_call_id =
                             normalize_mistral_tool_id(&mut mistral_ids, remapped_tool_use_id);
-                        messages.push(json!({ "role": "tool", "tool_call_id": tool_call_id, "content": tool_text }));
+                        messages.item(wire::ToolMsg {
+                            tool_call_id: &tool_call_id,
+                            content: tool_text,
+                        })?;
                         // The image-attribution label below is human-readable text for the model, not
                         // a validated wire id — kept as the original id, not the Mistral-reshaped one.
                         pending_images.extend(images.iter().map(|src| (tool_use_id.as_str(), src)));
@@ -358,7 +523,10 @@ pub fn build_body(req: &ModelRequest) -> Value {
                             })
                             .collect::<Vec<_>>()
                             .join("\n");
-                        messages.push(json!({ "role": "user", "content": text }));
+                        messages.item(wire::Entry {
+                            role: "user",
+                            content: &text,
+                        })?;
                     } else {
                         let mut parts: Vec<Value> = Vec::new();
                         let mut last_id: Option<&str> = None;
@@ -380,7 +548,10 @@ pub fn build_body(req: &ModelRequest) -> Value {
                                 },
                             }));
                         }
-                        messages.push(json!({ "role": "user", "content": parts }));
+                        messages.item(wire::Msg {
+                            role: "user",
+                            content: &Value::Array(parts),
+                        })?;
                     }
                 }
             }
@@ -424,7 +595,6 @@ pub fn build_body(req: &ModelRequest) -> Value {
                             input,
                             thought_signature,
                         } => {
-                            saw_tool_history = true;
                             let normalized = if is_foreign {
                                 normalize_cross_model_tool_id(id)
                             } else {
@@ -489,11 +659,20 @@ pub fn build_body(req: &ModelRequest) -> Value {
                 if !reasoning_details.is_empty() {
                     msg.insert("reasoning_details".into(), Value::Array(reasoning_details));
                 }
-                messages.push(Value::Object(msg));
+                messages.item_value(Value::Object(msg))?;
             }
         }
     }
 
+    Ok(())
+}
+
+/// Every wire field except `messages` — the fixed-size part of the body.
+fn build_scaffold(
+    req: &ModelRequest,
+    caps: &crate::models::ModelCaps,
+    saw_tool_history: bool,
+) -> Map<String, Value> {
     let mut map = Map::new();
     map.insert("model".into(), json!(req.model));
     // OpenAI reasoning models (o-series, gpt-5) reject `max_tokens` and require
@@ -507,13 +686,13 @@ pub fn build_body(req: &ModelRequest) -> Value {
     // window — see `super::clamp_max_tokens_to_context`'s doc comment for why this can't be skipped.
     map.insert(
         max_tokens_field.into(),
-        json!(super::clamp_max_tokens_to_context(req, &caps)),
+        json!(super::clamp_max_tokens_to_context(req, caps)),
     );
     // Reasoning models are driven by a reasoning-toggle field rather than a thinking-token budget; the
     // exact wire shape is family-specific (see `apply_reasoning_wire`'s own doc comment) — most take a
     // bare `reasoning_effort` string, several third-party providers want a nested `thinking`/`reasoning`
     // object instead.
-    apply_reasoning_wire(&mut map, &caps, req.reasoning_effort, &req.model);
+    apply_reasoning_wire(&mut map, caps, req.reasoning_effort, &req.model);
     map.insert("stream".into(), json!(true));
     // Ask for a trailing usage chunk so token accounting works on the streaming path.
     map.insert("stream_options".into(), json!({ "include_usage": true }));
@@ -560,7 +739,6 @@ pub fn build_body(req: &ModelRequest) -> Value {
     if req.cache_long && caps.supports_long_cache && !req.no_cache {
         map.insert("prompt_cache_retention".into(), json!("24h"));
     }
-    map.insert("messages".into(), Value::Array(messages));
     if !req.tools.is_empty() {
         let tools: Vec<Value> = req
             .tools
@@ -595,7 +773,7 @@ pub fn build_body(req: &ModelRequest) -> Value {
     if let Some(choice) = &req.tool_choice {
         map.insert("tool_choice".into(), tool_choice(choice));
     }
-    Value::Object(map)
+    map
 }
 
 /// Emit `req`'s reasoning effort (if any) onto `map` in whichever wire shape `caps`'s model actually
@@ -3613,5 +3791,68 @@ data: [DONE]
             ),
             None
         );
+    }
+
+    /// The streamed body must be **byte-identical** to the tree it replaces — same argument as the
+    /// other two dialects' versions of this test.
+    #[test]
+    fn streamed_body_is_byte_identical_to_the_tree() {
+        let model = "gpt-4.1";
+        let tool_use = ContentBlock::ToolUse {
+            id: "call_1".into(),
+            name: "read".into(),
+            input: json!({ "path": "/x" }),
+            thought_signature: None,
+        };
+        let foreign_call = ContentBlock::ToolUse {
+            id: "toolu_abc".into(),
+            name: "read".into(),
+            input: json!({}),
+            thought_signature: Some("sig".into()),
+        };
+        let tool_result = Message {
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: "call_1".into(),
+                content: "ok".into(),
+                is_error: false,
+                images: Vec::new(),
+            }],
+            ..Message::user("")
+        };
+        let thinking = Message::assistant(vec![ContentBlock::Thinking {
+            text: "hmm".into(),
+            signature: "sig".into(),
+        }]);
+        let mut foreign = Message::assistant(vec![foreign_call]);
+        foreign.model_id = Some("claude-opus-4-8".into());
+
+        let histories: Vec<Vec<Message>> = vec![
+            Vec::new(),
+            vec![Message::user("hello")],
+            vec![
+                Message::user("hello"),
+                Message::assistant(vec![tool_use.clone()]),
+                tool_result,
+            ],
+            vec![Message::user("hello"), thinking],
+            vec![Message::user("hello"), foreign],
+        ];
+
+        for history in histories {
+            let len = history.len();
+            for system in [None, Some("be brief")] {
+                for m in [model, "deepseek-chat", "mistral-large-latest"] {
+                    let mut req = ModelRequest::new(m, history.clone(), 256);
+                    req.system = system.map(std::sync::Arc::from);
+                    let streamed = build_body_bytes(&req).expect("stream");
+                    let tree = serde_json::to_vec(&build_body(&req)).expect("tree");
+                    assert_eq!(
+                        String::from_utf8_lossy(&streamed),
+                        String::from_utf8_lossy(&tree),
+                        "model={m} messages={len} system={system:?}"
+                    );
+                }
+            }
+        }
     }
 }

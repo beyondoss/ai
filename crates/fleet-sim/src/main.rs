@@ -79,14 +79,23 @@ async fn main() -> std::process::ExitCode {
             let shards = flag(&args, "--shards")
                 .and_then(|s| s.parse::<usize>().ok())
                 .unwrap_or(2);
-            if soak::run(
+            // How often a client drops its socket and comes back, in turns. `0` holds it for the
+            // whole run; `1` reconnects every turn, which is what this did before it was a knob —
+            // and which charges a TCP handshake, a WebSocket upgrade, a grant verification and a
+            // session attach to every single turn.
+            let reconnect_every = flag(&args, "--reconnect-every")
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(20);
+            if soak::run(soak::Soak {
                 kind,
-                std::time::Duration::from_secs(secs),
+                duration: std::time::Duration::from_secs(secs),
                 seed,
                 sessions,
                 tenants,
                 shards,
-            )
+                reconnect_every,
+                chaos: !args.iter().any(|a| a == "--no-chaos"),
+            })
             .await
             {
                 std::process::ExitCode::SUCCESS
