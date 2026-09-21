@@ -120,6 +120,30 @@ impl Edge {
         workspace_root: &str,
         exec_url: &str,
     ) -> String {
+        self.grant_with_dek(
+            tenant,
+            session_id,
+            home_shard,
+            workspace_root,
+            exec_url,
+            [7u8; 32],
+        )
+    }
+
+    /// Mint a grant carrying a specific tenant key.
+    ///
+    /// The isolation claim is about this byte string and nothing else: a tenant's lines are sealed
+    /// under its own DEK, so a grant bearing a different one must not be able to read them. Handing
+    /// the key to the caller is what lets a scenario try the wrong one on purpose.
+    pub fn grant_with_dek(
+        &self,
+        tenant: &str,
+        session_id: &str,
+        home_shard: &str,
+        workspace_root: &str,
+        exec_url: &str,
+        dek: [u8; 32],
+    ) -> String {
         let exp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| d.as_secs())
@@ -137,9 +161,7 @@ impl Edge {
             exec_headers: Vec::new(),
             mcp_headers: BTreeMap::new(),
             gateway_key: "bai_v1.test".into(),
-            // One tenant in these scenarios, so one key. A multi-tenant scenario derives a distinct
-            // one per tenant — the isolation claim is that no line opens under another tenant's.
-            dek: [7u8; 32],
+            dek,
         };
         self.minter.mint(&claims, &secrets)
     }

@@ -31,6 +31,7 @@ use substrate::Kind;
 
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
+    install_teardown_on_signal();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let command = args.first().map(String::as_str).unwrap_or("matrix");
 
@@ -82,6 +83,36 @@ async fn main() -> std::process::ExitCode {
     }
 }
 
+/// Bring the substrate down on `SIGINT`/`SIGTERM`.
+///
+/// `Drop` does not run when a process is signalled, so an interrupted or `timeout`-ed run left its
+/// NFS export and mounts on the host — and because an export is a machine-wide resource, the next
+/// run then collided with the last one's corpse. A harness that damages the machine it borrows when
+/// you press Ctrl-C is a harness people stop reaching for.
+fn install_teardown_on_signal() {
+    for kind in [
+        tokio::signal::unix::SignalKind::interrupt(),
+        tokio::signal::unix::SignalKind::terminate(),
+    ] {
+        let Ok(mut sig) = tokio::signal::unix::signal(kind) else {
+            continue;
+        };
+        tokio::spawn(async move {
+            sig.recv().await;
+            eprintln!("\nfleet-sim: interrupted — tearing the substrate down");
+            // On the blocking pool: teardown shells out, and the runtime is about to stop.
+            let _ = tokio::task::spawn_blocking(|| {
+                // Replicas first: one still holding a session lock on a mount we are about to
+                // withdraw is the orphan that confuses the next run.
+                replica::kill_all();
+                substrate::teardown_all();
+            })
+            .await;
+            std::process::exit(130);
+        });
+    }
+}
+
 fn flag(args: &[String], name: &str) -> Option<String> {
     let i = args.iter().position(|a| a == name)?;
     args.get(i + 1).cloned()
@@ -108,7 +139,16 @@ async fn run_matrix(kind: Kind) -> std::process::ExitCode {
     let mut failed = 0;
     let mut skipped = 0;
 
+    // `--only <name>` runs one scenario. A matrix that can only be run whole is a matrix nobody
+    // iterates on: the interesting scenarios are the slow ones, and re-running six to debug one is
+    // how a harness stops being used.
+    let only = flag(&std::env::args().collect::<Vec<_>>(), "--only");
     for s in scenarios::ALL {
+        if let Some(want) = &only
+            && s.name != want
+        {
+            continue;
+        }
         let history = dir.path().join(format!("{}.jsonl", s.name));
         let outcome = match s.name {
             "owner-refuses-non-owner" => scenarios::owner_refuses_non_owner(kind, &history).await,
@@ -118,6 +158,9 @@ async fn run_matrix(kind: Kind) -> std::process::ExitCode {
             }
             "live-session-cap-refuses" => scenarios::live_session_cap_refuses(kind, &history).await,
             "metrics-name-no-tenant" => scenarios::metrics_name_no_tenant(kind, &history).await,
+            "one-tenant-cannot-read-another" => {
+                scenarios::one_tenant_cannot_read_another(kind, &history).await
+            }
             "unmounted-shard-is-misdirected" => {
                 scenarios::unmounted_shard_is_misdirected(kind, &history).await
             }

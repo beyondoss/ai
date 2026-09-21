@@ -29,21 +29,46 @@ pub struct Launch<'a> {
     pub metrics_port: Option<u16>,
 }
 
+/// Every replica this process has spawned and not yet reaped.
+///
+/// `Drop` does not run when the simulator is signalled, and the comment on [`Replica::drop`] says
+/// exactly why that matters: a leaked replica holds a session lock the next run is about to reason
+/// over, and it goes on listening on a port the next run may be handed. One interrupted run left an
+/// orphan that the *next* investigation then mistook for the replica under test. Killing them from
+/// the signal handler is what keeps an interrupted run from lying to the run after it.
+static LIVE: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+
+fn forget(pid: u32) {
+    if let Ok(mut live) = LIVE.lock() {
+        live.retain(|p| *p != pid);
+    }
+}
+
+/// `SIGKILL` every replica still running. Best-effort, idempotent, signal-path only.
+pub fn kill_all() {
+    let pids = std::mem::take(&mut *LIVE.lock().unwrap_or_else(|e| e.into_inner()));
+    for pid in pids {
+        let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
+    }
+}
+
 /// A running replica.
 pub struct Replica {
     pub name: String,
     pub port: u16,
     child: Option<Child>,
-    /// Held for the replica's whole life, and that is load-bearing rather than tidy.
+    /// Everything the replica has said, drained continuously by a thread that owns the pipe.
     ///
-    /// Taking the pipe and letting the handle drop closes its read end, and the child then dies of
-    /// `SIGPIPE` on its next write to stderr. The drain's first act is to log that it has begun — so
-    /// a harness that dropped this killed the replica at precisely the moment a drain scenario needed
-    /// it alive, and the failure looked exactly like "drain does not work in service mode".
+    /// Two things make the draining load-bearing rather than tidy. The read end must stay **open**:
+    /// closing it kills the child with `SIGPIPE` on its next write, and since a drain's first act is
+    /// to log that it has begun, a harness that drops this pipe kills the replica at exactly the
+    /// moment a drain scenario needs it alive — which once looked precisely like "drain does not work
+    /// in service mode". And it must stay **drained**: a pipe nobody reads holds 64 KiB, after which
+    /// the replica blocks in `write` and the simulator reports a hang it caused itself.
     ///
-    /// It is also the evidence: when a replica ends a scenario by disappearing, what it said on the
-    /// way out is all there is.
-    stderr: Option<std::process::ChildStderr>,
+    /// So the thread reads until EOF and parks the text here, where a scenario can ask for it at any
+    /// point rather than only once, and only on the way out.
+    said: std::sync::Arc<std::sync::Mutex<String>>,
 }
 
 impl Replica {
@@ -99,12 +124,30 @@ impl Replica {
             // simulator that throws that away reports "never bound" for a one-line flag mistake.
             .stderr(Stdio::piped());
         let mut child = c.spawn().map_err(|e| format!("spawn {name}: {e}"))?;
-        let stderr = child.stderr.take();
+        if let Ok(mut live) = LIVE.lock() {
+            live.push(child.id());
+        }
+        let said = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        if let Some(mut pipe) = child.stderr.take() {
+            let sink = std::sync::Arc::clone(&said);
+            std::thread::spawn(move || {
+                use std::io::Read as _;
+                let mut buf = [0u8; 4096];
+                while let Ok(n) = pipe.read(&mut buf) {
+                    if n == 0 {
+                        return;
+                    }
+                    if let Ok(mut s) = sink.lock() {
+                        s.push_str(&String::from_utf8_lossy(&buf[..n]));
+                    }
+                }
+            });
+        }
         let mut replica = Self {
             name: name.to_string(),
             port,
             child: Some(child),
-            stderr,
+            said,
         };
         if let Err(e) = replica.wait_until_listening() {
             let said = replica.said();
@@ -129,16 +172,13 @@ impl Replica {
         Err(format!("replica {} never bound {}", self.name, self.port))
     }
 
-    /// Whatever the replica has written to stderr. Consumes the pipe, so it is read once — at the
-    /// point a scenario has already gone wrong and needs to explain why.
-    pub fn said(&mut self) -> String {
-        let Some(mut s) = self.stderr.take() else {
-            return String::new();
-        };
-        let mut buf = String::new();
-        use std::io::Read as _;
-        let _ = s.read_to_string(&mut buf);
-        buf
+    /// Whatever the replica has written to stderr so far. Non-consuming and callable at any time —
+    /// a scenario that is *about* to give up can read it without first having to end.
+    pub fn said(&self) -> String {
+        self.said
+            .lock()
+            .map(|s| s.clone())
+            .unwrap_or_else(|e| e.into_inner().clone())
     }
 
     pub fn pid(&self) -> Option<u32> {
@@ -151,8 +191,10 @@ impl Replica {
         let Some(child) = self.child.as_mut() else {
             return Ok(());
         };
+        let pid = child.id();
         child.kill().map_err(|e| format!("kill: {e}"))?;
         let _ = child.wait();
+        forget(pid);
         self.child = None;
         Ok(())
     }
@@ -203,8 +245,10 @@ impl Drop for Replica {
         // A simulator that leaks replicas poisons the next run's ports and, worse, leaves a process
         // holding a lock the next scenario is about to reason over.
         if let Some(child) = self.child.as_mut() {
+            let pid = child.id();
             let _ = child.kill();
             let _ = child.wait();
+            forget(pid);
         }
     }
 }

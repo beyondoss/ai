@@ -18,6 +18,7 @@
 //! green result that proved nothing is worse than a skip that says why.
 
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 /// How the shards under test are stored.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,6 +68,100 @@ fn sudo(args: &[&str]) -> Result<(), String> {
     ))
 }
 
+/// The name of the marker every export this simulator creates carries, holding the pid that made
+/// it. The sweep uses it to tell its own debris from an export somebody else on this host owns —
+/// without it, "clean up stale NFS exports" is a command that unexports production.
+const MARKER: &str = ".fleet-sim-export";
+
+/// A distinct `fsid` per export.
+///
+/// This was `fsid=8421`, a constant, and that was a real bug rather than a cosmetic one. NFSv4
+/// presents a single namespace keyed by `fsid`, so two exports claiming the same one are not two
+/// exports — the server resolves a mount to whichever it finds, which after a killed run means
+/// mounting a deleted directory and hanging on the first operation. A constant also made two
+/// fleet-sims on one host mutually destructive.
+fn unique_fsid() -> u32 {
+    let pid = std::process::id();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    // Non-zero: 0 is the pseudo-root on some server configurations.
+    (pid.wrapping_mul(2_654_435_761).wrapping_add(nanos) % 0xFFFF_FF00) + 1
+}
+
+/// Exports and mounts that must come down even if this process is killed.
+///
+/// `Drop` does not run on `SIGTERM`, which is exactly how a `timeout`-ed run leaves a mount behind.
+/// The registry is what the signal handler tears down, and it is the same list `Drop` uses, so the
+/// two paths cannot disagree about what was created.
+static PENDING: Mutex<Vec<(PathBuf, Vec<PathBuf>)>> = Mutex::new(Vec::new());
+
+/// Tear down one export and its mounts. Best-effort and idempotent in both directions: unmounting
+/// something already gone and unexporting something already withdrawn are both fine.
+fn teardown(export: &Path, mounts: &[PathBuf]) {
+    for m in mounts.iter().rev() {
+        let _ = sudo(&["umount", "-l", &m.display().to_string()]);
+    }
+    let _ = sudo(&["exportfs", "-u", &format!("127.0.0.1:{}", export.display())]);
+}
+
+/// Bring down everything this process registered. Safe to call twice.
+pub fn teardown_all() {
+    let pending = std::mem::take(&mut *PENDING.lock().unwrap_or_else(|e| e.into_inner()));
+    for (export, mounts) in pending {
+        teardown(&export, &mounts);
+    }
+}
+
+/// Undo what a *previous* run was killed before undoing.
+///
+/// Only exports carrying [`MARKER`] with a pid that is gone, which is the whole safety argument: an
+/// export without the marker was not made here and is not touched, and one whose pid is still alive
+/// belongs to a fleet-sim running right now.
+fn sweep_orphans() {
+    let Ok(out) = std::process::Command::new("sudo")
+        .arg("-n")
+        .args(["exportfs", "-v"])
+        .output()
+    else {
+        return;
+    };
+    let listing = String::from_utf8_lossy(&out.stdout).into_owned();
+    let mounts = std::fs::read_to_string("/proc/mounts").unwrap_or_default();
+    for line in listing.lines() {
+        // An indented line is the client/options continuation of the path above it.
+        if line.starts_with([' ', '\t']) || line.trim().is_empty() {
+            continue;
+        }
+        let Some(path) = line.split_whitespace().next() else {
+            continue;
+        };
+        let export = PathBuf::from(path);
+        let Ok(pid) = std::fs::read_to_string(export.join(MARKER)) else {
+            continue; // not ours
+        };
+        if std::path::Path::new(&format!("/proc/{}", pid.trim())).exists() {
+            continue; // a live run owns it
+        }
+        let stale: Vec<PathBuf> = mounts
+            .lines()
+            .filter_map(|m| {
+                let mut f = m.split_whitespace();
+                let dev = f.next()?;
+                let at = f.next()?;
+                dev.starts_with(&format!("127.0.0.1:{path}"))
+                    .then(|| PathBuf::from(at))
+            })
+            .collect();
+        eprintln!(
+            "fleet-sim: cleaning up an export left by pid {} ({path})",
+            pid.trim()
+        );
+        teardown(&export, &stale);
+    }
+}
+
 /// Say what is missing before touching anything, so a half-built export is never left behind.
 fn preflight_nfs() -> Result<(), String> {
     let mut missing = Vec::new();
@@ -90,7 +185,9 @@ fn preflight_nfs() -> Result<(), String> {
             missing.join(" and ")
         ));
     }
-    sudo(&["true"]).map_err(|e| format!("the `nfs` substrate needs passwordless sudo: {e}"))
+    sudo(&["true"]).map_err(|e| format!("the `nfs` substrate needs passwordless sudo: {e}"))?;
+    sweep_orphans();
+    Ok(())
 }
 
 /// A prepared substrate: the shard directories, and whatever has to be torn down afterwards.
@@ -113,10 +210,10 @@ impl Drop for Substrate {
         let Some((export, mounts)) = self.nfs_teardown.take() else {
             return;
         };
-        for m in mounts.iter().rev() {
-            let _ = sudo(&["umount", "-l", &m.display().to_string()]);
+        if let Ok(mut pending) = PENDING.lock() {
+            pending.retain(|(e, _)| e != &export);
         }
-        let _ = sudo(&["exportfs", "-u", &format!("127.0.0.1:{}", export.display())]);
+        teardown(&export, &mounts);
     }
 }
 
@@ -170,6 +267,11 @@ impl Substrate {
             out.push((name, mnt.join(format!("s{i}"))));
         }
 
+        // The marker goes down before the export does, so a kill between the two lines leaves a
+        // marked directory and no export rather than an export the sweep cannot claim.
+        std::fs::write(export.join(MARKER), std::process::id().to_string())
+            .map_err(|e| format!("export marker: {e}"))?;
+
         // `no_root_squash` so the replicas (running as this user) own what they write, and
         // `no_subtree_check` because the export is a temporary directory rather than a real
         // filesystem. `fsid` is required for an NFSv4 export of a non-device directory.
@@ -183,9 +285,17 @@ impl Substrate {
         sudo(&[
             "exportfs",
             "-o",
-            "rw,sync,no_subtree_check,no_root_squash,insecure,fsid=8421",
+            &format!(
+                "rw,sync,no_subtree_check,no_root_squash,insecure,fsid={}",
+                unique_fsid()
+            ),
             &format!("127.0.0.1:{}", export.display()),
         ])?;
+
+        // Registered before the first mount: from here on a signal tears down whatever exists.
+        if let Ok(mut pending) = PENDING.lock() {
+            pending.push((export.clone(), out.iter().map(|(_, p)| p.clone()).collect()));
+        }
 
         for (name, path) in &out {
             sudo(&[

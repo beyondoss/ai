@@ -51,6 +51,11 @@ pub const ALL: &[Scenario] = &[
         needs_shared_fs: false,
     },
     Scenario {
+        name: "one-tenant-cannot-read-another",
+        claims: "C10",
+        needs_shared_fs: false,
+    },
+    Scenario {
         name: "metrics-name-no-tenant",
         claims: "C11",
         needs_shared_fs: false,
@@ -565,7 +570,7 @@ pub async fn drain_keeps_serving_what_it_owns(
         Duration::from_secs(6),
         vec![turn_text("finished after the signal")],
     );
-    let mut fleet = match Fleet::start_against(kind, 1, history_path, None, false, gateway).await {
+    let fleet = match Fleet::start_against(kind, 1, history_path, None, false, gateway).await {
         Ok(f) => f,
         Err(e) => return Outcome::failed_with(e),
     };
@@ -864,4 +869,216 @@ pub async fn unmounted_shard_is_misdirected(
     } else {
         Outcome::Failed
     }
+}
+
+/// One complete read of a session by a client presenting `grant`: connect, replay, give up.
+///
+/// Bounded and timed, and both matter. What C10 asks is whether a wrong key produces a **refusal**,
+/// and an attempt that simply never returns is a different answer to that question — one a patient
+/// scenario would report as a hung simulator rather than as the finding it is. The elapsed time is
+/// printed because "refused" and "refused after ninety seconds" are not the same contract.
+async fn read_session(
+    port: u16,
+    session: &str,
+    grant: &str,
+) -> (Result<String, String>, std::time::Duration) {
+    let began = std::time::Instant::now();
+    let attempt = async {
+        let mut ws = workload::connect(port, session, grant).await?;
+        let msgs = workload::transcript(&mut ws).await?;
+        Ok::<_, String>(serde_json::to_string(&msgs).unwrap_or_default())
+    };
+    let out = match tokio::time::timeout(std::time::Duration::from_secs(90), attempt).await {
+        Ok(r) => r,
+        Err(_) => Err("the attempt never returned, and never failed, within 90s".to_owned()),
+    };
+    (out, began.elapsed())
+}
+
+/// **C10** — per-tenant sealing, checked three ways that fail for three different reasons.
+///
+/// The claim is not "tenants are in different directories", which any bug in path handling would
+/// undo silently. It is that a tenant's lines are **sealed under its own key**, so the data is
+/// useless to anyone else even if every other control were bypassed. So this checks the paths, then
+/// the plaintext, then the key itself — by handing a replica the right session with the wrong DEK
+/// and requiring that it cannot produce the content.
+pub async fn one_tenant_cannot_read_another(kind: Kind, history_path: &std::path::Path) -> Outcome {
+    let mut fleet = match Fleet::start(kind, 1, history_path).await {
+        Ok(f) => f,
+        Err(e) => return Outcome::failed_with(e),
+    };
+    let exec_url = fleet.exec.url.clone();
+    let port = fleet.replicas[0].port;
+
+    // Two tenants, two keys, two markers. Same shard, deliberately: sharing storage is the condition
+    // the sealing exists for, and putting them on different shards would prove nothing.
+    let one_dek = [0x11u8; 32];
+    let two_dek = [0x22u8; 32];
+    let one_marker = "tenant-one-private-text";
+    let two_marker = "tenant-two-private-text";
+
+    for (tenant, session, dek, marker) in [
+        ("t-one", "s1.one", one_dek, one_marker),
+        ("t-two", "s1.two", two_dek, two_marker),
+    ] {
+        let grant = fleet
+            .edge
+            .grant_with_dek(tenant, session, "s1", "/", &exec_url, dek);
+        let mut ws = match workload::connect(port, session, &grant).await {
+            Ok(ws) => ws,
+            Err(e) => return Outcome::failed_with(format!("{tenant} connect: {e}")),
+        };
+        if let Err(e) = workload::prompt(&mut ws, marker).await {
+            return Outcome::failed_with(format!("{tenant} prompt: {e}"));
+        }
+    }
+
+    eprintln!("  … both tenants wrote");
+    let mut findings = Vec::new();
+
+    // 1. Paths. Each tenant's sessions live under its own subtree.
+    let one_dirs = fleet.substrate.session_dirs("s1", "t-one");
+    let two_dirs = fleet.substrate.session_dirs("s1", "t-two");
+    findings.push(Finding {
+        claim: "C10",
+        ok: !one_dirs.is_empty() && !two_dirs.is_empty(),
+        detail: format!(
+            "each tenant wrote its own subtree ({} and {} session dir(s))",
+            one_dirs.len(),
+            two_dirs.len()
+        ),
+    });
+
+    eprintln!("  … checking plaintext on the shard");
+    // 2. Plaintext. Neither tenant's text appears anywhere on the shard in the clear — not in the
+    // other's tree, and not in its own either. A directory boundary is an access control; sealing is
+    // what survives one being wrong.
+    let mut leaked = Vec::new();
+    for (name, path) in &fleet.substrate.shards {
+        for marker in [one_marker, two_marker] {
+            if grep_tree(path, marker) {
+                leaked.push(format!("{marker:?} readable in shard {name}"));
+            }
+        }
+    }
+    findings.push(Finding {
+        claim: "C10",
+        ok: leaked.is_empty(),
+        detail: if leaked.is_empty() {
+            "neither tenant's text is readable on the shard — every line is sealed".to_string()
+        } else {
+            leaked.join("; ")
+        },
+    });
+
+    // 3. The key — and the session has to be **re-opened from disk** for this to mean anything.
+    //
+    // A live session is already open, holding the codec it was opened with. A second connection
+    // naming the same tenant and id attaches to that open session and reads its in-memory
+    // transcript, and the DEK in the grant is never consulted. The first version of this scenario
+    // did exactly that and reported a key failure that was really its own impatience.
+    //
+    // Restarting the replica clears the map, so the next connection must open the sealed segments
+    // from the shard — which is the only path on which the DEK is used at all.
+    eprintln!(
+        "  … restarting the replica (was pid {:?} port {})",
+        fleet.replicas[0].pid(),
+        fleet.replicas[0].port
+    );
+    if let Err(e) = fleet.replicas[0].kill_hard() {
+        return Outcome::failed_with(format!("could not stop the replica: {e}"));
+    }
+    if let Err(e) = fleet.restart(0).await {
+        return Outcome::failed_with(format!("could not restart the replica: {e}"));
+    }
+    let port = fleet.replicas[0].port;
+
+    eprintln!(
+        "  … restarted (now pid {:?} port {}); trying the wrong key",
+        fleet.replicas[0].pid(),
+        fleet.replicas[0].port
+    );
+    let wrong_key = fleet
+        .edge
+        .grant_with_dek("t-two", "s1.two", "s1", "/", &exec_url, one_dek);
+    let (with_wrong_key, wrong_took) = read_session(port, "s1.two", &wrong_key).await;
+    eprintln!("  … the wrong key finished in {wrong_took:?}: {with_wrong_key:?}");
+    if with_wrong_key
+        .as_ref()
+        .err()
+        .is_some_and(|e| e.contains("never returned"))
+    {
+        eprintln!(
+            "  ── the replica said ──\n{}\n  ──────────────────────",
+            fleet.replicas[0].said().trim()
+        );
+    }
+
+    // And the control: the *right* key, on the same restarted replica, must still read it. Without
+    // this, a replica that simply failed to reopen anything would pass the check above.
+    eprintln!("  … trying the right key (control)");
+    let right_key = fleet
+        .edge
+        .grant_with_dek("t-two", "s1.two", "s1", "/", &exec_url, two_dek);
+    let (with_right_key, right_took) = read_session(port, "s1.two", &right_key).await;
+    eprintln!("  … the right key finished in {right_took:?}");
+    let exposed = with_wrong_key
+        .as_ref()
+        .is_ok_and(|text| text.contains(two_marker));
+    findings.push(Finding {
+        claim: "C10",
+        ok: !exposed,
+        detail: if exposed {
+            "a grant bearing the WRONG tenant key read the session's content".to_string()
+        } else {
+            format!(
+                "the wrong key could not produce the content ({})",
+                match &with_wrong_key {
+                    Ok(_) => "session opened but the text was not there",
+                    Err(_) => "the session refused to open at all",
+                }
+            )
+        },
+    });
+
+    let recovered = with_right_key
+        .as_ref()
+        .is_ok_and(|text| text.contains(two_marker));
+    findings.push(Finding {
+        claim: "C10",
+        ok: recovered,
+        detail: if recovered {
+            "and the right key still reads it after the restart — the refusal above is the key, \
+             not a replica that reopened nothing"
+                .to_string()
+        } else {
+            format!("the correct key could not read it either: {with_right_key:?}")
+        },
+    });
+
+    if check::report("one-tenant-cannot-read-another", &findings) {
+        Outcome::Passed
+    } else {
+        Outcome::Failed
+    }
+}
+
+/// Does `needle` appear, in the clear, in any file under `root`?
+fn grep_tree(root: &std::path::Path, needle: &str) -> bool {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            if grep_tree(&path, needle) {
+                return true;
+            }
+        } else if let Ok(bytes) = std::fs::read(&path)
+            && bytes.windows(needle.len()).any(|w| w == needle.as_bytes())
+        {
+            return true;
+        }
+    }
+    false
 }

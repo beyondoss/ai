@@ -12,9 +12,24 @@ use serde_json::{Value, json};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
-/// How long any single frame may take before a session is called stuck. Generous: a loaded
-/// simulator is still a correct one, and a deadline that fails a slow run teaches nothing.
+/// How long a client waits for the answer it asked for. Generous: a loaded simulator is still a
+/// correct one, and a deadline that fails a slow run teaches nothing.
+///
+/// It is a deadline on the **whole wait**, not on each frame, and that distinction cost an
+/// afternoon. A per-frame timer is reset by any frame at all, so a replica that keeps a connection
+/// alive while never answering the question resets it forever — the client hangs, and the harness
+/// reports nothing rather than reporting that. What a client actually wants to bound is how long it
+/// waits for its response.
 const FRAME_WAIT: Duration = Duration::from_secs(60);
+
+/// How long the WebSocket **upgrade** may take before the attempt is called refused.
+///
+/// Separate from [`FRAME_WAIT`] and not a detail: `connect_async` has no deadline of its own, so a
+/// replica that accepts the TCP connection and then never answers the upgrade hangs the client
+/// forever — and a simulator that hangs reports nothing at all, which is strictly worse than a
+/// scenario that fails. It is also what a real client does: an edge with no connect timeout is an
+/// edge with an unbounded queue.
+const CONNECT_WAIT: Duration = Duration::from_secs(30);
 
 pub type Ws =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
@@ -29,8 +44,14 @@ pub async fn connect(port: u16, session_id: &str, grant: &str) -> Result<Ws, Str
         "x-beyond-grant",
         grant.parse().map_err(|e| format!("grant header: {e}"))?,
     );
-    let (ws, _) = tokio_tungstenite::connect_async(req)
+    let (ws, _) = tokio::time::timeout(CONNECT_WAIT, tokio_tungstenite::connect_async(req))
         .await
+        .map_err(|_| {
+            format!(
+                "connect: the upgrade was never answered within {CONNECT_WAIT:?} (the replica \
+                     accepted the connection and then said nothing)"
+            )
+        })?
         .map_err(|e| format!("connect: {e}"))?;
     Ok(ws)
 }
@@ -70,14 +91,33 @@ pub async fn read_until(
     mut matches: impl FnMut(&Value) -> bool,
 ) -> Result<(Value, Vec<Value>), String> {
     let mut seen = Vec::new();
+    let deadline = tokio::time::Instant::now() + FRAME_WAIT;
     loop {
-        let frame = tokio::time::timeout(FRAME_WAIT, ws.next())
+        let frame = tokio::time::timeout_at(deadline, ws.next())
             .await
-            .map_err(|_| format!("timed out after {FRAME_WAIT:?}; saw {} frames", seen.len()))?;
+            .map_err(|_| {
+                format!(
+                    "no matching frame within {FRAME_WAIT:?}; saw {} frame(s): {}",
+                    seen.len(),
+                    seen.iter()
+                        .map(|f: &Value| f["type"].as_str().unwrap_or("?").to_owned())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            })?;
         let Some(msg) = frame else {
             return Err(format!("socket closed after {} frames", seen.len()));
         };
-        let msg = msg.map_err(|e| format!("read: {e}"))?;
+        let msg = msg.map_err(|e| {
+            format!(
+                "read: {e}; saw {} frame(s) first: {}",
+                seen.len(),
+                seen.iter()
+                    .map(|f: &Value| f["type"].as_str().unwrap_or("?").to_owned())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        })?;
         let Message::Text(text) = msg else {
             continue;
         };
