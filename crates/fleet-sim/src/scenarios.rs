@@ -16,6 +16,7 @@ use serde_json::json;
 
 use crate::check::{self, Finding};
 use crate::edge::{Addr, Edge, Placement, Target};
+use crate::faults::{Fault, Faults};
 use crate::history::History;
 use crate::replica::Replica;
 use crate::substrate::{Kind, Substrate};
@@ -97,6 +98,57 @@ impl Drop for Fleet {
     }
 }
 
+/// Marks an error that is really "this scenario cannot run against *this* fleet" rather than a
+/// failure. The matrix turns it into a skip with the reason attached, so a run never reports a claim
+/// as proved when the fleet could not host the scenario that proves it.
+pub const ATTACHED_SKIP: &str = "cannot-attach: ";
+
+/// An attached fleet's address, set once from the command line.
+///
+/// A global rather than a parameter threaded through nine scenario signatures, and that is a
+/// deliberate trade: the spec is parsed once from `argv`, is immutable afterwards, and every
+/// scenario reaches `Fleet::start_against` eventually — so threading it would add an argument to
+/// nine functions to reach one decision point. What a scenario *does* still differs by substrate,
+/// and that stays explicit via `Kind::is_shared_filesystem`.
+static ATTACHED: std::sync::OnceLock<Attachment> = std::sync::OnceLock::new();
+
+/// Where an attached fleet lives. See [`Fleet::attach`].
+#[derive(Clone)]
+pub struct Attachment {
+    pub shards: Vec<(String, std::path::PathBuf)>,
+    pub replicas: Vec<Addr>,
+    pub fault_cmd: String,
+}
+
+/// Name the fleet every scenario in this process will attach to. Called once, from `main`.
+pub fn attach_to(spec: Attachment) {
+    let _ = ATTACHED.set(spec);
+}
+
+/// What an attached fleet cannot provide, if a scenario asked for it.
+///
+/// A replica's live-session cap and metrics listener are set when the *task* starts, which happened
+/// before this process did. Rather than quietly ignoring the request and grading a scenario that
+/// tested something else, say so — the caller turns it into a skip with a reason, which is the same
+/// contract `needs_shared_fs` already uses.
+fn attached_cannot(max_live_sessions: Option<usize>, with_metrics: bool) -> Option<String> {
+    if max_live_sessions.is_some() {
+        return Some(
+            "an attached replica's --max-live-sessions was fixed when its task started; the fleet \
+             would have to be provisioned with the cap this scenario needs"
+                .to_owned(),
+        );
+    }
+    if with_metrics {
+        return Some(
+            "an attached replica's metrics listener is loopback-only inside its own task, so it is \
+             only scrapeable through a sidecar the fleet must be provisioned with"
+                .to_owned(),
+        );
+    }
+    None
+}
+
 /// Everything a scenario needs standing up: shards, an edge, replicas, a history.
 pub struct Fleet {
     pub substrate: Substrate,
@@ -109,6 +161,9 @@ pub struct Fleet {
     pub exec: ExecMock,
     /// Each replica's metrics listener, in the same order as `replicas`.
     pub metrics_ports: Vec<Option<u16>>,
+    /// How this fleet's faults are performed. Local mechanisms for a fleet it spawned; a
+    /// caller-supplied command for one it attached to — see [`crate::faults`].
+    pub faults: Faults,
     _keys: tempfile::TempDir,
     _sandbox: tempfile::TempDir,
 }
@@ -121,6 +176,86 @@ impl Fleet {
         history_path: &std::path::Path,
     ) -> Result<Self, String> {
         Self::start_with(kind, replicas, history_path, None, false).await
+    }
+
+    /// Attach to a fleet **somebody else is running**, on storage somebody else provisioned.
+    ///
+    /// The inverse of every other constructor: nothing is spawned, nothing is exported, nothing is
+    /// mounted, and `Drop` takes nothing down. The shards are paths that already exist, the replicas
+    /// are addresses that already answer, and every fault goes through `fault_cmd` because the
+    /// simulator owns neither the processes nor the network.
+    ///
+    /// This is the path the EFS proof runs on — and it is worth running against the *local* NFS
+    /// substrate first, with a fault script that drives `ip link`, because then the attach path is
+    /// proved by the same nine scenarios before any of it depends on AWS.
+    ///
+    /// The grant and seal keys are deterministic (`Minter::new`'s seeds are fixed so a failure
+    /// reproduces), so the replicas can be started with the matching `--grant-key`/`--seal-key`
+    /// before the simulator ever runs — see the `keys` subcommand. That also means they are **not
+    /// secret**: an attached fleet must be somewhere private.
+    pub async fn attach(
+        shards: Vec<(String, std::path::PathBuf)>,
+        replicas: Vec<Addr>,
+        fault_cmd: String,
+        history_path: &std::path::Path,
+    ) -> Result<Self, String> {
+        if replicas.is_empty() {
+            return Err("an attached fleet needs at least one --replica host:port".into());
+        }
+        let substrate = Substrate::attach(shards)?;
+        let keys = tempfile::tempdir().map_err(|e| format!("keys: {e}"))?;
+        let sandbox = tempfile::tempdir().map_err(|e| format!("sandbox: {e}"))?;
+        let sandbox_home = sandbox.path().join("home");
+        std::fs::create_dir_all(&sandbox_home).map_err(|e| format!("sandbox home: {e}"))?;
+        let exec = ExecMock::start_with_home(sandbox.path(), Some(&sandbox_home), true).await;
+        let (gateway_url, _bodies) = (
+            spawn_model_server_routed_unrecorded(Vec::new(), turn_text("ok")),
+            (),
+        );
+
+        let attached: Vec<Replica> = replicas
+            .iter()
+            .enumerate()
+            .map(|(i, addr)| Replica::attach(&format!("r{}", i + 1), addr.clone()))
+            .collect();
+        let targets = attached
+            .iter()
+            .map(|r| Target {
+                name: r.name.clone(),
+                addr: r.addr.clone(),
+            })
+            .collect();
+        let mut edge = Edge::new(keys.path(), Vec::new());
+        edge.set_targets(targets);
+
+        // Every replica is reachable before a scenario starts, or the first failure is a routing
+        // mystery rather than a claim.
+        for r in &attached {
+            match workload::http_get(&r.addr, "/livez").await {
+                Ok((200, _)) => {}
+                other => {
+                    return Err(format!(
+                        "replica {} at {} did not answer /livez with 200: {other:?}",
+                        r.name, r.addr
+                    ));
+                }
+            }
+        }
+
+        let metrics_ports = vec![None; attached.len()];
+        let history = History::create(history_path)?;
+        Ok(Self {
+            substrate,
+            edge,
+            replicas: attached,
+            history,
+            gateway_url,
+            exec,
+            metrics_ports,
+            faults: Faults::external(fault_cmd),
+            _keys: keys,
+            _sandbox: sandbox,
+        })
     }
 
     /// As [`start`](Self::start), over `shards` shards rather than one.
@@ -226,6 +361,25 @@ impl Fleet {
         with_metrics: bool,
         gateway_url: String,
     ) -> Result<Self, String> {
+        if let Some(spec) = ATTACHED.get() {
+            if let Some(why) = attached_cannot(max_live_sessions, with_metrics) {
+                return Err(format!("{ATTACHED_SKIP}{why}"));
+            }
+            if spec.replicas.len() < replicas {
+                return Err(format!(
+                    "{ATTACHED_SKIP}this scenario needs {replicas} replicas and the attached fleet \
+                     has {}",
+                    spec.replicas.len()
+                ));
+            }
+            return Self::attach(
+                spec.shards.clone(),
+                spec.replicas[..replicas].to_vec(),
+                spec.fault_cmd.clone(),
+                history_path,
+            )
+            .await;
+        }
         let substrate = Substrate::prepare(kind, shards, replicas)?;
         let keys = tempfile::tempdir().map_err(|e| format!("keys: {e}"))?;
         let sandbox = tempfile::tempdir().map_err(|e| format!("sandbox: {e}"))?;
@@ -281,14 +435,76 @@ impl Fleet {
             gateway_url,
             exec,
             metrics_ports,
+            faults: Faults::local(),
             _keys: keys,
             _sandbox: sandbox,
         })
     }
 
+    /// Kill replica `idx` the way a machine failure does — no signal handler, no destructors, no
+    /// chance to release a lock or seal a segment. The case the epoch fence exists for.
+    ///
+    /// One dispatch point rather than a choice at each call site: a scenario should not have to know
+    /// whether this fleet owns its replicas, and a scenario that asked the wrong way would silently
+    /// test a different failure than the one it is named for.
+    pub fn kill_hard(&mut self, idx: usize) -> Result<(), String> {
+        if self.faults.is_external() {
+            return self.faults.run(Fault::Kill, &self.replicas[idx].name);
+        }
+        self.replicas[idx].kill_hard()
+    }
+
+    /// `SIGTERM` replica `idx` and **return immediately** — the deploy case, as a drain scenario
+    /// needs it: the interesting window is while the replica is still up and draining, so waiting
+    /// for it to exit here would skip the very thing under test. (It did, once: every drain
+    /// assertion came back `Connection refused` because the replica was already gone.)
+    pub fn signal_term(&mut self, idx: usize) -> Result<(), String> {
+        if self.faults.is_external() {
+            return self.faults.run(Fault::Term, &self.replicas[idx].name);
+        }
+        self.replicas[idx].signal_term()
+    }
+
+    /// `SIGTERM` replica `idx` and wait for it to actually go — what chaos wants, where the next
+    /// event should not start until this one finished.
+    pub fn stop_gracefully(&mut self, idx: usize, within: Duration) -> Result<(), String> {
+        self.signal_term(idx)?;
+        if self.faults.is_external() {
+            // Whoever owns the replica owns how long stopping takes; the fault command is expected
+            // to have returned only once it was done.
+            return Ok(());
+        }
+        self.replicas[idx].wait_for_exit(within)
+    }
+
+    /// Cut replica `idx` off from its storage while its peers keep serving.
+    pub fn partition(&self, idx: usize) -> Result<(), String> {
+        if self.faults.is_external() {
+            return self.faults.run(Fault::Partition, &self.replicas[idx].name);
+        }
+        self.substrate.partition(idx)
+    }
+
+    /// Give replica `idx` its storage back. Best-effort: a scenario that has already failed still
+    /// has to leave the fleet usable for the next one.
+    pub fn heal(&self, idx: usize) {
+        if self.faults.is_external() {
+            let _ = self.faults.run(Fault::Heal, &self.replicas[idx].name);
+            return;
+        }
+        self.substrate.heal(idx);
+    }
+
     /// Bring replica `idx` back on a fresh port, and put it back in the ring — a deploy replacing a
     /// task, not a process resurrecting.
+    ///
+    /// An attached replica comes back at the *same* address: whoever owns it replaces the task, and
+    /// the simulator has no port to choose. So the ring does not change and there is nothing to
+    /// retarget.
     pub async fn restart(&mut self, idx: usize) -> Result<(), String> {
+        if self.faults.is_external() {
+            return self.faults.run(Fault::Restart, &self.replicas[idx].name);
+        }
         let name = self.replicas[idx].name.clone();
         let port = free_port()?;
         let shard_args = self.substrate.shard_args_for(idx);
@@ -452,7 +668,16 @@ pub async fn owner_refuses_non_owner(kind: Kind, history_path: &std::path::Path)
 impl Outcome {
     /// Report why a scenario could not even run, then fail it. A scenario that fell over during
     /// setup has not disproved anything, and saying so is more useful than a bare FAIL.
+    /// A scenario that could not proceed.
+    ///
+    /// A [`ATTACHED_SKIP`]-prefixed reason becomes a **skip**, not a failure: the fleet could not
+    /// host the scenario, which is a different statement from the claim being false, and grading it
+    /// as a failure would be as misleading as grading it as a pass. Every scenario gets this for
+    /// free because they all report a failed start through here.
     fn failed_with(msg: String) -> Self {
+        if let Some(why) = msg.strip_prefix(ATTACHED_SKIP) {
+            return Self::Skipped(why.to_owned());
+        }
         println!("  ✗ {msg}");
         Self::Failed
     }
@@ -646,7 +871,8 @@ pub async fn drain_keeps_serving_what_it_owns(
         Duration::from_secs(6),
         vec![turn_text("finished after the signal")],
     );
-    let fleet = match Fleet::start_against(kind, 1, 1, history_path, None, false, gateway).await {
+    let mut fleet = match Fleet::start_against(kind, 1, 1, history_path, None, false, gateway).await
+    {
         Ok(f) => f,
         Err(e) => return Outcome::failed_with(e),
     };
@@ -669,7 +895,7 @@ pub async fn drain_keeps_serving_what_it_owns(
         return Outcome::failed_with(format!("waiting for the run to start: {e}"));
     }
 
-    if let Err(e) = fleet.replicas[0].signal_term() {
+    if let Err(e) = fleet.signal_term(0) {
         return Outcome::failed_with(format!("SIGTERM: {e}"));
     }
     fleet
@@ -1062,7 +1288,7 @@ pub async fn one_tenant_cannot_read_another(kind: Kind, history_path: &std::path
         fleet.replicas[0].pid(),
         fleet.replicas[0].addr
     );
-    if let Err(e) = fleet.replicas[0].kill_hard() {
+    if let Err(e) = fleet.kill_hard(0) {
         return Outcome::failed_with(format!("could not stop the replica: {e}"));
     }
     if let Err(e) = fleet.restart(0).await {
@@ -1223,7 +1449,7 @@ pub async fn hung_mount_is_reported_not_leaked(
     }
     let baseline = threads(pid);
 
-    if let Err(e) = fleet.substrate.partition(0) {
+    if let Err(e) = fleet.partition(0) {
         return Outcome::failed_with(format!("could not take the mount away: {e}"));
     }
 
@@ -1249,7 +1475,7 @@ pub async fn hung_mount_is_reported_not_leaked(
     let after = threads(pid);
     let livez = get_within(&addr, "/livez", Duration::from_secs(10)).await;
 
-    fleet.substrate.heal(0);
+    fleet.heal(0);
 
     let mut findings = Vec::new();
 
@@ -1397,7 +1623,7 @@ pub async fn fenced_owner_stops_and_says_so(kind: Kind, history_path: &std::path
     }
     eprintln!("  … the owner holds it; cutting it off from its storage");
 
-    if let Err(e) = fleet.substrate.partition(0) {
+    if let Err(e) = fleet.partition(0) {
         return Outcome::failed_with(format!("could not partition the owner: {e}"));
     }
 
@@ -1425,7 +1651,7 @@ pub async fn fenced_owner_stops_and_says_so(kind: Kind, history_path: &std::path
     }
     let took_over_in = began.elapsed();
     let Some(mut successor) = successor else {
-        fleet.substrate.heal(0);
+        fleet.heal(0);
         return Outcome::failed_with(format!(
             "the successor never got the session: still refused {refusals} times after \
              {took_over_in:?}, so a partitioned owner strands its sessions indefinitely"
@@ -1442,7 +1668,7 @@ pub async fn fenced_owner_stops_and_says_so(kind: Kind, history_path: &std::path
         }
     };
 
-    fleet.substrate.heal(0);
+    fleet.heal(0);
     eprintln!("  … storage back; the old owner is about to find out");
 
     // The old owner, still attached, still believing it owns this session, now tries to write.

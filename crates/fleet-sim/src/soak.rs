@@ -284,11 +284,10 @@ pub async fn run(opts: Soak) -> bool {
             .record("chaos_drain", json!({ "replica": name, "hard": hard }));
         if hard {
             kills += 1;
-            let _ = fleet.replicas[victim].kill_hard();
+            let _ = fleet.kill_hard(victim);
         } else {
             deploys += 1;
-            let _ = fleet.replicas[victim].signal_term();
-            let _ = fleet.replicas[victim].wait_for_exit(Duration::from_secs(45));
+            let _ = fleet.stop_gracefully(victim, Duration::from_secs(45));
         }
         fleet.retarget_excluding(&name);
         if let Ok(mut t) = targets.lock() {

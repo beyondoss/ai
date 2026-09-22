@@ -8,6 +8,13 @@
 //! fleet-sim soak [--duration S] [--seed N]      randomized chaos, then the checker — the burn-in
 //!              [--sessions N] [--tenants N] [--shards N]
 //! fleet-sim list                                 the scenarios and which substrate each needs
+//! fleet-sim keys --dir D                        write the seal key, print the grant-key flag
+//!
+//! `--substrate attached` runs the same scenarios against a fleet **somebody else is running**, on
+//! storage somebody else provisioned: `--shard name=/path` (repeatable), `--replica host:port`
+//! (repeatable) and `--fault-cmd CMD`, which the simulator invokes as `CMD <action> <replica>` for
+//! `kill|term|partition|heal|restart`. Nothing in here knows what provides any of it, which is what
+//! lets the identical binary grade a local NFS fleet and a real ECS+EFS one.
 //! ```
 //!
 //! It is not a CI shard. The substrate that makes the interesting claims checkable needs root, an
@@ -21,6 +28,7 @@
 
 mod check;
 mod edge;
+mod faults;
 mod history;
 mod replica;
 mod scenarios;
@@ -60,7 +68,17 @@ async fn main() -> std::process::ExitCode {
             }
             std::process::ExitCode::SUCCESS
         }
-        "matrix" => run_matrix(kind).await,
+        "keys" => {
+            // So the infrastructure can start replicas with the matching keys *before* the simulator
+            // runs. Deterministic by design — the seeds are fixed so a failure reproduces — which
+            // also means they are not secret and an attached fleet must be private.
+            let dir = flag(&args, "--dir").unwrap_or_else(|| ".".to_owned());
+            let minter = beyond_ai_test_support::grant::Minter::new(std::path::Path::new(&dir));
+            println!("AI_AGENT_GRANT_KEY={}", minter.grant_key_flag());
+            println!("AI_AGENT_SEAL_KEY={}", minter.seal_key().display());
+            std::process::ExitCode::SUCCESS
+        }
+        "matrix" => run_matrix(kind, &args).await,
         "soak" => {
             let secs = flag(&args, "--duration")
                 .and_then(|s| s.parse::<u64>().ok())
@@ -140,12 +158,69 @@ fn install_teardown_on_signal() {
     }
 }
 
+/// Every occurrence of a repeatable flag, in order.
+fn flags(args: &[String], name: &str) -> Vec<String> {
+    args.iter()
+        .enumerate()
+        .filter(|(_, a)| a.as_str() == name)
+        .filter_map(|(i, _)| args.get(i + 1).cloned())
+        .collect()
+}
+
+/// `--shard name=/path`, parsed the same way the agent parses its own.
+fn shard_args(args: &[String]) -> Result<Vec<(String, std::path::PathBuf)>, String> {
+    flags(args, "--shard")
+        .iter()
+        .map(|s| {
+            s.split_once('=')
+                .map(|(n, p)| (n.to_owned(), std::path::PathBuf::from(p)))
+                .ok_or_else(|| format!("--shard {s:?} is not name=/path"))
+        })
+        .collect()
+}
+
 fn flag(args: &[String], name: &str) -> Option<String> {
     let i = args.iter().position(|a| a == name)?;
     args.get(i + 1).cloned()
 }
 
-async fn run_matrix(kind: Kind) -> std::process::ExitCode {
+fn attached_from(args: &[String]) -> Result<Option<scenarios::Attachment>, String> {
+    if flag(args, "--substrate").as_deref() != Some("attached") {
+        return Ok(None);
+    }
+    let replicas = flags(args, "--replica")
+        .iter()
+        .map(|s| crate::edge::Addr::parse(s))
+        .collect::<Result<Vec<_>, _>>()?;
+    let fault_cmd = flag(args, "--fault-cmd").ok_or_else(|| {
+        "`--substrate attached` needs --fault-cmd CMD: the simulator does not own these replicas, \
+         so it cannot kill or partition them itself"
+            .to_owned()
+    })?;
+    Ok(Some(scenarios::Attachment {
+        shards: shard_args(args)?,
+        replicas,
+        fault_cmd,
+    }))
+}
+
+async fn run_matrix(kind: Kind, args: &[String]) -> std::process::ExitCode {
+    match attached_from(args) {
+        Ok(Some(spec)) => {
+            println!(
+                "attached: {} shard(s), {} replica(s), faults via {:?}",
+                spec.shards.len(),
+                spec.replicas.len(),
+                spec.fault_cmd
+            );
+            scenarios::attach_to(spec);
+        }
+        Ok(None) => {}
+        Err(e) => {
+            eprintln!("fleet-sim: {e}");
+            return std::process::ExitCode::from(2);
+        }
+    }
     let dir = match tempfile::tempdir() {
         Ok(d) => d,
         Err(e) => {

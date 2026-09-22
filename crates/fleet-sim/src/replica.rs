@@ -60,6 +60,10 @@ pub struct Replica {
     /// Where this replica answers. Always loopback for one this process spawned.
     pub addr: Addr,
     child: Option<Child>,
+    /// True when this replica was **attached to**, not spawned: an ECS task, or anything else the
+    /// simulator did not start and cannot signal. Its process-shaped methods refuse, and the fleet
+    /// routes those faults through the fault command instead.
+    attached: bool,
     /// Everything the replica has said, drained continuously by a thread that owns the pipe.
     ///
     /// Two things make the draining load-bearing rather than tidy. The read end must stay **open**:
@@ -157,6 +161,7 @@ impl Replica {
             name: name.to_string(),
             addr: Addr::local(port),
             child: Some(child),
+            attached: false,
             said,
         };
         if let Err(e) = replica.wait_until_listening() {
@@ -169,6 +174,27 @@ impl Replica {
             });
         }
         Ok(replica)
+    }
+
+    /// A replica somebody else is running, at `addr`.
+    ///
+    /// Nothing is spawned and nothing is owned: no child to signal, no stderr to drain, and `Drop`
+    /// must not kill it. Everything a scenario would do to a local child — kill, term, restart —
+    /// goes through the fault command; its liveness is the `/livez` probe the placement path already
+    /// performs, not a pid.
+    pub fn attach(name: &str, addr: Addr) -> Self {
+        Self {
+            name: name.to_string(),
+            addr,
+            child: None,
+            attached: true,
+            said: std::sync::Arc::new(std::sync::Mutex::new(String::new())),
+        }
+    }
+
+    /// Whether this replica was attached to rather than spawned.
+    pub fn is_attached(&self) -> bool {
+        self.attached
     }
 
     fn wait_until_listening(&self) -> Result<(), String> {
@@ -245,8 +271,14 @@ impl Replica {
         ))
     }
 
+    /// Whether the fleet should still route to this replica.
+    ///
+    /// For a spawned replica that is exactly "we have not killed it". An attached one is always
+    /// routable as far as the fleet is concerned — whoever owns it decides whether it is up, and the
+    /// placement path finds out for real by probing. Answering `false` here would drop it from the
+    /// ring permanently the first time a scenario stopped it.
     pub fn is_running(&self) -> bool {
-        self.child.is_some()
+        self.attached || self.child.is_some()
     }
 }
 
