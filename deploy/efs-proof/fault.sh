@@ -113,13 +113,25 @@ case "$action" in
     # fault quietly does nothing and the scenario reports that a hard kill failed to fence anybody,
     # which is a claim about the design made out of a bad pattern. `comm` is exact and is in every
     # kernel, so it needs no tool to agree with.
-    # Bounded, because an `--interactive` session whose stdin is /dev/null does not always notice
-    # that it is over: the signal lands in milliseconds and the session then sat for twenty minutes.
-    # The kill is fire-and-check — `wait_stopped` below is what actually decides whether it worked —
-    # so cutting the session short costs nothing.
-    timeout 45 aws ecs execute-command --cluster "$CLUSTER" --task "$arn" --container agent --interactive \
-      --command "/bin/sh -c 'for p in /proc/[0-9]*; do [ \"\$(cat \$p/comm 2>/dev/null)\" = beyond-ai-agent ] && kill -9 \${p#/proc/}; done; true'" >/dev/null 2>&1 || true
-    wait_stopped "$arn"
+    # Issued more than once, and checked in between. The exec is bounded because an `--interactive`
+    # session whose stdin is /dev/null does not always notice it is over — the signal lands in
+    # milliseconds and the session then sat for twenty minutes — and it is *retried* because the
+    # ExecuteCommandAgent in a freshly started task comes up a while after the agent does. A replica
+    # the simulator restored seconds ago answers `/readyz` long before it can be exec'd into, so a
+    # single attempt is a coin flip, and the way it loses is silence: a kill that did nothing, then
+    # a scenario reporting that a hard kill failed to fence anybody.
+    for attempt in 1 2 3 4; do
+      timeout 45 aws ecs execute-command --cluster "$CLUSTER" --task "$arn" --container agent --interactive \
+        --command "/bin/sh -c 'for p in /proc/[0-9]*; do [ \"\$(cat \$p/comm 2>/dev/null)\" = beyond-ai-agent ] && kill -9 \${p#/proc/}; done; true'" >/dev/null 2>&1 || true
+      for _ in $(seq 1 15); do
+        st=$(aws ecs describe-tasks --cluster "$CLUSTER" --tasks "$arn" --query 'tasks[0].lastStatus' || echo STOPPED)
+        [ "$st" = "STOPPED" ] && exit 0
+        sleep 2
+      done
+      echo "fault: kill attempt $attempt did not land on $replica, retrying" >&2
+    done
+    echo "fault: $replica did not reach STOPPED" >&2
+    exit 1
     ;;
 
   partition)
@@ -179,11 +191,25 @@ case "$action" in
     [ -n "$arn" ] || { echo "fault: run-task for $replica returned nothing" >&2; exit 1; }
     for _ in $(seq 1 180); do
       st=$(aws ecs describe-tasks --cluster "$CLUSTER" --tasks "$arn" --query 'tasks[0].lastStatus')
-      [ "$st" = "RUNNING" ] && exit 0
+      [ "$st" = "RUNNING" ] && break
       [ "$st" = "STOPPED" ] && { echo "fault: $replica stopped while starting" >&2; exit 1; }
       sleep 1
     done
-    echo "fault: $replica did not reach RUNNING" >&2
+    [ "$st" = "RUNNING" ] || { echo "fault: $replica did not reach RUNNING" >&2; exit 1; }
+    # And wait for the way back *in*. A task is RUNNING, and answers its health checks, before its
+    # ExecuteCommandAgent is up — and that agent is how `kill` reaches the process. A replica that
+    # is not yet killable is not yet restarted, however healthy it looks from outside.
+    for _ in $(seq 1 90); do
+      # Piped at each filter. Chaining two filter projections with `.` gives a list of lists that
+      # `|[0][0]` does not reach into, and the query comes back `None` — which reads as "the agent
+      # never started" rather than "the query was wrong", and fails the restart of a replica that
+      # was in fact perfectly ready.
+      ea=$(aws ecs describe-tasks --cluster "$CLUSTER" --tasks "$arn" \
+        --query 'tasks[0].containers[?name==`agent`]|[0].managedAgents[?name==`ExecuteCommandAgent`]|[0].lastStatus')
+      [ "$ea" = "RUNNING" ] && exit 0
+      sleep 2
+    done
+    echo "fault: $replica came up but its exec agent did not ($ea)" >&2
     exit 1
     ;;
 
