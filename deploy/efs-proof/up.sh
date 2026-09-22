@@ -67,6 +67,38 @@ if [ "${1:-}" = "--images" ]; then
   docker push "$ECR/fleetsim-driver:latest"
 fi
 
+say "iam"
+# Three roles. The execution role is what pulls images and writes logs; the replica role exists only
+# so ECS Exec works (the `kill` fault goes in that way); the driver role is the interesting one,
+# because the fault command runs as it.
+TRUST='{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"ecs-tasks.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
+SSM='{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["ssmmessages:CreateControlChannel","ssmmessages:CreateDataChannel","ssmmessages:OpenControlChannel","ssmmessages:OpenDataChannel"],"Resource":"*"}]}'
+for role in fleetsimTaskExecutionRole fleetsimDriverTaskRole fleetsimReplicaTaskRole; do
+  aws iam get-role --role-name "$role" >/dev/null 2>&1 || aws iam create-role --role-name "$role"     --assume-role-policy-document "$TRUST" --tags Key=fleetsim,Value=efs-proof >/dev/null
+done
+aws iam attach-role-policy --role-name fleetsimTaskExecutionRole   --policy-arn arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+aws iam put-role-policy --role-name fleetsimReplicaTaskRole --policy-name fleetsimExec --policy-document "$SSM"
+aws iam put-role-policy --role-name fleetsimDriverTaskRole --policy-name fleetsimExec --policy-document "$SSM"
+# What the fault command needs, and nothing else. `PassRole` must name **every** role the driver
+# hands to `RunTask`, the replica role included — leaving it out is an AccessDenied that only
+# appears the first time a scenario restarts a replica, which is two scenarios into a run.
+cat > /tmp/fleetsim-driver-policy.json <<JSON
+{"Version":"2012-10-17","Statement":[
+ {"Sid":"ReadNetworkAcls","Effect":"Allow",
+  "Action":["ec2:DescribeNetworkAcls","ec2:DescribeSubnets","ec2:DescribeNetworkInterfaces"],"Resource":"*"},
+ {"Sid":"TogglePartitionRules","Effect":"Allow",
+  "Action":["ec2:CreateNetworkAclEntry","ec2:DeleteNetworkAclEntry","ec2:ReplaceNetworkAclEntry"],
+  "Resource":"arn:aws:ec2:$REGION:$ACCOUNT:network-acl/*"},
+ {"Sid":"ReplicaLifecycle","Effect":"Allow",
+  "Action":["ecs:StopTask","ecs:RunTask","ecs:DescribeTasks","ecs:ListTasks","ecs:ExecuteCommand","ecs:DescribeTaskDefinition"],
+  "Resource":"*","Condition":{"ArnEquals":{"ecs:cluster":"arn:aws:ecs:$REGION:$ACCOUNT:cluster/$CLUSTER"}}},
+ {"Sid":"PassTaskRoles","Effect":"Allow","Action":"iam:PassRole","Resource":[
+   "arn:aws:iam::$ACCOUNT:role/fleetsimTaskExecutionRole",
+   "arn:aws:iam::$ACCOUNT:role/fleetsimDriverTaskRole",
+   "arn:aws:iam::$ACCOUNT:role/fleetsimReplicaTaskRole"]}]}
+JSON
+aws iam put-role-policy --role-name fleetsimDriverTaskRole --policy-name fleetsimDriverFaults   --policy-document file:///tmp/fleetsim-driver-policy.json
+
 say "vpc"
 VPC=$(aws ec2 describe-vpcs --filters "$TAG" --query 'Vpcs[0].VpcId')
 if [ "$VPC" = "None" ] || [ -z "$VPC" ]; then
