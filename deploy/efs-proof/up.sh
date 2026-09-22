@@ -301,7 +301,9 @@ addr_of() {
 echo
 echo "fleet up. from inside the driver task, run the matrix with:"
 echo -n "  fleet-sim matrix --substrate attached --fault-cmd /usr/local/bin/fault.sh"
-echo -n " --mock-listen $DRIVER_IP:19000 --shard s1=/mnt/efs/s1"
+# `s2` exists on EFS and no replica mounts it — the replica task definition names `s1` and nothing
+# else. That is exactly what the misdirection scenario needs, and it costs a directory.
+echo -n " --mock-listen $DRIVER_IP:19000 --shard s1=/mnt/efs/s1 --shard s2=/mnt/efs/s2"
 for i in $(seq 1 "$REPLICAS"); do echo -n " --replica $(addr_of "${STARTED[$((i - 1))]}"):8080"; done
 for _ in $(seq 1 "$REPLICAS"); do echo -n " --replica-metrics 9091"; done
 echo -n " --capped-replica $(addr_of "$CAPPED"):8080=1"

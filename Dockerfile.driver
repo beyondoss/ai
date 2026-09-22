@@ -35,6 +35,14 @@ RUN case "$TARGETARCH" in \
 RUN cargo install cargo-chef --locked --version ^0.1
 WORKDIR /app
 
+# Same flag `Dockerfile.agent` sets, and here for a blunter reason than its RSS one: the default
+# musl target links `crt-static` as a **static-PIE**, and the `fleet-sim` binary built that way
+# segfaults before `main` in this base image — silently, exit 139, with no output at all, which from
+# the outside looks exactly like a matrix that started and hung. The agent image has always carried
+# this flag and has always run here, so the driver carries it too rather than being the one binary
+# built a way nothing else in this repo ships.
+ENV RUSTFLAGS="-C relocation-model=static"
+
 FROM chef AS planner
 COPY . .
 RUN cargo chef prepare --recipe-path recipe.json

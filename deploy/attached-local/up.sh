@@ -50,6 +50,11 @@ eval "$("$SIM" keys --dir "$STATE/keys")"
 echo "grant key: $AI_AGENT_GRANT_KEY"
 
 for s in $(seq 1 "$SHARDS"); do mkdir -p "$EXPORT/s$s"; done
+# One more shard that exists on the storage and is deliberately **not** mounted by any replica.
+# That is the whole of what the misdirection scenario needs: a session homed somewhere this replica
+# cannot serve. It costs a directory.
+UNMOUNTED="s$((SHARDS + 1))"
+mkdir -p "$EXPORT/$UNMOUNTED"
 sudo -n exportfs -o rw,sync,no_subtree_check,no_root_squash,insecure,fsid=$((RANDOM + 1000)) "10.0.0.0/8:$EXPORT"
 
 for i in $(seq 1 "$TOTAL"); do
@@ -114,6 +119,7 @@ echo
 echo "fleet up. run the matrix with:"
 echo -n "  $SIM matrix --substrate attached --fault-cmd $(dirname "$0")/fault.sh --mock-listen $MOCK"
 for s in $(seq 1 "$SHARDS"); do echo -n " --shard s$s=$EXPORT/s$s"; done
+echo -n " --shard $UNMOUNTED=$EXPORT/$UNMOUNTED"
 while read -r a; do echo -n " --replica $a"; done < "$STATE/replicas"
 while read -r a; do echo -n " --replica-metrics $a"; done < "$STATE/metrics"
 echo -n " --capped-replica $(cat "$STATE/capped")"

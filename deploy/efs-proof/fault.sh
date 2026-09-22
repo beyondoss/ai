@@ -41,8 +41,8 @@ REGION=${AWS_REGION:-us-west-2}
 EFS_IP=${FLEETSIM_EFS_IP:?FLEETSIM_EFS_IP must be the EFS mount target address}
 RULE=${FLEETSIM_DENY_RULE:-50}
 
-action=${1:?usage: fault.sh <kill|term|partition|heal|restart> <replica>}
-replica=${2:?usage: fault.sh <kill|term|partition|heal|restart> <replica>}
+action=${1:?usage: fault.sh <kill|term|stop|partition|heal|restart> <replica>}
+replica=${2:?usage: fault.sh <kill|term|stop|partition|heal|restart> <replica>}
 
 aws() { command aws --region "$REGION" --output text "$@"; }
 
@@ -83,19 +83,36 @@ wait_stopped() {
 
 case "$action" in
   term)
+    # StopTask and return. ECS sends SIGTERM to the task's init — the wrapper shell in the replica's
+    # task definition, which forwards it to the agent — and only SIGKILLs after the container's
+    # `stopTimeout`. The drain window is everything between those two, so this must *not* wait: the
+    # first EFS run did, and C7 graded a replica that had already exited (`/readyz answered 0`).
     arn=$(task_arn)
     [ -n "$arn" ] || { echo "fault: no running task tagged replica=$replica" >&2; exit 1; }
     aws ecs stop-task --cluster "$CLUSTER" --task "$arn" --reason "fleet-sim term" --query 'task.taskArn' >/dev/null
+    ;;
+
+  stop)
+    # The same signal, and this one is over when the replica is gone.
+    arn=$(task_arn)
+    [ -n "$arn" ] || exit 0
+    aws ecs stop-task --cluster "$CLUSTER" --task "$arn" --reason "fleet-sim stop" --query 'task.taskArn' >/dev/null
     wait_stopped "$arn"
     ;;
 
   kill)
     arn=$(task_arn)
     [ -n "$arn" ] || { echo "fault: no running task tagged replica=$replica" >&2; exit 1; }
-    # SIGKILL the agent itself. The wrapper shell (PID 1) stays up just long enough for ECS to
-    # notice its child died; the task then stops on its own.
+    # SIGKILL the agent itself. The wrapper shell (PID 1) then falls out of its wait loop and
+    # exits, the essential container is gone, and ECS stops the task.
+    #
+    # `-x` matches the process *name*, not the command line. `pgrep -f beyond-ai-agent` would also
+    # match the wrapper — the agent's command line is inside it — and picking the lowest pid from
+    # that is PID 1, which the kernel refuses to SIGKILL from inside its own namespace. The fault
+    # would then quietly do nothing and the scenario would report that a hard kill did not fence
+    # anybody, which is a claim about the design made out of a bad pattern.
     aws ecs execute-command --cluster "$CLUSTER" --task "$arn" --container agent --interactive \
-      --command "/bin/sh -c 'kill -9 \$(pgrep -f beyond-ai-agent | head -1)'" >/dev/null 2>&1 || true
+      --command "/bin/sh -c 'kill -9 \$(pgrep -x beyond-ai-agent)'" >/dev/null 2>&1 || true
     wait_stopped "$arn"
     ;;
 

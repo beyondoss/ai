@@ -28,6 +28,16 @@ case "$action" in
     p=$(cat "$pidfile" 2>/dev/null || true)
     [ -n "$p" ] && kill -TERM "$p" 2>/dev/null || true
     exit 0 ;;
+  # The same signal, waited on. `term` is defined by the replica still being there; `stop` by it
+  # being gone, so they cannot be the same word.
+  stop)
+    p=$(cat "$pidfile" 2>/dev/null || true)
+    [ -n "$p" ] && kill -TERM "$p" 2>/dev/null || true
+    for _ in $(seq 1 120); do
+      [ -n "$p" ] && kill -0 "$p" 2>/dev/null || break
+      sleep 0.5
+    done
+    exit 0 ;;
   # Link state, not a firewall rule: it stops traffic *and* lease renewal, which is what a lost
   # mount target does, and it cuts an already-established connection.
   partition) sudo -n ip netns exec "$ns" ip link set "$cif" down ;;

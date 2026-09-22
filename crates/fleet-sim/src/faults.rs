@@ -30,8 +30,18 @@ pub enum Fault {
     /// Machine failure: no signal handler, no unwind, no chance to release a lock or seal a segment.
     /// This is the case the epoch fence exists for.
     Kill,
-    /// The deploy case: `SIGTERM`, which a replica is supposed to survive gracefully.
+    /// The deploy case: `SIGTERM`, and **return at once**. The window a drain scenario asserts on
+    /// is the one where the replica is still up and still finishing what it owns, so a fault that
+    /// waited for the process to be gone would close the window before anything could look through
+    /// it — which is exactly what the first EFS run did: all four C7 assertions came back against a
+    /// replica that had already exited.
     Term,
+    /// `SIGTERM`, and wait for it to actually be gone. What chaos wants, where the next event must
+    /// not begin until this one has finished.
+    ///
+    /// A separate word from [`Fault::Term`] rather than a flag on it, because the difference is not
+    /// a nuance: one of them is defined by the replica still being there.
+    Stop,
     /// Cut this replica off from its storage while its peers keep serving. Its lease stops being
     /// renewed, which is what makes a takeover lease-bound rather than instant.
     Partition,
@@ -47,6 +57,7 @@ impl Fault {
         match self {
             Fault::Kill => "kill",
             Fault::Term => "term",
+            Fault::Stop => "stop",
             Fault::Partition => "partition",
             Fault::Heal => "heal",
             Fault::Restart => "restart",

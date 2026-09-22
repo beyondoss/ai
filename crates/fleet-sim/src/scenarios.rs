@@ -579,12 +579,12 @@ impl Fleet {
     /// `SIGTERM` replica `idx` and wait for it to actually go — what chaos wants, where the next
     /// event should not start until this one finished.
     pub fn stop_gracefully(&mut self, idx: usize, within: Duration) -> Result<(), String> {
-        self.signal_term(idx)?;
         if self.faults.is_external() {
-            // Whoever owns the replica owns how long stopping takes; the fault command is expected
-            // to have returned only once it was done.
-            return Ok(());
+            // A distinct word, not `term` again: whoever owns the replica owns how long stopping
+            // takes, and `stop` is the one that is over when the replica is gone.
+            return self.faults.run(Fault::Stop, &self.replicas[idx].name);
         }
+        self.signal_term(idx)?;
         self.replicas[idx].wait_for_exit(within)
     }
 
@@ -1229,6 +1229,40 @@ pub async fn unmounted_shard_is_misdirected(
     // accumulated over a run, so there is nothing to compare against afterwards.
     _history_path: &std::path::Path,
 ) -> Outcome {
+    // An attached fleet already *is* the shape this scenario needs, so nothing is built: its
+    // replicas were started with `--shard s1=…` and nothing else, which makes any *other* shard the
+    // simulator was told about one they provably do not mount. Building one here instead would need
+    // an agent binary, and the driver task has none — it runs the simulator, not the agent — which
+    // is how this first failed on EFS, two scenarios into the run.
+    if ATTACHED.get().is_some() {
+        let fleet =
+            match Fleet::start_against(kind, 1, 2, _history_path, None, false, String::new()).await
+            {
+                Ok(f) => f,
+                Err(e) => return Outcome::failed_with(e),
+            };
+        let shards = fleet.substrate.shards.clone();
+        let [(mine, _), (elsewhere, _)] = &shards[..] else {
+            return Outcome::failed_with(format!(
+                "{ATTACHED_SKIP}this scenario needs a shard the replicas do **not** mount, so the \
+                 fleet must be attached to with a second --shard the replica tasks were not \
+                 started with ({} given)",
+                shards.len()
+            ));
+        };
+        let addr = fleet.replicas[0].addr.clone();
+        let exec_url = fleet.exec.url.clone();
+        let (there, here) = (
+            format!("{elsewhere}.somewhere-else"),
+            format!("{mine}.mine"),
+        );
+        let g = fleet.edge.grant("t1", &there, elsewhere, "/", &exec_url);
+        let answered = workload::probe_session(&addr, &there, &g).await;
+        let g = fleet.edge.grant("t1", &here, mine, "/", &exec_url);
+        let served = workload::probe_session(&addr, &here, &g).await;
+        return report_misdirection(answered, served);
+    }
+
     // Two shards, and a replica that mounts only the first.
     let substrate = match Substrate::prepare(kind, 2, 1) {
         Ok(s) => s,
@@ -1286,6 +1320,11 @@ pub async fn unmounted_shard_is_misdirected(
     let mine = edge.grant("t1", "s1.mine", "s1", "/", &exec.url);
     let served = workload::probe_session(&addr, "s1.mine", &mine).await;
 
+    report_misdirection(answered, served)
+}
+
+/// The two findings C5 is, whichever way the replica that answered them was obtained.
+fn report_misdirection(answered: Result<u16, String>, served: Result<u16, String>) -> Outcome {
     let findings = vec![
         Finding {
             claim: "C5",
