@@ -688,6 +688,21 @@ impl Substrate {
     }
 
     /// Every session directory currently on `shard`, for the checker.
+    /// The directory **one named session** wrote on this shard, if it wrote one.
+    ///
+    /// [`session_dirs`](Self::session_dirs) returns every session a tenant has there, in whatever
+    /// order `read_dir` gives, so taking the first of them is right only while the tenant has
+    /// exactly one. That holds on a substrate the simulator built for a single scenario and does
+    /// not hold on a fleet that nine scenarios share: by the time the takeover scenario ran, `t1`
+    /// owned five session directories on `s1`, and reading "the first" meant reading a *different*
+    /// scenario's session — which reported that a takeover had not advanced the epoch while the
+    /// takeover it was actually watching had advanced it perfectly well.
+    pub fn session_dir(&self, shard: &str, tenant: &str, session: &str) -> Option<PathBuf> {
+        self.session_dirs(shard, tenant)
+            .into_iter()
+            .find(|p| p.file_name().is_some_and(|n| n == session))
+    }
+
     pub fn session_dirs(&self, shard: &str, tenant: &str) -> Vec<PathBuf> {
         let Some((_, root)) = self.shards.iter().find(|(n, _)| n == shard) else {
             return Vec::new();

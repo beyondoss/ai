@@ -9,8 +9,7 @@ use std::time::{Duration, Instant};
 
 use beyond_ai_test_support::exec_mock::ExecMock;
 use beyond_ai_test_support::{
-    spawn_model_server, spawn_model_server_routed_unrecorded,
-    spawn_model_server_with_stalled_response, turn_text,
+    spawn_model_server, spawn_model_server_routed_unrecorded, stall_prompt, turn_text,
 };
 use serde_json::json;
 
@@ -132,6 +131,24 @@ static ATTACHED: std::sync::OnceLock<Attachment> = std::sync::OnceLock::new();
 pub struct Attachment {
     pub shards: Vec<(String, std::path::PathBuf)>,
     pub replicas: Vec<Addr>,
+    /// The port the replica in the same position publishes its scrape on, when the fleet was
+    /// provisioned with somewhere to publish it.
+    ///
+    /// A port and not an address, because the **host is always the replica's own**. A replica's
+    /// metrics listener is loopback-only by design (`metrics::parse_listen_addr` refuses anything
+    /// else: the scrape describes every tenant on the replica and the replica is reachable by
+    /// tenants), so reaching it from the driver goes through a sidecar — and a sidecar shares its
+    /// replica's network namespace, which is the whole reason it can see loopback at all. Storing
+    /// the host too would mean storing it twice and letting the copies disagree: a restarted
+    /// Fargate task comes back on a new address, and the scrape would still be aimed at the old one.
+    pub metrics: Vec<u16>,
+    /// A replica held back, started with `--max-live-sessions`, for the one scenario about the cap.
+    ///
+    /// Separate from `replicas` rather than one of them: the cap is fixed when the task starts, so a
+    /// capped replica in the general pool would silently refuse the second session of every *other*
+    /// scenario. The `usize` is the cap it was started with, checked against the one the scenario
+    /// asks for — a fleet provisioned with a cap of 4 cannot answer a question about a cap of 1.
+    pub capped: Option<(Addr, usize)>,
     pub fault_cmd: String,
     /// Where the mock model server binds, and — on the next port up — the exec double.
     ///
@@ -152,18 +169,32 @@ pub fn attach_to(spec: Attachment) {
 /// before this process did. Rather than quietly ignoring the request and grading a scenario that
 /// tested something else, say so — the caller turns it into a skip with a reason, which is the same
 /// contract `needs_shared_fs` already uses.
-fn attached_cannot(max_live_sessions: Option<usize>, with_metrics: bool) -> Option<String> {
-    if max_live_sessions.is_some() {
-        return Some(
-            "an attached replica's --max-live-sessions was fixed when its task started; the fleet \
-             would have to be provisioned with the cap this scenario needs"
-                .to_owned(),
-        );
+fn attached_cannot(
+    spec: &Attachment,
+    max_live_sessions: Option<usize>,
+    with_metrics: bool,
+) -> Option<String> {
+    match (max_live_sessions, &spec.capped) {
+        (None, _) => {}
+        (Some(want), Some((_, have))) if want == *have => {}
+        (Some(want), Some((_, have))) => {
+            return Some(format!(
+                "this scenario needs a replica capped at {want} live session(s) and the fleet was \
+                 provisioned with one capped at {have}; the cap is fixed when the task starts"
+            ));
+        }
+        (Some(want), None) => {
+            return Some(format!(
+                "an attached replica's --max-live-sessions was fixed when its task started; this \
+                 scenario needs one capped at {want}, provisioned as --capped-replica"
+            ));
+        }
     }
-    if with_metrics {
+    if with_metrics && spec.metrics.is_empty() {
         return Some(
             "an attached replica's metrics listener is loopback-only inside its own task, so it is \
-             only scrapeable through a sidecar the fleet must be provisioned with"
+             only scrapeable through a sidecar the fleet must be provisioned with — give one \
+             --replica-metrics per --replica"
                 .to_owned(),
         );
     }
@@ -181,7 +212,9 @@ pub struct Fleet {
     /// and ownership, not isolation between sandboxes, which the service suites already cover.
     pub exec: ExecMock,
     /// Each replica's metrics listener, in the same order as `replicas`.
-    pub metrics_ports: Vec<Option<u16>>,
+    /// The port each replica's scrape is on, when it has one. Read through
+    /// [`metrics_addr`](Self::metrics_addr), which composes it with wherever that replica is *now*.
+    pub metrics: Vec<Option<u16>>,
     /// How this fleet's faults are performed. Local mechanisms for a fleet it spawned; a
     /// caller-supplied command for one it attached to — see [`crate::faults`].
     pub faults: Faults,
@@ -216,7 +249,8 @@ impl Fleet {
     /// secret**: an attached fleet must be somewhere private.
     pub async fn attach(
         shards: Vec<(String, std::path::PathBuf)>,
-        replicas: Vec<Addr>,
+        mut replicas: Vec<(String, Addr)>,
+        metrics: Vec<Option<u16>>,
         fault_cmd: String,
         spec_bind: Addr,
         history_path: &std::path::Path,
@@ -249,10 +283,37 @@ impl Fleet {
         // This `Fleet` owns no sandbox of its own — the shared one above outlives it.
         let sandbox = tempfile::tempdir().map_err(|e| format!("scratch: {e}"))?;
 
+        // Restore the fleet before using it.
+        //
+        // Scenarios *share* an attached fleet — there is one of it, and it outlives every `Fleet`
+        // here — so damage accumulates across a run in a way it never does on a substrate the
+        // simulator owns, where each scenario spawns its own replicas and drops them. A scenario
+        // that terminates a replica (the drain) or kills one (the takeover) leaves it that way, and
+        // every scenario after it grades a fleet that is missing a member: the first run with the
+        // drain scenario enabled reported six failures, all of them `503 Service Unavailable`
+        // against a replica that had been asked to drain two scenarios earlier and had done so.
+        //
+        // Readiness rather than liveness, because a draining replica answers `/livez` with 200 for
+        // as long as it takes to finish what it owns — which is the whole point of the drain — and
+        // is exactly the replica that must not be handed the next scenario.
+        let faults = Faults::external(fault_cmd);
+        for (name, addr) in &mut replicas {
+            if ready_within(addr, Duration::from_secs(10)).await {
+                continue;
+            }
+            println!("  … restoring {name}: it is not ready, so asking for a restart");
+            faults.run(Fault::Restart, name)?;
+            *addr = Addr::parse(&faults.address(name)?)?;
+            if !ready_within(addr, Duration::from_secs(180)).await {
+                return Err(format!(
+                    "replica {name} was restarted and still does not report ready at {addr}"
+                ));
+            }
+        }
+
         let attached: Vec<Replica> = replicas
             .iter()
-            .enumerate()
-            .map(|(i, addr)| Replica::attach(&format!("r{}", i + 1), addr.clone()))
+            .map(|(name, addr)| Replica::attach(name, addr.clone()))
             .collect();
         let targets = attached
             .iter()
@@ -264,21 +325,6 @@ impl Fleet {
         let mut edge = Edge::new(keys.path(), Vec::new());
         edge.set_targets(targets);
 
-        // Every replica is reachable before a scenario starts, or the first failure is a routing
-        // mystery rather than a claim.
-        for r in &attached {
-            match workload::http_get(&r.addr, "/livez").await {
-                Ok((200, _)) => {}
-                other => {
-                    return Err(format!(
-                        "replica {} at {} did not answer /livez with 200: {other:?}",
-                        r.name, r.addr
-                    ));
-                }
-            }
-        }
-
-        let metrics_ports = vec![None; attached.len()];
         let history = History::create(history_path)?;
         Ok(Self {
             substrate,
@@ -287,8 +333,8 @@ impl Fleet {
             history,
             gateway_url,
             exec,
-            metrics_ports,
-            faults: Faults::external(fault_cmd),
+            metrics,
+            faults,
             _keys: keys,
             _sandbox: sandbox,
         })
@@ -385,9 +431,17 @@ impl Fleet {
         .await
     }
 
-    /// As above, against a model server the caller already has — for a scenario that needs the model
-    /// to *stall*, which is the only way to hold a run in flight without depending on how fast a
-    /// sandbox happens to be.
+    /// As above, against a model server the caller already has.
+    ///
+    /// The `gateway_url` is used **only** when the simulator owns the replicas. An attached fleet's
+    /// replicas carry `--gateway-url` from the moment their tasks started and share one model server
+    /// for the whole run, so a server built here would sit somewhere none of them would ever dial —
+    /// and silently substituting it is what the first attached run did: nothing stalled, the drain
+    /// finished instantly, the replica exited, and all four C7 assertions came back
+    /// `Connection refused`, which reads as "drain is broken" and was really "the harness sent the
+    /// wrong model". A scenario that needs the model to behave a particular way asks for it **in the
+    /// request** instead — see `stall_prompt` — honoured by the shared server and a local one alike.
+    #[allow(clippy::too_many_arguments)]
     pub async fn start_against(
         kind: Kind,
         replicas: usize,
@@ -397,59 +451,40 @@ impl Fleet {
         with_metrics: bool,
         gateway_url: String,
     ) -> Result<Self, String> {
-        Self::start_against_model(
-            kind,
-            replicas,
-            shards,
-            history_path,
-            max_live_sessions,
-            with_metrics,
-            gateway_url,
-            false,
-        )
-        .await
-    }
-
-    /// As [`start_against`](Self::start_against), stating whether *this* model server is the point.
-    ///
-    /// One scenario needs a model that **stalls**, so a turn is genuinely in flight when the replica
-    /// is asked to drain. An attached replica carries `--gateway-url` from its task definition and
-    /// cannot be repointed per scenario, so that scenario cannot run against an arbitrary attached
-    /// fleet — and saying so is the only honest answer. Silently substituting the default server is
-    /// what the first attached run did: nothing stalled, the drain finished instantly, the replica
-    /// exited, and all four C7 assertions came back `Connection refused` — which reads as "drain is
-    /// broken" and was really "the harness sent the wrong model".
-    #[allow(clippy::too_many_arguments)]
-    pub async fn start_against_model(
-        kind: Kind,
-        replicas: usize,
-        shards: usize,
-        history_path: &std::path::Path,
-        max_live_sessions: Option<usize>,
-        with_metrics: bool,
-        gateway_url: String,
-        model_is_the_point: bool,
-    ) -> Result<Self, String> {
         if let Some(spec) = ATTACHED.get() {
-            if model_is_the_point {
-                return Err(format!(
-                    "{ATTACHED_SKIP}this scenario needs a model server that stalls, and an attached \
-                     replica's --gateway-url was fixed when its task started"
-                ));
-            }
-            if let Some(why) = attached_cannot(max_live_sessions, with_metrics) {
+            if let Some(why) = attached_cannot(spec, max_live_sessions, with_metrics) {
                 return Err(format!("{ATTACHED_SKIP}{why}"));
             }
-            if spec.replicas.len() < replicas {
-                return Err(format!(
-                    "{ATTACHED_SKIP}this scenario needs {replicas} replicas and the attached fleet \
-                     has {}",
-                    spec.replicas.len()
-                ));
-            }
+            // The capped replica stands in for the whole fleet, and only for the scenario that
+            // asked for a cap. It is named apart from `r1`…`rN` so that a fault aimed at it fails
+            // loudly rather than landing on whichever task happens to be tagged `r1`.
+            let (members, metrics) = match (max_live_sessions, &spec.capped) {
+                (Some(_), Some((addr, _))) => {
+                    (vec![("capped".to_owned(), addr.clone())], vec![None])
+                }
+                _ => {
+                    if spec.replicas.len() < replicas {
+                        return Err(format!(
+                            "{ATTACHED_SKIP}this scenario needs {replicas} replicas and the \
+                             attached fleet has {}",
+                            spec.replicas.len()
+                        ));
+                    }
+                    let members = spec.replicas[..replicas]
+                        .iter()
+                        .enumerate()
+                        .map(|(i, a)| (format!("r{}", i + 1), a.clone()))
+                        .collect();
+                    let metrics = (0..replicas)
+                        .map(|i| spec.metrics.get(i).copied())
+                        .collect();
+                    (members, metrics)
+                }
+            };
             return Self::attach(
                 spec.shards.clone(),
-                spec.replicas[..replicas].to_vec(),
+                members,
+                metrics,
                 spec.fault_cmd.clone(),
                 spec.mock_listen.clone(),
                 history_path,
@@ -472,7 +507,7 @@ impl Fleet {
 
         let mut started = Vec::new();
         let mut targets = Vec::new();
-        let mut metrics_ports = Vec::new();
+        let mut metrics = Vec::new();
         for i in 0..replicas {
             let name = format!("r{}", i + 1);
             let port = free_port()?;
@@ -497,7 +532,7 @@ impl Fleet {
                 name,
                 addr: Addr::local(port),
             });
-            metrics_ports.push(metrics_port);
+            metrics.push(metrics_port);
             started.push(replica);
         }
         edge.set_targets(targets);
@@ -510,7 +545,7 @@ impl Fleet {
             history,
             gateway_url,
             exec,
-            metrics_ports,
+            metrics,
             faults: Faults::local(),
             _keys: keys,
             _sandbox: sandbox,
@@ -579,7 +614,16 @@ impl Fleet {
     /// retarget.
     pub async fn restart(&mut self, idx: usize) -> Result<(), String> {
         if self.faults.is_external() {
-            return self.faults.run(Fault::Restart, &self.replicas[idx].name);
+            let name = self.replicas[idx].name.clone();
+            self.faults.run(Fault::Restart, &name)?;
+            // Then ask where it came back. A replaced Fargate task draws a fresh address from its
+            // subnet, so assuming the old one would leave the edge routing to nothing — and the
+            // scenario would report that a restarted replica never rejoins, which is a claim about
+            // the design made out of a fact about the platform.
+            let addr = Addr::parse(&self.faults.address(&name)?)?;
+            self.replicas[idx].addr = addr.clone();
+            self.edge.readdress(&name, addr);
+            return Ok(());
         }
         let name = self.replicas[idx].name.clone();
         let port = free_port()?;
@@ -611,6 +655,19 @@ impl Fleet {
     }
 
     /// Drop a replica from the edge's ring — what an orchestrator does when a task dies.
+    /// Where replica `idx`'s scrape is, right now.
+    ///
+    /// Composed rather than stored, so a replica that moved cannot leave a stale address behind: a
+    /// sidecar lives in its replica's network namespace, so its host is the replica's host by
+    /// construction and there is no second thing to keep in step.
+    pub fn metrics_addr(&self, idx: usize) -> Option<Addr> {
+        let port = (*self.metrics.get(idx)?)?;
+        Some(Addr {
+            host: self.replicas.get(idx)?.addr.host.clone(),
+            port,
+        })
+    }
+
     pub fn retarget_excluding(&mut self, name: &str) {
         let targets = self
             .replicas
@@ -724,9 +781,8 @@ pub async fn owner_refuses_non_owner(kind: Kind, history_path: &std::path::Path)
         },
     }
 
-    let dirs = fleet.substrate.session_dirs("s1", tenant);
-    match dirs.first() {
-        Some(dir) => findings.push(check::one_writer_per_session(dir)),
+    match fleet.substrate.session_dir("s1", tenant, session) {
+        Some(dir) => findings.push(check::one_writer_per_session(&dir)),
         None => findings.push(Finding {
             claim: "C1",
             ok: false,
@@ -805,8 +861,7 @@ pub async fn takeover_after_hard_kill(kind: Kind, history_path: &std::path::Path
         .history
         .record("message_committed", json!({ "text": marker }));
 
-    let dirs = fleet.substrate.session_dirs("s1", tenant);
-    let Some(session_dir) = dirs.first().cloned() else {
+    let Some(session_dir) = fleet.substrate.session_dir("s1", tenant, session) else {
         return Outcome::failed_with("the session wrote no directory".into());
     };
     let epoch_before = check::segments(&session_dir)
@@ -942,22 +997,15 @@ pub async fn drain_keeps_serving_what_it_owns(
     // The *model* stalls rather than a tool, because a tool's duration depends on the sandbox and a
     // request/response exec endpoint streams nothing while it runs, so "the command has started" is
     // not observable from here. A model that has not answered keeps the run in flight by definition.
-    let gateway = spawn_model_server_with_stalled_response(
-        Vec::new(),
-        Duration::from_secs(6),
-        vec![turn_text("finished after the signal")],
-    );
-    let mut fleet = match Fleet::start_against_model(
-        kind,
-        1,
-        1,
-        history_path,
-        None,
-        false,
-        gateway,
-        true,
-    )
-    .await
+    //
+    // The stall is asked for in the **prompt** (`stall_prompt`) rather than configured on a server
+    // stood up for this scenario. A fleet the simulator merely attached to dials a model server
+    // whose address was fixed when its tasks started, so a purpose-built server would sit somewhere
+    // no replica would ever call — which is why this scenario used to skip on an attached fleet, and
+    // C7 is exactly the claim a rolling ECS deploy rests on. Now the same code stalls both.
+    let gateway =
+        spawn_model_server_routed_unrecorded(Vec::new(), turn_text("finished after the signal"));
+    let mut fleet = match Fleet::start_against(kind, 1, 1, history_path, None, false, gateway).await
     {
         Ok(f) => f,
         Err(e) => return Outcome::failed_with(e),
@@ -971,8 +1019,9 @@ pub async fn drain_keeps_serving_what_it_owns(
         Ok(ws) => ws,
         Err(e) => return Outcome::failed_with(format!("connect: {e}")),
     };
-    // Start the run and wait until the tool is provably executing, so the drain has work to protect.
-    if let Err(e) = workload::send(&mut ws, json!({ "type": "prompt", "message": "go" })).await {
+    // Start the run and wait until it is provably executing, so the drain has work to protect.
+    let go = json!({ "type": "prompt", "message": stall_prompt(6_000) });
+    if let Err(e) = workload::send(&mut ws, go).await {
         return Outcome::failed_with(format!("prompt: {e}"));
     }
     // The first event proves the run has begun; the model will not answer for several seconds, so
@@ -1115,7 +1164,7 @@ pub async fn metrics_name_no_tenant(kind: Kind, history_path: &std::path::Path) 
         Ok(f) => f,
         Err(e) => return Outcome::failed_with(e),
     };
-    let Some(Some(metrics_port)) = fleet.metrics_ports.first().copied() else {
+    let Some(metrics_at) = fleet.metrics_addr(0) else {
         return Outcome::failed_with("the replica has no metrics listener".into());
     };
     let exec_url = fleet.exec.url.clone();
@@ -1133,7 +1182,7 @@ pub async fn metrics_name_no_tenant(kind: Kind, history_path: &std::path::Path) 
     };
     let _ = workload::command(&mut ws, json!({ "type": "get_state" }), "get_state").await;
 
-    let scrape = match workload::http_get(&Addr::local(metrics_port), "/metrics").await {
+    let scrape = match workload::http_get(&metrics_at, "/metrics").await {
         Ok((200, body)) => body,
         other => return Outcome::failed_with(format!("scrape: {other:?}")),
     };
@@ -1472,17 +1521,49 @@ fn grep_tree(root: &std::path::Path, needle: &str) -> bool {
     false
 }
 
-/// How many OS threads a process has right now.
+/// How many OS threads the replica says it has, from `agent_threads` in its scrape.
 ///
 /// The measurement C8 is actually about. A `spawn_blocking` probe is **uncancellable**: once it is
 /// stuck in a `stat` on a hard mount that stopped answering, it stays stuck, and the thread it is on
 /// is gone until the mount comes back. Whether that costs one thread or one per request is the whole
 /// difference between a replica that reports itself unhealthy and a replica that exhausts tokio's
 /// 512-thread blocking pool and takes every other `spawn_blocking` in the process down with it.
-fn threads(pid: u32) -> usize {
-    std::fs::read_dir(format!("/proc/{pid}/task"))
-        .map(|d| d.flatten().count())
-        .unwrap_or(0)
+///
+/// Asked of the replica rather than read from `/proc/<pid>/task`, even for a replica this process
+/// spawned. `/proc` does not cross a container boundary, so a `/proc` reading would prove this on
+/// the homelab and prove nothing on Fargate — and a claim that is checked one way locally and
+/// another way in production is two claims.
+async fn scrape_threads(at: &Addr) -> Result<usize, String> {
+    let (code, body) = workload::http_get(at, "/metrics")
+        .await
+        .map_err(|e| format!("scraping {at}: {e}"))?;
+    if code != 200 {
+        return Err(format!("scraping {at}: HTTP {code}"));
+    }
+    // `# HELP`/`# TYPE` lines start with `#`, so a bare name match cannot pick one up.
+    body.lines()
+        .find_map(|l| l.strip_prefix("agent_threads "))
+        .ok_or_else(|| format!("no agent_threads in the scrape from {at}"))?
+        .trim()
+        .parse()
+        .map_err(|_| format!("agent_threads from {at} is not a count"))
+}
+
+/// Does this replica report itself ready within `within`?
+///
+/// Polled rather than asked once: a replica that is starting, or finishing a drain, gets there on
+/// its own, and the caller's next move (restarting it) is far more disruptive than waiting.
+async fn ready_within(at: &Addr, within: Duration) -> bool {
+    let deadline = Instant::now() + within;
+    loop {
+        if let Ok((200, _)) = workload::http_get(at, "/readyz").await {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
 }
 
 /// A bounded `GET`, because the point of the scenario is that the replica answers.
@@ -1519,20 +1600,19 @@ pub async fn hung_mount_is_reported_not_leaked(
                 .into(),
         );
     }
-    let fleet = match Fleet::start(kind, 1, history_path).await {
+    // Metrics on, because the thread count comes from the replica's own `agent_threads` gauge
+    // rather than from `/proc`. `/proc/<pid>/task` exists only for a replica in this process's
+    // namespace, so reading it would grade the local substrate on the whole claim and an attached
+    // fleet on half of it — the same code has to prove the same thing in both places, or the EFS
+    // run is not the homelab run. If the fleet was not provisioned with a scrape, `start_with`
+    // returns the skip and says so.
+    let fleet = match Fleet::start_with(kind, 1, history_path, None, true).await {
         Ok(f) => f,
         Err(e) => return Outcome::failed_with(e),
     };
     let addr = fleet.replicas[0].addr.clone();
-    // The thread-count half of this claim reads `/proc/<pid>/task`, which only exists for a replica
-    // in this process's own namespace. An attached replica's blocking-pool size has to come from its
-    // metrics listener instead, which is loopback-only inside its task and needs a sidecar to scrape
-    // — so say that rather than grade the claim on the half that still works.
-    let Some(pid) = fleet.replicas[0].pid() else {
-        return Outcome::failed_with(format!(
-            "{ATTACHED_SKIP}the probe-thread bound is counted from /proc, which an attached \
-             replica does not share; it needs the metrics listener scraped through a sidecar"
-        ));
+    let Some(metrics_at) = fleet.metrics_addr(0) else {
+        return Outcome::failed_with("the replica has no metrics listener".into());
     };
 
     // Healthy first, or the rest proves nothing.
@@ -1540,7 +1620,10 @@ pub async fn hung_mount_is_reported_not_leaked(
         Ok(200) => {}
         other => return Outcome::failed_with(format!("/readyz before the partition: {other:?}")),
     }
-    let baseline = threads(pid);
+    let baseline = match scrape_threads(&metrics_at).await {
+        Ok(n) => n,
+        Err(e) => return Outcome::failed_with(format!("thread count before the partition: {e}")),
+    };
 
     if let Err(e) = fleet.partition(0) {
         return Outcome::failed_with(format!("could not take the mount away: {e}"));
@@ -1565,7 +1648,13 @@ pub async fn hung_mount_is_reported_not_leaked(
         slowest = slowest.max(began.elapsed());
         statuses.push(status);
     }
-    let after = threads(pid);
+    // Scraped while the mount is still gone: after the heal the pool would drain and a leak would
+    // read as no leak. The scrape itself is unaffected by the partition — only traffic to the
+    // storage is denied, and the metrics listener is loopback inside the replica's own namespace.
+    let after = match scrape_threads(&metrics_at).await {
+        Ok(n) => n,
+        Err(e) => return Outcome::failed_with(format!("thread count after the probes: {e}")),
+    };
     let livez = get_within(&addr, "/livez", Duration::from_secs(10)).await;
 
     fleet.heal(0);

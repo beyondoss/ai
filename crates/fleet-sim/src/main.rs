@@ -15,6 +15,22 @@
 //! (repeatable) and `--fault-cmd CMD`, which the simulator invokes as `CMD <action> <replica>` for
 //! `kill|term|partition|heal|restart`. Nothing in here knows what provides any of it, which is what
 //! lets the identical binary grade a local NFS fleet and a real ECS+EFS one.
+//!
+//! Two scenarios need the fleet to have been provisioned for them, because both knobs are fixed when
+//! a replica's task starts and neither can be asked for afterwards:
+//!
+//! ```text
+//! --replica-metrics PORT        one per --replica, in order: the port that replica's scrape is
+//!                               on. Its own listener is loopback-only by design, so this is a
+//!                               sidecar beside it — and a sidecar shares the replica's network
+//!                               namespace, so the host is the replica's and is never given here.
+//! --capped-replica host:port=N  an extra replica started with --max-live-sessions N, used only by
+//!                               the scenario about the cap. Apart from the pool on purpose: a
+//!                               capped replica in it would refuse every other scenario's second
+//!                               session.
+//! ```
+//!
+//! Without them those scenarios skip, with the reason, rather than failing or quietly passing.
 //! ```
 //!
 //! It is not a CI shard. The substrate that makes the interesting claims checkable needs root, an
@@ -204,9 +220,41 @@ fn attached_from(args: &[String]) -> Result<Option<scenarios::Attachment>, Strin
             .as_deref()
             .unwrap_or("127.0.0.1:19000"),
     )?;
+    // One per `--replica`, in the same order, or none at all. A partial list is refused rather
+    // than padded: a scenario that scraped the wrong replica would be grading the wrong process,
+    // and positional flags are exactly where that mistake is silent.
+    let metrics = flags(args, "--replica-metrics")
+        .iter()
+        .map(|s| {
+            s.parse::<u16>()
+                .map_err(|_| format!("--replica-metrics {s:?} is not a port"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if !metrics.is_empty() && metrics.len() != replicas.len() {
+        return Err(format!(
+            "--replica-metrics is positional: give one per --replica ({} replicas, {} metrics \
+             addresses) or none",
+            replicas.len(),
+            metrics.len()
+        ));
+    }
+    let capped = match flag(args, "--capped-replica") {
+        None => None,
+        Some(s) => {
+            let (addr, cap) = s.rsplit_once('=').ok_or_else(|| {
+                format!("--capped-replica {s:?} is not host:port=<max live sessions>")
+            })?;
+            let cap: usize = cap
+                .parse()
+                .map_err(|_| format!("--capped-replica {s:?} has no valid session cap"))?;
+            Some((crate::edge::Addr::parse(addr)?, cap))
+        }
+    };
     Ok(Some(scenarios::Attachment {
         shards: shard_args(args)?,
         replicas,
+        metrics,
+        capped,
         fault_cmd,
         mock_listen,
     }))

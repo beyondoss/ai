@@ -13,6 +13,10 @@
 set -euo pipefail
 
 REPLICAS=${REPLICAS:-3}
+# One more client than there are replicas in the pool: the last is started with
+# `--max-live-sessions 1` and kept out of the pool, because the cap is fixed when a replica starts
+# and one inside the pool would refuse every other scenario's second session. See `--capped-replica`.
+TOTAL=$((REPLICAS + 1))
 SHARDS=${SHARDS:-1}
 STATE=${STATE:-/var/tmp/fleet-attached}
 BIN=${BIN:-/home/jared/ai/target/debug/beyond-ai-agent}
@@ -28,12 +32,13 @@ OCTET=$((66 + RANDOM % 60))
 # the health check then passes against the *old* ones — still serving mounts that no longer exist,
 # with sessions still live in memory — and the matrix grades claims against a fleet nobody intended.
 # That produced a false C10 isolation violation before this check existed.
-for i in $(seq 1 "$REPLICAS"); do
-  port=$((18100 + i))
-  if ss -ltn 2>/dev/null | grep -q ":$port "; then
-    echo "port $port is already listening — run down.sh first" >&2
-    exit 1
-  fi
+for i in $(seq 1 "$TOTAL"); do
+  for port in $((18100 + i)) $((18200 + i)); do
+    if ss -ltn 2>/dev/null | grep -q ":$port "; then
+      echo "port $port is already listening — run down.sh first" >&2
+      exit 1
+    fi
+  done
 done
 mkdir -p "$STATE"/{mnt,keys}
 EXPORT="$STATE/export"
@@ -47,7 +52,7 @@ echo "grant key: $AI_AGENT_GRANT_KEY"
 for s in $(seq 1 "$SHARDS"); do mkdir -p "$EXPORT/s$s"; done
 sudo -n exportfs -o rw,sync,no_subtree_check,no_root_squash,insecure,fsid=$((RANDOM + 1000)) "10.0.0.0/8:$EXPORT"
 
-for i in $(seq 1 "$REPLICAS"); do
+for i in $(seq 1 "$TOTAL"); do
   c=$((i - 1)); ns="algate$c"; hif="alh$c"; cif="alc$c"
   hip="10.$OCTET.$c.1"; cip="10.$OCTET.$c.2"
   sudo -n ip netns add "$ns"
@@ -69,17 +74,35 @@ for i in $(seq 1 "$REPLICAS"); do
   done
 
   port=$((18100 + i))
+  # A pool replica publishes a scrape and has no session cap; the held-back one is the opposite.
+  # Locally the scrape needs no sidecar — the simulator is on this host, so loopback is reachable —
+  # but the flag it is passed to the matrix through is the same one an ECS sidecar's address goes in.
+  # The name the simulator knows this replica by, and the one `fault.sh` is invoked with. The
+  # held-back one is `capped`, not `r4`: a fault aimed at it must not be able to land on a pool
+  # member by arithmetic.
+  if [ "$i" -le "$REPLICAS" ]; then
+    name="r$i"
+    extra=(--metrics-listen "127.0.0.1:$((18200 + i))")
+  else
+    name="capped"
+    extra=(--max-live-sessions 1)
+  fi
   cmd=("$BIN" serve --service --gateway-url "http://$MOCK" --model claude-test
        --listen "127.0.0.1:$port" --grant-key "$AI_AGENT_GRANT_KEY"
-       --seal-key "$AI_AGENT_SEAL_KEY" "${shard_args[@]}" --drain-grace 30)
-  printf '%q ' "${cmd[@]}" > "$STATE/cmd-r$i"
-  HOME=/nonexistent-fleet-sim-home "${cmd[@]}" >/dev/null 2>"$STATE/r$i.log" &
-  echo $! > "$STATE/pid-r$i"
-  echo "127.0.0.1:$port" >> "$STATE/replicas"
+       --seal-key "$AI_AGENT_SEAL_KEY" "${shard_args[@]}" --drain-grace 30 "${extra[@]}")
+  printf '%q ' "${cmd[@]}" > "$STATE/cmd-$name"
+  HOME=/nonexistent-fleet-sim-home "${cmd[@]}" >/dev/null 2>"$STATE/$name.log" &
+  echo $! > "$STATE/pid-$name"
+  if [ "$i" -le "$REPLICAS" ]; then
+    echo "127.0.0.1:$port" >> "$STATE/replicas"
+    echo "$((18200 + i))" >> "$STATE/metrics"
+  else
+    echo "127.0.0.1:$port=1" > "$STATE/capped"
+  fi
 done
 
 # Wait for every replica to answer before claiming the fleet is up.
-for i in $(seq 1 "$REPLICAS"); do
+for i in $(seq 1 "$TOTAL"); do
   port=$((18100 + i))
   for _ in $(seq 1 80); do
     if curl -sf -o /dev/null "http://127.0.0.1:$port/livez" 2>/dev/null; then break; fi
@@ -92,4 +115,6 @@ echo "fleet up. run the matrix with:"
 echo -n "  $SIM matrix --substrate attached --fault-cmd $(dirname "$0")/fault.sh --mock-listen $MOCK"
 for s in $(seq 1 "$SHARDS"); do echo -n " --shard s$s=$EXPORT/s$s"; done
 while read -r a; do echo -n " --replica $a"; done < "$STATE/replicas"
+while read -r a; do echo -n " --replica-metrics $a"; done < "$STATE/metrics"
+echo -n " --capped-replica $(cat "$STATE/capped")"
 echo

@@ -124,6 +124,20 @@ impl Edge {
         self.targets = targets;
     }
 
+    /// Point an existing target at a new address, leaving the ring's *membership* alone.
+    ///
+    /// A restarted replica may come back somewhere else (a replaced Fargate task draws a fresh
+    /// address from its subnet), and the edge has to follow it. What the edge must **not** do is
+    /// rebuild the ring while it is at it: a scenario that deliberately took a replica out with
+    /// [`Fleet::retarget_excluding`] and then restarted something would find it silently back in,
+    /// every session rehashed mid-scenario, and two claims failing for a reason that is not in
+    /// either of them.
+    pub fn readdress(&mut self, name: &str, addr: Addr) {
+        if let Some(t) = self.targets.iter_mut().find(|t| t.name == name) {
+            t.addr = addr;
+        }
+    }
+
     /// Which replica this session id hashes to.
     ///
     /// **Consistent hashing, not `hash % len`** — and the difference is not a refinement, it is the

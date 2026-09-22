@@ -9,6 +9,12 @@
 //! repo entirely, which is the boundary this crate is held to, and it means **the same matrix binary
 //! runs in both places**: locally with a script that shells out to `ip link`, on AWS with one that
 //! calls the EC2 API. A claim proved in one is proved by the same code in the other.
+//!
+//! The command answers one question as well as performing five actions: `<cmd> address <replica>`
+//! prints where that replica answers now. A restarted replica is not obliged to come back where it
+//! was — a replaced Fargate task draws a fresh address from its subnet — and the alternative to
+//! asking is for this crate to know how the platform assigns addresses, which is the thing it is
+//! built not to know.
 
 /// A fault injector: either the simulator's own mechanisms, or a command that owns them instead.
 #[derive(Clone, Default)]
@@ -67,6 +73,38 @@ impl Faults {
     /// failure when it is a harness one.
     pub fn is_external(&self) -> bool {
         self.cmd.is_some()
+    }
+
+    /// Where `replica` answers **now**, by asking whoever runs it.
+    ///
+    /// A restarted replica does not have to come back at the address it left. Locally it does — the
+    /// port is in the saved command line — but a replaced Fargate task draws a fresh private address
+    /// from its subnet, and nothing in ECS will pin one. So the address is a question for the same
+    /// party that performs the faults, asked through the same seam, rather than an assumption this
+    /// crate makes about a platform it deliberately knows nothing about.
+    pub fn address(&self, replica: &str) -> Result<String, String> {
+        let Some(cmd) = &self.cmd else {
+            return Err(format!(
+                "no fault command configured, so {replica}'s address cannot be asked for"
+            ));
+        };
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("{cmd} address {replica}"))
+            .output()
+            .map_err(|e| format!("fault command for address: {e}"))?;
+        if !out.status.success() {
+            return Err(format!(
+                "address of {replica} failed ({}): {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        let addr = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+        if addr.is_empty() {
+            return Err(format!("address of {replica} came back empty"));
+        }
+        Ok(addr)
     }
 
     /// Ask for `fault` on `replica`, by name.
