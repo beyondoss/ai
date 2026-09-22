@@ -2609,6 +2609,15 @@ pub(crate) async fn serve_session(
     // [`open_persistence_blocking`].
     let (mut cfg, opened) = open_persistence_blocking(cfg).await;
     let (mut persistence, mut session) = opened?;
+
+    // The session whose title has already been attempted, so the attempt happens **at most once**
+    // rather than once per turn until it succeeds. `title.is_none()` alone cannot express that: a
+    // failed attempt leaves it `None`, so a model that reliably declines (or a gateway that is
+    // down) would charge an extra call on every turn, forever.
+    //
+    // Keyed by session id rather than a bool, so a `new_session`/`switch_session` becomes eligible
+    // again by construction — nothing has to remember to reset it.
+    let mut title_attempted_for: Option<String> = None;
     timing.mark("open persistence");
 
     // `--name`: only for a genuinely fresh session (no messages, no title yet) — a resumed session
@@ -5043,6 +5052,52 @@ pub(crate) async fn serve_session(
                     }
                 }
                 emit!(frame);
+
+                // Name the session, once, from the exchange that just happened.
+                //
+                // **After `emit!(frame)`**, deliberately: this is a second model call, and running
+                // it before the response would charge its latency to the client's first turn for a
+                // decoration. The `SessionNamed` lifecycle event is its own event rather than a
+                // field on the terminal one precisely so it can arrive a moment later without
+                // anything depending on the order.
+                //
+                // Only after a run that succeeded *and* persisted: a title describes what a session
+                // turned out to be about, and there is nothing to describe about a first turn that
+                // failed. Generated once and never regenerated — a session is about what it was
+                // opened for, and re-titling it later would make it change names underneath whoever
+                // was looking for it.
+                //
+                // Best-effort at every step. A session that works without a name is worth more than
+                // one that fails because a decoration could not be generated, so a model error, a
+                // refusal, or an unusable reply all leave the title exactly as it was: absent.
+                // No store means `set_title` is a no-op, so the call could only ever be waste.
+                if persistence.store.is_some()
+                    && matches!(result, Ok(()))
+                    && persist_error.is_none()
+                    && persistence.meta.title.is_none()
+                    && title_attempted_for.as_deref() != Some(persistence.meta.id.as_str())
+                    && !session.messages.is_empty()
+                {
+                    title_attempted_for = Some(persistence.meta.id.clone());
+                    match agent.title_for(&session.messages, &cancel).await {
+                        Ok(Some(title)) => {
+                            if let Err(e) = persistence.set_title(&title) {
+                                eprintln!(
+                                    "serve: could not persist the generated session title: {e}"
+                                );
+                            }
+                            // Announced whether or not it persisted: the consumer's catalog is a
+                            // separate copy, and a title that reached one of the two is better than
+                            // a title that reached neither.
+                            if let Some(life) = &life {
+                                life.named(title);
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(e) => eprintln!("serve: could not generate a session title: {e}"),
+                    }
+                }
+
                 if running.swap(false, Ordering::Relaxed)
                     && let Some(m) = &cfg.metrics
                 {

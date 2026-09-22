@@ -463,19 +463,27 @@ The harness layers several capabilities over the bare tools + loop:
   `updated_at`(the newest stamped `Entry::Message::timestamp` found in the file, not the file's OS
   mtime — a copy/restore/sync that doesn't preserve mtime exactly, or a wrong one, no longer makes a
   session look stale or falsely fresh; mtime is only a fallback for a legacy file with no stamped
-  message at all)/`message_count`/`preview`(first user message, truncated)/`search_text`(every user _and_
-  assistant message in the session — matching pi's own `allMessagesText`, so a session is findable by
-  something only the assistant said — space-joined and capped at 50,000 chars (pi's own equivalent is
-  fully uncapped; this stays bounded since `list_all_sessions` holds one of these per session across a
-  fan-out scan of potentially hundreds of files at once — an uncapped string per session risks real
-  memory pressure at that scale, so this raises the original 2,000-char cap 25x rather than removing it
-  outright) — a broader substring-match surface than `preview` alone) without opening each transcript
-  fully beyond the single streaming scan. Both fields were computed and serialized long before anything
-  actually searched them: `list_sessions`/`list_all_sessions` now accept an optional `query` string,
-  filtered and ranked by `session_store::search_sessions` — a case-insensitive substring match checked in
-  priority order (`title`, `id`, `preview`, `cwd`, then the full `search_text`), so a title hit always
-  outranks a coincidental `search_text`-only hit, with a most-recently-active tiebreak; a session that
-  doesn't match at all is dropped, not just ranked low. Deliberately simpler than pi's own interactive TUI
+  message at all)/`message_count`/`preview`(first user message, truncated) without opening each
+  transcript fully beyond the single streaming scan. These were computed and serialized long before
+  anything actually searched them: `list_sessions`/`list_all_sessions` accept an optional `query`
+  string, filtered and ranked by `session_store::search_sessions` — a case-insensitive substring match
+  checked in priority order (`title`, `id`, `preview`, `cwd`), so a title hit always outranks a
+  coincidental hit in a lower field, with a most-recently-active tiebreak; a session that doesn't
+  match at all is dropped, not just ranked low.
+
+  **Matching is over metadata, not the transcript.** A `search_text` field used to accumulate every
+  user _and_ assistant message, capped at 50,000 chars, cached on the shard and returned to the
+  client on every listing entry. It was a **second copy of the transcript** — a complete one for any
+  session under that cap — and it truncated from the _start_, so past roughly the first fifty turns a
+  session simply stopped being findable, silently. It is gone; `LISTING_INDEX_VERSION` v3 is what
+  deletes the cached copy from the shard on the next listing. Content search, if it is ever wanted,
+  belongs somewhere that can do it properly — see [FLEET.md](FLEET.md).
+
+  **A listing is a page.** `limit` (default 50, capped at 500) and `offset`, with a `total` beside
+  `sessions`, resolved once in `serve`'s `listing_page`. Previously a listing was unbounded in
+  cardinality _and_ each entry carried the session's text, so one `list_sessions` asked the process
+  to build a tenant's whole transcript set in memory and write it to a single frame — and in service
+  mode the caller is a tenant holding one session's grant. This bounds the _response_, not the scan. Deliberately simpler than pi's own interactive TUI
   session-picker scorer (`fuzzyMatch` — a fuzzy subsequence matcher with a hand-tuned consecutive-run/
   word-boundary/gap-penalty heuristic built for a human eyeballing highlighted matches as they type):
   Beyond has no TUI of its own, so the only consumer is a scripting RPC/CLI caller, which wants
@@ -1804,6 +1812,15 @@ Spine: `started → progress* → succeeded | failed | aborted`. Exactly one `st
 per `run_id`. Progress after terminal is dropped. `started` without a later terminal (SIGKILL) is
 **unknown**, not failed.
 
+`session_named` sits outside that spine. It carries the title a session generated for itself from its
+opening exchange (see **Session titles** below) and is emitted at most once per session, between the
+run finishing and its terminal event — so it is deliberately _not_ gated on the run-state machine
+`started`/terminal share, and a consumer must not expect it in any particular position. Durable like
+`started` and the terminal events rather than latest-wins progress: a consumer that misses it never
+learns the title, because nothing regenerates one. It is a **session** fact rather than a run one,
+which is why it is its own event instead of a field smeared across every terminal event — it becomes
+true exactly once, and the consumer's job is a single upsert.
+
 Terminal kind matches that host's client contract:
 
 - `serve` natural end / `stop_after_turn`: `Succeeded`
@@ -1812,6 +1829,34 @@ Terminal kind matches that host's client contract:
 - `serve` abort: `Aborted`
 - CLI text-mode refusal: `Failed` + `refused: true` (`exit(1)`)
 - CLI JSON-mode refusal: `Succeeded` + `refused: true` (exit 0)
+
+#### Session titles
+
+A session names itself once, from its first successful run, via one extra model call
+(`agent_core::session_title`, `Agent::title_for`). It is the highest-priority field
+`session_store::search_rank` checks and was `None` for every session nobody had explicitly named, so
+the field ranked first was empty almost always.
+
+Four properties, each of which is a cost decision rather than a quality one:
+
+- **After the client has its answer.** The call runs after the `prompt` response is emitted, so its
+  latency is never charged to the turn the user is waiting on.
+- **At most once per session**, tracked by session id, not by `title.is_none()` — a failed attempt
+  leaves the title `None`, so without the guard a model that reliably declines would charge an extra
+  call on every turn, forever.
+- **Never when there is no store.** `set_title` is a no-op without persistence, so the call could
+  only be waste.
+- **Never fatal.** A model error, a refusal, or an unusable reply all leave the session untitled and
+  working. `session_title::clean_title` rejects rather than repairs: a wrong title is worse than
+  none, because it is what a person scans for and what ranking weighs most heavily.
+
+It is generated once and never regenerated — a session is about what it was opened for, and
+re-titling it later would make it change names underneath whoever was looking for it.
+
+**Why the agent and not the control plane.** A title is derived from conversation content, and in a
+fleet the replica is the only component holding both the transcript and the tenant's key. Everything
+else a session catalog wants — filtering, sorting, paging, facets — is derivable from the lifecycle
+events a consumer already receives, and belongs there. See [FLEET.md](FLEET.md).
 
 Progress is a latest-wins sample: tool **names** (never arguments), `steps`, optional
 `attempt`/`todos`/`depth`. Todos ride on progress (full-replace). Emit on `ToolStart`/`ToolEnd`,

@@ -184,6 +184,26 @@ pub enum RunEvent {
         ts: u64,
         model: String,
     },
+    /// The session acquired a name (`session_title`), generated once from its opening exchange.
+    ///
+    /// A **session** fact, not a run one, which is why it is its own event rather than a field
+    /// smeared across every terminal event: it becomes true exactly once, and the consumer's job is
+    /// a single upsert. It is also the one piece of a session catalog that cannot be assembled on
+    /// the consumer's side — a title is derived from conversation content, and nothing outside the
+    /// replica holds both the transcript and the tenant's key.
+    ///
+    /// Carries no run counters for the same reason: everything else a catalog wants (when, how
+    /// often, by whom) is already derivable from `Started`/`Succeeded`/`Failed`.
+    SessionNamed {
+        run_id: String,
+        session_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        tenant: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        command_id: Option<String>,
+        ts: u64,
+        title: String,
+    },
     Progress {
         run_id: String,
         session_id: String,
@@ -262,6 +282,7 @@ impl RunEvent {
         match self {
             Self::Started { run_id, .. }
             | Self::Progress { run_id, .. }
+            | Self::SessionNamed { run_id, .. }
             | Self::Succeeded { run_id, .. }
             | Self::Failed { run_id, .. }
             | Self::Aborted { run_id, .. } => run_id,
@@ -488,6 +509,24 @@ impl Run {
             ts: now_ts(),
             steps,
             summary: cap_summary(summary),
+        });
+    }
+
+    /// Announce the session's generated name. Durable like `started`/terminal rather than
+    /// latest-wins progress: a catalog that misses this never learns the title, because nothing
+    /// regenerates it.
+    ///
+    /// Deliberately **not** gated on the run-state machine `started`/`terminal` share. It is emitted
+    /// between the run finishing and its terminal event, and it says nothing about the run, so
+    /// holding it to that machine would only create an ordering constraint neither side needs.
+    pub fn named(&self, title: String) {
+        self.sink.emit(RunEvent::SessionNamed {
+            run_id: self.run_id.clone(),
+            session_id: self.session_id.clone(),
+            tenant: self.tenant.clone(),
+            command_id: self.command_id.clone(),
+            ts: now_ts(),
+            title,
         });
     }
 

@@ -256,6 +256,14 @@ docker run --rm -p 8080:8080 \
   Loopback addresses only — the scrape describes every tenant on the replica and the replica is
   reachable by tenants, so a routable bind is refused rather than warned about. Run the scraper
   beside it. No tenant or session identifier appears in any label.
+- **Listings:** `list_sessions`/`list_all_sessions` take `query` (case-insensitive substring over
+  `title`/`id`/`preview`/`cwd`), plus `limit` (default **50**, capped at **500**) and `offset`; the
+  response carries `total` beside `sessions` so a client can page without guessing. Entries are
+  metadata — a listing never carries the sessions' text.
+- **Session titles:** a session names itself from its first successful run, via one extra model
+  call, and never again. Best-effort throughout: an unusable or failed generation leaves the session
+  untitled and working. The title is also announced on the `session_named` lifecycle event, which is
+  how a catalog outside the fleet learns it.
 - **Idle sessions:** `--session-idle-timeout` defaults to **60s in service mode** (an hour for the
   single-user daemon). A detached session holds its session lock until it is reaped, and on a replica
   that lock is what a failed-over session's new connections wait on — so the window is short, and
