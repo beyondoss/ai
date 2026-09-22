@@ -2877,6 +2877,11 @@ is still rooted at the same tenant. An id the caller supplies is never rewritten
 
 ## Service mode — one replica, many tenants
 
+> **Operating a fleet of these, and building the edge in front of them, is
+> [FLEET.md](FLEET.md).** This section is the mechanism: what a replica does and why. That one is the
+> contract and the operations — the routing obligations the agent cannot enforce, replica sizing and
+> blast radius, what to alert on, how it scales, and what it costs against the alternatives.
+
 `serve --listen … --service` turns the daemon from "a headless agent for whoever is on the other end
 of this socket" into a **fail-closed multi-tenant service**. Every connection presents a
 [session grant](#session-grant-bsg_v1) in the `x-beyond-grant` header; that grant says which tenant
