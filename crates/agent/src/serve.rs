@@ -90,11 +90,11 @@
 //!     session — `--session-id`, the daemon's `?session_id=` — keeps its own id instead of minting one,
 //!     archiving the outgoing conversation into a sibling session; see [`Persistence::new_session`]
 //!   - `{type:"list_sessions", query?}`  (repo mode) → `data: {sessions: [SessionMeta + updated_at/
-//!     message_count/preview/search_text…]}` (via `SessionMeta::to_listing_json` — those four fields are
+//!     message_count/preview…]}` (via `SessionMeta::to_listing_json` — those derived fields are
 //!     `#[serde(skip)]` on the struct itself), this project's sessions only (matched by the default
 //!     per-cwd directory, or whatever `--session-dir` points at). An optional `query` string filters and
 //!     ranks the result (`session_store::search_sessions` — case-insensitive substring match against
-//!     `title`/`id`/`preview`/`cwd`/`search_text`, in that priority order); omitted (or blank) returns
+//!     `title`/`id`/`preview`/`cwd`, in that priority order); omitted (or blank) returns
 //!     every session, recency-sorted, unchanged from before this existed. The underlying scan
 //!     (`SessionRepo::list_with_progress`) runs across a small worker pool rather than one file at a
 //!     time, and streams `list_progress` frames while it's in flight.
@@ -4665,7 +4665,6 @@ pub(crate) async fn serve_session(
                                             "list_sessions" => {
                                                 let progress_id = cid.clone();
                                                 let progress_tx = out_tx.clone();
-                                                let query = c.get("query").and_then(Value::as_str);
                                                 let sessions = persistence
                                                     .list_with_progress(service.as_deref(), move |scanned, total| {
                                                         if should_report_scan_progress(scanned, total) {
@@ -4673,24 +4672,18 @@ pub(crate) async fn serve_session(
                                                         }
                                                     })
                                                     .await;
-                                                let sessions: Vec<Value> = search_sessions(sessions, query)
-                                                    .iter()
-                                                    .map(SessionMeta::to_listing_json)
-                                                    .collect();
-                                                let _ = out_tx.send(response(cid, "list_sessions", true, Some(json!({ "sessions": sessions })), None));
+                                                let _ = out_tx.send(response(cid, "list_sessions", true, Some(listing_page(sessions, &c)), None));
                                             }
                                             "list_all_sessions" => {
                                                 let progress_id = cid.clone();
                                                 let progress_tx = out_tx.clone();
-                                                let query = c.get("query").and_then(Value::as_str);
                                                 match persistence.list_all_with_progress(service.as_deref(), move |scanned, total| {
                                                     if should_report_scan_progress(scanned, total) {
                                                         let _ = progress_tx.send(list_progress_frame(progress_id.clone(), "list_all_sessions", scanned, total));
                                                     }
                                                 }).await {
                                                     Ok(sessions) => {
-                                                        let sessions: Vec<Value> = search_sessions(sessions, query).iter().map(SessionMeta::to_listing_json).collect();
-                                                        let _ = out_tx.send(response(cid, "list_all_sessions", true, Some(json!({ "sessions": sessions })), None));
+                                                        let _ = out_tx.send(response(cid, "list_all_sessions", true, Some(listing_page(sessions, &c)), None));
                                                     }
                                                     Err(e) => {
                                                         let _ = out_tx.send(response(cid, "list_all_sessions", false, None, Some(&e.to_string())));
@@ -5472,7 +5465,6 @@ pub(crate) async fn serve_session(
             "list_sessions" => {
                 let progress_id = id.clone();
                 let progress_tx = out_tx.clone();
-                let query = cmd.get("query").and_then(Value::as_str);
                 let sessions = persistence
                     .list_with_progress(service.as_deref(), move |scanned, total| {
                         if should_report_scan_progress(scanned, total) {
@@ -5485,22 +5477,17 @@ pub(crate) async fn serve_session(
                         }
                     })
                     .await;
-                let sessions: Vec<Value> = search_sessions(sessions, query)
-                    .iter()
-                    .map(SessionMeta::to_listing_json)
-                    .collect();
                 emit!(response(
                     id,
                     "list_sessions",
                     true,
-                    Some(json!({ "sessions": sessions })),
+                    Some(listing_page(sessions, &cmd)),
                     None,
                 ));
             }
             "list_all_sessions" => {
                 let progress_id = id.clone();
                 let progress_tx = out_tx.clone();
-                let query = cmd.get("query").and_then(Value::as_str);
                 match persistence
                     .list_all_with_progress(service.as_deref(), move |scanned, total| {
                         if should_report_scan_progress(scanned, total) {
@@ -5515,15 +5502,11 @@ pub(crate) async fn serve_session(
                     .await
                 {
                     Ok(sessions) => {
-                        let sessions: Vec<Value> = search_sessions(sessions, query)
-                            .iter()
-                            .map(SessionMeta::to_listing_json)
-                            .collect();
                         emit!(response(
                             id,
                             "list_all_sessions",
                             true,
-                            Some(json!({ "sessions": sessions })),
+                            Some(listing_page(sessions, &cmd)),
                             None,
                         ));
                     }
@@ -10037,6 +10020,46 @@ fn login_progress_frame(
         m.insert("message".into(), json!(message));
     }
     Value::Object(m).into()
+}
+
+/// A listing's default page size, when the caller does not ask for one.
+const DEFAULT_LIST_LIMIT: usize = 50;
+/// The most a caller can ask for in one page, whatever it passes.
+const MAX_LIST_LIMIT: usize = 500;
+
+/// The `data` payload of a listing response: `query` applied, then **one page** of the result.
+///
+/// Shared by the four listing arms (`list_sessions`/`list_all_sessions`, idle and busy) so the
+/// paging rule is stated once rather than four times.
+///
+/// **A listing is always paged.** It used to be unbounded in cardinality *and* each entry carried up
+/// to 50 KB of that session's conversation text, so a single call asked a replica to build the
+/// tenant's whole transcript set in memory and write it to one frame — and in service mode the
+/// caller is a tenant holding one session's grant. `limit` defaults to [`DEFAULT_LIST_LIMIT`] and is
+/// capped at [`MAX_LIST_LIMIT`]; an explicit `0` is clamped to 1, since a page of nothing is never
+/// what a caller meant. `total` is the size of the match set *before* paging, so a client can page
+/// without guessing when to stop.
+///
+/// This bounds the **response**, not the scan: every session is still stat'd to build the match set
+/// (cheap against the warm listing index, and the reason that index exists). Bounding the scan means
+/// an index that can seek, which is a catalog — see `crates/agent/FLEET.md`.
+fn listing_page(sessions: Vec<SessionMeta>, cmd: &Value) -> Value {
+    let matched = search_sessions(sessions, cmd.get("query").and_then(Value::as_str));
+    let total = matched.len();
+    let offset = cmd.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize;
+    let limit = cmd
+        .get("limit")
+        .and_then(Value::as_u64)
+        .map_or(DEFAULT_LIST_LIMIT, |n| {
+            (n as usize).clamp(1, MAX_LIST_LIMIT)
+        });
+    let page: Vec<Value> = matched
+        .iter()
+        .skip(offset)
+        .take(limit)
+        .map(SessionMeta::to_listing_json)
+        .collect();
+    json!({ "sessions": page, "total": total })
 }
 
 /// Build a `list_progress` frame — an unsolicited progress update for an in-flight `list_sessions`/

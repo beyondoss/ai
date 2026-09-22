@@ -76,16 +76,6 @@ const VERSION: u32 = 1;
 
 /// How many characters of the first user message a listing preview keeps.
 const PREVIEW_MAX: usize = 80;
-/// How many characters of accumulated user-*and*-assistant-message text a listing's `search_text`
-/// keeps — enough to substring-match a session by topic without opening every transcript, capped so a
-/// huge session doesn't bloat every listing response. pi's own `allMessagesText` is fully uncapped; this
-/// stays capped (rather than matching that exactly) because `list_all_sessions` holds one of these per
-/// session across a fan-out scan of potentially hundreds of files at once — an uncapped string per
-/// session risks real memory pressure at that scale. 50,000 (25x the original 2,000, matching the
-/// `50 * 1024`-byte "generous but bounded" budget `tools::output::DEFAULT_MAX_BYTES` already uses
-/// elsewhere in this codebase) comfortably covers a realistic session's worth of conversation text —
-/// the old 2,000-char cap could truncate after as little as a couple of turns.
-const SEARCH_TEXT_MAX_CHARS: usize = 50_000;
 
 /// Stable identity + metadata for one session, persisted as the file's header line.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -168,13 +158,6 @@ pub struct SessionMeta {
     /// or when the session has no user text yet (e.g. empty, or only tool-result turns so far).
     #[serde(skip)]
     pub preview: Option<String>,
-    /// User *and* assistant message text accumulated across the whole session (not just the first
-    /// message, and not just the user's side of it — matching pi's own `allMessagesText`), space-joined
-    /// and truncated to [`SEARCH_TEXT_MAX_CHARS`] — a broader surface than `preview` for a client to
-    /// substring/fuzzy-match a session by topic (including something only the assistant said) without
-    /// opening every transcript. Empty outside of a listing, or when the session has no text yet.
-    #[serde(skip)]
-    pub search_text: String,
 }
 
 impl SessionMeta {
@@ -209,15 +192,18 @@ impl SessionMeta {
             updated_at: 0,
             message_count: 0,
             preview: None,
-            search_text: String::new(),
         }
     }
 
     /// The listing view as JSON: every persisted field, plus the derived-only fields
-    /// (`updated_at`/`message_count`/`preview`/`search_text`) that `#[serde(skip)]` deliberately
-    /// keeps out of the on-disk header — so a stale scan can never leak into it — but that a
-    /// client browsing a listing needs to see. Use this instead of `serde_json::to_value` when
-    /// serializing a listing entry for an RPC response.
+    /// (`updated_at`/`message_count`/`preview`) that `#[serde(skip)]` deliberately keeps out of the
+    /// on-disk header — so a stale scan can never leak into it — but that a client browsing a
+    /// listing needs to see. Use this instead of `serde_json::to_value` when serializing a listing
+    /// entry for an RPC response.
+    ///
+    /// **Not** the session's text. Matching is done here (see [`search_sessions`]), so a client has
+    /// never needed the corpus to filter locally — and returning it made a listing's size the
+    /// tenant's whole transcript set rather than a page of metadata.
     pub fn to_listing_json(&self) -> serde_json::Value {
         let mut v = serde_json::to_value(self).unwrap_or(serde_json::Value::Null);
         if let serde_json::Value::Object(map) = &mut v {
@@ -227,7 +213,6 @@ impl SessionMeta {
                 serde_json::json!(self.message_count),
             );
             map.insert("preview".into(), serde_json::json!(self.preview));
-            map.insert("search_text".into(), serde_json::json!(self.search_text));
         }
         v
     }
@@ -236,9 +221,15 @@ impl SessionMeta {
 /// One session's best match against a lowercased, already-trimmed `query`, for ranking search results —
 /// `(field_priority, byte_offset)`, ascending order is "more relevant" (a match in a higher-priority
 /// field beats any match in a lower one; within the same field, an earlier match beats a later one).
-/// Checked in priority order — `title`, `id`, `preview`, `cwd`, then the full `search_text` — and stops
-/// at the first field that matches, so a title hit is never outranked by a coincidental `search_text`
-/// hit elsewhere. `None` when `query` doesn't appear in any field at all (the session doesn't match).
+/// Checked in priority order — `title`, `id`, `preview`, `cwd` — and stops at the first field that
+/// matches, so a title hit is never outranked by a coincidental hit in a lower one. `None` when
+/// `query` doesn't appear in any field at all (the session doesn't match).
+///
+/// **Metadata only.** This used to scan a per-session corpus of the conversation itself; that corpus
+/// was up to 50 KB per session, was cached on the shard, was returned to the client on every listing
+/// entry, and was silently truncated after roughly the first fifty turns — so it answered "is this
+/// word in the first part of this session" while reading as "search". Content search, if it is ever
+/// wanted, belongs somewhere that can do it properly; see `crates/agent/FLEET.md`.
 ///
 /// Deliberately simpler than pi's own TUI session-picker scorer (`fuzzyMatch` in
 /// `packages/tui/src/fuzzy.ts`): that one is a fuzzy subsequence matcher with a hand-tuned heuristic
@@ -247,12 +238,11 @@ impl SessionMeta {
 /// interactive TUI of its own — wants predictable "does this text contain the query" filtering instead
 /// of typo-tolerant fuzzy scoring, so this is a plain case-insensitive substring search.
 fn search_rank(meta: &SessionMeta, query_lower: &str) -> Option<(usize, usize)> {
-    let fields: [&str; 5] = [
+    let fields: [&str; 4] = [
         meta.title.as_deref().unwrap_or(""),
         &meta.id,
         meta.preview.as_deref().unwrap_or(""),
         &meta.cwd,
-        &meta.search_text,
     ];
     fields.iter().enumerate().find_map(|(priority, field)| {
         find_case_insensitive(field, query_lower).map(|offset| (priority, offset))
@@ -263,9 +253,8 @@ fn search_rank(meta: &SessionMeta, query_lower: &str) -> Option<(usize, usize)> 
 /// caller) in `haystack`, or `None` — the allocation-free replacement for
 /// `haystack.to_lowercase().find(needle_lower)`.
 ///
-/// The old expression allocated a fully-lowercased copy of *every* field — including the up-to-50 KB
-/// `search_text` — for every session on every query, ran `find` on it, and threw it away. This scans
-/// in place. The common case (an all-ASCII haystack and needle, which session text and a typed query
+/// The old expression allocated a fully-lowercased copy of *every* field for every session on every
+/// query, ran `find` on it, and threw it away. This scans in place. The common case (an all-ASCII haystack and needle, which session text and a typed query
 /// overwhelmingly are) takes a `memchr`-accelerated scan with no allocation at all. Any non-ASCII in
 /// either falls back to the exact original expression, so the match set *and* the returned byte offset
 /// stay
@@ -292,7 +281,7 @@ fn find_case_insensitive(haystack: &str, needle_lower: &str) -> Option<usize> {
 /// its 50 KB allocation: skip to the next position whose byte could start a match with `str::find` on
 /// a single char — which is SIMD/`memchr`-accelerated in the standard library — trying both cases of
 /// the needle's first byte, then verify the (short) remainder there. A non-matching query, the worst
-/// case, is thus one or two vectorized passes over `search_text` and no allocation at all, rather than
+/// case, is thus one or two vectorized passes over the field and no allocation at all, rather than
 /// the scalar per-byte scan a hand-rolled loop would be.
 fn find_ascii_case_insensitive(haystack: &str, needle: &str) -> Option<usize> {
     let hb = haystack.as_bytes();
@@ -333,7 +322,7 @@ fn find_ascii_case_insensitive(haystack: &str, needle: &str) -> Option<usize> {
 }
 
 /// Filter `sessions` to those matching `query` (case-insensitive substring against `title`/`id`/
-/// `preview`/`cwd`/`search_text` — see [`search_rank`]), sorted best-match-first with a most-recently-
+/// `preview`/`cwd` — see [`search_rank`]), sorted best-match-first with a most-recently-
 /// active tiebreak. `query: None` (or empty/whitespace-only) returns `sessions` unchanged, in whatever
 /// order the caller already sorted them (recency, from [`SessionRepo::list`]/[`SessionRepo::list_all`]) —
 /// so an absent query is a true no-op, not just "matches everything."
@@ -2880,7 +2869,7 @@ impl SessionRepo {
 
     /// All sessions' metadata, most-recently-active first (by `updated_at` — matches pi's own session
     /// list, sorted by `modified`). Each entry carries the derived listing fields (`updated_at`,
-    /// `message_count`, `preview`, `search_text`). Files that fail to read, lack a header, or carry an
+    /// `message_count`, `preview`). Files that fail to read, lack a header, or carry an
     /// unreadable version are skipped.
     pub fn list(&self) -> std::io::Result<Vec<SessionMeta>> {
         self.list_with_progress(|_, _| {})
@@ -3831,7 +3820,11 @@ const LISTING_INDEX_FILE: &str = ".listings.json";
 ///
 /// v2: [`Stamp`] became the newest segment's `(len, mtime, epoch)` plus the segment count, where v1
 /// held the directory's total bytes, newest mtime, newest epoch and base epoch.
-const LISTING_INDEX_VERSION: u32 = 2;
+///
+/// v3: `search_text` is gone. A v2 index holds up to 50 KB of every session's conversation text, so
+/// the bump is not only about shape — it is what gets that text deleted from the shard on the next
+/// listing, rather than left sitting in a cache nothing reads any more.
+const LISTING_INDEX_VERSION: u32 = 3;
 
 #[derive(Deserialize)]
 struct ListingIndex {
@@ -3843,7 +3836,7 @@ struct ListingIndex {
 
 /// Write-side mirror of [`ListingIndex`] that **borrows** the entries map instead of owning it — so
 /// [`store_listing_index`] can serialize the index directly out of the caller's `HashMap` without
-/// cloning every (up-to-50 KB `search_text`) entry just to wrap it in a `version` field. Serialize
+/// cloning every entry just to wrap it in a `version` field. Serialize
 /// only; the read path still deserializes the owned [`ListingIndex`].
 #[derive(Serialize)]
 struct ListingIndexRef<'a> {
@@ -3877,7 +3870,6 @@ struct ListingIndexEntry {
     updated_at: u64,
     message_count: usize,
     preview: Option<String>,
-    search_text: String,
 }
 
 fn is_zero(v: &u64) -> bool {
@@ -3895,7 +3887,6 @@ impl ListingIndexEntry {
             updated_at: meta.updated_at,
             message_count: meta.message_count,
             preview: meta.preview.clone(),
-            search_text: meta.search_text.clone(),
         }
     }
 
@@ -3915,7 +3906,6 @@ impl ListingIndexEntry {
             updated_at: self.updated_at,
             message_count: self.message_count,
             preview: self.preview.clone(),
-            search_text: self.search_text.clone(),
             ..self.meta.clone()
         }
     }
@@ -4041,10 +4031,10 @@ pub(crate) fn scan_listings_in(
     // mid-scan and cache a listing against a file state it never saw.
     let mut miss_stamps: HashMap<PathBuf, Stamp> = HashMap::new();
     // The file names this scan actually produced a listing for, per directory — the oracle for dropping
-    // an index entry whose session file has since been deleted. Names only, never the (up-to-50 KB)
-    // meta: a cache hit reuses the entry already sitting in `indexes` rather than rebuilding it, so the
-    // warm path deep-clones each session's `search_text` exactly once (the `to_meta()` it must return),
-    // not twice as it used to (`to_meta()` *and* `ListingIndexEntry::new`).
+    // an index entry whose session file has since been deleted. Names only, never the meta: a cache
+    // hit reuses the entry already sitting in `indexes` rather than rebuilding it, so the warm path
+    // clones each entry once (the `to_meta()` it must return), not twice as it used to (`to_meta()`
+    // *and* `ListingIndexEntry::new`).
     let mut seen: HashMap<PathBuf, HashSet<String>> = HashMap::new();
     // Directory index sizes as loaded, so a shrink (a deleted session, whose entry must be forgotten)
     // is distinguishable from an unchanged scan without holding a copy of the old entries.
@@ -4185,9 +4175,9 @@ fn scan_uncached(
 }
 
 /// Read a session file's listing metadata: its (version-checked) header with the derived `updated_at` /
-/// `message_count` / `preview` / `search_text` fields filled in. One streaming pass — lines are read and
+/// `message_count` / `preview` fields filled in. One streaming pass — lines are read and
 /// parsed individually, never collected — so this stays light even for long transcripts (the header
-/// alone gives id/title/etc.; only the count and preview/search text need the scan). Returns `None` for
+/// alone gives id/title/etc.; only the count and preview need the scan). Returns `None` for
 /// a file that isn't a readable session (no/invalid header, or an unreadable version), matching `list`'s
 /// skip semantics.
 /// Whole-second mtime derived from a `(size, mtime_ns)` stamp the caller already `stat`'d — nanos → the
@@ -4233,8 +4223,6 @@ pub(crate) fn read_listing(
     // session today, since nothing yet writes an off-branch entry.
     let mut message_count = 0usize;
     let mut preview = None;
-    let mut search_text = String::new();
-    let mut search_chars = 0usize;
     // The most recent stamped `Entry::Message` timestamp seen — preferred over `mtime` below when
     // any message actually carries one (see `Entry::Message::timestamp`'s doc comment). `0` means
     // "no stamped message seen" (an all-legacy file, or one with no message lines at all), in which
@@ -4273,13 +4261,6 @@ pub(crate) fn read_listing(
                 {
                     preview = Some(preview_of(text));
                 }
-                // The search corpus is broader than the preview: every user *and* assistant message's
-                // text (not just the first user turn) — matching pi's own `allMessagesText`, so a
-                // session is findable by something only the assistant said (a file path it named, an
-                // error it printed), not only by what the user typed. The text-block chars go straight
-                // into the corpus up to the budget — no throwaway `Vec<&str>`+`join`, no second
-                // `taken` `String` to re-count.
-                append_message_search_text(&message, &mut search_text, &mut search_chars);
             }
             // A stray header mid-file (or a branch-navigation/summary/compaction-provenance/label/custom
             // marker) is ignored — a custom entry contributes no message text of its own, matching
@@ -4326,7 +4307,6 @@ pub(crate) fn read_listing(
     };
     meta.message_count = message_count;
     meta.preview = preview;
-    meta.search_text = search_text;
     Some(meta)
 }
 
@@ -4340,76 +4320,6 @@ fn first_user_text(msg: &Message) -> Option<&str> {
         ContentBlock::Text { text, .. } => Some(&**text),
         _ => None,
     })
-}
-
-/// Append every plain-text block of a user *or* assistant message — the broader search-corpus
-/// counterpart of [`first_user_text`] (which looks only at a `User` message's first block, for the
-/// one-line preview) — into `search_text`, space-separated from the prior corpus content and from each
-/// other, stopping at [`SEARCH_TEXT_MAX_CHARS`] total chars. A tool-result-only turn or a text-free
-/// turn contributes nothing, same as before.
-///
-/// This replaces the old `message_search_text` (which `join`ed the blocks into one throwaway `String`)
-/// plus the caller's `taken` (a second `String` it re-counted): the join separators and the char
-/// budget are threaded through the append, so the chars land in the corpus directly. The result is
-/// byte-identical to `join(" ")` truncated to the remaining budget — including the degenerate cases a
-/// `join` produced (a lone empty block joins to `""` and so is skipped; two-plus blocks always join to
-/// at least a separator space).
-fn append_message_search_text(msg: &Message, search_text: &mut String, search_chars: &mut usize) {
-    if (msg.role != Role::User && msg.role != Role::Assistant)
-        || *search_chars >= SEARCH_TEXT_MAX_CHARS
-    {
-        return;
-    }
-    let mut blocks = msg.content.iter().filter_map(|b| match b {
-        ContentBlock::Text { text, .. } => Some(&**text),
-        _ => None,
-    });
-    let Some(first) = blocks.next() else {
-        return;
-    };
-    let mut rest = blocks.peekable();
-    // `join(" ")` was empty — contributing nothing — only for a message whose single text block was
-    // itself empty; a second block always makes the join non-empty (at least a bare separator space).
-    if first.is_empty() && rest.peek().is_none() {
-        return;
-    }
-    // Separate this message from the prior corpus content, exactly as the outer per-message join did.
-    if !search_text.is_empty() {
-        search_text.push(' ');
-        *search_chars += 1;
-    }
-    let mut budget = SEARCH_TEXT_MAX_CHARS - *search_chars;
-    let took = take_chars_into(search_text, first, budget);
-    *search_chars += took;
-    budget -= took;
-    for block in rest {
-        if budget == 0 {
-            break;
-        }
-        // The single inter-block separator space is itself a char of the joined text, counted against
-        // the same budget as the block chars — so truncation lands exactly where `join`+`take` did.
-        search_text.push(' ');
-        *search_chars += 1;
-        budget -= 1;
-        let took = take_chars_into(search_text, block, budget);
-        *search_chars += took;
-        budget -= took;
-    }
-}
-
-/// Append up to `budget` chars of `s` to `out`, returning how many landed — a char-bounded `push_str`,
-/// so the search corpus can be truncated to its remaining budget without first materializing the taken
-/// prefix as its own `String`.
-fn take_chars_into(out: &mut String, s: &str, budget: usize) -> usize {
-    let mut n = 0;
-    for ch in s.chars() {
-        if n == budget {
-            break;
-        }
-        out.push(ch);
-        n += 1;
-    }
-    n
 }
 
 /// A one-line, length-bounded preview: the first non-blank line of `text`, trimmed, truncated on a char
@@ -6818,7 +6728,7 @@ mod tests {
         // continue recovery logic (same `read_capped_line` primitive, same three corruption cases),
         // but only `open`'s recovery had a dedicated test — this one drives all three corruption
         // shapes through the *listing* scan specifically, proving `message_count`/`preview`/
-        // `search_text` all still reflect every good entry, not just the ones before the first bad
+        // `preview` all still reflect every good entry, not just the ones before the first bad
         // line.
         let dir = tmpdir();
         let repo = SessionRepo::open(dir.path()).unwrap();
@@ -6851,11 +6761,6 @@ mod tests {
         assert_eq!(
             listed.message_count, 2,
             "both good messages must be counted, not just the one before the corruption"
-        );
-        assert!(
-            listed.search_text.contains("second good message"),
-            "the message appended after the corrupted lines must still reach the search corpus: {}",
-            listed.search_text
         );
     }
 
@@ -8752,12 +8657,6 @@ mod tests {
             Some("hello world, this is the first message")
         );
         assert!(l.updated_at > 0);
-        // Unlike `preview` (first message only), `search_text` accumulates every user message.
-        assert!(
-            l.search_text
-                .contains("hello world, this is the first message")
-        );
-        assert!(l.search_text.contains("second"));
     }
 
     #[test]
@@ -8825,82 +8724,6 @@ mod tests {
     }
 
     #[test]
-    fn search_text_is_capped() {
-        let dir = tmpdir();
-        let repo = SessionRepo::open(dir.path()).unwrap();
-        let mut store = repo.create(SessionMeta::new("/w", "m")).unwrap();
-        let mut session = Session::new();
-        session.user("x".repeat(SEARCH_TEXT_MAX_CHARS + 500));
-        session.user("this must not appear: budget already spent");
-        store.append_new(&session.messages).unwrap();
-
-        let listings = repo.list().unwrap();
-        let search_text = &listings[0].search_text;
-        assert!(
-            search_text.chars().count() <= SEARCH_TEXT_MAX_CHARS,
-            "got {} chars",
-            search_text.chars().count()
-        );
-        assert!(!search_text.contains("this must not appear"));
-    }
-
-    #[test]
-    fn search_text_captures_a_marker_well_beyond_the_original_2000_char_cap() {
-        // Track L7: the cap was raised from 2,000 to 50,000 chars — a session whose distinguishing
-        // text lands past where the *old* cap would have cut it off must still be findable. This
-        // padding is comfortably past 2,000 chars but still well under the new cap.
-        let dir = tmpdir();
-        let repo = SessionRepo::open(dir.path()).unwrap();
-        let mut store = repo.create(SessionMeta::new("/w", "m")).unwrap();
-        let mut session = Session::new();
-        session.user("x".repeat(10_000));
-        session.user("findable-only-past-the-old-cap-marker");
-        store.append_new(&session.messages).unwrap();
-
-        let listings = repo.list().unwrap();
-        assert!(
-            listings[0]
-                .search_text
-                .contains("findable-only-past-the-old-cap-marker"),
-            "a marker past the old 2,000-char cap must still be captured under the raised cap"
-        );
-    }
-
-    #[test]
-    fn search_text_includes_assistant_replies_not_just_user_turns() {
-        // The whole point of Track M18: a session must be findable by something only the *assistant*
-        // said — matching pi's own `allMessagesText` (which joins every user AND assistant message's
-        // text, not just the user's).
-        let dir = tmpdir();
-        let repo = SessionRepo::open(dir.path()).unwrap();
-        let mut store = repo.create(SessionMeta::new("/w", "m")).unwrap();
-        let mut session = Session::new();
-        session.user("what's broken?");
-        session.push(Message::assistant(vec![ContentBlock::text(
-            "the bug is in unique-marker-xyz.rs",
-        )]));
-        store.append_new(&session.messages).unwrap();
-
-        let listings = repo.list().unwrap();
-        assert!(
-            listings[0].search_text.contains("unique-marker-xyz.rs"),
-            "search_text must include assistant text: {:?}",
-            listings[0].search_text
-        );
-    }
-
-    #[test]
-    fn search_text_is_empty_when_the_session_has_no_user_text() {
-        let dir = tmpdir();
-        let repo = SessionRepo::open(dir.path()).unwrap();
-        let store = repo.create(SessionMeta::new("/w", "m")).unwrap();
-        let id = store.meta().id.clone();
-        let listings = repo.list().unwrap();
-        let l = listings.iter().find(|l| l.id == id).unwrap();
-        assert_eq!(l.search_text, "");
-    }
-
-    #[test]
     fn to_listing_json_surfaces_derived_fields_that_serde_skip_hides() {
         let dir = tmpdir();
         let repo = SessionRepo::open(dir.path()).unwrap();
@@ -8915,27 +8738,22 @@ mod tests {
         assert!(bare.get("updated_at").is_none());
         assert!(bare.get("message_count").is_none());
         assert!(bare.get("preview").is_none());
-        assert!(bare.get("search_text").is_none());
 
         let full = listing.to_listing_json();
         assert_eq!(full["message_count"], 1);
         assert_eq!(full["preview"], "hello world");
-        assert_eq!(full["search_text"], "hello world");
         assert!(full["updated_at"].as_u64().unwrap() > 0);
         // Persisted fields still round-trip through the same call.
         assert_eq!(full["id"], listing.id);
         assert_eq!(full["cwd"], "/w");
     }
 
-    fn meta_for_search(
-        id: &str,
-        title: Option<&str>,
-        search_text: &str,
-        updated_at: u64,
-    ) -> SessionMeta {
+    /// `body` lands in `preview` — a real field `search_rank` checks, and one ranked *below*
+    /// `title`, which is the ordering every test below turns on.
+    fn meta_for_search(id: &str, title: Option<&str>, body: &str, updated_at: u64) -> SessionMeta {
         let mut m = SessionMeta::with_id(id, "/w", "m");
         m.title = title.map(str::to_string);
-        m.search_text = search_text.to_string();
+        m.preview = Some(body.to_string());
         m.updated_at = updated_at;
         m
     }
@@ -8986,7 +8804,7 @@ mod tests {
     }
 
     #[test]
-    fn search_sessions_ranks_a_title_match_above_a_search_text_only_match() {
+    fn search_sessions_ranks_a_title_match_above_a_body_only_match() {
         let sessions = vec![
             meta_for_search(
                 "text-only",
@@ -9005,7 +8823,7 @@ mod tests {
         assert_eq!(
             out.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
             vec!["title-match", "text-only"],
-            "a title hit must outrank a search_text-only hit even though it's less recent"
+            "a title hit must outrank a lower-field hit even though it's less recent"
         );
     }
 

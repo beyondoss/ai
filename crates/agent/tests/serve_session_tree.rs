@@ -340,7 +340,7 @@ fn serve_repo_lists_switches_and_forks_sessions() {
         sessions.len() >= 2,
         "both sessions should be listed: {sessions:#?}"
     );
-    // Derived listing fields (`preview`/`message_count`/`updated_at`/`search_text`) live behind
+    // Derived listing fields (`preview`/`message_count`/`updated_at`) live behind
     // `#[serde(skip)]` on `SessionMeta` so they never leak into the on-disk header — `list_sessions`
     // must still surface them to the client via `SessionMeta::to_listing_json`.
     let first_session = &sessions[0];
@@ -355,10 +355,6 @@ fn serve_repo_lists_switches_and_forks_sessions() {
     assert!(
         first_session["preview"].is_string(),
         "preview must be populated: {first_session:#?}"
-    );
-    assert!(
-        first_session["search_text"].is_string(),
-        "search_text must be populated: {first_session:#?}"
     );
     // The lineage marker also persists to disk and survives into `list_sessions`, not just the
     // `new_session` response.
@@ -2069,10 +2065,10 @@ fn serve_switch_branch_before_the_first_message_resets_to_root() {
 
 #[test]
 fn serve_list_sessions_query_filters_to_matching_sessions_only() {
-    // Pi-parity fix: `search_text`/`preview` were computed and serialized into every listing entry, but
+    // Pi-parity fix: the derived listing fields were computed and serialized into every entry, but
     // nothing ever filtered or ranked by them — `list_sessions`/`list_all_sessions` always returned
-    // every session regardless of any query. A `query` field must now narrow the result to sessions
-    // whose recorded text actually contains it.
+    // every session regardless of any query. A `query` field must narrow the result to sessions whose
+    // recorded metadata actually contains it.
     let session_dir = tempfile::tempdir().unwrap();
     let session_dir_str = session_dir.path().to_string_lossy().into_owned();
     let (base, _bodies) = spawn_model_server(vec![turn_text("ok"), turn_text("ok")]);
@@ -2133,7 +2129,7 @@ fn serve_list_sessions_query_filters_to_matching_sessions_only() {
         "the query must filter out the unrelated session: {sessions:#?}"
     );
     assert!(
-        sessions[0]["search_text"]
+        sessions[0]["preview"]
             .as_str()
             .unwrap()
             .contains("zephyr-unique-42"),
@@ -2212,7 +2208,7 @@ fn serve_list_all_sessions_query_filters_across_every_project() {
         "the query must narrow the cross-project result to the one matching session: {sessions:#?}"
     );
     assert!(
-        sessions[0]["search_text"]
+        sessions[0]["preview"]
             .as_str()
             .unwrap()
             .contains("widget-frobnication"),
