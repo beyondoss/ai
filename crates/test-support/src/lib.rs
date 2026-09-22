@@ -213,12 +213,33 @@ pub fn spawn_model_server_routed_unrecorded(
     spawn_model_server_routed_inner(routes, fallback, false).0
 }
 
+/// As [`spawn_model_server_routed_unrecorded`], bound where the caller says.
+///
+/// Replicas in an attached fleet are started *before* the driver and carry `--gateway-url` from then
+/// on, so the model server's address has to be known in advance and reachable from another host.
+pub fn spawn_model_server_routed_unrecorded_on(
+    bind: &str,
+    routes: Vec<(String, String)>,
+    fallback: String,
+) -> String {
+    spawn_model_server_routed_at(bind, routes, fallback, false).0
+}
+
 fn spawn_model_server_routed_inner(
     routes: Vec<(String, String)>,
     fallback: String,
     record: bool,
 ) -> (String, Arc<Mutex<Vec<String>>>) {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    spawn_model_server_routed_at("127.0.0.1:0", routes, fallback, record)
+}
+
+fn spawn_model_server_routed_at(
+    bind: &str,
+    routes: Vec<(String, String)>,
+    fallback: String,
+    record: bool,
+) -> (String, Arc<Mutex<Vec<String>>>) {
+    let listener = TcpListener::bind(bind).unwrap();
     let addr = listener.local_addr().unwrap();
     let requests = Arc::new(Mutex::new(Vec::new()));
     let recorder = requests.clone();

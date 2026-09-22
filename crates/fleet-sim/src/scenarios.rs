@@ -118,6 +118,12 @@ pub struct Attachment {
     pub shards: Vec<(String, std::path::PathBuf)>,
     pub replicas: Vec<Addr>,
     pub fault_cmd: String,
+    /// Where the mock model server binds, and — on the next port up — the exec double.
+    ///
+    /// Fixed rather than ephemeral because the replicas are started **before** this process: they
+    /// carry `--gateway-url` from their task definition and the exec URL inside every grant, so both
+    /// addresses have to be predictable and reachable from another host. `127.0.0.1:0` is neither.
+    pub mock_listen: Addr,
 }
 
 /// Name the fleet every scenario in this process will attach to. Called once, from `main`.
@@ -197,6 +203,7 @@ impl Fleet {
         shards: Vec<(String, std::path::PathBuf)>,
         replicas: Vec<Addr>,
         fault_cmd: String,
+        spec_bind: Addr,
         history_path: &std::path::Path,
     ) -> Result<Self, String> {
         if replicas.is_empty() {
@@ -207,10 +214,15 @@ impl Fleet {
         let sandbox = tempfile::tempdir().map_err(|e| format!("sandbox: {e}"))?;
         let sandbox_home = sandbox.path().join("home");
         std::fs::create_dir_all(&sandbox_home).map_err(|e| format!("sandbox home: {e}"))?;
-        let exec = ExecMock::start_with_home(sandbox.path(), Some(&sandbox_home), true).await;
-        let (gateway_url, _bodies) = (
-            spawn_model_server_routed_unrecorded(Vec::new(), turn_text("ok")),
-            (),
+        // Bound where the caller said, and reachable by that same address: a replica dialing
+        // `127.0.0.1` would reach itself, not the driver.
+        let model_at = format!("{}:{}", spec_bind.host, spec_bind.port);
+        let exec_at = format!("{}:{}", spec_bind.host, spec_bind.port + 1);
+        let exec = ExecMock::start_on(&exec_at, sandbox.path(), Some(&sandbox_home), true).await;
+        let gateway_url = beyond_ai_test_support::spawn_model_server_routed_unrecorded_on(
+            &model_at,
+            Vec::new(),
+            turn_text("ok"),
         );
 
         let attached: Vec<Replica> = replicas
@@ -376,6 +388,7 @@ impl Fleet {
                 spec.shards.clone(),
                 spec.replicas[..replicas].to_vec(),
                 spec.fault_cmd.clone(),
+                spec.mock_listen.clone(),
                 history_path,
             )
             .await;

@@ -197,10 +197,18 @@ fn attached_from(args: &[String]) -> Result<Option<scenarios::Attachment>, Strin
          so it cannot kill or partition them itself"
             .to_owned()
     })?;
+    // Fixed, not ephemeral, and defaulted to something a human can retype: the value has to be
+    // written into replica task definitions by hand before this process exists.
+    let mock_listen = crate::edge::Addr::parse(
+        flag(args, "--mock-listen")
+            .as_deref()
+            .unwrap_or("127.0.0.1:19000"),
+    )?;
     Ok(Some(scenarios::Attachment {
         shards: shard_args(args)?,
         replicas,
         fault_cmd,
+        mock_listen,
     }))
 }
 
