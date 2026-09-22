@@ -6,6 +6,8 @@
 //! here is a child process, killed with a real signal.
 
 use std::path::Path;
+
+use crate::edge::Addr;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -55,7 +57,8 @@ pub fn kill_all() {
 /// A running replica.
 pub struct Replica {
     pub name: String,
-    pub port: u16,
+    /// Where this replica answers. Always loopback for one this process spawned.
+    pub addr: Addr,
     child: Option<Child>,
     /// Everything the replica has said, drained continuously by a thread that owns the pipe.
     ///
@@ -152,7 +155,7 @@ impl Replica {
         }
         let mut replica = Self {
             name: name.to_string(),
-            port,
+            addr: Addr::local(port),
             child: Some(child),
             said,
         };
@@ -171,12 +174,12 @@ impl Replica {
     fn wait_until_listening(&self) -> Result<(), String> {
         let deadline = Instant::now() + Duration::from_secs(20);
         while Instant::now() < deadline {
-            if std::net::TcpStream::connect(("127.0.0.1", self.port)).is_ok() {
+            if std::net::TcpStream::connect((self.addr.host.as_str(), self.addr.port)).is_ok() {
                 return Ok(());
             }
             std::thread::sleep(Duration::from_millis(25));
         }
-        Err(format!("replica {} never bound {}", self.name, self.port))
+        Err(format!("replica {} never bound {}", self.name, self.addr))
     }
 
     /// Whatever the replica has written to stderr so far. Non-consuming and callable at any time —

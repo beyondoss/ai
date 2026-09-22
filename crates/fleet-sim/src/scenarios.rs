@@ -15,7 +15,7 @@ use beyond_ai_test_support::{
 use serde_json::json;
 
 use crate::check::{self, Finding};
-use crate::edge::{Edge, Placement, Target};
+use crate::edge::{Addr, Edge, Placement, Target};
 use crate::history::History;
 use crate::replica::Replica;
 use crate::substrate::{Kind, Substrate};
@@ -263,7 +263,10 @@ impl Fleet {
                 max_live_sessions,
                 metrics_port,
             })?;
-            targets.push(Target { name, port });
+            targets.push(Target {
+                name,
+                addr: Addr::local(port),
+            });
             metrics_ports.push(metrics_port);
             started.push(replica);
         }
@@ -308,7 +311,7 @@ impl Fleet {
             .filter(|r| r.is_running())
             .map(|r| Target {
                 name: r.name.clone(),
-                port: r.port,
+                addr: r.addr.clone(),
             })
             .collect();
         self.edge.set_targets(targets);
@@ -323,7 +326,7 @@ impl Fleet {
             .filter(|r| r.name != name && r.is_running())
             .map(|r| Target {
                 name: r.name.clone(),
-                port: r.port,
+                addr: r.addr.clone(),
             })
             .collect();
         self.edge.set_targets(targets);
@@ -378,14 +381,15 @@ pub async fn owner_refuses_non_owner(kind: Kind, history_path: &std::path::Path)
 
     // Place it the way the edge would, and hold it open so the second replica sees a live owner.
     let placed = crate::edge::place(&fleet.edge, session, &grant, Duration::from_secs(20)).await;
-    let Placement::Served { port, .. } = placed else {
+    let Placement::Served { addr, .. } = placed else {
         return Outcome::failed_with(format!("the edge could not place the session: {placed:?}"));
     };
-    fleet
-        .history
-        .record("placed", json!({ "session": session, "port": port }));
+    fleet.history.record(
+        "placed",
+        json!({ "session": session, "addr": addr.to_string() }),
+    );
 
-    let mut ws = match workload::connect(port, session, &grant).await {
+    let mut ws = match workload::connect(&addr, session, &grant).await {
         Ok(ws) => ws,
         Err(e) => return Outcome::failed_with(format!("owner connect: {e}")),
     };
@@ -394,14 +398,14 @@ pub async fn owner_refuses_non_owner(kind: Kind, history_path: &std::path::Path)
     }
     fleet
         .history
-        .record("session_live", json!({ "port": port }));
+        .record("session_live", json!({ "addr": addr.to_string() }));
 
     // Now the other replica. It must refuse — not serve, not corrupt.
     let other = fleet
         .replicas
         .iter()
-        .find(|r| r.port != port)
-        .map(|r| r.port);
+        .find(|r| r.addr != addr)
+        .map(|r| r.addr.clone());
     let mut findings = Vec::new();
     match other {
         None => findings.push(Finding {
@@ -409,7 +413,7 @@ pub async fn owner_refuses_non_owner(kind: Kind, history_path: &std::path::Path)
             ok: false,
             detail: "only one replica: nothing to refuse the session".into(),
         }),
-        Some(other_port) => match workload::probe_session(other_port, session, &grant).await {
+        Some(other) => match workload::probe_session(&other, session, &grant).await {
             Ok(503) => findings.push(Finding {
                 claim: "C4",
                 ok: true,
@@ -485,10 +489,10 @@ pub async fn takeover_after_hard_kill(kind: Kind, history_path: &std::path::Path
     // Place it, and commit a turn the client is told about. That acknowledgement is the promise the
     // rest of this scenario has to keep.
     let placed = crate::edge::place(&fleet.edge, session, &grant, Duration::from_secs(30)).await;
-    let Placement::Served { port, .. } = placed else {
+    let Placement::Served { addr, .. } = placed else {
         return Outcome::failed_with(format!("could not place the session: {placed:?}"));
     };
-    let mut ws = match workload::connect(port, session, &grant).await {
+    let mut ws = match workload::connect(&addr, session, &grant).await {
         Ok(ws) => ws,
         Err(e) => return Outcome::failed_with(format!("owner connect: {e}")),
     };
@@ -511,7 +515,7 @@ pub async fn takeover_after_hard_kill(kind: Kind, history_path: &std::path::Path
 
     // Kill the owner outright: no signal handler, no destructors, nothing released. Its lock now
     // survives on the server's lease, which is the whole point.
-    let owner_name = match fleet.replicas.iter_mut().find(|r| r.port == port) {
+    let owner_name = match fleet.replicas.iter_mut().find(|r| r.addr == addr) {
         Some(r) => {
             let name = r.name.clone();
             if let Err(e) = r.kill_hard() {
@@ -535,7 +539,7 @@ pub async fn takeover_after_hard_kill(kind: Kind, history_path: &std::path::Path
     let waited = began.elapsed();
     let mut findings = Vec::new();
 
-    let Placement::Served { port: new_port, .. } = replaced else {
+    let Placement::Served { addr: new_addr, .. } = replaced else {
         findings.push(Finding {
             claim: "C6",
             ok: false,
@@ -553,7 +557,7 @@ pub async fn takeover_after_hard_kill(kind: Kind, history_path: &std::path::Path
     };
     fleet.history.record(
         "taken_over",
-        json!({ "port": new_port, "waited_ms": waited.as_millis() }),
+        json!({ "addr": new_addr.to_string(), "waited_ms": waited.as_millis() }),
     );
     findings.push(Finding {
         claim: "C6",
@@ -567,7 +571,7 @@ pub async fn takeover_after_hard_kill(kind: Kind, history_path: &std::path::Path
     // Make the new owner *write* before asking whether it opened its own epoch. A takeover that has
     // only read has nothing to seal yet: the roll happens when the new owner first persists, so
     // checking before that measures the scenario's own impatience rather than the fence.
-    match workload::connect(new_port, session, &grant).await {
+    match workload::connect(&new_addr, session, &grant).await {
         Ok(mut ws2) => {
             if let Err(e) = workload::prompt(&mut ws2, "after-the-takeover").await {
                 findings.push(Finding {
@@ -592,7 +596,7 @@ pub async fn takeover_after_hard_kill(kind: Kind, history_path: &std::path::Path
     findings.push(check::one_writer_per_session(&session_dir));
 
     // And the promise: what the client was told committed is still in the transcript it replays.
-    match workload::connect(new_port, session, &grant).await {
+    match workload::connect(&new_addr, session, &grant).await {
         Ok(mut ws2) => match workload::transcript(&mut ws2).await {
             Ok(replayed) => {
                 let history =
@@ -649,9 +653,9 @@ pub async fn drain_keeps_serving_what_it_owns(
     let (tenant, session) = ("t1", "s1.draining");
     let exec_url = fleet.exec.url.clone();
     let grant = fleet.edge.grant(tenant, session, "s1", "/", &exec_url);
-    let port = fleet.replicas[0].port;
+    let addr = fleet.replicas[0].addr.clone();
 
-    let mut ws = match workload::connect(port, session, &grant).await {
+    let mut ws = match workload::connect(&addr, session, &grant).await {
         Ok(ws) => ws,
         Err(e) => return Outcome::failed_with(format!("connect: {e}")),
     };
@@ -670,7 +674,7 @@ pub async fn drain_keeps_serving_what_it_owns(
     }
     fleet
         .history
-        .record("drain_started", json!({ "port": port }));
+        .record("drain_started", json!({ "addr": addr.to_string() }));
 
     let mut findings = Vec::new();
 
@@ -679,7 +683,7 @@ pub async fn drain_keeps_serving_what_it_owns(
     let deadline = std::time::Instant::now() + Duration::from_secs(15);
     let mut readyz = 0;
     while std::time::Instant::now() < deadline {
-        if let Ok((status, _)) = workload::http_get(port, "/readyz").await {
+        if let Ok((status, _)) = workload::http_get(&addr, "/readyz").await {
             readyz = status;
             if status == 503 {
                 break;
@@ -693,7 +697,7 @@ pub async fn drain_keeps_serving_what_it_owns(
         detail: format!("/readyz answered {readyz} while draining (503 takes it out of the pool)"),
     });
 
-    let livez = workload::http_get(port, "/livez").await.map(|(s, _)| s);
+    let livez = workload::http_get(&addr, "/livez").await.map(|(s, _)| s);
     findings.push(Finding {
         claim: "C7",
         ok: livez.as_ref().is_ok_and(|s| *s == 200),
@@ -707,7 +711,7 @@ pub async fn drain_keeps_serving_what_it_owns(
     let fresh = fleet
         .edge
         .grant(tenant, "s1.brand-new", "s1", "/", &exec_url);
-    let refused = workload::probe_session(port, "s1.brand-new", &fresh).await;
+    let refused = workload::probe_session(&addr, "s1.brand-new", &fresh).await;
     findings.push(Finding {
         claim: "C7",
         ok: matches!(refused, Ok(503)),
@@ -719,7 +723,7 @@ pub async fn drain_keeps_serving_what_it_owns(
     // Asked on a *fresh* connection to the same session rather than on the socket already draining
     // the run's event stream: a reconnect is the case the contract is about, and it is the one an
     // earlier draft of the drain got wrong by checking the closed flag before the map lookup.
-    let owned = match workload::connect(port, session, &grant).await {
+    let owned = match workload::connect(&addr, session, &grant).await {
         Ok(mut again) => {
             workload::command(&mut again, json!({ "type": "get_state" }), "get_state").await
         }
@@ -759,11 +763,11 @@ pub async fn live_session_cap_refuses(kind: Kind, history_path: &std::path::Path
         Err(e) => return Outcome::failed_with(e),
     };
     let exec_url = fleet.exec.url.clone();
-    let port = fleet.replicas[0].port;
+    let addr = fleet.replicas[0].addr.clone();
     let first = fleet.edge.grant("t1", "s1.first", "s1", "/", &exec_url);
     let second = fleet.edge.grant("t1", "s1.second", "s1", "/", &exec_url);
 
-    let mut held = match workload::connect(port, "s1.first", &first).await {
+    let mut held = match workload::connect(&addr, "s1.first", &first).await {
         Ok(ws) => ws,
         Err(e) => return Outcome::failed_with(format!("first session: {e}")),
     };
@@ -772,7 +776,7 @@ pub async fn live_session_cap_refuses(kind: Kind, history_path: &std::path::Path
         return Outcome::failed_with(format!("first get_state: {e}"));
     }
 
-    let over = workload::probe_session(port, "s1.second", &second).await;
+    let over = workload::probe_session(&addr, "s1.second", &second).await;
     let findings = vec![Finding {
         claim: "C9",
         ok: matches!(over, Ok(503)),
@@ -810,14 +814,14 @@ pub async fn metrics_name_no_tenant(kind: Kind, history_path: &std::path::Path) 
         "/",
         &exec_url,
     );
-    let mut ws = match workload::connect(fleet.replicas[0].port, "s1.secret-session", &grant).await
+    let mut ws = match workload::connect(&fleet.replicas[0].addr, "s1.secret-session", &grant).await
     {
         Ok(ws) => ws,
         Err(e) => return Outcome::failed_with(format!("connect: {e}")),
     };
     let _ = workload::command(&mut ws, json!({ "type": "get_state" }), "get_state").await;
 
-    let scrape = match workload::http_get(metrics_port, "/metrics").await {
+    let scrape = match workload::http_get(&Addr::local(metrics_port), "/metrics").await {
         Ok((200, body)) => body,
         other => return Outcome::failed_with(format!("scrape: {other:?}")),
     };
@@ -906,19 +910,20 @@ pub async fn unmounted_shard_is_misdirected(
         Ok(r) => r,
         Err(e) => return Outcome::failed_with(e),
     };
+    let addr = replica.addr.clone();
     edge.set_targets(vec![Target {
         name: "r1".into(),
-        port: replica.port,
+        addr: addr.clone(),
     }]);
 
     // A session homed on the shard this replica does *not* mount.
     let elsewhere = edge.grant("t1", "s2.somewhere-else", "s2", "/", &exec.url);
-    let answered = workload::probe_session(port, "s2.somewhere-else", &elsewhere).await;
+    let answered = workload::probe_session(&addr, "s2.somewhere-else", &elsewhere).await;
 
     // And the control: the same replica serves its own shard, so a 421 above is about the shard and
     // not about the replica being broken.
     let mine = edge.grant("t1", "s1.mine", "s1", "/", &exec.url);
-    let served = workload::probe_session(port, "s1.mine", &mine).await;
+    let served = workload::probe_session(&addr, "s1.mine", &mine).await;
 
     let findings = vec![
         Finding {
@@ -950,13 +955,13 @@ pub async fn unmounted_shard_is_misdirected(
 /// scenario would report as a hung simulator rather than as the finding it is. The elapsed time is
 /// printed because "refused" and "refused after ninety seconds" are not the same contract.
 async fn read_session(
-    port: u16,
+    at: &Addr,
     session: &str,
     grant: &str,
 ) -> (Result<String, String>, std::time::Duration) {
     let began = std::time::Instant::now();
     let attempt = async {
-        let mut ws = workload::connect(port, session, grant).await?;
+        let mut ws = workload::connect(at, session, grant).await?;
         let msgs = workload::transcript(&mut ws).await?;
         Ok::<_, String>(serde_json::to_string(&msgs).unwrap_or_default())
     };
@@ -980,7 +985,7 @@ pub async fn one_tenant_cannot_read_another(kind: Kind, history_path: &std::path
         Err(e) => return Outcome::failed_with(e),
     };
     let exec_url = fleet.exec.url.clone();
-    let port = fleet.replicas[0].port;
+    let addr = fleet.replicas[0].addr.clone();
 
     // Two tenants, two keys, two markers. Same shard, deliberately: sharing storage is the condition
     // the sealing exists for, and putting them on different shards would prove nothing.
@@ -996,7 +1001,7 @@ pub async fn one_tenant_cannot_read_another(kind: Kind, history_path: &std::path
         let grant = fleet
             .edge
             .grant_with_dek(tenant, session, "s1", "/", &exec_url, dek);
-        let mut ws = match workload::connect(port, session, &grant).await {
+        let mut ws = match workload::connect(&addr, session, &grant).await {
             Ok(ws) => ws,
             Err(e) => return Outcome::failed_with(format!("{tenant} connect: {e}")),
         };
@@ -1055,7 +1060,7 @@ pub async fn one_tenant_cannot_read_another(kind: Kind, history_path: &std::path
     eprintln!(
         "  … restarting the replica (was pid {:?} port {})",
         fleet.replicas[0].pid(),
-        fleet.replicas[0].port
+        fleet.replicas[0].addr
     );
     if let Err(e) = fleet.replicas[0].kill_hard() {
         return Outcome::failed_with(format!("could not stop the replica: {e}"));
@@ -1063,17 +1068,17 @@ pub async fn one_tenant_cannot_read_another(kind: Kind, history_path: &std::path
     if let Err(e) = fleet.restart(0).await {
         return Outcome::failed_with(format!("could not restart the replica: {e}"));
     }
-    let port = fleet.replicas[0].port;
+    let addr = fleet.replicas[0].addr.clone();
 
     eprintln!(
         "  … restarted (now pid {:?} port {}); trying the wrong key",
         fleet.replicas[0].pid(),
-        fleet.replicas[0].port
+        fleet.replicas[0].addr
     );
     let wrong_key = fleet
         .edge
         .grant_with_dek("t-two", "s1.two", "s1", "/", &exec_url, one_dek);
-    let (with_wrong_key, wrong_took) = read_session(port, "s1.two", &wrong_key).await;
+    let (with_wrong_key, wrong_took) = read_session(&addr, "s1.two", &wrong_key).await;
     eprintln!("  … the wrong key finished in {wrong_took:?}: {with_wrong_key:?}");
     if with_wrong_key
         .as_ref()
@@ -1092,7 +1097,7 @@ pub async fn one_tenant_cannot_read_another(kind: Kind, history_path: &std::path
     let right_key = fleet
         .edge
         .grant_with_dek("t-two", "s1.two", "s1", "/", &exec_url, two_dek);
-    let (with_right_key, right_took) = read_session(port, "s1.two", &right_key).await;
+    let (with_right_key, right_took) = read_session(&addr, "s1.two", &right_key).await;
     eprintln!("  … the right key finished in {right_took:?}");
     let exposed = with_wrong_key
         .as_ref()
@@ -1169,8 +1174,8 @@ fn threads(pid: u32) -> usize {
 }
 
 /// A bounded `GET`, because the point of the scenario is that the replica answers.
-async fn get_within(port: u16, path: &str, within: Duration) -> Result<u16, String> {
-    match tokio::time::timeout(within, workload::http_get(port, path)).await {
+async fn get_within(at: &Addr, path: &str, within: Duration) -> Result<u16, String> {
+    match tokio::time::timeout(within, workload::http_get(at, path)).await {
         Ok(Ok((status, _))) => Ok(status),
         Ok(Err(e)) => Err(e),
         Err(_) => Err(format!("{path} did not answer within {within:?}")),
@@ -1206,13 +1211,13 @@ pub async fn hung_mount_is_reported_not_leaked(
         Ok(f) => f,
         Err(e) => return Outcome::failed_with(e),
     };
-    let port = fleet.replicas[0].port;
+    let addr = fleet.replicas[0].addr.clone();
     let Some(pid) = fleet.replicas[0].pid() else {
         return Outcome::failed_with("the replica has no pid".to_owned());
     };
 
     // Healthy first, or the rest proves nothing.
-    match get_within(port, "/readyz", Duration::from_secs(10)).await {
+    match get_within(&addr, "/readyz", Duration::from_secs(10)).await {
         Ok(200) => {}
         other => return Outcome::failed_with(format!("/readyz before the partition: {other:?}")),
     }
@@ -1237,12 +1242,12 @@ pub async fn hung_mount_is_reported_not_leaked(
     let mut slowest = Duration::ZERO;
     for _ in 0..20 {
         let began = Instant::now();
-        let status = get_within(port, "/readyz", Duration::from_secs(15)).await;
+        let status = get_within(&addr, "/readyz", Duration::from_secs(15)).await;
         slowest = slowest.max(began.elapsed());
         statuses.push(status);
     }
     let after = threads(pid);
-    let livez = get_within(port, "/livez", Duration::from_secs(10)).await;
+    let livez = get_within(&addr, "/livez", Duration::from_secs(10)).await;
 
     fleet.substrate.heal(0);
 
@@ -1312,7 +1317,7 @@ pub async fn hung_mount_is_reported_not_leaked(
     let mut recovered = false;
     let deadline = Instant::now() + Duration::from_secs(60);
     while Instant::now() < deadline {
-        if let Ok(200) = get_within(port, "/readyz", Duration::from_secs(10)).await {
+        if let Ok(200) = get_within(&addr, "/readyz", Duration::from_secs(10)).await {
             recovered = true;
             break;
         }
@@ -1371,7 +1376,10 @@ pub async fn fenced_owner_stops_and_says_so(kind: Kind, history_path: &std::path
         Ok(f) => f,
         Err(e) => return Outcome::failed_with(e),
     };
-    let (a, b) = (fleet.replicas[0].port, fleet.replicas[1].port);
+    let (a, b) = (
+        fleet.replicas[0].addr.clone(),
+        fleet.replicas[1].addr.clone(),
+    );
     let session = "s1.fenced";
     let grant = fleet
         .edge
@@ -1379,7 +1387,7 @@ pub async fn fenced_owner_stops_and_says_so(kind: Kind, history_path: &std::path
 
     // The old owner, addressed directly rather than through the ring: which replica owns this
     // session is the whole subject, so it is chosen here and not by a hash.
-    let mut owner = match workload::connect(a, session, &grant).await {
+    let mut owner = match workload::connect(&a, session, &grant).await {
         Ok(ws) => ws,
         Err(e) => return Outcome::failed_with(format!("the owner could not open it: {e}")),
     };
@@ -1401,7 +1409,7 @@ pub async fn fenced_owner_stops_and_says_so(kind: Kind, history_path: &std::path
     let mut successor = None;
     let mut refusals = 0u32;
     while Instant::now() < deadline {
-        match workload::connect(b, session, &grant).await {
+        match workload::connect(&b, session, &grant).await {
             Ok(ws) => {
                 successor = Some(ws);
                 break;

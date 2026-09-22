@@ -8,6 +8,8 @@
 use std::time::Duration;
 
 use futures::{SinkExt, StreamExt};
+
+use crate::edge::Addr;
 use serde_json::{Value, json};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -35,8 +37,8 @@ pub type Ws =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
 /// Open a session on `port`, presenting `grant`.
-pub async fn connect(port: u16, session_id: &str, grant: &str) -> Result<Ws, String> {
-    let url = format!("ws://127.0.0.1:{port}/_beyond/agent?session_id={session_id}");
+pub async fn connect(at: &Addr, session_id: &str, grant: &str) -> Result<Ws, String> {
+    let url = format!("ws://{at}/_beyond/agent?session_id={session_id}");
     let mut req = url
         .into_client_request()
         .map_err(|e| format!("request: {e}"))?;
@@ -61,8 +63,8 @@ pub async fn connect(port: u16, session_id: &str, grant: &str) -> Result<Ws, Str
 /// Returns the HTTP status, which is the whole point: `503` is "not mine, retry", `421` is "wrong
 /// shard", `401`/`403` are the grant's problem. A successful upgrade is reported as 101 and the
 /// socket is dropped immediately — the caller reconnects if it wants to drive the session.
-pub async fn probe_session(port: u16, session_id: &str, grant: &str) -> Result<u16, String> {
-    match connect(port, session_id, grant).await {
+pub async fn probe_session(at: &Addr, session_id: &str, grant: &str) -> Result<u16, String> {
+    match connect(at, session_id, grant).await {
         Ok(ws) => {
             drop(ws);
             Ok(101)
@@ -202,11 +204,11 @@ pub async fn transcript(ws: &mut Ws) -> Result<Vec<Value>, String> {
 ///
 /// Hand-rolled for the same reason the mock model server is: a client with no framework of its own
 /// has nothing to agree with the thing under test about, and these are three-line requests.
-pub async fn http_get(port: u16, path: &str) -> Result<(u16, String), String> {
+pub async fn http_get(at: &Addr, path: &str) -> Result<(u16, String), String> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let mut s = tokio::net::TcpStream::connect(("127.0.0.1", port))
+    let mut s = tokio::net::TcpStream::connect((at.host.as_str(), at.port))
         .await
-        .map_err(|e| format!("connect {port}: {e}"))?;
+        .map_err(|e| format!("connect {at}: {e}"))?;
     s.write_all(format!("GET {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").as_bytes())
         .await
         .map_err(|e| format!("write: {e}"))?;
