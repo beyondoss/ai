@@ -50,11 +50,14 @@ for _ in $(seq 1 60); do
 done
 vpc=$(aws ec2 describe-vpcs --filters "$TAG" --query 'Vpcs[0].VpcId')
 if [ -n "$vpc" ] && [ "$vpc" != "None" ]; then
-  for acl in $(aws ec2 describe-network-acls --filters "$TAG" --query 'NetworkAcls[].NetworkAclId'); do
-    aws ec2 delete-network-acl --network-acl-id "$acl" 2>/dev/null && echo "deleted $acl"
-  done
+  # Subnets before NACLs: a custom NACL that is still associated with a subnet cannot be deleted,
+  # and deleting the subnet is what releases it. The other order leaves the NACLs behind, which the
+  # gate at the bottom then reports — which is the gate working, and still a second run to do.
   for sub in $(aws ec2 describe-subnets --filters "$TAG" --query 'Subnets[].SubnetId'); do
     aws ec2 delete-subnet --subnet-id "$sub" 2>/dev/null && echo "deleted $sub"
+  done
+  for acl in $(aws ec2 describe-network-acls --filters "$TAG" --query 'NetworkAcls[].NetworkAclId'); do
+    aws ec2 delete-network-acl --network-acl-id "$acl" 2>/dev/null && echo "deleted $acl"
   done
   for sg in $(aws ec2 describe-security-groups --filters "$TAG" --query 'SecurityGroups[].GroupId'); do
     aws ec2 delete-security-group --group-id "$sg" 2>/dev/null && echo "deleted $sg"
@@ -72,7 +75,7 @@ fi
 echo "── cluster, logs, images, roles ──"
 aws ecs delete-cluster --cluster "$CLUSTER" --query 'cluster.status' 2>/dev/null
 aws logs delete-log-group --log-group-name /fleetsim 2>/dev/null
-for repo in fleetsim-agent fleetsim-driver; do
+for repo in fleetsim-agent fleetsim-driver fleetsim-socat; do
   aws ecr delete-repository --repository-name "$repo" --force --query 'repository.repositoryName' 2>/dev/null
 done
 for role in fleetsimDriverTaskRole fleetsimReplicaTaskRole fleetsimTaskExecutionRole; do
