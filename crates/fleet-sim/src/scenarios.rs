@@ -103,6 +103,21 @@ impl Drop for Fleet {
 /// as proved when the fleet could not host the scenario that proves it.
 pub const ATTACHED_SKIP: &str = "cannot-attach: ";
 
+/// The driver's mock model server and exec double, bound once for the whole process.
+///
+/// Per-`Fleet` is wrong for an attached run in two ways. The addresses are **fixed** — replicas were
+/// started with them baked in — so a second scenario binding them again fails with `AddrInUse`,
+/// which is precisely what the first attached run did on its third scenario. And it is not how the
+/// real thing is shaped either: the driver task hosts one of each for the whole run, and every
+/// scenario shares them.
+/// The sandbox directory is in here too, and that is the whole point of the third field: the exec
+/// double serves commands rooted at it, so it has to outlive every `Fleet` that shares the double.
+/// Owned by the first `Fleet` instead, it was deleted when that `Fleet` dropped, and the next
+/// scenario's sessions died with `the sandbox did not report a home directory (exit Some(127))` —
+/// command-not-found, because the root no longer existed.
+static MOCKS: tokio::sync::OnceCell<(String, ExecMock, tempfile::TempDir)> =
+    tokio::sync::OnceCell::const_new();
+
 /// An attached fleet's address, set once from the command line.
 ///
 /// A global rather than a parameter threaded through nine scenario signatures, and that is a
@@ -211,19 +226,28 @@ impl Fleet {
         }
         let substrate = Substrate::attach(shards)?;
         let keys = tempfile::tempdir().map_err(|e| format!("keys: {e}"))?;
-        let sandbox = tempfile::tempdir().map_err(|e| format!("sandbox: {e}"))?;
-        let sandbox_home = sandbox.path().join("home");
-        std::fs::create_dir_all(&sandbox_home).map_err(|e| format!("sandbox home: {e}"))?;
-        // Bound where the caller said, and reachable by that same address: a replica dialing
+        // Bound once per process, at the address the replicas already carry: one dialing
         // `127.0.0.1` would reach itself, not the driver.
-        let model_at = format!("{}:{}", spec_bind.host, spec_bind.port);
-        let exec_at = format!("{}:{}", spec_bind.host, spec_bind.port + 1);
-        let exec = ExecMock::start_on(&exec_at, sandbox.path(), Some(&sandbox_home), true).await;
-        let gateway_url = beyond_ai_test_support::spawn_model_server_routed_unrecorded_on(
-            &model_at,
-            Vec::new(),
-            turn_text("ok"),
-        );
+        let (gateway_url, exec, _) = MOCKS
+            .get_or_try_init(|| async {
+                let sandbox = tempfile::tempdir().map_err(|e| format!("sandbox dir: {e}"))?;
+                let sandbox_home = sandbox.path().join("home");
+                std::fs::create_dir_all(&sandbox_home).map_err(|e| format!("sandbox home: {e}"))?;
+                let model_at = format!("{}:{}", spec_bind.host, spec_bind.port);
+                let exec_at = format!("{}:{}", spec_bind.host, spec_bind.port + 1);
+                let exec =
+                    ExecMock::start_on(&exec_at, sandbox.path(), Some(&sandbox_home), true).await;
+                let url = beyond_ai_test_support::spawn_model_server_routed_unrecorded_on(
+                    &model_at,
+                    Vec::new(),
+                    turn_text("ok"),
+                );
+                Ok::<_, String>((url, exec, sandbox))
+            })
+            .await?;
+        let (gateway_url, exec) = (gateway_url.clone(), exec.clone());
+        // This `Fleet` owns no sandbox of its own — the shared one above outlives it.
+        let sandbox = tempfile::tempdir().map_err(|e| format!("scratch: {e}"))?;
 
         let attached: Vec<Replica> = replicas
             .iter()
@@ -373,7 +397,46 @@ impl Fleet {
         with_metrics: bool,
         gateway_url: String,
     ) -> Result<Self, String> {
+        Self::start_against_model(
+            kind,
+            replicas,
+            shards,
+            history_path,
+            max_live_sessions,
+            with_metrics,
+            gateway_url,
+            false,
+        )
+        .await
+    }
+
+    /// As [`start_against`](Self::start_against), stating whether *this* model server is the point.
+    ///
+    /// One scenario needs a model that **stalls**, so a turn is genuinely in flight when the replica
+    /// is asked to drain. An attached replica carries `--gateway-url` from its task definition and
+    /// cannot be repointed per scenario, so that scenario cannot run against an arbitrary attached
+    /// fleet — and saying so is the only honest answer. Silently substituting the default server is
+    /// what the first attached run did: nothing stalled, the drain finished instantly, the replica
+    /// exited, and all four C7 assertions came back `Connection refused` — which reads as "drain is
+    /// broken" and was really "the harness sent the wrong model".
+    #[allow(clippy::too_many_arguments)]
+    pub async fn start_against_model(
+        kind: Kind,
+        replicas: usize,
+        shards: usize,
+        history_path: &std::path::Path,
+        max_live_sessions: Option<usize>,
+        with_metrics: bool,
+        gateway_url: String,
+        model_is_the_point: bool,
+    ) -> Result<Self, String> {
         if let Some(spec) = ATTACHED.get() {
+            if model_is_the_point {
+                return Err(format!(
+                    "{ATTACHED_SKIP}this scenario needs a model server that stalls, and an attached \
+                     replica's --gateway-url was fixed when its task started"
+                ));
+            }
             if let Some(why) = attached_cannot(max_live_sessions, with_metrics) {
                 return Err(format!("{ATTACHED_SKIP}{why}"));
             }
@@ -884,7 +947,17 @@ pub async fn drain_keeps_serving_what_it_owns(
         Duration::from_secs(6),
         vec![turn_text("finished after the signal")],
     );
-    let mut fleet = match Fleet::start_against(kind, 1, 1, history_path, None, false, gateway).await
+    let mut fleet = match Fleet::start_against_model(
+        kind,
+        1,
+        1,
+        history_path,
+        None,
+        false,
+        gateway,
+        true,
+    )
+    .await
     {
         Ok(f) => f,
         Err(e) => return Outcome::failed_with(e),
@@ -1451,8 +1524,15 @@ pub async fn hung_mount_is_reported_not_leaked(
         Err(e) => return Outcome::failed_with(e),
     };
     let addr = fleet.replicas[0].addr.clone();
+    // The thread-count half of this claim reads `/proc/<pid>/task`, which only exists for a replica
+    // in this process's own namespace. An attached replica's blocking-pool size has to come from its
+    // metrics listener instead, which is loopback-only inside its task and needs a sidecar to scrape
+    // — so say that rather than grade the claim on the half that still works.
     let Some(pid) = fleet.replicas[0].pid() else {
-        return Outcome::failed_with("the replica has no pid".to_owned());
+        return Outcome::failed_with(format!(
+            "{ATTACHED_SKIP}the probe-thread bound is counted from /proc, which an attached \
+             replica does not share; it needs the metrics listener scraped through a sidecar"
+        ));
     };
 
     // Healthy first, or the rest proves nothing.

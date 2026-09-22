@@ -47,6 +47,10 @@ impl ExecRequest {
     }
 }
 
+/// `Clone` shares the endpoint rather than starting a second one — the request log is behind the
+/// same `Arc`. That is what a driver hosting one exec double for a whole run wants: every scenario
+/// holds a handle to the same server, at the one address its replicas were started with.
+#[derive(Clone)]
 pub struct ExecMock {
     pub url: String,
     requests: Arc<Mutex<Vec<ExecRequest>>>,
