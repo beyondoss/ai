@@ -1,0 +1,121 @@
+# syntax=docker/dockerfile:1.7-labs
+#
+# The fleet simulator (`fleet-sim`) as the driver of an *attached* fleet: it owns no replicas and no
+# filesystem, it attaches to ones somebody else is running. Built from the workspace root:
+#
+#     docker build -f Dockerfile.driver -t fleetsim-driver .
+#
+# Companion to `Dockerfile.agent`, which builds the replicas this drives.
+#
+# ## Why this image exists at all
+#
+# The checker reads the shards through the *local* filesystem (`check.rs`), so the driver has to be
+# somewhere the shards are mounted — inside the VPC, with the same EFS. It also hosts the mock model
+# server and the exec double the replicas dial back into, at a fixed address the replicas were
+# started with. Both of those make it a task rather than something run from a laptop.
+#
+# The AWS CLI is here for one reason: `--fault-cmd`. The simulator does not own these replicas, so
+# `kill`, `term`, `partition` and `heal` are somebody else's to perform — on AWS, the EC2 and ECS
+# APIs. The CLI stays in *this* image and out of the agent image, and the words `ECS`/`EFS`/`AWS`
+# stay out of the Rust entirely.
+
+ARG RUST_VERSION=1
+ARG ALPINE_VERSION=3.22
+
+FROM rust:${RUST_VERSION}-bookworm AS chef
+ARG TARGETARCH
+RUN apt-get update && apt-get install -y --no-install-recommends musl-tools \
+    && rm -rf /var/lib/apt/lists/*
+RUN case "$TARGETARCH" in \
+      amd64) echo x86_64-unknown-linux-musl ;; \
+      arm64) echo aarch64-unknown-linux-musl ;; \
+      *) echo "unsupported TARGETARCH=$TARGETARCH" >&2; exit 1 ;; \
+    esac > /etc/cargo-target \
+    && rustup target add "$(cat /etc/cargo-target)"
+RUN cargo install cargo-chef --locked --version ^0.1
+WORKDIR /app
+
+# Same flag `Dockerfile.agent` sets, and here for a blunter reason than its RSS one: the default
+# musl target links `crt-static` as a **static-PIE**, and the `fleet-sim` binary built that way
+# segfaults before `main` in this base image — silently, exit 139, with no output at all, which from
+# the outside looks exactly like a matrix that started and hung. The agent image has always carried
+# this flag and has always run here, so the driver carries it too rather than being the one binary
+# built a way nothing else in this repo ships.
+ENV RUSTFLAGS="-C relocation-model=static"
+
+FROM chef AS planner
+COPY . .
+RUN cargo chef prepare --recipe-path recipe.json
+
+FROM chef AS builder
+COPY --from=planner /app/recipe.json recipe.json
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    target="$(cat /etc/cargo-target)" \
+    && linker_env="CARGO_TARGET_$(echo "$target" | tr 'a-z-' 'A-Z_')_LINKER" \
+    && cc_env="CC_$(echo "$target" | tr '-' '_')" \
+    && export "$linker_env=musl-gcc" "$cc_env=musl-gcc" \
+    && cargo chef cook --release --target "$target" -p beyond-ai-fleet-sim --recipe-path recipe.json
+COPY . .
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    target="$(cat /etc/cargo-target)" \
+    && linker_env="CARGO_TARGET_$(echo "$target" | tr 'a-z-' 'A-Z_')_LINKER" \
+    && cc_env="CC_$(echo "$target" | tr '-' '_')" \
+    && export "$linker_env=musl-gcc" "$cc_env=musl-gcc" \
+    && cargo build --release --target "$target" -p beyond-ai-fleet-sim --bin fleet-sim \
+    && cp "target/$target/release/fleet-sim" /usr/local/bin/fleet-sim
+
+# The metrics sidecar, in its own image. Nothing but socat, because it is pulled by every replica
+# task and the driver image below is ~400 MB of AWS CLI that a port forwarder has no use for.
+#
+#     docker build -f Dockerfile.driver --target socat -t fleetsim-socat .
+FROM alpine:${ALPINE_VERSION} AS socat
+RUN apk add --no-cache socat
+ENTRYPOINT ["socat"]
+
+# ---------------------------------------------------------------------------
+# The driver: Debian, not Alpine, and the reason is one binary.
+#
+# `aws ecs execute-command` needs the Session Manager plugin, which is how the `kill` fault gets a
+# SIGKILL into a replica — the only way to reach inside a Fargate task, since ECS has no
+# "signal this container" API and StopTask always sends SIGTERM first. AWS ships that plugin as a
+# `.deb` and an `.rpm` against glibc and publishes nothing for musl, so on Alpine the fault failed
+# with `SessionManagerPlugin is not found` — swallowed, because the call is best-effort, and
+# surfacing 250 s later as "r1 did not reach STOPPED".
+#
+# The alternative was to make `kill` mean something else (partition from storage, then StopTask),
+# which would have produced a replica that died without sealing — the right *outcome* — while no
+# longer being the same fault the local substrate performs with `kill -9`. A claim proved one way
+# on the homelab and another way here is two claims, so the image changes instead of the fault.
+#
+# `fleet-sim` is a static musl binary and does not care which libc is installed.
+# ---------------------------------------------------------------------------
+FROM debian:stable-slim AS runtime
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates curl unzip jq socat less procps \
+    && rm -rf /var/lib/apt/lists/*
+ARG TARGETARCH
+RUN set -eux; \
+    case "$TARGETARCH" in \
+      amd64) awscli=x86_64; plugin=64bit ;; \
+      arm64) awscli=aarch64; plugin=arm64 ;; \
+      *) echo "unsupported TARGETARCH=$TARGETARCH" >&2; exit 1 ;; \
+    esac; \
+    curl -sSL "https://awscli.amazonaws.com/awscli-exe-linux-${awscli}.zip" -o /tmp/awscli.zip; \
+    unzip -q /tmp/awscli.zip -d /tmp; /tmp/aws/install; \
+    curl -sSL "https://s3.amazonaws.com/session-manager-downloads/plugin/latest/ubuntu_${plugin}/session-manager-plugin.deb" \
+      -o /tmp/smp.deb; \
+    dpkg -i /tmp/smp.deb; \
+    rm -rf /tmp/awscli.zip /tmp/aws /tmp/smp.deb; \
+    aws --version; session-manager-plugin --version
+
+COPY --from=builder /usr/local/bin/fleet-sim /usr/local/bin/fleet-sim
+COPY deploy/efs-proof/fault.sh /usr/local/bin/fault.sh
+RUN chmod 0755 /usr/local/bin/fault.sh
+
+# Root on purpose. The EFS access point pins every operation to uid/gid 10001 regardless of the
+# caller, so the container user buys no isolation here — and the driver has to read every tenant's
+# shard, which is exactly what the access point already grants it.
+WORKDIR /mnt/efs
+ENTRYPOINT ["/bin/bash"]

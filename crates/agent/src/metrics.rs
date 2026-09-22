@@ -165,6 +165,19 @@ pub struct Metrics {
     /// answering altogether.
     pub ready_probe_seconds: Histogram,
 
+    /// OS threads in this process, sampled at scrape time rather than maintained.
+    ///
+    /// This is the number that says whether `/readyz` is leaking. A readiness probe that does a
+    /// blocking `stat` per request against a mount whose target has gone parks one blocking-pool
+    /// thread per probe and never gets it back: the replica climbs toward the pool ceiling and then
+    /// stops answering anything at all, health checks included. Single-flighting the probe keeps
+    /// this flat while the mount hangs, and *flat* is the claim — which nothing outside the task can
+    /// verify, because `/proc` is not shared across a container boundary and a thread count is not
+    /// visible from a socket. Sampled here so a sidecar can see it.
+    ///
+    /// Linux only; elsewhere it reads 0, which is why it is a sampled gauge and not a counter.
+    threads: IntGauge,
+
     refusals: IntCounterVec,
 }
 
@@ -212,6 +225,10 @@ impl Metrics {
             "agent_ready_probe_seconds",
             "Duration of the /readyz shard probe.",
         ))?;
+        let threads = IntGauge::with_opts(Opts::new(
+            "agent_threads",
+            "OS threads in this process, sampled at scrape time.",
+        ))?;
         let refusals = IntCounterVec::new(
             Opts::new(
                 "agent_refusals_total",
@@ -228,6 +245,7 @@ impl Metrics {
         registry.register(Box::new(lock_failures.clone()))?;
         registry.register(Box::new(sessions_superseded.clone()))?;
         registry.register(Box::new(ready_probe_seconds.clone()))?;
+        registry.register(Box::new(threads.clone()))?;
         registry.register(Box::new(refusals.clone()))?;
 
         // Touch every child once so a series exists at zero rather than appearing on first use. An
@@ -263,6 +281,7 @@ impl Metrics {
             lock_failures,
             sessions_superseded,
             ready_probe_seconds,
+            threads,
             refusals,
         }))
     }
@@ -285,11 +304,37 @@ impl Metrics {
 
     /// The scrape body, in the Prometheus text exposition format.
     pub fn encode(&self) -> Vec<u8> {
+        // Sampled here, not tracked: threads are created and retired by the runtime, which has no
+        // hook to count them through, and a scrape is the only moment the number is wanted.
+        self.threads.set(os_threads());
         let mut buf = Vec::new();
         let encoder = TextEncoder::new();
         // Encoding fails only on a broken writer; a `Vec` is not one.
         let _ = encoder.encode(&self.registry.gather(), &mut buf);
         buf
+    }
+}
+
+/// OS threads in this process, or 0 where the platform does not say.
+///
+/// `/proc/self/status` rather than counting `/proc/self/task`: one read and one parse, against one
+/// `readdir` plus an allocation per thread — and this runs on a scrape, which a replica serving
+/// tenants should not be paying a per-thread cost for.
+fn os_threads() -> i64 {
+    #[cfg(target_os = "linux")]
+    {
+        let Ok(status) = std::fs::read_to_string("/proc/self/status") else {
+            return 0;
+        };
+        status
+            .lines()
+            .find_map(|l| l.strip_prefix("Threads:"))
+            .and_then(|n| n.trim().parse().ok())
+            .unwrap_or(0)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        0
     }
 }
 
@@ -451,6 +496,38 @@ mod tests {
         // `/livez` and `/readyz` belong to the tenant-facing listener. This one knows one path.
         let other = request(addr, "/livez").await;
         assert!(other.starts_with("HTTP/1.1 404"), "{other}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_thread_gauge_is_sampled_on_every_scrape() {
+        let m = Metrics::new().unwrap();
+        // Zero before anything encodes: the gauge is sampled, never maintained, so an un-scraped
+        // registry has no opinion about it.
+        assert_eq!(m.threads.get(), 0);
+
+        let before = String::from_utf8(m.encode()).unwrap();
+        let sampled = m.threads.get();
+        assert!(
+            sampled > 0,
+            "a running process has at least one thread: {before}"
+        );
+        assert!(
+            before.contains(&format!("agent_threads {sampled}")),
+            "{before}"
+        );
+
+        // And every scrape re-samples rather than latching the first reading. Asserted by
+        // poisoning the gauge instead of by spawning a thread and watching the number rise: this
+        // test shares a process with the rest of the suite, whose own threads come and go, so a
+        // strict inequality here would be grading the test runner. What C8 needs from this gauge is
+        // that a *later* scrape tells the truth about *now*, and that is exactly what this checks.
+        m.threads.set(999_999);
+        let after = String::from_utf8(m.encode()).unwrap();
+        assert!(
+            m.threads.get() > 0 && m.threads.get() < 999_999,
+            "a scrape must re-sample, not report what was there before: {after}"
+        );
     }
 
     #[test]

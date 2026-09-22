@@ -217,6 +217,13 @@ is, where its sandbox is, and — sealed — the credentials to reach them. Noth
 reaches a tenant: not its `$HOME`, its settings, its cwd, or its filesystem. See
 [crates/agent/ARCHITECTURE.md](crates/agent/ARCHITECTURE.md#service-mode--one-replica-many-tenants).
 
+This section covers running **one** replica. For a fleet of them, see
+**[crates/agent/FLEET.md](crates/agent/FLEET.md)**: what service mode is for, the **edge contract**
+(routing obligations the agent cannot enforce — consistent hashing, the ring walk, a retry budget
+longer than the storage lease), sizing and blast radius, what to alert on, how it scales, and what it
+costs against the alternatives. Every number there was measured; `deploy/efs-proof/results/` holds
+the run they came from.
+
 `Dockerfile.agent` builds it — a static musl binary in an Alpine runtime, entrypoint
 `serve --service`, non-root (uid 10001):
 

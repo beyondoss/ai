@@ -8,6 +8,29 @@
 //! fleet-sim soak [--duration S] [--seed N]      randomized chaos, then the checker — the burn-in
 //!              [--sessions N] [--tenants N] [--shards N]
 //! fleet-sim list                                 the scenarios and which substrate each needs
+//! fleet-sim keys --dir D                        write the seal key, print the grant-key flag
+//!
+//! `--substrate attached` runs the same scenarios against a fleet **somebody else is running**, on
+//! storage somebody else provisioned: `--shard name=/path` (repeatable), `--replica host:port`
+//! (repeatable) and `--fault-cmd CMD`, which the simulator invokes as `CMD <action> <replica>` for
+//! `kill|term|partition|heal|restart`. Nothing in here knows what provides any of it, which is what
+//! lets the identical binary grade a local NFS fleet and a real ECS+EFS one.
+//!
+//! Two scenarios need the fleet to have been provisioned for them, because both knobs are fixed when
+//! a replica's task starts and neither can be asked for afterwards:
+//!
+//! ```text
+//! --replica-metrics PORT        one per --replica, in order: the port that replica's scrape is
+//!                               on. Its own listener is loopback-only by design, so this is a
+//!                               sidecar beside it — and a sidecar shares the replica's network
+//!                               namespace, so the host is the replica's and is never given here.
+//! --capped-replica host:port=N  an extra replica started with --max-live-sessions N, used only by
+//!                               the scenario about the cap. Apart from the pool on purpose: a
+//!                               capped replica in it would refuse every other scenario's second
+//!                               session.
+//! ```
+//!
+//! Without them those scenarios skip, with the reason, rather than failing or quietly passing.
 //! ```
 //!
 //! It is not a CI shard. The substrate that makes the interesting claims checkable needs root, an
@@ -21,6 +44,7 @@
 
 mod check;
 mod edge;
+mod faults;
 mod history;
 mod replica;
 mod scenarios;
@@ -60,8 +84,21 @@ async fn main() -> std::process::ExitCode {
             }
             std::process::ExitCode::SUCCESS
         }
-        "matrix" => run_matrix(kind).await,
+        "keys" => {
+            // So the infrastructure can start replicas with the matching keys *before* the simulator
+            // runs. Deterministic by design — the seeds are fixed so a failure reproduces — which
+            // also means they are not secret and an attached fleet must be private.
+            let dir = flag(&args, "--dir").unwrap_or_else(|| ".".to_owned());
+            let minter = beyond_ai_test_support::grant::Minter::new(std::path::Path::new(&dir));
+            println!("AI_AGENT_GRANT_KEY={}", minter.grant_key_flag());
+            println!("AI_AGENT_SEAL_KEY={}", minter.seal_key().display());
+            std::process::ExitCode::SUCCESS
+        }
+        "matrix" => run_matrix(kind, &args).await,
         "soak" => {
+            if let Err(code) = attach_if_asked(&args) {
+                return code;
+            }
             let secs = flag(&args, "--duration")
                 .and_then(|s| s.parse::<u64>().ok())
                 .unwrap_or(120);
@@ -140,12 +177,122 @@ fn install_teardown_on_signal() {
     }
 }
 
+/// Every occurrence of a repeatable flag, in order.
+fn flags(args: &[String], name: &str) -> Vec<String> {
+    args.iter()
+        .enumerate()
+        .filter(|(_, a)| a.as_str() == name)
+        .filter_map(|(i, _)| args.get(i + 1).cloned())
+        .collect()
+}
+
+/// `--shard name=/path`, parsed the same way the agent parses its own.
+fn shard_args(args: &[String]) -> Result<Vec<(String, std::path::PathBuf)>, String> {
+    flags(args, "--shard")
+        .iter()
+        .map(|s| {
+            s.split_once('=')
+                .map(|(n, p)| (n.to_owned(), std::path::PathBuf::from(p)))
+                .ok_or_else(|| format!("--shard {s:?} is not name=/path"))
+        })
+        .collect()
+}
+
 fn flag(args: &[String], name: &str) -> Option<String> {
     let i = args.iter().position(|a| a == name)?;
     args.get(i + 1).cloned()
 }
 
-async fn run_matrix(kind: Kind) -> std::process::ExitCode {
+fn attached_from(args: &[String]) -> Result<Option<scenarios::Attachment>, String> {
+    if flag(args, "--substrate").as_deref() != Some("attached") {
+        return Ok(None);
+    }
+    let replicas = flags(args, "--replica")
+        .iter()
+        .map(|s| crate::edge::Addr::parse(s))
+        .collect::<Result<Vec<_>, _>>()?;
+    let fault_cmd = flag(args, "--fault-cmd").ok_or_else(|| {
+        "`--substrate attached` needs --fault-cmd CMD: the simulator does not own these replicas, \
+         so it cannot kill or partition them itself"
+            .to_owned()
+    })?;
+    // Fixed, not ephemeral, and defaulted to something a human can retype: the value has to be
+    // written into replica task definitions by hand before this process exists.
+    let mock_listen = crate::edge::Addr::parse(
+        flag(args, "--mock-listen")
+            .as_deref()
+            .unwrap_or("127.0.0.1:19000"),
+    )?;
+    // One per `--replica`, in the same order, or none at all. A partial list is refused rather
+    // than padded: a scenario that scraped the wrong replica would be grading the wrong process,
+    // and positional flags are exactly where that mistake is silent.
+    let metrics = flags(args, "--replica-metrics")
+        .iter()
+        .map(|s| {
+            s.parse::<u16>()
+                .map_err(|_| format!("--replica-metrics {s:?} is not a port"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if !metrics.is_empty() && metrics.len() != replicas.len() {
+        return Err(format!(
+            "--replica-metrics is positional: give one per --replica ({} replicas, {} metrics \
+             addresses) or none",
+            replicas.len(),
+            metrics.len()
+        ));
+    }
+    let capped = match flag(args, "--capped-replica") {
+        None => None,
+        Some(s) => {
+            let (addr, cap) = s.rsplit_once('=').ok_or_else(|| {
+                format!("--capped-replica {s:?} is not host:port=<max live sessions>")
+            })?;
+            let cap: usize = cap
+                .parse()
+                .map_err(|_| format!("--capped-replica {s:?} has no valid session cap"))?;
+            Some((crate::edge::Addr::parse(addr)?, cap))
+        }
+    };
+    Ok(Some(scenarios::Attachment {
+        shards: shard_args(args)?,
+        replicas,
+        metrics,
+        capped,
+        fault_cmd,
+        mock_listen,
+    }))
+}
+
+/// Register the attached fleet, if `--substrate attached` asked for one.
+///
+/// Shared by `matrix` and `soak` rather than living in either: both build their fleets through
+/// `Fleet::start_against`, so both honour an attachment — and a soak that silently ran against a
+/// *local* substrate because only the matrix knew how to attach would be the most expensive kind of
+/// wrong answer, since it is the one that runs for an hour before saying anything.
+fn attach_if_asked(args: &[String]) -> Result<(), std::process::ExitCode> {
+    match attached_from(args) {
+        Ok(Some(spec)) => {
+            println!(
+                "attached: {} shard(s), {} replica(s), faults via {:?}",
+                spec.shards.len(),
+                spec.replicas.len(),
+                spec.fault_cmd
+            );
+            scenarios::attach_to(spec);
+            Ok(())
+        }
+        Ok(None) => Ok(()),
+        Err(e) => {
+            eprintln!("fleet-sim: {e}");
+            Err(std::process::ExitCode::from(2))
+        }
+    }
+}
+
+async fn run_matrix(kind: Kind, args: &[String]) -> std::process::ExitCode {
+    if let Err(code) = attach_if_asked(args) {
+        return code;
+    }
     let dir = match tempfile::tempdir() {
         Ok(d) => d,
         Err(e) => {

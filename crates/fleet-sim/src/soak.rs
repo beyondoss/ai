@@ -215,12 +215,12 @@ pub async fn run(opts: Soak) -> bool {
                         .unwrap_or_else(|e| e.into_inner().clone());
                     let placed =
                         edge::place_among(&now, &session, &grant, Duration::from_secs(20)).await;
-                    let Placement::Served { port, .. } = placed else {
+                    let Placement::Served { addr, .. } = placed else {
                         refused.fetch_add(1, Ordering::Relaxed);
                         tokio::time::sleep(Duration::from_millis(200)).await;
                         continue;
                     };
-                    let Ok(ws) = workload::connect(port, &session, &grant).await else {
+                    let Ok(ws) = workload::connect(&addr, &session, &grant).await else {
                         tokio::time::sleep(Duration::from_millis(200)).await;
                         continue;
                     };
@@ -228,7 +228,7 @@ pub async fn run(opts: Soak) -> bool {
                     // which the fan-out design is for. It must not disturb the first — and it is a
                     // second *view*, never a second writer.
                     if rng.below(4) == 0
-                        && let Ok(second) = workload::connect(port, &session, &grant).await
+                        && let Ok(second) = workload::connect(&addr, &session, &grant).await
                     {
                         drop(second);
                     }
@@ -284,11 +284,10 @@ pub async fn run(opts: Soak) -> bool {
             .record("chaos_drain", json!({ "replica": name, "hard": hard }));
         if hard {
             kills += 1;
-            let _ = fleet.replicas[victim].kill_hard();
+            let _ = fleet.kill_hard(victim);
         } else {
             deploys += 1;
-            let _ = fleet.replicas[victim].signal_term();
-            let _ = fleet.replicas[victim].wait_for_exit(Duration::from_secs(45));
+            let _ = fleet.stop_gracefully(victim, Duration::from_secs(45));
         }
         fleet.retarget_excluding(&name);
         if let Ok(mut t) = targets.lock() {
@@ -366,10 +365,10 @@ pub async fn run(opts: Soak) -> bool {
         // lock rather than wandering. But a session that failed over is live on the *substitute*,
         // and its hash target answers 503 until the substitute's copy is idle-reaped.
         let strict = edge::place(&fleet.edge, &a.session, &grant, Duration::from_secs(10)).await;
-        let port = match strict {
-            Placement::Served { port, .. } => {
+        let addr = match strict {
+            Placement::Served { addr, .. } => {
                 findings.push(check::reachable_by_hash(&a.session));
-                port
+                addr
             }
             _ => {
                 let walked = edge::place_among(
@@ -380,10 +379,10 @@ pub async fn run(opts: Soak) -> bool {
                 )
                 .await;
                 match walked {
-                    Placement::Served { port, .. } => {
+                    Placement::Served { addr, .. } => {
                         needed_the_walk += 1;
                         findings.push(check::stranded_from_its_hash_target(&a.session));
-                        port
+                        addr
                     }
                     _ => {
                         findings.push(check::unreachable_after_soak(&a.session));
@@ -392,7 +391,7 @@ pub async fn run(opts: Soak) -> bool {
                 }
             }
         };
-        match workload::connect(port, &a.session, &grant).await {
+        match workload::connect(&addr, &a.session, &grant).await {
             Ok(mut ws) => match workload::transcript(&mut ws).await {
                 Ok(replayed) => {
                     let mine: Vec<_> = promised

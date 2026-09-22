@@ -2877,6 +2877,11 @@ is still rooted at the same tenant. An id the caller supplies is never rewritten
 
 ## Service mode — one replica, many tenants
 
+> **Operating a fleet of these, and building the edge in front of them, is
+> [FLEET.md](FLEET.md).** This section is the mechanism: what a replica does and why. That one is the
+> contract and the operations — the routing obligations the agent cannot enforce, replica sizing and
+> blast radius, what to alert on, how it scales, and what it costs against the alternatives.
+
 `serve --listen … --service` turns the daemon from "a headless agent for whoever is on the other end
 of this socket" into a **fail-closed multi-tenant service**. Every connection presents a
 [session grant](#session-grant-bsg_v1) in the `x-beyond-grant` header; that grant says which tenant
@@ -3268,10 +3273,19 @@ listener is reachable by tenants, and a scrape is not tenant-scoped.**
 | `agent_refusals_total`            | counter   | By reason: `auth`, `misdirected`, `unavailable`, `bad_request`                                                                                                                                                                                                               |
 | `agent_ready_probe_seconds`       | histogram | How often a `/readyz` caller waited on the mount, and for how long                                                                                                                                                                                                           |
 | `agent_sessions_superseded_total` | counter   | Owners that discovered they had been fenced                                                                                                                                                                                                                                  |
+| `agent_threads`                   | gauge     | OS threads in the process, **sampled on each scrape**. Whether `/readyz` is leaking: a probe that blocked per request against a hung mount would park one uncancellable blocking-pool thread per probe and climb toward tokio's 512-thread ceiling. Flat is the claim        |
 
 Refusals are counted in exactly one place — `Supervisor::refuse`, which counts then answers — so a
 refusal path added later cannot quietly skip the counter. `HttpError::refusal` buckets by status
 rather than by variant, so a new variant lands in the right bucket by construction.
+
+`agent_threads` is sampled rather than maintained: threads are created and retired by the runtime,
+which offers no hook to count through, and a scrape is the only moment the number is wanted. It reads
+`/proc/self/status` — one read and one parse, against a `readdir` plus an allocation per thread — and
+is 0 off Linux. It exists because the thread count is otherwise **unobservable from outside the
+task**: `/proc` does not cross a container boundary and a thread count is not visible from a socket,
+so the fleet simulator could check this claim on a replica it spawned and only wave it through on a
+real Fargate one. A claim checked one way locally and another way in production is two claims.
 
 **Deliberately absent:** the storage-side counters (appends, bytes, segment seals). They live below
 `session_store`'s `Log` seam, which has no handle on the metrics, and defining them without wiring

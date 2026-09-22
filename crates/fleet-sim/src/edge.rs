@@ -26,11 +26,55 @@ const GRANT_TTL: Duration = Duration::from_secs(3600);
 /// way, but a budget shorter than the lease is an outage the tenant sees.
 pub const RETRY_BUDGET: Duration = Duration::from_secs(120);
 
+/// Where a replica answers.
+///
+/// A host as well as a port, because a replica the simulator did **not** spawn is not on loopback.
+/// The local substrates still produce `127.0.0.1`; an attached fleet (real ECS tasks) produces
+/// whatever the platform assigned, and every dialer has to go through this rather than assuming.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Addr {
+    pub host: String,
+    pub port: u16,
+}
+
+impl Addr {
+    /// A replica this process spawned on loopback.
+    pub fn local(port: u16) -> Self {
+        Self {
+            host: "127.0.0.1".to_owned(),
+            port,
+        }
+    }
+
+    /// Parse `host:port` — how an attached fleet is named on the command line.
+    pub fn parse(s: &str) -> Result<Self, String> {
+        let (host, port) = s
+            .rsplit_once(':')
+            .ok_or_else(|| format!("{s:?} is not host:port"))?;
+        let port = port
+            .parse()
+            .map_err(|_| format!("{s:?} has no valid port"))?;
+        if host.is_empty() {
+            return Err(format!("{s:?} has no host"));
+        }
+        Ok(Self {
+            host: host.to_owned(),
+            port,
+        })
+    }
+}
+
+impl std::fmt::Display for Addr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}:{}", self.host, self.port)
+    }
+}
+
 /// One replica the edge can route to.
 #[derive(Clone)]
 pub struct Target {
     pub name: String,
-    pub port: u16,
+    pub addr: Addr,
 }
 
 /// Virtual nodes per replica on the ring. Enough that removing one replica spreads its keys across
@@ -78,6 +122,20 @@ impl Edge {
     /// Replace the routable set — a deploy, a scale-in, a replica that died.
     pub fn set_targets(&mut self, targets: Vec<Target>) {
         self.targets = targets;
+    }
+
+    /// Point an existing target at a new address, leaving the ring's *membership* alone.
+    ///
+    /// A restarted replica may come back somewhere else (a replaced Fargate task draws a fresh
+    /// address from its subnet), and the edge has to follow it. What the edge must **not** do is
+    /// rebuild the ring while it is at it: a scenario that deliberately took a replica out with
+    /// [`Fleet::retarget_excluding`] and then restarted something would find it silently back in,
+    /// every session rehashed mid-scenario, and two claims failing for a reason that is not in
+    /// either of them.
+    pub fn readdress(&mut self, name: &str, addr: Addr) {
+        if let Some(t) = self.targets.iter_mut().find(|t| t.name == name) {
+            t.addr = addr;
+        }
     }
 
     /// Which replica this session id hashes to.
@@ -170,8 +228,8 @@ impl Edge {
 /// What happened when the edge tried to place a connection.
 #[derive(Debug)]
 pub enum Placement {
-    /// A replica accepted it, and this is the port that did.
-    Served { port: u16, waited: Duration },
+    /// A replica accepted it, and this is where it answered.
+    Served { addr: Addr, waited: Duration },
     /// Every attempt inside the budget was refused.
     Exhausted { last_status: u16, waited: Duration },
     /// Nothing to route to.
@@ -188,14 +246,14 @@ pub async fn place(edge: &Edge, session_id: &str, grant: &str, budget: Duration)
     let Some(target) = edge.route(session_id) else {
         return Placement::NoTarget;
     };
-    let port = target.port;
+    let addr = target.addr.clone();
     let began = Instant::now();
     let mut last_status = 0;
     while began.elapsed() < budget {
-        match crate::workload::probe_session(port, session_id, grant).await {
+        match crate::workload::probe_session(&addr, session_id, grant).await {
             Ok(status) if status < 400 => {
                 return Placement::Served {
-                    port,
+                    addr,
                     waited: began.elapsed(),
                 };
             }
@@ -241,11 +299,11 @@ pub async fn place_among(
         // real edge's health checks would have dropped it. Starting from the hash keeps a session
         // sticky to one replica whenever that replica is up.
         for candidate in ring_order(targets, session_id) {
-            let port = candidate.port;
-            match crate::workload::probe_session(port, session_id, grant).await {
+            let addr = candidate.addr.clone();
+            match crate::workload::probe_session(&addr, session_id, grant).await {
                 Ok(status) if status < 400 => {
                     return Placement::Served {
-                        port,
+                        addr,
                         waited: began.elapsed(),
                     };
                 }

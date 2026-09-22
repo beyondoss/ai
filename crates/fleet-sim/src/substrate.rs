@@ -27,6 +27,15 @@ pub enum Kind {
     LocalDir,
     /// A real NFSv4.1 export, mounted per replica. Needs root and `nfs-kernel-server`.
     Nfs,
+    /// A shared filesystem **somebody else provisioned**, already mounted, at paths the caller
+    /// names. Creates nothing and tears nothing down.
+    ///
+    /// This is what runs the matrix against real EFS: the shards are an EFS filesystem mounted into
+    /// every task by the platform, the replicas are ECS tasks the simulator attached to rather than
+    /// spawned, and faults are performed by a caller-supplied command (see [`crate::faults`]).
+    /// Nothing about EFS or ECS is known here — only that the paths exist and that two clients can
+    /// reach them, which is the only property the storage claims actually rest on.
+    Attached,
 }
 
 impl Kind {
@@ -34,8 +43,9 @@ impl Kind {
         match s {
             "local-dir" => Ok(Self::LocalDir),
             "nfs" => Ok(Self::Nfs),
+            "attached" => Ok(Self::Attached),
             other => Err(format!(
-                "unknown substrate {other:?} (expected `local-dir` or `nfs`)"
+                "unknown substrate {other:?} (expected `local-dir`, `nfs` or `attached`)"
             )),
         }
     }
@@ -47,7 +57,7 @@ impl Kind {
     /// scenario written to catch a lost write or a lapsed lease would go green having exercised
     /// nothing.
     pub fn is_shared_filesystem(self) -> bool {
-        matches!(self, Self::Nfs)
+        matches!(self, Self::Nfs | Self::Attached)
     }
 }
 
@@ -371,6 +381,41 @@ impl Substrate {
     ///
     /// `clients` is the replica count: under NFS each replica mounts the export separately, from its
     /// own loopback address, so one replica's storage can be taken away without touching its peers'.
+    /// Point at a shared filesystem somebody else provisioned.
+    ///
+    /// Validated rather than assumed: every path must exist, be a directory, and be **writable** —
+    /// an EFS access point with the wrong uid produces a mount the replicas cannot use, and finding
+    /// that out from a scenario failing three steps later wastes a run. The probe file is written and
+    /// removed here for the same reason `/readyz` writes one: a directory that stats fine and rejects
+    /// a create is the failure mode worth catching up front.
+    pub fn attach(shards: Vec<(String, PathBuf)>) -> Result<Self, String> {
+        if shards.is_empty() {
+            return Err("an attached substrate needs at least one --shard name=/path".into());
+        }
+        for (name, path) in &shards {
+            if !path.is_dir() {
+                return Err(format!(
+                    "shard {name} at {} is not a directory that exists",
+                    path.display()
+                ));
+            }
+            let probe = path.join(".fleet-sim-writable");
+            std::fs::write(&probe, b"")
+                .map_err(|e| format!("shard {name} at {} is not writable: {e}", path.display()))?;
+            let _ = std::fs::remove_file(&probe);
+        }
+        Ok(Self {
+            kind: Kind::Attached,
+            // Every replica reaches the same filesystem at the same path — an EFS volume is mounted
+            // into each task at the same container path, so there is one set, shared.
+            clients: vec![shards.clone()],
+            shards,
+            nets: Vec::new(),
+            nfs_teardown: None,
+            _root: tempfile::tempdir().map_err(|e| format!("scratch dir: {e}"))?,
+        })
+    }
+
     pub fn prepare(kind: Kind, shards: usize, clients: usize) -> Result<Self, String> {
         let clients = clients.max(1);
         if kind == Kind::Nfs {
@@ -616,6 +661,13 @@ impl Substrate {
     /// target does; a firewall rule on a shared address could not, because a shared address is a
     /// shared client.
     fn link(&self, client: usize, state: &str) -> Result<(), String> {
+        if self.kind == Kind::Attached {
+            return Err(
+                "an attached substrate's network belongs to whoever provisioned it — partition it \
+                 through the fault command instead"
+                    .into(),
+            );
+        }
         if self.kind != Kind::Nfs {
             return Err("a local directory cannot be partitioned from itself".into());
         }
@@ -636,6 +688,21 @@ impl Substrate {
     }
 
     /// Every session directory currently on `shard`, for the checker.
+    /// The directory **one named session** wrote on this shard, if it wrote one.
+    ///
+    /// [`session_dirs`](Self::session_dirs) returns every session a tenant has there, in whatever
+    /// order `read_dir` gives, so taking the first of them is right only while the tenant has
+    /// exactly one. That holds on a substrate the simulator built for a single scenario and does
+    /// not hold on a fleet that nine scenarios share: by the time the takeover scenario ran, `t1`
+    /// owned five session directories on `s1`, and reading "the first" meant reading a *different*
+    /// scenario's session — which reported that a takeover had not advanced the epoch while the
+    /// takeover it was actually watching had advanced it perfectly well.
+    pub fn session_dir(&self, shard: &str, tenant: &str, session: &str) -> Option<PathBuf> {
+        self.session_dirs(shard, tenant)
+            .into_iter()
+            .find(|p| p.file_name().is_some_and(|n| n == session))
+    }
+
     pub fn session_dirs(&self, shard: &str, tenant: &str) -> Vec<PathBuf> {
         let Some((_, root)) = self.shards.iter().find(|(n, _)| n == shard) else {
             return Vec::new();

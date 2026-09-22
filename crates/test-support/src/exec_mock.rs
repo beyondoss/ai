@@ -47,6 +47,10 @@ impl ExecRequest {
     }
 }
 
+/// `Clone` shares the endpoint rather than starting a second one — the request log is behind the
+/// same `Arc`. That is what a driver hosting one exec double for a whole run wants: every scenario
+/// holds a handle to the same server, at the one address its replicas were started with.
+#[derive(Clone)]
 pub struct ExecMock {
     pub url: String,
     requests: Arc<Mutex<Vec<ExecRequest>>>,
@@ -61,7 +65,22 @@ impl ExecMock {
     /// A sandbox: commands run with `cwd` defaulting to `root` and `HOME` set to `home`, so `$HOME`
     /// (what `serve --service`'s startup probe asks for) is the sandbox's, never the replica's.
     pub async fn start_with_home(root: &Path, home: Option<&Path>, honors_stdin: bool) -> Self {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        Self::start_on("127.0.0.1:0", root, home, honors_stdin).await
+    }
+
+    /// As [`Self::start_with_home`], bound where the caller says.
+    ///
+    /// A test wants an ephemeral loopback port. A **fleet the simulator attached to** needs the
+    /// opposite: replicas carry the exec URL in their grant and are started before the driver, so
+    /// the address has to be predictable and reachable from another host — which `127.0.0.1:0` is
+    /// neither of.
+    pub async fn start_on(
+        bind: &str,
+        root: &Path,
+        home: Option<&Path>,
+        honors_stdin: bool,
+    ) -> Self {
+        let listener = tokio::net::TcpListener::bind(bind).await.unwrap();
         let url = format!("http://{}/exec", listener.local_addr().unwrap());
         let requests = Arc::new(Mutex::new(Vec::new()));
         let root = root.to_path_buf();

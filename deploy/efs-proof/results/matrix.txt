@@ -1,0 +1,83 @@
+driver=10.77.3.14 r1=10.77.0.8:8080 r2=10.77.1.10:8080 r3=10.77.2.13:8080 capped=10.77.3.9:8080
+
+attached: 2 shard(s), 3 replica(s), faults via "/usr/local/bin/fault.sh"
+fleet-sim matrix · substrate: Attached
+
+PASS drain-keeps-serving-what-it-owns
+  · C7             /readyz answered 503 while draining (503 takes it out of the pool)
+  · C7             /livez answered 200 (200 keeps the orchestrator from killing it mid-drain)
+  · C7             a new session got Ok(503) (503 sends the edge to a replica that stays)
+  · C7             the session it already owns still answers — the outage a drain exists to avoid
+
+PASS live-session-cap-refuses
+  · C9             at the cap, the next session got Ok(503) — 503 so the edge places it elsewhere rather than this replica running past its lock and descriptor budget
+  … restoring r1: it is not ready, so asking for a restart
+
+PASS unmounted-shard-is-misdirected
+  · C5             a shard this replica does not mount got Ok(421) — 421 is a routing fact the edge can act on, where 404 would claim the session does not exist
+  · C5             the shard it does mount was served (Ok(101))
+  … restoring r1: it is not ready, so asking for a restart
+  … both tenants wrote
+  … checking plaintext on the shard
+  … restarting the replica (was pid None port 10.77.0.6:8080)
+  … restarted (now pid None port 10.77.0.12:8080); trying the wrong key
+  … the wrong key finished in 76.452535ms: Err("socket closed after 1 frames")
+  … trying the right key (control)
+  … the right key finished in 119.537727ms
+
+PASS one-tenant-cannot-read-another
+  · C10            each tenant wrote its own subtree (1 and 1 session dir(s))
+  · C10            neither tenant's text is readable on the shard — every line is sealed
+  · C10            the wrong key could not produce the content (the session refused to open at all)
+  · C10            and the right key still reads it after the restart — the refusal above is the key, not a replica that reopened nothing
+  … restoring r1: it is not ready, so asking for a restart
+
+PASS metrics-name-no-tenant
+  · C11            "tenant-should-not-appear" does not appear in the scrape
+  · C11            "secret-session" does not appear in the scrape
+  · C11            "tenant=" does not appear in the scrape
+  · C11            "session_id=" does not appear in the scrape
+  · C11            "shard=" does not appear in the scrape
+  · C11            "workspace=" does not appear in the scrape
+  · C11            the scrape carries the replica's own instruments
+  … restoring r1: it is not ready, so asking for a restart
+
+PASS owner-refuses-non-owner
+  · C4             the non-owner answered 503, as the edge's retry expects
+  · C1             one segment, the O_EXCL create that says it exists
+  … restoring r1: it is not ready, so asking for a restart
+
+PASS takeover-after-hard-kill
+  · C6             a survivor took the session over after 73.089696663s — the lock cost a wait, not a line of history
+  · C2             epoch advanced 1 → 2
+  · C1             2 epoch(s), contiguous from 1, one file each
+  · no-lost-write  1 acknowledged message(s) all present after replay
+
+PASS hung-mount-is-reported-not-leaked
+  · C8             every one of 20 probes reported not-ready, the slowest in 1.002814252s — the orchestrator is told, and told promptly
+  · C8             /livez stayed 200 — the process is alive, so the orchestrator takes it out of the pool rather than killing it mid-session
+  · C8             the slowest probe answered in 1.002814252s
+  · C8             0 thread(s) while the mount was gone (4 → 4) across 20 probes — single-flight holds; a probe per request would be 20
+  · C8             and /readyz went back to 200 once the mount answered again — the replica rejoins the pool by itself
+  … the owner holds it; cutting it off from its storage
+  … still refused after 13.184124ms: connect: HTTP error: 503 Service Unavailable
+  … still refused after 20.107815134s: connect: HTTP error: 503 Service Unavailable
+  … still refused after 40.193317458s: connect: HTTP error: 503 Service Unavailable
+  … still refused after 60.271632843s: connect: HTTP error: 503 Service Unavailable
+  … still refused after 80.352785485s: connect: HTTP error: 503 Service Unavailable
+  … the successor took it over after 88.394245191s (44 refusals)
+  … storage back; the old owner is about to find out
+
+PASS fenced-owner-stops-and-says-so
+  · C3             the successor took the session over 88.394245191s after the owner was cut off (44 refusals meanwhile) and committed a turn — the lease is the cost, the takeover is not in doubt
+  · C3             the fenced owner said `session_superseded` — the client is told to reconnect, rather than going on talking to a replica whose writes go nowhere
+  · C3             the fenced owner acknowledged nothing, so nothing was promised
+  · C1             one segment, the O_EXCL create that says it exists
+  · C1             one segment, the O_EXCL create that says it exists
+  · C1             5 epoch(s), contiguous from 1, one file each
+  · C1             2 epoch(s), contiguous from 1, one file each
+  · C1             one segment, the O_EXCL create that says it exists
+  · C1             2 epoch(s), contiguous from 1, one file each
+  · C3             6 session director(ies) on the shard
+
+9 passed · 0 failed · 0 skipped

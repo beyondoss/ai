@@ -213,12 +213,33 @@ pub fn spawn_model_server_routed_unrecorded(
     spawn_model_server_routed_inner(routes, fallback, false).0
 }
 
+/// As [`spawn_model_server_routed_unrecorded`], bound where the caller says.
+///
+/// Replicas in an attached fleet are started *before* the driver and carry `--gateway-url` from then
+/// on, so the model server's address has to be known in advance and reachable from another host.
+pub fn spawn_model_server_routed_unrecorded_on(
+    bind: &str,
+    routes: Vec<(String, String)>,
+    fallback: String,
+) -> String {
+    spawn_model_server_routed_at(bind, routes, fallback, false).0
+}
+
 fn spawn_model_server_routed_inner(
     routes: Vec<(String, String)>,
     fallback: String,
     record: bool,
 ) -> (String, Arc<Mutex<Vec<String>>>) {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    spawn_model_server_routed_at("127.0.0.1:0", routes, fallback, record)
+}
+
+fn spawn_model_server_routed_at(
+    bind: &str,
+    routes: Vec<(String, String)>,
+    fallback: String,
+    record: bool,
+) -> (String, Arc<Mutex<Vec<String>>>) {
+    let listener = TcpListener::bind(bind).unwrap();
     let addr = listener.local_addr().unwrap();
     let requests = Arc::new(Mutex::new(Vec::new()));
     let recorder = requests.clone();
@@ -237,18 +258,61 @@ fn spawn_model_server_routed_inner(
                     .find(|(needle, _)| req.contains(needle.as_str()))
                     .map(|(_, r)| r.clone())
                     .unwrap_or(fallback);
+                // Read before the recorder takes the request: recording is optional, stalling is
+                // not a property of whether anyone is watching.
+                let asked_to_stall = stall_for(&req);
                 if record {
                     recorder.lock().unwrap().push(req);
                 }
+                // A request that asked to be stalled gets the same reply, sent in two parts.
+                let (head, tail) = match asked_to_stall {
+                    Some(hold) => match resp.split_once("\n\n") {
+                        Some((first, rest)) => {
+                            (format!("{first}\n\n"), Some((hold, rest.to_owned())))
+                        }
+                        None => (resp, None),
+                    },
+                    None => (resp, None),
+                };
                 let http = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{resp}"
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{head}"
                 );
                 let _ = stream.write_all(http.as_bytes());
                 let _ = stream.flush();
+                if let Some((hold, rest)) = tail {
+                    thread::sleep(hold);
+                    let _ = stream.write_all(rest.as_bytes());
+                    let _ = stream.flush();
+                }
             });
         }
     });
     (format!("http://{addr}"), requests)
+}
+
+/// A prompt asks the model to stall by carrying `STALL_MARKER` followed by a count of milliseconds.
+///
+/// The turn then arrives in two parts: `message_start` at once — so the run is provably *running*,
+/// which is what a caller is waiting for — and the rest of it after the hold.
+///
+/// Requested by the **request** rather than configured on the server, because the server is not
+/// always the caller's to configure. An attached fleet's replicas carry `--gateway-url` from the
+/// moment their tasks started and every scenario shares one model server at that address; a scenario
+/// needing a stall could otherwise only have one by standing up a second server nowhere the replicas
+/// would dial. Putting it in the prompt means the *same* scenario code stalls a local fleet and a
+/// real one, which is the only way the two runs are comparable.
+pub const STALL_MARKER: &str = "please-stall-ms=";
+
+/// A prompt that stalls the model for `ms`, to be sent as a turn's message text.
+pub fn stall_prompt(ms: u64) -> String {
+    format!("{STALL_MARKER}{ms}")
+}
+
+/// How long a request asked to be held, if it asked.
+fn stall_for(req: &str) -> Option<std::time::Duration> {
+    let after = req.split_once(STALL_MARKER)?.1;
+    let digits: String = after.chars().take_while(char::is_ascii_digit).collect();
+    digits.parse().ok().map(std::time::Duration::from_millis)
 }
 
 /// A model server whose first `fast.len()` requests get an instant response, and whose next request
