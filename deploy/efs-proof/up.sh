@@ -57,7 +57,7 @@ SEAL_B64=$(cat "$AI_AGENT_SEAL_KEY")
 if [ "${1:-}" = "--images" ]; then
   say "images"
   aws ecr get-login-password | docker login --username AWS --password-stdin "$ECR" >/dev/null
-  for r in fleetsim-agent fleetsim-driver; do
+  for r in fleetsim-agent fleetsim-driver fleetsim-socat; do
     aws ecr describe-repositories --repository-names "$r" >/dev/null 2>&1 \
       || aws ecr create-repository --repository-name "$r" --tags "Key=fleetsim,Value=efs-proof" >/dev/null
   done
@@ -65,6 +65,8 @@ if [ "${1:-}" = "--images" ]; then
   docker push "$ECR/fleetsim-agent:latest"
   docker build -f "$ROOT/Dockerfile.driver" -t "$ECR/fleetsim-driver:latest" "$ROOT"
   docker push "$ECR/fleetsim-driver:latest"
+  docker build -f "$ROOT/Dockerfile.driver" --target socat -t "$ECR/fleetsim-socat:latest" "$ROOT"
+  docker push "$ECR/fleetsim-socat:latest"
 fi
 
 say "iam"
@@ -92,6 +94,8 @@ cat > /tmp/fleetsim-driver-policy.json <<JSON
  {"Sid":"ReplicaLifecycle","Effect":"Allow",
   "Action":["ecs:StopTask","ecs:RunTask","ecs:DescribeTasks","ecs:ListTasks","ecs:ExecuteCommand","ecs:DescribeTaskDefinition"],
   "Resource":"*","Condition":{"ArnEquals":{"ecs:cluster":"arn:aws:ecs:$REGION:$ACCOUNT:cluster/$CLUSTER"}}},
+ {"Sid":"TagTasks","Effect":"Allow","Action":"ecs:TagResource",
+  "Resource":"arn:aws:ecs:$REGION:$ACCOUNT:task/$CLUSTER/*"},
  {"Sid":"PassTaskRoles","Effect":"Allow","Action":"iam:PassRole","Resource":[
    "arn:aws:iam::$ACCOUNT:role/fleetsimTaskExecutionRole",
    "arn:aws:iam::$ACCOUNT:role/fleetsimDriverTaskRole",
@@ -265,8 +269,8 @@ print(json.dumps({
     # — it describes every tenant on the replica, and the replica is reachable by tenants — so the
     # only way the driver can read it is a process inside the same network namespace, which is
     # exactly what an `awsvpc` sidecar is. This one forwards and does nothing else.
-    {"name": "metrics", "image": os.environ["ECR"] + "/fleetsim-driver:latest", "essential": False,
-     "entryPoint": ["socat"], "command": ["TCP-LISTEN:9091,fork,reuseaddr", "TCP:127.0.0.1:9090"],
+    {"name": "metrics", "image": os.environ["ECR"] + "/fleetsim-socat:latest", "essential": False,
+     "command": ["TCP-LISTEN:9091,fork,reuseaddr", "TCP:127.0.0.1:9090"],
      "logConfiguration": json.loads(os.environ["LOGS"])},
   ],
 }, indent=2))

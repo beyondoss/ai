@@ -96,6 +96,9 @@ async fn main() -> std::process::ExitCode {
         }
         "matrix" => run_matrix(kind, &args).await,
         "soak" => {
+            if let Err(code) = attach_if_asked(&args) {
+                return code;
+            }
             let secs = flag(&args, "--duration")
                 .and_then(|s| s.parse::<u64>().ok())
                 .unwrap_or(120);
@@ -260,7 +263,13 @@ fn attached_from(args: &[String]) -> Result<Option<scenarios::Attachment>, Strin
     }))
 }
 
-async fn run_matrix(kind: Kind, args: &[String]) -> std::process::ExitCode {
+/// Register the attached fleet, if `--substrate attached` asked for one.
+///
+/// Shared by `matrix` and `soak` rather than living in either: both build their fleets through
+/// `Fleet::start_against`, so both honour an attachment — and a soak that silently ran against a
+/// *local* substrate because only the matrix knew how to attach would be the most expensive kind of
+/// wrong answer, since it is the one that runs for an hour before saying anything.
+fn attach_if_asked(args: &[String]) -> Result<(), std::process::ExitCode> {
     match attached_from(args) {
         Ok(Some(spec)) => {
             println!(
@@ -270,12 +279,19 @@ async fn run_matrix(kind: Kind, args: &[String]) -> std::process::ExitCode {
                 spec.fault_cmd
             );
             scenarios::attach_to(spec);
+            Ok(())
         }
-        Ok(None) => {}
+        Ok(None) => Ok(()),
         Err(e) => {
             eprintln!("fleet-sim: {e}");
-            return std::process::ExitCode::from(2);
+            Err(std::process::ExitCode::from(2))
         }
+    }
+}
+
+async fn run_matrix(kind: Kind, args: &[String]) -> std::process::ExitCode {
+    if let Err(code) = attach_if_asked(args) {
+        return code;
     }
     let dir = match tempfile::tempdir() {
         Ok(d) => d,

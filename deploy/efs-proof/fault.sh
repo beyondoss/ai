@@ -106,13 +106,19 @@ case "$action" in
     # SIGKILL the agent itself. The wrapper shell (PID 1) then falls out of its wait loop and
     # exits, the essential container is gone, and ECS stops the task.
     #
-    # `-x` matches the process *name*, not the command line. `pgrep -f beyond-ai-agent` would also
-    # match the wrapper — the agent's command line is inside it — and picking the lowest pid from
-    # that is PID 1, which the kernel refuses to SIGKILL from inside its own namespace. The fault
-    # would then quietly do nothing and the scenario would report that a hard kill did not fence
-    # anybody, which is a claim about the design made out of a bad pattern.
-    aws ecs execute-command --cluster "$CLUSTER" --task "$arn" --container agent --interactive \
-      --command "/bin/sh -c 'kill -9 \$(pgrep -x beyond-ai-agent)'" >/dev/null 2>&1 || true
+    # Matched against `/proc/<pid>/comm` exactly, rather than with `pgrep`. `pgrep -f
+    # beyond-ai-agent` matches the wrapper shell too — the agent's command line is inside it — and
+    # on this image that is pids 1, 8 and 9, the first of which the kernel refuses to SIGKILL from
+    # inside its own namespace. BusyBox's `pgrep -x` matches nothing here at all. Either way the
+    # fault quietly does nothing and the scenario reports that a hard kill failed to fence anybody,
+    # which is a claim about the design made out of a bad pattern. `comm` is exact and is in every
+    # kernel, so it needs no tool to agree with.
+    # Bounded, because an `--interactive` session whose stdin is /dev/null does not always notice
+    # that it is over: the signal lands in milliseconds and the session then sat for twenty minutes.
+    # The kill is fire-and-check — `wait_stopped` below is what actually decides whether it worked —
+    # so cutting the session short costs nothing.
+    timeout 45 aws ecs execute-command --cluster "$CLUSTER" --task "$arn" --container agent --interactive \
+      --command "/bin/sh -c 'for p in /proc/[0-9]*; do [ \"\$(cat \$p/comm 2>/dev/null)\" = beyond-ai-agent ] && kill -9 \${p#/proc/}; done; true'" >/dev/null 2>&1 || true
     wait_stopped "$arn"
     ;;
 

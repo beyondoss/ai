@@ -66,8 +66,49 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     && cargo build --release --target "$target" -p beyond-ai-fleet-sim --bin fleet-sim \
     && cp "target/$target/release/fleet-sim" /usr/local/bin/fleet-sim
 
-FROM alpine:${ALPINE_VERSION} AS runtime
-RUN apk add --no-cache ca-certificates aws-cli bash curl jq coreutils socat
+# The metrics sidecar, in its own image. Nothing but socat, because it is pulled by every replica
+# task and the driver image below is ~400 MB of AWS CLI that a port forwarder has no use for.
+#
+#     docker build -f Dockerfile.driver --target socat -t fleetsim-socat .
+FROM alpine:${ALPINE_VERSION} AS socat
+RUN apk add --no-cache socat
+ENTRYPOINT ["socat"]
+
+# ---------------------------------------------------------------------------
+# The driver: Debian, not Alpine, and the reason is one binary.
+#
+# `aws ecs execute-command` needs the Session Manager plugin, which is how the `kill` fault gets a
+# SIGKILL into a replica — the only way to reach inside a Fargate task, since ECS has no
+# "signal this container" API and StopTask always sends SIGTERM first. AWS ships that plugin as a
+# `.deb` and an `.rpm` against glibc and publishes nothing for musl, so on Alpine the fault failed
+# with `SessionManagerPlugin is not found` — swallowed, because the call is best-effort, and
+# surfacing 250 s later as "r1 did not reach STOPPED".
+#
+# The alternative was to make `kill` mean something else (partition from storage, then StopTask),
+# which would have produced a replica that died without sealing — the right *outcome* — while no
+# longer being the same fault the local substrate performs with `kill -9`. A claim proved one way
+# on the homelab and another way here is two claims, so the image changes instead of the fault.
+#
+# `fleet-sim` is a static musl binary and does not care which libc is installed.
+# ---------------------------------------------------------------------------
+FROM debian:stable-slim AS runtime
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates curl unzip jq socat less \
+    && rm -rf /var/lib/apt/lists/*
+ARG TARGETARCH
+RUN set -eux; \
+    case "$TARGETARCH" in \
+      amd64) awscli=x86_64; plugin=64bit ;; \
+      arm64) awscli=aarch64; plugin=arm64 ;; \
+      *) echo "unsupported TARGETARCH=$TARGETARCH" >&2; exit 1 ;; \
+    esac; \
+    curl -sSL "https://awscli.amazonaws.com/awscli-exe-linux-${awscli}.zip" -o /tmp/awscli.zip; \
+    unzip -q /tmp/awscli.zip -d /tmp; /tmp/aws/install; \
+    curl -sSL "https://s3.amazonaws.com/session-manager-downloads/plugin/latest/ubuntu_${plugin}/session-manager-plugin.deb" \
+      -o /tmp/smp.deb; \
+    dpkg -i /tmp/smp.deb; \
+    rm -rf /tmp/awscli.zip /tmp/aws /tmp/smp.deb; \
+    aws --version; session-manager-plugin --version
 
 COPY --from=builder /usr/local/bin/fleet-sim /usr/local/bin/fleet-sim
 COPY deploy/efs-proof/fault.sh /usr/local/bin/fault.sh
