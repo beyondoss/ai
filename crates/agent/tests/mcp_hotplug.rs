@@ -71,7 +71,13 @@ fn set_mcp_enabled_changes_advertised_tools_and_model_request() {
     write_global_settings(&home, two_servers());
 
     let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
-    let (base, bodies) = spawn_model_server(vec![turn_text("one"), turn_text("two")]);
+    // Three, not two: a session's first successful run also makes a one-off title call
+    // (`Agent::title_for`), which consumes a scripted turn like any other model request.
+    let (base, bodies) = spawn_model_server(vec![
+        turn_text("one"),
+        turn_text("a title"),
+        turn_text("two"),
+    ]);
 
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
     let mut cmd = serve_cmd(bin, &base, &session_file);
@@ -195,12 +201,20 @@ fn set_mcp_enabled_changes_advertised_tools_and_model_request() {
     read_until_response(&mut stdout, "prompt");
 
     {
+        // The last request that carries a tool list, not a positional index: a session's first
+        // successful run also makes a one-off title call (`Agent::title_for`), which is a utility
+        // turn with **no tools**, so it is both unpredictably placed and never the request this
+        // assertion means.
         let recorded = bodies.lock().unwrap();
         assert!(recorded.len() >= 2);
+        let turn = recorded
+            .iter()
+            .rev()
+            .find(|r| r.contains("\"tools\""))
+            .expect("at least one request must advertise tools");
         assert!(
-            recorded[1].contains("mcp__beta__") && recorded[1].contains("mcp__alpha__"),
-            "re-enabling all must restore both servers in the model request: {}",
-            recorded[1]
+            turn.contains("mcp__beta__") && turn.contains("mcp__alpha__"),
+            "re-enabling all must restore both servers in the model request: {turn}"
         );
     }
 

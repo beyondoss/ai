@@ -2566,6 +2566,23 @@ impl Agent {
             compaction::format_file_operations(&read, &modified)
         ))
     }
+
+    /// A short name for this session, from its opening exchange — or `None` when the model declined
+    /// to name one or returned something unusable (see [`crate::session_title::clean_title`]).
+    ///
+    /// A **utility** turn, like the summarization calls above: it has no session to attach to, emits
+    /// no events, and its partial output on a mid-stream failure is discarded. The caller treats a
+    /// failure as "no title", never as a failed turn — a session that works without a name is worth
+    /// far more than one that refuses to start because a decoration could not be generated.
+    pub async fn title_for(
+        &self,
+        messages: &[Message],
+        cancel: &CancellationToken,
+    ) -> Result<Option<String>> {
+        let req = crate::session_title::session_title_request(&self.model, messages);
+        let turn = self.run_utility_turn(req, cancel).await?;
+        Ok(crate::session_title::clean_title(&turn_text(&turn)))
+    }
 }
 
 /// The concatenated text blocks of a summarization turn — a summary is always plain prose, so anything

@@ -36,6 +36,7 @@ pub mod message;
 pub mod mock;
 pub mod models;
 pub mod session;
+pub mod session_title;
 pub mod steering;
 pub mod tls;
 pub mod tool;

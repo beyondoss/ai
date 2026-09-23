@@ -90,11 +90,11 @@
 //!     session — `--session-id`, the daemon's `?session_id=` — keeps its own id instead of minting one,
 //!     archiving the outgoing conversation into a sibling session; see [`Persistence::new_session`]
 //!   - `{type:"list_sessions", query?}`  (repo mode) → `data: {sessions: [SessionMeta + updated_at/
-//!     message_count/preview/search_text…]}` (via `SessionMeta::to_listing_json` — those four fields are
+//!     message_count/preview…]}` (via `SessionMeta::to_listing_json` — those derived fields are
 //!     `#[serde(skip)]` on the struct itself), this project's sessions only (matched by the default
 //!     per-cwd directory, or whatever `--session-dir` points at). An optional `query` string filters and
 //!     ranks the result (`session_store::search_sessions` — case-insensitive substring match against
-//!     `title`/`id`/`preview`/`cwd`/`search_text`, in that priority order); omitted (or blank) returns
+//!     `title`/`id`/`preview`/`cwd`, in that priority order); omitted (or blank) returns
 //!     every session, recency-sorted, unchanged from before this existed. The underlying scan
 //!     (`SessionRepo::list_with_progress`) runs across a small worker pool rather than one file at a
 //!     time, and streams `list_progress` frames while it's in flight.
@@ -2609,6 +2609,15 @@ pub(crate) async fn serve_session(
     // [`open_persistence_blocking`].
     let (mut cfg, opened) = open_persistence_blocking(cfg).await;
     let (mut persistence, mut session) = opened?;
+
+    // The session whose title has already been attempted, so the attempt happens **at most once**
+    // rather than once per turn until it succeeds. `title.is_none()` alone cannot express that: a
+    // failed attempt leaves it `None`, so a model that reliably declines (or a gateway that is
+    // down) would charge an extra call on every turn, forever.
+    //
+    // Keyed by session id rather than a bool, so a `new_session`/`switch_session` becomes eligible
+    // again by construction — nothing has to remember to reset it.
+    let mut title_attempted_for: Option<String> = None;
     timing.mark("open persistence");
 
     // `--name`: only for a genuinely fresh session (no messages, no title yet) — a resumed session
@@ -4665,7 +4674,6 @@ pub(crate) async fn serve_session(
                                             "list_sessions" => {
                                                 let progress_id = cid.clone();
                                                 let progress_tx = out_tx.clone();
-                                                let query = c.get("query").and_then(Value::as_str);
                                                 let sessions = persistence
                                                     .list_with_progress(service.as_deref(), move |scanned, total| {
                                                         if should_report_scan_progress(scanned, total) {
@@ -4673,24 +4681,18 @@ pub(crate) async fn serve_session(
                                                         }
                                                     })
                                                     .await;
-                                                let sessions: Vec<Value> = search_sessions(sessions, query)
-                                                    .iter()
-                                                    .map(SessionMeta::to_listing_json)
-                                                    .collect();
-                                                let _ = out_tx.send(response(cid, "list_sessions", true, Some(json!({ "sessions": sessions })), None));
+                                                let _ = out_tx.send(response(cid, "list_sessions", true, Some(listing_page(sessions, &c)), None));
                                             }
                                             "list_all_sessions" => {
                                                 let progress_id = cid.clone();
                                                 let progress_tx = out_tx.clone();
-                                                let query = c.get("query").and_then(Value::as_str);
                                                 match persistence.list_all_with_progress(service.as_deref(), move |scanned, total| {
                                                     if should_report_scan_progress(scanned, total) {
                                                         let _ = progress_tx.send(list_progress_frame(progress_id.clone(), "list_all_sessions", scanned, total));
                                                     }
                                                 }).await {
                                                     Ok(sessions) => {
-                                                        let sessions: Vec<Value> = search_sessions(sessions, query).iter().map(SessionMeta::to_listing_json).collect();
-                                                        let _ = out_tx.send(response(cid, "list_all_sessions", true, Some(json!({ "sessions": sessions })), None));
+                                                        let _ = out_tx.send(response(cid, "list_all_sessions", true, Some(listing_page(sessions, &c)), None));
                                                     }
                                                     Err(e) => {
                                                         let _ = out_tx.send(response(cid, "list_all_sessions", false, None, Some(&e.to_string())));
@@ -5050,6 +5052,52 @@ pub(crate) async fn serve_session(
                     }
                 }
                 emit!(frame);
+
+                // Name the session, once, from the exchange that just happened.
+                //
+                // **After `emit!(frame)`**, deliberately: this is a second model call, and running
+                // it before the response would charge its latency to the client's first turn for a
+                // decoration. The `SessionNamed` lifecycle event is its own event rather than a
+                // field on the terminal one precisely so it can arrive a moment later without
+                // anything depending on the order.
+                //
+                // Only after a run that succeeded *and* persisted: a title describes what a session
+                // turned out to be about, and there is nothing to describe about a first turn that
+                // failed. Generated once and never regenerated — a session is about what it was
+                // opened for, and re-titling it later would make it change names underneath whoever
+                // was looking for it.
+                //
+                // Best-effort at every step. A session that works without a name is worth more than
+                // one that fails because a decoration could not be generated, so a model error, a
+                // refusal, or an unusable reply all leave the title exactly as it was: absent.
+                // No store means `set_title` is a no-op, so the call could only ever be waste.
+                if persistence.store.is_some()
+                    && matches!(result, Ok(()))
+                    && persist_error.is_none()
+                    && persistence.meta.title.is_none()
+                    && title_attempted_for.as_deref() != Some(persistence.meta.id.as_str())
+                    && !session.messages.is_empty()
+                {
+                    title_attempted_for = Some(persistence.meta.id.clone());
+                    match agent.title_for(&session.messages, &cancel).await {
+                        Ok(Some(title)) => {
+                            if let Err(e) = persistence.set_title(&title) {
+                                eprintln!(
+                                    "serve: could not persist the generated session title: {e}"
+                                );
+                            }
+                            // Announced whether or not it persisted: the consumer's catalog is a
+                            // separate copy, and a title that reached one of the two is better than
+                            // a title that reached neither.
+                            if let Some(life) = &life {
+                                life.named(title);
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(e) => eprintln!("serve: could not generate a session title: {e}"),
+                    }
+                }
+
                 if running.swap(false, Ordering::Relaxed)
                     && let Some(m) = &cfg.metrics
                 {
@@ -5472,7 +5520,6 @@ pub(crate) async fn serve_session(
             "list_sessions" => {
                 let progress_id = id.clone();
                 let progress_tx = out_tx.clone();
-                let query = cmd.get("query").and_then(Value::as_str);
                 let sessions = persistence
                     .list_with_progress(service.as_deref(), move |scanned, total| {
                         if should_report_scan_progress(scanned, total) {
@@ -5485,22 +5532,17 @@ pub(crate) async fn serve_session(
                         }
                     })
                     .await;
-                let sessions: Vec<Value> = search_sessions(sessions, query)
-                    .iter()
-                    .map(SessionMeta::to_listing_json)
-                    .collect();
                 emit!(response(
                     id,
                     "list_sessions",
                     true,
-                    Some(json!({ "sessions": sessions })),
+                    Some(listing_page(sessions, &cmd)),
                     None,
                 ));
             }
             "list_all_sessions" => {
                 let progress_id = id.clone();
                 let progress_tx = out_tx.clone();
-                let query = cmd.get("query").and_then(Value::as_str);
                 match persistence
                     .list_all_with_progress(service.as_deref(), move |scanned, total| {
                         if should_report_scan_progress(scanned, total) {
@@ -5515,15 +5557,11 @@ pub(crate) async fn serve_session(
                     .await
                 {
                     Ok(sessions) => {
-                        let sessions: Vec<Value> = search_sessions(sessions, query)
-                            .iter()
-                            .map(SessionMeta::to_listing_json)
-                            .collect();
                         emit!(response(
                             id,
                             "list_all_sessions",
                             true,
-                            Some(json!({ "sessions": sessions })),
+                            Some(listing_page(sessions, &cmd)),
                             None,
                         ));
                     }
@@ -10037,6 +10075,46 @@ fn login_progress_frame(
         m.insert("message".into(), json!(message));
     }
     Value::Object(m).into()
+}
+
+/// A listing's default page size, when the caller does not ask for one.
+const DEFAULT_LIST_LIMIT: usize = 50;
+/// The most a caller can ask for in one page, whatever it passes.
+const MAX_LIST_LIMIT: usize = 500;
+
+/// The `data` payload of a listing response: `query` applied, then **one page** of the result.
+///
+/// Shared by the four listing arms (`list_sessions`/`list_all_sessions`, idle and busy) so the
+/// paging rule is stated once rather than four times.
+///
+/// **A listing is always paged.** It used to be unbounded in cardinality *and* each entry carried up
+/// to 50 KB of that session's conversation text, so a single call asked a replica to build the
+/// tenant's whole transcript set in memory and write it to one frame — and in service mode the
+/// caller is a tenant holding one session's grant. `limit` defaults to [`DEFAULT_LIST_LIMIT`] and is
+/// capped at [`MAX_LIST_LIMIT`]; an explicit `0` is clamped to 1, since a page of nothing is never
+/// what a caller meant. `total` is the size of the match set *before* paging, so a client can page
+/// without guessing when to stop.
+///
+/// This bounds the **response**, not the scan: every session is still stat'd to build the match set
+/// (cheap against the warm listing index, and the reason that index exists). Bounding the scan means
+/// an index that can seek, which is a catalog — see `crates/agent/FLEET.md`.
+fn listing_page(sessions: Vec<SessionMeta>, cmd: &Value) -> Value {
+    let matched = search_sessions(sessions, cmd.get("query").and_then(Value::as_str));
+    let total = matched.len();
+    let offset = cmd.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize;
+    let limit = cmd
+        .get("limit")
+        .and_then(Value::as_u64)
+        .map_or(DEFAULT_LIST_LIMIT, |n| {
+            (n as usize).clamp(1, MAX_LIST_LIMIT)
+        });
+    let page: Vec<Value> = matched
+        .iter()
+        .skip(offset)
+        .take(limit)
+        .map(SessionMeta::to_listing_json)
+        .collect();
+    json!({ "sessions": page, "total": total })
 }
 
 /// Build a `list_progress` frame — an unsolicited progress update for an in-flight `list_sessions`/

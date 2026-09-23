@@ -173,9 +173,29 @@ conservative. The 3,700 figure extrapolates a memory slope measured across a 15-
 
 **The unquantified one:** sessions live at `<shard>/<tenant>/sessions/<id>/`, and `list_sessions`
 scans that directory. Nobody has measured `readdir` on a tenant with 100k sessions on a network
-filesystem. That is the real ceiling on _stored_ sessions per tenant, and it is why the session
-catalog is flagged in ARCHITECTURE.md's contract ledger as possibly belonging to the control plane
-instead.
+filesystem. That is the real ceiling on _stored_ sessions per tenant.
+
+A listing's **response** is bounded — `limit` defaults to 50 and caps at 500, and entries carry
+metadata rather than the transcript — so the failure mode is a slow listing rather than a replica
+building a tenant's whole session set in memory. The **scan** is not bounded, and cannot be by
+anything the agent holds: bounding it needs an index that can seek to a page, which is a catalog.
+
+### The session catalog belongs to the control plane
+
+This is the one contract-ledger row that was open, and it is now decided: **the control plane owns
+it.** It mints every session id, so it already knows the tenant, shard and creation time of every
+session that exists, and it consumes the lifecycle events this repo already emits, so it knows every
+run's timing and outcome. Filtering, sorting, paging, facets and search at scale are a database it
+can build today, and doing any of it in the agent means the agent scanning a network filesystem to
+answer a catalog query.
+
+The one piece it cannot assemble on its own is the **title** — that is derived from conversation
+content, and nothing outside the replica holds both the transcript and the tenant's key. So the
+agent generates it and announces it on the `session_named` lifecycle event, once per session. See
+ARCHITECTURE.md, "Session titles".
+
+What the agent keeps is a bounded, recency-ordered listing with substring matching over
+`title`/`id`/`preview`/`cwd` — a picker for a client that already holds a grant, not a catalog.
 
 ### The number that should actually decide your replica size
 
