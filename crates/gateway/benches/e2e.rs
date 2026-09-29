@@ -37,18 +37,24 @@ const AUTO_BODY: &str = r#"{"model":"gpt-4o-mini","messages":[{"role":"user","co
 /// unchanged, no verify/deny/swap). The mock upstream accepts any token.
 const BYO_KEY: &str = "sk-byo-provider-token-1234567890";
 
-/// A realistically-sized chat body (~64 KiB of message content, `model` last so a structural scan
-/// must walk the whole thing). `MANAGED_BODY` is 60 bytes, which makes every body-proportional cost
-/// in the request path invisible — the same blind spot that hid the response-side findings.
+/// A realistically-sized chat body (`model` last so a structural scan must walk the whole thing).
+/// `MANAGED_BODY` is 60 bytes, which makes every body-proportional cost in the request path
+/// invisible — the same blind spot that hid the response-side findings.
+///
+/// Content is 60 KiB, not 64. The JSON wrapper puts a 64 KiB pad a few dozen bytes past pingora's
+/// retry buffer (`BODY_PEEK_LIMIT`). `model` then sits inside that one read, the scanner finds it,
+/// and the buffer is both truncated and fully consumed — pingora will not send the attempt, and
+/// the client gets 502. That is not the latency this row exists to measure. Staying under the cap
+/// keeps `model` visible to the peek and the body replayable.
 fn large_body() -> String {
-    let content = "x".repeat(64 * 1024);
+    let content = "x".repeat(60 * 1024);
     format!(r#"{{"messages":[{{"role":"user","content":"{content}"}}],"model":"gpt-4o"}}"#)
 }
 
 /// The `large_body` shape on the model route: same size, `model` named as the catalog row so the
 /// rewrite path runs. This is where `/auto`'s whole-body buffering has to show up if anywhere.
 fn large_auto_body() -> String {
-    let content = "x".repeat(64 * 1024);
+    let content = "x".repeat(60 * 1024);
     format!(r#"{{"messages":[{{"role":"user","content":"{content}"}}],"model":"gpt-4o-mini"}}"#)
 }
 

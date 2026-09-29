@@ -32,6 +32,33 @@ fn main() {
     divan::main();
 }
 
+/// One process-wide registry for every bench that touches metrics.
+///
+/// `Metrics::new` registers on the default registry, which rejects a second registration. `admin`
+/// and `reject` each used to build their own, so a full `divan` run — `admin` is alphabetical,
+/// so it always goes first — panicked in `reject` with "registered once". The provider child
+/// series are materialised here too: that cross-product is what makes a scrape body tens of KiB
+/// from the first sample, and it has to happen exactly once regardless of which module runs first.
+fn bench_metrics() -> &'static std::sync::Arc<beyond_ai::metrics::Metrics> {
+    use std::sync::{Arc, OnceLock};
+
+    use beyond_ai::metrics::{Metrics, ProviderMetrics};
+
+    static M: OnceLock<Arc<Metrics>> = OnceLock::new();
+    M.get_or_init(|| {
+        let m = Metrics::new().expect("register metrics once");
+        for spec in beyond_ai::route::known_providers() {
+            let pm = ProviderMetrics::resolve(&m, spec.name);
+            // Non-zero observations so the histogram buckets encode realistic values, not zeros.
+            pm.ttft_seconds.observe(0.42);
+            pm.upstream_latency_seconds.observe(3.5);
+            pm.record_response(200);
+            pm.record_response(429);
+        }
+        m
+    })
+}
+
 mod key {
     use super::*;
     use beyond_ai::key::{Keyring, VirtualKey, mint, mint_v2};
@@ -75,28 +102,9 @@ mod key {
 mod admin {
     use super::*;
     use beyond_ai::admin::{AdminApp, HEALTH_OK};
-    use beyond_ai::metrics::{Metrics, ProviderMetrics};
-    use std::sync::{Arc, OnceLock};
 
-    /// Register the real metric set **and** materialise every per-provider child series, exactly as
-    /// boot does (`state::build_providers` → `ProviderMetrics::resolve`) — that cross-product is what
-    /// makes a scrape body tens of KiB from process start rather than a few KiB. `Metrics::new`
-    /// registers on the process-wide default registry, which rejects a second registration, so it is
-    /// built once behind a `OnceLock` (same shape as `state.rs`'s test fixture).
-    fn registry() -> &'static Arc<Metrics> {
-        static M: OnceLock<Arc<Metrics>> = OnceLock::new();
-        M.get_or_init(|| {
-            let m = Metrics::new().expect("register metrics once");
-            for spec in beyond_ai::route::known_providers() {
-                let pm = ProviderMetrics::resolve(&m, spec.name);
-                // Non-zero observations so the histogram buckets encode realistic values, not zeros.
-                pm.ttft_seconds.observe(0.42);
-                pm.upstream_latency_seconds.observe(3.5);
-                pm.record_response(200);
-                pm.record_response(429);
-            }
-            m
-        })
+    fn registry() -> &'static std::sync::Arc<beyond_ai::metrics::Metrics> {
+        bench_metrics()
     }
 
     /// `/metrics`: gather the default registry and text-encode it. The `BytesCount` reports the real
@@ -121,14 +129,11 @@ mod admin {
 
 mod reject {
     use super::*;
-    use beyond_ai::metrics::{Metrics, Rejection};
+    use beyond_ai::metrics::Rejection;
     use beyond_ai::proxy::{REJECT_BODIES, error_body};
-    use std::sync::{Arc, OnceLock};
 
-    fn metrics() -> &'static Arc<Metrics> {
-        static M: OnceLock<Arc<Metrics>> = OnceLock::new();
-        // May already be registered by another bench module in the same process.
-        M.get_or_init(|| Metrics::new().unwrap_or_else(|_| unreachable!("registered once")))
+    fn metrics() -> &'static std::sync::Arc<beyond_ai::metrics::Metrics> {
+        bench_metrics()
     }
 
     /// The rejection response body. This is the flood path: `ratelimit`'s whole reason for existing
@@ -336,18 +341,13 @@ mod resp_tail {
 mod state {
     use super::*;
     use beyond_ai::config::AiConfig;
-    use beyond_ai::metrics::Metrics;
     use beyond_ai::state::GatewayState;
     use std::sync::{Arc, OnceLock};
 
     fn state() -> &'static Arc<GatewayState> {
         static S: OnceLock<Arc<GatewayState>> = OnceLock::new();
         S.get_or_init(|| {
-            static M: OnceLock<Arc<Metrics>> = OnceLock::new();
-            let m = M
-                .get_or_init(|| Metrics::new().expect("register metrics once"))
-                .clone();
-            GatewayState::new(AiConfig::default(), m).expect("build state")
+            GatewayState::new(AiConfig::default(), bench_metrics().clone()).expect("build state")
         })
     }
 
