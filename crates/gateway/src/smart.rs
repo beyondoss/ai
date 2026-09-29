@@ -39,6 +39,9 @@ pub(crate) const PROBE_EVERY: u64 = 8;
 /// retried without an operator flipping a header.
 const STALE: Duration = Duration::from_secs(30);
 
+/// [`STALE`] in nanoseconds, so a rank does not re-convert it once per candidate.
+const STALE_NS: u128 = STALE.as_nanos();
+
 /// Cap on a stored sample. Matches the top [`crate::metrics`] TTFT bucket.
 const MAX_US: u64 = 30_000_000;
 
@@ -119,20 +122,26 @@ impl Router {
         let Some(row) = self.row(route) else {
             return walk;
         };
+        // One clock read for every candidate. `effective` used to call `now_ns` itself, so a
+        // row with three arms took three vDSO reads to answer one ranking.
+        let now = now_ns();
         if seed != 0 && seed.is_multiple_of(PROBE_EVERY) {
-            return probe(walk, |orig| self.effective(row, orig));
+            return probe(walk, |orig| self.effective(row, orig, now));
         }
-        sort_measured(walk, |orig| self.effective(row, orig))
+        sort_measured(walk, |orig| self.effective(row, orig, now))
     }
 
     fn row(&self, route: &ModelRoute) -> Option<&Row> {
+        // Name search, not the row's address. `MODEL_ROUTES` is a `const` slice, so each use
+        // site can hold its own copy — pointer arithmetic against `as_ptr()` does not land on
+        // the `&'static` row `for_model` returned.
         let i = MODEL_ROUTES
             .binary_search_by(|r| r.model.cmp(route.model))
             .ok()?;
         self.rows.get(i)
     }
 
-    fn effective(&self, row: &Row, catalog_idx: u8) -> u64 {
+    fn effective(&self, row: &Row, catalog_idx: u8, now: u64) -> u64 {
         let i = usize::from(catalog_idx);
         if i >= MAX_CANDIDATES {
             return 0;
@@ -142,7 +151,7 @@ impl Router {
             return 0;
         }
         let last = row.last_ns[i].load(Ordering::Relaxed);
-        if last != 0 && u128::from(now_ns().saturating_sub(last)) > STALE.as_nanos() {
+        if last != 0 && u128::from(now.saturating_sub(last)) > STALE_NS {
             return 0;
         }
         ewma
@@ -297,5 +306,21 @@ mod tests {
         r.observe(row, 0, 200_000, true);
         let walk = r.rank(Walk::identity(row.candidates.len()), row, 0);
         assert_eq!(names(walk, row), ["anthropic", "bedrock", "openrouter"]);
+    }
+
+    #[test]
+    fn a_route_outside_the_catalog_slice_is_not_ranked() {
+        // A name the catalog does not have has no EWMA cells. Ranking leaves the walk alone.
+        let r = Router::new();
+        let route = ModelRoute {
+            model: "not-a-catalog-row",
+            wire: providers::WireFormat::OpenAi,
+            candidates: &[],
+            responses: &[],
+        };
+        let walk = Walk::identity(3);
+        let ranked = r.rank(walk, &route, 1);
+        assert_eq!(ranked.indices, walk.indices);
+        assert_eq!(ranked.len, walk.len);
     }
 }

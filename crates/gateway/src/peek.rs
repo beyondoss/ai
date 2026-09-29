@@ -79,6 +79,15 @@ impl ModelScanner {
         self.model.take()
     }
 
+    /// Whether the scan has already closed a root `model` value.
+    ///
+    /// Further [`Self::feed`] calls are no-ops once this is set. Callers that only need to
+    /// know *whether* to stop reading — the catalog peek, which may still have to drain a
+    /// small body — check this instead of re-walking bytes already fed.
+    pub fn found(&self) -> bool {
+        self.done
+    }
+
     /// Whether the current depth is one whose keys we inspect: the root object always, plus the
     /// object under a root `message` key when [`Self::for_response`] enabled it.
     #[inline]
@@ -512,6 +521,23 @@ mod tests {
         let mut s = ModelScanner::new();
         s.feed(body);
         s.take_model()
+    }
+
+    #[test]
+    fn found_flips_only_when_the_model_value_closes() {
+        let body = br#"{"messages":[{"content":"hello"}],"model":"gpt-4o"}"#;
+        let at = body
+            .windows(7)
+            .position(|w| w == b"\"model\"")
+            .expect("fixture has a model key");
+        let mut s = ModelScanner::new();
+        s.feed(&body[..at]);
+        assert!(!s.found(), "the value has not closed yet");
+        s.feed(&body[at..]);
+        assert!(s.found());
+        assert_eq!(s.take_model().as_deref(), Some("gpt-4o"));
+        // `done` stays set: a later feed must stay a no-op even after the string is taken.
+        assert!(s.found());
     }
 
     fn scan_response(body: &[u8]) -> Option<String> {

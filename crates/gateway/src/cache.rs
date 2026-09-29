@@ -20,9 +20,18 @@ use crate::usage::Usage;
 use bytes::Bytes;
 use pingora::http::RequestHeader;
 use std::collections::{HashMap, VecDeque};
-use std::hash::Hasher;
-use std::sync::Mutex;
+use std::hash::{BuildHasher, Hasher};
+use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
+
+/// Process-secret ahash state for [`key`].
+///
+/// `std`'s `DefaultHasher::new()` is SipHash-1-3 keyed with zeros. The fingerprint covers the
+/// whole pre-rewrite body (up to the 64 KiB peek), twice, on the lookup that sits in front of
+/// `upstream_peer`. ahash is already in the build for the rate limiter; a per-process secret
+/// keeps a crafted same-tenant collision from being precomputed offline. The table still hashes
+/// `CacheKey` with `HashMap`'s own `RandomState`.
+static KEY_HASHER: LazyLock<ahash::RandomState> = LazyLock::new(ahash::RandomState::new);
 
 /// 128-bit fingerprint of `(tenant_id, inbound path, pre-rewrite body, candidate provider ids)`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -96,20 +105,20 @@ impl ResponseTap {
 /// `providers` is the effective catalog-walk order (`ProviderId::index` bytes) so split/order
 /// cache per arm instead of pinning both to the first fill.
 pub fn key(tenant_id: u64, inbound_path: &str, body: &[u8], providers: &[u8]) -> CacheKey {
-    fn sip(seed: u8, tenant_id: u64, path: &str, body: &[u8], providers: &[u8]) -> u64 {
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        h.write(&[seed]);
-        h.write(&tenant_id.to_le_bytes());
-        h.write(&(path.len() as u64).to_le_bytes());
+    fn mix(seed: u64, tenant_id: u64, path: &str, body: &[u8], providers: &[u8]) -> u64 {
+        let mut h = KEY_HASHER.build_hasher();
+        h.write_u64(seed);
+        h.write_u64(tenant_id);
+        h.write_u64(path.len() as u64);
         h.write(path.as_bytes());
-        h.write(&(body.len() as u64).to_le_bytes());
+        h.write_u64(body.len() as u64);
         h.write(body);
-        h.write(&(providers.len() as u64).to_le_bytes());
+        h.write_u64(providers.len() as u64);
         h.write(providers);
         h.finish()
     }
-    let a = sip(0, tenant_id, inbound_path, body, providers).to_le_bytes();
-    let b = sip(1, tenant_id, inbound_path, body, providers).to_le_bytes();
+    let a = mix(0, tenant_id, inbound_path, body, providers).to_le_bytes();
+    let b = mix(1, tenant_id, inbound_path, body, providers).to_le_bytes();
     let mut out = [0u8; 16];
     out[..8].copy_from_slice(&a);
     out[8..].copy_from_slice(&b);
@@ -149,22 +158,32 @@ struct Inner {
 }
 
 impl Inner {
+    /// Drop `key` from the map and, only when it was present, from the insertion order.
+    ///
+    /// A fill of a key the table has never seen — the common miss — used to walk the whole
+    /// order deque to confirm the absence the map already reports. The scan stays for a
+    /// refresh, which has to move that one entry to the back.
     fn remove_key(&mut self, key: &CacheKey) {
-        self.map.remove(key);
+        if self.map.remove(key).is_none() {
+            return;
+        }
         if let Some(i) = self.order.iter().position(|k| k == key) {
             self.order.remove(i);
         }
     }
 
+    /// Drop the expired prefix.
+    ///
+    /// One TTL means insertion order is expiry order, including after a refresh (that key is
+    /// removed and pushed back). The first entry that is still live proves every later entry
+    /// is too, so a fill does not walk the live suffix under the mutex.
     fn evict_expired(&mut self, now: Instant) {
-        let mut i = 0;
-        while i < self.order.len() {
-            let k = self.order[i];
+        while let Some(k) = self.order.front().copied() {
             match self.map.get(&k) {
-                Some(s) if s.expires_at > now => i += 1,
-                Some(_) | None => {
+                Some(s) if s.expires_at > now => break,
+                _ => {
+                    self.order.pop_front();
                     self.map.remove(&k);
-                    self.order.remove(i);
                 }
             }
         }
@@ -352,6 +371,38 @@ mod tests {
         assert!(c.get(&k1).is_none(), "oldest of 3 into a 2-slot store");
         assert_eq!(c.get(&k2).unwrap().body.as_ref(), b"2");
         assert_eq!(c.get(&k3).unwrap().body.as_ref(), b"3");
+    }
+
+    #[test]
+    fn refreshing_a_key_moves_it_behind_older_entries() {
+        // A re-fill must not stay at the front of the order, or the next insert evicts the
+        // entry that was just written and keeps the one that is about to go stale.
+        let c = ResponseCache::new(Duration::from_secs(60), 2, 1024);
+        let k1 = key(1, "/v1", b"a", &[]);
+        let k2 = key(1, "/v1", b"b", &[]);
+        let k3 = key(1, "/v1", b"c", &[]);
+        c.insert(k1, entry(b"1"));
+        c.insert(k2, entry(b"2"));
+        c.insert(k1, entry(b"1b"));
+        c.insert(k3, entry(b"3"));
+        assert_eq!(c.get(&k1).unwrap().body.as_ref(), b"1b");
+        assert!(c.get(&k2).is_none(), "the unrefreshed key is the oldest");
+        assert_eq!(c.get(&k3).unwrap().body.as_ref(), b"3");
+    }
+
+    #[test]
+    fn insert_drops_an_expired_prefix_without_evicting_a_newer_live_entry() {
+        let c = ResponseCache::new(Duration::from_millis(40), 2, 1024);
+        let k1 = key(1, "/v1", b"a", &[]);
+        let k2 = key(1, "/v1", b"b", &[]);
+        c.insert(k1, entry(b"old"));
+        std::thread::sleep(Duration::from_millis(50));
+        c.insert(k2, entry(b"new"));
+        let k3 = key(1, "/v1", b"c", &[]);
+        c.insert(k3, entry(b"newer"));
+        assert!(c.get(&k1).is_none());
+        assert_eq!(c.get(&k2).unwrap().body.as_ref(), b"new");
+        assert_eq!(c.get(&k3).unwrap().body.as_ref(), b"newer");
     }
 
     #[test]
