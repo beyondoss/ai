@@ -309,11 +309,46 @@ impl<'a> Iterator for SseLines<'a> {
     }
 }
 
+/// Iterate SSE lines newest-first, split on `\n` with `memrchr`.
+///
+/// `slice::rsplit` is `rposition` of a closure, a scalar walk. The forward iterator was already
+/// switched to `memchr` for that reason (17.6 µs vs 2.65 µs over a 64 KiB tail). OpenAI's usage
+/// parser is the one that walks **backwards**, and the no-usage tail — the case that cannot stop
+/// early — was still on the scalar path.
+///
+/// A trailing `\n` yields an empty element first, matching `rsplit`. [`strip_sse_data`] rejects
+/// that element, so the payload sequence is the same.
+struct SseLinesRev<'a> {
+    rest: &'a [u8],
+}
+
+fn sse_lines_rev(sse: &[u8]) -> SseLinesRev<'_> {
+    SseLinesRev { rest: sse }
+}
+
+impl<'a> Iterator for SseLinesRev<'a> {
+    type Item = &'a [u8];
+
+    fn next(&mut self) -> Option<&'a [u8]> {
+        if self.rest.is_empty() {
+            return None;
+        }
+        match memchr::memrchr(b'\n', self.rest) {
+            Some(i) => {
+                let line = &self.rest[i + 1..];
+                self.rest = &self.rest[..i];
+                Some(line)
+            }
+            None => Some(std::mem::take(&mut self.rest)),
+        }
+    }
+}
+
 /// Iterate the raw JSON payloads carried on `data:` lines, **newest first**. Used by the dialects
 /// whose answer is "the last usage block wins", so they can stop at the first hit instead of parsing
 /// every line to overwrite the result.
 fn sse_data_lines_rev(sse: &[u8]) -> impl Iterator<Item = &[u8]> {
-    sse.rsplit(|&b| b == b'\n').filter_map(strip_sse_data)
+    sse_lines_rev(sse).filter_map(strip_sse_data)
 }
 
 /// Whether a line could possibly carry a usage block.
@@ -757,6 +792,17 @@ mod tests {
                 via_split,
                 via_memchr,
                 "line iteration diverged for {:?}",
+                String::from_utf8_lossy(body)
+            );
+            let via_rsplit: Vec<&[u8]> = body
+                .rsplit(|&b| b == b'\n')
+                .filter_map(strip_sse_data)
+                .collect();
+            let via_memrchr: Vec<&[u8]> = sse_lines_rev(body).filter_map(strip_sse_data).collect();
+            assert_eq!(
+                via_rsplit,
+                via_memrchr,
+                "reverse line iteration diverged for {:?}",
                 String::from_utf8_lossy(body)
             );
         }

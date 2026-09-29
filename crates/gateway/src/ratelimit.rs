@@ -424,8 +424,8 @@ impl RateLimit {
     /// `check`, with the clock supplied by the caller.
     ///
     /// `request_filter` already takes an `Instant::now()` at the top of every request for its
-    /// latency histogram; handing that same reading in makes the limiter's clock read free instead
-    /// of duplicating a vDSO `clock_gettime`. It is also what makes the window boundaries testable:
+    /// latency histogram and passes that same reading in, so the limiter does not take a second
+    /// vDSO `clock_gettime`. It is also what makes the window boundaries testable:
     /// a test pins `now` and gets a deterministic window rather than sleeping for one.
     #[must_use = "the throttle decision must be enforced — dropping it charges the request but lets it through"]
     pub fn check_at(&self, raw_credential: &str, managed: bool, now: Instant) -> Option<Throttled> {

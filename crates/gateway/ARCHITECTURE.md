@@ -236,9 +236,11 @@ from `attempt_start` the same way `ai_ttft_seconds` is. Cold start (no samples) 
 order. A connect failure or 5xx takes a penalty floor so a fast error does not outrank a slower 2xx;
 a 429 is a real answer. Unmeasured arms stay failover until a deterministic probe (every 8th
 request, skipping seq `0`) promotes one. A sample older than 30s is treated as unmeasured so a
-recovered arm is retried. `smart_router = false` restores static catalog order. Samples never leave
-the pod — `ai_smart_rank_scope{kind="process"}=1` is the honesty metric; this is not fleet-wide
-smart routing. `x-beyond-split` is the only cross-replica pin (hash of the request counter).
+recovered arm is retried. Ranking reads the monotonic clock once per request and reuses that
+instant for every candidate's staleness check. `smart_router = false`
+restores static catalog order. Samples never leave the pod —
+`ai_smart_rank_scope{kind="process"}=1` is the honesty metric; this is not fleet-wide smart
+routing. `x-beyond-split` is the only cross-replica pin (hash of the request counter).
 
 A managed request may also permute that list with headers, still on the same wire, without adding a
 provider the row does not already name (`ProviderSpec::name` on that row). Parsed in `control.rs`,
@@ -302,7 +304,10 @@ The name can live in the body because the gateway peeks it itself: pingora's 64 
 enabled, at most that many bytes are read, and — if the buffer truncated — the prefix is prepended
 in `request_body_filter`. Untruncated peeks are replayed by pingora. Draining the body in
 `request_filter` and leaving Pingora with an empty forward hangs the upstream; that is why the peek
-replays rather than consuming.
+replays rather than consuming. The peek feeds each new chunk to `ModelScanner` once and stops when
+the value closes (unless a cache hash or a Responses session field still needs the rest of a small
+body). It does not re-walk the accumulated prefix: a `model` placed after a long prompt, arriving
+in small reads, used to rescan every earlier byte on every chunk.
 
 Three things differ from the provider-routed path, all consequences of the client no longer naming
 the provider:
@@ -440,7 +445,9 @@ Missing or zero usage fields deserialize to zero (safe default) — **except** `
 all, distinct from `Some(0)` when it reported a real zero; that distinction is unrecoverable once the
 request completes, so it's never collapsed to a bare zero. If the tail is truncated by the compaction
 drain, the usage chunk is still present because SSE usage is always the final `data:` line and the
-tail keeps the last 64KB.
+tail keeps the last 64KB. OpenAI's parser walks those lines backwards and stops at the first usage
+block; the split is `memrchr`, the same reason the forward Anthropic walk uses `memchr` — a tail
+with no usage block still has to scan all 64 KiB.
 
 **Dialect-mismatch guard:** a config-added provider whose `provider_dialects` value doesn't match its
 actual wire (e.g. an Anthropic-wire vendor left at the default OpenAI dialect) would otherwise have
@@ -579,11 +586,13 @@ the miss path: a miss is always the unbuffered upstream relay. `ai_cache_scope{k
 is the honesty metric; do not alert as if a shared cache were in front of the providers.
 
 **The key is the client request plus the walk, not the upstream attempt.** Hash of the pre-rewrite
-body + inbound path + `tenant_id` + the effective candidate order (`ProviderId` indices). Not the
-pool key, not the serving candidate, not the raw virtual key: a 429 that walks to a second key and
-then 200s is still one client request and is stored under that request's body hash. Split/order
-permute the walk, so each arm is its own cache entry rather than pinning A/B traffic to whichever
-provider filled first. Tenants cannot read each other's entries.
+body + inbound path + `tenant_id` + the effective candidate order (`ProviderId` indices). Two ahash
+passes with a process-secret key — not `DefaultHasher`, which is SipHash-1-3 with zero keys, run
+over the whole body on the lookup in front of `upstream_peer`. Not the pool key, not the serving
+candidate, not the raw virtual key: a 429 that walks to a second key and then 200s is still one
+client request and is stored under that request's body hash. Split/order permute the walk, so each
+arm is its own cache entry rather than pinning A/B traffic to whichever provider filled first.
+Tenants cannot read each other's entries.
 
 **Lookup only where the body is already in hand** before `upstream_peer` — the headerless managed
 catalog walk on `/v1` and `/auto`, the same peek that resolves `model`. BYO and `/{provider}`
@@ -599,7 +608,9 @@ carries `cache_hit` and the tokens stored on the fill, and `ai_cache_hits_total`
 as payload capture. Insert only on a complete 2xx. Client abort, 4xx/5xx, and truncation (the tap
 hit `cache_max_bytes`) are all skips: serving a cut or error body as a cached 2xx would be a silent
 wrong answer. Cache errors never fail the request: a poisoned lock is recovered, a full store
-evicts the oldest insertion, an oversized body is dropped.
+evicts the oldest insertion, an oversized body is dropped. One TTL means insertion order is expiry
+order, so a fill drops only the expired prefix and does not scan the live entries to learn that a
+new key is absent. Refreshing a key moves it to the back.
 
 `x-beyond-cache: off` or `Cache-Control: no-store` skips lookup **and** store. `x-beyond-cache: on`
 cannot turn a disabled cache on; `cache_ttl_secs = 0` is the operator's off switch.
@@ -626,7 +637,8 @@ reset timestamp from an independently-taken clock reading, which underflows when
 inverted by a stall — a panicking worker under the workspace's `overflow-checks`, reproduced in
 seconds under oversubscribed threads. The local `WindowedRate` keeps the same red/blue rotation but
 compares monotonic window _indices_ instead, so there is nothing to underflow. Both tiers take the
-window index from one clock reading per request (`RateLimit::check_at`).
+window index from one clock reading per request (`RateLimit::check_at`). `request_filter` passes
+the `Instant` it already took at admission, so the limiter does not read the clock again.
 
 The per-credential tier is keyed on the **raw presented credential** (not the verified tenant),
 which has two consequences: (1) the guard sits ahead of verify, so forged tokens are rejected

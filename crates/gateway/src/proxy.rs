@@ -937,8 +937,15 @@ struct BodyPeek {
 }
 
 /// Enable pingora's 64 KiB retry buffer, read until a root `model` appears, the body ends, or the
-/// cap is hit, then scan once. Boxed at the call site so this I/O is not inlined into
-/// `request_filter`'s future.
+/// cap is hit. Boxed at the call site so this I/O is not inlined into `request_filter`'s future.
+///
+/// The model is found by feeding each *new* chunk to [`peek::ModelScanner`] once. Re-running
+/// [`peek::scan_buffered`] on the accumulated prefix after every read re-walked every earlier
+/// byte — quadratic in the number of chunks when `model` sits after a long prompt, which is the
+/// case the streaming scanner exists to make linear. `reserve` is the caller's content-length
+/// when the whole body will be drained (a cache hash or a Responses session field); the
+/// stop-at-model path passes `0` so a stock SDK that puts `model` first does not allocate the
+/// rest of a large body it will not keep.
 ///
 /// Stopping at the first `model` is load-bearing. Pingora will not send a first attempt when the
 /// retry buffer truncated *and* the body is already fully consumed (`get_retry_buffer()` is `None`
@@ -955,21 +962,20 @@ struct BodyPeek {
 async fn peek_body_model(
     session: &mut Session,
     drain_complete: bool,
+    reserve: usize,
 ) -> pingora_core::Result<BodyPeek> {
     session.as_mut().enable_retry_buffering();
-    let mut buf = Vec::new();
-    let mut found_model = false;
+    let mut buf = Vec::with_capacity(reserve.min(BODY_PEEK_LIMIT));
+    let mut scanner = peek::ModelScanner::new();
     loop {
         if buf.len() >= BODY_PEEK_LIMIT || session.as_ref().retry_buffer_truncated() {
             break;
         }
         match session.read_request_body().await? {
             Some(chunk) if !chunk.is_empty() => {
+                scanner.feed(&chunk);
                 buf.extend_from_slice(&chunk);
-                if !found_model {
-                    found_model = peek::scan_buffered(&buf).model.is_some();
-                }
-                if found_model && !drain_complete {
+                if scanner.found() && !drain_complete {
                     break;
                 }
             }
@@ -979,7 +985,7 @@ async fn peek_body_model(
     }
     let truncated = session.as_ref().retry_buffer_truncated();
     let done = session.as_mut().is_body_done();
-    let model = peek::scan_buffered(&buf).model;
+    let model = scanner.take_model();
     let (replay, complete) = if truncated {
         (Some(Bytes::from(buf)), None)
     } else if done {
@@ -1367,11 +1373,11 @@ impl ProxyHttp for AiProxy {
         // verified tenant id) is what lets this sit ahead of the Ed25519 verify: a single leaked,
         // runaway, or forged key can't drive unbounded crypto work (per-credential tier), and a flood
         // of distinct random BYO tokens can't drive junk-auth connects to providers from our egress
-        // IPs (global BYO tier — managed traffic is exempt, see `ratelimit`). The `check` borrow of
+        // IPs (global BYO tier — managed traffic is exempt, see `ratelimit`). The `check_at` borrow of
         // `raw_key` ends as the call returns, so the `&mut session` reject is free to run on the
         // over-limit path (where `raw_key` is unused afterward).
         if let Some(rl) = &self.state.rate_limit
-            && let Some(reason) = rl.check(raw_key, key::is_managed_prefix(raw_key))
+            && let Some(reason) = rl.check_at(raw_key, key::is_managed_prefix(raw_key), start)
         {
             self.state.metrics.rejection(reason.into()).inc();
             return Self::reject_boxed(
@@ -1563,7 +1569,14 @@ impl ProxyHttp for AiProxy {
                         && !cache_bypass
                         && declared_len.is_some_and(|n| n < BODY_PEEK_LIMIT))
                         || (responses && declared_len.is_none_or(|n| n < BODY_PEEK_LIMIT));
-                    let peek = Box::pin(peek_body_model(session, drain)).await?;
+                    // Only a full drain is sized up front. Stopping at `model` (the common
+                    // stock-SDK shape, field first) must not reserve the rest of the body.
+                    let reserve = if drain {
+                        declared_len.unwrap_or(0).min(BODY_PEEK_LIMIT)
+                    } else {
+                        0
+                    };
+                    let peek = Box::pin(peek_body_model(session, drain, reserve)).await?;
                     let Some(name) = peek.model.filter(|n| !n.is_empty()) else {
                         self.state.metrics.rejection(Rejection::UnknownModel).inc();
                         return Self::reject_catalog_miss(session, &request_id, None).await;
@@ -1588,7 +1601,12 @@ impl ProxyHttp for AiProxy {
             && body_replay.is_none()
         {
             let drain = declared_len.is_none_or(|n| n < BODY_PEEK_LIMIT);
-            let peek = Box::pin(peek_body_model(session, drain)).await?;
+            let reserve = if drain {
+                declared_len.unwrap_or(0).min(BODY_PEEK_LIMIT)
+            } else {
+                0
+            };
+            let peek = Box::pin(peek_body_model(session, drain, reserve)).await?;
             body_replay = peek.replay;
             body_complete = peek.complete;
         }
