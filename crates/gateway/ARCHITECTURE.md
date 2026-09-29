@@ -1181,10 +1181,21 @@ gateway's added cost is negligible and bounded** — i.e. it never becomes the c
   measures allocations natively (divan's `AllocProfiler` reports alloc/dealloc/grow count + bytes
   beside ns/iter, no `unsafe` needed). Coverage: `key` verify/mint; `peek::ModelScanner` over
   0/4KB/256KB bodies with `model` placed last (worst case); `usage` parsers; `route`; `deny`
-  (`parse_key`/`parse_reason` off-path + `reason()` on-path); `ratelimit::check` (managed tier
-  only vs. BYO which runs both tiers) — single-threaded/hot-cache _and_ `check_flood_*`, which
-  charges 65536 distinct credentials from 1 and 16 threads over ≥ 2 window rotations, plus
-  `rotate_window`, which prices the window rotation on its own.
+  (`parse_key`/`parse_reason` off-path + `reason()` on-path); `allowance::reason_for` (v1 and v2,
+  miss and hit, empty and 1M entries); `ratelimit::check` (managed tier only vs. BYO which runs
+  both tiers) — single-threaded/hot-cache _and_ `check_flood_*`, which charges 65536 distinct
+  credentials from 1 and 16 threads over ≥ 2 window rotations, plus `rotate_window`, which prices
+  the window rotation on its own; `smart::rank` / `observe` (unmeasured and fully measured);
+  `cache::key` over 0/4KB/64KB/256KB plus `ResponseCache::get` miss, hit, and a 16-thread shared
+  hit; `translate` request and response (chat ↔ messages, including a 64KB body) and one SSE
+  `text_delta`.
+
+  Left unbenched on purpose. The open and half-open breaker are the failure path; the closed
+  `allow` is what every request pays, and it is already measured. A hung failover waits out
+  `connect_timeout_secs` — that number is configuration, not gateway CPU, and the instant-refuse
+  case below already isolates the walk. The H2-vs-H1 and worker-thread sweeps stay on a small body
+  so they measure protocol and cores; body-sized work is the unit benches plus
+  `managed_large_anthropic_sse_throughput`.
 
   What the alloc numbers assert:
   | Operation            | Cost      | Allocations                  | Claim verified                   |
@@ -1200,10 +1211,17 @@ gateway's added cost is negligible and bounded** — i.e. it never becomes the c
   guardrail sits before verify in `proxy::request_filter`.
 
 - **End-to-end (`benches/e2e.rs`, `mise run bench:e2e`) — `criterion`.** Real `beyond-ai` binary
-  - real nats-server + mock upstream (reuses `tests/common`). Four decomposed cases:
+  - real nats-server + mock upstream (reuses `tests/common`). Latency group:
     `reject_missing_key_latency` (401, short-circuit before any upstream connection — transport floor),
     `byo_json_latency` (pure passthrough), `managed_json_latency` (verify + deny + key swap),
-    `managed_sse_latency` (streaming response tap). Plus a concurrent-throughput group.
+    `managed_sse_latency` (a 3-line stream), `managed_large_sse_latency` and
+    `managed_large_anthropic_sse_latency` (streams big enough to wrap the response tail, the
+    Anthropic one splitting usage across head and tail), `managed_large_body_latency` /
+    `byo_large_body_latency` (64 KiB, `model` last), and the model route
+    (`auto_json_latency`, `auto_large_body_latency`, `auto_failover_latency`). Throughput at 32
+    in-flight for both a tiny JSON body and the large Anthropic stream. Then
+    `e2e_concurrency` (HTTP/2 vs HTTP/1.1 to the upstream at 1/8/32/128/512) and
+    `e2e_worker_threads` (1 worker vs one per core, same sweep).
 
   All four cases land in ~110–120µs on loopback with ±15–20µs jitter — larger than the gateway's
   own CPU cost. This harness cannot resolve the verify cost (that's the unit bench's job). Its value:
