@@ -317,6 +317,13 @@ mod tests {
             wire: providers::WireFormat::OpenAi,
             candidates: &[],
             responses: &[],
+            // Not a catalog row — the ranker must ignore it. The price is unused.
+            price: providers::ListPrice {
+                input: "0",
+                output: "0",
+                cache_read: "0",
+                cache_write: "0",
+            },
         };
         let walk = Walk::identity(3);
         let ranked = r.rank(walk, &route, 1);
