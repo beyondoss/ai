@@ -123,8 +123,18 @@ fn openai_model_parses_families_and_hosts() {
             Efforts(&["minimal", "low", "medium", "high"]),
         ),
         ("openai/o4-mini", false, Efforts(&["low", "medium", "high"])),
+        // gpt-oss on any host: only the effort is fit (reasoning is mandatory there).
+        (
+            "openai/gpt-oss-120b",
+            false,
+            Efforts(&["low", "medium", "high"]),
+        ),
+        (
+            "accounts/fireworks/models/gpt-oss-120b",
+            false,
+            Efforts(&["low", "medium", "high"]),
+        ),
         // Not OpenAI's own model, or not OpenAI at all: nothing is reshaped.
-        ("openai/gpt-oss-120b", false, Unknown),
         ("grok-4.6", false, Unknown),
         ("deepseek-chat", false, Unknown),
         ("x-ai/grok-4.6", false, Unknown),
@@ -334,7 +344,8 @@ fn responses_hosted_tools_are_forwarded_and_custom_tools_mapped() {
 fn responses_tool_choice_shapes_become_chat_shapes() {
     let choice = |c: Value| {
         r2c(
-            &json!({"model": "m", "store": false, "input": "x", "tool_choice": c}),
+            &json!({"model": "m", "store": false, "input": "x", "tool_choice": c,
+                "tools": [{"type": "function", "name": "get_weather", "parameters": {"type": "object"}}]}),
             "gpt-5",
         )["tool_choice"]
             .clone()
@@ -1141,4 +1152,271 @@ fn a_tiny_limit_is_raised_to_the_responses_floor() {
     ))
     .unwrap();
     assert_eq!(v["max_output_tokens"], 900);
+}
+
+// ---- Thinking replay, tool fields, effort (second audit) ----
+
+/// A Chat client that keeps only `reasoning_content` (LiteLLM and most frameworks do) or
+/// `reasoning`: that text was never signed, and sent as a thinking block it is a 400 on every later
+/// turn ("messages.1.content.0.thinking.signature: Field required", measured). Anthropic takes the
+/// turn without its thinking, so the text goes; so does an unsigned thinking part.
+#[test]
+fn bare_reasoning_text_never_becomes_an_unsigned_thinking_block() {
+    for assistant in [
+        json!({"role": "assistant", "content": "4", "reasoning_content": "simple"}),
+        json!({"role": "assistant", "content": "4", "reasoning": "simple"}),
+        json!({"role": "assistant", "content": [
+            {"type": "thinking", "thinking": "simple"},
+            {"type": "text", "text": "4"},
+        ]}),
+        json!({"role": "assistant", "content": "4", "thinking": [{"type": "thinking", "thinking": "simple"}]}),
+    ] {
+        let v = c2m(
+            &chat(json!({"messages": [
+                {"role": "user", "content": "2+2?"}, assistant.clone(), {"role": "user", "content": "3+3?"},
+            ]})),
+            "claude-sonnet-4-5",
+        );
+        let turn = &v["messages"][1]["content"];
+        assert!(
+            !turn.to_string().contains("\"thinking\""),
+            "{assistant} became {turn}"
+        );
+        assert!(turn.to_string().contains('4'), "{turn}");
+    }
+}
+
+/// Signed blocks cross whichever way the client carried them: our `thinking` array (what the
+/// gateway's Chat responses return), thinking parts, or OpenRouter's `reasoning_details` — a turn a
+/// Chat client got relayed from OpenRouter (failover) and echoes onto the Anthropic primary.
+#[test]
+fn signed_thinking_crosses_from_every_chat_shape() {
+    let want = json!([
+        {"type": "thinking", "thinking": "simple", "signature": "EqQBSIG"},
+        {"type": "redacted_thinking", "data": "RD"},
+        {"type": "text", "text": "4"},
+    ]);
+    for assistant in [
+        json!({"role": "assistant", "content": "4", "reasoning_content": "simple", "thinking": [
+            {"index": 0, "type": "thinking", "thinking": "simple", "signature": "EqQBSIG"},
+            {"index": 1, "type": "redacted_thinking", "data": "RD"},
+        ]}),
+        json!({"role": "assistant", "content": [
+            {"type": "thinking", "thinking": "simple", "signature": "EqQBSIG"},
+            {"type": "redacted_thinking", "data": "RD"},
+            {"type": "text", "text": "4"},
+        ]}),
+        json!({"role": "assistant", "content": "4", "reasoning": "simple", "reasoning_details": [
+            {"type": "reasoning.text", "text": "simple", "signature": "EqQBSIG", "format": "anthropic-claude-v1", "index": 0},
+            {"type": "reasoning.encrypted", "data": "RD", "format": "anthropic-claude-v1", "index": 1},
+        ]}),
+    ] {
+        let v = c2m(
+            &chat(json!({"messages": [
+                {"role": "user", "content": "2+2?"}, assistant.clone(), {"role": "user", "content": "3+3?"},
+            ]})),
+            "claude-sonnet-4-5",
+        );
+        let mut turn = v["messages"][1]["content"].clone();
+        for b in turn.as_array_mut().unwrap() {
+            b.as_object_mut().unwrap().remove("cache_control");
+        }
+        assert_eq!(turn, want, "{assistant}");
+    }
+}
+
+/// OpenRouter replays Claude's thinking only from `reasoning_details`: with the gateway's
+/// `thinking` array and `reasoning_content` alone, a thinking + tool loop on an OpenRouter-only
+/// Claude row (or any Claude row's OpenRouter failover) 400ed on turn 2 ("a final `assistant`
+/// message must start with a thinking block", measured on claude-sonnet-4).
+#[test]
+fn signed_thinking_rides_reasoning_details_to_claude_on_openrouter() {
+    let body = anth(json!({
+        "thinking": {"type": "enabled", "budget_tokens": 1024},
+        "max_tokens": 2000,
+        "tools": [{"name": "get_weather", "input_schema": weather_schema()}],
+        "messages": [
+            {"role": "user", "content": "weather?"},
+            {"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "t", "signature": "SIG"},
+                {"type": "redacted_thinking", "data": "RD"},
+                {"type": "tool_use", "id": "toolu_1", "name": "get_weather", "input": {}},
+            ]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_1", "content": "sunny"}]},
+        ],
+    }));
+    let v = m2c(&body, "anthropic/claude-sonnet-4");
+    assert_eq!(
+        v["messages"][1]["reasoning_details"],
+        json!([
+            {"type": "reasoning.text", "text": "t", "signature": "SIG", "format": "anthropic-claude-v1", "index": 0},
+            {"type": "reasoning.encrypted", "data": "RD", "format": "anthropic-claude-v1", "index": 1},
+        ])
+    );
+    // Only a Claude model can verify the signature; nobody else is sent it.
+    let v = m2c(&body, "gpt-5-nano");
+    assert!(v["messages"][1].get("reasoning_details").is_none(), "{v}");
+}
+
+/// A Responses client on a Claude row gets each signed thinking block as a `reasoning` item
+/// (`rs_gw…`, signature in `encrypted_content`) and sends it back as it came. Dropped, a thinking +
+/// tool loop on a model that needs its thinking back (claude-sonnet-4 via OpenRouter) 400ed.
+/// OpenAI's own reasoning items (and unsigned ones) mean nothing to Claude and stay dropped.
+#[test]
+fn gateway_reasoning_items_come_back_as_signed_thinking() {
+    let body = json!({"model": "claude-sonnet-4", "store": false, "reasoning": {"effort": "low"},
+    "tools": [{"type": "function", "name": "get_weather", "parameters": weather_schema()}],
+    "input": [
+        {"role": "user", "content": "weather?"},
+        {"type": "reasoning", "id": "rs_gw18f2a0001", "summary": [{"type": "summary_text", "text": "t"}], "encrypted_content": "SIG"},
+        {"type": "reasoning", "id": "rs_68ab01", "summary": [], "encrypted_content": "gAAAAopenai"},
+        {"type": "reasoning", "id": "rs_gw18f2a0002", "summary": [{"type": "summary_text", "text": "unsigned"}]},
+        {"type": "function_call", "call_id": "toolu_1", "name": "get_weather", "arguments": "{}"},
+        {"type": "function_call_output", "call_id": "toolu_1", "output": "sunny"},
+    ]});
+    let chat = r2c(&body, "anthropic/claude-sonnet-4");
+    let turn = &chat["messages"][1];
+    assert_eq!(turn["tool_calls"][0]["id"], "toolu_1");
+    assert_eq!(
+        turn["reasoning_details"],
+        json!([{"type": "reasoning.text", "text": "t", "signature": "SIG", "format": "anthropic-claude-v1", "index": 0}]),
+        "{chat}"
+    );
+    assert!(!chat.to_string().contains("gAAAA"), "{chat}");
+
+    let msgs = req(
+        Endpoint::Responses,
+        Endpoint::Messages,
+        &body,
+        "claude-sonnet-4-5",
+    );
+    let content = &msgs["messages"][1]["content"];
+    assert_eq!(
+        content[0],
+        json!({"type": "thinking", "thinking": "t", "signature": "SIG"}),
+        "{msgs}"
+    );
+    assert_eq!(content[1]["type"], "tool_use");
+    assert!(!msgs.to_string().contains("gAAAA") && !msgs.to_string().contains("unsigned"));
+
+    // An OpenAI row gets none of it.
+    let v = r2c(&body, "gpt-5-nano");
+    assert!(!v.to_string().contains("SIG"), "{v}");
+}
+
+/// OpenAI's Chat Completions 400s `tool_choice` and `parallel_tool_calls` without `tools` ("only
+/// allowed when 'tools' are specified", measured); Messages and Responses accept both.
+#[test]
+fn tool_choice_and_parallel_tool_calls_go_to_chat_only_with_tools() {
+    let a = m2c(
+        &anth(json!({"tool_choice": {"type": "auto", "disable_parallel_tool_use": true}})),
+        "gpt-5-mini",
+    );
+    assert!(
+        a.get("tool_choice").is_none() && a.get("parallel_tool_calls").is_none(),
+        "{a}"
+    );
+    let r = r2c(
+        &json!({"model": "m", "input": "hi", "store": false, "tool_choice": "auto", "parallel_tool_calls": false}),
+        "gpt-5-mini",
+    );
+    assert!(
+        r.get("tool_choice").is_none() && r.get("parallel_tool_calls").is_none(),
+        "{r}"
+    );
+    // With tools, both still cross.
+    let tools = json!([{"name": "get_weather", "input_schema": weather_schema()}]);
+    let a = m2c(
+        &anth(
+            json!({"tools": tools, "tool_choice": {"type": "auto", "disable_parallel_tool_use": true}}),
+        ),
+        "gpt-5-mini",
+    );
+    assert_eq!(a["tool_choice"], "auto");
+    assert_eq!(a["parallel_tool_calls"], false);
+    let r = r2c(
+        &json!({"model": "m", "input": "hi", "store": false, "tool_choice": "required", "parallel_tool_calls": false,
+            "tools": [{"type": "function", "name": "get_weather", "parameters": weather_schema()}]}),
+        "gpt-5-mini",
+    );
+    assert_eq!(r["tool_choice"], "required");
+    assert_eq!(r["parallel_tool_calls"], false);
+}
+
+/// Sonnet 5.5 rejects `thinking: disabled`, and an omitted `thinking` is adaptive thinking, so
+/// `reasoning_effort: "none"` thought anyway. Its "off" is `between_tools` at effort `high` or
+/// below, alone in the `thinking` object — unless the history holds thinking on a request that
+/// carries `block_binding`, which `between_tools` rejects: that one stays adaptive at `low`.
+#[test]
+fn reasoning_none_on_sonnet_5_5_is_between_tools() {
+    for model in ["claude-sonnet-5-5", "us.anthropic.claude-sonnet-5-5-v1:0"] {
+        let v = c2m(&chat(json!({"reasoning_effort": "none"})), model);
+        assert_eq!(
+            v["thinking"],
+            json!({"type": "between_tools"}),
+            "{model}: {v}"
+        );
+        assert_eq!(v["output_config"]["effort"], "low", "{model}: {v}");
+        let v = c2m(&chat(json!({"thinking": {"type": "disabled"}})), model);
+        assert_eq!(
+            v["thinking"],
+            json!({"type": "between_tools"}),
+            "{model}: {v}"
+        );
+    }
+    let history = chat(json!({"reasoning_effort": "none", "messages": [
+        {"role": "user", "content": "x"},
+        {"role": "assistant", "content": "y", "thinking": [{"type": "thinking", "thinking": "", "signature": "SIG"}]},
+        {"role": "user", "content": "z"},
+    ]}));
+    let v = c2m(&history, "claude-sonnet-5-5");
+    assert_eq!(v["thinking"]["type"], "adaptive", "{v}");
+    assert_eq!(
+        v["thinking"]["block_binding"]["prefix_mismatch_behavior"],
+        "drop_block"
+    );
+    assert_eq!(v["output_config"]["effort"], "low");
+    // Bedrock carries no `block_binding`, so nothing stands in the way there.
+    let v = c2m(&history, "us.anthropic.claude-sonnet-5-5-v1:0");
+    assert_eq!(v["thinking"], json!({"type": "between_tools"}), "{v}");
+    // Models without `between_tools` keep the omitted-thinking shape.
+    let v = c2m(
+        &chat(json!({"reasoning_effort": "none"})),
+        "claude-opus-4-8",
+    );
+    assert!(v.get("thinking").is_none(), "{v}");
+    assert_eq!(v["output_config"]["effort"], "low");
+}
+
+/// A large Anthropic budget (Claude Code's 31999) or `effort: max` maps to `xhigh`, which only
+/// OpenAI's newer families define; a host the table does not know gets `high`. gpt-oss, on any
+/// host, always reasons (`none` is a 400 there, measured on OpenRouter).
+#[test]
+fn unknown_hosts_get_the_classic_efforts() {
+    let big =
+        anth(json!({"max_tokens": 32000, "thinking": {"type": "enabled", "budget_tokens": 31999}}));
+    for model in [
+        "x-ai/grok-4.6",
+        "grok-4.6",
+        "deepseek-chat",
+        "moonshotai/kimi-k3",
+    ] {
+        assert_eq!(m2c(&big, model)["reasoning_effort"], "high", "{model}");
+    }
+    let max = anth(json!({"output_config": {"effort": "max"}}));
+    assert_eq!(m2c(&max, "deepseek-chat")["reasoning_effort"], "high");
+    let off = anth(json!({"thinking": {"type": "disabled"}}));
+    for model in [
+        "openai/gpt-oss-120b",
+        "accounts/fireworks/models/gpt-oss-120b",
+    ] {
+        assert_eq!(m2c(&off, model)["reasoning_effort"], "low", "{model}");
+        assert_eq!(m2c(&big, model)["reasoning_effort"], "high", "{model}");
+        let v = m2c(&anth(json!({"temperature": 0.3})), model);
+        assert_eq!(v["max_tokens"], 300, "not OpenAI's own API: {v}");
+        assert_eq!(v["temperature"], 0.3, "{v}");
+    }
+    let r =
+        json!({"model": "m", "store": false, "input": "hi", "reasoning": {"effort": "minimal"}});
+    assert_eq!(r2c(&r, "x-ai/grok-4.6")["reasoning_effort"], "low");
 }
