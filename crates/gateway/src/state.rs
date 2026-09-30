@@ -9,6 +9,7 @@
 use crate::allowance::AllowanceSet;
 use crate::cache::{self, ResponseCache};
 use crate::capture::{CaptureRule, CaptureSet};
+use crate::concurrency::TenantSlots;
 use crate::config::AiConfig;
 use crate::deny::DenySet;
 use crate::error::{GatewayError, Result};
@@ -227,6 +228,9 @@ pub struct GatewayState {
     /// skips both. Process-local: replicas do not share samples.
     pub smart: smart::Router,
 
+    /// Per-tenant in-flight cap (see `concurrency`). `None` when `tenant_max_in_flight == 0`.
+    pub tenant_slots: Option<TenantSlots>,
+
     /// Per-key request-rate guardrail (see `ratelimit`). `None` when `rate_limit_rps == 0`. Fixed
     /// memory regardless of tenant count, so it lives in the static state with no GC.
     pub rate_limit: Option<RateLimit>,
@@ -331,6 +335,7 @@ impl GatewayState {
             capture_defaults,
             cache,
             smart: smart::Router::new(),
+            tenant_slots: TenantSlots::new(config.tenant_max_in_flight),
             rate_limit,
             dns_cache: ArcSwap::from_pointee(HashMap::new()),
             instance_prefix: {

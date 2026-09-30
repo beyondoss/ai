@@ -124,6 +124,15 @@ capture_queue_depth = 1024
 # cache_max_entries = 1024
 # cache_max_bytes = 65536
 
+# Per-tenant in-flight cap: the most requests one tenant may hold open on THIS process at once.
+# Spend is enforced after the fact — the allowance-set's exhaust bit lands only once usage has shipped
+# and been summed — so a tenant keeps being served for that lag. This bounds the overshoot in that
+# window to (this many requests' worth) per replica. Over it → 429
+# (`ai_rejections_total{reason="tenant_concurrency"}`), before any provider is contacted. Managed
+# traffic only. `0` disables (the default): size it to the most agents a tenant legitimately runs in
+# parallel, divided across replicas.
+# tenant_max_in_flight = 0
+
 # Rank managed catalog walks (`/auto`, managed `/v1`) by observed time-to-first-byte. This process's
 # EWMA per catalog candidate; cold start is the row's static order. `x-beyond-order` / `split` pin
 # a sequence; `only` filters then ranks. Set false to always use catalog order. Not fleet-wide:

@@ -337,6 +337,13 @@ pub struct AiConfig {
     /// Ranking is **this process**. Replicas do not share TTFT samples, so the default walk is not
     /// a fleet-wide smart router.
     pub smart_router: bool,
+
+    /// Most requests one tenant may hold open on this process at once. `0` disables it (the
+    /// default). Spend is enforced after the fact — the allowance-set's exhaust bit lands only once
+    /// usage has shipped and been summed — so this is what bounds a tenant's overshoot in that
+    /// window: at most this many requests' worth per replica. Over the cap → `429`
+    /// (`ai_rejections_total{reason="tenant_concurrency"}`). Managed traffic only.
+    pub tenant_max_in_flight: u32,
 }
 
 impl Default for AiConfig {
@@ -413,6 +420,9 @@ impl Default for AiConfig {
             // than the request that produced it was allowed to be while still being "in hand".
             cache_max_bytes: 64 * 1024,
             smart_router: true,
+            // Off. The right ceiling depends on how many parallel agents a tenant legitimately runs
+            // and how long the allowance pipeline lags; that is an operator's call.
+            tenant_max_in_flight: 0,
         }
     }
 }

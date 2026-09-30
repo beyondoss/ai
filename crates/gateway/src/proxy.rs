@@ -296,6 +296,17 @@ pub struct RequestCtx {
     /// Process-unique id for this request (`{instance}-{seq}`), echoed in the `x-beyond-request-id`
     /// response header and the `ai.usage` event so a client report ties back to a log line.
     request_id: RequestId,
+    /// Text bytes of the request body (base64 payloads excluded), counted as it streams past —
+    /// managed only. The input-token estimate for a stream cut short before its usage block, on a
+    /// wire (OpenAI) that reports input only at the end. See `usage::InputTally`.
+    input_tally: usage::InputTally,
+    /// Response bytes relayed — managed streams only. Scales the retained tail up to the whole
+    /// stream in `usage::estimate_stream_output`. One add per chunk; nothing is scanned.
+    stream_bytes: u32,
+    /// Whether this request holds one of its tenant's `tenant_max_in_flight` slots, released in
+    /// `logging` (which runs exactly once per admitted request — the same guarantee
+    /// `requests_in_flight` rests on).
+    tenant_slot: bool,
 }
 
 /// State that exists only when a request uses the `x-beyond-*` control surface — it carried
@@ -458,6 +469,7 @@ impl RequestCtx {
         self.req_buf.clear();
         self.body_bytes_fed = 0;
         self.model_scanner = peek::ModelScanner::new();
+        self.input_tally = usage::InputTally::default();
     }
 }
 
@@ -468,7 +480,7 @@ impl RequestCtx {
 /// Kept as a table so `reject_bodies_are_valid_json` can walk it and assert each entry parses,
 /// carries the `type` and `message` it claims, and is reachable — a hand-written JSON literal is
 /// exactly the thing that rots silently otherwise.
-pub const REJECT_BODIES: [(&str, &str, &str); 12] = [
+pub const REJECT_BODIES: [(&str, &str, &str); 13] = [
     (
         "invalid_request_error",
         "unknown provider",
@@ -528,6 +540,11 @@ pub const REJECT_BODIES: [(&str, &str, &str); 12] = [
         "insufficient_quota",
         "allowance unavailable",
         r#"{"error":{"message":"allowance unavailable","type":"insufficient_quota"}}"#,
+    ),
+    (
+        "rate_limit_error",
+        "too many concurrent requests",
+        r#"{"error":{"message":"too many concurrent requests","type":"rate_limit_error"}}"#,
     ),
 ];
 
@@ -1946,6 +1963,9 @@ impl ProxyHttp for AiProxy {
                         })
                     }),
                     request_id,
+                    input_tally: usage::InputTally::default(),
+                    stream_bytes: 0,
+                    tenant_slot: false,
                 });
                 self.state.metrics.requests_in_flight.inc();
                 return Ok(true);
@@ -1959,6 +1979,30 @@ impl ProxyHttp for AiProxy {
             }
             None => {}
         }
+
+        // Per-tenant in-flight cap — the bound on overspend while the allowance-set lags (see
+        // `concurrency`). After the cache (a hit costs no provider spend) and before the breaker,
+        // so a refused request never holds a half-open probe permit.
+        let tenant_slot = match self.state.tenant_slots.as_ref() {
+            Some(slots) if managed => {
+                if !slots.try_acquire(tenant_id) {
+                    self.state
+                        .metrics
+                        .rejection(Rejection::TenantConcurrency)
+                        .inc();
+                    return Self::reject_boxed(
+                        session,
+                        &request_id,
+                        429,
+                        "rate_limit_error",
+                        "too many concurrent requests",
+                    )
+                    .await;
+                }
+                true
+            }
+            _ => false,
+        };
 
         // Circuit breaker (per provider, all traffic — a down provider is down regardless of whose
         // key is used). Checked here, after every other rejection, so claiming a half-open probe
@@ -1976,6 +2020,9 @@ impl ProxyHttp for AiProxy {
             && let Some(breaker) = &provider.breaker
             && breaker.allow().is_err()
         {
+            if tenant_slot && let Some(slots) = self.state.tenant_slots.as_ref() {
+                slots.release(tenant_id);
+            }
             self.state.metrics.rejection(Rejection::CircuitOpen).inc();
             return Self::reject_boxed(
                 session,
@@ -2061,6 +2108,9 @@ impl ProxyHttp for AiProxy {
                 })
             }),
             request_id,
+            input_tally: usage::InputTally::default(),
+            stream_bytes: 0,
+            tenant_slot,
         });
         // Admitted: count it in-flight. Balanced by the decrement in `logging`, which runs exactly
         // once per admitted request (rejected requests leave `ctx` None and never reach that path,
@@ -2579,6 +2629,11 @@ impl ProxyHttp for AiProxy {
             if let Some(c) = rc.control.as_mut().and_then(|c| c.capture.as_mut()) {
                 c.push_req(chunk);
             }
+            // Managed only: the estimate feeds a billing row, and BYO emits none. One `memmem`
+            // pass for `;base64,` — the bytes are already hot from the scanner or buffer above.
+            if rc.managed {
+                rc.input_tally.feed(chunk);
+            }
 
             if rc.rewrites_body() {
                 rc.req_buf.extend_from_slice(chunk);
@@ -2795,6 +2850,12 @@ impl ProxyHttp for AiProxy {
             }
 
             rc.resp_tail.push(chunk);
+            // Managed streams only. Counts *upstream* bytes (pre-translate), like the tail.
+            if rc.managed && rc.streaming {
+                rc.stream_bytes = rc
+                    .stream_bytes
+                    .saturating_add(u32::try_from(chunk.len()).unwrap_or(u32::MAX));
+            }
         }
 
         let translating = rc.auto.as_ref().is_some_and(|a| catalog_translating(a));
@@ -2853,6 +2914,28 @@ impl ProxyHttp for AiProxy {
             }
         }
         Ok(None)
+    }
+
+    /// Keep pingora 0.8's retry policy for an error after the connection is up.
+    ///
+    /// Pingora 0.9's default refuses to retry any non-idempotent method, and every LLM call is a
+    /// `POST` — so the default silently turned off both retries this gateway decides for itself:
+    /// the managed 429 key walk and the model-routed 5xx vendor walk. `upstream_response_filter`
+    /// only marks those retryable after `body_replayable` has proven the body can be resent, which
+    /// is the safety condition the new default approximates with the method. A reused-connection
+    /// failure still retries only when the replay buffer holds the whole body, exactly as before.
+    fn error_while_proxy(
+        &self,
+        peer: &HttpPeer,
+        session: &mut Session,
+        e: Box<pingora_core::Error>,
+        _ctx: &mut Self::CTX,
+        client_reused: bool,
+    ) -> Box<pingora_core::Error> {
+        let mut e = e.more_context(format!("Peer: {peer}"));
+        e.retry
+            .decide_reuse(client_reused && !session.as_ref().retry_buffer_truncated());
+        e
     }
 
     fn fail_to_connect(
@@ -2930,6 +3013,11 @@ impl ProxyHttp for AiProxy {
         // admitted request — including on upstream errors and client disconnects — so the gauge
         // always returns to baseline and can't drift upward.
         self.state.metrics.requests_in_flight.dec();
+        if std::mem::take(&mut rc.tenant_slot)
+            && let Some(slots) = self.state.tenant_slots.as_ref()
+        {
+            slots.release(rc.tenant_id);
+        }
 
         // An upstream error (DNS/connect timeout, read timeout, abort) lands here with `Some(e)` but
         // no `ai.usage` row (no parseable body) — and the earlier `warn!` in `upstream_peer` only
@@ -2995,6 +3083,7 @@ impl ProxyHttp for AiProxy {
         // The last `USAGE_TAIL_CAP` bytes of the response, oldest first (see `UsageTail`). Short
         // responses are the whole body; long ones are rotated into order here, once. Skipped on a
         // cache hit — there is no tail; tokens come from the stored entry.
+        let mut usage_estimated = false;
         let parsed = if cache_hit.is_some() {
             cache_hit.as_ref().map(|h| h.usage)
         } else {
@@ -3003,20 +3092,59 @@ impl ProxyHttp for AiProxy {
             // Anthropic streaming *additionally* reads the head, because that's where `message_start`
             // put the input and cache token counts. The two buffers may overlap on a short response —
             // harmless, since every field is assigned rather than accumulated.
-            match (rc.dialect, rc.streaming) {
+            let parsed = match (rc.dialect, rc.streaming) {
                 (Dialect::OpenAi, true) => usage::openai_stream(tail),
                 (Dialect::OpenAi, false) => usage::openai_body(tail),
                 (Dialect::Anthropic, true) => usage::anthropic_stream_parts(&[&rc.resp_head, tail]),
                 (Dialect::Anthropic, false) => usage::anthropic_body(tail),
+            };
+            // A managed 2xx stream that ended before its usage block: the client hung up (a
+            // cancelled agent turn) or the upstream died mid-stream. The provider bills us for what
+            // it generated before it noticed, so bill an estimate rather than the zero this used to
+            // emit — which made "stream, then disconnect before the last event" free. Anthropic's
+            // `message_start` already carries exact input and cache counts, so only the missing
+            // side is estimated. See `usage`'s estimate section for the measured divisors; both err
+            // low.
+            let cut_short = rc.managed
+                && rc.streaming
+                && rc.upstream_status.is_some_and(|s| (200..300).contains(&s))
+                && match rc.dialect {
+                    Dialect::OpenAi => parsed.is_none(),
+                    Dialect::Anthropic => !usage::anthropic_stream_finished(tail),
+                };
+            // Only once the provider demonstrably started: Anthropic's `message_start` arrived, or
+            // at least one generated delta was relayed. A 200 stream carrying nothing but an error
+            // event (`overloaded_error` before any output) is not work we were billed for.
+            let output = if cut_short {
+                usage::estimate_stream_output(tail, u64::from(rc.stream_bytes))
+            } else {
+                0
+            };
+            if cut_short && (parsed.is_some() || output > 0) {
+                usage_estimated = true;
+                let mut u = parsed.unwrap_or_default();
+                if u.input_tokens == 0 {
+                    u.input_tokens = rc.input_tally.estimate_tokens();
+                }
+                u.output_tokens = u.output_tokens.max(output);
+                Some(u)
+            } else {
+                parsed
             }
         };
+        if usage_estimated {
+            self.state.metrics.usage_estimated_total.inc();
+        }
         // A managed 2xx response is *expected* to carry usage; `None` there means the provider's
         // usage block changed shape (a new API version, a wire change) and we're about to emit a
         // zero-token billing row that looks exactly like a (non-existent) legitimate zero-token
         // generation — silently zeroing that tenant's bill. Surface it on a counter + a warn so it
         // can be alerted on. A `None` on a 4xx/5xx (error body has no usage) is normal, not logged.
         // Cache hits never trip this: they carry the tokens stored from the fill.
-        if parsed.is_none()
+        //
+        // A stream that ended *cleanly* without usage is that same shape-change signal even though
+        // it is now billed an estimate, so it still counts here; one cut short by an error does not.
+        if (parsed.is_none() || (usage_estimated && e.is_none()))
             && rc.managed
             && cache_hit.is_none()
             && let Some(s) = rc.upstream_status
@@ -3030,7 +3158,7 @@ impl ProxyHttp for AiProxy {
                 dialect = ?rc.dialect,
                 stream = rc.streaming,
                 status = s,
-                "managed 2xx response carried no parseable usage; emitting a zero-token billing row",
+                "managed 2xx response ended cleanly without parseable usage; billing an estimate or zero",
             );
         }
         let usage = parsed.unwrap_or_default();
@@ -3145,6 +3273,9 @@ impl ProxyHttp for AiProxy {
                 routed_model,
                 stream = usage_stream,
                 cache_hit = cache_hit.is_some(),
+                // True when the stream was cut short before its usage block and the token counts
+                // below are the gateway's estimate, not the provider's report. Estimates err low.
+                usage_estimated,
                 input_tokens = usage.input_tokens,
                 output_tokens = usage.output_tokens,
                 cache_read_tokens = usage.cache_read_tokens,
@@ -3199,6 +3330,7 @@ impl ProxyHttp for AiProxy {
             // Fill: complete 2xx only. Client abort, 4xx/5xx, and truncation are all skips — a
             // partial or error body must never be replayed as a success.
             if e.is_none()
+                && !usage_estimated
                 && rc.upstream_status.is_some_and(|s| (200..300).contains(&s))
                 && let Some(cache::Pending::Fill {
                     key,
@@ -3272,6 +3404,9 @@ mod tests {
             auto: None,
             control: None,
             request_id: RequestId::new(),
+            input_tally: usage::InputTally::default(),
+            stream_bytes: 0,
+            tenant_slot: false,
         }
     }
 

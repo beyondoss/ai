@@ -9,9 +9,13 @@
 //!
 //! v1 is allowed to be lossy on extras a stock SDK does not need for a tool loop:
 //! - **Dropped:** Responses-only fields (`store`, `previous_response_id`, `include`, `truncation`,
-//!   `text` format, …) when leaving Responses; `stream_options` on a Responses or Anthropic body;
-//!   image `http(s)` URLs (Anthropic wants base64). Base64 data-URI images are converted both ways.
+//!   `text` format, …) when leaving Responses; `stream_options` on a Responses or Anthropic body.
 //!   Same-endpoint Responses is a byte relay: those session fields pass through.
+//! - **Images, both ways:** base64 data-URI images convert to Anthropic `base64` sources and back;
+//!   `http(s)` image URLs become Anthropic `url` sources and back, and pass through between Chat
+//!   Completions and Responses. Nothing is fetched: every one of those upstreams downloads the URL
+//!   itself. Amazon Bedrock is the exception — it rejects `url` sources — so a URL image that fails
+//!   over onto a Bedrock candidate gets Bedrock's 400 rather than a silently image-less answer.
 //! - **Passed both ways:** `thinking` / `redacted_thinking` blocks, `cache_control` on tools and
 //!   content, `reasoning_effort` ↔ Anthropic `thinking`. These are what an agent workload sends.
 //! - **Required mapping:** system/messages/`input`, `max_tokens`/`max_output_tokens`, temperature,
@@ -612,6 +616,12 @@ fn openai_image_to_anthropic(part: &Value) -> Option<Value> {
         .pointer("/image_url/url")
         .and_then(Value::as_str)
         .or_else(|| part.get("url").and_then(Value::as_str))?;
+    if is_http_url(url) {
+        return Some(json!({
+            "type": "image",
+            "source": { "type": "url", "url": url },
+        }));
+    }
     let (media_type, data) = parse_data_uri(url)?;
     Some(json!({
         "type": "image",
@@ -621,6 +631,12 @@ fn openai_image_to_anthropic(part: &Value) -> Option<Value> {
             "data": data,
         }
     }))
+}
+
+/// An image the upstream downloads itself. Carried as a URL on every wire rather than dropped:
+/// a silently image-less request produces a confident answer about a picture the model never saw.
+fn is_http_url(url: &str) -> bool {
+    url.starts_with("https://") || url.starts_with("http://")
 }
 
 fn parse_data_uri(url: &str) -> Option<(&str, &str)> {
@@ -973,8 +989,19 @@ fn anthropic_user_to_openai(m: &Value) -> Vec<Value> {
 
 fn anthropic_image_to_openai(b: &Value) -> Option<Value> {
     let src = b.get("source")?;
-    if src.get("type").and_then(Value::as_str) != Some("base64") {
-        return None;
+    match src.get("type").and_then(Value::as_str) {
+        Some("base64") => {}
+        Some("url") => {
+            let url = src
+                .get("url")
+                .and_then(Value::as_str)
+                .filter(|u| is_http_url(u))?;
+            return Some(json!({
+                "type": "image_url",
+                "image_url": { "url": url },
+            }));
+        }
+        _ => return None,
     }
     let media = src.get("media_type").and_then(Value::as_str)?;
     let data = src.get("data").and_then(Value::as_str)?;
@@ -1431,9 +1458,6 @@ fn responses_part_to_openai(part: &Value) -> Option<Value> {
                 Some(Value::String(s)) => s.as_str(),
                 _ => return None,
             };
-            if url.starts_with("http://") || url.starts_with("https://") {
-                return None;
-            }
             let mut m = json!({
                 "type": "image_url",
                 "image_url": { "url": url },
@@ -1480,9 +1504,6 @@ fn openai_part_to_responses(part: &Value, text_type: &str) -> Option<Value> {
         }
         Some("image_url") => {
             let url = part.pointer("/image_url/url").and_then(Value::as_str)?;
-            if url.starts_with("http://") || url.starts_with("https://") {
-                return None;
-            }
             let mut m = json!({
                 "type": "input_image",
                 "image_url": url,
@@ -3118,7 +3139,7 @@ mod tests {
     }
 
     #[test]
-    fn http_image_urls_are_still_dropped() {
+    fn http_image_urls_become_anthropic_url_sources() {
         let oai = json!({
             "model": "m",
             "messages": [{
@@ -3135,7 +3156,105 @@ mod tests {
             &serde_json::to_vec(&oai).unwrap(),
         ))
         .unwrap();
+        let content = &v["messages"][0]["content"];
+        assert_eq!(content[0]["text"], "see");
+        assert_eq!(content[1]["type"], "image");
+        assert_eq!(content[1]["source"]["type"], "url");
+        assert_eq!(content[1]["source"]["url"], "https://example.com/x.png");
+    }
+
+    #[test]
+    fn anthropic_url_sources_become_openai_image_urls() {
+        let msg = json!({
+            "model": "m",
+            "max_tokens": 16,
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "image", "source": {"type": "url", "url": "https://example.com/x.png"}},
+                    {"type": "text", "text": "see"}
+                ]
+            }]
+        });
+        let v: Value = serde_json::from_slice(&request(
+            Endpoint::Messages,
+            Endpoint::ChatCompletions,
+            &serde_json::to_vec(&msg).unwrap(),
+        ))
+        .unwrap();
+        let content = &v["messages"][0]["content"];
+        assert_eq!(content[0]["type"], "image_url");
+        assert_eq!(content[0]["image_url"]["url"], "https://example.com/x.png");
+        assert_eq!(content[1]["text"], "see");
+    }
+
+    /// A `url` source that is not http(s) (`file:`, `ftp:`, garbage) is not forwarded as an
+    /// OpenAI `image_url` the upstream would try, and fail, to fetch.
+    #[test]
+    fn non_http_url_sources_are_not_forwarded() {
+        let msg = json!({
+            "model": "m",
+            "max_tokens": 16,
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "image", "source": {"type": "url", "url": "file:///etc/passwd"}},
+                    {"type": "text", "text": "see"}
+                ]
+            }]
+        });
+        let v: Value = serde_json::from_slice(&request(
+            Endpoint::Messages,
+            Endpoint::ChatCompletions,
+            &serde_json::to_vec(&msg).unwrap(),
+        ))
+        .unwrap();
         assert_eq!(v["messages"][0]["content"], "see");
+    }
+
+    #[test]
+    fn http_image_urls_pass_between_responses_and_chat() {
+        let resp = json!({
+            "model": "m",
+            "store": false,
+            "input": [{
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "see"},
+                    {"type": "input_image", "image_url": "https://example.com/x.png"}
+                ]
+            }]
+        });
+        let chat: Value = serde_json::from_slice(&request(
+            Endpoint::Responses,
+            Endpoint::ChatCompletions,
+            &serde_json::to_vec(&resp).unwrap(),
+        ))
+        .unwrap();
+        let content = &chat["messages"][0]["content"];
+        assert_eq!(content[1]["type"], "image_url");
+        assert_eq!(content[1]["image_url"]["url"], "https://example.com/x.png");
+
+        let back: Value = serde_json::from_slice(&request(
+            Endpoint::ChatCompletions,
+            Endpoint::Responses,
+            &serde_json::to_vec(&chat).unwrap(),
+        ))
+        .unwrap();
+        let content = &back["input"][0]["content"];
+        assert_eq!(content[1]["type"], "input_image");
+        assert_eq!(content[1]["image_url"], "https://example.com/x.png");
+
+        // And on through Messages: Responses → Messages is composed through Chat Completions.
+        let msgs: Value = serde_json::from_slice(&request(
+            Endpoint::Responses,
+            Endpoint::Messages,
+            &serde_json::to_vec(&resp).unwrap(),
+        ))
+        .unwrap();
+        let content = &msgs["messages"][0]["content"];
+        assert_eq!(content[1]["source"]["type"], "url");
+        assert_eq!(content[1]["source"]["url"], "https://example.com/x.png");
     }
 
     #[test]

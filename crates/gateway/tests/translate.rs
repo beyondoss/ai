@@ -971,3 +971,36 @@ async fn provider_prefixed_responses_is_still_a_relay() {
         "include/truncation pass through on the provider path: {got}"
     );
 }
+
+/// A stock OpenAI SDK sends images as `http(s)` URLs. Translated onto Claude they must arrive as
+/// Anthropic `url` image sources — they used to be silently dropped, so the model answered about a
+/// picture it never saw.
+#[tokio::test]
+async fn openai_sdk_image_url_reaches_claude_as_a_url_source() {
+    let nats_port = unused_nats_port();
+    let (pubkey, sk) = test_keypair(1);
+    let mock = MockUpstream::start(Mode::AnthropicJson).await;
+    let gw = Gateway::builder(nats_port, &mock.authority(), &b64(&pubkey))
+        .providers(&["anthropic", "openai", "openrouter"])
+        .start()
+        .await;
+    let body = r#"{"model":"claude-opus-4-8","messages":[{"role":"user","content":[{"type":"text","text":"what is this?"},{"type":"image_url","image_url":{"url":"https://example.com/cat.png"}}]}]}"#;
+
+    let resp = test_client()
+        .post(format!("{}/v1/chat/completions", gw.url()))
+        .header("authorization", format!("Bearer {}", vkey(&sk)))
+        .header("content-type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+
+    let cap = mock.captured().expect("the upstream saw the request");
+    assert_eq!(cap.path, "/v1/messages");
+    let sent: Value = serde_json::from_slice(&cap.body).unwrap();
+    let content = &sent["messages"][0]["content"];
+    assert_eq!(content[1]["type"], "image", "{sent}");
+    assert_eq!(content[1]["source"]["type"], "url", "{sent}");
+    assert_eq!(content[1]["source"]["url"], "https://example.com/cat.png");
+}
