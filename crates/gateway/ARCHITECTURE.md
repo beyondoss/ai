@@ -308,9 +308,17 @@ relay** so `store`, `previous_response_id`, `include`, and `truncation` pass thr
 those fields are in play. `store: false` one-shot Responses may still translate onto Chat
 Completions (lossy). Claude rows have no OpenAI store: Responses + session state is a **400**
 naming the field, not a hollow Messages call. Usage/billing still parse the upstream body/SSE;
-`ai.usage.model` is what the provider echoed. Other mismatches (`/v1/embeddings` with a Claude
-row) are still a **400**. Same-wire Responses (`/{provider}/v1/responses`) stays a byte relay.
-`/{provider}/…` never translates.
+`ai.usage.model` is what the provider echoed. Same-wire Responses (`/{provider}/v1/responses`)
+stays a byte relay. `/{provider}/…` never translates.
+
+**Embeddings rows.** `text-embedding-3-small` and `-large` are catalog rows whose candidates are
+embeddings paths (OpenAI `/v1/embeddings`, then OpenRouter `/api/v1/embeddings`), so a stock
+`client.embeddings.create` on managed `/v1` walks, fails over, and bills input tokens like any other
+row. The row's endpoint is `Endpoint::of_row`: `Embeddings` when its primary's path is, else what
+`wire` says. Embeddings never translates: `/v1/embeddings` against a generation row, and a
+generation path against an embeddings row, are a **400** naming the row's endpoint. So is any
+other named path (`/v1/moderations`, …), which used to relay onto the row's chat path when the
+wire matched. A catalog test keeps rows from mixing embeddings and generation candidates.
 
 v1 mapping is lossy on extras a stock SDK does not need for a tool loop: Responses-only
 fields (`store`, `previous_response_id`, `include`, `truncation`, …) are dropped when leaving
@@ -1287,8 +1295,9 @@ Prometheus on the default registry, exposed at `/metrics` on `metrics_listen`.
   `ai.usage` has non-zero Anthropic tokens including cache/reasoning from the upstream parser;
   `cache_control` / `reasoning_effort` reach Anthropic fields and thinking blocks reappear on the
   client stream; the reverse with a GPT id on `/v1/messages`; same-wire walks still byte-relay;
-  `/{provider}` still 400s a Claude body to OpenAI; `/v1/embeddings` with a Claude row is still a
-  wire-mismatch 400). **Mixed-wire rows:** Anthropic 5xx fails onto OpenRouter Chat Completions with
+  `/{provider}` still 400s a Claude body to OpenAI; `/v1/embeddings` with a Claude or GPT row, and a
+  chat body against an embeddings row, are wire-mismatch 400s; `/v1/embeddings` on an embeddings
+  row reaches `/v1/embeddings`, fails over to OpenRouter's path and id, and bills input tokens). **Mixed-wire rows:** Anthropic 5xx fails onto OpenRouter Chat Completions with
   a Chat Completions body spliced from the original client; billing dialect is the serving
   candidate. **Responses** (`tests/translate.rs`): a stock `/v1/responses` body with `store: false`
   and a GPT catalog id is translated onto Chat Completions; the same body with `claude-*` lands on

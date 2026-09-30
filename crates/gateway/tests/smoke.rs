@@ -393,11 +393,16 @@ async fn catalog_rows_are_servable() {
             let (gw, vkey) = managed_gateway(&nats, spec.name, &key).await;
 
             // The body is the row's own wire. `max_tokens` is required by Anthropic and harmless to
-            // OpenAI, and 1 token keeps the bill to a fraction of a cent.
-            let body = format!(
-                r#"{{"model":"{}","max_tokens":1,"messages":[{{"role":"user","content":"hi"}}]}}"#,
-                route.model,
-            );
+            // OpenAI, and 1 token keeps the bill to a fraction of a cent. An embeddings row takes
+            // `input` instead.
+            let body = if candidate.path.ends_with("/embeddings") {
+                format!(r#"{{"model":"{}","input":"hi"}}"#, route.model)
+            } else {
+                format!(
+                    r#"{{"model":"{}","max_tokens":1,"messages":[{{"role":"user","content":"hi"}}]}}"#,
+                    route.model,
+                )
+            };
             let mut req = test_client()
                 .post(format!("{}/auto/x", gw.url()))
                 .header("authorization", format!("Bearer {vkey}"))

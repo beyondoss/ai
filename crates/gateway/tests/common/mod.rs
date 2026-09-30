@@ -371,6 +371,8 @@ pub enum Mode {
     /// The Anthropic twin: `message_start` (exact input/cache counts), [`STALL_DELTAS`] text deltas,
     /// then silence — no `message_delta`, so no output count.
     AnthropicStallSse,
+    /// An OpenAI embeddings response: vectors first, then `model`, then `usage` (input only).
+    Embeddings,
 }
 
 /// Content deltas a `*StallSse` mode sends before it stalls. Each carries one short token, so an
@@ -451,6 +453,7 @@ pub struct MockUpstream {
     task: tokio::task::JoinHandle<()>,
 }
 
+const CANNED_EMBEDDINGS: &str = r#"{"object":"list","data":[{"object":"embedding","index":0,"embedding":[0.0023,-0.0093,0.0158]}],"model":"text-embedding-3-small","usage":{"prompt_tokens":5,"total_tokens":5}}"#;
 const CANNED_JSON: &str = r#"{"id":"chatcmpl-mock","object":"chat.completion","model":"gpt-4o-2024-08-06","choices":[{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}],"usage":{"prompt_tokens":11,"completion_tokens":7,"total_tokens":18}}"#;
 
 const CANNED_SSE: &str = "data: {\"id\":\"chatcmpl-mock\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4o-2024-08-06\",\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n\
@@ -579,6 +582,10 @@ fn canned_body(mode: Mode) -> (&'static str, Bytes) {
         Mode::Sse => (
             "text/event-stream",
             Bytes::from_static(CANNED_SSE.as_bytes()),
+        ),
+        Mode::Embeddings => (
+            "application/json",
+            Bytes::from_static(CANNED_EMBEDDINGS.as_bytes()),
         ),
         Mode::AnthropicJson => (
             "application/json",

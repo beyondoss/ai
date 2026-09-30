@@ -1495,6 +1495,120 @@ async fn embeddings_path_with_a_claude_row_is_still_a_wire_mismatch() {
     );
 }
 
+/// A stock OpenAI SDK's `client.embeddings.create` on the managed drop-in: the catalog row routes
+/// it to the embeddings path, and the input tokens are billed.
+#[tokio::test]
+async fn v1_embeddings_route_through_the_catalog_and_bill_input() {
+    let nats_port = unused_nats_port();
+    let (pubkey, sk) = test_keypair(1);
+    let mock = MockUpstream::start(Mode::Embeddings).await;
+    let gw = Gateway::builder(nats_port, &mock.authority(), &b64(&pubkey))
+        .providers(&["openai", "openrouter"])
+        .start()
+        .await;
+
+    let resp = test_client()
+        .post(format!("{}/v1/embeddings", gw.url()))
+        .header("authorization", format!("Bearer {}", vkey(&sk)))
+        .header("content-type", "application/json")
+        .body(r#"{"model":"text-embedding-3-small","input":"hello world"}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let text = resp.text().await.unwrap();
+    assert!(text.contains(r#""object":"embedding""#), "{text}");
+
+    let cap = mock.captured().expect("forwarded");
+    assert_eq!(cap.path, "/v1/embeddings");
+    let body = String::from_utf8(cap.body).unwrap();
+    assert!(!body.contains("stream_options"), "{body}");
+
+    let line = gw
+        .wait_for_log_line(&["ai.usage", r#""model":"text-embedding-3-small""#])
+        .await;
+    assert!(line.contains(r#""input_tokens":5"#), "{line}");
+    assert!(line.contains(r#""output_tokens":0"#), "{line}");
+}
+
+/// The failover candidate is OpenRouter's own embeddings path, with its own spelling of the id.
+#[tokio::test]
+async fn embeddings_fail_over_to_openrouter_embeddings() {
+    let nats_port = unused_nats_port();
+    let (pubkey, sk) = test_keypair(1);
+    let dead = MockUpstream::start(Mode::Status(503)).await;
+    let fallback = MockUpstream::start(Mode::Embeddings).await;
+    let gw = Gateway::builder(nats_port, &dead.authority(), &b64(&pubkey))
+        .providers(&["openai", "openrouter"])
+        .provider_authority("openrouter", &fallback.authority())
+        .start()
+        .await;
+
+    let resp = test_client()
+        .post(format!("{}/v1/embeddings", gw.url()))
+        .header("authorization", format!("Bearer {}", vkey(&sk)))
+        .header("content-type", "application/json")
+        .body(r#"{"model":"text-embedding-3-small","input":"hi"}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let cap = fallback.captured().expect("fallback served");
+    assert_eq!(cap.path, "/api/v1/embeddings");
+    let body = String::from_utf8(cap.body).unwrap();
+    assert!(
+        body.contains(r#""model":"openai/text-embedding-3-small""#),
+        "{body}"
+    );
+}
+
+/// A chat body naming an embeddings model is a 400, not a request forwarded to `/v1/embeddings`.
+#[tokio::test]
+async fn chat_completions_against_an_embeddings_row_is_a_wire_mismatch() {
+    let nats_port = unused_nats_port();
+    let (pubkey, sk) = test_keypair(1);
+    let mock = MockUpstream::start(Mode::Json).await;
+    let gw = Gateway::builder(nats_port, &mock.authority(), &b64(&pubkey))
+        .providers(&["openai", "openrouter"])
+        .start()
+        .await;
+
+    let resp = post_v1(
+        &test_client(),
+        &gw.url(),
+        &vkey(&sk),
+        r#"{"model":"text-embedding-3-small","messages":[{"role":"user","content":"hi"}]}"#.into(),
+    )
+    .await;
+    assert_eq!(resp.status().as_u16(), 400);
+    let text = resp.text().await.unwrap();
+    assert!(text.contains("POST /v1/embeddings"), "{text}");
+    assert_eq!(mock.hits(), 0);
+}
+
+/// Embeddings against a GPT row used to be a byte relay onto the row's chat path.
+#[tokio::test]
+async fn embeddings_against_a_chat_row_is_a_wire_mismatch() {
+    let nats_port = unused_nats_port();
+    let (pubkey, sk) = test_keypair(1);
+    let mock = MockUpstream::start(Mode::Json).await;
+    let gw = Gateway::builder(nats_port, &mock.authority(), &b64(&pubkey))
+        .providers(&["openai", "openrouter"])
+        .start()
+        .await;
+
+    let resp = test_client()
+        .post(format!("{}/v1/embeddings", gw.url()))
+        .header("authorization", format!("Bearer {}", vkey(&sk)))
+        .header("content-type", "application/json")
+        .body(r#"{"model":"gpt-4o-mini","input":"hi"}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 400);
+    assert_eq!(mock.hits(), 0);
+}
+
 /// OpenRouter (and other candidate) spellings are aliases for the catalog row.
 #[tokio::test]
 async fn v1_accepts_a_candidate_spelling_as_an_alias() {
@@ -1575,10 +1689,14 @@ async fn v1_models_lists_the_catalog() {
     assert_eq!(claude["pricing"]["output"], "25");
     assert_eq!(claude["pricing"]["cache_read"], "0.5");
     assert_eq!(claude["pricing"]["cache_write"], "6.25");
+    // Embeddings produce no output tokens, so only their output rate may be zero.
     assert!(
         data.iter().all(|m| {
+            let embeddings = m["id"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("text-embedding-"));
             m["pricing"]["input"].as_str().is_some_and(|s| s != "0")
-                && m["pricing"]["output"].as_str().is_some_and(|s| s != "0")
+                && (embeddings || m["pricing"]["output"].as_str().is_some_and(|s| s != "0"))
         }),
         "a catalog model without a list price bills as free: {v}"
     );

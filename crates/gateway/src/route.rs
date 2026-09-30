@@ -36,13 +36,15 @@ pub use providers::{AuthScheme, ProviderSpec, gateway_providers as known_provide
 pub use providers::WireFormat as Dialect;
 
 /// An HTTP endpoint shape the catalog walk can name. Distinct from [`Dialect`]: OpenAI-wire
-/// covers both Chat Completions and Responses, and a catalog row's `wire` only distinguishes
-/// Messages from the OpenAI family. Translation is per *endpoint*.
+/// covers Chat Completions, Responses and Embeddings, and a catalog row's `wire` only
+/// distinguishes Messages from the OpenAI family. Translation is per *endpoint*, and only among
+/// the three generation endpoints: Embeddings never translates to or from anything.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Endpoint {
     ChatCompletions,
     Messages,
     Responses,
+    Embeddings,
 }
 
 impl Endpoint {
@@ -59,7 +61,9 @@ impl Endpoint {
     /// `/responses` is Responses, everything else is Chat Completions — including OpenRouter's
     /// `/api/v1/chat/completions`. Used per attempt so a mixed row never sends the wrong wire.
     pub fn of_upstream_path(path: &str) -> Self {
-        if path.ends_with("/messages") {
+        if path.ends_with("/embeddings") {
+            Endpoint::Embeddings
+        } else if path.ends_with("/messages") {
             Endpoint::Messages
         } else if path.contains("/responses") {
             Endpoint::Responses
@@ -71,7 +75,28 @@ impl Endpoint {
     pub fn wire(self) -> Dialect {
         match self {
             Endpoint::Messages => Dialect::Anthropic,
-            Endpoint::ChatCompletions | Endpoint::Responses => Dialect::OpenAi,
+            Endpoint::ChatCompletions | Endpoint::Responses | Endpoint::Embeddings => {
+                Dialect::OpenAi
+            }
+        }
+    }
+
+    /// The endpoint a catalog row serves. An embeddings row is recognized by its primary's path;
+    /// every other row is what its `wire` says (Chat Completions or Messages).
+    pub fn of_row(row: &ModelRoute) -> Self {
+        match row.candidates.first() {
+            Some(c) if c.path.ends_with("/embeddings") => Endpoint::Embeddings,
+            _ => Endpoint::of_wire(row.wire),
+        }
+    }
+
+    /// Caller-facing hint for the wire-mismatch 400.
+    pub fn post_hint(self) -> &'static str {
+        match self {
+            Endpoint::Messages => "Anthropic Messages; POST /v1/messages",
+            Endpoint::ChatCompletions => "OpenAI Chat Completions; POST /v1/chat/completions",
+            Endpoint::Responses => "OpenAI Responses; POST /v1/responses",
+            Endpoint::Embeddings => "OpenAI Embeddings; POST /v1/embeddings",
         }
     }
 }
@@ -151,12 +176,15 @@ pub fn implied_wire(path: &str) -> Option<Dialect> {
 }
 
 /// The inbound endpoint a catalog-walk path names, when it names Chat Completions, Messages,
-/// or Responses (including the `/auto` suffix). Bare `/v1` and embeddings-class paths return
-/// `None` — those either let the row pick the path or stay a 400 against the wrong row.
+/// Responses, or Embeddings (including the `/auto` suffix). Bare `/v1` returns `None` (the row
+/// picks the path), and so does any other named path, which is a 400 against every row.
 pub fn implied_endpoint(path: &str) -> Option<Endpoint> {
     let rest = catalog_path_rest(path)?;
     if rest.is_empty() || rest == "/v1" || rest == "/v1/" {
         return None;
+    }
+    if rest.ends_with("/embeddings") {
+        return Some(Endpoint::Embeddings);
     }
     if is_messages_rest(rest) {
         return Some(Endpoint::Messages);
@@ -217,46 +245,33 @@ pub fn candidate_path_is_responses(path: &str) -> bool {
 /// with the row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WireAction {
-    /// Same endpoint, or the path does not name Chat Completions / Messages / Responses.
-    /// Byte-relay. Bare `/v1` is this: the row picks the path.
+    /// Same endpoint, or a bare `/v1` / `/auto` path that names none. Byte-relay: the row
+    /// picks the path.
     Relay,
     /// Inbound Chat Completions, Messages, or Responses vs a row that speaks a different one
     /// of those three. Translate; `client` is what the caller sent and must receive.
     Translate { client: Endpoint },
-    /// Named path we do not translate (`/v1/embeddings` with a Claude row, …). 400.
+    /// Embeddings against a generation row or the reverse, or a named path the catalog does not
+    /// serve (`/v1/moderations`, …). 400. Relaying would send the body to the candidate's path,
+    /// which is a different endpoint.
     Reject,
 }
 
-/// Catalog-walk decision for an inbound path vs the row's wire.
+/// Catalog-walk decision for an inbound path vs the row's endpoint ([`Endpoint::of_row`]).
 ///
-/// The row's `wire` maps to Chat Completions or Messages ([`Endpoint::of_wire`]). Inbound
-/// `/v1/responses` is a third client dialect vs the row primary; per-candidate translate then
-/// uses the serving path, so a GPT session walk onto `/v1/responses` is a byte relay. Same-wire
-/// Responses on `/{provider}` never reaches here.
-pub fn catalog_wire_action(path: &str, row_wire: Dialect) -> WireAction {
-    let Some(got) = implied_wire(path) else {
+/// Inbound `/v1/responses` is a third client dialect vs the row primary; per-candidate translate
+/// then uses the serving path, so a GPT session walk onto `/v1/responses` is a byte relay.
+/// Same-wire Responses on `/{provider}` never reaches here.
+pub fn catalog_wire_action(path: &str, row: Endpoint) -> WireAction {
+    if implied_wire(path).is_none() {
         return WireAction::Relay;
-    };
-    let row_ep = Endpoint::of_wire(row_wire);
-    if let Some(client) = implied_endpoint(path) {
-        if client == row_ep {
-            return WireAction::Relay;
+    }
+    match implied_endpoint(path) {
+        Some(client) if client == row => WireAction::Relay,
+        Some(client) if client != Endpoint::Embeddings && row != Endpoint::Embeddings => {
+            WireAction::Translate { client }
         }
-        return WireAction::Translate { client };
-    }
-    // Named path that is not Chat Completions / Messages / Responses (embeddings, models, …).
-    if got == row_wire {
-        WireAction::Relay
-    } else {
-        WireAction::Reject
-    }
-}
-
-/// Caller-facing hint for a catalog row's wire, used in the wire-mismatch 400.
-pub fn wire_post_hint(d: Dialect) -> &'static str {
-    match d {
-        Dialect::Anthropic => "Anthropic Messages; POST /v1/messages",
-        Dialect::OpenAi => "OpenAI Chat Completions; POST /v1/chat/completions",
+        _ => WireAction::Reject,
     }
 }
 
@@ -446,67 +461,117 @@ mod tests {
     #[test]
     fn catalog_wire_action_translates_chat_completions_versus_messages() {
         assert_eq!(
-            catalog_wire_action("/v1/chat/completions", Dialect::Anthropic),
+            catalog_wire_action("/v1/chat/completions", Endpoint::Messages),
             WireAction::Translate {
                 client: Endpoint::ChatCompletions
             }
         );
         assert_eq!(
-            catalog_wire_action("/auto/chat/completions", Dialect::Anthropic),
+            catalog_wire_action("/auto/chat/completions", Endpoint::Messages),
             WireAction::Translate {
                 client: Endpoint::ChatCompletions
             }
         );
         assert_eq!(
-            catalog_wire_action("/v1/messages", Dialect::OpenAi),
+            catalog_wire_action("/v1/messages", Endpoint::ChatCompletions),
             WireAction::Translate {
                 client: Endpoint::Messages
             }
         );
         assert_eq!(
-            catalog_wire_action("/auto/v1/messages", Dialect::OpenAi),
+            catalog_wire_action("/auto/v1/messages", Endpoint::ChatCompletions),
             WireAction::Translate {
                 client: Endpoint::Messages
             }
         );
         // Same wire: byte-relay.
         assert_eq!(
-            catalog_wire_action("/v1/chat/completions", Dialect::OpenAi),
+            catalog_wire_action("/v1/chat/completions", Endpoint::ChatCompletions),
             WireAction::Relay
         );
         assert_eq!(
-            catalog_wire_action("/v1/messages", Dialect::Anthropic),
+            catalog_wire_action("/v1/messages", Endpoint::Messages),
             WireAction::Relay
         );
         // Other OpenAI-shaped paths are still a 400 against an Anthropic row.
         assert_eq!(
-            catalog_wire_action("/v1/embeddings", Dialect::Anthropic),
+            catalog_wire_action("/v1/embeddings", Endpoint::Messages),
             WireAction::Reject
         );
         // Responses is a third inbound dialect: translate onto the row's Chat or Messages endpoint.
         assert_eq!(
-            catalog_wire_action("/v1/responses", Dialect::Anthropic),
+            catalog_wire_action("/v1/responses", Endpoint::Messages),
             WireAction::Translate {
                 client: Endpoint::Responses
             }
         );
         assert_eq!(
-            catalog_wire_action("/v1/responses", Dialect::OpenAi),
+            catalog_wire_action("/v1/responses", Endpoint::ChatCompletions),
             WireAction::Translate {
                 client: Endpoint::Responses
             }
         );
         assert_eq!(
-            catalog_wire_action("/auto/v1/responses", Dialect::OpenAi),
+            catalog_wire_action("/auto/v1/responses", Endpoint::ChatCompletions),
             WireAction::Translate {
                 client: Endpoint::Responses
             }
         );
         // Bare /v1 does not name an endpoint.
         assert_eq!(
-            catalog_wire_action("/v1", Dialect::Anthropic),
+            catalog_wire_action("/v1", Endpoint::Messages),
             WireAction::Relay
         );
+    }
+
+    /// Embeddings relays only onto an embeddings row. Anything else would forward the body to a
+    /// candidate path that is a different endpoint.
+    #[test]
+    fn embeddings_never_translate() {
+        assert_eq!(
+            catalog_wire_action("/v1/embeddings", Endpoint::Embeddings),
+            WireAction::Relay
+        );
+        assert_eq!(
+            catalog_wire_action("/auto/v1/embeddings", Endpoint::Embeddings),
+            WireAction::Relay
+        );
+        for row in [Endpoint::ChatCompletions, Endpoint::Messages] {
+            assert_eq!(
+                catalog_wire_action("/v1/embeddings", row),
+                WireAction::Reject,
+                "{row:?}"
+            );
+        }
+        for path in ["/v1/chat/completions", "/v1/messages", "/v1/responses"] {
+            assert_eq!(
+                catalog_wire_action(path, Endpoint::Embeddings),
+                WireAction::Reject,
+                "{path}"
+            );
+        }
+        // A named path the catalog does not serve is a 400 even on a same-wire row. It used to
+        // relay, which sent the body to the row's chat path.
+        assert_eq!(
+            catalog_wire_action("/v1/moderations", Endpoint::ChatCompletions),
+            WireAction::Reject
+        );
+    }
+
+    #[test]
+    fn embedding_paths_are_the_embeddings_endpoint() {
+        assert_eq!(
+            Endpoint::of_upstream_path("/api/v1/embeddings"),
+            Endpoint::Embeddings
+        );
+        assert_eq!(
+            implied_endpoint("/v1/embeddings"),
+            Some(Endpoint::Embeddings)
+        );
+        let row = providers::for_model("text-embedding-3-small").expect("catalog row");
+        assert_eq!(Endpoint::of_row(row), Endpoint::Embeddings);
+        let chat = providers::for_model("gpt-4o-mini").expect("catalog row");
+        assert_eq!(Endpoint::of_row(chat), Endpoint::ChatCompletions);
     }
 
     #[test]

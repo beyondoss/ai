@@ -1860,14 +1860,15 @@ impl ProxyHttp for AiProxy {
 
         // Catalog walk: inbound path may name Chat Completions, Messages, or Responses while the
         // serving *candidate* speaks a different one of those three. Always keep the client
-        // endpoint so failover can translate onto the next path; embeddings-class mismatches
-        // are still a 400. Inbound Responses with session state already chose the Responses arm
+        // endpoint so failover can translate onto the next path; embeddings against a generation
+        // row (or the reverse) is a 400. Inbound Responses with session state already chose the Responses arm
         // (or 400'd) — same-endpoint is a byte relay (`from == to`). `/{provider}/…` never
         // reaches this — it has no row.
         let mut translate_state = None;
         if let Some(row) = model_route {
             let path = session.req_header().uri.path();
-            match route::catalog_wire_action(path, row.wire) {
+            let row_endpoint = route::Endpoint::of_row(row);
+            match route::catalog_wire_action(path, row_endpoint) {
                 route::WireAction::Reject => {
                     self.state.metrics.rejection(Rejection::WireMismatch).inc();
                     return Self::reject_message_boxed(
@@ -1875,14 +1876,13 @@ impl ProxyHttp for AiProxy {
                         &request_id,
                         400,
                         "invalid_request_error",
-                        format!("{} is {}", row.model, route::wire_post_hint(row.wire)),
+                        format!("{} is {}", row.model, row_endpoint.post_hint()),
                     )
                     .await;
                 }
                 route::WireAction::Relay => {
                     translate_state = Some(translate::TranslateState::new(
-                        route::implied_endpoint(path)
-                            .unwrap_or_else(|| route::Endpoint::of_wire(row.wire)),
+                        route::implied_endpoint(path).unwrap_or(row_endpoint),
                     ));
                 }
                 route::WireAction::Translate { client } => {

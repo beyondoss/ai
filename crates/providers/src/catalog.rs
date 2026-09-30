@@ -164,13 +164,15 @@ pub fn wire_of_path(path: &str) -> WireFormat {
     }
 }
 
-/// Chat Completions vs Messages vs Responses, from a candidate path.
+/// Chat Completions vs Messages vs Responses vs Embeddings, from a candidate path.
 ///
 /// Distinct from [`wire_of_path`]: `/v1/chat/completions` and `/v1/responses` are both OpenAI-wire
 /// but different endpoints. The gateway translates when this candidate's path differs from the
 /// client's; it never sends a Messages body at Chat Completions (or the reverse).
 pub fn endpoint_of_path(path: &str) -> &'static str {
-    if path.ends_with("/messages") {
+    if path.ends_with("/embeddings") {
+        "embeddings"
+    } else if path.ends_with("/messages") {
         "messages"
     } else if path.contains("/responses") {
         "responses"
@@ -244,6 +246,24 @@ const fn openai_chat(native: &'static str, openrouter: &'static str) -> [Candida
             provider: ProviderId::OpenRouter,
             upstream_model: openrouter,
             path: "/api/v1/chat/completions",
+        },
+    ]
+}
+
+/// OpenAI `/v1/embeddings`, then OpenRouter's `/api/v1/embeddings`. An embeddings row is only ever
+/// embeddings candidates: the gateway recognizes the row by its primary's path and never translates
+/// it to or from a generation endpoint. Ids and paths verified live 2026-09-30.
+const fn openai_embeddings(native: &'static str, openrouter: &'static str) -> [Candidate; 2] {
+    [
+        Candidate {
+            provider: ProviderId::OpenAi,
+            upstream_model: native,
+            path: "/v1/embeddings",
+        },
+        Candidate {
+            provider: ProviderId::OpenRouter,
+            upstream_model: openrouter,
+            path: "/api/v1/embeddings",
         },
     ]
 }
@@ -1206,6 +1226,23 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         responses: &[],
         price: price("0.15", "0.47", "0.016", "0.2"),
     },
+    // Embeddings: input only. Output is priced 0 and there is no cache, so both cache rates are
+    // the input rate (the `ListPrice` rule for an unpublished rate). `text-embedding-ada-002` is
+    // left out: both providers answer it as `text-embedding-ada-002-v2`, a billed id no row names.
+    ModelRoute {
+        model: "text-embedding-3-large",
+        wire: WireFormat::OpenAi,
+        candidates: &openai_embeddings("text-embedding-3-large", "openai/text-embedding-3-large"),
+        responses: &[],
+        price: price("0.13", "0", "0.13", "0.13"),
+    },
+    ModelRoute {
+        model: "text-embedding-3-small",
+        wire: WireFormat::OpenAi,
+        candidates: &openai_embeddings("text-embedding-3-small", "openai/text-embedding-3-small"),
+        responses: &[],
+        price: price("0.02", "0", "0.02", "0.02"),
+    },
     ModelRoute {
         model: "thinkingmachines/inkling",
         wire: WireFormat::OpenAi,
@@ -1429,7 +1466,7 @@ mod tests {
                 let ep = endpoint_of_path(c.path);
                 assert_ne!(
                     ep, "other",
-                    "route {:?} candidate {:?} path {:?} is not Chat Completions, Messages, or Responses",
+                    "route {:?} candidate {:?} path {:?} is not Chat Completions, Messages, Responses, or Embeddings",
                     route.model, c.provider, c.path,
                 );
             }
@@ -1526,6 +1563,25 @@ mod tests {
             upstream_model: _,
             path: _,
         } = c;
+    }
+
+    /// The gateway decides a row is embeddings from its primary's path and never translates it,
+    /// so a row that mixed an embeddings candidate with a generation one would fail over onto a
+    /// different endpoint with the wrong body.
+    #[test]
+    fn embeddings_rows_are_only_embeddings() {
+        for route in MODEL_ROUTES {
+            let embeds = route
+                .candidates
+                .iter()
+                .filter(|c| c.path.ends_with("/embeddings"))
+                .count();
+            assert!(
+                embeds == 0 || (embeds == route.candidates.len() && route.responses.is_empty()),
+                "{} mixes embeddings and generation candidates",
+                route.model
+            );
+        }
     }
 
     #[test]
@@ -1682,7 +1738,12 @@ mod tests {
             let cache_read = micros("cache_read", route.model, p.cache_read);
             let cache_write = micros("cache_write", route.model, p.cache_write);
             assert!(input > 0, "{} input", route.model);
-            assert!(output > 0, "{} output", route.model);
+            // Embeddings produce no output tokens; everything else must price them.
+            let embeddings = route
+                .candidates
+                .first()
+                .is_some_and(|c| c.path.ends_with("/embeddings"));
+            assert!(output > 0 || embeddings, "{} output", route.model);
             assert!(
                 cache_read > 0 && cache_read <= input,
                 "{} cache_read {cache_read} vs input {input}",
@@ -2021,9 +2082,9 @@ mod tests {
     #[test]
     fn gpt_rows_carry_an_openai_responses_arm() {
         for route in MODEL_ROUTES.iter().filter(|r| {
-            r.candidates
-                .first()
-                .is_some_and(|c| c.provider == ProviderId::OpenAi)
+            r.candidates.first().is_some_and(|c| {
+                c.provider == ProviderId::OpenAi && !c.path.ends_with("/embeddings")
+            })
         }) {
             assert_eq!(
                 route.responses.len(),

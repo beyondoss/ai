@@ -184,7 +184,7 @@ fn map_error(v: &Value, client: Endpoint) -> Value {
     let (typ, msg) = extract_error(v);
     match client {
         Endpoint::Messages => json!({ "type": "error", "error": { "type": typ, "message": msg } }),
-        Endpoint::ChatCompletions | Endpoint::Responses => {
+        Endpoint::ChatCompletions | Endpoint::Responses | Endpoint::Embeddings => {
             json!({ "error": { "message": msg, "type": typ } })
         }
     }
@@ -2342,7 +2342,7 @@ impl SseBridge {
                         sse_data("[DONE]")
                     }
                 }
-                Endpoint::Messages | Endpoint::Responses => Vec::new(),
+                Endpoint::Messages | Endpoint::Responses | Endpoint::Embeddings => Vec::new(),
             };
         }
         match (self.upstream, self.client) {
@@ -2368,6 +2368,8 @@ impl SseBridge {
                 out
             }
             (_, Endpoint::Responses) => self.oai_to_resp.finish(),
+            // Embeddings never stream and never translate.
+            (_, Endpoint::Embeddings) => Vec::new(),
         }
     }
 
