@@ -14,6 +14,14 @@
 //! order. A connect failure or 5xx is recorded as a penalty so a fast error does not outrank a
 //! slower 2xx. A 429 is a real answer, not a penalty — same distinction the breaker already makes.
 //!
+//! A candidate whose **latest** attempt failed ranks behind every other candidate, unmeasured ones
+//! included, until it answers again or its sample goes stale. This is what makes a client's own
+//! retry a failover. A 5xx on a request body past pingora's 64 KiB replay buffer cannot be retried
+//! in-gateway (see ARCHITECTURE.md), so it is relayed; the stock OpenAI/Anthropic SDKs retry 5xx
+//! and 529 on their own, and that retry is a fresh request with a fresh body. Before this, the
+//! penalty alone left a failing primary *measured* and so still ahead of a never-tried fallback —
+//! the retry went straight back to the provider that had just failed.
+//!
 //! Unmeasured candidates would otherwise never run if the primary always succeeds, so every
 //! [`PROBE_EVERY`]th request (skipping seq `0`) promotes the first unmeasured slot to primary.
 //! Once every candidate on the row has a sample, the walk is pure EWMA. A sample older than
@@ -26,7 +34,7 @@
 use crate::control::Walk;
 use providers::{MAX_CANDIDATES, ModelRoute, catalog::MODEL_ROUTES};
 use std::sync::LazyLock;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 /// Promote the first unmeasured candidate to primary on `seq % PROBE_EVERY == 0` (and `seq != 0`).
@@ -58,6 +66,9 @@ pub struct Router {
 struct Row {
     ewma_us: [AtomicU64; MAX_CANDIDATES],
     last_ns: [AtomicU64; MAX_CANDIDATES],
+    /// The latest attempt against this candidate failed (connect failure or 5xx). Cleared by the
+    /// next success; ignored once the sample is [`STALE`].
+    failed: [AtomicBool; MAX_CANDIDATES],
 }
 
 impl Row {
@@ -65,8 +76,18 @@ impl Row {
         Self {
             ewma_us: std::array::from_fn(|_| AtomicU64::new(0)),
             last_ns: std::array::from_fn(|_| AtomicU64::new(0)),
+            failed: std::array::from_fn(|_| AtomicBool::new(false)),
         }
     }
+}
+
+/// How a candidate ranks: healthy measured (fastest first), then unmeasured (catalog order), then
+/// candidates whose latest attempt failed (least bad first).
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Tier {
+    Healthy(u64),
+    Unmeasured,
+    Failed(u64),
 }
 
 impl Default for Router {
@@ -110,6 +131,7 @@ impl Router {
                 break;
             }
         }
+        row.failed[i].store(!ok, Ordering::Relaxed);
         row.last_ns[i].store(now_ns(), Ordering::Relaxed);
     }
 
@@ -141,20 +163,24 @@ impl Router {
         self.rows.get(i)
     }
 
-    fn effective(&self, row: &Row, catalog_idx: u8, now: u64) -> u64 {
+    fn effective(&self, row: &Row, catalog_idx: u8, now: u64) -> Tier {
         let i = usize::from(catalog_idx);
         if i >= MAX_CANDIDATES {
-            return 0;
+            return Tier::Unmeasured;
         }
         let ewma = row.ewma_us[i].load(Ordering::Relaxed);
         if ewma == 0 {
-            return 0;
+            return Tier::Unmeasured;
         }
         let last = row.last_ns[i].load(Ordering::Relaxed);
         if last != 0 && u128::from(now.saturating_sub(last)) > STALE_NS {
-            return 0;
+            return Tier::Unmeasured;
         }
-        ewma
+        if row.failed[i].load(Ordering::Relaxed) {
+            Tier::Failed(ewma)
+        } else {
+            Tier::Healthy(ewma)
+        }
     }
 }
 
@@ -172,47 +198,32 @@ fn now_ns() -> u64 {
     BASE.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64
 }
 
-/// Measured slots (ewma > 0) sorted fastest-first, then unmeasured in the order they already sat.
-fn sort_measured(walk: Walk, score: impl Fn(u8) -> u64) -> Walk {
-    let n = walk.len;
-    let mut measured = [(0u64, 0u8, 0u8); MAX_CANDIDATES];
-    let mut unmeasured = [0u8; MAX_CANDIDATES];
-    let mut nm = 0usize;
-    let mut nu = 0usize;
-    for slot in 0..n {
-        let orig = walk.indices[slot as usize];
-        let ewma = score(orig);
-        if ewma == 0 {
-            unmeasured[nu] = orig;
-            nu += 1;
-        } else {
-            measured[nm] = (ewma, slot, orig);
-            nm += 1;
-        }
+/// Sort by [`Tier`]: healthy measured fastest-first, then unmeasured, then failed. Ties keep the
+/// order the walk already had, so unmeasured candidates stay in catalog (or header) order.
+fn sort_measured(walk: Walk, score: impl Fn(u8) -> Tier) -> Walk {
+    let n = usize::from(walk.len);
+    let mut keyed = [(Tier::Unmeasured, 0u8, 0u8); MAX_CANDIDATES];
+    for (slot, (key, &orig)) in keyed.iter_mut().zip(&walk.indices[..n]).enumerate() {
+        *key = (score(orig), slot as u8, orig);
     }
-    measured[..nm].sort_unstable_by_key(|&(ewma, slot, _)| (ewma, slot));
+    keyed[..n].sort_unstable_by_key(|&(tier, slot, _)| (tier, slot));
     let mut out = Walk {
         indices: [0u8; MAX_CANDIDATES],
-        len: n,
+        len: walk.len,
     };
-    for (slot, orig) in out.indices.iter_mut().zip(
-        measured[..nm]
-            .iter()
-            .map(|t| t.2)
-            .chain(unmeasured[..nu].iter().copied()),
-    ) {
-        *slot = orig;
+    for (dst, &(_, _, orig)) in out.indices.iter_mut().zip(&keyed[..n]) {
+        *dst = orig;
     }
     out
 }
 
 /// Move the first unmeasured catalog index to slot 0; leave the rest in order. No-op when every
 /// slot is already measured (exploit-only) or the unmeasured one is already primary.
-fn probe(walk: Walk, score: impl Fn(u8) -> u64) -> Walk {
+fn probe(walk: Walk, score: impl Fn(u8) -> Tier) -> Walk {
     let n = walk.len;
     let mut pick = None;
     for i in 0..n {
-        if score(walk.indices[i as usize]) == 0 {
+        if score(walk.indices[i as usize]) == Tier::Unmeasured {
             pick = Some(i);
             break;
         }
@@ -288,6 +299,39 @@ mod tests {
         r.observe(row, 1, 200_000, true);
         let walk = r.rank(Walk::identity(row.candidates.len()), row, 1);
         assert_eq!(names(walk, row)[0], "bedrock");
+    }
+
+    /// The client-retry failover: a primary that just 5xx'd must not stay ahead of a fallback that
+    /// has never been tried, or the SDK's retry goes straight back to it.
+    #[test]
+    fn a_failed_primary_ranks_behind_an_unmeasured_fallback() {
+        let r = Router::new();
+        let row = opus();
+        r.observe(row, 0, 200_000, true);
+        r.observe(row, 0, 50_000, false);
+        let walk = r.rank(Walk::identity(row.candidates.len()), row, 1);
+        assert_eq!(names(walk, row), ["bedrock", "openrouter", "anthropic"]);
+    }
+
+    #[test]
+    fn a_success_restores_a_failed_candidate() {
+        let r = Router::new();
+        let row = opus();
+        r.observe(row, 0, 50_000, false);
+        r.observe(row, 0, 200_000, true);
+        let walk = r.rank(Walk::identity(row.candidates.len()), row, 1);
+        assert_eq!(names(walk, row)[0], "anthropic");
+    }
+
+    #[test]
+    fn when_everything_failed_the_least_bad_goes_first() {
+        let r = Router::new();
+        let row = opus();
+        r.observe(row, 0, 9_000_000, false);
+        r.observe(row, 1, 6_000_000, false);
+        r.observe(row, 2, 7_000_000, false);
+        let walk = r.rank(Walk::identity(row.candidates.len()), row, 1);
+        assert_eq!(names(walk, row), ["bedrock", "openrouter", "anthropic"]);
     }
 
     #[test]

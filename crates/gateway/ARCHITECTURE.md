@@ -239,7 +239,9 @@ id) is an alias for the row — those are the ids we already rewrite _to_.
 The default walk is TTFT-ranked (`smart.rs`): **this process's** EWMA per catalog candidate, measured
 from `attempt_start` the same way `ai_ttft_seconds` is. Cold start (no samples) is the row's static
 order. A connect failure or 5xx takes a penalty floor so a fast error does not outrank a slower 2xx;
-a 429 is a real answer. Unmeasured arms stay failover until a deterministic probe (every 8th
+a 429 is a real answer. A candidate whose **latest** attempt failed ranks behind every other
+candidate — unmeasured ones included — until it answers again or its sample goes stale (30s). That
+is what turns a client's own retry into a failover; see "Status-based failover, and where it stops". Unmeasured arms stay failover until a deterministic probe (every 8th
 request, skipping seq `0`) promotes one. A sample older than 30s is treated as unmeasured so a
 recovered arm is retried. Ranking reads the monotonic clock once per request and reuses that
 instant for every candidate's staleness check. `smart_router = false`
@@ -948,6 +950,17 @@ against pingora 0.9.0 and its main branch, 2026-09-30: the constant is unchanged
 buffered copy in is not an option either — on a truncated retry pingora sends no body at all and
 never calls `request_body_filter`. Upstream PR cloudflare/pingora#816, early request-body
 buffering replayed across retries, would remove the limit.)
+
+**What covers it instead: the client's own retry.** The stock OpenAI and Anthropic SDKs retry 5xx
+and 529 by default, and that retry is a fresh request with a fresh body. The relayed 5xx marks the
+candidate failed in the TTFT ranker, which puts it behind every alternative, so the retry lands on
+the fallback. The cost is one extra round trip plus the SDK's backoff (≈0.5–1s) instead of an
+instant switch. Limits: clients that do not retry get the error; the ranker is per process, so a
+retry that reaches another replica may hit the failing provider once more (the per-provider breaker
+still cuts a sustained outage everywhere); and every catalog walk on that process avoids the failed
+candidate for up to 30s, not just the retry. `smart_router = false` or a pinned walk
+(`x-beyond-order` / `split`) turns it off. `an_sdk_retry_after_an_unreplayable_529_lands_on_the_fallback`
+pins it — and fails with the demotion removed.
 
 **Pingora 0.9's default refuses to retry a non-idempotent method** — every LLM call is a `POST` —
 which silently disabled both walks above. `error_while_proxy` is overridden to keep 0.8's policy:

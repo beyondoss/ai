@@ -854,6 +854,66 @@ async fn an_unreplayable_body_relays_the_5xx_and_is_counted() {
     );
 }
 
+/// The client-retry failover. A 529 on a body past the replay buffer cannot be retried in-gateway,
+/// so it is relayed — but the stock SDKs retry 529/5xx on their own, and that retry is a fresh
+/// request with a fresh body. It must land on the fallback: the primary's latest attempt failed, so
+/// the ranker puts it behind the never-tried fallback. Before, the penalty alone left the failing
+/// primary *measured* and so ahead of the unmeasured fallback, and the retry went straight back to it.
+#[tokio::test]
+async fn an_sdk_retry_after_an_unreplayable_529_lands_on_the_fallback() {
+    let nats_port = unused_nats_port();
+    let (pubkey, sk) = test_keypair(1);
+    let primary = MockUpstream::start(Mode::AnthropicStatus(529)).await;
+    let fallback = MockUpstream::start(Mode::Json).await;
+    let gw = Gateway::builder(nats_port, &primary.authority(), &b64(&pubkey))
+        .providers(&["anthropic", "openrouter"])
+        .provider_authority("openrouter", &fallback.authority())
+        .start()
+        .await;
+
+    // 256 KiB — an agent turn's worth, comfortably past BODY_BUF_LIMIT.
+    let filler = "x".repeat(256 * 1024);
+    let big = format!(
+        r#"{{"model":"claude-opus-4-8","max_tokens":16,"messages":[{{"role":"user","content":"{filler}"}}]}}"#
+    );
+    let send = || {
+        test_client()
+            .post(format!("{}/v1/messages", gw.url()))
+            .header("x-api-key", vkey(&sk))
+            .header("content-type", "application/json")
+            .body(big.clone())
+            .send()
+    };
+
+    let first = send().await.unwrap();
+    assert_eq!(
+        first.status().as_u16(),
+        529,
+        "unreplayable: the 529 is relayed"
+    );
+    assert_eq!(fallback.hits(), 0);
+
+    // What the SDK does next.
+    let retry = send().await.unwrap();
+    assert_eq!(
+        retry.status().as_u16(),
+        200,
+        "the retry must be served by the fallback: {}",
+        retry.text().await.unwrap()
+    );
+    assert_eq!(
+        primary.hits(),
+        1,
+        "the retry must not go back to the provider that just failed"
+    );
+    assert_eq!(fallback.hits(), 1);
+    let cap = fallback.captured().expect("fallback served");
+    assert!(
+        cap.body.len() > 256 * 1024,
+        "the whole large body reached the fallback"
+    );
+}
+
 /// The ledger holds on the **status** failover path too: a candidate that answers 5xx has that
 /// failure recorded against its own breaker, while the candidate that served does not.
 ///
