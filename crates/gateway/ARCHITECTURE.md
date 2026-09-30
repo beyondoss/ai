@@ -139,6 +139,9 @@ Client (stock OpenAI/Anthropic SDK)
   ▼  response_body_filter (proxy.rs)  — response relayed chunk-by-chunk; SSE is never fully buffered
   │  Translate path: convert SSE event-by-event into the inbound dialect (do not wait for `[DONE]`
   │    before forwarding deltas). Non-stream: map the JSON object, including error envelopes.
+  │    Both held buffers (the non-stream body; one not-yet-terminated SSE event) are capped at
+  │    MAX_TRANSLATE_BUFFER (32 MiB) — past it the response is aborted
+  │    (ai_rejections_total{reason="response_too_large"}). A stream as a whole is never capped.
   │  Managed only: feed *upstream* chunks → ModelScanner::for_response → billed model
   │    (accepts Anthropic's nested message.model, so it stops in the first chunk for both dialects)
   │  Append *upstream* bytes to bounded 64KB tail (copy_within compaction once tail > 128KB)
@@ -1092,7 +1095,7 @@ Secret-bearing fields (`pool_keys`, `nats_creds`) are held as `Secret<T>` — st
 | `idle_timeout_secs`             | `90`                              | Idle timeout on a pooled upstream connection before it's closed.                                                                                                                                                                                                 |
 | `shutdown_grace_period_secs`    | `600`                             | SIGTERM drain window for in-flight requests (= `read_timeout_secs` so a deploy never truncates a stream). Capped by the orchestrator's stop timeout (ECS Fargate: 120s).                                                                                         |
 | `shutdown_runtime_timeout_secs` | `10`                              | Final runtime-teardown backstop after the drain window.                                                                                                                                                                                                          |
-| `capture_max_bytes`             | `262144`                          | Per-direction cap on a captured payload before truncation; the default a per-tenant entry overrides. Really a bound on what the log pipeline will carry — raise only alongside its per-record limit.                                                             |
+| `capture_max_bytes`             | `262144`                          | Per-direction cap on a captured payload; the default a per-tenant entry overrides. Bounded by the log pipeline's per-record limit. This and per-tenant values clamp to 4 MiB (`MAX_CAPTURE_BYTES`).                                                              |
 | `capture_default_sample_n`      | `1`                               | Default sampling for control-plane-enabled capture (keep 1 request in N). `1` captures every request. A capture requested via `x-beyond-capture: on` is never sampled away.                                                                                      |
 | `capture_queue_depth`           | `1024`                            | Depth of the bounded `ai.payload` sink queue. When full, captures are **dropped** (`ai_capture_dropped_total`) rather than blocking — a stalled log sink must never backpressure the data plane.                                                                 |
 | `cache_ttl_secs`                | `0`                               | Per-pod exact-match response cache TTL. `0` disables. Only managed catalog walks whose body is already in hand before `upstream_peer`. A hit on **this process** replays the stored 2xx; a miss stays an unbuffered relay (no Redis).                            |

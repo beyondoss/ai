@@ -759,6 +759,28 @@ impl AiProxy {
         Ok(true)
     }
 
+    /// Abort a translated response whose buffer crossed [`translate::MAX_TRANSLATE_BUFFER`].
+    ///
+    /// Headers are already downstream, so there is no clean error to send — the same trade as the
+    /// request-body cap in `request_body_filter`: an abuse guard, not a client path.
+    fn translate_overflow(
+        &self,
+        request_id: &str,
+        buffer: &'static str,
+    ) -> Box<pingora_core::Error> {
+        self.state
+            .metrics
+            .rejection(Rejection::ResponseTooLarge)
+            .inc();
+        warn!(
+            request_id,
+            buffer,
+            limit = translate::MAX_TRANSLATE_BUFFER,
+            "translated response exceeds the buffer limit; aborting",
+        );
+        pingora_core::Error::new_str("translated response exceeds buffer limit")
+    }
+
     async fn reply_cache_hit_boxed(
         session: &mut Session,
         request_id: &str,
@@ -2870,12 +2892,17 @@ impl ProxyHttp for AiProxy {
             let out = if let Some(t) = rc.auto.as_mut().and_then(|a| a.translate.as_mut()) {
                 if streaming {
                     let client = t.client;
-                    t.sse
-                        .get_or_insert_with(|| translate::SseBridge::new(client, upstream))
-                        .feed(chunk, end_of_stream)
+                    let sse = t
+                        .sse
+                        .get_or_insert_with(|| translate::SseBridge::new(client, upstream));
+                    let out = sse.feed(chunk, end_of_stream);
+                    if sse.pending_len() > translate::MAX_TRANSLATE_BUFFER {
+                        return Err(self.translate_overflow(&rc.request_id, "sse_event"));
+                    }
+                    out
                 } else {
-                    if !chunk.is_empty() {
-                        t.json_buf.extend_from_slice(chunk);
+                    if !t.push_json(chunk) {
+                        return Err(self.translate_overflow(&rc.request_id, "json_body"));
                     }
                     if end_of_stream {
                         translate::response_json(upstream, t.client, &t.json_buf)
