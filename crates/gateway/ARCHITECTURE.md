@@ -104,6 +104,7 @@ Client (stock OpenAI/Anthropic SDK)
   │    x-goog-api-key) UNCONDITIONALLY → inject the next unused pool key in the
   │    provider's own scheme (never provider A's key on provider B)
   │  BYO: leave auth header unchanged
+  │  Managed: accept-encoding: identity (the gateway parses the body; gzip billed 0 tokens)
   │  Strip x-beyond-* control headers (ours; meaningless upstream)
   │  Set Host; path: verbatim for /{provider} (prefix stripped), or the candidate's
   │    own catalog path for a catalog walk (`/auto`, managed `/v1`). Model-routed: strip
@@ -434,6 +435,14 @@ Responses-only models the catalog routes to `/v1/responses`, and is held to the 
   upstream did not give is minted (`…_gw…`), never a shared constant.
 - **Not mapped:** server-tool blocks and hosted-tool items (only reachable through tools a
   translated client cannot declare), `choices` past the first, logprobs.
+
+**Managed responses are never compressed upstream.** The usage tap parses every managed response
+body and the bridge translates it, both as plain bytes. The OpenAI and Anthropic Python SDKs send
+`accept-encoding: gzip, deflate`; forwarded, Anthropic gzips JSON and SSE and OpenAI gzips JSON, and
+then (measured live, 2026-09-30) every such request billed zero tokens, same-wire relays included,
+and a translated response reached the client untranslated or as plain text under
+`content-encoding: gzip`. `upstream_request_filter` sends `accept-encoding: identity` on every
+managed request. BYO traffic, which nothing parses, keeps the client's header.
 
 `/{provider}/…` is the escape hatch and does not consult the catalog. This arm is reached only after
 a provider-table miss, so `/{provider}/…` traffic runs exactly the code it always did; `auto` is
@@ -1348,7 +1357,16 @@ Prometheus on the default registry, exposed at `/metrics` on `metrics_listen`.
 ## Verification
 
 - **Unit (`cargo test --lib`):** key, route, peek, usage, deny, allowance, secret, config, cache, control,
-  smart, translate. `clippy --all-targets -D warnings` clean.
+  smart, translate. `clippy --all-targets -D warnings` clean. The response side of translate
+  (`src/translate_response_tests.rs`) feeds every stream whole, byte by byte and in 7-byte chunks
+  and requires the same events from each, and rebuilds client state the way the OpenAI and
+  Anthropic SDKs accumulate it (tool calls by `index`, blocks by `content[index]`, the Responses
+  item lifecycle).
+- **Translated responses end to end (`tests/translate_response.rs`):** through the real proxy with
+  provider-shaped fixtures — the full Responses stream for a Claude and a GPT row, an OpenRouter
+  thinking signature reaching a Messages client on failover, cache-inclusive `prompt_tokens`,
+  truncation as `incomplete`, a Bedrock-shaped 400 and an OpenRouter provider error keeping their
+  message, and `accept-encoding: identity` on every managed upstream request.
 - **End-to-end (`tests/e2e.rs`, `mise run test:integration:rs`):** real `beyond-ai` binary + real
   nats-server + mock upstream. Covers managed key-swap + passthrough fidelity + usage metering
   (OpenAI JSON + SSE, **Anthropic `/v1/messages`** with `x-api-key` swap + metering), **BYO

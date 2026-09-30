@@ -1361,6 +1361,43 @@ fn index_less_and_whole_chunk_tool_calls_are_kept_apart() {
     );
 }
 
+#[test]
+fn a_server_tool_input_never_lands_on_a_client_call() {
+    let src = concat!(
+        "event: message_start\n",
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"model\":\"c\",\"usage\":{\"input_tokens\":1}}}\n\n",
+        "event: content_block_start\n",
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_a\",\"name\":\"f\",\"input\":{}}}\n\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"x\\\":1}\"}}\n\n",
+        "event: content_block_stop\n",
+        "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+        "event: content_block_start\n",
+        "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"server_tool_use\",\"id\":\"srvtoolu_1\",\"name\":\"web_search\",\"input\":{}}}\n\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"query\\\":\\\"q\\\"}\"}}\n\n",
+        "event: content_block_stop\n",
+        "data: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
+        "event: message_delta\n",
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":5}}\n\n",
+    );
+    let evs = stream(Messages, Chat, src);
+    assert_eq!(
+        chat_tool_calls(&evs),
+        vec![("toolu_a".to_owned(), "f".to_owned(), "{\"x\":1}".to_owned())]
+    );
+}
+
+#[test]
+fn an_empty_reasoning_details_does_not_hide_reasoning_text() {
+    let src = concat!(
+        "data: {\"id\":\"c\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\"hmm\",\"reasoning_details\":[]}}]}\n\n",
+        "data: {\"id\":\"c\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":2}}\n\n",
+    );
+    let resp = assert_responses_lifecycle(&stream(Chat, Responses, src), "response.completed");
+    assert_eq!(resp["output"][0]["summary"][0]["text"], "hmm", "{resp:#}");
+}
+
 // ---- Responses upstream ------------------------------------------------------------------------
 
 #[test]

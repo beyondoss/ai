@@ -3118,9 +3118,12 @@ fn reasoning_delta(text: &str) -> Value {
 #[derive(Default)]
 struct AntToOai {
     meta: ChunkMeta,
-    /// Tool calls opened so far: the next one's Chat `index`. Anthropic content blocks never
-    /// interleave, so a JSON delta always belongs to the latest.
+    /// Tool calls opened so far: the next one's Chat `index`.
     tools: u32,
+    /// The Chat `index` of the block now open, when it is a client `tool_use`. Anthropic blocks
+    /// never interleave, so a JSON delta belongs to it; one for any other block (a server tool's
+    /// input) must not land on a client call's arguments.
+    open_tool: Option<u32>,
     usage: Usage,
 }
 
@@ -3163,10 +3166,12 @@ impl AntToOai {
             }
             "content_block_start" => {
                 let block = v.get("content_block").unwrap_or(&Value::Null);
+                self.open_tool = None;
                 let delta = match block.get("type").and_then(Value::as_str) {
                     Some("tool_use") => {
                         let index = self.tools;
                         self.tools = self.tools.saturating_add(1);
+                        self.open_tool = Some(index);
                         json!({ "tool_calls": [{
                             "index": index,
                             "id": id_or_fresh(block.get("id"), "call"),
@@ -3200,13 +3205,15 @@ impl AntToOai {
                         Some(t) => json!({ "content": t }),
                         None => return,
                     },
-                    Some("input_json_delta") => match non_empty_str(d, "partial_json") {
-                        Some(p) => json!({ "tool_calls": [{
-                            "index": self.tools.saturating_sub(1),
-                            "function": { "arguments": p },
-                        }] }),
-                        None => return,
-                    },
+                    Some("input_json_delta") => {
+                        match (self.open_tool, non_empty_str(d, "partial_json")) {
+                            (Some(index), Some(p)) => json!({ "tool_calls": [{
+                                "index": index,
+                                "function": { "arguments": p },
+                            }] }),
+                            _ => return,
+                        }
+                    }
                     Some("thinking_delta") => {
                         match non_empty_str(d, "thinking").or_else(|| non_empty_str(d, "text")) {
                             Some(t) => reasoning_delta(t),
@@ -3239,6 +3246,7 @@ impl AntToOai {
                 items.push(self.meta.chunk(json!({}), Some(map_stop_to_openai(stop))));
                 items.push(self.meta.usage(self.usage.to_chat()));
             }
+            "content_block_stop" => self.open_tool = None,
             "message_stop" => items.push(ChatItem::Done),
             _ => {}
         }
@@ -3592,7 +3600,11 @@ impl OaiToAnt {
         if let Some(delta) = choice.and_then(|c| c.get("delta")) {
             let mut blocks = Vec::new();
             // OpenRouter repeats `reasoning_details` text in `reasoning`: read one, not both.
-            if let Some(details) = delta.get("reasoning_details").and_then(Value::as_array) {
+            if let Some(details) = delta
+                .get("reasoning_details")
+                .and_then(Value::as_array)
+                .filter(|d| !d.is_empty())
+            {
                 for d in details {
                     self.thinking.detail(d, &mut blocks);
                 }
@@ -3929,7 +3941,11 @@ impl OaiToResp {
             .and_then(Value::as_array)
             .and_then(|a| a.first());
         if let Some(delta) = choice.and_then(|c| c.get("delta")) {
-            if let Some(details) = delta.get("reasoning_details").and_then(Value::as_array) {
+            if let Some(details) = delta
+                .get("reasoning_details")
+                .and_then(Value::as_array)
+                .filter(|d| !d.is_empty())
+            {
                 for d in details {
                     let key = d.get("index").and_then(Value::as_u64);
                     match d.get("type").and_then(Value::as_str) {

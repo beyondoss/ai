@@ -406,6 +406,9 @@ pub enum Mode {
     AnthropicStallSse,
     /// An OpenAI embeddings response: vectors first, then `model`, then `usage` (input only).
     Embeddings,
+    /// Reply with exactly this status, content type, and body — for fixtures that belong to one
+    /// test file (a provider's real stream shape, an error body with no `error` key).
+    Raw(u16, &'static str, &'static str),
 }
 
 /// Content deltas a `*StallSse` mode sends before it stalls. Each carries one short token, so an
@@ -477,6 +480,9 @@ pub struct Captured {
     /// so a Chat Completions → Messages translate walk can prove the gateway injected it.
     pub anthropic_version: Option<String>,
     pub body: Vec<u8>,
+    /// What the gateway asked the upstream to encode the body as. A managed request must say
+    /// `identity`: the gateway parses the body, and a gzip body bills zero tokens.
+    pub accept_encoding: Option<String>,
 }
 
 pub struct MockUpstream {
@@ -669,6 +675,7 @@ fn canned_body(mode: Mode) -> (&'static str, Bytes) {
                 br#"{"type":"error","error":{"type":"api_error","message":"mock"}}"#,
             ),
         ),
+        Mode::Raw(_, content_type, body) => (content_type, Bytes::from_static(body.as_bytes())),
     }
 }
 
@@ -732,6 +739,11 @@ async fn mock_handle(
             get("anthropic-version"),
         )
     };
+    let accept_encoding = req
+        .headers()
+        .get("accept-encoding")
+        .and_then(|v| v.to_str().ok())
+        .map(String::from);
     let body = req
         .into_body()
         .collect()
@@ -767,6 +779,7 @@ async fn mock_handle(
         beyond_split,
         anthropic_version,
         body,
+        accept_encoding,
     });
     // A slow upstream is still a *working* upstream; the point is to be slower than the client's
     // patience, so the client hangs up first.
@@ -774,7 +787,7 @@ async fn mock_handle(
         sleep(Duration::from_millis(ms)).await;
     }
     let status = match mode {
-        Mode::Status(s) | Mode::AnthropicStatus(s) => s,
+        Mode::Status(s) | Mode::AnthropicStatus(s) | Mode::Raw(s, _, _) => s,
         Mode::ThrottleKey(_) if throttled => 429,
         _ => 200,
     };

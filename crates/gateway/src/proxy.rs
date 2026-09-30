@@ -2541,6 +2541,15 @@ impl ProxyHttp for AiProxy {
             }
         }
 
+        // A managed response body is read as plain bytes: by the usage tap on every request, and by
+        // the translate bridge on a cross-wire walk. The client's `accept-encoding` forwarded as-is
+        // (the OpenAI and Anthropic Python SDKs send `gzip, deflate`) let Anthropic and OpenAI gzip
+        // it, and then billing parsed nothing — zero tokens — and a translated response reached the
+        // client untranslated, or as plain text under `content-encoding: gzip`.
+        if rc.managed {
+            upstream_request.insert_header("accept-encoding", "identity")?;
+        }
+
         // The routing header is ours, not the provider's. Stripped on every attempt (pingora rebuilds
         // this header from the downstream request each time, so it reappears each time).
         if rc.auto.is_some() {
