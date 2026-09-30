@@ -133,7 +133,7 @@ Client (stock OpenAI/Anthropic SDK)
   ▼  response_filter (proxy.rs)
   │  Record TTFT; detect streaming (Content-Type: text/event-stream)
   │  Count upstream response by provider + status class
-  │  Set x-beyond-request-id header
+  │  Set x-beyond-request-id, x-beyond-provider, x-beyond-upstream-model (catalog walk)
   │  Translate walk: drop Content-Length (body length will change)
   │
   ▼  response_body_filter (proxy.rs)  — response relayed chunk-by-chunk; SSE is never fully buffered
@@ -652,6 +652,24 @@ bounds only control-plane-enabled capture.
 
 **Enablement expiry costs zero gateway code**: the control plane writes the `aicapture.{tenant}`
 entry with a slipstream TTL, and its expiry arrives as an ordinary `Delete` delta.
+
+### Served-by response headers
+
+Every response says what served it, so a client sees a failover or a cache replay without a log
+search:
+
+| Header                    | When                                        | Value                                                                       |
+| ------------------------- | ------------------------------------------- | --------------------------------------------------------------------------- |
+| `x-beyond-request-id`     | every response                              | the `request_id` on `ai.usage` / `ai.payload`                               |
+| `x-beyond-provider`       | every upstream response, and a cache replay | the provider that answered (on a replay, the one that originally served it) |
+| `x-beyond-upstream-model` | catalog walks (`/auto`, managed `/v1`)      | the model id as the gateway sent it to that provider                        |
+| `x-beyond-cache-status`   | cache replays only                          | `hit`                                                                       |
+
+Cost is deliberately **not** returned. The gateway never prices a request (see "Why the catalog has
+a list price and the request does not"): the billed amount is decided downstream and can differ
+from list price, so a gateway-computed figure could disagree with the invoice. A per-request cost
+lookup belongs to the control plane, keyed by `x-beyond-request-id`. The provider header value is
+precomputed per provider at boot (`Provider::name_header`), so it is a refcount bump per response.
 
 ### Capture is a tap, not a buffer
 

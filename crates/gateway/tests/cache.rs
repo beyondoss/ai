@@ -77,6 +77,19 @@ async fn two_identical_managed_v1_requests_hit_the_cache() {
 
     let second = post(&client, &gw.url(), &key, body(), &[]).await;
     let second_status = second.status().as_u16();
+    let header = |name: &str| {
+        second
+            .headers()
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned)
+    };
+    assert_eq!(header("x-beyond-cache-status").as_deref(), Some("hit"));
+    assert_eq!(
+        header("x-beyond-provider").as_deref(),
+        Some("openai"),
+        "a replay names the provider that originally served it"
+    );
     let second_body = second.bytes().await.unwrap();
 
     assert_eq!(first_status, 200);

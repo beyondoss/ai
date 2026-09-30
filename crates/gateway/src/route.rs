@@ -316,6 +316,8 @@ pub struct Provider {
     pub pool_auth: Box<[PoolAuth]>,
     /// `host` as a ready-to-insert `HeaderValue` — see [`PoolAuth`].
     pub host_header: Option<http::HeaderValue>,
+    /// `name` as a ready-to-insert `HeaderValue`, for the `x-beyond-provider` response header.
+    pub name_header: Option<http::HeaderValue>,
     /// Per-provider metric handles, resolved once here so the response path bumps a direct
     /// counter/histogram instead of a string-keyed label lookup per response.
     pub metrics: ProviderMetrics,
@@ -358,7 +360,9 @@ impl Provider {
             })
             .collect();
         let host_header = http::HeaderValue::from_str(&host).ok();
+        let name_header = http::HeaderValue::from_str(name).ok();
         Provider {
+            name_header,
             name: name.to_string(),
             authority,
             host,

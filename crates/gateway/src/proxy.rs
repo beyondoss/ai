@@ -87,6 +87,14 @@ use tracing::{info, warn};
 /// response and every reject body so a client can quote it and an oncall can grep for it.
 const REQUEST_ID_HEADER: &str = "x-beyond-request-id";
 
+/// Response headers naming what served the request, so a client can see a failover or a cache
+/// replay without a log search. Provider on every upstream response and on a cache replay (the
+/// provider that originally served it); the upstream model id on catalog walks, as the gateway
+/// sent it to that provider; cache status only on a replay.
+const PROVIDER_HEADER: &str = "x-beyond-provider";
+const UPSTREAM_MODEL_HEADER: &str = "x-beyond-upstream-model";
+const CACHE_STATUS_HEADER: &str = "x-beyond-cache-status";
+
 /// OpenRouter's dashboard-attribution headers (https://openrouter.ai/docs/quickstart): purely
 /// cosmetic on OpenRouter's side (their own cost/usage categorization), no effect on the request
 /// or response. Static — this doesn't need to be configurable, just present. Only OpenRouter is in
@@ -743,7 +751,7 @@ impl AiProxy {
     ) -> Result<bool> {
         let mut len_buf = ArrayString::<20>::new();
         let _ = write!(len_buf, "{}", hit.body.len());
-        let mut resp = ResponseHeader::build(hit.status, Some(4))?;
+        let mut resp = ResponseHeader::build(hit.status, Some(6))?;
         let ct = if hit.content_type.is_empty() {
             "application/json"
         } else {
@@ -752,6 +760,10 @@ impl AiProxy {
         resp.insert_header("content-type", ct)?;
         resp.insert_header("content-length", len_buf.as_str())?;
         resp.insert_header(REQUEST_ID_HEADER, request_id)?;
+        resp.insert_header(CACHE_STATUS_HEADER, "hit")?;
+        if !hit.provider.is_empty() {
+            resp.insert_header(PROVIDER_HEADER, hit.provider.as_ref())?;
+        }
         session.write_response_header(Box::new(resp), false).await?;
         session
             .write_response_body(Some(hit.body.clone()), true)
@@ -2823,6 +2835,12 @@ impl ProxyHttp for AiProxy {
             // and land on this request's log line. `insert_header` only fails on an invalid value;
             // our id is `[0-9a-f-]`, always valid — but surface a failure rather than silently drop.
             upstream_response.insert_header(REQUEST_ID_HEADER, rc.request_id.as_str())?;
+            if let Some(hv) = rc.provider.name_header.as_ref() {
+                upstream_response.insert_header(PROVIDER_HEADER, hv.clone())?;
+            }
+            if let Some(c) = rc.auto.as_ref().and_then(|a| a.candidate_at(a.candidate)) {
+                upstream_response.insert_header(UPSTREAM_MODEL_HEADER, c.upstream_model)?;
+            }
 
             if let Some(cache::Pending::Fill { content_type, .. }) =
                 rc.auto.as_mut().and_then(|a| a.cache.as_mut())

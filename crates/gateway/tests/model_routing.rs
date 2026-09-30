@@ -134,6 +134,19 @@ async fn fails_over_to_the_next_candidate_when_the_primary_wont_connect() {
         200,
         "a dead primary must be invisible to the client",
     );
+    // ...to the response body. The headers say who served it.
+    let header = |name: &str| {
+        resp.headers()
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned)
+    };
+    assert_eq!(header("x-beyond-provider").as_deref(), Some("openrouter"));
+    assert_eq!(
+        header("x-beyond-upstream-model").as_deref(),
+        Some("openai/gpt-4o-mini")
+    );
+    assert_eq!(header("x-beyond-cache-status"), None, "not a replay");
 
     let cap = fallback.captured().expect("fallback served the request");
     // OpenRouter's mount, not OpenAI's — the path is rebuilt for the candidate that serves.
