@@ -20,6 +20,7 @@ pub mod cache;
 pub mod capture;
 pub mod capture_sink;
 pub mod circuit_breaker;
+pub mod concurrency;
 pub mod config;
 pub mod control;
 pub mod deny;

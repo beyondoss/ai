@@ -31,6 +31,8 @@ published `beyond-slipstream` — clones, CI-builds, and publishes anywhere.
 | **Capture-set**                            | Sparse map of `tenant_id`s with payload logging on; default-**off**; watched under its own prefix by its own watcher                                                                                                                                                                                                                                                                                                                                                                     | Retention policy — the gateway emits and forgets; the store owns TTL/erasure                                                                 |
 | **Capture tap**                            | Bounded **head**-keeping copy of each body, taken pre-rewrite; relayed bytes are untouched                                                                                                                                                                                                                                                                                                                                                                                               | A buffer — nothing is withheld, so it costs memcpy, never latency                                                                            |
 | **Response cache**                         | **Per-pod** exact-match store: identical managed catalog-walk request (pre-rewrite body + inbound path + `tenant_id` + effective candidate order) replays a stored 2xx on **this process**. Off unless `cache_ttl_secs > 0`. Miss is an unbuffered relay; fill is a tap. Replicas do not share entries.                                                                                                                                                                                  | Redis, semantic cache, a pool-key key, or a fleet-wide cache — none of those                                                                 |
+| **Cut-short estimate**                     | A managed 2xx stream that ended before its usage block (client cancel, upstream death) is billed an **estimate** flagged `usage_estimated`: input from the body's text bytes ÷ 5 (Anthropic keeps `message_start`'s exact count), output from the relayed delta events and text. Errs low.                                                                                                                                                                                               | A reported count, or a way to see hidden reasoning — both estimates are blind to thinking the stream never shows                             |
+| **Tenant slot**                            | One of `tenant_max_in_flight` concurrent requests a tenant may hold **on this process**; over it → 429 before the breaker and upstream. The bound on overspend while the allowance-set lags. Off by default.                                                                                                                                                                                                                                                                             | A rate limit or a quota — short fast requests never hit it; N replicas admit N × the limit                                                   |
 | **Control header** (`x-beyond-*`)          | Per-request caller input: `metadata` tags, `capture` on/off, `cache` on/off, catalog `order` / `only` / `split`. Managed only; stripped before the upstream                                                                                                                                                                                                                                                                                                                              | A way to 4xx a request — unusable values are dropped and counted; an `only` that leaves no keyed candidate is the same 503 as an unkeyed row |
 | **Smart router**                           | **Per-pod** EWMA of TTFT per catalog candidate. Default walk for managed `/auto` and `/v1` when `order`/`split` are absent. Probe of unmeasured arms every 8th request. `smart_router = false` restores static catalog order. Two replicas can rank the same row differently.                                                                                                                                                                                                            | Live Redis, cost sort, or a fleet-wide shared ranking — none of those                                                                        |
 | **Snapshot**                               | On-disk deny-set cache (entries + NATS cursor) for edge/tunnel deployments. Allowance uses `{snapshot_path}.allowance`.                                                                                                                                                                                                                                                                                                                                                                  | Persistent store — a pure cache; delete it and the gateway re-scans NATS                                                                     |
@@ -84,6 +86,7 @@ Client (stock OpenAI/Anthropic SDK)
   │  │    x-beyond-cache: off / Cache-Control: no-store ────────── skip lookup and store
   │  │    hit: write stored 2xx (no upstream, no breaker, no key-walk)
   │  │    miss: unbuffered relay; fill is a tap, insert only on complete 2xx
+  │  ├─ Tenant slot (managed, tenant_max_in_flight > 0): at ceiling ──► 429
   │  └─ Circuit breaker (per provider, all traffic): if OPEN ─────► 503
   │       (claims a half-open probe permit only on an actual attempt)
   │
@@ -149,6 +152,8 @@ Client (stock OpenAI/Anthropic SDK)
   │
   ▼  logging (proxy.rs)
      Parse usage from tail (by dialect + streaming flag)
+     Managed 2xx stream cut short before its usage block (client cancel / upstream death):
+       estimate the missing side from the request tally + relayed events → usage_estimated
      Emit ai.usage fact: tenant, vpc, key_id, model, requested_model, routed_model, token counts +
        reasoning breakout, + x-beyond-metadata tags (managed only) → blocking stdout, lossless
      Cache hit: same row with `cache_hit` and the stored tokens; no parse, no upstream latency
@@ -156,7 +161,7 @@ Client (stock OpenAI/Anthropic SDK)
        request_id → bounded queue, DROPPED on overflow so a stalled sink can't backpressure
      Record circuit-breaker outcome, only if one is still owed (breaker_pending): 5xx / upstream
        failure → failure; else → success (429 and client aborts included)
-     Decrement requests_in_flight gauge
+     Decrement requests_in_flight gauge; release the tenant slot
 ```
 
 ### Background: Control-Plane Watchers
@@ -234,7 +239,9 @@ id) is an alias for the row — those are the ids we already rewrite _to_.
 The default walk is TTFT-ranked (`smart.rs`): **this process's** EWMA per catalog candidate, measured
 from `attempt_start` the same way `ai_ttft_seconds` is. Cold start (no samples) is the row's static
 order. A connect failure or 5xx takes a penalty floor so a fast error does not outrank a slower 2xx;
-a 429 is a real answer. Unmeasured arms stay failover until a deterministic probe (every 8th
+a 429 is a real answer. A candidate whose **latest** attempt failed ranks behind every other
+candidate — unmeasured ones included — until it answers again or its sample goes stale (30s). That
+is what turns a client's own retry into a failover; see "Status-based failover, and where it stops". Unmeasured arms stay failover until a deterministic probe (every 8th
 request, skipping seq `0`) promotes one. A sample older than 30s is treated as unmeasured so a
 recovered arm is retried. Ranking reads the monotonic clock once per request and reuses that
 instant for every candidate's staleness check. `smart_router = false`
@@ -287,8 +294,13 @@ row) are still a **400**. Same-wire Responses (`/{provider}/v1/responses`) stays
 
 v1 mapping is lossy on extras a stock SDK does not need for a tool loop: Responses-only
 fields (`store`, `previous_response_id`, `include`, `truncation`, …) are dropped when leaving
-Responses; they are **not** dropped when the walk stays on `/v1/responses`. `http(s)` image URLs
-are dropped (base64 data-URI images convert). `thinking` /
+Responses; they are **not** dropped when the walk stays on `/v1/responses`. Images convert both
+ways: base64 data URIs ↔ Anthropic `base64` sources, and `http(s)` URLs ↔ Anthropic `url` sources
+(passed through unchanged between Chat Completions and Responses). The gateway fetches nothing —
+each upstream downloads the URL itself. Amazon Bedrock rejects `url` sources, so a URL image that
+fails over onto a Bedrock candidate gets Bedrock's 400 rather than an answer about a picture the
+model never saw; the walk is chosen before the body is read, so it cannot skip Bedrock for these
+requests. `thinking` /
 `redacted_thinking` blocks, `cache_control`, and `reasoning_effort` (mapped to Anthropic
 `thinking`) pass both ways so an agent workload round-trips. Tools, text, and usage still
 round-trip. Anthropic requires `max_tokens`; a missing OpenAI value becomes 4096. OpenAI→Anthropic
@@ -462,6 +474,46 @@ for the _other_ dialect's characteristic field names (Anthropic's `input_tokens`
 OpenAI's `prompt_tokens`/`completion_tokens`) before accepting a parse, and return `None` on a match —
 tripping `usage_parse_errors_total` (see Metrics) instead of a silent zero-billing row.
 
+### Streams cut short (`usage.rs` estimates)
+
+A stream's usage block is its **last** event. A client that hangs up first — a cancelled agent
+turn, routine for a coding agent — or an upstream that dies mid-stream leaves nothing to parse,
+while the provider still bills us for what it generated before it noticed. Emitting zero there made
+"stream a long answer, disconnect one event before the end" free.
+
+A managed 2xx stream is **cut short** when its usage never arrived: no parseable usage on the
+OpenAI wire, no `message_delta` on the Anthropic wire (`message_start` alone parses, so a successful
+parse is not the same as a finished stream) — and only once the provider demonstrably started
+(`message_start` arrived, or at least one generated delta was relayed): a 200 stream carrying only an
+error event is not work we were billed for. Its row carries an estimate and `usage_estimated=true`;
+`ai_usage_estimated_total` counts them.
+
+- **Input:** Anthropic's `message_start` is the first event and carries exact input and cache
+  counts, so those are kept. Otherwise the request body's text bytes ÷ 5, counted as the body
+  streams past (`InputTally`, 12 bytes of state, one two-pattern SIMD pass at ~34 GB/s) with binary
+  payloads excluded: data-URI payloads (`;base64,…`) and any string under a `"data"` key (Anthropic
+  `base64` image/document sources, OpenAI `input_audio`). An inline image is ~1 MB of base64 and
+  ~1–2K tokens; counted as text, an Anthropic-format image served by an OpenAI-wire candidate
+  estimated 44,042 input tokens for a 42-token prompt.
+- **Output:** only the 64 KiB tail is retained, so the tail is measured (delta events and text bytes
+  per byte of stream) and scaled up to the bytes relayed over the whole stream — one add per managed
+  stream chunk, no scan on the relay path (counting `data:` per chunk measured +9.5% on a 600 KiB
+  Anthropic stream). The estimate is the larger of one token per delta
+  event (exact on OpenAI) and text bytes ÷ 4.5 (the floor for providers that batch tokens).
+
+Both divisors were measured against live providers and rounded to under-count: an estimate is a bill
+the customer cannot check. On five real streams each cut at 50% and 99% of their bytes, the output
+estimate ranged 0.94–1.05× on OpenAI Chat Completions and 0.86–1.05× on Responses (the one over-count:
+a Responses stream cut halfway, where the preamble events skew the byte scaling), 0.84–0.85× on
+Claude Haiku 4.5, 0.75–0.84× on Claude via OpenRouter, and 0.57–0.60× on
+Claude Sonnet 5 (a denser tokenizer). Hidden reasoning — an OpenAI reasoning model, Claude with
+thinking display omitted — is invisible to both. A non-streaming request cancelled before its
+response head is not covered: nothing arrived to estimate from.
+
+A stream that ends **cleanly** without usage still counts on `ai_usage_parse_errors_total` (the
+wire-shape-change alarm) even though it is now billed an estimate. An estimated response is never
+stored in the response cache.
+
 ### Deny-Set (`deny.rs`)
 
 Two `HashMap<u64, DenyReason>`s — tenants (`blackhole.{tenant}`) and credentials
@@ -482,6 +534,12 @@ an empty one** — absence is remaining-ok. Until that read, every managed reque
 (`allowance_unavailable`) and does not call `upstream_peer`. v1 tokens have no `key_id`, so only
 the tenant grain applies. The control plane writes the bit; this is not a price table and the
 gateway does not decrement a remaining counter. Restore = delete the KV entry.
+
+The exhaust bit is written only after usage has shipped and been summed downstream, so a tenant
+keeps being served for that lag. The overshoot is `lag × requests in flight × cost per request`;
+`tenant_max_in_flight` (`concurrency.rs`) bounds the middle term per process — a sharded, sparse,
+exact counter per tenant, claimed after the cache and before the breaker, released in `logging`.
+Off by default: the right ceiling depends on how many agents a tenant legitimately runs in parallel.
 
 Checked after deny, before the exact-match cache, so an exhausted key cannot be served from a
 cached 2xx.
@@ -890,7 +948,27 @@ whether covering them is worth building, and the options are not cheap: patch `B
 (fork, or upstream a config knob) or drive the retry ourselves via pingora's `Subrequest` API
 (`allow_spawning_subrequest` — a full inner proxy request whose downstream is a channel, so the body
 comes from our buffer with no cap, at the cost of every filter re-entering on the inner request).
-Neither is worth starting before the counter says how often the limit actually bites.
+Neither is worth starting before the counter says how often the limit actually bites. (Checked
+against pingora 0.9.0 and its main branch, 2026-09-30: the constant is unchanged. Swapping our own
+buffered copy in is not an option either — on a truncated retry pingora sends no body at all and
+never calls `request_body_filter`. Upstream PR cloudflare/pingora#816, early request-body
+buffering replayed across retries, would remove the limit.)
+
+**What covers it instead: the client's own retry.** The stock OpenAI and Anthropic SDKs retry 5xx
+and 529 by default, and that retry is a fresh request with a fresh body. The relayed 5xx marks the
+candidate failed in the TTFT ranker, which puts it behind every alternative, so the retry lands on
+the fallback. The cost is one extra round trip plus the SDK's backoff (≈0.5–1s) instead of an
+instant switch. Limits: clients that do not retry get the error; the ranker is per process, so a
+retry that reaches another replica may hit the failing provider once more (the per-provider breaker
+still cuts a sustained outage everywhere); and every catalog walk on that process avoids the failed
+candidate for up to 30s, not just the retry. `smart_router = false` or a pinned walk
+(`x-beyond-order` / `split`) turns it off. `an_sdk_retry_after_an_unreplayable_529_lands_on_the_fallback`
+pins it — and fails with the demotion removed.
+
+**Pingora 0.9's default refuses to retry a non-idempotent method** — every LLM call is a `POST` —
+which silently disabled both walks above. `error_while_proxy` is overridden to keep 0.8's policy:
+our walks are marked retryable only after `body_replayable` has proven the body can be resent, and a
+reused-connection failure retries only when the replay buffer holds the whole body.
 
 ### Why the catalog has a list price and the request does not
 
@@ -1019,6 +1097,7 @@ Secret-bearing fields (`pool_keys`, `nats_creds`) are held as `Secret<T>` — st
 | `cache_max_entries`             | `1024`                            | Cap on stored cache entries. Oldest insertion is dropped when a new one would exceed it.                                                                                                                                                                         |
 | `cache_max_bytes`               | `65536`                           | Cap on a single stored response body. Oversize complete 2xxs are relayed but not stored.                                                                                                                                                                         |
 | `smart_router`                  | `true`                            | Rank managed catalog walks by **this process's** TTFT EWMA. `false` restores static catalog order. `x-beyond-order` / `split` pin either way. Not a fleet-wide ranking.                                                                                          |
+| `tenant_max_in_flight`          | `0`                               | Most requests one tenant may hold open **on this process**. `0` disables. Over it → 429 (`ai_rejections_total{reason="tenant_concurrency"}`), before the breaker. Bounds overspend while the allowance-set lags. Managed only.                                   |
 | `nats_url`                      | `nats://localhost:4222`           | NATS server for the control-plane watchers. Unreachable → deny-set stale (fail-open), capture off, allowance fail-closed until a scan or `{snapshot_path}.allowance` lands.                                                                                      |
 | `nats_creds`                    | _(unset)_                         | NATS credentials file path. Required for authenticated clusters.                                                                                                                                                                                                 |
 | `listen_addr`                   | `0.0.0.0:8080`                    | Proxy listener address (client traffic).                                                                                                                                                                                                                         |
@@ -1044,7 +1123,7 @@ Secret-bearing fields (`pool_keys`, `nats_creds`) are held as `Secret<T>` — st
 | Provider brownout (sustained 5xx)                                  | After `circuit_breaker_threshold` 5xx/connect failures in the window, the breaker opens; requests fast-fail 503 (`circuit_open`) instead of stalling against the read timeout.                                                                                     | Auto: after `circuit_breaker_reset_secs` a half-open probe is admitted — success closes the breaker, failure reopens it. Per-provider, so other providers are unaffected.                                                                                                                                                |
 | Provider throttles (429 storm)                                     | Walk the next unused pool key on the same provider when the body is replayable; the last 429 is relayed with `Retry-After` if the upstream sent one. Does **not** trip the breaker (provider is healthy). Does **not** fail over to another vendor.                | Client `Retry-After` backoff after keys are exhausted; no gateway-side circuit action.                                                                                                                                                                                                                                   |
 | Response body > 128KB before usage chunk                           | Tail compaction fires: `drain(..half)` discards first half, keeps tail. Usage extracted from retained tail.                                                                                                                                                        | No action — SSE usage is always in the final `data:` line, which always lands in the tail.                                                                                                                                                                                                                               |
-| Client cancels mid-request (ESC on a slow turn)                    | Relayed as a downstream abort. **Not** counted against the provider's breaker — pingora tags it `ErrorSource::Downstream`. Was previously recorded as a provider failure, so a burst of cancellations opened the breaker and 503'd everyone.                       | None. `tests/cancellation.rs` pins both halves: aborts do not open the breaker, sustained 5xx still does.                                                                                                                                                                                                                |
+| Client cancels mid-request (ESC on a slow turn)                    | Relayed as a downstream abort. **Not** counted against the provider's breaker — pingora tags it `ErrorSource::Downstream`. A streaming 2xx cut short this way is billed an estimate (`usage_estimated=true`), not zero. The tenant slot is released.               | None. `tests/cancellation.rs` pins the breaker halves; `tests/cut_short.rs` the billing.                                                                                                                                                                                                                                 |
 | Retry replays a partially-read request body                        | `upstream_peer` resets the body-phase state each attempt, so the replayed prefix replaces rather than appends. Previously it was appended, producing a duplicated JSON fragment the provider rejected with a `400` that `logging` recorded as a breaker _success_. | None — the reset is unconditional and O(1) on the first attempt.                                                                                                                                                                                                                                                         |
 | Model-routed candidate refuses the connection                      | `fail_to_connect` advances to the next candidate and pingora re-invokes `upstream_peer`; the abandoned candidate's breaker records the failure. Client sees nothing.                                                                                               | Automatic. `ai_candidate_failovers_total` counts it; the per-provider `ai_connect_retries_total` names the candidate left behind.                                                                                                                                                                                        |
 | Model-routed request with every candidate down                     | Each is attempted once, then the request fails with pingora's `5xx`. Each candidate's breaker records its own failure.                                                                                                                                             | Fix whichever providers are down; `doctor`'s `model_catalog` check catches the _configuration_ case (a row with no pool-keyed candidate) at boot.                                                                                                                                                                        |
@@ -1056,35 +1135,36 @@ Secret-bearing fields (`pool_keys`, `nats_creds`) are held as `Secret<T>` — st
 
 Prometheus on the default registry, exposed at `/metrics` on `metrics_listen`.
 
-| Metric                                | Type      | Labels               | What It Measures                                                                                       |
-| ------------------------------------- | --------- | -------------------- | ------------------------------------------------------------------------------------------------------ |
-| `ai_requests_total`                   | Counter   | —                    | Total admitted requests                                                                                |
-| `ai_rejections_total`                 | Counter   | `reason`             | Rejected requests by cause (auth, deny_spend, quota, allowance_unavailable, deny_fraud, rate_limit, …) |
-| `ai_upstream_responses_total`         | Counter   | `provider`, `status` | Upstream responses by provider and status class                                                        |
-| `ai_tokens_total`                     | Counter   | `kind`               | input / output / cache_read / cache_write token counts                                                 |
-| `ai_ttft_seconds`                     | Histogram | `provider`           | Time to first token (50ms–30s buckets)                                                                 |
-| `ai_upstream_latency_seconds`         | Histogram | `provider`           | Full request latency (100ms–600s buckets)                                                              |
-| `ai_active_streams`                   | Gauge     | —                    | Open SSE streams                                                                                       |
-| `ai_requests_in_flight`               | Gauge     | —                    | All in-flight requests (streaming + non-streaming)                                                     |
-| `ai_deny_set_size`                    | Gauge     | —                    | Current number of denied tenants                                                                       |
-| `ai_nats_connected`                   | Gauge     | —                    | 1 if the **deny-set** watcher is connected, 0 otherwise                                                |
-| `ai_allowance_set_size`               | Gauge     | —                    | Exhausted tenants + keys in the allowance-set                                                          |
-| `ai_allowance_ready`                  | Gauge     | —                    | 1 after a successful allowance scan/snapshot (empty = remaining-ok); 0 = fail-closed                   |
-| `ai_allowance_nats_connected`         | Gauge     | —                    | 1 if the **allowance-set** watcher is connected                                                        |
-| `ai_capture_set_size`                 | Gauge     | —                    | Tenants with payload capture enabled (climbing and never falling ⇒ missing TTLs)                       |
-| `ai_capture_nats_connected`           | Gauge     | —                    | 1 if the **capture-set** watcher is connected — separate watcher, separate connection                  |
-| `ai_captures_total`                   | Counter   | —                    | Requests whose payloads were captured (post-sampling)                                                  |
-| `ai_capture_bytes_total`              | Counter   | —                    | Payload bytes handed to the sink — the cost signal, ahead of the storage bill                          |
-| `ai_capture_dropped_total`            | Counter   | —                    | Captures dropped on a full sink queue — distinguishes "lost it" from "capture was off"                 |
-| `ai_control_header_errors_total`      | Counter   | —                    | `x-beyond-*` headers present but unusable (dropped; request still served)                              |
-| `ai_usage_parse_errors_total`         | Counter   | —                    | Managed 2xx responses with no parseable usage (emitted as a zero-token billing row)                    |
-| `ai_cache_hits_total`                 | Counter   | —                    | Exact-match cache hits that replayed a stored 2xx and skipped the provider                             |
-| `ai_cache_scope`                      | Gauge     | `kind`               | Constant `1` with `kind="process"`: this pod's cache table, not a fleet store                          |
-| `ai_smart_rank_scope`                 | Gauge     | `kind`               | Constant `1` with `kind="process"`: this pod's TTFT EWMA, not a fleet-wide ranking                     |
-| `ai_candidate_failovers_total`        | Counter   | —                    | Model-routed requests that abandoned a candidate for the next one                                      |
-| `ai_key_walks_total`                  | Counter   | —                    | Managed 429s that retried the same provider with the next unused pool key                              |
-| `ai_model_header_body_mismatch_total` | Counter   | —                    | Catalog-walk requests whose `x-beyond-model` and body `model` disagreed (header wins; client bug)      |
-| `ai_failover_body_too_large_total`    | Counter   | —                    | 5xx that could not fail over: request body exceeded the 64 KiB replay buffer                           |
+| Metric                                | Type      | Labels               | What It Measures                                                                                                           |
+| ------------------------------------- | --------- | -------------------- | -------------------------------------------------------------------------------------------------------------------------- |
+| `ai_requests_total`                   | Counter   | —                    | Total admitted requests                                                                                                    |
+| `ai_rejections_total`                 | Counter   | `reason`             | Rejected requests by cause (auth, deny_spend, quota, allowance_unavailable, deny_fraud, rate_limit, tenant_concurrency, …) |
+| `ai_upstream_responses_total`         | Counter   | `provider`, `status` | Upstream responses by provider and status class                                                                            |
+| `ai_tokens_total`                     | Counter   | `kind`               | input / output / cache_read / cache_write token counts                                                                     |
+| `ai_ttft_seconds`                     | Histogram | `provider`           | Time to first token (50ms–30s buckets)                                                                                     |
+| `ai_upstream_latency_seconds`         | Histogram | `provider`           | Full request latency (100ms–600s buckets)                                                                                  |
+| `ai_active_streams`                   | Gauge     | —                    | Open SSE streams                                                                                                           |
+| `ai_requests_in_flight`               | Gauge     | —                    | All in-flight requests (streaming + non-streaming)                                                                         |
+| `ai_deny_set_size`                    | Gauge     | —                    | Current number of denied tenants                                                                                           |
+| `ai_nats_connected`                   | Gauge     | —                    | 1 if the **deny-set** watcher is connected, 0 otherwise                                                                    |
+| `ai_allowance_set_size`               | Gauge     | —                    | Exhausted tenants + keys in the allowance-set                                                                              |
+| `ai_allowance_ready`                  | Gauge     | —                    | 1 after a successful allowance scan/snapshot (empty = remaining-ok); 0 = fail-closed                                       |
+| `ai_allowance_nats_connected`         | Gauge     | —                    | 1 if the **allowance-set** watcher is connected                                                                            |
+| `ai_capture_set_size`                 | Gauge     | —                    | Tenants with payload capture enabled (climbing and never falling ⇒ missing TTLs)                                           |
+| `ai_capture_nats_connected`           | Gauge     | —                    | 1 if the **capture-set** watcher is connected — separate watcher, separate connection                                      |
+| `ai_captures_total`                   | Counter   | —                    | Requests whose payloads were captured (post-sampling)                                                                      |
+| `ai_capture_bytes_total`              | Counter   | —                    | Payload bytes handed to the sink — the cost signal, ahead of the storage bill                                              |
+| `ai_capture_dropped_total`            | Counter   | —                    | Captures dropped on a full sink queue — distinguishes "lost it" from "capture was off"                                     |
+| `ai_control_header_errors_total`      | Counter   | —                    | `x-beyond-*` headers present but unusable (dropped; request still served)                                                  |
+| `ai_usage_parse_errors_total`         | Counter   | —                    | Managed 2xx responses with no parseable usage (emitted as a zero-token billing row)                                        |
+| `ai_cache_hits_total`                 | Counter   | —                    | Exact-match cache hits that replayed a stored 2xx and skipped the provider                                                 |
+| `ai_cache_scope`                      | Gauge     | `kind`               | Constant `1` with `kind="process"`: this pod's cache table, not a fleet store                                              |
+| `ai_smart_rank_scope`                 | Gauge     | `kind`               | Constant `1` with `kind="process"`: this pod's TTFT EWMA, not a fleet-wide ranking                                         |
+| `ai_candidate_failovers_total`        | Counter   | —                    | Model-routed requests that abandoned a candidate for the next one                                                          |
+| `ai_key_walks_total`                  | Counter   | —                    | Managed 429s that retried the same provider with the next unused pool key                                                  |
+| `ai_model_header_body_mismatch_total` | Counter   | —                    | Catalog-walk requests whose `x-beyond-model` and body `model` disagreed (header wins; client bug)                          |
+| `ai_failover_unreplayable_total`      | Counter   | —                    | 5xx/429 retries declined: request body not provably replayable (past 64 KiB, or still uploading)                           |
+| `ai_usage_estimated_total`            | Counter   | —                    | Managed streams cut short before their usage block, billed with estimated tokens                                           |
 
 ---
 
@@ -1105,6 +1185,7 @@ Prometheus on the default registry, exposed at `/metrics` on `metrics_listen`.
 | `translate`       | Chat Completions ↔ Messages ↔ Responses mapping for a catalog endpoint mismatch; SSE event-by-event                             | unit ✓ + e2e ✓ |
 | `smart`           | Per-pod TTFT EWMA table; ranks unpinned catalog walks; probe of unmeasured arms; not fleet-wide                                 | unit ✓ + e2e ✓ |
 | `cache`           | Per-pod exact-match response store (TTL + max entries + max bytes/entry); tap, never a buffer; miss does not consult Redis      | unit ✓ + e2e ✓ |
+| `concurrency`     | Per-tenant in-flight cap (`tenant_max_in_flight`): sharded, sparse, exact counters; the overspend bound                         | unit ✓ + e2e ✓ |
 | `ratelimit`       | Two-tier guardrail: per-credential (count-min sketch, fixed memory, no GC) + global BYO (one atomic)                            | unit ✓         |
 | `circuit_breaker` | Per-provider lock-free breaker (packed `AtomicU64`, windowed policy) — trips on 5xx/connect, not 429                            | unit ✓ + e2e ✓ |
 | `state`           | Keyring + provider registry + watched deny-/allowance-/capture-sets (ArcSwap) + TTL DNS cache                                   | unit ✓         |
@@ -1173,6 +1254,13 @@ Prometheus on the default registry, exposed at `/metrics` on `metrics_listen`.
   always goes upstream and never fills, a 429-then-200 is still one cacheable client-body hash, and
   two candidate orders (default vs `x-beyond-order`) do not cross-hit. `ai_cache_scope{kind="process"}`
   and `ai_smart_rank_scope{kind="process"}` are `1` — rank and cache are per-pod, not fleet-wide.
+- **Cut short (`tests/cut_short.rs`):** a real stream cancelled mid-flight through the binary —
+  OpenAI bills estimated input (body ÷ 5) and one token per relayed delta; Anthropic keeps
+  `message_start`'s exact input and estimates output; a base64 image does not inflate the input
+  estimate; a stream that finishes is billed exactly, `usage_estimated=false`.
+- **Tenant concurrency (`tests/tenant_concurrency.rs`):** at the ceiling a tenant gets a 429 without
+  the provider being hit, another tenant is unaffected, the slot comes back on completion, and
+  cancelled requests do not strand slots.
 - **Cancellation (`tests/cancellation.rs`):** a client that gives up must not open the provider's
   breaker, and a genuinely broken provider still must. Verified non-vacuous — reverting the fix makes
   the first test fail.

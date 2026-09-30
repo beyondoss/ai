@@ -56,12 +56,16 @@ pub enum Rejection {
     /// Allowance-set has not been read yet (no successful scan or snapshot). Fail-closed 402,
     /// unlike the deny-set's fail-open empty map.
     AllowanceUnavailable,
+    /// The tenant already has `tenant_max_in_flight` requests open. The overshoot bound on the
+    /// allowance-set's lag: an exhausted tenant can spend at most this many requests' worth before
+    /// its exhaust bit lands.
+    TenantConcurrency,
 }
 
 impl Rejection {
     /// Every variant, in `as_index` order. The array in `Metrics` is built from this, so adding a
     /// variant without adding it here fails the exhaustive `match` in `as_index`.
-    pub(crate) const ALL: [Rejection; 14] = [
+    pub(crate) const ALL: [Rejection; 15] = [
         Rejection::Auth,
         Rejection::DenySpend,
         Rejection::DenyFraud,
@@ -76,6 +80,7 @@ impl Rejection {
         Rejection::WireMismatch,
         Rejection::Quota,
         Rejection::AllowanceUnavailable,
+        Rejection::TenantConcurrency,
     ];
 
     /// The `reason=` label value. `RateLimit` keeps the original `"rate_limit"` string so existing
@@ -96,6 +101,7 @@ impl Rejection {
             Rejection::WireMismatch => "wire_mismatch",
             Rejection::Quota => "quota",
             Rejection::AllowanceUnavailable => "allowance_unavailable",
+            Rejection::TenantConcurrency => "tenant_concurrency",
         }
     }
 
@@ -115,6 +121,7 @@ impl Rejection {
             Rejection::WireMismatch => 11,
             Rejection::Quota => 12,
             Rejection::AllowanceUnavailable => 13,
+            Rejection::TenantConcurrency => 14,
         }
     }
 }
@@ -129,7 +136,7 @@ pub struct Metrics {
     /// path fires at full request rate under a credential-stuffing flood. Measured 14.3 ns vs 1.3 ns
     /// single-threaded, and 808 ns vs 151 ns with 16 threads contending the same lock.
     /// Indexed by [`Rejection::as_index`]; read it through [`Metrics::rejection`].
-    rejections: [IntCounter; 14],
+    rejections: [IntCounter; Rejection::ALL.len()],
     /// Upstream responses by provider + status class ("2xx"/"4xx"/"5xx"). A provider degrading
     /// (429/5xx) is otherwise invisible until it surfaces as latency or missing usage events —
     /// this is the per-provider error-rate signal an oncall pages on.
@@ -235,6 +242,9 @@ pub struct Metrics {
     /// legitimate zero-token generation — so a provider changing its usage wire shape would silently
     /// zero out billing. This counter (paired with a `warn!`) is the alerting surface for that.
     pub usage_parse_errors_total: IntCounter,
+    /// Managed streams cut short before their usage block (client cancel, upstream death) whose
+    /// `ai.usage` row carries estimated tokens (`usage_estimated=true`) instead of reported ones.
+    pub usage_estimated_total: IntCounter,
     /// Current allowance-set cardinality (exhausted tenants + keys). Sparse; a climb that never
     /// falls means the control plane is writing exhaust bits without deleting them on restore.
     pub allowance_set_size: IntGauge,
@@ -388,6 +398,10 @@ impl Metrics {
             "ai_usage_parse_errors_total",
             "Managed 2xx responses with no parseable usage (emitted as a zero-token billing row)",
         ))?;
+        let usage_estimated_total = IntCounter::with_opts(Opts::new(
+            "ai_usage_estimated_total",
+            "Managed streams cut short before their usage block, billed with estimated tokens",
+        ))?;
         let cache_hits_total = IntCounter::with_opts(Opts::new(
             "ai_cache_hits_total",
             "Exact-match cache hits that replayed a stored 2xx and skipped the provider",
@@ -436,6 +450,7 @@ impl Metrics {
         r.register(Box::new(capture_dropped_total.clone()))?;
         r.register(Box::new(control_header_errors_total.clone()))?;
         r.register(Box::new(usage_parse_errors_total.clone()))?;
+        r.register(Box::new(usage_estimated_total.clone()))?;
         r.register(Box::new(cache_hits_total.clone()))?;
         r.register(Box::new(cache_scope.clone()))?;
         r.register(Box::new(smart_rank_scope.clone()))?;
@@ -471,6 +486,7 @@ impl Metrics {
             capture_dropped_total,
             control_header_errors_total,
             usage_parse_errors_total,
+            usage_estimated_total,
             cache_hits_total,
             cache_scope: cache_scope_process,
             smart_rank_scope: smart_rank_scope_process,

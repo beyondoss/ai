@@ -489,9 +489,373 @@ pub fn anthropic_stream_parts(parts: &[&[u8]]) -> Option<Usage> {
     saw_any.then_some(usage)
 }
 
+// --- Estimates for a stream cut short -----------------------------------------------------------
+//
+// A stream's usage block is its *last* event. When the client hangs up first (a cancelled agent
+// turn) or the upstream dies mid-stream, the block never arrives — but the provider still bills us
+// for everything it generated before it noticed. Emitting zero there was a free-generation hole:
+// stream a long answer, disconnect one event before the end, pay nothing.
+//
+// What follows estimates those rows instead. Both divisors were measured against real providers
+// (2026-09-30) and then rounded in the direction that **under**-counts, because an estimate is a
+// bill the customer cannot check against anything:
+//
+// | Measured                               | OpenAI (gpt-4o-mini) | Claude Haiku 4.5 | Claude Sonnet 5 |
+// | -------------------------------------- | -------------------- | ---------------- | --------------- |
+// | JSON request-body bytes / input token  | 4.63                 | 3.95             | 3.00            |
+// | streamed text bytes / output token     | 4.32                 | 3.73             | 2.69            |
+// | output tokens / delta event            | 1.00                 | 2.95             | 4.85            |
+//
+// Hidden reasoning is invisible to both estimates — an OpenAI reasoning model, or Claude with
+// thinking display omitted, is billed for thinking the stream never shows. The row is flagged
+// `usage_estimated` so a downstream consumer can tell estimated rows from reported ones.
+
+/// JSON-escaped request-body bytes per input token. 5 under-counts every provider measured above.
+const INPUT_BYTES_PER_TOKEN: u64 = 5;
+
+/// Streamed text bytes per output token, ×10 so the math stays in integers: 4.5.
+const OUTPUT_TEXT_BYTES_PER_TOKEN_X10: u64 = 45;
+
+/// Where binary payloads start in a request body — the bytes that are not text. An inline image is
+/// ~1 MB of base64 and ~1–2K tokens, so counting it as text would bill one picture as a novel.
+///
+/// - `;base64,` — a data URI (`data:image/png;base64,…`): OpenAI `image_url`, Responses
+///   `input_image` / `input_file`. The payload runs to the string's closing quote.
+/// - `"data":` — the value of any `data` key: Anthropic `base64` image and document sources,
+///   OpenAI `input_audio`. The payload is the next string. A `data` key holding something else (a
+///   tool schema property, say) is skipped too, which only ever under-counts.
+///
+/// Both are at most 8 bytes, so a 7-byte carry catches either split across two chunks.
+const PAYLOAD_MARKERS: [&[u8]; 2] = [b";base64,", br#""data":"#];
+const MARKER_CARRY: usize = 7;
+
+static PAYLOAD_FINDER: std::sync::LazyLock<aho_corasick::AhoCorasick> =
+    std::sync::LazyLock::new(|| {
+        aho_corasick::AhoCorasick::new(PAYLOAD_MARKERS).unwrap_or_else(|_| unreachable!())
+    });
+
+/// Running count of a request body's text bytes, fed chunk by chunk as the body streams past.
+///
+/// Excludes binary payloads (see [`PAYLOAD_MARKERS`]). A marker split across two chunks is still
+/// found: the last few bytes of each chunk are carried into the next. Nothing is buffered — 12
+/// bytes of state however large the body, because it sits in `RequestCtx`, which is touched once
+/// per response chunk.
+#[derive(Default, Clone, Copy)]
+pub struct InputTally {
+    text_bytes: u32,
+    /// Low bits ([`CARRY_LEN`]): how many of `carry`'s bytes are live. High bits: the phase —
+    /// [`AWAIT_OPEN`] (after `"data":`, before its string opens) or [`IN_PAYLOAD`].
+    state: u8,
+    carry: [u8; MARKER_CARRY],
+}
+
+const CARRY_LEN: u8 = 0x0f;
+const AWAIT_OPEN: u8 = 0x40;
+const IN_PAYLOAD: u8 = 0x80;
+
+impl InputTally {
+    pub fn feed(&mut self, mut chunk: &[u8]) {
+        loop {
+            if self.state & (AWAIT_OPEN | IN_PAYLOAD) != 0 {
+                // Base64 has no escapes, so the payload ends at the next quote; after `"data":`,
+                // the next quote opens the payload.
+                let Some(q) = memchr::memchr(b'"', chunk) else {
+                    // Whitespace between `"data":` and its string is text; a payload is not.
+                    if self.state & AWAIT_OPEN != 0 {
+                        self.count(chunk.len());
+                    }
+                    return;
+                };
+                if self.state & AWAIT_OPEN != 0 {
+                    self.count(q + 1);
+                    self.state = IN_PAYLOAD;
+                    chunk = &chunk[q + 1..];
+                    continue;
+                }
+                self.state = 0;
+                chunk = &chunk[q..];
+            }
+            let found = self.take_split_marker(chunk).or_else(|| {
+                PAYLOAD_FINDER
+                    .find(chunk)
+                    .map(|m| (m.end(), m.pattern().as_usize()))
+            });
+            match found {
+                Some((end, pattern)) => {
+                    self.count(end);
+                    chunk = &chunk[end..];
+                    self.state = if pattern == 0 { IN_PAYLOAD } else { AWAIT_OPEN };
+                }
+                None => {
+                    self.count(chunk.len());
+                    let keep = chunk.len().min(MARKER_CARRY);
+                    self.carry[..keep].copy_from_slice(&chunk[chunk.len() - keep..]);
+                    self.state = keep as u8;
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Where a marker that *began* in the previous chunk ends in this one, if it did, and which.
+    fn take_split_marker(&mut self, chunk: &[u8]) -> Option<(usize, usize)> {
+        // Only reached outside a payload, where `state` is exactly the carry length.
+        let carried = usize::from(std::mem::take(&mut self.state) & CARRY_LEN);
+        if carried == 0 {
+            return None;
+        }
+        let mut joined = [0u8; 2 * MARKER_CARRY];
+        let n = chunk.len().min(MARKER_CARRY);
+        joined[..carried].copy_from_slice(&self.carry[..carried]);
+        joined[carried..carried + n].copy_from_slice(&chunk[..n]);
+        let m = PAYLOAD_FINDER.find(&joined[..carried + n])?;
+        // A marker wholly inside `chunk` is the ordinary search's to find.
+        (m.start() < carried).then(|| (m.end() - carried, m.pattern().as_usize()))
+    }
+
+    fn count(&mut self, n: usize) {
+        self.text_bytes = self
+            .text_bytes
+            .saturating_add(u32::try_from(n).unwrap_or(u32::MAX));
+    }
+
+    /// Estimated input tokens. Deliberately low; see the table above.
+    pub fn estimate_tokens(&self) -> u64 {
+        u64::from(self.text_bytes) / INPUT_BYTES_PER_TOKEN
+    }
+}
+
+/// Whether an Anthropic stream reached its `message_delta` — the event carrying the final output
+/// count. `message_start` alone parses as usage too (input and cache tokens), so a parse succeeding
+/// is not the same as the stream finishing.
+pub fn anthropic_stream_finished(tail: &[u8]) -> bool {
+    memchr::memmem::find(tail, b"message_delta").is_some()
+}
+
+/// Estimate the output tokens of a stream that ended before its usage block.
+///
+/// Only the tail is retained, so this measures the tail — delta events and generated text per
+/// byte of stream — and scales both up to `total_bytes`, what was relayed over the whole stream.
+/// Events in one stream are homogeneous, so the tail is a fair sample; a stream shorter than the
+/// tail is measured whole. Scaling by bytes rather than counting events on the relay path keeps
+/// the per-chunk cost to one add: counting `data:` with `memmem` on every managed chunk measured
+/// +9.5% on a 600 KiB Anthropic stream. The estimate is the larger of "one token per delta
+/// event" (exact on OpenAI) and "text bytes / 4.5" (the floor on providers that batch several tokens
+/// into one event), each of which under-counts on its own side.
+///
+/// Runs once, on the cut-short path only, so it parses each line into a `Value` rather than
+/// maintaining a typed view per wire.
+pub fn estimate_stream_output(tail: &[u8], total_bytes: u64) -> u64 {
+    let (mut events, mut deltas, mut text) = (0u64, 0u64, 0u64);
+    for line in sse_lines(tail) {
+        let Some(payload) = strip_sse_data(line) else {
+            continue;
+        };
+        let Ok(v) = serde_json::from_slice::<serde_json::Value>(payload) else {
+            continue;
+        };
+        events += 1;
+        let n = delta_text_len(&v);
+        if n > 0 {
+            deltas += 1;
+            text += n;
+        }
+    }
+    if events == 0 || tail.is_empty() {
+        return 0;
+    }
+    // The bytes before the tail are extrapolated at 90%: a stream opens with heavier preamble
+    // events (a Responses stream's `response.created` carries the whole response object, ~4× a
+    // delta), so the unseen head holds fewer deltas per byte than the tail. Measured +7% over on a
+    // Responses stream cut at 50% before this; the discount brings it under.
+    let sampled = tail.len() as u64;
+    let unseen = total_bytes.saturating_sub(sampled);
+    let scale = |n: u64| n + n * unseen * 9 / (sampled * 10);
+    let by_events = scale(deltas);
+    let by_text = scale(text) * 10 / OUTPUT_TEXT_BYTES_PER_TOKEN_X10;
+    by_events.max(by_text)
+}
+
+/// Generated text carried by one stream event, across the three wires: Chat Completions
+/// (`choices[0].delta` content, reasoning, tool-call arguments), Messages (`delta` text, thinking,
+/// tool-input JSON), and Responses (a string `delta`).
+fn delta_text_len(v: &serde_json::Value) -> u64 {
+    use serde_json::Value;
+    let len = |x: Option<&Value>| x.and_then(Value::as_str).map_or(0, |s| s.len() as u64);
+    if let Some(d) = v.pointer("/choices/0/delta") {
+        let calls = d
+            .get("tool_calls")
+            .and_then(Value::as_array)
+            .map_or(0, |calls| {
+                calls
+                    .iter()
+                    .map(|c| len(c.pointer("/function/arguments")))
+                    .sum()
+            });
+        return len(d.get("content"))
+            + len(d.get("reasoning"))
+            + len(d.get("reasoning_content"))
+            + calls;
+    }
+    match v.get("delta") {
+        Some(Value::String(s)) => s.len() as u64,
+        Some(d @ Value::Object(_)) => {
+            len(d.get("text")) + len(d.get("thinking")) + len(d.get("partial_json"))
+        }
+        _ => 0,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- cut-short estimates ---
+
+    fn tally(chunks: &[&[u8]]) -> InputTally {
+        let mut t = InputTally::default();
+        for c in chunks {
+            t.feed(c);
+        }
+        t
+    }
+
+    #[test]
+    fn input_tally_counts_text_and_skips_base64_payloads() {
+        let b64 = "A".repeat(10_000);
+        let body = format!(
+            r#"{{"messages":[{{"role":"user","content":[{{"type":"image_url","image_url":{{"url":"data:image/png;base64,{b64}"}}}},{{"type":"text","text":"hi"}}]}}]}}"#
+        );
+        let whole = tally(&[body.as_bytes()]);
+        assert_eq!(
+            u64::from(whole.text_bytes),
+            (body.len() - b64.len()) as u64,
+            "every byte but the base64 payload is text"
+        );
+        // Any split point — including inside the marker and inside the payload — agrees.
+        for cut in [1, 60, 95, 98, 100, 101, 500, body.len() - 5] {
+            let (a, b) = body.as_bytes().split_at(cut);
+            assert_eq!(
+                tally(&[a, b]).text_bytes,
+                whole.text_bytes,
+                "split at {cut}"
+            );
+        }
+    }
+
+    #[test]
+    fn input_tally_is_twelve_bytes() {
+        assert_eq!(std::mem::size_of::<InputTally>(), 12);
+    }
+
+    /// Anthropic's image source is `{"type":"base64","data":"…"}` — no data URI — and OpenAI's
+    /// `input_audio` is `{"data":"…"}`. Both must be skipped, compact or spaced, at any split.
+    #[test]
+    fn input_tally_skips_data_key_payloads() {
+        let b64 = "B".repeat(10_000);
+        for body in [
+            format!(
+                r#"{{"messages":[{{"role":"user","content":[{{"type":"image","source":{{"type":"base64","media_type":"image/png","data":"{b64}"}}}},{{"type":"text","text":"hi"}}]}}]}}"#
+            ),
+            format!(r#"{{"input_audio": {{"data": "{b64}", "format": "wav"}}}}"#),
+        ] {
+            let whole = tally(&[body.as_bytes()]);
+            assert_eq!(
+                u64::from(whole.text_bytes),
+                (body.len() - b64.len()) as u64,
+                "{}",
+                &body[..60]
+            );
+            for cut in 1..body.len().min(200) {
+                let (a, b) = body.as_bytes().split_at(cut);
+                assert_eq!(
+                    tally(&[a, b]).text_bytes,
+                    whole.text_bytes,
+                    "split at {cut}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn input_tally_without_images_is_the_body_length() {
+        let body = br#"{"model":"m","messages":[{"role":"user","content":"hello there"}]}"#;
+        let t = tally(&[&body[..10], &body[10..]]);
+        assert_eq!(u64::from(t.text_bytes), body.len() as u64);
+        assert_eq!(
+            t.estimate_tokens(),
+            body.len() as u64 / INPUT_BYTES_PER_TOKEN
+        );
+    }
+
+    fn openai_delta(text: &str) -> String {
+        format!(
+            "data: {{\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4o-mini\",\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"{text}\"}}}}]}}\n\n"
+        )
+    }
+
+    fn anthropic_delta(text: &str) -> String {
+        format!(
+            "event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":\"{text}\"}}}}\n\n"
+        )
+    }
+
+    /// OpenAI sends one token per event, so the delta-event count is the estimate — and a stream
+    /// longer than the tail scales up by the events relayed, not just the ones retained.
+    #[test]
+    fn openai_estimate_is_one_token_per_delta_event() {
+        let tail: String = (0..100).map(|_| openai_delta(" tok")).collect();
+        let n = tail.len() as u64;
+        assert_eq!(estimate_stream_output(tail.as_bytes(), n), 100);
+        assert_eq!(
+            estimate_stream_output(tail.as_bytes(), 10 * n),
+            100 + 900 * 9 / 10,
+            "the tail is a sample scaled up to the relayed bytes, the unseen part at 90%"
+        );
+    }
+
+    /// Providers that batch several tokens into one event are floored by text length instead.
+    #[test]
+    fn batched_deltas_are_estimated_from_text_length() {
+        let chunk = "x".repeat(45);
+        let tail: String = (0..10).map(|_| anthropic_delta(&chunk)).collect();
+        // 10 events × 45 bytes = 450 bytes of text = 100 tokens at 4.5 bytes/token.
+        assert_eq!(
+            estimate_stream_output(tail.as_bytes(), tail.len() as u64),
+            100
+        );
+    }
+
+    #[test]
+    fn responses_and_tool_call_deltas_count_as_output() {
+        let tail = concat!(
+            "event: response.output_text.delta\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{\\\"a\\\"\"}}]}}]}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"b\"}}\n\n",
+        );
+        assert_eq!(
+            estimate_stream_output(tail.as_bytes(), tail.len() as u64),
+            3
+        );
+    }
+
+    #[test]
+    fn empty_or_unparseable_tails_estimate_zero() {
+        assert_eq!(estimate_stream_output(b"", 5_000), 0);
+        assert_eq!(estimate_stream_output(b"data: [DONE]\n\n", 5_000), 0);
+        assert_eq!(estimate_stream_output(b"garbage\n", 5_000), 0);
+    }
+
+    #[test]
+    fn anthropic_stream_finishes_at_message_delta() {
+        let started = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":9,\"output_tokens\":1}}}\n\n";
+        assert!(!anthropic_stream_finished(started.as_bytes()));
+        let finished = format!(
+            "{started}event: message_delta\ndata: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"end_turn\"}},\"usage\":{{\"output_tokens\":5}}}}\n\n"
+        );
+        assert!(anthropic_stream_finished(finished.as_bytes()));
+    }
 
     #[test]
     fn openai_nonstreaming() {

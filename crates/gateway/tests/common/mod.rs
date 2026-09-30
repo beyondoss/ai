@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use base64::Engine;
 use bytes::Bytes;
-use http_body_util::{BodyExt, Full};
+use http_body_util::{BodyExt, Either, Full};
 use hyper::service::service_fn;
 use hyper::{Request, Response};
 use hyper_util::rt::{TokioExecutor, TokioIo};
@@ -364,7 +364,60 @@ pub enum Mode {
     /// to give up first. The only way to produce a *downstream* abort while the upstream is still
     /// healthy, which is the distinction the breaker has to draw.
     Slow(u64),
+    /// An OpenAI chat stream that sends [`STALL_DELTAS`] content deltas and then never sends another
+    /// byte — no usage chunk, no `[DONE]`. The client reads what arrived and hangs up: a cancelled
+    /// agent turn, with the upstream still healthy and still (in reality) billing.
+    StallSse,
+    /// The Anthropic twin: `message_start` (exact input/cache counts), [`STALL_DELTAS`] text deltas,
+    /// then silence — no `message_delta`, so no output count.
+    AnthropicStallSse,
 }
+
+/// Content deltas a `*StallSse` mode sends before it stalls. Each carries one short token, so an
+/// estimate of one token per delta event is exact against these fixtures.
+pub const STALL_DELTAS: u64 = 40;
+/// Input tokens `Mode::AnthropicStallSse` reports on `message_start`.
+pub const STALL_ANTHROPIC_INPUT_TOKENS: u64 = 1234;
+
+fn stall_sse(anthropic: bool) -> String {
+    let mut s = String::new();
+    if anthropic {
+        s.push_str(&format!(
+            "event: message_start\n\
+             data: {{\"type\":\"message_start\",\"message\":{{\"id\":\"msg_mock\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-opus-4-8\",\"content\":[],\"usage\":{{\"input_tokens\":{STALL_ANTHROPIC_INPUT_TOKENS},\"output_tokens\":1}}}}}}\n\n"
+        ));
+    }
+    for _ in 0..STALL_DELTAS {
+        if anthropic {
+            s.push_str("event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\" tok\"}}\n\n");
+        } else {
+            s.push_str("data: {\"id\":\"chatcmpl-mock\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4o-2024-08-06\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\" tok\"}}]}\n\n");
+        }
+    }
+    s
+}
+
+/// A response body that yields one chunk and then never completes — the upstream half of a stream
+/// the client abandons. It never wakes after the first frame; hyper drops it when the gateway closes
+/// the connection.
+pub struct StallingBody(Option<Bytes>);
+
+impl hyper::body::Body for StallingBody {
+    type Data = Bytes;
+    type Error = std::io::Error;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<hyper::body::Frame<Bytes>, Self::Error>>> {
+        match self.0.take() {
+            Some(b) => std::task::Poll::Ready(Some(Ok(hyper::body::Frame::data(b)))),
+            None => std::task::Poll::Pending,
+        }
+    }
+}
+
+type MockBody = Either<Full<Bytes>, StallingBody>;
 
 #[derive(Default, Clone, Debug)]
 pub struct Captured {
@@ -517,6 +570,8 @@ fn anthropic_sse_large() -> String {
 fn canned_body(mode: Mode) -> (&'static str, Bytes) {
     match mode {
         // A slow reply, and the surviving requests of a close-on-Nth mock, are ordinary successes.
+        Mode::StallSse => ("text/event-stream", Bytes::from(stall_sse(false))),
+        Mode::AnthropicStallSse => ("text/event-stream", Bytes::from(stall_sse(true))),
         Mode::Json | Mode::Slow(_) | Mode::CloseOnReusedConnection | Mode::ThrottleKey(_) => (
             "application/json",
             Bytes::from_static(CANNED_JSON.as_bytes()),
@@ -596,7 +651,7 @@ async fn mock_handle(
     mode: Mode,
     // `on_conn`: how many requests this **connection** has already served. 0 ⇒ fresh connection.
     on_conn: usize,
-) -> Result<Response<Full<Bytes>>, std::io::Error> {
+) -> Result<Response<MockBody>, std::io::Error> {
     hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let version = req.version();
     // Path **and query**. Recording only `uri.path()` meant the harness was structurally blind to the
@@ -698,7 +753,12 @@ async fn mock_handle(
     if status == 429 {
         builder = builder.header("retry-after", "7");
     }
-    Ok(builder.body(Full::new(payload)).unwrap())
+    let body = if matches!(mode, Mode::StallSse | Mode::AnthropicStallSse) {
+        Either::Right(StallingBody(Some(payload)))
+    } else {
+        Either::Left(Full::new(payload))
+    };
+    Ok(builder.body(body).unwrap())
 }
 
 impl MockUpstream {
@@ -892,6 +952,8 @@ pub struct GatewayBuilder {
     capture_default_sample_n: Option<u32>,
     /// Exact-match response cache TTL. `None` ⇒ gateway default (off). `Some(0)` disables.
     cache_ttl_secs: Option<u64>,
+    /// Per-tenant in-flight cap. `None` ⇒ gateway default (off).
+    tenant_max_in_flight: Option<u32>,
     /// Wait until `ai_allowance_ready==1` after the listeners bind. Default on: allowance is
     /// fail-closed until the watcher seeds, and a first request that races the scan 402s. Tests that
     /// prove the unready path skip this.
@@ -1034,6 +1096,11 @@ impl GatewayBuilder {
         self
     }
 
+    pub fn tenant_max_in_flight(mut self, n: u32) -> Self {
+        self.tenant_max_in_flight = Some(n);
+        self
+    }
+
     /// Do not wait for the allowance watcher to seed. Only for the fail-closed-unready test —
     /// every other managed test needs remaining-ok before the first request.
     pub fn skip_allowance_ready(mut self) -> Self {
@@ -1083,6 +1150,9 @@ impl GatewayBuilder {
         }
         if let Some(secs) = self.cache_ttl_secs {
             cfg.push_str(&format!("cache_ttl_secs = {secs}\n"));
+        }
+        if let Some(n) = self.tenant_max_in_flight {
+            cfg.push_str(&format!("tenant_max_in_flight = {n}\n"));
         }
         if let Some(threshold) = self.circuit_breaker_threshold {
             // Tight window + reset so the test trips and recovers quickly.
@@ -1261,6 +1331,7 @@ impl Gateway {
             capture_max_bytes: None,
             capture_default_sample_n: None,
             cache_ttl_secs: None,
+            tenant_max_in_flight: None,
             wait_allowance_ready: true,
         }
     }
