@@ -2935,6 +2935,7 @@ impl ProxyHttp for AiProxy {
         if translating {
             let streaming = rc.streaming;
             let dialect = rc.dialect;
+            let status = rc.upstream_status.unwrap_or(200);
             let upstream = rc
                 .auto
                 .as_ref()
@@ -2956,7 +2957,7 @@ impl ProxyHttp for AiProxy {
                         return Err(self.translate_overflow(&rc.request_id, "json_body"));
                     }
                     if end_of_stream {
-                        translate::response_json(upstream, t.client, &t.json_buf)
+                        translate::response_json_status(upstream, t.client, status, &t.json_buf)
                     } else {
                         Vec::new()
                     }

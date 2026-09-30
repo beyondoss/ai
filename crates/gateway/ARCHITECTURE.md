@@ -384,6 +384,57 @@ turn reads the conversation back. A single-turn request gets only the prefix mar
 costs 1.25× input and a one-shot never reads it. One client marker anywhere disables all of this.
 Same-wire Messages traffic is a byte relay and is never touched.
 
+**What the client gets back.** Responses are translated in `translate::response_json_status`
+(non-stream, withheld until end of stream) and `translate::SseBridge` (event by event). Every stream
+pairing meets in Chat Completions chunks held as values, so Messages → Responses parses each event
+once. Every Responses-upstream path (Responses → Chat Completions / Messages) is live for the
+Responses-only models the catalog routes to `/v1/responses`, and is held to the same mapping:
+
+- **Usage.** Anthropic's `input_tokens` counts only uncached prompt tokens; OpenAI's
+  `prompt_tokens` and Responses `input_tokens` count the whole prompt. So `prompt_tokens` =
+  `input_tokens` + `cache_read_input_tokens` + `cache_creation_input_tokens`, with
+  `prompt_tokens_details.cached_tokens` = cache reads and `cache_write_tokens` = cache writes (the
+  field OpenAI and OpenRouter use); the reverse subtracts. Responses usage always carries
+  `input_tokens_details` and `output_tokens_details` (the schema requires them). A `message_delta`'s
+  cumulative counts replace `message_start`'s. Billing is untouched: it parses the upstream body.
+- **Stop reasons.** `end_turn`/`stop_sequence` ↔ `stop`, `tool_use` ↔ `tool_calls`, `max_tokens` ↔
+  `length`, `refusal` ↔ `content_filter`. `model_context_window_exceeded` and `pause_turn` become
+  `length`: both leave the turn unfinished, and resending it is the remedy for either. A Responses
+  client gets `status: "incomplete"` with `incomplete_details.reason` `max_output_tokens` or
+  `content_filter`, and a terminal `response.incomplete`. OpenRouter's `native_finish_reason`, when
+  it is an Anthropic stop reason, reaches an Anthropic client exactly. OpenAI's `message.refusal`
+  becomes refusal text plus `stop_reason: "refusal"` (and a Responses `refusal` part); Anthropic's
+  `stop_details.explanation` becomes `message.refusal`. Tool calls under a plain `stop` are still
+  `tool_use`. No empty text block is invented.
+- **Thinking.** An Anthropic client only ever receives signed `thinking` or `redacted_thinking`.
+  OpenRouter streams Claude's signature in a later `reasoning_details` entry, so the bridge holds a
+  thinking block (up to 8 MiB) until its signature arrives and emits it whole; `reasoning.encrypted`
+  becomes `redacted_thinking`. Only payloads whose `format` is Anthropic's are trusted. Reasoning
+  that never gets a signature — DeepSeek, gpt-oss, OpenAI summaries, a block cut off mid-way — is
+  **dropped**: echoed back unsigned, it would 400 every later turn Anthropic serves. A Responses
+  client gets each thinking block as a `reasoning` item (text as a summary, signature as
+  `encrypted_content`); `redacted_thinking` has no Responses form and is dropped there. A Chat
+  client gets `reasoning_content` plus the `thinking` array / `thinking_signature` extension.
+- **The Responses stream** is the full lifecycle: `response.created`, `response.in_progress`, and per
+  item `output_item.added` → content events (`content_part.*`, `output_text.*`, `refusal.*`,
+  `function_call_arguments.*`, `reasoning_summary_part.*` / `reasoning_summary_text.*`) →
+  `output_item.done`, each with `sequence_number`, `output_index` and `item_id`, ending in
+  `response.completed` carrying the whole `output` and usage. An upstream error is an `error` event
+  (with the envelope under `error`, so an OpenAI SDK raises it) followed by `response.failed`.
+- **Tool-call deltas** are keyed by `index`, else by `id`: an id repeated on every delta is one call,
+  a reused `index` with a new id is a new call, interleaved deltas land on their own call, and a call
+  opens only once its name is known.
+- **Errors.** Any non-2xx JSON body is an error, whatever its shape (Bedrock's `{"message"}` has no
+  `error` key); `message`, `type`, `code` and `param` survive, a string `error` is the message,
+  OpenRouter's `metadata.raw` is quoted after its message with the provider's name, and a numeric
+  `code` is a string on the OpenAI wire. OpenAI types with an Anthropic name get it
+  (`server_error` → `api_error`, rate limits → `rate_limit_error`).
+- **Fields.** Every `chat.completion` and chunk has `created` and one `id`; Responses objects have
+  `created_at`, items have `id`s (`msg_`, `fc_`, `rs_`) and function calls a `call_id`. An id the
+  upstream did not give is minted (`…_gw…`), never a shared constant.
+- **Not mapped:** server-tool blocks and hosted-tool items (only reachable through tools a
+  translated client cannot declare), `choices` past the first, logprobs.
+
 `/{provider}/…` is the escape hatch and does not consult the catalog. This arm is reached only after
 a provider-table miss, so `/{provider}/…` traffic runs exactly the code it always did; `auto` is
 refused as a provider name at boot so config cannot shadow it.
