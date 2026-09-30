@@ -267,8 +267,10 @@ expired anyway), and after 1h so a pin taken during an outage drifts back to the
 An open breaker or an unkeyed candidate needs no check: `upstream_peer` skips it and the 2xx that
 follows re-pins. The table is 16384 packed `AtomicU64`s per pod, direct-mapped by hash: a collision
 overwrites and costs one re-rank. Per pod like the EWMA; with a healthy primary two pods rank a new
-caller the same way. `ai_session_pinned_total` counts walks a pin decided. `order` / `split` walks
-skip ranking and so skip the pin.
+caller the same way. `ai_session_pinned_total` counts walks a pin decided. `order` / `split` walks skip ranking and so
+skip the pin; an `only` walk may follow the key's pin. Neither writes one: a walk the caller shaped
+says nothing about where the key's other requests should go, and one debug header must not route
+them for an hour.
 
 A managed request may also permute that list with headers, still on the same wire, without adding a
 provider the row does not already name (`ProviderSpec::name` on that row). Parsed in `control.rs`,
@@ -550,6 +552,30 @@ The pipe idle-watches the client while the subrequest runs, the way pingora's ow
 (pingora's `pipe_subrequest` does not poll the client when the body is preset). A client that hangs
 up closes the subrequest's channels, so its upstream is aborted at once and a cut-short stream
 bills its estimate, instead of a hidden-reasoning model generating for minutes after an ESC.
+
+What the parent does for every attempt, so a relayed request behaves like any other:
+
+- **One request.** Every attempt carries the parent's request id and sequence (`FullBody`), so the
+  client's `x-beyond-request-id` names the row that bills, and `x-beyond-split` or the probe seed
+  cannot pick a different primary per attempt (a 429 key walk stays on its vendor). An abandoned
+  attempt (one that recorded a `RelayRetry`) still feeds the breaker and the ranker but writes no
+  `ai.usage` or `ai.payload` row.
+- **One tenant slot, taken before the read.** `tenant_max_in_flight` is checked before the body is
+  read in full (`SlotGuard`), so it bounds the bodies held in memory, not only requests in flight: a
+  tenant at its cap gets its 429 before uploading. The parent holds the slot across every attempt;
+  attempts neither take nor release one.
+- **Abandoned attempts wind down first.** The next attempt starts after the abandoned one finishes
+  (bounded at 2s), since it still holds that candidate's breaker permit and a half-open breaker has
+  one.
+- **A reset retries.** An upstream connection that fails before any response header (a reused
+  connection closed under us) is retried on the same candidate once, then the next, which pingora
+  cannot do for a body past its buffer.
+- **HTTP/2 clients.** Pingora builds a subrequest by rendering the parent's header as HTTP/1.1; an H2
+  parent renders as `HTTP/2`, which that parser rejects. The header is rendered as HTTP/1.1 with the
+  body's real `Content-Length` and a `Host` from `:authority`, then restored.
+- **No silent hang.** An attempt that ends with neither a response nor an error (a panic) is a 502,
+  never a connection left open with nothing written.
+- **`Expect: 100-continue`** is answered before the body is read (curl waits a second for it).
 
 Before this, a body whose `model` was past 64 KiB was a 404, and one where the read that found it
 also ended the body hung until the client timed out (openai-python batches of ~150 embeddings

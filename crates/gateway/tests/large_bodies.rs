@@ -242,3 +242,207 @@ async fn a_small_body_is_not_relayed() {
     let metrics = gw.metrics().await;
     assert_eq!(parse_metric(&metrics, "ai_full_body_relays_total", ""), 0.0);
 }
+
+// ---- Relay audit round 2 ----
+
+fn big_chat(model: &str) -> String {
+    let filler = "x".repeat(200 * 1024);
+    format!(r#"{{"model":"{model}","messages":[{{"role":"user","content":"{filler}"}}]}}"#)
+}
+
+/// An HTTP/2 client (the default for the agent's `h2c` serve mode) used to get a bare 400: the
+/// subrequest was built by rendering the H2 request line as `HTTP/2`, which its parser rejects.
+#[tokio::test]
+async fn an_h2c_client_can_send_a_large_body() {
+    let (mock, gw, sk) = gateway(Mode::Json).await;
+    let h2 = reqwest::Client::builder()
+        .http2_prior_knowledge()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .unwrap();
+    for model_first in [true, false] {
+        let body = if model_first {
+            big_chat("gpt-4o-mini")
+        } else {
+            let filler = "x".repeat(200 * 1024);
+            format!(
+                r#"{{"messages":[{{"role":"user","content":"{filler}"}}],"model":"gpt-4o-mini"}}"#
+            )
+        };
+        let resp = h2
+            .post(format!("{}/v1/chat/completions", gw.url()))
+            .header("authorization", format!("Bearer {}", vkey(&sk)))
+            .header("content-type", "application/json")
+            .body(body.clone())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.version(), reqwest::Version::HTTP_2);
+        assert_eq!(resp.status().as_u16(), 200, "model_first={model_first}");
+        assert!(resp.headers().contains_key("x-beyond-request-id"));
+        let cap = mock.captured().expect("forwarded");
+        assert_eq!(
+            cap.body.len(),
+            body.len(),
+            "the subrequest carried the whole body"
+        );
+    }
+}
+
+/// The tenant cap is taken before the body is read, so it bounds the bodies held in memory: a
+/// tenant at its cap gets a 429 at once instead of the gateway buffering a slow upload.
+#[tokio::test]
+async fn the_tenant_cap_is_checked_before_a_large_body_is_read() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let (pubkey, sk) = test_keypair(1);
+    let slow = MockUpstream::start(Mode::Slow(3000)).await;
+    let gw = Gateway::builder(unused_nats_port(), &slow.authority(), &b64(&pubkey))
+        .providers(&["openai", "openrouter"])
+        .tenant_max_in_flight(1)
+        .start()
+        .await;
+    let key = vkey(&sk);
+    let url = format!("{}/v1/chat/completions", gw.url());
+    let holder = {
+        let (url, key) = (url.clone(), key.clone());
+        tokio::spawn(async move {
+            client()
+                .post(url)
+                .header("authorization", format!("Bearer {key}"))
+                .header("content-type", "application/json")
+                .body(r#"{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}]}"#)
+                .send()
+                .await
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // A slow upload: declares 300 KB, sends 2 KB, then waits.
+    let addr = gw.url().trim_start_matches("http://").to_owned();
+    let mut sock = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let head = format!(
+        "POST /v1/chat/completions HTTP/1.1\r\nhost: {addr}\r\nauthorization: Bearer {key}\r\n\
+         content-type: application/json\r\ncontent-length: 300000\r\n\r\n"
+    );
+    sock.write_all(head.as_bytes()).await.unwrap();
+    sock.write_all(
+        format!(
+            r#"{{"messages":[{{"role":"user","content":"{}"#,
+            "x".repeat(2000)
+        )
+        .as_bytes(),
+    )
+    .await
+    .unwrap();
+    let mut buf = vec![0u8; 512];
+    let n = tokio::time::timeout(Duration::from_millis(1000), sock.read(&mut buf))
+        .await
+        .expect("answered before the upload finished, not after buffering it")
+        .unwrap();
+    let text = String::from_utf8_lossy(&buf[..n]);
+    assert!(text.starts_with("HTTP/1.1 429"), "{text}");
+    let _ = holder.await;
+}
+
+/// An abandoned attempt holds nothing the next one needs: with a cap of 1, a large-body failover
+/// completes even when the failed upstream never finishes its error body.
+#[tokio::test]
+async fn a_large_body_failover_fits_a_tenant_cap_of_one() {
+    let (pubkey, sk) = test_keypair(1);
+    let primary = MockUpstream::start(Mode::StatusThenStall(500)).await;
+    let fallback = MockUpstream::start(Mode::Json).await;
+    // One worker: the next attempt runs before an unawaited abandoned one could let go.
+    let gw = Gateway::builder(unused_nats_port(), &primary.authority(), &b64(&pubkey))
+        .providers(&["openai", "openrouter"])
+        .provider_authority("openrouter", &fallback.authority())
+        .tenant_max_in_flight(1)
+        .worker_threads(1)
+        .start()
+        .await;
+    for _ in 0..3 {
+        let started = std::time::Instant::now();
+        let resp = client()
+            .post(format!("{}/v1/chat/completions", gw.url()))
+            .header("authorization", format!("Bearer {}", vkey(&sk)))
+            .header("content-type", "application/json")
+            .body(big_chat("gpt-4o-mini"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 200);
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+}
+
+/// One request, one billing row: the abandoned attempt writes none, and every attempt shares the
+/// id the client was given.
+#[tokio::test]
+async fn a_relayed_failover_writes_one_usage_row_under_the_clients_id() {
+    let (pubkey, sk) = test_keypair(1);
+    let primary = MockUpstream::start(Mode::Status(500)).await;
+    let fallback = MockUpstream::start(Mode::Json).await;
+    let gw = Gateway::builder(unused_nats_port(), &primary.authority(), &b64(&pubkey))
+        .providers(&["openai", "openrouter"])
+        .provider_authority("openrouter", &fallback.authority())
+        .start()
+        .await;
+    let resp = client()
+        .post(format!("{}/v1/chat/completions", gw.url()))
+        .header("authorization", format!("Bearer {}", vkey(&sk)))
+        .header("content-type", "application/json")
+        .body(big_chat("gpt-4o-mini"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let id = resp
+        .headers()
+        .get("x-beyond-request-id")
+        .and_then(|v| v.to_str().ok())
+        .unwrap()
+        .to_owned();
+    let line = gw
+        .wait_for_log_line(&["\"target\":\"ai.usage\"", r#""provider":"openrouter""#])
+        .await;
+    assert!(
+        line.contains(&id),
+        "the served row carries the client's id {id}: {line}"
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let rows = gw
+        .log()
+        .lines()
+        .filter(|l| l.contains("\"target\":\"ai.usage\""))
+        .count();
+    assert_eq!(rows, 1, "{}", gw.log());
+}
+
+/// A connection that fails before any response header (a reused connection closed under us) is
+/// retried from the held body, as the ordinary walk would for a small body.
+#[tokio::test]
+async fn a_reset_before_the_header_is_retried_from_the_held_body() {
+    let (pubkey, sk) = test_keypair(1);
+    let flaky = MockUpstream::start(Mode::CloseOnReusedConnection).await;
+    let fallback = MockUpstream::start(Mode::Json).await;
+    let gw = Gateway::builder(unused_nats_port(), &flaky.authority(), &b64(&pubkey))
+        .providers(&["openai", "openrouter"])
+        .provider_authority("openrouter", &fallback.authority())
+        .start()
+        .await;
+    for _ in 0..4 {
+        let resp = client()
+            .post(format!("{}/v1/chat/completions", gw.url()))
+            .header("authorization", format!("Bearer {}", vkey(&sk)))
+            .header("content-type", "application/json")
+            .header("x-beyond-order", "openai,openrouter")
+            .body(big_chat("gpt-4o-mini"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 200);
+    }
+}

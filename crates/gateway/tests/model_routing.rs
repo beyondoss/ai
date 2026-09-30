@@ -2117,3 +2117,45 @@ async fn ttft_ranker_prefers_the_faster_candidate_after_a_probe() {
         "x-beyond-order must pin the slow primary even after the ranker learned the fast arm"
     );
 }
+
+/// A walk the caller shaped says nothing about where the key's other requests go: an
+/// `x-beyond-order` request must not re-pin the key to the (slower) provider it named.
+#[tokio::test]
+async fn an_order_header_does_not_pin_the_key() {
+    let nats_port = unused_nats_port();
+    let (pubkey, sk) = test_keypair(1);
+    let primary = MockUpstream::start(Mode::Json).await;
+    let fallback = MockUpstream::start(Mode::Slow(150)).await;
+    let gw = catalog_gateway(
+        nats_port,
+        &b64(&pubkey),
+        &primary.authority(),
+        &fallback.authority(),
+    )
+    .await;
+    let client = test_client();
+    let key = vkey(&sk);
+    // The key's ordinary traffic: served by (and pinned to) the fast primary.
+    let first = post_auto(&client, &gw.url(), &key, Some(MODEL)).await;
+    assert_eq!(first.status().as_u16(), 200);
+    assert_eq!(primary.hits(), 1);
+    // One debug request aimed at the slow fallback.
+    let ordered = client
+        .post(format!("{}/auto/chat/completions", gw.url()))
+        .header("authorization", format!("Bearer {key}"))
+        .header("content-type", "application/json")
+        .header("x-beyond-model", MODEL)
+        .header("x-beyond-order", "openrouter")
+        .body(body())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ordered.status().as_u16(), 200);
+    assert_eq!(fallback.hits(), 1, "the order header was honored");
+    for _ in 0..3 {
+        let resp = post_auto(&client, &gw.url(), &key, Some(MODEL)).await;
+        assert_eq!(resp.status().as_u16(), 200);
+    }
+    assert_eq!(primary.hits(), 4, "the key stayed on its provider");
+    assert_eq!(fallback.hits(), 1);
+}

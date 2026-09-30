@@ -444,6 +444,9 @@ pub enum Mode {
     /// Reply with exactly this status, content type, and body — for fixtures that belong to one
     /// test file (a provider's real stream shape, an error body with no `error` key).
     Raw(u16, &'static str, &'static str),
+    /// Answer with this status, then never send the body: an upstream that fails and hangs. The
+    /// gateway must not wait on an attempt it abandoned.
+    StatusThenStall(u16),
 }
 
 /// Content deltas a `*StallSse` mode sends before it stalls. Each carries one short token, so an
@@ -703,7 +706,7 @@ fn canned_body(mode: Mode) -> (&'static str, Bytes) {
         Mode::SseLarge => ("text/event-stream", Bytes::from(large_sse())),
         Mode::AnthropicSseLarge => ("text/event-stream", Bytes::from(anthropic_sse_large())),
         // The status is applied by `mock_handle`; the body is a stock error shape.
-        Mode::Status(_) => (
+        Mode::Status(_) | Mode::StatusThenStall(_) => (
             "application/json",
             Bytes::from_static(br#"{"error":{"message":"mock"}}"#),
         ),
@@ -825,7 +828,10 @@ async fn mock_handle(
         sleep(Duration::from_millis(ms)).await;
     }
     let status = match mode {
-        Mode::Status(s) | Mode::AnthropicStatus(s) | Mode::Raw(s, _, _) => s,
+        Mode::Status(s)
+        | Mode::AnthropicStatus(s)
+        | Mode::Raw(s, _, _)
+        | Mode::StatusThenStall(s) => s,
         Mode::ThrottleKey(_) if throttled => 429,
         _ => 200,
     };
@@ -844,7 +850,9 @@ async fn mock_handle(
     if status == 429 {
         builder = builder.header("retry-after", "7");
     }
-    let body = if matches!(mode, Mode::StallSse | Mode::AnthropicStallSse) {
+    let body = if matches!(mode, Mode::StatusThenStall(_)) {
+        Either::Right(StallingBody(None))
+    } else if matches!(mode, Mode::StallSse | Mode::AnthropicStallSse) {
         Either::Right(StallingBody(Some(payload)))
     } else {
         Either::Left(Full::new(payload))
