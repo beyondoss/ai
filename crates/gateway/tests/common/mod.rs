@@ -479,6 +479,9 @@ pub struct Captured {
     /// What the gateway asked the provider to compress with. Managed traffic must ask for
     /// `identity`: the usage tail, the cache and translation all read the body as plain bytes.
     pub accept_encoding: Option<String>,
+    /// Recorded so a translate walk onto a conversation-binding Claude model can prove the gateway
+    /// sent the beta its `thinking.block_binding` needs (and that no other walk gets it).
+    pub anthropic_beta: Option<String>,
     pub body: Vec<u8>,
 }
 
@@ -720,6 +723,7 @@ async fn mock_handle(
         beyond_split,
         anthropic_version,
         accept_encoding,
+        anthropic_beta,
     ) = {
         let h = req.headers();
         let get = |k: &str| h.get(k).and_then(|v| v.to_str().ok()).map(String::from);
@@ -735,6 +739,7 @@ async fn mock_handle(
             get("x-beyond-split"),
             get("anthropic-version"),
             get("accept-encoding"),
+            get("anthropic-beta"),
         )
     };
     let body = req
@@ -772,6 +777,7 @@ async fn mock_handle(
         beyond_split,
         anthropic_version,
         accept_encoding,
+        anthropic_beta,
         body,
     });
     // A slow upstream is still a *working* upstream; the point is to be slower than the client's
