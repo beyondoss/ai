@@ -2,7 +2,8 @@
 //!
 //! `translate.rs`'s unit tests pin each mapping; these drive the stock-SDK flows those mappings
 //! exist for through the real proxy, and read what the mock upstream received (body *and* headers,
-//! which leave before the body is translated).
+//! which leave before the body is translated) — including a client's next turn built from what the
+//! gateway streamed it, and signed thinking bound for OpenRouter.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -255,6 +256,156 @@ async fn preserved_thinking_survives_a_forced_tool_turn() {
     assert_eq!(
         got["thinking"]["block_binding"]["prefix_mismatch_behavior"],
         "drop_block"
+    );
+}
+
+/// Claude streaming signed thinking, then a tool call.
+const CLAUDE_THINKING_TOOL_SSE: &str = r#"event: message_start
+data: {"type":"message_start","message":{"id":"msg_01","type":"message","role":"assistant","model":"claude-haiku-4-5","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":10,"output_tokens":1}}}
+
+event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"Need weather."}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"EqQBsig=="}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":0}
+
+event: content_block_start
+data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_1","name":"get_weather","input":{}}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"city\":\"Paris\"}"}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":1}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"tool_use","stop_sequence":null},"usage":{"output_tokens":30}}
+
+event: message_stop
+data: {"type":"message_stop"}
+
+"#;
+
+/// A streaming OpenAI SDK on a Claude row with reasoning, two turns. Turn 2 was a 400
+/// ("thinking.signature: Field required"): the signature rode a string the request side never read
+/// back, and the echoed `reasoning_content` became an unsigned block. The stream now carries each
+/// finished block on the `thinking` list, and the echo reaches Anthropic signed.
+#[tokio::test]
+async fn a_streamed_claude_turn_reaches_anthropic_signed_on_the_next_turn() {
+    let nats_port = unused_nats_port();
+    let (pubkey, sk) = test_keypair(1);
+    let mock = MockUpstream::start(Mode::Raw(
+        200,
+        "text/event-stream",
+        CLAUDE_THINKING_TOOL_SSE,
+    ))
+    .await;
+    let gw = Gateway::builder(nats_port, &mock.authority(), &b64(&pubkey))
+        .providers(&["anthropic", "openai", "openrouter"])
+        .start()
+        .await;
+
+    let user = json!({"role": "user", "content": "Paris?"});
+    let turn1 = json!({
+        "model": "claude-haiku-4-5", "stream": true, "reasoning_effort": "low",
+        "tools": [weather_tool()], "messages": [user.clone()]
+    });
+    let text = post(&gw, &sk, "/v1/chat/completions", &turn1).await;
+    // What an OpenAI SDK accumulates: list entries by `index`, strings concatenated.
+    let mut assistant =
+        json!({"role": "assistant", "content": null, "tool_calls": [], "thinking": []});
+    let mut args = String::new();
+    for data in text.lines().filter_map(|l| l.strip_prefix("data: ")) {
+        let Ok(chunk) = serde_json::from_str::<Value>(data) else {
+            continue;
+        };
+        let delta = &chunk["choices"][0]["delta"];
+        for entry in delta["thinking"].as_array().into_iter().flatten() {
+            let i = usize::try_from(entry["index"].as_u64().expect("an index")).unwrap();
+            assert_eq!(i, assistant["thinking"].as_array().unwrap().len(), "{text}");
+            assistant["thinking"]
+                .as_array_mut()
+                .unwrap()
+                .push(entry.clone());
+        }
+        for call in delta["tool_calls"].as_array().into_iter().flatten() {
+            if call.get("id").is_some() {
+                assistant["tool_calls"] = json!([{"id": call["id"], "type": "function",
+                    "function": {"name": call["function"]["name"], "arguments": ""}}]);
+            }
+            args.push_str(call["function"]["arguments"].as_str().unwrap_or(""));
+        }
+    }
+    assistant["tool_calls"][0]["function"]["arguments"] = json!(args);
+    assert!(!text.contains("thinking_signature"), "{text}");
+
+    let turn2 = json!({
+        "model": "claude-haiku-4-5", "reasoning_effort": "low", "tools": [weather_tool()],
+        "messages": [user, assistant, {"role": "tool", "tool_call_id": "toolu_1", "content": "18C"}]
+    });
+    post(&gw, &sk, "/v1/chat/completions", &turn2).await;
+    let (cap, got) = captured(&mock);
+    assert_eq!(cap.path, "/v1/messages");
+    let turn = &got["messages"][1]["content"];
+    assert_eq!(
+        turn[0],
+        json!({"type": "thinking", "thinking": "Need weather.", "signature": "EqQBsig=="}),
+        "{got}"
+    );
+    assert_eq!(turn[1]["type"], "tool_use");
+    assert_eq!(turn[1]["input"], json!({"city": "Paris"}));
+}
+
+/// An Anthropic SDK thinking + tool loop on a Claude row only OpenRouter serves. OpenRouter replays
+/// Claude's thinking from `reasoning_details` alone; without it turn 2 was a 400 ("a final
+/// `assistant` message must start with a thinking block").
+#[tokio::test]
+async fn anthropic_sdk_thinking_reaches_openrouter_as_reasoning_details() {
+    let nats_port = unused_nats_port();
+    let (pubkey, sk) = test_keypair(1);
+    let fallback = MockUpstream::start(Mode::Json).await;
+    let gw = Gateway::builder(nats_port, &GatewayBuilder::dead_authority(), &b64(&pubkey))
+        .providers(&["anthropic", "openrouter"])
+        .provider_authority("openrouter", &fallback.authority())
+        .start()
+        .await;
+
+    let body = json!({
+        "model": "claude-sonnet-4", "max_tokens": 2000,
+        "thinking": {"type": "enabled", "budget_tokens": 1024},
+        "tools": [{"name": "get_weather", "input_schema": {"type": "object", "properties": {"city": {"type": "string"}}}}],
+        "messages": [
+            {"role": "user", "content": "weather?"},
+            {"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "t", "signature": "EqQBsig=="},
+                {"type": "tool_use", "id": "toolu_1", "name": "get_weather", "input": {"city": "Paris"}},
+            ]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_1", "content": "sunny"}]},
+        ]
+    });
+    let resp = test_client()
+        .post(format!("{}/v1/messages", gw.url()))
+        .header("x-api-key", vkey(&sk))
+        .header("anthropic-version", "2023-06-01")
+        .header("content-type", "application/json")
+        .body(serde_json::to_vec(&body).unwrap())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200, "{}", gw.log());
+    let (cap, got) = captured(&fallback);
+    assert_eq!(cap.path, "/api/v1/chat/completions");
+    assert_eq!(
+        got["messages"][1]["reasoning_details"],
+        json!([{"type": "reasoning.text", "text": "t", "signature": "EqQBsig==",
+                "format": "anthropic-claude-v1", "index": 0}]),
+        "{got}"
     );
 }
 

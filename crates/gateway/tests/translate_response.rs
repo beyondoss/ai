@@ -1,10 +1,11 @@
 //! End-to-end: what a translated catalog walk hands the client back, through the real proxy.
 //!
 //! `tests/translate.rs` proves the walk translates at all. This file drives the response contract
-//! with provider-shaped fixtures: the full Responses stream lifecycle with tool calls and reasoning,
-//! an OpenRouter Claude signature reaching a Messages client on failover, cache-inclusive usage on
-//! a Chat client, and upstream errors — including a non-2xx body with no `error` key — keeping
-//! their detail.
+//! with provider-shaped fixtures: the full Responses stream lifecycle with tool calls (custom ones
+//! too) and reasoning, an OpenRouter Claude signature reaching a Messages client on failover,
+//! cache-inclusive usage on a Chat client, and upstream errors — including a non-2xx body with no
+//! `error` key, an OpenRouter mid-stream failure, and a stream cut before its end — keeping their
+//! detail.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -450,6 +451,131 @@ async fn managed_requests_ask_the_upstream_for_an_uncompressed_body() {
             "{path} must not let the upstream compress"
         );
     }
+}
+
+/// OpenAI streaming a custom (free-form) tool call, as a live gpt-5-nano capture shaped it.
+const OPENAI_CUSTOM_SSE: &str = r#"data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":1790808721,"model":"gpt-4o-mini","choices":[{"index":0,"delta":{"role":"assistant","content":null,"tool_calls":[{"index":0,"id":"call_c1","type":"custom","custom":{"name":"apply_patch","input":""}}]},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":1790808721,"model":"gpt-4o-mini","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"custom":{"input":"*** Begin Patch"}}]},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":1790808721,"model":"gpt-4o-mini","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}
+
+data: [DONE]
+
+"#;
+
+/// A Responses client (Codex's `apply_patch`) on a Chat Completions row: the custom call arrived as a
+/// `function_call` with an empty name and `{}` arguments.
+#[tokio::test]
+async fn responses_client_gets_a_custom_tool_call_from_a_chat_row() {
+    let nats_port = unused_nats_port();
+    let (pubkey, sk) = test_keypair(1);
+    let mock = MockUpstream::start(Mode::Raw(200, "text/event-stream", OPENAI_CUSTOM_SSE)).await;
+    let gw = Gateway::builder(nats_port, &mock.authority(), &b64(&pubkey))
+        .providers(&["openai", "openrouter", "anthropic"])
+        .start()
+        .await;
+
+    let body = r#"{"model":"gpt-4o-mini","input":"patch it","stream":true,"store":false,"tools":[{"type":"custom","name":"apply_patch","description":"patch"}]}"#;
+    let (status, text) = post(&gw, "/v1/responses", &vkey(&sk), body.to_owned()).await;
+    assert_eq!(status, 200, "{text}\n{}", gw.log());
+    let evs = events(&text);
+    let resp = assert_lifecycle(&evs);
+    assert_eq!(
+        resp["output"][0]["type"], "custom_tool_call",
+        "{}",
+        resp["output"]
+    );
+    assert_eq!(resp["output"][0]["name"], "apply_patch");
+    assert_eq!(resp["output"][0]["input"], "*** Begin Patch");
+    assert_eq!(resp["output"][0]["call_id"], "call_c1");
+    assert!(names(&evs).contains(&"response.custom_tool_call_input.delta"));
+    let cap = mock.captured().expect("reaches OpenAI");
+    assert_eq!(cap.path, "/v1/chat/completions");
+    let sent: Value = serde_json::from_slice(&cap.body).unwrap();
+    assert_eq!(sent["tools"][0]["custom"]["name"], "apply_patch");
+}
+
+/// OpenRouter serving a Claude row on failover reports a provider that died mid-generation as a
+/// chunk with `choices`, an `error`, and `finish_reason: "error"`. The Messages client got a clean
+/// `end_turn` on a half-written answer; now it gets the error.
+#[tokio::test]
+async fn an_openrouter_mid_stream_error_reaches_a_messages_client_as_an_error() {
+    const OR_ERROR_SSE: &str = r#"data: {"id":"gen-1","object":"chat.completion.chunk","created":1,"model":"anthropic/claude-opus-4.8","choices":[{"index":0,"delta":{"role":"assistant","content":"Hello, the answer is"},"finish_reason":null}]}
+
+data: {"id":"gen-1","object":"chat.completion.chunk","created":1,"model":"anthropic/claude-opus-4.8","provider":"Amazon Bedrock","error":{"code":"server_error","message":"Provider disconnected unexpectedly"},"choices":[{"index":0,"delta":{"content":""},"finish_reason":"error"}]}
+
+data: [DONE]
+
+"#;
+    let nats_port = unused_nats_port();
+    let (pubkey, sk) = test_keypair(1);
+    let fallback = MockUpstream::start(Mode::Raw(200, "text/event-stream", OR_ERROR_SSE)).await;
+    let gw = Gateway::builder(nats_port, &GatewayBuilder::dead_authority(), &b64(&pubkey))
+        .providers(&["anthropic", "openrouter"])
+        .provider_authority("openrouter", &fallback.authority())
+        .start()
+        .await;
+
+    let body = r#"{"model":"claude-opus-4-8","max_tokens":200,"stream":true,"messages":[{"role":"user","content":"hi"}]}"#;
+    let (status, text) = post(&gw, "/v1/messages", &vkey(&sk), body.to_owned()).await;
+    assert_eq!(status, 200, "{text}\n{}", gw.log());
+    let evs = events(&text);
+    assert_eq!(evs.last().unwrap().0, "error", "{text}");
+    assert!(!names(&evs).contains(&"message_stop"), "{text}");
+    assert_eq!(
+        evs.last().unwrap().1["error"]["message"],
+        "Provider disconnected unexpectedly"
+    );
+}
+
+/// An upstream stream that ends cleanly without its terminal event (no `message_delta`, no
+/// `message_stop`) was cut short. The Chat client used to get a bare `[DONE]`, and a Responses
+/// client `response.completed`, for a half-written answer.
+#[tokio::test]
+async fn a_claude_stream_cut_before_its_end_is_an_error_for_the_client() {
+    const CUT_SSE: &str = r#"event: message_start
+data: {"type":"message_start","message":{"id":"msg_01","type":"message","role":"assistant","model":"claude-opus-4-8","content":[],"usage":{"input_tokens":3,"output_tokens":1}}}
+
+event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"half an ans"}}
+
+"#;
+    let nats_port = unused_nats_port();
+    let (pubkey, sk) = test_keypair(1);
+    let mock = MockUpstream::start(Mode::Raw(200, "text/event-stream", CUT_SSE)).await;
+    let gw = Gateway::builder(nats_port, &mock.authority(), &b64(&pubkey))
+        .providers(&["anthropic", "openai", "openrouter"])
+        .start()
+        .await;
+
+    let body =
+        r#"{"model":"claude-opus-4-8","stream":true,"messages":[{"role":"user","content":"hi"}]}"#;
+    let (status, text) = post(&gw, "/v1/chat/completions", &vkey(&sk), body.to_owned()).await;
+    assert_eq!(status, 200, "{text}\n{}", gw.log());
+    let evs = events(&text);
+    assert_eq!(evs.last().unwrap().1, "[DONE]", "{text}");
+    assert_eq!(
+        evs[evs.len() - 2].1["error"]["code"],
+        "stream_truncated",
+        "{text}"
+    );
+    assert!(!text.contains("\"finish_reason\":\"stop\""), "{text}");
+
+    let (status, text) = post(
+        &gw,
+        "/v1/responses",
+        &vkey(&sk),
+        responses_body("claude-opus-4-8", true),
+    )
+    .await;
+    assert_eq!(status, 200, "{text}\n{}", gw.log());
+    let evs = events(&text);
+    assert_eq!(evs.last().unwrap().0, "response.failed", "{text}");
+    assert!(!names(&evs).contains(&"response.completed"), "{text}");
 }
 
 /// OpenRouter wraps the provider's error; the Messages client gets the provider's message too.

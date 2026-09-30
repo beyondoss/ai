@@ -340,7 +340,19 @@ fails over onto a Bedrock candidate gets Bedrock's 400 rather than an answer abo
 model never saw; the walk is chosen before the body is read, so it cannot skip Bedrock for these
 requests. `thinking` / `redacted_thinking` blocks, `cache_control`,
 `parallel_tool_calls: false` ↔ `tool_choice.disable_parallel_tool_use`, and `user` ↔
-`metadata.user_id` pass both ways so an agent workload round-trips. Structured output maps
+`metadata.user_id` pass both ways so an agent workload round-trips. Onto Messages, thinking crosses
+only as a block Anthropic can verify — signed, or redacted — from the gateway's `thinking` array,
+thinking content parts, or OpenRouter's `reasoning_details` (a turn a Chat client got relayed from
+OpenRouter on failover). Bare `reasoning_content` / `reasoning` text is never signed and never
+becomes a block: an unsigned block is a 400 on every later turn ("thinking.signature: Field
+required"), while a turn without its thinking is accepted (measured on Haiku 4.5 and Sonnet 4.6).
+Onto a Claude model behind Chat Completions (OpenRouter's `anthropic/…`), signed blocks also ride
+`reasoning_details` (`reasoning.text` with its signature, `reasoning.encrypted` for a redacted
+block, `format: "anthropic-claude-v1"`): OpenRouter replays nothing else, and older Claude models
+400 a tool turn without its thinking ("a final `assistant` message must start with a thinking
+block", measured on claude-sonnet-4). A Responses client echoes the `reasoning` items the gateway
+minted (`rs_gw…`, Anthropic signature in `encrypted_content`); onto a Claude upstream they become
+that turn's signed thinking again, while OpenAI's own reasoning items stay dropped. Structured output maps
 `response_format` `json_schema` ↔ `output_config.format` ↔ Responses `text.format`; OpenAI JSON mode
 (`json_object`) has no schema to give Anthropic and is dropped (OpenAI already requires the prompt to
 ask for JSON). Inline PDFs map Chat `file` ↔ Anthropic base64 `document` ↔ Responses `input_file`.
@@ -351,7 +363,12 @@ attempt's candidate receives and parses its Claude generation (`ClaudeGen`, any 
 (and Fable, Mythos), `budget_tokens` and non-default `temperature` / `top_p` are 400s, so
 `reasoning_effort` becomes `thinking: {type: adaptive}` plus `output_config.effort`, "none" becomes an
 omitted `thinking` at effort `low` (several of these models reject `thinking: disabled`), and sampling
-is dropped. 4.6 is the same with `xhigh` → `max`. Before 4.6, and for non-Claude models behind a
+is dropped. Sonnet 5.5 is the exception for "none": it rejects `disabled` and an omitted `thinking`
+is adaptive thinking, so "none" is `thinking: {type: between_tools}` at effort `low` (no extended
+thinking; nothing else may sit in that object, and effort must be `high` or below). When the
+history holds thinking and the request carries `block_binding` (below), which `between_tools`
+rejects, it stays adaptive at `low`: keeping the conversation answerable outranks skipping the
+thinking. 4.6 is the same with `xhigh` → `max`. Before 4.6, and for non-Claude models behind a
 Messages-compatible API, effort becomes `budget_tokens` held below `max_tokens` (at most half, at
 least 1024, none at all when `max_tokens` ≤ 1024), and sampling is dropped only alongside thinking.
 Before this, an OpenAI SDK sending `reasoning_effort` or `temperature` to `claude-opus-4-8` got a
@@ -374,8 +391,12 @@ is "Unrecognized"), GPT-5 `minimal`–`high`, 5.1 `none`–`high`, 5.2+ `none`�
 `low`–`xhigh`, `-pro` variants `medium`–`xhigh` (`gpt-5-pro`: `high` only), o-series `low`–`high`.
 So `thinking: disabled` is `minimal` on GPT-5 and omitted on GPT-4.1, and `effort: max` is `xhigh`
 or `high`. OpenRouter's `openai/…` ids get only the effort clamp: OpenRouter renames `max_tokens`
-and drops sampling itself (measured) but passes `none` and `xhigh` through to a 400. Other
-OpenAI-wire hosts (xAI, DeepSeek, Groq's `openai/gpt-oss-…`) keep the body as sent. `stop` on a
+and drops sampling itself (measured) but passes `none` and `xhigh` through to a 400. gpt-oss, on
+any host and in any spelling, gets the same clamp to `low`–`high` (reasoning is mandatory: `none` is
+"Reasoning is mandatory for this endpoint", measured on OpenRouter). Other OpenAI-wire hosts (xAI,
+DeepSeek, Kimi, …) keep the body as sent, except that an effort only OpenAI's newer families define
+becomes the classic one: `xhigh` / `max` (what a large Anthropic `budget_tokens` or `effort: max`
+maps to) → `high`, `minimal` → `low`. `stop` on a
 model that rejects it (GPT-5+, o3, o4-mini) is still forwarded: dropping it would return text past
 the stop sequence the client asked for.
 
@@ -434,7 +455,11 @@ forwarded in any shape. Hints that change nothing about the response's shape (`s
 `service_tier` and `verbosity` everywhere but OpenAI's own Chat Completions (which takes all three).
 Equivalents are mapped instead: legacy `functions` / `function_call` become the `tools` loop (a
 legacy call gets an id from its message position, reused by its `function` result); a
-Responses `custom` tool and its calls map to Chat Completions' `custom`; a Responses named
+Responses `custom` tool and its calls map to Chat Completions' `custom`, in requests and in
+responses both ways (a Responses `custom_tool_call` item with its raw `input` ↔ a Chat
+`tool_calls` entry of `type: "custom"`, streamed as `response.custom_tool_call_input.*` ↔
+`custom.input` deltas); `tool_choice` and `parallel_tool_calls` go onto Chat Completions only
+alongside `tools` (OpenAI 400s either without them; Messages and Responses accept both); a Responses named
 `tool_choice` or `allowed_tools` nests its name the Chat Completions way and back; consecutive
 Responses `function_call` items become one assistant message (OpenAI rejects the split form),
 joined to that turn's text; an assistant refusal is text on Messages; a mid-conversation Anthropic
@@ -497,13 +522,29 @@ Responses-only models the catalog routes to `/v1/responses`, and is held to the 
   **dropped**: echoed back unsigned, it would 400 every later turn Anthropic serves. A Responses
   client gets each thinking block as a `reasoning` item (text as a summary, signature as
   `encrypted_content`); `redacted_thinking` has no Responses form and is dropped there. A Chat
-  client gets `reasoning_content` plus the `thinking` array / `thinking_signature` extension.
+  client gets what it must send back: `reasoning_content` (the text) plus the `thinking` array
+  (the blocks). Streamed, the text arrives as `reasoning_content` deltas and each finished block —
+  signed, or redacted — as one `thinking` list entry with its own `index`, so openai-python's
+  accumulator (which requires an `index` on every list entry) keeps blocks apart and
+  `messages.append(final.choices[0].message)` echoes exactly the signed blocks. A block that never
+  got its signature is not offered for replay.
 - **The Responses stream** is the full lifecycle: `response.created`, `response.in_progress`, and per
   item `output_item.added` → content events (`content_part.*`, `output_text.*`, `refusal.*`,
   `function_call_arguments.*`, `reasoning_summary_part.*` / `reasoning_summary_text.*`) →
   `output_item.done`, each with `sequence_number`, `output_index` and `item_id`, ending in
   `response.completed` carrying the whole `output` and usage. An upstream error is an `error` event
-  (with the envelope under `error`, so an OpenAI SDK raises it) followed by `response.failed`.
+  (with the envelope under `error`, so an OpenAI SDK raises it) followed by `response.failed`, whose
+  `error.code` is one of the closed set the Responses schema allows (`server_error` when the
+  upstream's code is not; the `error` event keeps the upstream's own).
+- **Streams that fail or stop mid-way.** OpenRouter reports a provider that died mid-generation as
+  a chunk carrying `choices` _and_ an `error` (with `finish_reason: "error"`); that is an error, not
+  a finish, for a Messages or Responses client (a Chat client on the same wire gets the relay). A
+  stream that ends without saying how — no stop reason, no end marker — was cut short: the client
+  gets an error (`code: "stream_truncated"`; a Chat client then its `[DONE]`), never an invented
+  `end_turn` / `response.completed`. `proxy` reaches that flush only on a clean end of the upstream
+  body (a close-delimited body, or a provider that stopped writing); an upstream that drops a
+  chunked, sized or HTTP/2 body mid-way fails the request in Pingora, and the client's connection is
+  cut instead.
 - **Tool-call deltas** are keyed by `index`, else by `id`: an id repeated on every delta is one call,
   a reused `index` with a new id is a new call, interleaved deltas land on their own call, and a call
   opens only once its name is known.
@@ -1457,12 +1498,17 @@ Prometheus on the default registry, exposed at `/metrics` on `metrics_listen`.
   (`src/translate_response_tests.rs`) feeds every stream whole, byte by byte and in 7-byte chunks
   and requires the same events from each, and rebuilds client state the way the OpenAI and
   Anthropic SDKs accumulate it (tool calls by `index`, blocks by `content[index]`, the Responses
-  item lifecycle).
+  item lifecycle, and openai-python's `accumulate_delta` for the message a Chat client echoes on
+  its next turn).
 - **Translated responses end to end (`tests/translate_response.rs`):** through the real proxy with
-  provider-shaped fixtures — the full Responses stream for a Claude and a GPT row, an OpenRouter
-  thinking signature reaching a Messages client on failover, cache-inclusive `prompt_tokens`,
-  truncation as `incomplete`, a Bedrock-shaped 400 and an OpenRouter provider error keeping their
-  message, and `accept-encoding: identity` on every managed upstream request.
+  provider-shaped fixtures — the full Responses stream for a Claude and a GPT row, a custom tool
+  call reaching a Responses client, an OpenRouter thinking signature reaching a Messages client on
+  failover, cache-inclusive `prompt_tokens`, truncation as `incomplete`, a Bedrock-shaped 400, an
+  OpenRouter provider error and mid-stream failure keeping their message, a stream cut before its
+  end reaching the client as an error, and `accept-encoding: identity` on every managed upstream
+  request. `tests/translate_request.rs` reads what the upstream received, including a Chat
+  client's next turn built from what the gateway streamed it and signed thinking bound for
+  OpenRouter as `reasoning_details`.
 - **End-to-end (`tests/e2e.rs`, `mise run test:integration:rs`):** real `beyond-ai` binary + real
   nats-server + mock upstream. Covers managed key-swap + passthrough fidelity + usage metering
   (OpenAI JSON + SSE, **Anthropic `/v1/messages`** with `x-api-key` swap + metering), **BYO

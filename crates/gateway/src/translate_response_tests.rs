@@ -1557,3 +1557,459 @@ fn a_responses_json_reaches_chat_with_reasoning_refusal_and_calls() {
         "length"
     );
 }
+
+// ---- thinking a Chat client sends back (second audit) ----------------------------------------
+
+/// openai-python's `accumulate_delta` (`lib/streaming/chat/_completions.py`), faithfully: how
+/// `chat.completions.stream()` builds the message a client appends to its history. Strings
+/// concatenate, `index` / `type` are replaced, and every dict entry of a list delta must carry an
+/// `index` (a `RuntimeError` inside `.stream()` otherwise).
+fn openai_accumulate(
+    acc: &mut Map<String, Value>,
+    delta: &Map<String, Value>,
+) -> Result<(), String> {
+    for (k, dv) in delta {
+        let Some(av) = acc.get_mut(k) else {
+            acc.insert(k.clone(), dv.clone());
+            continue;
+        };
+        if av.is_null() || k == "index" || k == "type" {
+            *av = dv.clone();
+            continue;
+        }
+        match (av, dv) {
+            (Value::String(a), Value::String(d)) => a.push_str(d),
+            (Value::Object(a), Value::Object(d)) => openai_accumulate(a, d)?,
+            (Value::Array(a), Value::Array(d)) => {
+                if a.iter().all(|x| x.is_string() || x.is_number()) {
+                    a.extend(d.iter().cloned());
+                    continue;
+                }
+                for e in d {
+                    let eo = e.as_object().ok_or(format!("not a dict: {e}"))?;
+                    let i = eo.get("index").and_then(Value::as_u64).ok_or(format!(
+                        "Expected list delta entry to have an `index` key; {e}"
+                    ))?;
+                    let i = usize::try_from(i).unwrap();
+                    if i >= a.len() {
+                        a.push(e.clone());
+                    } else {
+                        openai_accumulate(a[i].as_object_mut().unwrap(), eo)?;
+                    }
+                }
+            }
+            (av, dv) => *av = dv.clone(),
+        }
+    }
+    Ok(())
+}
+
+/// The assistant message an openai-python `.stream()` consumer ends up with.
+fn openai_stream_message(evs: &[Event]) -> Result<Value, String> {
+    let mut msg = Map::new();
+    for c in chunks(evs) {
+        if let Some(d) = c.pointer("/choices/0/delta").and_then(Value::as_object) {
+            openai_accumulate(&mut msg, d)?;
+        }
+    }
+    Ok(Value::Object(msg))
+}
+
+fn ant_sse(events: &[Value]) -> String {
+    events
+        .iter()
+        .map(|e| format!("event: {}\ndata: {e}\n\n", e["type"].as_str().unwrap()))
+        .collect()
+}
+
+/// A Claude turn: `blocks` (each a whole content block, its text streamed as one delta), then
+/// `stop`.
+fn claude_turn(blocks: &[Value], stop: &str) -> String {
+    let mut evs = vec![
+        json!({"type": "message_start", "message": {"id": "msg_1", "type": "message",
+        "role": "assistant", "model": "claude-haiku-4-5", "content": [],
+        "usage": {"input_tokens": 10, "output_tokens": 1}}}),
+    ];
+    for (index, b) in blocks.iter().enumerate() {
+        let (start, delta) = match b["type"].as_str().unwrap() {
+            "thinking" => (
+                json!({"type": "thinking", "thinking": "", "signature": ""}),
+                vec![
+                    json!({"type": "thinking_delta", "thinking": b["thinking"]}),
+                    json!({"type": "signature_delta", "signature": b["signature"]}),
+                ],
+            ),
+            "text" => (
+                json!({"type": "text", "text": ""}),
+                vec![json!({"type": "text_delta", "text": b["text"]})],
+            ),
+            "tool_use" => (
+                json!({"type": "tool_use", "id": b["id"], "name": b["name"], "input": {}}),
+                vec![json!({"type": "input_json_delta", "partial_json": b["input"].to_string()})],
+            ),
+            _ => (b.clone(), vec![]),
+        };
+        evs.push(json!({"type": "content_block_start", "index": index, "content_block": start}));
+        for d in delta {
+            evs.push(json!({"type": "content_block_delta", "index": index, "delta": d}));
+        }
+        evs.push(json!({"type": "content_block_stop", "index": index}));
+    }
+    evs.push(json!({"type": "message_delta", "delta": {"stop_reason": stop}, "usage": {"output_tokens": 30}}));
+    evs.push(json!({"type": "message_stop"}));
+    ant_sse(&evs)
+}
+
+/// The Chat client's next turn onto Messages: `assistant` echoed as the SDK accumulated it.
+fn next_turn(assistant: Value) -> Value {
+    let body = json!({
+        "model": "claude-haiku-4-5", "reasoning_effort": "low", "max_tokens": 2000,
+        "tools": [{"type": "function", "function": {"name": "get_weather", "parameters": {"type": "object"}}}],
+        "messages": [
+            {"role": "user", "content": "weather in Paris?"},
+            assistant,
+            {"role": "tool", "tool_call_id": "toolu_01", "content": "sunny"},
+        ],
+    });
+    serde_json::from_slice(&request(
+        Chat,
+        Messages,
+        &serde_json::to_vec(&body).unwrap(),
+        "claude-haiku-4-5",
+    ))
+    .unwrap()
+}
+
+/// A streaming Chat client on a Claude row with reasoning: turn 2 was a 400 ("thinking.signature:
+/// Field required"). The signature rode a `thinking_signature` string the request side never read,
+/// and the echoed `reasoning_content` became an unsigned block. Now each finished block arrives
+/// whole on the `thinking` list — what the non-stream body returns — and `messages.append(final
+/// .choices[0].message)` sends back exactly the signed blocks.
+#[test]
+fn a_streamed_claude_turn_goes_back_signed() {
+    let blocks = [
+        json!({"type": "thinking", "thinking": "Need weather.", "signature": "SIG_ONE"}),
+        json!({"type": "tool_use", "id": "toolu_01", "name": "get_weather", "input": {"city": "Paris"}}),
+    ];
+    let evs = stream(Messages, Chat, &claude_turn(&blocks, "tool_use"));
+    let msg = openai_stream_message(&evs).unwrap();
+    assert_eq!(
+        msg["reasoning_content"], "Need weather.",
+        "still streamed as text: {msg}"
+    );
+    assert_eq!(
+        msg["thinking"],
+        json!([{"index": 0, "type": "thinking", "thinking": "Need weather.", "signature": "SIG_ONE"}])
+    );
+    assert!(msg.get("thinking_signature").is_none(), "{msg}");
+    // The stream and the non-stream body carry the same blocks.
+    let body = json_resp(
+        Messages,
+        Chat,
+        &anthropic_msg(
+            json!(blocks),
+            "tool_use",
+            json!({"input_tokens": 1, "output_tokens": 1}),
+        ),
+    );
+    assert_eq!(
+        body["choices"][0]["message"]["thinking"][0]["signature"],
+        msg["thinking"][0]["signature"]
+    );
+
+    let up = next_turn(msg);
+    let turn = &up["messages"][1]["content"];
+    assert_eq!(
+        turn[0],
+        json!({"type": "thinking", "thinking": "Need weather.", "signature": "SIG_ONE"}),
+        "{up}"
+    );
+    assert_eq!(turn[1]["type"], "tool_use");
+    assert_eq!(turn.as_array().unwrap().len(), 2, "{turn}");
+}
+
+/// Interleaved thinking signs each block; two blocks' signatures on one string concatenated
+/// ("S1S2") beyond repair. Two `redacted_thinking` blocks had no `index`, which openai-python's
+/// accumulator requires on the second list delta: `.stream()` itself raised.
+#[test]
+fn every_thinking_block_streams_whole_under_its_own_index() {
+    let blocks = [
+        json!({"type": "redacted_thinking", "data": "RD1"}),
+        json!({"type": "thinking", "thinking": "A", "signature": "S1"}),
+        json!({"type": "text", "text": "x"}),
+        json!({"type": "thinking", "thinking": "B", "signature": "S2"}),
+        json!({"type": "redacted_thinking", "data": "RD2"}),
+        json!({"type": "tool_use", "id": "toolu_01", "name": "get_weather", "input": {}}),
+    ];
+    let src = claude_turn(&blocks, "tool_use");
+    let msg = openai_stream_message(&stream(Messages, Chat, &src)).unwrap();
+    assert_eq!(
+        msg["thinking"],
+        json!([
+            {"index": 0, "type": "redacted_thinking", "data": "RD1"},
+            {"index": 1, "type": "thinking", "thinking": "A", "signature": "S1"},
+            {"index": 2, "type": "thinking", "thinking": "B", "signature": "S2"},
+            {"index": 3, "type": "redacted_thinking", "data": "RD2"},
+        ])
+    );
+    let turn = next_turn(msg)["messages"][1]["content"].clone();
+    let kinds: Vec<(&str, &str)> = turn
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|b| {
+            (
+                b["type"].as_str().unwrap(),
+                b["signature"]
+                    .as_str()
+                    .or_else(|| b["data"].as_str())
+                    .unwrap_or(""),
+            )
+        })
+        .collect();
+    assert_eq!(
+        kinds,
+        [
+            ("redacted_thinking", "RD1"),
+            ("thinking", "S1"),
+            ("thinking", "S2"),
+            ("redacted_thinking", "RD2"),
+            ("text", ""),
+            ("tool_use", ""),
+        ]
+    );
+
+    // A Responses client gets one signed `reasoning` item per thinking block.
+    let evs = stream(Messages, Responses, &src);
+    let resp = assert_responses_lifecycle(&evs, "response.completed");
+    let sigs: Vec<&Value> = resp["output"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|i| i["type"] == "reasoning")
+        .map(|i| &i["encrypted_content"])
+        .collect();
+    assert_eq!(sigs, [&json!("S1"), &json!("S2")], "{resp:#}");
+
+    // A block that never got its signature is never offered for replay.
+    let mut unsigned = blocks.to_vec();
+    unsigned[1]["signature"] = json!("");
+    let msg = openai_stream_message(&stream(Messages, Chat, &claude_turn(&unsigned, "tool_use")))
+        .unwrap();
+    assert_eq!(msg["reasoning_content"], "AB");
+    assert!(!msg["thinking"].to_string().contains("\"A\""), "{msg}");
+}
+
+// ---- custom (free-form) tool calls (second audit) ---------------------------------------------
+
+/// OpenAI streaming a custom tool call (shape from a live gpt-5-nano capture, 2026-09-30).
+const OPENAI_CUSTOM_SSE: &str = r#"data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":1790808721,"model":"gpt-5-nano","choices":[{"index":0,"delta":{"role":"assistant","content":null,"tool_calls":[{"index":0,"id":"call_c1","type":"custom","custom":{"name":"run_code","input":""}}],"refusal":null},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":1790808721,"model":"gpt-5-nano","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"custom":{"input":"print"}}]},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":1790808721,"model":"gpt-5-nano","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"custom":{"input":"(1+1)"}}]},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":1790808721,"model":"gpt-5-nano","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}
+
+data: [DONE]
+
+"#;
+
+/// A Responses client (Codex's `apply_patch`) on a Chat Completions row: the custom call became a
+/// `function_call` with an empty name and `{}` arguments — the patch was lost.
+#[test]
+fn a_chat_custom_tool_call_reaches_responses_as_a_custom_tool_call() {
+    let body = chat_completion(
+        json!({"role": "assistant", "content": null, "tool_calls": [
+            {"id": "call_1", "type": "custom", "custom": {"name": "apply_patch", "input": "*** Begin Patch"}},
+            {"id": "call_2", "type": "function", "function": {"name": "f", "arguments": "{}"}},
+        ]}),
+        "tool_calls",
+        json!({}),
+    );
+    let r = json_resp(Chat, Responses, &body);
+    let out = r["output"].as_array().unwrap();
+    assert_eq!(out[0]["type"], "custom_tool_call", "{r}");
+    assert_eq!(out[0]["call_id"], "call_1");
+    assert_eq!(out[0]["name"], "apply_patch");
+    assert_eq!(out[0]["input"], "*** Begin Patch");
+    assert!(out[0]["id"].as_str().unwrap().starts_with("ctc_"), "{r}");
+    assert_eq!(out[1]["type"], "function_call");
+
+    let evs = stream(Chat, Responses, OPENAI_CUSTOM_SSE);
+    let resp = assert_responses_lifecycle(&evs, "response.completed");
+    let item = &resp["output"][0];
+    assert_eq!(item["type"], "custom_tool_call", "{resp:#}");
+    assert_eq!(item["call_id"], "call_c1");
+    assert_eq!(item["name"], "run_code");
+    assert_eq!(item["input"], "print(1+1)");
+    let deltas: String = named(&evs, "response.custom_tool_call_input.delta")
+        .iter()
+        .map(|v| v["delta"].as_str().unwrap())
+        .collect();
+    assert_eq!(deltas, "print(1+1)");
+    assert_eq!(
+        one(&evs, "response.custom_tool_call_input.done")["input"],
+        "print(1+1)"
+    );
+    assert!(named(&evs, "response.function_call_arguments.delta").is_empty());
+}
+
+/// A Chat client on a Responses-only row (the `-codex` models) with a custom tool: the call was
+/// dropped, and the turn ended `stop` with nothing to run.
+#[test]
+fn a_responses_custom_tool_call_reaches_chat_as_a_custom_tool_call() {
+    let body = json!({"id": "resp_1", "object": "response", "created_at": 1, "status": "completed", "model": "gpt-5.3-codex",
+        "output": [{"type": "custom_tool_call", "id": "ctc_1", "call_id": "call_1", "name": "run_code", "input": "print(1)", "status": "completed"}]});
+    let c = json_resp(Responses, Chat, &body);
+    assert_eq!(c["choices"][0]["finish_reason"], "tool_calls", "{c}");
+    assert_eq!(
+        c["choices"][0]["message"]["tool_calls"],
+        json!([{"id": "call_1", "type": "custom", "custom": {"name": "run_code", "input": "print(1)"}}])
+    );
+
+    let src = concat!(
+        "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"created_at\":1,\"model\":\"gpt-5.3-codex\"}}\n\n",
+        "event: response.output_item.added\ndata: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"custom_tool_call\",\"id\":\"ctc_1\",\"call_id\":\"call_1\",\"name\":\"run_code\",\"input\":\"\"}}\n\n",
+        "event: response.custom_tool_call_input.delta\ndata: {\"type\":\"response.custom_tool_call_input.delta\",\"output_index\":0,\"item_id\":\"ctc_1\",\"delta\":\"print\"}\n\n",
+        "event: response.custom_tool_call_input.delta\ndata: {\"type\":\"response.custom_tool_call_input.delta\",\"output_index\":0,\"item_id\":\"ctc_1\",\"delta\":\"(1)\"}\n\n",
+        "event: response.custom_tool_call_input.done\ndata: {\"type\":\"response.custom_tool_call_input.done\",\"output_index\":0,\"item_id\":\"ctc_1\",\"input\":\"print(1)\"}\n\n",
+        "event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"custom_tool_call\",\"id\":\"ctc_1\",\"call_id\":\"call_1\",\"name\":\"run_code\",\"input\":\"print(1)\"}}\n\n",
+        "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\":\"completed\",\"usage\":{\"input_tokens\":5,\"output_tokens\":3}}}\n\n",
+    );
+    let evs = stream(Responses, Chat, src);
+    let msg = openai_stream_message(&evs).unwrap();
+    assert_eq!(
+        msg["tool_calls"],
+        json!([{"index": 0, "id": "call_1", "type": "custom", "custom": {"name": "run_code", "input": "print(1)"}}]),
+        "{msg}"
+    );
+    assert_eq!(finish_reason(&evs), "tool_calls");
+    // A call announced only by its closing item still arrives whole.
+    let late = src
+        .lines()
+        .filter(|l| !l.contains("output_item.added") && !l.contains("input.delta"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let msg = openai_stream_message(&stream(Responses, Chat, &late)).unwrap();
+    assert_eq!(msg["tool_calls"][0]["custom"]["input"], "print(1)", "{msg}");
+    assert_eq!(msg["tool_calls"][0]["custom"]["name"], "run_code");
+}
+
+// ---- streams that fail or stop mid-way (second audit) -----------------------------------------
+
+/// OpenRouter reports a provider that died mid-generation as a chunk with `choices` *and* an
+/// `error`, and `finish_reason: "error"`. A Messages client got `end_turn` and a Responses client
+/// `completed` on a half-written answer.
+#[test]
+fn an_openrouter_mid_stream_error_is_an_error() {
+    let src = concat!(
+        "data: {\"id\":\"gen-1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"moonshotai/kimi-k3\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Hello, the answer is\"},\"finish_reason\":null}]}\n\n",
+        "data: {\"id\":\"gen-1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"moonshotai/kimi-k3\",\"provider\":\"Fireworks\",\"error\":{\"code\":\"server_error\",\"message\":\"Provider disconnected unexpectedly\"},\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\"},\"finish_reason\":\"error\"}]}\n\n",
+        "data: [DONE]\n\n",
+    );
+    let evs = stream(Chat, Messages, src);
+    let names: Vec<&str> = evs.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(names.last(), Some(&"error"), "{names:?}");
+    assert!(!names.contains(&"message_stop") && !names.contains(&"message_delta"));
+    assert_eq!(
+        one(&evs, "error")["error"]["message"],
+        "Provider disconnected unexpectedly"
+    );
+
+    let evs = stream(Chat, Responses, src);
+    let names: Vec<&str> = evs.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(names.last(), Some(&"response.failed"), "{names:?}");
+    assert!(!names.contains(&"response.completed"), "{names:?}");
+    assert_eq!(
+        one(&evs, "error")["message"],
+        "Provider disconnected unexpectedly"
+    );
+
+    // `finish_reason: "error"` alone, and the same failure in a non-stream body.
+    let bare = src.replace(
+        ",\"error\":{\"code\":\"server_error\",\"message\":\"Provider disconnected unexpectedly\"}",
+        "",
+    );
+    assert_ne!(bare, src);
+    let evs = stream(Chat, Messages, &bare);
+    assert_eq!(evs.last().unwrap().0, "error", "{evs:#?}");
+    let body = json!({"id": "gen-1", "object": "chat.completion", "model": "m",
+        "error": {"code": 502, "message": "Provider disconnected unexpectedly"},
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": "Hello"}, "finish_reason": "error"}]});
+    let anth = json_resp(Chat, Messages, &body);
+    assert_eq!(anth["type"], "error", "{anth}");
+    assert_eq!(
+        anth["error"]["message"],
+        "Provider disconnected unexpectedly"
+    );
+    let resp = json_resp(Chat, Responses, &body);
+    assert!(resp.get("output").is_none(), "{resp}");
+    assert_eq!(
+        resp["error"]["message"],
+        "Provider disconnected unexpectedly"
+    );
+}
+
+/// An upstream stream that ends cleanly without saying how the response ended (no stop reason, no
+/// end marker) was cut short. The bridge used to close it as a success — `end_turn`,
+/// `response.completed`, a bare `[DONE]` — on a half-written answer.
+#[test]
+fn a_stream_that_ends_without_saying_how_is_an_error_for_every_client() {
+    let cut_claude = concat!(
+        "event: message_start\n",
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"model\":\"c\",\"usage\":{\"input_tokens\":3,\"output_tokens\":1}}}\n\n",
+        "event: content_block_start\n",
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"half an ans\"}}\n\n",
+    );
+    let evs = stream(Messages, Chat, cut_claude);
+    assert_eq!(evs.last().unwrap().1, "[DONE]");
+    let err = &evs[evs.len() - 2].1;
+    assert_eq!(err["error"]["code"], "stream_truncated", "{evs:#?}");
+    assert_eq!(
+        finish_reason(&evs),
+        Value::Null,
+        "no finish reason is invented"
+    );
+
+    let evs = stream(Messages, Responses, cut_claude);
+    let names: Vec<&str> = evs.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(names.last(), Some(&"response.failed"), "{names:?}");
+    assert!(!names.contains(&"response.completed"), "{names:?}");
+    assert_eq!(one(&evs, "error")["code"], "stream_truncated");
+    assert_eq!(
+        one(&evs, "response.failed")["response"]["error"]["code"],
+        "server_error",
+        "a failed Response's code is a closed set; a typed client rejects any other"
+    );
+
+    let cut_chat = "data: {\"id\":\"c\",\"model\":\"gpt-5\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"half\"}}]}\n\n";
+    let evs = stream(Chat, Messages, cut_chat);
+    let names: Vec<&str> = evs.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(names.last(), Some(&"error"), "{names:?}");
+    assert!(!names.contains(&"message_stop"), "{names:?}");
+    assert_eq!(
+        one(&evs, "error")["error"]["type"],
+        "api_error",
+        "an Anthropic SDK raises it"
+    );
+    // Nothing at all is no answer either.
+    assert_eq!(stream(Chat, Messages, "").last().unwrap().0, "error");
+
+    // Each upstream's own end marker still closes cleanly.
+    let ended = format!("{cut_chat}data: [DONE]\n\n");
+    assert_eq!(
+        stream(Chat, Messages, &ended).last().unwrap().0,
+        "message_stop"
+    );
+    let stopped = cut_chat.replace(
+        "\"content\":\"half\"}}",
+        "\"content\":\"half\"},\"finish_reason\":\"stop\"}",
+    );
+    assert_eq!(
+        stream(Chat, Responses, &stopped).last().unwrap().0,
+        "response.completed"
+    );
+}

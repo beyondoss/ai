@@ -12,11 +12,13 @@
 //!   `truncation`, …) when leaving Responses; `stream_options` on a Responses or Anthropic body.
 //!   Same-endpoint Responses is a byte relay: those session fields pass through. Hints with no
 //!   equivalent and no effect on the response's shape (`seed`, penalties, `logit_bias`, `top_k`,
-//!   a message's `name`, Responses `reasoning` items, and off OpenAI's own API `prompt_cache_key`,
-//!   `service_tier` and `verbosity`) are dropped, as is OpenAI JSON mode (`json_object`):
-//!   Anthropic's format needs a schema, and OpenAI already requires a JSON-mode prompt to ask for
-//!   JSON. Another vendor's `thinking` blocks and Anthropic `cache_control` are dropped onto
-//!   Responses, which reads neither.
+//!   a message's `name`, Responses `reasoning` items other than the gateway's own for a Claude
+//!   upstream, and off OpenAI's own API `prompt_cache_key`, `service_tier` and `verbosity`) are
+//!   dropped, as is OpenAI JSON mode (`json_object`): Anthropic's format needs a schema, and OpenAI
+//!   already requires a JSON-mode prompt to ask for JSON. Another vendor's `thinking` blocks and
+//!   Anthropic `cache_control` are dropped onto Responses, which reads neither. Bare reasoning text
+//!   (`reasoning_content`) is never sent to Anthropic as a block: it was never signed. `tool_choice`
+//!   and `parallel_tool_calls` without `tools` are dropped onto Chat Completions, which 400s them.
 //! - **Forwarded for the provider to reject:** input and options that change what the client gets
 //!   back and have no equivalent on the target (`input_audio`, a `file_id` or URL document or
 //!   image, a non-base64 data URI, `n` > 1, `logprobs`, audio output, `stop` onto Responses or a
@@ -33,12 +35,15 @@
 //!   base64 `document` ↔ a Responses `input_file`.
 //! - **Structured output, both ways:** `response_format` `json_schema` ↔ Anthropic
 //!   `output_config.format` ↔ Responses `text.format`.
-//! - **Passed both ways:** `thinking` / `redacted_thinking` blocks, `cache_control` on tools and
-//!   content, `parallel_tool_calls: false` ↔ `tool_choice.disable_parallel_tool_use`, `user` ↔
+//! - **Passed both ways:** signed `thinking` / `redacted_thinking` blocks (our `thinking` array,
+//!   OpenRouter's `reasoning_details`, and the gateway's Responses `reasoning` items; see
+//!   `openai_assistant_content` and `reasoning_details`), `cache_control` on tools and content,
+//!   `parallel_tool_calls: false` ↔ `tool_choice.disable_parallel_tool_use`, `user` ↔
 //!   `metadata.user_id` (an email address, which Anthropic rejects, becomes a stable hash), tool
-//!   `strict`, mid-conversation `system` / `developer` messages in place (see `place_system`), and
-//!   images or files a tool returned (a Chat Completions `tool` message holds text, so they follow
-//!   it as a user message). Legacy `functions` / `function_call` become the `tools` loop.
+//!   `strict`, custom (free-form) tool calls, mid-conversation `system` / `developer` messages in
+//!   place (see `place_system`), and images or files a tool returned (a Chat Completions `tool`
+//!   message holds text, so they follow it as a user message). Legacy `functions` /
+//!   `function_call` become the `tools` loop.
 //! - **Model-aware onto Messages** (see `ClaudeModel`): `reasoning_effort`, or a client's own
 //!   `thinking` object, becomes adaptive thinking plus `output_config.effort` on Claude 4.6 and
 //!   later, and a `budget_tokens` below `max_tokens` before that. `temperature` / `top_p` are
@@ -48,7 +53,8 @@
 //!   `bind_thinking_with_drop_block`). Tool ids are rewritten to Anthropic's pattern.
 //! - **Model-aware onto Chat Completions and Responses** (see `OpenAiModel`): OpenAI's own ids get
 //!   `max_completion_tokens`, sampling only where the model takes it, and an effort from the set
-//!   the family accepts (none on a model that does not reason).
+//!   the family accepts (none on a model that does not reason). Other hosts get the classic
+//!   `low`–`high` in place of `xhigh` / `max` / `minimal`.
 //! - **Added onto Messages:** default `cache_control` breakpoints when the client set none (see
 //!   `auto_cache_breakpoints`). An OpenAI SDK never marks anything, and without a marker Anthropic
 //!   caches nothing.
@@ -129,6 +135,10 @@ pub fn request(from: Endpoint, to: Endpoint, body: &[u8], upstream_model: &str) 
 struct Upstream {
     claude: ClaudeModel,
     openai: OpenAiModel,
+    /// A Claude model (any spelling, any generation) — the only kind that verifies an Anthropic
+    /// thinking signature. On a Chat Completions host (OpenRouter's `anthropic/…`) signed thinking
+    /// must also ride `reasoning_details`, the only field OpenRouter replays to Anthropic.
+    claude_thinking: bool,
 }
 
 impl Upstream {
@@ -136,6 +146,7 @@ impl Upstream {
         Self {
             claude: ClaudeModel::of(model),
             openai: OpenAiModel::of(model),
+            claude_thinking: model.contains("claude"),
         }
     }
 }
@@ -146,13 +157,13 @@ fn map_request(from: Endpoint, to: Endpoint, v: &Value, up: Upstream) -> Value {
     let chat = chat.as_ref().and_then(Option::as_ref).unwrap_or(v);
     match (from, to) {
         (Endpoint::ChatCompletions, Endpoint::Messages) => openai_req_to_anthropic(chat, up.claude),
-        (Endpoint::Messages, Endpoint::ChatCompletions) => anthropic_req_to_openai(v, up.openai),
-        (Endpoint::Responses, Endpoint::ChatCompletions) => responses_req_to_openai(v, up.openai),
+        (Endpoint::Messages, Endpoint::ChatCompletions) => anthropic_req_to_openai(v, up),
+        (Endpoint::Responses, Endpoint::ChatCompletions) => responses_req_to_openai(v, up),
         (Endpoint::ChatCompletions, Endpoint::Responses) => {
             openai_req_to_responses(chat, up.openai)
         }
         (Endpoint::Responses, Endpoint::Messages) => {
-            let mut chat = responses_req_to_openai(v, up.openai);
+            let mut chat = responses_req_to_openai(v, up);
             // Intermediate only (never sent): `reasoning.summary` has no Chat Completions field, but
             // it decides `thinking.display` on Messages.
             if let (Some(r), Some(obj)) = (v.get("reasoning"), chat.as_object_mut()) {
@@ -161,7 +172,7 @@ fn map_request(from: Endpoint, to: Endpoint, v: &Value, up: Upstream) -> Value {
             openai_req_to_anthropic(&chat, up.claude)
         }
         (Endpoint::Messages, Endpoint::Responses) => {
-            openai_req_to_responses(&anthropic_req_to_openai(v, up.openai), up.openai)
+            openai_req_to_responses(&anthropic_req_to_openai(v, up), up.openai)
         }
         (a, b) if a == b => v.clone(),
         _ => v.clone(),
@@ -224,10 +235,22 @@ fn looks_like_error(v: &Value) -> bool {
         return v.get("status").and_then(Value::as_str) == Some("failed")
             && v.get("error").is_some_and(Value::is_object);
     }
-    if v.get("error").is_none_or(Value::is_null) {
-        return false;
+    // OpenRouter reports a provider that failed mid-generation as a chunk (or body) with `choices`
+    // *and* a top-level `error` object, and `finish_reason: "error"`. Read as a success, a Messages
+    // or Responses client got a clean `end_turn` / `completed` on a half-written answer.
+    if v.pointer("/choices/0/finish_reason")
+        .and_then(Value::as_str)
+        == Some("error")
+    {
+        return true;
     }
-    // Success bodies never carry a top-level `error` next to `choices` / `content` / `output`.
+    let Some(err) = v.get("error").filter(|e| !e.is_null()) else {
+        return false;
+    };
+    if err.is_object() {
+        return true;
+    }
+    // Success bodies never carry a string `error` next to `choices` / `content` / `output`.
     if v.get("choices").is_some() || v.get("content").is_some() || v.get("output").is_some() {
         return false;
     }
@@ -262,7 +285,16 @@ fn error_info(v: &Value) -> ErrorInfo {
             .filter(|x| !x.is_null())
             .cloned()
     };
-    let mut message = plain_error_message(v).unwrap_or_else(|| clip(&value_string(v)));
+    let mut message = plain_error_message(v).unwrap_or_else(|| {
+        if v.pointer("/choices/0/finish_reason")
+            .and_then(Value::as_str)
+            == Some("error")
+        {
+            "The upstream ended the response with an error.".to_owned()
+        } else {
+            clip(&value_string(v))
+        }
+    });
     let code = field("code");
     let param = field("param");
     let metadata = err.get("metadata").filter(|m| m.is_object()).cloned();
@@ -412,7 +444,7 @@ fn openai_req_to_anthropic(v: &Value, claude: ClaudeModel) -> Value {
     copy_if(&mut out, v, "model");
     let max_tokens = max_tokens_of(v).unwrap_or(DEFAULT_MAX_TOKENS);
     out.insert("max_tokens".into(), json!(max_tokens));
-    openai_reasoning_to_anthropic(v, &mut out, claude, max_tokens);
+    let thinking_off = openai_reasoning_to_anthropic(v, &mut out, claude, max_tokens);
     copy_if(&mut out, v, "stream");
     if let Some(format) = openai_format_to_anthropic(v.get("response_format")) {
         set_output_config(&mut out, "format", format);
@@ -576,10 +608,51 @@ fn openai_req_to_anthropic(v: &Value, claude: ClaudeModel) -> Value {
     {
         messages.push(json!({ "role": "system", "content": text }));
     }
+    if thinking_off && claude.between_tools {
+        thinking_off_between_tools(&mut out, claude);
+    }
     if claude.binding_controls {
         bind_thinking_with_drop_block(&mut out);
     }
     Value::Object(out)
+}
+
+/// "No reasoning" on a model whose lowest setting is `between_tools` (Sonnet 5.5): it rejects
+/// `thinking: disabled`, and an omitted `thinking` is adaptive thinking, so `reasoning_effort:
+/// "none"` used to think anyway. `between_tools` does no extended thinking (the model's short notes
+/// between tool calls still come back as thinking blocks) and takes effort `high` or below — the
+/// effort here is `low`.
+///
+/// Except when the history holds thinking and the request will carry `block_binding`: the API
+/// rejects `block_binding` alongside `between_tools`, and without it a replayed block whose prefix
+/// the gateway changed is a 400 on enforced accounts (see `bind_thinking_with_drop_block`). Keeping
+/// the conversation answerable outranks skipping the thinking, so that request stays adaptive at
+/// `low`.
+fn thinking_off_between_tools(out: &mut Map<String, Value>, claude: ClaudeModel) {
+    if out.contains_key("thinking") {
+        return;
+    }
+    let history_thinks = out
+        .get("messages")
+        .and_then(Value::as_array)
+        .is_some_and(|ms| {
+            ms.iter().any(|m| {
+                m.get("content")
+                    .and_then(Value::as_array)
+                    .is_some_and(|bs| {
+                        bs.iter().any(|b| {
+                            matches!(
+                                b.get("type").and_then(Value::as_str),
+                                Some("thinking" | "redacted_thinking")
+                            )
+                        })
+                    })
+            })
+        });
+    if claude.binding_controls && history_thinks {
+        return;
+    }
+    out.insert("thinking".into(), json!({ "type": "between_tools" }));
 }
 
 /// Emit mid-conversation system messages where Messages accepts one: right after a user turn,
@@ -1159,6 +1232,20 @@ impl OpenAiModel {
     };
 
     pub(crate) fn of(model: &str) -> Self {
+        // OpenAI's open-weight gpt-oss, on whichever host serves it (Groq, Together, OpenRouter's
+        // `openai/gpt-oss-…`, Fireworks' `accounts/fireworks/models/gpt-oss-…`): reasoning is
+        // mandatory and the efforts are `low`–`high` (`none` is "Reasoning is mandatory for this
+        // endpoint", measured on OpenRouter). Never OpenAI's own API, so every other field stays.
+        if model
+            .rsplit('/')
+            .next()
+            .is_some_and(|id| id.starts_with("gpt-oss"))
+        {
+            return Self {
+                native: false,
+                reasoning: OpenAiReasoning::Efforts(&["low", "medium", "high"]),
+            };
+        }
         let (native, id) = match model.split_once('/') {
             None => (true, model),
             Some(("openai", id)) => (false, id),
@@ -1192,13 +1279,25 @@ impl OpenAiModel {
     /// model lacks becomes the nearest one above it (`none` on a model that always reasons becomes
     /// its lowest), or its highest when nothing is above. An unrecognized name passes through for
     /// the provider to reject by name.
+    ///
+    /// A model this table does not know gets the classic `low` / `medium` / `high` in place of the
+    /// rungs only OpenAI's newer families define: `xhigh` / `max` (what a large Anthropic
+    /// `budget_tokens` or `effort: max` maps to) become `high`, `minimal` becomes `low`. Hosts that
+    /// take `reasoning_effort` at all take those three; Groq documents no other.
     fn effort(self, requested: &str) -> Option<String> {
         let requested = match requested {
             "off" | "disabled" => "none",
             other => other,
         };
         match self.reasoning {
-            OpenAiReasoning::Unknown => Some(requested.to_owned()),
+            OpenAiReasoning::Unknown => Some(
+                match requested {
+                    "xhigh" | "max" => "high",
+                    "minimal" => "low",
+                    other => other,
+                }
+                .to_owned(),
+            ),
             OpenAiReasoning::Off => None,
             OpenAiReasoning::Efforts(accepted) => {
                 let rank = |e: &str| EFFORT_LADDER.iter().position(|x| *x == e);
@@ -1280,12 +1379,14 @@ enum ThinkingIntent<'a> {
     Effort(&'a str),
 }
 
+/// Returns whether the client asked for no reasoning on an adaptive-generation model, where that
+/// is an omitted `thinking` at effort `low` (see `thinking_off_between_tools` for the exception).
 fn openai_reasoning_to_anthropic(
     v: &Value,
     out: &mut Map<String, Value>,
     claude: ClaudeModel,
     max_tokens: u64,
-) {
+) -> bool {
     let effort = v
         .get("reasoning_effort")
         .and_then(Value::as_str)
@@ -1310,12 +1411,12 @@ fn openai_reasoning_to_anthropic(
             if let Some(t) = native {
                 out.insert("thinking".into(), t.clone());
             }
-            return;
+            return false;
         }
         None => match effort {
             Some("none" | "off" | "disabled") => ThinkingIntent::Off,
             Some(e) => ThinkingIntent::Effort(e),
-            None => return,
+            None => return false,
         },
     };
     let intent = match intent {
@@ -1327,7 +1428,7 @@ fn openai_reasoning_to_anthropic(
             let budget = match intent {
                 ThinkingIntent::Off | ThinkingIntent::BetweenTools => {
                     out.insert("thinking".into(), json!({ "type": "disabled" }));
-                    return;
+                    return false;
                 }
                 ThinkingIntent::Budget(n) => n,
                 ThinkingIntent::Effort(e) => budget_for_effort(e).min(max_tokens / 2),
@@ -1335,18 +1436,19 @@ fn openai_reasoning_to_anthropic(
             // `budget_tokens` must be at least 1024 and below `max_tokens`, which also has to hold
             // the answer. Leave the answer at least half; too small a request thinks not at all.
             if max_tokens <= MIN_THINKING_BUDGET {
-                return;
+                return false;
             }
             let budget = budget.clamp(MIN_THINKING_BUDGET, max_tokens - 1);
             let mut t = json!({ "type": "enabled", "budget_tokens": budget });
             copy_display(&mut t, native);
             out.insert("thinking".into(), t);
+            false
         }
         ClaudeGen::Adaptive46 | ClaudeGen::Adaptive => {
             let requested = match intent {
                 ThinkingIntent::BetweenTools => {
                     out.insert("thinking".into(), json!({ "type": "between_tools" }));
-                    return;
+                    return false;
                 }
                 ThinkingIntent::Off => "none",
                 ThinkingIntent::Budget(n) => effort_from_budget(n),
@@ -1375,6 +1477,7 @@ fn openai_reasoning_to_anthropic(
                 out.insert("thinking".into(), t);
             }
             set_output_config(out, "effort", json!(level));
+            matches!(intent, ThinkingIntent::Off)
         }
     }
 }
@@ -1608,8 +1711,14 @@ fn openai_tool_part_to_anthropic(p: &Value) -> Option<Value> {
     }
 }
 
+/// A Chat Completions assistant turn as Messages content. Thinking crosses only as a block
+/// Anthropic can verify — signed, or redacted — from our `thinking` array, OpenRouter's
+/// `reasoning_details`, or thinking parts in `content`. Bare reasoning text (`reasoning_content`,
+/// `reasoning`) is never signed, and an unsigned block is a 400 ("thinking.signature: Field
+/// required") on every later turn, so it goes; Anthropic accepts a turn without its thinking.
 fn openai_assistant_content(m: &Value) -> Value {
     let mut blocks: Vec<Value> = Vec::new();
+    let mut thinking_parts = false;
     match m.get("content") {
         Some(Value::String(s)) if !s.is_empty() => {
             blocks.push(json!({ "type": "text", "text": s }));
@@ -1617,8 +1726,13 @@ fn openai_assistant_content(m: &Value) -> Value {
         Some(Value::Array(parts)) => {
             for p in parts {
                 match p.get("type").and_then(Value::as_str) {
-                    Some("thinking") => blocks.push(thinking_block_from_openai(p)),
-                    Some("redacted_thinking") => blocks.push(redacted_block_from_openai(p)),
+                    Some("thinking" | "redacted_thinking") => {
+                        thinking_parts = true;
+                        let b = anthropic_thinking_block(p);
+                        if is_replayable_thinking(&b) {
+                            blocks.push(b);
+                        }
+                    }
                     Some("text") | None => {
                         if let Some(t) =
                             p.get("text").and_then(Value::as_str).or_else(|| p.as_str())
@@ -1637,24 +1751,11 @@ fn openai_assistant_content(m: &Value) -> Value {
         }
         _ => {}
     }
-    if let Some(extra) = m.get("thinking").and_then(Value::as_array) {
-        for p in extra.iter().rev() {
-            let block = match p.get("type").and_then(Value::as_str) {
-                Some("redacted_thinking") => redacted_block_from_openai(p),
-                _ => thinking_block_from_openai(p),
-            };
-            blocks.insert(0, block);
-        }
-    } else if blocks
-        .iter()
-        .all(|b| b.get("type").and_then(Value::as_str) != Some("thinking"))
-        && let Some(reasoning) = m
-            .get("reasoning_content")
-            .and_then(Value::as_str)
-            .or_else(|| m.get("reasoning").and_then(Value::as_str))
-        && !reasoning.is_empty()
-    {
-        blocks.insert(0, json!({ "type": "thinking", "thinking": reasoning }));
+    if !thinking_parts {
+        let signed = chat_thinking_blocks(m)
+            .into_iter()
+            .filter(is_replayable_thinking);
+        blocks.splice(0..0, signed);
     }
     if let Some(calls) = m.get("tool_calls").and_then(Value::as_array) {
         for c in calls {
@@ -1680,28 +1781,6 @@ fn openai_assistant_content(m: &Value) -> Value {
         return Value::String(String::new());
     }
     Value::Array(blocks)
-}
-
-fn thinking_block_from_openai(p: &Value) -> Value {
-    let mut m = Map::new();
-    m.insert("type".into(), json!("thinking"));
-    let text = p
-        .get("thinking")
-        .and_then(Value::as_str)
-        .or_else(|| p.get("text").and_then(Value::as_str))
-        .unwrap_or("");
-    m.insert("thinking".into(), json!(text));
-    if let Some(sig) = p.get("signature") {
-        m.insert("signature".into(), sig.clone());
-    }
-    Value::Object(m)
-}
-
-fn redacted_block_from_openai(p: &Value) -> Value {
-    json!({
-        "type": "redacted_thinking",
-        "data": p.get("data").cloned().unwrap_or(json!("")),
-    })
 }
 
 fn openai_user_content(m: &Value) -> Value {
@@ -1915,7 +1994,8 @@ pub fn responses_to_chat(body: &[u8]) -> Vec<u8> {
 
 // --- request: Anthropic → OpenAI --------------------------------------------
 
-fn anthropic_req_to_openai(v: &Value, openai: OpenAiModel) -> Value {
+fn anthropic_req_to_openai(v: &Value, up: Upstream) -> Value {
+    let openai = up.openai;
     let mut out = Map::new();
     copy_if(&mut out, v, "model");
     if let Some(t) = v.get("max_tokens") {
@@ -1933,7 +2013,10 @@ fn anthropic_req_to_openai(v: &Value, openai: OpenAiModel) -> Value {
             out.insert("tools".into(), Value::Array(mapped));
         }
     }
-    if let Some(choice) = v.get("tool_choice") {
+    // Chat Completions rejects `tool_choice` and `parallel_tool_calls` without `tools` ("only
+    // allowed when 'tools' are specified"); Messages accepts them, and they mean nothing there.
+    let has_tools = out.contains_key("tools");
+    if let Some(choice) = v.get("tool_choice").filter(|_| has_tools) {
         out.insert(
             "tool_choice".into(),
             anthropic_tool_choice_to_openai(choice),
@@ -1957,9 +2040,10 @@ fn anthropic_req_to_openai(v: &Value, openai: OpenAiModel) -> Value {
     if let Some(format) = anthropic_format_to_openai(v) {
         out.insert("response_format".into(), format);
     }
-    if v.pointer("/tool_choice/disable_parallel_tool_use")
-        .and_then(Value::as_bool)
-        == Some(true)
+    if has_tools
+        && v.pointer("/tool_choice/disable_parallel_tool_use")
+            .and_then(Value::as_bool)
+            == Some(true)
     {
         out.insert("parallel_tool_calls".into(), json!(false));
     }
@@ -1977,7 +2061,7 @@ fn anthropic_req_to_openai(v: &Value, openai: OpenAiModel) -> Value {
         for m in arr {
             let role = m.get("role").and_then(Value::as_str).unwrap_or("user");
             match role {
-                "assistant" => messages.push(anthropic_assistant_to_openai(m)),
+                "assistant" => messages.push(anthropic_assistant_to_openai(m, up.claude_thinking)),
                 // A mid-conversation system message keeps its role and its place. Chat Completions
                 // takes `system` anywhere. A directive-only one (`content: []` plus
                 // `output_config`) says nothing a Chat model can read, so it has no message.
@@ -2132,7 +2216,10 @@ fn anthropic_tool_choice_to_openai(choice: &Value) -> Value {
     }
 }
 
-fn anthropic_assistant_to_openai(m: &Value) -> Value {
+/// An Anthropic assistant turn → Chat Completions. Its thinking rides `reasoning_content` (the text),
+/// our `thinking` array (the blocks, which a Chat client sends back), and, for a Claude model
+/// behind a Chat Completions host, `reasoning_details` (see [`reasoning_details`]).
+fn anthropic_assistant_to_openai(m: &Value, claude_thinking: bool) -> Value {
     let mut text = String::new();
     let mut thinking_text = String::new();
     let mut thinking_blocks: Vec<Value> = Vec::new();
@@ -2197,9 +2284,7 @@ fn anthropic_assistant_to_openai(m: &Value) -> Value {
     if !thinking_text.is_empty() {
         msg.insert("reasoning_content".into(), json!(thinking_text));
     }
-    if !thinking_blocks.is_empty() {
-        msg.insert("thinking".into(), Value::Array(thinking_blocks));
-    }
+    attach_thinking(&mut msg, thinking_blocks, claude_thinking);
     Value::Object(msg)
 }
 
@@ -2744,29 +2829,7 @@ impl Gather {
 /// plain `reasoning_content` / `reasoning` text, which is never signed.
 fn chat_thinking_blocks(m: &Value) -> Vec<Value> {
     if let Some(blocks) = m.get("thinking").and_then(Value::as_array) {
-        return blocks
-            .iter()
-            .map(|b| match b.get("type").and_then(Value::as_str) {
-                Some("redacted_thinking") => json!({
-                    "type": "redacted_thinking",
-                    "data": b.get("data").cloned().unwrap_or(json!("")),
-                }),
-                _ => {
-                    let mut t = Map::new();
-                    t.insert("type".into(), json!("thinking"));
-                    let text = b
-                        .get("thinking")
-                        .or_else(|| b.get("text"))
-                        .and_then(Value::as_str)
-                        .unwrap_or("");
-                    t.insert("thinking".into(), json!(text));
-                    if let Some(sig) = non_empty_str(b, "signature") {
-                        t.insert("signature".into(), json!(sig));
-                    }
-                    Value::Object(t)
-                }
-            })
-            .collect();
+        return blocks.iter().map(anthropic_thinking_block).collect();
     }
     let mut out = Vec::new();
     if let Some(details) = m.get("reasoning_details").and_then(Value::as_array) {
@@ -2783,6 +2846,82 @@ fn chat_thinking_blocks(m: &Value) -> Vec<Value> {
         out.push(json!({ "type": "thinking", "thinking": text }));
     }
     out
+}
+
+/// One entry of our `thinking` array (or a thinking content part) in exactly Anthropic's block
+/// shape. A streamed entry also carries the `index` it was accumulated under, which goes.
+fn anthropic_thinking_block(b: &Value) -> Value {
+    if b.get("type").and_then(Value::as_str) == Some("redacted_thinking") {
+        return json!({
+            "type": "redacted_thinking",
+            "data": b.get("data").cloned().unwrap_or(json!("")),
+        });
+    }
+    let mut t = Map::new();
+    t.insert("type".into(), json!("thinking"));
+    let text = b
+        .get("thinking")
+        .or_else(|| b.get("text"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    t.insert("thinking".into(), json!(text));
+    if let Some(sig) = non_empty_str(b, "signature") {
+        t.insert("signature".into(), json!(sig));
+    }
+    Value::Object(t)
+}
+
+/// The `format` OpenRouter stamps on Claude's reasoning, and requires to replay it to Anthropic.
+const ANTHROPIC_REASONING_FORMAT: &str = "anthropic-claude-v1";
+
+/// Signed Anthropic thinking as OpenRouter `reasoning_details`: `reasoning.text` with its
+/// signature, `reasoning.encrypted` for a redacted block. OpenRouter replays nothing else — not
+/// `reasoning_content`, not our `thinking` array — so without these a thinking + tool loop on a
+/// Claude model OpenRouter serves 400s on turn 2 ("a final `assistant` message must start with a
+/// thinking block"). Unsigned blocks are left out: they would not verify.
+fn reasoning_details(blocks: &[Value]) -> Vec<Value> {
+    blocks
+        .iter()
+        .filter(|b| is_replayable_thinking(b))
+        .enumerate()
+        .map(|(index, b)| match b.get("type").and_then(Value::as_str) {
+            Some("redacted_thinking") => json!({
+                "type": "reasoning.encrypted",
+                "data": b.get("data").cloned().unwrap_or(json!("")),
+                "format": ANTHROPIC_REASONING_FORMAT,
+                "index": index,
+            }),
+            _ => json!({
+                "type": "reasoning.text",
+                "text": b.get("thinking").cloned().unwrap_or(json!("")),
+                "signature": b.get("signature").cloned().unwrap_or(json!("")),
+                "format": ANTHROPIC_REASONING_FORMAT,
+                "index": index,
+            }),
+        })
+        .collect()
+}
+
+/// Add thinking blocks to a Chat Completions assistant message: our `thinking` array (read back by
+/// `chat_thinking_blocks` onto Messages), plus `reasoning_details` when the upstream is a Claude
+/// model (see [`reasoning_details`]).
+fn attach_thinking(msg: &mut Map<String, Value>, add: Vec<Value>, claude_thinking: bool) {
+    if add.is_empty() {
+        return;
+    }
+    let mut blocks = msg
+        .get("thinking")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    blocks.extend(add);
+    if claude_thinking {
+        let details = reasoning_details(&blocks);
+        if !details.is_empty() {
+            msg.insert("reasoning_details".into(), Value::Array(details));
+        }
+    }
+    msg.insert("thinking".into(), Value::Array(blocks));
 }
 
 /// A thinking block an Anthropic client may hold: signed, or redacted. An unsigned `thinking`
@@ -2937,7 +3076,8 @@ fn openai_resp_to_anthropic(v: &Value) -> Value {
 
 // --- request: Responses ↔ Chat Completions ----------------------------------
 
-fn responses_req_to_openai(v: &Value, openai: OpenAiModel) -> Value {
+fn responses_req_to_openai(v: &Value, up: Upstream) -> Value {
+    let openai = up.openai;
     let mut out = Map::new();
     copy_if(&mut out, v, "model");
     copy_if(&mut out, v, "stream");
@@ -2966,13 +3106,18 @@ fn responses_req_to_openai(v: &Value, openai: OpenAiModel) -> Value {
             out.insert("tools".into(), Value::Array(mapped));
         }
     }
-    if let Some(choice) = v.get("tool_choice") {
-        out.insert(
-            "tool_choice".into(),
-            responses_tool_choice_to_openai(choice),
-        );
+    // Responses takes `tool_choice` and `parallel_tool_calls` without tools; Chat Completions
+    // rejects both ("only allowed when 'tools' are specified").
+    if out.contains_key("tools") {
+        if let Some(choice) = v.get("tool_choice") {
+            out.insert(
+                "tool_choice".into(),
+                responses_tool_choice_to_openai(choice),
+            );
+        }
+        copy_if(&mut out, v, "parallel_tool_calls");
     }
-    for key in ["parallel_tool_calls", "user", "safety_identifier"] {
+    for key in ["user", "safety_identifier"] {
         copy_if(&mut out, v, key);
     }
     // OpenAI's Chat Completions takes these too. Elsewhere they are hints (cache routing, latency
@@ -3010,7 +3155,10 @@ fn responses_req_to_openai(v: &Value, openai: OpenAiModel) -> Value {
     if let Some(instr) = v.get("instructions") {
         messages.push(responses_instructions_to_system(instr));
     }
-    messages.extend(responses_input_to_messages(v.get("input")));
+    messages.extend(responses_input_to_messages(
+        v.get("input"),
+        up.claude_thinking,
+    ));
     out.insert("messages".into(), Value::Array(messages));
     Value::Object(out)
 }
@@ -3422,7 +3570,10 @@ fn responses_instructions_to_system(instr: &Value) -> Value {
     }
 }
 
-fn responses_input_to_messages(input: Option<&Value>) -> Vec<Value> {
+/// Responses `input` → Chat Completions messages. `claude_thinking`: the upstream is a Claude model,
+/// which is sent the thinking the gateway minted as `reasoning` items (see
+/// [`gateway_reasoning_block`]).
+fn responses_input_to_messages(input: Option<&Value>, claude_thinking: bool) -> Vec<Value> {
     let items = match input {
         Some(Value::String(s)) => return vec![json!({ "role": "user", "content": s })],
         Some(Value::Array(items)) => items,
@@ -3432,6 +3583,8 @@ fn responses_input_to_messages(input: Option<&Value>) -> Vec<Value> {
     // Images and files a tool returned. A Chat Completions tool message holds text, so they follow
     // the run of tool messages as one user message.
     let mut carried: Vec<Value> = Vec::new();
+    // Signed thinking from `reasoning` items, waiting for the assistant turn they open.
+    let mut thinking: Vec<Value> = Vec::new();
     for item in items {
         let typ = item.get("type").and_then(Value::as_str).unwrap_or("");
         match typ {
@@ -3456,26 +3609,66 @@ fn responses_input_to_messages(input: Option<&Value>) -> Vec<Value> {
                         "tool_calls": [call],
                     })),
                 }
+                if let Some(last) = out.last_mut().and_then(Value::as_object_mut) {
+                    attach_thinking(last, std::mem::take(&mut thinking), claude_thinking);
+                }
             }
             "function_call_output" | "custom_tool_call_output" => {
+                thinking.clear();
                 out.push(responses_output_to_tool_message(item, &mut carried));
             }
-            // The model's own earlier reasoning, and hosted-tool call records: no Chat Completions
-            // equivalent, and nothing the client wrote.
-            "reasoning" => {}
+            // The model's own earlier reasoning. Only a Claude upstream can use any of it, and only
+            // what the gateway minted from Claude's signed thinking; OpenAI's encrypted reasoning
+            // means nothing off OpenAI's Responses API.
+            "reasoning" => {
+                if claude_thinking && let Some(block) = gateway_reasoning_block(item) {
+                    thinking.push(block);
+                }
+            }
             _ if typ == "message" || item.get("role").is_some() => {
                 flush_carried(&mut out, &mut carried);
                 let role = item.get("role").and_then(Value::as_str).unwrap_or("user");
-                out.push(json!({
-                    "role": role,
-                    "content": responses_content_to_openai(item.get("content")),
-                }));
+                let mut msg = Map::new();
+                msg.insert("role".into(), json!(role));
+                msg.insert(
+                    "content".into(),
+                    responses_content_to_openai(item.get("content")),
+                );
+                if role == "assistant" {
+                    attach_thinking(&mut msg, std::mem::take(&mut thinking), claude_thinking);
+                } else {
+                    thinking.clear();
+                }
+                out.push(Value::Object(msg));
             }
+            // Hosted-tool call records: no Chat Completions equivalent, and nothing the client
+            // wrote.
             _ => {}
         }
     }
     flush_carried(&mut out, &mut carried);
     out
+}
+
+/// The Anthropic thinking block behind a `reasoning` item this gateway minted for a Responses
+/// client (see [`reasoning_item`]): its id is ours (`rs_gw…`), its summary is the block's text, and
+/// its `encrypted_content` is the block's Anthropic signature. Sent back to a Claude upstream it
+/// keeps a thinking + tool loop valid (older Claude models 400 a tool turn without its thinking).
+/// Any other reasoning item — OpenAI's own, or one without a signature — is `None`.
+fn gateway_reasoning_block(item: &Value) -> Option<Value> {
+    let id = item.get("id").and_then(Value::as_str)?;
+    if !id.starts_with("rs_gw") {
+        return None;
+    }
+    let signature = non_empty_str(item, "encrypted_content")?;
+    let text: String = item
+        .get("summary")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|p| p.get("text").and_then(Value::as_str))
+        .collect();
+    Some(json!({ "type": "thinking", "thinking": text, "signature": signature }))
 }
 
 fn flush_carried(out: &mut Vec<Value>, carried: &mut Vec<Value>) {
@@ -3704,6 +3897,20 @@ fn openai_resp_to_responses(v: &Value) -> Value {
         .map(Vec::as_slice)
         .unwrap_or_default()
     {
+        // A custom (free-form) tool call is its own item type on Responses, with raw `input`.
+        if let Some(custom) = c
+            .get("custom")
+            .filter(|_| c.get("type").and_then(Value::as_str) != Some("function"))
+        {
+            output.push(json!({
+                "type": "custom_tool_call",
+                "id": fresh_id("ctc"),
+                "call_id": id_or_fresh(c.get("id"), "call"),
+                "name": custom.get("name").and_then(Value::as_str).unwrap_or(""),
+                "input": custom.get("input").and_then(Value::as_str).unwrap_or(""),
+            }));
+            continue;
+        }
         let func = c.get("function").unwrap_or(c);
         output.push(json!({
             "type": "function_call",
@@ -3815,6 +4022,14 @@ fn responses_resp_to_openai(v: &Value) -> Value {
                     "arguments": arguments_string(item.get("arguments")),
                 },
             })),
+            Some("custom_tool_call") => tool_calls.push(json!({
+                "id": id_or_fresh(item.get("call_id").or_else(|| item.get("id")), "call"),
+                "type": "custom",
+                "custom": {
+                    "name": item.get("name").and_then(Value::as_str).unwrap_or(""),
+                    "input": item.get("input").and_then(Value::as_str).unwrap_or(""),
+                },
+            })),
             Some("reasoning") => {
                 let texts = ["summary", "content"]
                     .into_iter()
@@ -3916,6 +4131,10 @@ pub struct SseBridge {
     errored: bool,
     /// A Chat client's `[DONE]` went out.
     done: bool,
+    /// The upstream said how the response ended: a finish reason, its own end marker, or an error.
+    /// A stream that ends without one was cut short, and flush reports that instead of inventing a
+    /// clean `end_turn` / `completed`.
+    ended: bool,
 }
 
 /// One Chat Completions stream item, the dialect every pairing meets in.
@@ -3924,6 +4143,28 @@ enum ChatItem {
     /// The upstream's error body as it came; each client shapes its own envelope from it.
     Error(Value),
     Done,
+}
+
+impl ChatItem {
+    /// Whether this item tells the client how the response ended.
+    fn ends(&self) -> bool {
+        match self {
+            Self::Chunk(v) => v
+                .pointer("/choices/0/finish_reason")
+                .and_then(Value::as_str)
+                .is_some_and(|f| !f.is_empty()),
+            Self::Error(_) | Self::Done => true,
+        }
+    }
+}
+
+/// What a client is told when the upstream stream ended without saying how.
+fn truncated_stream_error() -> Value {
+    json!({ "error": {
+        "message": "The upstream stream ended before the response was complete.",
+        "type": "api_error",
+        "code": "stream_truncated",
+    }})
 }
 
 impl SseBridge {
@@ -3939,6 +4180,7 @@ impl SseBridge {
             oai_to_resp: OaiToResp::default(),
             errored: false,
             done: false,
+            ended: false,
         }
     }
 
@@ -3982,6 +4224,7 @@ impl SseBridge {
         }
         let mut out = Vec::new();
         for item in items {
+            self.ended |= item.ends();
             self.deliver(item, &mut out);
         }
         out
@@ -4024,10 +4267,19 @@ impl SseBridge {
         }
     }
 
+    /// End of the upstream body. `proxy` reaches this only when the upstream ended its body cleanly
+    /// (an upstream that drops a chunked, sized or HTTP/2 body mid-way fails the request instead,
+    /// and the client's connection is cut). A clean end with no terminal event is still a cut-short
+    /// response — a close-delimited body, or a provider that stopped writing — so the client gets
+    /// an error, never a `message_stop` / `response.completed` for a half-written answer.
     fn flush(&mut self) -> Vec<u8> {
         let mut out = Vec::new();
         if self.upstream == self.client {
             return out;
+        }
+        if !self.ended && !self.errored {
+            self.ended = true;
+            self.deliver(ChatItem::Error(truncated_stream_error()), &mut out);
         }
         match self.client {
             Endpoint::ChatCompletions => {
@@ -4109,6 +4361,13 @@ fn reasoning_delta(text: &str) -> Value {
 }
 
 /// Anthropic Messages events → Chat Completions items.
+///
+/// Thinking reaches a Chat client twice, as the non-stream body carries it: its text as
+/// `reasoning_content` deltas while it streams, and each finished block whole — signed, or
+/// redacted — as one entry of the `thinking` list, under its own `index` so an OpenAI SDK's
+/// accumulator (which requires one on every list entry) keeps blocks apart. The accumulated
+/// message is then exactly what the request side reads back onto Messages; a signature on a
+/// string field would concatenate across blocks ("S1S2") and could never be split again.
 #[derive(Default)]
 struct AntToOai {
     meta: ChunkMeta,
@@ -4118,7 +4377,34 @@ struct AntToOai {
     /// never interleave, so a JSON delta belongs to it; one for any other block (a server tool's
     /// input) must not land on a client call's arguments.
     open_tool: Option<u32>,
+    /// The thinking block now open, gathered until its `content_block_stop`.
+    open_thinking: Option<HeldThinking>,
+    /// `thinking` list entries sent so far: the next one's `index`.
+    thinking_blocks: u32,
     usage: Usage,
+}
+
+/// A streaming Anthropic thinking block, held whole so it can be sent back.
+#[derive(Default)]
+struct HeldThinking {
+    text: String,
+    signature: String,
+    /// Past [`MAX_HELD_THINKING`]: dropped, since a signature covers the whole text.
+    overflow: bool,
+}
+
+impl HeldThinking {
+    fn push(&mut self, text: &str) {
+        if self.overflow {
+            return;
+        }
+        if self.text.len().saturating_add(text.len()) > MAX_HELD_THINKING {
+            self.overflow = true;
+            self.text = String::new();
+            return;
+        }
+        self.text.push_str(text);
+    }
 }
 
 impl AntToOai {
@@ -4161,6 +4447,7 @@ impl AntToOai {
             "content_block_start" => {
                 let block = v.get("content_block").unwrap_or(&Value::Null);
                 self.open_tool = None;
+                self.open_thinking = None;
                 let delta = match block.get("type").and_then(Value::as_str) {
                     Some("tool_use") => {
                         let index = self.tools;
@@ -4176,18 +4463,27 @@ impl AntToOai {
                             },
                         }] })
                     }
-                    Some("redacted_thinking") => json!({ "thinking": [{
+                    Some("redacted_thinking") => self.thinking_entry(json!({
                         "type": "redacted_thinking",
                         "data": block.get("data").cloned().unwrap_or(json!("")),
-                    }] }),
+                    })),
                     Some("text") => match non_empty_str(block, "text") {
                         Some(t) => json!({ "content": t }),
                         None => return,
                     },
-                    Some("thinking") => match non_empty_str(block, "thinking") {
-                        Some(t) => reasoning_delta(t),
-                        None => return,
-                    },
+                    Some("thinking") => {
+                        let mut held = HeldThinking::default();
+                        let text = non_empty_str(block, "thinking");
+                        held.push(text.unwrap_or(""));
+                        if let Some(sig) = non_empty_str(block, "signature") {
+                            held.signature.push_str(sig);
+                        }
+                        self.open_thinking = Some(held);
+                        match text {
+                            Some(t) => reasoning_delta(t),
+                            None => return,
+                        }
+                    }
                     _ => return,
                 };
                 items.push(self.meta.chunk(delta, None));
@@ -4210,14 +4506,24 @@ impl AntToOai {
                     }
                     Some("thinking_delta") => {
                         match non_empty_str(d, "thinking").or_else(|| non_empty_str(d, "text")) {
-                            Some(t) => reasoning_delta(t),
+                            Some(t) => {
+                                if let Some(held) = self.open_thinking.as_mut() {
+                                    held.push(t);
+                                }
+                                reasoning_delta(t)
+                            }
                             None => return,
                         }
                     }
-                    Some("signature_delta") => match non_empty_str(d, "signature") {
-                        Some(sig) => json!({ "thinking_signature": sig }),
-                        None => return,
-                    },
+                    // Held for the block's `content_block_stop`, where the block goes out whole.
+                    Some("signature_delta") => {
+                        if let (Some(held), Some(sig)) =
+                            (self.open_thinking.as_mut(), non_empty_str(d, "signature"))
+                        {
+                            held.signature.push_str(sig);
+                        }
+                        return;
+                    }
                     _ => return,
                 };
                 items.push(self.meta.chunk(delta, None));
@@ -4240,20 +4546,57 @@ impl AntToOai {
                 items.push(self.meta.chunk(json!({}), Some(map_stop_to_openai(stop))));
                 items.push(self.meta.usage(self.usage.to_chat()));
             }
-            "content_block_stop" => self.open_tool = None,
+            "content_block_stop" => {
+                self.open_tool = None;
+                // A thinking block is whole now. Unsigned (or past the cap), it could never be sent
+                // back, so it is not offered for replay; its text already streamed.
+                if let Some(held) = self.open_thinking.take()
+                    && !held.overflow
+                    && !held.signature.is_empty()
+                {
+                    let delta = self.thinking_entry(json!({
+                        "type": "thinking",
+                        "thinking": held.text,
+                        "signature": held.signature,
+                    }));
+                    items.push(self.meta.chunk(delta, None));
+                }
+            }
             "message_stop" => items.push(ChatItem::Done),
             _ => {}
         }
     }
+
+    /// A delta adding one finished block to the Chat message's `thinking` list.
+    fn thinking_entry(&mut self, block: Value) -> Value {
+        let mut entry = Map::new();
+        entry.insert("index".into(), json!(self.thinking_blocks));
+        if let Value::Object(fields) = block {
+            entry.extend(fields);
+        }
+        self.thinking_blocks = self.thinking_blocks.saturating_add(1);
+        json!({ "thinking": [Value::Object(entry)] })
+    }
 }
 
-/// A function call a Responses upstream announced, and where its Chat deltas go.
+/// A function (or custom tool) call a Responses upstream announced, and where its Chat deltas go.
 struct RespCall {
     output_index: Option<u64>,
     item_id: Option<String>,
     index: u32,
     /// Argument bytes already went out, so a closing event's full `arguments` must not repeat them.
     args_sent: bool,
+    /// A `custom_tool_call`: its raw `input` rides the Chat call's `custom.input`.
+    custom: bool,
+}
+
+/// A Responses output item that is a client tool call, and whether it is a custom one.
+fn resp_call_kind(item: &Value) -> Option<bool> {
+    match item.get("type").and_then(Value::as_str) {
+        Some("function_call") => Some(false),
+        Some("custom_tool_call") => Some(true),
+        _ => None,
+    }
 }
 
 /// Responses events → Chat Completions items.
@@ -4297,25 +4640,29 @@ impl RespToOai {
             "response.output_item.added" => {
                 self.start(items);
                 let item = v.get("item").unwrap_or(&Value::Null);
-                if item.get("type").and_then(Value::as_str) == Some("function_call") {
+                if resp_call_kind(item).is_some() {
                     self.open_call(&v, item, items);
                 }
             }
-            "response.function_call_arguments.delta" => {
+            "response.function_call_arguments.delta" | "response.custom_tool_call_input.delta" => {
                 if let Some(at) = self.find(&v)
                     && let Some(delta) = non_empty_str(&v, "delta")
                 {
                     self.args(at, delta, items);
                 }
             }
-            "response.function_call_arguments.done" | "response.output_item.done" => {
+            "response.function_call_arguments.done"
+            | "response.custom_tool_call_input.done"
+            | "response.output_item.done" => {
                 let item = v.get("item");
-                if item
-                    .is_some_and(|i| i.get("type").and_then(Value::as_str) != Some("function_call"))
-                {
+                if item.is_some_and(|i| resp_call_kind(i).is_none()) {
                     return;
                 }
-                let args = item.unwrap_or(&v).get("arguments").and_then(Value::as_str);
+                let args = item
+                    .unwrap_or(&v)
+                    .get("arguments")
+                    .or_else(|| item.unwrap_or(&v).get("input"))
+                    .and_then(Value::as_str);
                 match self.find(&v) {
                     Some(at) => {
                         if let Some(args) = args.filter(|a| !a.is_empty())
@@ -4390,25 +4737,32 @@ impl RespToOai {
 
     fn open_call(&mut self, v: &Value, item: &Value, items: &mut Vec<ChatItem>) {
         let index = u32::try_from(self.calls.len()).unwrap_or(u32::MAX);
-        let args = item.get("arguments").and_then(Value::as_str).unwrap_or("");
+        let custom = resp_call_kind(item) == Some(true);
+        let args = item
+            .get(if custom { "input" } else { "arguments" })
+            .and_then(Value::as_str)
+            .unwrap_or("");
         self.calls.push(RespCall {
             output_index: v.get("output_index").and_then(Value::as_u64),
             item_id: non_empty_str(item, "id").map(str::to_owned),
             index,
             args_sent: !args.is_empty(),
+            custom,
         });
-        items.push(self.meta.chunk(
-            json!({ "tool_calls": [{
-                "index": index,
-                "id": id_or_fresh(item.get("call_id").or_else(|| item.get("id")), "call"),
-                "type": "function",
-                "function": {
-                    "name": item.get("name").and_then(Value::as_str).unwrap_or(""),
-                    "arguments": args,
-                },
-            }] }),
-            None,
-        ));
+        let id = id_or_fresh(item.get("call_id").or_else(|| item.get("id")), "call");
+        let name = item.get("name").and_then(Value::as_str).unwrap_or("");
+        let call = if custom {
+            json!({
+                "index": index, "id": id, "type": "custom",
+                "custom": { "name": name, "input": args },
+            })
+        } else {
+            json!({
+                "index": index, "id": id, "type": "function",
+                "function": { "name": name, "arguments": args },
+            })
+        };
+        items.push(self.meta.chunk(json!({ "tool_calls": [call] }), None));
     }
 
     fn args(&mut self, at: usize, args: &str, items: &mut Vec<ChatItem>) {
@@ -4417,10 +4771,12 @@ impl RespToOai {
         };
         call.args_sent = true;
         let index = call.index;
-        items.push(self.meta.chunk(
-            json!({ "tool_calls": [{ "index": index, "function": { "arguments": args } }] }),
-            None,
-        ));
+        let delta = if call.custom {
+            json!({ "index": index, "custom": { "input": args } })
+        } else {
+            json!({ "index": index, "function": { "arguments": args } })
+        };
+        items.push(self.meta.chunk(json!({ "tool_calls": [delta] }), None));
     }
 
     /// The call an event is about, by `output_index`, else by item id.
@@ -4450,7 +4806,10 @@ struct ChatCall {
     index: Option<u64>,
     id: String,
     name: String,
+    /// JSON arguments, or a `custom` (free-form) tool's raw `input`.
     args: String,
+    /// A `custom` tool call (`{"type": "custom", "custom": {name, input}}`), not a function call.
+    custom: bool,
     opened: bool,
     closed: bool,
     /// Where the client sees it: an Anthropic block index or a Responses `output_index`.
@@ -4490,13 +4849,22 @@ impl ToolCalls {
         {
             id.clone_into(&mut call.id);
         }
-        let func = c.get("function").unwrap_or(c);
+        // A custom tool's name and input ride `custom`, the way a function's ride `function`.
+        let custom = c.get("custom");
+        if custom.is_some() || c.get("type").and_then(Value::as_str) == Some("custom") {
+            call.custom = true;
+        }
+        let func = c.get("function").or(custom).unwrap_or(c);
         if call.name.is_empty()
             && let Some(name) = non_empty_str(func, "name")
         {
             name.clone_into(&mut call.name);
         }
-        let args = func.get("arguments").and_then(Value::as_str).unwrap_or("");
+        let args = func
+            .get("arguments")
+            .or_else(|| func.get("input"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
         call.args.push_str(args);
         if !call.opened && !call.name.is_empty() {
             Self::open(call, at, steps);
@@ -4536,6 +4904,7 @@ impl ToolCalls {
                 id: String::new(),
                 name: String::new(),
                 args: String::new(),
+                custom: false,
                 opened: false,
                 closed: false,
                 slot: 0,
@@ -4607,21 +4976,18 @@ impl OaiToAnt {
             {
                 self.thinking.text(None, r, &mut blocks);
             }
-            if let Some(sig) = non_empty_str(delta, "thinking_signature") {
-                self.thinking.sign(sig, &mut blocks);
-            }
+            // Whole blocks on the `thinking` list (a Messages upstream read by `AntToOai`): the
+            // reasoning text streamed just before is the same block's, now signed.
             for b in delta
                 .get("thinking")
                 .and_then(Value::as_array)
                 .map(Vec::as_slice)
                 .unwrap_or_default()
             {
-                if b.get("type").and_then(Value::as_str) == Some("redacted_thinking") {
-                    self.thinking.close(&mut blocks);
-                    blocks.push(json!({
-                        "type": "redacted_thinking",
-                        "data": b.get("data").cloned().unwrap_or(json!("")),
-                    }));
+                let block = anthropic_thinking_block(b);
+                if is_replayable_thinking(&block) {
+                    self.thinking.discard();
+                    blocks.push(block);
                 }
             }
             for b in blocks.iter().filter(|b| is_replayable_thinking(b)) {
@@ -4966,8 +5332,19 @@ impl OaiToResp {
             {
                 self.reasoning_text(None, Some(r), out);
             }
-            if let Some(sig) = non_empty_str(delta, "thinking_signature") {
-                self.reasoning_signature(None, sig, out);
+            // A whole signed block (see `AntToOai`) ends the reasoning item its text streamed into.
+            // `redacted_thinking` has no Responses form.
+            for b in delta
+                .get("thinking")
+                .and_then(Value::as_array)
+                .map(Vec::as_slice)
+                .unwrap_or_default()
+            {
+                let block = anthropic_thinking_block(b);
+                if let Some(sig) = non_empty_str(&block, "signature") {
+                    let text = block.get("thinking").and_then(Value::as_str).unwrap_or("");
+                    self.reasoning_block(text, sig, out);
+                }
             }
             if let Some(t) = non_empty_str(delta, "content") {
                 self.message_delta(false, t, out);
@@ -5123,6 +5500,22 @@ impl OaiToResp {
         if let Some(r) = self.reasoning.as_mut() {
             r.signature = Some(sig.to_owned());
         }
+    }
+
+    /// A whole signed thinking block. Its text already streamed into the open reasoning item when
+    /// one is waiting for a signature; otherwise (display omitted, nothing streamed) it opens one.
+    fn reasoning_block(&mut self, text: &str, sig: &str, out: &mut Vec<u8>) {
+        let streamed = self
+            .reasoning
+            .as_ref()
+            .is_some_and(|r| r.signature.is_none());
+        if !streamed {
+            self.reasoning_text(None, Some(text).filter(|t| !t.is_empty()), out);
+        }
+        if let Some(r) = self.reasoning.as_mut() {
+            r.signature = Some(sig.to_owned());
+        }
+        self.close_reasoning(out);
     }
 
     fn close_reasoning(&mut self, out: &mut Vec<u8>) {
@@ -5315,50 +5708,76 @@ impl OaiToResp {
         for step in steps {
             match step {
                 CallStep::Open(at) => {
-                    let Some((call_id, name, args)) = self
+                    let Some((call_id, name, args, custom)) = self
                         .calls
                         .calls
                         .get(at)
-                        .map(|c| (c.id.clone(), c.name.clone(), c.args.clone()))
+                        .map(|c| (c.id.clone(), c.name.clone(), c.args.clone(), c.custom))
                     else {
                         continue;
                     };
-                    let item_id = fresh_id("fc");
-                    let output_index = self.add_item(
-                        out,
-                        json!({
+                    let (item_id, item) = if custom {
+                        let id = fresh_id("ctc");
+                        let item = json!({
+                            "type": "custom_tool_call",
+                            "id": id,
+                            "call_id": call_id,
+                            "name": name,
+                            "input": "",
+                        });
+                        (id, item)
+                    } else {
+                        let id = fresh_id("fc");
+                        let item = json!({
                             "type": "function_call",
-                            "id": item_id,
+                            "id": id,
                             "call_id": call_id,
                             "name": name,
                             "arguments": "",
                             "status": "in_progress",
-                        }),
-                    );
+                        });
+                        (id, item)
+                    };
+                    let output_index = self.add_item(out, item);
                     if let Some(call) = self.calls.calls.get_mut(at) {
                         call.slot = output_index;
                         call.item.clone_from(&item_id);
                     }
                     if !args.is_empty() {
-                        self.args_delta(out, &item_id, output_index, &args);
+                        self.args_delta(out, custom, &item_id, output_index, &args);
                     }
                 }
                 CallStep::Args(at, args) => {
-                    let Some((item_id, output_index)) =
-                        self.calls.calls.get(at).map(|c| (c.item.clone(), c.slot))
+                    let Some((item_id, output_index, custom)) = self
+                        .calls
+                        .calls
+                        .get(at)
+                        .map(|c| (c.item.clone(), c.slot, c.custom))
                     else {
                         continue;
                     };
-                    self.args_delta(out, &item_id, output_index, &args);
+                    self.args_delta(out, custom, &item_id, output_index, &args);
                 }
             }
         }
     }
 
-    fn args_delta(&mut self, out: &mut Vec<u8>, item_id: &str, output_index: usize, args: &str) {
+    fn args_delta(
+        &mut self,
+        out: &mut Vec<u8>,
+        custom: bool,
+        item_id: &str,
+        output_index: usize,
+        args: &str,
+    ) {
+        let typ = if custom {
+            "response.custom_tool_call_input.delta"
+        } else {
+            "response.function_call_arguments.delta"
+        };
         self.emit(
             out,
-            "response.function_call_arguments.delta",
+            typ,
             json!({ "item_id": item_id, "output_index": output_index, "delta": args }),
         );
     }
@@ -5380,10 +5799,27 @@ impl OaiToResp {
                     call.id.clone(),
                     call.name.clone(),
                     call.args.clone(),
+                    call.custom,
                 ));
             }
         }
-        for (output_index, item_id, call_id, name, args) in done {
+        for (output_index, item_id, call_id, name, args, custom) in done {
+            if custom {
+                self.emit(
+                    out,
+                    "response.custom_tool_call_input.done",
+                    json!({ "item_id": item_id, "output_index": output_index, "input": args }),
+                );
+                let item = json!({
+                    "type": "custom_tool_call",
+                    "id": item_id,
+                    "call_id": call_id,
+                    "name": name,
+                    "input": args,
+                });
+                self.done_item(out, output_index, item);
+                continue;
+            }
             self.emit(
                 out,
                 "response.function_call_arguments.done",
@@ -5461,14 +5897,47 @@ impl OaiToResp {
         );
         let mut resp = self.response("failed", Value::Null, Value::Null);
         if let Some(m) = resp.as_object_mut() {
-            let code = if code.is_null() {
-                json!("server_error")
-            } else {
-                code
-            };
+            let code = responses_error_code(code.as_str().unwrap_or(""));
             m.insert("error".into(), json!({ "code": code, "message": message }));
         }
         self.emit(out, "response.failed", json!({ "response": resp }));
+    }
+}
+
+/// A failed Response's `error.code` is a closed set in the Responses schema (a typed client rejects
+/// any other value, and then reports that instead of the error). The upstream's own code still
+/// rides the `error` event, where any string is allowed.
+fn responses_error_code(code: &str) -> &'static str {
+    const CODES: [&str; 21] = [
+        "server_error",
+        "rate_limit_exceeded",
+        "invalid_prompt",
+        "data_residency_mismatch",
+        "bio_policy",
+        "misalignment_policy_violation",
+        "vector_store_timeout",
+        "invalid_image",
+        "invalid_image_format",
+        "invalid_base64_image",
+        "invalid_image_url",
+        "image_too_large",
+        "image_too_small",
+        "image_parse_error",
+        "image_content_policy_violation",
+        "invalid_image_mode",
+        "image_file_too_large",
+        "unsupported_image_media_type",
+        "empty_image_file",
+        "failed_to_download_image",
+        "image_file_not_found",
+    ];
+    match code {
+        "rate_limit_error" | "429" => "rate_limit_exceeded",
+        _ => CODES
+            .iter()
+            .find(|c| **c == code)
+            .copied()
+            .unwrap_or("server_error"),
     }
 }
 
@@ -6028,8 +6497,10 @@ mod tests {
 
     #[test]
     fn openai_sse_flush_without_deltas_still_emits_message_start() {
+        // A `[DONE]`-only stream ended as the upstream said; a bodiless one is covered by
+        // `a_stream_that_ends_without_saying_how_is_an_error_for_every_client`.
         let mut b = SseBridge::new(Endpoint::Messages, Endpoint::ChatCompletions);
-        let out = String::from_utf8(b.feed(b"", true)).unwrap();
+        let out = String::from_utf8(b.feed(b"data: [DONE]\n\n", true)).unwrap();
         assert!(out.contains("event: message_start"), "{out}");
         assert!(out.contains("event: message_stop"), "{out}");
     }
