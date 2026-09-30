@@ -2448,14 +2448,22 @@ fn responses_req_to_openai(v: &Value, openai: OpenAiModel) -> Value {
     Value::Object(out)
 }
 
+/// The smallest `max_output_tokens` the Responses API accepts.
+const RESPONSES_MIN_OUTPUT_TOKENS: u64 = 16;
+
 fn openai_req_to_responses(v: &Value, openai: OpenAiModel) -> Value {
     let mut out = Map::new();
     copy_if(&mut out, v, "model");
     copy_if(&mut out, v, "stream");
-    if let Some(t) = max_tokens_of(v) {
-        out.insert("max_output_tokens".into(), json!(t));
-    } else if let Some(t) = v.get("max_output_tokens") {
-        out.insert("max_output_tokens".into(), t.clone());
+    // The Responses API rejects a limit under 16 ("integer_below_min_value"); Chat Completions
+    // and Messages accept 1. Raising a tiny limit to the floor answers the request instead of
+    // forwarding a guaranteed 400.
+    if let Some(t) = max_tokens_of(v).or_else(|| v.get("max_output_tokens").and_then(Value::as_u64))
+    {
+        out.insert(
+            "max_output_tokens".into(),
+            json!(t.max(RESPONSES_MIN_OUTPUT_TOKENS)),
+        );
     }
     // Chat Completions stores nothing unless asked; Responses stores every response by default.
     out.insert(

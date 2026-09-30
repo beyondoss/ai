@@ -1119,3 +1119,26 @@ fn chat_only_fields_are_forwarded_onto_responses() {
     assert_eq!(v["logprobs"], true);
     assert!(v.get("seed").is_none(), "a hint: {v}");
 }
+
+/// The Responses API 400s on `max_output_tokens` under 16; a Chat client may send 1.
+#[test]
+fn a_tiny_limit_is_raised_to_the_responses_floor() {
+    let body = json!({"model": "gpt-5-pro", "max_tokens": 1, "messages": [{"role": "user", "content": "hi"}]});
+    let v: Value = serde_json::from_slice(&request(
+        Endpoint::ChatCompletions,
+        Endpoint::Responses,
+        &serde_json::to_vec(&body).unwrap(),
+        "gpt-5-pro",
+    ))
+    .unwrap();
+    assert_eq!(v["max_output_tokens"], 16);
+    let body = json!({"model": "gpt-5-pro", "max_tokens": 900, "messages": [{"role": "user", "content": "hi"}]});
+    let v: Value = serde_json::from_slice(&request(
+        Endpoint::ChatCompletions,
+        Endpoint::Responses,
+        &serde_json::to_vec(&body).unwrap(),
+        "gpt-5-pro",
+    ))
+    .unwrap();
+    assert_eq!(v["max_output_tokens"], 900);
+}
