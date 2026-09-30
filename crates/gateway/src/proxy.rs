@@ -2588,6 +2588,32 @@ impl ProxyHttp for AiProxy {
         {
             upstream_request.remove_header("anthropic-version");
         }
+        // Preserved thinking on a translated walk: `translate::request` sets
+        // `thinking.block_binding` for Anthropic's own conversation-binding models, a 400 without
+        // this beta. Decided from the candidate alone, since headers leave before the body is
+        // translated; merged with any beta value the client sent.
+        if let Some(a) = rc.auto.as_ref()
+            && catalog_translating(a)
+            && let Some(c) = a.candidate_at(a.candidate)
+            && c.provider == providers::ProviderId::Anthropic
+            && route::Endpoint::of_upstream_path(c.path) == route::Endpoint::Messages
+            && let Some(beta) = translate::messages_beta(c.upstream_model)
+        {
+            let existing = upstream_request
+                .headers
+                .get("anthropic-beta")
+                .and_then(|v| v.to_str().ok())
+                .map(str::trim)
+                .filter(|v| !v.is_empty());
+            match existing {
+                Some(v) if v.split(',').any(|b| b.trim() == beta) => {}
+                Some(v) => {
+                    let merged = format!("{v},{beta}");
+                    upstream_request.insert_header("anthropic-beta", merged)?;
+                }
+                None => upstream_request.insert_header("anthropic-beta", beta)?,
+            }
+        }
 
         // Forward the provider-native path (computed in `request_filter`): the client path with the
         // `/{provider}` segment stripped. Sent verbatim — no per-provider rewriting. The body's

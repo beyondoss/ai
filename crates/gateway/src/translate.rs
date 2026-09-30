@@ -11,14 +11,19 @@
 //! - **Dropped:** Responses-only session fields (`store`, `previous_response_id`, `include`,
 //!   `truncation`, …) when leaving Responses; `stream_options` on a Responses or Anthropic body.
 //!   Same-endpoint Responses is a byte relay: those session fields pass through. Hints with no
-//!   equivalent and no effect on the response's shape (`seed`, penalties, `logit_bias`, `top_k`)
-//!   are dropped, as is OpenAI JSON mode (`json_object`): Anthropic's format needs a schema, and
-//!   OpenAI already requires a JSON-mode prompt to ask for JSON.
+//!   equivalent and no effect on the response's shape (`seed`, penalties, `logit_bias`, `top_k`,
+//!   a message's `name`, Responses `reasoning` items, and off OpenAI's own API `prompt_cache_key`,
+//!   `service_tier` and `verbosity`) are dropped, as is OpenAI JSON mode (`json_object`):
+//!   Anthropic's format needs a schema, and OpenAI already requires a JSON-mode prompt to ask for
+//!   JSON. Another vendor's `thinking` blocks and Anthropic `cache_control` are dropped onto
+//!   Responses, which reads neither.
 //! - **Forwarded for the provider to reject:** input and options that change what the client gets
-//!   back and have no equivalent on the target (`input_audio`, a `file_id` or URL document, `n` > 1,
-//!   `logprobs`, audio output). Translation runs after the request headers went upstream, so the
-//!   gateway cannot 400 here; passing the field through gets the provider's 400 naming it, instead
-//!   of an answer about input the model never saw.
+//!   back and have no equivalent on the target (`input_audio`, a `file_id` or URL document or
+//!   image, a non-base64 data URI, `n` > 1, `logprobs`, audio output, `stop` onto Responses or a
+//!   model that rejects it, hosted / server / `custom` tools, `mcp_servers`, a Responses `prompt`
+//!   template). Translation runs after the request headers went upstream, so the gateway cannot 400
+//!   here; passing the field through gets the provider's 400 naming it, instead of an answer about
+//!   input the model never saw or without a tool the client offered.
 //! - **Images, both ways:** base64 data-URI images convert to Anthropic `base64` sources and back;
 //!   `http(s)` image URLs become Anthropic `url` sources and back, and pass through between Chat
 //!   Completions and Responses. Nothing is fetched: every one of those upstreams downloads the URL
@@ -30,14 +35,25 @@
 //!   `output_config.format` ↔ Responses `text.format`.
 //! - **Passed both ways:** `thinking` / `redacted_thinking` blocks, `cache_control` on tools and
 //!   content, `parallel_tool_calls: false` ↔ `tool_choice.disable_parallel_tool_use`, `user` ↔
-//!   `metadata.user_id`.
-//! - **Model-aware onto Messages** (see `ClaudeModel`): `reasoning_effort` becomes adaptive
-//!   thinking plus `output_config.effort` on Claude 4.6 and later, and a `budget_tokens` below
-//!   `max_tokens` before that. `temperature` / `top_p` are dropped where the model rejects them
-//!   (4.7 and later, and anything with thinking on).
+//!   `metadata.user_id` (an email address, which Anthropic rejects, becomes a stable hash), tool
+//!   `strict`, mid-conversation `system` / `developer` messages in place (see `place_system`), and
+//!   images or files a tool returned (a Chat Completions `tool` message holds text, so they follow
+//!   it as a user message). Legacy `functions` / `function_call` become the `tools` loop.
+//! - **Model-aware onto Messages** (see `ClaudeModel`): `reasoning_effort`, or a client's own
+//!   `thinking` object, becomes adaptive thinking plus `output_config.effort` on Claude 4.6 and
+//!   later, and a `budget_tokens` below `max_tokens` before that. `temperature` / `top_p` are
+//!   dropped where the model rejects them (4.7 and later, and anything with thinking on), clamped
+//!   to 0–1, and `top_p` yields to `temperature`. Budget thinking yields to forced tool use.
+//!   Conversation-binding models get `thinking.block_binding` (see
+//!   `bind_thinking_with_drop_block`). Tool ids are rewritten to Anthropic's pattern.
+//! - **Model-aware onto Chat Completions and Responses** (see `OpenAiModel`): OpenAI's own ids get
+//!   `max_completion_tokens`, sampling only where the model takes it, and an effort from the set
+//!   the family accepts (none on a model that does not reason).
 //! - **Added onto Messages:** default `cache_control` breakpoints when the client set none (see
 //!   `auto_cache_breakpoints`). An OpenAI SDK never marks anything, and without a marker Anthropic
 //!   caches nothing.
+//! - **Added onto Responses:** `store: false` unless the client asked to store; Chat Completions
+//!   stores nothing by default, Responses stores everything.
 //! - **Required mapping:** system/messages/`input`, `max_tokens`/`max_output_tokens`, stop,
 //!   stream, tools, `tool_choice`, text + tool_use/tool_result, usage. Anthropic requires
 //!   `max_tokens`; a missing OpenAI value becomes 4096.
@@ -105,20 +121,47 @@ pub fn request(from: Endpoint, to: Endpoint, body: &[u8], upstream_model: &str) 
     if !v.is_object() {
         return body.to_vec();
     }
-    encode(&map_request(from, to, &v, ClaudeModel::of(upstream_model)))
+    encode(&map_request(from, to, &v, Upstream::of(upstream_model)))
 }
 
-fn map_request(from: Endpoint, to: Endpoint, v: &Value, claude: ClaudeModel) -> Value {
+/// What this attempt's upstream model accepts, parsed once from the id it will receive.
+#[derive(Debug, Clone, Copy)]
+struct Upstream {
+    claude: ClaudeModel,
+    openai: OpenAiModel,
+}
+
+impl Upstream {
+    fn of(model: &str) -> Self {
+        Self {
+            claude: ClaudeModel::of(model),
+            openai: OpenAiModel::of(model),
+        }
+    }
+}
+
+fn map_request(from: Endpoint, to: Endpoint, v: &Value, up: Upstream) -> Value {
+    // Legacy `functions` / `function_call` are the same tool loop in an older shape.
+    let chat = (from == Endpoint::ChatCompletions).then(|| legacy_functions_to_tools(v));
+    let chat = chat.as_ref().and_then(Option::as_ref).unwrap_or(v);
     match (from, to) {
-        (Endpoint::ChatCompletions, Endpoint::Messages) => openai_req_to_anthropic(v, claude),
-        (Endpoint::Messages, Endpoint::ChatCompletions) => anthropic_req_to_openai(v),
-        (Endpoint::Responses, Endpoint::ChatCompletions) => responses_req_to_openai(v),
-        (Endpoint::ChatCompletions, Endpoint::Responses) => openai_req_to_responses(v),
+        (Endpoint::ChatCompletions, Endpoint::Messages) => openai_req_to_anthropic(chat, up.claude),
+        (Endpoint::Messages, Endpoint::ChatCompletions) => anthropic_req_to_openai(v, up.openai),
+        (Endpoint::Responses, Endpoint::ChatCompletions) => responses_req_to_openai(v, up.openai),
+        (Endpoint::ChatCompletions, Endpoint::Responses) => {
+            openai_req_to_responses(chat, up.openai)
+        }
         (Endpoint::Responses, Endpoint::Messages) => {
-            openai_req_to_anthropic(&responses_req_to_openai(v), claude)
+            let mut chat = responses_req_to_openai(v, up.openai);
+            // Intermediate only (never sent): `reasoning.summary` has no Chat Completions field, but
+            // it decides `thinking.display` on Messages.
+            if let (Some(r), Some(obj)) = (v.get("reasoning"), chat.as_object_mut()) {
+                obj.insert("reasoning".into(), r.clone());
+            }
+            openai_req_to_anthropic(&chat, up.claude)
         }
         (Endpoint::Messages, Endpoint::Responses) => {
-            openai_req_to_responses(&anthropic_req_to_openai(v))
+            openai_req_to_responses(&anthropic_req_to_openai(v, up.openai), up.openai)
         }
         (a, b) if a == b => v.clone(),
         _ => v.clone(),
@@ -211,18 +254,7 @@ fn openai_req_to_anthropic(v: &Value, claude: ClaudeModel) -> Value {
     copy_if(&mut out, v, "model");
     let max_tokens = max_tokens_of(v).unwrap_or(DEFAULT_MAX_TOKENS);
     out.insert("max_tokens".into(), json!(max_tokens));
-    openai_reasoning_to_anthropic(v, &mut out, claude.reasoning, max_tokens);
-    // Current Claude models 400 on non-default sampling, and every model 400s on it alongside
-    // thinking. OpenAI clients send `temperature` by habit; it is a hint, so it goes.
-    let thinking_on = out
-        .get("thinking")
-        .and_then(|t| t.get("type"))
-        .and_then(Value::as_str)
-        .is_some_and(|t| t != "disabled");
-    if claude.reasoning != ClaudeGen::Adaptive && !thinking_on {
-        copy_if(&mut out, v, "temperature");
-        copy_if(&mut out, v, "top_p");
-    }
+    openai_reasoning_to_anthropic(v, &mut out, claude, max_tokens);
     copy_if(&mut out, v, "stream");
     if let Some(format) = openai_format_to_anthropic(v.get("response_format")) {
         set_output_config(&mut out, "format", format);
@@ -230,9 +262,12 @@ fn openai_req_to_anthropic(v: &Value, claude: ClaudeModel) -> Value {
     if let Some(user) = v
         .get("user")
         .or_else(|| v.get("safety_identifier"))
-        .filter(|u| u.is_string())
+        .and_then(Value::as_str)
     {
-        out.insert("metadata".into(), json!({ "user_id": user }));
+        out.insert(
+            "metadata".into(),
+            json!({ "user_id": anthropic_user_id(user) }),
+        );
     }
     // No Anthropic equivalent, and each changes what the client gets back. Forwarded verbatim so
     // the provider rejects them by name; dropping them would answer a different question.
@@ -273,6 +308,19 @@ fn openai_req_to_anthropic(v: &Value, claude: ClaudeModel) -> Value {
     let mut must_call: Option<String> = None;
     if let Some(choice) = v.get("tool_choice") {
         let mut mapped = openai_tool_choice_to_anthropic(choice);
+        let forced = matches!(
+            mapped.get("type").and_then(Value::as_str),
+            Some("any" | "tool")
+        );
+        // Budget-thinking models 400 on thinking alongside forced tool use ("Thinking may not be
+        // enabled when tool_choice forces tool use"). The forced call is the client's contract (it
+        // expects a tool call back); reasoning is a quality hint. The contract wins.
+        if forced
+            && claude.forced_tool_choice
+            && out.get("thinking").and_then(|t| t.get("type")) == Some(&json!("enabled"))
+        {
+            out.remove("thinking");
+        }
         if !claude.forced_tool_choice {
             must_call = match mapped.get("type").and_then(Value::as_str) {
                 Some("any") => Some("Respond by calling one of the provided tools.".to_owned()),
@@ -300,53 +348,334 @@ fn openai_req_to_anthropic(v: &Value, claude: ClaudeModel) -> Value {
             obj.insert("disable_parallel_tool_use".into(), json!(true));
         }
     }
+    openai_sampling_to_anthropic(v, &mut out, claude);
 
     let mut system_parts: Vec<Value> = Vec::new();
     let mut messages: Vec<Value> = Vec::new();
     if let Some(arr) = v.get("messages").and_then(Value::as_array) {
         let mut pending_tool_results: Vec<Value> = Vec::new();
+        // Mid-conversation system messages waiting for a place Messages accepts them.
+        let mut pending_system: Vec<Value> = Vec::new();
+        let mut in_conversation = false;
         for m in arr {
             let role = m.get("role").and_then(Value::as_str).unwrap_or("");
             match role {
+                "system" | "developer" if !in_conversation => {
+                    system_parts.extend(openai_system_blocks(m));
+                }
+                "system" | "developer" if claude.mid_system => {
+                    flush_tool_results(&mut messages, &mut pending_tool_results);
+                    pending_system.extend(openai_system_blocks(m));
+                }
                 "system" | "developer" => {
+                    // No mid-conversation system role on this model: the top-level prompt is the
+                    // only place the instruction keeps system authority.
                     flush_tool_results(&mut messages, &mut pending_tool_results);
                     system_parts.extend(openai_system_blocks(m));
                 }
                 "tool" => {
+                    in_conversation = true;
                     if let Some(tr) = openai_tool_result(m) {
                         pending_tool_results.push(tr);
                     }
                 }
                 "assistant" => {
+                    in_conversation = true;
                     flush_tool_results(&mut messages, &mut pending_tool_results);
-                    push_anth_message(&mut messages, "assistant", openai_assistant_content(m));
+                    place_system(&mut messages, &mut pending_system, &mut system_parts);
+                    let m = assistant_refusal_as_text(m);
+                    push_anth_message(&mut messages, "assistant", openai_assistant_content(&m));
                 }
                 _ => {
                     // user (and anything else treated as user)
+                    in_conversation = true;
                     flush_tool_results(&mut messages, &mut pending_tool_results);
                     push_anth_message(&mut messages, "user", openai_user_content(m));
                 }
             }
         }
         flush_tool_results(&mut messages, &mut pending_tool_results);
+        place_system(&mut messages, &mut pending_system, &mut system_parts);
     }
+    sanitize_tool_ids(&mut messages);
     if !system_parts.is_empty() {
         out.insert("system".into(), anthropic_system_value(system_parts));
     }
     out.insert("messages".into(), Value::Array(messages));
     auto_cache_breakpoints(&mut out);
     // After the breakpoints, so the instruction sits past the cached prefix. A mid-conversation
-    // system message must follow a user turn; when the request ends on an assistant turn (a prefill,
-    // which these models also reject), there is nowhere valid to put it.
+    // system message must follow a user turn (or another system message that does); when the
+    // request ends on an assistant turn (a prefill, which these models also reject), there is
+    // nowhere valid to put it.
     if let Some(text) = must_call
         && let Some(messages) = out.get_mut("messages").and_then(Value::as_array_mut)
-        && messages
-            .last()
-            .is_some_and(|m| m.get("role").and_then(Value::as_str) == Some("user"))
+        && messages.last().is_some_and(|m| {
+            matches!(
+                m.get("role").and_then(Value::as_str),
+                Some("user" | "system")
+            )
+        })
     {
         messages.push(json!({ "role": "system", "content": text }));
     }
+    if claude.binding_controls {
+        bind_thinking_with_drop_block(&mut out);
+    }
     Value::Object(out)
+}
+
+/// Emit mid-conversation system messages where Messages accepts one: right after a user turn,
+/// followed by the next assistant turn or ending the array. Called before each assistant message
+/// and at the end, so a system message between two user turns, or right after an assistant turn,
+/// moves past the next user turn. That keeps it in the conversation (appending one never rewrites
+/// the prefix earlier thinking blocks are bound to, nor the prompt cache) and still ahead of the
+/// reply it is meant to shape. With no user turn to follow (the request ends on an assistant
+/// turn), it joins the top-level prompt, the only other place it keeps system authority.
+fn place_system(
+    messages: &mut Vec<Value>,
+    pending: &mut Vec<Value>,
+    system_parts: &mut Vec<Value>,
+) {
+    if pending.is_empty() {
+        return;
+    }
+    let blocks = std::mem::take(pending);
+    if messages
+        .last()
+        .is_some_and(|m| m.get("role").and_then(Value::as_str) == Some("user"))
+    {
+        messages.push(json!({ "role": "system", "content": anthropic_system_value(blocks) }));
+    } else {
+        system_parts.extend(blocks);
+    }
+}
+
+/// The `anthropic-beta` value that lets a translated request set
+/// `thinking.block_binding.prefix_mismatch_behavior`.
+pub const THINKING_BINDING_BETA: &str = "thinking-binding-controls-2026-08-01";
+
+/// The `anthropic-beta` value a request translated onto Messages needs for `upstream_model`, if
+/// any. `proxy` sends it on that attempt's request headers, which leave before the body is
+/// translated, so it is decided from the model id alone (the same fact [`request`] uses to add
+/// `block_binding`).
+pub fn messages_beta(upstream_model: &str) -> Option<&'static str> {
+    ClaudeModel::of(upstream_model)
+        .binding_controls
+        .then_some(THINKING_BINDING_BETA)
+}
+
+/// Preserved thinking on a translated conversation: never let the conversation check 400 it.
+///
+/// On models that bind a thinking block to the conversation that produced it (Claude Fable 5.1,
+/// Opus 5.5, Sonnet 5.5), a replayed block whose prefix changed is a 400 on enforced accounts. A
+/// translated conversation cannot promise an unchanged prefix: the forced-tool instruction above
+/// exists only in the request the gateway built, so the client's next turn replays that turn's
+/// thinking without it. `drop_block` makes the API drop such a block (and every one after it)
+/// instead of failing. Set on every request to these models, not only ones replaying thinking:
+/// a thinking parameter that changes between turns would also restart the prompt cache.
+///
+/// Requires [`THINKING_BINDING_BETA`], which `proxy` adds for the same models. Not with
+/// `between_tools` (the API rejects `block_binding` there) or with thinking off.
+fn bind_thinking_with_drop_block(out: &mut Map<String, Value>) {
+    let binding = json!({ "prefix_mismatch_behavior": "drop_block" });
+    match out.get_mut("thinking") {
+        Some(Value::Object(t)) => {
+            if matches!(
+                t.get("type").and_then(Value::as_str),
+                Some("adaptive" | "enabled")
+            ) {
+                t.insert("block_binding".into(), binding);
+            }
+        }
+        // These models think by default; an explicit `adaptive` is the same request.
+        None => {
+            out.insert(
+                "thinking".into(),
+                json!({ "type": "adaptive", "block_binding": binding }),
+            );
+        }
+        Some(_) => {}
+    }
+}
+
+/// Sampling onto Messages. Current Claude models 400 on non-default sampling, and every model 400s
+/// on it alongside thinking. OpenAI clients send `temperature` by habit; it is a hint, so it goes.
+/// Where it stays: Anthropic's range is 0–1 (OpenAI's is 0–2), and Claude 4.5-era models reject
+/// `temperature` and `top_p` together, so `top_p` yields to `temperature`.
+fn openai_sampling_to_anthropic(v: &Value, out: &mut Map<String, Value>, claude: ClaudeModel) {
+    let thinking_on = out
+        .get("thinking")
+        .and_then(|t| t.get("type"))
+        .and_then(Value::as_str)
+        .is_some_and(|t| t != "disabled");
+    if claude.reasoning == ClaudeGen::Adaptive || thinking_on {
+        return;
+    }
+    if let Some(t) = v.get("temperature").and_then(Value::as_f64) {
+        out.insert("temperature".into(), json!(t.clamp(0.0, 1.0)));
+    } else {
+        copy_if(out, v, "top_p");
+    }
+}
+
+/// A Chat Completions assistant turn with its refusal as text. A refusal is what the assistant
+/// said; Messages has no refusal part, and dropping it would leave an empty turn.
+fn assistant_refusal_as_text(m: &Value) -> std::borrow::Cow<'_, Value> {
+    use std::borrow::Cow;
+    let content_empty = match m.get("content") {
+        None | Some(Value::Null) => true,
+        Some(Value::String(s)) => s.is_empty(),
+        Some(Value::Array(a)) => a.is_empty(),
+        _ => false,
+    };
+    // The `refusal` field stands in for content only when there is none.
+    let refusal = m
+        .get("refusal")
+        .and_then(Value::as_str)
+        .filter(|r| !r.is_empty() && content_empty);
+    let has_part = m.get("content").and_then(Value::as_array).is_some_and(|p| {
+        p.iter()
+            .any(|x| x.get("type").and_then(Value::as_str) == Some("refusal"))
+    });
+    if !has_part && refusal.is_none() {
+        return Cow::Borrowed(m);
+    }
+    let mut m = m.clone();
+    if let Some(parts) = m.get_mut("content").and_then(Value::as_array_mut) {
+        for p in parts.iter_mut() {
+            if p.get("type").and_then(Value::as_str) == Some("refusal") {
+                let text = p.get("refusal").cloned().unwrap_or(json!(""));
+                *p = json!({ "type": "text", "text": text });
+            }
+        }
+    }
+    if let Some(r) = refusal {
+        m["content"] = json!(r);
+    }
+    Cow::Owned(m)
+}
+
+/// Anthropic tool ids must match `^[a-zA-Z0-9_-]+$`; other providers mint ids like
+/// `functions.get_weather:0` (Kimi). Rewritten the same way on the `tool_use` and on its
+/// `tool_result`, so the pair still matches, and on every turn, so the history stays byte-stable.
+fn sanitize_tool_ids(messages: &mut [Value]) {
+    for m in messages {
+        let Some(blocks) = m.get_mut("content").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for b in blocks {
+            let key = match b.get("type").and_then(Value::as_str) {
+                Some("tool_use") => "id",
+                Some("tool_result") => "tool_use_id",
+                _ => continue,
+            };
+            if let Some(id) = b.get(key).and_then(Value::as_str)
+                && let Some(clean) = anthropic_tool_id(id)
+            {
+                b[key] = json!(clean);
+            }
+        }
+    }
+}
+
+/// `None` when `id` is already valid. Otherwise each disallowed character becomes `_`, plus a hash
+/// of the original so two ids that differ only in those characters stay distinct.
+fn anthropic_tool_id(id: &str) -> Option<String> {
+    let ok = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '-';
+    if !id.is_empty() && id.chars().all(ok) {
+        return None;
+    }
+    let mut clean: String = id.chars().map(|c| if ok(c) { c } else { '_' }).collect();
+    clean.push_str(&format!("_{:016x}", fnv1a64(id.as_bytes())));
+    Some(clean)
+}
+
+/// Anthropic rejects a `metadata.user_id` that looks like an email address ("send a uuid or hash
+/// value instead"; measured: names, phone numbers and 300-character ids pass). Such a value becomes
+/// a hash of itself, so the same user still maps to the same id and the address itself never
+/// reaches the provider. It is an abuse-tracking key, not a secret: an unsalted hash of a known
+/// address is recomputable. Anything else passes unchanged.
+fn anthropic_user_id(user: &str) -> String {
+    if user.contains('@') {
+        format!("{:016x}", fnv1a64(user.as_bytes()))
+    } else {
+        user.to_owned()
+    }
+}
+
+/// FNV-1a, 64-bit: stable across builds, platforms and processes (unlike `std`'s hasher), which is
+/// what an id that must repeat on every turn needs.
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |h, &b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3)
+    })
+}
+
+/// Chat Completions' pre-`tools` function calling (`functions`, `function_call`, an assistant
+/// `function_call`, `role: "function"` results) rewritten as the `tools` loop it is equivalent to,
+/// so every mapping below sees one shape. `None` when the body uses none of it. A legacy call has
+/// no id; it gets one derived from its message position, which the `function` result that answers
+/// it (the next one) reuses, and which is the same on every turn.
+fn legacy_functions_to_tools(v: &Value) -> Option<Value> {
+    let msgs = v.get("messages").and_then(Value::as_array);
+    let legacy_history = msgs.is_some_and(|ms| {
+        ms.iter().any(|m| {
+            m.get("function_call").is_some()
+                || m.get("role").and_then(Value::as_str) == Some("function")
+        })
+    });
+    let legacy_tools = v.get("tools").is_none() && v.get("functions").is_some();
+    let legacy_choice = v.get("tool_choice").is_none() && v.get("function_call").is_some();
+    if !legacy_history && !legacy_tools && !legacy_choice {
+        return None;
+    }
+    let mut out = v.clone();
+    let obj = out.as_object_mut()?;
+    if legacy_tools && let Some(Value::Array(fs)) = obj.remove("functions") {
+        let tools = fs
+            .into_iter()
+            .map(|f| json!({ "type": "function", "function": f }))
+            .collect();
+        obj.insert("tools".into(), Value::Array(tools));
+    }
+    if legacy_choice && let Some(fc) = obj.remove("function_call") {
+        let choice = match fc {
+            Value::Object(o) => match o.get("name") {
+                Some(name) => json!({ "type": "function", "function": { "name": name } }),
+                None => json!("auto"),
+            },
+            other => other,
+        };
+        obj.insert("tool_choice".into(), choice);
+    }
+    if legacy_history && let Some(Value::Array(ms)) = obj.get_mut("messages") {
+        let mut last_call: Option<String> = None;
+        for (i, m) in ms.iter_mut().enumerate() {
+            let Some(mo) = m.as_object_mut() else {
+                continue;
+            };
+            if mo.get("role").and_then(Value::as_str) == Some("function") {
+                let id = last_call
+                    .take()
+                    .unwrap_or_else(|| format!("call_legacy_{i}"));
+                mo.insert("role".into(), json!("tool"));
+                mo.insert("tool_call_id".into(), json!(id));
+                mo.remove("name");
+                continue;
+            }
+            if let Some(fc) = mo.remove("function_call")
+                && !mo.contains_key("tool_calls")
+            {
+                let id = format!("call_legacy_{i}");
+                mo.insert(
+                    "tool_calls".into(),
+                    json!([{ "id": id, "type": "function", "function": fc }]),
+                );
+                last_call = Some(id);
+            }
+        }
+    }
+    Some(out)
 }
 
 /// Default prompt-cache breakpoints for a translated request that set none.
@@ -497,6 +826,15 @@ fn merge_content(msg: &mut Value, add: Value) {
 }
 
 fn openai_tool_to_anthropic(t: &Value) -> Option<Value> {
+    // `custom` (free-form input) and hosted tools have no Messages equivalent. Forwarded for the
+    // provider to reject by name: dropping one would let the model answer without a tool the
+    // client offered.
+    if t.get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|ty| ty != "function")
+    {
+        return Some(t.clone());
+    }
     let func = t.get("function").unwrap_or(t);
     let name = func.get("name").and_then(Value::as_str)?;
     let mut m = Map::new();
@@ -509,6 +847,9 @@ fn openai_tool_to_anthropic(t: &Value) -> Option<Value> {
         .cloned()
         .unwrap_or_else(|| json!({ "type": "object", "properties": {} }));
     m.insert("input_schema".into(), schema);
+    if func.get("strict").and_then(Value::as_bool) == Some(true) {
+        m.insert("strict".into(), json!(true));
+    }
     copy_cache_control(&mut m, t);
     if !m.contains_key("cache_control") {
         copy_cache_control(&mut m, func);
@@ -547,6 +888,19 @@ pub(crate) struct ClaudeModel {
     /// Whether forced `tool_choice` (`any` / `tool`) is accepted. Claude Fable 5.1, Mythos 5.1,
     /// Opus 5.5 and Sonnet 5.5 reject it with a 400.
     pub(crate) forced_tool_choice: bool,
+    /// Whether `{"role": "system"}` may appear inside `messages`: Opus 4.8 and later, Fable,
+    /// Mythos, Sonnet 5.5 and later. Not Sonnet 5 or older (the docs list it as unsupported), and
+    /// never a model that is not Claude.
+    pub(crate) mid_system: bool,
+    /// Whether the request should carry `thinking.block_binding` (see
+    /// `bind_thinking_with_drop_block`): a model that binds thinking to its conversation (Fable
+    /// 5.1, Opus 5.5 and Sonnet 5.5 and later; not Mythos 5.1, which skips that check), spelled as
+    /// Anthropic's own API spells it. Bedrock (`…anthropic.claude-…`) and OpenRouter
+    /// (`anthropic/…`) spellings are excluded: whether those hosts accept the beta header that the
+    /// field requires is unverified, and a field without its header is a 400.
+    pub(crate) binding_controls: bool,
+    /// Whether `thinking: {type: between_tools}` exists: Sonnet 5.5 and later Sonnets only.
+    pub(crate) between_tools: bool,
 }
 
 impl ClaudeModel {
@@ -554,13 +908,20 @@ impl ClaudeModel {
         const NOT_CLAUDE: ClaudeModel = ClaudeModel {
             reasoning: ClaudeGen::Budget,
             forced_tool_choice: true,
-        };
-        const NEWEST: ClaudeModel = ClaudeModel {
-            reasoning: ClaudeGen::Adaptive,
-            forced_tool_choice: false,
+            mid_system: false,
+            binding_controls: false,
+            between_tools: false,
         };
         let Some(at) = model.find("claude-") else {
             return NOT_CLAUDE;
+        };
+        let first_party = at == 0;
+        let newest = ClaudeModel {
+            reasoning: ClaudeGen::Adaptive,
+            forced_tool_choice: false,
+            mid_system: true,
+            binding_controls: first_party,
+            between_tools: false,
         };
         let mut parts = model[at + "claude-".len()..].split(['-', '.']);
         let family = parts.next().unwrap_or("");
@@ -569,7 +930,7 @@ impl ClaudeModel {
             return NOT_CLAUDE;
         }
         let Some(major) = parts.next().and_then(|p| p.parse::<u32>().ok()) else {
-            return NEWEST;
+            return newest;
         };
         let minor = parts
             .next()
@@ -585,67 +946,287 @@ impl ClaudeModel {
                     _ => ClaudeGen::Budget,
                 },
                 forced_tool_choice: version < (5, 5),
+                mid_system: match family {
+                    "opus" => version >= (4, 8),
+                    _ => version >= (5, 5),
+                },
+                binding_controls: first_party && version >= (5, 5),
+                between_tools: family == "sonnet" && version >= (5, 5),
             },
             "fable" | "mythos" => ClaudeModel {
                 reasoning: ClaudeGen::Adaptive,
                 forced_tool_choice: version < (5, 1),
+                mid_system: true,
+                binding_controls: first_party && family == "fable" && version >= (5, 1),
+                between_tools: false,
             },
-            _ => NEWEST,
+            _ => newest,
         }
     }
+}
+
+/// Which reasoning and sampling controls an OpenAI model accepts, parsed from the id this
+/// attempt's candidate receives. Measured live on 2026-09-30 against Chat Completions and
+/// Responses; where the two differ (o-series `xhigh`, GPT-6 `max`), the set is what both accept.
+///
+/// Applied only to OpenAI's own ids. Other hosts (xAI, DeepSeek, Groq's `openai/gpt-oss-…`) keep
+/// every field as the client sent it. OpenRouter's `openai/…` normalizes `max_tokens` and drops
+/// sampling on its own, but passes the effort through (`none` on GPT-5 is "Reasoning is mandatory",
+/// `xhigh` on o4-mini a 400), so only the effort is clamped there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct OpenAiModel {
+    /// OpenAI's own API (bare id): `max_tokens` is rejected on reasoning models, and non-default
+    /// sampling is rejected unless reasoning is off.
+    pub(crate) native: bool,
+    pub(crate) reasoning: OpenAiReasoning,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OpenAiReasoning {
+    /// Not an OpenAI model this table knows: effort and sampling pass through.
+    Unknown,
+    /// No reasoning (`gpt-4`, `gpt-4o`, `gpt-4.1`): `reasoning_effort` is an unrecognized argument.
+    Off,
+    /// A reasoning model and the `reasoning_effort` values it accepts, lowest first.
+    Efforts(&'static [&'static str]),
+}
+
+/// Effort names, lowest first. Anthropic's `max` is the top rung.
+const EFFORT_LADDER: [&str; 7] = ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
+
+impl OpenAiModel {
+    const UNKNOWN: Self = Self {
+        native: false,
+        reasoning: OpenAiReasoning::Unknown,
+    };
+
+    pub(crate) fn of(model: &str) -> Self {
+        let (native, id) = match model.split_once('/') {
+            None => (true, model),
+            Some(("openai", id)) => (false, id),
+            Some(_) => return Self::UNKNOWN,
+        };
+        let is_openai = id.starts_with("chatgpt-")
+            || (id.starts_with("gpt-") && !id.starts_with("gpt-oss"))
+            || id
+                .strip_prefix('o')
+                .is_some_and(|r| r.starts_with(|c: char| c.is_ascii_digit()));
+        if !is_openai {
+            return Self::UNKNOWN;
+        }
+        Self {
+            native,
+            reasoning: openai_reasoning_of(id),
+        }
+    }
+
+    /// The field that caps output on Chat Completions: OpenAI's own API rejects `max_tokens` on
+    /// every reasoning model and accepts `max_completion_tokens` on all of them.
+    fn max_tokens_key(self) -> &'static str {
+        if self.native {
+            "max_completion_tokens"
+        } else {
+            "max_tokens"
+        }
+    }
+
+    /// The `reasoning_effort` to send for a requested effort, or `None` to send none. A value this
+    /// model lacks becomes the nearest one above it (`none` on a model that always reasons becomes
+    /// its lowest), or its highest when nothing is above. An unrecognized name passes through for
+    /// the provider to reject by name.
+    fn effort(self, requested: &str) -> Option<String> {
+        let requested = match requested {
+            "off" | "disabled" => "none",
+            other => other,
+        };
+        match self.reasoning {
+            OpenAiReasoning::Unknown => Some(requested.to_owned()),
+            OpenAiReasoning::Off => None,
+            OpenAiReasoning::Efforts(accepted) => {
+                let rank = |e: &str| EFFORT_LADDER.iter().position(|x| *x == e);
+                let Some(want) = rank(requested) else {
+                    return Some(requested.to_owned());
+                };
+                accepted
+                    .iter()
+                    .find(|a| rank(a).is_some_and(|r| r >= want))
+                    .or_else(|| accepted.last())
+                    .map(|e| (*e).to_owned())
+            }
+        }
+    }
+
+    /// Whether `temperature` / `top_p` may go upstream given the effort being sent. OpenAI's
+    /// reasoning models accept only the default unless reasoning is `none`; OpenRouter drops them
+    /// itself, and a model this table does not know keeps them.
+    fn keeps_sampling(self, effort: Option<&str>) -> bool {
+        !self.native
+            || !matches!(self.reasoning, OpenAiReasoning::Efforts(_))
+            || effort == Some("none")
+    }
+}
+
+/// Accepted efforts by family, measured live (2026-09-30). Pro variants take fewer.
+fn openai_reasoning_of(id: &str) -> OpenAiReasoning {
+    const O_SERIES: &[&str] = &["low", "medium", "high"];
+    const GPT5: &[&str] = &["minimal", "low", "medium", "high"];
+    const GPT5_PRO: &[&str] = &["high"];
+    const GPT51: &[&str] = &["none", "low", "medium", "high"];
+    const GPT52: &[&str] = &["none", "low", "medium", "high", "xhigh"];
+    const GPT6: &[&str] = &["low", "medium", "high", "xhigh"];
+    const PRO: &[&str] = &["medium", "high", "xhigh"];
+    if id.starts_with('o') {
+        return OpenAiReasoning::Efforts(O_SERIES);
+    }
+    let Some(rest) = id.strip_prefix("gpt-") else {
+        // `chatgpt-4o-latest`.
+        return OpenAiReasoning::Off;
+    };
+    fn digits(s: &str) -> (Option<u32>, &str) {
+        let n = s.bytes().take_while(u8::is_ascii_digit).count();
+        (s[..n].parse::<u32>().ok(), &s[n..])
+    }
+    let (Some(major), after) = digits(rest) else {
+        return OpenAiReasoning::Unknown;
+    };
+    let (minor, suffix) = match after.strip_prefix('.') {
+        Some(m) => {
+            let (minor, suffix) = digits(m);
+            (minor.unwrap_or(0), suffix)
+        }
+        None => (0, after),
+    };
+    let pro = suffix.split('-').any(|s| s == "pro");
+    if major <= 4 {
+        return OpenAiReasoning::Off;
+    }
+    if suffix.split('-').any(|s| s == "chat") {
+        // ChatGPT's instant snapshots (`gpt-5.2-chat`): not verified; leave them alone.
+        return OpenAiReasoning::Unknown;
+    }
+    OpenAiReasoning::Efforts(match (major, minor, pro) {
+        (5, 0, true) => GPT5_PRO,
+        (5, 0, false) => GPT5,
+        (5, 1, _) => GPT51,
+        (5, _, true) | (6.., _, true) => PRO,
+        (5, _, false) => GPT52,
+        _ => GPT6,
+    })
+}
+
+/// A thinking request, whichever shape the client used, before it is fit to the model.
+enum ThinkingIntent<'a> {
+    Off,
+    BetweenTools,
+    Budget(u64),
+    Effort(&'a str),
 }
 
 fn openai_reasoning_to_anthropic(
     v: &Value,
     out: &mut Map<String, Value>,
-    claude: ClaudeGen,
+    claude: ClaudeModel,
     max_tokens: u64,
 ) {
-    // An already-Anthropic `thinking` object wins over `reasoning_effort` so a round-trip that
-    // kept the native shape is not re-bucketed.
-    if let Some(t) = v.get("thinking").filter(|t| t.is_object()) {
-        out.insert("thinking".into(), t.clone());
-        return;
-    }
-    let Some(effort) = v
+    let effort = v
         .get("reasoning_effort")
         .and_then(Value::as_str)
-        .or_else(|| v.pointer("/reasoning/effort").and_then(Value::as_str))
-    else {
-        return;
-    };
-    let off = matches!(effort, "none" | "off" | "disabled");
-    match claude {
-        ClaudeGen::Budget => {
-            if off {
-                out.insert("thinking".into(), json!({ "type": "disabled" }));
-                return;
+        .or_else(|| v.pointer("/reasoning/effort").and_then(Value::as_str));
+    // A client may send Anthropic's own `thinking` object on the OpenAI wire. It is a request for
+    // thinking, not a finished shape: `budget_tokens` is a 400 on current models and adaptive a
+    // 400 before 4.6, so it goes through the same model-aware mapping as `reasoning_effort`.
+    let native = v.get("thinking").filter(|t| t.is_object());
+    let intent = match native.and_then(|t| t.get("type")).and_then(Value::as_str) {
+        Some("disabled") => ThinkingIntent::Off,
+        Some("between_tools") => ThinkingIntent::BetweenTools,
+        Some("enabled") => match native
+            .and_then(|t| t.get("budget_tokens"))
+            .and_then(Value::as_u64)
+        {
+            Some(n) if effort.is_none() => ThinkingIntent::Budget(n),
+            _ => ThinkingIntent::Effort(effort.unwrap_or("medium")),
+        },
+        Some("adaptive") => ThinkingIntent::Effort(effort.unwrap_or("high")),
+        Some(_) => {
+            // An unknown thinking type: the provider names it.
+            if let Some(t) = native {
+                out.insert("thinking".into(), t.clone());
             }
+            return;
+        }
+        None => match effort {
+            Some("none" | "off" | "disabled") => ThinkingIntent::Off,
+            Some(e) => ThinkingIntent::Effort(e),
+            None => return,
+        },
+    };
+    let intent = match intent {
+        ThinkingIntent::BetweenTools if !claude.between_tools => ThinkingIntent::Off,
+        other => other,
+    };
+    match claude.reasoning {
+        ClaudeGen::Budget => {
+            let budget = match intent {
+                ThinkingIntent::Off | ThinkingIntent::BetweenTools => {
+                    out.insert("thinking".into(), json!({ "type": "disabled" }));
+                    return;
+                }
+                ThinkingIntent::Budget(n) => n,
+                ThinkingIntent::Effort(e) => budget_for_effort(e).min(max_tokens / 2),
+            };
             // `budget_tokens` must be at least 1024 and below `max_tokens`, which also has to hold
             // the answer. Leave the answer at least half; too small a request thinks not at all.
             if max_tokens <= MIN_THINKING_BUDGET {
                 return;
             }
-            let budget = budget_for_effort(effort)
-                .min(max_tokens / 2)
-                .clamp(MIN_THINKING_BUDGET, max_tokens - 1);
-            out.insert(
-                "thinking".into(),
-                json!({ "type": "enabled", "budget_tokens": budget }),
-            );
+            let budget = budget.clamp(MIN_THINKING_BUDGET, max_tokens - 1);
+            let mut t = json!({ "type": "enabled", "budget_tokens": budget });
+            copy_display(&mut t, native);
+            out.insert("thinking".into(), t);
         }
         ClaudeGen::Adaptive46 | ClaudeGen::Adaptive => {
-            let level = match effort_alias(effort) {
+            let requested = match intent {
+                ThinkingIntent::BetweenTools => {
+                    out.insert("thinking".into(), json!({ "type": "between_tools" }));
+                    return;
+                }
+                ThinkingIntent::Off => "none",
+                ThinkingIntent::Budget(n) => effort_from_budget(n),
+                ThinkingIntent::Effort(e) => e,
+            };
+            let level = match effort_alias(requested) {
                 "none" => "low",
-                "xhigh" if claude == ClaudeGen::Adaptive46 => "max",
-                "xhigh" if effort == "max" => "max",
+                "xhigh" if claude.reasoning == ClaudeGen::Adaptive46 => "max",
+                "xhigh" if requested == "max" => "max",
                 other => other,
             };
-            if !off {
-                out.insert("thinking".into(), json!({ "type": "adaptive" }));
+            if !matches!(intent, ThinkingIntent::Off) {
+                let mut t = json!({ "type": "adaptive" });
+                copy_display(&mut t, native);
+                // A Responses client asking for a reasoning summary: current models default to
+                // `omitted`, which streams empty thinking blocks.
+                if claude.reasoning == ClaudeGen::Adaptive
+                    && t.get("display").is_none()
+                    && v.pointer("/reasoning/summary")
+                        .and_then(Value::as_str)
+                        .is_some_and(|s| s != "none")
+                    && let Some(obj) = t.as_object_mut()
+                {
+                    obj.insert("display".into(), json!("summarized"));
+                }
+                out.insert("thinking".into(), t);
             }
             set_output_config(out, "effort", json!(level));
         }
+    }
+}
+
+/// Carry a client's `thinking.display` (`summarized` / `omitted` / …) onto the mapped object.
+fn copy_display(t: &mut Value, native: Option<&Value>) {
+    if let Some(d) = native.and_then(|n| n.get("display"))
+        && let Some(obj) = t.as_object_mut()
+    {
+        obj.insert("display".into(), d.clone());
     }
 }
 
@@ -685,7 +1266,11 @@ fn anthropic_format_to_openai(v: &Value) -> Option<Value> {
     let schema = format.get("schema")?;
     Some(json!({
         "type": "json_schema",
-        "json_schema": { "name": "response", "strict": true, "schema": schema },
+        "json_schema": {
+            "name": "response",
+            "strict": openai_strict_schema(schema),
+            "schema": schema,
+        },
     }))
 }
 
@@ -794,8 +1379,22 @@ fn openai_tool_choice_to_anthropic(choice: &Value) -> Value {
             _ => json!({ "type": "auto" }),
         },
         Value::Object(o) => {
+            // `allowed_tools` narrows which tools may be called this turn. Messages has no subset
+            // (and trimming `tools` would rewrite the cached, thinking-bound prefix), so the mode
+            // carries: `required` over one tool forces that tool, over several forces any tool.
+            if let Some(allowed) = o.get("allowed_tools") {
+                let tools = allowed.get("tools").and_then(Value::as_array);
+                if allowed.get("mode").and_then(Value::as_str) != Some("required") {
+                    return json!({ "type": "auto" });
+                }
+                return match tools.map(Vec::as_slice) {
+                    Some([only]) => openai_tool_choice_to_anthropic(only),
+                    _ => json!({ "type": "any" }),
+                };
+            }
             if let Some(name) = o
                 .get("function")
+                .or_else(|| o.get("custom"))
                 .and_then(|f| f.get("name"))
                 .and_then(Value::as_str)
                 .or_else(|| o.get("name").and_then(Value::as_str))
@@ -814,12 +1413,41 @@ fn openai_tool_result(m: &Value) -> Option<Value> {
         .get("tool_call_id")
         .and_then(Value::as_str)
         .unwrap_or("call_0");
-    let content = message_text(m).unwrap_or_default();
+    // A tool message may carry images (OpenAI accepts `image_url` parts there); `tool_result`
+    // content holds images too, so they stay with the result instead of being flattened away.
+    let content = match m.get("content") {
+        Some(Value::Array(parts))
+            if parts.iter().any(|p| {
+                p.get("type")
+                    .and_then(Value::as_str)
+                    .is_some_and(|t| t != "text")
+            }) =>
+        {
+            let blocks: Vec<Value> = parts
+                .iter()
+                .filter_map(openai_tool_part_to_anthropic)
+                .collect();
+            Value::Array(blocks)
+        }
+        _ => json!(message_text(m).unwrap_or_default()),
+    };
     Some(json!({
         "type": "tool_result",
         "tool_use_id": id,
         "content": content,
     }))
+}
+
+fn openai_tool_part_to_anthropic(p: &Value) -> Option<Value> {
+    match p.get("type").and_then(Value::as_str) {
+        Some("text") => Some(text_block(
+            p.get("text").and_then(Value::as_str)?,
+            p.get("cache_control"),
+        )),
+        Some("image_url") => openai_image_part_to_anthropic(p),
+        Some("file") => Some(openai_file_to_anthropic(p)),
+        _ => Some(p.clone()),
+    }
 }
 
 fn openai_assistant_content(m: &Value) -> Value {
@@ -937,7 +1565,7 @@ fn openai_user_content(m: &Value) -> Value {
                         }
                     }
                     Some("image_url") => {
-                        if let Some(mut b) = openai_image_to_anthropic(p) {
+                        if let Some(mut b) = openai_image_part_to_anthropic(p) {
                             if let Some(obj) = b.as_object_mut() {
                                 copy_cache_control(obj, p);
                             }
@@ -1005,6 +1633,21 @@ fn openai_file_to_anthropic(part: &Value) -> Value {
         obj.insert("title".into(), name.clone());
     }
     doc
+}
+
+/// A Chat Completions image part onto Messages. A data URI that is not base64
+/// (`data:image/svg+xml;utf8,…`) has no Messages image source: it is forwarded for the provider to
+/// reject, since dropped, the model would describe a picture it never saw. Other schemes
+/// (`file://`) are never forwarded in any shape.
+fn openai_image_part_to_anthropic(p: &Value) -> Option<Value> {
+    if let Some(b) = openai_image_to_anthropic(p) {
+        return Some(b);
+    }
+    p.pointer("/image_url/url")
+        .or_else(|| p.get("url"))
+        .and_then(Value::as_str)
+        .is_some_and(|u| u.starts_with("data:"))
+        .then(|| p.clone())
 }
 
 fn openai_image_to_anthropic(part: &Value) -> Option<Value> {
@@ -1114,15 +1757,15 @@ pub fn responses_to_chat(body: &[u8]) -> Vec<u8> {
 
 // --- request: Anthropic → OpenAI --------------------------------------------
 
-fn anthropic_req_to_openai(v: &Value) -> Value {
+fn anthropic_req_to_openai(v: &Value, openai: OpenAiModel) -> Value {
     let mut out = Map::new();
     copy_if(&mut out, v, "model");
     if let Some(t) = v.get("max_tokens") {
-        out.insert("max_tokens".into(), t.clone());
+        out.insert(openai.max_tokens_key().into(), t.clone());
     }
-    copy_if(&mut out, v, "temperature");
-    copy_if(&mut out, v, "top_p");
     copy_if(&mut out, v, "stream");
+    // Remote MCP servers have no Chat Completions equivalent and change what the model can do.
+    copy_if(&mut out, v, "mcp_servers");
     if let Some(stop) = v.get("stop_sequences") {
         out.insert("stop".into(), stop.clone());
     }
@@ -1138,12 +1781,18 @@ fn anthropic_req_to_openai(v: &Value) -> Value {
             anthropic_tool_choice_to_openai(choice),
         );
     }
-    // Anthropic's effort lives in `output_config.effort`; `thinking` alone implies one.
+    // Anthropic's effort lives in `output_config.effort`; `thinking` alone implies one. Fit to what
+    // the upstream model accepts (see `OpenAiModel`).
     let effort = v
         .pointer("/output_config/effort")
         .and_then(Value::as_str)
         .map(effort_alias)
-        .or_else(|| v.get("thinking").and_then(effort_from_thinking));
+        .or_else(|| v.get("thinking").and_then(effort_from_thinking))
+        .and_then(|e| openai.effort(e));
+    if openai.keeps_sampling(effort.as_deref()) {
+        copy_if(&mut out, v, "temperature");
+        copy_if(&mut out, v, "top_p");
+    }
     if let Some(effort) = effort {
         out.insert("reasoning_effort".into(), json!(effort));
     }
@@ -1171,6 +1820,10 @@ fn anthropic_req_to_openai(v: &Value) -> Value {
             let role = m.get("role").and_then(Value::as_str).unwrap_or("user");
             match role {
                 "assistant" => messages.push(anthropic_assistant_to_openai(m)),
+                // A mid-conversation system message keeps its role and its place. Chat Completions
+                // takes `system` anywhere. A directive-only one (`content: []` plus
+                // `output_config`) says nothing a Chat model can read, so it has no message.
+                "system" => messages.extend(m.get("content").and_then(anthropic_system_to_openai)),
                 _ => messages.extend(anthropic_user_to_openai(m)),
             }
         }
@@ -1227,6 +1880,16 @@ fn anthropic_system_text(sys: &Value) -> Option<String> {
 }
 
 fn anthropic_tool_to_openai(t: &Value) -> Option<Value> {
+    // Server tools (`web_search_…`, `code_execution_…`) and Anthropic-defined client tools
+    // (`bash_…`, `text_editor_…`, `computer_…`) run a contract no Chat Completions function
+    // carries: as an empty-schema function the model would call it and nothing would run it.
+    // Forwarded as-is for the provider to reject by name.
+    if t.get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|ty| ty != "custom")
+    {
+        return Some(t.clone());
+    }
     let name = t.get("name").and_then(Value::as_str)?;
     let mut func = Map::new();
     func.insert("name".into(), json!(name));
@@ -1237,12 +1900,66 @@ fn anthropic_tool_to_openai(t: &Value) -> Option<Value> {
         .get("input_schema")
         .cloned()
         .unwrap_or_else(|| json!({ "type": "object", "properties": {} }));
+    // OpenAI's strict mode needs a stricter schema than Anthropic's (see `openai_strict_schema`).
+    if t.get("strict").and_then(Value::as_bool) == Some(true) {
+        func.insert("strict".into(), json!(openai_strict_schema(&params)));
+    }
     func.insert("parameters".into(), params);
     let mut tool = json!({ "type": "function", "function": Value::Object(func) });
     if let Some(obj) = tool.as_object_mut() {
         copy_cache_control(obj, t);
     }
     Some(tool)
+}
+
+/// Whether OpenAI accepts `schema` under `strict: true`: every object sets
+/// `additionalProperties: false` and lists all of its properties in `required`. Anthropic's
+/// structured outputs allow optional properties, so a schema valid there is a 400 here with
+/// `strict: true`; sent with `strict: false` it still shapes the output, without the guarantee.
+fn openai_strict_schema(schema: &Value) -> bool {
+    let Some(obj) = schema.as_object() else {
+        return true;
+    };
+    let is_object =
+        obj.get("type").and_then(Value::as_str) == Some("object") || obj.contains_key("properties");
+    if is_object {
+        if obj.get("additionalProperties") != Some(&Value::Bool(false)) {
+            return false;
+        }
+        let required: Vec<&str> = obj
+            .get("required")
+            .and_then(Value::as_array)
+            .map(|r| r.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default();
+        if let Some(props) = obj.get("properties").and_then(Value::as_object)
+            && !props.keys().all(|k| required.contains(&k.as_str()))
+        {
+            return false;
+        }
+    }
+    let nested = |key: &str| -> Vec<&Value> {
+        match obj.get(key) {
+            Some(Value::Object(m)) if matches!(key, "properties" | "$defs" | "definitions") => {
+                m.values().collect()
+            }
+            Some(Value::Array(a)) => a.iter().collect(),
+            Some(v @ Value::Object(_)) => vec![v],
+            _ => Vec::new(),
+        }
+    };
+    [
+        "properties",
+        "$defs",
+        "definitions",
+        "items",
+        "prefixItems",
+        "anyOf",
+        "oneOf",
+        "allOf",
+    ]
+    .into_iter()
+    .flat_map(nested)
+    .all(openai_strict_schema)
 }
 
 fn anthropic_tool_choice_to_openai(choice: &Value) -> Value {
@@ -1348,37 +2065,15 @@ fn anthropic_user_to_openai(m: &Value) -> Vec<Value> {
                     out.push(json!({ "role": "user", "content": Value::Array(p) }));
                 }
             };
+            // Chat Completions wants every `tool` message right after the assistant turn that
+            // called it, so the tool results go first and the rest of the turn follows as one
+            // user message (Anthropic puts `tool_result` blocks first anyway).
             for b in blocks {
                 match b.get("type").and_then(Value::as_str) {
                     Some("tool_result") => {
-                        flush_user(&mut user_parts, &mut out);
-                        let id = b
-                            .get("tool_use_id")
-                            .and_then(Value::as_str)
-                            .unwrap_or("call_0");
-                        let content = match b.get("content") {
-                            Some(Value::String(s)) => s.clone(),
-                            Some(Value::Array(inner)) => inner
-                                .iter()
-                                .filter_map(|x| x.get("text").and_then(Value::as_str))
-                                .collect::<Vec<_>>()
-                                .join(""),
-                            _ => String::new(),
-                        };
-                        out.push(json!({
-                            "role": "tool",
-                            "tool_call_id": id,
-                            "content": content,
-                        }));
+                        out.push(anthropic_tool_result_to_openai(b, &mut user_parts));
                     }
-                    Some("image") => {
-                        if let Some(mut part) = anthropic_image_to_openai(b) {
-                            if let Some(obj) = part.as_object_mut() {
-                                copy_cache_control(obj, b);
-                            }
-                            user_parts.push(part);
-                        }
-                    }
+                    Some("image") => user_parts.extend(anthropic_image_part(b)),
                     Some("text") | None => {
                         if let Some(t) =
                             b.get("text").and_then(Value::as_str).or_else(|| b.as_str())
@@ -1387,7 +2082,9 @@ fn anthropic_user_to_openai(m: &Value) -> Vec<Value> {
                         }
                     }
                     Some("document") => user_parts.push(anthropic_document_to_openai(b)),
-                    _ => {}
+                    // Anything else (`search_result`, `container_upload`, …) has no Chat
+                    // Completions part: forwarded for the provider to reject by name.
+                    Some(_) => user_parts.push(b.clone()),
                 }
             }
             flush_user(&mut user_parts, &mut out);
@@ -1398,6 +2095,59 @@ fn anthropic_user_to_openai(m: &Value) -> Vec<Value> {
         }
         _ => vec![json!({ "role": "user", "content": "" })],
     }
+}
+
+/// Anthropic `tool_result` → a Chat Completions `tool` message holding its text. A tool message
+/// holds text only, so images and documents in the result (a screenshot, a rendered PDF) move to
+/// `carried`, which the caller sends as the user message right after the tool messages; dropping
+/// them would get an answer about output the model never saw. `is_error` has no field: the text
+/// says so instead.
+fn anthropic_tool_result_to_openai(b: &Value, carried: &mut Vec<Value>) -> Value {
+    let id = b
+        .get("tool_use_id")
+        .and_then(Value::as_str)
+        .unwrap_or("call_0");
+    let mut text = String::new();
+    match b.get("content") {
+        Some(Value::String(s)) => text.push_str(s),
+        Some(Value::Array(inner)) => {
+            for x in inner {
+                match x.get("type").and_then(Value::as_str) {
+                    Some("text") | None => {
+                        if let Some(t) = x.get("text").and_then(Value::as_str) {
+                            text.push_str(t);
+                        }
+                    }
+                    Some("image") => carried.extend(anthropic_image_part(x)),
+                    Some("document") => carried.push(anthropic_document_to_openai(x)),
+                    Some(_) => carried.push(x.clone()),
+                }
+            }
+        }
+        _ => {}
+    }
+    if b.get("is_error").and_then(Value::as_bool) == Some(true) {
+        text = if text.is_empty() {
+            "Error".to_owned()
+        } else {
+            format!("Error: {text}")
+        };
+    }
+    json!({ "role": "tool", "tool_call_id": id, "content": text })
+}
+
+/// Anthropic `image` → a Chat Completions `image_url` part. A source Chat Completions cannot
+/// reference (a Files API `file_id`) is forwarded as-is for the provider to reject by name. A
+/// `url` source that is not http(s) is never forwarded in any shape.
+fn anthropic_image_part(b: &Value) -> Option<Value> {
+    let Some(mut part) = anthropic_image_to_openai(b) else {
+        let url_source = b.pointer("/source/type").and_then(Value::as_str) == Some("url");
+        return (!url_source).then(|| b.clone());
+    };
+    if let Some(obj) = part.as_object_mut() {
+        copy_cache_control(obj, b);
+    }
+    Some(part)
 }
 
 /// Anthropic `document` → a Chat Completions part. A base64 PDF becomes a `file` part with a data
@@ -1620,38 +2370,57 @@ fn map_usage_to_anthropic(usage: Option<&Value>) -> Value {
 
 // --- request: Responses ↔ Chat Completions ----------------------------------
 
-fn responses_req_to_openai(v: &Value) -> Value {
+fn responses_req_to_openai(v: &Value, openai: OpenAiModel) -> Value {
     let mut out = Map::new();
     copy_if(&mut out, v, "model");
-    copy_if(&mut out, v, "temperature");
-    copy_if(&mut out, v, "top_p");
     copy_if(&mut out, v, "stream");
     if let Some(t) = v
         .get("max_output_tokens")
         .or_else(|| v.get("max_tokens"))
         .or_else(|| v.get("max_completion_tokens"))
     {
-        out.insert("max_tokens".into(), t.clone());
+        out.insert(openai.max_tokens_key().into(), t.clone());
     }
-    if let Some(effort) = v
+    let effort = v
         .get("reasoning_effort")
-        .cloned()
-        .or_else(|| v.pointer("/reasoning/effort").cloned())
-    {
-        out.insert("reasoning_effort".into(), effort);
+        .and_then(Value::as_str)
+        .or_else(|| v.pointer("/reasoning/effort").and_then(Value::as_str))
+        .and_then(|e| openai.effort(e));
+    if openai.keeps_sampling(effort.as_deref()) {
+        copy_if(&mut out, v, "temperature");
+        copy_if(&mut out, v, "top_p");
+    }
+    if let Some(effort) = effort {
+        out.insert("reasoning_effort".into(), json!(effort));
     }
     if let Some(tools) = v.get("tools").and_then(Value::as_array) {
-        let mapped: Vec<Value> = tools.iter().filter_map(responses_tool_to_openai).collect();
+        let mapped: Vec<Value> = tools.iter().map(responses_tool_to_openai).collect();
         if !mapped.is_empty() {
             out.insert("tools".into(), Value::Array(mapped));
         }
     }
     if let Some(choice) = v.get("tool_choice") {
-        out.insert("tool_choice".into(), choice.clone());
+        out.insert(
+            "tool_choice".into(),
+            responses_tool_choice_to_openai(choice),
+        );
     }
     for key in ["parallel_tool_calls", "user", "safety_identifier"] {
         copy_if(&mut out, v, key);
     }
+    // OpenAI's Chat Completions takes these too. Elsewhere they are hints (cache routing, latency
+    // tier, answer length) and go.
+    if openai.native {
+        for key in ["prompt_cache_key", "service_tier"] {
+            copy_if(&mut out, v, key);
+        }
+        if let Some(verbosity) = v.pointer("/text/verbosity") {
+            out.insert("verbosity".into(), verbosity.clone());
+        }
+    }
+    // A stored prompt template decides what the model is asked. Chat Completions has no
+    // equivalent: forwarded for the provider to reject by name.
+    copy_if(&mut out, v, "prompt");
     // Responses nests the output format under `text.format` and flattens `json_schema`.
     if let Some(format) = v.pointer("/text/format") {
         let rf = match format.get("type").and_then(Value::as_str) {
@@ -1679,22 +2448,33 @@ fn responses_req_to_openai(v: &Value) -> Value {
     Value::Object(out)
 }
 
-fn openai_req_to_responses(v: &Value) -> Value {
+fn openai_req_to_responses(v: &Value, openai: OpenAiModel) -> Value {
     let mut out = Map::new();
     copy_if(&mut out, v, "model");
-    copy_if(&mut out, v, "temperature");
-    copy_if(&mut out, v, "top_p");
     copy_if(&mut out, v, "stream");
     if let Some(t) = max_tokens_of(v) {
         out.insert("max_output_tokens".into(), json!(t));
     } else if let Some(t) = v.get("max_output_tokens") {
         out.insert("max_output_tokens".into(), t.clone());
     }
-    if let Some(effort) = v
+    // Chat Completions stores nothing unless asked; Responses stores every response by default.
+    out.insert(
+        "store".into(),
+        v.get("store")
+            .filter(|s| s.is_boolean())
+            .cloned()
+            .unwrap_or(json!(false)),
+    );
+    let effort = v
         .get("reasoning_effort")
         .and_then(Value::as_str)
         .or_else(|| v.pointer("/reasoning/effort").and_then(Value::as_str))
-    {
+        .and_then(|e| openai.effort(e));
+    if openai.keeps_sampling(effort.as_deref()) {
+        copy_if(&mut out, v, "temperature");
+        copy_if(&mut out, v, "top_p");
+    }
+    if let Some(effort) = effort {
         out.insert(
             "reasoning".into(),
             json!({ "effort": effort, "summary": "auto" }),
@@ -1707,11 +2487,40 @@ fn openai_req_to_responses(v: &Value) -> Value {
         }
     }
     if let Some(choice) = v.get("tool_choice") {
-        out.insert("tool_choice".into(), choice.clone());
+        out.insert(
+            "tool_choice".into(),
+            openai_tool_choice_to_responses(choice),
+        );
     }
-    for key in ["parallel_tool_calls", "user", "safety_identifier"] {
+    for key in [
+        "parallel_tool_calls",
+        "user",
+        "safety_identifier",
+        "prompt_cache_key",
+        "service_tier",
+        "metadata",
+        "top_logprobs",
+    ] {
         copy_if(&mut out, v, key);
     }
+    // No Responses field, and each changes what the client gets back: forwarded for the provider to
+    // reject by name. (`mcp_servers` arrives here from a Messages client.)
+    for key in ["stop", "audio", "web_search_options", "mcp_servers"] {
+        copy_if(&mut out, v, key);
+    }
+    if v.get("n").and_then(Value::as_u64).is_some_and(|n| n > 1) {
+        copy_if(&mut out, v, "n");
+    }
+    if v.get("logprobs").and_then(Value::as_bool) == Some(true) {
+        copy_if(&mut out, v, "logprobs");
+    }
+    if v.get("modalities")
+        .and_then(Value::as_array)
+        .is_some_and(|m| m.iter().any(|x| x != "text"))
+    {
+        copy_if(&mut out, v, "modalities");
+    }
+    let mut text = Map::new();
     if let Some(rf) = v.get("response_format") {
         let format = match rf.get("type").and_then(Value::as_str) {
             Some("json_schema") => {
@@ -1728,101 +2537,303 @@ fn openai_req_to_responses(v: &Value) -> Value {
             _ => None,
         };
         if let Some(format) = format {
-            out.insert("text".into(), json!({ "format": format }));
+            text.insert("format".into(), format);
         }
     }
+    copy_if(&mut text, v, "verbosity");
+    if !text.is_empty() {
+        out.insert("text".into(), Value::Object(text));
+    }
 
-    let mut instructions: Vec<Value> = Vec::new();
+    let mut instructions: Vec<String> = Vec::new();
     let mut input: Vec<Value> = Vec::new();
     if let Some(arr) = v.get("messages").and_then(Value::as_array) {
+        let mut in_conversation = false;
         for m in arr {
             let role = m.get("role").and_then(Value::as_str).unwrap_or("");
             match role {
-                "system" | "developer" => instructions.extend(openai_system_to_responses_blocks(m)),
+                "system" | "developer" if !in_conversation => {
+                    instructions.extend(
+                        openai_system_to_responses_blocks(m)
+                            .iter()
+                            .filter_map(|b| b.get("text").and_then(Value::as_str))
+                            .map(str::to_owned),
+                    );
+                }
+                // Responses takes system and developer messages in `input`; a mid-conversation one
+                // stays where the client put it.
+                "system" | "developer" => input.push(json!({
+                    "type": "message",
+                    "role": role,
+                    "content": chat_content_to_responses(m.get("content"), false),
+                })),
                 "tool" => {
-                    if let Some(item) = openai_tool_to_function_call_output(m) {
-                        input.push(item);
-                    }
+                    in_conversation = true;
+                    input.push(chat_tool_to_function_call_output(m));
                 }
                 "assistant" => {
-                    if let Some(calls) = m.get("tool_calls").and_then(Value::as_array) {
-                        for c in calls {
-                            input.push(openai_tool_call_to_function_call(c));
-                        }
+                    in_conversation = true;
+                    // The turn's text comes before the calls it made, as Responses emits them.
+                    let content = chat_content_to_responses(m.get("content"), true);
+                    let mut content = content.as_array().cloned().unwrap_or_default();
+                    if let Some(r) = m
+                        .get("refusal")
+                        .and_then(Value::as_str)
+                        .filter(|r| !r.is_empty())
+                        && content.is_empty()
+                    {
+                        content.push(json!({ "type": "refusal", "refusal": r }));
                     }
-                    let content = openai_message_to_responses_content(m, false);
-                    if !content_is_empty(&content) {
+                    if !content.is_empty() {
                         input.push(json!({
                             "type": "message",
                             "role": "assistant",
                             "content": content,
                         }));
                     }
+                    if let Some(calls) = m.get("tool_calls").and_then(Value::as_array) {
+                        input.extend(calls.iter().map(chat_tool_call_to_responses_item));
+                    }
                 }
                 _ => {
+                    in_conversation = true;
                     input.push(json!({
                         "type": "message",
                         "role": "user",
-                        "content": openai_message_to_responses_content(m, true),
+                        "content": chat_content_to_responses(m.get("content"), false),
                     }));
                 }
             }
         }
     }
     if !instructions.is_empty() {
-        out.insert("instructions".into(), anthropic_system_value(instructions));
+        // `instructions` is a string; a list of text blocks is not one of its shapes.
+        out.insert("instructions".into(), json!(instructions.join("\n\n")));
     }
     out.insert("input".into(), Value::Array(input));
     Value::Object(out)
 }
 
-fn responses_tool_to_openai(t: &Value) -> Option<Value> {
-    if t.get("function").is_some() {
-        return Some(t.clone());
+/// A Chat Completions message's content as Responses input content. `cache_control` is Anthropic's
+/// and goes; `thinking` / `redacted_thinking` blocks carry another vendor's reasoning, which a
+/// Responses model cannot read (it is the earlier turn's own scratch work, not input); parts with
+/// no Responses equivalent (`input_audio`) are forwarded for the provider to reject by name.
+fn chat_content_to_responses(content: Option<&Value>, assistant: bool) -> Value {
+    let text_type = if assistant {
+        "output_text"
+    } else {
+        "input_text"
+    };
+    let text = |t: &Value| json!({ "type": text_type, "text": t });
+    match content {
+        Some(Value::String(s)) => json!([text(&json!(s))]),
+        Some(Value::Array(parts)) => Value::Array(
+            parts
+                .iter()
+                .filter_map(|p| match p.get("type").and_then(Value::as_str) {
+                    Some("text") | None => p
+                        .get("text")
+                        .cloned()
+                        .or_else(|| p.as_str().map(|s| json!(s)))
+                        .map(|t| text(&t)),
+                    Some("refusal") if assistant => Some(json!({
+                        "type": "refusal",
+                        "refusal": p.get("refusal").cloned().unwrap_or(json!("")),
+                    })),
+                    Some("refusal") => p.get("refusal").map(text),
+                    Some("image_url") => Some(chat_image_to_responses(p)),
+                    Some("file") => {
+                        let mut m = Map::new();
+                        m.insert("type".into(), json!("input_file"));
+                        if let Some(file) = p.get("file") {
+                            for key in ["file_data", "file_id", "filename"] {
+                                copy_if(&mut m, file, key);
+                            }
+                        }
+                        Some(Value::Object(m))
+                    }
+                    Some("thinking" | "redacted_thinking") => None,
+                    Some(_) => Some(p.clone()),
+                })
+                .collect(),
+        ),
+        _ => json!([]),
     }
-    let typ = t.get("type").and_then(Value::as_str).unwrap_or("function");
-    if typ != "function" {
-        return None;
-    }
-    let name = t.get("name").and_then(Value::as_str)?;
-    let mut func = Map::new();
-    func.insert("name".into(), json!(name));
-    if let Some(d) = t.get("description") {
-        func.insert("description".into(), d.clone());
-    }
-    if let Some(p) = t.get("parameters") {
-        func.insert("parameters".into(), p.clone());
-    }
-    if let Some(s) = t.get("strict") {
-        func.insert("strict".into(), s.clone());
-    }
-    let mut out = Map::new();
-    out.insert("type".into(), json!("function"));
-    out.insert("function".into(), Value::Object(func));
-    copy_cache_control(&mut out, t);
-    Some(Value::Object(out))
 }
 
+fn chat_image_to_responses(p: &Value) -> Value {
+    let Some(url) = p.pointer("/image_url/url").and_then(Value::as_str) else {
+        return p.clone();
+    };
+    let mut m = json!({ "type": "input_image", "image_url": url });
+    if let Some(detail) = p.pointer("/image_url/detail")
+        && let Some(obj) = m.as_object_mut()
+    {
+        obj.insert("detail".into(), detail.clone());
+    }
+    m
+}
+
+/// A Chat Completions `tool` message → a Responses `function_call_output`, whose `output` is a
+/// string or a list of input parts (text, images, files).
+fn chat_tool_to_function_call_output(m: &Value) -> Value {
+    let output = match m.get("content") {
+        Some(Value::String(s)) => json!(s),
+        Some(content @ Value::Array(_)) => chat_content_to_responses(Some(content), false),
+        _ => json!(""),
+    };
+    json!({
+        "type": "function_call_output",
+        "call_id": m.get("tool_call_id").cloned().unwrap_or(json!("call_0")),
+        "output": output,
+    })
+}
+
+/// A Chat Completions tool call → a Responses `function_call` (or `custom_tool_call`) item.
+fn chat_tool_call_to_responses_item(c: &Value) -> Value {
+    let call_id = c.get("id").cloned().unwrap_or(json!("call_0"));
+    if c.get("type").and_then(Value::as_str) == Some("custom") {
+        let custom = c.get("custom").unwrap_or(c);
+        return json!({
+            "type": "custom_tool_call",
+            "call_id": call_id,
+            "name": custom.get("name").cloned().unwrap_or(json!("")),
+            "input": custom.get("input").cloned().unwrap_or(json!("")),
+        });
+    }
+    let func = c.get("function").unwrap_or(c);
+    json!({
+        "type": "function_call",
+        "call_id": call_id,
+        "name": func.get("name").cloned().unwrap_or(json!("")),
+        "arguments": func.get("arguments").cloned().unwrap_or(json!("{}")),
+    })
+}
+
+/// A Responses tool → Chat Completions. `custom` (free-form input) has a Chat Completions shape;
+/// hosted tools (`web_search`, `file_search`, `mcp`, …) do not, and are forwarded as-is for the
+/// provider to reject by name. Dropping one would let the model answer without a tool the client
+/// offered.
+fn responses_tool_to_openai(t: &Value) -> Value {
+    if t.get("function").is_some() || t.get("custom").is_some() {
+        return t.clone();
+    }
+    let typ = t.get("type").and_then(Value::as_str).unwrap_or("function");
+    let Some(name) = t.get("name").and_then(Value::as_str) else {
+        return t.clone();
+    };
+    let keys: &[&str] = match typ {
+        "function" => &["description", "parameters", "strict"],
+        "custom" => &["description", "format"],
+        _ => return t.clone(),
+    };
+    let mut inner = Map::new();
+    inner.insert("name".into(), json!(name));
+    for key in keys {
+        copy_if(&mut inner, t, key);
+    }
+    let mut out = Map::new();
+    out.insert("type".into(), json!(typ));
+    out.insert(typ.into(), Value::Object(inner));
+    copy_cache_control(&mut out, t);
+    Value::Object(out)
+}
+
+/// A Chat Completions tool → Responses (flat). `cache_control` is Anthropic's and goes.
 fn openai_tool_to_responses(t: &Value) -> Option<Value> {
-    let func = t.get("function").unwrap_or(t);
-    let name = func.get("name").and_then(Value::as_str)?;
+    let typ = t.get("type").and_then(Value::as_str).unwrap_or("function");
+    let (inner, keys): (&Value, &[&str]) = match typ {
+        "function" => (
+            t.get("function").unwrap_or(t),
+            &["description", "parameters", "strict"],
+        ),
+        "custom" => (t.get("custom").unwrap_or(t), &["description", "format"]),
+        // Hosted and Anthropic server tools: forwarded for the provider to reject by name.
+        _ => return Some(t.clone()),
+    };
+    let name = inner.get("name").and_then(Value::as_str)?;
     let mut m = Map::new();
-    m.insert("type".into(), json!("function"));
+    m.insert("type".into(), json!(typ));
     m.insert("name".into(), json!(name));
-    if let Some(d) = func.get("description") {
-        m.insert("description".into(), d.clone());
-    }
-    if let Some(p) = func.get("parameters") {
-        m.insert("parameters".into(), p.clone());
-    }
-    if let Some(s) = func.get("strict") {
-        m.insert("strict".into(), s.clone());
-    }
-    copy_cache_control(&mut m, t);
-    if !m.contains_key("cache_control") {
-        copy_cache_control(&mut m, func);
+    for key in keys {
+        copy_if(&mut m, inner, key);
     }
     Some(Value::Object(m))
+}
+
+/// A tool reference inside `tool_choice` / `allowed_tools`, Responses (flat) → Chat (nested).
+fn responses_tool_ref_to_openai(r: &Value) -> Value {
+    match (
+        r.get("type").and_then(Value::as_str),
+        r.get("name").and_then(Value::as_str),
+    ) {
+        (Some(typ @ ("function" | "custom")), Some(name)) => {
+            json!({ "type": typ, typ: { "name": name } })
+        }
+        _ => r.clone(),
+    }
+}
+
+/// A tool reference, Chat (nested) → Responses (flat).
+fn openai_tool_ref_to_responses(r: &Value) -> Value {
+    match r.get("type").and_then(Value::as_str) {
+        Some(typ @ ("function" | "custom")) => {
+            match r
+                .get(typ)
+                .and_then(|f| f.get("name"))
+                .and_then(Value::as_str)
+            {
+                Some(name) => json!({ "type": typ, "name": name }),
+                None => r.clone(),
+            }
+        }
+        _ => r.clone(),
+    }
+}
+
+/// Responses `tool_choice` → Chat Completions. Strings are the same; a named tool nests its name,
+/// and `allowed_tools` nests its mode and list. A hosted-tool choice (`{"type": "web_search"}`)
+/// is forwarded for the provider to reject.
+fn responses_tool_choice_to_openai(choice: &Value) -> Value {
+    match choice.get("type").and_then(Value::as_str) {
+        Some("allowed_tools") if choice.get("allowed_tools").is_none() => {
+            let tools: Vec<Value> = choice
+                .get("tools")
+                .and_then(Value::as_array)
+                .map(|ts| ts.iter().map(responses_tool_ref_to_openai).collect())
+                .unwrap_or_default();
+            json!({
+                "type": "allowed_tools",
+                "allowed_tools": {
+                    "mode": choice.get("mode").cloned().unwrap_or(json!("auto")),
+                    "tools": tools,
+                },
+            })
+        }
+        Some("function" | "custom") => responses_tool_ref_to_openai(choice),
+        _ => choice.clone(),
+    }
+}
+
+/// Chat Completions `tool_choice` → Responses: the inverse of [`responses_tool_choice_to_openai`].
+fn openai_tool_choice_to_responses(choice: &Value) -> Value {
+    match choice.get("type").and_then(Value::as_str) {
+        Some("allowed_tools") => {
+            let allowed = choice.get("allowed_tools").unwrap_or(choice);
+            let tools: Vec<Value> = allowed
+                .get("tools")
+                .and_then(Value::as_array)
+                .map(|ts| ts.iter().map(openai_tool_ref_to_responses).collect())
+                .unwrap_or_default();
+            json!({
+                "type": "allowed_tools",
+                "mode": allowed.get("mode").cloned().unwrap_or(json!("auto")),
+                "tools": tools,
+            })
+        }
+        Some("function" | "custom") => openai_tool_ref_to_responses(choice),
+        _ => choice.clone(),
+    }
 }
 
 fn responses_instructions_to_system(instr: &Value) -> Value {
@@ -1837,66 +2848,125 @@ fn responses_instructions_to_system(instr: &Value) -> Value {
 }
 
 fn responses_input_to_messages(input: Option<&Value>) -> Vec<Value> {
-    match input {
-        Some(Value::String(s)) => vec![json!({ "role": "user", "content": s })],
-        Some(Value::Array(items)) => items.iter().flat_map(responses_item_to_messages).collect(),
-        _ => Vec::new(),
+    let items = match input {
+        Some(Value::String(s)) => return vec![json!({ "role": "user", "content": s })],
+        Some(Value::Array(items)) => items,
+        _ => return Vec::new(),
+    };
+    let mut out: Vec<Value> = Vec::new();
+    // Images and files a tool returned. A Chat Completions tool message holds text, so they follow
+    // the run of tool messages as one user message.
+    let mut carried: Vec<Value> = Vec::new();
+    for item in items {
+        let typ = item.get("type").and_then(Value::as_str).unwrap_or("");
+        match typ {
+            "function_call" | "custom_tool_call" => {
+                flush_carried(&mut out, &mut carried);
+                let call = responses_call_to_openai(item);
+                // Parallel calls arrive as consecutive items; Chat Completions wants them on one
+                // assistant message (split across several, OpenAI rejects the history), after
+                // whatever text that turn said.
+                match out.last_mut().and_then(Value::as_object_mut) {
+                    Some(last) if last.get("role").and_then(Value::as_str) == Some("assistant") => {
+                        match last.get_mut("tool_calls").and_then(Value::as_array_mut) {
+                            Some(calls) => calls.push(call),
+                            None => {
+                                last.insert("tool_calls".into(), json!([call]));
+                            }
+                        }
+                    }
+                    _ => out.push(json!({
+                        "role": "assistant",
+                        "content": Value::Null,
+                        "tool_calls": [call],
+                    })),
+                }
+            }
+            "function_call_output" | "custom_tool_call_output" => {
+                out.push(responses_output_to_tool_message(item, &mut carried));
+            }
+            // The model's own earlier reasoning, and hosted-tool call records: no Chat Completions
+            // equivalent, and nothing the client wrote.
+            "reasoning" => {}
+            _ if typ == "message" || item.get("role").is_some() => {
+                flush_carried(&mut out, &mut carried);
+                let role = item.get("role").and_then(Value::as_str).unwrap_or("user");
+                out.push(json!({
+                    "role": role,
+                    "content": responses_content_to_openai(item.get("content")),
+                }));
+            }
+            _ => {}
+        }
+    }
+    flush_carried(&mut out, &mut carried);
+    out
+}
+
+fn flush_carried(out: &mut Vec<Value>, carried: &mut Vec<Value>) {
+    if !carried.is_empty() {
+        out.push(json!({ "role": "user", "content": std::mem::take(carried) }));
     }
 }
 
-fn responses_item_to_messages(item: &Value) -> Vec<Value> {
-    let typ = item.get("type").and_then(Value::as_str).unwrap_or("");
-    match typ {
-        "function_call" => {
-            let call = json!({
-                "id": item.get("call_id").or_else(|| item.get("id")).cloned().unwrap_or(json!("call_0")),
-                "type": "function",
-                "function": {
-                    "name": item.get("name").cloned().unwrap_or(json!("")),
-                    "arguments": match item.get("arguments") {
-                        Some(Value::String(s)) => Value::String(s.clone()),
-                        Some(other) => json!(value_string(other)),
-                        None => json!("{}"),
-                    },
-                }
-            });
-            vec![json!({
-                "role": "assistant",
-                "content": Value::Null,
-                "tool_calls": [call],
-            })]
-        }
-        "function_call_output" => {
-            let mut m = Map::new();
-            m.insert("role".into(), json!("tool"));
-            if let Some(id) = item.get("call_id").or_else(|| item.get("id")) {
-                m.insert("tool_call_id".into(), id.clone());
-            }
-            m.insert(
-                "content".into(),
-                item.get("output").cloned().unwrap_or(json!("")),
-            );
-            vec![Value::Object(m)]
-        }
-        "message" | "" => {
-            let role = item.get("role").and_then(Value::as_str).unwrap_or("user");
-            vec![json!({
-                "role": role,
-                "content": responses_content_to_openai(item.get("content")),
-            })]
-        }
-        _ => {
-            if item.get("role").is_some() {
-                let role = item.get("role").and_then(Value::as_str).unwrap_or("user");
-                vec![json!({
-                    "role": role,
-                    "content": responses_content_to_openai(item.get("content")),
-                })]
-            } else {
-                Vec::new()
-            }
-        }
+/// A Responses `function_call` / `custom_tool_call` item → a Chat Completions tool call.
+fn responses_call_to_openai(item: &Value) -> Value {
+    let id = item
+        .get("call_id")
+        .or_else(|| item.get("id"))
+        .cloned()
+        .unwrap_or(json!("call_0"));
+    let name = item.get("name").cloned().unwrap_or(json!(""));
+    if item.get("type").and_then(Value::as_str) == Some("custom_tool_call") {
+        return json!({
+            "id": id,
+            "type": "custom",
+            "custom": { "name": name, "input": item.get("input").cloned().unwrap_or(json!("")) },
+        });
     }
+    json!({
+        "id": id,
+        "type": "function",
+        "function": {
+            "name": name,
+            "arguments": match item.get("arguments") {
+                Some(Value::String(s)) => Value::String(s.clone()),
+                Some(other) => json!(value_string(other)),
+                None => json!("{}"),
+            },
+        }
+    })
+}
+
+/// A Responses tool output → a Chat Completions `tool` message. An output that is a list of parts
+/// keeps its text here; its images and files go to `carried` (see `responses_input_to_messages`).
+fn responses_output_to_tool_message(item: &Value, carried: &mut Vec<Value>) -> Value {
+    let mut m = Map::new();
+    m.insert("role".into(), json!("tool"));
+    if let Some(id) = item.get("call_id").or_else(|| item.get("id")) {
+        m.insert("tool_call_id".into(), id.clone());
+    }
+    let content = match item.get("output") {
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Array(parts)) => {
+            let mut text = String::new();
+            for p in parts {
+                match p.get("type").and_then(Value::as_str) {
+                    Some("input_text" | "output_text" | "text") | None => {
+                        if let Some(t) = p.get("text").and_then(Value::as_str) {
+                            text.push_str(t);
+                        }
+                    }
+                    _ => carried.extend(responses_part_to_openai(p)),
+                }
+            }
+            text
+        }
+        Some(other) => value_string(other),
+        None => String::new(),
+    };
+    m.insert("content".into(), json!(content));
+    Value::Object(m)
 }
 
 fn responses_content_to_openai(content: Option<&Value>) -> Value {
@@ -1941,17 +3011,22 @@ fn responses_part_to_openai(part: &Value) -> Option<Value> {
                 .or_else(|| part.get("url"));
             let url = match url {
                 Some(Value::String(s)) => s.as_str(),
-                _ => return None,
+                // A Files API image (`file_id`): Chat Completions images are URLs only. Forwarded
+                // for the provider to reject by name, not answered without the picture.
+                _ => return Some(part.clone()),
             };
-            let mut m = json!({
-                "type": "image_url",
-                "image_url": { "url": url },
-            });
+            let mut image_url = json!({ "url": url });
+            if let (Some(d), Some(obj)) = (part.get("detail"), image_url.as_object_mut()) {
+                obj.insert("detail".into(), d.clone());
+            }
+            let mut m = json!({ "type": "image_url", "image_url": image_url });
             if let Some(obj) = m.as_object_mut() {
                 copy_cache_control(obj, part);
             }
             Some(m)
         }
+        // A `file_url` document has no Chat Completions `file` field: forwarded as-is.
+        "input_file" if part.get("file_url").is_some() => Some(part.clone()),
         "input_file" => {
             let mut file = Map::new();
             for key in ["file_data", "file_id", "filename"] {
@@ -2029,18 +3104,6 @@ fn content_is_empty(content: &Value) -> bool {
         Value::Null => true,
         _ => false,
     }
-}
-
-fn openai_tool_to_function_call_output(m: &Value) -> Option<Value> {
-    Some(json!({
-        "type": "function_call_output",
-        "call_id": m.get("tool_call_id").cloned().unwrap_or(json!("call_0")),
-        "output": match m.get("content") {
-            Some(Value::String(s)) => Value::String(s.clone()),
-            Some(other) => other.clone(),
-            None => json!(""),
-        },
-    }))
 }
 
 fn openai_tool_call_to_function_call(c: &Value) -> Value {
@@ -4270,12 +5333,10 @@ mod tests {
             ("kimi-k3", Budget, true),
             ("", Budget, true),
         ] {
+            let m = ClaudeModel::of(id);
             assert_eq!(
-                ClaudeModel::of(id),
-                ClaudeModel {
-                    reasoning,
-                    forced_tool_choice: forced
-                },
+                (m.reasoning, m.forced_tool_choice),
+                (reasoning, forced),
                 "{id}"
             );
         }
@@ -4325,7 +5386,8 @@ mod tests {
             &chat(json!({"reasoning_effort": "none"})),
             "claude-opus-5-5",
         );
-        assert!(v.get("thinking").is_none(), "{v}");
+        // Opus 5.5 always thinks; the explicit `adaptive` only carries `block_binding`.
+        assert_eq!(v["thinking"]["type"], "adaptive", "{v}");
         assert_eq!(v["output_config"]["effort"], "low");
     }
 
@@ -4671,3 +5733,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "translate_request_tests.rs"]
+mod request_tests;

@@ -345,7 +345,29 @@ is dropped. 4.6 is the same with `xhigh` → `max`. Before 4.6, and for non-Clau
 Messages-compatible API, effort becomes `budget_tokens` held below `max_tokens` (at most half, at
 least 1024, none at all when `max_tokens` ≤ 1024), and sampling is dropped only alongside thinking.
 Before this, an OpenAI SDK sending `reasoning_effort` or `temperature` to `claude-opus-4-8` got a
-400.
+400. A client's own Anthropic `thinking` object on the OpenAI wire goes through the same mapping
+(`{type: enabled, budget_tokens}` is a 400 on 4.7+, `{type: enabled}` without a budget a 400
+everywhere). Where sampling survives it is clamped to Anthropic's 0–1, and `top_p` yields to
+`temperature` (Claude 4.5-era models reject both together). Budget thinking with a forced
+`tool_choice` is a 400 ("Thinking may not be enabled when tool_choice forces tool use"); the forced
+call is the client's contract and reasoning a hint, so the thinking goes. Adaptive thinking takes
+forced tool use (measured on 4.6, 4.8 and Opus 5).
+
+The other direction has the same problem. `translate::OpenAiModel` parses OpenAI's own ids
+(`gpt-4*`, `gpt-5*`, `gpt-6*`, `o*`; measured against Chat Completions and Responses on
+2026-09-30) and every OpenAI-bound mapping (Messages → Chat Completions, Responses → Chat
+Completions, Chat Completions / Messages → Responses) applies it: `max_tokens` becomes
+`max_completion_tokens` (a 400 otherwise on every reasoning model), `temperature` / `top_p` go
+unless the effort sent is `none` (reasoning models take only the default), and the effort is
+clamped to what the family accepts (next value up, else the highest): GPT-4.x has none (the field
+is "Unrecognized"), GPT-5 `minimal`–`high`, 5.1 `none`–`high`, 5.2+ `none`–`xhigh`, GPT-6
+`low`–`xhigh`, `-pro` variants `medium`–`xhigh` (`gpt-5-pro`: `high` only), o-series `low`–`high`.
+So `thinking: disabled` is `minimal` on GPT-5 and omitted on GPT-4.1, and `effort: max` is `xhigh`
+or `high`. OpenRouter's `openai/…` ids get only the effort clamp: OpenRouter renames `max_tokens`
+and drops sampling itself (measured) but passes `none` and `xhigh` through to a 400. Other
+OpenAI-wire hosts (xAI, DeepSeek, Groq's `openai/gpt-oss-…`) keep the body as sent. `stop` on a
+model that rejects it (GPT-5+, o3, o4-mini) is still forwarded: dropping it would return text past
+the stop sequence the client asked for.
 
 **Forced tool use on models that reject it.** Claude Fable 5.1, Mythos 5.1, Opus 5.5 and Sonnet 5.5
 400 on `tool_choice` `any` / `tool` (`ClaudeModel::forced_tool_choice`). For those, Chat `required`
@@ -358,14 +380,65 @@ only place such a message is valid). It is an instruction, not a guarantee. Meas
 5.5 and Opus 5.5; a named tool that conflicts with the question was called 8/8, and Sonnet 5.5 also
 called the tool that fit the question alongside it 4/4. Limiting it to one call made Sonnet pick the
 fitting tool instead, so parallel calls stay allowed. Every other model keeps the hard `any` /
-`tool`.
+`tool`. `allowed_tools` has no Messages subset: `required` over one tool forces that tool, over
+several forces any tool (trimming `tools` instead would rewrite the cached, thinking-bound prefix).
 
-**Unmappable input is forwarded, not dropped.** `input_audio`, a `file_id` or URL document, `n` > 1,
-`logprobs` and audio output have no equivalent on the other wire and change what the client gets
-back. Translation runs in `request_body_filter`, after the request headers went upstream, so the
-gateway cannot answer 400 itself; the field is passed through and the provider's 400 names it.
-Hints that change nothing about the response's shape (`seed`, penalties, `logit_bias`, `top_k`) are
-dropped. Tools, text, and usage still
+**Preserved thinking on a translated conversation.** Fable 5.1, Opus 5.5 and Sonnet 5.5 bind each
+thinking block to the conversation that produced it (system, tools, every earlier message); a
+replayed block whose prefix changed is a 400 ("bound to a different conversation") on accounts
+created on or after 2026-08-31, and on any account whose request sets
+`thinking.block_binding.prefix_mismatch_behavior`. The translator keeps the prefix append-only
+where it can: a mid-conversation `system` / `developer` message stays in `messages` as a
+`role: "system"` message (Opus 4.8+, Fable, Mythos, Sonnet 5.5+) instead of being folded into
+top-level `system`, which used to rewrite the prefix, and the prompt cache, every time a client
+appended one. Messages accepts such a message only right after a user turn and before an assistant
+turn or at the end, so one placed elsewhere moves past the next user turn; with no user turn after
+it (the request ends on an assistant turn) it joins top-level `system`, as it does on every other
+model. The forced-tool instruction above cannot be made append-only: it exists only in the
+gateway's request, so the client's next turn replays that turn's thinking without it. So every
+translated request to one of those models on Anthropic's own API carries `block_binding:
+{prefix_mismatch_behavior: "drop_block"}` (on an explicit `{type: adaptive}` when the client sent
+no thinking; never with `between_tools`, which rejects it), and `proxy`'s `upstream_request_filter`
+adds the `thinking-binding-controls-2026-08-01` beta, merged with any the client sent, from the
+same model-id fact (`translate::messages_beta`), since headers leave before the body is
+translated. The API then drops that block and every thinking block after it instead of failing.
+Always set, not only when the history holds thinking: a thinking parameter that changes between
+turns restarts the prompt cache. Measured live on Sonnet 5.5 with enforcement on: turn 2 after a
+forced turn was the 400 without the field and a 200 with `thinking_dropped` with it; a client
+appending a system message kept every block valid across three turns, where hoisting 400ed.
+Bedrock and OpenRouter spellings get neither the field nor the header: whether those hosts accept
+the beta is unverified, and the field without it is a 400. No Bedrock candidate serves one of those
+models today; one that does would 400 a turn after a forced one on an enforced account.
+
+**Unmappable input is forwarded, not dropped.** `input_audio`, a `file_id` or URL document, a
+Files API image, a non-base64 data URI, `n` > 1, `logprobs`, audio output, Anthropic server and
+Anthropic-defined tools (`web_search_…`, `bash_…`, `text_editor_…`: as an empty-schema function the
+model would call one and nothing would run it), Responses hosted tools (`web_search`,
+`file_search`, …), OpenAI `custom` tools onto Messages, `mcp_servers`, a Responses `prompt`
+template, and `stop` onto Responses have no equivalent on the other wire and change what the
+client gets back. Translation runs in `request_body_filter`, after the request headers went
+upstream, so the gateway cannot answer 400 itself; the field is passed through and the provider's
+400 names it (each verified live, 2026-09-30). A non-http(s) image URL (`file://`) is never
+forwarded in any shape. Hints that change nothing about the response's shape (`seed`, penalties,
+`logit_bias`, `top_k`, a message's `name`) are dropped, and so are `prompt_cache_key`,
+`service_tier` and `verbosity` everywhere but OpenAI's own Chat Completions (which takes all three).
+Equivalents are mapped instead: legacy `functions` / `function_call` become the `tools` loop (a
+legacy call gets an id from its message position, reused by its `function` result); a
+Responses `custom` tool and its calls map to Chat Completions' `custom`; a Responses named
+`tool_choice` or `allowed_tools` nests its name the Chat Completions way and back; consecutive
+Responses `function_call` items become one assistant message (OpenAI rejects the split form),
+joined to that turn's text; an assistant refusal is text on Messages; a mid-conversation Anthropic
+`system` message stays a Chat Completions `system` message in place; tool `strict` crosses both
+ways; structured output is `strict: true` onto OpenAI only when the schema qualifies (every object
+closed with `additionalProperties: false`, every property required; Anthropic allows optional
+ones); an Anthropic `tool_result` that is an error says so in the tool text (`Error: …`); a
+Responses `reasoning.summary` asks current Claude for `display: "summarized"`. Images or files a
+tool returned stay with it: inside the `tool_result` on Messages, and on Chat Completions (whose
+tool message holds text) as a user message right after the run of tool messages. Other hosts' tool
+call ids (`functions.get_weather:0`) become `^[a-zA-Z0-9_-]+$` on Messages, identically on the
+call and its result, with a hash of the original. An email address as `user` (Anthropic rejects
+it as `metadata.user_id`) becomes its FNV-1a hash, stable per user. Chat Completions → Responses
+sends `store: false` unless the client asked to store. Tools, text, and usage still
 round-trip. Anthropic requires `max_tokens`; a missing OpenAI value becomes 4096. OpenAI→Anthropic
 does not inject `stream_options`. Anthropic→OpenAI injects `include_usage` on the translated
 Chat Completions body when streaming; Responses→Chat Completions does the same because injection
