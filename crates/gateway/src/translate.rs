@@ -1324,7 +1324,7 @@ fn openai_tool_to_responses(t: &Value) -> Option<Value> {
     let mut m = Map::new();
     m.insert("type".into(), json!("function"));
     m.insert("name".into(), json!(name));
-    if let Some(d) = t.get("description") {
+    if let Some(d) = func.get("description") {
         m.insert("description".into(), d.clone());
     }
     if let Some(p) = func.get("parameters") {
@@ -2685,6 +2685,26 @@ mod tests {
         );
         assert_eq!(v["tool_choice"]["type"], "auto");
         assert_eq!(v["model"], "claude-opus-4-8");
+    }
+
+    /// Chat Completions nests a tool's description under `function`; the Responses shape is flat.
+    /// Every field has to come from the nested object, or the model loses what the tool is for.
+    #[test]
+    fn openai_tools_keep_their_description_on_responses() {
+        let body = serde_json::to_vec(&oai_req()).unwrap();
+        for from in [Endpoint::ChatCompletions, Endpoint::Messages] {
+            let src = if from == Endpoint::Messages {
+                request(Endpoint::ChatCompletions, Endpoint::Messages, &body)
+            } else {
+                body.clone()
+            };
+            let v: Value =
+                serde_json::from_slice(&request(from, Endpoint::Responses, &src)).unwrap();
+            let tool = &v["tools"][0];
+            assert_eq!(tool["name"], "get_weather", "{from:?}: {v}");
+            assert_eq!(tool["description"], "weather", "{from:?}: {v}");
+            assert_eq!(tool["parameters"]["properties"]["city"]["type"], "string");
+        }
     }
 
     #[test]

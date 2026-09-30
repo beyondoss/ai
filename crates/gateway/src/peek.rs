@@ -4,10 +4,25 @@
 //! it with a structural state machine fed the body chunks *as they stream through* — the body is
 //! never buffered or reordered. This is exact (not a byte-heuristic): it tracks nesting depth and
 //! string/escape state, so a `"model"` appearing inside a nested object (e.g. a message) or inside
-//! a string value is correctly ignored, and field order is irrelevant. Memory is O(1): only short
-//! root-level *keys* and the `model` value are accumulated. Large uninteresting string content
+//! a string value is correctly ignored, and field order is irrelevant. Memory is O(1): only
+//! root-level *keys* and the `model` value are accumulated, each capped at [`MAX_CAPTURE`] bytes. Large uninteresting string content
 //! (system prompts, base64 images) is skipped with a SIMD-accelerated `memchr2` search to the next
 //! `"`/`\`, not inspected byte-by-byte — so even a multi-MB request is walked cheaply.
+
+/// Most bytes of a root-level key or `model` value we will hold. Real model ids are well under
+/// 128 bytes (`proxy::sanitize_model` records anything longer as `unknown`), and the only keys we
+/// compare against are `model` and `message`, so anything past this is junk — and without a bound a
+/// managed request carrying a multi-megabyte `model` string would be materialized in full just to be
+/// discarded. A capped value is a prefix: longer than any catalog name or loggable id, so it can only
+/// ever miss the catalog or log as `unknown`, never match something it isn't.
+pub const MAX_CAPTURE: usize = 256;
+
+#[inline]
+fn push_capped(buf: &mut Vec<u8>, b: u8) {
+    if buf.len() < MAX_CAPTURE {
+        buf.push(b);
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Default)]
 enum Cap {
@@ -123,7 +138,7 @@ impl ModelScanner {
                 if self.escaped {
                     self.escaped = false;
                     if self.cap != Cap::No {
-                        self.cur.push(b);
+                        push_capped(&mut self.cur, b);
                     }
                 } else if b == b'\\' {
                     self.escaped = true;
@@ -154,7 +169,7 @@ impl ModelScanner {
                     self.cap = Cap::No;
                     self.cur.clear();
                 } else if self.cap != Cap::No {
-                    self.cur.push(b);
+                    push_capped(&mut self.cur, b);
                 }
                 continue;
             }
@@ -429,7 +444,7 @@ pub fn scan_buffered(body: &[u8]) -> BufferedScan {
             if escaped {
                 escaped = false;
                 if capturing_model {
-                    model_buf.push(b);
+                    push_capped(&mut model_buf, b);
                 }
             } else if b == b'\\' {
                 escaped = true;
@@ -461,7 +476,7 @@ pub fn scan_buffered(body: &[u8]) -> BufferedScan {
                     );
                 }
             } else if capturing_model {
-                model_buf.push(b);
+                push_capped(&mut model_buf, b);
             }
             j += 1;
             continue;
@@ -516,6 +531,38 @@ pub fn scan_buffered(body: &[u8]) -> BufferedScan {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A pathological `model` value is held to a bounded prefix, fed in small chunks the way a
+    /// streamed body arrives, and the buffered scan agrees — while the span still covers the whole
+    /// raw value, so a model-routed rewrite replaces all of it.
+    #[test]
+    fn an_oversized_model_value_is_capped_not_materialized() {
+        let huge = "a".repeat(MAX_CAPTURE * 64);
+        let body = format!(r#"{{"model":"{huge}","messages":[]}}"#);
+        let mut s = ModelScanner::new();
+        for chunk in body.as_bytes().chunks(1024) {
+            s.feed(chunk);
+            assert!(
+                s.cur.capacity() <= MAX_CAPTURE * 2,
+                "accumulation must stay bounded"
+            );
+        }
+        let m = s.take_model().expect("value still closes");
+        assert_eq!(m.len(), MAX_CAPTURE);
+
+        let fused = scan_buffered(body.as_bytes());
+        assert_eq!(fused.model.as_deref(), Some(m.as_str()));
+        let (start, end) = fused.model_span.expect("span");
+        assert_eq!(end - start, huge.len());
+    }
+
+    /// An overlong key is capped too, and a capped key can never be mistaken for `model`.
+    #[test]
+    fn an_oversized_key_is_capped_and_does_not_match() {
+        let key = format!("model{}", "x".repeat(MAX_CAPTURE * 4));
+        let body = format!(r#"{{"{key}":"nope","model":"gpt-4o"}}"#);
+        assert_eq!(scan(body.as_bytes()).as_deref(), Some("gpt-4o"));
+    }
 
     fn scan(body: &[u8]) -> Option<String> {
         let mut s = ModelScanner::new();

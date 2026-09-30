@@ -482,6 +482,14 @@ impl AiConfig {
                     .to_string(),
             ));
         }
+        if self.circuit_breaker_threshold > crate::circuit_breaker::MAX_FAILURE_THRESHOLD {
+            return Err(GatewayError::Config(format!(
+                "circuit_breaker_threshold = {} exceeds the maximum of {} (the breaker's packed \
+                 failure count cannot hold more)",
+                self.circuit_breaker_threshold,
+                crate::circuit_breaker::MAX_FAILURE_THRESHOLD,
+            )));
+        }
         Ok(())
     }
 
@@ -665,6 +673,17 @@ mod tests {
     fn loads_without_a_file() {
         let c = AiConfig::load_with_path(None).unwrap();
         assert_eq!(c.listen, "0.0.0.0:8080");
+    }
+
+    #[test]
+    fn validate_rejects_a_breaker_threshold_the_count_cannot_hold() {
+        let at = |t| AiConfig {
+            circuit_breaker_threshold: t,
+            ..Default::default()
+        };
+        let max = crate::circuit_breaker::MAX_FAILURE_THRESHOLD;
+        assert!(at(max).validate().is_ok());
+        assert!(at(max + 1).validate().is_err());
     }
 
     #[test]
