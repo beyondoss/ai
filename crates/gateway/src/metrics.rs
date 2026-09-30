@@ -189,6 +189,10 @@ pub struct Metrics {
     /// `smart`'s "Session pins"). Against `ai_requests_total` it is the share of traffic being kept
     /// on its provider's prompt cache; a sudden drop means pins are yielding (failures) or evicting.
     pub session_pinned_total: IntCounter,
+    /// Managed requests re-run as a subrequest because finding `model` (or Responses session
+    /// state) took the whole body past pingora's 64 KiB replay buffer. Typical for stock Python
+    /// SDKs, which put `model` after `messages` / `input`.
+    pub full_body_relays_total: IntCounter,
     /// Labeled by kind: input|output|cache_read|cache_write. Cache tokens are also in the `ai.usage`
     /// billing log, but that ships with lag — the Prometheus counter is the alerting surface for
     /// "cache hit rate fell off a cliff after a deploy" (cache write ≈ 3× input, cache read ≈ 0.1×,
@@ -303,6 +307,10 @@ impl Metrics {
         let key_walks_total = IntCounter::with_opts(Opts::new(
             "ai_key_walks_total",
             "Managed requests that retried the same provider with the next unused pool key after a 429",
+        ))?;
+        let full_body_relays_total = IntCounter::with_opts(Opts::new(
+            "ai_full_body_relays_total",
+            "Managed requests re-run as a subrequest carrying a body read past the 64 KiB replay buffer",
         ))?;
         let session_pinned_total = IntCounter::with_opts(Opts::new(
             "ai_session_pinned_total",
@@ -443,6 +451,7 @@ impl Metrics {
         r.register(Box::new(candidate_failovers_total.clone()))?;
         r.register(Box::new(key_walks_total.clone()))?;
         r.register(Box::new(session_pinned_total.clone()))?;
+        r.register(Box::new(full_body_relays_total.clone()))?;
         r.register(Box::new(model_header_body_mismatch_total.clone()))?;
         r.register(Box::new(failover_unreplayable_total.clone()))?;
         r.register(Box::new(rejections_total.clone()))?;
@@ -475,6 +484,7 @@ impl Metrics {
             candidate_failovers_total,
             key_walks_total,
             session_pinned_total,
+            full_body_relays_total,
             model_header_body_mismatch_total,
             failover_unreplayable_total,
             rejections_total,

@@ -388,14 +388,30 @@ Same-wire Messages traffic is a byte relay and is never touched.
 a provider-table miss, so `/{provider}/…` traffic runs exactly the code it always did; `auto` is
 refused as a provider name at boot so config cannot shadow it.
 
-The name can live in the body because the gateway peeks it itself: pingora's 64 KiB retry buffer is
-enabled, at most that many bytes are read, and — if the buffer truncated — the prefix is prepended
-in `request_body_filter`. Untruncated peeks are replayed by pingora. Draining the body in
-`request_filter` and leaving Pingora with an empty forward hangs the upstream; that is why the peek
-replays rather than consuming. The peek feeds each new chunk to `ModelScanner` once and stops when
-the value closes (unless a cache hash or a Responses session field still needs the rest of a small
-body). It does not re-walk the accumulated prefix: a `model` placed after a long prompt, arriving
-in small reads, used to rescan every earlier byte on every chunk.
+The name can live in the body because the gateway peeks it itself. Pingora's 64 KiB retry buffer is
+enabled and `ModelScanner` is fed each new chunk once (a `model` after a long prompt is linear, not a
+rescan per chunk). Where `model` sits decides what happens next, and stock Python SDKs put it
+**after** the large field (`{"messages": …, "model": …}`, `{"input": …, "model": …}`):
+
+- **Found inside 64 KiB:** stop reading. Pingora replays its buffer.
+- **Found past 64 KiB, body not finished:** stop. The retry buffer has truncated, so
+  `request_body_filter` prepends our copy of the prefix while pingora streams the rest.
+- **The whole body read before it could be routed** (`model` near the end, or inbound Responses,
+  whose `store` / `previous_response_id` can sit after `input` and pick the arm): pingora has nothing
+  left to send. Its retry buffer is gone and the client has nothing more to read, so it would open
+  the upstream and wait forever. The request is re-run as a pingora **subrequest** carrying the body
+  (`AiProxy::relay_full_body`), and its response is piped to the client. The subrequest runs this same
+  proxy with a gateway-only context (`FullBody`: the chosen row and Responses session field), so it
+  does not peek again, does not charge the rate guardrail twice, and does not count as a second
+  request; it does its own auth, walk, failover, translation and `ai.usage`. Counted on
+  `ai_full_body_relays_total`.
+- **No `model` in the whole body:** 404.
+
+Before this, a body whose `model` was past 64 KiB was a 404, and one where the read that found it
+also ended the body hung until the client timed out (openai-python batches of ~150 embeddings
+inputs, or any long agent turn). A Responses turn with `previous_response_id` past 64 KiB was taken
+for a one-shot and translated onto Chat Completions, which dropped the conversation. A body pingora
+cannot replay still cannot fail over in-gateway (see "Status-based failover, and where it stops").
 
 Three things differ from the provider-routed path, all consequences of the client no longer naming
 the provider:
@@ -522,7 +538,11 @@ when the snapshot is newer than the downstream price table.
 
 ### Usage Extraction (`usage.rs`)
 
-The tail tap feeds the parser after `logging` fires. Two dialects:
+The tail tap feeds the parser after `logging` fires. It reads plain bytes, so managed requests go
+upstream with `Accept-Encoding: identity`: stock Python and Node SDKs send `gzip`, OpenAI and
+OpenRouter honor it, and a gzipped body parsed as no usage (a **zero-token** billing row) and filled
+the cache with gzip bytes that a hit replayed without their `Content-Encoding`. BYO requests keep
+the caller's own header. Two dialects:
 
 | Dialect   | Format     | Fields                                                                                                                                                           |
 | --------- | ---------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -1257,6 +1277,7 @@ Prometheus on the default registry, exposed at `/metrics` on `metrics_listen`.
 | `ai_candidate_failovers_total`        | Counter   | —                    | Model-routed requests that abandoned a candidate for the next one                                                          |
 | `ai_key_walks_total`                  | Counter   | —                    | Managed 429s that retried the same provider with the next unused pool key                                                  |
 | `ai_session_pinned_total`             | Counter   | —                    | Catalog walks whose primary came from a session pin instead of the TTFT rank                                               |
+| `ai_full_body_relays_total`           | Counter   | —                    | Managed requests re-run as a subrequest because routing needed the whole body past 64 KiB                                  |
 | `ai_model_header_body_mismatch_total` | Counter   | —                    | Catalog-walk requests whose `x-beyond-model` and body `model` disagreed (header wins; client bug)                          |
 | `ai_failover_unreplayable_total`      | Counter   | —                    | 5xx/429 retries declined: request body not provably replayable (past 64 KiB, or still uploading)                           |
 | `ai_usage_estimated_total`            | Counter   | —                    | Managed streams cut short before their usage block, billed with estimated tokens                                           |

@@ -1544,6 +1544,51 @@ async fn v1_embeddings_route_through_the_catalog_and_bill_input() {
     assert!(line.contains(r#""output_tokens":0"#), "{line}");
 }
 
+/// Stock Python/Node SDKs send `Accept-Encoding: gzip` and providers honor it. The gateway must
+/// ask for `identity`, or the usage tail reads gzip and the request bills zero tokens.
+#[tokio::test]
+async fn managed_requests_ask_the_provider_for_an_uncompressed_body() {
+    let nats_port = unused_nats_port();
+    let (pubkey, sk) = test_keypair(1);
+    let mock = MockUpstream::start(Mode::Embeddings).await;
+    let gw = Gateway::builder(nats_port, &mock.authority(), &b64(&pubkey))
+        .providers(&["openai", "openrouter"])
+        .start()
+        .await;
+
+    let resp = test_client()
+        .post(format!("{}/v1/embeddings", gw.url()))
+        .header("authorization", format!("Bearer {}", vkey(&sk)))
+        .header("content-type", "application/json")
+        .header("accept-encoding", "gzip, deflate")
+        .body(r#"{"input":"hello world","model":"text-embedding-3-small"}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let cap = mock.captured().expect("forwarded");
+    assert_eq!(cap.accept_encoding.as_deref(), Some("identity"));
+
+    // BYO is a pure relay: the caller's own preference passes through.
+    let byo = test_client()
+        .post(format!("{}/v1/embeddings", gw.url()))
+        .header("authorization", "Bearer sk-someones-own-key")
+        .header("content-type", "application/json")
+        .header("accept-encoding", "gzip")
+        .body(r#"{"input":"hi","model":"text-embedding-3-small"}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(byo.status().as_u16(), 200);
+    assert_eq!(
+        mock.captured()
+            .expect("forwarded")
+            .accept_encoding
+            .as_deref(),
+        Some("gzip")
+    );
+}
+
 /// The failover candidate is OpenRouter's own embeddings path, with its own spelling of the id.
 #[tokio::test]
 async fn embeddings_fail_over_to_openrouter_embeddings() {

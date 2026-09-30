@@ -476,6 +476,9 @@ pub struct Captured {
     /// Anthropic (and Bedrock Messages) require this; a stock OpenAI SDK never sends it. Recorded
     /// so a Chat Completions → Messages translate walk can prove the gateway injected it.
     pub anthropic_version: Option<String>,
+    /// What the gateway asked the provider to compress with. Managed traffic must ask for
+    /// `identity`: the usage tail, the cache and translation all read the body as plain bytes.
+    pub accept_encoding: Option<String>,
     pub body: Vec<u8>,
 }
 
@@ -716,6 +719,7 @@ async fn mock_handle(
         beyond_only,
         beyond_split,
         anthropic_version,
+        accept_encoding,
     ) = {
         let h = req.headers();
         let get = |k: &str| h.get(k).and_then(|v| v.to_str().ok()).map(String::from);
@@ -730,6 +734,7 @@ async fn mock_handle(
             get("x-beyond-only"),
             get("x-beyond-split"),
             get("anthropic-version"),
+            get("accept-encoding"),
         )
     };
     let body = req
@@ -766,6 +771,7 @@ async fn mock_handle(
         beyond_only,
         beyond_split,
         anthropic_version,
+        accept_encoding,
         body,
     });
     // A slow upstream is still a *working* upstream; the point is to be slower than the client's
