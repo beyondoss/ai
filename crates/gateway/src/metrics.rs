@@ -185,6 +185,10 @@ pub struct Metrics {
     /// a vendor". This one means "the credential was throttled and another key on the same provider
     /// served" — a 429 is not a vendor outage.
     pub key_walks_total: IntCounter,
+    /// Catalog walks whose primary came from a live session pin rather than the TTFT rank (see
+    /// `smart`'s "Session pins"). Against `ai_requests_total` it is the share of traffic being kept
+    /// on its provider's prompt cache; a sudden drop means pins are yielding (failures) or evicting.
+    pub session_pinned_total: IntCounter,
     /// Labeled by kind: input|output|cache_read|cache_write. Cache tokens are also in the `ai.usage`
     /// billing log, but that ships with lag — the Prometheus counter is the alerting surface for
     /// "cache hit rate fell off a cliff after a deploy" (cache write ≈ 3× input, cache read ≈ 0.1×,
@@ -299,6 +303,10 @@ impl Metrics {
         let key_walks_total = IntCounter::with_opts(Opts::new(
             "ai_key_walks_total",
             "Managed requests that retried the same provider with the next unused pool key after a 429",
+        ))?;
+        let session_pinned_total = IntCounter::with_opts(Opts::new(
+            "ai_session_pinned_total",
+            "Catalog walks whose primary provider came from a session pin",
         ))?;
         let model_header_body_mismatch_total = IntCounter::with_opts(Opts::new(
             "ai_model_header_body_mismatch_total",
@@ -434,6 +442,7 @@ impl Metrics {
         r.register(Box::new(requests_total.clone()))?;
         r.register(Box::new(candidate_failovers_total.clone()))?;
         r.register(Box::new(key_walks_total.clone()))?;
+        r.register(Box::new(session_pinned_total.clone()))?;
         r.register(Box::new(model_header_body_mismatch_total.clone()))?;
         r.register(Box::new(failover_unreplayable_total.clone()))?;
         r.register(Box::new(rejections_total.clone()))?;
@@ -465,6 +474,7 @@ impl Metrics {
             requests_total,
             candidate_failovers_total,
             key_walks_total,
+            session_pinned_total,
             model_header_body_mismatch_total,
             failover_unreplayable_total,
             rejections_total,

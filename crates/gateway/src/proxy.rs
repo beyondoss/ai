@@ -68,7 +68,7 @@ use crate::key;
 use crate::metrics::Rejection;
 use crate::route::{self, Dialect, Provider};
 use crate::state::{GatewayState, RequestId};
-use crate::{control, peek, translate, usage};
+use crate::{control, peek, smart, translate, usage};
 use arrayvec::ArrayString;
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -930,6 +930,26 @@ fn record_walk_ttft(state: &GatewayState, rc: &RequestCtx, ok: bool) {
     state.smart.observe(auto.route, orig, us, ok);
 }
 
+/// Pin this caller to the candidate that just answered 2xx, so its next request goes back to the
+/// provider holding its prompt cache (see `smart`'s "Session pins"). Same scope as
+/// [`record_walk_ttft`]: managed catalog walks over `candidates`, smart router on.
+fn pin_walk(state: &GatewayState, rc: &RequestCtx) {
+    if !state.config.smart_router {
+        return;
+    }
+    let Some(auto) = rc.auto.as_ref() else {
+        return;
+    };
+    if !std::ptr::eq(auto.arms, auto.route.candidates) {
+        return;
+    }
+    let Some(orig) = auto.walk.catalog_index(auto.candidate) else {
+        return;
+    };
+    let affinity = smart::affinity(rc.tenant_id, rc.vpc_id, rc.key_id);
+    state.smart.pin(auto.route, affinity, orig);
+}
+
 /// Pingora will only replay a body that has fully arrived and fit in its private 64 KiB buffer.
 /// See `upstream_response_filter` — the same gate for a 429 key-walk and a 5xx vendor walk.
 fn body_replayable(session: &mut Session) -> bool {
@@ -1762,7 +1782,15 @@ impl ProxyHttp for AiProxy {
                         .as_ref()
                         .is_some_and(control::Control::pins_walk)
                 {
-                    walk = self.state.smart.rank(walk, row, request_seq);
+                    let affinity = smart::affinity(tenant_id, vpc_id, key_id);
+                    let (ranked, pinned) =
+                        self.state
+                            .smart
+                            .rank(walk, row, request_seq, Some(affinity));
+                    walk = ranked;
+                    if pinned {
+                        self.state.metrics.session_pinned_total.inc();
+                    }
                 }
                 if walk.len == 0 {
                     self.state.metrics.rejection(Rejection::NoCandidate).inc();
@@ -2766,6 +2794,9 @@ impl ProxyHttp for AiProxy {
                 .ttft_seconds
                 .observe(rc.attempt_start().elapsed().as_secs_f64());
             record_walk_ttft(&self.state, rc, status < 500);
+            if (200..300).contains(&status) {
+                pin_walk(&self.state, rc);
+            }
             rc.provider.metrics.record_response(status);
             // Remember the status for the circuit-breaker outcome resolved in `logging` (a response
             // arrived, so the provider is reachable — even a 429/5xx is a real answer, not a connect

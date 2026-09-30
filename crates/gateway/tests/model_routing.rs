@@ -14,6 +14,9 @@
 mod common;
 
 use beyond_ai::key::{VirtualKey, mint};
+
+/// `smart::PROBE_EVERY` (crate-private).
+const PROBE_EVERY: u64 = 8;
 use common::*;
 
 const MODEL: &str = "gpt-4o-mini";
@@ -1739,8 +1742,9 @@ async fn split_over_n_requests_hits_both_primaries() {
     );
 }
 
-/// Cold start is catalog order. After a probe samples a faster fallback, later unpinned requests
-/// prefer it. `x-beyond-order` still pins the slow primary.
+/// Cold start is catalog order. After a probe samples a faster fallback, **new** callers prefer
+/// it, while a caller already served stays on its provider (session pin, so its prompt cache is not
+/// thrown away). `x-beyond-order` still pins the slow primary.
 #[tokio::test]
 async fn ttft_ranker_prefers_the_faster_candidate_after_a_probe() {
     let nats_port = unused_nats_port();
@@ -1757,6 +1761,18 @@ async fn ttft_ranker_prefers_the_faster_candidate_after_a_probe() {
 
     let client = test_client();
     let key = vkey(&sk);
+    // A distinct app per request: each one is a new caller with no pin.
+    let fresh = |n: u64| {
+        mint(
+            &VirtualKey {
+                tenant_id: 1_000 + n,
+                vpc_id: 7,
+                key_id: None,
+            },
+            1,
+            &sk,
+        )
+    };
 
     let first = post_auto(&client, &gw.url(), &key, Some(MODEL)).await;
     assert_eq!(first.status().as_u16(), 200);
@@ -1764,18 +1780,30 @@ async fn ttft_ranker_prefers_the_faster_candidate_after_a_probe() {
     assert_eq!(fast.hits(), 0, "the fallback is not probed on seq 0");
 
     // seq 1..=7 still exploit the only sampled arm; seq 8 probes openrouter; seq 9+ rank by EWMA.
-    for _ in 0..15 {
-        let resp = post_auto(&client, &gw.url(), &key, Some(MODEL)).await;
+    for n in 0..15 {
+        let resp = post_auto(&client, &gw.url(), &fresh(n), Some(MODEL)).await;
         assert_eq!(resp.status().as_u16(), 200);
     }
     assert!(
         fast.hits() >= 3,
-        "after the probe the faster arm must serve (slow={}, fast={})",
+        "after the probe the faster arm must serve new callers (slow={}, fast={})",
         slow.hits(),
         fast.hits()
     );
     let cap = fast.captured().expect("fast arm served at least once");
     assert_eq!(cap.path, "/api/v1/chat/completions");
+
+    // The first caller was served by openai; it stays there even though openrouter now ranks first.
+    let fast_before = fast.hits();
+    for _ in 0..(PROBE_EVERY + 1) {
+        let resp = post_auto(&client, &gw.url(), &key, Some(MODEL)).await;
+        assert_eq!(resp.status().as_u16(), 200);
+    }
+    assert_eq!(
+        fast.hits(),
+        fast_before,
+        "a pinned caller must stay on the provider holding its prompt cache, probe seed included"
+    );
 
     let slow_before_pin = slow.hits();
     let pinned = client
