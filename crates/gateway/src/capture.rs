@@ -25,6 +25,14 @@ use std::hash::BuildHasherDefault;
 /// this choice would have to be revisited.
 type CaptureHasher = BuildHasherDefault<rustc_hash::FxHasher>;
 
+/// Ceiling on a capture's per-direction `max_bytes`, from config or a control-plane entry.
+///
+/// Sixteen times the 256 KiB default. The entry value is operator-typed during an incident, and
+/// without a ceiling a slip of three zeros asks every sampled request to buffer gigabytes per
+/// direction. Clamped rather than refused, in both places: a present entry is still a request to
+/// capture, and a debug knob must never be the reason a gateway fails to boot.
+pub const MAX_CAPTURE_BYTES: u32 = 4 * 1024 * 1024;
+
 /// Fraction of a capturing tenant's requests to actually capture, as `1` in `sample_n`.
 ///
 /// Exists because "capture tenant 42" can mean 10k req/s. Note this bounds only *operator*-enabled
@@ -219,7 +227,10 @@ pub fn parse_rule(value: &[u8], defaults: CaptureRule) -> CaptureRule {
         // zero or silently nothing depending on how it's read. Clamp to 1 (capture everything) —
         // consistent with treating the key's presence as the enablement signal.
         sample_n: parsed.sample_n.unwrap_or(defaults.sample_n).max(1),
-        max_bytes: parsed.max_bytes.unwrap_or(defaults.max_bytes),
+        max_bytes: parsed
+            .max_bytes
+            .unwrap_or(defaults.max_bytes)
+            .min(MAX_CAPTURE_BYTES),
     }
 }
 
@@ -292,6 +303,18 @@ mod tests {
         let r = parse_rule(br#"{"sample_n":0}"#, DEFAULTS);
         assert_eq!(r.sample_n, 1);
         assert!(r.samples(0) && r.samples(1) && r.samples(7));
+    }
+
+    #[test]
+    fn an_oversized_max_bytes_is_clamped_not_honored() {
+        // Three zeros too many is still a request to capture — at the ceiling, not at 4 GB.
+        let r = parse_rule(br#"{"max_bytes":4000000000}"#, DEFAULTS);
+        assert_eq!(r.max_bytes, MAX_CAPTURE_BYTES);
+        let r = parse_rule(br#"{"max_bytes":1024}"#, DEFAULTS);
+        assert_eq!(
+            r.max_bytes, 1024,
+            "a value under the ceiling is kept as written"
+        );
     }
 
     #[test]

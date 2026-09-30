@@ -30,6 +30,12 @@ use serde_json::{Map, Value, json};
 /// Anthropic requires this; OpenAI does not. Used when the Chat Completions body omitted it.
 const DEFAULT_MAX_TOKENS: u64 = 4096;
 
+/// Most bytes translation holds for one response: a whole non-streaming body, or one SSE event not
+/// yet terminated. Sized for the largest legitimate case — a Responses `response.completed` event
+/// repeats the entire output — with room to spare; past it `proxy` aborts the response rather than
+/// let one upstream grow the gateway's memory without bound.
+pub const MAX_TRANSLATE_BUFFER: usize = 32 * 1024 * 1024;
+
 /// Per-request translate state, boxed on [`crate::proxy`]'s model-routed path only.
 pub struct TranslateState {
     /// Inbound endpoint — what the client sent and what it must receive.
@@ -47,6 +53,17 @@ impl TranslateState {
             sse: None,
             json_buf: Vec::new(),
         }
+    }
+
+    /// Append a non-streaming response chunk. `false`, with nothing appended, once the body would
+    /// pass [`MAX_TRANSLATE_BUFFER`].
+    #[must_use]
+    pub fn push_json(&mut self, chunk: &[u8]) -> bool {
+        if self.json_buf.len().saturating_add(chunk.len()) > MAX_TRANSLATE_BUFFER {
+            return false;
+        }
+        self.json_buf.extend_from_slice(chunk);
+        true
     }
 }
 
@@ -1737,6 +1754,9 @@ pub struct SseBridge {
     client: Endpoint,
     upstream: Endpoint,
     buf: Vec<u8>,
+    /// Bytes of `buf` already searched for an event end, so a long unterminated event is scanned
+    /// once rather than from the start on every chunk.
+    scanned: usize,
     ant_to_oai: AntToOai,
     oai_to_ant: OaiToAnt,
     oai_to_resp: OaiToResp,
@@ -1799,6 +1819,7 @@ impl SseBridge {
             client,
             upstream,
             buf: Vec::new(),
+            scanned: 0,
             ant_to_oai: AntToOai::default(),
             oai_to_ant: OaiToAnt::default(),
             oai_to_resp: OaiToResp::default(),
@@ -1807,15 +1828,21 @@ impl SseBridge {
         }
     }
 
+    /// Bytes held for an event whose terminating blank line has not arrived yet.
+    pub fn pending_len(&self) -> usize {
+        self.buf.len()
+    }
+
     /// Feed upstream SSE bytes. Returns client-dialect SSE bytes (possibly empty).
     pub fn feed(&mut self, data: &[u8], end: bool) -> Vec<u8> {
         self.buf.extend_from_slice(data);
         let mut out = Vec::new();
-        while let Some(raw) = take_event(&mut self.buf) {
+        while let Some(raw) = take_event(&mut self.buf, &mut self.scanned) {
             out.extend(self.map_event(&raw));
         }
         if end {
             if !self.buf.is_empty() {
+                self.scanned = 0;
                 let rest = std::mem::take(&mut self.buf);
                 out.extend(self.map_event(&rest));
             }
@@ -1857,8 +1884,9 @@ impl SseBridge {
         mut map: impl FnMut(&mut Self, &str, &str) -> Vec<u8>,
     ) -> Vec<u8> {
         let mut buf = bytes.to_vec();
+        let mut scanned = 0;
         let mut out = Vec::new();
-        while let Some(raw) = take_event(&mut buf) {
+        while let Some(raw) = take_event(&mut buf, &mut scanned) {
             let (event, data) = parse_sse(&raw);
             if data.is_empty() && event.is_empty() {
                 continue;
@@ -2584,20 +2612,43 @@ impl OaiToAnt {
     }
 }
 
-fn take_event(buf: &mut Vec<u8>) -> Option<Vec<u8>> {
-    let end = find_event_end(buf)?;
-    let event = buf.drain(..end).collect();
-    Some(event)
+/// Remove and return the first complete event. `scanned` is how much of `buf` an earlier call
+/// already searched without finding an end; the search resumes there, not from byte 0.
+fn take_event(buf: &mut Vec<u8>, scanned: &mut usize) -> Option<Vec<u8>> {
+    // A terminator is judged at its first `\n`, which needs up to two bytes after it — so the last
+    // two positions searched before may have been undecidable and are searched again.
+    match find_event_end(buf, scanned.saturating_sub(2)) {
+        Some(end) => {
+            *scanned = 0;
+            Some(buf.drain(..end).collect())
+        }
+        None => {
+            *scanned = buf.len();
+            None
+        }
+    }
 }
 
-fn find_event_end(buf: &[u8]) -> Option<usize> {
-    let crlf = buf.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4);
-    let lf = buf.windows(2).position(|w| w == b"\n\n").map(|i| i + 2);
-    match (crlf, lf) {
-        (Some(a), Some(b)) => Some(a.min(b)),
-        (Some(a), None) | (None, Some(a)) => Some(a),
-        _ => None,
+/// End (exclusive) of the first `\n\n` or `\r\n\r\n`, judging only `\n`s at or after `from`.
+///
+/// One forward pass over newlines. The earlier two-`windows` form ran both searches to completion,
+/// so a stream using only one line ending walked the whole buffer for the other on every call.
+fn find_event_end(buf: &[u8], from: usize) -> Option<usize> {
+    let mut at = from;
+    while let Some(off) = memchr::memchr(b'\n', buf.get(at..)?) {
+        let nl = at + off;
+        match buf.get(nl + 1) {
+            Some(b'\n') => return Some(nl + 2),
+            Some(b'\r')
+                if nl > 0 && buf.get(nl - 1) == Some(&b'\r') && buf.get(nl + 2) == Some(&b'\n') =>
+            {
+                return Some(nl + 3);
+            }
+            _ => {}
+        }
+        at = nl + 1;
     }
+    None
 }
 
 fn parse_sse(raw: &[u8]) -> (String, String) {
@@ -2643,6 +2694,65 @@ fn value_string(v: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn json_buffer_refuses_past_the_cap_and_keeps_what_it_has() {
+        let mut t = TranslateState::new(Endpoint::ChatCompletions);
+        assert!(t.push_json(&vec![b' '; MAX_TRANSLATE_BUFFER - 1]));
+        assert!(t.push_json(b"{"), "exactly at the cap is allowed");
+        assert!(!t.push_json(b"}"), "one byte past is refused");
+        assert_eq!(
+            t.json_buf.len(),
+            MAX_TRANSLATE_BUFFER,
+            "a refused chunk appends nothing"
+        );
+    }
+
+    #[test]
+    fn an_unterminated_event_is_held_and_reported_as_pending() {
+        let mut b = SseBridge::new(Endpoint::ChatCompletions, Endpoint::Messages);
+        let big = format!("event: content_block_delta\ndata: {}", "x".repeat(10_000));
+        for chunk in big.as_bytes().chunks(1000) {
+            assert!(b.feed(chunk, false).is_empty());
+        }
+        assert_eq!(b.pending_len(), big.len());
+    }
+
+    /// The resumable search must find exactly what a from-scratch search finds, including a
+    /// terminator split across chunks at every possible point, for both line endings.
+    #[test]
+    fn resumable_event_scan_matches_a_fresh_scan_at_every_split() {
+        for stream in [
+            &b"data: a\n\ndata: bb\n\n: c\n\n"[..],
+            &b"data: a\r\n\r\ndata: bb\r\n\r\n"[..],
+            &b"data: a\r\ndata: b\n\ndata: c\r\n\r\n"[..],
+        ] {
+            let mut fresh = stream.to_vec();
+            let mut want = Vec::new();
+            let mut s = 0;
+            while let Some(e) = take_event(&mut fresh, &mut s) {
+                want.push(e);
+                s = 0;
+            }
+            for split in 0..=stream.len() {
+                let mut buf = Vec::new();
+                let mut scanned = 0;
+                let mut got = Vec::new();
+                for part in [&stream[..split], &stream[split..]] {
+                    buf.extend_from_slice(part);
+                    while let Some(e) = take_event(&mut buf, &mut scanned) {
+                        got.push(e);
+                    }
+                }
+                assert_eq!(
+                    got,
+                    want,
+                    "split at {split} of {:?}",
+                    String::from_utf8_lossy(stream)
+                );
+            }
+        }
+    }
 
     fn oai_req() -> Value {
         json!({

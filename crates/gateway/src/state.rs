@@ -311,9 +311,18 @@ impl GatewayState {
 
         // Resolved once here rather than read per-request: these are boot config, and the capture
         // decision runs on every managed request.
+        if config.capture_max_bytes > crate::capture::MAX_CAPTURE_BYTES {
+            warn!(
+                configured = config.capture_max_bytes,
+                ceiling = crate::capture::MAX_CAPTURE_BYTES,
+                "capture_max_bytes exceeds the ceiling; clamping",
+            );
+        }
         let capture_defaults = CaptureRule {
             sample_n: config.capture_default_sample_n.max(1),
-            max_bytes: config.capture_max_bytes,
+            max_bytes: config
+                .capture_max_bytes
+                .min(crate::capture::MAX_CAPTURE_BYTES),
         };
 
         let cache = (config.cache_ttl_secs > 0).then(|| {
