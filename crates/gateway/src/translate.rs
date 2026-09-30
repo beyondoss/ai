@@ -18,6 +18,9 @@
 //!   over onto a Bedrock candidate gets Bedrock's 400 rather than a silently image-less answer.
 //! - **Passed both ways:** `thinking` / `redacted_thinking` blocks, `cache_control` on tools and
 //!   content, `reasoning_effort` ↔ Anthropic `thinking`. These are what an agent workload sends.
+//! - **Added onto Messages:** default `cache_control` breakpoints when the client set none (see
+//!   `auto_cache_breakpoints`). An OpenAI SDK never marks anything, and without a marker Anthropic
+//!   caches nothing.
 //! - **Required mapping:** system/messages/`input`, `max_tokens`/`max_output_tokens`, temperature,
 //!   stop, stream, tools, `tool_choice`, text + tool_use/tool_result, usage. Anthropic requires
 //!   `max_tokens`; a missing OpenAI value becomes 4096.
@@ -252,7 +255,108 @@ fn openai_req_to_anthropic(v: &Value) -> Value {
         out.insert("system".into(), anthropic_system_value(system_parts));
     }
     out.insert("messages".into(), Value::Array(messages));
+    auto_cache_breakpoints(&mut out);
     Value::Object(out)
+}
+
+/// Default prompt-cache breakpoints for a translated request that set none.
+///
+/// OpenAI caches a repeated prefix on its own; Anthropic caches only up to an explicit
+/// `cache_control` marker. A stock OpenAI SDK never sends one, so every Chat Completions or
+/// Responses call that translated onto Messages paid full input price for its whole prefix on
+/// every turn: an agent loop re-bought its system prompt, tools and history each request.
+///
+/// A client that marked anything keeps full control: one `cache_control` anywhere and nothing is
+/// added. Otherwise, at most two markers (Anthropic allows four):
+///
+/// - **The static prefix**: the last system block, or the last tool when there is no system.
+///   Tools render before system, so one marker covers both. An app's system prompt and tools repeat
+///   across its requests, so this is written once and read on every later call.
+/// - **The conversation so far**: the last cacheable block of the last message, only once the
+///   request holds an assistant turn. The next turn appends to this prefix and reads it back
+///   (Anthropic looks back up to 20 blocks for the previous marker). A single-turn request skips it:
+///   a write costs 1.25× input and a one-shot never reads it.
+///
+/// Prefixes shorter than the model's minimum (1024 tokens on most Claude models) are simply not
+/// cached; the marker costs nothing there.
+fn auto_cache_breakpoints(out: &mut Map<String, Value>) {
+    if has_cache_control(out) {
+        return;
+    }
+    let ephemeral = || json!({ "type": "ephemeral" });
+    let mut marked_prefix = false;
+    if let Some(system) = out.get_mut("system") {
+        if let Value::String(t) = system
+            && !t.is_empty()
+        {
+            *system = json!([{ "type": "text", "text": std::mem::take(t) }]);
+        }
+        if let Some(last) = system.as_array_mut().and_then(|a| a.last_mut())
+            && let Some(obj) = last.as_object_mut()
+        {
+            obj.insert("cache_control".into(), ephemeral());
+            marked_prefix = true;
+        }
+    }
+    if !marked_prefix
+        && let Some(last) = out
+            .get_mut("tools")
+            .and_then(Value::as_array_mut)
+            .and_then(|a| a.last_mut())
+            .and_then(Value::as_object_mut)
+    {
+        last.insert("cache_control".into(), ephemeral());
+    }
+    let Some(messages) = out.get_mut("messages").and_then(Value::as_array_mut) else {
+        return;
+    };
+    if !messages
+        .iter()
+        .any(|m| m.get("role").and_then(Value::as_str) == Some("assistant"))
+    {
+        return;
+    }
+    let Some(last) = messages.last_mut() else {
+        return;
+    };
+    if let Some(Value::String(t)) = last.get("content")
+        && !t.is_empty()
+    {
+        let t = t.clone();
+        last["content"] = json!([{ "type": "text", "text": t }]);
+    }
+    // Thinking blocks cannot carry a marker; walk back to the last block that can.
+    if let Some(block) = last
+        .get_mut("content")
+        .and_then(Value::as_array_mut)
+        .and_then(|blocks| {
+            blocks.iter_mut().rev().find(|b| {
+                !matches!(
+                    b.get("type").and_then(Value::as_str),
+                    Some("thinking" | "redacted_thinking")
+                )
+            })
+        })
+        .and_then(Value::as_object_mut)
+    {
+        block.insert("cache_control".into(), ephemeral());
+    }
+}
+
+/// Whether the translated request already carries a `cache_control` on a tool, a system block,
+/// or a message content block.
+fn has_cache_control(out: &Map<String, Value>) -> bool {
+    let marked = |v: &Value| v.get("cache_control").is_some();
+    let in_array = |v: Option<&Value>| {
+        v.and_then(Value::as_array)
+            .is_some_and(|a| a.iter().any(marked))
+    };
+    in_array(out.get("tools"))
+        || in_array(out.get("system"))
+        || out
+            .get("messages")
+            .and_then(Value::as_array)
+            .is_some_and(|ms| ms.iter().any(|m| in_array(m.get("content"))))
 }
 
 fn flush_tool_results(messages: &mut Vec<Value>, pending: &mut Vec<Value>) {
@@ -2777,12 +2881,162 @@ mod tests {
         })
     }
 
+    fn to_messages(body: &Value) -> Value {
+        let out = request(
+            Endpoint::ChatCompletions,
+            Endpoint::Messages,
+            &serde_json::to_vec(body).unwrap(),
+        );
+        serde_json::from_slice(&out).unwrap()
+    }
+
+    fn count_markers(v: &Value) -> usize {
+        match v {
+            Value::Object(m) => {
+                usize::from(m.contains_key("cache_control"))
+                    + m.values().map(count_markers).sum::<usize>()
+            }
+            Value::Array(a) => a.iter().map(count_markers).sum(),
+            _ => 0,
+        }
+    }
+
+    /// A stock OpenAI SDK sends no `cache_control`. Without a marker Anthropic caches nothing, so
+    /// the static prefix gets one.
+    #[test]
+    fn an_unmarked_request_caches_its_system_prompt() {
+        let v = to_messages(&oai_req());
+        assert_eq!(v["system"][0]["text"], "be brief");
+        assert_eq!(v["system"][0]["cache_control"]["type"], "ephemeral");
+        assert!(
+            v["tools"][0].get("cache_control").is_none(),
+            "one marker covers tools + system"
+        );
+        // Single turn: no conversation marker (a write costs 1.25x and a one-shot never reads it).
+        assert_eq!(v["messages"][0]["content"], "hi");
+        assert_eq!(count_markers(&v), 1, "{v}");
+    }
+
+    #[test]
+    fn without_a_system_prompt_the_last_tool_is_marked() {
+        let mut req = oai_req();
+        req["messages"] = json!([{"role": "user", "content": "hi"}]);
+        req["tools"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"type": "function", "function": {"name": "second"}}));
+        let v = to_messages(&req);
+        assert!(v.get("system").is_none());
+        assert!(v["tools"][0].get("cache_control").is_none());
+        assert_eq!(v["tools"][1]["cache_control"]["type"], "ephemeral");
+        assert_eq!(count_markers(&v), 1, "{v}");
+    }
+
+    /// Once the request is a conversation, the whole prefix is marked so the next turn reads it.
+    #[test]
+    fn a_conversation_marks_the_end_of_its_last_message() {
+        let mut req = oai_req();
+        req["messages"] = json!([
+            {"role": "system", "content": "be brief"},
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": null, "tool_calls": [{
+                "id": "call_1", "type": "function",
+                "function": {"name": "get_weather", "arguments": "{\"city\":\"Paris\"}"}
+            }]},
+            {"role": "tool", "tool_call_id": "call_1", "content": "sunny"},
+            {"role": "user", "content": "and tomorrow?"}
+        ]);
+        let v = to_messages(&req);
+        let last = v["messages"].as_array().unwrap().last().unwrap().clone();
+        assert_eq!(last["role"], "user");
+        let blocks = last["content"].as_array().unwrap();
+        assert!(blocks[0].get("cache_control").is_none(), "{last}");
+        assert_eq!(blocks.last().unwrap()["cache_control"]["type"], "ephemeral");
+        assert_eq!(count_markers(&v), 2, "system + conversation: {v}");
+    }
+
+    #[test]
+    fn a_string_last_message_becomes_a_marked_text_block() {
+        let mut req = oai_req();
+        req["messages"] = json!([
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "hello"},
+            {"role": "user", "content": "again"}
+        ]);
+        let v = to_messages(&req);
+        assert_eq!(
+            v["messages"][2]["content"],
+            json!([{"type": "text", "text": "again", "cache_control": {"type": "ephemeral"}}])
+        );
+    }
+
+    /// Anthropic rejects `cache_control` on a thinking block.
+    #[test]
+    fn the_conversation_marker_skips_trailing_thinking_blocks() {
+        let mut req = oai_req();
+        req["messages"] = json!([
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": [
+                {"type": "text", "text": "hello"},
+                {"type": "thinking", "thinking": "hm", "signature": "sig"}
+            ]}
+        ]);
+        let v = to_messages(&req);
+        let blocks = v["messages"][1]["content"].as_array().unwrap();
+        assert!(
+            blocks.iter().any(|b| b["type"] == "thinking"),
+            "fixture must carry a thinking block: {blocks:?}"
+        );
+        for b in blocks {
+            if matches!(b["type"].as_str(), Some("thinking" | "redacted_thinking")) {
+                assert!(b.get("cache_control").is_none(), "{b}");
+            }
+        }
+        assert!(
+            blocks.iter().any(|b| b.get("cache_control").is_some()),
+            "a non-thinking block carries the marker: {blocks:?}"
+        );
+    }
+
+    /// A client that manages its own caching keeps full control.
+    #[test]
+    fn a_client_marker_anywhere_disables_the_defaults() {
+        let mut req = oai_req();
+        req["messages"] = json!([
+            {"role": "system", "content": "be brief"},
+            {"role": "user", "content": [
+                {"type": "text", "text": "hi", "cache_control": {"type": "ephemeral", "ttl": "1h"}}
+            ]},
+            {"role": "assistant", "content": "hello"},
+            {"role": "user", "content": "again"}
+        ]);
+        let v = to_messages(&req);
+        assert_eq!(count_markers(&v), 1, "{v}");
+        assert_eq!(v["messages"][0]["content"][0]["cache_control"]["ttl"], "1h");
+    }
+
+    #[test]
+    fn responses_onto_messages_gets_the_same_defaults() {
+        let body = json!({
+            "model": "claude-opus-4-8",
+            "instructions": "be brief",
+            "input": "hi"
+        });
+        let out = request(
+            Endpoint::Responses,
+            Endpoint::Messages,
+            &serde_json::to_vec(&body).unwrap(),
+        );
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["system"][0]["cache_control"]["type"], "ephemeral", "{v}");
+    }
+
     #[test]
     fn openai_request_maps_system_tools_and_drops_stream_options() {
         let body = serde_json::to_vec(&oai_req()).unwrap();
         let out = request(Endpoint::ChatCompletions, Endpoint::Messages, &body);
         let v: Value = serde_json::from_slice(&out).unwrap();
-        assert_eq!(v["system"], "be brief");
+        assert_eq!(v["system"][0]["text"], "be brief");
         assert_eq!(v["max_tokens"], 16);
         assert_eq!(v["stream"], true);
         assert!(v.get("stream_options").is_none(), "{v}");

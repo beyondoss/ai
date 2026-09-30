@@ -330,6 +330,17 @@ follows the **upstream** endpoint. A stock OpenAI SDK also does not send `anthro
 gateway injects `2023-06-01` on a walk that lands on Messages. Usage/billing still parse the
 **upstream** body. Responses ↔ Messages is composed through Chat Completions.
 
+**Default cache breakpoints onto Messages.** OpenAI caches a repeated prefix by itself; Anthropic
+caches only up to an explicit `cache_control` marker, and a stock OpenAI SDK never sends one. So a
+Chat Completions or Responses client on a Claude row used to pay full input price for its whole
+prefix every turn. When a request translated onto Messages carries no `cache_control` anywhere,
+the gateway adds at most two `{"type":"ephemeral"}` markers: one on the last system block (or the
+last tool when there is no system; tools render first, so one marker covers both), and, once the
+request holds an assistant turn, one on the last non-thinking block of the last message so the next
+turn reads the conversation back. A single-turn request gets only the prefix marker, since a write
+costs 1.25× input and a one-shot never reads it. One client marker anywhere disables all of this.
+Same-wire Messages traffic is a byte relay and is never touched.
+
 `/{provider}/…` is the escape hatch and does not consult the catalog. This arm is reached only after
 a provider-table miss, so `/{provider}/…` traffic runs exactly the code it always did; `auto` is
 refused as a provider name at boot so config cannot shadow it.
