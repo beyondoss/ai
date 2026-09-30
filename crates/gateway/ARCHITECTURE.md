@@ -481,7 +481,12 @@ the table covers the current 4 / 4.1 / 4o / 5 / 5.x / 6 and o-series ids OpenRou
 and the Groq/Together/Fireworks llama / qwen / open-weight ids people send (Groq
 `llama-3.3-70b-versatile` and `openai/gpt-oss-120b` also name Together and Fireworks as aliases;
 Kimi K3 / GLM-5.2 / MiniMax M3 do the same Together + Fireworks + OpenRouter shape). Those rows
-have no Responses arm — `previous_response_id` is OpenAI's store. Every row and candidate is
+have no Responses arm — `previous_response_id` is OpenAI's store. OpenAI serves some GPT ids only
+on the Responses API (`gpt-5-pro`, `gpt-5.x-pro`, `gpt-5.3-codex`, `o1-pro`): their OpenAI candidate
+is `/v1/responses` (a Chat Completions or Messages client is translated onto it), with OpenRouter
+Chat Completions as the failover. Rows whose first-party API no longer serves our keys (Claude
+Opus 4.1 and Sonnet 4, retired at Anthropic; older `-codex` and some `-pro` ids OpenAI does not
+serve this account) are OpenRouter-only. Every row and candidate is
 verified against the live providers by `catalog_rows_are_servable` in `tests/smoke.rs`, and the
 failover itself by `model_route_fails_over_to_a_real_provider`.
 
