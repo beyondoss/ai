@@ -713,13 +713,16 @@ to ever close.
 
 ### Why rate guardrails sit before Ed25519 verify
 
-Ed25519 verify is ~28µs — roughly 350–650× more expensive than every other per-request operation.
-A flood of forged `bai_v1` tokens could drive unbounded crypto work if the rate limit came after
-verify. By checking the per-credential bucket first (keyed on the raw token, no crypto), a
-forged-key flood is rejected in tens of nanoseconds per request. Legit traffic is unaffected: the
-rate guard passes through, then verify runs as normal. The unit bench (`benches/unit.rs`) asserts
-this: `key/verify` ≈ 23µs; `ratelimit::check` ≈ 39–60ns single-threaded, ≈ 88–220ns at 16 threads
-under a flood of distinct credentials; 0 allocations for either.
+Ed25519 verify is ~26µs — roughly 300–1000× more expensive than every other **always-on**
+per-request operation (deny, allowance, rank, the rate-limit check). A flood of forged `bai_v1`
+tokens could drive unbounded crypto work if the rate limit came after verify. By checking the
+per-credential bucket first (keyed on the raw token, no crypto), a forged-key flood is rejected in
+tens of nanoseconds per request. Legit traffic is unaffected: the rate guard passes through, then
+verify runs as normal. The unit bench (`benches/unit.rs`) asserts this: `key/verify` ≈ 26µs;
+`ratelimit::check` ≈ 70ns single-threaded, ≈ 130–190ns at 16 threads under a flood of distinct
+credentials; 0 allocations for either. Two paths are not in that "always-on" set and can sit next
+to verify: a cross-wire `translate` of a 64 KiB body (~34µs, once) and, only when the response
+cache is enabled, fingerprinting a 256 KiB body (~35µs). See the benchmarking table.
 
 ### Why the body injection exception exists (`managed + OpenAI + streaming`)
 
@@ -1181,34 +1184,72 @@ gateway's added cost is negligible and bounded** — i.e. it never becomes the c
   measures allocations natively (divan's `AllocProfiler` reports alloc/dealloc/grow count + bytes
   beside ns/iter, no `unsafe` needed). Coverage: `key` verify/mint; `peek::ModelScanner` over
   0/4KB/256KB bodies with `model` placed last (worst case); `usage` parsers; `route`; `deny`
-  (`parse_key`/`parse_reason` off-path + `reason()` on-path); `ratelimit::check` (managed tier
-  only vs. BYO which runs both tiers) — single-threaded/hot-cache _and_ `check_flood_*`, which
-  charges 65536 distinct credentials from 1 and 16 threads over ≥ 2 window rotations, plus
-  `rotate_window`, which prices the window rotation on its own.
+  (`parse_key`/`parse_reason` off-path + `reason()` on-path); `allowance::reason_for` (v1 and v2,
+  miss and hit, empty and 1M entries); `ratelimit::check` (managed tier only vs. BYO which runs
+  both tiers) — single-threaded/hot-cache _and_ `check_flood_*`, which charges 65536 distinct
+  credentials from 1 and 16 threads over ≥ 2 window rotations, plus `rotate_window`, which prices
+  the window rotation on its own; `smart::rank` / `observe` (unmeasured and fully measured);
+  `cache::key` over 0/4KB/64KB/256KB plus `ResponseCache::get` miss, hit, and a 16-thread shared
+  hit; `translate` request and response (chat ↔ messages, including a 64KB body) and one SSE
+  `text_delta`.
+
+  Left unbenched on purpose. The open and half-open breaker are the failure path; the closed
+  `allow` is what every request pays, and it is already measured. A hung failover waits out
+  `connect_timeout_secs` — that number is configuration, not gateway CPU, and the instant-refuse
+  case below already isolates the walk. The H2-vs-H1 and worker-thread sweeps stay on a small body
+  so they measure protocol and cores; body-sized work is the unit benches plus
+  `managed_large_anthropic_sse_throughput`.
 
   What the alloc numbers assert:
-  | Operation            | Cost      | Allocations                  | Claim verified                   |
-  | -------------------- | --------- | ---------------------------- | -------------------------------- |
-  | `key/verify`         | ~23µs     | 0                            | Stack-only Ed25519 decode        |
-  | `peek/ModelScanner`  | varies    | 1 (independent of body size) | O(1) memory                      |
-  | `route`              | ~ns       | 0                            | —                                |
-  | `deny::reason`       | ~1–8ns    | 0, flat 0→1M entries         | O(1) lookup, O(denied) memory    |
-  | `ratelimit::check`   | ~39–220ns | 0                            | Fixed-memory, no per-key state   |
-  | `ratelimit` rotation | ~39µs     | 0                            | Once per window, not per request |
+  | Operation                          | Cost                                | Allocations                   | Claim verified                   |
+  | ---------------------------------- | ----------------------------------- | ----------------------------- | -------------------------------- |
+  | `key/verify`                       | ~26µs                               | 0                             | Stack-only Ed25519 decode        |
+  | `peek/ModelScanner`                | ~0.2µs at 4 KiB, ~3.6µs at 256 KiB  | 1 (independent of body size)  | O(1) memory                      |
+  | `route`                            | ~ns                                 | 0                             | —                                |
+  | `deny::reason`                     | ~0.3–2ns                            | 0, flat 0→1M entries          | O(1) lookup, O(denied) memory    |
+  | `allowance::reason_for`            | ~1.3–3.3ns                          | 0, flat 0→1M entries          | Same claim; v2 probes two maps   |
+  | `smart::rank` / `observe`          | ~110–150ns                          | 0                             | Atomics only, no lock            |
+  | `ratelimit::check`                 | ~70ns; ~130–190ns at 16 threads     | 0                             | Fixed-memory, no per-key state   |
+  | `ratelimit` rotation               | ~81µs                               | 0                             | Once per window, not per request |
+  | `cache::key` (cache on)            | ~9µs at 64 KiB, ~35µs at 256 KiB    | 0                             | Two SipHash passes, ~7 GB/s      |
+  | `ResponseCache::get` hit           | ~130ns; ~450ns median at 16 threads | 4 × 55 B, flat at 64 KiB body | `Bytes` clone, not a body copy   |
+  | `translate` request, chat→messages | ~2µs small, ~34µs at 64 KiB         | ~46 allocs (serde DOM, freed) | Once per cross-wire request      |
+  | `translate` SSE `text_delta`       | ~1.4µs                              | ~38 allocs / ~6 KiB           | Per event, not per request       |
 
-  **Headline: `key/verify` ≈ 23µs is ~100–600× every other per-request op.** This is why the rate
-  guardrail sits before verify in `proxy::request_filter`.
+  Fastest sample from one full `divan` run. Ratios against `key/verify` on that run are the claim;
+  absolute µs move with the host.
+
+  **Headline: on the always-on path, `key/verify` ≈ 26µs is still ~100–1000× deny, allowance, rank,
+  and the rate-limit check.** That is why the rate guardrail sits before verify in
+  `proxy::request_filter`. Cross-wire translate and an enabled response-cache fingerprint are the
+  exceptions, and both are off the path a same-wire request with the default config pays. The SSE
+  bridge is the one that adds up: ~1.4µs and ~38 allocations **per event**. A long translated
+  stream pays that once a token, which is still small next to provider time-to-first-byte, and it
+  is the first hot path in this suite that allocates per event rather than per request.
 
 - **End-to-end (`benches/e2e.rs`, `mise run bench:e2e`) — `criterion`.** Real `beyond-ai` binary
-  - real nats-server + mock upstream (reuses `tests/common`). Four decomposed cases:
+  - real nats-server + mock upstream (reuses `tests/common`). Latency group:
     `reject_missing_key_latency` (401, short-circuit before any upstream connection — transport floor),
     `byo_json_latency` (pure passthrough), `managed_json_latency` (verify + deny + key swap),
-    `managed_sse_latency` (streaming response tap). Plus a concurrent-throughput group.
+    `managed_sse_latency` (a 3-line stream), `managed_large_sse_latency` and
+    `managed_large_anthropic_sse_latency` (streams big enough to wrap the response tail, the
+    Anthropic one splitting usage across head and tail), `managed_large_body_latency` /
+    `byo_large_body_latency` (60 KiB, `model` last, under the 64 KiB replay cap), and the model route
+    (`auto_json_latency`, `auto_large_body_latency`, `auto_failover_latency`). Throughput at 32
+    in-flight for both a tiny JSON body and the large Anthropic stream. Then
+    `e2e_concurrency` (HTTP/2 vs HTTP/1.1 to the upstream at 1/8/32/128/512) and
+    `e2e_worker_threads` (1 worker vs one per core, same sweep).
 
-  All four cases land in ~110–120µs on loopback with ±15–20µs jitter — larger than the gateway's
-  own CPU cost. This harness cannot resolve the verify cost (that's the unit bench's job). Its value:
+  On one host the four small cases landed in ~110–120µs. A later run of the same harness did not:
+  BYO ~73µs, reject ~103µs, managed and `/auto` ~113µs, a 60 KiB body ~149µs managed / ~105µs BYO.
+  The managed−BYO gap is on the order of `key/verify`, which a noisy loopback floor can hide. This
+  harness still cannot resolve anything at nanosecond scale (that's the unit bench). Its value:
   catching gross regressions (a buffering mistake, a dropped connection pool, an O(n) path added
-  would move the band by far more than 20µs) and saved-baseline RPS trend via `--save-baseline`.
+  would move the band by far more than the run-to-run jitter) and saved-baseline RPS trend via
+  `--save-baseline`. At 32 in flight the same later run did ~25k req/s of tiny JSON and ~6k req/s
+  of the large Anthropic stream. Four workers against one roughly doubled throughput by concurrency
+  128 (~31k vs ~15k req/s) and did not differ at concurrency 1. HTTP/2 to the upstream did not beat
+  HTTP/1.1 at any point in the sweep on that loopback mock.
 
   **The model route (`/auto`) costs nothing measurable.** Paired runs against the provider-routed
   path: `managed_json` 107.85 / 108.84 / 108.68 µs vs `auto_json` 107.19 / 108.65 / 108.67 µs — a

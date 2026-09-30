@@ -11,6 +11,12 @@
 //! (the O(1)-memory claim). A regression shows up as a non-zero / grown number in the alloc
 //! columns the moment this runs.
 //!
+//! Also on a request we actually serve, and measured here for that reason: `allowance::reason_for`
+//! (every managed request, same shape as deny), `smart::rank` / `observe` (every unpinned catalog
+//! walk), `cache::key` + `ResponseCache::get` (every catalog walk **when the cache is enabled** —
+//! it is off by default), and `translate` (only when the client wire and the candidate wire
+//! differ). Circuit-open and a hung failover are not here: neither is steady-state gateway CPU.
+//!
 //! Fixtures are built *outside* the closure handed to `Bencher::bench` (or in `args`), so only the
 //! measured call is timed and counted — setup allocations don't pollute the numbers.
 
@@ -24,6 +30,33 @@ static ALLOC: divan::AllocProfiler = divan::AllocProfiler::system();
 
 fn main() {
     divan::main();
+}
+
+/// One process-wide registry for every bench that touches metrics.
+///
+/// `Metrics::new` registers on the default registry, which rejects a second registration. `admin`
+/// and `reject` each used to build their own, so a full `divan` run — `admin` is alphabetical,
+/// so it always goes first — panicked in `reject` with "registered once". The provider child
+/// series are materialised here too: that cross-product is what makes a scrape body tens of KiB
+/// from the first sample, and it has to happen exactly once regardless of which module runs first.
+fn bench_metrics() -> &'static std::sync::Arc<beyond_ai::metrics::Metrics> {
+    use std::sync::{Arc, OnceLock};
+
+    use beyond_ai::metrics::{Metrics, ProviderMetrics};
+
+    static M: OnceLock<Arc<Metrics>> = OnceLock::new();
+    M.get_or_init(|| {
+        let m = Metrics::new().expect("register metrics once");
+        for spec in beyond_ai::route::known_providers() {
+            let pm = ProviderMetrics::resolve(&m, spec.name);
+            // Non-zero observations so the histogram buckets encode realistic values, not zeros.
+            pm.ttft_seconds.observe(0.42);
+            pm.upstream_latency_seconds.observe(3.5);
+            pm.record_response(200);
+            pm.record_response(429);
+        }
+        m
+    })
 }
 
 mod key {
@@ -69,28 +102,9 @@ mod key {
 mod admin {
     use super::*;
     use beyond_ai::admin::{AdminApp, HEALTH_OK};
-    use beyond_ai::metrics::{Metrics, ProviderMetrics};
-    use std::sync::{Arc, OnceLock};
 
-    /// Register the real metric set **and** materialise every per-provider child series, exactly as
-    /// boot does (`state::build_providers` → `ProviderMetrics::resolve`) — that cross-product is what
-    /// makes a scrape body tens of KiB from process start rather than a few KiB. `Metrics::new`
-    /// registers on the process-wide default registry, which rejects a second registration, so it is
-    /// built once behind a `OnceLock` (same shape as `state.rs`'s test fixture).
-    fn registry() -> &'static Arc<Metrics> {
-        static M: OnceLock<Arc<Metrics>> = OnceLock::new();
-        M.get_or_init(|| {
-            let m = Metrics::new().expect("register metrics once");
-            for spec in beyond_ai::route::known_providers() {
-                let pm = ProviderMetrics::resolve(&m, spec.name);
-                // Non-zero observations so the histogram buckets encode realistic values, not zeros.
-                pm.ttft_seconds.observe(0.42);
-                pm.upstream_latency_seconds.observe(3.5);
-                pm.record_response(200);
-                pm.record_response(429);
-            }
-            m
-        })
+    fn registry() -> &'static std::sync::Arc<beyond_ai::metrics::Metrics> {
+        bench_metrics()
     }
 
     /// `/metrics`: gather the default registry and text-encode it. The `BytesCount` reports the real
@@ -115,14 +129,11 @@ mod admin {
 
 mod reject {
     use super::*;
-    use beyond_ai::metrics::{Metrics, Rejection};
+    use beyond_ai::metrics::Rejection;
     use beyond_ai::proxy::{REJECT_BODIES, error_body};
-    use std::sync::{Arc, OnceLock};
 
-    fn metrics() -> &'static Arc<Metrics> {
-        static M: OnceLock<Arc<Metrics>> = OnceLock::new();
-        // May already be registered by another bench module in the same process.
-        M.get_or_init(|| Metrics::new().unwrap_or_else(|_| unreachable!("registered once")))
+    fn metrics() -> &'static std::sync::Arc<beyond_ai::metrics::Metrics> {
+        bench_metrics()
     }
 
     /// The rejection response body. This is the flood path: `ratelimit`'s whole reason for existing
@@ -330,18 +341,13 @@ mod resp_tail {
 mod state {
     use super::*;
     use beyond_ai::config::AiConfig;
-    use beyond_ai::metrics::Metrics;
     use beyond_ai::state::GatewayState;
     use std::sync::{Arc, OnceLock};
 
     fn state() -> &'static Arc<GatewayState> {
         static S: OnceLock<Arc<GatewayState>> = OnceLock::new();
         S.get_or_init(|| {
-            static M: OnceLock<Arc<Metrics>> = OnceLock::new();
-            let m = M
-                .get_or_init(|| Metrics::new().expect("register metrics once"))
-                .clone();
-            GatewayState::new(AiConfig::default(), m).expect("build state")
+            GatewayState::new(AiConfig::default(), bench_metrics().clone()).expect("build state")
         })
     }
 
@@ -1053,5 +1059,273 @@ mod store_watch {
                 black_box(KvUpdate::Put(e));
             }
         });
+    }
+}
+
+/// Allowance check on every managed request, after verify (`proxy::request_filter`). Same hasher
+/// and same claim as `deny::reason`: O(1), 0-alloc, flat from an empty set to a large one. v2 pays
+/// two lookups (key, then tenant); v1 pays the tenant lookup only.
+mod allowance {
+    use super::*;
+    use beyond_ai::allowance::{AllowanceSet, AllowanceTarget};
+
+    /// `n` exhausted tenants and `n` exhausted keys. Built outside the timed closure.
+    fn populated(n: u64) -> AllowanceSet {
+        let mut set = AllowanceSet::from_ready();
+        for id in 0..n {
+            set.insert_target(AllowanceTarget::Tenant(id));
+            set.insert_target(AllowanceTarget::Key(id));
+        }
+        set
+    }
+
+    /// Steady state: ready, and neither id is exhausted. `Some(key_id)` is the v2 shape — both
+    /// maps are probed. Must stay 0-alloc and flat across set size.
+    #[divan::bench(args = [0, 1_000_000])]
+    fn reason_miss_v2(bencher: Bencher, n: u64) {
+        let set = populated(n);
+        bencher.bench(|| set.reason_for(black_box(n + 1), black_box(Some(n + 1))));
+    }
+
+    /// v1 token: no `key_id`, so only the tenant map is probed.
+    #[divan::bench(args = [0, 1_000_000])]
+    fn reason_miss_v1(bencher: Bencher, n: u64) {
+        let set = populated(n);
+        bencher.bench(|| set.reason_for(black_box(n + 1), black_box(None)));
+    }
+
+    /// The 402 branch. Same hash lookup as the miss — the rejection must not cost more.
+    #[divan::bench(args = [1, 1_000_000])]
+    fn reason_hit_key(bencher: Bencher, n: u64) {
+        let set = populated(n);
+        bencher.bench(|| set.reason_for(black_box(0), black_box(Some(n / 2))));
+    }
+}
+
+/// Catalog-walk ranker. Runs on every unpinned `/auto` or managed `/v1` request. The claim in
+/// `smart` is atomics only: no allocation and no lock, on either the reorder or the sample.
+mod smart_rank {
+    use super::*;
+    use beyond_ai::control::Walk;
+    use beyond_ai::smart::Router;
+    use providers::ModelRoute;
+
+    fn opus() -> &'static ModelRoute {
+        providers::for_model("claude-opus-4-8").expect("catalog row")
+    }
+
+    /// No samples yet: rank keeps catalog order. This is the first request of a process, and every
+    /// request until something has been observed.
+    #[divan::bench]
+    fn rank_unmeasured(bencher: Bencher) {
+        let router = Router::new();
+        let row = opus();
+        let walk = Walk::identity(row.candidates.len());
+        bencher.bench(|| router.rank(black_box(walk), black_box(row), black_box(1)));
+    }
+
+    /// Every candidate has an EWMA, so rank sorts. Still a handful of slots (`MAX_CANDIDATES`),
+    /// still no heap.
+    #[divan::bench]
+    fn rank_measured(bencher: Bencher) {
+        let router = Router::new();
+        let row = opus();
+        for (i, _) in row.candidates.iter().enumerate() {
+            router.observe(row, i as u8, 100_000 * (i as u64 + 1), true);
+        }
+        let walk = Walk::identity(row.candidates.len());
+        bencher.bench(|| router.rank(black_box(walk), black_box(row), black_box(1)));
+    }
+
+    /// One sample after a candidate answers. Once per attempt, not per chunk.
+    #[divan::bench]
+    fn observe(bencher: Bencher) {
+        let router = Router::new();
+        let row = opus();
+        bencher.bench(|| {
+            router.observe(
+                black_box(row),
+                black_box(0),
+                black_box(200_000),
+                black_box(true),
+            );
+        });
+    }
+}
+
+/// Exact-match response cache. Off unless `cache_ttl_secs > 0`. When it is on, every managed
+/// catalog walk fingerprints the pre-rewrite body and takes the process-wide mutex for `get` —
+/// a miss still pays both. The fingerprint hashes the body twice (two seeds → 128 bits).
+mod response_cache {
+    use super::*;
+    use std::sync::LazyLock;
+    use std::time::Duration;
+
+    use beyond_ai::cache::{self, CacheKey, CachedResponse, ResponseCache};
+    use beyond_ai::usage::Usage;
+    use bytes::Bytes;
+
+    fn entry(body: &[u8]) -> CachedResponse {
+        CachedResponse {
+            status: 200,
+            content_type: "application/json".into(),
+            body: Bytes::copy_from_slice(body),
+            usage: Usage::default(),
+            billed_model: "claude-opus-4-8".into(),
+            requested_model: "claude-opus-4-8".into(),
+            routed_model: Some("claude-opus-4-8"),
+            provider: "anthropic".into(),
+            streaming: false,
+        }
+    }
+
+    fn body_of(n: usize) -> Vec<u8> {
+        let content = "x".repeat(n);
+        format!(r#"{{"messages":[{{"role":"user","content":"{content}"}}],"model":"gpt-4o"}}"#)
+            .into_bytes()
+    }
+
+    /// The miss-path CPU that does not take the lock: two SipHash passes over the whole body.
+    /// Bytes-counter is the body once; the hasher walks it twice.
+    #[divan::bench(args = [0, 4 * 1024, 64 * 1024, 256 * 1024])]
+    fn fingerprint(bencher: Bencher, padding: usize) {
+        let body = body_of(padding);
+        bencher.counter(BytesCount::of_slice(&body)).bench(|| {
+            cache::key(
+                black_box(42),
+                black_box("/auto"),
+                black_box(&body),
+                black_box(&[1, 2, 3]),
+            )
+        });
+    }
+
+    fn fill(entries: usize) -> ResponseCache {
+        let cache = ResponseCache::new(Duration::from_secs(3600), entries.max(1) + 8, 64);
+        for i in 0..entries {
+            let body = (i as u64).to_le_bytes();
+            let key = cache::key(i as u64, "/auto", &body, &[1]);
+            cache.insert(key, entry(&body));
+        }
+        cache
+    }
+
+    /// Common case once the cache is on and traffic does not repeat: lock, probe, miss.
+    /// `entries` is 0 and the default cap (1024) so a scan-shaped lookup would show up as a gap.
+    #[divan::bench(args = [0, 1024])]
+    fn get_miss(bencher: Bencher, entries: usize) {
+        let cache = fill(entries);
+        let missing = cache::key(u64::MAX, "/auto", b"nope", &[9]);
+        bencher.bench(|| cache.get(black_box(&missing)));
+    }
+
+    /// Hit clones the stored response. The body is `Bytes` (refcount); the alloc column is the
+    /// four owned strings and must stay flat when the body grows from a few bytes to 64 KiB.
+    #[divan::bench(args = [16, 64 * 1024])]
+    fn get_hit(bencher: Bencher, body_len: usize) {
+        let body = vec![b'y'; body_len];
+        let cache = ResponseCache::new(Duration::from_secs(3600), 8, body_len.max(1));
+        let key = cache::key(7, "/auto", &body, &[1, 2]);
+        cache.insert(key, entry(&body));
+        bencher.bench(|| cache.get(black_box(&key)));
+    }
+
+    struct SharedHit {
+        cache: ResponseCache,
+        key: CacheKey,
+    }
+
+    fn shared_hit() -> &'static SharedHit {
+        static HIT: LazyLock<SharedHit> = LazyLock::new(|| {
+            let body: &[u8] = b"{\"ok\":true}";
+            let cache = ResponseCache::new(Duration::from_secs(3600), 8, 1024);
+            let key = cache::key(7, "/auto", body, &[1, 2]);
+            cache.insert(key, entry(body));
+            SharedHit { cache, key }
+        });
+        &HIT
+    }
+
+    /// Same hit from 1 and 16 threads. The cache is one `Mutex` for the whole process; this is
+    /// what a hot key costs once more than one worker is in `get` at once.
+    #[divan::bench(threads = [1, 16])]
+    fn get_hit_shared(bencher: Bencher) {
+        let hit = shared_hit();
+        bencher.bench(|| hit.cache.get(black_box(&hit.key)));
+    }
+}
+
+/// Cross-wire translation. Called only when the inbound endpoint and the candidate endpoint
+/// differ (`proxy` skips it on a same-wire walk). A full `serde_json` parse and rebuild of the
+/// body — once per request for JSON, once per SSE event for a stream. This is the CPU that can
+/// actually sit next to `key/verify`.
+mod translate {
+    use super::*;
+    use beyond_ai::route::Endpoint;
+    use beyond_ai::translate::{self, SseBridge};
+
+    fn chat_request(padding: usize) -> Vec<u8> {
+        let content = "x".repeat(padding);
+        format!(
+            r#"{{"model":"claude-opus-4-8","messages":[{{"role":"user","content":"{content}"}}],"tools":[{{"type":"function","function":{{"name":"get_weather","parameters":{{"type":"object","properties":{{}}}}}}}}]}}"#
+        )
+        .into_bytes()
+    }
+
+    fn anthropic_message(text_len: usize) -> Vec<u8> {
+        let text = "y".repeat(text_len);
+        format!(
+            r#"{{"id":"msg_1","type":"message","role":"assistant","model":"claude-opus-4-8","content":[{{"type":"text","text":"{text}"}}],"stop_reason":"end_turn","usage":{{"input_tokens":12,"output_tokens":34}}}}"#
+        )
+        .into_bytes()
+    }
+
+    /// OpenAI SDK → Claude, the agent path. Once, at end of the request body.
+    #[divan::bench(args = [0, 64 * 1024])]
+    fn request_chat_to_messages(bencher: Bencher, padding: usize) {
+        let body = chat_request(padding);
+        bencher.counter(BytesCount::of_slice(&body)).bench(|| {
+            translate::request(
+                black_box(Endpoint::ChatCompletions),
+                black_box(Endpoint::Messages),
+                black_box(&body),
+            )
+        });
+    }
+
+    /// Responses → Messages is two maps (Responses → Chat → Messages). Small body: the point is
+    /// the extra pass, not the payload.
+    #[divan::bench]
+    fn request_responses_to_messages(bencher: Bencher) {
+        let body = br#"{"model":"claude-opus-4-8","input":[{"role":"user","content":[{"type":"input_text","text":"hi"}]}],"max_output_tokens":16}"#;
+        bencher.bench(|| {
+            translate::request(
+                black_box(Endpoint::Responses),
+                black_box(Endpoint::Messages),
+                black_box(body),
+            )
+        });
+    }
+
+    /// Non-stream response, withheld until end-of-stream and mapped in one shot.
+    #[divan::bench(args = [16, 64 * 1024])]
+    fn response_messages_to_chat(bencher: Bencher, text_len: usize) {
+        let body = anthropic_message(text_len);
+        bencher.counter(BytesCount::of_slice(&body)).bench(|| {
+            translate::response_json(
+                black_box(Endpoint::Messages),
+                black_box(Endpoint::ChatCompletions),
+                black_box(&body),
+            )
+        });
+    }
+
+    /// One Anthropic `text_delta` rewritten into an OpenAI chat chunk. This is the per-token cost
+    /// of a translated stream; a completion pays it once per event, not once per request.
+    #[divan::bench]
+    fn sse_text_delta(bencher: Bencher) {
+        let event = b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hello\"}}\n\n";
+        let mut bridge = SseBridge::new(Endpoint::ChatCompletions, Endpoint::Messages);
+        bencher.bench_local(|| bridge.feed(black_box(event), false));
     }
 }

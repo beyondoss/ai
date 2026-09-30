@@ -71,7 +71,7 @@ cargo test -p beyond-ai-agent --test smoke -- --ignored --nocapture
 """
 
 [tasks."bench:unit"]
-description = "divan micro-benchmarks of the IO-free hot paths (key/peek/usage/route/deny): timing + native allocation counts."
+description = "divan micro-benchmarks of the IO-free hot paths (key/peek/usage/route/deny/allowance/cache/translate/rank): timing + native allocation counts."
 run = "cargo bench --bench unit"
 
 [tasks."bench:e2e"]
