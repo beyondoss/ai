@@ -2708,7 +2708,9 @@ impl ProxyHttp for AiProxy {
                     && let Some(to) = catalog_serving_endpoint(a.as_ref())
                     && t.client != to
                 {
-                    buf = translate::request(t.client, to, &buf);
+                    let upstream_model =
+                        a.candidate_at(a.candidate).map_or("", |c| c.upstream_model);
+                    buf = translate::request(t.client, to, &buf, upstream_model);
                 }
                 let scan = peek::scan_buffered(&buf);
                 if rc.model.is_empty()

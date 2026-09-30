@@ -1336,6 +1336,7 @@ mod translate {
                 black_box(Endpoint::ChatCompletions),
                 black_box(Endpoint::Messages),
                 black_box(&body),
+                black_box("claude-opus-4-8"),
             )
         });
     }
@@ -1350,6 +1351,7 @@ mod translate {
                 black_box(Endpoint::Responses),
                 black_box(Endpoint::Messages),
                 black_box(body),
+                black_box("claude-opus-4-8"),
             )
         });
     }

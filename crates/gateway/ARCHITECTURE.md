@@ -320,9 +320,31 @@ ways: base64 data URIs ↔ Anthropic `base64` sources, and `http(s)` URLs ↔ An
 each upstream downloads the URL itself. Amazon Bedrock rejects `url` sources, so a URL image that
 fails over onto a Bedrock candidate gets Bedrock's 400 rather than an answer about a picture the
 model never saw; the walk is chosen before the body is read, so it cannot skip Bedrock for these
-requests. `thinking` /
-`redacted_thinking` blocks, `cache_control`, and `reasoning_effort` (mapped to Anthropic
-`thinking`) pass both ways so an agent workload round-trips. Tools, text, and usage still
+requests. `thinking` / `redacted_thinking` blocks, `cache_control`,
+`parallel_tool_calls: false` ↔ `tool_choice.disable_parallel_tool_use`, and `user` ↔
+`metadata.user_id` pass both ways so an agent workload round-trips. Structured output maps
+`response_format` `json_schema` ↔ `output_config.format` ↔ Responses `text.format`; OpenAI JSON mode
+(`json_object`) has no schema to give Anthropic and is dropped (OpenAI already requires the prompt to
+ask for JSON). Inline PDFs map Chat `file` ↔ Anthropic base64 `document` ↔ Responses `input_file`.
+
+**Reasoning and sampling follow the upstream model.** `translate::request` takes the id this
+attempt's candidate receives and parses its Claude generation (`ClaudeGen`, any spelling:
+`claude-opus-4-8`, `anthropic/claude-opus-4.8`, Bedrock's `global.anthropic.…`). On 4.7 and later
+(and Fable, Mythos), `budget_tokens` and non-default `temperature` / `top_p` are 400s, so
+`reasoning_effort` becomes `thinking: {type: adaptive}` plus `output_config.effort`, "none" becomes an
+omitted `thinking` at effort `low` (several of these models reject `thinking: disabled`), and sampling
+is dropped. 4.6 is the same with `xhigh` → `max`. Before 4.6, and for non-Claude models behind a
+Messages-compatible API, effort becomes `budget_tokens` held below `max_tokens` (at most half, at
+least 1024, none at all when `max_tokens` ≤ 1024), and sampling is dropped only alongside thinking.
+Before this, an OpenAI SDK sending `reasoning_effort` or `temperature` to `claude-opus-4-8` got a
+400.
+
+**Unmappable input is forwarded, not dropped.** `input_audio`, a `file_id` or URL document, `n` > 1,
+`logprobs` and audio output have no equivalent on the other wire and change what the client gets
+back. Translation runs in `request_body_filter`, after the request headers went upstream, so the
+gateway cannot answer 400 itself; the field is passed through and the provider's 400 names it.
+Hints that change nothing about the response's shape (`seed`, penalties, `logit_bias`, `top_k`) are
+dropped. Tools, text, and usage still
 round-trip. Anthropic requires `max_tokens`; a missing OpenAI value becomes 4096. OpenAI→Anthropic
 does not inject `stream_options`. Anthropic→OpenAI injects `include_usage` on the translated
 Chat Completions body when streaming; Responses→Chat Completions does the same because injection

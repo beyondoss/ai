@@ -652,7 +652,9 @@ async fn openai_sdk_passes_cache_control_and_sees_thinking_on_the_stream() {
         .captured()
         .expect("translated request reaches Anthropic");
     let got: Value = serde_json::from_slice(&cap.body).unwrap();
-    assert_eq!(got["thinking"]["type"], "enabled", "{got}");
+    // Opus 4.8 rejects `budget_tokens`: adaptive thinking, effort in `output_config`.
+    assert_eq!(got["thinking"]["type"], "adaptive", "{got}");
+    assert_eq!(got["output_config"]["effort"], "high", "{got}");
     assert_eq!(
         got["messages"][0]["content"][0]["cache_control"]["type"], "ephemeral",
         "{got}"

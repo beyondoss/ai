@@ -7,22 +7,39 @@
 //! Responses ↔ Messages is composed through Chat Completions so thinking / `cache_control` /
 //! `reasoning_effort` keep the slice-1 mappings.
 //!
-//! v1 is allowed to be lossy on extras a stock SDK does not need for a tool loop:
-//! - **Dropped:** Responses-only fields (`store`, `previous_response_id`, `include`, `truncation`,
-//!   `text` format, …) when leaving Responses; `stream_options` on a Responses or Anthropic body.
-//!   Same-endpoint Responses is a byte relay: those session fields pass through.
+//! What crosses, and how:
+//! - **Dropped:** Responses-only session fields (`store`, `previous_response_id`, `include`,
+//!   `truncation`, …) when leaving Responses; `stream_options` on a Responses or Anthropic body.
+//!   Same-endpoint Responses is a byte relay: those session fields pass through. Hints with no
+//!   equivalent and no effect on the response's shape (`seed`, penalties, `logit_bias`, `top_k`)
+//!   are dropped, as is OpenAI JSON mode (`json_object`): Anthropic's format needs a schema, and
+//!   OpenAI already requires a JSON-mode prompt to ask for JSON.
+//! - **Forwarded for the provider to reject:** input and options that change what the client gets
+//!   back and have no equivalent on the target (`input_audio`, a `file_id` or URL document, `n` > 1,
+//!   `logprobs`, audio output). Translation runs after the request headers went upstream, so the
+//!   gateway cannot 400 here; passing the field through gets the provider's 400 naming it, instead
+//!   of an answer about input the model never saw.
 //! - **Images, both ways:** base64 data-URI images convert to Anthropic `base64` sources and back;
 //!   `http(s)` image URLs become Anthropic `url` sources and back, and pass through between Chat
 //!   Completions and Responses. Nothing is fetched: every one of those upstreams downloads the URL
 //!   itself. Amazon Bedrock is the exception — it rejects `url` sources — so a URL image that fails
 //!   over onto a Bedrock candidate gets Bedrock's 400 rather than a silently image-less answer.
+//! - **PDFs, both ways:** a Chat Completions `file` part with inline `file_data` ↔ an Anthropic
+//!   base64 `document` ↔ a Responses `input_file`.
+//! - **Structured output, both ways:** `response_format` `json_schema` ↔ Anthropic
+//!   `output_config.format` ↔ Responses `text.format`.
 //! - **Passed both ways:** `thinking` / `redacted_thinking` blocks, `cache_control` on tools and
-//!   content, `reasoning_effort` ↔ Anthropic `thinking`. These are what an agent workload sends.
+//!   content, `parallel_tool_calls: false` ↔ `tool_choice.disable_parallel_tool_use`, `user` ↔
+//!   `metadata.user_id`.
+//! - **Model-aware onto Messages** (see `ClaudeGen`): `reasoning_effort` becomes adaptive
+//!   thinking plus `output_config.effort` on Claude 4.6 and later, and a `budget_tokens` below
+//!   `max_tokens` before that. `temperature` / `top_p` are dropped where the model rejects them
+//!   (4.7 and later, and anything with thinking on).
 //! - **Added onto Messages:** default `cache_control` breakpoints when the client set none (see
 //!   `auto_cache_breakpoints`). An OpenAI SDK never marks anything, and without a marker Anthropic
 //!   caches nothing.
-//! - **Required mapping:** system/messages/`input`, `max_tokens`/`max_output_tokens`, temperature,
-//!   stop, stream, tools, `tool_choice`, text + tool_use/tool_result, usage. Anthropic requires
+//! - **Required mapping:** system/messages/`input`, `max_tokens`/`max_output_tokens`, stop,
+//!   stream, tools, `tool_choice`, text + tool_use/tool_result, usage. Anthropic requires
 //!   `max_tokens`; a missing OpenAI value becomes 4096.
 //!
 //! Usage/billing parse the **upstream** body. This module only reshapes bytes the client sees.
@@ -72,10 +89,13 @@ impl TranslateState {
 
 /// Map a buffered request body from `from` (inbound) to `to` (upstream endpoint).
 ///
+/// `upstream_model` is the id this attempt's candidate will receive. Onto Messages it decides
+/// which reasoning and sampling controls the Claude model accepts (see `ClaudeGen`).
+///
 /// Unparseable JSON is returned unchanged so the provider 400s rather than us 502ing after
 /// headers have already gone upstream. The candidate `model` id is spliced by the caller
 /// **after** this returns.
-pub fn request(from: Endpoint, to: Endpoint, body: &[u8]) -> Vec<u8> {
+pub fn request(from: Endpoint, to: Endpoint, body: &[u8], upstream_model: &str) -> Vec<u8> {
     if from == to {
         return body.to_vec();
     }
@@ -85,17 +105,17 @@ pub fn request(from: Endpoint, to: Endpoint, body: &[u8]) -> Vec<u8> {
     if !v.is_object() {
         return body.to_vec();
     }
-    encode(&map_request(from, to, &v))
+    encode(&map_request(from, to, &v, ClaudeGen::of(upstream_model)))
 }
 
-fn map_request(from: Endpoint, to: Endpoint, v: &Value) -> Value {
+fn map_request(from: Endpoint, to: Endpoint, v: &Value, claude: ClaudeGen) -> Value {
     match (from, to) {
-        (Endpoint::ChatCompletions, Endpoint::Messages) => openai_req_to_anthropic(v),
+        (Endpoint::ChatCompletions, Endpoint::Messages) => openai_req_to_anthropic(v, claude),
         (Endpoint::Messages, Endpoint::ChatCompletions) => anthropic_req_to_openai(v),
         (Endpoint::Responses, Endpoint::ChatCompletions) => responses_req_to_openai(v),
         (Endpoint::ChatCompletions, Endpoint::Responses) => openai_req_to_responses(v),
         (Endpoint::Responses, Endpoint::Messages) => {
-            openai_req_to_anthropic(&responses_req_to_openai(v))
+            openai_req_to_anthropic(&responses_req_to_openai(v), claude)
         }
         (Endpoint::Messages, Endpoint::Responses) => {
             openai_req_to_responses(&anthropic_req_to_openai(v))
@@ -186,17 +206,51 @@ fn extract_error(v: &Value) -> (String, String) {
 
 // --- request: OpenAI → Anthropic --------------------------------------------
 
-fn openai_req_to_anthropic(v: &Value) -> Value {
+fn openai_req_to_anthropic(v: &Value, claude: ClaudeGen) -> Value {
     let mut out = Map::new();
     copy_if(&mut out, v, "model");
-    if let Some(t) = max_tokens_of(v) {
-        out.insert("max_tokens".into(), json!(t));
-    } else {
-        out.insert("max_tokens".into(), json!(DEFAULT_MAX_TOKENS));
+    let max_tokens = max_tokens_of(v).unwrap_or(DEFAULT_MAX_TOKENS);
+    out.insert("max_tokens".into(), json!(max_tokens));
+    openai_reasoning_to_anthropic(v, &mut out, claude, max_tokens);
+    // Current Claude models 400 on non-default sampling, and every model 400s on it alongside
+    // thinking. OpenAI clients send `temperature` by habit; it is a hint, so it goes.
+    let thinking_on = out
+        .get("thinking")
+        .and_then(|t| t.get("type"))
+        .and_then(Value::as_str)
+        .is_some_and(|t| t != "disabled");
+    if claude != ClaudeGen::Adaptive && !thinking_on {
+        copy_if(&mut out, v, "temperature");
+        copy_if(&mut out, v, "top_p");
     }
-    copy_if(&mut out, v, "temperature");
-    copy_if(&mut out, v, "top_p");
     copy_if(&mut out, v, "stream");
+    if let Some(format) = openai_format_to_anthropic(v.get("response_format")) {
+        set_output_config(&mut out, "format", format);
+    }
+    if let Some(user) = v
+        .get("user")
+        .or_else(|| v.get("safety_identifier"))
+        .filter(|u| u.is_string())
+    {
+        out.insert("metadata".into(), json!({ "user_id": user }));
+    }
+    // No Anthropic equivalent, and each changes what the client gets back. Forwarded verbatim so
+    // the provider rejects them by name; dropping them would answer a different question.
+    for key in ["audio", "web_search_options", "top_logprobs"] {
+        copy_if(&mut out, v, key);
+    }
+    if v.get("n").and_then(Value::as_u64).is_some_and(|n| n > 1) {
+        copy_if(&mut out, v, "n");
+    }
+    if v.get("logprobs").and_then(Value::as_bool) == Some(true) {
+        copy_if(&mut out, v, "logprobs");
+    }
+    if v.get("modalities")
+        .and_then(Value::as_array)
+        .is_some_and(|m| m.iter().any(|x| x != "text"))
+    {
+        copy_if(&mut out, v, "modalities");
+    }
     if let Some(stop) = v.get("stop") {
         match stop {
             Value::String(s) => {
@@ -220,7 +274,18 @@ fn openai_req_to_anthropic(v: &Value) -> Value {
             openai_tool_choice_to_anthropic(choice),
         );
     }
-    openai_reasoning_to_anthropic(v, &mut out);
+    if v.get("parallel_tool_calls").and_then(Value::as_bool) == Some(false)
+        && out.contains_key("tools")
+    {
+        let choice = out
+            .entry("tool_choice")
+            .or_insert_with(|| json!({ "type": "auto" }));
+        if choice.get("type").and_then(Value::as_str) != Some("none")
+            && let Some(obj) = choice.as_object_mut()
+        {
+            obj.insert("disable_parallel_tool_use".into(), json!(true));
+        }
+    }
 
     let mut system_parts: Vec<Value> = Vec::new();
     let mut messages: Vec<Value> = Vec::new();
@@ -426,30 +491,151 @@ fn openai_tool_to_anthropic(t: &Value) -> Option<Value> {
     Some(Value::Object(m))
 }
 
-fn openai_reasoning_to_anthropic(v: &Value, out: &mut Map<String, Value>) {
+/// Which reasoning and sampling controls a Claude model accepts. Decided from the id the candidate
+/// will receive, because the same OpenAI `reasoning_effort` must become different requests: the
+/// old `thinking.budget_tokens` shape is a 400 on every current model, and adaptive thinking is a
+/// 400 before 4.6.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ClaudeGen {
+    /// Claude 3.x through 4.5, and non-Claude models behind a Messages-compatible API:
+    /// `thinking: {type: enabled, budget_tokens}` (less than `max_tokens`), sampling allowed
+    /// without thinking.
+    Budget,
+    /// Claude 4.6: adaptive thinking with `output_config.effort` `low`..`max` (no `xhigh`),
+    /// sampling allowed without thinking.
+    Adaptive46,
+    /// Claude 4.7 and later, Fable, Mythos: adaptive thinking and effort (`xhigh` included).
+    /// `budget_tokens` and non-default `temperature` / `top_p` are 400s, and several reject
+    /// `thinking: disabled`, so "no reasoning" is an omitted `thinking` at effort `low`.
+    Adaptive,
+}
+
+impl ClaudeGen {
+    /// Parse the generation out of any spelling a candidate uses: `claude-opus-4-8`,
+    /// OpenRouter's `anthropic/claude-opus-4.8`, Bedrock's `global.anthropic.claude-haiku-4-5-…`.
+    /// A dated suffix (`claude-sonnet-4-20250514`) is not a minor version. An unrecognized Claude
+    /// family is assumed current; a model that is not Claude at all keeps the long-standing
+    /// `budget_tokens` shape, which is what Messages-compatible APIs implement.
+    pub(crate) fn of(model: &str) -> Self {
+        let Some(at) = model.find("claude-") else {
+            return Self::Budget;
+        };
+        let mut parts = model[at + "claude-".len()..].split(['-', '.']);
+        let family = parts.next().unwrap_or("");
+        if family.starts_with(|c: char| c.is_ascii_digit()) {
+            return Self::Budget;
+        }
+        if !matches!(family, "opus" | "sonnet" | "haiku") {
+            return Self::Adaptive;
+        }
+        let Some(major) = parts.next().and_then(|p| p.parse::<u32>().ok()) else {
+            return Self::Adaptive;
+        };
+        let minor = parts
+            .next()
+            .filter(|p| p.len() <= 2)
+            .and_then(|p| p.parse::<u32>().ok())
+            .unwrap_or(0);
+        match (major, minor) {
+            (5.., _) | (4, 7..) => Self::Adaptive,
+            (4, 6) => Self::Adaptive46,
+            _ => Self::Budget,
+        }
+    }
+}
+
+fn openai_reasoning_to_anthropic(
+    v: &Value,
+    out: &mut Map<String, Value>,
+    claude: ClaudeGen,
+    max_tokens: u64,
+) {
     // An already-Anthropic `thinking` object wins over `reasoning_effort` so a round-trip that
     // kept the native shape is not re-bucketed.
     if let Some(t) = v.get("thinking").filter(|t| t.is_object()) {
         out.insert("thinking".into(), t.clone());
         return;
     }
-    let effort = v
+    let Some(effort) = v
         .get("reasoning_effort")
         .and_then(Value::as_str)
-        .or_else(|| v.pointer("/reasoning/effort").and_then(Value::as_str));
-    if let Some(effort) = effort {
-        out.insert("thinking".into(), thinking_from_effort(effort));
+        .or_else(|| v.pointer("/reasoning/effort").and_then(Value::as_str))
+    else {
+        return;
+    };
+    let off = matches!(effort, "none" | "off" | "disabled");
+    match claude {
+        ClaudeGen::Budget => {
+            if off {
+                out.insert("thinking".into(), json!({ "type": "disabled" }));
+                return;
+            }
+            // `budget_tokens` must be at least 1024 and below `max_tokens`, which also has to hold
+            // the answer. Leave the answer at least half; too small a request thinks not at all.
+            if max_tokens <= MIN_THINKING_BUDGET {
+                return;
+            }
+            let budget = budget_for_effort(effort)
+                .min(max_tokens / 2)
+                .clamp(MIN_THINKING_BUDGET, max_tokens - 1);
+            out.insert(
+                "thinking".into(),
+                json!({ "type": "enabled", "budget_tokens": budget }),
+            );
+        }
+        ClaudeGen::Adaptive46 | ClaudeGen::Adaptive => {
+            let level = match effort_alias(effort) {
+                "none" => "low",
+                "xhigh" if claude == ClaudeGen::Adaptive46 => "max",
+                "xhigh" if effort == "max" => "max",
+                other => other,
+            };
+            if !off {
+                out.insert("thinking".into(), json!({ "type": "adaptive" }));
+            }
+            set_output_config(out, "effort", json!(level));
+        }
     }
 }
 
-fn thinking_from_effort(effort: &str) -> Value {
-    match effort {
-        "none" | "off" | "disabled" => json!({ "type": "disabled" }),
-        _ => json!({
-            "type": "enabled",
-            "budget_tokens": budget_for_effort(effort),
-        }),
+/// Anthropic's floor for `thinking.budget_tokens`.
+const MIN_THINKING_BUDGET: u64 = 1024;
+
+/// Set one field of the request's `output_config` (effort, structured-output format).
+fn set_output_config(out: &mut Map<String, Value>, key: &str, value: Value) {
+    if let Some(Value::Object(m)) = out.get_mut("output_config") {
+        m.insert(key.into(), value);
+        return;
     }
+    let mut m = Map::new();
+    m.insert(key.into(), value);
+    out.insert("output_config".into(), Value::Object(m));
+}
+
+/// OpenAI `response_format` → Anthropic `output_config.format`. Only `json_schema` has an
+/// equivalent. `json_object` (JSON mode, no schema) has none: Anthropic's format needs a schema,
+/// and OpenAI already requires a JSON-mode prompt to ask for JSON, so it is dropped. `text` is the
+/// default.
+fn openai_format_to_anthropic(rf: Option<&Value>) -> Option<Value> {
+    let rf = rf?;
+    if rf.get("type").and_then(Value::as_str) != Some("json_schema") {
+        return None;
+    }
+    let schema = rf.pointer("/json_schema/schema")?;
+    Some(json!({ "type": "json_schema", "schema": schema }))
+}
+
+/// Anthropic `output_config.format` → OpenAI `response_format`.
+fn anthropic_format_to_openai(v: &Value) -> Option<Value> {
+    let format = v.pointer("/output_config/format")?;
+    if format.get("type").and_then(Value::as_str) != Some("json_schema") {
+        return None;
+    }
+    let schema = format.get("schema")?;
+    Some(json!({
+        "type": "json_schema",
+        "json_schema": { "name": "response", "strict": true, "schema": schema },
+    }))
 }
 
 fn budget_for_effort(effort: &str) -> u64 {
@@ -707,9 +893,21 @@ fn openai_user_content(m: &Value) -> Value {
                             blocks.push(b);
                         }
                     }
+                    Some("file") => {
+                        let mut b = openai_file_to_anthropic(p);
+                        if let Some(obj) = b.as_object_mut() {
+                            copy_cache_control(obj, p);
+                        }
+                        blocks.push(b);
+                    }
                     _ => {
                         if let Some(t) = p.get("text").and_then(Value::as_str) {
                             blocks.push(text_block(t, p.get("cache_control").or(msg_cc)));
+                        } else {
+                            // `input_audio` and anything else without text: no Messages
+                            // equivalent. Forwarded so the provider rejects it by name; dropping it
+                            // would get an answer about input the model never saw.
+                            blocks.push(p.clone());
                         }
                     }
                 }
@@ -730,6 +928,32 @@ fn openai_user_content(m: &Value) -> Value {
         }
         _ => Value::String(String::new()),
     }
+}
+
+/// Chat Completions `file` part → Anthropic `document`. Inline data (`file_data`, a data URI) maps
+/// to a base64 source. A `file_id` names an OpenAI Files upload Anthropic cannot read, so the part
+/// is forwarded as-is for the provider to reject by name.
+fn openai_file_to_anthropic(part: &Value) -> Value {
+    let file = part.get("file");
+    let Some((media_type, data)) = file
+        .and_then(|f| f.get("file_data"))
+        .and_then(Value::as_str)
+        .and_then(parse_data_uri)
+    else {
+        return part.clone();
+    };
+    let mut doc = json!({
+        "type": "document",
+        "source": { "type": "base64", "media_type": media_type, "data": data },
+    });
+    if let Some(name) = file
+        .and_then(|f| f.get("filename"))
+        .filter(|n| n.is_string())
+        && let Some(obj) = doc.as_object_mut()
+    {
+        obj.insert("title".into(), name.clone());
+    }
+    doc
 }
 
 fn openai_image_to_anthropic(part: &Value) -> Option<Value> {
@@ -834,7 +1058,7 @@ fn previous_response_id_set(v: &Value) -> bool {
 /// `messages`. Used when a `store: false` one-shot is allowed to leave the Responses endpoint.
 /// Same-endpoint Responses must not call this — those fields pass through as a byte relay.
 pub fn responses_to_chat(body: &[u8]) -> Vec<u8> {
-    request(Endpoint::Responses, Endpoint::ChatCompletions, body)
+    request(Endpoint::Responses, Endpoint::ChatCompletions, body, "")
 }
 
 // --- request: Anthropic → OpenAI --------------------------------------------
@@ -863,10 +1087,26 @@ fn anthropic_req_to_openai(v: &Value) -> Value {
             anthropic_tool_choice_to_openai(choice),
         );
     }
-    if let Some(t) = v.get("thinking")
-        && let Some(effort) = effort_from_thinking(t)
-    {
+    // Anthropic's effort lives in `output_config.effort`; `thinking` alone implies one.
+    let effort = v
+        .pointer("/output_config/effort")
+        .and_then(Value::as_str)
+        .map(effort_alias)
+        .or_else(|| v.get("thinking").and_then(effort_from_thinking));
+    if let Some(effort) = effort {
         out.insert("reasoning_effort".into(), json!(effort));
+    }
+    if let Some(format) = anthropic_format_to_openai(v) {
+        out.insert("response_format".into(), format);
+    }
+    if v.pointer("/tool_choice/disable_parallel_tool_use")
+        .and_then(Value::as_bool)
+        == Some(true)
+    {
+        out.insert("parallel_tool_calls".into(), json!(false));
+    }
+    if let Some(user) = v.pointer("/metadata/user_id").filter(|u| u.is_string()) {
+        out.insert("user".into(), user.clone());
     }
 
     let mut messages: Vec<Value> = Vec::new();
@@ -1095,6 +1335,7 @@ fn anthropic_user_to_openai(m: &Value) -> Vec<Value> {
                             user_parts.push(text_block(t, b.get("cache_control")));
                         }
                     }
+                    Some("document") => user_parts.push(anthropic_document_to_openai(b)),
                     _ => {}
                 }
             }
@@ -1105,6 +1346,36 @@ fn anthropic_user_to_openai(m: &Value) -> Vec<Value> {
             out
         }
         _ => vec![json!({ "role": "user", "content": "" })],
+    }
+}
+
+/// Anthropic `document` → a Chat Completions part. A base64 PDF becomes a `file` part with a data
+/// URI and a plain-text document becomes text. A URL or Files-API document has no Chat Completions
+/// equivalent and is forwarded as-is, so the provider rejects it by name instead of the model
+/// answering without it.
+fn anthropic_document_to_openai(b: &Value) -> Value {
+    let src = b.get("source");
+    let kind = src.and_then(|s| s.get("type")).and_then(Value::as_str);
+    let media = src
+        .and_then(|s| s.get("media_type"))
+        .and_then(Value::as_str);
+    let data = src.and_then(|s| s.get("data")).and_then(Value::as_str);
+    match (kind, media, data) {
+        (Some("base64"), Some(media), Some(data)) => {
+            let filename = b
+                .get("title")
+                .and_then(Value::as_str)
+                .unwrap_or("document.pdf");
+            json!({
+                "type": "file",
+                "file": {
+                    "filename": filename,
+                    "file_data": format!("data:{media};base64,{data}"),
+                }
+            })
+        }
+        (Some("text"), _, Some(text)) => json!({ "type": "text", "text": text }),
+        _ => b.clone(),
     }
 }
 
@@ -1327,6 +1598,26 @@ fn responses_req_to_openai(v: &Value) -> Value {
     if let Some(choice) = v.get("tool_choice") {
         out.insert("tool_choice".into(), choice.clone());
     }
+    for key in ["parallel_tool_calls", "user", "safety_identifier"] {
+        copy_if(&mut out, v, key);
+    }
+    // Responses nests the output format under `text.format` and flattens `json_schema`.
+    if let Some(format) = v.pointer("/text/format") {
+        let rf = match format.get("type").and_then(Value::as_str) {
+            Some("json_schema") => {
+                let mut js = Map::new();
+                for key in ["name", "schema", "strict", "description"] {
+                    copy_if(&mut js, format, key);
+                }
+                Some(json!({ "type": "json_schema", "json_schema": js }))
+            }
+            Some("json_object") => Some(json!({ "type": "json_object" })),
+            _ => None,
+        };
+        if let Some(rf) = rf {
+            out.insert("response_format".into(), rf);
+        }
+    }
 
     let mut messages: Vec<Value> = Vec::new();
     if let Some(instr) = v.get("instructions") {
@@ -1366,6 +1657,28 @@ fn openai_req_to_responses(v: &Value) -> Value {
     }
     if let Some(choice) = v.get("tool_choice") {
         out.insert("tool_choice".into(), choice.clone());
+    }
+    for key in ["parallel_tool_calls", "user", "safety_identifier"] {
+        copy_if(&mut out, v, key);
+    }
+    if let Some(rf) = v.get("response_format") {
+        let format = match rf.get("type").and_then(Value::as_str) {
+            Some("json_schema") => {
+                let mut f = Map::new();
+                f.insert("type".into(), json!("json_schema"));
+                if let Some(js) = rf.get("json_schema") {
+                    for key in ["name", "schema", "strict", "description"] {
+                        copy_if(&mut f, js, key);
+                    }
+                }
+                Some(Value::Object(f))
+            }
+            Some("json_object") => Some(json!({ "type": "json_object" })),
+            _ => None,
+        };
+        if let Some(format) = format {
+            out.insert("text".into(), json!({ "format": format }));
+        }
     }
 
     let mut instructions: Vec<Value> = Vec::new();
@@ -1588,6 +1901,13 @@ fn responses_part_to_openai(part: &Value) -> Option<Value> {
             }
             Some(m)
         }
+        "input_file" => {
+            let mut file = Map::new();
+            for key in ["file_data", "file_id", "filename"] {
+                copy_if(&mut file, part, key);
+            }
+            Some(json!({ "type": "file", "file": file }))
+        }
         "thinking" | "redacted_thinking" => Some(part.clone()),
         _ => None,
     }
@@ -1633,6 +1953,16 @@ fn openai_part_to_responses(part: &Value, text_type: &str) -> Option<Value> {
                 copy_cache_control(obj, part);
             }
             Some(m)
+        }
+        Some("file") => {
+            let mut m = Map::new();
+            m.insert("type".into(), json!("input_file"));
+            if let Some(file) = part.get("file") {
+                for key in ["file_data", "file_id", "filename"] {
+                    copy_if(&mut m, file, key);
+                }
+            }
+            Some(Value::Object(m))
         }
         Some("thinking") | Some("redacted_thinking") => Some(part.clone()),
         _ => part
@@ -2799,6 +3129,9 @@ fn value_string(v: &Value) -> String {
 mod tests {
     use super::*;
 
+    /// A current (adaptive-generation) Claude id, what most catalog walks land on.
+    const OPUS: &str = "claude-opus-4-8";
+
     #[test]
     fn json_buffer_refuses_past_the_cap_and_keeps_what_it_has() {
         let mut t = TranslateState::new(Endpoint::ChatCompletions);
@@ -2886,6 +3219,7 @@ mod tests {
             Endpoint::ChatCompletions,
             Endpoint::Messages,
             &serde_json::to_vec(body).unwrap(),
+            OPUS,
         );
         serde_json::from_slice(&out).unwrap()
     }
@@ -3026,6 +3360,7 @@ mod tests {
             Endpoint::Responses,
             Endpoint::Messages,
             &serde_json::to_vec(&body).unwrap(),
+            OPUS,
         );
         let v: Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(v["system"][0]["cache_control"]["type"], "ephemeral", "{v}");
@@ -3034,7 +3369,7 @@ mod tests {
     #[test]
     fn openai_request_maps_system_tools_and_drops_stream_options() {
         let body = serde_json::to_vec(&oai_req()).unwrap();
-        let out = request(Endpoint::ChatCompletions, Endpoint::Messages, &body);
+        let out = request(Endpoint::ChatCompletions, Endpoint::Messages, &body, OPUS);
         let v: Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(v["system"][0]["text"], "be brief");
         assert_eq!(v["max_tokens"], 16);
@@ -3058,12 +3393,12 @@ mod tests {
         let body = serde_json::to_vec(&oai_req()).unwrap();
         for from in [Endpoint::ChatCompletions, Endpoint::Messages] {
             let src = if from == Endpoint::Messages {
-                request(Endpoint::ChatCompletions, Endpoint::Messages, &body)
+                request(Endpoint::ChatCompletions, Endpoint::Messages, &body, OPUS)
             } else {
                 body.clone()
             };
             let v: Value =
-                serde_json::from_slice(&request(from, Endpoint::Responses, &src)).unwrap();
+                serde_json::from_slice(&request(from, Endpoint::Responses, &src, OPUS)).unwrap();
             let tool = &v["tools"][0];
             assert_eq!(tool["name"], "get_weather", "{from:?}: {v}");
             assert_eq!(tool["description"], "weather", "{from:?}: {v}");
@@ -3078,6 +3413,7 @@ mod tests {
             Endpoint::ChatCompletions,
             Endpoint::Messages,
             body,
+            OPUS,
         ))
         .unwrap();
         assert_eq!(v["max_tokens"], DEFAULT_MAX_TOKENS);
@@ -3106,6 +3442,7 @@ mod tests {
             Endpoint::ChatCompletions,
             Endpoint::Messages,
             &serde_json::to_vec(&oai).unwrap(),
+            OPUS,
         );
         let anth: Value = serde_json::from_slice(&anth_bytes).unwrap();
         assert_eq!(anth["messages"][1]["role"], "assistant");
@@ -3115,7 +3452,12 @@ mod tests {
         assert_eq!(anth["messages"][2]["content"][0]["type"], "tool_result");
         assert_eq!(anth["messages"][2]["content"][0]["tool_use_id"], "call_1");
 
-        let back_bytes = request(Endpoint::Messages, Endpoint::ChatCompletions, &anth_bytes);
+        let back_bytes = request(
+            Endpoint::Messages,
+            Endpoint::ChatCompletions,
+            &anth_bytes,
+            OPUS,
+        );
         let back: Value = serde_json::from_slice(&back_bytes).unwrap();
         assert_eq!(back["messages"][1]["tool_calls"][0]["id"], "call_1");
         assert_eq!(back["messages"][2]["role"], "tool");
@@ -3131,6 +3473,7 @@ mod tests {
             Endpoint::Messages,
             Endpoint::ChatCompletions,
             body,
+            OPUS,
         ))
         .unwrap();
         assert_eq!(v["stream"], true);
@@ -3243,7 +3586,12 @@ mod tests {
     fn same_wire_is_a_byte_copy() {
         let body = br#"{"model":"x"}"#;
         assert_eq!(
-            request(Endpoint::ChatCompletions, Endpoint::ChatCompletions, body),
+            request(
+                Endpoint::ChatCompletions,
+                Endpoint::ChatCompletions,
+                body,
+                OPUS
+            ),
             body
         );
         assert_eq!(
@@ -3442,10 +3790,13 @@ mod tests {
             Endpoint::ChatCompletions,
             Endpoint::Messages,
             &serde_json::to_vec(&oai).unwrap(),
+            OPUS,
         ))
         .unwrap();
-        assert_eq!(v["thinking"]["type"], "enabled");
-        assert_eq!(v["thinking"]["budget_tokens"], 8192);
+        // Opus 4.8 rejects `budget_tokens`: effort goes to `output_config`.
+        assert_eq!(v["thinking"]["type"], "adaptive");
+        assert_eq!(v["output_config"]["effort"], "high");
+        assert!(v["thinking"].get("budget_tokens").is_none(), "{v}");
         assert_eq!(
             v["messages"][0]["content"][0]["cache_control"]["type"],
             "ephemeral"
@@ -3473,6 +3824,7 @@ mod tests {
             Endpoint::Messages,
             Endpoint::ChatCompletions,
             &serde_json::to_vec(&anth).unwrap(),
+            OPUS,
         ))
         .unwrap();
         assert_eq!(v["reasoning_effort"], "low");
@@ -3497,6 +3849,7 @@ mod tests {
             Endpoint::Messages,
             Endpoint::ChatCompletions,
             &serde_json::to_vec(&anth).unwrap(),
+            OPUS,
         ))
         .unwrap();
         assert_eq!(oai["messages"][0]["content"], "hi");
@@ -3511,6 +3864,7 @@ mod tests {
             Endpoint::ChatCompletions,
             Endpoint::Messages,
             &serde_json::to_vec(&oai).unwrap(),
+            OPUS,
         ))
         .unwrap();
         let content = &back["messages"][0]["content"];
@@ -3538,6 +3892,7 @@ mod tests {
             Endpoint::ChatCompletions,
             Endpoint::Messages,
             &serde_json::to_vec(&oai).unwrap(),
+            OPUS,
         ))
         .unwrap();
         let content = &v["messages"][0]["content"];
@@ -3564,6 +3919,7 @@ mod tests {
             Endpoint::Messages,
             Endpoint::ChatCompletions,
             &serde_json::to_vec(&msg).unwrap(),
+            OPUS,
         ))
         .unwrap();
         let content = &v["messages"][0]["content"];
@@ -3591,6 +3947,7 @@ mod tests {
             Endpoint::Messages,
             Endpoint::ChatCompletions,
             &serde_json::to_vec(&msg).unwrap(),
+            OPUS,
         ))
         .unwrap();
         assert_eq!(v["messages"][0]["content"], "see");
@@ -3613,6 +3970,7 @@ mod tests {
             Endpoint::Responses,
             Endpoint::ChatCompletions,
             &serde_json::to_vec(&resp).unwrap(),
+            OPUS,
         ))
         .unwrap();
         let content = &chat["messages"][0]["content"];
@@ -3623,6 +3981,7 @@ mod tests {
             Endpoint::ChatCompletions,
             Endpoint::Responses,
             &serde_json::to_vec(&chat).unwrap(),
+            OPUS,
         ))
         .unwrap();
         let content = &back["input"][0]["content"];
@@ -3634,6 +3993,7 @@ mod tests {
             Endpoint::Responses,
             Endpoint::Messages,
             &serde_json::to_vec(&resp).unwrap(),
+            OPUS,
         ))
         .unwrap();
         let content = &msgs["messages"][0]["content"];
@@ -3733,6 +4093,7 @@ mod tests {
             Endpoint::Responses,
             Endpoint::ChatCompletions,
             &serde_json::to_vec(&stock_responses("gpt-4o-mini")).unwrap(),
+            OPUS,
         ))
         .unwrap();
         assert_eq!(v["messages"][0]["role"], "user");
@@ -3751,12 +4112,13 @@ mod tests {
             Endpoint::Responses,
             Endpoint::Messages,
             &serde_json::to_vec(&stock_responses("claude-opus-4-8")).unwrap(),
+            OPUS,
         ))
         .unwrap();
         assert_eq!(v["messages"][0]["role"], "user");
         assert_eq!(v["messages"][0]["content"], "hi");
         assert_eq!(v["max_tokens"], 16);
-        assert_eq!(v["thinking"]["type"], "enabled");
+        assert_eq!(v["thinking"]["type"], "adaptive");
         assert!(v.get("store").is_none(), "{v}");
         assert!(v.get("input").is_none(), "{v}");
     }
@@ -3823,5 +4185,322 @@ mod tests {
         assert_eq!(resp["usage"]["input_tokens"], 11);
         assert_eq!(resp["usage"]["output_tokens"], 7);
         assert!(resp.get("choices").is_none(), "{resp}");
+    }
+
+    // ---- Model-aware reasoning and sampling ----
+
+    #[test]
+    fn claude_generation_parses_every_candidate_spelling() {
+        use ClaudeGen::*;
+        for (id, want) in [
+            ("claude-opus-4-8", Adaptive),
+            ("anthropic/claude-opus-4.8", Adaptive),
+            ("global.anthropic.claude-opus-4-7-v1:0", Adaptive),
+            ("claude-opus-5-5", Adaptive),
+            ("claude-sonnet-5", Adaptive),
+            ("claude-fable-5-1", Adaptive),
+            ("claude-opus-4-6", Adaptive46),
+            ("claude-sonnet-4-6", Adaptive46),
+            ("claude-haiku-4-5", Budget),
+            ("anthropic.claude-haiku-4-5-20251001-v1:0", Budget),
+            ("claude-sonnet-4-20250514", Budget),
+            ("claude-opus-4-1", Budget),
+            ("claude-3-haiku", Budget),
+            ("claude-3-5-sonnet-latest", Budget),
+            ("kimi-k3", Budget),
+            ("", Budget),
+        ] {
+            assert_eq!(ClaudeGen::of(id), want, "{id}");
+        }
+    }
+
+    fn chat(extra: Value) -> Value {
+        let mut req = json!({
+            "model": "m",
+            "max_tokens": 16000,
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        if let (Some(r), Some(e)) = (req.as_object_mut(), extra.as_object()) {
+            for (k, v) in e {
+                r.insert(k.clone(), v.clone());
+            }
+        }
+        req
+    }
+
+    fn to_claude(body: &Value, model: &str) -> Value {
+        serde_json::from_slice(&request(
+            Endpoint::ChatCompletions,
+            Endpoint::Messages,
+            &serde_json::to_vec(body).unwrap(),
+            model,
+        ))
+        .unwrap()
+    }
+
+    /// Current Claude models 400 on `budget_tokens` and on `temperature` / `top_p`.
+    #[test]
+    fn current_claude_gets_adaptive_thinking_and_no_sampling() {
+        let v = to_claude(
+            &chat(json!({"reasoning_effort": "xhigh", "temperature": 0.2, "top_p": 0.9})),
+            "claude-opus-4-8",
+        );
+        assert_eq!(v["thinking"], json!({"type": "adaptive"}));
+        assert_eq!(v["output_config"]["effort"], "xhigh");
+        assert!(v.get("temperature").is_none(), "{v}");
+        assert!(v.get("top_p").is_none(), "{v}");
+    }
+
+    /// Several current models reject `thinking: disabled`; "no reasoning" is the lowest effort.
+    #[test]
+    fn reasoning_none_on_current_claude_omits_thinking() {
+        let v = to_claude(
+            &chat(json!({"reasoning_effort": "none"})),
+            "claude-opus-5-5",
+        );
+        assert!(v.get("thinking").is_none(), "{v}");
+        assert_eq!(v["output_config"]["effort"], "low");
+    }
+
+    #[test]
+    fn claude_4_6_has_no_xhigh() {
+        let v = to_claude(
+            &chat(json!({"reasoning_effort": "xhigh"})),
+            "claude-sonnet-4-6",
+        );
+        assert_eq!(v["output_config"]["effort"], "max");
+    }
+
+    #[test]
+    fn older_claude_gets_a_budget_below_max_tokens() {
+        let v = to_claude(
+            &chat(json!({"reasoning_effort": "high"})),
+            "claude-haiku-4-5",
+        );
+        assert_eq!(v["thinking"]["type"], "enabled");
+        assert_eq!(
+            v["thinking"]["budget_tokens"], 8000,
+            "half of max_tokens 16000: {v}"
+        );
+        assert!(
+            v.get("output_config").is_none(),
+            "Haiku 4.5 rejects effort: {v}"
+        );
+
+        let mut small = chat(json!({"reasoning_effort": "high"}));
+        small["max_tokens"] = json!(1000);
+        let v = to_claude(&small, "claude-haiku-4-5");
+        assert!(
+            v.get("thinking").is_none(),
+            "no room to think under 1024: {v}"
+        );
+    }
+
+    /// Sampling is fine on older models, except alongside thinking.
+    #[test]
+    fn older_claude_keeps_sampling_unless_thinking() {
+        let v = to_claude(&chat(json!({"temperature": 0.2})), "claude-haiku-4-5");
+        assert_eq!(v["temperature"], 0.2);
+        let v = to_claude(
+            &chat(json!({"temperature": 0.2, "reasoning_effort": "low"})),
+            "claude-haiku-4-5",
+        );
+        assert!(v.get("temperature").is_none(), "{v}");
+    }
+
+    // ---- Fields that used to vanish ----
+
+    fn schema() -> Value {
+        json!({
+            "type": "object",
+            "properties": {"answer": {"type": "string"}},
+            "required": ["answer"],
+            "additionalProperties": false
+        })
+    }
+
+    #[test]
+    fn json_schema_response_format_becomes_output_config_format() {
+        let v = to_claude(
+            &chat(json!({"response_format": {
+                "type": "json_schema",
+                "json_schema": {"name": "a", "strict": true, "schema": schema()}
+            }})),
+            OPUS,
+        );
+        assert_eq!(
+            v["output_config"]["format"],
+            json!({"type": "json_schema", "schema": schema()})
+        );
+        assert!(v.get("response_format").is_none(), "{v}");
+    }
+
+    #[test]
+    fn format_and_effort_share_one_output_config() {
+        let v = to_claude(
+            &chat(json!({
+                "reasoning_effort": "low",
+                "response_format": {"type": "json_schema", "json_schema": {"name": "a", "schema": schema()}}
+            })),
+            OPUS,
+        );
+        assert_eq!(v["output_config"]["effort"], "low");
+        assert_eq!(v["output_config"]["format"]["type"], "json_schema");
+    }
+
+    #[test]
+    fn output_config_format_becomes_response_format() {
+        let anth = json!({
+            "model": "claude-opus-4-8",
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "hi"}],
+            "output_config": {"format": {"type": "json_schema", "schema": schema()}, "effort": "medium"}
+        });
+        let v: Value = serde_json::from_slice(&request(
+            Endpoint::Messages,
+            Endpoint::ChatCompletions,
+            &serde_json::to_vec(&anth).unwrap(),
+            "gpt-5",
+        ))
+        .unwrap();
+        assert_eq!(v["response_format"]["type"], "json_schema");
+        assert_eq!(v["response_format"]["json_schema"]["schema"], schema());
+        assert_eq!(v["reasoning_effort"], "medium");
+    }
+
+    #[test]
+    fn parallel_tool_calls_false_disables_parallel_tool_use_both_ways() {
+        let v = to_claude(
+            &chat(json!({
+                "parallel_tool_calls": false,
+                "tools": [{"type": "function", "function": {"name": "f"}}]
+            })),
+            OPUS,
+        );
+        assert_eq!(
+            v["tool_choice"],
+            json!({"type": "auto", "disable_parallel_tool_use": true})
+        );
+        let back: Value = serde_json::from_slice(&request(
+            Endpoint::Messages,
+            Endpoint::ChatCompletions,
+            &serde_json::to_vec(&v).unwrap(),
+            "gpt-5",
+        ))
+        .unwrap();
+        assert_eq!(back["parallel_tool_calls"], false);
+    }
+
+    #[test]
+    fn user_becomes_metadata_user_id_both_ways() {
+        let v = to_claude(&chat(json!({"user": "u-123"})), OPUS);
+        assert_eq!(v["metadata"], json!({"user_id": "u-123"}));
+        let back: Value = serde_json::from_slice(&request(
+            Endpoint::Messages,
+            Endpoint::ChatCompletions,
+            &serde_json::to_vec(&v).unwrap(),
+            "gpt-5",
+        ))
+        .unwrap();
+        assert_eq!(back["user"], "u-123");
+    }
+
+    #[test]
+    fn an_inline_pdf_becomes_a_document_and_back() {
+        let v = to_claude(
+            &chat(json!({"messages": [{"role": "user", "content": [
+                {"type": "file", "file": {"filename": "q3.pdf", "file_data": "data:application/pdf;base64,JVBERi0="}},
+                {"type": "text", "text": "summarize"}
+            ]}]})),
+            OPUS,
+        );
+        let doc = &v["messages"][0]["content"][0];
+        assert_eq!(doc["type"], "document");
+        assert_eq!(
+            doc["source"],
+            json!({"type": "base64", "media_type": "application/pdf", "data": "JVBERi0="})
+        );
+        assert_eq!(doc["title"], "q3.pdf");
+        let back: Value = serde_json::from_slice(&request(
+            Endpoint::Messages,
+            Endpoint::ChatCompletions,
+            &serde_json::to_vec(&v).unwrap(),
+            "gpt-5",
+        ))
+        .unwrap();
+        assert_eq!(
+            back["messages"][0]["content"][0],
+            json!({"type": "file", "file": {"filename": "q3.pdf", "file_data": "data:application/pdf;base64,JVBERi0="}})
+        );
+    }
+
+    /// No Messages equivalent: forwarded so the provider names the problem. Dropping them would
+    /// answer a question about input the model never saw.
+    #[test]
+    fn unmappable_input_is_forwarded_for_the_provider_to_reject() {
+        let audio =
+            json!({"type": "input_audio", "input_audio": {"data": "UklG", "format": "wav"}});
+        let by_id = json!({"type": "file", "file": {"file_id": "file-abc"}});
+        let v = to_claude(
+            &chat(
+                json!({"n": 2, "logprobs": true, "messages": [{"role": "user", "content": [
+                    audio.clone(), by_id.clone(), {"type": "text", "text": "what is this"}
+                ]}]}),
+            ),
+            OPUS,
+        );
+        assert_eq!(v["n"], 2);
+        assert_eq!(v["logprobs"], true);
+        assert_eq!(v["messages"][0]["content"][0], audio);
+        assert_eq!(v["messages"][0]["content"][1], by_id);
+    }
+
+    #[test]
+    fn harmless_defaults_are_not_forwarded() {
+        let v = to_claude(&chat(json!({"n": 1, "logprobs": false, "seed": 7})), OPUS);
+        for key in ["n", "logprobs", "seed"] {
+            assert!(v.get(key).is_none(), "{key}: {v}");
+        }
+    }
+
+    #[test]
+    fn responses_text_format_and_input_file_reach_messages() {
+        let body = json!({
+            "model": "claude-opus-4-8",
+            "store": false,
+            "text": {"format": {"type": "json_schema", "name": "a", "strict": true, "schema": schema()}},
+            "input": [{"role": "user", "content": [
+                {"type": "input_file", "filename": "q3.pdf", "file_data": "data:application/pdf;base64,JVBERi0="},
+                {"type": "input_text", "text": "summarize"}
+            ]}]
+        });
+        let v: Value = serde_json::from_slice(&request(
+            Endpoint::Responses,
+            Endpoint::Messages,
+            &serde_json::to_vec(&body).unwrap(),
+            OPUS,
+        ))
+        .unwrap();
+        assert_eq!(v["output_config"]["format"]["schema"], schema());
+        assert_eq!(v["messages"][0]["content"][0]["type"], "document");
+    }
+
+    #[test]
+    fn chat_response_format_becomes_responses_text_format() {
+        let v: Value = serde_json::from_slice(&request(
+            Endpoint::ChatCompletions,
+            Endpoint::Responses,
+            &serde_json::to_vec(&chat(json!({"response_format": {
+                "type": "json_schema",
+                "json_schema": {"name": "a", "strict": true, "schema": schema()}
+            }})))
+            .unwrap(),
+            "gpt-5",
+        ))
+        .unwrap();
+        assert_eq!(
+            v["text"]["format"],
+            json!({"type": "json_schema", "name": "a", "strict": true, "schema": schema()})
+        );
     }
 }
