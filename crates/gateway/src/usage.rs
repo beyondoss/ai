@@ -516,59 +516,79 @@ const INPUT_BYTES_PER_TOKEN: u64 = 5;
 /// Streamed text bytes per output token, ×10 so the math stays in integers: 4.5.
 const OUTPUT_TEXT_BYTES_PER_TOKEN_X10: u64 = 45;
 
-/// Start of a base64 data-URI payload (`data:image/png;base64,…`) — the one shape in an
-/// OpenAI-wire body whose bytes are not text. An inline image is ~1 MB of base64 and ~1–2K tokens,
-/// so counting its bytes as text would bill one picture as a novel.
-const BASE64_MARKER: &[u8] = b";base64,";
+/// Where binary payloads start in a request body — the bytes that are not text. An inline image is
+/// ~1 MB of base64 and ~1–2K tokens, so counting it as text would bill one picture as a novel.
+///
+/// - `;base64,` — a data URI (`data:image/png;base64,…`): OpenAI `image_url`, Responses
+///   `input_image` / `input_file`. The payload runs to the string's closing quote.
+/// - `"data":` — the value of any `data` key: Anthropic `base64` image and document sources,
+///   OpenAI `input_audio`. The payload is the next string. A `data` key holding something else (a
+///   tool schema property, say) is skipped too, which only ever under-counts.
+///
+/// Both are at most 8 bytes, so a 7-byte carry catches either split across two chunks.
+const PAYLOAD_MARKERS: [&[u8]; 2] = [b";base64,", br#""data":"#];
+const MARKER_CARRY: usize = 7;
 
-static BASE64_FINDER: std::sync::LazyLock<memchr::memmem::Finder<'static>> =
-    std::sync::LazyLock::new(|| memchr::memmem::Finder::new(BASE64_MARKER));
+static PAYLOAD_FINDER: std::sync::LazyLock<aho_corasick::AhoCorasick> =
+    std::sync::LazyLock::new(|| {
+        aho_corasick::AhoCorasick::new(PAYLOAD_MARKERS).unwrap_or_else(|_| unreachable!())
+    });
 
 /// Running count of a request body's text bytes, fed chunk by chunk as the body streams past.
 ///
-/// Excludes base64 data-URI payloads (everything from `;base64,` to the closing quote). A marker
-/// split across two chunks is still found: the last few bytes of each chunk are carried into the
-/// next. Nothing is buffered — 12 bytes of state however large the body, because it sits in
-/// `RequestCtx`, which is touched once per response chunk.
+/// Excludes binary payloads (see [`PAYLOAD_MARKERS`]). A marker split across two chunks is still
+/// found: the last few bytes of each chunk are carried into the next. Nothing is buffered — 12
+/// bytes of state however large the body, because it sits in `RequestCtx`, which is touched once
+/// per response chunk.
 #[derive(Default, Clone, Copy)]
 pub struct InputTally {
     text_bytes: u32,
-    /// Low bits: how many of `carry`'s bytes are live (≤ 7). [`IN_BASE64`]: inside a payload.
+    /// Low bits ([`CARRY_LEN`]): how many of `carry`'s bytes are live. High bits: the phase —
+    /// [`AWAIT_OPEN`] (after `"data":`, before its string opens) or [`IN_PAYLOAD`].
     state: u8,
-    carry: [u8; BASE64_MARKER.len() - 1],
+    carry: [u8; MARKER_CARRY],
 }
 
-/// `InputTally::state` bit: the tally is inside a base64 payload. Packed rather than a `bool` field
-/// to keep the struct at 12 bytes.
-const IN_BASE64: u8 = 0x80;
+const CARRY_LEN: u8 = 0x0f;
+const AWAIT_OPEN: u8 = 0x40;
+const IN_PAYLOAD: u8 = 0x80;
 
 impl InputTally {
     pub fn feed(&mut self, mut chunk: &[u8]) {
         loop {
-            if self.state & IN_BASE64 != 0 {
-                // The payload ends at its string's closing quote; base64 has no escapes to skip.
-                let Some(end) = memchr::memchr(b'"', chunk) else {
+            if self.state & (AWAIT_OPEN | IN_PAYLOAD) != 0 {
+                // Base64 has no escapes, so the payload ends at the next quote; after `"data":`,
+                // the next quote opens the payload.
+                let Some(q) = memchr::memchr(b'"', chunk) else {
+                    // Whitespace between `"data":` and its string is text; a payload is not.
+                    if self.state & AWAIT_OPEN != 0 {
+                        self.count(chunk.len());
+                    }
                     return;
                 };
+                if self.state & AWAIT_OPEN != 0 {
+                    self.count(q + 1);
+                    self.state = IN_PAYLOAD;
+                    chunk = &chunk[q + 1..];
+                    continue;
+                }
                 self.state = 0;
-                chunk = &chunk[end..];
+                chunk = &chunk[q..];
             }
-            if let Some(end) = self.take_split_marker(chunk) {
-                self.count(end);
-                chunk = &chunk[end..];
-                self.state = IN_BASE64;
-                continue;
-            }
-            match BASE64_FINDER.find(chunk) {
-                Some(at) => {
-                    let end = at + BASE64_MARKER.len();
+            let found = self.take_split_marker(chunk).or_else(|| {
+                PAYLOAD_FINDER
+                    .find(chunk)
+                    .map(|m| (m.end(), m.pattern().as_usize()))
+            });
+            match found {
+                Some((end, pattern)) => {
                     self.count(end);
                     chunk = &chunk[end..];
-                    self.state = IN_BASE64;
+                    self.state = if pattern == 0 { IN_PAYLOAD } else { AWAIT_OPEN };
                 }
                 None => {
                     self.count(chunk.len());
-                    let keep = chunk.len().min(self.carry.len());
+                    let keep = chunk.len().min(MARKER_CARRY);
                     self.carry[..keep].copy_from_slice(&chunk[chunk.len() - keep..]);
                     self.state = keep as u8;
                     return;
@@ -577,20 +597,20 @@ impl InputTally {
         }
     }
 
-    /// Where a marker that *began* in the previous chunk ends in this one, if it did.
-    fn take_split_marker(&mut self, chunk: &[u8]) -> Option<usize> {
+    /// Where a marker that *began* in the previous chunk ends in this one, if it did, and which.
+    fn take_split_marker(&mut self, chunk: &[u8]) -> Option<(usize, usize)> {
         // Only reached outside a payload, where `state` is exactly the carry length.
-        let carried = usize::from(std::mem::take(&mut self.state));
+        let carried = usize::from(std::mem::take(&mut self.state) & CARRY_LEN);
         if carried == 0 {
             return None;
         }
-        let mut joined = [0u8; 2 * (BASE64_MARKER.len() - 1)];
-        let n = chunk.len().min(BASE64_MARKER.len() - 1);
+        let mut joined = [0u8; 2 * MARKER_CARRY];
+        let n = chunk.len().min(MARKER_CARRY);
         joined[..carried].copy_from_slice(&self.carry[..carried]);
         joined[carried..carried + n].copy_from_slice(&chunk[..n]);
-        let at = BASE64_FINDER.find(&joined[..carried + n])?;
+        let m = PAYLOAD_FINDER.find(&joined[..carried + n])?;
         // A marker wholly inside `chunk` is the ordinary search's to find.
-        (at < carried).then(|| at + BASE64_MARKER.len() - carried)
+        (m.start() < carried).then(|| (m.end() - carried, m.pattern().as_usize()))
     }
 
     fn count(&mut self, n: usize) {
@@ -726,6 +746,35 @@ mod tests {
     #[test]
     fn input_tally_is_twelve_bytes() {
         assert_eq!(std::mem::size_of::<InputTally>(), 12);
+    }
+
+    /// Anthropic's image source is `{"type":"base64","data":"…"}` — no data URI — and OpenAI's
+    /// `input_audio` is `{"data":"…"}`. Both must be skipped, compact or spaced, at any split.
+    #[test]
+    fn input_tally_skips_data_key_payloads() {
+        let b64 = "B".repeat(10_000);
+        for body in [
+            format!(
+                r#"{{"messages":[{{"role":"user","content":[{{"type":"image","source":{{"type":"base64","media_type":"image/png","data":"{b64}"}}}},{{"type":"text","text":"hi"}}]}}]}}"#
+            ),
+            format!(r#"{{"input_audio": {{"data": "{b64}", "format": "wav"}}}}"#),
+        ] {
+            let whole = tally(&[body.as_bytes()]);
+            assert_eq!(
+                u64::from(whole.text_bytes),
+                (body.len() - b64.len()) as u64,
+                "{}",
+                &body[..60]
+            );
+            for cut in 1..body.len().min(200) {
+                let (a, b) = body.as_bytes().split_at(cut);
+                assert_eq!(
+                    tally(&[a, b]).text_bytes,
+                    whole.text_bytes,
+                    "split at {cut}"
+                );
+            }
+        }
     }
 
     #[test]

@@ -490,8 +490,11 @@ error event is not work we were billed for. Its row carries an estimate and `usa
 
 - **Input:** Anthropic's `message_start` is the first event and carries exact input and cache
   counts, so those are kept. Otherwise the request body's text bytes ÷ 5, counted as the body
-  streams past (`InputTally`, 12 bytes of state) with base64 data-URI payloads excluded — an inline
-  image is ~1 MB of base64 and ~1–2K tokens.
+  streams past (`InputTally`, 12 bytes of state, one two-pattern SIMD pass at ~34 GB/s) with binary
+  payloads excluded: data-URI payloads (`;base64,…`) and any string under a `"data"` key (Anthropic
+  `base64` image/document sources, OpenAI `input_audio`). An inline image is ~1 MB of base64 and
+  ~1–2K tokens; counted as text, an Anthropic-format image served by an OpenAI-wire candidate
+  estimated 44,042 input tokens for a 42-token prompt.
 - **Output:** only the 64 KiB tail is retained, so the tail is measured (delta events and text bytes
   per byte of stream) and scaled up to the bytes relayed over the whole stream — one add per managed
   stream chunk, no scan on the relay path (counting `data:` per chunk measured +9.5% on a 600 KiB

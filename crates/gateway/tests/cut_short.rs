@@ -206,3 +206,35 @@ async fn an_error_only_stream_is_not_billed_an_estimate() {
     assert_eq!(row["input_tokens"].as_u64(), Some(0), "{row}");
     assert_eq!(row["output_tokens"].as_u64(), Some(0), "{row}");
 }
+
+/// The over-count this guards: a Messages client's image is `{"type":"base64","data":"…"}` — not a
+/// data URI — and when an OpenAI-wire candidate serves it, input is estimated from the body. That
+/// payload must not be counted as text either.
+#[tokio::test]
+async fn anthropic_format_images_do_not_inflate_the_input_estimate() {
+    let (pubkey, sk) = test_keypair(46);
+    let mock = MockUpstream::start(Mode::StallSse).await;
+    let gw = Gateway::builder(unused_nats_port(), &mock.authority(), &b64(&pubkey))
+        .start()
+        .await;
+    let image = "iVBORw0KGgo".repeat(20_000);
+    let body = format!(
+        r#"{{"model":"gpt-4o-mini","max_tokens":64,"stream":true,"messages":[{{"role":"user","content":[{{"type":"image","source":{{"type":"base64","media_type":"image/png","data":"{image}"}}}},{{"type":"text","text":"what is this?"}}]}}]}}"#
+    );
+
+    stream_then_cancel(
+        format!("{}/v1/messages", gw.url()),
+        &vkey(&sk, 46),
+        "x-api-key",
+        body.clone(),
+    )
+    .await;
+
+    let row = usage_row(&gw).await;
+    assert_eq!(row["usage_estimated"], true, "{row}");
+    assert_eq!(
+        row["input_tokens"].as_u64(),
+        Some((body.len() - image.len()) as u64 / 5),
+        "an Anthropic base64 source is not text: {row}"
+    );
+}
