@@ -203,9 +203,10 @@ async fn a_large_body_without_a_model_is_a_404_not_a_hang() {
     assert_eq!(mock.hits(), 0);
 }
 
-/// `model` first (the Rust and Go SDK order) still streams: no relay, pingora forwards the rest.
+/// `model` first (the Rust and Go SDK order) takes the same path once the body outgrows the replay
+/// buffer: it is read in full and re-run, which is what lets it fail over.
 #[tokio::test]
-async fn a_large_body_with_model_first_is_not_relayed() {
+async fn a_large_body_with_model_first_is_relayed_too() {
     let (mock, gw, sk) = gateway(Mode::Json).await;
     let filler = "x".repeat(200 * 1024);
     let body =
@@ -220,6 +221,24 @@ async fn a_large_body_with_model_first_is_not_relayed() {
         .unwrap();
     assert_eq!(resp.status().as_u16(), 200);
     assert_eq!(mock.captured().expect("forwarded").body.len(), body.len());
+    let metrics = gw.metrics().await;
+    assert_eq!(parse_metric(&metrics, "ai_full_body_relays_total", ""), 1.0);
+}
+
+/// A small body is still a plain pingora relay: no subrequest.
+#[tokio::test]
+async fn a_small_body_is_not_relayed() {
+    let (mock, gw, sk) = gateway(Mode::Json).await;
+    let resp = client()
+        .post(format!("{}/v1/chat/completions", gw.url()))
+        .header("authorization", format!("Bearer {}", vkey(&sk)))
+        .header("content-type", "application/json")
+        .body(r#"{"messages":[{"role":"user","content":"hi"}],"model":"gpt-4o-mini"}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    assert_eq!(mock.hits(), 1);
     let metrics = gw.metrics().await;
     assert_eq!(parse_metric(&metrics, "ai_full_body_relays_total", ""), 0.0);
 }

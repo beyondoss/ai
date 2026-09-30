@@ -314,10 +314,9 @@ stays a byte relay. `/{provider}/…` never translates.
 **Embeddings rows.** `text-embedding-3-small` and `-large` are catalog rows whose candidates are
 embeddings paths (OpenAI `/v1/embeddings`, then OpenRouter `/api/v1/embeddings`), so a stock
 `client.embeddings.create` on managed `/v1` walks, fails over, and bills input tokens like any other
-row. A batch past 64 KiB (openai-python puts `input` before `model`) is re-run with its whole body
-(see the peek below). Like any body pingora cannot replay, it does not fail over in-gateway on a
-5xx or 429: it is relayed, counted on `ai_failover_unreplayable_total`, and the SDK's retry lands
-on the next candidate. The row's endpoint is `Endpoint::of_row`: `Embeddings` when its primary's
+row. A batch past 64 KiB (openai-python puts `input` before `model`) is read in full and re-run
+(see the peek below), which is also what lets it fail over on a 5xx or walk keys on a 429.
+The row's endpoint is `Endpoint::of_row`: `Embeddings` when its primary's
 path is, else what `wire` says.
 
 **Which paths name an endpoint.** `route::implied_endpoint` is an exact table:
@@ -400,28 +399,34 @@ refused as a provider name at boot so config cannot shadow it.
 
 The name can live in the body because the gateway peeks it itself. Pingora's 64 KiB retry buffer is
 enabled and `ModelScanner` is fed each new chunk once (a `model` after a long prompt is linear, not a
-rescan per chunk). Where `model` sits decides what happens next, and stock Python SDKs put it
-**after** the large field (`{"messages": …, "model": …}`, `{"input": …, "model": …}`):
+rescan per chunk). One rule decides how much is read: **stop at `model` only while pingora can still
+replay what was read.**
 
-- **Found inside 64 KiB:** stop reading. Pingora replays its buffer.
-- **Found past 64 KiB, body not finished:** stop. The retry buffer has truncated, so
-  `request_body_filter` prepends our copy of the prefix while pingora streams the rest.
-- **The whole body read before it could be routed** (`model` near the end, or inbound Responses,
-  whose `store` / `previous_response_id` can sit after `input` and pick the arm): pingora has nothing
-  left to send. Its retry buffer is gone and the client has nothing more to read, so it would open
-  the upstream and wait forever. The request is re-run as a pingora **subrequest** carrying the body
-  (`AiProxy::relay_full_body`), and its response is piped to the client. The subrequest runs this same
-  proxy with a gateway-only context (`FullBody`: the chosen row and Responses session field), so it
-  does not peek again, does not charge the rate guardrail twice, and does not count as a second
-  request; it does its own auth, walk, failover, translation and `ai.usage`. Counted on
-  `ai_full_body_relays_total`.
-- **No `model` in the whole body:** 404.
+- **A small body** (declared under 64 KiB) stops at `model`. Pingora replays its own buffer on the
+  first attempt and on every failover.
+- **Anything else is read to the end:** a body declared larger than the buffer or of unknown length,
+  inbound Responses (`store` / `previous_response_id` pick the arm and can sit after `input`), a
+  cache lookup (it hashes the whole body), and any body whose `model` had not appeared by the time
+  the buffer truncated (stock Python SDKs put `model` **after** `messages` / `input`). A body that
+  outgrew the buffer leaves pingora nothing to send, since its retry buffer is gone and the client
+  has nothing more to read, so the request is re-run as a pingora **subrequest** carrying the body
+  (`AiProxy::relay_full_body`), whose response is piped to the client (`pipe_full_body`). The
+  subrequest runs this same proxy with a gateway-only context (`FullBody`: the chosen row and
+  Responses session field), so it does not peek again, does not charge the rate guardrail twice,
+  and does not count as a second request. It does its own auth, walk, translation and `ai.usage`.
+  Counted on `ai_full_body_relays_total`.
+- **No `model` in the whole body:** 404. **Past `MAX_REQUEST_BODY`:** 413.
+
+The pipe idle-watches the client while the subrequest runs, the way pingora's own proxy loop does
+(pingora's `pipe_subrequest` does not poll the client when the body is preset). A client that hangs
+up closes the subrequest's channels, so its upstream is aborted at once and a cut-short stream
+bills its estimate, instead of a hidden-reasoning model generating for minutes after an ESC.
 
 Before this, a body whose `model` was past 64 KiB was a 404, and one where the read that found it
 also ended the body hung until the client timed out (openai-python batches of ~150 embeddings
 inputs, or any long agent turn). A Responses turn with `previous_response_id` past 64 KiB was taken
-for a one-shot and translated onto Chat Completions, which dropped the conversation. A body pingora
-cannot replay still cannot fail over in-gateway (see "Status-based failover, and where it stops").
+for a one-shot and translated onto Chat Completions, which dropped the conversation. And no body
+past 64 KiB could fail over (see "Status-based failover, and where it stops").
 
 Three things differ from the provider-routed path, all consequences of the client no longer naming
 the provider:
@@ -1050,49 +1055,35 @@ Two deliberate non-cases, plus one same-provider retry:
 - **When every candidate 5xxes, the client gets the last provider's own status**, not a synthetic
   error. Better diagnostics than an exhausted retry loop produces.
 
-**Where it stops: bodies that cannot be replayed.** Failover rides pingora's retry, whose request
-buffer is `BODY_BUF_LIMIT` = 64 KiB, a private constant with no knob. Past it the body cannot be
-re-sent, so the 5xx is relayed rather than attempted — a retry there would hand the next upstream
-headers describing a body it never writes, hanging it until `read_timeout_secs`.
+**Bodies pingora cannot replay.** Pingora's retry replays its request buffer, which is
+`BODY_BUF_LIMIT` = 64 KiB, a private constant with no knob (checked against pingora 0.9.0 and main,
+2026-09-30; upstream PR cloudflare/pingora#816 would lift it). Past it pingora sends no body on a
+retry and never calls `request_body_filter`, so its own retry would hand the next upstream headers
+for a body it never writes.
 
-The gate is `is_body_done() && !retry_buffer_truncated()`, and the first half deserves an
-explanation because it is not the obvious one. Truncation reports on what has been buffered _so
-far_, so a provider that 5xxes fast — which is what a failing provider does — answers before a large
-body has finished streaming in, and the check reads `false` only because the bytes that would
-truncate it have not arrived yet.
+**On a managed catalog walk this no longer limits failover.** Every body past the buffer is read in
+full before the walk (see the peek above) and run as a `FullBody` subrequest. Inside it the body is
+still unreplayable to pingora, so where an ordinary walk would retry (a 5xx with another candidate
+left, a 429 with another pool key) the subrequest records the decision in its context (`RelayRetry`)
+and relays its response. The parent's pipe sees the decision before the response header reaches the
+client, abandons that attempt, and runs a new subrequest that skips the failed candidate or resumes
+the key walk. Same rules as above: one attempt per subrequest, the last candidate's own status when
+every one fails, `ai_candidate_failovers_total` / `ai_key_walks_total` as usual. The breaker and the
+TTFT ranker see each failed attempt, since each is a real request. The cost is holding the body in
+memory (the model splice already buffered it) and connecting only after it has fully arrived.
 
-Retrying there would not be _unsafe_: pingora replays the buffered prefix with
-`end_of_body = is_body_done()` and the duplex loop reads the remainder straight from the socket, so
-the next candidate does receive the whole body. It would be **timing-dependent** — the same request
-fails over or does not, depending on how quickly the upstream rejected it. On a path that decides
-which vendor gets billed, a deterministic rule is worth more than the extra failovers a looser one
-would win.
+**Where it still stops: `/{provider}/…` and BYO.** Those are not catalog walks, so a body past the
+buffer takes pingora's path. A 429 there is relayed rather than key-walked, counted on
+`ai_failover_unreplayable_total`. That also counts a small body whose 5xx or 429 arrived while it was
+still uploading: the gate is `is_body_done() && !retry_buffer_truncated()`, and truncation only
+reports on what has been buffered so far, so retrying before the upload finished would make the
+same request fail over or not depending on how fast the upstream rejected it. On a path that decides
+which vendor gets billed, a deterministic rule is worth more than the extra retries.
 
-The cost is real: a 5xx arriving while the client is still uploading is relayed rather than retried
-even when it would have replayed fine.
-
-`ai_failover_unreplayable_total` counts every request this excludes — both the too-large bodies and
-the not-yet-known ones, since both cost the same thing: a failover declined. That number is the input to
-whether covering them is worth building, and the options are not cheap: patch `BODY_BUF_LIMIT`
-(fork, or upstream a config knob) or drive the retry ourselves via pingora's `Subrequest` API
-(`allow_spawning_subrequest` — a full inner proxy request whose downstream is a channel, so the body
-comes from our buffer with no cap, at the cost of every filter re-entering on the inner request).
-Neither is worth starting before the counter says how often the limit actually bites. (Checked
-against pingora 0.9.0 and its main branch, 2026-09-30: the constant is unchanged. Swapping our own
-buffered copy in is not an option either — on a truncated retry pingora sends no body at all and
-never calls `request_body_filter`. Upstream PR cloudflare/pingora#816, early request-body
-buffering replayed across retries, would remove the limit.)
-
-**What covers it instead: the client's own retry.** The stock OpenAI and Anthropic SDKs retry 5xx
-and 529 by default, and that retry is a fresh request with a fresh body. The relayed 5xx marks the
-candidate failed in the TTFT ranker, which puts it behind every alternative, so the retry lands on
-the fallback. The cost is one extra round trip plus the SDK's backoff (≈0.5–1s) instead of an
-instant switch. Limits: clients that do not retry get the error; the ranker is per process, so a
-retry that reaches another replica may hit the failing provider once more (the per-provider breaker
-still cuts a sustained outage everywhere); and every catalog walk on that process avoids the failed
-candidate for up to 30s, not just the retry. `smart_router = false` or a pinned walk
-(`x-beyond-order` / `split`) turns it off. `an_sdk_retry_after_an_unreplayable_529_lands_on_the_fallback`
-pins it — and fails with the demotion removed.
+**The client's own retry is still a second line.** The stock OpenAI and Anthropic SDKs retry 5xx and
+529, and a relayed 5xx marks the candidate failed in the TTFT ranker, which puts it behind every
+alternative, so that retry lands on a fallback. `smart_router = false` or a pinned walk
+(`x-beyond-order` / `split`) turns the demotion off.
 
 **Pingora 0.9's default refuses to retry a non-idempotent method** — every LLM call is a `POST` —
 which silently disabled both walks above. `error_while_proxy` is overridden to keep 0.8's policy:
@@ -1264,38 +1255,38 @@ Secret-bearing fields (`pool_keys`, `nats_creds`) are held as `Secret<T>` — st
 
 Prometheus on the default registry, exposed at `/metrics` on `metrics_listen`.
 
-| Metric                                | Type      | Labels               | What It Measures                                                                                                           |
-| ------------------------------------- | --------- | -------------------- | -------------------------------------------------------------------------------------------------------------------------- |
-| `ai_requests_total`                   | Counter   | —                    | Total admitted requests                                                                                                    |
-| `ai_rejections_total`                 | Counter   | `reason`             | Rejected requests by cause (auth, deny_spend, quota, allowance_unavailable, deny_fraud, rate_limit, tenant_concurrency, …) |
-| `ai_upstream_responses_total`         | Counter   | `provider`, `status` | Upstream responses by provider and status class                                                                            |
-| `ai_tokens_total`                     | Counter   | `kind`               | input / output / cache_read / cache_write token counts                                                                     |
-| `ai_ttft_seconds`                     | Histogram | `provider`           | Time to first token (50ms–30s buckets)                                                                                     |
-| `ai_upstream_latency_seconds`         | Histogram | `provider`           | Full request latency (100ms–600s buckets)                                                                                  |
-| `ai_active_streams`                   | Gauge     | —                    | Open SSE streams                                                                                                           |
-| `ai_requests_in_flight`               | Gauge     | —                    | All in-flight requests (streaming + non-streaming)                                                                         |
-| `ai_deny_set_size`                    | Gauge     | —                    | Current number of denied tenants                                                                                           |
-| `ai_nats_connected`                   | Gauge     | —                    | 1 if the **deny-set** watcher is connected, 0 otherwise                                                                    |
-| `ai_allowance_set_size`               | Gauge     | —                    | Exhausted tenants + keys in the allowance-set                                                                              |
-| `ai_allowance_ready`                  | Gauge     | —                    | 1 after a successful allowance scan/snapshot (empty = remaining-ok); 0 = fail-closed                                       |
-| `ai_allowance_nats_connected`         | Gauge     | —                    | 1 if the **allowance-set** watcher is connected                                                                            |
-| `ai_capture_set_size`                 | Gauge     | —                    | Tenants with payload capture enabled (climbing and never falling ⇒ missing TTLs)                                           |
-| `ai_capture_nats_connected`           | Gauge     | —                    | 1 if the **capture-set** watcher is connected — separate watcher, separate connection                                      |
-| `ai_captures_total`                   | Counter   | —                    | Requests whose payloads were captured (post-sampling)                                                                      |
-| `ai_capture_bytes_total`              | Counter   | —                    | Payload bytes handed to the sink — the cost signal, ahead of the storage bill                                              |
-| `ai_capture_dropped_total`            | Counter   | —                    | Captures dropped on a full sink queue — distinguishes "lost it" from "capture was off"                                     |
-| `ai_control_header_errors_total`      | Counter   | —                    | `x-beyond-*` headers present but unusable (dropped; request still served)                                                  |
-| `ai_usage_parse_errors_total`         | Counter   | —                    | Managed 2xx responses with no parseable usage (emitted as a zero-token billing row)                                        |
-| `ai_cache_hits_total`                 | Counter   | —                    | Exact-match cache hits that replayed a stored 2xx and skipped the provider                                                 |
-| `ai_cache_scope`                      | Gauge     | `kind`               | Constant `1` with `kind="process"`: this pod's cache table, not a fleet store                                              |
-| `ai_smart_rank_scope`                 | Gauge     | `kind`               | Constant `1` with `kind="process"`: this pod's TTFT EWMA, not a fleet-wide ranking                                         |
-| `ai_candidate_failovers_total`        | Counter   | —                    | Model-routed requests that abandoned a candidate for the next one                                                          |
-| `ai_key_walks_total`                  | Counter   | —                    | Managed 429s that retried the same provider with the next unused pool key                                                  |
-| `ai_session_pinned_total`             | Counter   | —                    | Catalog walks whose primary came from a session pin instead of the TTFT rank                                               |
-| `ai_full_body_relays_total`           | Counter   | —                    | Managed requests re-run as a subrequest because routing needed the whole body past 64 KiB                                  |
-| `ai_model_header_body_mismatch_total` | Counter   | —                    | Catalog-walk requests whose `x-beyond-model` and body `model` disagreed (header wins; client bug)                          |
-| `ai_failover_unreplayable_total`      | Counter   | —                    | 5xx/429 retries declined: request body not provably replayable (past 64 KiB, or still uploading)                           |
-| `ai_usage_estimated_total`            | Counter   | —                    | Managed streams cut short before their usage block, billed with estimated tokens                                           |
+| Metric                                | Type      | Labels               | What It Measures                                                                                                            |
+| ------------------------------------- | --------- | -------------------- | --------------------------------------------------------------------------------------------------------------------------- |
+| `ai_requests_total`                   | Counter   | —                    | Total admitted requests                                                                                                     |
+| `ai_rejections_total`                 | Counter   | `reason`             | Rejected requests by cause (auth, deny_spend, quota, allowance_unavailable, deny_fraud, rate_limit, tenant_concurrency, …)  |
+| `ai_upstream_responses_total`         | Counter   | `provider`, `status` | Upstream responses by provider and status class                                                                             |
+| `ai_tokens_total`                     | Counter   | `kind`               | input / output / cache_read / cache_write token counts                                                                      |
+| `ai_ttft_seconds`                     | Histogram | `provider`           | Time to first token (50ms–30s buckets)                                                                                      |
+| `ai_upstream_latency_seconds`         | Histogram | `provider`           | Full request latency (100ms–600s buckets)                                                                                   |
+| `ai_active_streams`                   | Gauge     | —                    | Open SSE streams                                                                                                            |
+| `ai_requests_in_flight`               | Gauge     | —                    | All in-flight requests (streaming + non-streaming)                                                                          |
+| `ai_deny_set_size`                    | Gauge     | —                    | Current number of denied tenants                                                                                            |
+| `ai_nats_connected`                   | Gauge     | —                    | 1 if the **deny-set** watcher is connected, 0 otherwise                                                                     |
+| `ai_allowance_set_size`               | Gauge     | —                    | Exhausted tenants + keys in the allowance-set                                                                               |
+| `ai_allowance_ready`                  | Gauge     | —                    | 1 after a successful allowance scan/snapshot (empty = remaining-ok); 0 = fail-closed                                        |
+| `ai_allowance_nats_connected`         | Gauge     | —                    | 1 if the **allowance-set** watcher is connected                                                                             |
+| `ai_capture_set_size`                 | Gauge     | —                    | Tenants with payload capture enabled (climbing and never falling ⇒ missing TTLs)                                            |
+| `ai_capture_nats_connected`           | Gauge     | —                    | 1 if the **capture-set** watcher is connected — separate watcher, separate connection                                       |
+| `ai_captures_total`                   | Counter   | —                    | Requests whose payloads were captured (post-sampling)                                                                       |
+| `ai_capture_bytes_total`              | Counter   | —                    | Payload bytes handed to the sink — the cost signal, ahead of the storage bill                                               |
+| `ai_capture_dropped_total`            | Counter   | —                    | Captures dropped on a full sink queue — distinguishes "lost it" from "capture was off"                                      |
+| `ai_control_header_errors_total`      | Counter   | —                    | `x-beyond-*` headers present but unusable (dropped; request still served)                                                   |
+| `ai_usage_parse_errors_total`         | Counter   | —                    | Managed 2xx responses with no parseable usage (emitted as a zero-token billing row)                                         |
+| `ai_cache_hits_total`                 | Counter   | —                    | Exact-match cache hits that replayed a stored 2xx and skipped the provider                                                  |
+| `ai_cache_scope`                      | Gauge     | `kind`               | Constant `1` with `kind="process"`: this pod's cache table, not a fleet store                                               |
+| `ai_smart_rank_scope`                 | Gauge     | `kind`               | Constant `1` with `kind="process"`: this pod's TTFT EWMA, not a fleet-wide ranking                                          |
+| `ai_candidate_failovers_total`        | Counter   | —                    | Model-routed requests that abandoned a candidate for the next one                                                           |
+| `ai_key_walks_total`                  | Counter   | —                    | Managed 429s that retried the same provider with the next unused pool key                                                   |
+| `ai_session_pinned_total`             | Counter   | —                    | Catalog walks whose primary came from a session pin instead of the TTFT rank                                                |
+| `ai_full_body_relays_total`           | Counter   | —                    | Managed requests re-run as a subrequest because routing needed the whole body past 64 KiB                                   |
+| `ai_model_header_body_mismatch_total` | Counter   | —                    | Catalog-walk requests whose `x-beyond-model` and body `model` disagreed (header wins; client bug)                           |
+| `ai_failover_unreplayable_total`      | Counter   | —                    | 5xx/429 retries declined on `/{provider}` or a still-uploading body: not provably replayable (catalog walks re-run instead) |
+| `ai_usage_estimated_total`            | Counter   | —                    | Managed streams cut short before their usage block, billed with estimated tokens                                            |
 
 ---
 

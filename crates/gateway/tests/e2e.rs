@@ -1458,8 +1458,58 @@ async fn one_pool_key_relays_429_with_retry_after() {
 }
 
 #[tokio::test]
-async fn unreplayable_body_relays_429_without_walking() {
-    // Same gate as vendor failover: a body past pingora's 64 KiB replay buffer is not walked.
+async fn a_large_catalog_body_walks_keys_on_429() {
+    // A body past pingora's 64 KiB replay buffer walks keys like any other on a catalog walk: the
+    // gateway holds the body and re-runs it on the next key (see `FullBody`).
+    let nats = Nats::start().await;
+    let (pubkey, sk) = test_keypair(33);
+    let mock = MockUpstream::start(Mode::ThrottleKey(WALK_KEY_A)).await;
+    let gw = Gateway::builder(nats.port, &mock.authority(), &b64(&pubkey))
+        .providers(&["openai"])
+        .pool_keys("openai", &[WALK_KEY_A, WALK_KEY_B])
+        .start()
+        .await;
+    let vkey = mint(
+        &VirtualKey {
+            tenant_id: 33,
+            vpc_id: 1,
+            key_id: None,
+        },
+        1,
+        &sk,
+    );
+    let filler = "x".repeat(256 * 1024);
+    let big =
+        format!(r#"{{"model":"gpt-4o","messages":[{{"role":"user","content":"{filler}"}}]}}"#);
+    let resp = test_client()
+        .post(format!("{}/v1/chat/completions", gw.url()))
+        .header("authorization", format!("Bearer {vkey}"))
+        .header("content-type", "application/json")
+        .body(big.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200, "the second key serves");
+    assert_eq!(mock.hits(), 2);
+    let cap = mock.captured().expect("second key");
+    assert!(
+        cap.authorization
+            .as_deref()
+            .is_some_and(|a| a.contains(WALK_KEY_B)),
+        "{:?}",
+        cap.authorization
+    );
+    assert!(cap.body.len() > 256 * 1024);
+    assert_eq!(
+        parse_metric(&gw.metrics().await, "ai_key_walks_total", ""),
+        1.0
+    );
+}
+
+#[tokio::test]
+async fn unreplayable_provider_routed_body_relays_429_without_walking() {
+    // `/{provider}/…` is not a catalog walk, so a body past pingora's 64 KiB replay buffer still
+    // cannot be re-sent there: the 429 is relayed.
     let nats = Nats::start().await;
     let (pubkey, sk) = test_keypair(33);
     let mock = MockUpstream::start(Mode::Status(429)).await;
@@ -1492,7 +1542,7 @@ async fn unreplayable_body_relays_429_without_walking() {
     let big =
         format!(r#"{{"model":"gpt-4o","messages":[{{"role":"user","content":"{filler}"}}]}}"#);
     let resp = test_client()
-        .post(format!("{}/v1/chat/completions", gw.url()))
+        .post(format!("{}/openai/v1/chat/completions", gw.url()))
         .header("authorization", format!("Bearer {vkey}"))
         .header("content-type", "application/json")
         .body(big)

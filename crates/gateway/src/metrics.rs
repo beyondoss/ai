@@ -159,17 +159,13 @@ pub struct Metrics {
     /// counter rather than a log line because a client that always disagrees would otherwise emit
     /// one warn per request forever; a non-zero rate here is a client bug to go and find.
     pub model_header_body_mismatch_total: IntCounter,
-    /// Model-routed requests that hit a retryable upstream status, had a candidate left to try, and
-    /// could **not** fail over because the request body was not provably replayable.
+    /// Requests that hit a retryable upstream status (a 5xx with a candidate left, a 429 with a key
+    /// left) and could **not** retry because the request body was not provably replayable.
     ///
-    /// Two ways to land here: the body exceeded pingora's 64 KiB replay buffer, or it had not
-    /// finished arriving when the upstream answered, so replayability was not yet knowable. Both are
-    /// counted together because both cost the same thing — a failover we declined to attempt.
-    ///
-    /// This is the measurement that decides whether the expensive fix is worth building. Covering
-    /// these requests means either patching pingora's private buffer limit or driving the retry
-    /// ourselves (see ARCHITECTURE.md); neither is worth starting until this counter says how often
-    /// the limit actually bites.
+    /// Managed catalog walks no longer land here for size: a body past pingora's 64 KiB replay
+    /// buffer is read in full and re-run as a subrequest that can fail over (`FullBody` in `proxy`).
+    /// What remains: `/{provider}/…` requests past the buffer, and small bodies that had not
+    /// finished arriving when the upstream answered, so replayability was not yet knowable.
     pub failover_unreplayable_total: IntCounter,
     /// Model-routed requests that gave up on a candidate and moved to the next one.
     ///
@@ -322,7 +318,7 @@ impl Metrics {
         ))?;
         let failover_unreplayable_total = IntCounter::with_opts(Opts::new(
             "ai_failover_unreplayable_total",
-            "Retryable upstream statuses that could not fail over: body not provably replayable",
+            "5xx/429 retries declined because the body was not provably replayable (/{provider} or still uploading)",
         ))?;
         let rejections_total = IntCounterVec::new(
             Opts::new("ai_rejections_total", "Requests rejected before upstream"),

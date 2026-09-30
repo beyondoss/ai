@@ -818,17 +818,11 @@ async fn every_candidate_5xx_relays_the_last_error() {
     assert_eq!(fallback.hits(), 1, "both candidates must have been tried");
 }
 
-/// A body past pingora's 64 KiB replay buffer is not provably replayable, so the 5xx is relayed
-/// rather than retried — and the case is **counted**, which is the number that decides whether
-/// covering it is worth the work.
-///
-/// Note what this does *not* claim. Retrying such a body is not unsafe: pingora would replay the
-/// buffered prefix and read the remainder from the socket. The rule exists so the decision is
-/// deterministic rather than a race against how fast the upstream rejected the request — an earlier
-/// version of this test passed or failed depending on whether the 256 KiB body had finished
-/// arriving, because both outcomes were correct behaviour under a looser gate.
+/// A body past pingora's 64 KiB replay buffer fails over like any other: the gateway holds the
+/// whole body and re-runs the request on the next candidate (see `FullBody`). Before, the 5xx was
+/// relayed and counted on `ai_failover_unreplayable_total`.
 #[tokio::test]
-async fn an_unreplayable_body_relays_the_5xx_and_is_counted() {
+async fn a_large_body_fails_over_on_a_5xx() {
     let nats_port = unused_nats_port();
     let (pubkey, sk) = test_keypair(1);
     let primary = MockUpstream::start(Mode::Status(500)).await;
@@ -848,35 +842,77 @@ async fn an_unreplayable_body_relays_the_5xx_and_is_counted() {
         .header("authorization", format!("Bearer {}", vkey(&sk)))
         .header("content-type", "application/json")
         .header("x-beyond-model", MODEL)
-        .body(big)
+        .body(big.clone())
         .send()
         .await
         .unwrap();
 
+    assert_eq!(resp.status().as_u16(), 200, "the fallback serves");
     assert_eq!(
-        resp.status().as_u16(),
-        500,
-        "an unreplayable body must relay the error, not attempt a retry it cannot complete",
+        resp.headers()
+            .get("x-beyond-provider")
+            .and_then(|v| v.to_str().ok()),
+        Some("openrouter")
     );
-    assert_eq!(
-        fallback.hits(),
-        0,
-        "the fallback must not be sent headers for a body we cannot resend",
+    assert_eq!(primary.hits(), 1);
+    assert_eq!(fallback.hits(), 1);
+    let cap = fallback.captured().expect("fallback served");
+    assert_eq!(cap.path, "/api/v1/chat/completions");
+    let sent = String::from_utf8(cap.body).unwrap();
+    assert!(
+        sent.contains(r#""model":"openai/gpt-4o-mini""#),
+        "{}",
+        &sent[..80]
+    );
+    assert!(
+        sent.len() > 256 * 1024,
+        "the whole body reached the fallback"
     );
     let metrics = gw.metrics().await;
-    assert!(
-        parse_metric(&metrics, "ai_failover_unreplayable_total", "") >= 1.0,
-        "the uncovered case must be measurable — it is what decides the next investment:\n{metrics}"
+    assert!(parse_metric(&metrics, "ai_candidate_failovers_total", "") >= 1.0);
+    assert_eq!(
+        parse_metric(&metrics, "ai_failover_unreplayable_total", ""),
+        0.0,
+        "{metrics}"
     );
 }
 
-/// The client-retry failover. A 529 on a body past the replay buffer cannot be retried in-gateway,
-/// so it is relayed — but the stock SDKs retry 529/5xx on their own, and that retry is a fresh
-/// request with a fresh body. It must land on the fallback: the primary's latest attempt failed, so
-/// the ranker puts it behind the never-tried fallback. Before, the penalty alone left the failing
-/// primary *measured* and so ahead of the unmeasured fallback, and the retry went straight back to it.
+/// When every candidate fails a large body, the client gets the last provider's own status.
 #[tokio::test]
-async fn an_sdk_retry_after_an_unreplayable_529_lands_on_the_fallback() {
+async fn a_large_body_relays_the_last_error_when_every_candidate_fails() {
+    let nats_port = unused_nats_port();
+    let (pubkey, sk) = test_keypair(1);
+    let primary = MockUpstream::start(Mode::Status(500)).await;
+    let fallback = MockUpstream::start(Mode::Status(503)).await;
+    let gw = Gateway::builder(nats_port, &primary.authority(), &b64(&pubkey))
+        .providers(&["openai", "openrouter"])
+        .provider_authority("openrouter", &fallback.authority())
+        .start()
+        .await;
+    let filler = "x".repeat(256 * 1024);
+    let resp = test_client()
+        .post(format!("{}/v1/chat/completions", gw.url()))
+        .header("authorization", format!("Bearer {}", vkey(&sk)))
+        .header("content-type", "application/json")
+        .body(format!(
+            r#"{{"messages":[{{"role":"user","content":"{filler}"}}],"model":"{MODEL}"}}"#
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        503,
+        "the last candidate's own status"
+    );
+    assert_eq!(primary.hits(), 1);
+    assert_eq!(fallback.hits(), 1);
+}
+
+/// Anthropic's `529 overloaded` on an agent-sized body fails over in the gateway. Before, it was
+/// relayed and only the SDK's own retry reached the fallback.
+#[tokio::test]
+async fn a_large_body_529_fails_over_in_the_gateway() {
     let nats_port = unused_nats_port();
     let (pubkey, sk) = test_keypair(1);
     let primary = MockUpstream::start(Mode::AnthropicStatus(529)).await;
@@ -892,36 +928,21 @@ async fn an_sdk_retry_after_an_unreplayable_529_lands_on_the_fallback() {
     let big = format!(
         r#"{{"model":"claude-opus-4-8","max_tokens":16,"messages":[{{"role":"user","content":"{filler}"}}]}}"#
     );
-    let send = || {
-        test_client()
-            .post(format!("{}/v1/messages", gw.url()))
-            .header("x-api-key", vkey(&sk))
-            .header("content-type", "application/json")
-            .body(big.clone())
-            .send()
-    };
-
-    let first = send().await.unwrap();
+    let resp = test_client()
+        .post(format!("{}/v1/messages", gw.url()))
+        .header("x-api-key", vkey(&sk))
+        .header("content-type", "application/json")
+        .body(big)
+        .send()
+        .await
+        .unwrap();
     assert_eq!(
-        first.status().as_u16(),
-        529,
-        "unreplayable: the 529 is relayed"
-    );
-    assert_eq!(fallback.hits(), 0);
-
-    // What the SDK does next.
-    let retry = send().await.unwrap();
-    assert_eq!(
-        retry.status().as_u16(),
+        resp.status().as_u16(),
         200,
-        "the retry must be served by the fallback: {}",
-        retry.text().await.unwrap()
+        "served by the fallback: {}",
+        resp.text().await.unwrap()
     );
-    assert_eq!(
-        primary.hits(),
-        1,
-        "the retry must not go back to the provider that just failed"
-    );
+    assert_eq!(primary.hits(), 1);
     assert_eq!(fallback.hits(), 1);
     let cap = fallback.captured().expect("fallback served");
     assert!(
