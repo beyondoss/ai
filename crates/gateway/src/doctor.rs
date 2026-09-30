@@ -378,9 +378,10 @@ mod tests {
     #[test]
     fn catalog_coverage_reports_reduced_failover_without_failing() {
         let config = AiConfig {
-            // Every catalog primary is keyed; OpenRouter is not. New rows stay serviceable
-            // instead of becoming unreachable (which would fail the check, not degrade it).
-            pool_keys: catalog_pool_keys(&["openrouter"]),
+            // Everything keyed but Bedrock. The Bedrock-backed Claude rows keep Anthropic and
+            // OpenRouter, so they are degraded, not unreachable. (Leaving OpenRouter unkeyed now
+            // makes its OpenRouter-only rows unreachable, which is a failure, not a degradation.)
+            pool_keys: catalog_pool_keys(&["bedrock"]),
             ..Default::default()
         };
         let r = check_catalog_coverage(&config);
@@ -390,7 +391,7 @@ mod tests {
             r.message
         );
         assert!(
-            r.message.contains("reduced failover") && r.message.contains("gpt-4o-mini"),
+            r.message.contains("reduced failover") && r.message.contains("claude-opus-4-8"),
             "must name the degraded model, got {:?}",
             r.message,
         );

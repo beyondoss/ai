@@ -400,12 +400,12 @@ async fn catalog_rows_are_servable() {
             // `input` instead.
             // OpenAI itself rejects `max_tokens` on its reasoning models (`gpt-5*`, `o*`) and wants
             // `max_completion_tokens`, which every OpenAI chat model accepts; other OpenAI-wire hosts
-            // keep `max_tokens`. Reasoning models think before any text (`o3` 400s at 16), so 1024; a "hi" uses a fraction.
+            // keep `max_tokens`. Reasoning models think before any text (`o3` 400s at 16), so 256: enough for a "hi" on every OpenAI row, and it caps a `-pro` reasoning bill.
             let body = if candidate.path.ends_with("/embeddings") {
                 format!(r#"{{"model":"{}","input":"hi"}}"#, route.model)
             } else if candidate.provider == providers::ProviderId::OpenAi {
                 format!(
-                    r#"{{"model":"{}","max_completion_tokens":1024,"messages":[{{"role":"user","content":"hi"}}]}}"#,
+                    r#"{{"model":"{}","max_completion_tokens":256,"messages":[{{"role":"user","content":"hi"}}]}}"#,
                     route.model,
                 )
             } else {
