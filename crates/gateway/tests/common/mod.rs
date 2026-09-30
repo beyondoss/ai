@@ -67,6 +67,43 @@ fn sweep_stale_port_dirs() {
     }
 }
 
+/// Ports [`free_port`] has handed out in this process.
+fn used_ports() -> &'static Mutex<std::collections::HashSet<u16>> {
+    static USED: OnceLock<Mutex<std::collections::HashSet<u16>>> = OnceLock::new();
+    USED.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+}
+
+/// The run-scoped reservation directory [`free_port`] claims ports in.
+static PORT_DIR: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
+
+/// Bind an in-process server to a `:0` port that is not reserved for a gateway subprocess.
+///
+/// [`free_port`] returns a port and then releases it so the subprocess can bind it, and the kernel
+/// may hand that same port to the next `bind(:0)` before the subprocess gets there. When the next
+/// `bind(:0)` was another test's `MockUpstream`, the first test's client "reached its gateway" and
+/// was answered by the other test's mock: one test saw no upstream hit, the other saw a hit it
+/// never sent. Skipping reserved ports (holding them so the kernel moves on) closes that.
+async fn bind_unreserved() -> TcpListener {
+    let dir = PORT_DIR.get_or_init(port_reservation_dir);
+    let mut held = Vec::new();
+    for _ in 0..1000 {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let reserved = used_ports()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains(&port)
+            || dir
+                .as_ref()
+                .is_some_and(|d| d.join(port.to_string()).exists());
+        if !reserved {
+            return listener;
+        }
+        held.push(listener);
+    }
+    panic!("could not bind an unreserved port after 1000 attempts");
+}
+
 /// Hand out a TCP port no other `free_port()` call in this test **run** has returned.
 ///
 /// Two layers, because there are two ways to collide:
@@ -89,12 +126,8 @@ fn sweep_stale_port_dirs() {
 /// In-process servers should still bind `:0` and read the port back (see `MockUpstream`), which has
 /// no window at all.
 pub fn free_port() -> u16 {
-    use std::collections::HashSet;
-    use std::sync::OnceLock;
-    static USED: OnceLock<Mutex<HashSet<u16>>> = OnceLock::new();
-    static DIR: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
-    let used = USED.get_or_init(|| Mutex::new(HashSet::new()));
-    let dir = DIR.get_or_init(port_reservation_dir);
+    let used = used_ports();
+    let dir = PORT_DIR.get_or_init(port_reservation_dir);
 
     let mut held = Vec::new();
     for _ in 0..1000 {
@@ -772,7 +805,7 @@ impl MockUpstream {
     pub async fn start(mode: Mode) -> Self {
         // Bind `:0` and read the port back, keeping the listener open the whole time — no
         // free_port()→rebind window for another test to slip into (this is an in-process server).
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = bind_unreserved().await;
         let port = listener.local_addr().unwrap().port();
         let captured: Arc<Mutex<Option<Captured>>> = Arc::new(Mutex::new(None));
         let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -818,7 +851,7 @@ impl MockUpstream {
         // no default), pick ring to match the gateway. Idempotent across multiple mocks in one process.
         let _ = rustls::crypto::ring::default_provider().install_default();
 
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = bind_unreserved().await;
         let port = listener.local_addr().unwrap().port();
 
         let ck = rcgen::generate_simple_self_signed(vec![
