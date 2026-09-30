@@ -169,15 +169,27 @@ fn map_request(from: Endpoint, to: Endpoint, v: &Value, up: Upstream) -> Value {
 }
 
 /// Map a non-stream JSON response from `upstream` into `client`. Error objects are reshaped
-/// into the client's error envelope.
+/// into the client's error envelope. Same as [`response_json_status`] with a 200.
 pub fn response_json(upstream: Endpoint, client: Endpoint, body: &[u8]) -> Vec<u8> {
+    response_json_status(upstream, client, 200, body)
+}
+
+/// Map a non-stream JSON response carrying HTTP `status`. Any non-2xx JSON body is an error
+/// whatever its shape — Bedrock's `{"message": …}` and FastAPI's `{"detail": …}` have no `error`
+/// key, and used to be reshaped as an empty success. A body that is not JSON passes unchanged.
+pub fn response_json_status(
+    upstream: Endpoint,
+    client: Endpoint,
+    status: u16,
+    body: &[u8],
+) -> Vec<u8> {
     if upstream == client {
         return body.to_vec();
     }
     let Ok(v) = serde_json::from_slice::<Value>(body) else {
         return body.to_vec();
     };
-    if looks_like_error(&v) {
+    if !(200..300).contains(&status) || looks_like_error(&v) {
         return encode(&map_error(&v, client));
     }
     encode(&map_response(upstream, client, &v))
@@ -207,44 +219,190 @@ fn encode(v: &Value) -> Vec<u8> {
 }
 
 fn looks_like_error(v: &Value) -> bool {
-    if v.get("error").is_none() {
+    // A Responses object is an error only once it failed; its `error` is `null` otherwise.
+    if v.get("object").and_then(Value::as_str) == Some("response") {
+        return v.get("status").and_then(Value::as_str) == Some("failed")
+            && v.get("error").is_some_and(Value::is_object);
+    }
+    if v.get("error").is_none_or(Value::is_null) {
         return false;
     }
     // Success bodies never carry a top-level `error` next to `choices` / `content` / `output`.
     if v.get("choices").is_some() || v.get("content").is_some() || v.get("output").is_some() {
         return false;
     }
-    if v.get("type").and_then(Value::as_str) == Some("message") {
-        return false;
+    v.get("type").and_then(Value::as_str) != Some("message")
+}
+
+/// Everything an upstream error says, whichever dialect said it.
+struct ErrorInfo {
+    typ: String,
+    message: String,
+    code: Option<Value>,
+    param: Option<Value>,
+    /// OpenRouter's `metadata` (`provider_name`, `raw`, moderation `reasons`), kept whole for an
+    /// OpenAI-shaped client.
+    metadata: Option<Value>,
+}
+
+/// Longest upstream error message quoted into the client's envelope. A provider that answers an
+/// error with a whole HTML page gets it cut here, not relayed in full.
+const MAX_ERROR_MESSAGE: usize = 4096;
+
+fn error_info(v: &Value) -> ErrorInfo {
+    // `{"error": {…}}` (OpenAI, OpenRouter, Anthropic's envelope), a Responses `response.failed`
+    // object, or a flat body: a Responses `error` event, Bedrock `{"message"}`, `{"detail"}`.
+    let err = match v.get("error") {
+        Some(e @ Value::Object(_)) => e,
+        _ => v,
+    };
+    let field = |key: &str| {
+        err.get(key)
+            .or_else(|| v.get(key))
+            .filter(|x| !x.is_null())
+            .cloned()
+    };
+    let mut message = plain_error_message(v).unwrap_or_else(|| clip(&value_string(v)));
+    let code = field("code");
+    let param = field("param");
+    let metadata = err.get("metadata").filter(|m| m.is_object()).cloned();
+    let mut typ = err
+        .get("type")
+        .and_then(Value::as_str)
+        .filter(|t| *t != "error")
+        .map(str::to_owned);
+    // OpenRouter wraps the provider's own error: "Provider returned error" alone tells the client
+    // nothing, so the provider's message (and type, when ours has none) is quoted after it.
+    if let Some(meta) = metadata.as_ref() {
+        let provider = meta.get("provider_name").and_then(Value::as_str);
+        let inner = match meta.get("raw") {
+            Some(Value::String(raw)) => match serde_json::from_str::<Value>(raw) {
+                Ok(parsed) if parsed.is_object() => {
+                    if typ.is_none() {
+                        typ = parsed
+                            .get("error")
+                            .and_then(|e| e.get("type"))
+                            .and_then(Value::as_str)
+                            .filter(|t| *t != "error")
+                            .map(str::to_owned);
+                    }
+                    plain_error_message(&parsed).or_else(|| Some(clip(raw)))
+                }
+                _ => Some(clip(raw)),
+            },
+            Some(raw @ Value::Object(_)) => plain_error_message(raw),
+            _ => None,
+        }
+        .filter(|s| !s.is_empty());
+        let reasons = meta
+            .get("reasons")
+            .and_then(Value::as_array)
+            .map(|r| {
+                r.iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .filter(|s| !s.is_empty());
+        if let Some(detail) = inner.or(reasons) {
+            message = match provider {
+                Some(p) => format!("{message} ({p}): {detail}"),
+                None => format!("{message}: {detail}"),
+            };
+        }
     }
-    if v.get("object").and_then(Value::as_str) == Some("response") {
-        return false;
+    ErrorInfo {
+        typ: typ.unwrap_or_else(|| "api_error".to_owned()),
+        message,
+        code,
+        param,
+        metadata,
     }
-    true
+}
+
+/// The human message of an error body, wherever its dialect keeps it.
+fn plain_error_message(v: &Value) -> Option<String> {
+    let err = v.get("error");
+    let msg = match err {
+        Some(Value::String(s)) => Some(s.as_str()),
+        Some(e) => e.get("message").and_then(Value::as_str),
+        None => None,
+    }
+    .or_else(|| v.get("message").and_then(Value::as_str))
+    .or_else(|| v.get("detail").and_then(Value::as_str))
+    .or_else(|| v.pointer("/response/error/message").and_then(Value::as_str))?;
+    Some(clip(msg))
+}
+
+fn clip(s: &str) -> String {
+    if s.len() <= MAX_ERROR_MESSAGE {
+        return s.to_owned();
+    }
+    let mut end = MAX_ERROR_MESSAGE;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &s[..end])
+}
+
+/// Anthropic's error types are a closed set its SDKs match on; name the OpenAI ones that have an
+/// equivalent there. Anything else passes as the upstream spelled it.
+fn anthropic_error_type(typ: &str, code: Option<&Value>) -> String {
+    let code = code.and_then(Value::as_str).unwrap_or("");
+    match (typ, code) {
+        ("server_error", _) => "api_error",
+        ("insufficient_quota", _) | (_, "insufficient_quota") => "billing_error",
+        ("requests" | "tokens" | "rate_limit_exceeded", _) | (_, "rate_limit_exceeded") => {
+            "rate_limit_error"
+        }
+        (_, "invalid_api_key") => "authentication_error",
+        (_, "model_not_found") => "not_found_error",
+        _ => typ,
+    }
+    .to_owned()
+}
+
+/// OpenAI's `code` and `param` are strings; OpenRouter sends the HTTP status as a numeric `code`,
+/// which a strictly typed client fails to decode — and then reports that instead of the error.
+fn openai_error_field(v: Option<Value>) -> Value {
+    match v {
+        Some(Value::String(s)) => Value::String(s),
+        Some(Value::Null) | None => Value::Null,
+        Some(other) => Value::String(value_string(&other)),
+    }
 }
 
 fn map_error(v: &Value, client: Endpoint) -> Value {
-    let (typ, msg) = extract_error(v);
+    let info = error_info(v);
     match client {
-        Endpoint::Messages => json!({ "type": "error", "error": { "type": typ, "message": msg } }),
+        Endpoint::Messages => {
+            let mut err = Map::new();
+            err.insert(
+                "type".into(),
+                json!(anthropic_error_type(&info.typ, info.code.as_ref())),
+            );
+            err.insert("message".into(), json!(info.message));
+            // Not Anthropic fields, but an SDK hands the whole body to the caller: keep them.
+            if let Some(code) = info.code {
+                err.insert("code".into(), code);
+            }
+            if let Some(param) = info.param {
+                err.insert("param".into(), param);
+            }
+            json!({ "type": "error", "error": err })
+        }
         Endpoint::ChatCompletions | Endpoint::Responses | Endpoint::Embeddings => {
-            json!({ "error": { "message": msg, "type": typ } })
+            let mut err = Map::new();
+            err.insert("message".into(), json!(info.message));
+            err.insert("type".into(), json!(info.typ));
+            err.insert("param".into(), openai_error_field(info.param));
+            err.insert("code".into(), openai_error_field(info.code));
+            if let Some(meta) = info.metadata {
+                err.insert("metadata".into(), meta);
+            }
+            json!({ "error": err })
         }
     }
-}
-
-fn extract_error(v: &Value) -> (String, String) {
-    let err = v.get("error").unwrap_or(v);
-    let typ = err
-        .get("type")
-        .and_then(Value::as_str)
-        .or_else(|| v.get("type").and_then(Value::as_str))
-        .unwrap_or("api_error");
-    let msg = err
-        .get("message")
-        .and_then(Value::as_str)
-        .unwrap_or("upstream error");
-    (typ.to_owned(), msg.to_owned())
 }
 
 // --- request: OpenAI → Anthropic --------------------------------------------
@@ -2206,166 +2364,575 @@ fn anthropic_image_to_openai(b: &Value) -> Option<Value> {
 
 // --- response JSON ----------------------------------------------------------
 
-fn anthropic_resp_to_openai(v: &Value) -> Value {
-    let id = v.get("id").cloned().unwrap_or(json!("msg_translated"));
-    let model = v.get("model").cloned().unwrap_or(json!(""));
-    let assistant = anthropic_assistant_to_openai(&json!({
-        "role": "assistant",
-        "content": v.get("content").cloned().unwrap_or(json!([])),
-    }));
-    let finish = map_stop_to_openai(v.get("stop_reason").and_then(Value::as_str));
-    let usage = map_usage_to_openai(v.get("usage"));
-    json!({
-        "id": id,
-        "object": "chat.completion",
-        "model": model,
-        "choices": [{
-            "index": 0,
-            "message": assistant,
-            "finish_reason": finish,
-        }],
-        "usage": usage,
-    })
+/// Unix seconds, for a `created` / `created_at` the upstream did not supply.
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
 }
 
-fn openai_resp_to_anthropic(v: &Value) -> Value {
-    let id = v.get("id").cloned().unwrap_or(json!("chatcmpl_translated"));
-    let model = v.get("model").cloned().unwrap_or(json!(""));
-    let choice = v
-        .get("choices")
-        .and_then(Value::as_array)
-        .and_then(|a| a.first());
-    let message = choice.and_then(|c| c.get("message")).unwrap_or(v);
-    let content = openai_assistant_content(message);
-    let finish = choice
-        .and_then(|c| c.get("finish_reason"))
-        .and_then(Value::as_str);
-    let usage = map_usage_to_anthropic(v.get("usage"));
-    json!({
-        "id": id,
-        "type": "message",
-        "role": "assistant",
-        "model": model,
-        "content": normalize_anth_content(content),
-        "stop_reason": map_stop_to_anthropic(finish),
-        "usage": usage,
-    })
+/// A process-unique id (`{prefix}_gw…`) for an object the upstream left unnamed. Stable for the
+/// life of one response because the caller keeps it; unique across responses so a client that
+/// keys on it (a tool call id, a Responses item id) never sees two alike.
+fn fresh_id(prefix: &str) -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    let t = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_micros()).unwrap_or(u64::MAX));
+    format!("{prefix}_gw{t:x}{n:04x}")
 }
 
-fn normalize_anth_content(content: Value) -> Value {
-    match content {
-        Value::String(s) => json!([{ "type": "text", "text": s }]),
-        other => other,
-    }
+fn id_or_fresh(v: Option<&Value>, prefix: &str) -> String {
+    v.and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map_or_else(|| fresh_id(prefix), str::to_owned)
 }
 
+fn non_empty_str<'a>(v: &'a Value, key: &str) -> Option<&'a str> {
+    v.get(key).and_then(Value::as_str).filter(|s| !s.is_empty())
+}
+
+/// Anthropic stop reason → Chat Completions `finish_reason`.
 fn map_stop_to_openai(reason: Option<&str>) -> &'static str {
     match reason {
-        Some("max_tokens") => "length",
         Some("tool_use") => "tool_calls",
+        // All three leave the answer unfinished. `pause_turn` is a long server-tool turn Anthropic
+        // paused; the remedy is the truncation one — send the partial turn back to continue.
+        Some("max_tokens" | "model_context_window_exceeded" | "pause_turn") => "length",
+        Some("refusal") => "content_filter",
         _ => "stop",
     }
 }
 
+/// Chat Completions `finish_reason` → Anthropic stop reason.
 fn map_stop_to_anthropic(reason: Option<&str>) -> &'static str {
     match reason {
         Some("length") => "max_tokens",
-        Some("tool_calls") => "tool_use",
+        Some("tool_calls" | "function_call") => "tool_use",
+        Some("content_filter") => "refusal",
         _ => "end_turn",
     }
 }
 
-fn map_usage_to_openai(usage: Option<&Value>) -> Value {
-    let u = usage.unwrap_or(&Value::Null);
-    let input = u
-        .get("input_tokens")
-        .and_then(Value::as_u64)
-        .or_else(|| u.get("prompt_tokens").and_then(Value::as_u64))
-        .unwrap_or(0);
-    let output = u
-        .get("output_tokens")
-        .and_then(Value::as_u64)
-        .or_else(|| u.get("completion_tokens").and_then(Value::as_u64))
-        .unwrap_or(0);
-    let mut m = json!({
-        "prompt_tokens": input,
-        "completion_tokens": output,
-        "total_tokens": input.saturating_add(output),
-    });
-    if let Some(obj) = m.as_object_mut() {
-        let cached = u
-            .get("cache_read_input_tokens")
-            .and_then(Value::as_u64)
-            .or_else(|| {
-                u.pointer("/prompt_tokens_details/cached_tokens")
-                    .and_then(Value::as_u64)
-            })
-            .unwrap_or(0);
-        if cached > 0 {
-            obj.insert(
-                "prompt_tokens_details".into(),
-                json!({ "cached_tokens": cached }),
-            );
-        }
-        let reasoning = u
-            .pointer("/output_tokens_details/thinking_tokens")
-            .and_then(Value::as_u64)
-            .or_else(|| {
-                u.pointer("/completion_tokens_details/reasoning_tokens")
-                    .and_then(Value::as_u64)
-            });
-        if let Some(r) = reasoning {
-            obj.insert(
-                "completion_tokens_details".into(),
-                json!({ "reasoning_tokens": r }),
-            );
-        }
-    }
-    m
+/// A `finish_reason` that is already an Anthropic stop reason — OpenRouter's
+/// `native_finish_reason` on a Claude model — survives exactly (`stop_sequence`, `pause_turn`).
+fn anthropic_stop_reason(reason: &str) -> Option<&'static str> {
+    Some(match reason {
+        "end_turn" => "end_turn",
+        "max_tokens" => "max_tokens",
+        "stop_sequence" => "stop_sequence",
+        "tool_use" => "tool_use",
+        "pause_turn" => "pause_turn",
+        "refusal" => "refusal",
+        "model_context_window_exceeded" => "model_context_window_exceeded",
+        _ => return None,
+    })
 }
 
-fn map_usage_to_anthropic(usage: Option<&Value>) -> Value {
-    let u = usage.unwrap_or(&Value::Null);
-    let input = u
-        .get("prompt_tokens")
-        .and_then(Value::as_u64)
-        .or_else(|| u.get("input_tokens").and_then(Value::as_u64))
-        .unwrap_or(0);
-    let output = u
-        .get("completion_tokens")
-        .and_then(Value::as_u64)
-        .or_else(|| u.get("output_tokens").and_then(Value::as_u64))
-        .unwrap_or(0);
-    let mut m = json!({ "input_tokens": input, "output_tokens": output });
-    if let Some(obj) = m.as_object_mut() {
-        if let Some(c) = u
-            .pointer("/prompt_tokens_details/cached_tokens")
-            .and_then(Value::as_u64)
-            .or_else(|| u.get("cache_read_input_tokens").and_then(Value::as_u64))
-            && c > 0
-        {
-            obj.insert("cache_read_input_tokens".into(), json!(c));
+/// The Anthropic stop reason for a Chat choice: the native one when the upstream named it, else
+/// the mapped `finish_reason`. A refusal the model spoke (`message.refusal`) is a `refusal`, and
+/// tool calls under a plain `stop` (some OpenAI-compatible servers) are a `tool_use` — the reason
+/// an Anthropic agent loop checks before running them.
+fn anthropic_stop_of(choice: Option<&Value>, refused: bool, called: bool) -> &'static str {
+    let native = choice
+        .and_then(|c| c.get("native_finish_reason"))
+        .and_then(Value::as_str)
+        .and_then(anthropic_stop_reason);
+    let stop = native.unwrap_or_else(|| {
+        map_stop_to_anthropic(
+            choice
+                .and_then(|c| c.get("finish_reason"))
+                .and_then(Value::as_str),
+        )
+    });
+    finish_anthropic_stop(stop, refused, called)
+}
+
+fn finish_anthropic_stop(stop: &'static str, refused: bool, called: bool) -> &'static str {
+    match stop {
+        "end_turn" if refused => "refusal",
+        "end_turn" if called => "tool_use",
+        _ => stop,
+    }
+}
+
+/// A Chat `finish_reason` kept past its chunk.
+fn chat_finish(reason: &str) -> &'static str {
+    match reason {
+        "length" => "length",
+        "tool_calls" | "function_call" => "tool_calls",
+        "content_filter" => "content_filter",
+        _ => "stop",
+    }
+}
+
+/// Chat `finish_reason` → Responses `status` and `incomplete_details`.
+fn responses_status(finish: Option<&str>) -> (&'static str, Value) {
+    match finish {
+        Some("length") => ("incomplete", json!({ "reason": "max_output_tokens" })),
+        Some("content_filter") => ("incomplete", json!({ "reason": "content_filter" })),
+        _ => ("completed", Value::Null),
+    }
+}
+
+/// Responses `status` → Chat `finish_reason`, before tool calls are considered.
+fn responses_finish(resp: &Value) -> &'static str {
+    if resp.get("status").and_then(Value::as_str) != Some("incomplete") {
+        return "stop";
+    }
+    match resp
+        .pointer("/incomplete_details/reason")
+        .and_then(Value::as_str)
+    {
+        Some("content_filter") => "content_filter",
+        _ => "length",
+    }
+}
+
+fn u64_at(v: &Value, ptr: &str) -> Option<u64> {
+    v.pointer(ptr).and_then(Value::as_u64)
+}
+
+/// Token counts in one shape, whichever dialect reported them.
+///
+/// Anthropic's `input_tokens` counts only the prompt tokens that were neither read from nor
+/// written to the cache. OpenAI's `prompt_tokens` / Responses `input_tokens` count the whole
+/// prompt, with the cached share broken out beneath it. Passing either number through as the
+/// other told an OpenAI client a 7,000-token prompt was 10 tokens, and an Anthropic client that a
+/// mostly-cached prompt was uncached.
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+struct Usage {
+    uncached: u64,
+    cache_read: u64,
+    cache_write: u64,
+    output: u64,
+    reasoning: Option<u64>,
+}
+
+impl Usage {
+    fn from_anthropic(u: &Value) -> Self {
+        let mut usage = Self::default();
+        usage.merge_anthropic(u);
+        usage
+    }
+
+    /// Take what `u` reports. A `message_delta` repeats cumulative totals and omits those that do
+    /// not apply, so an absent field keeps the `message_start` value.
+    fn merge_anthropic(&mut self, u: &Value) {
+        if let Some(n) = u64_at(u, "/input_tokens") {
+            self.uncached = n;
         }
-        if let Some(w) = u.get("cache_creation_input_tokens").and_then(Value::as_u64)
-            && w > 0
-        {
-            obj.insert("cache_creation_input_tokens".into(), json!(w));
+        if let Some(n) = u64_at(u, "/cache_read_input_tokens") {
+            self.cache_read = n;
         }
-        if let Some(r) = u
-            .pointer("/completion_tokens_details/reasoning_tokens")
-            .and_then(Value::as_u64)
-            .or_else(|| {
-                u.pointer("/output_tokens_details/thinking_tokens")
-                    .and_then(Value::as_u64)
-            })
-        {
-            obj.insert(
+        if let Some(n) = u64_at(u, "/cache_creation_input_tokens") {
+            self.cache_write = n;
+        }
+        if let Some(n) = u64_at(u, "/output_tokens") {
+            self.output = n;
+        }
+        if let Some(n) = u64_at(u, "/output_tokens_details/thinking_tokens") {
+            self.reasoning = Some(n);
+        }
+    }
+
+    fn from_chat(u: &Value) -> Self {
+        let cache_read = u64_at(u, "/prompt_tokens_details/cached_tokens").unwrap_or(0);
+        // OpenAI and OpenRouter spell cache writes `cache_write_tokens`; LiteLLM keeps Anthropic's.
+        let cache_write = u64_at(u, "/prompt_tokens_details/cache_write_tokens")
+            .or_else(|| u64_at(u, "/cache_creation_input_tokens"))
+            .unwrap_or(0);
+        let prompt = u64_at(u, "/prompt_tokens").unwrap_or(0);
+        Self {
+            uncached: prompt
+                .saturating_sub(cache_read)
+                .saturating_sub(cache_write),
+            cache_read,
+            cache_write,
+            output: u64_at(u, "/completion_tokens").unwrap_or(0),
+            reasoning: u64_at(u, "/completion_tokens_details/reasoning_tokens"),
+        }
+    }
+
+    fn from_responses(u: &Value) -> Self {
+        let cache_read = u64_at(u, "/input_tokens_details/cached_tokens").unwrap_or(0);
+        let cache_write = u64_at(u, "/input_tokens_details/cache_write_tokens").unwrap_or(0);
+        let input = u64_at(u, "/input_tokens").unwrap_or(0);
+        Self {
+            uncached: input.saturating_sub(cache_read).saturating_sub(cache_write),
+            cache_read,
+            cache_write,
+            output: u64_at(u, "/output_tokens").unwrap_or(0),
+            reasoning: u64_at(u, "/output_tokens_details/reasoning_tokens"),
+        }
+    }
+
+    fn prompt(&self) -> u64 {
+        self.uncached
+            .saturating_add(self.cache_read)
+            .saturating_add(self.cache_write)
+    }
+
+    fn to_anthropic(self) -> Value {
+        let mut m = Map::new();
+        m.insert("input_tokens".into(), json!(self.uncached));
+        m.insert(
+            "cache_creation_input_tokens".into(),
+            json!(self.cache_write),
+        );
+        m.insert("cache_read_input_tokens".into(), json!(self.cache_read));
+        m.insert("output_tokens".into(), json!(self.output));
+        if let Some(r) = self.reasoning {
+            m.insert(
                 "output_tokens_details".into(),
                 json!({ "thinking_tokens": r }),
             );
         }
+        Value::Object(m)
     }
-    m
+
+    /// Cache writes ride `prompt_tokens_details.cache_write_tokens`, the field OpenAI and
+    /// OpenRouter both use; `prompt_tokens` includes them, as it includes cache reads.
+    fn to_chat(self) -> Value {
+        let mut m = Map::new();
+        m.insert("prompt_tokens".into(), json!(self.prompt()));
+        m.insert("completion_tokens".into(), json!(self.output));
+        m.insert(
+            "total_tokens".into(),
+            json!(self.prompt().saturating_add(self.output)),
+        );
+        m.insert(
+            "prompt_tokens_details".into(),
+            json!({ "cached_tokens": self.cache_read, "cache_write_tokens": self.cache_write }),
+        );
+        if let Some(r) = self.reasoning {
+            m.insert(
+                "completion_tokens_details".into(),
+                json!({ "reasoning_tokens": r }),
+            );
+        }
+        Value::Object(m)
+    }
+
+    /// Every detail field is required by the Responses schema, so unknown counts are 0.
+    fn to_responses(self) -> Value {
+        json!({
+            "input_tokens": self.prompt(),
+            "input_tokens_details": {
+                "cached_tokens": self.cache_read,
+                "cache_write_tokens": self.cache_write,
+            },
+            "output_tokens": self.output,
+            "output_tokens_details": { "reasoning_tokens": self.reasoning.unwrap_or(0) },
+            "total_tokens": self.prompt().saturating_add(self.output),
+        })
+    }
+}
+
+/// Longest thinking text held back waiting for its signature. Past it the block is dropped: a
+/// signature covers the whole text, so a truncated block could never be sent back.
+const MAX_HELD_THINKING: usize = 8 * 1024 * 1024;
+
+/// Whether an OpenRouter `reasoning_details` entry's opaque payload is Anthropic's. Only those
+/// verify at Anthropic; an OpenAI or Gemini blob presented as a signature would 400 there.
+fn anthropic_format(detail: &Value) -> bool {
+    detail
+        .get("format")
+        .and_then(Value::as_str)
+        .is_none_or(|f| f.starts_with("anthropic"))
+}
+
+/// Gathers one thinking block until it is whole. OpenRouter streams a Claude block as
+/// `reasoning_details` `reasoning.text` pieces sharing an `index`, then one more carrying only its
+/// `signature`; a non-stream message carries both in one entry. Finished blocks come out in
+/// Anthropic's shape — `thinking` (with `signature` when there was one) or `redacted_thinking`.
+#[derive(Default)]
+struct Gather {
+    index: Option<u64>,
+    text: String,
+    active: bool,
+    overflow: bool,
+}
+
+impl Gather {
+    /// One OpenRouter `reasoning_details` entry.
+    fn detail(&mut self, d: &Value, done: &mut Vec<Value>) {
+        let index = d.get("index").and_then(Value::as_u64);
+        match d.get("type").and_then(Value::as_str) {
+            Some("reasoning.text") => {
+                self.text(
+                    index,
+                    d.get("text").and_then(Value::as_str).unwrap_or(""),
+                    done,
+                );
+                if let Some(sig) = non_empty_str(d, "signature") {
+                    if anthropic_format(d) {
+                        self.sign(sig, done);
+                    } else {
+                        self.close(done);
+                    }
+                }
+            }
+            Some("reasoning.summary") => {
+                self.text(
+                    index,
+                    d.get("summary").and_then(Value::as_str).unwrap_or(""),
+                    done,
+                );
+            }
+            Some("reasoning.encrypted") => {
+                self.close(done);
+                if anthropic_format(d)
+                    && let Some(data) = non_empty_str(d, "data")
+                {
+                    done.push(json!({ "type": "redacted_thinking", "data": data }));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn text(&mut self, index: Option<u64>, text: &str, done: &mut Vec<Value>) {
+        if self.active && index.is_some() && self.index.is_some() && index != self.index {
+            self.close(done);
+        }
+        if !self.active {
+            self.active = true;
+            self.index = index;
+        }
+        if self.overflow {
+            return;
+        }
+        if self.text.len().saturating_add(text.len()) > MAX_HELD_THINKING {
+            self.overflow = true;
+            self.text = String::new();
+            return;
+        }
+        self.text.push_str(text);
+    }
+
+    /// The block is whole and signed.
+    fn sign(&mut self, signature: &str, done: &mut Vec<Value>) {
+        if !self.overflow {
+            done.push(json!({
+                "type": "thinking",
+                "thinking": std::mem::take(&mut self.text),
+                "signature": signature,
+            }));
+        }
+        *self = Self::default();
+    }
+
+    /// The block ended without a signature.
+    fn close(&mut self, done: &mut Vec<Value>) {
+        if self.active && !self.overflow {
+            done.push(json!({ "type": "thinking", "thinking": std::mem::take(&mut self.text) }));
+        }
+        *self = Self::default();
+    }
+
+    /// Forget the block being gathered: it ended, and will never be signed.
+    fn discard(&mut self) {
+        *self = Self::default();
+    }
+}
+
+/// The thinking blocks of a Chat Completions message, in order: our own `thinking` array (what
+/// this module writes for a Messages upstream), else OpenRouter's `reasoning_details`, else the
+/// plain `reasoning_content` / `reasoning` text, which is never signed.
+fn chat_thinking_blocks(m: &Value) -> Vec<Value> {
+    if let Some(blocks) = m.get("thinking").and_then(Value::as_array) {
+        return blocks
+            .iter()
+            .map(|b| match b.get("type").and_then(Value::as_str) {
+                Some("redacted_thinking") => json!({
+                    "type": "redacted_thinking",
+                    "data": b.get("data").cloned().unwrap_or(json!("")),
+                }),
+                _ => {
+                    let mut t = Map::new();
+                    t.insert("type".into(), json!("thinking"));
+                    let text = b
+                        .get("thinking")
+                        .or_else(|| b.get("text"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    t.insert("thinking".into(), json!(text));
+                    if let Some(sig) = non_empty_str(b, "signature") {
+                        t.insert("signature".into(), json!(sig));
+                    }
+                    Value::Object(t)
+                }
+            })
+            .collect();
+    }
+    let mut out = Vec::new();
+    if let Some(details) = m.get("reasoning_details").and_then(Value::as_array) {
+        let mut gather = Gather::default();
+        for d in details {
+            gather.detail(d, &mut out);
+        }
+        gather.close(&mut out);
+        return out;
+    }
+    if let Some(text) =
+        non_empty_str(m, "reasoning_content").or_else(|| non_empty_str(m, "reasoning"))
+    {
+        out.push(json!({ "type": "thinking", "thinking": text }));
+    }
+    out
+}
+
+/// A thinking block an Anthropic client may hold: signed, or redacted. An unsigned `thinking`
+/// block would be echoed back on the next turn and a turn served by Anthropic would 400 on it
+/// ("thinking.signature: Field required") for the rest of the conversation — so it is dropped.
+fn is_replayable_thinking(block: &Value) -> bool {
+    match block.get("type").and_then(Value::as_str) {
+        Some("thinking") => non_empty_str(block, "signature").is_some(),
+        Some("redacted_thinking") => true,
+        _ => false,
+    }
+}
+
+fn anthropic_resp_to_openai(v: &Value) -> Value {
+    let mut text = String::new();
+    let mut reasoning = String::new();
+    let mut thinking: Vec<Value> = Vec::new();
+    let mut tool_calls: Vec<Value> = Vec::new();
+    for b in v
+        .get("content")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+    {
+        match b.get("type").and_then(Value::as_str) {
+            Some("text") => text.push_str(b.get("text").and_then(Value::as_str).unwrap_or("")),
+            Some("thinking") => {
+                reasoning.push_str(b.get("thinking").and_then(Value::as_str).unwrap_or(""));
+                thinking.push(b.clone());
+            }
+            Some("redacted_thinking") => thinking.push(b.clone()),
+            Some("tool_use") => tool_calls.push(json!({
+                "id": id_or_fresh(b.get("id"), "call"),
+                "type": "function",
+                "function": {
+                    "name": b.get("name").and_then(Value::as_str).unwrap_or(""),
+                    "arguments": b.get("input").map_or_else(|| "{}".to_owned(), value_string),
+                },
+            })),
+            // Server-tool blocks (`server_tool_use`, `web_search_tool_result`, …) have no Chat
+            // Completions form; they only arise from tools a Chat client cannot declare.
+            _ => {}
+        }
+    }
+    let stop = v.get("stop_reason").and_then(Value::as_str);
+    let mut msg = Map::new();
+    msg.insert("role".into(), json!("assistant"));
+    let content = if text.is_empty() && (!tool_calls.is_empty() || stop == Some("refusal")) {
+        Value::Null
+    } else {
+        json!(text)
+    };
+    msg.insert("content".into(), content);
+    if stop == Some("refusal") {
+        let why = v
+            .pointer("/stop_details/explanation")
+            .and_then(Value::as_str);
+        msg.insert("refusal".into(), why.map_or(Value::Null, |w| json!(w)));
+    }
+    if !tool_calls.is_empty() {
+        msg.insert("tool_calls".into(), Value::Array(tool_calls));
+    }
+    if !reasoning.is_empty() {
+        msg.insert("reasoning_content".into(), json!(reasoning));
+    }
+    if !thinking.is_empty() {
+        msg.insert("thinking".into(), Value::Array(thinking));
+    }
+    json!({
+        "id": id_or_fresh(v.get("id"), "chatcmpl"),
+        "object": "chat.completion",
+        "created": unix_now(),
+        "model": v.get("model").cloned().unwrap_or(json!("")),
+        "choices": [{
+            "index": 0,
+            "message": Value::Object(msg),
+            "finish_reason": map_stop_to_openai(stop),
+            "logprobs": Value::Null,
+        }],
+        "usage": Usage::from_anthropic(v.get("usage").unwrap_or(&Value::Null)).to_chat(),
+    })
+}
+
+fn openai_resp_to_anthropic(v: &Value) -> Value {
+    let choice = v
+        .get("choices")
+        .and_then(Value::as_array)
+        .and_then(|a| a.first());
+    let message = choice
+        .and_then(|c| c.get("message"))
+        .unwrap_or(&Value::Null);
+    let mut content: Vec<Value> = chat_thinking_blocks(message)
+        .into_iter()
+        .filter(is_replayable_thinking)
+        .collect();
+    let mut refused = false;
+    fn push_text(content: &mut Vec<Value>, t: &str) {
+        if !t.is_empty() {
+            content.push(json!({ "type": "text", "text": t }));
+        }
+    }
+    match message.get("content") {
+        Some(Value::String(s)) => push_text(&mut content, s),
+        Some(Value::Array(parts)) => {
+            for p in parts {
+                match p.get("type").and_then(Value::as_str) {
+                    Some("refusal") => {
+                        refused = true;
+                        push_text(
+                            &mut content,
+                            p.get("refusal").and_then(Value::as_str).unwrap_or(""),
+                        );
+                    }
+                    _ => push_text(
+                        &mut content,
+                        p.get("text").and_then(Value::as_str).unwrap_or(""),
+                    ),
+                }
+            }
+        }
+        _ => {}
+    }
+    if let Some(r) = non_empty_str(message, "refusal") {
+        refused = true;
+        push_text(&mut content, r);
+    }
+    let calls = message
+        .get("tool_calls")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    for c in calls {
+        let func = c.get("function").unwrap_or(c);
+        content.push(json!({
+            "type": "tool_use",
+            "id": id_or_fresh(c.get("id"), "toolu"),
+            "name": func.get("name").and_then(Value::as_str).unwrap_or(""),
+            "input": parse_arguments(func.get("arguments")),
+        }));
+    }
+    json!({
+        "id": id_or_fresh(v.get("id"), "msg"),
+        "type": "message",
+        "role": "assistant",
+        "model": v.get("model").cloned().unwrap_or(json!("")),
+        "content": content,
+        "stop_reason": anthropic_stop_of(choice, refused, !calls.is_empty()),
+        "stop_sequence": Value::Null,
+        "usage": Usage::from_chat(v.get("usage").unwrap_or(&Value::Null)).to_anthropic(),
+    })
 }
 
 // --- request: Responses ↔ Chat Completions ----------------------------------
@@ -3047,83 +3614,6 @@ fn responses_part_to_openai(part: &Value) -> Option<Value> {
     }
 }
 
-fn openai_message_to_responses_content(m: &Value, input: bool) -> Value {
-    let text_type = if input { "input_text" } else { "output_text" };
-    match m.get("content") {
-        Some(Value::String(s)) => json!([{ "type": text_type, "text": s }]),
-        Some(Value::Array(parts)) => Value::Array(
-            parts
-                .iter()
-                .filter_map(|p| openai_part_to_responses(p, text_type))
-                .collect(),
-        ),
-        Some(Value::Null) | None => json!([]),
-        Some(other) => other.clone(),
-    }
-}
-
-fn openai_part_to_responses(part: &Value, text_type: &str) -> Option<Value> {
-    match part.get("type").and_then(Value::as_str) {
-        Some("text") | None if part.get("text").is_some() || part.is_string() => {
-            let mut m = Map::new();
-            m.insert("type".into(), json!(text_type));
-            m.insert(
-                "text".into(),
-                part.get("text")
-                    .cloned()
-                    .or_else(|| part.as_str().map(|s| json!(s)))
-                    .unwrap_or(json!("")),
-            );
-            copy_cache_control(&mut m, part);
-            Some(Value::Object(m))
-        }
-        Some("image_url") => {
-            let url = part.pointer("/image_url/url").and_then(Value::as_str)?;
-            let mut m = json!({
-                "type": "input_image",
-                "image_url": url,
-            });
-            if let Some(obj) = m.as_object_mut() {
-                copy_cache_control(obj, part);
-            }
-            Some(m)
-        }
-        Some("file") => {
-            let mut m = Map::new();
-            m.insert("type".into(), json!("input_file"));
-            if let Some(file) = part.get("file") {
-                for key in ["file_data", "file_id", "filename"] {
-                    copy_if(&mut m, file, key);
-                }
-            }
-            Some(Value::Object(m))
-        }
-        Some("thinking") | Some("redacted_thinking") => Some(part.clone()),
-        _ => part
-            .as_str()
-            .map(|s| json!({ "type": text_type, "text": s })),
-    }
-}
-
-fn content_is_empty(content: &Value) -> bool {
-    match content {
-        Value::Array(a) => a.is_empty(),
-        Value::String(s) => s.is_empty(),
-        Value::Null => true,
-        _ => false,
-    }
-}
-
-fn openai_tool_call_to_function_call(c: &Value) -> Value {
-    let func = c.get("function").unwrap_or(c);
-    json!({
-        "type": "function_call",
-        "call_id": c.get("id").cloned().unwrap_or(json!("call_0")),
-        "name": func.get("name").cloned().unwrap_or(json!("")),
-        "arguments": func.get("arguments").cloned().unwrap_or(json!("{}")),
-    })
-}
-
 fn openai_system_to_responses_blocks(m: &Value) -> Vec<Value> {
     match m.get("content") {
         Some(Value::String(s)) => {
@@ -3154,158 +3644,261 @@ fn openai_system_to_responses_blocks(m: &Value) -> Vec<Value> {
     }
 }
 
+/// A Chat Completions response for a Responses client. Items come in the order OpenAI emits
+/// them: reasoning, the message, then function calls.
 fn openai_resp_to_responses(v: &Value) -> Value {
-    let id = v.get("id").cloned().unwrap_or(json!("resp_translated"));
-    let model = v.get("model").cloned().unwrap_or(json!(""));
     let choice = v
         .get("choices")
         .and_then(Value::as_array)
         .and_then(|a| a.first());
-    let message = choice.and_then(|c| c.get("message")).unwrap_or(v);
-    let mut output = Vec::new();
-    if let Some(calls) = message.get("tool_calls").and_then(Value::as_array) {
-        for c in calls {
-            output.push(openai_tool_call_to_function_call(c));
-        }
-    }
-    let content = openai_message_to_responses_content(message, false);
-    if !content_is_empty(&content) {
-        output.insert(
-            0,
-            json!({
-                "type": "message",
-                "id": "msg_translated",
-                "role": "assistant",
-                "content": content,
-                "status": "completed",
-            }),
-        );
-    }
-    json!({
-        "id": id,
-        "object": "response",
-        "status": "completed",
-        "model": model,
-        "output": output,
-        "usage": map_usage_to_responses(v.get("usage")),
-    })
-}
-
-fn responses_resp_to_openai(v: &Value) -> Value {
-    let id = v.get("id").cloned().unwrap_or(json!("resp_translated"));
-    let model = v.get("model").cloned().unwrap_or(json!(""));
-    let output = v.get("output").and_then(Value::as_array);
-    let mut text = String::new();
-    let mut tool_calls = Vec::new();
-    if let Some(items) = output {
-        for item in items {
-            match item.get("type").and_then(Value::as_str) {
-                Some("function_call") => tool_calls.push(json!({
-                    "id": item.get("call_id").or_else(|| item.get("id")).cloned().unwrap_or(json!("call_0")),
-                    "type": "function",
-                    "function": {
-                        "name": item.get("name").cloned().unwrap_or(json!("")),
-                        "arguments": item.get("arguments").cloned().unwrap_or(json!("{}")),
-                    }
-                })),
-                _ => {
-                    if let Some(content) = item.get("content").and_then(Value::as_array) {
-                        for p in content {
-                            if let Some(t) = p.get("text").and_then(Value::as_str) {
-                                text.push_str(t);
-                            }
+    let message = choice
+        .and_then(|c| c.get("message"))
+        .unwrap_or(&Value::Null);
+    let finish = choice
+        .and_then(|c| c.get("finish_reason"))
+        .and_then(Value::as_str);
+    let (status, incomplete) = responses_status(finish);
+    let item_status = if status == "completed" {
+        "completed"
+    } else {
+        "incomplete"
+    };
+    let mut output: Vec<Value> = chat_thinking_blocks(message)
+        .iter()
+        .filter_map(|b| reasoning_item(b, fresh_id("rs")))
+        .collect();
+    let mut parts = Vec::new();
+    match message.get("content") {
+        Some(Value::String(s)) if !s.is_empty() => parts.push(output_text_part(s)),
+        Some(Value::Array(content)) => {
+            for p in content {
+                match p.get("type").and_then(Value::as_str) {
+                    Some("refusal") => parts.push(refusal_part(
+                        p.get("refusal").and_then(Value::as_str).unwrap_or(""),
+                    )),
+                    _ => {
+                        if let Some(t) = non_empty_str(p, "text") {
+                            parts.push(output_text_part(t));
                         }
-                    } else if let Some(t) = item.get("content").and_then(Value::as_str) {
-                        text.push_str(t);
                     }
                 }
             }
         }
+        _ => {}
     }
-    let mut message = json!({ "role": "assistant", "content": text });
-    let finish = if tool_calls.is_empty() {
-        "stop"
-    } else {
-        if let Some(obj) = message.as_object_mut() {
-            obj.insert("tool_calls".into(), Value::Array(tool_calls));
-            obj.insert("content".into(), Value::Null);
-        }
-        "tool_calls"
-    };
+    if let Some(r) = non_empty_str(message, "refusal") {
+        parts.push(refusal_part(r));
+    }
+    if !parts.is_empty() {
+        output.push(json!({
+            "type": "message",
+            "id": fresh_id("msg"),
+            "role": "assistant",
+            "status": item_status,
+            "content": parts,
+        }));
+    }
+    for c in message
+        .get("tool_calls")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+    {
+        let func = c.get("function").unwrap_or(c);
+        output.push(json!({
+            "type": "function_call",
+            "id": fresh_id("fc"),
+            "call_id": id_or_fresh(c.get("id"), "call"),
+            "name": func.get("name").and_then(Value::as_str).unwrap_or(""),
+            "arguments": arguments_string(func.get("arguments")),
+            "status": item_status,
+        }));
+    }
+    responses_object(
+        id_or_fresh(v.get("id"), "resp"),
+        v.get("created")
+            .and_then(Value::as_u64)
+            .unwrap_or_else(unix_now),
+        v.get("model").cloned().unwrap_or(json!("")),
+        status,
+        incomplete,
+        output,
+        Usage::from_chat(v.get("usage").unwrap_or(&Value::Null)).to_responses(),
+    )
+}
+
+/// A Responses object with every field the schema requires. The request's `tools` and
+/// `tool_choice` are not known here; the defaults stand in for them.
+fn responses_object(
+    id: String,
+    created_at: u64,
+    model: Value,
+    status: &str,
+    incomplete: Value,
+    output: Vec<Value>,
+    usage: Value,
+) -> Value {
     json!({
         "id": id,
-        "object": "chat.completion",
+        "object": "response",
+        "created_at": created_at,
+        "status": status,
+        "error": Value::Null,
+        "incomplete_details": incomplete,
         "model": model,
-        "choices": [{
-            "index": 0,
-            "message": message,
-            "finish_reason": finish,
-        }],
-        "usage": map_usage_to_openai(v.get("usage")),
+        "output": output,
+        "parallel_tool_calls": true,
+        "tool_choice": "auto",
+        "tools": [],
+        "usage": usage,
     })
 }
 
-fn map_usage_to_responses(usage: Option<&Value>) -> Value {
-    let u = usage.unwrap_or(&Value::Null);
-    let input = u
-        .get("input_tokens")
-        .and_then(Value::as_u64)
-        .or_else(|| u.get("prompt_tokens").and_then(Value::as_u64))
-        .unwrap_or(0);
-    let output = u
-        .get("output_tokens")
-        .and_then(Value::as_u64)
-        .or_else(|| u.get("completion_tokens").and_then(Value::as_u64))
-        .unwrap_or(0);
-    let mut m = json!({
-        "input_tokens": input,
-        "output_tokens": output,
-        "total_tokens": input.saturating_add(output),
-    });
-    if let Some(obj) = m.as_object_mut() {
-        let cached = u
-            .get("cache_read_input_tokens")
-            .and_then(Value::as_u64)
-            .or_else(|| {
-                u.pointer("/prompt_tokens_details/cached_tokens")
-                    .and_then(Value::as_u64)
-            })
-            .or_else(|| {
-                u.pointer("/input_tokens_details/cached_tokens")
-                    .and_then(Value::as_u64)
-            })
-            .unwrap_or(0);
-        if cached > 0 {
-            obj.insert(
-                "input_tokens_details".into(),
-                json!({ "cached_tokens": cached }),
-            );
-        }
-        if let Some(r) = u
-            .pointer("/completion_tokens_details/reasoning_tokens")
-            .and_then(Value::as_u64)
-            .or_else(|| {
-                u.pointer("/output_tokens_details/reasoning_tokens")
-                    .and_then(Value::as_u64)
-            })
-            .or_else(|| {
-                u.pointer("/output_tokens_details/thinking_tokens")
-                    .and_then(Value::as_u64)
-            })
-        {
-            obj.insert(
-                "output_tokens_details".into(),
-                json!({ "reasoning_tokens": r }),
-            );
+fn output_text_part(text: &str) -> Value {
+    json!({ "type": "output_text", "text": text, "annotations": [] })
+}
+
+fn refusal_part(refusal: &str) -> Value {
+    json!({ "type": "refusal", "refusal": refusal })
+}
+
+/// A Responses `reasoning` item for a thinking block: its text as a summary, its Anthropic
+/// signature (when there was one) as `encrypted_content`. `redacted_thinking` has no text to show
+/// and no slot of its own on Responses, and is dropped.
+fn reasoning_item(block: &Value, id: String) -> Option<Value> {
+    if block.get("type").and_then(Value::as_str) != Some("thinking") {
+        return None;
+    }
+    let text = block.get("thinking").and_then(Value::as_str).unwrap_or("");
+    let summary = if text.is_empty() {
+        json!([])
+    } else {
+        json!([{ "type": "summary_text", "text": text }])
+    };
+    let mut item = Map::new();
+    item.insert("type".into(), json!("reasoning"));
+    item.insert("id".into(), json!(id));
+    item.insert("summary".into(), summary);
+    if let Some(sig) = non_empty_str(block, "signature") {
+        item.insert("encrypted_content".into(), json!(sig));
+    }
+    Some(Value::Object(item))
+}
+
+/// Tool arguments as the JSON text Chat Completions and Responses carry them in.
+fn arguments_string(v: Option<&Value>) -> String {
+    match v {
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Null) | None => "{}".to_owned(),
+        Some(other) => value_string(other),
+    }
+}
+
+/// A Responses response for a Chat Completions client.
+fn responses_resp_to_openai(v: &Value) -> Value {
+    let mut text = String::new();
+    let mut refusal = String::new();
+    let mut reasoning = String::new();
+    let mut tool_calls = Vec::new();
+    for item in v
+        .get("output")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+    {
+        match item.get("type").and_then(Value::as_str) {
+            Some("function_call") => tool_calls.push(json!({
+                "id": id_or_fresh(item.get("call_id").or_else(|| item.get("id")), "call"),
+                "type": "function",
+                "function": {
+                    "name": item.get("name").and_then(Value::as_str).unwrap_or(""),
+                    "arguments": arguments_string(item.get("arguments")),
+                },
+            })),
+            Some("reasoning") => {
+                let texts = ["summary", "content"]
+                    .into_iter()
+                    .filter_map(|k| item.get(k).and_then(Value::as_array))
+                    .flatten()
+                    .filter_map(|p| non_empty_str(p, "text"));
+                for t in texts {
+                    if !reasoning.is_empty() {
+                        reasoning.push_str("\n\n");
+                    }
+                    reasoning.push_str(t);
+                }
+            }
+            // Messages; hosted-tool items (web search, file search, …) have no Chat form and only
+            // follow tools a Chat client cannot declare.
+            Some("message") | None => match item.get("content") {
+                Some(Value::String(s)) => text.push_str(s),
+                Some(Value::Array(parts)) => {
+                    for p in parts {
+                        match p.get("type").and_then(Value::as_str) {
+                            Some("refusal") => refusal
+                                .push_str(p.get("refusal").and_then(Value::as_str).unwrap_or("")),
+                            _ => text.push_str(p.get("text").and_then(Value::as_str).unwrap_or("")),
+                        }
+                    }
+                }
+                _ => {}
+            },
+            _ => {}
         }
     }
-    m
+    let status_finish = responses_finish(v);
+    let finish = if status_finish == "stop" && !tool_calls.is_empty() {
+        "tool_calls"
+    } else {
+        status_finish
+    };
+    let mut msg = Map::new();
+    msg.insert("role".into(), json!("assistant"));
+    let content = if text.is_empty() && (!tool_calls.is_empty() || !refusal.is_empty()) {
+        Value::Null
+    } else {
+        json!(text)
+    };
+    msg.insert("content".into(), content);
+    if !refusal.is_empty() {
+        msg.insert("refusal".into(), json!(refusal));
+    }
+    if !tool_calls.is_empty() {
+        msg.insert("tool_calls".into(), Value::Array(tool_calls));
+    }
+    if !reasoning.is_empty() {
+        msg.insert("reasoning_content".into(), json!(reasoning));
+    }
+    json!({
+        "id": id_or_fresh(v.get("id"), "chatcmpl"),
+        "object": "chat.completion",
+        "created": created_of(v.get("created_at")),
+        "model": v.get("model").cloned().unwrap_or(json!("")),
+        "choices": [{
+            "index": 0,
+            "message": Value::Object(msg),
+            "finish_reason": finish,
+            "logprobs": Value::Null,
+        }],
+        "usage": Usage::from_responses(v.get("usage").unwrap_or(&Value::Null)).to_chat(),
+    })
+}
+
+/// Responses `created_at` (seconds, sometimes fractional) as Chat's integer `created`.
+fn created_of(v: Option<&Value>) -> u64 {
+    v.and_then(|c| c.as_u64().or_else(|| c.as_f64().map(|f| f as u64)))
+        .filter(|c| *c > 0)
+        .unwrap_or_else(unix_now)
 }
 
 // --- SSE --------------------------------------------------------------------
 
 /// Event-by-event SSE translator. Incomplete events stay in `buf`; complete events are mapped
 /// immediately. Does not wait for `[DONE]` before forwarding deltas.
+///
+/// Every pairing meets in Chat Completions chunks: a Messages or Responses upstream is read into
+/// [`ChatItem`]s, and a Messages or Responses client is written from them. The middle is values,
+/// not bytes, so a composed pairing (Messages → Responses) parses each event once.
 pub struct SseBridge {
     client: Endpoint,
     upstream: Endpoint,
@@ -3314,59 +3907,23 @@ pub struct SseBridge {
     /// once rather than from the start on every chunk.
     scanned: usize,
     ant_to_oai: AntToOai,
+    resp_to_oai: RespToOai,
     oai_to_ant: OaiToAnt,
     oai_to_resp: OaiToResp,
-    resp_to_oai: RespToOai,
-    /// An `error` event already went to the client. Flush must not invent a success close
-    /// (`message_start`/`message_stop` or a trailing `[DONE]`-only envelope that implies a message).
+    /// An error already went to the client. Nothing after it is forwarded, and flush must not
+    /// invent a success close (`message_stop`, `response.completed`); a Chat client still gets its
+    /// `[DONE]`.
     errored: bool,
-}
-
-#[derive(Default)]
-struct AntToOai {
-    id: String,
-    model: String,
-    next_tool: u32,
-    input_tokens: u64,
-    cache_read: u64,
-    thinking_tokens: Option<u64>,
+    /// A Chat client's `[DONE]` went out.
     done: bool,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Default)]
-enum OpenBlock {
-    #[default]
-    None,
-    Text,
-    Tool,
-    Thinking,
-}
-
-#[derive(Default)]
-struct OaiToAnt {
-    started: bool,
-    id: String,
-    model: String,
-    next_block: u32,
-    open: OpenBlock,
-    pending_stop: Option<&'static str>,
-    prompt_tokens: Option<u64>,
-    completion_tokens: Option<u64>,
-    finished: bool,
-}
-
-#[derive(Default)]
-struct OaiToResp {
-    id: String,
-    model: String,
-    created: bool,
-    completed: bool,
-    usage: Option<Value>,
-}
-
-#[derive(Default)]
-struct RespToOai {
-    done: bool,
+/// One Chat Completions stream item, the dialect every pairing meets in.
+enum ChatItem {
+    Chunk(Value),
+    /// The upstream's error body as it came; each client shapes its own envelope from it.
+    Error(Value),
+    Done,
 }
 
 impl SseBridge {
@@ -3377,10 +3934,11 @@ impl SseBridge {
             buf: Vec::new(),
             scanned: 0,
             ant_to_oai: AntToOai::default(),
+            resp_to_oai: RespToOai::default(),
             oai_to_ant: OaiToAnt::default(),
             oai_to_resp: OaiToResp::default(),
-            resp_to_oai: RespToOai::default(),
             errored: false,
+            done: false,
         }
     }
 
@@ -3408,765 +3966,1509 @@ impl SseBridge {
     }
 
     fn map_event(&mut self, raw: &[u8]) -> Vec<u8> {
+        if self.upstream == self.client {
+            return raw.to_vec();
+        }
         let (event, data) = parse_sse(raw);
         if data.is_empty() && event.is_empty() {
             return Vec::new();
         }
-        match (self.upstream, self.client) {
-            (Endpoint::Messages, Endpoint::ChatCompletions) => self.ant_event_to_oai(&event, &data),
-            (Endpoint::ChatCompletions, Endpoint::Messages) => self.oai_event_to_ant(&event, &data),
-            (Endpoint::ChatCompletions, Endpoint::Responses) => {
-                self.oai_event_to_resp(&event, &data)
-            }
-            (Endpoint::Responses, Endpoint::ChatCompletions) => {
-                self.resp_event_to_oai(&event, &data)
-            }
-            (Endpoint::Messages, Endpoint::Responses) => {
-                let chat = self.ant_event_to_oai(&event, &data);
-                self.rewrite_chat_sse(&chat, |s, e, d| s.oai_event_to_resp(e, d))
-            }
-            (Endpoint::Responses, Endpoint::Messages) => {
-                let chat = self.resp_event_to_oai(&event, &data);
-                self.rewrite_chat_sse(&chat, |s, e, d| s.oai_event_to_ant(e, d))
-            }
-            (a, b) if a == b => raw.to_vec(),
-            _ => Vec::new(),
+        let mut items = Vec::new();
+        match self.upstream {
+            Endpoint::Messages => self.ant_to_oai.event(&event, &data, &mut items),
+            Endpoint::Responses => self.resp_to_oai.event(&event, &data, &mut items),
+            Endpoint::ChatCompletions => chat_items(&data, &mut items),
+            Endpoint::Embeddings => {}
         }
-    }
-
-    fn rewrite_chat_sse(
-        &mut self,
-        bytes: &[u8],
-        mut map: impl FnMut(&mut Self, &str, &str) -> Vec<u8>,
-    ) -> Vec<u8> {
-        let mut buf = bytes.to_vec();
-        let mut scanned = 0;
         let mut out = Vec::new();
-        while let Some(raw) = take_event(&mut buf, &mut scanned) {
-            let (event, data) = parse_sse(&raw);
-            if data.is_empty() && event.is_empty() {
-                continue;
-            }
-            out.extend(map(self, &event, &data));
+        for item in items {
+            self.deliver(item, &mut out);
         }
         out
     }
 
-    fn flush(&mut self) -> Vec<u8> {
+    fn deliver(&mut self, item: ChatItem, out: &mut Vec<u8>) {
         if self.errored {
-            return match self.client {
-                Endpoint::ChatCompletions => {
-                    if self.ant_to_oai.done || self.resp_to_oai.done {
-                        Vec::new()
-                    } else {
-                        self.ant_to_oai.done = true;
-                        self.resp_to_oai.done = true;
-                        sse_data("[DONE]")
-                    }
-                }
-                Endpoint::Messages | Endpoint::Responses | Endpoint::Embeddings => Vec::new(),
-            };
+            return;
         }
-        match (self.upstream, self.client) {
-            (_, Endpoint::ChatCompletions) => {
-                if self.ant_to_oai.done || self.resp_to_oai.done {
-                    Vec::new()
-                } else {
-                    self.ant_to_oai.done = true;
-                    self.resp_to_oai.done = true;
-                    sse_data("[DONE]")
+        match (self.client, item) {
+            (client, ChatItem::Error(v)) => {
+                self.errored = true;
+                match client {
+                    Endpoint::ChatCompletions => out.extend(sse_data(&value_string(&map_error(
+                        &v,
+                        Endpoint::ChatCompletions,
+                    )))),
+                    Endpoint::Messages => out.extend(sse_named(
+                        "error",
+                        &value_string(&map_error(&v, Endpoint::Messages)),
+                    )),
+                    Endpoint::Responses => self.oai_to_resp.error(&v, out),
+                    Endpoint::Embeddings => {}
                 }
             }
-            (_, Endpoint::Messages) => self.oai_to_ant.finish(),
-            (Endpoint::Messages, Endpoint::Responses) => {
-                let chat = if self.ant_to_oai.done {
-                    Vec::new()
-                } else {
-                    self.ant_to_oai.done = true;
-                    sse_data("[DONE]")
-                };
-                let mut out = self.rewrite_chat_sse(&chat, |s, e, d| s.oai_event_to_resp(e, d));
-                out.extend(self.oai_to_resp.finish());
-                out
+            (Endpoint::ChatCompletions, ChatItem::Chunk(v)) => {
+                out.extend(sse_data(&value_string(&v)));
             }
-            (_, Endpoint::Responses) => self.oai_to_resp.finish(),
-            // Embeddings never stream and never translate.
-            (_, Endpoint::Embeddings) => Vec::new(),
+            (Endpoint::ChatCompletions, ChatItem::Done) => {
+                if !self.done {
+                    self.done = true;
+                    out.extend(sse_data("[DONE]"));
+                }
+            }
+            (Endpoint::Messages, ChatItem::Chunk(v)) => self.oai_to_ant.chunk(&v, out),
+            (Endpoint::Messages, ChatItem::Done) => self.oai_to_ant.finish(out),
+            (Endpoint::Responses, ChatItem::Chunk(v)) => self.oai_to_resp.chunk(&v, out),
+            (Endpoint::Responses, ChatItem::Done) => self.oai_to_resp.finish(out),
+            (Endpoint::Embeddings, _) => {}
         }
     }
 
-    fn ant_event_to_oai(&mut self, event: &str, data: &str) -> Vec<u8> {
+    fn flush(&mut self) -> Vec<u8> {
+        let mut out = Vec::new();
+        if self.upstream == self.client {
+            return out;
+        }
+        match self.client {
+            Endpoint::ChatCompletions => {
+                if !self.done {
+                    self.done = true;
+                    out.extend(sse_data("[DONE]"));
+                }
+            }
+            Endpoint::Messages if !self.errored => self.oai_to_ant.finish(&mut out),
+            Endpoint::Responses if !self.errored => self.oai_to_resp.finish(&mut out),
+            // Embeddings never stream and never translate.
+            Endpoint::Messages | Endpoint::Responses | Endpoint::Embeddings => {}
+        }
+        out
+    }
+}
+
+/// A Chat Completions upstream event.
+fn chat_items(data: &str, items: &mut Vec<ChatItem>) {
+    if data == "[DONE]" {
+        items.push(ChatItem::Done);
+        return;
+    }
+    let Ok(v) = serde_json::from_str::<Value>(data) else {
+        return;
+    };
+    items.push(if looks_like_error(&v) {
+        ChatItem::Error(v)
+    } else {
+        ChatItem::Chunk(v)
+    });
+}
+
+/// The fields every Chat Completions chunk repeats.
+#[derive(Default)]
+struct ChunkMeta {
+    id: String,
+    model: String,
+    created: u64,
+}
+
+impl ChunkMeta {
+    fn fill(&mut self) {
+        if self.id.is_empty() {
+            self.id = fresh_id("chatcmpl");
+        }
+        if self.created == 0 {
+            self.created = unix_now();
+        }
+    }
+
+    fn chunk(&mut self, delta: Value, finish: Option<&str>) -> ChatItem {
+        self.fill();
+        ChatItem::Chunk(json!({
+            "id": self.id,
+            "object": "chat.completion.chunk",
+            "created": self.created,
+            "model": self.model,
+            "choices": [{ "index": 0, "delta": delta, "finish_reason": finish }],
+        }))
+    }
+
+    /// The trailing usage-only chunk, as `stream_options.include_usage` shapes it.
+    fn usage(&mut self, usage: Value) -> ChatItem {
+        self.fill();
+        ChatItem::Chunk(json!({
+            "id": self.id,
+            "object": "chat.completion.chunk",
+            "created": self.created,
+            "model": self.model,
+            "choices": [],
+            "usage": usage,
+        }))
+    }
+}
+
+fn reasoning_delta(text: &str) -> Value {
+    json!({ "reasoning_content": text, "reasoning": text })
+}
+
+/// Anthropic Messages events → Chat Completions items.
+#[derive(Default)]
+struct AntToOai {
+    meta: ChunkMeta,
+    /// Tool calls opened so far: the next one's Chat `index`.
+    tools: u32,
+    /// The Chat `index` of the block now open, when it is a client `tool_use`. Anthropic blocks
+    /// never interleave, so a JSON delta belongs to it; one for any other block (a server tool's
+    /// input) must not land on a client call's arguments.
+    open_tool: Option<u32>,
+    usage: Usage,
+}
+
+impl AntToOai {
+    fn event(&mut self, event: &str, data: &str, items: &mut Vec<ChatItem>) {
         if event == "ping" {
-            return Vec::new();
+            return;
         }
         if data == "[DONE]" {
-            if self.errored || self.ant_to_oai.done {
-                return Vec::new();
-            }
-            self.ant_to_oai.done = true;
-            return sse_data("[DONE]");
+            items.push(ChatItem::Done);
+            return;
         }
         let Ok(v) = serde_json::from_str::<Value>(data) else {
-            return Vec::new();
+            return;
         };
-        if looks_like_error(&v) || event == "error" {
-            self.errored = true;
-            return sse_data(&value_string(&map_error(&v, Endpoint::ChatCompletions)));
-        }
         let typ = if event.is_empty() {
             v.get("type").and_then(Value::as_str).unwrap_or("")
         } else {
             event
         };
+        if typ == "error" || looks_like_error(&v) {
+            items.push(ChatItem::Error(v));
+            return;
+        }
         match typ {
             "message_start" => {
                 let msg = v.get("message").unwrap_or(&v);
-                if let Some(id) = msg.get("id").and_then(Value::as_str) {
-                    self.ant_to_oai.id = id.to_owned();
-                }
+                self.meta.id = id_or_fresh(msg.get("id"), "chatcmpl");
                 if let Some(model) = msg.get("model").and_then(Value::as_str) {
-                    self.ant_to_oai.model = model.to_owned();
+                    model.clone_into(&mut self.meta.model);
                 }
+                self.meta.created = unix_now();
                 if let Some(u) = msg.get("usage") {
-                    self.ant_to_oai.input_tokens =
-                        u.get("input_tokens").and_then(Value::as_u64).unwrap_or(0);
-                    self.ant_to_oai.cache_read = u
-                        .get("cache_read_input_tokens")
-                        .and_then(Value::as_u64)
-                        .unwrap_or(0);
+                    self.usage.merge_anthropic(u);
                 }
-                self.emit_oai_delta(json!({ "role": "assistant", "content": "" }), None)
+                items.push(
+                    self.meta
+                        .chunk(json!({ "role": "assistant", "content": "" }), None),
+                );
             }
             "content_block_start" => {
                 let block = v.get("content_block").unwrap_or(&Value::Null);
-                match block.get("type").and_then(Value::as_str) {
+                self.open_tool = None;
+                let delta = match block.get("type").and_then(Value::as_str) {
                     Some("tool_use") => {
-                        let idx = self.ant_to_oai.next_tool;
-                        self.ant_to_oai.next_tool = self.ant_to_oai.next_tool.saturating_add(1);
-                        let id = block.get("id").and_then(Value::as_str).unwrap_or("call_0");
-                        let name = block.get("name").and_then(Value::as_str).unwrap_or("");
-                        self.emit_oai_delta(
-                            json!({
-                                "tool_calls": [{
-                                    "index": idx,
-                                    "id": id,
-                                    "type": "function",
-                                    "function": { "name": name, "arguments": "" },
-                                }]
-                            }),
-                            None,
-                        )
+                        let index = self.tools;
+                        self.tools = self.tools.saturating_add(1);
+                        self.open_tool = Some(index);
+                        json!({ "tool_calls": [{
+                            "index": index,
+                            "id": id_or_fresh(block.get("id"), "call"),
+                            "type": "function",
+                            "function": {
+                                "name": block.get("name").and_then(Value::as_str).unwrap_or(""),
+                                "arguments": "",
+                            },
+                        }] })
                     }
-                    Some("redacted_thinking") => {
-                        let data = block.get("data").cloned().unwrap_or(json!(""));
-                        self.emit_oai_delta(
-                            json!({
-                                "thinking": [{ "type": "redacted_thinking", "data": data }]
-                            }),
-                            None,
-                        )
-                    }
-                    // text / thinking: OpenAI has no block-start
-                    _ => Vec::new(),
-                }
+                    Some("redacted_thinking") => json!({ "thinking": [{
+                        "type": "redacted_thinking",
+                        "data": block.get("data").cloned().unwrap_or(json!("")),
+                    }] }),
+                    Some("text") => match non_empty_str(block, "text") {
+                        Some(t) => json!({ "content": t }),
+                        None => return,
+                    },
+                    Some("thinking") => match non_empty_str(block, "thinking") {
+                        Some(t) => reasoning_delta(t),
+                        None => return,
+                    },
+                    _ => return,
+                };
+                items.push(self.meta.chunk(delta, None));
             }
             "content_block_delta" => {
-                let delta = v.get("delta").unwrap_or(&Value::Null);
-                match delta.get("type").and_then(Value::as_str) {
-                    Some("text_delta") => {
-                        let text = delta.get("text").and_then(Value::as_str).unwrap_or("");
-                        if text.is_empty() {
-                            return Vec::new();
-                        }
-                        self.emit_oai_delta(json!({ "content": text }), None)
-                    }
+                let d = v.get("delta").unwrap_or(&Value::Null);
+                let delta = match d.get("type").and_then(Value::as_str) {
+                    Some("text_delta") => match non_empty_str(d, "text") {
+                        Some(t) => json!({ "content": t }),
+                        None => return,
+                    },
                     Some("input_json_delta") => {
-                        let partial = delta
-                            .get("partial_json")
-                            .and_then(Value::as_str)
-                            .unwrap_or("");
-                        let idx = self.ant_to_oai.next_tool.saturating_sub(1);
-                        self.emit_oai_delta(
-                            json!({
-                                "tool_calls": [{
-                                    "index": idx,
-                                    "function": { "arguments": partial },
-                                }]
-                            }),
-                            None,
-                        )
+                        match (self.open_tool, non_empty_str(d, "partial_json")) {
+                            (Some(index), Some(p)) => json!({ "tool_calls": [{
+                                "index": index,
+                                "function": { "arguments": p },
+                            }] }),
+                            _ => return,
+                        }
                     }
                     Some("thinking_delta") => {
-                        let text = delta
-                            .get("thinking")
-                            .and_then(Value::as_str)
-                            .or_else(|| delta.get("text").and_then(Value::as_str))
-                            .unwrap_or("");
-                        if text.is_empty() {
-                            return Vec::new();
+                        match non_empty_str(d, "thinking").or_else(|| non_empty_str(d, "text")) {
+                            Some(t) => reasoning_delta(t),
+                            None => return,
                         }
-                        self.emit_oai_delta(
-                            json!({ "reasoning_content": text, "reasoning": text }),
-                            None,
-                        )
                     }
-                    Some("signature_delta") => {
-                        let sig = delta.get("signature").and_then(Value::as_str).unwrap_or("");
-                        if sig.is_empty() {
-                            return Vec::new();
-                        }
-                        self.emit_oai_delta(json!({ "thinking_signature": sig }), None)
-                    }
-                    _ => Vec::new(),
-                }
+                    Some("signature_delta") => match non_empty_str(d, "signature") {
+                        Some(sig) => json!({ "thinking_signature": sig }),
+                        None => return,
+                    },
+                    _ => return,
+                };
+                items.push(self.meta.chunk(delta, None));
             }
             "message_delta" => {
                 let stop = v
                     .pointer("/delta/stop_reason")
                     .and_then(Value::as_str)
                     .or_else(|| v.get("stop_reason").and_then(Value::as_str));
-                let finish = map_stop_to_openai(stop);
-                if let Some(u) = v.get("usage")
-                    && let Some(o) = u.get("output_tokens").and_then(Value::as_u64)
+                if let Some(u) = v.get("usage") {
+                    self.usage.merge_anthropic(u);
+                }
+                if stop == Some("refusal")
+                    && let Some(why) = v
+                        .pointer("/delta/stop_details/explanation")
+                        .and_then(Value::as_str)
                 {
-                    if let Some(t) = u
-                        .pointer("/output_tokens_details/thinking_tokens")
-                        .and_then(Value::as_u64)
-                    {
-                        self.ant_to_oai.thinking_tokens = Some(t);
-                    }
-                    let mut finish_bytes = self.emit_oai_delta(json!({}), Some(finish));
-                    let mut usage = json!({
-                        "prompt_tokens": self.ant_to_oai.input_tokens,
-                        "completion_tokens": o,
-                        "total_tokens": self.ant_to_oai.input_tokens.saturating_add(o),
-                    });
-                    if let Some(obj) = usage.as_object_mut() {
-                        if self.ant_to_oai.cache_read > 0 {
-                            obj.insert(
-                                "prompt_tokens_details".into(),
-                                json!({ "cached_tokens": self.ant_to_oai.cache_read }),
-                            );
-                        }
-                        if let Some(t) = self.ant_to_oai.thinking_tokens {
-                            obj.insert(
-                                "completion_tokens_details".into(),
-                                json!({ "reasoning_tokens": t }),
-                            );
-                        }
-                    }
-                    finish_bytes.extend(self.emit_oai_usage(usage));
-                    return finish_bytes;
+                    items.push(self.meta.chunk(json!({ "refusal": why }), None));
                 }
-                self.emit_oai_delta(json!({}), Some(finish))
+                items.push(self.meta.chunk(json!({}), Some(map_stop_to_openai(stop))));
+                items.push(self.meta.usage(self.usage.to_chat()));
             }
-            "message_stop" => {
-                if self.errored || self.ant_to_oai.done {
-                    Vec::new()
-                } else {
-                    self.ant_to_oai.done = true;
-                    sse_data("[DONE]")
-                }
-            }
-            "content_block_stop" => Vec::new(),
-            _ => Vec::new(),
+            "content_block_stop" => self.open_tool = None,
+            "message_stop" => items.push(ChatItem::Done),
+            _ => {}
         }
     }
+}
 
-    fn emit_oai_delta(&mut self, delta: Value, finish: Option<&str>) -> Vec<u8> {
-        let mut choice = json!({ "index": 0, "delta": delta });
-        if let Some(f) = finish
-            && let Some(obj) = choice.as_object_mut()
-        {
-            obj.insert("finish_reason".into(), json!(f));
-        }
-        let chunk = json!({
-            "id": self.ant_to_oai.id,
-            "object": "chat.completion.chunk",
-            "model": self.ant_to_oai.model,
-            "choices": [choice],
-        });
-        sse_data(&value_string(&chunk))
-    }
+/// A function call a Responses upstream announced, and where its Chat deltas go.
+struct RespCall {
+    output_index: Option<u64>,
+    item_id: Option<String>,
+    index: u32,
+    /// Argument bytes already went out, so a closing event's full `arguments` must not repeat them.
+    args_sent: bool,
+}
 
-    fn emit_oai_usage(&self, usage: Value) -> Vec<u8> {
-        let chunk = json!({
-            "id": self.ant_to_oai.id,
-            "object": "chat.completion.chunk",
-            "model": self.ant_to_oai.model,
-            "choices": [],
-            "usage": usage,
-        });
-        sse_data(&value_string(&chunk))
-    }
+/// Responses events → Chat Completions items.
+#[derive(Default)]
+struct RespToOai {
+    meta: ChunkMeta,
+    started: bool,
+    calls: Vec<RespCall>,
+}
 
-    fn oai_event_to_ant(&mut self, _event: &str, data: &str) -> Vec<u8> {
+impl RespToOai {
+    fn event(&mut self, event: &str, data: &str, items: &mut Vec<ChatItem>) {
         if data == "[DONE]" {
-            if self.errored {
-                return Vec::new();
-            }
-            return self.oai_to_ant.finish();
+            items.push(ChatItem::Done);
+            return;
         }
         let Ok(v) = serde_json::from_str::<Value>(data) else {
-            return Vec::new();
+            return;
         };
-        if looks_like_error(&v) {
-            self.errored = true;
-            let err = map_error(&v, Endpoint::Messages);
-            return sse_named("error", &value_string(&err));
+        let typ = if event.is_empty() {
+            v.get("type").and_then(Value::as_str).unwrap_or("")
+        } else {
+            event
+        };
+        if typ == "error" || looks_like_error(&v) {
+            items.push(ChatItem::Error(v));
+            return;
         }
-        let mut out = Vec::new();
-        if let Some(id) = v.get("id").and_then(Value::as_str)
-            && !id.is_empty()
+        match typ {
+            "response.created" | "response.in_progress" => {
+                let r = v.get("response").unwrap_or(&v);
+                if self.meta.id.is_empty() {
+                    self.meta.id = id_or_fresh(r.get("id"), "chatcmpl");
+                    self.meta.created = created_of(r.get("created_at"));
+                }
+                if let Some(model) = non_empty_str(r, "model") {
+                    model.clone_into(&mut self.meta.model);
+                }
+                self.start(items);
+            }
+            "response.output_item.added" => {
+                self.start(items);
+                let item = v.get("item").unwrap_or(&Value::Null);
+                if item.get("type").and_then(Value::as_str) == Some("function_call") {
+                    self.open_call(&v, item, items);
+                }
+            }
+            "response.function_call_arguments.delta" => {
+                if let Some(at) = self.find(&v)
+                    && let Some(delta) = non_empty_str(&v, "delta")
+                {
+                    self.args(at, delta, items);
+                }
+            }
+            "response.function_call_arguments.done" | "response.output_item.done" => {
+                let item = v.get("item");
+                if item
+                    .is_some_and(|i| i.get("type").and_then(Value::as_str) != Some("function_call"))
+                {
+                    return;
+                }
+                let args = item.unwrap_or(&v).get("arguments").and_then(Value::as_str);
+                match self.find(&v) {
+                    Some(at) => {
+                        if let Some(args) = args.filter(|a| !a.is_empty())
+                            && self.calls.get(at).is_some_and(|c| !c.args_sent)
+                        {
+                            self.args(at, args, items);
+                        }
+                    }
+                    // A call never announced by `output_item.added`: announce it whole.
+                    None => {
+                        if let Some(item) = item {
+                            self.start(items);
+                            self.open_call(&v, item, items);
+                        }
+                    }
+                }
+            }
+            "response.output_text.delta" => {
+                if let Some(t) = text_delta_of(&v) {
+                    items.push(self.meta.chunk(json!({ "content": t }), None));
+                }
+            }
+            "response.refusal.delta" => {
+                if let Some(t) = text_delta_of(&v) {
+                    items.push(self.meta.chunk(json!({ "refusal": t }), None));
+                }
+            }
+            "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
+                if let Some(t) = text_delta_of(&v) {
+                    items.push(self.meta.chunk(reasoning_delta(t), None));
+                }
+            }
+            // Separate one summary part from the next, as a single reasoning text.
+            "response.reasoning_summary_part.added" => {
+                if v.get("summary_index").and_then(Value::as_u64) > Some(0) {
+                    items.push(self.meta.chunk(reasoning_delta("\n\n"), None));
+                }
+            }
+            "response.completed" | "response.incomplete" => {
+                let r = v.get("response").unwrap_or(&v);
+                self.start(items);
+                let mut finish = responses_finish(r);
+                if finish == "stop" && !self.calls.is_empty() {
+                    finish = "tool_calls";
+                }
+                items.push(self.meta.chunk(json!({}), Some(finish)));
+                let usage = Usage::from_responses(r.get("usage").unwrap_or(&Value::Null));
+                items.push(self.meta.usage(usage.to_chat()));
+                items.push(ChatItem::Done);
+            }
+            "response.failed" => {
+                let err = v
+                    .pointer("/response/error")
+                    .filter(|e| e.is_object())
+                    .cloned()
+                    .unwrap_or_else(|| json!({ "message": "the upstream response failed" }));
+                items.push(ChatItem::Error(json!({ "error": err })));
+            }
+            _ => {}
+        }
+    }
+
+    fn start(&mut self, items: &mut Vec<ChatItem>) {
+        if !self.started {
+            self.started = true;
+            items.push(
+                self.meta
+                    .chunk(json!({ "role": "assistant", "content": "" }), None),
+            );
+        }
+    }
+
+    fn open_call(&mut self, v: &Value, item: &Value, items: &mut Vec<ChatItem>) {
+        let index = u32::try_from(self.calls.len()).unwrap_or(u32::MAX);
+        let args = item.get("arguments").and_then(Value::as_str).unwrap_or("");
+        self.calls.push(RespCall {
+            output_index: v.get("output_index").and_then(Value::as_u64),
+            item_id: non_empty_str(item, "id").map(str::to_owned),
+            index,
+            args_sent: !args.is_empty(),
+        });
+        items.push(self.meta.chunk(
+            json!({ "tool_calls": [{
+                "index": index,
+                "id": id_or_fresh(item.get("call_id").or_else(|| item.get("id")), "call"),
+                "type": "function",
+                "function": {
+                    "name": item.get("name").and_then(Value::as_str).unwrap_or(""),
+                    "arguments": args,
+                },
+            }] }),
+            None,
+        ));
+    }
+
+    fn args(&mut self, at: usize, args: &str, items: &mut Vec<ChatItem>) {
+        let Some(call) = self.calls.get_mut(at) else {
+            return;
+        };
+        call.args_sent = true;
+        let index = call.index;
+        items.push(self.meta.chunk(
+            json!({ "tool_calls": [{ "index": index, "function": { "arguments": args } }] }),
+            None,
+        ));
+    }
+
+    /// The call an event is about, by `output_index`, else by item id.
+    fn find(&self, v: &Value) -> Option<usize> {
+        let output_index = v.get("output_index").and_then(Value::as_u64);
+        let item_id = non_empty_str(v, "item_id")
+            .or_else(|| v.get("item").and_then(|i| non_empty_str(i, "id")));
+        self.calls.iter().position(|c| {
+            (output_index.is_some() && c.output_index == output_index)
+                || (item_id.is_some() && c.item_id.as_deref() == item_id)
+        })
+    }
+}
+
+fn text_delta_of(v: &Value) -> Option<&str> {
+    match v.get("delta") {
+        Some(Value::String(s)) => Some(s.as_str()),
+        Some(d) => d.get("text").and_then(Value::as_str),
+        None => None,
+    }
+    .filter(|s| !s.is_empty())
+}
+
+/// One call in a Chat Completions stream, gathered across its deltas.
+struct ChatCall {
+    /// The stream's own `index`, when it sends one.
+    index: Option<u64>,
+    id: String,
+    name: String,
+    args: String,
+    opened: bool,
+    closed: bool,
+    /// Where the client sees it: an Anthropic block index or a Responses `output_index`.
+    slot: usize,
+    /// The Responses item id (`fc_…`); unused for an Anthropic client.
+    item: String,
+}
+
+enum CallStep {
+    /// The call is ready to show: emit its start, then all of `args` gathered so far.
+    Open(usize),
+    /// More arguments for an open call.
+    Args(usize, String),
+}
+
+/// Chat Completions tool-call deltas, keyed the way the stream means them.
+///
+/// A delta names its call by `index`. Some upstreams repeat the `id` on every delta, some omit
+/// `index`, and some reuse one `index` for parallel calls with different ids; all three used to
+/// open a new call per delta or pour one call's arguments into another's. A call opens once its
+/// name is known (or at the end), so a client never sees a nameless tool.
+#[derive(Default)]
+struct ToolCalls {
+    calls: Vec<ChatCall>,
+}
+
+impl ToolCalls {
+    fn feed(&mut self, c: &Value, steps: &mut Vec<CallStep>) {
+        let index = c.get("index").and_then(Value::as_u64);
+        let id = non_empty_str(c, "id");
+        let at = self.locate(index, id);
+        let Some(call) = self.calls.get_mut(at) else {
+            return;
+        };
+        if call.id.is_empty()
+            && let Some(id) = id
         {
-            self.oai_to_ant.id = id.to_owned();
+            id.clone_into(&mut call.id);
         }
-        if let Some(model) = v.get("model").and_then(Value::as_str)
-            && !model.is_empty()
+        let func = c.get("function").unwrap_or(c);
+        if call.name.is_empty()
+            && let Some(name) = non_empty_str(func, "name")
         {
-            self.oai_to_ant.model = model.to_owned();
+            name.clone_into(&mut call.name);
         }
-        if !self.oai_to_ant.started {
-            out.extend(self.oai_to_ant.start());
+        let args = func.get("arguments").and_then(Value::as_str).unwrap_or("");
+        call.args.push_str(args);
+        if !call.opened && !call.name.is_empty() {
+            Self::open(call, at, steps);
+        } else if call.opened && !args.is_empty() {
+            steps.push(CallStep::Args(at, args.to_owned()));
+        }
+    }
+
+    /// Open every call still waiting for its name.
+    fn open_rest(&mut self, steps: &mut Vec<CallStep>) {
+        for (at, call) in self.calls.iter_mut().enumerate() {
+            if !call.opened {
+                Self::open(call, at, steps);
+            }
+        }
+    }
+
+    fn open(call: &mut ChatCall, at: usize, steps: &mut Vec<CallStep>) {
+        call.opened = true;
+        if call.id.is_empty() {
+            call.id = fresh_id("call");
+        }
+        steps.push(CallStep::Open(at));
+    }
+
+    fn locate(&mut self, index: Option<u64>, id: Option<&str>) -> usize {
+        let found = match (index, id) {
+            (Some(i), _) => self.calls.iter().rposition(|c| {
+                c.index == Some(i) && (id.is_none() || c.id.is_empty() || Some(c.id.as_str()) == id)
+            }),
+            (None, Some(id)) => self.calls.iter().rposition(|c| c.id == id),
+            (None, None) => self.calls.len().checked_sub(1),
+        };
+        found.unwrap_or_else(|| {
+            self.calls.push(ChatCall {
+                index,
+                id: String::new(),
+                name: String::new(),
+                args: String::new(),
+                opened: false,
+                closed: false,
+                slot: 0,
+                item: String::new(),
+            });
+            self.calls.len().saturating_sub(1)
+        })
+    }
+
+    fn is_empty(&self) -> bool {
+        self.calls.is_empty()
+    }
+}
+
+/// Chat Completions items → Anthropic Messages events.
+#[derive(Default)]
+struct OaiToAnt {
+    started: bool,
+    id: String,
+    model: String,
+    next_block: usize,
+    /// The open text block's index. Anthropic blocks are sequential: anything else closes it.
+    text_block: Option<usize>,
+    calls: ToolCalls,
+    /// Thinking held back until its signature arrives. See [`is_replayable_thinking`].
+    thinking: Gather,
+    stop: Option<&'static str>,
+    /// The model refused in words (`refusal`), which Anthropic reports as a stop reason.
+    refused: bool,
+    usage: Option<Usage>,
+    finished: bool,
+}
+
+fn ant_event(out: &mut Vec<u8>, typ: &str, body: &Value) {
+    out.extend(sse_named(typ, &value_string(body)));
+}
+
+impl OaiToAnt {
+    fn chunk(&mut self, v: &Value, out: &mut Vec<u8>) {
+        if self.finished {
+            return;
+        }
+        if !self.started {
+            if let Some(id) = non_empty_str(v, "id") {
+                id.clone_into(&mut self.id);
+            }
+            if let Some(model) = non_empty_str(v, "model") {
+                model.clone_into(&mut self.model);
+            }
+            self.start(out);
         }
         let choice = v
             .get("choices")
             .and_then(Value::as_array)
             .and_then(|a| a.first());
         if let Some(delta) = choice.and_then(|c| c.get("delta")) {
-            if let Some(content) = delta.get("content").and_then(Value::as_str)
-                && !content.is_empty()
+            let mut blocks = Vec::new();
+            // OpenRouter repeats `reasoning_details` text in `reasoning`: read one, not both.
+            if let Some(details) = delta
+                .get("reasoning_details")
+                .and_then(Value::as_array)
+                .filter(|d| !d.is_empty())
             {
-                out.extend(self.oai_to_ant.text_delta(content));
-            }
-            let reasoning = delta
-                .get("reasoning_content")
-                .and_then(Value::as_str)
-                .or_else(|| delta.get("reasoning").and_then(Value::as_str));
-            if let Some(r) = reasoning
-                && !r.is_empty()
+                for d in details {
+                    self.thinking.detail(d, &mut blocks);
+                }
+            } else if let Some(r) = non_empty_str(delta, "reasoning_content")
+                .or_else(|| non_empty_str(delta, "reasoning"))
             {
-                out.extend(self.oai_to_ant.thinking_delta(r));
+                self.thinking.text(None, r, &mut blocks);
             }
-            if let Some(sig) = delta.get("thinking_signature").and_then(Value::as_str)
-                && !sig.is_empty()
+            if let Some(sig) = non_empty_str(delta, "thinking_signature") {
+                self.thinking.sign(sig, &mut blocks);
+            }
+            for b in delta
+                .get("thinking")
+                .and_then(Value::as_array)
+                .map(Vec::as_slice)
+                .unwrap_or_default()
             {
-                out.extend(self.oai_to_ant.signature_delta(sig));
-            }
-            if let Some(blocks) = delta.get("thinking").and_then(Value::as_array) {
-                for b in blocks {
-                    if b.get("type").and_then(Value::as_str) == Some("redacted_thinking") {
-                        out.extend(self.oai_to_ant.redacted_thinking(b));
-                    }
+                if b.get("type").and_then(Value::as_str) == Some("redacted_thinking") {
+                    self.thinking.close(&mut blocks);
+                    blocks.push(json!({
+                        "type": "redacted_thinking",
+                        "data": b.get("data").cloned().unwrap_or(json!("")),
+                    }));
                 }
             }
-            if let Some(calls) = delta.get("tool_calls").and_then(Value::as_array) {
-                for c in calls {
-                    out.extend(self.oai_to_ant.tool_delta(c));
-                }
+            for b in blocks.iter().filter(|b| is_replayable_thinking(b)) {
+                self.thinking_block(b, out);
+            }
+            if let Some(t) = non_empty_str(delta, "content") {
+                self.text(t, out);
+            }
+            if let Some(r) = non_empty_str(delta, "refusal") {
+                self.refused = true;
+                self.text(r, out);
+            }
+            for c in delta
+                .get("tool_calls")
+                .and_then(Value::as_array)
+                .map(Vec::as_slice)
+                .unwrap_or_default()
+            {
+                self.tool(c, out);
             }
         }
         if let Some(finish) = choice
             .and_then(|c| c.get("finish_reason"))
             .and_then(Value::as_str)
-            && !finish.is_empty()
-            && finish != "null"
+            .filter(|f| !f.is_empty())
         {
-            self.oai_to_ant.pending_stop = Some(map_stop_to_anthropic(Some(finish)));
+            let native = choice
+                .and_then(|c| c.get("native_finish_reason"))
+                .and_then(Value::as_str)
+                .and_then(anthropic_stop_reason);
+            self.stop = Some(native.unwrap_or_else(|| map_stop_to_anthropic(Some(finish))));
         }
-        if let Some(u) = v.get("usage") {
-            self.oai_to_ant.prompt_tokens = u.get("prompt_tokens").and_then(Value::as_u64);
-            self.oai_to_ant.completion_tokens = u.get("completion_tokens").and_then(Value::as_u64);
+        if let Some(u) = v.get("usage").filter(|u| u.is_object()) {
+            self.usage = Some(Usage::from_chat(u));
         }
-        if self.oai_to_ant.pending_stop.is_some() && self.oai_to_ant.completion_tokens.is_some() {
-            out.extend(self.oai_to_ant.finish());
+        if self.stop.is_some() && self.usage.is_some() {
+            self.finish(out);
         }
-        out
     }
 
-    fn oai_event_to_resp(&mut self, _event: &str, data: &str) -> Vec<u8> {
-        if data == "[DONE]" {
-            return self.oai_to_resp.finish();
+    fn start(&mut self, out: &mut Vec<u8>) {
+        self.started = true;
+        if self.id.is_empty() {
+            self.id = fresh_id("msg");
         }
-        let Ok(v) = serde_json::from_str::<Value>(data) else {
-            return Vec::new();
-        };
-        if looks_like_error(&v) {
-            self.errored = true;
-            return sse_data(&value_string(&map_error(&v, Endpoint::Responses)));
-        }
-        if let Some(id) = v.get("id").and_then(Value::as_str)
-            && self.oai_to_resp.id.is_empty()
-        {
-            self.oai_to_resp.id = id.to_owned();
-        }
-        if let Some(model) = v.get("model").and_then(Value::as_str)
-            && self.oai_to_resp.model.is_empty()
-        {
-            self.oai_to_resp.model = model.to_owned();
-        }
-        let mut out = Vec::new();
-        if !self.oai_to_resp.created {
-            self.oai_to_resp.created = true;
-            if self.oai_to_resp.id.is_empty() {
-                self.oai_to_resp.id = "resp_translated".into();
-            }
-            let created = json!({
-                "type": "response.created",
-                "response": {
-                    "id": self.oai_to_resp.id,
-                    "object": "response",
-                    "status": "in_progress",
-                    "model": self.oai_to_resp.model,
+        ant_event(
+            out,
+            "message_start",
+            &json!({
+                "type": "message_start",
+                "message": {
+                    "id": self.id,
+                    "type": "message",
+                    "role": "assistant",
+                    "model": self.model,
+                    "content": [],
+                    "stop_reason": Value::Null,
+                    "stop_sequence": Value::Null,
+                    "usage": { "input_tokens": 0, "output_tokens": 0 },
                 }
-            });
-            out.extend(sse_named("response.created", &value_string(&created)));
+            }),
+        );
+    }
+
+    fn next_index(&mut self) -> usize {
+        let idx = self.next_block;
+        self.next_block = self.next_block.saturating_add(1);
+        idx
+    }
+
+    fn close_text(&mut self, out: &mut Vec<u8>) {
+        if let Some(idx) = self.text_block.take() {
+            block_stop(out, idx);
+        }
+    }
+
+    fn close_calls(&mut self, out: &mut Vec<u8>) {
+        for call in &mut self.calls.calls {
+            if call.opened && !call.closed {
+                call.closed = true;
+                block_stop(out, call.slot);
+            }
+        }
+    }
+
+    /// A whole thinking block, signed or redacted, emitted at once.
+    fn thinking_block(&mut self, b: &Value, out: &mut Vec<u8>) {
+        self.close_text(out);
+        self.close_calls(out);
+        let idx = self.next_index();
+        if b.get("type").and_then(Value::as_str) == Some("redacted_thinking") {
+            block_start(out, idx, b);
+            block_stop(out, idx);
+            return;
+        }
+        block_start(
+            out,
+            idx,
+            &json!({ "type": "thinking", "thinking": "", "signature": "" }),
+        );
+        if let Some(text) = non_empty_str(b, "thinking") {
+            block_delta(
+                out,
+                idx,
+                &json!({ "type": "thinking_delta", "thinking": text }),
+            );
+        }
+        if let Some(sig) = non_empty_str(b, "signature") {
+            block_delta(
+                out,
+                idx,
+                &json!({ "type": "signature_delta", "signature": sig }),
+            );
+        }
+        block_stop(out, idx);
+    }
+
+    fn text(&mut self, text: &str, out: &mut Vec<u8>) {
+        // Text ends any thinking block still waiting for a signature: it never gets one now.
+        self.thinking.discard();
+        self.close_calls(out);
+        let idx = match self.text_block {
+            Some(idx) => idx,
+            None => {
+                let idx = self.next_index();
+                self.text_block = Some(idx);
+                block_start(out, idx, &json!({ "type": "text", "text": "" }));
+                idx
+            }
+        };
+        block_delta(out, idx, &json!({ "type": "text_delta", "text": text }));
+    }
+
+    fn tool(&mut self, c: &Value, out: &mut Vec<u8>) {
+        self.thinking.discard();
+        self.close_text(out);
+        let mut steps = Vec::new();
+        self.calls.feed(c, &mut steps);
+        self.call_steps(steps, out);
+    }
+
+    fn call_steps(&mut self, steps: Vec<CallStep>, out: &mut Vec<u8>) {
+        for step in steps {
+            match step {
+                CallStep::Open(at) => {
+                    let idx = self.next_index();
+                    let Some(call) = self.calls.calls.get_mut(at) else {
+                        continue;
+                    };
+                    call.slot = idx;
+                    block_start(
+                        out,
+                        idx,
+                        &json!({ "type": "tool_use", "id": call.id, "name": call.name, "input": {} }),
+                    );
+                    if !call.args.is_empty() {
+                        block_delta(
+                            out,
+                            idx,
+                            &json!({ "type": "input_json_delta", "partial_json": call.args }),
+                        );
+                    }
+                }
+                CallStep::Args(at, args) => {
+                    if let Some(call) = self.calls.calls.get(at) {
+                        block_delta(
+                            out,
+                            call.slot,
+                            &json!({ "type": "input_json_delta", "partial_json": args }),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    fn finish(&mut self, out: &mut Vec<u8>) {
+        if self.finished {
+            return;
+        }
+        // A usage-only / `[DONE]`-only upstream stream never opened a block; the client still
+        // needs `message_start` before `message_delta` / `message_stop`.
+        if !self.started {
+            self.start(out);
+        }
+        self.finished = true;
+        self.thinking.discard();
+        let mut steps = Vec::new();
+        self.calls.open_rest(&mut steps);
+        if !steps.is_empty() {
+            self.close_text(out);
+        }
+        self.call_steps(steps, out);
+        self.close_text(out);
+        self.close_calls(out);
+        let stop = finish_anthropic_stop(
+            self.stop.unwrap_or("end_turn"),
+            self.refused,
+            !self.calls.is_empty(),
+        );
+        ant_event(
+            out,
+            "message_delta",
+            &json!({
+                "type": "message_delta",
+                "delta": { "stop_reason": stop, "stop_sequence": Value::Null },
+                "usage": self.usage.unwrap_or_default().to_anthropic(),
+            }),
+        );
+        ant_event(out, "message_stop", &json!({ "type": "message_stop" }));
+    }
+}
+
+fn block_start(out: &mut Vec<u8>, index: usize, block: &Value) {
+    ant_event(
+        out,
+        "content_block_start",
+        &json!({ "type": "content_block_start", "index": index, "content_block": block }),
+    );
+}
+
+fn block_delta(out: &mut Vec<u8>, index: usize, delta: &Value) {
+    ant_event(
+        out,
+        "content_block_delta",
+        &json!({ "type": "content_block_delta", "index": index, "delta": delta }),
+    );
+}
+
+fn block_stop(out: &mut Vec<u8>, index: usize) {
+    ant_event(
+        out,
+        "content_block_stop",
+        &json!({ "type": "content_block_stop", "index": index }),
+    );
+}
+
+/// The open message item of a Responses stream.
+struct OpenMessage {
+    output_index: usize,
+    id: String,
+    parts: Vec<Value>,
+    /// The part being streamed: `true` for a refusal, `false` for output text.
+    part: Option<(bool, String)>,
+}
+
+/// The open reasoning item of a Responses stream.
+struct OpenReasoning {
+    output_index: usize,
+    id: String,
+    /// OpenRouter's `reasoning_details` index, when it numbers blocks.
+    key: Option<u64>,
+    text: String,
+    /// `reasoning_summary_part.added` went out (only once there is text to show).
+    part: bool,
+    signature: Option<String>,
+}
+
+/// Chat Completions items → the Responses streaming event lifecycle: `response.created`,
+/// `response.in_progress`, then per output item `output_item.added` → its content events →
+/// `output_item.done`, and a terminal `response.completed` (or `response.incomplete`) carrying
+/// the whole `output` and usage. Every event has a `sequence_number`; every item event names its
+/// `output_index` and `item_id`.
+#[derive(Default)]
+struct OaiToResp {
+    id: String,
+    model: String,
+    created_at: u64,
+    seq: u64,
+    started: bool,
+    /// Items by `output_index`; `Null` until the item is done.
+    output: Vec<Value>,
+    message: Option<OpenMessage>,
+    reasoning: Option<OpenReasoning>,
+    calls: ToolCalls,
+    finish: Option<&'static str>,
+    usage: Option<Usage>,
+    completed: bool,
+}
+
+impl OaiToResp {
+    fn emit(&mut self, out: &mut Vec<u8>, typ: &str, mut body: Value) {
+        if let Some(m) = body.as_object_mut() {
+            m.insert("type".into(), json!(typ));
+            m.insert("sequence_number".into(), json!(self.seq));
+        }
+        self.seq = self.seq.saturating_add(1);
+        out.extend(sse_named(typ, &value_string(&body)));
+    }
+
+    fn chunk(&mut self, v: &Value, out: &mut Vec<u8>) {
+        if self.completed {
+            return;
+        }
+        if !self.started {
+            if let Some(id) = non_empty_str(v, "id") {
+                id.clone_into(&mut self.id);
+            }
+            self.created_at = v.get("created").and_then(Value::as_u64).unwrap_or(0);
+        }
+        if self.model.is_empty()
+            && let Some(model) = non_empty_str(v, "model")
+        {
+            model.clone_into(&mut self.model);
+        }
+        if !self.started {
+            self.start(out);
         }
         let choice = v
             .get("choices")
             .and_then(Value::as_array)
             .and_then(|a| a.first());
-        let delta = choice.and_then(|c| c.get("delta")).unwrap_or(&Value::Null);
-        if let Some(text) = delta
-            .get("content")
+        if let Some(delta) = choice.and_then(|c| c.get("delta")) {
+            if let Some(details) = delta
+                .get("reasoning_details")
+                .and_then(Value::as_array)
+                .filter(|d| !d.is_empty())
+            {
+                for d in details {
+                    let key = d.get("index").and_then(Value::as_u64);
+                    match d.get("type").and_then(Value::as_str) {
+                        Some("reasoning.text") => {
+                            if let Some(text) = non_empty_str(d, "text") {
+                                self.reasoning_text(key, Some(text), out);
+                            }
+                            if let Some(sig) = non_empty_str(d, "signature")
+                                && anthropic_format(d)
+                            {
+                                self.reasoning_signature(key, sig, out);
+                            }
+                        }
+                        Some("reasoning.summary") => {
+                            if let Some(text) = non_empty_str(d, "summary") {
+                                self.reasoning_text(key, Some(text), out);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            } else if let Some(r) = non_empty_str(delta, "reasoning_content")
+                .or_else(|| non_empty_str(delta, "reasoning"))
+            {
+                self.reasoning_text(None, Some(r), out);
+            }
+            if let Some(sig) = non_empty_str(delta, "thinking_signature") {
+                self.reasoning_signature(None, sig, out);
+            }
+            if let Some(t) = non_empty_str(delta, "content") {
+                self.message_delta(false, t, out);
+            }
+            if let Some(r) = non_empty_str(delta, "refusal") {
+                self.message_delta(true, r, out);
+            }
+            if let Some(calls) = delta
+                .get("tool_calls")
+                .and_then(Value::as_array)
+                .filter(|c| !c.is_empty())
+            {
+                self.close_reasoning(out);
+                self.close_message(out);
+                let mut steps = Vec::new();
+                for c in calls {
+                    self.calls.feed(c, &mut steps);
+                }
+                self.call_steps(steps, out);
+            }
+        }
+        if let Some(finish) = choice
+            .and_then(|c| c.get("finish_reason"))
             .and_then(Value::as_str)
-            .filter(|s| !s.is_empty())
+            .filter(|f| !f.is_empty())
         {
-            let ev = json!({
-                "type": "response.output_text.delta",
-                "delta": text,
-            });
-            out.extend(sse_named("response.output_text.delta", &value_string(&ev)));
+            self.finish = Some(chat_finish(finish));
         }
-        if let Some(reason) = delta
-            .get("reasoning_content")
-            .and_then(Value::as_str)
-            .filter(|s| !s.is_empty())
-        {
-            let ev = json!({
-                "type": "response.reasoning_text.delta",
-                "delta": reason,
-            });
-            out.extend(sse_named(
-                "response.reasoning_text.delta",
-                &value_string(&ev),
-            ));
+        if let Some(u) = v.get("usage").filter(|u| u.is_object()) {
+            self.usage = Some(Usage::from_chat(u));
         }
-        if let Some(u) = v.get("usage") {
-            self.oai_to_resp.usage = Some(u.clone());
-            out.extend(self.oai_to_resp.finish());
-            return out;
-        }
-        out
-    }
-
-    fn resp_event_to_oai(&mut self, event: &str, data: &str) -> Vec<u8> {
-        if data == "[DONE]" {
-            if self.resp_to_oai.done {
-                return Vec::new();
-            }
-            self.resp_to_oai.done = true;
-            return sse_data("[DONE]");
-        }
-        let Ok(v) = serde_json::from_str::<Value>(data) else {
-            return Vec::new();
-        };
-        if looks_like_error(&v) || event == "error" {
-            self.errored = true;
-            return sse_data(&value_string(&map_error(&v, Endpoint::ChatCompletions)));
-        }
-        let typ = if event.is_empty() {
-            v.get("type").and_then(Value::as_str).unwrap_or("")
-        } else {
-            event
-        };
-        match typ {
-            "response.output_text.delta" => {
-                let text = v
-                    .get("delta")
-                    .and_then(|d| {
-                        d.as_str()
-                            .map(str::to_owned)
-                            .or_else(|| d.get("text").and_then(Value::as_str).map(str::to_owned))
-                    })
-                    .or_else(|| v.get("text").and_then(Value::as_str).map(str::to_owned))
-                    .unwrap_or_default();
-                if text.is_empty() {
-                    return Vec::new();
-                }
-                sse_data(&value_string(&json!({
-                    "id": "chatcmpl_translated",
-                    "object": "chat.completion.chunk",
-                    "choices": [{ "index": 0, "delta": { "content": text } }],
-                })))
-            }
-            "response.reasoning_text.delta" | "response.reasoning.delta" => {
-                let text = v.get("delta").and_then(Value::as_str).unwrap_or("");
-                if text.is_empty() {
-                    return Vec::new();
-                }
-                sse_data(&value_string(&json!({
-                    "id": "chatcmpl_translated",
-                    "object": "chat.completion.chunk",
-                    "choices": [{ "index": 0, "delta": { "reasoning_content": text } }],
-                })))
-            }
-            "response.completed" => {
-                let resp = v.get("response").unwrap_or(&v);
-                let usage = map_usage_to_openai(resp.get("usage"));
-                let mut out = sse_data(&value_string(&json!({
-                    "id": "chatcmpl_translated",
-                    "object": "chat.completion.chunk",
-                    "choices": [{ "index": 0, "delta": {}, "finish_reason": "stop" }],
-                    "usage": usage,
-                })));
-                if !self.resp_to_oai.done {
-                    self.resp_to_oai.done = true;
-                    out.extend(sse_data("[DONE]"));
-                }
-                out
-            }
-            _ => Vec::new(),
+        if self.finish.is_some() && self.usage.is_some() {
+            self.complete(out);
         }
     }
-}
 
-impl OaiToResp {
-    fn finish(&mut self) -> Vec<u8> {
-        if self.completed {
-            return Vec::new();
-        }
-        self.completed = true;
-        if self.id.is_empty() {
-            self.id = "resp_translated".into();
-        }
-        let usage = self
-            .usage
-            .as_ref()
-            .map(|u| map_usage_to_responses(Some(u)))
-            .unwrap_or_else(|| map_usage_to_responses(None));
-        let ev = json!({
-            "type": "response.completed",
-            "response": {
-                "id": self.id,
-                "object": "response",
-                "status": "completed",
-                "model": self.model,
-                "usage": usage,
-            }
-        });
-        sse_named("response.completed", &value_string(&ev))
-    }
-}
-
-impl OaiToAnt {
-    fn start(&mut self) -> Vec<u8> {
-        self.started = true;
-        if self.id.is_empty() {
-            self.id = "chatcmpl_translated".into();
-        }
-        let msg = json!({
-            "type": "message_start",
-            "message": {
-                "id": self.id,
-                "type": "message",
-                "role": "assistant",
-                "model": self.model,
-                "content": [],
-                "usage": { "input_tokens": 0, "output_tokens": 0 },
-            }
-        });
-        sse_named("message_start", &value_string(&msg))
-    }
-
-    fn close_open(&mut self) -> Vec<u8> {
-        if self.open == OpenBlock::None {
-            return Vec::new();
-        }
-        let idx = self.next_block.saturating_sub(1);
-        self.open = OpenBlock::None;
-        sse_named(
-            "content_block_stop",
-            &value_string(&json!({ "type": "content_block_stop", "index": idx })),
+    fn response(&self, status: &str, incomplete: Value, usage: Value) -> Value {
+        responses_object(
+            self.id.clone(),
+            self.created_at,
+            json!(self.model),
+            status,
+            incomplete,
+            self.output
+                .iter()
+                .filter(|i| !i.is_null())
+                .cloned()
+                .collect(),
+            usage,
         )
     }
 
-    fn text_delta(&mut self, text: &str) -> Vec<u8> {
-        let mut out = Vec::new();
-        if self.open == OpenBlock::Tool || self.open == OpenBlock::Thinking {
-            out.extend(self.close_open());
+    fn start(&mut self, out: &mut Vec<u8>) {
+        self.started = true;
+        if self.id.is_empty() {
+            self.id = fresh_id("resp");
         }
-        if self.open != OpenBlock::Text {
-            let idx = self.next_block;
-            self.next_block = self.next_block.saturating_add(1);
-            self.open = OpenBlock::Text;
-            out.extend(sse_named(
-                "content_block_start",
-                &value_string(&json!({
-                    "type": "content_block_start",
-                    "index": idx,
-                    "content_block": { "type": "text", "text": "" },
-                })),
-            ));
+        if self.created_at == 0 {
+            self.created_at = unix_now();
         }
-        let idx = self.next_block.saturating_sub(1);
-        out.extend(sse_named(
-            "content_block_delta",
-            &value_string(&json!({
-                "type": "content_block_delta",
-                "index": idx,
-                "delta": { "type": "text_delta", "text": text },
-            })),
-        ));
-        out
+        let resp = self.response("in_progress", Value::Null, Value::Null);
+        self.emit(out, "response.created", json!({ "response": resp }));
+        self.emit(out, "response.in_progress", json!({ "response": resp }));
     }
 
-    fn tool_delta(&mut self, call: &Value) -> Vec<u8> {
-        let mut out = Vec::new();
-        if self.open == OpenBlock::Text || self.open == OpenBlock::Thinking {
-            out.extend(self.close_open());
+    fn add_item(&mut self, out: &mut Vec<u8>, item: Value) -> usize {
+        let output_index = self.output.len();
+        self.output.push(Value::Null);
+        self.emit(
+            out,
+            "response.output_item.added",
+            json!({ "output_index": output_index, "item": item }),
+        );
+        output_index
+    }
+
+    fn done_item(&mut self, out: &mut Vec<u8>, output_index: usize, item: Value) {
+        if let Some(slot) = self.output.get_mut(output_index) {
+            *slot = item.clone();
         }
-        let id = call.get("id").and_then(Value::as_str);
-        let name = call
-            .pointer("/function/name")
-            .and_then(Value::as_str)
-            .or_else(|| call.get("name").and_then(Value::as_str));
-        if self.open != OpenBlock::Tool || id.is_some() {
-            if self.open == OpenBlock::Tool {
-                out.extend(self.close_open());
-            }
-            let idx = self.next_block;
-            self.next_block = self.next_block.saturating_add(1);
-            self.open = OpenBlock::Tool;
-            out.extend(sse_named(
-                "content_block_start",
-                &value_string(&json!({
-                    "type": "content_block_start",
-                    "index": idx,
-                    "content_block": {
-                        "type": "tool_use",
-                        "id": id.unwrap_or("call_0"),
-                        "name": name.unwrap_or(""),
-                        "input": {},
-                    },
-                })),
-            ));
-        }
-        if let Some(args) = call.pointer("/function/arguments").and_then(Value::as_str)
-            && !args.is_empty()
+        self.emit(
+            out,
+            "response.output_item.done",
+            json!({ "output_index": output_index, "item": item }),
+        );
+    }
+
+    fn reasoning_text(&mut self, key: Option<u64>, text: Option<&str>, out: &mut Vec<u8>) {
+        self.close_message(out);
+        self.close_calls(out);
+        // A signature ends its block; so does a new OpenRouter block index.
+        if let Some(r) = &self.reasoning
+            && (r.signature.is_some() || (key.is_some() && r.key.is_some() && key != r.key))
         {
-            let idx = self.next_block.saturating_sub(1);
-            out.extend(sse_named(
-                "content_block_delta",
-                &value_string(&json!({
-                    "type": "content_block_delta",
-                    "index": idx,
-                    "delta": { "type": "input_json_delta", "partial_json": args },
-                })),
-            ));
+            self.close_reasoning(out);
         }
-        out
-    }
-
-    fn thinking_delta(&mut self, text: &str) -> Vec<u8> {
-        let mut out = Vec::new();
-        if self.open == OpenBlock::Text || self.open == OpenBlock::Tool {
-            out.extend(self.close_open());
+        if self.reasoning.is_none() {
+            let id = fresh_id("rs");
+            let output_index =
+                self.add_item(out, json!({ "type": "reasoning", "id": id, "summary": [] }));
+            self.reasoning = Some(OpenReasoning {
+                output_index,
+                id,
+                key,
+                text: String::new(),
+                part: false,
+                signature: None,
+            });
         }
-        if self.open != OpenBlock::Thinking {
-            let idx = self.next_block;
-            self.next_block = self.next_block.saturating_add(1);
-            self.open = OpenBlock::Thinking;
-            out.extend(sse_named(
-                "content_block_start",
-                &value_string(&json!({
-                    "type": "content_block_start",
-                    "index": idx,
-                    "content_block": { "type": "thinking", "thinking": "" },
-                })),
-            ));
-        }
-        let idx = self.next_block.saturating_sub(1);
-        out.extend(sse_named(
-            "content_block_delta",
-            &value_string(&json!({
-                "type": "content_block_delta",
-                "index": idx,
-                "delta": { "type": "thinking_delta", "thinking": text },
-            })),
-        ));
-        out
-    }
-
-    fn signature_delta(&mut self, sig: &str) -> Vec<u8> {
-        let mut out = Vec::new();
-        if self.open != OpenBlock::Thinking {
-            out.extend(self.thinking_delta(""));
-        }
-        let idx = self.next_block.saturating_sub(1);
-        out.extend(sse_named(
-            "content_block_delta",
-            &value_string(&json!({
-                "type": "content_block_delta",
-                "index": idx,
-                "delta": { "type": "signature_delta", "signature": sig },
-            })),
-        ));
-        out
-    }
-
-    fn redacted_thinking(&mut self, block: &Value) -> Vec<u8> {
-        let mut out = Vec::new();
-        if self.open != OpenBlock::None {
-            out.extend(self.close_open());
-        }
-        let idx = self.next_block;
-        self.next_block = self.next_block.saturating_add(1);
-        self.open = OpenBlock::Thinking;
-        out.extend(sse_named(
-            "content_block_start",
-            &value_string(&json!({
-                "type": "content_block_start",
-                "index": idx,
-                "content_block": {
-                    "type": "redacted_thinking",
-                    "data": block.get("data").cloned().unwrap_or(json!("")),
-                },
-            })),
-        ));
-        out
-    }
-
-    fn finish(&mut self) -> Vec<u8> {
-        if self.finished {
-            return Vec::new();
-        }
-        // A usage-only / `[DONE]`-only upstream stream never opened a text block. `start()`'s
-        // bytes used to be discarded (`let _ =`), so the client got `message_delta`/`message_stop`
-        // with no `message_start` — which a stock Anthropic SDK treats as a broken stream.
-        let mut out = if self.started {
-            Vec::new()
-        } else {
-            self.start()
+        let Some(text) = text else {
+            return;
         };
-        self.finished = true;
-        out.extend(self.close_open());
-        let stop = self.pending_stop.unwrap_or("end_turn");
-        let output = self.completion_tokens.unwrap_or(0);
-        let input = self.prompt_tokens.unwrap_or(0);
-        out.extend(sse_named(
-            "message_delta",
-            &value_string(&json!({
-                "type": "message_delta",
-                "delta": { "stop_reason": stop },
-                "usage": { "input_tokens": input, "output_tokens": output },
-            })),
-        ));
-        out.extend(sse_named(
-            "message_stop",
-            &value_string(&json!({ "type": "message_stop" })),
-        ));
-        out
+        let Some((output_index, id, first)) = self.reasoning.as_mut().map(|r| {
+            (
+                r.output_index,
+                r.id.clone(),
+                !std::mem::replace(&mut r.part, true),
+            )
+        }) else {
+            return;
+        };
+        if first {
+            self.emit(
+                out,
+                "response.reasoning_summary_part.added",
+                json!({
+                    "item_id": id,
+                    "output_index": output_index,
+                    "summary_index": 0,
+                    "part": { "type": "summary_text", "text": "" },
+                }),
+            );
+        }
+        self.emit(
+            out,
+            "response.reasoning_summary_text.delta",
+            json!({
+                "item_id": id,
+                "output_index": output_index,
+                "summary_index": 0,
+                "delta": text,
+            }),
+        );
+        if let Some(r) = self.reasoning.as_mut() {
+            r.text.push_str(text);
+        }
+    }
+
+    fn reasoning_signature(&mut self, key: Option<u64>, sig: &str, out: &mut Vec<u8>) {
+        // Opens a reasoning item when none is (a signed block with no text shown), or a new one
+        // when this signature belongs to another block.
+        self.reasoning_text(key, None, out);
+        if let Some(r) = self.reasoning.as_mut() {
+            r.signature = Some(sig.to_owned());
+        }
+    }
+
+    fn close_reasoning(&mut self, out: &mut Vec<u8>) {
+        let Some(r) = self.reasoning.take() else {
+            return;
+        };
+        if r.part {
+            self.emit(
+                out,
+                "response.reasoning_summary_text.done",
+                json!({
+                    "item_id": r.id,
+                    "output_index": r.output_index,
+                    "summary_index": 0,
+                    "text": r.text,
+                }),
+            );
+            self.emit(
+                out,
+                "response.reasoning_summary_part.done",
+                json!({
+                    "item_id": r.id,
+                    "output_index": r.output_index,
+                    "summary_index": 0,
+                    "part": { "type": "summary_text", "text": r.text },
+                }),
+            );
+        }
+        let mut block = json!({ "type": "thinking", "thinking": r.text });
+        if let (Some(sig), Some(m)) = (r.signature, block.as_object_mut()) {
+            m.insert("signature".into(), json!(sig));
+        }
+        if let Some(item) = reasoning_item(&block, r.id) {
+            self.done_item(out, r.output_index, item);
+        }
+    }
+
+    fn message_delta(&mut self, refusal: bool, text: &str, out: &mut Vec<u8>) {
+        self.close_reasoning(out);
+        self.close_calls(out);
+        if self.message.is_none() {
+            let id = fresh_id("msg");
+            let output_index = self.add_item(
+                out,
+                json!({
+                    "type": "message",
+                    "id": id,
+                    "status": "in_progress",
+                    "role": "assistant",
+                    "content": [],
+                }),
+            );
+            self.message = Some(OpenMessage {
+                output_index,
+                id,
+                parts: Vec::new(),
+                part: None,
+            });
+        }
+        if self
+            .message
+            .as_ref()
+            .is_some_and(|m| m.part.as_ref().is_some_and(|(r, _)| *r != refusal))
+        {
+            self.close_part(out);
+        }
+        let Some((output_index, id, content_index, opening)) = self.message.as_mut().map(|m| {
+            let opening = m.part.is_none();
+            if opening {
+                m.part = Some((refusal, String::new()));
+            }
+            (m.output_index, m.id.clone(), m.parts.len(), opening)
+        }) else {
+            return;
+        };
+        if opening {
+            let part = if refusal {
+                refusal_part("")
+            } else {
+                output_text_part("")
+            };
+            self.emit(
+                out,
+                "response.content_part.added",
+                json!({
+                    "item_id": id,
+                    "output_index": output_index,
+                    "content_index": content_index,
+                    "part": part,
+                }),
+            );
+        }
+        if refusal {
+            self.emit(
+                out,
+                "response.refusal.delta",
+                json!({
+                    "item_id": id,
+                    "output_index": output_index,
+                    "content_index": content_index,
+                    "delta": text,
+                }),
+            );
+        } else {
+            self.emit(
+                out,
+                "response.output_text.delta",
+                json!({
+                    "item_id": id,
+                    "output_index": output_index,
+                    "content_index": content_index,
+                    "delta": text,
+                    "logprobs": [],
+                }),
+            );
+        }
+        if let Some((_, buf)) = self.message.as_mut().and_then(|m| m.part.as_mut()) {
+            buf.push_str(text);
+        }
+    }
+
+    fn close_part(&mut self, out: &mut Vec<u8>) {
+        let Some((output_index, id, content_index, (refusal, text))) =
+            self.message.as_mut().and_then(|m| {
+                m.part
+                    .take()
+                    .map(|p| (m.output_index, m.id.clone(), m.parts.len(), p))
+            })
+        else {
+            return;
+        };
+        let part = if refusal {
+            self.emit(
+                out,
+                "response.refusal.done",
+                json!({
+                    "item_id": id,
+                    "output_index": output_index,
+                    "content_index": content_index,
+                    "refusal": text,
+                }),
+            );
+            refusal_part(&text)
+        } else {
+            self.emit(
+                out,
+                "response.output_text.done",
+                json!({
+                    "item_id": id,
+                    "output_index": output_index,
+                    "content_index": content_index,
+                    "text": text,
+                    "logprobs": [],
+                }),
+            );
+            output_text_part(&text)
+        };
+        self.emit(
+            out,
+            "response.content_part.done",
+            json!({
+                "item_id": id,
+                "output_index": output_index,
+                "content_index": content_index,
+                "part": part,
+            }),
+        );
+        if let Some(m) = self.message.as_mut() {
+            m.parts.push(part);
+        }
+    }
+
+    fn close_message(&mut self, out: &mut Vec<u8>) {
+        self.close_part(out);
+        let Some(m) = self.message.take() else {
+            return;
+        };
+        let (status, _) = responses_status(self.finish);
+        let item = json!({
+            "type": "message",
+            "id": m.id,
+            "status": if status == "completed" { "completed" } else { "incomplete" },
+            "role": "assistant",
+            "content": m.parts,
+        });
+        self.done_item(out, m.output_index, item);
+    }
+
+    fn call_steps(&mut self, steps: Vec<CallStep>, out: &mut Vec<u8>) {
+        for step in steps {
+            match step {
+                CallStep::Open(at) => {
+                    let Some((call_id, name, args)) = self
+                        .calls
+                        .calls
+                        .get(at)
+                        .map(|c| (c.id.clone(), c.name.clone(), c.args.clone()))
+                    else {
+                        continue;
+                    };
+                    let item_id = fresh_id("fc");
+                    let output_index = self.add_item(
+                        out,
+                        json!({
+                            "type": "function_call",
+                            "id": item_id,
+                            "call_id": call_id,
+                            "name": name,
+                            "arguments": "",
+                            "status": "in_progress",
+                        }),
+                    );
+                    if let Some(call) = self.calls.calls.get_mut(at) {
+                        call.slot = output_index;
+                        call.item.clone_from(&item_id);
+                    }
+                    if !args.is_empty() {
+                        self.args_delta(out, &item_id, output_index, &args);
+                    }
+                }
+                CallStep::Args(at, args) => {
+                    let Some((item_id, output_index)) =
+                        self.calls.calls.get(at).map(|c| (c.item.clone(), c.slot))
+                    else {
+                        continue;
+                    };
+                    self.args_delta(out, &item_id, output_index, &args);
+                }
+            }
+        }
+    }
+
+    fn args_delta(&mut self, out: &mut Vec<u8>, item_id: &str, output_index: usize, args: &str) {
+        self.emit(
+            out,
+            "response.function_call_arguments.delta",
+            json!({ "item_id": item_id, "output_index": output_index, "delta": args }),
+        );
+    }
+
+    fn close_calls(&mut self, out: &mut Vec<u8>) {
+        let (status, _) = responses_status(self.finish);
+        let status = if status == "completed" {
+            "completed"
+        } else {
+            "incomplete"
+        };
+        let mut done = Vec::new();
+        for call in &mut self.calls.calls {
+            if call.opened && !call.closed {
+                call.closed = true;
+                done.push((
+                    call.slot,
+                    call.item.clone(),
+                    call.id.clone(),
+                    call.name.clone(),
+                    call.args.clone(),
+                ));
+            }
+        }
+        for (output_index, item_id, call_id, name, args) in done {
+            self.emit(
+                out,
+                "response.function_call_arguments.done",
+                json!({
+                    "item_id": item_id,
+                    "output_index": output_index,
+                    "name": name,
+                    "arguments": args,
+                }),
+            );
+            let item = json!({
+                "type": "function_call",
+                "id": item_id,
+                "call_id": call_id,
+                "name": name,
+                "arguments": args,
+                "status": status,
+            });
+            self.done_item(out, output_index, item);
+        }
+    }
+
+    fn complete(&mut self, out: &mut Vec<u8>) {
+        if self.completed {
+            return;
+        }
+        if !self.started {
+            self.start(out);
+        }
+        let mut steps = Vec::new();
+        self.calls.open_rest(&mut steps);
+        if !steps.is_empty() {
+            self.close_reasoning(out);
+            self.close_message(out);
+        }
+        self.call_steps(steps, out);
+        self.close_reasoning(out);
+        self.close_message(out);
+        self.close_calls(out);
+        let (status, incomplete) = responses_status(self.finish);
+        let usage = self.usage.unwrap_or_default().to_responses();
+        let resp = self.response(status, incomplete, usage);
+        let terminal = if status == "completed" {
+            "response.completed"
+        } else {
+            "response.incomplete"
+        };
+        self.emit(out, terminal, json!({ "response": resp }));
+        self.completed = true;
+    }
+
+    fn finish(&mut self, out: &mut Vec<u8>) {
+        self.complete(out);
+    }
+
+    /// An upstream error: the Responses `error` event, then `response.failed`. The event also
+    /// carries the error under `error`, so an OpenAI SDK raises it as an `APIError` with the
+    /// upstream's message instead of ending on a missing `response.completed`.
+    fn error(&mut self, v: &Value, out: &mut Vec<u8>) {
+        if self.completed {
+            return;
+        }
+        if !self.started {
+            self.start(out);
+        }
+        self.completed = true;
+        let envelope = map_error(v, Endpoint::Responses);
+        let err = envelope.get("error").cloned().unwrap_or(Value::Null);
+        let field = |k: &str| err.get(k).cloned().unwrap_or(Value::Null);
+        let (code, message, param) = (field("code"), field("message"), field("param"));
+        self.emit(
+            out,
+            "error",
+            json!({ "code": code, "message": message, "param": param, "error": err }),
+        );
+        let mut resp = self.response("failed", Value::Null, Value::Null);
+        if let Some(m) = resp.as_object_mut() {
+            let code = if code.is_null() {
+                json!("server_error")
+            } else {
+                code
+            };
+            m.insert("error".into(), json!({ "code": code, "message": message }));
+        }
+        self.emit(out, "response.failed", json!({ "response": resp }));
     }
 }
 
@@ -5153,6 +6455,8 @@ mod tests {
         assert!(out.contains("\"cached_tokens\":4"), "{out}");
     }
 
+    /// Unsigned reasoning never reaches a Messages client: echoed back, it would 400 the next
+    /// turn Anthropic serves. Signed reasoning is covered in `translate_response_tests.rs`.
     #[test]
     fn openai_reasoning_sse_becomes_anthropic_thinking() {
         let mut b = SseBridge::new(Endpoint::Messages, Endpoint::ChatCompletions);
@@ -5162,9 +6466,8 @@ mod tests {
             "data: [DONE]\n\n",
         );
         let out = String::from_utf8(b.feed(src.as_bytes(), true)).unwrap();
-        assert!(out.contains("\"type\":\"thinking\""), "{out}");
-        assert!(out.contains("thinking_delta"), "{out}");
-        assert!(out.contains("plan"), "{out}");
+        assert!(!out.contains("\"type\":\"thinking\""), "{out}");
+        assert!(!out.contains("plan"), "{out}");
         assert!(out.contains("text_delta"), "{out}");
         assert!(out.contains("hi"), "{out}");
     }
@@ -5745,3 +7048,7 @@ mod tests {
 #[cfg(test)]
 #[path = "translate_request_tests.rs"]
 mod request_tests;
+
+#[cfg(test)]
+#[path = "translate_response_tests.rs"]
+mod response_tests;

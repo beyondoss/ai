@@ -406,6 +406,9 @@ pub enum Mode {
     AnthropicStallSse,
     /// An OpenAI embeddings response: vectors first, then `model`, then `usage` (input only).
     Embeddings,
+    /// Reply with exactly this status, content type, and body — for fixtures that belong to one
+    /// test file (a provider's real stream shape, an error body with no `error` key).
+    Raw(u16, &'static str, &'static str),
 }
 
 /// Content deltas a `*StallSse` mode sends before it stalls. Each carries one short token, so an
@@ -675,6 +678,7 @@ fn canned_body(mode: Mode) -> (&'static str, Bytes) {
                 br#"{"type":"error","error":{"type":"api_error","message":"mock"}}"#,
             ),
         ),
+        Mode::Raw(_, content_type, body) => (content_type, Bytes::from_static(body.as_bytes())),
     }
 }
 
@@ -786,7 +790,7 @@ async fn mock_handle(
         sleep(Duration::from_millis(ms)).await;
     }
     let status = match mode {
-        Mode::Status(s) | Mode::AnthropicStatus(s) => s,
+        Mode::Status(s) | Mode::AnthropicStatus(s) | Mode::Raw(s, _, _) => s,
         Mode::ThrottleKey(_) if throttled => 429,
         _ => 200,
     };
