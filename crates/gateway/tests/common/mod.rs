@@ -173,7 +173,7 @@ pub fn unused_nats_port() -> u16 {
     static SERVER: OnceLock<Nats> = OnceLock::new();
     SERVER
         .get_or_init(|| {
-            let mut nats = Nats::spawn("beyond-ai-nats-shared");
+            let mut nats = Nats::spawn_reaped("beyond-ai-nats-shared");
             let deadline = std::time::Instant::now() + Duration::from_secs(20);
             while std::time::Instant::now() < deadline {
                 if std::net::TcpStream::connect(("127.0.0.1", nats.port)).is_ok() {
@@ -258,6 +258,41 @@ impl Nats {
                 "-p",
                 &port.to_string(),
                 "-sd",
+                store_dir.to_str().unwrap(),
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn nats-server (on PATH? run via mise)");
+        Nats {
+            child,
+            port,
+            store_dir,
+        }
+    }
+
+    /// Like [`Self::spawn`], for a server that outlives every `Drop`: the per-process shared one
+    /// in [`unused_nats_port`], held in a `static`, whose destructor never runs. Under nextest every
+    /// test is its own process, so each run leaked one `nats-server` per test (thousands a day on a
+    /// busy machine). A shell watchdog polls this test process and stops the server, and removes its
+    /// store, within a second of the process exiting, however it exits.
+    fn spawn_reaped(store_prefix: &str) -> Self {
+        const WATCHDOG: &str = r#"nats-server -js -a 127.0.0.1 -p "$2" -sd "$3" >/dev/null 2>&1 &
+server=$!
+while kill -0 "$1" 2>/dev/null && kill -0 "$server" 2>/dev/null; do sleep 1; done
+kill "$server" 2>/dev/null
+wait "$server" 2>/dev/null
+rm -rf "$3""#;
+        let port = free_port();
+        let store_dir = std::env::temp_dir().join(format!("{store_prefix}-{port}"));
+        let _ = std::fs::create_dir_all(&store_dir);
+        let child = Command::new("sh")
+            .args([
+                "-c",
+                WATCHDOG,
+                "nats-watchdog",
+                &std::process::id().to_string(),
+                &port.to_string(),
                 store_dir.to_str().unwrap(),
             ])
             .stdout(std::process::Stdio::null())
