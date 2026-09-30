@@ -314,11 +314,21 @@ stays a byte relay. `/{provider}/…` never translates.
 **Embeddings rows.** `text-embedding-3-small` and `-large` are catalog rows whose candidates are
 embeddings paths (OpenAI `/v1/embeddings`, then OpenRouter `/api/v1/embeddings`), so a stock
 `client.embeddings.create` on managed `/v1` walks, fails over, and bills input tokens like any other
-row. The row's endpoint is `Endpoint::of_row`: `Embeddings` when its primary's path is, else what
-`wire` says. Embeddings never translates: `/v1/embeddings` against a generation row, and a
-generation path against an embeddings row, are a **400** naming the row's endpoint. So is any
-other named path (`/v1/moderations`, …), which used to relay onto the row's chat path when the
-wire matched. A catalog test keeps rows from mixing embeddings and generation candidates.
+row. A batch past 64 KiB (openai-python puts `input` before `model`) is re-run with its whole body
+(see the peek below). Like any body pingora cannot replay, it does not fail over in-gateway on a
+5xx or 429: it is relayed, counted on `ai_failover_unreplayable_total`, and the SDK's retry lands
+on the next candidate. The row's endpoint is `Endpoint::of_row`: `Embeddings` when its primary's
+path is, else what `wire` says.
+
+**Which paths name an endpoint.** `route::implied_endpoint` is an exact table:
+`/v1/chat/completions`, `/v1/messages`, `/v1/responses`, `/v1/embeddings` (under `/auto` the `/v1`
+is optional; a trailing slash is ignored). Bare `/v1` and `/auto` name none and relay onto the row's
+primary path. Everything else is a **400** naming the row's endpoint: embeddings against a
+generation row or the reverse (translation never involves embeddings), any other API path
+(`/v1/moderations`, …), and sub-resources such as `/v1/messages/count_tokens`,
+`/v1/responses/{id}` and `/v1/responses/input_tokens`. Those last ones used to match their parent
+by prefix and were forwarded to the candidate's generation path, where they ran and billed as a
+generation; `/auto/embeddings` and `/auto/responses` used to skip the check entirely.
 
 v1 mapping is lossy on extras a stock SDK does not need for a tool loop: Responses-only
 fields (`store`, `previous_response_id`, `include`, `truncation`, …) are dropped when leaving

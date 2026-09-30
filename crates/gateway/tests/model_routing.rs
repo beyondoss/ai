@@ -1667,6 +1667,103 @@ async fn embeddings_against_a_chat_row_is_a_wire_mismatch() {
     assert_eq!(mock.hits(), 0);
 }
 
+/// `/auto` without `/v1` used to skip the endpoint check: an embeddings body relayed onto a chat
+/// path, and a Responses body onto `/v1/embeddings`, both answered 200.
+#[tokio::test]
+async fn auto_short_paths_get_the_same_endpoint_check() {
+    let nats_port = unused_nats_port();
+    let (pubkey, sk) = test_keypair(1);
+    let mock = MockUpstream::start(Mode::Json).await;
+    let gw = Gateway::builder(nats_port, &mock.authority(), &b64(&pubkey))
+        .providers(&["openai", "openrouter"])
+        .start()
+        .await;
+    for (path, body) in [
+        (
+            "/auto/embeddings",
+            r#"{"model":"gpt-4o-mini","input":"hi"}"#,
+        ),
+        (
+            "/auto/responses",
+            r#"{"model":"text-embedding-3-small","input":"hi","store":false}"#,
+        ),
+        // Session state against an embeddings row names the endpoint, not a field.
+        (
+            "/v1/responses",
+            r#"{"model":"text-embedding-3-small","input":"hi"}"#,
+        ),
+    ] {
+        let resp = test_client()
+            .post(format!("{}{path}", gw.url()))
+            .header("authorization", format!("Bearer {}", vkey(&sk)))
+            .header("content-type", "application/json")
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 400, "{path}");
+        let text = resp.text().await.unwrap();
+        assert!(!text.contains("cannot be honored"), "{path}: {text}");
+    }
+    assert_eq!(mock.hits(), 0);
+}
+
+/// Sub-resources are not their parent endpoint: a token count or a retrieve must not run (and
+/// bill) as a generation on the row's path.
+#[tokio::test]
+async fn sub_resources_of_an_endpoint_are_not_generations() {
+    let nats_port = unused_nats_port();
+    let (pubkey, sk) = test_keypair(1);
+    let mock = MockUpstream::start(Mode::AnthropicJson).await;
+    let gw = Gateway::builder(nats_port, &mock.authority(), &b64(&pubkey))
+        .providers(&["anthropic", "openrouter", "openai"])
+        .start()
+        .await;
+    for (path, body) in [
+        (
+            "/v1/messages/count_tokens",
+            r#"{"model":"claude-opus-4-8","messages":[{"role":"user","content":"hi"}]}"#,
+        ),
+        (
+            "/v1/responses/input_tokens",
+            r#"{"model":"gpt-4o-mini","input":"hi"}"#,
+        ),
+    ] {
+        let resp = test_client()
+            .post(format!("{}{path}", gw.url()))
+            .header("x-api-key", vkey(&sk))
+            .header("authorization", format!("Bearer {}", vkey(&sk)))
+            .header("content-type", "application/json")
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 400, "{path}");
+    }
+    assert_eq!(mock.hits(), 0, "nothing ran as a generation");
+}
+
+#[tokio::test]
+async fn a_trailing_slash_is_the_same_endpoint() {
+    let nats_port = unused_nats_port();
+    let (pubkey, sk) = test_keypair(1);
+    let mock = MockUpstream::start(Mode::Embeddings).await;
+    let gw = Gateway::builder(nats_port, &mock.authority(), &b64(&pubkey))
+        .providers(&["openai", "openrouter"])
+        .start()
+        .await;
+    let resp = test_client()
+        .post(format!("{}/v1/embeddings/", gw.url()))
+        .header("authorization", format!("Bearer {}", vkey(&sk)))
+        .header("content-type", "application/json")
+        .body(r#"{"model":"text-embedding-3-small","input":"hi"}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    assert_eq!(mock.captured().expect("forwarded").path, "/v1/embeddings");
+}
+
 /// OpenRouter (and other candidate) spellings are aliases for the catalog row.
 #[tokio::test]
 async fn v1_accepts_a_candidate_spelling_as_an_alias() {

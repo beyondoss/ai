@@ -415,7 +415,7 @@ async fn catalog_rows_are_servable() {
                 )
             };
             let mut req = test_client()
-                .post(format!("{}/auto/x", gw.url()))
+                .post(format!("{}/auto", gw.url()))
                 .header("authorization", format!("Bearer {vkey}"))
                 .header("content-type", "application/json")
                 .header("x-beyond-model", route.model);
@@ -505,7 +505,7 @@ async fn model_route_fails_over_to_a_real_provider() {
     );
 
     let resp = test_client()
-        .post(format!("{}/auto/x", gw.url()))
+        .post(format!("{}/auto", gw.url()))
         .header("authorization", format!("Bearer {vkey}"))
         .header("content-type", "application/json")
         .header("anthropic-version", "2023-06-01")

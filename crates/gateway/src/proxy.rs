@@ -1880,8 +1880,12 @@ impl ProxyHttp for AiProxy {
                 // Messages. `store: false` one-shots stay on `candidates` (lossy translate onto
                 // Chat Completions is allowed). TTFT ranking is only for `candidates` — do not
                 // observe Responses attempts into that table.
+                // An embeddings row has no Responses arm either, but "store cannot be honored"
+                // would name a field the caller may never have set: it walks its candidates and the
+                // wire check below rejects the endpoint, which is what is actually wrong.
+                let embeddings_row = route::Endpoint::of_row(row) == route::Endpoint::Embeddings;
                 let arms: &'static [route::Candidate] =
-                    if inbound_responses && session_field.is_some() {
+                    if inbound_responses && session_field.is_some() && !embeddings_row {
                         row.responses
                     } else {
                         row.candidates

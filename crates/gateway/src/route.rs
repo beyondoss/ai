@@ -152,50 +152,31 @@ pub fn dialect_default(d: Dialect) -> &'static str {
     }
 }
 
-/// The wire an inbound catalog-walk path *implies*, if any.
+/// The endpoint an inbound catalog-walk path names, if any.
 ///
-/// Bare `/v1` and `/auto` (no suffix) do not name an endpoint — the catalog picks the path.
-/// `/v1/messages` and `/auto/v1/messages` imply Anthropic; `/v1/chat/completions`,
-/// `/v1/responses`, and other `/v1/…` paths imply OpenAI. [`catalog_wire_action`] translates
-/// Chat Completions ↔ Messages ↔ Responses against the row's primary. Inbound Responses with
-/// session state still walks the GPT row's `/v1/responses` arm (or 400s on Claude); a
-/// `store: false` one-shot may translate onto Chat Completions. Other mismatches
-/// (`/v1/embeddings` with a Claude row) are still a 400.
-pub fn implied_wire(path: &str) -> Option<Dialect> {
-    let rest = catalog_path_rest(path)?;
-    if rest.is_empty() || rest == "/v1" || rest == "/v1/" {
-        return None;
+/// Exact, not a prefix: `/v1/messages` is Messages, but `/v1/messages/count_tokens`,
+/// `/v1/responses/{id}` and `/v1/responses/input_tokens` are endpoints the catalog does not serve.
+/// Treating them as their parent used to forward a token count or a retrieve to the candidate's
+/// generation path, where it ran (and billed) as a generation. Under `/auto` the `/v1` is optional
+/// (`/auto/chat/completions`), and a trailing slash is ignored everywhere.
+pub fn implied_endpoint(path: &str) -> Option<Endpoint> {
+    let rest = catalog_path_rest(path)?.trim_end_matches('/');
+    match rest.strip_prefix("/v1").unwrap_or(rest) {
+        "/chat/completions" => Some(Endpoint::ChatCompletions),
+        "/messages" => Some(Endpoint::Messages),
+        "/responses" => Some(Endpoint::Responses),
+        "/embeddings" => Some(Endpoint::Embeddings),
+        _ => None,
     }
-    if is_messages_rest(rest) {
-        return Some(Dialect::Anthropic);
-    }
-    if rest.contains("chat/completions") || rest.starts_with("/v1/") {
-        return Some(Dialect::OpenAi);
-    }
-    None
 }
 
-/// The inbound endpoint a catalog-walk path names, when it names Chat Completions, Messages,
-/// Responses, or Embeddings (including the `/auto` suffix). Bare `/v1` returns `None` (the row
-/// picks the path), and so does any other named path, which is a 400 against every row.
-pub fn implied_endpoint(path: &str) -> Option<Endpoint> {
-    let rest = catalog_path_rest(path)?;
-    if rest.is_empty() || rest == "/v1" || rest == "/v1/" {
-        return None;
+/// Whether a catalog-walk path names no endpoint at all (bare `/v1` or `/auto`), so the row's
+/// primary picks the path.
+fn names_no_endpoint(path: &str) -> bool {
+    match catalog_path_rest(path) {
+        None => true,
+        Some(rest) => matches!(rest.trim_end_matches('/'), "" | "/v1"),
     }
-    if rest.ends_with("/embeddings") {
-        return Some(Endpoint::Embeddings);
-    }
-    if is_messages_rest(rest) {
-        return Some(Endpoint::Messages);
-    }
-    if is_responses_rest(rest) {
-        return Some(Endpoint::Responses);
-    }
-    if rest.contains("chat/completions") {
-        return Some(Endpoint::ChatCompletions);
-    }
-    None
 }
 
 fn catalog_path_rest(path: &str) -> Option<&str> {
@@ -206,34 +187,9 @@ fn catalog_path_rest(path: &str) -> Option<&str> {
     }
 }
 
-fn is_messages_rest(rest: &str) -> bool {
-    rest.starts_with("/v1/messages")
-        || rest == "/messages"
-        || rest.starts_with("/messages/")
-        || rest.ends_with("/messages")
-}
-
-/// Whether `path` is a Chat Completions endpoint (including `/auto/chat/completions`).
-pub fn is_chat_completions_path(path: &str) -> bool {
-    catalog_path_rest(path).is_some_and(|r| r.contains("chat/completions"))
-}
-
-/// Whether `path` is a Messages endpoint (including `/auto/v1/messages`).
-pub fn is_messages_path(path: &str) -> bool {
-    catalog_path_rest(path).is_some_and(is_messages_rest)
-}
-
 /// Whether `path` is a Responses endpoint (including `/auto/v1/responses`).
 pub fn is_responses_path(path: &str) -> bool {
-    catalog_path_rest(path).is_some_and(is_responses_rest)
-}
-
-fn is_responses_rest(rest: &str) -> bool {
-    let tail = rest
-        .strip_prefix("/v1/")
-        .or_else(|| rest.strip_prefix('/'))
-        .unwrap_or(rest);
-    tail == "responses" || tail.starts_with("responses/")
+    implied_endpoint(path) == Some(Endpoint::Responses)
 }
 
 /// Whether a catalog candidate path is the Responses endpoint.
@@ -263,15 +219,14 @@ pub enum WireAction {
 /// then uses the serving path, so a GPT session walk onto `/v1/responses` is a byte relay.
 /// Same-wire Responses on `/{provider}` never reaches here.
 pub fn catalog_wire_action(path: &str, row: Endpoint) -> WireAction {
-    if implied_wire(path).is_none() {
-        return WireAction::Relay;
-    }
     match implied_endpoint(path) {
         Some(client) if client == row => WireAction::Relay,
         Some(client) if client != Endpoint::Embeddings && row != Endpoint::Embeddings => {
             WireAction::Translate { client }
         }
-        _ => WireAction::Reject,
+        Some(_) => WireAction::Reject,
+        None if names_no_endpoint(path) => WireAction::Relay,
+        None => WireAction::Reject,
     }
 }
 
@@ -431,23 +386,34 @@ mod tests {
     }
 
     #[test]
-    fn implied_wire_matches_stock_sdk_paths() {
-        assert_eq!(implied_wire("/v1"), None);
-        assert_eq!(implied_wire("/v1/"), None);
-        assert_eq!(implied_wire("/auto"), None);
-        assert_eq!(implied_wire("/auto/"), None);
-        assert_eq!(implied_wire("/v1/messages"), Some(Dialect::Anthropic));
-        assert_eq!(implied_wire("/auto/v1/messages"), Some(Dialect::Anthropic));
-        assert_eq!(implied_wire("/auto/messages"), Some(Dialect::Anthropic));
-        assert_eq!(implied_wire("/v1/chat/completions"), Some(Dialect::OpenAi));
-        assert_eq!(
-            implied_wire("/auto/chat/completions"),
-            Some(Dialect::OpenAi)
-        );
-        assert_eq!(implied_wire("/v1/embeddings"), Some(Dialect::OpenAi));
-        assert_eq!(implied_wire("/v1/models"), Some(Dialect::OpenAi));
-        assert_eq!(implied_wire("/v1/responses"), Some(Dialect::OpenAi));
-        assert_eq!(implied_wire("/auto/v1/responses"), Some(Dialect::OpenAi));
+    fn implied_endpoint_is_exact() {
+        for (path, want) in [
+            ("/v1", None),
+            ("/v1/", None),
+            ("/auto", None),
+            ("/auto/", None),
+            ("/v1/messages", Some(Endpoint::Messages)),
+            ("/v1/messages/", Some(Endpoint::Messages)),
+            ("/auto/v1/messages", Some(Endpoint::Messages)),
+            ("/auto/messages", Some(Endpoint::Messages)),
+            ("/v1/chat/completions", Some(Endpoint::ChatCompletions)),
+            ("/auto/chat/completions", Some(Endpoint::ChatCompletions)),
+            ("/v1/responses", Some(Endpoint::Responses)),
+            ("/auto/responses", Some(Endpoint::Responses)),
+            ("/v1/embeddings", Some(Endpoint::Embeddings)),
+            ("/v1/embeddings/", Some(Endpoint::Embeddings)),
+            ("/auto/embeddings", Some(Endpoint::Embeddings)),
+            // Sub-resources are not the endpoint they hang off.
+            ("/v1/messages/count_tokens", None),
+            ("/v1/messages/batches", None),
+            ("/v1/responses/resp_123", None),
+            ("/v1/responses/input_tokens", None),
+            ("/v1/chat/completions/abc", None),
+            ("/v1/models", None),
+            ("/v1/moderations", None),
+        ] {
+            assert_eq!(implied_endpoint(path), want, "{path}");
+        }
     }
 
     #[test]
@@ -559,6 +525,31 @@ mod tests {
         assert_eq!(
             catalog_wire_action("/v1/moderations", Endpoint::ChatCompletions),
             WireAction::Reject
+        );
+        // `/auto` without `/v1` used to slip past the check (and `/auto/responses` too).
+        assert_eq!(
+            catalog_wire_action("/auto/embeddings", Endpoint::ChatCompletions),
+            WireAction::Reject
+        );
+        assert_eq!(
+            catalog_wire_action("/auto/responses", Endpoint::Embeddings),
+            WireAction::Reject
+        );
+        // Sub-resources ran as billed generations on the row's path.
+        for path in [
+            "/v1/messages/count_tokens",
+            "/v1/responses/input_tokens",
+            "/v1/responses/resp_123",
+        ] {
+            assert_eq!(
+                catalog_wire_action(path, Endpoint::Messages),
+                WireAction::Reject,
+                "{path}"
+            );
+        }
+        assert_eq!(
+            catalog_wire_action("/auto", Endpoint::Embeddings),
+            WireAction::Relay
         );
     }
 
