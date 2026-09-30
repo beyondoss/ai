@@ -1201,20 +1201,20 @@ gateway's added cost is negligible and bounded** — i.e. it never becomes the c
   `managed_large_anthropic_sse_throughput`.
 
   What the alloc numbers assert:
-  | Operation                         | Cost                         | Allocations                         | Claim verified                        |
-  | --------------------------------- | ---------------------------- | ----------------------------------- | ------------------------------------- |
-  | `key/verify`                      | ~26µs                        | 0                                   | Stack-only Ed25519 decode             |
-  | `peek/ModelScanner`               | ~0.2µs at 4 KiB, ~3.6µs at 256 KiB | 1 (independent of body size)  | O(1) memory                           |
-  | `route`                           | ~ns                          | 0                                   | —                                     |
-  | `deny::reason`                    | ~0.3–2ns                     | 0, flat 0→1M entries                | O(1) lookup, O(denied) memory         |
-  | `allowance::reason_for`           | ~1.3–3.3ns                   | 0, flat 0→1M entries                | Same claim; v2 probes two maps        |
-  | `smart::rank` / `observe`         | ~110–150ns                   | 0                                   | Atomics only, no lock                 |
-  | `ratelimit::check`                | ~70ns; ~130–190ns at 16 threads | 0                                | Fixed-memory, no per-key state        |
-  | `ratelimit` rotation              | ~81µs                        | 0                                   | Once per window, not per request      |
-  | `cache::key` (cache on)           | ~9µs at 64 KiB, ~35µs at 256 KiB | 0                               | Two SipHash passes, ~7 GB/s           |
-  | `ResponseCache::get` hit          | ~130ns; ~450ns median at 16 threads | 4 × 55 B, flat at 64 KiB body | `Bytes` clone, not a body copy        |
-  | `translate` request, chat→messages | ~2µs small, ~34µs at 64 KiB | ~46 allocs (serde DOM, freed)       | Once per cross-wire request           |
-  | `translate` SSE `text_delta`      | ~1.4µs                       | ~38 allocs / ~6 KiB                 | Per event, not per request            |
+  | Operation                          | Cost                                | Allocations                   | Claim verified                   |
+  | ---------------------------------- | ----------------------------------- | ----------------------------- | -------------------------------- |
+  | `key/verify`                       | ~26µs                               | 0                             | Stack-only Ed25519 decode        |
+  | `peek/ModelScanner`                | ~0.2µs at 4 KiB, ~3.6µs at 256 KiB  | 1 (independent of body size)  | O(1) memory                      |
+  | `route`                            | ~ns                                 | 0                             | —                                |
+  | `deny::reason`                     | ~0.3–2ns                            | 0, flat 0→1M entries          | O(1) lookup, O(denied) memory    |
+  | `allowance::reason_for`            | ~1.3–3.3ns                          | 0, flat 0→1M entries          | Same claim; v2 probes two maps   |
+  | `smart::rank` / `observe`          | ~110–150ns                          | 0                             | Atomics only, no lock            |
+  | `ratelimit::check`                 | ~70ns; ~130–190ns at 16 threads     | 0                             | Fixed-memory, no per-key state   |
+  | `ratelimit` rotation               | ~81µs                               | 0                             | Once per window, not per request |
+  | `cache::key` (cache on)            | ~9µs at 64 KiB, ~35µs at 256 KiB    | 0                             | Two SipHash passes, ~7 GB/s      |
+  | `ResponseCache::get` hit           | ~130ns; ~450ns median at 16 threads | 4 × 55 B, flat at 64 KiB body | `Bytes` clone, not a body copy   |
+  | `translate` request, chat→messages | ~2µs small, ~34µs at 64 KiB         | ~46 allocs (serde DOM, freed) | Once per cross-wire request      |
+  | `translate` SSE `text_delta`       | ~1.4µs                              | ~38 allocs / ~6 KiB           | Per event, not per request       |
 
   Fastest sample from one full `divan` run. Ratios against `key/verify` on that run are the claim;
   absolute µs move with the host.
