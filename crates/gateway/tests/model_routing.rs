@@ -1494,11 +1494,31 @@ async fn v1_models_lists_the_catalog() {
         .find(|m| m["id"] == "gpt-4o-mini")
         .expect("gpt-4o-mini");
     assert_eq!(gpt["wire"], "openai");
+    assert_eq!(gpt["pricing"]["input"], "0.15");
+    assert_eq!(gpt["pricing"]["output"], "0.6");
+    assert_eq!(gpt["pricing"]["cache_read"], "0.075");
+    assert!(
+        gpt["pricing"]["cache_write"]
+            .as_str()
+            .is_some_and(|s| !s.is_empty()),
+        "every listed model carries a cache-write rate: {gpt}"
+    );
     let claude = data
         .iter()
         .find(|m| m["id"] == "claude-opus-4-8")
         .expect("claude-opus-4-8");
     assert_eq!(claude["wire"], "anthropic");
+    assert_eq!(claude["pricing"]["input"], "5");
+    assert_eq!(claude["pricing"]["output"], "25");
+    assert_eq!(claude["pricing"]["cache_read"], "0.5");
+    assert_eq!(claude["pricing"]["cache_write"], "6.25");
+    assert!(
+        data.iter().all(|m| {
+            m["pricing"]["input"].as_str().is_some_and(|s| s != "0")
+                && m["pricing"]["output"].as_str().is_some_and(|s| s != "0")
+        }),
+        "a catalog model without a list price bills as free: {v}"
+    );
     assert_eq!(mock.hits(), 0, "listing must not contact an upstream");
 }
 

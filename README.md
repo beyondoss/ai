@@ -291,7 +291,7 @@ docker run --rm -p 8080:8080 \
 - **BYO keys** — any other token passes through to the provider untouched. No key-swap, no deny-set, no attribution, no `ai.usage` billing event (aggregate throughput metrics still count it).
 - **11 providers, zero config** — openai, anthropic, openrouter, fireworks, groq, deepseek, together, cerebras, mistral, xai, bedrock. Add more in `config.toml` under `[provider_authorities]`.
 - **Never buffers** — request and response stream through; a SIMD scanner extracts `model` in O(1) memory. 64KB tail taps usage without holding the body.
-- **Token facts, not pricing** — emits `ai.usage` token-count events as structured logs (stdout → logfwd/OTLP → ClickHouse). A closed downstream consumer prices; slipstream carries only the deny-set.
+- **List prices on the catalog, token facts on the request** — `GET /v1/models` publishes a standard list price for every catalog model (USD per million tokens). `ai.usage` stays token counts (stdout → logfwd/OTLP → ClickHouse). A closed downstream consumer applies that card, or a contract rate; slipstream carries only the deny-set.
 - **Rate guardrail** — per-key request ceiling (`rate_limit_rps`). Circuit breaker against runaway keys. Deny-set owns spend control.
 - **Fail-open NATS** — auth works without NATS. A NATS outage stales the deny-set; existing allows stay allowed.
 

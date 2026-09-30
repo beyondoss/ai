@@ -264,8 +264,10 @@ Not in this surface: cost sort, weighted load-balance across keys, `MODEL_ROUTES
 Vercel `providerOptions` from the body.
 
 `GET /v1/models` (and `HEAD`) lists the catalog in OpenAI list shape, plus a `wire` field
-(`openai` / `anthropic`) so a caller can pick the matching SDK. Served after identity, before the
-body peek, so an empty GET is not a missing-model 404.
+(`openai` / `anthropic`) so a caller can pick the matching SDK, and a `pricing` object on every
+row (USD per million tokens: `input`, `output`, `cache_read`, `cache_write`; the list's
+`pricing_unit` says so once). Served after identity, before the body peek, so an empty GET is not
+a missing-model 404.
 
 A stock OpenAI or Anthropic SDK pointed at `/v1` with `model` in the JSON body is `/auto` without
 the header. Same-wire failover is a byte relay — the gateway rewrites ids, not API shapes, across
@@ -332,8 +334,9 @@ request body is still replayable. Candidates whose breaker is open are skipped w
 See "Status-based failover, and where it stops" for the 5xx path and its one real limit.
 
 Catalog rows live in `providers::catalog`, shared with the agent. A row's `wire` is the _client
-default_ (what the primary speaks, and what a bare `/v1` caller is assumed to send). Candidates may
-list Messages and Chat Completions (or Responses) together — Claude's OpenRouter arm is Chat
+default_ (what the primary speaks, and what a bare `/v1` caller is assumed to send). Its `price` is
+the standard list card published on `GET /v1/models`, not a rate the proxy applies to `ai.usage`.
+Candidates may list Messages and Chat Completions (or Responses) together — Claude's OpenRouter arm is Chat
 Completions. Each attempt translates the **original** client body onto **this candidate's** path
 (`endpoint_of_path` / `wire_of_path`); injection (`stream_options`) follows the upstream candidate,
 not the client. Billing dialect is the serving candidate's path, never the row or the provider
@@ -889,12 +892,19 @@ whether covering them is worth building, and the options are not cheap: patch `B
 comes from our buffer with no cap, at the cost of every filter re-entering on the inner request).
 Neither is worth starting before the counter says how often the limit actually bites.
 
-### Why pricing is absent from the gateway
+### Why the catalog has a list price and the request does not
 
-The gateway emits token _facts_ (`ai.usage`): counts and model identifiers. Applying prices to
-those facts is a downstream concern. Provider pricing changes frequently, varies by contract tier,
-and is sometimes retroactively corrected on invoices. A downstream consumer can reprice historical
-facts; the gateway's facts cannot be regenerated once the request is gone.
+`GET /v1/models` carries a standard list price on every catalog row (`providers::catalog::ListPrice`):
+USD per million tokens for input, output, cache read, and cache write. That is the card a client
+estimates with, and the card a downstream consumer uses when it has nothing better. A public card
+that omits a cache rate is stored as the input rate — no discount, no write premium. Omission is
+not zero; a missing rate is how cache tokens used to bill free.
+
+The gateway still does not multiply those rates into `ai.usage`. It emits token facts: counts and
+model identifiers. Provider pricing changes frequently, varies by contract tier, and is sometimes
+retroactively corrected on invoices. Batch, fast mode, the 1-hour Claude cache write (2× input),
+and long-context overrides are not this card. A downstream consumer can reprice historical facts;
+the gateway's facts cannot be regenerated once the request is gone.
 
 ### Why routing uses the first path segment, not a header
 

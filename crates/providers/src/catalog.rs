@@ -10,9 +10,11 @@
 //! A candidate's `upstream_model` spelling is an alias for the same row. `/{provider}/…` does
 //! not consult it.
 //!
-//! It carries routing facts only — provider, the id that provider spells it with, and the path to
-//! send it to. Model *capability* facts (context window, thinking shape) stay in
-//! `agent_core::models`; a test keeps this file from growing them.
+//! A row carries routing facts — provider, the id that provider spells it with, and the path to
+//! send it to — plus one published list price ([`ListPrice`]). Model *capability* facts (context
+//! window, thinking shape) stay in `agent_core::models`; a test keeps a [`Candidate`] from growing
+//! them. The price is the public standard card, not the invoice: `ai.usage` still emits token
+//! counts, and a downstream consumer applies (or replaces) this card.
 //!
 //! # Wire format belongs to the row, not the provider
 //!
@@ -40,12 +42,13 @@
 //!
 //! # Maintenance
 //!
-//! These rows are product data and they go stale — providers rename ids, deprecate models, and
-//! change what they host. Every id and path below was verified against the live API before being
-//! added, and `catalog_rows_are_servable` (in `crates/gateway/tests/smoke.rs`) re-verifies the whole
-//! table against real providers whenever the keys are present. Add a row the same way: check it,
-//! then add it. A wrong entry does not fail loudly — it routes to a 404 that looks like the client's
-//! fault.
+//! These rows are product data and they go stale — providers rename ids, deprecate models, change
+//! what they host, and reprice. Every id and path below was verified against the live API before
+//! being added, and `catalog_rows_are_servable` (in `crates/gateway/tests/smoke.rs`) re-verifies the
+//! whole table against real providers whenever the keys are present. Add a row the same way: check
+//! it, then add it, **with a list price**. A wrong route does not fail loudly — it routes to a 404
+//! that looks like the client's fault. A missing price used to fail the same way in the other
+//! direction: `GET /v1/models` named the model and a consumer priced it at zero.
 
 use crate::{ProviderId, WireFormat};
 
@@ -93,6 +96,56 @@ pub struct ModelRoute {
     /// `truncation` pass through). A Responses 5xx may walk another entry here; it must not walk
     /// onto [`Self::candidates`] while session fields are in play.
     pub responses: &'static [Candidate],
+    /// Standard public list price for this model. See [`ListPrice`].
+    pub price: ListPrice,
+}
+
+/// Standard list price, USD per million tokens.
+///
+/// Decimal strings, not `f64`: `0.075` is not binary-exact, and these bytes are copied into
+/// `GET /v1/models`. At most six digits after the point (one micro-dollar). The four rates are the
+/// standard card only — not batch, not fast mode, not a long-context override, and not the 1-hour
+/// Claude cache write (2× input). `cache_write` here is the 5-minute / default write rate.
+///
+/// Taken from OpenRouter's public `https://openrouter.ai/api/v1/models` card on 2026-09-30, which
+/// matched Anthropic's first-party table on every Claude row OpenRouter still lists. Two retired
+/// Claude rows OpenRouter has dropped (`claude-3-haiku`, `claude-opus-4`) use Anthropic's published
+/// card instead (`claude-opus-4` is still on the first-party pricing page; Haiku 3 keeps the
+/// long-standing $0.25 / $1.25 card with the same 0.1× read and 1.25× write multipliers as the
+/// rest of the Claude table).
+///
+/// A card that omits `cache_read` or `cache_write` is filled with the **input** rate: no discount,
+/// no write premium. Omission is not $0. A consumer that subtracted cache tokens and then multiplied
+/// the remainder by a missing rate was billing those tokens free, which is how most of the catalog
+/// used to be unpriced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ListPrice {
+    /// Uncached input, USD per million tokens.
+    pub input: &'static str,
+    /// Output, USD per million tokens. Reasoning tokens are already inside the output count the
+    /// gateway meters; this rate is not an extra charge on top of them.
+    pub output: &'static str,
+    /// Cache hits, USD per million tokens. Equal to [`Self::input`] when the public card publishes
+    /// no separate read rate.
+    pub cache_read: &'static str,
+    /// Cache writes (5-minute / default), USD per million tokens. Equal to [`Self::input`] when the
+    /// public card publishes no separate write rate. On the OpenAI wire the gateway's
+    /// `cache_write_tokens` is always zero, so this rate is unused there.
+    pub cache_write: &'static str,
+}
+
+const fn price(
+    input: &'static str,
+    output: &'static str,
+    cache_read: &'static str,
+    cache_write: &'static str,
+) -> ListPrice {
+    ListPrice {
+        input,
+        output,
+        cache_read,
+        cache_write,
+    }
 }
 
 /// Upper bound on candidates per row, so the gateway can track which are usable in a single `u8`
@@ -450,18 +503,21 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         wire: WireFormat::Anthropic,
         candidates: &claude("claude-3-haiku", "anthropic/claude-3-haiku"),
         responses: &[],
+        price: price("0.25", "1.25", "0.025", "0.3125"),
     },
     ModelRoute {
         model: "claude-fable-5",
         wire: WireFormat::Anthropic,
         candidates: &claude("claude-fable-5", "anthropic/claude-fable-5"),
         responses: &[],
+        price: price("10", "50", "1", "12.5"),
     },
     ModelRoute {
         model: "claude-fable-5-1",
         wire: WireFormat::Anthropic,
         candidates: &claude("claude-fable-5-1", "anthropic/claude-fable-5.1"),
         responses: &[],
+        price: price("10", "50", "0.25", "12.5"),
     },
     ModelRoute {
         model: "claude-haiku-4-5",
@@ -472,36 +528,42 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
             "anthropic/claude-haiku-4.5",
         ),
         responses: &[],
+        price: price("1", "5", "0.1", "1.25"),
     },
     ModelRoute {
         model: "claude-opus-4",
         wire: WireFormat::Anthropic,
         candidates: &claude("claude-opus-4", "anthropic/claude-opus-4"),
         responses: &[],
+        price: price("15", "75", "1.5", "18.75"),
     },
     ModelRoute {
         model: "claude-opus-4-1",
         wire: WireFormat::Anthropic,
         candidates: &claude("claude-opus-4-1", "anthropic/claude-opus-4.1"),
         responses: &[],
+        price: price("15", "75", "1.5", "18.75"),
     },
     ModelRoute {
         model: "claude-opus-4-5",
         wire: WireFormat::Anthropic,
         candidates: &claude("claude-opus-4-5", "anthropic/claude-opus-4.5"),
         responses: &[],
+        price: price("5", "25", "0.5", "6.25"),
     },
     ModelRoute {
         model: "claude-opus-4-6",
         wire: WireFormat::Anthropic,
         candidates: &claude("claude-opus-4-6", "anthropic/claude-opus-4.6"),
         responses: &[],
+        price: price("5", "25", "0.5", "6.25"),
     },
     ModelRoute {
         model: "claude-opus-4-7",
         wire: WireFormat::Anthropic,
         candidates: &claude("claude-opus-4-7", "anthropic/claude-opus-4.7"),
         responses: &[],
+        price: price("5", "25", "0.5", "6.25"),
     },
     ModelRoute {
         model: "claude-opus-4-8",
@@ -512,36 +574,42 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
             "anthropic/claude-opus-4.8",
         ),
         responses: &[],
+        price: price("5", "25", "0.5", "6.25"),
     },
     ModelRoute {
         model: "claude-opus-5",
         wire: WireFormat::Anthropic,
         candidates: &claude("claude-opus-5", "anthropic/claude-opus-5"),
         responses: &[],
+        price: price("5", "25", "0.5", "6.25"),
     },
     ModelRoute {
         model: "claude-sonnet-4",
         wire: WireFormat::Anthropic,
         candidates: &claude("claude-sonnet-4", "anthropic/claude-sonnet-4"),
         responses: &[],
+        price: price("3", "15", "0.3", "3.75"),
     },
     ModelRoute {
         model: "claude-sonnet-4-5",
         wire: WireFormat::Anthropic,
         candidates: &claude("claude-sonnet-4-5", "anthropic/claude-sonnet-4.5"),
         responses: &[],
+        price: price("3", "15", "0.3", "3.75"),
     },
     ModelRoute {
         model: "claude-sonnet-4-6",
         wire: WireFormat::Anthropic,
         candidates: &claude("claude-sonnet-4-6", "anthropic/claude-sonnet-4.6"),
         responses: &[],
+        price: price("3", "15", "0.3", "3.75"),
     },
     ModelRoute {
         model: "claude-sonnet-5",
         wire: WireFormat::Anthropic,
         candidates: &claude("claude-sonnet-5", "anthropic/claude-sonnet-5"),
         responses: &[],
+        price: price("2", "10", "0.2", "2.5"),
     },
     // Mistral `-latest` aliases (GA only). Magistral and Devstral are retired as of 2026-09;
     // a guessed still-served alias 404s and looks like the client's fault.
@@ -550,6 +618,7 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         wire: WireFormat::OpenAi,
         candidates: &mistral("codestral-latest", "mistralai/codestral-2508"),
         responses: &[],
+        price: price("0.3", "0.9", "0.03", "0.3"), // cache_write unpublished; equals input
     },
     // DeepSeek. Official current names are `deepseek-flash` / `deepseek-v4-pro`. `deepseek-chat`
     // and `deepseek-reasoner` are the ids stock SDKs still send; OpenRouter still lists the chat
@@ -560,24 +629,28 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         wire: WireFormat::OpenAi,
         candidates: &deepseek("deepseek-chat", "deepseek/deepseek-chat"),
         responses: &[],
+        price: price("0.2574", "1.0287", "0.2574", "0.2574"), // no separate cache card; both rates equal input
     },
     ModelRoute {
         model: "deepseek-flash",
         wire: WireFormat::OpenAi,
         candidates: &deepseek("deepseek-flash", "deepseek/deepseek-v4.1-flash"),
         responses: &[],
+        price: price("0.3", "1.2", "0.006", "0.3"), // cache_write unpublished; equals input
     },
     ModelRoute {
         model: "deepseek-reasoner",
         wire: WireFormat::OpenAi,
         candidates: &deepseek("deepseek-reasoner", "deepseek/deepseek-r1"),
         responses: &[],
+        price: price("0.7", "2.5", "0.7", "0.7"), // no separate cache card; both rates equal input
     },
     ModelRoute {
         model: "deepseek-v4-pro",
         wire: WireFormat::OpenAi,
         candidates: &deepseek("deepseek-v4-pro", "deepseek/deepseek-v4-pro"),
         responses: &[],
+        price: price("0.95526", "1.91052", "0.079605", "0.95526"), // cache_write unpublished; equals input
     },
     // Gemma 4 on Together (vision table, `google/gemma-4-31B-it`) with OpenRouter failover.
     // Not a Gemini dialect — Chat Completions like every other third-party row.
@@ -586,6 +659,7 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         wire: WireFormat::OpenAi,
         candidates: &together("google/gemma-4-31B-it", "google/gemma-4-31b-it"),
         responses: &[],
+        price: price("0.09", "0.34", "0.05", "0.09"), // cache_write unpublished; equals input
     },
     // The same shape on the OpenAI wire, where the two mounts differ as well (`/v1` vs `/api/v1`).
     // Flagships first in the *id* sort: 4.x, then 5 / 5.4 / 5.5 / 5.6, then 6 Astra, then o-series.
@@ -596,204 +670,238 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         wire: WireFormat::OpenAi,
         candidates: &openai_chat("gpt-4", "openai/gpt-4"),
         responses: &openai_responses("gpt-4"),
+        price: price("30", "60", "30", "30"), // no separate cache card; both rates equal input
     },
     ModelRoute {
         model: "gpt-4-turbo",
         wire: WireFormat::OpenAi,
         candidates: &openai_chat("gpt-4-turbo", "openai/gpt-4-turbo"),
         responses: &openai_responses("gpt-4-turbo"),
+        price: price("10", "30", "10", "10"), // no separate cache card; both rates equal input
     },
     ModelRoute {
         model: "gpt-4.1",
         wire: WireFormat::OpenAi,
         candidates: &openai_chat("gpt-4.1", "openai/gpt-4.1"),
         responses: &openai_responses("gpt-4.1"),
+        price: price("2", "8", "0.5", "2"), // cache_write unpublished; equals input
     },
     ModelRoute {
         model: "gpt-4.1-mini",
         wire: WireFormat::OpenAi,
         candidates: &openai_chat("gpt-4.1-mini", "openai/gpt-4.1-mini"),
         responses: &openai_responses("gpt-4.1-mini"),
+        price: price("0.4", "1.6", "0.1", "0.4"), // cache_write unpublished; equals input
     },
     ModelRoute {
         model: "gpt-4.1-nano",
         wire: WireFormat::OpenAi,
         candidates: &openai_chat("gpt-4.1-nano", "openai/gpt-4.1-nano"),
         responses: &openai_responses("gpt-4.1-nano"),
+        price: price("0.1", "0.4", "0.025", "0.1"), // cache_write unpublished; equals input
     },
     ModelRoute {
         model: "gpt-4o",
         wire: WireFormat::OpenAi,
         candidates: &openai_chat("gpt-4o", "openai/gpt-4o"),
         responses: &openai_responses("gpt-4o"),
+        price: price("2.5", "10", "1.25", "2.5"), // cache_write unpublished; equals input
     },
     ModelRoute {
         model: "gpt-4o-mini",
         wire: WireFormat::OpenAi,
         candidates: &openai_chat("gpt-4o-mini", "openai/gpt-4o-mini"),
         responses: &openai_responses("gpt-4o-mini"),
+        price: price("0.15", "0.6", "0.075", "0.15"), // cache_write unpublished; equals input
     },
     ModelRoute {
         model: "gpt-5",
         wire: WireFormat::OpenAi,
         candidates: &openai_chat("gpt-5", "openai/gpt-5"),
         responses: &openai_responses("gpt-5"),
+        price: price("1.25", "10", "0.125", "1.25"), // cache_write unpublished; equals input
     },
     ModelRoute {
         model: "gpt-5-mini",
         wire: WireFormat::OpenAi,
         candidates: &openai_chat("gpt-5-mini", "openai/gpt-5-mini"),
         responses: &openai_responses("gpt-5-mini"),
+        price: price("0.25", "2", "0.025", "0.25"), // cache_write unpublished; equals input
     },
     ModelRoute {
         model: "gpt-5-nano",
         wire: WireFormat::OpenAi,
         candidates: &openai_chat("gpt-5-nano", "openai/gpt-5-nano"),
         responses: &openai_responses("gpt-5-nano"),
+        price: price("0.05", "0.4", "0.005", "0.05"), // cache_write unpublished; equals input
     },
     ModelRoute {
         model: "gpt-5-pro",
         wire: WireFormat::OpenAi,
         candidates: &openai_chat("gpt-5-pro", "openai/gpt-5-pro"),
         responses: &openai_responses("gpt-5-pro"),
+        price: price("15", "120", "15", "15"), // no separate cache card; both rates equal input
     },
     ModelRoute {
         model: "gpt-5.1",
         wire: WireFormat::OpenAi,
         candidates: &openai_chat("gpt-5.1", "openai/gpt-5.1"),
         responses: &openai_responses("gpt-5.1"),
+        price: price("1.25", "10", "0.125", "1.25"), // cache_write unpublished; equals input
     },
     ModelRoute {
         model: "gpt-5.1-codex",
         wire: WireFormat::OpenAi,
         candidates: &openai_chat("gpt-5.1-codex", "openai/gpt-5.1-codex"),
         responses: &openai_responses("gpt-5.1-codex"),
+        price: price("1.25", "10", "0.13", "1.25"), // cache_write unpublished; equals input
     },
     ModelRoute {
         model: "gpt-5.1-codex-max",
         wire: WireFormat::OpenAi,
         candidates: &openai_chat("gpt-5.1-codex-max", "openai/gpt-5.1-codex-max"),
         responses: &openai_responses("gpt-5.1-codex-max"),
+        price: price("1.25", "10", "0.125", "1.25"), // cache_write unpublished; equals input
     },
     ModelRoute {
         model: "gpt-5.1-codex-mini",
         wire: WireFormat::OpenAi,
         candidates: &openai_chat("gpt-5.1-codex-mini", "openai/gpt-5.1-codex-mini"),
         responses: &openai_responses("gpt-5.1-codex-mini"),
+        price: price("0.25", "2", "0.03", "0.25"), // cache_write unpublished; equals input
     },
     ModelRoute {
         model: "gpt-5.2",
         wire: WireFormat::OpenAi,
         candidates: &openai_chat("gpt-5.2", "openai/gpt-5.2"),
         responses: &openai_responses("gpt-5.2"),
+        price: price("1.75", "14", "0.175", "1.75"), // cache_write unpublished; equals input
     },
     ModelRoute {
         model: "gpt-5.2-chat",
         wire: WireFormat::OpenAi,
         candidates: &openai_chat("gpt-5.2-chat", "openai/gpt-5.2-chat"),
         responses: &openai_responses("gpt-5.2-chat"),
+        price: price("1.75", "14", "0.175", "1.75"), // cache_write unpublished; equals input
     },
     ModelRoute {
         model: "gpt-5.2-codex",
         wire: WireFormat::OpenAi,
         candidates: &openai_chat("gpt-5.2-codex", "openai/gpt-5.2-codex"),
         responses: &openai_responses("gpt-5.2-codex"),
+        price: price("1.75", "14", "0.175", "1.75"), // cache_write unpublished; equals input
     },
     ModelRoute {
         model: "gpt-5.2-pro",
         wire: WireFormat::OpenAi,
         candidates: &openai_chat("gpt-5.2-pro", "openai/gpt-5.2-pro"),
         responses: &openai_responses("gpt-5.2-pro"),
+        price: price("21", "168", "21", "21"), // no separate cache card; both rates equal input
     },
     ModelRoute {
         model: "gpt-5.3-codex",
         wire: WireFormat::OpenAi,
         candidates: &openai_chat("gpt-5.3-codex", "openai/gpt-5.3-codex"),
         responses: &openai_responses("gpt-5.3-codex"),
+        price: price("1.75", "14", "0.175", "1.75"), // cache_write unpublished; equals input
     },
     ModelRoute {
         model: "gpt-5.4",
         wire: WireFormat::OpenAi,
         candidates: &openai_chat("gpt-5.4", "openai/gpt-5.4"),
         responses: &openai_responses("gpt-5.4"),
+        price: price("2.5", "15", "0.25", "2.5"), // cache_write unpublished; equals input
     },
     ModelRoute {
         model: "gpt-5.4-mini",
         wire: WireFormat::OpenAi,
         candidates: &openai_chat("gpt-5.4-mini", "openai/gpt-5.4-mini"),
         responses: &openai_responses("gpt-5.4-mini"),
+        price: price("0.75", "4.5", "0.075", "0.75"), // cache_write unpublished; equals input
     },
     ModelRoute {
         model: "gpt-5.4-nano",
         wire: WireFormat::OpenAi,
         candidates: &openai_chat("gpt-5.4-nano", "openai/gpt-5.4-nano"),
         responses: &openai_responses("gpt-5.4-nano"),
+        price: price("0.2", "1.25", "0.02", "0.2"), // cache_write unpublished; equals input
     },
     ModelRoute {
         model: "gpt-5.4-pro",
         wire: WireFormat::OpenAi,
         candidates: &openai_chat("gpt-5.4-pro", "openai/gpt-5.4-pro"),
         responses: &openai_responses("gpt-5.4-pro"),
+        price: price("30", "180", "30", "30"), // no separate cache card; both rates equal input
     },
     ModelRoute {
         model: "gpt-5.5",
         wire: WireFormat::OpenAi,
         candidates: &openai_chat("gpt-5.5", "openai/gpt-5.5"),
         responses: &openai_responses("gpt-5.5"),
+        price: price("5", "30", "0.5", "5"), // cache_write unpublished; equals input
     },
     ModelRoute {
         model: "gpt-5.5-pro",
         wire: WireFormat::OpenAi,
         candidates: &openai_chat("gpt-5.5-pro", "openai/gpt-5.5-pro"),
         responses: &openai_responses("gpt-5.5-pro"),
+        price: price("30", "180", "30", "30"), // no separate cache card; both rates equal input
     },
     ModelRoute {
         model: "gpt-5.6-luna",
         wire: WireFormat::OpenAi,
         candidates: &openai_chat("gpt-5.6-luna", "openai/gpt-5.6-luna"),
         responses: &openai_responses("gpt-5.6-luna"),
+        price: price("0.2", "1.2", "0.02", "0.25"),
     },
     ModelRoute {
         model: "gpt-5.6-luna-pro",
         wire: WireFormat::OpenAi,
         candidates: &openai_chat("gpt-5.6-luna-pro", "openai/gpt-5.6-luna-pro"),
         responses: &openai_responses("gpt-5.6-luna-pro"),
+        price: price("0.2", "1.2", "0.02", "0.25"),
     },
     ModelRoute {
         model: "gpt-5.6-sol",
         wire: WireFormat::OpenAi,
         candidates: &openai_chat("gpt-5.6-sol", "openai/gpt-5.6-sol"),
         responses: &openai_responses("gpt-5.6-sol"),
+        price: price("2", "10", "0.2", "2.5"),
     },
     ModelRoute {
         model: "gpt-5.6-sol-pro",
         wire: WireFormat::OpenAi,
         candidates: &openai_chat("gpt-5.6-sol-pro", "openai/gpt-5.6-sol-pro"),
         responses: &openai_responses("gpt-5.6-sol-pro"),
+        price: price("4", "20", "0.4", "5"),
     },
     ModelRoute {
         model: "gpt-5.6-terra",
         wire: WireFormat::OpenAi,
         candidates: &openai_chat("gpt-5.6-terra", "openai/gpt-5.6-terra"),
         responses: &openai_responses("gpt-5.6-terra"),
+        price: price("2", "12", "0.2", "2.5"),
     },
     ModelRoute {
         model: "gpt-5.6-terra-pro",
         wire: WireFormat::OpenAi,
         candidates: &openai_chat("gpt-5.6-terra-pro", "openai/gpt-5.6-terra-pro"),
         responses: &openai_responses("gpt-5.6-terra-pro"),
+        price: price("2", "12", "0.2", "2.5"),
     },
     ModelRoute {
         model: "gpt-6-astra",
         wire: WireFormat::OpenAi,
         candidates: &openai_chat("gpt-6-astra", "openai/gpt-6-astra"),
         responses: &openai_responses("gpt-6-astra"),
+        price: price("10", "50", "1", "12.5"),
     },
     ModelRoute {
         model: "gpt-6-astra-pro",
         wire: WireFormat::OpenAi,
         candidates: &openai_chat("gpt-6-astra-pro", "openai/gpt-6-astra-pro"),
         responses: &openai_responses("gpt-6-astra-pro"),
+        price: price("10", "50", "1", "12.5"),
     },
     // xAI Grok. Native ids from the 2026-09-17 xAI models table plus `grok-4.20-multi-agent`
     // (OpenRouter `x-ai/grok-4.20-multi-agent`, 2026-09-19). No Responses arm — session state
@@ -803,36 +911,42 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         wire: WireFormat::OpenAi,
         candidates: &xai("grok-4.20", "x-ai/grok-4.20"),
         responses: &[],
+        price: price("1.25", "2.5", "0.2", "1.25"), // cache_write unpublished; equals input
     },
     ModelRoute {
         model: "grok-4.20-multi-agent",
         wire: WireFormat::OpenAi,
         candidates: &xai("grok-4.20-multi-agent", "x-ai/grok-4.20-multi-agent"),
         responses: &[],
+        price: price("1.25", "2.5", "0.2", "1.25"), // cache_write unpublished; equals input
     },
     ModelRoute {
         model: "grok-4.3",
         wire: WireFormat::OpenAi,
         candidates: &xai("grok-4.3", "x-ai/grok-4.3"),
         responses: &[],
+        price: price("1.25", "2.5", "0.2", "1.25"), // cache_write unpublished; equals input
     },
     ModelRoute {
         model: "grok-4.5",
         wire: WireFormat::OpenAi,
         candidates: &xai("grok-4.5", "x-ai/grok-4.5"),
         responses: &[],
+        price: price("2", "6", "0.3", "2"), // cache_write unpublished; equals input
     },
     ModelRoute {
         model: "grok-4.6",
         wire: WireFormat::OpenAi,
         candidates: &xai("grok-4.6", "x-ai/grok-4.6"),
         responses: &[],
+        price: price("2", "6", "0.5", "2"), // cache_write unpublished; equals input
     },
     ModelRoute {
         model: "grok-build-0.1",
         wire: WireFormat::OpenAi,
         candidates: &xai("grok-build-0.1", "x-ai/grok-build-0.1"),
         responses: &[],
+        price: price("1", "2", "0.2", "1"), // cache_write unpublished; equals input
     },
     // Groq / Together / Fireworks llama + qwen + open-weight ids people send. No Meta row, so
     // primary is the host whose id is the catalog name (Groq for the short llama-3.x ids,
@@ -844,12 +958,14 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         wire: WireFormat::OpenAi,
         candidates: &groq("llama-3.1-8b-instant", "meta-llama/llama-3.1-8b-instruct"),
         responses: &[],
+        price: price("0.05", "0.08", "0.025", "0.05"), // cache_write unpublished; equals input
     },
     ModelRoute {
         model: "llama-3.3-70b-versatile",
         wire: WireFormat::OpenAi,
         candidates: &llama_3_3(),
         responses: &[],
+        price: price("0.1", "0.32", "0.1", "0.1"), // no separate cache card; both rates equal input
     },
     ModelRoute {
         model: "meta-llama/llama-4-maverick",
@@ -859,6 +975,7 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
             "meta-llama/llama-4-maverick",
         ),
         responses: &[],
+        price: price("0.1875", "0.6525", "0.1875", "0.1875"), // no separate cache card; both rates equal input
     },
     ModelRoute {
         model: "meta-llama/llama-4-scout",
@@ -868,66 +985,77 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
             "meta-llama/llama-4-scout",
         ),
         responses: &[],
+        price: price("0.1", "0.3", "0.1", "0.1"), // no separate cache card; both rates equal input
     },
     ModelRoute {
         model: "meta/muse-glimmer-30b",
         wire: WireFormat::OpenAi,
         candidates: &together("meta-models/Muse-Glimmer-30B", "meta/muse-glimmer-30b"),
         responses: &[],
+        price: price("0.35", "1.5", "0.04", "0.35"), // cache_write unpublished; equals input
     },
     ModelRoute {
         model: "minimax/minimax-m3",
         wire: WireFormat::OpenAi,
         candidates: &minimax_m3(),
         responses: &[],
+        price: price("0.3", "1.2", "0.06", "0.3"), // cache_write unpublished; equals input
     },
     ModelRoute {
         model: "minimaxai/minimax-m2.7",
         wire: WireFormat::OpenAi,
         candidates: &groq("minimaxai/minimax-m2.7", "minimax/minimax-m2.7"),
         responses: &[],
+        price: price("0.21", "0.84", "0.042", "0.21"), // cache_write unpublished; equals input
     },
     ModelRoute {
         model: "ministral-14b-latest",
         wire: WireFormat::OpenAi,
         candidates: &mistral("ministral-14b-latest", "mistralai/ministral-14b-2512"),
         responses: &[],
+        price: price("0.2", "0.2", "0.02", "0.2"), // cache_write unpublished; equals input
     },
     ModelRoute {
         model: "ministral-3b-latest",
         wire: WireFormat::OpenAi,
         candidates: &mistral("ministral-3b-latest", "mistralai/ministral-3b-2512"),
         responses: &[],
+        price: price("0.1", "0.1", "0.01", "0.1"), // cache_write unpublished; equals input
     },
     ModelRoute {
         model: "ministral-8b-latest",
         wire: WireFormat::OpenAi,
         candidates: &mistral("ministral-8b-latest", "mistralai/ministral-8b-2512"),
         responses: &[],
+        price: price("0.15", "0.15", "0.015", "0.15"), // cache_write unpublished; equals input
     },
     ModelRoute {
         model: "mistral-large-latest",
         wire: WireFormat::OpenAi,
         candidates: &mistral("mistral-large-latest", "mistralai/mistral-large-2512"),
         responses: &[],
+        price: price("0.5", "1.5", "0.05", "0.5"), // cache_write unpublished; equals input
     },
     ModelRoute {
         model: "mistral-medium-latest",
         wire: WireFormat::OpenAi,
         candidates: &mistral("mistral-medium-latest", "mistralai/mistral-medium-3-5"),
         responses: &[],
+        price: price("1.5", "7.5", "1.5", "1.5"), // no separate cache card; both rates equal input
     },
     ModelRoute {
         model: "mistral-nemo",
         wire: WireFormat::OpenAi,
         candidates: &mistral("mistral-nemo", "mistralai/mistral-nemo"),
         responses: &[],
+        price: price("0.019", "0.03", "0.019", "0.019"), // no separate cache card; both rates equal input
     },
     ModelRoute {
         model: "mistral-small-latest",
         wire: WireFormat::OpenAi,
         candidates: &mistral("mistral-small-latest", "mistralai/mistral-small-2603"),
         responses: &[],
+        price: price("0.15", "0.6", "0.015", "0.15"), // cache_write unpublished; equals input
     },
     ModelRoute {
         model: "moonshotai/kimi-k2.6",
@@ -937,66 +1065,77 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
             "moonshotai/kimi-k2.6",
         ),
         responses: &[],
+        price: price("0.65", "3.41", "0.15", "0.65"), // cache_write unpublished; equals input
     },
     ModelRoute {
         model: "moonshotai/kimi-k2.7-code",
         wire: WireFormat::OpenAi,
         candidates: &together("moonshotai/Kimi-K2.7-Code", "moonshotai/kimi-k2.7-code"),
         responses: &[],
+        price: price("0.6562", "3.3", "0.18", "0.6562"), // cache_write unpublished; equals input
     },
     ModelRoute {
         model: "moonshotai/kimi-k3",
         wire: WireFormat::OpenAi,
         candidates: &kimi_k3(),
         responses: &[],
+        price: price("3", "15", "0.3", "3"), // cache_write unpublished; equals input
     },
     ModelRoute {
         model: "o1",
         wire: WireFormat::OpenAi,
         candidates: &openai_chat("o1", "openai/o1"),
         responses: &openai_responses("o1"),
+        price: price("15", "60", "7.5", "15"), // cache_write unpublished; equals input
     },
     ModelRoute {
         model: "o1-pro",
         wire: WireFormat::OpenAi,
         candidates: &openai_chat("o1-pro", "openai/o1-pro"),
         responses: &openai_responses("o1-pro"),
+        price: price("150", "600", "150", "150"), // no separate cache card; both rates equal input
     },
     ModelRoute {
         model: "o3",
         wire: WireFormat::OpenAi,
         candidates: &openai_chat("o3", "openai/o3"),
         responses: &openai_responses("o3"),
+        price: price("2", "8", "0.5", "2"), // cache_write unpublished; equals input
     },
     ModelRoute {
         model: "o3-mini",
         wire: WireFormat::OpenAi,
         candidates: &openai_chat("o3-mini", "openai/o3-mini"),
         responses: &openai_responses("o3-mini"),
+        price: price("1.1", "4.4", "0.55", "1.1"), // cache_write unpublished; equals input
     },
     ModelRoute {
         model: "o3-pro",
         wire: WireFormat::OpenAi,
         candidates: &openai_chat("o3-pro", "openai/o3-pro"),
         responses: &openai_responses("o3-pro"),
+        price: price("20", "80", "20", "20"), // no separate cache card; both rates equal input
     },
     ModelRoute {
         model: "o4-mini",
         wire: WireFormat::OpenAi,
         candidates: &openai_chat("o4-mini", "openai/o4-mini"),
         responses: &openai_responses("o4-mini"),
+        price: price("1.1", "4.4", "0.275", "1.1"), // cache_write unpublished; equals input
     },
     ModelRoute {
         model: "openai/gpt-oss-120b",
         wire: WireFormat::OpenAi,
         candidates: &gpt_oss_120b(),
         responses: &[],
+        price: price("0.037", "0.17", "0.037", "0.037"), // no separate cache card; both rates equal input
     },
     ModelRoute {
         model: "openai/gpt-oss-20b",
         wire: WireFormat::OpenAi,
         candidates: &gpt_oss_20b(),
         responses: &[],
+        price: price("0.018", "0.09", "0.009", "0.018"), // cache_write unpublished; equals input
     },
     ModelRoute {
         model: "openai/gpt-oss-safeguard-20b",
@@ -1006,6 +1145,7 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
             "openai/gpt-oss-safeguard-20b",
         ),
         responses: &[],
+        price: price("0.075", "0.3", "0.0375", "0.075"), // cache_write unpublished; equals input
     },
     ModelRoute {
         model: "qwen/qwen-2.5-7b-instruct",
@@ -1015,78 +1155,91 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
             "qwen/qwen-2.5-7b-instruct",
         ),
         responses: &[],
+        price: price("0.1", "0.2", "0.1", "0.1"), // no separate cache card; both rates equal input
     },
     ModelRoute {
         model: "qwen/qwen3.5-9b",
         wire: WireFormat::OpenAi,
         candidates: &together("Qwen/Qwen3.5-9B", "qwen/qwen3.5-9b"),
         responses: &[],
+        price: price("0.1", "0.15", "0.1", "0.1"), // no separate cache card; both rates equal input
     },
     ModelRoute {
         model: "qwen/qwen3.6-plus",
         wire: WireFormat::OpenAi,
         candidates: &together("Qwen/Qwen3.6-Plus", "qwen/qwen3.6-plus"),
         responses: &[],
+        price: price("0.325", "1.95", "0.325", "0.40625"), // cache_read unpublished; equals input
     },
     ModelRoute {
         model: "qwen/qwen3.7-max",
         wire: WireFormat::OpenAi,
         candidates: &together("Qwen/Qwen3.7-Max", "qwen/qwen3.7-max"),
         responses: &[],
+        price: price("1.475", "4.425", "0.295", "1.84375"),
     },
     ModelRoute {
         model: "qwen/qwen3.7-plus",
         wire: WireFormat::OpenAi,
         candidates: &together("Qwen/Qwen3.7-Plus", "qwen/qwen3.7-plus"),
         responses: &[],
+        price: price("0.32", "1.28", "0.064", "0.4"),
     },
     ModelRoute {
         model: "qwen/qwen3.8-2.4t-a95b",
         wire: WireFormat::OpenAi,
         candidates: &together("Qwen/Qwen3.8-2.4T-A95B", "qwen/qwen3.8-2.4t-a95b"),
         responses: &[],
+        price: price("2", "6", "0.25", "2"), // cache_write unpublished; equals input
     },
     ModelRoute {
         model: "qwen/qwen3.8-27b",
         wire: WireFormat::OpenAi,
         candidates: &groq("qwen/qwen3.8-27b", "qwen/qwen3.8-27b"),
         responses: &[],
+        price: price("0.42", "3", "0.085", "0.42"), // cache_write unpublished; equals input
     },
     ModelRoute {
         model: "qwen/qwen3.8-flash",
         wire: WireFormat::OpenAi,
         candidates: &together("Qwen/Qwen3.8-Flash", "qwen/qwen3.8-flash"),
         responses: &[],
+        price: price("0.15", "0.47", "0.016", "0.2"),
     },
     ModelRoute {
         model: "thinkingmachines/inkling",
         wire: WireFormat::OpenAi,
         candidates: &together("thinkingmachines/Inkling", "thinkingmachines/inkling"),
         responses: &[],
+        price: price("1", "4.05", "0.17", "1"), // cache_write unpublished; equals input
     },
     ModelRoute {
         model: "z-ai/glm-5.1",
         wire: WireFormat::OpenAi,
         candidates: &fireworks("accounts/fireworks/models/glm-5p1", "z-ai/glm-5.1"),
         responses: &[],
+        price: price("1.4", "4.4", "0.26", "1.4"), // cache_write unpublished; equals input
     },
     ModelRoute {
         model: "z-ai/glm-5.2",
         wire: WireFormat::OpenAi,
         candidates: &glm_5_2(),
         responses: &[],
+        price: price("0.1739", "3.99", "0.1391", "0.1739"), // cache_write unpublished; equals input
     },
     ModelRoute {
         model: "z-ai/glm-5.3",
         wire: WireFormat::OpenAi,
         candidates: &together("zai-org/GLM-5.3", "z-ai/glm-5.3"),
         responses: &[],
+        price: price("1.4", "4.4", "0.26", "1.4"), // cache_write unpublished; equals input
     },
     ModelRoute {
         model: "z-ai/glm-5.3-flash",
         wire: WireFormat::OpenAi,
         candidates: &together("zai-org/GLM-5.3-Flash", "z-ai/glm-5.3-flash"),
         responses: &[],
+        price: price("0.15", "0.5", "0.03", "0.15"), // cache_write unpublished; equals input
     },
 ];
 
@@ -1118,22 +1271,29 @@ pub fn for_model(name: &str) -> Option<&'static ModelRoute> {
 }
 
 /// OpenAI-shaped `GET /v1/models` body for the catalog. Extra `wire` (`"openai"` / `"anthropic"`)
-/// so a caller can pick the matching SDK. Names are log-safe (`[a-z0-9._/-]`), so this needs no
-/// JSON escaping.
+/// so a caller can pick the matching SDK, and `pricing` (USD per million tokens — see [`ListPrice`]).
+/// Names are log-safe (`[a-z0-9._/-]`) and prices are decimal strings, so this needs no JSON escaping.
 pub fn models_list_json() -> &'static str {
     static JSON: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     JSON.get_or_init(|| {
         use std::fmt::Write as _;
-        let mut out = String::from("{\"object\":\"list\",\"data\":[");
+        let mut out = String::from(
+            "{\"object\":\"list\",\"pricing_unit\":\"usd_per_million_tokens\",\"data\":[",
+        );
         for (i, r) in MODEL_ROUTES.iter().enumerate() {
             if i > 0 {
                 out.push(',');
             }
+            let p = r.price;
             let _ = write!(
                 out,
-                "{{\"id\":\"{}\",\"object\":\"model\",\"type\":\"model\",\"owned_by\":\"system\",\"wire\":\"{}\"}}",
+                "{{\"id\":\"{}\",\"object\":\"model\",\"type\":\"model\",\"owned_by\":\"system\",\"wire\":\"{}\",\"pricing\":{{\"input\":\"{}\",\"output\":\"{}\",\"cache_read\":\"{}\",\"cache_write\":\"{}\"}}}}",
                 r.model,
                 r.wire.as_str(),
+                p.input,
+                p.output,
+                p.cache_read,
+                p.cache_write,
             );
         }
         out.push_str("]}");
@@ -1458,30 +1618,119 @@ mod tests {
     }
 
     #[test]
-    fn models_list_json_names_every_row_and_its_wire() {
+    fn models_list_json_names_every_row_its_wire_and_its_price() {
         let json = models_list_json();
         assert!(
-            json.starts_with("{\"object\":\"list\",\"data\":["),
+            json.starts_with(
+                "{\"object\":\"list\",\"pricing_unit\":\"usd_per_million_tokens\",\"data\":["
+            ),
             "OpenAI list envelope: {json}"
         );
         assert!(json.ends_with("]}"), "{json}");
         for route in MODEL_ROUTES {
-            assert!(
-                json.contains(&format!("\"id\":\"{}\"", route.model)),
-                "{:?} missing from {json}",
-                route.model
-            );
+            let p = route.price;
             assert!(
                 json.contains(&format!(
-                    "\"id\":\"{}\",\"object\":\"model\",\"type\":\"model\",\"owned_by\":\"system\",\"wire\":\"{}\"",
+                    "\"id\":\"{}\",\"object\":\"model\",\"type\":\"model\",\"owned_by\":\"system\",\"wire\":\"{}\",\"pricing\":{{\"input\":\"{}\",\"output\":\"{}\",\"cache_read\":\"{}\",\"cache_write\":\"{}\"}}",
                     route.model,
-                    route.wire.as_str()
+                    route.wire.as_str(),
+                    p.input,
+                    p.output,
+                    p.cache_read,
+                    p.cache_write,
                 )),
-                "{:?} wire {} missing from {json}",
-                route.model,
-                route.wire.as_str()
+                "{:?} wire/price missing from the models list",
+                route.model
             );
         }
+    }
+
+    /// Every catalog row has a real standard card. A zero rate is how a consumer bills tokens free;
+    /// a cache rate above input is not a discount; a write rate of zero is the omission this table
+    /// exists to close. Six decimal places is one micro-dollar, which covers every card we store.
+    #[test]
+    fn every_route_has_a_positive_list_price() {
+        fn micros(label: &str, model: &str, raw: &str) -> u64 {
+            assert!(
+                !raw.is_empty()
+                    && raw.bytes().all(|b| b.is_ascii_digit() || b == b'.')
+                    && raw.matches('.').count() <= 1
+                    && !raw.starts_with('.')
+                    && !raw.ends_with('.'),
+                "{model} {label} {raw:?} is not a plain decimal",
+            );
+            let (whole, frac) = raw.split_once('.').unwrap_or((raw, ""));
+            assert!(
+                frac.len() <= 6,
+                "{model} {label} {raw} has more than 6 decimal places",
+            );
+            let mut padded = frac.to_string();
+            padded.extend(std::iter::repeat_n('0', 6 - frac.len()));
+            let w = whole.parse::<u64>();
+            let f = padded.parse::<u64>();
+            assert!(w.is_ok() && f.is_ok(), "{model} {label} {raw:?}");
+            let w = w.unwrap_or(0);
+            let f = f.unwrap_or(0);
+            let scaled = w.checked_mul(1_000_000).and_then(|n| n.checked_add(f));
+            assert!(scaled.is_some(), "{model} {label} overflow");
+            scaled.unwrap_or(0)
+        }
+        for route in MODEL_ROUTES {
+            let p = route.price;
+            let input = micros("input", route.model, p.input);
+            let output = micros("output", route.model, p.output);
+            let cache_read = micros("cache_read", route.model, p.cache_read);
+            let cache_write = micros("cache_write", route.model, p.cache_write);
+            assert!(input > 0, "{} input", route.model);
+            assert!(output > 0, "{} output", route.model);
+            assert!(
+                cache_read > 0 && cache_read <= input,
+                "{} cache_read {cache_read} vs input {input}",
+                route.model
+            );
+            assert!(cache_write > 0, "{} cache_write", route.model);
+        }
+    }
+
+    /// The two cards the eval harness already freezes, plus the first-party Claude flagship, so a
+    /// refresh of this table cannot silently reprice the models we bill against in tests.
+    #[test]
+    fn pinned_list_prices_match_the_published_cards() {
+        // `unwrap_or` of the first row is only reached if the assert above it failed and
+        // didn't abort — the id is in `MODEL_ROUTES`, so the fallback is dead.
+        let glm = for_model("z-ai/glm-5.3");
+        assert!(glm.is_some(), "glm-5.3");
+        let glm = glm.unwrap_or(&MODEL_ROUTES[0]).price;
+        assert_eq!(
+            (glm.input, glm.cache_read, glm.output),
+            ("1.4", "0.26", "4.4")
+        );
+        let kimi = for_model("moonshotai/kimi-k3");
+        assert!(kimi.is_some(), "kimi-k3");
+        let kimi = kimi.unwrap_or(&MODEL_ROUTES[0]).price;
+        assert_eq!(
+            (kimi.input, kimi.cache_read, kimi.output),
+            ("3", "0.3", "15")
+        );
+        let opus = for_model("claude-opus-4-8");
+        assert!(opus.is_some(), "claude-opus-4-8");
+        let opus = opus.unwrap_or(&MODEL_ROUTES[0]).price;
+        assert_eq!(
+            (opus.input, opus.output, opus.cache_read, opus.cache_write),
+            ("5", "25", "0.5", "6.25")
+        );
+        let haiku3 = for_model("claude-3-haiku");
+        assert!(haiku3.is_some(), "claude-3-haiku");
+        let haiku3 = haiku3.unwrap_or(&MODEL_ROUTES[0]).price;
+        assert_eq!(
+            (
+                haiku3.input,
+                haiku3.output,
+                haiku3.cache_read,
+                haiku3.cache_write
+            ),
+            ("0.25", "1.25", "0.025", "0.3125")
+        );
     }
 
     /// `wire_of_path` is what per-candidate usage parsing leans on, so prove it discriminates
