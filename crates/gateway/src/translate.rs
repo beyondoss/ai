@@ -31,7 +31,7 @@
 //! - **Passed both ways:** `thinking` / `redacted_thinking` blocks, `cache_control` on tools and
 //!   content, `parallel_tool_calls: false` ↔ `tool_choice.disable_parallel_tool_use`, `user` ↔
 //!   `metadata.user_id`.
-//! - **Model-aware onto Messages** (see `ClaudeGen`): `reasoning_effort` becomes adaptive
+//! - **Model-aware onto Messages** (see `ClaudeModel`): `reasoning_effort` becomes adaptive
 //!   thinking plus `output_config.effort` on Claude 4.6 and later, and a `budget_tokens` below
 //!   `max_tokens` before that. `temperature` / `top_p` are dropped where the model rejects them
 //!   (4.7 and later, and anything with thinking on).
@@ -90,7 +90,7 @@ impl TranslateState {
 /// Map a buffered request body from `from` (inbound) to `to` (upstream endpoint).
 ///
 /// `upstream_model` is the id this attempt's candidate will receive. Onto Messages it decides
-/// which reasoning and sampling controls the Claude model accepts (see `ClaudeGen`).
+/// which reasoning, sampling and tool-choice controls the Claude model accepts (see `ClaudeModel`).
 ///
 /// Unparseable JSON is returned unchanged so the provider 400s rather than us 502ing after
 /// headers have already gone upstream. The candidate `model` id is spliced by the caller
@@ -105,10 +105,10 @@ pub fn request(from: Endpoint, to: Endpoint, body: &[u8], upstream_model: &str) 
     if !v.is_object() {
         return body.to_vec();
     }
-    encode(&map_request(from, to, &v, ClaudeGen::of(upstream_model)))
+    encode(&map_request(from, to, &v, ClaudeModel::of(upstream_model)))
 }
 
-fn map_request(from: Endpoint, to: Endpoint, v: &Value, claude: ClaudeGen) -> Value {
+fn map_request(from: Endpoint, to: Endpoint, v: &Value, claude: ClaudeModel) -> Value {
     match (from, to) {
         (Endpoint::ChatCompletions, Endpoint::Messages) => openai_req_to_anthropic(v, claude),
         (Endpoint::Messages, Endpoint::ChatCompletions) => anthropic_req_to_openai(v),
@@ -206,12 +206,12 @@ fn extract_error(v: &Value) -> (String, String) {
 
 // --- request: OpenAI → Anthropic --------------------------------------------
 
-fn openai_req_to_anthropic(v: &Value, claude: ClaudeGen) -> Value {
+fn openai_req_to_anthropic(v: &Value, claude: ClaudeModel) -> Value {
     let mut out = Map::new();
     copy_if(&mut out, v, "model");
     let max_tokens = max_tokens_of(v).unwrap_or(DEFAULT_MAX_TOKENS);
     out.insert("max_tokens".into(), json!(max_tokens));
-    openai_reasoning_to_anthropic(v, &mut out, claude, max_tokens);
+    openai_reasoning_to_anthropic(v, &mut out, claude.reasoning, max_tokens);
     // Current Claude models 400 on non-default sampling, and every model 400s on it alongside
     // thinking. OpenAI clients send `temperature` by habit; it is a hint, so it goes.
     let thinking_on = out
@@ -219,7 +219,7 @@ fn openai_req_to_anthropic(v: &Value, claude: ClaudeGen) -> Value {
         .and_then(|t| t.get("type"))
         .and_then(Value::as_str)
         .is_some_and(|t| t != "disabled");
-    if claude != ClaudeGen::Adaptive && !thinking_on {
+    if claude.reasoning != ClaudeGen::Adaptive && !thinking_on {
         copy_if(&mut out, v, "temperature");
         copy_if(&mut out, v, "top_p");
     }
@@ -268,11 +268,25 @@ fn openai_req_to_anthropic(v: &Value, claude: ClaudeGen) -> Value {
             out.insert("tools".into(), Value::Array(mapped));
         }
     }
+    // Models that reject forced tool use get `auto` plus a closing system instruction naming what
+    // must be called (appended after the messages below).
+    let mut must_call: Option<String> = None;
     if let Some(choice) = v.get("tool_choice") {
-        out.insert(
-            "tool_choice".into(),
-            openai_tool_choice_to_anthropic(choice),
-        );
+        let mut mapped = openai_tool_choice_to_anthropic(choice);
+        if !claude.forced_tool_choice {
+            must_call = match mapped.get("type").and_then(Value::as_str) {
+                Some("any") => Some("Respond by calling one of the provided tools.".to_owned()),
+                Some("tool") => mapped
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .map(|n| format!("Respond by calling the `{n}` tool.")),
+                _ => None,
+            };
+            if must_call.is_some() {
+                mapped = json!({ "type": "auto" });
+            }
+        }
+        out.insert("tool_choice".into(), mapped);
     }
     if v.get("parallel_tool_calls").and_then(Value::as_bool) == Some(false)
         && out.contains_key("tools")
@@ -321,6 +335,17 @@ fn openai_req_to_anthropic(v: &Value, claude: ClaudeGen) -> Value {
     }
     out.insert("messages".into(), Value::Array(messages));
     auto_cache_breakpoints(&mut out);
+    // After the breakpoints, so the instruction sits past the cached prefix. A mid-conversation
+    // system message must follow a user turn; when the request ends on an assistant turn (a prefill,
+    // which these models also reject), there is nowhere valid to put it.
+    if let Some(text) = must_call
+        && let Some(messages) = out.get_mut("messages").and_then(Value::as_array_mut)
+        && messages
+            .last()
+            .is_some_and(|m| m.get("role").and_then(Value::as_str) == Some("user"))
+    {
+        messages.push(json!({ "role": "system", "content": text }));
+    }
     Value::Object(out)
 }
 
@@ -510,36 +535,62 @@ pub(crate) enum ClaudeGen {
     Adaptive,
 }
 
-impl ClaudeGen {
-    /// Parse the generation out of any spelling a candidate uses: `claude-opus-4-8`,
-    /// OpenRouter's `anthropic/claude-opus-4.8`, Bedrock's `global.anthropic.claude-haiku-4-5-…`.
-    /// A dated suffix (`claude-sonnet-4-20250514`) is not a minor version. An unrecognized Claude
-    /// family is assumed current; a model that is not Claude at all keeps the long-standing
-    /// `budget_tokens` shape, which is what Messages-compatible APIs implement.
+/// What the Claude model behind a candidate accepts, parsed from the id it will receive (any
+/// spelling: `claude-opus-4-8`, OpenRouter's `anthropic/claude-opus-4.8`, Bedrock's
+/// `global.anthropic.claude-haiku-4-5-…`). A dated suffix (`claude-sonnet-4-20250514`) is not a
+/// minor version. An unrecognized Claude family is assumed to behave like the newest models; a
+/// model that is not Claude at all keeps the long-standing shapes Messages-compatible APIs
+/// implement (`budget_tokens`, forced `tool_choice`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ClaudeModel {
+    pub(crate) reasoning: ClaudeGen,
+    /// Whether forced `tool_choice` (`any` / `tool`) is accepted. Claude Fable 5.1, Mythos 5.1,
+    /// Opus 5.5 and Sonnet 5.5 reject it with a 400.
+    pub(crate) forced_tool_choice: bool,
+}
+
+impl ClaudeModel {
     pub(crate) fn of(model: &str) -> Self {
+        const NOT_CLAUDE: ClaudeModel = ClaudeModel {
+            reasoning: ClaudeGen::Budget,
+            forced_tool_choice: true,
+        };
+        const NEWEST: ClaudeModel = ClaudeModel {
+            reasoning: ClaudeGen::Adaptive,
+            forced_tool_choice: false,
+        };
         let Some(at) = model.find("claude-") else {
-            return Self::Budget;
+            return NOT_CLAUDE;
         };
         let mut parts = model[at + "claude-".len()..].split(['-', '.']);
         let family = parts.next().unwrap_or("");
         if family.starts_with(|c: char| c.is_ascii_digit()) {
-            return Self::Budget;
-        }
-        if !matches!(family, "opus" | "sonnet" | "haiku") {
-            return Self::Adaptive;
+            // `claude-3-haiku`, `claude-3-5-sonnet-…`.
+            return NOT_CLAUDE;
         }
         let Some(major) = parts.next().and_then(|p| p.parse::<u32>().ok()) else {
-            return Self::Adaptive;
+            return NEWEST;
         };
         let minor = parts
             .next()
             .filter(|p| p.len() <= 2)
             .and_then(|p| p.parse::<u32>().ok())
             .unwrap_or(0);
-        match (major, minor) {
-            (5.., _) | (4, 7..) => Self::Adaptive,
-            (4, 6) => Self::Adaptive46,
-            _ => Self::Budget,
+        let version = (major, minor);
+        match family {
+            "opus" | "sonnet" | "haiku" => ClaudeModel {
+                reasoning: match version {
+                    (5.., _) | (4, 7..) => ClaudeGen::Adaptive,
+                    (4, 6) => ClaudeGen::Adaptive46,
+                    _ => ClaudeGen::Budget,
+                },
+                forced_tool_choice: version < (5, 5),
+            },
+            "fable" | "mythos" => ClaudeModel {
+                reasoning: ClaudeGen::Adaptive,
+                forced_tool_choice: version < (5, 1),
+            },
+            _ => NEWEST,
         }
     }
 }
@@ -4194,25 +4245,39 @@ mod tests {
     #[test]
     fn claude_generation_parses_every_candidate_spelling() {
         use ClaudeGen::*;
-        for (id, want) in [
-            ("claude-opus-4-8", Adaptive),
-            ("anthropic/claude-opus-4.8", Adaptive),
-            ("global.anthropic.claude-opus-4-7-v1:0", Adaptive),
-            ("claude-opus-5-5", Adaptive),
-            ("claude-sonnet-5", Adaptive),
-            ("claude-fable-5-1", Adaptive),
-            ("claude-opus-4-6", Adaptive46),
-            ("claude-sonnet-4-6", Adaptive46),
-            ("claude-haiku-4-5", Budget),
-            ("anthropic.claude-haiku-4-5-20251001-v1:0", Budget),
-            ("claude-sonnet-4-20250514", Budget),
-            ("claude-opus-4-1", Budget),
-            ("claude-3-haiku", Budget),
-            ("claude-3-5-sonnet-latest", Budget),
-            ("kimi-k3", Budget),
-            ("", Budget),
+        // (id, reasoning, forced tool_choice accepted)
+        for (id, reasoning, forced) in [
+            ("claude-opus-4-8", Adaptive, true),
+            ("anthropic/claude-opus-4.8", Adaptive, true),
+            ("global.anthropic.claude-opus-4-7-v1:0", Adaptive, true),
+            ("claude-opus-5", Adaptive, true),
+            ("claude-opus-5-5", Adaptive, false),
+            ("anthropic/claude-opus-5.5", Adaptive, false),
+            ("claude-sonnet-5", Adaptive, true),
+            ("claude-sonnet-5-5", Adaptive, false),
+            ("claude-fable-5", Adaptive, true),
+            ("claude-fable-5-1", Adaptive, false),
+            ("claude-mythos-5-1", Adaptive, false),
+            ("claude-opus-4-6", Adaptive46, true),
+            ("claude-sonnet-4-6", Adaptive46, true),
+            ("claude-haiku-4-5", Budget, true),
+            ("anthropic.claude-haiku-4-5-20251001-v1:0", Budget, true),
+            ("claude-sonnet-4-20250514", Budget, true),
+            ("claude-opus-4-1", Budget, true),
+            ("claude-3-haiku", Budget, true),
+            ("claude-3-5-sonnet-latest", Budget, true),
+            ("claude-nova", Adaptive, false),
+            ("kimi-k3", Budget, true),
+            ("", Budget, true),
         ] {
-            assert_eq!(ClaudeGen::of(id), want, "{id}");
+            assert_eq!(
+                ClaudeModel::of(id),
+                ClaudeModel {
+                    reasoning,
+                    forced_tool_choice: forced
+                },
+                "{id}"
+            );
         }
     }
 
@@ -4504,5 +4569,105 @@ mod tests {
             v["text"]["format"],
             json!({"type": "json_schema", "name": "a", "strict": true, "schema": schema()})
         );
+    }
+
+    // ---- Forced tool use on models that reject it ----
+
+    fn tools_req(choice: Value) -> Value {
+        chat(json!({
+            "tool_choice": choice,
+            "tools": [
+                {"type": "function", "function": {"name": "get_weather", "parameters": {"type": "object", "properties": {}}}},
+                {"type": "function", "function": {"name": "get_time", "parameters": {"type": "object", "properties": {}}}}
+            ]
+        }))
+    }
+
+    #[test]
+    fn required_is_forced_where_the_model_allows_it() {
+        let v = to_claude(&tools_req(json!("required")), "claude-opus-4-8");
+        assert_eq!(v["tool_choice"], json!({"type": "any"}));
+        assert!(
+            v["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|m| m["role"] != "system"),
+            "{v}"
+        );
+    }
+
+    /// Opus 5.5 / Sonnet 5.5 / Fable 5.1 400 on `any` and `tool`: `auto` plus a closing
+    /// instruction, which is Anthropic's documented migration for these models.
+    #[test]
+    fn required_becomes_auto_plus_an_instruction_where_forcing_is_rejected() {
+        for model in ["claude-opus-5-5", "claude-sonnet-5-5", "claude-fable-5-1"] {
+            let v = to_claude(&tools_req(json!("required")), model);
+            assert_eq!(v["tool_choice"], json!({"type": "auto"}), "{model}");
+            let last = v["messages"].as_array().unwrap().last().unwrap().clone();
+            assert_eq!(last["role"], "system", "{model}: {v}");
+            assert!(last["content"].as_str().unwrap().contains("provided tools"));
+        }
+    }
+
+    #[test]
+    fn a_named_tool_choice_names_the_tool_in_the_instruction() {
+        let v = to_claude(
+            &tools_req(json!({"type": "function", "function": {"name": "get_time"}})),
+            "claude-opus-5-5",
+        );
+        assert_eq!(v["tool_choice"], json!({"type": "auto"}));
+        let last = v["messages"].as_array().unwrap().last().unwrap().clone();
+        assert_eq!(last["role"], "system");
+        assert!(
+            last["content"].as_str().unwrap().contains("`get_time`"),
+            "{last}"
+        );
+    }
+
+    #[test]
+    fn unforced_choice_keeps_disable_parallel_tool_use() {
+        let mut req = tools_req(json!("required"));
+        req["parallel_tool_calls"] = json!(false);
+        let v = to_claude(&req, "claude-opus-5-5");
+        assert_eq!(
+            v["tool_choice"],
+            json!({"type": "auto", "disable_parallel_tool_use": true})
+        );
+    }
+
+    /// The instruction goes after the cache marker, so it never invalidates the cached prefix.
+    #[test]
+    fn the_instruction_follows_the_conversation_cache_marker() {
+        let mut req = tools_req(json!("required"));
+        req["messages"] = json!([
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "hello"},
+            {"role": "user", "content": "weather?"}
+        ]);
+        let v = to_claude(&req, "claude-opus-5-5");
+        let msgs = v["messages"].as_array().unwrap();
+        assert_eq!(msgs.last().unwrap()["role"], "system");
+        assert!(msgs.last().unwrap().get("cache_control").is_none());
+        let user = &msgs[msgs.len() - 2];
+        assert_eq!(
+            user["content"][0]["cache_control"]["type"], "ephemeral",
+            "{v}"
+        );
+    }
+
+    #[test]
+    fn auto_and_none_are_untouched_everywhere() {
+        for choice in ["auto", "none"] {
+            let v = to_claude(&tools_req(json!(choice)), "claude-opus-5-5");
+            assert_eq!(v["tool_choice"]["type"], choice);
+            assert!(
+                v["messages"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|m| m["role"] != "system")
+            );
+        }
     }
 }

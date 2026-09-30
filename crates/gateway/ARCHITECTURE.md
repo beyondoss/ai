@@ -347,6 +347,19 @@ least 1024, none at all when `max_tokens` ≤ 1024), and sampling is dropped onl
 Before this, an OpenAI SDK sending `reasoning_effort` or `temperature` to `claude-opus-4-8` got a
 400.
 
+**Forced tool use on models that reject it.** Claude Fable 5.1, Mythos 5.1, Opus 5.5 and Sonnet 5.5
+400 on `tool_choice` `any` / `tool` (`ClaudeModel::forced_tool_choice`). For those, Chat `required`
+or a named function becomes `auto` plus a closing mid-conversation system message ("Respond by
+calling one of the provided tools." / "Respond by calling the `get_time` tool."), which is
+Anthropic's documented migration for these models. The message is appended after the cache
+breakpoints, so the cached prefix is untouched, and only when the request ends on a user turn (the
+only place such a message is valid). It is an instruction, not a guarantee. Measured live
+(2026-09-30): `required` with no fitting tool ("tell me a joke") still called a tool 6/6 on Sonnet
+5.5 and Opus 5.5; a named tool that conflicts with the question was called 8/8, and Sonnet 5.5 also
+called the tool that fit the question alongside it 4/4. Limiting it to one call made Sonnet pick the
+fitting tool instead, so parallel calls stay allowed. Every other model keeps the hard `any` /
+`tool`.
+
 **Unmappable input is forwarded, not dropped.** `input_audio`, a `file_id` or URL document, `n` > 1,
 `logprobs` and audio output have no equivalent on the other wire and change what the client gets
 back. Translation runs in `request_body_filter`, after the request headers went upstream, so the
