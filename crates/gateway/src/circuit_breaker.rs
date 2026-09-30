@@ -215,6 +215,10 @@ const PERMIT_MASK: u64 = 0xFFFF; // 16 bits
 
 const TIMESTAMP_MASK: u64 = 0xFFFF_FFFF; // 32 bits
 
+/// Largest failure threshold the packed 14-bit count can reach. A higher one is clamped here: past
+/// it the count would wrap to 0 on `pack` and the breaker could never open — silently disabled.
+pub const MAX_FAILURE_THRESHOLD: u32 = FAILURE_MASK as u32;
+
 impl CircuitBreaker {
     /// Create a new circuit breaker with the given configuration.
     pub fn new(config: CircuitBreakerConfig) -> Self {
@@ -411,6 +415,7 @@ impl CircuitBreaker {
 
     /// Record failure with consecutive failure tracking.
     fn record_failure_consecutive(&self, threshold: u32) {
+        let threshold = threshold.min(MAX_FAILURE_THRESHOLD);
         // Read the clock once, above the retry loop — the timestamp this failure stamps is the time
         // the failure happened, not the time its CAS finally landed, and re-reading a vDSO clock on
         // every contended retry is pure waste. Matches `record_failure_windowed`.
@@ -456,6 +461,7 @@ impl CircuitBreaker {
     /// each independently resetting to 1 and dropping the others (which could pin the count at 1 and
     /// keep a genuinely-broken provider's breaker stuck closed).
     fn record_failure_windowed(&self, threshold: u32, window_secs: u64) {
+        let threshold = threshold.min(MAX_FAILURE_THRESHOLD);
         let now = self.now_secs();
 
         loop {
@@ -1039,6 +1045,31 @@ mod tests {
             CircuitState::Open,
             "the breaker must still trip at its threshold while the clock is behind"
         );
+    }
+
+    /// A threshold past the 14-bit count used to wrap the count to 0 on `pack`, so the breaker
+    /// could never open. It is clamped to the largest count the word can hold instead.
+    #[test]
+    fn a_threshold_past_the_packed_count_still_opens() {
+        for config in [
+            CircuitBreakerConfig::consecutive(u32::MAX),
+            CircuitBreakerConfig::windowed(MAX_FAILURE_THRESHOLD + 1, Duration::from_secs(60)),
+        ] {
+            let cb = CircuitBreaker::with_clock(
+                config.reset_timeout(Duration::from_secs(3600)),
+                fixed_clock,
+            );
+            for _ in 0..MAX_FAILURE_THRESHOLD - 1 {
+                cb.record_failure();
+            }
+            assert!(matches!(cb.state(), CircuitState::Closed { .. }));
+            cb.record_failure();
+            assert_eq!(
+                cb.state(),
+                CircuitState::Open,
+                "must open, not wrap back to 0"
+            );
+        }
     }
 
     // =========================================================================

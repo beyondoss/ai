@@ -431,7 +431,9 @@ A streaming structural scanner fed body or response chunks as they arrive. Track
 depth, string-escape state, and quote boundaries. Captures the **root-level `model` field only**
 (depth 0 in the object), ignoring nested `model` keys in tool calls or message content.
 SIMD-accelerated via `memchr2` to skip over large string values (base64-encoded images, long
-prompts). O(1) memory: one struct, no heap growth with payload size — proven by the unit bench
+prompts). Root keys and the `model` value are accumulated only up to `MAX_CAPTURE` (256) bytes, so
+a multi-megabyte `model` string is never materialized — past the cap it can only miss the catalog
+or log as `unknown`. O(1) memory: one struct, no heap growth with payload size — proven by the unit bench
 which shows a single allocation independent of whether the body is 0 bytes, 4 KB, or 256 KB.
 
 The billing fact carries **two model fields**:
@@ -1081,7 +1083,7 @@ Secret-bearing fields (`pool_keys`, `nats_creds`) are held as `Secret<T>` — st
 | `snapshot_path`                 | _(unset)_                         | Path for the on-disk deny-set cache. Allowance uses `{path}.allowance`. Unset → re-scan NATS on every cold boot. Set → load from disk and enforce before NATS reconnects (edge/tunnel deployments).                                                              |
 | `rate_limit_rps`                | `100`                             | Per-credential request ceiling (count-min, keyed on raw key hash). `0` disables. Exceeded → 429. Checked before Ed25519 verify.                                                                                                                                  |
 | `byo_rate_limit_rps`            | `1000`                            | Aggregate ceiling for all BYO traffic (single shared bucket). `0` disables. Managed traffic exempt. Exceeded → 429.                                                                                                                                              |
-| `circuit_breaker_threshold`     | `20`                              | Per-provider upstream failures (5xx / connect; **not** 429) within the window before the breaker opens. While open, requests to that provider fast-fail with 503. `0` disables.                                                                                  |
+| `circuit_breaker_threshold`     | `20`                              | Per-provider upstream failures (5xx / connect; **not** 429) within the window before the breaker opens. While open, requests to that provider fast-fail with 503. `0` disables. Max 16383 (the packed count); above → hard boot failure.                         |
 | `circuit_breaker_window_secs`   | `10`                              | Rolling window over which failures are counted (trips on a burst, not a slow trickle).                                                                                                                                                                           |
 | `circuit_breaker_reset_secs`    | `30`                              | How long the breaker stays open before admitting a half-open probe. Probe success closes it; failure reopens it.                                                                                                                                                 |
 | `connect_timeout_secs`          | `10`                              | TCP connect timeout to the upstream provider. Exceeded → retry up to 2×, then 502.                                                                                                                                                                               |
