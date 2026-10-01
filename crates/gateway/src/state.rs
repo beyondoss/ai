@@ -290,6 +290,15 @@ impl GatewayState {
         }
 
         let providers = build_providers(&config, &metrics)?;
+        // Pool keys over cleartext: every managed request would carry Beyond's provider key across
+        // the network unencrypted. Legitimate only against the local plaintext mock (e2e/bench).
+        if !config.upstream_tls && providers.values().any(|p| p.has_pool_key()) {
+            warn!(
+                "upstream_tls is DISABLED while pool keys are configured — Beyond's provider keys \
+                 are sent in cleartext on every managed request. Valid ONLY for a local test/bench \
+                 mock; never set upstream_tls=false against a real provider."
+            );
+        }
         let by_id = index_by_id(&providers);
         let rate_limit = RateLimit::new(config.rate_limit_rps, config.byo_rate_limit_rps);
 

@@ -142,7 +142,8 @@ Client (stock OpenAI/Anthropic SDK)
   ▼  response_filter (proxy.rs)
   │  Record TTFT; detect streaming (Content-Type: text/event-stream)
   │  Count upstream response by provider + status class
-  │  Set x-beyond-request-id, x-beyond-provider, x-beyond-upstream-model (catalog walk)
+  │  Drop any upstream x-beyond-* header, then set x-beyond-request-id, x-beyond-provider,
+  │    x-beyond-upstream-model (catalog walk)
   │  Translate walk: drop Content-Length (body length will change)
   │
   ▼  response_body_filter (proxy.rs)  — response relayed chunk-by-chunk; SSE is never fully buffered
@@ -988,6 +989,10 @@ search:
 | `x-beyond-upstream-model` | catalog walks (`/auto`, managed `/v1`)      | the model id as the gateway sent it to that provider                        |
 | `x-beyond-cache-status`   | cache replays only                          | `hit`                                                                       |
 
+The namespace is the gateway's. Any `x-beyond-*` header on the upstream response is removed before
+the gateway adds its own, so a provider (or anything between us and it) cannot tell the client who
+served a request or that it was a cache replay.
+
 Cost is deliberately **not** returned. The gateway never prices a request (see "Why the catalog has
 a list price and the request does not"): the billed amount is decided downstream and can differ
 from list price, so a gateway-computed figure could disagree with the invoice. A per-request cost
@@ -1520,7 +1525,11 @@ crosses the proxy for anyone. BYO requests forward every client header untouched
 
 All fields configurable via `config.example.toml` and environment (`AI_` prefix, flat merge).
 Secret-bearing fields (`pool_keys`, `nats_creds`) are held as `Secret<T>` — stray `Debug` or
-`Serialize` output redacts to `"***"` and the value is zeroized on drop (`secret.rs`).
+`Serialize` output redacts to `"***"` and the value is zeroized on drop (`secret.rs`). The
+pool key's precomputed `HeaderValue` is marked sensitive, so HPACK never indexes it and its `Debug`
+prints `Sensitive`. Booting with pool keys and `upstream_tls = false` logs a loud warning: every
+managed request would carry Beyond's provider key in cleartext, which is valid only against the
+local plaintext mock.
 
 | Field                           | Default                           | Runtime Effect                                                                                                                                                                                                                                                   |
 | ------------------------------- | --------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |

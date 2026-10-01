@@ -88,7 +88,6 @@ async fn a_body_with_two_root_model_keys_is_refused_on_a_catalog_walk() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 200);
-    let sent: serde_json::Value =
-        serde_json::from_slice(&mock.captured().unwrap().body).unwrap();
+    let sent: serde_json::Value = serde_json::from_slice(&mock.captured().unwrap().body).unwrap();
     assert_eq!(sent["model"], "gpt-4o-mini");
 }

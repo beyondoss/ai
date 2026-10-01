@@ -374,7 +374,14 @@ impl Provider {
             .iter()
             .map(|k| {
                 let value = Secret::new(auth.format(k));
-                let header = http::HeaderValue::from_str(value.expose()).ok();
+                // Sensitive: HPACK never indexes it (so it cannot be recovered from the
+                // compression table) and `Debug` prints `Sensitive`, not the key.
+                let header = http::HeaderValue::from_str(value.expose())
+                    .ok()
+                    .map(|mut h| {
+                        h.set_sensitive(true);
+                        h
+                    });
                 PoolAuth { value, header }
             })
             .collect();
@@ -674,6 +681,8 @@ mod tests {
         assert_eq!(dialect_default(Dialect::Anthropic), "anthropic");
     }
 
+    /// claim: SEC-8
+    /// defect: D53
     #[test]
     fn resolve_derives_host_and_pool_auth() {
         let p = Provider::resolve(
@@ -688,6 +697,12 @@ mod tests {
         assert_eq!(p.host, "api.openai.com");
         assert_eq!(p.dialect, Dialect::OpenAi);
         assert_eq!(p.pool_auth[0].value.expose(), "Bearer sk-x");
+        let header = p.pool_auth[0].header.as_ref().unwrap();
+        assert!(
+            header.is_sensitive(),
+            "the pool key header is marked sensitive"
+        );
+        assert!(!format!("{header:?}").contains("sk-x"));
 
         // No pool key ⇒ no managed auth value (managed requests to it would 503).
         let a = Provider::resolve(

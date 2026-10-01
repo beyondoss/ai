@@ -253,3 +253,67 @@ async fn a_managed_upgrade_is_refused_before_the_upstream() {
     }
     assert_eq!(mock.hits(), 0, "no upgrade may reach the provider");
 }
+
+/// `x-beyond-*` response headers are the gateway's. One sent by the upstream is dropped before the
+/// gateway adds its own, so a client never reads a provider's (or a middlebox's) claim about who
+/// served it or whether it was a cache replay.
+/// claim: SEC-22
+/// defect: D53
+#[tokio::test]
+async fn upstream_x_beyond_headers_never_reach_the_client() {
+    let (pubkey, sk) = test_keypair(1);
+    let body = br#"{"id":"chatcmpl-mock","object":"chat.completion","model":"gpt-4o-mini","choices":[],"usage":{"prompt_tokens":1,"completion_tokens":1}}"#;
+    let reply = {
+        let mut r = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nconnection: close\r\n\
+             x-beyond-provider: evil\r\nx-beyond-cache-status: hit\r\n\
+             x-beyond-request-id: forged\r\nx-beyond-anything: 1\r\ncontent-length: {}\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        r.extend_from_slice(body);
+        r
+    };
+    let upstream = ScriptedUpstream::start(move |_, _| vec![Step::Write(reply.clone())]).await;
+    let gw = Gateway::builder(unused_nats_port(), &upstream.authority(), &b64(&pubkey))
+        .providers(&["openai"])
+        .start()
+        .await;
+    for auth in [
+        format!("Bearer {}", managed_key(&sk)),
+        "Bearer sk-byo".to_owned(),
+    ] {
+        let resp = test_client()
+            .post(format!("{}/openai/v1/chat/completions", gw.url()))
+            .header("authorization", &auth)
+            .header("content-type", "application/json")
+            .body(CHAT)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let h = resp.headers();
+        assert_eq!(h.get_all("x-beyond-provider").iter().count(), 1);
+        assert_eq!(h.get("x-beyond-provider").unwrap(), "openai");
+        assert_eq!(h.get_all("x-beyond-request-id").iter().count(), 1);
+        assert_ne!(h.get("x-beyond-request-id").unwrap(), "forged");
+        assert!(h.get("x-beyond-cache-status").is_none());
+        assert!(h.get("x-beyond-anything").is_none());
+    }
+}
+
+/// Pool keys over a plaintext upstream are sent in cleartext on every managed request. Legitimate
+/// only against a local mock (as here), so it boots, but loudly.
+/// claim: SEC-8
+/// defect: D53
+#[tokio::test]
+async fn pool_keys_over_cleartext_warn_at_boot() {
+    let (pubkey, _sk) = test_keypair(1);
+    let mock = MockUpstream::start(Mode::Json).await;
+    let gw = Gateway::builder(unused_nats_port(), &mock.authority(), &b64(&pubkey))
+        .providers(&["openai"])
+        .start()
+        .await;
+    gw.wait_for_log_line(&["upstream_tls is DISABLED while pool keys are configured"])
+        .await;
+}

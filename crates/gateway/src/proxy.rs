@@ -3692,6 +3692,19 @@ impl ProxyHttp for AiProxy {
                 self.state.metrics.active_streams.inc();
             }
 
+            // `x-beyond-*` is the gateway's namespace. A provider (or anything between us and it)
+            // that sent its own `x-beyond-provider` or `x-beyond-cache-status` would otherwise reach
+            // the client beside, or instead of, ours. Allocates only when one is present.
+            let spoofed: Vec<http::HeaderName> = upstream_response
+                .headers
+                .keys()
+                .filter(|k| k.as_str().starts_with("x-beyond-"))
+                .cloned()
+                .collect();
+            for name in &spoofed {
+                upstream_response.remove_header(name);
+            }
+
             // Echo the request id so a client (or an oncall reading a captured response) can quote it
             // and land on this request's log line. `insert_header` only fails on an invalid value;
             // our id is `[0-9a-f-]`, always valid — but surface a failure rather than silently drop.
