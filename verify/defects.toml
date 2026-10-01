@@ -1739,10 +1739,10 @@ impact = "SseBridge forwards what an upstream sends after its terminal event: a 
 confidence = "high"
 evidence = "props_sse::prop_errors_and_cuts_anywhere_leave_a_well_formed_failure and ::prop_vocabulary_events_keep_the_client_lifecycle, minimized: Chat upstream [role chunk, tool call, finish_reason tool_calls, usage chunk, data: {\"error\":{\"message\":\"boom\",...}}, data: [DONE]] -> Messages client ... event: message_stop, then event: error. Messages upstream [data: {\"type\":\"message_stop\"}, data: {\"type\":\"error\"}] -> Chat client: data: [DONE] then data: {\"error\":...}. translate.rs SseBridge::deliver drops nothing once `done` / OaiToAnt::finished is set."
 claims = ["S2"]
-state = "reproduced"
+state = "fixed"
 test = "nothing_reaches_the_client_after_its_terminal_event"
-fix = ""
-note = "Found by the property suites (crates/gateway/tests/props_sse.rs). Proposed: once the client's terminal event went out (Chat `done`, OaiToAnt `finished`, OaiToResp `completed`), deliver nothing more."
+fix = "41e1dff"
+note = "Found by the property suites (crates/gateway/tests/props_sse.rs). Proposed: once the client's terminal event went out (Chat `done`, OaiToAnt `finished`, OaiToResp `completed`), deliver nothing more. Fixed in 41e1dff: SseBridge::deliver drops every item once the client's terminal event went out (Chat `done`, OaiToAnt `finished`, OaiToResp `completed`), so the stream a translated client is sent ends on its terminal event, which is also what terminal::TerminalTracker reads to bill a close after the answer as ok (D120). The same-wire relays (OpenAI's zero-copy relay, ChatIdentity relay mode) still forward the provider's own bytes unchanged. Both props_sse exclusions (the stream stopping at the upstream's terminal event, the Messages<-Chat error-after-usage case) are removed."
 
 [[defect]]
 id = "D125"
@@ -1767,10 +1767,10 @@ impact = "SSE lets one event carry its data on several `data:` lines, joined wit
 confidence = "high"
 evidence = "props_usage::prop_streams_bill_like_their_bodies and props_sse::prop_translated_streams_preserve_content_and_usage with Framing.multiline, minimized: a Chat stream whose usage chunk is `data: {` + `data: \"id\":...,\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":9,...}}` -> usage::openai_stream None, while SseBridge(Messages<-Chat) shows output_tokens 9; same for an Anthropic message_delta split the same way."
 claims = ["B1"]
-state = "reproduced"
+state = "fixed"
 test = "usage_spread_over_two_data_lines_is_billed"
-fix = ""
-note = "Found by the property suites. Proposed: join an event's consecutive data: lines before parsing (only on lines that fail to parse, to keep the fast path)."
+fix = "c559d49"
+note = "Found by the property suites. Proposed: join an event's consecutive data: lines before parsing (only on lines that fail to parse, to keep the fast path). Fixed in c559d49: openai_stream and anthropic_stream_parts keep their line-by-line fast path; a line that names `usage` but is not JSON alone sends them to a slow path that reads the view event by event, each event's data: lines joined with \\n (each line alone when the joined text is not one JSON value). One-line-per-event streams never take it: benches/unit.rs usage anthropic_stream_tail/65536 9.5 us (documented 9.4), openai_stream_tail 0.18 us. The props_usage (two) and props_sse multiline exclusions are removed."
 
 [[defect]]
 id = "D127"
@@ -1781,10 +1781,10 @@ impact = "Translation re-parses tool arguments as serde_json Values (a Chat hist
 confidence = "high"
 evidence = "props_numbers::prop_tool_argument_numbers_keep_their_value, minimized: Chat history arguments {\"n\":-1.32417719719006e-11} -> Messages tool_use input {\"n\":-1.3241771971900598e-11}; {\"n\":2.380369113685511e-306} -> 2.3803691136855108e-306. Messages tool_use input {\"n\":123456789012345678901234567890} -> Chat arguments {\"n\":1.2345678901234568e29}. Integers within i64/u64 and decimals up to 7 significant digits survive (200,000 cases)."
 claims = ["T1"]
-state = "reproduced"
+state = "fixed"
 test = "tool_argument_numbers_keep_their_value"
-fix = ""
-note = "Found by the property suites. Proposed: enable serde_json's `float_roundtrip` (correct rounding), and keep arguments as raw JSON text where they are only relayed (RawValue, or `arbitrary_precision` if every consumer tolerates it)."
+fix = "511afaa"
+note = "Found by the property suites. Proposed: enable serde_json's `float_roundtrip` (correct rounding), and keep arguments as raw JSON text where they are only relayed (RawValue, or `arbitrary_precision` if every consumer tolerates it). Fixed in 511afaa: arguments holding a number a serde_json Value keeps as an f64 keep their text. A Chat `arguments` string becomes a one-entry stand-in (translate::RAW_JSON_KEY) that translate::Exact, now behind encode and value_string, writes back verbatim, validated as one JSON value so a client object carrying the key cannot splice bytes; a Messages body whose tool_use inputs hold one is parsed a second time (KeepInputs) keeping each `input`'s raw text. arbitrary_precision was rejected: it is crate-wide and breaks untagged enums holding numbers, which async-nats' JetStream responses are. Cost (new benches in benches/unit.rs translate): a Messages tool call with a decimal onto a Chat client 4.0 -> 5.4 us; integer-only arguments and 20 replayed Chat calls onto Messages unchanged. props_numbers now generates integers past u64, 8-25 digit decimals and exponents out to f64's edges."
 
 [[defect]]
 id = "D128"
@@ -1795,10 +1795,10 @@ impact = "`conversation` (the Conversations API: the request continues a stored 
 confidence = "high"
 evidence = "props_fields::prop_answer_changing_fields_are_never_silently_dropped, minimized: {\"model\":\"m\",\"input\":\"hi\",\"store\":false,\"conversation\":\"conv_abc123\"} -> responses_session_field(_, true/false) = None, and translate::request(Responses -> Chat / Messages) emits no conversation. translate.rs responses_session_field checks previous_response_id and store only."
 claims = ["E3"]
-state = "reproduced"
+state = "fixed"
 test = "a_responses_conversation_is_session_state"
-fix = ""
-note = "Found by the property suites (crates/gateway/tests/props_fields.rs). Proposed: treat a non-null `conversation` like `previous_response_id`."
+fix = "33f965a"
+note = "Found by the property suites (crates/gateway/tests/props_fields.rs). Proposed: treat a non-null `conversation` like `previous_response_id`. Fixed in 33f965a: responses_session_field returns Some(\"conversation\") for a non-null, non-empty `conversation` (an id string or an object), checked after previous_response_id and before store. The proxy already treats any session field the same way: the request walks the row's Responses arm as a byte relay, and a row without one is a 400 naming `conversation`. The props_fields exclusion is removed."
 
 [[defect]]
 id = "D129"
@@ -1809,10 +1809,10 @@ impact = "Options that change the answer must map or be forwarded for the provid
 confidence = "high"
 evidence = "props_fields::prop_answer_changing_fields_are_never_silently_dropped, minimized: Responses {\"input\":\"hi\",\"store\":false,\"prompt\":{\"id\":\"pmpt_abc123\"}} -> Messages {\"max_tokens\":4096,\"messages\":[{\"content\":\"hi\",\"role\":\"user\"}],\"model\":\"m\"}; {\"top_logprobs\":5} -> Chat and Messages bodies with no trace of it. Responses -> Chat keeps prompt."
 claims = ["TRN-21"]
-state = "reproduced"
+state = "fixed"
 test = "responses_answer_options_are_never_dropped"
-fix = ""
-note = "Found by the property suites. openai_req_to_anthropic rebuilds the body from known Chat fields, so a Responses field the intermediate Chat body carried for forwarding is lost on the second hop."
+fix = "33f965a"
+note = "Found by the property suites. openai_req_to_anthropic rebuilds the body from known Chat fields, so a Responses field the intermediate Chat body carried for forwarding is lost on the second hop. Fixed in 33f965a, by ARCHITECTURE.md's rule for unmappable answer-changing input (forward it for the provider to reject by name): responses_req_to_openai forwards `top_logprobs` beside `prompt` (Chat Completions has no logprobs a translated client is shown, so it is not mapped onto `logprobs: true`), and openai_req_to_anthropic forwards `prompt`, so both survive the second hop of Responses -> Chat -> Messages. The props_fields exclusions are removed."
 
 [[defect]]
 id = "D130"
