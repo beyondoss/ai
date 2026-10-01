@@ -339,7 +339,6 @@ async fn refusals_before_the_upstream_write_no_row() {
 /// claim: BIL-18
 /// defect: D69
 #[tokio::test]
-#[ignore = "D69 reproduced: provider-routed count_tokens and input_tokens each write a zero-token ai.usage row"]
 async fn token_counts_write_no_row_on_a_provider_route() {
     let (pubkey, sk) = test_keypair(106);
     let anthropic =

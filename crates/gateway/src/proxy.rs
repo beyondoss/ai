@@ -5157,11 +5157,17 @@ impl ProxyHttp for AiProxy {
             self.state.metrics.usage_estimated_total.inc();
         }
         // A free sub-resource (a token count) is not a billable call: it carries no usage block,
-        // writes no billing row, and is not a usage-shape regression.
+        // writes no billing row, and is not a usage-shape regression. On every route: a catalog
+        // walk records it, a `/{provider}` route names it in the forwarded path.
         let free = rc
             .auto
             .as_ref()
             .and_then(|a| a.sub)
+            .or_else(|| {
+                rc.forward_path
+                    .as_deref()
+                    .and_then(route::SubResource::of_forward_path)
+            })
             .is_some_and(|sub| !sub.billed());
         // A managed 2xx response is *expected* to carry usage; `None` there means the provider's
         // usage block changed shape (a new API version, a wire change) and we're about to emit a

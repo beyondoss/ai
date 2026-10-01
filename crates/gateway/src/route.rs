@@ -198,6 +198,24 @@ impl SubResource {
         }
     }
 
+    /// The sub-resource a forwarded upstream path names (`/{provider}/…` with the provider segment
+    /// stripped, query allowed), so a provider-routed token count is as free as a catalog walk's.
+    pub fn of_forward_path(path_and_query: &str) -> Option<Self> {
+        let path = path_and_query
+            .split_once('?')
+            .map_or(path_and_query, |(p, _)| p);
+        let path = path.strip_suffix('/').unwrap_or(path);
+        if path.ends_with("/messages/count_tokens") {
+            Some(Self::CountTokens)
+        } else if path.ends_with("/responses/input_tokens") {
+            Some(Self::InputTokens)
+        } else if path.ends_with("/responses/compact") {
+            Some(Self::Compact)
+        } else {
+            None
+        }
+    }
+
     /// Appended to a serving candidate's own path (`/v1/messages` → `/v1/messages/count_tokens`).
     pub fn suffix(self) -> &'static str {
         match self {
@@ -641,6 +659,16 @@ mod tests {
             ("/openai/v1/responses/compact", None),
         ] {
             assert_eq!(SubResource::of_path(path), want, "{path}");
+        }
+        for (path, want) in [
+            ("/v1/messages/count_tokens", Some(SubResource::CountTokens)),
+            ("/v1/messages/count_tokens/?beta=true", Some(SubResource::CountTokens)),
+            ("/v1/responses/input_tokens", Some(SubResource::InputTokens)),
+            ("/v1/responses/compact", Some(SubResource::Compact)),
+            ("/v1/messages", None),
+            ("/v1/responses", None),
+        ] {
+            assert_eq!(SubResource::of_forward_path(path), want, "{path}");
         }
         let claude = providers::for_model("claude-opus-4-8").expect("row");
         let served: Vec<_> = claude

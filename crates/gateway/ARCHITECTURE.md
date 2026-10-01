@@ -418,6 +418,11 @@ count answers in a fraction of a generation's time and would skew both. A row wi
 candidate is a 400 naming the missing provider (`count_tokens` on a GPT row, `compact` on a Claude
 row). OpenRouter candidates are never used for them.
 
+The billing column holds on every route, not only the catalog walk: a `/{provider}` request whose
+forwarded path ends in one of these suffixes (`route::SubResource::of_forward_path`) is billed the
+same way, so a provider-routed token count writes no ai.usage row and does not count toward
+`ai_usage_parse_errors_total`.
+
 v1 mapping is lossy on extras a stock SDK does not need for a tool loop: Responses-only
 fields (`store`, `previous_response_id`, `include`, `truncation`, …) are dropped when leaving
 Responses; they are **not** dropped when the walk stays on `/v1/responses`. Images convert both
