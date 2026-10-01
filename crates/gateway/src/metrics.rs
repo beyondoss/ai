@@ -196,13 +196,13 @@ pub struct Metrics {
     /// that answers "is failover actually firing, and how often". The per-provider
     /// `connect_retries_total` still fires alongside it, labelled with the candidate we left.
     pub candidate_failovers_total: IntCounter,
-    /// Managed requests that retried the same provider with the next unused pool key after a 429, 401 or 403.
+    /// Managed requests that retried the same provider with the next unused pool key after a 429 or 401.
     ///
     /// Deliberately *not* folded into `candidate_failovers_total`: that counter means "we abandoned
     /// a vendor". This one means "the credential was throttled and another key on the same provider
     /// served" — a 429 is not a vendor outage.
     pub key_walks_total: IntCounter,
-    /// Managed responses where a pool key drew a 401/403 (revoked, invalid, not entitled). Each one
+    /// Managed responses where a pool key drew a 401, or a 403 whose body names the key (revoked, invalid). Each one
     /// cools that key off for later requests; the request itself walks to the next key when there
     /// is one (also counted on `key_walks_total`). Any rate here means a pool key needs replacing.
     pub key_auth_failures_total: IntCounter,
@@ -331,11 +331,11 @@ impl Metrics {
         ))?;
         let key_walks_total = IntCounter::with_opts(Opts::new(
             "ai_key_walks_total",
-            "Managed requests that retried the same provider with the next unused pool key after a 429, 401 or 403",
+            "Managed requests that retried the same provider with the next unused pool key after a 429 or 401",
         ))?;
         let key_auth_failures_total = IntCounter::with_opts(Opts::new(
             "ai_key_auth_failures_total",
-            "Managed responses where a pool key drew a 401 or 403; the key is cooled off for later requests",
+            "Managed responses where a pool key drew a 401, or a 403 naming the key; the key is cooled off for later requests",
         ))?;
         let full_body_relays_total = IntCounter::with_opts(Opts::new(
             "ai_full_body_relays_total",

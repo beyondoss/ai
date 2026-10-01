@@ -337,7 +337,7 @@ pub struct PoolAuth {
     pub header: Option<http::HeaderValue>,
     /// Where the bare key starts in `value` (after the scheme's `Bearer `), for [`Self::key`].
     key_at: usize,
-    /// When this key's last auth failure (401/403) cools off, in ms since [`clock_ms`]'s epoch; 0
+    /// When this key's last auth failure (a 401, or a 403 naming the key) cools off, in ms since [`clock_ms`]'s epoch; 0
     /// when it has none. A cooling key is skipped as a request's *first* key, so traffic stops
     /// paying a round trip to a revoked key on every request. Shared across requests; relaxed
     /// ordering, since a stale read costs only one more walk.
@@ -356,7 +356,7 @@ impl PoolAuth {
     }
 }
 
-/// How long a pool key that drew a 401/403 is skipped as a request's first key.
+/// How long a pool key that drew a 401 (or a 403 naming the key) is skipped as a request's first key.
 pub const KEY_COOLDOWN: Duration = Duration::from_secs(60);
 
 /// Monotonic milliseconds since the first call, plus one (so 0 stays "never failed"). Coarse
@@ -383,8 +383,8 @@ pub struct Provider {
     pub auth: AuthScheme,
     /// Precomputed managed auth values, one per configured pool key, in config order. Empty ⇒ no
     /// pool key is configured for this provider ⇒ managed requests to it are rejected (503). A
-    /// managed 429, 401 or 403 walks the next unused entry; the key is never sent to a different
-    /// provider. A 401/403 also cools the key off for later requests (see [`Self::first_key`]).
+    /// managed 429 or 401 walks the next unused entry; the key is never sent to a different
+    /// provider. A 401 (or a 403 whose body names the key) also cools the key off for later requests (see [`Self::first_key`]).
     pub pool_auth: Box<[PoolAuth]>,
     /// `host` as a ready-to-insert `HeaderValue` — see [`PoolAuth`].
     pub host_header: Option<http::HeaderValue>,
@@ -419,7 +419,7 @@ impl Provider {
             .unwrap_or(0)
     }
 
-    /// Record that pool key `i` drew a 401/403: later requests start past it for [`KEY_COOLDOWN`].
+    /// Record that pool key `i` drew a 401 (or a 403 naming the key): later requests start past it for [`KEY_COOLDOWN`].
     pub fn mark_key_bad(&self, i: u8) {
         if let Some(k) = self.pool_auth.get(usize::from(i)) {
             let cooldown = u64::try_from(KEY_COOLDOWN.as_millis()).unwrap_or(u64::MAX);

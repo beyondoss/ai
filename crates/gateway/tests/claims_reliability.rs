@@ -914,7 +914,6 @@ async fn a_revoked_pool_key_cools_off_and_the_last_401_is_relayed() {
 /// claim: REL-4, REL-14, SEC-15
 /// defect: D84
 #[tokio::test]
-#[ignore = "D84 reproduced: every managed 403 walks the pool keys and cools the key"]
 async fn a_request_specific_403_neither_walks_nor_cools_the_pool_key() {
     const PERMISSION: &str = r#"{"error":{"message":"Your project does not have access to model gpt-4o","type":"invalid_request_error","code":"model_not_found"}}"#;
     const BAD_KEY: &str = r#"{"error":{"message":"Incorrect API key provided","type":"invalid_request_error","code":"invalid_api_key"}}"#;

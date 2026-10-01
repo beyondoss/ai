@@ -417,8 +417,8 @@ pub struct RequestCtx {
     /// Connect-retry counter (see `fail_to_connect`).
     attempt: u8,
     /// Index into `provider.pool_auth` of the key used on this attempt. Starts on
-    /// `Provider::first_key` (past keys cooling off from a 401/403). Advanced on a managed 429,
-    /// 401 or 403 when another unused key remains. Reset to the new provider's first key when
+    /// `Provider::first_key` (past keys cooling off from a 401). Advanced on a managed 429 or
+    /// 401 when another unused key remains. Reset to the new provider's first key when
     /// `provider` changes — never send provider A's key to provider B.
     pool_key: u8,
     /// The previous attempt was a same-provider key walk. `upstream_peer` must not treat that as a
@@ -733,10 +733,29 @@ impl PendingHealth {
 /// so in its first key (`{"error":` / `{"type":"error"`) or its first SSE event.
 const HEALTH_PREFIX_CAP: usize = 1024;
 
-/// A managed catalog walk's status that means this candidate's pool key failed: revoked (401),
-/// not entitled (403), or unfunded (402).
+/// A managed status that means the pool key itself was refused (revoked, wrong): a 401. It cools
+/// the key off and walks to the next one; on a catalog walk's last key it is a candidate failure.
+/// A 403 is not: it is usually about the request (moderation, a model the key's project may not
+/// use, Anthropic's `permission_error`), so one tenant's 403 must not move the shared pool off a
+/// key (D84). A 403 whose body names the key is cooled from the body ([`body_names_the_key`]).
 fn is_pool_key_failure(status: u16) -> bool {
+    status == 401
+}
+
+/// A managed catalog walk's status that another candidate (holding a different key, at a different
+/// vendor) may well not return: refused (401), unfunded (402), or forbidden (403). A candidate
+/// failure for this request like a 5xx, but nothing about the provider's health: never a breaker
+/// failure, and only a 401 ([`is_pool_key_failure`]) cools or walks keys.
+fn is_candidate_refusal(status: u16) -> bool {
     (401..=403).contains(&status)
+}
+
+/// Whether an error body says the credential itself is bad: OpenAI's `invalid_api_key` code, or
+/// Anthropic's `authentication_error` type. Read from a relayed managed 403, which then cools the
+/// key for later requests (this one has already answered).
+fn body_names_the_key(body: &[u8]) -> bool {
+    memchr::memmem::find(body, b"\"invalid_api_key\"").is_some()
+        || memchr::memmem::find(body, b"\"authentication_error\"").is_some()
 }
 
 /// Whether a 2xx body's first bytes are an error: `Some(true)` an error object, `Some(false)` an
@@ -2095,7 +2114,7 @@ fn walk_front(walk: &mut control::Walk, orig: u8) {
 /// A retry a [`FullBody`] subrequest hands back to its parent.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RelayRetry {
-    /// A candidate failure (a 5xx, a pool-key 401/403/402, or a connection that failed before the
+    /// A candidate failure (a 5xx, a pool-key 401/402/403, or a connection that failed before the
     /// upstream had the whole body) from this catalog index with another candidate left: skip it.
     Candidate(u8),
     /// A 429 from this catalog index with another pool key left: resume there.
@@ -3859,7 +3878,7 @@ impl ProxyHttp for AiProxy {
         // ledger existed, so recording is unchanged for the provider-routed path. The model-routed
         // path starts owing nothing and takes on its first permit in `upstream_peer`.
         let breaker_pending = model_route.is_none() && provider.breaker.is_some();
-        // Past any key cooling off from a 401/403 (D71); a catalog walk picks per candidate.
+        // Past any key cooling off from a 401 (D71); a catalog walk picks per candidate.
         let pool_key = provider.first_key();
         if tenant_slot {
             ctx.held.tenant = Some(tenant_id);
@@ -4189,13 +4208,14 @@ impl ProxyHttp for AiProxy {
     ///
     /// Two distinct retries, never mixed:
     ///
-    /// - **Managed 429, 401 or 403 → next unused key, same provider.** A 429 is a healthy provider
-    ///   throttling *that credential*, not a vendor outage; a 401/403 is that credential revoked or
-    ///   not entitled (D71), which also cools the key off for later requests
+    /// - **Managed 429 or 401 → next unused key, same provider.** A 429 is a healthy provider
+    ///   throttling *that credential*, not a vendor outage; a 401 is that credential revoked
+    ///   (D71), which also cools the key off for later requests
     ///   (`Provider::mark_key_bad`, counted on `ai_key_auth_failures_total`). Walks `/{provider}`
     ///   and `/auto`. BYO does not walk. The last 429 is relayed, `Retry-After` included; the last
-    ///   key's 401/403 is relayed on a provider route and is a candidate failure on a catalog walk.
-    ///   Counted on `ai_key_walks_total`.
+    ///   key's 401 is relayed on a provider route and is a candidate failure on a catalog walk.
+    ///   Counted on `ai_key_walks_total`. A 403 never walks or cools a key (D84): it is usually
+    ///   about the request; one whose body names the key cools it from `logging`.
     /// - **Model-routed 5xx → next candidate.** A provider-routed request named its provider; there
     ///   is nowhere else to go. A 429 is *not* a vendor failover — re-asking a different vendor
     ///   would convert a self-healing throttle into spend somewhere else. Counted on
@@ -4215,19 +4235,20 @@ impl ProxyHttp for AiProxy {
         };
         let status = upstream_response.status.as_u16();
 
-        // Managed 401/403: this pool key is revoked or not entitled (D71). Never the caller's
-        // fault. Cool it off so later requests start on a good key, then walk like a 429.
-        let key_auth = rc.managed && matches!(status, 401 | 403);
+        // Managed 401: this pool key is revoked (D71). Never the caller's fault. Cool it off so
+        // later requests start on a good key, then walk like a 429. Not a 403 (D84, see
+        // `is_pool_key_failure`).
+        let key_auth = rc.managed && is_pool_key_failure(status);
         if key_auth {
             self.state.metrics.key_auth_failures_total.inc();
             rc.provider.mark_key_bad(rc.pool_key);
         }
 
-        // Managed 429, 401 or 403: walk the next unused key on *this* provider. Not a vendor
-        // failover (those rules stay — `/auto` 5xx owns that, and a 401/403 on the last key falls
-        // through to it below) and not a breaker failure (the provider answered). A 401/403 is the
-        // provider refusing the credential before it processed anything, so resending the body
-        // under the next key is as safe as after a 429.
+        // Managed 429 or 401: walk the next unused key on *this* provider. Not a vendor failover
+        // (those rules stay — `/auto` 5xx owns that, and a 401 on the last key falls through to it
+        // below) and not a breaker failure (the provider answered). A 401 is the provider refusing
+        // the credential before it processed anything, so resending the body under the next key
+        // is as safe as after a 429.
         if rc.managed && (status == 429 || key_auth) {
             let next = usize::from(rc.pool_key).saturating_add(1);
             if next < rc.provider.pool_auth.len()
@@ -4278,7 +4299,7 @@ impl ProxyHttp for AiProxy {
                     "upstream returned {status} but the request body is not provably replayable; not walking keys",
                 );
             }
-            // Last key, or unreplayable: relay this 429, Retry-After included. A 401/403 goes on to
+            // Last key, or unreplayable: relay this 429, Retry-After included. A 401 goes on to
             // the catalog walk's key-failure rule (next candidate), or is relayed.
             if status == 429 {
                 return Ok(());
@@ -4288,12 +4309,12 @@ impl ProxyHttp for AiProxy {
         let Some((usable, at)) = rc.auto.as_ref().map(|a| (a.usable, a.candidate)) else {
             return Ok(());
         };
-        // A managed walk's 401/403/402 is this candidate's pool key failing (revoked, unfunded,
-        // not entitled to the model), not the caller's request: the next candidate holds a
+        // A managed walk's 401/402/403 is this candidate refusing (a revoked or unfunded key, a
+        // 403 its vendor may not share), not a provider failure: the next candidate holds a
         // different key, so it is a candidate failure for this request like a 5xx. Unlike a 5xx
         // it says nothing about the provider's health, so it never opens the breaker (resolved
         // as a success below).
-        let key_failure = rc.managed && is_pool_key_failure(status);
+        let key_failure = rc.managed && is_candidate_refusal(status);
         if status < 500 && !key_failure {
             return Ok(());
         }
@@ -4808,7 +4829,7 @@ impl ProxyHttp for AiProxy {
                     });
                 }
             } else if !(rc.relay_abandoned && status == 429) {
-                let healthy = status < 500 && !(rc.managed && is_pool_key_failure(status));
+                let healthy = status < 500 && !(rc.managed && is_candidate_refusal(status));
                 record_walk_ttft(&self.state, rc, healthy);
             }
             rc.provider.metrics.record_response(status);
@@ -5496,6 +5517,13 @@ impl ProxyHttp for AiProxy {
             cache_hit.as_ref().map(|h| h.usage)
         } else {
             let tail = rc.resp_tail.contiguous();
+            // A relayed managed 403 whose body names the key (not the request) is that key being
+            // refused: cool it so later requests start past it, as a 401 does at the head (D84).
+            // This request already answered; it does not walk.
+            if rc.managed && rc.upstream_status == Some(403) && body_names_the_key(tail) {
+                self.state.metrics.key_auth_failures_total.inc();
+                rc.provider.mark_key_bad(rc.pool_key);
+            }
             // Extract usage facts (shape depends on dialect + streaming). Every case reads the tail;
             // Anthropic streaming *additionally* reads the head, because that's where `message_start`
             // put the input and cache token counts. The two buffers may overlap on a short response —
@@ -6162,6 +6190,29 @@ mod tests {
         // The old derivation (row.wire, or provider.wire) is wrong for this fallback:
         assert_eq!(row.wire, Dialect::Anthropic);
         assert_eq!(openrouter.wire, Dialect::OpenAi);
+    }
+
+    /// Only a 401 walks and cools a key; 401, 402 and 403 are all catalog refusals. A 403's body
+    /// cools the key only when it names the credential.
+    #[test]
+    fn only_a_401_or_a_403_naming_the_key_is_a_key_failure() {
+        assert!(is_pool_key_failure(401));
+        assert!(!is_pool_key_failure(403) && !is_pool_key_failure(402));
+        assert!((401..=403).all(is_candidate_refusal));
+        assert!(!is_candidate_refusal(429) && !is_candidate_refusal(400));
+        assert!(body_names_the_key(
+            br#"{"error":{"message":"Incorrect API key provided","code":"invalid_api_key"}}"#
+        ));
+        assert!(body_names_the_key(
+            br#"{"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"}}"#
+        ));
+        for body in [
+            &br#"{"type":"error","error":{"type":"permission_error","message":"no access"}}"#[..],
+            br#"{"error":{"message":"flagged by moderation","code":403}}"#,
+            br#"{"error":{"code":"model_not_found"}}"#,
+        ] {
+            assert!(!body_names_the_key(body));
+        }
     }
 
     /// A resumed key walk's candidate goes first; everyone else keeps their order behind it.
