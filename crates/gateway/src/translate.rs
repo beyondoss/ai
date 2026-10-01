@@ -639,14 +639,7 @@ fn thinking_off_between_tools(out: &mut Map<String, Value>, claude: ClaudeModel)
             ms.iter().any(|m| {
                 m.get("content")
                     .and_then(Value::as_array)
-                    .is_some_and(|bs| {
-                        bs.iter().any(|b| {
-                            matches!(
-                                b.get("type").and_then(Value::as_str),
-                                Some("thinking" | "redacted_thinking")
-                            )
-                        })
-                    })
+                    .is_some_and(|bs| bs.iter().any(is_thinking_block))
             })
         });
     if claude.binding_controls && history_thinks {
@@ -979,14 +972,7 @@ fn auto_cache_breakpoints(out: &mut Map<String, Value>) {
     if let Some(block) = last
         .get_mut("content")
         .and_then(Value::as_array_mut)
-        .and_then(|blocks| {
-            blocks.iter_mut().rev().find(|b| {
-                !matches!(
-                    b.get("type").and_then(Value::as_str),
-                    Some("thinking" | "redacted_thinking")
-                )
-            })
-        })
+        .and_then(|blocks| blocks.iter_mut().rev().find(|b| !is_thinking_block(b)))
         .and_then(Value::as_object_mut)
     {
         block.insert("cache_control".into(), ephemeral());
@@ -1699,11 +1685,15 @@ fn openai_tool_result(m: &Value) -> Option<Value> {
         }
         _ => json!(message_text(m).unwrap_or_default()),
     };
-    Some(json!({
+    let mut result = json!({
         "type": "tool_result",
         "tool_use_id": id,
         "content": content,
-    }))
+    });
+    if let Some(obj) = result.as_object_mut() {
+        copy_cache_control(obj, m);
+    }
+    Some(result)
 }
 
 fn openai_tool_part_to_anthropic(p: &Value) -> Option<Value> {
@@ -1778,7 +1768,21 @@ fn openai_assistant_content(m: &Value) -> Value {
             }));
         }
     }
-    if blocks.len() == 1 && blocks[0].get("type").and_then(Value::as_str) == Some("text") {
+    // A marker on the whole message caches through its end: its last block (thinking blocks take
+    // none, and only ever lead).
+    if let Some(cc) = m.get("cache_control")
+        && let Some(last) = blocks
+            .last_mut()
+            .filter(|b| !is_thinking_block(b))
+            .and_then(Value::as_object_mut)
+        && !last.contains_key("cache_control")
+    {
+        last.insert("cache_control".into(), cc.clone());
+    }
+    if blocks.len() == 1
+        && blocks[0].get("type").and_then(Value::as_str) == Some("text")
+        && blocks[0].get("cache_control").is_none()
+    {
         return blocks[0]
             .get("text")
             .cloned()
@@ -2943,6 +2947,13 @@ fn is_replayable_thinking(block: &Value) -> bool {
         Some("redacted_thinking") => true,
         _ => false,
     }
+}
+
+fn is_thinking_block(block: &Value) -> bool {
+    matches!(
+        block.get("type").and_then(Value::as_str),
+        Some("thinking" | "redacted_thinking")
+    )
 }
 
 fn anthropic_resp_to_openai(v: &Value) -> Value {

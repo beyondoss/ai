@@ -562,6 +562,9 @@ last tool when there is no system; tools render first, so one marker covers both
 request holds an assistant turn, one on the last non-thinking block of the last message so the next
 turn reads the conversation back. A single-turn request gets only the prefix marker, since a write
 costs 1.25× input and a one-shot never reads it. One client marker anywhere disables all of this.
+A Chat client's marker on a whole message (rather than a content part) is kept on every role: on
+each system or user text block, on an assistant turn's last non-thinking block, and on a tool
+message's `tool_result`.
 Same-wire Messages traffic is a byte relay and is never touched.
 
 **What the client gets back.** Responses are translated in `translate::response_json_status`

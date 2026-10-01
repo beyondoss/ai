@@ -1581,7 +1581,6 @@ fn consecutive_user_messages_keep_their_text_apart() {
 /// claim: TRN-4
 /// defect: D47
 #[test]
-#[ignore = "D47 reproduced: message-level cache_control on assistant and tool messages is dropped"]
 fn message_level_cache_control_survives_on_assistant_and_tool_messages() {
     let cc = json!({"type": "ephemeral"});
     let v = c2m(
