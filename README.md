@@ -29,6 +29,30 @@ Or pass your own provider key directly (BYO — forwarded unchanged, no swap):
 client = OpenAI(base_url="http://ai.internal/v1", api_key="sk-your-openai-key")
 ```
 
+### Using the Vercel AI SDK
+
+`createOpenAI({ baseURL: "http://ai.internal/v1", apiKey })` works for every model. Its default
+model speaks the Responses API and assumes the upstream stores every response, so it sends your
+earlier assistant turns as `item_reference` ids instead of their text. Only OpenAI keeps those, and
+the gateway stores no conversation content. On a non-OpenAI model (Claude, Llama, Grok, …) a
+continued conversation is refused with a 400 naming `item_reference`; tool loops work as they are.
+Send history in full with `store: false`:
+
+```ts
+const openai = createOpenAI({
+  baseURL: "http://ai.internal/v1",
+  apiKey: process.env.BAI_KEY,
+});
+await generateText({
+  model: openai("claude-sonnet-4-5"),
+  messages,
+  providerOptions: { openai: { store: false } },
+});
+```
+
+Or use `@ai-sdk/anthropic` (base URL `http://ai.internal/v1`) or `@ai-sdk/openai-compatible`, which
+never send references. See `crates/gateway/ARCHITECTURE.md`, "Stored-response references".
+
 ## Agent Quick Start
 
 **The gateway is optional.** Export a provider key and the agent goes straight to that provider — no

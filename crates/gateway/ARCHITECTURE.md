@@ -432,16 +432,18 @@ Responses-only tools (Codex's `namespace` groups and `custom` grammars) pass thr
 5xx may walk another Responses candidate; it never walks onto Chat Completions/Messages. Rows with
 no Responses arm (Claude, DeepSeek, …) translate a one-shot and have no OpenAI store: an
 **omitted** `store` there is the stock `responses.create()` call and translates as a one-shot, while
-an explicit `store: true`, a `previous_response_id`, a `conversation` or an `item_reference` input
-item is a **400** naming the field, not a hollow Messages call (`translate::responses_session_field`;
-the `item_reference` refusal also says to send items in full with `store: false`). A `conversation` (the Conversations API) is the same OpenAI-held
+an explicit `store: true`, a `previous_response_id`, a `conversation` or an `item_reference` that
+stands for an earlier turn is a **400** naming the field, not a hollow Messages call
+(`translate::responses_session_field`; an `item_reference` inside a tool step is dropped instead,
+see [Stored-response references](#stored-response-references-item_reference)). A `conversation` (the Conversations API) is the same OpenAI-held
 history `previous_response_id` points into, so it is session state too: relayed on a row's
 Responses arm, refused elsewhere, never translated with the history dropped (D128). Grok rows have no Responses arm either (xAI's store is not
 OpenAI's, and no failover shares it), but their xAI candidate is `/v1/responses`: a Responses
 one-shot is relayed there as sent, except that it goes as `store: false`
 (`translate::store_false`), because xAI stores every response for 30 days unless told not to (its
 `store` defaults to true). So an `item_reference` points at nothing xAI kept (xAI answered it 422
-"unknown item type"): it is refused before xAI like the other session state (D175). Usage/billing
+"unknown item type"): one for an earlier turn is refused before xAI like the other session state,
+and a tool step's is cut from the body (`translate::strip_item_references`, D175). Usage/billing
 still parse the upstream body/SSE;
 `ai.usage.model` is what the provider echoed. Same-wire Responses (`/{provider}/v1/responses`)
 stays a byte relay. `/{provider}/…` never translates.
@@ -719,18 +721,9 @@ the client gets back. Only records of a hosted tool the provider ran itself (`we
 message. So is a `compaction` item, OpenAI-held state (a summary only OpenAI can decrypt) that no
 translated upstream can resolve: a compacted Codex session that fails over onto a translated
 candidate runs on the history the client holds, a degraded answer rather than a 400. An
-`item_reference` (a pointer into a store) never reaches translation: it is session state (above),
-so a row with no Responses arm answers it with a 400 that names it and the remedy (D175). The
-Vercel AI SDK's default Responses model sends no `store`, takes the upstream to be keeping every
-response, and passes each earlier assistant text or reasoning item back as an `item_reference`
-(`convertToOpenAIResponsesInput` in `@ai-sdk/openai`, gated only on the request's
-`providerOptions.openai.store ?? true` and the part's `itemId`). Dropped, the model answered a
-conversation without its own turns. The gateway stores no customer content, so it cannot resolve
-the reference, and no response field steers the SDK: it reads `itemId` from every output item's
-`id` (required by its schema, and fixed at `response.output_item.added`, before the content
-exists) and never reads `response.store`. A translated response still says `store: false`,
-because nothing keeps it. AI SDK callers on such rows set `providerOptions.openai.store = false`,
-and the SDK then sends every item in full. The distinction from forwarding:
+`item_reference` reaches translation only from inside a tool step, and is dropped there; one that
+stands for an earlier turn is refused before any upstream (D175, see
+[Stored-response references](#stored-response-references-item_reference)). The distinction from forwarding:
 an item the gateway does not know is forwarded (the provider names it), and a known item that only OpenAI can read is
 dropped when translating. A same-wire Responses relay keeps both. OpenAI's hosted search
 (`web_search`, `web_search_preview` and dated spellings) is the one tool dropped leaving Responses,
@@ -1176,6 +1169,62 @@ picks its own backend per request and has been observed serving these ids from A
 _and_ from Bedrock. A 5xx from Anthropic on those rows therefore fails over to Bedrock first;
 OpenRouter is what is left if Bedrock is down or unkeyed too. Other Claude rows still go
 Anthropic → OpenRouter until a live-verified Bedrock inference-profile id is added.
+
+### Stored-response references (`item_reference`)
+
+**What it is.** A Responses input item `{"type":"item_reference","id":"msg_…"}` stands in for an
+item of an earlier response that the upstream stored: OpenAI expands it from its own store. The
+Vercel AI SDK's default OpenAI model (`openai(model)`, the Responses API) sends no `store`, so it
+takes the upstream to be keeping every response, and on every later call it sends each earlier
+assistant text or reasoning item that has an id as an `item_reference`
+(`convertToOpenAIResponsesInput` in `@ai-sdk/openai`, gated only on
+`providerOptions.openai.store ?? true` and the part's `itemId`). Client-executed tool calls always go
+in full: a `function_call` and its `function_call_output`.
+
+**Why the gateway cannot resolve it.** The gateway is stateless: it stores no customer content, so
+it holds no copy of an answer it translated. On a row with no Responses arm (Claude, Bedrock,
+OpenRouter, Together, the failover rows, grok) no upstream holds the item either: Anthropic and
+Together have no such store, a translated response was never stored anywhere, and grok goes to xAI
+as `store: false` (D145; xAI answers an `item_reference` 422 "unknown item type"). Nor can the response
+steer the SDK into sending items in full: it takes `itemId` from each output item's required `id`,
+fixed at `response.output_item.added` before the content exists, and never reads
+`response.store`. A translated response still says `store: false`, truthfully.
+
+**The rule** (`translate::turn_reference_in_input`, in the same single pass over `input` as the other
+session fields; no extra parse). Read `input` as model steps: a **step** is a maximal run of
+`item_reference`, `reasoning`, `function_call` and `custom_tool_call` items, ended by any other item
+(a user or assistant message, a tool output) or by the end of `input`.
+
+- A reference in a step that holds a call is the preamble text or reasoning of the step that made
+  the call. It is **dropped**: translation skips it, and a Responses relay off the row (grok's xAI
+  candidate) cuts it from the body (`translate::strip_item_references`). The call and its output
+  are sent in full. This covers several references in a row, a reference then a reasoning item then
+  the call, parallel calls, text the model wrote after the call (a reference between the call and
+  its output), and every step of a multi-step loop.
+- A reference in a step with no call stands for an earlier **turn**: followed by a user message,
+  at the end of `input`, the whole `input`, or before a tool output with no call in its step. It is
+  a **400** `invalid_request_error` that names `item_reference` and the remedy, before any upstream
+  is contacted (`translate::session_field_refusal`).
+
+**Why.** Dropping a turn means the model answers a conversation without its own earlier answers, and
+says so with confidence: live, Claude replied "NO-REPLY" when asked to repeat what it had said, and
+Llama invented a different number. That is never acceptable silently, so it is a named refusal. A
+tool step's preamble ("Let me check the weather.") or reasoning is not a turn: the call and its
+result say what the step did, the model loses nothing it needs, and refusing it would break every AI
+SDK tool loop whose model wrote a sentence before calling a tool (D175's first fix did exactly
+that).
+
+**GPT rows** relay every `item_reference`, a tool step's and a turn's alike, to OpenAI's Responses
+arm byte for byte: OpenAI holds the items it stored, and resolves them.
+
+**OpenRouter's own Responses API** (verified live 2026-10-01) silently drops an `item_reference` it
+does not know and answers anyway: the silent loss this rule exists to prevent. Claude rows reach
+OpenRouter over Chat Completions, so the gateway's rule applies before it.
+
+**Client remedy.** Send earlier items in full. With the AI SDK's OpenAI provider on a non-GPT model,
+set `providerOptions: { openai: { store: false } }` (the SDK then sends every item as content), or
+use a provider that never sends references: `@ai-sdk/anthropic` (the `/v1/messages` wire) or
+`@ai-sdk/openai-compatible` (Chat Completions). The 400 says this.
 
 ### Identity (`key.rs`)
 

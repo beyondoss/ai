@@ -5054,10 +5054,13 @@ impl ProxyHttp for AiProxy {
                             buf = translate::strip_gateway_reasoning(buf);
                             // A row with no Responses arm walks its candidates only for a one-shot
                             // (session state there is a 400): onto a Responses candidate (xAI's)
-                            // it must not be stored, and xAI stores by default.
+                            // it must not be stored, and xAI stores by default. Nothing there holds
+                            // a tool step's `item_reference` either: dropped, as translation drops
+                            // it (one for an earlier turn was the 400, D175).
                             changed |= buf.len() != len;
                             if a.route.responses.is_empty() {
                                 changed |= translate::store_false(&mut buf);
+                                changed |= translate::strip_item_references(&mut buf);
                             }
                         } else if to == route::Endpoint::ChatCompletions
                             && upstream_model.contains("claude")

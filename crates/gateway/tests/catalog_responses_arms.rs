@@ -115,8 +115,9 @@ async fn a_one_shot_on_a_grok_row_is_not_stored_at_xai() {
     assert_eq!(resp.status().as_u16(), 400);
     assert_eq!(xai.hits(), hits);
 
-    // So is an `item_reference` (the AI SDK's default for an earlier answer): sent as
-    // `store: false`, nothing at xAI holds the item, and xAI would 422 it (D175).
+    // So is an `item_reference` that stands for an earlier turn (the AI SDK's default for an
+    // earlier answer): sent as `store: false`, nothing at xAI holds the item, and xAI would 422 it
+    // (D175).
     let resp = post(
         &gw,
         &key,
@@ -136,6 +137,34 @@ async fn a_one_shot_on_a_grok_row_is_not_stored_at_xai() {
         "{text}"
     );
     assert_eq!(xai.hits(), hits);
+
+    // A tool step's `item_reference` (the preamble of the step that made the call) is cut out
+    // before xAI; the call and its output go as sent (D175).
+    let resp = post(
+        &gw,
+        &key,
+        "/v1/responses",
+        &[],
+        &json!({"model": "grok-4.3", "input": [
+            {"role": "user", "content": "weather in Paris?"},
+            {"type": "item_reference", "id": "msg_1"},
+            {"type": "function_call", "call_id": "c1", "name": "weather", "arguments": "{\"city\":\"Paris\"}"},
+            {"type": "function_call_output", "call_id": "c1", "output": "sunny"},
+        ]}),
+    )
+    .await;
+    assert_eq!(resp.status().as_u16(), 200);
+    let (_, v) = sent(&xai);
+    assert_eq!(v["store"], false, "{v}");
+    assert_eq!(
+        v["input"],
+        json!([
+            {"role": "user", "content": "weather in Paris?"},
+            {"type": "function_call", "call_id": "c1", "name": "weather", "arguments": "{\"city\":\"Paris\"}"},
+            {"type": "function_call_output", "call_id": "c1", "output": "sunny"},
+        ]),
+        "{v}"
+    );
 }
 
 /// `n` small function tools in Anthropic's shape, each `pad` bytes of description long.

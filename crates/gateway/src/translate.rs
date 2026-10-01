@@ -2646,12 +2646,11 @@ fn copy_if(out: &mut Map<String, Value>, v: &Value, key: &str) {
 /// way, never translated with the history dropped). An omitted
 /// (or `null`) `store` is OpenAI's default `true`, so it is session state only where the row has a
 /// Responses arm to keep it (`responses_arm`); elsewhere it is the stock `responses.create()` call,
-/// which translates rather than 400s. An `item_reference` input item is a pointer into the
-/// upstream's store, so it is session state wherever it appears (D175): the Vercel AI SDK sends
-/// one for every earlier assistant answer unless the caller sets `store: false`, and a row with no
-/// Responses arm has nowhere to resolve it (the gateway stores no customer content). Unparseable
-/// JSON is `Some("store")` so a catalog walk fail-closes onto a real Responses arm rather than
-/// silently stripping session state.
+/// which translates rather than 400s. An `item_reference` input item that stands for an earlier
+/// turn is session state too (D175, [`turn_reference_in_input`]): a pointer into a store that a
+/// row with no Responses arm cannot resolve (the gateway stores no customer content). One inside a
+/// tool step is not: it is dropped. Unparseable JSON is `Some("store")` so a catalog walk
+/// fail-closes onto a real Responses arm rather than silently stripping session state.
 pub fn responses_session_field(body: &[u8], responses_arm: bool) -> Option<&'static str> {
     let Ok(v) = serde_json::from_slice::<Value>(body) else {
         return Some("store");
@@ -2662,7 +2661,7 @@ pub fn responses_session_field(body: &[u8], responses_arm: bool) -> Option<&'sta
     if conversation_set(&v) {
         return Some("conversation");
     }
-    if item_reference_in_input(&v) {
+    if turn_reference_in_input(&v) {
         return Some("item_reference");
     }
     match v.get("store") {
@@ -2672,15 +2671,38 @@ pub fn responses_session_field(body: &[u8], responses_arm: bool) -> Option<&'sta
     }
 }
 
-/// Whether `input` carries an `item_reference` item (`{"type":"item_reference","id":…}`).
-fn item_reference_in_input(v: &Value) -> bool {
-    v.get("input")
-        .and_then(Value::as_array)
-        .is_some_and(|items| {
-            items
-                .iter()
-                .any(|i| i.get("type").and_then(Value::as_str) == Some("item_reference"))
-        })
+/// Whether `input` carries an `item_reference` that stands for an earlier conversation turn
+/// (D175): the one kind a row with no Responses arm refuses rather than drops.
+///
+/// The Vercel AI SDK's default Responses model sends each earlier assistant text or reasoning item
+/// that has an id as `{"type":"item_reference","id":…}`, but each client-executed tool call in
+/// full (`function_call`, then its `function_call_output`). So `input` reads as model steps: a
+/// **step** is a maximal run of `item_reference`, `reasoning`, `function_call` and
+/// `custom_tool_call` items, ended by any other item (a message, a tool output) or by the end of
+/// `input`. A reference in a step that holds a call is preamble text or reasoning of the step that
+/// made the call, wherever in the run it sits: the call and its output say what that step did, so
+/// the reference is dropped (translation skips it, [`strip_item_references`] cuts it from a
+/// Responses relay). A reference in a step without a call is an earlier answer, a turn the model
+/// would answer without: `true`, refused. One pass over `input`, no allocation.
+fn turn_reference_in_input(v: &Value) -> bool {
+    let Some(items) = v.get("input").and_then(Value::as_array) else {
+        return false;
+    };
+    let (mut refs, mut calls) = (false, false);
+    for item in items {
+        match item.get("type").and_then(Value::as_str) {
+            Some("item_reference") => refs = true,
+            Some("function_call" | "custom_tool_call") => calls = true,
+            Some("reasoning") => {}
+            _ => {
+                if refs && !calls {
+                    return true;
+                }
+                (refs, calls) = (false, false);
+            }
+        }
+    }
+    refs && !calls
 }
 
 /// The 400 for a Responses session field a row cannot honor. An `item_reference` also says how to
@@ -2688,9 +2710,9 @@ fn item_reference_in_input(v: &Value) -> bool {
 pub fn session_field_refusal(field: &str, model: &str) -> String {
     if field == "item_reference" {
         format!(
-            "item_reference cannot be honored for {model}: no upstream on this route keeps \
-             responses, and the gateway stores none. Send earlier items in full by setting \
-             store: false (Vercel AI SDK: providerOptions.openai.store = false)"
+            "an item_reference to an earlier turn cannot be honored for {model}: no upstream on \
+             this route keeps responses, and the gateway stores none. Send earlier items in full \
+             by setting store: false (Vercel AI SDK: providerOptions.openai.store = false)"
         )
     } else {
         format!("{field} cannot be honored for {model} (no Responses upstream)")
@@ -4605,10 +4627,11 @@ fn responses_input_to_messages(input: Option<&Value>, up: Upstream) -> Vec<Value
             | "mcp_list_tools" => {}
             // OpenAI-held state no other upstream can resolve: a `compaction` is a summary only
             // OpenAI can decrypt, an `item_reference` a pointer into its store. A catalog walk
-            // never brings an `item_reference` here: `responses_session_field` names it, and the
-            // row walks its Responses arm or 400s (D175). A `compaction` is dropped, so a
-            // compacted session on a translated candidate runs on the history the client holds
-            // (D95). The same-wire relay keeps both.
+            // brings only a tool step's `item_reference` here (its preamble or reasoning; the
+            // call and output follow in full): one for an earlier turn is session state that
+            // `responses_session_field` names, so the row walks its Responses arm or 400s (D175).
+            // A `compaction` is dropped, so a compacted session on a translated candidate runs on
+            // the history the client holds (D95). The same-wire relay keeps both.
             "compaction" | "item_reference" => {}
             // Anything else (`computer_call_output`, `local_shell_call`, …) is history the client
             // holds and the model would answer without. Forwarded as-is in place, so the provider
@@ -4678,6 +4701,41 @@ pub fn store_false(body: &mut Vec<u8>) -> bool {
     };
     body.splice(open + 1..open + 1, member.iter().copied());
     true
+}
+
+/// Cut every `item_reference` out of a Responses body walked onto a Responses candidate of a row
+/// with no Responses arm (xAI's, as `store: false`): nothing there holds the item (xAI answers one
+/// 422 "unknown item type"). Such a row walks its candidates only when every reference is a tool
+/// step's (`responses_session_field`: one for an earlier turn is a 400 there), so this drops what
+/// translation drops for any other candidate (D175). Every other byte stays as sent. `true` when
+/// the body changed; a body without the string is untouched and unparsed.
+pub fn strip_item_references(body: &mut Vec<u8>) -> bool {
+    const NEEDLE: &[u8] = b"item_reference";
+    if memchr::memmem::find(body, NEEDLE).is_none() {
+        return false;
+    }
+    // The last `input` is the one a provider's parser keeps.
+    let Some(input) = peek::root_members(body)
+        .and_then(|m| m.into_iter().rev().find(|m| m.key_is(body, "input")))
+    else {
+        return false;
+    };
+    if body.get(input.value.0) != Some(&b'[') {
+        return false;
+    }
+    let Some(items) = peek::array_elements(body, input.value.0) else {
+        return false;
+    };
+    let refs: Vec<bool> = items
+        .iter()
+        .map(|&(s, e)| {
+            let item = &body[s..e];
+            memchr::memmem::find(item, NEEDLE).is_some()
+                && serde_json::from_slice::<Value>(item)
+                    .is_ok_and(|v| v.get("type").and_then(Value::as_str) == Some("item_reference"))
+        })
+        .collect();
+    peek::remove_items(body, &items, |k| refs[k])
 }
 
 /// A body for a candidate that answers only streams (`providers::catalog::stream_only`, D147),
@@ -8525,7 +8583,7 @@ mod tests {
         let empty_prev = br#"{"model":"gpt-4o","previous_response_id":"","store":false}"#;
         assert_eq!(responses_session_field(empty_prev, true), None);
         assert_eq!(responses_session_field(b"not-json", false), Some("store"));
-        // A pointer into a store is session state on every row (D175).
+        // A reference-only input stands for an earlier turn, on every row (D175).
         let reference =
             br#"{"model":"m","store":false,"input":[{"type":"item_reference","id":"msg_1"}]}"#;
         assert_eq!(
@@ -8536,6 +8594,109 @@ mod tests {
             responses_session_field(reference, true),
             Some("item_reference")
         );
+        // A tool step's reference is not session state: a store: false one-shot stays one.
+        let step = br#"{"model":"m","store":false,"input":[{"role":"user","content":"hi"},
+            {"type":"item_reference","id":"msg_1"},
+            {"type":"function_call","call_id":"c","name":"f","arguments":"{}"},
+            {"type":"function_call_output","call_id":"c","output":"ok"}]}"#;
+        assert_eq!(responses_session_field(step, false), None);
+        assert_eq!(responses_session_field(step, true), None);
+    }
+
+    /// The D175 rule over the Responses input item sequence: a reference inside a step (a run of
+    /// references, reasoning and tool calls) that holds a call is dropped; one in a step without a
+    /// call is an earlier turn.
+    #[test]
+    fn an_item_reference_is_a_turn_unless_its_step_made_a_call() {
+        let r = || json!({"type": "item_reference", "id": "msg_1"});
+        let reasoning = || json!({"type": "reasoning", "id": "rs_1", "summary": []});
+        let call = |id: &str| json!({"type": "function_call", "call_id": id, "name": "f", "arguments": "{}"});
+        let out = |id: &str| json!({"type": "function_call_output", "call_id": id, "output": "ok"});
+        let user = |t: &str| json!({"role": "user", "content": t});
+        let turn = |input: Vec<Value>| turn_reference_in_input(&json!({"input": input}));
+        // Turns: followed by a user message, at the end of input, alone, or before an output with
+        // no call in its step.
+        assert!(turn(vec![user("a"), r(), user("b")]));
+        assert!(turn(vec![user("a"), r()]));
+        assert!(turn(vec![r()]));
+        assert!(turn(vec![r(), r()]));
+        assert!(turn(vec![user("a"), r(), reasoning(), user("b")]));
+        assert!(turn(vec![user("a"), r(), out("c")]));
+        // A tool loop that then answered and was asked again: the answer is a turn.
+        assert!(turn(vec![
+            user("a"),
+            r(),
+            call("c"),
+            out("c"),
+            r(),
+            user("b")
+        ]));
+        // Tool steps: preamble, several references, reasoning between, parallel calls, text after
+        // the call before its output, a custom tool call.
+        assert!(!turn(vec![user("a"), r(), call("c"), out("c")]));
+        assert!(!turn(vec![user("a"), r(), r(), call("c"), out("c")]));
+        assert!(!turn(vec![
+            user("a"),
+            r(),
+            reasoning(),
+            r(),
+            call("c"),
+            out("c")
+        ]));
+        assert!(!turn(vec![
+            user("a"),
+            reasoning(),
+            r(),
+            call("c"),
+            out("c")
+        ]));
+        assert!(!turn(vec![
+            user("a"),
+            r(),
+            call("c1"),
+            call("c2"),
+            out("c1"),
+            out("c2")
+        ]));
+        assert!(!turn(vec![user("a"), call("c"), r(), out("c")]));
+        assert!(!turn(vec![
+            user("a"),
+            r(),
+            json!({"type": "custom_tool_call", "call_id": "c", "name": "f", "input": ""}),
+        ]));
+        // Two steps of one loop, each with its preamble.
+        assert!(!turn(vec![
+            user("a"),
+            r(),
+            call("c1"),
+            out("c1"),
+            r(),
+            call("c2"),
+            out("c2")
+        ]));
+        // No reference, or no input array: nothing to refuse.
+        assert!(!turn(vec![user("a"), call("c"), out("c")]));
+        assert!(!turn_reference_in_input(&json!({"input": "hi"})));
+        assert!(!turn_reference_in_input(&json!({})));
+    }
+
+    /// A Responses relay off a row with no Responses arm loses every `item_reference` and nothing
+    /// else, byte for byte; a body without one is untouched.
+    #[test]
+    fn strip_item_references_cuts_only_references() {
+        let mut body = br#"{"model":"m","input":[{"role":"user","content":"item_reference?"},{"type":"item_reference","id":"msg_1"},{"type":"function_call","call_id":"c","name":"f","arguments":"{}"},{"type":"item_reference","id":"msg_2"}]}"#.to_vec();
+        assert!(strip_item_references(&mut body));
+        assert_eq!(
+            String::from_utf8(body).unwrap(),
+            r#"{"model":"m","input":[{"role":"user","content":"item_reference?"},{"type":"function_call","call_id":"c","name":"f","arguments":"{}"}]}"#
+        );
+        let plain = br#"{"model":"m","input":[{"role":"user","content":"hi"}]}"#;
+        let mut body = plain.to_vec();
+        assert!(!strip_item_references(&mut body));
+        assert_eq!(body, plain);
+        let mut only = br#"{"input":[{"type":"item_reference","id":"msg_1"}]}"#.to_vec();
+        assert!(strip_item_references(&mut only));
+        assert_eq!(only, br#"{"input":[]}"#);
     }
 
     #[test]

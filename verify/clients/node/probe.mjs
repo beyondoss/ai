@@ -228,36 +228,12 @@ async function aiSdk(model, wire) {
     inputSchema: jsonSchema({ type: "object", properties: { city: { type: "string" } }, required: ["city"] }),
     execute: async ({ city }) => `Sunny in ${city}, 31C`,
   });
-  const loop = async (providerOptions) => {
-    let refused = null;
-    const s = streamText({
-      model, maxRetries: 0, maxOutputTokens: 1024, tools: { weather }, stopWhen: stepCountIs(3), providerOptions,
-      prompt: "What's the weather in Paris? Use the weather tool, then answer.",
-      onError: ({ error }) => { refused = error; },
-    });
-    const text = await s.text;
-    const steps = await s.steps;
-    for (const st of steps) record(wire, aiUsage(st.usage));
-    return { text, steps, refused };
-  };
-  let run = await loop();
-  const detail = {};
-  // The AI SDK's default Responses model sends no `store`, so step 2 passes text or reasoning the
-  // model wrote before its tool call back as an `item_reference`. A row with no Responses arm keeps
-  // no responses and the gateway stores none, so that is a 400 naming the item and the remedy
-  // (D175). The remedy must then work: the same loop with `store: false`.
-  if (wire === "responses" && APICallError.isInstance(run.refused)) {
-    const e = run.refused;
-    record(wire, null, errors.at(-1)?.provider ? { error: true } : { rows: 0 });
-    detail.refused = { status: e.statusCode, message: e.message?.slice(0, 200) };
-    if (!(e.statusCode === 400 && /item_reference/.test(e.message ?? "") && /store: false/.test(e.message ?? ""))) {
-      return [false, detail];
-    }
-    run = await loop({ openai: { store: false } });
-  }
-  if (run.refused) return [false, { ...detail, error: String(run.refused).slice(0, 200) }];
-  const called = run.steps.some((st) => st.toolCalls?.length);
-  return [g.text.length > 0 && called && /31/.test(run.text), { ...detail, steps: run.steps.length, text: run.text.slice(0, 120) }];
+  const s = streamText({ model, maxRetries: 0, maxOutputTokens: 1024, tools: { weather }, stopWhen: stepCountIs(3), prompt: "What's the weather in Paris? Use the weather tool, then answer." });
+  const text = await s.text;
+  const steps = await s.steps;
+  for (const st of steps) record(wire, aiUsage(st.usage));
+  const called = steps.some((st) => st.toolCalls?.length);
+  return [g.text.length > 0 && called && /31/.test(text), { steps: steps.length, text: text.slice(0, 120) }];
 }
 
 // --- Translation and billing detail (same oracles as the Python probes of the same name) ------

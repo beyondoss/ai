@@ -2082,7 +2082,8 @@ fn an_unknown_role_is_forwarded_onto_responses() {
 /// instead of failing: `compaction` (an encrypted summary only OpenAI can read) and
 /// `item_reference` (a pointer into OpenAI's store) are OpenAI-held state no translated upstream
 /// can resolve, so translation drops them and the request runs on the history the client holds.
-/// The same-wire Responses relay keeps them; D49's rule (forward anything the gateway has no
+/// (A catalog walk refuses an `item_reference` that stands for an earlier turn before translation,
+/// D175; only a tool step's reaches it.) The same-wire Responses relay keeps them; D49's rule (forward anything the gateway has no
 /// mapping for) still holds for every other item.
 /// claim: TRN-17
 /// defect: D95
