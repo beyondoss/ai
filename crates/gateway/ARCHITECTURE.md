@@ -1638,6 +1638,8 @@ Nor does a second key. OpenAI's parser keeps the **last** of duplicate keys and 
 names, while the scan reads the first raw `stream_options`. So when the root carries more than one
 `stream_options`, or any spelled with escapes (`"stream\u005foptions"`), every such member is cut
 out by span (`peek::remove_root_members`) and the usual injection adds the one that reaches OpenAI.
+`stream` itself is read the same way: a key that decodes to `stream` (`"str\u0065am"`) counts, and
+the last one decides, so a client cannot hide `stream: true` from the scan (D88).
 
 ### Why the deny-set watch resumes from a saved revision
 
@@ -2286,6 +2288,22 @@ Prometheus on the default registry, exposed at `/metrics` on `metrics_listen`.
   Anthropic SDKs accumulate it (tool calls by `index`, blocks by `content[index]`, the Responses
   item lifecycle, and openai-python's `accumulate_delta` for the message a Chat client echoes on
   its next turn).
+- **Property tests (`tests/props_*.rs`):** generated, adversarial inputs instead of examples —
+  arbitrary unicode and escapes, nested tool arguments with boundary numbers, every content kind,
+  SSE framed with CRLF, comments, multi-line data and cut at any byte, errors and truncation at
+  any event. They check that `SseBridge` never panics and always hands each client a well-formed
+  stream of its own dialect (block nesting, the Responses item lifecycle and `sequence_number`,
+  Chat `[DONE]`), whatever the upstream sent; that chunking never changes the client's bytes; that
+  text, tool calls and signed thinking survive every pairing, request and response, and back;
+  that the usage a translated client is shown equals what `usage.rs` bills for the same upstream
+  bytes, stream and not; that `peek`'s scans agree with serde_json (the provider's reading, last
+  duplicate wins) on `model`, `stream`, `stream_options` and the output limits; that no field that
+  changes the answer is silently dropped; and that the route tables classify any path as
+  documented. Each property runs `PROPTEST_CASES` cases (default 2000), stopped after
+  `PROPS_SECS` (default 60); a failure prints the `PROPS_SEED` that replays it. Every
+  counterexample that was a real defect is a named regression in `tests/props_regressions.rs`
+  (and `tests/billing_streams.rs` for the metering bypass); the generators skip that exact shape,
+  naming the defect, until it is fixed.
 - **Translated responses end to end (`tests/translate_response.rs`):** through the real proxy with
   provider-shaped fixtures — the full Responses stream for a Claude and a GPT row, a custom tool
   call reaching a Responses client, an OpenRouter thinking signature reaching a Messages client on

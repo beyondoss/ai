@@ -92,6 +92,62 @@ async fn a_client_cannot_turn_off_exact_stream_metering() {
     }
 }
 
+/// The include_usage rewrite edits the member the provider reads. A JSON parser keeps the *last*
+/// of two duplicate keys and decodes an escaped key (`"stream_opti\u006fns"`); the gateway's scan
+/// matched only the first, plainly spelled one, so a client switched usage back off with a second
+/// `stream_options` (or an escaped one), or hid `stream: true` itself, and the row was an estimate
+/// that cannot see hidden reasoning. Found by `props_peek::prop_stream_and_stream_options_match_serde`.
+/// claim: BIL-2
+/// defect: D88
+#[tokio::test]
+async fn duplicate_or_escaped_stream_keys_cannot_turn_off_exact_metering() {
+    let (pubkey, sk) = test_keypair(62);
+    let mock = ScriptedUpstream::start(openai_stream_honoring_include_usage).await;
+    let gw = Gateway::builder(unused_nats_port(), &mock.authority(), &b64(&pubkey))
+        .providers(&["openai"])
+        .start()
+        .await;
+    let key = billing_vkey(&sk, 62);
+    let url = format!("{}/openai/v1/chat/completions", gw.url());
+    let cases = [
+        (
+            "duplicate stream_options",
+            r#"{"model":"gpt-4o","stream":true,"stream_options":{"include_usage":true},"stream_options":{"include_usage":false},"messages":[{"role":"user","content":"hi"}]}"#,
+        ),
+        (
+            "escaped stream_options",
+            r#"{"model":"gpt-4o","stream":true,"stream_opti\u006fns":{"include_usage":false},"messages":[{"role":"user","content":"hi"}]}"#,
+        ),
+        (
+            "escaped stream",
+            r#"{"model":"gpt-4o","str\u0065am":true,"messages":[{"role":"user","content":"hi"}]}"#,
+        ),
+    ];
+    for (_, body) in cases {
+        let (status, text) = post(url.clone(), &key, body, &[]).await;
+        assert_eq!(status, 200, "{text}");
+    }
+    let rows = wait_usage_rows(&gw, 3, 5).await;
+    assert_eq!(rows.len(), 3, "{}", gw.log());
+    let wrong: Vec<String> = rows
+        .iter()
+        .zip(cases)
+        .filter(|(row, _)| {
+            (
+                row["usage_estimated"].as_bool(),
+                row["input_tokens"].as_u64(),
+                row["output_tokens"].as_u64(),
+            ) != (Some(false), Some(5), Some(9))
+        })
+        .map(|(row, (what, _))| format!("{what}: {row}"))
+        .collect();
+    assert!(
+        wrong.is_empty(),
+        "rows not metered exactly:\n{}",
+        wrong.join("\n")
+    );
+}
+
 /// Usage the tests below assert, on a `response.completed` event bigger than the 64 KiB tail.
 fn responses_stream_with_a_huge_final_event() -> &'static str {
     // `response.completed` echoes the request's instructions (and tools, and output) ahead of

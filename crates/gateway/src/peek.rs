@@ -263,7 +263,13 @@ pub fn plan_stream_usage_injection(body: &[u8]) -> Option<usize> {
     // common case, since most requests aren't streaming. (Note `"stream_options"` does NOT contain
     // the needle: the byte after `stream` is `_`, not a closing quote — so a body carrying only
     // `stream_options` fails this pre-filter and returns `None` here, which is the correct answer.)
-    memchr::memmem::find(body, b"\"stream\"")?;
+    // An escaped key (`"str\u0065am"`) decodes to `stream` at the provider without spelling it,
+    // and such a key always carries `\u`; real clients never send one, so the second search runs
+    // only on a body with no `"stream"` at all.
+    if memchr::memmem::find(body, b"\"stream\"").is_none() && memchr::memmem::find(body, b"\\u").is_none()
+    {
+        return None;
+    }
     let mut i = 0;
     while i < n && body[i].is_ascii_whitespace() {
         i += 1;
@@ -281,8 +287,7 @@ pub fn plan_stream_usage_injection(body: &[u8]) -> Option<usize> {
     let mut capturing_key = false;
     // Start index (just past the opening `"`) of the root-level key currently being scanned. The
     // body is fully in hand, so we slice the key out of it at the closing quote — no accumulation
-    // buffer, zero-copy. (Escaped keys are sliced raw; since neither `stream` nor `stream_options`
-    // contains an escape, an escaped key simply doesn't match either needle — the correct answer.)
+    // buffer, zero-copy. A key with an escape in it is decoded, as the provider's parser does.
     let mut key_start = 0usize;
     // The current root-level key is exactly `stream` (so the next literal is its value).
     let mut last_key_is_stream = false;
@@ -315,10 +320,20 @@ pub fn plan_stream_usage_injection(body: &[u8]) -> Option<usize> {
                         // A root `stream_options` means the client already controls usage — the
                         // answer is `None` regardless of anything else in the body, so stop now
                         // rather than walking the remainder for a result we already know.
-                        if key == b"stream_options" {
+                        let escaped_key = key.contains(&b'\\');
+                        if key == b"stream_options"
+                            || (escaped_key
+                                && escaped_key_is(&body[key_start - 1..=j], "stream_options"))
+                        {
                             return None;
                         }
-                        last_key_is_stream = key == b"stream";
+                        // The provider keeps the last of duplicate keys, so each `stream` key
+                        // decides afresh.
+                        last_key_is_stream = key == b"stream"
+                            || (escaped_key && escaped_key_is(&body[key_start - 1..=j], "stream"));
+                        if last_key_is_stream {
+                            stream_true = false;
+                        }
                     }
                 }
             }
@@ -426,9 +441,10 @@ pub const OUTPUT_LIMIT_KEYS: [&[u8]; 3] = [
 /// `ModelScanner`, which is incremental and cannot be replaced by this.
 ///
 /// Semantics are exactly the two functions it replaces, including the details that look incidental:
-/// `stream_options` anywhere at root wins regardless of `stream`, an escaped key matches neither
-/// needle (so it is sliced raw), and the model value *is* unescaped because `ModelScanner`
-/// unescapes it. `fused_scan_matches_the_two_walks_it_replaces` cross-checks a corpus against both.
+/// `stream_options` anywhere at root wins regardless of `stream`, a key spelled with escapes is
+/// decoded and the last `stream` decides (as the provider's parser does; a duplicate or escaped
+/// `stream_options` is flagged in `stream_options_ambiguous` instead, D88), and the model value
+/// *is* unescaped because `ModelScanner` unescapes it. `fused_scan_matches_the_two_walks_it_replaces` cross-checks a corpus against both.
 pub fn scan_buffered(body: &[u8]) -> BufferedScan {
     let n = body.len();
     let mut i = 0;
@@ -516,7 +532,14 @@ pub fn scan_buffered(body: &[u8]) -> BufferedScan {
                         {
                             stream_options_ambiguous = true;
                         }
-                        last_key_is_stream = key == b"stream";
+                        // The provider decodes an escaped key and keeps the last duplicate,
+                        // so each key that decodes to `stream` decides afresh (D88).
+                        last_key_is_stream = key == b"stream"
+                            || (key.contains(&b'\\')
+                                && escaped_key_is(&body[key_start - 1..=j], "stream"));
+                        if last_key_is_stream {
+                            stream_true = false;
+                        }
                         last_key_is_model = key == b"model"
                             || (key.contains(&b'\\')
                                 && escaped_key_is(&body[key_start - 1..=j], "model"));

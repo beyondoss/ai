@@ -1224,7 +1224,7 @@ claims = ["BIL-4", "REL-17"]
 state = "fixed"
 test = "overflowing_provider_token_counts_saturate_instead_of_panicking"
 fix = "178a4df"
-note = "Found by the independent branch review (2026-10-01) of a54c22c. Fixed: every sum of provider-supplied counts saturates (usage.rs OpenAI arithmetic, translate.rs Usage::from_chat, and the cut-short estimators' scaling); a nonsense count bills a saturated value, never a panic."
+note = "Found by the independent branch review (2026-10-01) of a54c22c. Fixed: every sum of provider-supplied counts saturates (usage.rs OpenAI arithmetic, translate.rs Usage::from_chat, and the cut-short estimators' scaling); a nonsense count bills a saturated value, never a panic. Also held by props_regressions::usage_with_boundary_counts_never_panics (the property suites' minimized counterexample) and props_usage's boundary-count properties, whose D87 exclusions were removed at integration."
 
 [[defect]]
 id = "D88"
@@ -1236,9 +1236,9 @@ confidence = "high"
 evidence = "peek.rs ~535. Reproduced hermetically (billing_streams.rs): a second stream_options with include_usage false, and an escaped stream\\u005foptions key, each reach OpenAI with usage off; the row is an estimate (input 31, output 1) instead of the exact 5/9."
 claims = ["BIL-2"]
 state = "fixed"
-test = "duplicate_or_escaped_stream_options_cannot_turn_off_exact_metering"
-fix = "48a5c00"
-note = "Found by the independent branch review (2026-10-01) of a54c22c. Fixed: scan_buffered flags a root with more than one stream_options or an escaped spelling (stream_options_ambiguous); the buffered path removes every such member by span and the usual injection adds the one stream_options that reaches OpenAI."
+test = "duplicate_or_escaped_stream_keys_cannot_turn_off_exact_metering"
+fix = "790d911"
+note = "Found by the independent branch review (2026-10-01) of a54c22c. Fixed: scan_buffered flags a root with more than one stream_options or an escaped spelling (stream_options_ambiguous); the buffered path removes every such member by span and the usual injection adds the one stream_options that reaches OpenAI. That fix (48a5c00) covered stream_options; the property suites also found an escaped `stream` key (\"str\\u0065am\":true) hiding the stream from the scan, so no usage was injected. Completed at integration (790d911 on this branch): scan_buffered and plan_stream_usage_injection decode an escaped key and let the last `stream` decide. Held by billing_streams::duplicate_or_escaped_stream_keys_cannot_turn_off_exact_metering (all three cases), duplicate_or_escaped_stream_options_cannot_turn_off_exact_metering, and props_peek::prop_stream_and_stream_options_match_serde with its D88 exclusion removed."
 
 [[defect]]
 id = "D89"
@@ -1743,3 +1743,87 @@ state = "fixed"
 test = "a_read_timeout_before_the_head_bills_the_delivered_prompt"
 fix = "12981ee"
 note = "Fixed: no_head now covers any wait given up on (gave_up_waiting): the client going away, or the gateway's ReadTimedout from upstream. Both leave a provider holding the whole request on a live connection, and it cannot tell who hung up. A reset or close from the upstream before any head (the gateway's 502) stays 0 (a_close_before_the_head_bills_nothing): the peer declined to answer, the managed providers' edge (Cloudflare) answers a forwarded-then-lost request with a 52x status rather than a bare reset, and an estimate the customer cannot check errs low (BIL-20). A dead peer (keepalive or TCP_USER_TIMEOUT) stays 0 for the same reason. The fault suite now models stall_before_head as forwarded with the provider's answer held back (the realistic shape: a provider still working when the timeout fires) and owes an estimated row for it; reset_after_forward stays unbilled by design."
+
+[[defect]]
+id = "D124"
+severity = "low"
+area = "Translation"
+title = "Events after the upstream's own end reach the client after [DONE] or message_stop"
+impact = "SseBridge forwards what an upstream sends after its terminal event: a Chat client gets chunks after `data: [DONE]`, and a Messages client gets an `error` event after `message_stop` (for example an error between a Chat upstream's usage chunk and its [DONE]). A Responses client already ignores them. A client that reads past its terminal event raises an error on a turn that had completed, or appends a chunk to a finished message."
+confidence = "high"
+evidence = "props_sse::prop_errors_and_cuts_anywhere_leave_a_well_formed_failure and ::prop_vocabulary_events_keep_the_client_lifecycle, minimized: Chat upstream [role chunk, tool call, finish_reason tool_calls, usage chunk, data: {\"error\":{\"message\":\"boom\",...}}, data: [DONE]] -> Messages client ... event: message_stop, then event: error. Messages upstream [data: {\"type\":\"message_stop\"}, data: {\"type\":\"error\"}] -> Chat client: data: [DONE] then data: {\"error\":...}. translate.rs SseBridge::deliver drops nothing once `done` / OaiToAnt::finished is set."
+claims = ["S2"]
+state = "reproduced"
+test = "nothing_reaches_the_client_after_its_terminal_event"
+fix = ""
+note = "Found by the property suites (crates/gateway/tests/props_sse.rs). Proposed: once the client's terminal event went out (Chat `done`, OaiToAnt `finished`, OaiToResp `completed`), deliver nothing more."
+
+[[defect]]
+id = "D125"
+severity = "med"
+area = "Billing"
+title = "A payload marker split across three or more body chunks is missed, so a cut-short estimate bills the image as text"
+impact = "InputTally excludes base64 payloads from the cut-short input estimate by finding `;base64,` / `\"data\":` markers, carrying the last bytes of each chunk into the next. The carry is replaced by each chunk's own tail, so a marker spread over three chunks (any chunk shorter than the marker holding its middle) is never found and the payload counts as text: a 100 KB inline image estimates ~20,000 input tokens instead of ~24. Request bodies arrive in whatever chunks the client's writes and the H1/H2 framing make, and an estimate is a bill the customer cannot check."
+confidence = "high"
+evidence = "props_usage::prop_input_tally_ignores_chunking (fed byte by byte), minimized: a Chat body with one `data:application/pdf;base64,A+A0a` file part estimates 30 whole and 31 byte by byte. Regression: a 100,000-byte image body fed as [..`;ba`, `se`, `64,`..] estimates 20024 tokens, whole 24. usage.rs InputTally::feed (the `None` branch overwrites `carry` with only this chunk's tail)."
+claims = ["BIL-20"]
+state = "fixed"
+test = "input_estimate_ignores_how_the_body_is_chunked"
+fix = "12981ee"
+note = "Found by the property suites (crates/gateway/tests/props_usage.rs). Proposed: keep the last MARKER_CARRY bytes of carry+chunk, not of the chunk alone. Fixed by the D99 rewrite of InputTally (12981ee): payloads drop out as values of non-text keys, with no markers to split, so any chunking agrees with the whole body. The property's at-least-7-byte chunk exclusion was removed at integration."
+
+[[defect]]
+id = "D126"
+severity = "low"
+area = "Billing"
+title = "A usage event spread over several data: lines bills no exact usage"
+impact = "SSE lets one event carry its data on several `data:` lines, joined with `\\n` (JSON whitespace). The translator joins them, and so does any spec-following client SDK; the usage parsers (openai_stream, anthropic_stream_parts) parse each line alone, so a usage event written that way parses as nothing: the row is an estimate (or zero) while the client is shown exact usage. Real OpenAI and Anthropic write one line per event; a config-added or proxying provider may not."
+confidence = "high"
+evidence = "props_usage::prop_streams_bill_like_their_bodies and props_sse::prop_translated_streams_preserve_content_and_usage with Framing.multiline, minimized: a Chat stream whose usage chunk is `data: {` + `data: \"id\":...,\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":9,...}}` -> usage::openai_stream None, while SseBridge(Messages<-Chat) shows output_tokens 9; same for an Anthropic message_delta split the same way."
+claims = ["B1"]
+state = "reproduced"
+test = "usage_spread_over_two_data_lines_is_billed"
+fix = ""
+note = "Found by the property suites. Proposed: join an event's consecutive data: lines before parsing (only on lines that fail to parse, to keep the fast path)."
+
+[[defect]]
+id = "D127"
+severity = "low"
+area = "Translation"
+title = "Numbers in tool arguments change value when translation re-parses them"
+impact = "Translation re-parses tool arguments as serde_json Values (a Chat history call's `arguments` onto Messages; a non-stream Messages `tool_use.input` onto Chat or Responses; a Chat call onto a Messages client). serde_json's default float parsing is not correctly rounded and has no arbitrary precision, so a float with more than ~15 significant digits can come out a different number and an integer past u64 becomes an f64. The model's own arguments, replayed in history or handed to the client's tool, are silently altered; the stream path (which passes partial_json through) disagrees with the non-stream one."
+confidence = "high"
+evidence = "props_numbers::prop_tool_argument_numbers_keep_their_value, minimized: Chat history arguments {\"n\":-1.32417719719006e-11} -> Messages tool_use input {\"n\":-1.3241771971900598e-11}; {\"n\":2.380369113685511e-306} -> 2.3803691136855108e-306. Messages tool_use input {\"n\":123456789012345678901234567890} -> Chat arguments {\"n\":1.2345678901234568e29}. Integers within i64/u64 and decimals up to 7 significant digits survive (200,000 cases)."
+claims = ["T1"]
+state = "reproduced"
+test = "tool_argument_numbers_keep_their_value"
+fix = ""
+note = "Found by the property suites. Proposed: enable serde_json's `float_roundtrip` (correct rounding), and keep arguments as raw JSON text where they are only relayed (RawValue, or `arbitrary_precision` if every consumer tolerates it)."
+
+[[defect]]
+id = "D128"
+severity = "med"
+area = "Translation"
+title = "A Responses conversation is dropped instead of relayed or refused"
+impact = "`conversation` (the Conversations API: the request continues a stored conversation) is session state exactly like `previous_response_id`, but responses_session_field does not know it. A store:false request with a conversation counts as a one-shot, is translated (onto Chat Completions on a GPT row, onto Messages on a Claude row), and the field is dropped: the model answers without the conversation's history and the client gets a confident answer to a conversation it never saw, where E3 promises a relay on GPT and a 400 on Claude."
+confidence = "high"
+evidence = "props_fields::prop_answer_changing_fields_are_never_silently_dropped, minimized: {\"model\":\"m\",\"input\":\"hi\",\"store\":false,\"conversation\":\"conv_abc123\"} -> responses_session_field(_, true/false) = None, and translate::request(Responses -> Chat / Messages) emits no conversation. translate.rs responses_session_field checks previous_response_id and store only."
+claims = ["E3"]
+state = "reproduced"
+test = "a_responses_conversation_is_session_state"
+fix = ""
+note = "Found by the property suites (crates/gateway/tests/props_fields.rs). Proposed: treat a non-null `conversation` like `previous_response_id`."
+
+[[defect]]
+id = "D129"
+severity = "low"
+area = "Translation"
+title = "A Responses prompt template (onto Messages) and top_logprobs are dropped off Responses"
+impact = "Options that change the answer must map or be forwarded for the provider to reject by name. The Responses `prompt` template is documented as forwarded and is onto Chat Completions, but the composed Responses -> Chat -> Messages walk drops it, so a Claude row answers without the template's instructions. `top_logprobs` is dropped onto both Chat Completions and Messages, so the client asked for logprobs and silently gets none."
+confidence = "high"
+evidence = "props_fields::prop_answer_changing_fields_are_never_silently_dropped, minimized: Responses {\"input\":\"hi\",\"store\":false,\"prompt\":{\"id\":\"pmpt_abc123\"}} -> Messages {\"max_tokens\":4096,\"messages\":[{\"content\":\"hi\",\"role\":\"user\"}],\"model\":\"m\"}; {\"top_logprobs\":5} -> Chat and Messages bodies with no trace of it. Responses -> Chat keeps prompt."
+claims = ["TRN-21"]
+state = "reproduced"
+test = "responses_answer_options_are_never_dropped"
+fix = ""
+note = "Found by the property suites. openai_req_to_anthropic rebuilds the body from known Chat fields, so a Responses field the intermediate Chat body carried for forwarding is lost on the second hop."
