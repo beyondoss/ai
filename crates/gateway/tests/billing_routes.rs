@@ -134,7 +134,6 @@ async fn a_claude_row_normalizes_input_tokens_the_same_on_both_wires() {
 /// claim: BIL-8
 /// defect: D21
 #[tokio::test]
-#[ignore = "D21 reproduced: OpenRouter prompt_tokens_details.cache_write_tokens=50 lands as cache_write_tokens=0"]
 async fn openrouter_cache_write_tokens_reach_the_row() {
     let (pubkey, sk) = test_keypair(54);
     let mock = MockUpstream::start(Mode::Raw(

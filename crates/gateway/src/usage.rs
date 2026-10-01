@@ -29,7 +29,8 @@ pub struct Usage {
 
 /// OpenAI `usage` block (chat/completions). `prompt`/`completion` map to in/out; cached input rides
 /// in `prompt_tokens_details.cached_tokens`; reasoning in `completion_tokens_details.reasoning_tokens`.
-/// No cache-write concept on the OpenAI wire.
+/// OpenAI itself has no cache-write concept, but OpenRouter serves Claude on this wire and reports
+/// Anthropic's cache writes as `prompt_tokens_details.cache_write_tokens` (priced at 1.25× input).
 ///
 /// DeepSeek's wire never populates `prompt_tokens_details.cached_tokens` — it reports cache hits via
 /// its own flat, top-level `prompt_cache_hit_tokens` field instead (DeepSeek API docs). Both providers
@@ -81,6 +82,9 @@ struct OpenAiPromptDetails {
     /// `From<OpenAiUsage>` fall back to `prompt_cache_hit_tokens` only when this is truly missing.
     #[serde(default)]
     cached_tokens: Option<u64>,
+    /// OpenRouter's Claude cache writes (see [`OpenAiUsage`]). Absent on OpenAI proper.
+    #[serde(default)]
+    cache_write_tokens: u64,
 }
 
 #[derive(Deserialize, Default)]
@@ -125,7 +129,7 @@ impl From<OpenAiUsage> for Usage {
                 .cached_tokens
                 .or(u.prompt_cache_hit_tokens)
                 .unwrap_or(0),
-            cache_write_tokens: 0,
+            cache_write_tokens: u.prompt_tokens_details.cache_write_tokens,
             reasoning_tokens: u.completion_tokens_details.reasoning_tokens,
         }
     }
@@ -152,6 +156,9 @@ struct OpenAiResponsesUsage {
 struct OpenAiResponsesInputDetails {
     #[serde(default)]
     cached_tokens: u64,
+    /// OpenRouter's Claude cache writes, on its Responses mount (see [`OpenAiUsage`]).
+    #[serde(default)]
+    cache_write_tokens: u64,
 }
 
 #[derive(Deserialize, Default)]
@@ -166,7 +173,7 @@ impl From<OpenAiResponsesUsage> for Usage {
             input_tokens: u.input_tokens,
             output_tokens: u.output_tokens,
             cache_read_tokens: u.input_tokens_details.cached_tokens,
-            cache_write_tokens: 0,
+            cache_write_tokens: u.input_tokens_details.cache_write_tokens,
             reasoning_tokens: u.output_tokens_details.reasoning_tokens,
         }
     }
@@ -1488,7 +1495,6 @@ mod verify_billing {
     /// claim: BIL-8
     /// defect: D21
     #[test]
-    #[ignore = "D21 reproduced: OpenAiUsage hard-codes cache_write_tokens = 0"]
     fn openai_body_reads_openrouter_cache_write_tokens() {
         let body = br#"{"usage":{"prompt_tokens":120,"completion_tokens":7,"total_tokens":127,"prompt_tokens_details":{"cached_tokens":10,"cache_write_tokens":50}}}"#;
         let u = openai_body(body).unwrap();
