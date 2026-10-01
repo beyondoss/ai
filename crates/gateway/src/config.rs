@@ -175,6 +175,18 @@ pub struct AiConfig {
     /// (which run keyless) working out of the box.
     pub require_signing_keys: bool,
 
+    /// Secrets that bind provider-held Responses ids to a tenant (`signed_id.rs`): kid (one
+    /// character, `[0-9A-Za-z]`) → base64 of at least 32 random bytes. From the
+    /// `[id_signing_keys]` table or `AI_ID_SIGNING_KEY_<KID>` env. Empty ⇒ a managed Responses
+    /// relay to a store (a GPT row's Responses arm, a managed `/{provider}/…/responses`) is a 503
+    /// (fail-closed); everything else is unaffected. More than one ⇒ rotation (see
+    /// `id_signing_kid`).
+    pub id_signing_keys: HashMap<String, Secret>,
+
+    /// The kid in `id_signing_keys` that signs new ids. Optional with exactly one key. Ids carry
+    /// the kid that signed them, so ids from a previous key verify while that key stays listed.
+    pub id_signing_kid: String,
+
     /// Managed Beyond pool keys, **by provider name** (`openai`, `anthropic`, `fireworks`, …).
     /// From the `[pool_keys]` TOML table (an array of keys, or a string = list of one) or
     /// SSM-injected `AI_POOL_KEY_<NAME>` env (the env form is the production path and stays one
@@ -422,6 +434,8 @@ impl Default for AiConfig {
             snapshot_path: None,
             signing_keys: HashMap::new(),
             require_signing_keys: false,
+            id_signing_keys: HashMap::new(),
+            id_signing_kid: String::new(),
             pool_keys: HashMap::new(),
             provider_authorities: HashMap::new(),
             provider_dialects: HashMap::new(),
@@ -580,7 +594,16 @@ impl AiConfig {
                 crate::circuit_breaker::MAX_FAILURE_THRESHOLD,
             )));
         }
+        // A malformed id signing key is a boot failure, not a 503 on every managed Responses turn.
+        self.build_id_signer()?;
         Ok(())
+    }
+
+    /// The signer for tenant-bound Responses ids (`signed_id.rs`), or `None` when no
+    /// `id_signing_keys` are set.
+    pub fn build_id_signer(&self) -> Result<Option<crate::signed_id::Signer>> {
+        crate::signed_id::Signer::from_config(&self.id_signing_keys, &self.id_signing_kid)
+            .map_err(GatewayError::Config)
     }
 
     /// The per-provider circuit-breaker config, or `None` when disabled (`circuit_breaker_threshold
@@ -608,11 +631,12 @@ impl AiConfig {
         )
     }
 
-    /// Fold the two secret-carrying env prefixes into the config, in a single pass.
+    /// Fold the secret-carrying env prefixes into the config, in a single pass.
     ///
-    /// `AI_POOL_KEY_<NAME>` → `pool_keys[name]` (provider name lowercased) and
-    /// `AI_SIGNING_KEY_<KID>` → `signing_keys[kid]` (key id verbatim). This is the production secret
-    /// path: both are map fields a flat figment env merge can't target, the ECS container has no
+    /// `AI_POOL_KEY_<NAME>` → `pool_keys[name]` (provider name lowercased),
+    /// `AI_SIGNING_KEY_<KID>` → `signing_keys[kid]` and `AI_ID_SIGNING_KEY_<KID>` →
+    /// `id_signing_keys[kid]` (key ids verbatim). This is the production secret path: all are map
+    /// fields a flat figment env merge can't target, the ECS container has no
     /// mounted config file, and env must win over anything baked into one.
     ///
     /// `std::env::vars()` allocates a `(String, String)` for *every* variable in the environment,
@@ -627,6 +651,8 @@ impl AiConfig {
                 self.pool_keys.insert(name, Secret::new(v).into());
             } else if let Some(kid) = k.strip_prefix("AI_SIGNING_KEY_") {
                 self.signing_keys.insert(kid.to_string(), v);
+            } else if let Some(kid) = k.strip_prefix("AI_ID_SIGNING_KEY_") {
+                self.id_signing_keys.insert(kid.to_string(), Secret::new(v));
             }
         }
     }

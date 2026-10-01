@@ -34,6 +34,7 @@ pub mod ratelimit;
 pub mod remedy;
 pub mod route;
 pub mod secret;
+pub mod signed_id;
 pub mod smart;
 pub mod state;
 pub mod store_watch;

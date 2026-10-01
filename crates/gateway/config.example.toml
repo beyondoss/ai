@@ -157,6 +157,11 @@ capture_queue_depth = 1024
 # replicas do not share TTFT samples.
 # smart_router = true
 
+# The kid in [id_signing_keys] (below) that signs new tenant-bound Responses ids, e.g. "2". Empty
+# means the only key; required with more than one (rotation: add the new key everywhere, then
+# switch this).
+# id_signing_kid = ""
+
 # Optional per-provider upstream authority (host:port), BY PROVIDER NAME. For a known provider this
 # overrides its built-in default; for an unknown name it ADDS a new provider, then reachable at
 # `/{name}/…` (the provider is the first path segment of the request). Known providers (zero-config
@@ -246,3 +251,12 @@ capture_queue_depth = 1024
 # is 401 (fail-closed), never BYO. BYO raw tokens skip verification.
 [signing_keys]
 # 1 = "<base64-ed25519-public-key>"
+
+# Secrets that bind the ids OpenAI stores (response, conversation and item ids) to the tenant they
+# were issued to (kid -> base64 of >= 32 random bytes; `openssl rand -base64 32`). Inject via
+# AI_ID_SIGNING_KEY_<KID>. Every managed tenant shares Beyond's OpenAI organization, so without a
+# key a managed Responses request on a GPT row (or managed /{provider}/…/responses) is a 503
+# (fail-closed); everything else is served. Keep a rotated-out key listed for 30 days so the ids it
+# signed still verify. See ARCHITECTURE.md "Tenant-bound Responses ids".
+[id_signing_keys]
+# 1 = "<base64-32-random-bytes>"

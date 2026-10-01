@@ -497,6 +497,7 @@ fn run_trial(
         cfg.push_str(&format!("{} = \"127.0.0.1:{}\"\n", f.name, fp.port));
     }
     cfg.push_str(&format!("\n[signing_keys]\n1 = \"{DEV_PUBKEY_B64}\"\n"));
+    cfg.push_str(common::DEV_ID_SIGNING_TOML);
     let cfg_path = dir.join("gateway.toml");
     std::fs::write(&cfg_path, cfg).map_err(|e| e.to_string())?;
 

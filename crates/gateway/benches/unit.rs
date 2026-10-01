@@ -1500,3 +1500,112 @@ mod input_tally {
         feed(bencher, image_body());
     }
 }
+
+/// Tenant-bound Responses ids (`signed_id`): paid only by managed Responses relays to a store.
+/// Per SSE event, the cost a GPT-row Responses stream adds: a delta event names its item id (a
+/// memo hit after the first), `created` / `completed` name the response id, and an event with no
+/// id is copied after one `memmem`.
+mod signed_id {
+    use super::*;
+    use beyond_ai::signed_id::{Relay, Signer};
+
+    const RESP: &str = "resp_0750331520328311006abeeacfb62c87d0bdb6cbe1c41eea26";
+    const MSG: &str = "msg_0750331520328311006abeead0270c87d0b8128a81f8474fea";
+
+    fn signer() -> Signer {
+        Signer::new(&[(b'1', &[7u8; 32])], b'1').unwrap()
+    }
+
+    #[divan::bench]
+    fn sign(bencher: Bencher) {
+        let s = signer();
+        bencher.bench(|| s.sign(black_box(42), black_box(RESP)));
+    }
+
+    #[divan::bench]
+    fn verify(bencher: Bencher) {
+        let s = signer();
+        let t = s.sign(42, RESP);
+        bencher.bench(|| s.verify(black_box(42), black_box(&t)));
+    }
+
+    /// One event through a relay already streaming (`begin` once, outside the loop).
+    fn event(bencher: Bencher, ev: String) {
+        let s = signer();
+        let mut relay = Relay::new(42);
+        relay.begin(200, true);
+        let _ = relay.feed(&s, ev.as_bytes(), false);
+        bencher
+            .counter(BytesCount::new(ev.len()))
+            .bench_local(|| relay.feed(&s, black_box(ev.as_bytes()), false));
+    }
+
+    #[divan::bench]
+    fn delta_event(bencher: Bencher) {
+        event(
+            bencher,
+            format!(
+                "event: response.output_text.delta\ndata: {{\"type\":\"response.output_text.delta\",\"sequence_number\":7,\"item_id\":\"{MSG}\",\"output_index\":0,\"content_index\":0,\"delta\":\" world\",\"logprobs\":[],\"obfuscation\":\"Xq3k\"}}\n\n"
+            ),
+        );
+    }
+
+    #[divan::bench]
+    fn completed_event(bencher: Bencher) {
+        event(
+            bencher,
+            format!(
+                "event: response.completed\ndata: {{\"type\":\"response.completed\",\"sequence_number\":40,\"response\":{{\"id\":\"{RESP}\",\"object\":\"response\",\"status\":\"completed\",\"model\":\"gpt-5.1\",\"output\":[{{\"id\":\"{MSG}\",\"type\":\"message\",\"status\":\"completed\",\"role\":\"assistant\",\"content\":[{{\"type\":\"output_text\",\"text\":\"{}\",\"annotations\":[]}}]}}],\"usage\":{{\"input_tokens\":12,\"output_tokens\":300,\"total_tokens\":312}}}}}}\n\n",
+                "lorem ipsum ".repeat(100)
+            ),
+        );
+    }
+
+    #[divan::bench]
+    fn event_without_id(bencher: Bencher) {
+        event(
+            bencher,
+            "event: response.in_progress\ndata: {\"type\":\"keepalive\",\"sequence_number\":3}\n\n"
+                .to_owned(),
+        );
+    }
+
+    /// The same delta event through a relay that is off (a non-2xx): the floor `delta_event` adds to.
+    #[divan::bench]
+    fn delta_event_off(bencher: Bencher) {
+        let s = signer();
+        let mut relay = Relay::new(42);
+        relay.begin(500, true);
+        let ev = format!(
+            "data: {{\"type\":\"response.output_text.delta\",\"item_id\":\"{MSG}\",\"delta\":\" world\"}}\n\n"
+        );
+        bencher.bench_local(|| relay.feed(&s, black_box(ev.as_bytes()), false));
+    }
+
+    /// An AI SDK turn sent back: `previous_response_id` and twenty items, half of them references.
+    #[divan::bench]
+    fn unsign_request(bencher: Bencher) {
+        let s = signer();
+        let mut items = Vec::new();
+        for i in 0..20 {
+            if i % 2 == 0 {
+                items.push(format!(
+                    r#"{{"role":"user","content":"question {i} about the weather in Paris and Lyon"}}"#
+                ));
+            } else {
+                items.push(format!(
+                    r#"{{"type":"item_reference","id":"{}"}}"#,
+                    s.sign(42, MSG)
+                ));
+            }
+        }
+        let body = format!(
+            r#"{{"model":"gpt-5.1","previous_response_id":"{}","input":[{}]}}"#,
+            s.sign(42, RESP),
+            items.join(",")
+        );
+        bencher
+            .counter(BytesCount::new(body.len()))
+            .bench(|| s.unsign_request(42, black_box(body.as_bytes()), true));
+    }
+}

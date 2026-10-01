@@ -68,6 +68,7 @@ use crate::capture::CaptureBufs;
 use crate::key;
 use crate::metrics::{KeyCooled, Rejection};
 use crate::route::{self, Dialect, Provider};
+use crate::signed_id;
 use crate::state::{GatewayState, RequestId};
 use crate::terminal::TerminalTracker;
 use crate::{control, peek, remedy, smart, translate, usage};
@@ -497,6 +498,10 @@ pub struct RequestCtx {
     /// `message_stop`, `response.completed`). Fed on managed streams only; read in `logging` so a
     /// client that closes once it has the whole answer is not a cancel (D120, D122).
     terminal: TerminalTracker,
+    /// A managed Responses relay to a provider's store (`signed_id`): the ids in its 2xx are signed
+    /// for this tenant, and the ids the client sent were verified and are stripped back in
+    /// `request_body_filter`. Boxed: `None` on every other request.
+    signed: Option<Box<signed_id::Relay>>,
 }
 
 /// Scrubs a managed error body (status >= 400) as it streams past: the pool key the attempt sent
@@ -995,7 +1000,7 @@ impl RequestCtx {
     ///
     /// Both can apply to the same request, in which case every edit is made to the one buffer.
     fn rewrites_body(&self) -> bool {
-        self.inject_eligible || self.background_check || self.auto.is_some()
+        self.inject_eligible || self.background_check || self.auto.is_some() || self.signed.is_some()
     }
 
     /// Point the forwarded path at the candidate about to be attempted.
@@ -1469,6 +1474,42 @@ impl AiProxy {
 
     async fn reply_models_list_boxed(session: &mut Session, request_id: &str) -> Result<bool> {
         Box::pin(Self::reply_models_list(session, request_id)).await
+    }
+
+    /// `signed_id`: a large catalog body's ids, checked before its first attempt connects (its
+    /// `FullBody` re-runs see the body only as it streams in). `Some` when the request was refused
+    /// and the reply is written.
+    async fn refuse_foreign_ids(
+        &self,
+        session: &mut Session,
+        request_id: &str,
+        route: &'static route::ModelRoute,
+        body: &[u8],
+        tenant_id: u64,
+    ) -> Option<Result<bool>> {
+        if !signed_id::catalog_applies(session.req_header().uri.path(), route) {
+            return None;
+        }
+        let (reason, status, typ, msg) = match self.state.id_signer.as_ref() {
+            None => (
+                Rejection::IdSigningUnset,
+                503,
+                "api_error",
+                "managed Responses ids cannot be issued: the gateway has no id signing key configured"
+                    .to_owned(),
+            ),
+            Some(signer) => {
+                let refusal = signer.unsign_request(tenant_id, body, true).err()?;
+                (
+                    Rejection::ForeignId,
+                    400,
+                    "invalid_request_error",
+                    refusal.to_string(),
+                )
+            }
+        };
+        self.state.metrics.rejection(reason).inc();
+        Some(Self::reject_message_boxed(session, request_id, status, typ, msg).await)
     }
 
     /// Re-run a request whose body the gateway read in full as a pingora subrequest carrying that
@@ -3689,6 +3730,13 @@ impl ProxyHttp for AiProxy {
                     };
                     if peek.relay {
                         let body = peek.complete.unwrap_or_default();
+                        // --- signed ids (`signed_id`) ---
+                        if let Some(done) = self
+                            .refuse_foreign_ids(session, &request_id, route, &body, tenant_id)
+                            .await
+                        {
+                            return done;
+                        }
                         let slot_held = early_slot.is_some();
                         let relayed = self
                             .relay_full_body(
@@ -3739,6 +3787,13 @@ impl ProxyHttp for AiProxy {
             }
             if peek.relay {
                 let body = peek.complete.unwrap_or_default();
+                // --- signed ids (`signed_id`) ---
+                if let Some(done) = self
+                    .refuse_foreign_ids(session, &request_id, route, &body, tenant_id)
+                    .await
+                {
+                    return done;
+                }
                 let slot_held = early_slot.is_some();
                 let relayed = self
                     .relay_full_body(session, request_id, request_seq, route, body, slot_held)
@@ -4077,6 +4132,56 @@ impl ProxyHttp for AiProxy {
             }
         };
 
+        // --- signed ids (`signed_id`): Responses state a provider keeps is tenant-bound ---------
+        // A managed Responses relay to a store (a GPT row's Responses arm, `/{provider}/…/responses`)
+        // must not carry an id another tenant could resolve. The ids the client sent back are
+        // checked here, before connecting, wherever the body is in hand (every catalog walk); a
+        // `/{provider}` body streams, and is checked as it is stripped in `request_body_filter`.
+        let signed = if managed
+            && match model_route {
+                Some(row) => signed_id::catalog_applies(session.req_header().uri.path(), row),
+                None => {
+                    provider_route
+                        && forward_path
+                            .as_deref()
+                            .is_some_and(signed_id::provider_route_applies)
+                }
+            } {
+            let Some(signer) = self.state.id_signer.as_ref() else {
+                self.state
+                    .metrics
+                    .rejection(Rejection::IdSigningUnset)
+                    .inc();
+                return Self::reject_message_boxed(
+                    session,
+                    &request_id,
+                    503,
+                    "api_error",
+                    "managed Responses ids cannot be issued: the gateway has no id signing key configured"
+                        .to_owned(),
+                )
+                .await;
+            };
+            if let Some(Err(refusal)) = body_complete
+                .as_deref()
+                .map(|b| signer.unsign_request(tenant_id, b, model_route.is_some()))
+            {
+                self.state.metrics.rejection(Rejection::ForeignId).inc();
+                return Self::reject_message_boxed(
+                    session,
+                    &request_id,
+                    400,
+                    "invalid_request_error",
+                    refusal.to_string(),
+                )
+                .await;
+            }
+            Some(Box::new(signed_id::Relay::new(tenant_id)))
+        } else {
+            None
+        };
+        // --- end signed ids ---
+
         // Catalog walk: inbound path may name Chat Completions, Messages, or Responses while the
         // serving *candidate* speaks a different one of those three. Always keep the client
         // endpoint so failover can translate onto the next path; embeddings against a generation
@@ -4283,6 +4388,7 @@ impl ProxyHttp for AiProxy {
                     upstream_phase: UpstreamPhase::None,
                     redact: None,
                     terminal: TerminalTracker::default(),
+                    signed: None,
                 });
                 ctx.held.admit();
                 return Ok(true);
@@ -4403,7 +4509,7 @@ impl ProxyHttp for AiProxy {
             // `apply_stream_usage_injection` performs *in place*: with it the injection never
             // reallocates, so a body arrives, is spliced, and goes upstream on one allocation.
             req_buf: match (
-                inject_eligible || background_check || model_route.is_some(),
+                inject_eligible || background_check || model_route.is_some() || signed.is_some(),
                 declared_len,
             ) {
                 (true, Some(len)) => {
@@ -4458,6 +4564,7 @@ impl ProxyHttp for AiProxy {
             upstream_phase: UpstreamPhase::None,
             redact: None,
             terminal: TerminalTracker::default(),
+            signed,
         });
         // Admitted: count it in-flight. Released in `logging`, or by `Ctx`'s drop if a panic
         // skipped `logging`, so the gauge cannot leak. `active_streams` only covers SSE; this
@@ -5151,6 +5258,22 @@ impl ProxyHttp for AiProxy {
             if end_of_stream {
                 // One structural walk for every answer (see `peek::scan_buffered`).
                 let mut buf = std::mem::take(&mut rc.req_buf);
+                // --- signed ids (`signed_id`): the provider gets its own ids back ---
+                // The client's body, per attempt. A catalog walk was checked before connecting; a
+                // `/{provider}` body is refused here, before a byte of it goes upstream.
+                if rc.signed.is_some()
+                    && let Some(signer) = self.state.id_signer.as_ref()
+                {
+                    match signer.unsign_request(rc.tenant_id, &buf, rc.auto.is_some()) {
+                        Ok(Some(raw)) => buf = raw,
+                        Ok(None) => {}
+                        Err(_) => {
+                            self.state.metrics.rejection(Rejection::ForeignId).inc();
+                            return Err(gateway_error(400, signed_id::REFUSED).into_down());
+                        }
+                    }
+                }
+                // --- end signed ids ---
                 let mut scan = peek::scan_buffered(&buf);
                 // Two root `model` keys on a catalog walk: the row came from one and the rewrite
                 // below edits one, but the provider's parser picks its own (usually the last). Refused
@@ -5559,6 +5682,16 @@ impl ProxyHttp for AiProxy {
                     upstream_response.insert_header("transfer-encoding", "chunked")?;
                 }
             }
+            // --- signed ids (`signed_id`): a 2xx's ids are rewritten, so its length changes ---
+            if let Some(s) = rc.signed.as_mut()
+                && s.begin(status, rc.streaming)
+            {
+                upstream_response.remove_header("content-length");
+                if upstream_response.version != http::Version::HTTP_2 {
+                    upstream_response.insert_header("transfer-encoding", "chunked")?;
+                }
+            }
+            // --- end signed ids ---
         }
         Ok(())
     }
@@ -5634,6 +5767,19 @@ impl ProxyHttp for AiProxy {
                     .saturating_add(u32::try_from(chunk.len()).unwrap_or(u32::MAX));
             }
         }
+
+        // --- signed ids (`signed_id`): after the usage taps, before anything the client sees ---
+        if let (Some(s), Some(signer)) = (rc.signed.as_mut(), self.state.id_signer.as_ref()) {
+            match s.feed(signer, body.as_deref().unwrap_or(&[]), end_of_stream) {
+                Ok(Some(out)) => *body = Some(Bytes::from(out)),
+                Ok(None) => {}
+                Err(signed_id::Overflow) => {
+                    return Err(self.translate_overflow(&rc.request_id, "signed_id"));
+                }
+            }
+        }
+        let chunk = body.as_deref().unwrap_or(&[]);
+        // --- end signed ids ---
 
         // A translation, a Chat Completions relay that `response_filter` gave a bridge, or a
         // same-endpoint error put in the client's envelope.
@@ -6674,6 +6820,7 @@ mod tests {
             upstream_phase: UpstreamPhase::None,
             redact: None,
             terminal: TerminalTracker::default(),
+            signed: None,
         }
     }
 
@@ -6874,8 +7021,9 @@ mod tests {
     fn request_ctx_stays_small_enough_to_be_cheap_per_chunk() {
         let size = std::mem::size_of::<RequestCtx>();
         assert!(
-            size <= 424,
-            "RequestCtx grew to {size} bytes (ceiling 424). It is touched once per response chunk \
+            // 432: + the boxed `signed` (8 bytes, `None` off the managed Responses relay).
+            size <= 432,
+            "RequestCtx grew to {size} bytes (ceiling 432). It is touched once per response chunk \
              on a stream — if the new state is only needed on one route, box it the way \
              `ModelRouting` is rather than paying for it on every request.",
         );

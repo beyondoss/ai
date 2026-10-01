@@ -439,7 +439,10 @@ or `/v1/responses` with either) the gateway **translates** so the stock SDK comp
 inbound `/v1/responses` on a row with a Responses arm. GPT rows list a parallel OpenAI
 `/v1/responses` arm, and every Responses request on such a row walks it, `store: false` one-shots
 included: a **byte relay** so `store`, `previous_response_id`, `include`, `truncation`, and
-Responses-only tools (Codex's `namespace` groups and `custom` grammars) pass through. A Responses
+Responses-only tools (Codex's `namespace` groups and `custom` grammars) pass through. The one
+rewrite is the tenant binding on ids: every id OpenAI stores is signed for the calling tenant on
+the way out, and checked and stripped on the way back in (see
+[Tenant-bound Responses ids](#tenant-bound-responses-ids-signed_idrs)). A Responses
 5xx may walk another Responses candidate; it never walks onto Chat Completions/Messages. Rows with
 no Responses arm (Claude, DeepSeek, …) translate a one-shot and have no OpenAI store: an
 **omitted** `store` there is the stock `responses.create()` call and translates as a one-shot, while
@@ -1297,7 +1300,9 @@ SDK tool loop whose model wrote a sentence before calling a tool (D175's first f
 that).
 
 **GPT rows** relay every `item_reference`, a tool step's and a turn's alike, to OpenAI's Responses
-arm byte for byte: OpenAI holds the items it stored, and resolves them.
+arm: OpenAI holds the items it stored, and resolves them. Each id must be one the gateway issued to
+the same tenant, and goes upstream as OpenAI's own id (see [Tenant-bound Responses ids](#tenant-bound-responses-ids-signed_idrs)). Rows with no store
+sign and check nothing, so this rule applies there unchanged.
 
 **OpenRouter's own Responses API** (verified live 2026-10-01) silently drops an `item_reference` it
 does not know and answers anyway: the silent loss this rule exists to prevent. Claude rows reach
@@ -1307,6 +1312,91 @@ OpenRouter over Chat Completions, so the gateway's rule applies before it.
 set `providerOptions: { openai: { store: false } }` (the SDK then sends every item as content), or
 use a provider that never sends references: `@ai-sdk/anthropic` (the `/v1/messages` wire) or
 `@ai-sdk/openai-compatible` (Chat Completions). The 400 says this.
+
+### Tenant-bound Responses ids (`signed_id.rs`)
+
+**The problem.** Every managed tenant reaches OpenAI through Beyond's pool key, so every response
+OpenAI stores (`store` defaults to true) lives in one organization: its response id (`resp_…`),
+its conversation id (`conv_…`) and its output item ids (`msg_…`, `rs_…`, `fc_…`, …). OpenAI
+resolves any of them for whoever holds the key. `previous_response_id` and `conversation` continue
+the conversation, an `item_reference` expands the item, and so does a **full** input item carrying a
+stored item's `id`: OpenAI answers it from the store, not from the content sent (live, 2026-10-01:
+an assistant message with a stored `msg_` id and the content "Hello there." was quoted back as the
+stored text; D231). A tenant holding another tenant's id (a log, a ticket, a client bug) could read
+and continue that tenant's conversation (D230). OpenAI isolates organizations; the gateway isolates
+tenants, and stays stateless doing it: no mapping is stored, ids are signed.
+
+**Where it applies.** Managed traffic that relays the Responses wire to a store: inbound
+`/v1/responses`, `/v1/responses/compact` and `/v1/responses/input_tokens` on a row with a Responses
+arm (every GPT row; `signed_id::catalog_applies`), and a managed `/{provider}/…/responses` (and its
+`compact` / `input_tokens`). BYO keys are the caller's own organization and are never touched. A
+row with no Responses arm (Claude, grok, …) has no store behind it: a translated answer's ids are
+the gateway's or another vendor's, nothing upstream can resolve them, and grok goes to xAI as
+`store: false` (D145). Those ids are neither signed nor checked, so D175's `item_reference` rule
+runs there unchanged.
+
+**Out.** In a 2xx, every provider id is rewritten to a signed id bound to the caller's tenant: the
+response object's `id`, `previous_response_id`, `conversation` (string or `{id}`) and each `output`
+item's `id`, in a JSON body and under every SSE event's `response`, plus `item.id`
+(`output_item.*`) and `item_id` (every content event). The same provider id signs the same way on
+every event and every response, so a client that joins items by id still can. An error body is
+relayed as sent. The rewrite runs after the usage taps (which read the upstream body) and before
+capture, the cache (keyed by tenant, so a hit replays the tenant's own ids) and the terminal
+tracker.
+
+**In.** Root `previous_response_id`, root `conversation` (a string, or an object's `id`) and the
+`id` of **every** `input` item (references and full items) must verify for the calling tenant.
+Every occurrence of each key is checked, whatever its spelling: a duplicate key, or one written with
+escapes (`"previous\u005fresponse_id"`), is what a provider's parser decodes. Each is replaced by
+OpenAI's own id before the body leaves; nothing else changes. An unsigned id (a raw `resp_…`),
+another tenant's, an altered one or one signed under a key since removed is a **400**
+`invalid_request_error` naming the field ("previous_response_id does not belong to this tenant…",
+`ai_rejections_total{reason="foreign_id"}`). On a catalog walk the body is in hand before
+connecting, so the upstream never sees the request (a large body is checked in `relay_full_body`
+before its first attempt). A `/{provider}` body streams through, so it is checked as it is
+rewritten in `request_body_filter`: its request headers have already left, but not one byte of its
+body does, so the provider never processes it. On a catalog walk the gateway's own reasoning items
+(`rs_gw…`, D50) are cut first, by the same `translate::strip_gateway_reasoning` the relay uses, so
+their ids are neither checked nor sent.
+
+**Format.** The provider id's prefix (everything through its first `_`) is kept, so SDK schemas and
+prefix checks pass. When the rest is lowercase hex (every OpenAI id: a prefix and 50 hex digits),
+it is packed; any other id is kept verbatim with the tag appended:
+
+```
+packed   = prefix "x" kid base64url(hex_decode(rest) || tag)   resp_x1…: 62 chars for a 55-char resp_
+verbatim = provider_id "_v" kid base64url(tag)                  25 chars longer
+tag      = HMAC-SHA256(secret[kid], "beyond-ai/signed-id/v1" 0x00 || kid || tenant_id_le64 || provider_id)[..16]
+```
+
+`kid` is one character `[0-9A-Za-z]`. Only base64url and the provider's own characters appear, so
+an id is URL-safe whenever the provider's is. OpenAI caps every id it accepts at 64 characters
+(`previous_response_id`, `conversation`, `input[].id`; measured 2026-10-01: "Expected a string with
+maximum length 64"). A packed id stays under that cap (`resp_` 55 → 62, `msg_` 54 → 61, `rs_` 53 →
+60), so a client that sizes ids by OpenAI's own limit keeps working. The SDKs constrain nothing:
+openai-python, openai-node and the AI SDK type ids as plain strings.
+
+**Guarantees.** An id verifies only for the tenant it was issued to (the tenant id is inside the
+MAC), so tenant B can present neither A's signed id nor the provider id inside it (a raw id never
+verifies). Ids belong to the tenant, not the key: any of a tenant's keys may send them back. The tag
+is 128 bits, half of SHA-256's output, the truncation RFC 2104 §5 recommends (no less than half the
+hash and no less than 80 bits). A forgery is an online guess through the gateway, which rate-limits
+each credential, at 2^-128 per attempt. The provider id inside a signed id is readable, not secret:
+what is enforced is the binding.
+
+**Rotation.** `id_signing_keys` maps kid → secret (base64 of at least 32 random bytes;
+`AI_ID_SIGNING_KEY_<KID>`), and `id_signing_kid` names the one that signs new ids (optional with
+one key). Verification takes the key named by the id's own kid, so ids issued under a previous key
+keep verifying while it stays listed. Add the new key to every replica first, then switch
+`id_signing_kid`, and keep the old key at least as long as OpenAI keeps the responses (30 days by
+default). A malformed key or kid is a boot failure. **No key is fail-closed**: every request this
+section applies to is a 503 naming the missing key (`reason="id_signing_unset"`), before any
+upstream, and boot warns. Everything else is served.
+
+**Cost.** Only these relays pay it. A response line without `id"` is copied after one `memmem`; one
+with it gets one structural pass over its root members, and a memo of the last few ids means a
+delta event pays no HMAC for an item already signed (see [Benchmarking](#benchmarking)). A JSON
+body is held whole (at most `translate::MAX_TRANSLATE_BUFFER`) and loses its `Content-Length`.
 
 ### Identity (`key.rs`)
 
@@ -2350,6 +2440,9 @@ to serve.
   `request_body_filter` once it is all in: the request aborts before a body byte goes upstream,
   but its headers have already left, so the 400 is pingora's bare status.
 - Per-credential request rate within ceiling; aggregate BYO rate within ceiling
+- Every id sent back on a managed Responses relay to a store (`previous_response_id`,
+  `conversation`, each `input` item's `id`) is one the gateway issued to the same tenant (400
+  otherwise, before any upstream; see [Tenant-bound Responses ids](#tenant-bound-responses-ids-signed_idrs))
 
 **What passes through unchecked:**
 
@@ -2433,6 +2526,23 @@ managed or BYO) and the hop-by-hop ones.
 - A BYO key reaches only the provider it belongs to: on bare `/v1` the forwarded credential picks the provider (`x-api-key` or an `sk-ant-…` key → Anthropic, any other `sk-…` → OpenAI), and keys for two providers on one request are a 400.
 - `vpc_id` in the virtual key — decoded and emitted in billing facts, not used for access control
 
+**Provider-side state shared through Beyond's pool keys.** Every managed tenant's request to a
+provider goes out on the same pool key, so whatever that provider keeps per organization or project
+is kept once for all of them:
+
+1. **Prompt cache.** Providers cache prompt prefixes per organization. A response's exact
+   cached-token count (`cached_tokens`, `cache_read_input_tokens`) tells the caller whether that
+   exact prefix was sent recently by someone on Beyond. It only confirms a prefix the caller
+   already knows or guesses, and reveals no content. Accepted and documented: a customer who needs
+   isolation from other Beyond tenants uses its own key (BYO), whose cache is its own
+   organization's.
+2. **Responses stored state.** OpenAI stores responses by default, and resolves any stored
+   response, conversation or item id for whoever holds the key. Tenant-bound by signed ids: every
+   such id the gateway returns is signed for the tenant, and an id that does not verify for the
+   caller is a 400 before any upstream (see [Tenant-bound Responses ids](#tenant-bound-responses-ids-signed_idrs)). Other organization resources (files,
+   vector stores, stored prompts, batches) are out of reach: a managed key reaches only POST
+   generation endpoints, so no tenant can create or list them.
+
 **What the catalog allowlists (managed `/v1` and `/auto` only):**
 
 - The model name. A catalog miss is a 404. This is not a per-key grant list and not a parallel set
@@ -2453,7 +2563,8 @@ managed or BYO) and the hop-by-hop ones.
 
 Every field is set in the TOML config file (`config.example.toml` is the reference; an unknown key
 there is a boot failure). Scalar fields are also overridable by `AI_`-prefixed env vars (`AI_NATS_URL`,
-…), pool and signing keys by `AI_POOL_KEY_<NAME>` / `AI_SIGNING_KEY_<KID>`; the provider map fields
+…), pool, signing and id signing keys by `AI_POOL_KEY_<NAME>` / `AI_SIGNING_KEY_<KID>` /
+`AI_ID_SIGNING_KEY_<KID>`; the provider map fields
 (`provider_authorities.*`, `provider_dialects.*`, `provider_auth_schemes.*`) are file-only.
 Secret-bearing fields (`pool_keys`, `nats_creds`) are held as `Secret<T>` — stray `Debug` or
 `Serialize` output redacts to `"***"` and the value is zeroized on drop (`secret.rs`). The
@@ -2466,6 +2577,8 @@ local plaintext mock.
 | ------------------------------- | --------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `signing_keys`                  | _(required for managed)_          | Map of kid → base64 Ed25519 public key. Multiple kids enable rotation. Missing → every `bai_v1` token 401s (fail-closed); BYO still works.                                                                                                                                                                                                                                                                                                                                              |
 | `require_signing_keys`          | `false`                           | When `true`, an empty `signing_keys` is a hard boot failure. Set on managed deployments so a typo'd/absent SSM param fails at boot rather than 401-ing every managed client.                                                                                                                                                                                                                                                                                                            |
+| `id_signing_keys.<kid>`         | _(env `AI_ID_SIGNING_KEY_<KID>`)_ | Secrets that bind Responses ids to a tenant ([Tenant-bound Responses ids](#tenant-bound-responses-ids-signed_idrs)): kid (one character `[0-9A-Za-z]`) → base64 of ≥ 32 random bytes; more than one rotates. Malformed → boot failure. Missing → managed Responses on a GPT row and managed `/{provider}/…/responses` are a 503 (fail-closed) and boot warns; other traffic is served.                                                                                                  |
+| `id_signing_kid`                | _(the only key)_                  | The kid in `id_signing_keys` that signs new ids; required with more than one key. Ids carry the kid that signed them, so a previous key's ids verify while it stays listed (keep it 30 days, OpenAI's default retention).                                                                                                                                                                                                                                                               |
 | `pool_keys.<name>`              | _(from `AI_POOL_KEY_<NAME>` env)_ | Real provider API key(s). TOML array (a string is a list of one); env stays one key = list of one. `<NAME>` is lowercased, and when it names no provider its `_` → `-` spelling is tried, so `AI_POOL_KEY_OPENAI_CODEX` reaches `openai-codex` (an exact match wins). Missing or empty → managed requests to that provider return 503 before any upstream connection. A managed 429 walks the next unused key on the same provider.                                                     |
 | `provider_authorities.<name>`   | _(none)_                          | Override or add a provider's `authority` (host:port). Enables config-added providers beyond `KNOWN_PROVIDERS` with zero code change.                                                                                                                                                                                                                                                                                                                                                    |
 | `provider_dialects.<name>`      | `"openai"`                        | Wire dialect for a **config-added** provider (`"openai"` or `"anthropic"`, case-insensitive). No effect on a known provider (dialect fixed in code). Unrecognized value → hard boot failure.                                                                                                                                                                                                                                                                                            |
@@ -2647,6 +2760,7 @@ Prometheus on the default registry, exposed at `/metrics` on `metrics_listen`.
 | `store_watch`     | Generic `WatchedSet` driver — gap-free seeding + delta watch, instantiated per set                                                                    | e2e ✓          |
 | `config`          | Figment config; build keyring; pool keys / authorities by provider name                                                                               | unit ✓         |
 | `secret`          | Redacting, zeroize-on-drop `Secret<T>` newtype for pool keys and NATS creds                                                                           | unit ✓         |
+| `signed_id`       | Tenant-bound Responses ids: provider ids HMAC-signed for the tenant out, verified and stripped in; no state                     | unit ✓ + e2e ✓ |
 | `admin`           | `ServeHttp` on the metrics listener: `/livez`, `/readyz`, `/metrics`                                                                                  | e2e ✓          |
 | `metrics`         | Prometheus counter/histogram/gauge registration and update helpers                                                                                    | compile ✓      |
 | `doctor`          | Boot-time diagnostics (`beyond-ai doctor`)                                                                                                            | compile ✓      |
@@ -2673,14 +2787,24 @@ Prometheus on the default registry, exposed at `/metrics` on `metrics_listen`.
   that the usage a translated client is shown equals what `usage.rs` bills for the same upstream
   bytes, stream and not; that `peek`'s scans agree with serde_json (the provider's reading, last
   duplicate wins) on `model`, `stream`, `stream_options` and the output limits; that no field that
-  changes the answer is silently dropped; and that the route tables classify any path as
-  documented. Each property runs `PROPTEST_CASES` cases (default 2000), stopped after
+  changes the answer is silently dropped; that the route tables classify any path as
+  documented; and that a signed Responses id round-trips for its tenant, never verifies for another
+  or after any one-byte change, and is rewritten exactly where it appears in a request body or a
+  stream cut anywhere (`tests/props_signed_id.rs`). Each property runs `PROPTEST_CASES` cases (default 2000), stopped after
   `PROPS_SECS` (default 60); the weekly deep job (`.github/workflows/deep.yml`, nextest profile
   `deep`) runs 100,000 each with the box raised so all of them run. A failure prints the
   `PROPS_SEED` that replays it. Every
   counterexample that was a real defect is a named regression in `tests/props_regressions.rs`
   (and `tests/billing_streams.rs` for the metering bypass); the generators skip that exact shape,
   naming the defect, until it is fixed.
+- **Tenant-bound Responses ids end to end (`tests/signed_ids.rs`):** tenant A's response, item and
+  conversation ids, used by tenant B in each position (signed, or stripped to OpenAI's id), are a
+  400 naming the field with zero upstream hits, and so is a full item carrying A's id (D230, D231);
+  A's own ids round-trip and the upstream gets OpenAI's; JSON bodies and every SSE event are signed
+  consistently; BYO is relayed byte for byte; an id from before a rotation verifies and one from a
+  removed key does not; a tampered id is refused; no key is a 503 before any upstream; the
+  `/{provider}` route, a large body and `/v1/responses/compact` are bound the same way; and rows
+  with no store (Claude, grok) are untouched, D145 and D175 included.
 - **Translated responses end to end (`tests/translate_response.rs`):** through the real proxy with
   provider-shaped fixtures — the full Responses stream for a Claude and a GPT row, a custom tool
   call reaching a Responses client, an OpenRouter thinking signature reaching a Messages client on
@@ -2785,7 +2909,8 @@ gateway's added cost is negligible and bounded** — i.e. it never becomes the c
   the window rotation on its own; `smart::rank` / `observe` (unmeasured and fully measured);
   `cache::key` over 0/4KB/64KB/256KB plus `ResponseCache::get` miss, hit, and a 16-thread shared
   hit; `translate` request and response (chat ↔ messages, including a 64KB body) and one SSE
-  `text_delta`.
+  `text_delta`; `signed_id` sign / verify, one SSE event of each shape a Responses stream sends, and
+  a request body's check-and-strip.
 
   Left unbenched on purpose. The open and half-open breaker are the failure path; the closed
   `allow` is what every request pays, and it is already measured. A hung failover waits out
@@ -2809,6 +2934,10 @@ gateway's added cost is negligible and bounded** — i.e. it never becomes the c
   | `ResponseCache::get` hit           | ~130ns; ~450ns median at 16 threads | 4 × 55 B, flat at 64 KiB body | `Bytes` clone, not a body copy   |
   | `translate` request, chat→messages | ~2µs small, ~34µs at 64 KiB         | ~46 allocs (serde DOM, freed) | Once per cross-wire request      |
   | `translate` SSE `text_delta`       | ~1.4µs                              | ~38 allocs / ~6 KiB           | Per event, not per request       |
+  | `signed_id` sign / verify          | ~250ns                              | 1 (the output string)         | One HMAC-SHA256 (ring)           |
+  | `signed_id` SSE delta event        | ~265ns (~40ns with no id in it)     | 1 (the relayed chunk)         | Memo hit: no HMAC per delta      |
+  | `signed_id` `response.completed`   | ~810ns at 1.7 KiB                   | 1                             | One root walk, span edits        |
+  | `signed_id` request check + strip  | ~5.3µs, 20 items / 11 ids           | 25 / ~4.6 KiB                 | Once per Responses request       |
 
   Fastest sample from one full `divan` run. Ratios against `key/verify` on that run are the claim;
   absolute µs move with the host.
@@ -2819,7 +2948,9 @@ gateway's added cost is negligible and bounded** — i.e. it never becomes the c
   exceptions, and both are off the path a same-wire request with the default config pays. The SSE
   bridge is the one that adds up: ~1.4µs and ~38 allocations **per event**. A long translated
   stream pays that once a token, which is still small next to provider time-to-first-byte, and it
-  is the first hot path in this suite that allocates per event rather than per request.
+  is the first hot path in this suite that allocates per event rather than per request. The
+  tenant binding on a GPT row's Responses stream (`signed_id`) is a fifth of that: one allocation
+  and ~265ns per event that names an id, ~40ns for one that does not.
 
 - **End-to-end (`benches/e2e.rs`, `mise run bench:e2e`) — `criterion`.** Real `beyond-ai` binary
   - real nats-server + mock upstream (reuses `tests/common`). Latency group:

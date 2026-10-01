@@ -100,7 +100,8 @@ fn boot_gateway_pools(dir: &Path, pools: &[(&str, &str)]) -> (u16, ChildGuard) {
          config_bucket = \"ai-gateway\"\n\
          upstream_tls = true\n\
          \n[pool_keys]\n{pool_keys}\
-         \n[signing_keys]\n1 = \"{DEV_PUBKEY_B64}\"\n"
+         \n[signing_keys]\n1 = \"{DEV_PUBKEY_B64}\"\n\
+         \n[id_signing_keys]\n1 = \"BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=\"\n"
     );
     let config_path = dir.join("gateway.toml");
     std::fs::write(&config_path, config).unwrap();

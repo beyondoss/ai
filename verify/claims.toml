@@ -1162,6 +1162,20 @@ touches = [
 ]
 defects = []
 
+[[claim]]
+id = "SEC-25"
+priority = "P0"
+group = "Security and isolation"
+text = "Responses state a provider keeps under the pool key is tenant-bound: managed ids are signed for the tenant, and another tenant's, a raw or an altered id is refused before any upstream"
+layer = "both"
+clients = ["openai-py"]
+touches = [
+  "crates/gateway/src/signed_id.rs",
+  "crates/gateway/src/proxy.rs",
+  "crates/gateway/src/config.rs",
+]
+defects = ["D230", "D231"]
+
 # --- Billing integrity -------------------------------------------------------------------------
 [[claim]]
 id = "BIL-1"

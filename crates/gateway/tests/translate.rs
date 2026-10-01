@@ -811,8 +811,13 @@ async fn stock_responses_claude_translates_to_messages() {
     );
 }
 
-fn gpt_responses_session() -> &'static str {
-    r#"{"model":"gpt-4o","input":[{"role":"user","content":[{"type":"input_text","text":"hi"}]}],"previous_response_id":"resp_abc","include":["reasoning.encrypted_content"],"truncation":"auto"}"#
+/// A turn continuing tenant 42's `resp_abc`, the id as the gateway issued it to that tenant
+/// (`signed_id.rs`). The upstream gets `resp_abc` back.
+fn gpt_responses_session() -> String {
+    let prev = dev_id_signer().sign(42, "resp_abc");
+    format!(
+        r#"{{"model":"gpt-4o","input":[{{"role":"user","content":[{{"type":"input_text","text":"hi"}}]}}],"previous_response_id":"{prev}","include":["reasoning.encrypted_content"],"truncation":"auto"}}"#
+    )
 }
 
 fn gpt_responses_one_shot() -> &'static str {

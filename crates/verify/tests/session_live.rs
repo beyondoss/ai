@@ -346,6 +346,7 @@ fn run(s: Scenario, keys: &BTreeMap<String, String>) -> Result<(), Failed> {
         cfg.push_str(&format!("\n[provider_authorities]\n{authorities}"));
     }
     cfg.push_str(&format!("\n[signing_keys]\n1 = \"{DEV_PUBKEY_B64}\"\n"));
+    cfg.push_str(common::DEV_ID_SIGNING_TOML);
     let cfg_path = dir.join("gateway.toml");
     std::fs::write(&cfg_path, cfg).map_err(|e| e.to_string())?;
 

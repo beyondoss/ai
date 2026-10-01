@@ -351,6 +351,9 @@ pub struct GatewayState {
 
     /// Trusted Ed25519 public keys by kid — from config (rotate via redeploy). Static for life.
     pub keyring: Keyring,
+    /// Signs and verifies tenant-bound Responses ids (`signed_id.rs`). `None` without
+    /// `id_signing_keys`: a managed Responses relay to a store is then a 503.
+    pub id_signer: Option<crate::signed_id::Signer>,
     /// Resolved providers by name (upstream authority/host + precomputed managed auth value). Built
     /// once at boot from `route::KNOWN_PROVIDERS` + config; the request path clones the `Arc`.
     providers: HashMap<String, Arc<Provider>>,
@@ -454,6 +457,19 @@ impl FaultPanic {
 impl GatewayState {
     pub fn new(config: AiConfig, metrics: Arc<Metrics>) -> Result<Arc<Self>> {
         let keyring = config.build_keyring()?;
+        let id_signer = config.build_id_signer()?;
+        // Without it every managed Responses turn on a GPT row (and every managed
+        // `/{provider}/…/responses`) is a 503: the ids it would relay sit in one provider org
+        // that every tenant shares (`signed_id.rs`). Other traffic is unaffected, so this warns
+        // rather than refusing to boot.
+        if id_signer.is_none() && !config.signing_keys.is_empty() {
+            warn!(
+                "no id_signing_keys configured — managed /v1/responses on GPT rows and managed \
+                 /{{provider}}/…/responses will 503 (fail-closed: their response ids would be \
+                 resolvable by every tenant). Set AI_ID_SIGNING_KEY_<kid> to the base64 of 32 \
+                 random bytes."
+            );
+        }
         // No signing keys ⇒ every `bai_v1…` fails verify and 401s (fail-closed). BYO still works.
         // That's a *valid* mode (a BYO-only deployment), but a far more common cause is a
         // missing/typo'd `signing_keys` (SSM param, env) — which 401s every managed tenant. A
@@ -542,6 +558,7 @@ impl GatewayState {
         Ok(Arc::new(Self {
             metrics,
             keyring,
+            id_signer,
             providers,
             by_id,
             deny: ArcSwap::from_pointee(DenySet::new()),

@@ -55,6 +55,9 @@ h2 = "0.4"
 http = "1"
 memchr = "2"
 prometheus = "0.13"
+# HMAC-SHA256 for tenant-bound Responses ids (`signed_id.rs`). Already in the tree as rustls' crypto
+# provider: no build-graph cost.
+ring = "0.17"
 rustc-hash = "2"
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 serde.workspace = true

@@ -386,6 +386,7 @@ dependencies = [
  "proptest",
  "rcgen",
  "reqwest",
+ "ring",
  "rustc-hash",
  "rustls",
  "serde",

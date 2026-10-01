@@ -2247,3 +2247,31 @@ state = "fixed"
 test = "the_allowlist_and_the_routing_tables_agree_for_every_endpoint"
 fix = "8d04ec8"
 note = "Fixed by one table, route::ENDPOINT_PATHS (suffix, endpoint, sub-resource), read through endpoint_of_path / forward_endpoint (by suffix under any mount prefix, query ignored) and catalog_endpoint (exact, /v1 optional under /auto), with one normalisation per kind of path (a forwarded path drops one trailing slash and, for path+query callers, its query; a catalog path drops every trailing slash, as prop_documented_paths_classify_as_the_table_says pins). is_managed_provider_endpoint, wire_of_forward_path (falls back to Endpoint::of_upstream_path only for a path in no row, a BYO key's), is_streamable_path, forward_is_responses (D202), implied_endpoint and SubResource::of_path / of_forward_path are lookups into it. Every existing test is unchanged and green (is_streamable_path still takes a path without its query, as is_streamable_path_must_be_given_the_path_without_the_query pins). No behavior change for any path the old tables classified, except that is_streamable_path now also accepts one trailing slash."
+
+[[defect]]
+id = "D230"
+severity = "critical"
+area = "Security"
+title = "One tenant can continue or read another tenant's stored OpenAI Responses state"
+impact = "Every managed tenant shares Beyond's OpenAI organization through the pool key, and OpenAI stores every response by default. A response id, conversation id or output item id from another tenant (leaked in a log, a ticket or a client bug), sent as previous_response_id, conversation or an item_reference on a GPT row or a managed /openai/v1/responses, was relayed as sent, and OpenAI resolved it: the caller read and continued the other tenant's conversation."
+confidence = "high"
+evidence = "Owner review 2026-10-01; proxy.rs relayed same-wire Responses bodies and answers byte for byte on GPT rows' Responses arms and managed /{provider}/…/responses. Direct to OpenAI 2026-10-01 (gpt-4.1-nano, one key): an item_reference to a msg_ id from an earlier response, and previous_response_id, resolve across any two requests on the key."
+claims = ["SEC-25"]
+state = "fixed"
+test = "a_tenants_response_id_is_refused_for_another_tenant"
+fix = ""
+note = "Fixed directly by tenant-bound ids (signed_id.rs): every provider id in a managed Responses relay's 2xx is rewritten to an HMAC-signed id bound to the tenant, and every id sent back must verify for the caller and is stripped to the provider id before forwarding; anything else is a 400 before any upstream. Stateless: no mapping is stored."
+
+[[defect]]
+id = "D231"
+severity = "high"
+area = "Security"
+title = "A full Responses input item carrying a stored item's id is answered from OpenAI's store"
+impact = "Checking only item_reference would not have closed D230: OpenAI resolves the id on a full input item too, and answers from the stored item rather than the content sent. A tenant could put another tenant's msg_ or rs_ id on an assistant message or reasoning item of its own and read the stored content."
+confidence = "high"
+evidence = "Direct to OpenAI 2026-10-01 (gpt-4.1-nano): response R1 answered 'The secret word is PELICAN.' (msg_0750…474fea). A new request with input [{type: message, role: assistant, id: <that msg id>, content: [{type: output_text, text: 'Hello there.'}]}, {role: user, content: 'Quote your previous message exactly.'}] answered 'The secret word is PELICAN.' The same item with a fabricated msg_ id, or with no id, answered from the content sent."
+claims = ["SEC-25"]
+state = "fixed"
+test = "a_full_item_carrying_another_tenants_id_is_refused"
+fix = ""
+note = "Fixed with D230: the id of every input item, not only item_reference, must be signed for the caller (signed_id::Signer::unsign_request)."

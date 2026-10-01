@@ -210,6 +210,16 @@ pub fn test_client() -> reqwest::Client {
         .expect("build test client")
 }
 
+/// The `[id_signing_keys]` table, when there is one.
+fn write_id_signing_toml(cfg: &mut String, keys: Option<&IdSigning>) {
+    if let Some((keys, _)) = keys {
+        cfg.push_str("\n[id_signing_keys]\n");
+        for (kid, secret) in keys {
+            cfg.push_str(&format!("{kid} = \"{}\"\n", b64(secret)));
+        }
+    }
+}
+
 /// Base64 (standard) — used to put an Ed25519 public key into the gateway's `signing_keys` config.
 pub fn b64(bytes: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(bytes)
@@ -1080,9 +1090,39 @@ pub struct GatewayBuilder {
     /// verify phase 0: billing — raw `key = value` scalars and child env (see the marked block).
     extra_config: Vec<String>,
     env_overrides: Vec<(String, String)>,
+    /// `[id_signing_keys]` (kid → raw secret) and `id_signing_kid`. Defaults to [`DEV_ID_SECRET`]
+    /// under kid `1`; `None` writes no table (managed Responses on a GPT row then 503s).
+    id_signing: Option<IdSigning>,
+}
+
+/// `[id_signing_keys]` (kid → raw secret) and the `id_signing_kid` that signs, if named.
+type IdSigning = (Vec<(char, Vec<u8>)>, Option<char>);
+
+/// The test gateway's default id signing secret (kid `1`): what [`dev_id_signer`] signs with.
+pub const DEV_ID_SECRET: [u8; 32] = [7; 32];
+
+/// A signer holding the test gateway's default id signing key, to mint and read the signed ids
+/// a test gateway issues (`signed_id.rs`).
+pub fn dev_id_signer() -> beyond_ai::signed_id::Signer {
+    beyond_ai::signed_id::Signer::new(&[(b'1', &DEV_ID_SECRET)], b'1').unwrap()
 }
 
 impl GatewayBuilder {
+    /// Replace the id signing keys (kid → raw secret) and name the one that signs new ids.
+    pub fn id_signing_keys(mut self, keys: &[(char, &[u8])], current: char) -> Self {
+        self.id_signing = Some((
+            keys.iter().map(|(k, s)| (*k, s.to_vec())).collect(),
+            Some(current),
+        ));
+        self
+    }
+
+    /// Configure no id signing key at all.
+    pub fn without_id_signing_keys(mut self) -> Self {
+        self.id_signing = None;
+        self
+    }
+
     /// Set which providers are configured. Defaults to `["openai", "fireworks"]`.
     pub fn providers(mut self, providers: &[&'static str]) -> Self {
         self.providers = providers.to_vec();
@@ -1272,6 +1312,9 @@ impl GatewayBuilder {
             cfg.push_str(line);
             cfg.push('\n');
         }
+        if let Some((_, Some(kid))) = &self.id_signing {
+            cfg.push_str(&format!("id_signing_kid = \"{kid}\"\n"));
+        }
         if let Some(threshold) = self.circuit_breaker_threshold {
             // Tight window + reset so the test trips and recovers quickly.
             cfg.push_str(&format!(
@@ -1293,6 +1336,7 @@ impl GatewayBuilder {
             }
             if !self.signkey_b64.is_empty() {
                 cfg.push_str(&format!("\n[signing_keys]\n1 = \"{}\"\n", self.signkey_b64));
+                write_id_signing_toml(&mut cfg, self.id_signing.as_ref());
             }
             // Authority overrides still apply in real-upstream mode, so a smoke test can point one
             // provider at a dead port while the rest stay real — which is what proves a *live*
@@ -1327,6 +1371,7 @@ impl GatewayBuilder {
                 write_pool_keys_toml(&mut cfg, p, &keys);
             }
             cfg.push_str(&format!("\n[signing_keys]\n1 = \"{}\"\n", self.signkey_b64));
+            write_id_signing_toml(&mut cfg, self.id_signing.as_ref());
         }
         std::fs::File::create(&config_path)
             .unwrap()
@@ -1458,6 +1503,7 @@ impl Gateway {
             wait_allowance_ready: true,
             extra_config: Vec::new(),
             env_overrides: Vec::new(),
+            id_signing: Some((vec![('1', DEV_ID_SECRET.to_vec())], None)),
         }
     }
 

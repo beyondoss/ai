@@ -163,8 +163,10 @@ async fn a_large_embeddings_batch_with_input_first_is_served() {
 async fn large_responses_session_state_after_input_walks_the_responses_arm() {
     let (mock, gw, sk) = gateway(Mode::Json).await;
     let filler = "y".repeat(150 * 1024);
+    // The id as the gateway issued it to tenant 42 (`signed_id.rs`); the upstream gets `resp_123`.
+    let prev = dev_id_signer().sign(42, "resp_123");
     let body = format!(
-        r#"{{"input":"{filler}","model":"gpt-4o-mini","previous_response_id":"resp_123","store":true}}"#
+        r#"{{"input":"{filler}","model":"gpt-4o-mini","previous_response_id":"{prev}","store":true}}"#
     );
     let resp = client()
         .post(format!("{}/v1/responses", gw.url()))

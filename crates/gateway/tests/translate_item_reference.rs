@@ -279,7 +279,8 @@ async fn a_turn_reference_is_refused_before_the_upstream() {
 }
 
 /// A GPT row relays every `item_reference`, a tool step's and a turn's alike, to OpenAI's
-/// Responses arm byte for byte: OpenAI holds the items.
+/// Responses arm byte for byte, less the tenant binding on each id (`signed_id.rs`): OpenAI holds
+/// the items, and gets its own ids back.
 /// claim: E3
 /// defect: D175
 #[tokio::test]
@@ -290,17 +291,24 @@ async fn a_gpt_row_relays_item_references_unchanged() {
         .providers(&["openai", "openrouter", "anthropic"])
         .start()
         .await;
-    for input in [
-        vec![user("a"), reference("msg_1"), user("b")],
-        vec![
-            user("a"),
-            reference("msg_1"),
-            call("c1", "Paris"),
-            output("c1", "sunny"),
-        ],
-    ] {
+    let issued = dev_id_signer().sign(42, "msg_1");
+    let inputs = |id: &str| {
+        [
+            vec![user("a"), reference(id), user("b")],
+            vec![
+                user("a"),
+                reference(id),
+                call("c1", "Paris"),
+                output("c1", "sunny"),
+            ],
+        ]
+    };
+    for (input, upstream) in inputs(&issued).into_iter().zip(inputs("msg_1")) {
         let body = json!({"model": "gpt-4o", "tools": weather_tool(), "input": input});
-        let sent = serde_json::to_vec(&body).unwrap();
+        let sent = serde_json::to_vec(
+            &json!({"model": "gpt-4o", "tools": weather_tool(), "input": upstream}),
+        )
+        .unwrap();
         let (status, text) = post(&gw, &sk, &body).await;
         assert_eq!(status, 200, "{text}");
         let cap = mock.captured().unwrap();

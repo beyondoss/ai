@@ -79,12 +79,19 @@ pub enum Rejection {
     /// row, tools on a tool-less one). 400 before any upstream, which would ignore the image or
     /// answer 500, or call the tools badly.
     Modality,
+    /// A managed Responses request to a provider's store sent back an id that is not signed for
+    /// its tenant (another tenant's, a raw provider id, an altered one: `signed_id.rs`). 400
+    /// before any upstream.
+    ForeignId,
+    /// A managed Responses request to a provider's store with no `id_signing_keys` configured:
+    /// 503, fail-closed, rather than relaying ids every tenant could resolve.
+    IdSigningUnset,
 }
 
 impl Rejection {
     /// Every variant, in `as_index` order. The array in `Metrics` is built from this, so adding a
     /// variant without adding it here fails the exhaustive `match` in `as_index`.
-    pub(crate) const ALL: [Rejection; 20] = [
+    pub(crate) const ALL: [Rejection; 22] = [
         Rejection::Auth,
         Rejection::DenySpend,
         Rejection::DenyFraud,
@@ -105,6 +112,8 @@ impl Rejection {
         Rejection::DuplicateModel,
         Rejection::BodyMemory,
         Rejection::Modality,
+        Rejection::ForeignId,
+        Rejection::IdSigningUnset,
     ];
 
     /// The `reason=` label value. `RateLimit` keeps the original `"rate_limit"` string so existing
@@ -131,6 +140,8 @@ impl Rejection {
             Rejection::DuplicateModel => "duplicate_model",
             Rejection::BodyMemory => "body_memory",
             Rejection::Modality => "modality",
+            Rejection::ForeignId => "foreign_id",
+            Rejection::IdSigningUnset => "id_signing_unset",
         }
     }
 
@@ -156,6 +167,8 @@ impl Rejection {
             Rejection::DuplicateModel => 17,
             Rejection::BodyMemory => 18,
             Rejection::Modality => 19,
+            Rejection::ForeignId => 20,
+            Rejection::IdSigningUnset => 21,
         }
     }
 }

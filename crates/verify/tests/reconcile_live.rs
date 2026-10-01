@@ -460,7 +460,8 @@ impl Gateway {
             "listen = \"127.0.0.1:{port}\"\nmetrics_listen = \"127.0.0.1:{metrics_port}\"\n\
              nats_url = \"nats://127.0.0.1:{nats_port}\"\nconfig_bucket = \"ai-gateway\"\n\
              upstream_tls = true\n\n[pool_keys]\n{provider} = [{pool:?}]\n\n\
-             [signing_keys]\n1 = \"{DEV_PUBKEY_B64}\"\n"
+             [signing_keys]\n1 = \"{DEV_PUBKEY_B64}\"\n{}",
+            common::DEV_ID_SIGNING_TOML
         );
         let cfg_path = dir.join("gateway.toml");
         std::fs::write(&cfg_path, cfg).map_err(|e| e.to_string())?;
