@@ -221,6 +221,104 @@ async fn a_reused_connection_failure_after_the_body_is_not_resent() {
     );
 }
 
+/// An HTTP/1.1 upstream that closes a keep-alive connection with the next request unread in it, the
+/// idle-close race: it serves the first request on every connection, then waits for the whole of
+/// the second to arrive and closes without reading it, so its kernel answers with a reset. Returns
+/// the port and how many times that fired.
+async fn closes_reused_connections_unread() -> (u16, std::sync::Arc<std::sync::atomic::AtomicUsize>)
+{
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    const OK: &str = r#"{"id":"c","object":"chat.completion","model":"gpt-4o-mini","choices":[{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}],"usage":{"prompt_tokens":11,"completion_tokens":7,"total_tokens":18}}"#;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let fired = std::sync::Arc::new(AtomicUsize::new(0));
+    let count = fired.clone();
+    // Bytes that make up one whole request at the front of `buf`, if they are all there.
+    fn whole(buf: &[u8]) -> Option<usize> {
+        let head = buf.windows(4).position(|w| w == b"\r\n\r\n")? + 4;
+        let text = String::from_utf8_lossy(&buf[..head]).to_ascii_lowercase();
+        let len = text
+            .lines()
+            .find_map(|l| l.strip_prefix("content-length:"))
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(0);
+        (buf.len() >= head + len).then_some(head + len)
+    }
+    tokio::spawn(async move {
+        while let Ok((mut s, _)) = listener.accept().await {
+            let count = count.clone();
+            tokio::spawn(async move {
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 16 * 1024];
+                while whole(&buf).is_none() {
+                    match s.read(&mut chunk).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                    }
+                }
+                let reply = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{OK}",
+                    OK.len()
+                );
+                if s.write_all(reply.as_bytes()).await.is_err() {
+                    return;
+                }
+                // The next request: wait until all of it sits in the socket, then close unread.
+                let mut peek = vec![0u8; 64 * 1024];
+                loop {
+                    match s.peek(&mut peek).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) if whole(&peek[..n]).is_some() => break,
+                        Ok(_) => tokio::time::sleep(Duration::from_millis(5)).await,
+                    }
+                }
+                count.fetch_add(1, Ordering::SeqCst);
+                drop(s);
+            });
+        }
+    });
+    (port, fired)
+}
+
+/// A pooled connection the provider closed with the request unread (it answers with a reset, before
+/// any response byte) never reached a server, so the gateway resends it on a fresh connection, as
+/// pingora does for a reused connection. A small body is read straight through to the upstream:
+/// nothing reads it ahead of connecting, so "the body was read" is not mistaken for "the provider
+/// took it" (D80). A clean end-of-file after the body stays unretried (see the test above, D09).
+/// claim: REL-1
+/// defect: D80
+#[tokio::test]
+async fn a_reused_connection_reset_before_reading_is_resent() {
+    let (port, fired) = closes_reused_connections_unread().await;
+    let (pubkey, _sk) = test_keypair(1);
+    let gw = Gateway::builder(
+        unused_nats_port(),
+        &format!("127.0.0.1:{port}"),
+        &b64(&pubkey),
+    )
+    .start()
+    .await;
+    let client = reqwest::Client::new();
+    for i in 0..6 {
+        let resp = client
+            .post(format!("{}/openai/v1/chat/completions", gw.url()))
+            .header("authorization", "Bearer sk-byo-test")
+            .header("content-type", "application/json")
+            .body(body())
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("request {i}: {e}; log:\n{}", gw.log()));
+        let status = resp.status().as_u16();
+        let text = resp.text().await.unwrap_or_default();
+        assert_eq!(status, 200, "request {i}: {text}\n{}", gw.log());
+    }
+    assert!(
+        fired.load(std::sync::atomic::Ordering::SeqCst) > 0,
+        "no pooled connection was reused, so the scenario did not fire"
+    );
+}
+
 /// A retry pingora *does* make — the managed 429 key walk — replays its buffered request body
 /// through `request_body_filter`, which is what `RequestCtx::reset_request_body_phase` exists to
 /// make idempotent. The retried body must be whole and well-formed, not the original with a

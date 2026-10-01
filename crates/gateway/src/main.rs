@@ -20,6 +20,7 @@ use beyond_ai::store_watch::{Allowance, Capture, Deny, WatcherService};
 use clap::{Parser, Subcommand};
 use pingora_core::apps::HttpServerOptions;
 use pingora_core::apps::http_app::HttpServer;
+use pingora_core::listeners::TcpSocketOptions;
 use pingora_core::server::configuration::ServerConf;
 use pingora_core::server::{
     RunArgs, Server, ShutdownSignal, ShutdownSignalWatch, UnixShutdownSignalWatch,
@@ -303,7 +304,12 @@ fn main() {
         proxy_builder = proxy_builder.server_options(opts);
     }
     let mut proxy_svc = proxy_builder.build();
-    proxy_svc.add_tcp(&listen);
+    // TCP keepalive on accepted client sockets (see `tcp_keepalive_idle_secs`): a client that
+    // vanished during a silent model turn is dropped, and its slots freed, within the keepalive
+    // bound rather than when the model next speaks. `TcpSocketOptions` is `#[non_exhaustive]`.
+    let mut sock = TcpSocketOptions::default();
+    sock.tcp_keepalive = state.config.downstream_tcp_keepalive();
+    proxy_svc.add_tcp_with_settings(&listen, sock);
     // Size the proxy's worker pool. Pingora resolves a service's thread count as
     // `service.threads().unwrap_or(conf.threads)` (`server/mod.rs`), and `ServerConf::default()` is
     // `threads: 1` — so leaving this `None` runs every request filter, the Ed25519 verify, the body

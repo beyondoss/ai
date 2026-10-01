@@ -9,11 +9,13 @@ use crate::key::{Keyring, Kid};
 use crate::secret::Secret;
 use figment::Figment;
 use figment::providers::{Env, Format, Toml};
+use pingora_core::protocols::TcpKeepalive;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
 use std::ops::Deref;
 use std::path::Path;
+use std::time::Duration;
 
 /// One provider's pool keys.
 ///
@@ -208,6 +210,12 @@ pub struct AiConfig {
 
     /// Upstream timeouts (seconds). Streaming responses are long, so read/idle are generous.
     pub connect_timeout_secs: u64,
+    /// The longest the provider may stay silent: before its response head, or between body reads
+    /// (pingora has one per-read upstream timeout). 600 s, the OpenAI and Anthropic SDKs' default
+    /// request timeout, so the gateway never gives up on a slow-but-alive provider before the
+    /// client itself would. Silence is not a failure signal: a model thinking without emitting
+    /// looks exactly like a stuck provider. A *dead* provider connection is caught sooner, by
+    /// transport liveness (`h2_ping_interval_secs`, `tcp_keepalive_*`).
     pub read_timeout_secs: u64,
     pub write_timeout_secs: u64,
     pub idle_timeout_secs: u64,
@@ -217,16 +225,38 @@ pub struct AiConfig {
     /// half-dead connection) otherwise held its in-flight slot, its tenant slot, its upstream
     /// connection and possibly a half-open probe permit forever, since nothing else times out a
     /// blocked write. Per write: a slow but steady reader never trips it. `0` disables it.
+    ///
+    /// Not a guess at model behavior, and not replaceable by keepalive: it judges a client that
+    /// stopped consuming bytes the gateway already holds. A live process that stops reading still
+    /// ACKs at the kernel and advertises a zero window, so TCP keepalive (which probes only an idle
+    /// connection) reports it healthy forever, and its own timeout cannot fire because it is not
+    /// waiting on anything. A client that reads at all drains a full socket buffer within a few
+    /// round trips; 60 s of zero progress is hundreds of them.
     pub client_write_timeout_secs: u64,
 
-    /// The longest a provider may stay silent on a request that asked for a stream (root
-    /// `"stream": true`, read before connecting): before its response head, or between body
-    /// reads. A streaming provider answers its head at once and then keeps sending, so a longer
-    /// silence is a stall, ended with a JSON 504 rather than held for `read_timeout_secs` (600 s).
-    /// Pingora has one per-read upstream timeout, so this one bound covers the first byte and the
-    /// gaps alike. Requests that do not stream, or whose body is not read ahead (a large body on
-    /// `/{provider}` or BYO), keep `read_timeout_secs`. Capped by it; `0` disables.
-    pub stream_idle_timeout_secs: u64,
+    /// HTTP/2 PING interval on upstream connections (seconds); `0` disables. A provider that stops
+    /// acknowledging (a dead host, a partition, a wedged edge) fails the connection and every
+    /// stream on it within this interval plus pingora's fixed 5 s ACK deadline, however silent the
+    /// model is meant to be: a PING is answered by the peer's HTTP/2 stack, not by the model. 15 s:
+    /// the bound it buys (≤ 20 s) is far under any client's patience, and one 17-byte frame and its
+    /// ACK per connection per interval is negligible next to a token stream. The 5 s ACK deadline is
+    /// over ten worst-case intercontinental round trips (~300 ms) and fits several TCP
+    /// retransmissions, so a live but distant peer never misses it.
+    pub h2_ping_interval_secs: u64,
+    /// TCP keepalive on upstream and client connections: probe after this many idle seconds, every
+    /// `tcp_keepalive_interval_secs`, and drop the peer after `tcp_keepalive_count` unanswered
+    /// probes; `0` disables. Probes are answered by the peer's kernel, so a live process that is
+    /// merely quiet always passes, and a vanished host fails within idle + interval × count
+    /// (15 + 5 × 3 = 30 s). Upstream it covers HTTP/1.1 providers, which have no PING, and the
+    /// connection is also given `TCP_USER_TIMEOUT` of the same 30 s, so data the provider never
+    /// acknowledges (a partition mid-request, where keepalive does not probe) fails as fast.
+    /// Toward clients it frees a vanished client's slot during a silent model turn, when the
+    /// gateway has nothing to write. The interval is 15 × a 300 ms worst-case round trip and well
+    /// past Linux's 200 ms minimum retransmission timeout; three probes ride out two lost ones.
+    /// The kernel's own default (2 h idle, 9 × 75 s) is far too slow to matter.
+    pub tcp_keepalive_idle_secs: u64,
+    pub tcp_keepalive_interval_secs: u64,
+    pub tcp_keepalive_count: u32,
 
     /// Most request-body bytes this process holds in memory at once, across every request. A body
     /// past pingora's 64 KiB replay buffer is read in full for a catalog walk (twice over while its
@@ -401,7 +431,10 @@ impl Default for AiConfig {
             write_timeout_secs: 60,
             idle_timeout_secs: 90,
             client_write_timeout_secs: 60,
-            stream_idle_timeout_secs: 120,
+            h2_ping_interval_secs: 15,
+            tcp_keepalive_idle_secs: 15,
+            tcp_keepalive_interval_secs: 5,
+            tcp_keepalive_count: 3,
             max_buffered_body_bytes: 512 * 1024 * 1024,
             // Drain for the full request lifetime (= read_timeout_secs) so a deploy never truncates
             // an in-flight stream — we're a transparent proxy and must not mangle a paid-for
@@ -508,6 +541,16 @@ impl AiConfig {
         if self.read_timeout_secs == 0 {
             return Err(GatewayError::Config(
                 "read_timeout_secs must be > 0 (a 0 read timeout aborts every response before it arrives)"
+                    .to_string(),
+            ));
+        }
+        // The kernel rejects a zero probe interval or count (EINVAL), which would fail every
+        // upstream connect and leave every accepted client socket without keepalive.
+        if self.tcp_keepalive_idle_secs > 0
+            && (self.tcp_keepalive_interval_secs == 0 || self.tcp_keepalive_count == 0)
+        {
+            return Err(GatewayError::Config(
+                "tcp_keepalive_interval_secs and tcp_keepalive_count must be > 0 when                  tcp_keepalive_idle_secs is set; set tcp_keepalive_idle_secs = 0 to disable keepalive"
                     .to_string(),
             ));
         }
@@ -697,6 +740,47 @@ fn read_toml(path: &Path) -> Result<PreRead> {
             meta: provider.metadata(),
             data: figment::value::Map::new(),
         }),
+    }
+}
+
+impl AiConfig {
+    /// The upstream HTTP/2 PING interval (see `h2_ping_interval_secs`).
+    pub fn h2_ping_interval(&self) -> Option<Duration> {
+        (self.h2_ping_interval_secs > 0).then(|| Duration::from_secs(self.h2_ping_interval_secs))
+    }
+
+    /// TCP keepalive for an upstream connection: the probes, plus `TCP_USER_TIMEOUT` at the same
+    /// bound so unacknowledged request bytes (where keepalive does not probe) fail as fast.
+    pub fn upstream_tcp_keepalive(&self) -> Option<TcpKeepalive> {
+        self.tcp_keepalive(true)
+    }
+
+    /// TCP keepalive for an accepted client connection. No `TCP_USER_TIMEOUT`: a live client that
+    /// stops reading (zero window) is `client_write_timeout_secs`'s to judge, not the kernel's.
+    pub fn downstream_tcp_keepalive(&self) -> Option<TcpKeepalive> {
+        self.tcp_keepalive(false)
+    }
+
+    fn tcp_keepalive(&self, user_timeout: bool) -> Option<TcpKeepalive> {
+        if self.tcp_keepalive_idle_secs == 0 {
+            return None;
+        }
+        let idle = Duration::from_secs(self.tcp_keepalive_idle_secs);
+        let interval = Duration::from_secs(self.tcp_keepalive_interval_secs);
+        let count = self.tcp_keepalive_count as usize;
+        #[cfg(not(target_os = "linux"))]
+        let _ = user_timeout;
+        Some(TcpKeepalive {
+            idle,
+            interval,
+            count,
+            #[cfg(target_os = "linux")]
+            user_timeout: if user_timeout {
+                idle + interval * self.tcp_keepalive_count
+            } else {
+                Duration::ZERO
+            },
+        })
     }
 }
 

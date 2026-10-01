@@ -256,29 +256,6 @@ impl ModelScanner {
 /// always inside a non-empty object (a root `"stream"` is present), so the caller always follows the
 /// fragment with a comma.
 pub fn plan_stream_usage_injection(body: &[u8]) -> Option<usize> {
-    root_stream(body, true)
-        .filter(|s| s.stream_true && !s.has_options)
-        .map(|s| s.insert_at)
-}
-
-/// Whether a request body asks for a streamed response: a root-level `"stream": true`, with or
-/// without `stream_options`. Same structural walk as [`plan_stream_usage_injection`].
-pub fn requests_stream(body: &[u8]) -> bool {
-    root_stream(body, false).is_some_and(|s| s.stream_true)
-}
-
-/// What [`root_stream`] found at the root of a JSON object.
-struct RootStream {
-    /// Just past the root object's opening `{`.
-    insert_at: usize,
-    stream_true: bool,
-    has_options: bool,
-}
-
-/// One structural walk for the root `stream` / `stream_options` keys. `None` when the body is not
-/// a JSON object or never mentions `"stream"`. With `stop_at_options`, a root `stream_options`
-/// ends the walk at once (the injection planner's answer is then known).
-fn root_stream(body: &[u8], stop_at_options: bool) -> Option<RootStream> {
     let n = body.len();
     // Cheap pre-filter: injection is only ever needed when a root-level `"stream"` key is present.
     // If the quoted token `"stream"` doesn't occur *anywhere*, the structural answer is
@@ -310,7 +287,6 @@ fn root_stream(body: &[u8], stop_at_options: bool) -> Option<RootStream> {
     // The current root-level key is exactly `stream` (so the next literal is its value).
     let mut last_key_is_stream = false;
     let mut stream_true = false;
-    let mut has_options = false;
 
     let mut j = i;
     while j < n {
@@ -340,14 +316,7 @@ fn root_stream(body: &[u8], stop_at_options: bool) -> Option<RootStream> {
                         // answer is `None` regardless of anything else in the body, so stop now
                         // rather than walking the remainder for a result we already know.
                         if key == b"stream_options" {
-                            has_options = true;
-                            if stop_at_options {
-                                return Some(RootStream {
-                                    insert_at,
-                                    stream_true,
-                                    has_options,
-                                });
-                            }
+                            return None;
                         }
                         last_key_is_stream = key == b"stream";
                     }
@@ -393,11 +362,8 @@ fn root_stream(body: &[u8], stop_at_options: bool) -> Option<RootStream> {
         j += 1;
     }
 
-    Some(RootStream {
-        insert_at,
-        stream_true,
-        has_options,
-    })
+    // `stream_options` would have already returned `None` above, so reaching here means it's absent.
+    if stream_true { Some(insert_at) } else { None }
 }
 
 /// Both answers the injection path needs from a **fully buffered** request body.
@@ -990,16 +956,6 @@ mod tests {
     #[test]
     fn stream_can_be_the_only_or_last_key() {
         assert!(plan_stream_usage_injection(br#"{"stream":true}"#).is_some());
-        assert!(requests_stream(br#"{"stream":true}"#));
-        assert!(requests_stream(
-            br#"{"stream_options":{"include_usage":true},"stream":true}"#
-        ));
-        assert!(!requests_stream(br#"{"stream":false}"#));
-        assert!(!requests_stream(
-            br#"{"messages":[{"stream":true}],"model":"m"}"#
-        ));
-        assert!(!requests_stream(br#"{"content":"\"stream\": true"}"#));
-        assert!(!requests_stream(b"[]"));
         let v: serde_json::Value =
             serde_json::from_str(&inject(r#"{"model":"x","stream":true}"#)).unwrap();
         assert_eq!(

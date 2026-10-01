@@ -478,6 +478,14 @@ fn stall_sse(anthropic: bool) -> String {
 /// the connection.
 pub struct StallingBody(Option<Bytes>);
 
+impl StallingBody {
+    /// `first`, then nothing ever again.
+    #[allow(dead_code)]
+    pub fn new(first: Bytes) -> Self {
+        StallingBody(Some(first))
+    }
+}
+
 impl hyper::body::Body for StallingBody {
     type Data = Bytes;
     type Error = std::io::Error;

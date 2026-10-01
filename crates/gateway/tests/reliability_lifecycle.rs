@@ -126,76 +126,265 @@ async fn a_header_stall_ends_at_the_configured_read_timeout() {
     );
 }
 
-/// A streaming request whose upstream never sends a response head must fail well under the 600s
-/// `read_timeout_secs`: a stall bound below it has to exist. That bound is
-/// `stream_idle_timeout_secs`, 120s by default (asserted below, against the default read timeout);
-/// the e2e half configures it to 2s, leaving `read_timeout_secs` at its default, so the stall is
-/// observed ending in a JSON 504 within seconds rather than after two minutes.
-/// claim: REL-7
-/// defect: D36
-#[tokio::test]
-async fn a_streaming_header_stall_fails_well_under_read_timeout_by_default() {
-    let defaults = beyond_ai::config::AiConfig::default();
-    assert!(
-        defaults.stream_idle_timeout_secs > 0
-            && defaults.stream_idle_timeout_secs * 4 <= defaults.read_timeout_secs,
-        "a default stream stall bound well under read_timeout_secs: {} vs {}",
-        defaults.stream_idle_timeout_secs,
-        defaults.read_timeout_secs
-    );
-    let (pubkey, _sk) = test_keypair(1);
-    let mock = ReplyUpstream::start(|_, _| Reply::HeaderStall).await;
-    let gw = Gateway::builder(unused_nats_port(), &mock.authority(), &b64(&pubkey))
-        .config_line("stream_idle_timeout_secs = 2")
-        .start()
-        .await;
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(15))
-        .build()
+/// A TLS HTTP/2 upstream. Each request waits `head_delay`, then gets a 200 SSE head and one event
+/// and no more. With `freeze`, the connection stops being driven shortly after that event: the
+/// socket stays open and the kernel still ACKs TCP, but HTTP/2 PINGs go unanswered — a wedged
+/// peer, the case only H2 PING can see.
+async fn h2_upstream(head_delay: Duration, freeze: bool) -> (u16, tokio::task::JoinHandle<()>) {
+    use hyper::service::service_fn;
+    use hyper_util::rt::{TokioExecutor, TokioIo};
+    use std::sync::Arc;
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let ck = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string()]).unwrap();
+    let key = rustls::pki_types::PrivateKeyDer::Pkcs8(ck.key_pair.serialize_der().into());
+    let mut tls = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(vec![ck.cert.der().clone()], key)
         .unwrap();
+    tls.alpn_protocols = vec![b"h2".to_vec()];
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls));
+    let task = tokio::spawn(async move {
+        while let Ok((s, _)) = listener.accept().await {
+            let acceptor = acceptor.clone();
+            tokio::spawn(async move {
+                let Ok(tls) = acceptor.accept(s).await else {
+                    return;
+                };
+                let answered = Arc::new(tokio::sync::Notify::new());
+                let notify = answered.clone();
+                let svc = service_fn(move |_req: hyper::Request<hyper::body::Incoming>| {
+                    let notify = notify.clone();
+                    async move {
+                        tokio::time::sleep(head_delay).await;
+                        notify.notify_one();
+                        Ok::<_, std::convert::Infallible>(
+                            hyper::Response::builder()
+                                .header("content-type", "text/event-stream")
+                                .body(StallingBody::new(bytes::Bytes::from_static(FIRST_EVENT)))
+                                .unwrap(),
+                        )
+                    }
+                });
+                let conn = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+                    .serve_connection(TokioIo::new(tls), svc);
+                tokio::pin!(conn);
+                if !freeze {
+                    let _ = conn.await;
+                    return;
+                }
+                tokio::select! {
+                    _ = conn.as_mut() => return,
+                    _ = answered.notified() => {}
+                }
+                // Let the head and the event go out, then stop driving the connection while
+                // keeping it (and its socket) open.
+                let until = tokio::time::Instant::now() + Duration::from_millis(300);
+                tokio::select! {
+                    _ = conn.as_mut() => return,
+                    _ = tokio::time::sleep_until(until) => {}
+                }
+                std::future::pending::<()>().await;
+            });
+        }
+    });
+    (port, task)
+}
+
+const FIRST_EVENT: &[u8] = b"data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n";
+
+fn long_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(40))
+        .build()
+        .unwrap()
+}
+
+/// Post a stream request and read the response to its end: `(status, body or error, elapsed)`.
+async fn stream_to_end(gw: &Gateway) -> (u16, Result<String, String>, Duration) {
     let start = Instant::now();
-    let result = client
+    let resp = long_client()
         .post(format!("{}/openai/v1/chat/completions", gw.url()))
         .header("authorization", "Bearer sk-byo-test")
         .header("content-type", "application/json")
         .body(STREAM_BODY)
         .send()
         .await;
-    let took = start.elapsed();
-    let resp = result.unwrap_or_else(|e| panic!("no answer from the gateway after {took:?}: {e}"));
+    let resp = match resp {
+        Ok(r) => r,
+        Err(e) => return (0, Err(e.to_string()), start.elapsed()),
+    };
     let status = resp.status().as_u16();
-    let text = resp.text().await.unwrap_or_default();
-    assert!(
-        status == 504 && took < Duration::from_secs(6) && text.contains("\"error\""),
-        "status {status} after {took:?}: {text}"
-    );
+    let body = resp.text().await.map_err(|e| e.to_string());
+    (status, body, start.elapsed())
 }
 
-/// The stream bound is for streams only: a non-streaming request's time to its head is the whole
-/// generation, so it keeps `read_timeout_secs` and an answer slower than the stream bound arrives.
+/// A provider connection that goes dead mid-stream (the peer stops answering HTTP/2 PINGs while
+/// its socket stays open) is detected by transport liveness and failed promptly — not held until
+/// `read_timeout_secs` (600s). Measured with a 1s PING interval: detection within the interval plus
+/// pingora's 5s PING ACK deadline. Silence alone would never end it: the read timeout is the
+/// default 600s.
 /// claim: REL-7
 /// defect: D36
 #[tokio::test]
-async fn a_slow_non_streaming_answer_is_not_cut_at_the_stream_bound() {
+async fn a_dead_h2_upstream_is_detected_by_ping() {
+    let defaults = beyond_ai::config::AiConfig::default();
+    assert!(
+        defaults.h2_ping_interval_secs > 0 && defaults.h2_ping_interval_secs + 5 < 60,
+        "upstream H2 PING is on by default, with a bound far under any client timeout: {}s",
+        defaults.h2_ping_interval_secs
+    );
+    let (port, _task) = h2_upstream(Duration::ZERO, true).await;
     let (pubkey, _sk) = test_keypair(1);
-    let mock = ReplyUpstream::start(|_, _| {
-        Reply::Delayed(Duration::from_millis(3500), Box::new(Reply::ok()))
-    })
+    let gw = Gateway::builder(
+        unused_nats_port(),
+        &format!("127.0.0.1:{port}"),
+        &b64(&pubkey),
+    )
+    .tls_upstream()
+    .upstream_http2(true)
+    .config_line("h2_ping_interval_secs = 1")
+    .start()
     .await;
+    let (status, body, took) = stream_to_end(&gw).await;
+    assert_eq!(status, 200, "{body:?}");
+    assert!(
+        took < Duration::from_secs(12),
+        "a dead upstream was held for {took:?}: {body:?}"
+    );
+    assert!(
+        body.as_ref().is_err() || body.as_ref().is_ok_and(|b| !b.contains("[DONE]")),
+        "a dead upstream must end as an error, never a clean finish: {body:?}"
+    );
+}
+
+/// The other half of the contract: a provider that is alive but silent — a model thinking without
+/// emitting — is never cut by the gateway before `read_timeout_secs`, the clients' own 600s
+/// default. Silence is not a failure signal; only a dead transport is. Each upstream here holds
+/// its response head for 8s, several times the configured liveness bound (H2 PING every 1s with a
+/// 5s ACK deadline; TCP keepalive probing after 1s idle, every 1s, 2 probes), and the stream
+/// arrives: the PINGs and probes are answered by the peer's HTTP/2 stack and kernel, not the
+/// model. The old silence cut (`stream_idle_timeout_secs`, 120s by default) would have ended these
+/// at its bound, configured to 2s in the tests it replaced.
+/// claim: REL-7
+/// defect: D36
+#[tokio::test]
+async fn an_alive_but_silent_upstream_is_not_cut() {
+    let defaults = beyond_ai::config::AiConfig::default();
+    assert_eq!(
+        defaults.read_timeout_secs, 600,
+        "the silence bound is the OpenAI and Anthropic SDKs' 600s default request timeout"
+    );
+    let liveness = [
+        "h2_ping_interval_secs = 1",
+        "tcp_keepalive_idle_secs = 1",
+        "tcp_keepalive_interval_secs = 1",
+        "tcp_keepalive_count = 2",
+    ];
+    let (pubkey, _sk) = test_keypair(1);
+    let silence = Duration::from_secs(8);
+    // HTTP/2: the peer keeps answering PINGs while the model is silent.
+    let (port, _task) = h2_upstream(silence, false).await;
+    let mut h2 = Gateway::builder(
+        unused_nats_port(),
+        &format!("127.0.0.1:{port}"),
+        &b64(&pubkey),
+    )
+    .tls_upstream()
+    .upstream_http2(true);
+    // HTTP/1.1: only TCP keepalive watches the connection.
+    let h1_up =
+        ReplyUpstream::start(move |_, _| Reply::Delayed(silence, Box::new(Reply::sse()))).await;
+    let mut h1 = Gateway::builder(unused_nats_port(), &h1_up.authority(), &b64(&pubkey));
+    for line in liveness {
+        h2 = h2.config_line(line);
+        h1 = h1.config_line(line);
+    }
+    let (h2, h1) = (h2.start().await, h1.start().await);
+    let h2_run = async {
+        // This upstream stalls after its first event by design: the head and event arriving
+        // after the silence is what is asserted.
+        let start = Instant::now();
+        let mut resp = long_client()
+            .post(format!("{}/openai/v1/chat/completions", h2.url()))
+            .header("authorization", "Bearer sk-byo-test")
+            .header("content-type", "application/json")
+            .body(STREAM_BODY)
+            .send()
+            .await
+            .unwrap();
+        let status = resp.status().as_u16();
+        let first = resp.chunk().await.ok().flatten().unwrap_or_default();
+        let took = start.elapsed();
+        (status, String::from_utf8_lossy(&first).into_owned(), took)
+    };
+    let ((status, first, took), (h1_status, body, h1_took)) =
+        tokio::join!(h2_run, stream_to_end(&h1));
+    assert!(
+        status == 200 && first.contains("\"hi\"") && took >= silence,
+        "h2: an alive, silent upstream was cut: {status} after {took:?}: {first}"
+    );
+    assert!(
+        h1_status == 200 && body.as_ref().is_ok_and(|b| b.contains("[DONE]")) && h1_took >= silence,
+        "h1: an alive, silent upstream was cut: {h1_status} after {h1_took:?}: {body:?}"
+    );
+}
+
+/// The kernel half of liveness is armed: the gateway's upstream socket and its accepted client
+/// socket both carry TCP keepalive, read back from `/proc/net/tcp` (timer 2 = keepalive). A
+/// vanished peer cannot be simulated without dropping packets, so this pins the configuration the
+/// kernel acts on; the probes themselves are the kernel's.
+/// claim: REL-7
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn upstream_and_client_sockets_arm_tcp_keepalive() {
+    let mock = ReplyUpstream::start(|_, _| Reply::HeaderStall).await;
+    let (pubkey, _sk) = test_keypair(1);
     let gw = Gateway::builder(unused_nats_port(), &mock.authority(), &b64(&pubkey))
-        .config_line("stream_idle_timeout_secs = 2")
+        .config_line("tcp_keepalive_idle_secs = 7")
         .start()
         .await;
-    let status = test_client()
-        .post(format!("{}/openai/v1/chat/completions", gw.url()))
-        .header("authorization", "Bearer sk-byo-test")
-        .header("content-type", "application/json")
-        .body(r#"{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}"#)
-        .send()
+    let mut s = tokio::net::TcpStream::connect(("127.0.0.1", gw.port))
         .await
-        .map(|r| r.status().as_u16())
-        .unwrap_or(0);
-    assert_eq!(status, 200);
+        .unwrap();
+    let req = format!(
+        "POST /openai/v1/chat/completions HTTP/1.1\r\nhost: 127.0.0.1\r\n\
+         authorization: Bearer sk-byo-test\r\ncontent-type: application/json\r\n\
+         content-length: {}\r\n\r\n{STREAM_BODY}",
+        STREAM_BODY.len()
+    );
+    s.write_all(req.as_bytes()).await.unwrap();
+    // `(local port, remote port, timer)` of every established IPv4 socket.
+    let sockets = || -> Vec<(u16, u16, u8)> {
+        let table = std::fs::read_to_string("/proc/net/tcp").unwrap();
+        let port = |addr: &str| u16::from_str_radix(addr.rsplit(':').next().unwrap(), 16).unwrap();
+        table
+            .lines()
+            .skip(1)
+            .filter_map(|l| {
+                let f: Vec<&str> = l.split_whitespace().collect();
+                let timer = f.get(5)?.split(':').next()?.parse().ok()?;
+                (f.get(3) == Some(&"01")).then(|| (port(f[1]), port(f[2]), timer))
+            })
+            .collect()
+    };
+    let start = Instant::now();
+    let (mut upstream, mut client) = (None, None);
+    while start.elapsed() < Duration::from_secs(10) && (upstream != Some(2) || client != Some(2)) {
+        for (local, remote, timer) in sockets() {
+            if remote == mock.port {
+                upstream = Some(timer);
+            }
+            if local == gw.port {
+                client = Some(timer);
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    drop(s);
+    assert_eq!(upstream, Some(2), "upstream socket keepalive timer");
+    assert_eq!(client, Some(2), "client socket keepalive timer");
 }
 
 /// A client that sends a request for a large stream and then never reads must be released (its

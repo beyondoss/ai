@@ -26,9 +26,7 @@
 //! routing header) must resolve a catalog row from the body's root `model` before `upstream_peer`
 //! runs. That peek enables pingora's 64 KiB retry buffer and reads the whole body; one that outgrew
 //! the buffer is re-run as a pingora subrequest that carries it (`FullBody`), which is also how a
-//! large body fails over. Any other small body (declared, within the buffer) is read ahead too, to
-//! learn whether it asks for a stream (`stream_idle_timeout_secs`). Unknown or missing model → 404
-//! naming the miss. Chat Completions ↔ Messages ↔ Responses on a managed catalog walk is
+//! large body fails over. Unknown or missing model → 404 naming the miss. Chat Completions ↔ Messages ↔ Responses on a managed catalog walk is
 //! translated; inbound Responses with session state walks a GPT row's `/v1/responses` arm (byte
 //! relay) or 400s if none remain, naming the field. Any other inbound path vs row endpoint mismatch
 //! → 400. `GET /v1/models` lists the catalog.
@@ -249,9 +247,6 @@ struct Held {
     active_stream: bool,
     /// Holds one of this tenant's `tenant_max_in_flight` slots.
     tenant: Option<u64>,
-    /// The request asks for a stream (root `"stream": true`, read before connecting). Set in
-    /// `request_filter`; `upstream_peer` gives such an attempt the stream-idle read bound.
-    streams: bool,
     /// Bytes this request holds in the process body budget (`max_buffered_body_bytes`).
     body_bytes: usize,
     /// A `FullBody` re-run: its parent reserved the budget for both copies of the body.
@@ -566,6 +561,29 @@ fn upstream_refused_stream(e: &pingora_core::Error) -> bool {
         h.is_remote()
             && (h.is_go_away() || (h.is_reset() && h.reason() == Some(h2::Reason::REFUSED_STREAM)))
     })
+}
+
+/// Whether a **reused** HTTP/1.1 connection was reset before any response byte (D80): the
+/// provider's kernel answered with RST because the socket was closed with our request unread in it,
+/// the idle-close race on a pooled connection, so the request reached no server. Pingora marks this
+/// `ReusedOnly`, retryable on a reused connection.
+///
+/// Not a clean end-of-file: a server that read the request and then closed looks exactly like one
+/// that closed first, and the first may be generating (D09). Not a timeout either (`ETIMEDOUT` is a
+/// liveness verdict on a dead peer that may have taken the request), nor an HTTP/2 I/O error, which
+/// carries no such guarantee ([`upstream_refused_stream`] covers HTTP/2's own refusals).
+fn reset_before_reading(e: &pingora_core::Error, client_reused: bool) -> bool {
+    client_reused
+        && matches!(e.retry, pingora_core::RetryType::ReusedOnly)
+        && e.etype() == &pingora_core::ErrorType::ReadError
+        && e.root_cause()
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| {
+                matches!(
+                    io.kind(),
+                    std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
+                )
+            })
 }
 
 /// What became of a request, on its billing row: a consumer must be able to tell a zero-token row
@@ -980,12 +998,7 @@ impl AiProxy {
     /// Extracted so the provider-routed path and the model-routed candidate walk cannot drift apart
     /// on TLS, ALPN, or timeouts — a fallback candidate connected on different terms than the
     /// primary would be a genuinely nasty thing to debug.
-    fn build_peer(
-        &self,
-        addr: std::net::SocketAddr,
-        provider: &Provider,
-        streams: bool,
-    ) -> HttpPeer {
+    fn build_peer(&self, addr: std::net::SocketAddr, provider: &Provider) -> HttpPeer {
         let mut peer = HttpPeer::new(addr, self.state.config.upstream_tls, provider.host.clone());
         // Prefer HTTP/2 to the provider (config `upstream_http2`, default on), fall back to HTTP/1.1.
         // Every provider in `KNOWN_PROVIDERS` negotiates `h2` over TLS (verified by handshake), and H2
@@ -1009,17 +1022,13 @@ impl AiProxy {
         }
         peer.options.connection_timeout =
             Some(Duration::from_secs(self.state.config.connect_timeout_secs));
-        // One per-read timeout bounds every silence from the provider: the wait for the response
-        // head and each gap between body reads (pingora has no separate first-byte deadline). A
-        // request that asks for a stream gets `stream_idle_timeout_secs`: a streaming provider
-        // answers its head at once and then keeps sending, so a long silence is a stall.
-        // Everything else keeps `read_timeout_secs`, which must cover a long non-streaming
-        // generation's time to the head.
-        let read_timeout = match self.state.config.stream_idle_timeout_secs {
-            idle if streams && idle > 0 => idle.min(self.state.config.read_timeout_secs),
-            _ => self.state.config.read_timeout_secs,
-        };
-        peer.options.read_timeout = Some(Duration::from_secs(read_timeout));
+        // Silence is not a failure signal: a model thinking without emitting is indistinguishable
+        // from a stuck provider, so the per-read bound (the wait for the head, and each gap between
+        // body reads) is the clients' own: `read_timeout_secs`, 600s, the OpenAI and Anthropic
+        // SDKs' default request timeout. A *dead* peer is detected by transport liveness instead.
+        peer.options.read_timeout = Some(Duration::from_secs(self.state.config.read_timeout_secs));
+        peer.options.h2_ping_interval = self.state.config.h2_ping_interval();
+        peer.options.tcp_keepalive = self.state.config.upstream_tcp_keepalive();
         peer.options.write_timeout =
             Some(Duration::from_secs(self.state.config.write_timeout_secs));
         peer.options.idle_timeout = Some(Duration::from_secs(self.state.config.idle_timeout_secs));
@@ -1265,7 +1274,6 @@ impl AiProxy {
         } else {
             None
         };
-        let streams = peek::requests_stream(&body);
         let body = Bytes::from(body);
         self.state.metrics.full_body_relays_total.inc();
         let mut skip = 0u8;
@@ -1289,7 +1297,6 @@ impl AiProxy {
                     reset,
                     only,
                     final_attempt: n + 1 == MAX_ATTEMPTS,
-                    streams,
                     retry: Arc::clone(&retry),
                     request_id,
                     request_seq,
@@ -1909,9 +1916,8 @@ struct BodyPeek {
 /// failover. Once the buffer has truncated it replays nothing, so the caller re-runs the request as
 /// a subrequest carrying the body (`relay`), which is also what lets a large body fail over (see
 /// [`FullBody`]). The whole body, never a stop at `model`: inbound Responses' `store` /
-/// `previous_response_id` can sit after `input`, the cache hashes everything, `stream` decides the
-/// read bound (`stream_idle_timeout_secs`), and stock Python SDKs put `model` *after* `messages`
-/// anyway, so a long agent turn reads to the end regardless.
+/// `previous_response_id` can sit after `input`, the cache hashes everything, and stock Python SDKs
+/// put `model` *after* `messages` anyway, so a long agent turn reads to the end regardless.
 ///
 /// A body growing past the replay buffer reserves twice its size in the body budget as it grows
 /// (this buffer, and the `FullBody` re-run's own copy): a chunked upload has no length to reserve
@@ -2029,8 +2035,6 @@ struct FullBody {
     only: Option<u8>,
     /// The parent's attempt bound is reached: record no retry, relay this attempt's answer.
     final_attempt: bool,
-    /// The body asks for a stream (see `Held::streams`).
-    streams: bool,
     /// Set by this attempt when it would have retried but could not replay the body.
     retry: Arc<std::sync::Mutex<Option<RelayRetry>>>,
     /// The parent's request id and sequence: every attempt is the same request to the client and
@@ -2681,7 +2685,6 @@ impl ProxyHttp for AiProxy {
                 in_flight: false,
                 active_stream: false,
                 tenant: None,
-                streams: false,
                 body_bytes: 0,
                 body_exempt: false,
             },
@@ -3164,8 +3167,8 @@ impl ProxyHttp for AiProxy {
         // A headerless catalog walk reads the whole body before choosing a row, rather than
         // stopping at `model`: a large body can only fail over once fully read (see `FullBody`), a
         // small one fits pingora's replay buffer either way and costs nothing more, and with the
-        // whole body in hand the gateway knows whether the request streams (`stream_idle_timeout`),
-        // can hash it for the cache, and can read Responses session fields.
+        // whole body in hand the gateway can hash it for the cache and read Responses session
+        // fields.
         let responses = route::is_responses_path(session.req_header().uri.path());
         let large = declared_len.is_none_or(|n| n > BODY_PEEK_LIMIT);
         let mut peeked = false;
@@ -3273,34 +3276,10 @@ impl ProxyHttp for AiProxy {
                 return relayed;
             }
             body_complete = peek.complete;
-            peeked = true;
         }
 
-        // Whether the request asks for a stream, which bounds how long the provider may stay
-        // silent (`stream_idle_timeout_secs`, applied in `build_peer`). Known only when the body is
-        // in hand before connecting: a catalog walk's read above, a `FullBody` re-run, or — read
-        // here — any other small body (≤ the replay buffer, declared length, so pingora replays it
-        // byte for byte). A large body on `/{provider}` or BYO is not read ahead; it keeps the
-        // plain `read_timeout_secs`.
         // A `FullBody` re-run's body is its parent's, already reserved for both copies.
         ctx.held.body_exempt = full_body.is_some();
-        let streams = match (&full_body, body_complete.as_deref()) {
-            (Some(fb), _) => fb.streams,
-            (None, Some(body)) => peek::requests_stream(body),
-            (None, None) => match declared_len {
-                Some(n)
-                    if !peeked
-                        && n > 0
-                        && n <= BODY_PEEK_LIMIT
-                        && session.req_header().method == http::Method::POST =>
-                {
-                    let small = Box::pin(peek_body_model(session, n, &mut ctx.held)).await?;
-                    small.complete.as_deref().is_some_and(peek::requests_stream)
-                }
-                _ => false,
-            },
-        };
-        ctx.held.streams = streams;
 
         // Per-request control surface (`x-beyond-*`). Managed only: a BYO request carries no verified
         // identity, so a tag on it would be an unattributable row and a capture would be storing
@@ -3922,7 +3901,6 @@ impl ProxyHttp for AiProxy {
         // `ctx` is set by `request_filter` for every admitted request; a missing ctx here means an
         // unadmitted request reached `upstream_peer` (a Pingora ordering change or future refactor).
         // Surface it as an error rather than panicking the worker.
-        let streams = ctx.held.streams;
         let Some(rc) = ctx.as_mut() else {
             return Err(pingora_core::Error::new_str(
                 "upstream_peer reached without request context",
@@ -3962,7 +3940,7 @@ impl ProxyHttp for AiProxy {
                 }
             };
             rc.upstream_phase = UpstreamPhase::Attempted;
-            return Ok(Box::new(self.build_peer(addr, &rc.provider, streams)));
+            return Ok(Box::new(self.build_peer(addr, &rc.provider)));
         }
 
         // Model-routed: this hook owns the candidate walk *and* the breaker ledger.
@@ -4076,7 +4054,7 @@ impl ProxyHttp for AiProxy {
                             path.push_str(sub.suffix());
                         }
                         rc.upstream_phase = UpstreamPhase::Attempted;
-                        return Ok(Box::new(self.build_peer(addr, &p, streams)));
+                        return Ok(Box::new(self.build_peer(addr, &p)));
                     }
                     Err(e) => {
                         // DNS failure is handled *here*, inside the walk, rather than by returning
@@ -4130,7 +4108,7 @@ impl ProxyHttp for AiProxy {
             }
         };
         rc.upstream_phase = UpstreamPhase::Attempted;
-        Ok(Box::new(self.build_peer(addr, &rc.provider, streams)))
+        Ok(Box::new(self.build_peer(addr, &rc.provider)))
     }
 
     /// Fail over — or walk a pool key — before a byte of the error reaches the client.
@@ -5090,8 +5068,12 @@ impl ProxyHttp for AiProxy {
         // be generating, and billing, already; resending it — to the same candidate or the next,
         // pingora's reused-connection retry included — risks running the request twice, so that
         // failure ends the request (`fail_to_proxy` answers it).
+        // Except when the provider demonstrably never processed it: an HTTP/2 refusal, or a pooled
+        // HTTP/1.1 connection it closed with the request unread. Having the body is not having
+        // taken the request.
         let refused = upstream_refused_stream(&e);
         let delivered = !refused
+            && !reset_before_reading(&e, client_reused)
             && ctx
                 .rc
                 .as_ref()
