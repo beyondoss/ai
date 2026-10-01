@@ -1,0 +1,54 @@
+name: Deep checks
+# The slow hermetic hunts that don't fit a PR: the full mutation run over the money and correctness
+# paths, and the property tests at a case count high enough to find rare shapes. Neither needs
+# provider keys. Weekly, or on demand from the Actions tab.
+on:
+  schedule:
+    - cron: "0 7 * * 0"
+  workflow_dispatch:
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+jobs:
+  # cargo-mutants over the gateway's billing, translation, routing and parsing code, sharded so each
+  # job stays well under GitHub's 6-hour ceiling. A surviving mutant is code no test checks: the job
+  # fails and lists it.
+  mutants:
+    name: mutants (shard ${{ matrix.shard }}/8)
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v4
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: nextest,cargo-mutants
+      - run: |
+          cargo mutants -p beyond-ai --test-tool nextest --shard ${{ matrix.shard }}/8 \
+            --file crates/gateway/src/usage.rs --file crates/gateway/src/translate.rs \
+            --file crates/gateway/src/proxy.rs --file crates/gateway/src/peek.rs \
+            --file crates/gateway/src/circuit_breaker.rs --file crates/gateway/src/route.rs \
+            --jobs 2 --timeout-multiplier 2 </dev/null
+      - name: missed mutants
+        if: failure()
+        run: cat mutants.out/missed.txt 2>/dev/null || true
+  # The property tests (translator, usage parsers, body scanners) at 100x the PR case count.
+  properties:
+    name: property tests (deep)
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v4
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+      - run: cargo nextest run -p beyond-ai --profile ci -E 'test(/prop/)' </dev/null
+        env:
+          PROPTEST_CASES: "100000"
