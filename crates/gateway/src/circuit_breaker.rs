@@ -364,8 +364,13 @@ impl CircuitBreaker {
                         return Err(CircuitOpen);
                     }
 
-                    // Try to claim a permit
-                    let new_packed = Self::pack(STATE_HALF_OPEN, failures, permits - 1, timestamp);
+                    // Try to claim a permit, stamping when it was handed out: the stalled-probe
+                    // reclaim above measures from the newest handout, not from when the breaker
+                    // half-opened. Otherwise a permit given back by `release` and claimed again
+                    // looks a whole reset timeout old at once, and a second probe is admitted
+                    // beside it.
+                    let new_packed =
+                        Self::pack(STATE_HALF_OPEN, failures, permits - 1, self.now_secs());
 
                     match self.state.compare_exchange_weak(
                         packed,
@@ -936,6 +941,35 @@ mod tests {
         // A late success from either probe still closes it.
         cb.record_success();
         assert_eq!(cb.state(), CircuitState::Closed { failure_count: 0 });
+    }
+
+    /// A probe permit given back by `release` (an attempt with no provider outcome) and claimed
+    /// again is a fresh probe: the stalled-probe reclaim counts from that handout, so a second
+    /// probe is not admitted beside it.
+    #[test]
+    fn a_released_probe_permit_claimed_again_is_not_reclaimable_at_once() {
+        static NOW: AtomicU64 = AtomicU64::new(100);
+        fn clock() -> u64 {
+            NOW.load(Ordering::Relaxed)
+        }
+        let cb = CircuitBreaker::with_clock(
+            CircuitBreakerConfig::windowed(1, Duration::from_secs(60))
+                .reset_timeout(Duration::from_secs(5))
+                .half_open_permits(1),
+            clock,
+        );
+        cb.record_failure();
+        NOW.store(105, Ordering::Relaxed);
+        assert!(cb.allow().is_ok(), "the probe");
+        NOW.store(112, Ordering::Relaxed);
+        cb.release();
+        assert!(cb.allow().is_ok(), "the returned permit");
+        assert!(cb.allow().is_err(), "one probe at a time");
+        NOW.store(117, Ordering::Relaxed);
+        assert!(
+            cb.allow().is_ok(),
+            "reclaimed a reset timeout after its handout"
+        );
     }
 
     #[test]

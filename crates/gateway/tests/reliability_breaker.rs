@@ -349,7 +349,6 @@ async fn client_upload_failures_do_not_open_the_breaker() {
 /// claim: REL-6, SEC-16
 /// defect: D86
 #[tokio::test]
-#[ignore = "D86 reproduced: a probe that ends with no provider outcome records a success and closes the breaker"]
 async fn a_probe_with_no_provider_outcome_leaves_the_breaker_half_open() {
     let nats_port = unused_nats_port();
     let (pubkey, _sk) = test_keypair(1);

@@ -5430,10 +5430,12 @@ impl ProxyHttp for AiProxy {
                 None if is_upstream_failure(e) && !client_still_uploading(session, rc) => {
                     breaker.record_failure();
                 }
-                // Client went away, or the request ended with no error at all. The provider is not
-                // implicated either way; record a success so a claimed half-open probe permit still
-                // resolves rather than being stranded.
-                None => breaker.record_success(),
+                // Client went away, its upload stalled, or the request ended with no error at all:
+                // no provider outcome. Give the permit back without one (D86). A success here closed
+                // a half-open breaker on a probe that never heard from the provider, letting every
+                // caller flood one that may still be broken; `release` returns the probe permit so
+                // the next request probes instead.
+                None => breaker.release(),
             }
             rc.breaker_pending = false;
         }

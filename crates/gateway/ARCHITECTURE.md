@@ -187,7 +187,8 @@ Client (stock OpenAI/Anthropic SDK)
      Capturing: emit ai.payload (both bodies, truncation + completeness flags), correlated by
        request_id → bounded queue, DROPPED on overflow so a stalled sink can't backpressure
      Record circuit-breaker outcome, only if one is still owed (breaker_pending): 5xx / upstream
-       failure → failure; else → success (429 and client aborts included)
+       failure → failure; no head and no provider outcome (client abort, stalled upload)
+       → permit released (`CircuitBreaker::release`), never a success
      Decrement requests_in_flight gauge; release the tenant slot
 ```
 
@@ -1435,6 +1436,12 @@ the rate guardrails (which protect against abusive _inbound_ load):
   caller, BYO included, could open a provider's breaker for every tenant with a few oversized or
   stalled uploads. A connect failure feeds no body byte, so it still counts. The cost: a provider
   that resets the connection mid-upload is not blamed for it either; one that answers 5xx is.
+- **Nor is either of those a success.** An attempt that ends with no provider outcome (no response
+  head, and the error is the client's: an abort, a stalled or abandoned upload) gives its permit back
+  without one (`CircuitBreaker::release`). Recording a success there closed a half-open breaker on a
+  probe that never heard from the provider, and every caller then flooded a provider that may still
+  be broken. Released, the probe permit goes to the next request, and the stalled-probe reclaim
+  above counts from that new handout, so it stays one probe at a time.
 - **Applies to all traffic** (managed + BYO) — a down provider is down regardless of whose key is
   used. One breaker per provider, built at boot, shared lock-free across callers.
 - `circuit_breaker_threshold = 0` disables it.
