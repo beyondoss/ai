@@ -58,7 +58,6 @@ async fn managed_env_key_roundtrip(
 /// claim: REL-15
 /// defect: D52
 #[tokio::test]
-#[ignore = "D52 reproduced: AI_POOL_KEY_FIREWORKS_ANTHROPIC lands under fireworks_anthropic; 503 no provider key"]
 async fn env_pool_key_reaches_a_hyphenated_provider() {
     let (status, auth, text) =
         managed_env_key_roundtrip("fireworks-anthropic", "AI_POOL_KEY_FIREWORKS_ANTHROPIC").await;
@@ -88,7 +87,6 @@ async fn env_pool_key_reaches_a_plain_provider() {
 /// claim: REL-15
 /// defect: D52
 #[tokio::test]
-#[ignore = "D52 reproduced: window 0 boots and the breaker never opens under a solid 5xx run"]
 async fn a_zero_breaker_window_is_refused_or_still_trips() {
     let lines = "circuit_breaker_threshold = 3\ncircuit_breaker_window_secs = 0";
     if boot_refuses(lines, Duration::from_secs(3)).is_some() {

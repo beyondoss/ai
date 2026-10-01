@@ -482,6 +482,23 @@ impl AiConfig {
                     .to_string(),
             ));
         }
+        // A breaker with a zero window counts every failure into an already-expired window, so the
+        // count never passes 1 and the breaker never opens; a zero reset re-admits a probe at once,
+        // so an open breaker sheds nothing. Both read as "breaker on" while doing nothing.
+        if self.circuit_breaker_threshold > 0 && self.circuit_breaker_window_secs == 0 {
+            return Err(GatewayError::Config(
+                "circuit_breaker_window_secs must be > 0 (a 0 window never accrues a second \
+                 failure, so the breaker never opens); set circuit_breaker_threshold = 0 to disable it"
+                    .to_string(),
+            ));
+        }
+        if self.circuit_breaker_threshold > 0 && self.circuit_breaker_reset_secs == 0 {
+            return Err(GatewayError::Config(
+                "circuit_breaker_reset_secs must be > 0 (a 0 reset half-opens the breaker the \
+                 instant it opens); set circuit_breaker_threshold = 0 to disable it"
+                    .to_string(),
+            ));
+        }
         if self.circuit_breaker_threshold > crate::circuit_breaker::MAX_FAILURE_THRESHOLD {
             return Err(GatewayError::Config(format!(
                 "circuit_breaker_threshold = {} exceeds the maximum of {} (the breaker's packed \
@@ -533,12 +550,32 @@ impl AiConfig {
     fn merge_secret_env(&mut self, vars: impl Iterator<Item = (String, String)>) {
         for (k, v) in vars {
             if let Some(name) = k.strip_prefix("AI_POOL_KEY_") {
-                self.pool_keys
-                    .insert(name.to_ascii_lowercase(), Secret::new(v).into());
+                let name = self.pool_key_env_provider(name);
+                self.pool_keys.insert(name, Secret::new(v).into());
             } else if let Some(kid) = k.strip_prefix("AI_SIGNING_KEY_") {
                 self.signing_keys.insert(kid.to_string(), v);
             }
         }
+    }
+
+    /// The provider an `AI_POOL_KEY_<NAME>` variable is for.
+    ///
+    /// An environment variable name cannot hold `-`, so `<NAME>` is lowercased, and when that names
+    /// no provider but its `_` → `-` spelling does, the hyphenated provider wins:
+    /// `AI_POOL_KEY_OPENAI_CODEX` reaches `openai-codex`, and `AI_POOL_KEY_FIREWORKS_ANTHROPIC` a
+    /// config-added `fireworks-anthropic`. A name that matches exactly always wins, so a provider
+    /// really called `my_vendor` keeps its key.
+    fn pool_key_env_provider(&self, env_name: &str) -> String {
+        let name = env_name.to_ascii_lowercase();
+        let known = |n: &str| {
+            crate::route::known_providers().any(|p| p.name == n)
+                || self.provider_authorities.contains_key(n)
+        };
+        if known(&name) || !name.contains('_') {
+            return name;
+        }
+        let hyphenated = name.replace('_', "-");
+        if known(&hyphenated) { hyphenated } else { name }
     }
 
     /// Build the trusted keyring from the configured signing public keys.
@@ -708,6 +745,51 @@ mod tests {
         );
         // Defaults are valid.
         assert!(AiConfig::default().validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_a_zero_breaker_window_or_reset() {
+        let cfg = |window, reset, threshold| AiConfig {
+            circuit_breaker_window_secs: window,
+            circuit_breaker_reset_secs: reset,
+            circuit_breaker_threshold: threshold,
+            ..Default::default()
+        };
+        assert!(cfg(0, 30, 20).validate().is_err());
+        assert!(cfg(10, 0, 20).validate().is_err());
+        // A disabled breaker has no window to get wrong.
+        assert!(cfg(0, 0, 0).validate().is_ok());
+    }
+
+    #[test]
+    fn pool_key_env_reaches_a_hyphenated_provider() {
+        let mut c = AiConfig {
+            provider_authorities: HashMap::from([
+                ("fireworks-anthropic".to_string(), "h:443".to_string()),
+                ("my_vendor".to_string(), "h:443".to_string()),
+            ]),
+            ..Default::default()
+        };
+        c.merge_secret_env(
+            [
+                (
+                    "AI_POOL_KEY_FIREWORKS_ANTHROPIC".to_string(),
+                    "a".to_string(),
+                ),
+                ("AI_POOL_KEY_OPENAI_CODEX".to_string(), "b".to_string()),
+                ("AI_POOL_KEY_MY_VENDOR".to_string(), "c".to_string()),
+                ("AI_POOL_KEY_UNKNOWN_THING".to_string(), "d".to_string()),
+            ]
+            .into_iter(),
+        );
+        assert_eq!(c.pool_keys["fireworks-anthropic"][0].expose(), "a");
+        assert_eq!(c.pool_keys["openai-codex"][0].expose(), "b");
+        assert_eq!(
+            c.pool_keys["my_vendor"][0].expose(),
+            "c",
+            "an exact match wins"
+        );
+        assert_eq!(c.pool_keys["unknown_thing"][0].expose(), "d");
     }
 
     /// Write `body` to a uniquely-named temp TOML file (the literal `label` keeps parallel tests
