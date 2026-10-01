@@ -695,11 +695,12 @@ fn stock_responses(model: &str, stream: bool) -> String {
     )
 }
 
-/// Stock Responses body + a GPT catalog id translates onto Chat Completions. Billing still
-/// reads the upstream Chat Completions usage, not the Responses JSON the client sees.
+/// Stock Responses body + a Chat Completions row with no Responses arm translates onto Chat
+/// Completions. Billing still reads the upstream Chat Completions usage, not the Responses JSON the
+/// client sees.
 /// claim: E3
 #[tokio::test]
-async fn stock_responses_gpt_translates_to_chat_completions() {
+async fn stock_responses_on_a_chat_row_translates_to_chat_completions() {
     let nats_port = unused_nats_port();
     let (pubkey, sk) = test_keypair(1);
     let mock = MockUpstream::start(Mode::Sse).await;
@@ -712,7 +713,7 @@ async fn stock_responses_gpt_translates_to_chat_completions() {
         .post(format!("{}/v1/responses", gw.url()))
         .header("authorization", format!("Bearer {}", vkey(&sk)))
         .header("content-type", "application/json")
-        .body(stock_responses("gpt-4o-mini", true))
+        .body(stock_responses("llama-3.1-8b-instant", true))
         .send()
         .await
         .unwrap();
@@ -729,8 +730,8 @@ async fn stock_responses_gpt_translates_to_chat_completions() {
 
     let cap = mock
         .captured()
-        .expect("translated request reaches OpenAI Chat Completions");
-    assert_eq!(cap.path, "/v1/chat/completions");
+        .expect("translated request reaches Chat Completions");
+    assert_eq!(cap.path, "/api/v1/chat/completions");
     let got = String::from_utf8(cap.body).unwrap();
     assert!(got.contains(r#""messages""#), "{got}");
     assert!(got.contains(r#""hi""#), "{got}");
@@ -744,7 +745,7 @@ async fn stock_responses_gpt_translates_to_chat_completions() {
     );
 
     let line = gw
-        .wait_for_log_line(&["ai.usage", r#""provider":"openai""#])
+        .wait_for_log_line(&["ai.usage", r#""provider":"openrouter""#])
         .await;
     assert!(
         line.contains(r#""input_tokens":5"#) && line.contains(r#""output_tokens":9"#),
@@ -869,9 +870,11 @@ async fn managed_responses_with_previous_response_id_relays_to_openai_responses(
     );
 }
 
-/// `store: false` one-shot Responses may still translate onto Chat Completions.
+/// A `store: false` one-shot on a GPT row walks its Responses arm too: a byte relay, so what only
+/// Responses has (`include`, `truncation`, Codex's tools) is not lost to a translation.
+/// claim: E3
 #[tokio::test]
-async fn store_false_one_shot_responses_may_translate_onto_chat_completions() {
+async fn store_false_one_shot_responses_relay_to_the_responses_arm() {
     let nats_port = unused_nats_port();
     let (pubkey, sk) = test_keypair(1);
     let mock = MockUpstream::start(Mode::Json).await;
@@ -896,27 +899,15 @@ async fn store_false_one_shot_responses_may_translate_onto_chat_completions() {
     );
 
     let cap = mock.captured().expect("one-shot must reach OpenAI");
-    assert_eq!(
-        cap.path, "/v1/chat/completions",
-        "store:false may still land on Chat Completions"
-    );
+    assert_eq!(cap.path, "/v1/responses", "the row's Responses arm");
     let got = String::from_utf8(cap.body).unwrap();
+    assert!(got.contains(r#""store":false"#), "{got}");
     assert!(
-        !got.contains("previous_response_id"),
-        "session fields must not be required on a one-shot: {got}"
+        got.contains(r#""include":["file_search_call.results"]"#)
+            && got.contains(r#""truncation":"auto""#),
+        "include/truncation pass through on same-endpoint Responses: {got}"
     );
-    assert!(
-        !got.contains(r#""store""#),
-        "store is Responses-only and is dropped onto Chat Completions: {got}"
-    );
-    assert!(
-        !got.contains(r#""include""#) && !got.contains("truncation"),
-        "include/truncation are dropped when leaving Responses: {got}"
-    );
-    assert!(
-        got.contains(r#""messages""#),
-        "input must become messages on Chat Completions: {got}"
-    );
+    assert!(!got.contains(r#""messages""#), "not translated: {got}");
 }
 
 /// Claude rows have no OpenAI store. Responses + `previous_response_id` is 400, not Messages.

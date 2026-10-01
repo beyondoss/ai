@@ -241,8 +241,10 @@ async fn responses_client_on_claude_gets_items_for_reasoning_text_and_calls() {
     );
 }
 
+/// A Responses client on a Chat Completions row with no Responses arm (a GPT row's Responses
+/// request relays to its arm instead).
 #[tokio::test]
-async fn responses_client_on_gpt_gets_function_call_items() {
+async fn responses_client_on_a_chat_row_gets_function_call_items() {
     let nats_port = unused_nats_port();
     let (pubkey, sk) = test_keypair(1);
     let mock = MockUpstream::start(Mode::Raw(200, "text/event-stream", OPENAI_PARALLEL_SSE)).await;
@@ -255,7 +257,7 @@ async fn responses_client_on_gpt_gets_function_call_items() {
         &gw,
         "/v1/responses",
         &vkey(&sk),
-        responses_body("gpt-4o-mini", true),
+        responses_body("llama-3.1-8b-instant", true),
     )
     .await;
     assert_eq!(status, 200, "{text}\n{}", gw.log());
@@ -269,7 +271,7 @@ async fn responses_client_on_gpt_gets_function_call_items() {
         let args: Value = serde_json::from_str(item["arguments"].as_str().unwrap()).unwrap();
         assert_eq!(args["city"], city);
     }
-    assert_eq!(mock.captured().unwrap().path, "/v1/chat/completions");
+    assert_eq!(mock.captured().unwrap().path, "/api/v1/chat/completions");
 }
 
 /// Anthropic is down; OpenRouter serves the Claude row over Chat Completions. The signature it
@@ -526,7 +528,7 @@ async fn responses_client_gets_a_custom_tool_call_from_a_chat_row() {
         .start()
         .await;
 
-    let body = r#"{"model":"gpt-4o-mini","input":"patch it","stream":true,"store":false,"tools":[{"type":"custom","name":"apply_patch","description":"patch"}]}"#;
+    let body = r#"{"model":"llama-3.1-8b-instant","input":"patch it","stream":true,"store":false,"tools":[{"type":"custom","name":"apply_patch","description":"patch"}]}"#;
     let (status, text) = post(&gw, "/v1/responses", &vkey(&sk), body.to_owned()).await;
     assert_eq!(status, 200, "{text}\n{}", gw.log());
     let evs = events(&text);
@@ -540,8 +542,8 @@ async fn responses_client_gets_a_custom_tool_call_from_a_chat_row() {
     assert_eq!(resp["output"][0]["input"], "*** Begin Patch");
     assert_eq!(resp["output"][0]["call_id"], "call_c1");
     assert!(names(&evs).contains(&"response.custom_tool_call_input.delta"));
-    let cap = mock.captured().expect("reaches OpenAI");
-    assert_eq!(cap.path, "/v1/chat/completions");
+    let cap = mock.captured().expect("reaches the Chat Completions host");
+    assert_eq!(cap.path, "/api/v1/chat/completions");
     let sent: Value = serde_json::from_slice(&cap.body).unwrap();
     assert_eq!(sent["tools"][0]["custom"]["name"], "apply_patch");
 }

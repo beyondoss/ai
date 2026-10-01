@@ -3375,10 +3375,13 @@ impl ProxyHttp for AiProxy {
                     )
                     .await;
                 }
-                // Session-state Responses must walk the Responses arm, not Chat Completions /
-                // Messages. `store: false` one-shots stay on `candidates` (lossy translate onto
-                // Chat Completions is allowed). TTFT ranking is only for `candidates` — do not
-                // observe Responses attempts into that table.
+                // A Responses request walks the row's Responses arm whenever the row has one,
+                // `store: false` one-shots included: there it is a byte relay, and translation onto
+                // Chat Completions would lose what only Responses has (Codex's `namespace` tools,
+                // `custom` grammars, encrypted reasoning). Only a row without an arm translates,
+                // and only a one-shot may (session state there is the 400 below). A failover stays
+                // inside the arm it walks. TTFT ranking is only for `candidates` — do not observe
+                // Responses attempts into that table.
                 // An embeddings row has no Responses arm either, but "store cannot be honored"
                 // would name a field the caller may never have set: it walks its candidates and the
                 // wire check below rejects the endpoint, which is what is actually wrong.
@@ -3393,7 +3396,10 @@ impl ProxyHttp for AiProxy {
                         row.responses
                     }
                     Some(_) => row.candidates,
-                    None if inbound_responses && session_field.is_some() && !embeddings_row => {
+                    None if inbound_responses
+                        && !embeddings_row
+                        && (session_field.is_some() || !row.responses.is_empty()) =>
+                    {
                         row.responses
                     }
                     None => row.candidates,

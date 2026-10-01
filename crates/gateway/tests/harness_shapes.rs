@@ -85,7 +85,6 @@ fn codex_body(model: &str, input: Value) -> Value {
 /// claim: W2, E3, CAT-9
 /// defect: D74
 #[tokio::test]
-#[ignore = "D74 reproduced: a store:false Responses request on a Chat-first GPT row is translated onto Chat Completions"]
 async fn codex_on_a_chat_first_gpt_row_is_relayed_to_its_responses_arm() {
     let nats_port = unused_nats_port();
     let (pubkey, sk) = test_keypair(1);

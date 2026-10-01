@@ -52,7 +52,7 @@ pub enum Endpoint {
 
 impl Endpoint {
     /// The endpoint a catalog row's `wire` implies. GPT rows speak Chat Completions; Claude rows
-    /// speak Messages. GPT rows also list a parallel `/v1/responses` arm for session state.
+    /// speak Messages. GPT rows also list a parallel `/v1/responses` arm for Responses clients.
     pub fn of_wire(d: Dialect) -> Self {
         match d {
             Dialect::Anthropic => Endpoint::Messages,
@@ -301,7 +301,7 @@ pub enum WireAction {
 /// Catalog-walk decision for an inbound path vs the row's endpoint ([`Endpoint::of_row`]).
 ///
 /// Inbound `/v1/responses` is a third client dialect vs the row primary; per-candidate translate
-/// then uses the serving path, so a GPT session walk onto `/v1/responses` is a byte relay.
+/// then uses the serving path, so a GPT row's walk onto its `/v1/responses` arm is a byte relay.
 /// Same-wire Responses on `/{provider}` never reaches here.
 pub fn catalog_wire_action(path: &str, row: Endpoint) -> WireAction {
     match implied_endpoint(path) {

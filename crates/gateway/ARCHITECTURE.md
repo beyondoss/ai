@@ -355,12 +355,12 @@ the header. Same-wire failover is a byte relay — the gateway rewrites ids, not
 candidates in a row. When the inbound path names a different Chat Completions / Messages /
 Responses endpoint (`POST /v1/chat/completions` with a Claude row, `/v1/messages` with a GPT row,
 or `/v1/responses` with either) the gateway **translates** so the stock SDK completes — except
-inbound `/v1/responses` that uses session state (`previous_response_id` set, or `store` not
-explicitly `false`). GPT rows list a parallel OpenAI `/v1/responses` arm for that case: a **byte
-relay** so `store`, `previous_response_id`, `include`, and `truncation` pass through. A Responses
-5xx may walk another Responses candidate; it does not walk onto Chat Completions/Messages while
-those fields are in play. `store: false` one-shot Responses may still translate onto Chat
-Completions (lossy). Rows with no Responses arm (Claude, DeepSeek, …) have no OpenAI store: an
+inbound `/v1/responses` on a row with a Responses arm. GPT rows list a parallel OpenAI
+`/v1/responses` arm, and every Responses request on such a row walks it, `store: false` one-shots
+included: a **byte relay** so `store`, `previous_response_id`, `include`, `truncation`, and
+Responses-only tools (Codex's `namespace` groups and `custom` grammars) pass through. A Responses
+5xx may walk another Responses candidate; it never walks onto Chat Completions/Messages. Rows with
+no Responses arm (Claude, DeepSeek, …) translate a one-shot and have no OpenAI store: an
 **omitted** `store` there is the stock `responses.create()` call and translates as a one-shot, while
 an explicit `store: true` or a `previous_response_id` is a **400** naming the field, not a hollow
 Messages call. Usage/billing still parse the upstream body/SSE;

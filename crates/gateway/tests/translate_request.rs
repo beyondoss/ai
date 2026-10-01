@@ -105,7 +105,7 @@ async fn anthropic_sdk_on_a_gpt5_row_sends_what_openai_accepts() {
     );
 }
 
-/// A Responses client (store: false) with parallel tool calls on a GPT row. Consecutive
+/// A Responses client (store: false) with parallel tool calls on a Chat Completions row. Consecutive
 /// `function_call` items became one assistant message each, which OpenAI rejects; a Responses
 /// named `tool_choice` went through flat, which Chat Completions rejects.
 /// claim: T1
@@ -120,7 +120,7 @@ async fn responses_client_parallel_tool_calls_reach_chat_as_one_turn() {
         .await;
 
     let body = json!({
-        "model": "gpt-4.1-nano",
+        "model": "llama-3.1-8b-instant",
         "store": false,
         "max_output_tokens": 64,
         "tools": [
@@ -139,7 +139,7 @@ async fn responses_client_parallel_tool_calls_reach_chat_as_one_turn() {
     post(&gw, &sk, "/v1/responses", &body).await;
 
     let (cap, got) = captured(&mock);
-    assert_eq!(cap.path, "/v1/chat/completions");
+    assert_eq!(cap.path, "/api/v1/chat/completions");
     let msgs = got["messages"].as_array().unwrap();
     assert_eq!(msgs.len(), 4, "{got}");
     assert_eq!(msgs[1]["tool_calls"].as_array().unwrap().len(), 2, "{got}");
@@ -152,9 +152,9 @@ async fn responses_client_parallel_tool_calls_reach_chat_as_one_turn() {
     assert_eq!(
         got["tools"][1],
         json!({"type": "web_search"}),
-        "a hosted tool is forwarded for OpenAI to reject by name, not dropped"
+        "a hosted tool is forwarded for the provider to reject by name, not dropped"
     );
-    assert_eq!(got["max_completion_tokens"], 64);
+    assert_eq!(got["max_tokens"], 64);
 }
 
 fn weather_tool() -> Value {

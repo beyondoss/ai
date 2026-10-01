@@ -35,9 +35,9 @@
 //! Candidates in a row may disagree on the endpoint (Messages vs Chat Completions). The gateway
 //! translates the original client body onto **this candidate's** path each attempt, so Claude can
 //! fail onto an OpenAI-compat host without sending a Messages body at Chat Completions.
-//! GPT rows also list a parallel [`ModelRoute::responses`] arm (OpenAI `/v1/responses`) used when
-//! the inbound path is Responses **and** the body uses session state; Chat Completions / Messages
-//! inbound, and `store: false` one-shot Responses, still walk [`ModelRoute::candidates`].
+//! GPT rows also list a parallel [`ModelRoute::responses`] arm (OpenAI `/v1/responses`) that every
+//! inbound Responses request walks, `store: false` one-shots included; Chat Completions / Messages
+//! inbound walk [`ModelRoute::candidates`].
 //! `/{provider}/…` never translates.
 //!
 //! # Maintenance
@@ -85,21 +85,22 @@ pub struct ModelRoute {
     pub model: &'static str,
     /// The API shape the *primary* speaks, and the shape a bare `/v1` client is assumed to send.
     /// Failover candidates may speak a different endpoint; the gateway translates the original
-    /// client body onto each candidate's path. Inbound `/v1/responses` without session state is
-    /// translated onto Chat Completions or Messages according to this field for the primary, then
-    /// per candidate. Session-state Responses walks [`Self::responses`] instead.
+    /// client body onto each candidate's path. Inbound `/v1/responses` on a row without a
+    /// [`Self::responses`] arm is translated (a one-shot only) onto Chat Completions or Messages
+    /// according to this field for the primary, then per candidate; a row with one walks it.
     /// `/{provider}/…` never translates.
     pub wire: WireFormat,
     /// Preference order: `[0]` is primary, the rest are failover candidates. Non-empty, at most
     /// [`MAX_CANDIDATES`], no provider repeated. Chat Completions / Messages inbound, and one-shot
-    /// Responses (`store: false`) that may still translate onto Chat Completions, walk this list.
+    /// Responses on a row with no [`Self::responses`] arm, walk this list.
     pub candidates: &'static [Candidate],
-    /// OpenAI `/v1/responses` arms. Walked when the inbound path is Responses **and** the body uses
-    /// session state (`previous_response_id` set, or `store` not explicitly `false`). Empty on
-    /// Claude rows — those have no OpenAI store, so session-state Responses is a 400, not a hollow
-    /// Messages call. Same-endpoint: byte relay (`store` / `previous_response_id` / `include` /
-    /// `truncation` pass through). A Responses 5xx may walk another entry here; it must not walk
-    /// onto [`Self::candidates`] while session fields are in play.
+    /// OpenAI `/v1/responses` arms. Walked by every inbound Responses request when non-empty,
+    /// `store: false` one-shots included, so Responses-only fields and tools are never lost to a
+    /// translation. Empty on Claude rows — those have no OpenAI store, so session-state Responses
+    /// (`previous_response_id`, or an explicit `store: true`) is a 400, not a hollow Messages call.
+    /// Same-endpoint: byte relay (`store` / `previous_response_id` / `include` / `truncation` /
+    /// tools pass through). A Responses 5xx may walk another entry here; it never walks onto
+    /// [`Self::candidates`].
     pub responses: &'static [Candidate],
     /// Standard public list price for this model. See [`ListPrice`].
     pub price: ListPrice,
@@ -936,8 +937,8 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
     },
     // The same shape on the OpenAI wire, where the two mounts differ as well (`/v1` vs `/api/v1`).
     // Flagships first in the *id* sort: 4.x, then 5 / 5.4 / 5.5 / 5.6, then 6 Astra, then o-series.
-    // `responses` is the arm used when inbound is `/v1/responses` with session state; Chat
-    // Completions / Messages inbound still walks `candidates`.
+    // `responses` is the arm every inbound `/v1/responses` walks; Chat Completions / Messages
+    // inbound walks `candidates`.
     //
     // OpenAI bills prompts over 272K input tokens at 2x input and 1.5x output on gpt-5.4, gpt-5.4-pro,
     // gpt-5.5, gpt-5.5-pro, gpt-5.6-* and gpt-6-astra. These rows list the base tier only; such a
