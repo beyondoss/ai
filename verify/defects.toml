@@ -143,10 +143,10 @@ impact = "A fast 401/403 counts as a healthy, fast sample. The ranker promotes i
 confidence = "high"
 evidence = "proxy.rs:3394, 3741"
 claims = ["REL-4"]
-state = "suspected"
-test = ""
+state = "reproduced"
+test = "a_401_candidate_does_not_black_hole_the_row"
 fix = ""
-note = ""
+note = "Row gpt-4o-mini, openai mock 401 (fast), openrouter 200 (+30ms), 30 distinct tenants: 1/30 succeed (only the seq-8 probe reached openrouter; EWMA then ranks the 1ms 401 healthy and first again). A single key fares better only because the probe's 2xx pins it to the fallback."
 
 [[defect]]
 id = "D11"
@@ -157,10 +157,10 @@ impact = "Allowance fails closed until seeded, but readyz only checks the deny w
 confidence = "high"
 evidence = "admin.rs:136-145; proxy.rs:1969"
 claims = ["REL-5"]
-state = "suspected"
-test = ""
+state = "reproduced"
+test = "readyz_is_not_ready_while_allowance_is_unseeded"
 fix = ""
-note = ""
+note = "NATS down at boot: managed request gets 402 'allowance unavailable' while /readyz answers 200 {\"status\":\"degraded\"}. Not hermetically reached: NATS up but allowance not yet seeded, where the body would be 'ok'."
 
 [[defect]]
 id = "D12"
@@ -227,10 +227,10 @@ impact = "All candidates failing gives an empty 502. All breakers open gives a b
 confidence = "high"
 evidence = "proxy.rs:2771-2776, 3248-3256; no fail_to_proxy override"
 claims = ["REL-2", "CAT-11"]
-state = "suspected"
-test = ""
+state = "reproduced"
+test = "all_breakers_open_on_a_catalog_walk_is_a_json_503"
 fix = ""
-note = ""
+note = "Both candidates' breakers open: bare 500, empty body, no x-beyond-request-id. All candidates connect-refused: empty 502, no request id (all_candidates_failing_to_connect_is_a_json_502). 101 MiB chunked body on /openai/...: cap fires (body_too_large counted) but the client gets an empty pingora 500 (a_chunked_body_over_the_cap_is_a_json_413); the catalog path already 413s (control passes)."
 
 [[defect]]
 id = "D17"
@@ -241,10 +241,10 @@ impact = "The probe permit resolves only at end of stream and is never reclaimed
 confidence = "high"
 evidence = "circuit_breaker.rs:327; proxy.rs:3726-3753"
 claims = ["REL-6"]
-state = "suspected"
-test = ""
+state = "reproduced"
+test = "a_stalled_half_open_probe_does_not_wedge_the_provider"
 fix = ""
-note = ""
+note = "threshold 1, reset 1s: after the 500 opens it, the probe gets a 200 head and stalls; 32 follow-up requests over 8s all 503 and the upstream saw no further hits."
 
 [[defect]]
 id = "D18"
@@ -493,10 +493,10 @@ impact = "Concurrent 100 MiB declared bodies are buffered up to three times. ten
 confidence = "med"
 evidence = "proxy.rs:116, 1206, 2044"
 claims = ["SEC-19"]
-state = "suspected"
-test = ""
+state = "reproduced"
+test = "concurrent_large_uploads_have_bounded_memory"
 fix = ""
-note = ""
+note = "8 concurrent managed /v1 uploads of 90 MiB (720 MiB total) held while the upstream stalls: gateway VmRSS grew 1463 MiB (~2x the bodies). The trickle/pre-allocation variant was not measured (jemalloc does not fault untouched capacity into RSS)."
 
 [[defect]]
 id = "D36"
@@ -507,10 +507,10 @@ impact = "No first-byte, stall or total deadline, and no H2 ping. Ping-only stre
 confidence = "high"
 evidence = "proxy.rs:618"
 claims = ["REL-7"]
-state = "suspected"
-test = ""
+state = "reproduced"
+test = "a_streaming_header_stall_fails_well_under_read_timeout_by_default"
 fix = ""
-note = ""
+note = "Default config, stream:true request, upstream never sends a head: no answer after 15s (client timeout). With read_timeout_secs=2 the same stall ends in ~2.2s (a_header_stall_ends_at_the_configured_read_timeout passes), so read_timeout is the only bound."
 
 [[defect]]
 id = "D37"
@@ -521,10 +521,10 @@ impact = "Any success resets the failure count, so a 50% 5xx rate stays closed."
 confidence = "high"
 evidence = "circuit_breaker.rs:383"
 claims = ["REL-6"]
-state = "suspected"
-test = ""
+state = "reproduced"
+test = "a_half_failing_provider_opens_the_breaker"
 fix = ""
-note = ""
+note = "threshold 4 / window 60s: 40 requests alternating 500/200 never produce a gateway 503; a solid 500 run opens it within 10 requests (control passes)."
 
 [[defect]]
 id = "D38"
@@ -535,10 +535,10 @@ impact = "On Fargate (120s) every stop ends in SIGKILL, and in-flight streams lo
 confidence = "high"
 evidence = "main.rs:166-175; pingora server/mod.rs:811"
 claims = ["REL-16", "BIL-21"]
-state = "suspected"
-test = ""
+state = "reproduced"
+test = "an_idle_gateway_exits_promptly_on_sigterm"
 fix = ""
-note = ""
+note = "Idle gateway, default config: still running 15s after SIGTERM. With shutdown_grace_period_secs=3 it exits at 3.02s, i.e. it always sleeps the full grace."
 
 [[defect]]
 id = "D39"
@@ -552,7 +552,7 @@ claims = ["REL-17"]
 state = "suspected"
 test = ""
 fix = ""
-note = ""
+note = "needs test-only fault hook: reproducing requires a panic inside a proxy phase, which needs a cfg(test)/feature-gated panic trigger in production code."
 
 [[defect]]
 id = "D40"
@@ -563,10 +563,10 @@ impact = "No serve-stale (despite the docs), only the first IP is tried, and loo
 confidence = "high"
 evidence = "state.rs:408-417"
 claims = ["REL-20"]
-state = "suspected"
-test = ""
+state = "reproduced"
+test = "dns_tries_the_next_address_when_the_first_is_dead"
 fix = ""
-note = ""
+note = "provider authority localhost:<port>, getaddrinfo returns [::1, 127.0.0.1], mock listens on 127.0.0.1 only: 502 and zero upstream hits. Test skips on hosts that do not order ::1 first. Lookup timeout and serve-stale not covered (need a fault-injecting resolver)."
 
 [[defect]]
 id = "D41"
@@ -577,10 +577,10 @@ impact = "The OpenRouter error-in-200 pattern is promoted by the ranker and pinn
 confidence = "high"
 evidence = "proxy.rs:3394-3398"
 claims = ["REL-8"]
-state = "suspected"
-test = ""
+state = "reproduced"
+test = "a_200_with_an_error_body_is_not_pinned"
 fix = ""
-note = ""
+note = "Primary returns 200 + {\"error\":...}: one key's 10 requests all served by openai (9 pin decisions), 0 reach the healthy fallback. Same for an SSE error-first 200 (a_200_stream_with_an_error_first_event_is_not_pinned)."
 
 [[defect]]
 id = "D42"
@@ -591,10 +591,10 @@ impact = "No downstream write timeout. Holds the slot, the upstream connection a
 confidence = "med"
 evidence = "pingora default"
 claims = ["REL-10"]
-state = "suspected"
-test = ""
+state = "reproduced"
+test = "a_client_that_stops_reading_is_released"
 fix = ""
-note = ""
+note = "Raw client requests a 64 MiB SSE stream and never reads: ai_requests_in_flight stays 1 for 20s. The 20s bound is the test's choice; there is no downstream write timeout at all."
 
 [[defect]]
 id = "D43"
@@ -605,10 +605,10 @@ impact = "SDKs won't back off correctly. 'Allowance unavailable' is retryable, b
 confidence = "high"
 evidence = "proxy.rs:1969-1984, 2601-2611"
 claims = ["REL-19"]
-state = "suspected"
-test = ""
+state = "reproduced"
+test = "gateway_429_and_503_carry_retry_after"
 fix = ""
-note = ""
+note = "No Retry-After on the rate-limit 429, the tenant-concurrency 429 or the breaker-open 503; 'allowance unavailable' is 402."
 
 [[defect]]
 id = "D44"
@@ -717,10 +717,10 @@ impact = "A key walk can switch vendors. The final error after resets is wrong. 
 confidence = "high"
 evidence = "proxy.rs FullBody"
 claims = ["REL-21"]
-state = "suspected"
-test = ""
+state = "reproduced"
+test = "resets_on_every_candidate_end_the_same_for_small_and_large_bodies"
 fix = ""
-note = ""
+note = "Both candidates reset after reading the body: small body = empty 502 after 1 attempt; large (200 KiB) = 503 'no provider key available' after 4 attempts. The 429 key-walk comparison matches (a_429_key_walk_ends_the_same_for_small_and_large_bodies passes): no vendor switch reproduced."
 
 [[defect]]
 id = "D52"
@@ -731,10 +731,10 @@ impact = "bedrock-openai and fireworks-anthropic 503 on env-only deploys. circui
 confidence = "high"
 evidence = "config.rs:472-542; state.rs:134"
 claims = ["REL-15"]
-state = "suspected"
-test = ""
+state = "reproduced"
+test = "env_pool_key_reaches_a_hyphenated_provider"
 fix = ""
-note = ""
+note = "AI_POOL_KEY_FIREWORKS_ANTHROPIC with provider fireworks-anthropic: 503 'no provider key available' (AI_POOL_KEY_FIREWORKS for fireworks works). circuit_breaker_window_secs=0 boots and 12 straight 500s never open the breaker (a_zero_breaker_window_is_refused_or_still_trips)."
 
 [[defect]]
 id = "D53"

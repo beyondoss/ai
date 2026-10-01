@@ -1784,3 +1784,293 @@ pub fn billing_vkey(sk: &ed25519_dalek::SigningKey, tenant_id: u64) -> String {
         sk,
     )
 }
+
+// --- verify phase 0: reliability ---
+//
+// Additive helpers for the `reliability_*` test files: process lifecycle on a running gateway, an
+// upstream whose reply is chosen per request (`ReplyUpstream`), and raw HTTP/1.1 response parsing for the cases reqwest cannot express (chunked uploads, a reader that
+// stops reading).
+
+impl Gateway {
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
+    /// Send SIGTERM to the gateway process.
+    pub fn sigterm(&self) {
+        let _ = Command::new("kill")
+            .args(["-TERM", &self.child.id().to_string()])
+            .status();
+    }
+
+    /// Wait up to `limit` for the process to exit. `Some(elapsed)` when it did.
+    pub async fn wait_exit(&mut self, limit: Duration) -> Option<Duration> {
+        let start = std::time::Instant::now();
+        while start.elapsed() < limit {
+            if let Ok(Some(_)) = self.child.try_wait() {
+                return Some(start.elapsed());
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+        None
+    }
+
+    /// The current value of a metric (0 when absent).
+    pub async fn metric(&self, name: &str, label: &str) -> f64 {
+        parse_metric(&self.metrics().await, name, label)
+    }
+
+    /// Resident set size of the gateway process, in KiB, from `/proc/<pid>/status`.
+    pub fn rss_kib(&self) -> u64 {
+        let status = std::fs::read_to_string(format!("/proc/{}/status", self.child.id()))
+            .unwrap_or_default();
+        status
+            .lines()
+            .find(|l| l.starts_with("VmRSS:"))
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+    }
+}
+
+/// Boot the gateway binary on a minimal config plus `extra` scalar lines and report whether it
+/// refuses to start: `Some(stderr)` if it exited within `limit`, `None` if it is still running.
+pub fn boot_refuses(extra: &str, limit: Duration) -> Option<String> {
+    let port = free_port();
+    let metrics_port = free_port();
+    let path = std::env::temp_dir().join(format!("beyond-ai-bootcheck-{port}.toml"));
+    let cfg = format!(
+        "listen = \"127.0.0.1:{port}\"\nmetrics_listen = \"127.0.0.1:{metrics_port}\"\n\
+         nats_url = \"nats://127.0.0.1:{}\"\nupstream_tls = false\n{extra}\n",
+        closed_port()
+    );
+    std::fs::write(&path, cfg).unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_beyond-ai"))
+        .args(["run", "-c"])
+        .arg(&path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn beyond-ai");
+    let start = std::time::Instant::now();
+    let out = loop {
+        if let Ok(Some(_)) = child.try_wait() {
+            let mut err = String::new();
+            if let Some(mut s) = child.stderr.take() {
+                let _ = std::io::Read::read_to_string(&mut s, &mut err);
+            }
+            break Some(err);
+        }
+        if start.elapsed() > limit {
+            let _ = child.kill();
+            let _ = child.wait();
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let _ = std::fs::remove_file(&path);
+    out
+}
+
+/// What a [`ReplyUpstream`] does with one request.
+#[derive(Clone)]
+pub enum Reply {
+    /// A complete response.
+    Full {
+        status: u16,
+        content_type: &'static str,
+        body: Bytes,
+    },
+    /// The response head and `first`, then nothing ever again.
+    Stall {
+        status: u16,
+        content_type: &'static str,
+        first: Bytes,
+    },
+    /// Never send a response head.
+    HeaderStall,
+    /// Wait this long, then send the inner reply.
+    Delayed(Duration, Box<Reply>),
+    /// Drop the connection without answering, after reading the body.
+    Reset,
+}
+
+impl Reply {
+    pub fn json(status: u16, body: &'static str) -> Self {
+        Reply::Full {
+            status,
+            content_type: "application/json",
+            body: Bytes::from_static(body.as_bytes()),
+        }
+    }
+
+    /// The stock OpenAI chat completion the plain mock serves.
+    pub fn ok() -> Self {
+        Reply::json(200, CANNED_JSON)
+    }
+
+    /// The stock OpenAI SSE stream the plain mock serves.
+    pub fn sse() -> Self {
+        Reply::Full {
+            status: 200,
+            content_type: "text/event-stream",
+            body: Bytes::from_static(CANNED_SSE.as_bytes()),
+        }
+    }
+}
+
+/// The request facts a script can branch on.
+pub struct ScriptReq {
+    pub authorization: Option<String>,
+    pub body_len: usize,
+}
+
+type ReplyScript = Arc<dyn Fn(usize, &ScriptReq) -> Reply + Send + Sync>;
+
+/// A plaintext HTTP/1.1 upstream whose reply to request `n` (0-based, global) is `script(n, req)`.
+pub struct ReplyUpstream {
+    pub port: u16,
+    hits: Arc<std::sync::atomic::AtomicUsize>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+async fn scripted_reply(mut reply: Reply) -> Result<Response<MockBody>, std::io::Error> {
+    loop {
+        match reply {
+            Reply::Delayed(d, inner) => {
+                sleep(d).await;
+                reply = *inner;
+            }
+            Reply::HeaderStall => std::future::pending::<()>().await,
+            Reply::Reset => return Err(std::io::Error::other("scripted reset")),
+            Reply::Full {
+                status,
+                content_type,
+                body,
+            } => {
+                return Ok(Response::builder()
+                    .status(status)
+                    .header("content-type", content_type)
+                    .body(Either::Left(Full::new(body)))
+                    .unwrap());
+            }
+            Reply::Stall {
+                status,
+                content_type,
+                first,
+            } => {
+                return Ok(Response::builder()
+                    .status(status)
+                    .header("content-type", content_type)
+                    .body(Either::Right(StallingBody(Some(first))))
+                    .unwrap());
+            }
+        }
+    }
+}
+
+impl ReplyUpstream {
+    pub async fn start(
+        script: impl Fn(usize, &ScriptReq) -> Reply + Send + Sync + 'static,
+    ) -> Self {
+        let script: ReplyScript = Arc::new(script);
+        let listener = bind_unreserved().await;
+        let port = listener.local_addr().unwrap().port();
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = hits.clone();
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let io = TokioIo::new(stream);
+                let (script, counter) = (script.clone(), counter.clone());
+                tokio::spawn(async move {
+                    let svc = service_fn(move |req: Request<hyper::body::Incoming>| {
+                        let (script, counter) = (script.clone(), counter.clone());
+                        async move {
+                            let n = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            let authorization = req
+                                .headers()
+                                .get("authorization")
+                                .and_then(|v| v.to_str().ok())
+                                .map(String::from);
+                            let body_len = req
+                                .into_body()
+                                .collect()
+                                .await
+                                .map(|b| b.to_bytes().len())
+                                .unwrap_or_default();
+                            let reply = script(
+                                n,
+                                &ScriptReq {
+                                    authorization,
+                                    body_len,
+                                },
+                            );
+                            scripted_reply(reply).await
+                        }
+                    });
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(io, svc)
+                        .await;
+                });
+            }
+        });
+        ReplyUpstream { port, hits, task }
+    }
+
+    pub fn authority(&self) -> String {
+        format!("127.0.0.1:{}", self.port)
+    }
+
+    pub fn hits(&self) -> usize {
+        self.hits.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl Drop for ReplyUpstream {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// A raw HTTP/1.1 response: status, lower-cased headers, body (as far as it was read).
+#[derive(Debug, Default)]
+pub struct RawResponse {
+    pub status: u16,
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+}
+
+impl RawResponse {
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.as_str())
+    }
+}
+
+/// Parse whatever HTTP/1.1 response bytes arrived. Status `0` when no status line came back.
+pub fn parse_raw_response(buf: &[u8]) -> RawResponse {
+    let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") else {
+        return RawResponse::default();
+    };
+    let head = String::from_utf8_lossy(&buf[..end]);
+    let mut lines = head.split("\r\n");
+    let status = lines
+        .next()
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let headers = lines
+        .filter_map(|l| l.split_once(':'))
+        .map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_string()))
+        .collect();
+    RawResponse {
+        status,
+        headers,
+        body: buf[end + 4..].to_vec(),
+    }
+}
