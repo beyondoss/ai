@@ -5196,7 +5196,7 @@ impl SseBridge {
     }
 
     fn deliver(&mut self, item: ChatItem, out: &mut Vec<u8>) {
-        if self.errored {
+        if self.errored || self.client_ended() {
             return;
         }
         match (self.client, item) {
@@ -5230,6 +5230,20 @@ impl SseBridge {
             (Endpoint::Responses, ChatItem::Chunk(v)) => self.oai_to_resp.chunk(&v, out),
             (Endpoint::Responses, ChatItem::Done) => self.oai_to_resp.finish(out),
             (Endpoint::Embeddings, _) => {}
+        }
+    }
+
+    /// The client was sent its terminal event (a Chat `[DONE]`, a Messages `message_stop`, a
+    /// Responses `response.completed`). Nothing follows it: an upstream that writes past its own
+    /// end (an error after the usage chunk, a chunk after `message_stop`) must not hand the client
+    /// a second ending (D124), and `proxy`'s [`crate::terminal::TerminalTracker`] reads the end of
+    /// what the client was sent to tell a close after the answer from a cancel.
+    fn client_ended(&self) -> bool {
+        match self.client {
+            Endpoint::ChatCompletions => self.done,
+            Endpoint::Messages => self.oai_to_ant.finished,
+            Endpoint::Responses => self.oai_to_resp.completed,
+            Endpoint::Embeddings => false,
         }
     }
 

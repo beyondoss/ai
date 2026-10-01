@@ -37,7 +37,7 @@ fn usage_with_boundary_counts_never_panics() {
 /// claim: S2
 /// defect: D124
 #[test]
-#[ignore = "D124 reproduced: events after the upstream's end reach the client after [DONE] / message_stop"]
+
 fn nothing_reaches_the_client_after_its_terminal_event() {
     // Chat upstream → Messages client: an error between the usage chunk and `[DONE]`.
     let chat = concat!(

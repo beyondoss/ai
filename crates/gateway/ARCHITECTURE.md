@@ -794,6 +794,12 @@ Responses-only models the catalog routes to `/v1/responses`, and is held to the 
   body (a close-delimited body, or a provider that stopped writing); an upstream that drops a
   chunked, sized or HTTP/2 body mid-way fails the request in Pingora, and the client's connection is
   cut instead.
+- **Nothing follows the client's terminal event.** Once a translated client has its `[DONE]`,
+  `message_stop` or `response.completed`, nothing more reaches it: an upstream that writes past its
+  own end (an error between a Chat usage chunk and its `[DONE]`, an event after `message_stop`) is
+  dropped, where it used to hand the client a second ending on a turn that had completed (D124).
+  The stream the client was sent then ends on its terminal event, which is what
+  `terminal::TerminalTracker` reads to bill a close after the answer as `ok` (D120).
 - **Tool-call deltas** are keyed by `index`, else by `id`: an id repeated on every delta is one call,
   a reused `index` with a new id is a new call, interleaved deltas land on their own call, and a call
   opens only once its name is known. A `tool_use` block that closes with no argument bytes still

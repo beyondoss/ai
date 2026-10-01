@@ -65,21 +65,6 @@ fn bounded(input: usize, output: usize) -> bool {
     output <= input.saturating_mul(24) + 16 * 1024
 }
 
-/// The upstream's own end of stream: what a well-behaved upstream sends nothing after.
-fn upstream_terminal(name: Option<&str>, v: &Value) -> bool {
-    let typ = name.or_else(|| v["type"].as_str());
-    matches!(
-        typ,
-        Some(
-            "message_stop"
-                | "response.completed"
-                | "response.incomplete"
-                | "response.failed"
-                | "[DONE]"
-        )
-    )
-}
-
 fn billed(upstream: Endpoint, bytes: &[u8]) -> Option<usage::Usage> {
     match upstream {
         Endpoint::Messages => usage::anthropic_stream(bytes),
@@ -197,12 +182,6 @@ fn prop_vocabulary_events_keep_the_client_lifecycle() {
             let mut bytes = Vec::new();
             for (name, v) in &events {
                 fr.event(&mut bytes, *name, &v.to_string());
-                // D124: anything the upstream sends after its own terminal event reaches a Chat client
-                // after `[DONE]` (and an error reaches a Messages client after `message_stop`). The
-                // stream stops at the terminal event while that defect is open.
-                if upstream_terminal(name.filter(|_| !fr.no_event_lines), v) {
-                    break;
-                }
             }
             if done {
                 fr.event(&mut bytes, None, "[DONE]");
@@ -313,14 +292,6 @@ fn prop_errors_and_cuts_anywhere_leave_a_well_formed_failure() {
         (cross_pairings(), script(), any::<usize>(), any::<bool>()),
         |((client, upstream), s, at, cut)| {
             let n = s.event_count(upstream);
-            // D124: an error between a Chat upstream's usage chunk and its `[DONE]` reaches a Messages
-            // client after `message_stop`. Excluded while that defect is open.
-            prop_assume!(
-                !(client == Endpoint::Messages
-                    && upstream == Endpoint::ChatCompletions
-                    && !cut
-                    && at % n == n - 1)
-            );
             let bytes = if cut {
                 s.stream(upstream, Some(at % n), None)
             } else {
