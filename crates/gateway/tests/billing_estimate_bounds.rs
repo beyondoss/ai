@@ -327,3 +327,29 @@ async fn a_non_stream_error_in_200_is_not_billed() {
     assert_eq!(row["input_tokens"], 0, "{row}");
     assert_eq!(row["output_tokens"], 0, "{row}");
 }
+
+/// The same error-in-200 whatever order its keys come in: a provider (or OpenRouter quoting one)
+/// that writes `id`, `object` and `model` before `error` sends a body that is still only an error,
+/// with no `choices`, `output` or `content`. It stays 0/0, not an estimate of the envelope. A body
+/// that has an answer beside `"error": null` (a Responses object) is still billed as an answer.
+/// claim: BIL-12, BIL-20
+/// defect: D205
+#[tokio::test]
+async fn an_error_in_200_is_not_billed_whatever_its_key_order() {
+    let (pubkey, sk) = test_keypair(205);
+    let up = ScriptedUpstream::reply(
+        200,
+        "application/json",
+        r#"{"id":"gen-1","object":"chat.completion","created":1,"model":"x-ai/grok-4","error":{"code":502,"message":"Provider returned error","metadata":{"provider_name":"xAI"}},"user_id":"u"}"#.to_owned(),
+    )
+    .await;
+    let gw = Gateway::builder(unused_nats_port(), &up.authority(), &b64(&pubkey))
+        .providers(&["openai"])
+        .start()
+        .await;
+    post_non_stream(&gw, &billing_vkey(&sk, 205)).await;
+    let row = one_row(&wait_usage_rows(&gw, 1, 15).await, &gw);
+    assert_eq!(row["usage_estimated"], false, "{row}");
+    assert_eq!(row["input_tokens"], 0, "{row}");
+    assert_eq!(row["output_tokens"], 0, "{row}");
+}

@@ -2177,3 +2177,17 @@ state = "fixed"
 test = "each_cooled_key_is_counted_with_its_reason"
 fix = ""
 note = "Fixed: ai_key_auth_failures_total is an IntCounterVec with a reason label (metrics::KeyCooled: revoked | unfunded | key_named_403), each child resolved at boot (exported at 0 from start, one fetch_add per bump, as ai_rejections_total). The is_candidate_refusal doc names every cooling path; ARCHITECTURE.md's metrics table, failure-mode rows and Modules table (remedy) are updated. Dashboards summing the series are unaffected (tenancy_live sums every line); the hermetic tests now read their reason's line."
+
+[[defect]]
+id = "D205"
+severity = "low"
+area = "Billing"
+title = "A non-stream error-in-200 was billed an estimate unless error was its first key"
+impact = "D195 kept an error-only 2xx at 0/0 by reading the body with json_is_error_object, which looks only at the root's first key. An error-in-200 whose provider wrote id, object or model before error (the shape of a Chat Completions envelope carrying an error) was taken for an answer without usage and billed an estimate of its own envelope: a charge for a generation that never happened."
+confidence = "high"
+evidence = "Hermetic: an_error_in_200_is_not_billed_whatever_its_key_order. A 200 {\"id\":\"gen-1\",\"object\":\"chat.completion\",...,\"error\":{\"code\":502,...}} was billed input 16, output 12, usage_estimated true; the same body with error first (a_non_stream_error_in_200_is_not_billed) was 0/0."
+claims = ["BIL-12", "BIL-20"]
+state = "fixed"
+test = "an_error_in_200_is_not_billed_whatever_its_key_order"
+fix = ""
+note = "Fixed in proxy.rs logging: json_is_error_only reads the root's members in any order: a non-null error member and none of choices, output or content (so a Responses answer's \"error\": null beside output, and OpenRouter's partial choices with finish_reason error, stay answers). It is parsed only on the path that needs it (a managed non-stream 2xx with no parsed usage), so no other response pays a parse. Still read only when the whole body fits the 64 KiB usage tail; a larger body has no root to read and is estimated (an error-in-200 is under 2 KiB in practice). Unit: json_is_error_only_reads_members_in_any_order."

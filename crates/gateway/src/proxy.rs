@@ -920,6 +920,28 @@ fn json_is_error_object(bytes: &[u8]) -> Option<bool> {
     }
 }
 
+/// Whether a whole non-stream body is only an error (D195, D205): a root object with a non-null
+/// `error` member and none of the members an answer is carried in (`choices`, `output`,
+/// `content`), whatever order its keys come in. OpenRouter's error-in-200 is `{"error": {...}}`,
+/// but a provider may write `id`, `object` or `model` first; a Responses answer carries
+/// `"error": null` beside its `output`.
+fn json_is_error_only(body: &[u8]) -> bool {
+    peek::root_members(body).is_some_and(|members| {
+        let mut error = false;
+        for m in &members {
+            if m.key_is(body, "error") {
+                error |= &body[m.value.0..m.value.1] != b"null";
+            } else if ["choices", "output", "content"]
+                .iter()
+                .any(|k| m.key_is(body, k))
+            {
+                return false;
+            }
+        }
+        error
+    })
+}
+
 /// A leading JSON string's raw bytes and what follows it. `None` when it has not ended yet; an
 /// escaped string reads as itself, which matches neither `error` nor `type` (the right answer for
 /// a key spelled oddly enough to need one).
@@ -6163,9 +6185,13 @@ impl ProxyHttp for AiProxy {
             // and may bill, as a finished stream without usage is: estimated, never 0/0 (D195).
             // Except a body that is only an error object (OpenRouter's error-in-200, `{"error":
             // {...}}` with no answer), the non-stream form of an error-only stream: not work we
-            // were billed for. The tail is the whole body when the body fits in it.
-            let error_only_body = u64::from(rc.resp_bytes) <= tail.len() as u64
-                && json_is_error_object(tail) == Some(true);
+            // were billed for. Read from the root's members, in any order (D205). The tail is the
+            // whole body when the body fits in it.
+            let error_only_body = !rc.streaming
+                && ok_2xx
+                && parsed.is_none()
+                && u64::from(rc.resp_bytes) <= tail.len() as u64
+                && json_is_error_only(tail);
             let body_unmetered = rc.managed
                 && !free
                 && !rc.streaming
@@ -7220,6 +7246,30 @@ mod tests {
         );
         assert!(all("a=1&b=2&keys=3&monkey=4").is_empty());
         assert!(all("").is_empty());
+    }
+
+    /// An error-in-200 is read from the root's members in any order; an answer beside `"error":
+    /// null`, or with partial `choices`, is not one.
+    /// claim: BIL-12, BIL-20
+    #[test]
+    fn json_is_error_only_reads_members_in_any_order() {
+        for body in [
+            r#"{"error":{"code":502,"message":"x"}}"#,
+            r#"{"id":"gen-1","object":"chat.completion","error":{"code":502},"user_id":"u"}"#,
+            r#"{"model":"m","error":"upstream failed"}"#,
+        ] {
+            assert!(json_is_error_only(body.as_bytes()), "{body}");
+        }
+        for body in [
+            r#"{"id":"resp_1","object":"response","error":null,"output":[]}"#,
+            r#"{"error":{"code":502},"choices":[{"finish_reason":"error"}]}"#,
+            r#"{"type":"message","content":[],"error":{"x":1}}"#,
+            r#"{"id":"x","error":null}"#,
+            r#"{"error":{"code":502}"#,
+            "[]",
+        ] {
+            assert!(!json_is_error_only(body.as_bytes()), "{body}");
+        }
     }
 
     /// `background: true` is read as a provider's parser reads it: at the root, any copy, its name

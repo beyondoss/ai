@@ -1561,7 +1561,11 @@ Two more endings the provider bills and we used to write as zero get the same tr
   estimated as a cut-off body is: input from the tally, output from the body's string values. A
   body that is only an error object (OpenRouter's non-stream error-in-200, `{"error":{…}}` with no
   answer; read whole when the body fits the tail) is the exception, as an error-only stream is: no
-  generation, a 0/0 row, not an estimate. A free sub-resource (a token count) is never estimated.
+  generation, a 0/0 row, not an estimate. "Only an error" is a root object with a non-null `error`
+  member and no `choices`, `output` or `content`, in any key order (`json_is_error_only`, D205: a
+  provider that wrote `id` and `object` first used to be estimated). It is parsed only on this
+  path (a managed non-stream 2xx without usage). A free sub-resource (a token count) is never
+  estimated.
 
 A stream or non-stream body that ends **cleanly** without usage still counts on
 `ai_usage_parse_errors_total` (the wire-shape-change alarm) even though it is now billed an
