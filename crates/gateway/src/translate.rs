@@ -4194,10 +4194,14 @@ fn responses_input_to_messages(input: Option<&Value>, up: Upstream) -> Vec<Value
             | "image_generation_call"
             | "mcp_call"
             | "mcp_list_tools" => {}
-            // Anything else (`item_reference`, `computer_call_output`, `local_shell_call`,
-            // `compaction`, …) is history the model would answer without. Forwarded as-is in
-            // place, so the provider rejects it by name rather than answering a different
-            // conversation.
+            // OpenAI-held state no other upstream can resolve: a `compaction` is a summary only
+            // OpenAI can decrypt, an `item_reference` a pointer into its store. Dropped, so a
+            // compacted session that fails over onto a translated candidate runs on the history
+            // the client holds instead of failing (D95). The same-wire relay keeps both.
+            "compaction" | "item_reference" => {}
+            // Anything else (`computer_call_output`, `local_shell_call`, …) is history the client
+            // holds and the model would answer without. Forwarded as-is in place, so the provider
+            // rejects it by name rather than answering a different conversation.
             _ => {
                 flush_carried(&mut out, &mut carried);
                 out.push(item.clone());

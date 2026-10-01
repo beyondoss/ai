@@ -609,11 +609,16 @@ Anthropic-defined tools (`web_search_…`, `bash_…`, `text_editor_…`: as an 
 model would call one and nothing would run it), Responses hosted tools (`web_search`,
 `file_search`, …), a Chat Completions client's `custom` tools onto Messages, `mcp_servers`, a Responses `prompt`
 template, `stop` onto Responses, and Responses input items with no Chat Completions shape
-(`item_reference`, `computer_call_output`, `local_shell_call`, `compaction`, …, forwarded whole in
-their place in `messages`), and a message whose role no dialect has (a typo, a framework's private
+(`computer_call_output`, `local_shell_call`, …, forwarded whole in their place in `messages`), and a message whose role no dialect has (a typo, a framework's private
 role: forwarded whole, in place, role unchanged, never turned into a user turn) have no equivalent
 on the other wire and change what the client gets back. Only records of a hosted tool the provider ran itself (`web_search_call`, `mcp_call`, …) are
-dropped: the client wrote none of it, and the answer that used it follows as a message. An explicit
+dropped: the client wrote none of it, and the answer that used it follows as a message. So are
+`compaction` and `item_reference` items, which are OpenAI-held state (a summary only OpenAI can
+decrypt, a pointer into its store) that no translated upstream can resolve: a compacted Codex
+session that fails over onto a translated candidate runs on the history the client holds, a
+degraded answer rather than a 400. The distinction from forwarding: an item the gateway does not
+know is forwarded (the provider names it), and a known item that only OpenAI can read is dropped
+when translating. A same-wire Responses relay keeps both. An explicit
 `null` (how OpenAI SDKs send an unset option) is "not set" and is never forwarded; that includes
 `instructions: null`, which becomes no system message rather than one with null content. A
 same-wire Chat Completions relay to a host other than OpenAI (OpenRouter, xAI, Together, …) drops

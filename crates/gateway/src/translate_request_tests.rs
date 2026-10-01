@@ -1825,20 +1825,20 @@ fn a_responses_developer_message_is_system_on_a_non_openai_chat_host() {
 }
 
 /// Responses input items the gateway has no mapping for must reach the upstream so it rejects
-/// them by name, never silently vanish: an `item_reference` is the turn's content, and a dropped
-/// `computer_call_output` / `local_shell_call` leaves the model answering a different history.
+/// them by name, never silently vanish: a dropped `computer_call_output` / `local_shell_call`
+/// leaves the model answering a different history. (`compaction` and `item_reference` are
+/// OpenAI-held state, dropped when translating: see D95.)
 /// claim: TRN-17
 /// defect: D49
 #[test]
 fn unknown_responses_input_items_are_forwarded_not_dropped() {
     let mut dropped = Vec::new();
     for item in [
-        json!({"type": "item_reference", "id": "msg_abc123"}),
         json!({"type": "local_shell_call", "id": "lsh_1", "call_id": "call_1", "status": "completed",
             "action": {"type": "exec", "command": ["ls"], "env": {}}}),
         json!({"type": "computer_call_output", "call_id": "call_2",
             "output": {"type": "computer_screenshot", "image_url": "data:image/png;base64,AAAA"}}),
-        json!({"type": "compaction", "id": "cmp_1", "encrypted_content": "opaque"}),
+        json!({"type": "some_future_item", "id": "x_1"}),
     ] {
         let typ = item["type"].as_str().unwrap().to_owned();
         let v = r2c(
@@ -2047,7 +2047,6 @@ fn an_unknown_role_is_forwarded_onto_responses() {
 /// claim: TRN-17
 /// defect: D95
 #[test]
-#[ignore = "D95 reproduced: compaction and item_reference are forwarded onto a translated candidate"]
 fn openai_held_responses_items_are_dropped_only_when_translating() {
     let body = json!({"model": "m", "store": false, "input": [
         {"type": "compaction", "id": "cmp_1", "encrypted_content": "opaque"},
@@ -2058,11 +2057,19 @@ fn openai_held_responses_items_are_dropped_only_when_translating() {
         ("Responses→Chat", r2c(&body, "grok-4.3")),
         (
             "Responses→Messages",
-            req(Endpoint::Responses, Endpoint::Messages, &body, "claude-haiku-4-5"),
+            req(
+                Endpoint::Responses,
+                Endpoint::Messages,
+                &body,
+                "claude-haiku-4-5",
+            ),
         ),
     ] {
         let s = v.to_string();
-        assert!(!s.contains("compaction") && !s.contains("item_reference"), "{what}: {v}");
+        assert!(
+            !s.contains("compaction") && !s.contains("item_reference"),
+            "{what}: {v}"
+        );
         assert!(s.contains("continue"), "{what}: {v}");
     }
     // Same wire: relayed as sent.
