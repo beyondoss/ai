@@ -1882,4 +1882,60 @@ claims = ["CAT-1", "CAT-2", "E1", "E2", "E3"]
 state = "fixed"
 test = "a_non_stream_call_on_a_stream_only_candidate_gets_a_whole_answer"
 fix = "60dea1e"
-note = "Found by the live catalog sweep. Together publishes no stream-only flag in its model listing; the four ids were found by sending each Together id in the catalog a non-streaming request. Fixed: providers::catalog::stream_only names the four candidates; an attempt on one whose client did not stream sends stream: true with stream_options.include_usage spliced first (translate::force_stream, every other byte as sent) and assembles the stream into the client's JSON body with the bridge a Responses client's stream already uses (SseBridge::assembling: it writes no event and keeps the response.completed object, which is then mapped like any non-stream Responses body). Per attempt, so OpenRouter's failover copy gets the client's own body; billing reads the stream's usage chunk (one exact row); the cache stores the assembled JSON; a stream cut short is stream_truncated in the client's envelope and a cut-short estimate. Also held by a_tool_call_streamed_by_a_stream_only_candidate_arrives_whole, a_failover_from_a_stream_only_candidate_sends_the_client_body, an_assembled_answer_is_cached_as_json, a_cut_short_stream_becomes_an_error_and_an_estimate, force_stream_asks_for_one_stream_and_moves_nothing_else, an_assembling_bridge_writes_one_body_at_the_end and stream_only_candidates_are_together_qwen_on_chat."
+note = "Found by the live catalog sweep. Together publishes no stream-only flag in its model listing; the four ids were found by sending each Together id in the catalog a non-streaming request. Fixed: providers::catalog::stream_only names the four candidates; an attempt on one whose client did not stream sends stream: true with stream_options.include_usage spliced first (translate::force_stream, every other byte as sent) and assembles the stream into the client's JSON body with the bridge a Responses client's stream already uses (SseBridge::assembling: it writes no event and keeps the response.completed object, which is then mapped like any non-stream Responses body). Per attempt, so OpenRouter's failover copy gets the client's own body; billing reads the stream's usage chunk (one exact row); the cache stores the assembled JSON; a stream cut short is stream_truncated in the client's envelope and a cut-short estimate. Also held by a_tool_call_streamed_by_a_stream_only_candidate_arrives_whole, a_failover_from_a_stream_only_candidate_sends_the_client_body, an_assembled_answer_is_cached_as_json, a_cut_short_stream_becomes_an_error_and_an_estimate, force_stream_asks_for_one_stream_and_moves_nothing_else, an_assembling_bridge_writes_one_body_at_the_end and stream_only_candidates_are_together_qwen_on_chat. Live 2026-10-01: CAT-1::raw::together and CAT-2::raw::all pass on all four rows, as do BIL-13, CAT-4, CAT-5, CAT-7 and CAT-6+BIL-9 there; the stock-SDK basic cells (openai-py, openai-node, anthropic-py, anthropic-ts, ai-sdk, Responses) pass on qwen3.8-flash. CAT-6 on these rows now runs, and found D150 and D151."
+
+[[defect]]
+id = "D150"
+severity = "med"
+area = "Catalog"
+title = "Together's Qwen3.6 Plus does not hold a strict json_schema output"
+impact = "qwen/qwen3.6-plus advertises structured outputs, and its primary is Together. Asked for a strict json_schema of {\"answer\": <integer>}, it sometimes answers {\"result\": 391}, so a client that relies on the schema gets JSON that does not validate."
+confidence = "high"
+evidence = "live 2026-10-01, after D147's fix made the cell runnable: CAT-6::raw::together::qwen/qwen3.6-plus failed 4 of 10 runs with json_schema: \"{\\\"result\\\": 391}\" does not validate as {\"answer\": <integer>}. The upstream stream Together sent (dumped from the gateway on a scratch build) carries that text, so it is Together's output, not translation."
+claims = ["CAT-6", "T4"]
+state = "suspected"
+test = ""
+fix = ""
+note = "Found by D147's live re-run. Options: drop structured outputs from the card, or leave Together out of a json_schema walk (as serves_structured_outputs does for Bedrock) so OpenRouter serves it."
+
+[[defect]]
+id = "D151"
+severity = "med"
+area = "Catalog"
+title = "Together's Qwen3.7 Plus sometimes returns a tool call as text"
+impact = "qwen/qwen3.7-plus advertises tools, and its primary is Together. Some answers to a tool request come back as content text (\"call\\n{\\\"name\\\": \\\"get_weather\\\", \\\"arguments\\\": {...}}\") with no tool_calls, so an agent loop sees prose instead of a call."
+confidence = "med"
+evidence = "live 2026-10-01: CAT-6::raw::together::qwen/qwen3.7-plus failed 3 of 12 runs. Twice with tools: forced get_weather, got None / text \"call\\n{\\\"name\\\": \\\"get_weather\\\", \\\"arguments\\\": {\\\"city\\\": \\\"Paris\\\"}}\". The upstream stream Together sent (dumped from the gateway on a scratch build) carries it as delta.content, so this is Together's tool parser. Once with arguments \"{\\\"city\\\": \\\"Paris\\\"\" lacking their closing brace. That one was not captured, and 24 direct streams plus 16 dumped gateway runs never showed it."
+claims = ["CAT-6", "T1"]
+state = "suspected"
+test = ""
+fix = ""
+note = "Found by D147's live re-run. The assembly was checked against the captured streams (each assembled into Chat, Messages and Responses bodies with every argument intact)."
+
+[[defect]]
+id = "D152"
+severity = "med"
+area = "Catalog"
+title = "A forced tool_choice on Together's thinking Qwen rows is a 400"
+impact = "Together's Qwen3.6 Plus, 3.7 Plus, 3.7 Max and 3.8 Flash think by default and refuse tool_choice required or a named function while thinking: 400 \"The tool_choice parameter does not support being set to required or object in thinking mode\". A stock SDK or LangChain call that forces a tool fails on the primary, and the 400 does not fail over to OpenRouter."
+confidence = "high"
+evidence = "live 2026-10-01, the live.rs together route pointed at qwen/qwen3.8-flash on a scratch edit: T1+B1::openai-py::together::tools_chat, T1+B1::anthropic-py::together::tools_messages and E1+T1+B1::langchain::together::langchain_chat all got that 400 from Together. Direct to api.together.xyz with Qwen/Qwen3.7-Plus and a named tool_choice: the same 400."
+claims = ["T1", "E1", "E2"]
+state = "suspected"
+test = ""
+fix = ""
+note = "Found by D147's live re-run. Options: turn thinking off when a tool is forced (as thinking_off_between_tools does for Claude), or send tool_choice auto. The catalog sweep's CAT-6 already retries with auto, so it does not see this."
+
+[[defect]]
+id = "D153"
+severity = "low"
+area = "Translation"
+title = "A developer message on Together's Qwen rows is a 400"
+impact = "OpenAI's Chat clients send the system prompt as role developer (openai-python for reasoning models, the Agents SDK). Together's Qwen backend refuses it: 400 \"developer is not one of ['system', 'assistant', 'user', 'tool', 'function']\". A same-wire Chat relay to Together passes the role through as sent."
+confidence = "high"
+evidence = "live 2026-10-01, the live.rs together route pointed at qwen/qwen3.8-flash on a scratch edit: TRN-16+TRN-2::openai-py::together::developer_role got that 400 from Together."
+claims = ["TRN-16"]
+state = "suspected"
+test = ""
+fix = ""
+note = "Found by D147's live re-run. Likely fix: on a Chat relay to a host other than OpenAI, send developer as system. Not checked yet on Together's other model families."
