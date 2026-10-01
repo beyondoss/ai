@@ -108,7 +108,7 @@ const CACHE_STATUS_HEADER: &str = "x-beyond-cache-status";
 /// pi's current OpenRouter-specific set (`packages/coding-agent/src/core/provider-attribution.ts`):
 /// `HTTP-Referer`, `X-OpenRouter-Title` (NOT the generic `X-Title` pi used for the now-removed Vercel
 /// AI Gateway route), and `X-OpenRouter-Categories`.
-const OPENROUTER_REFERER: &str = "https://beyond.build";
+const OPENROUTER_REFERER: &str = "https://beyond.dev";
 const OPENROUTER_TITLE: &str = "Beyond Gateway";
 const OPENROUTER_CATEGORY: &str = "cli-agent";
 
