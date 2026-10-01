@@ -2184,3 +2184,53 @@ fn replayed_thinking_leaves_the_final_assistant_turn_when_thinking_is_off() {
         "{relayed}"
     );
 }
+
+/// Codex always offers its hosted `web_search`. Onto Anthropic's own API it becomes Anthropic's
+/// web search server tool (its domain filter and location carried over); where no search tool
+/// exists (Bedrock, a Chat Completions host) it is dropped, and Codex works without search,
+/// rather than the whole request failing on a tool type the provider does not know.
+/// claim: W2, TRN-21
+/// defect: D78
+#[test]
+#[ignore = "D78 reproduced: Codex's hosted web_search is forwarded as-is to Claude and Chat hosts"]
+fn codex_web_search_maps_onto_anthropic_or_is_dropped() {
+    let body = json!({"model": "m", "store": false, "input": "news?", "tool_choice": "auto",
+    "tools": [
+        {"type": "function", "name": "shell", "parameters": {"type": "object", "properties": {}}},
+        {"type": "web_search", "search_context_size": "medium",
+         "filters": {"allowed_domains": ["rust-lang.org"]},
+         "user_location": {"type": "approximate", "country": "US", "city": null}},
+    ]});
+    let tools = |v: &Value| v["tools"].as_array().cloned().unwrap_or_default();
+    let v = req(
+        Endpoint::Responses,
+        Endpoint::Messages,
+        &body,
+        "claude-haiku-4-5",
+    );
+    let t = tools(&v);
+    assert_eq!(t.len(), 2, "{v}");
+    assert_eq!(
+        t[1],
+        json!({"type": "web_search_20250305", "name": "web_search",
+            "allowed_domains": ["rust-lang.org"],
+            "user_location": {"type": "approximate", "country": "US"}}),
+        "{v}"
+    );
+    for (what, v) in [
+        (
+            "Bedrock",
+            req(
+                Endpoint::Responses,
+                Endpoint::Messages,
+                &body,
+                "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+            ),
+        ),
+        ("grok", r2c(&body, "grok-4.3")),
+    ] {
+        let t = tools(&v);
+        assert_eq!(t.len(), 1, "{what}: {v}");
+        assert!(!v.to_string().contains("web_search"), "{what}: {v}");
+    }
+}

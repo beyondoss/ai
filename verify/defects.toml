@@ -1093,10 +1093,10 @@ area = "Translation"
 title = "Codex on a Claude row fails on its hosted web_search tool"
 impact = "Codex always offers its hosted web_search tool. On rows without an OpenAI Responses arm (every Claude row) the gateway forwards it as-is and Anthropic rejects the request (tools.12), so Codex can't run on Claude at all."
 confidence = "high"
-evidence = "live cell W2::codex::claude::codex after the D75 fix: Anthropic 400 on tools.12 (Codex's web_search)"
+evidence = "live cell W2::codex::claude::codex after the D75 fix: Anthropic 400 on tools.12 (Codex's web_search). Reproduced hermetically: translate::request_tests::codex_web_search_maps_onto_anthropic_or_is_dropped (the hosted web_search tool reaches claude-haiku-4-5, Bedrock and grok verbatim) and translate::response_tests::claude_web_search_comes_back_as_a_web_search_call (server_tool_use / web_search_tool_result blocks vanish from the Responses output, stream and non-stream)."
 claims = ["W2", "TRN-21"]
-state = "suspected"
-test = ""
+state = "reproduced"
+test = "claude_web_search_comes_back_as_a_web_search_call"
 fix = ""
 note = "Proposed: map Responses' hosted web_search onto Anthropic's server tool (web_search_20250305) and its result blocks back onto web_search_call items; billed via server_tool_calls (D24)."
 
