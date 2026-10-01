@@ -1107,7 +1107,7 @@ mod allowance {
 mod smart_rank {
     use super::*;
     use beyond_ai::control::Walk;
-    use beyond_ai::smart::Router;
+    use beyond_ai::smart::{Router, affinity};
     use providers::ModelRoute;
 
     fn opus() -> &'static ModelRoute {
@@ -1121,7 +1121,15 @@ mod smart_rank {
         let router = Router::new();
         let row = opus();
         let walk = Walk::identity(row.candidates.len());
-        bencher.bench(|| router.rank(black_box(walk), black_box(row), black_box(1)));
+        let aff = affinity(42, 7, None);
+        bencher.bench(|| {
+            router.rank(
+                black_box(walk),
+                black_box(row),
+                black_box(1),
+                black_box(Some(aff)),
+            )
+        });
     }
 
     /// Every candidate has an EWMA, so rank sorts. Still a handful of slots (`MAX_CANDIDATES`),
@@ -1134,7 +1142,46 @@ mod smart_rank {
             router.observe(row, i as u8, 100_000 * (i as u64 + 1), true);
         }
         let walk = Walk::identity(row.candidates.len());
-        bencher.bench(|| router.rank(black_box(walk), black_box(row), black_box(1)));
+        let aff = affinity(42, 7, None);
+        bencher.bench(|| {
+            router.rank(
+                black_box(walk),
+                black_box(row),
+                black_box(1),
+                black_box(Some(aff)),
+            )
+        });
+    }
+
+    /// A caller with a live session pin: pin lookup, then the same sort plus a move-to-front.
+    #[divan::bench]
+    fn rank_pinned(bencher: Bencher) {
+        let router = Router::new();
+        let row = opus();
+        for (i, _) in row.candidates.iter().enumerate() {
+            router.observe(row, i as u8, 100_000 * (i as u64 + 1), true);
+        }
+        let aff = affinity(42, 7, None);
+        router.pin(row, aff, 1);
+        let walk = Walk::identity(row.candidates.len());
+        bencher.bench(|| {
+            router.rank(
+                black_box(walk),
+                black_box(row),
+                black_box(1),
+                black_box(Some(aff)),
+            )
+        });
+    }
+
+    /// Re-pinning after every 2xx. A live pin to the same candidate within the same second is a
+    /// load and no store.
+    #[divan::bench]
+    fn pin_refresh(bencher: Bencher) {
+        let router = Router::new();
+        let row = opus();
+        let aff = affinity(42, 7, None);
+        bencher.bench(|| router.pin(black_box(row), black_box(aff), black_box(0)));
     }
 
     /// One sample after a candidate answers. Once per attempt, not per chunk.
@@ -1289,6 +1336,7 @@ mod translate {
                 black_box(Endpoint::ChatCompletions),
                 black_box(Endpoint::Messages),
                 black_box(&body),
+                black_box("claude-opus-4-8"),
             )
         });
     }
@@ -1303,6 +1351,7 @@ mod translate {
                 black_box(Endpoint::Responses),
                 black_box(Endpoint::Messages),
                 black_box(body),
+                black_box("claude-opus-4-8"),
             )
         });
     }

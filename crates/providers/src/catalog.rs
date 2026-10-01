@@ -108,11 +108,9 @@ pub struct ModelRoute {
 /// Claude cache write (2× input). `cache_write` here is the 5-minute / default write rate.
 ///
 /// Taken from OpenRouter's public `https://openrouter.ai/api/v1/models` card on 2026-09-30, which
-/// matched Anthropic's first-party table on every Claude row OpenRouter still lists. Two retired
-/// Claude rows OpenRouter has dropped (`claude-3-haiku`, `claude-opus-4`) use Anthropic's published
-/// card instead (`claude-opus-4` is still on the first-party pricing page; Haiku 3 keeps the
-/// long-standing $0.25 / $1.25 card with the same 0.1× read and 1.25× write multipliers as the
-/// rest of the Claude table).
+/// matched Anthropic's first-party table on every Claude row. `claude-3-haiku`, `claude-opus-4` and
+/// `gpt-5.2-chat` were removed on 2026-09-30: no provider serves them any more (the catalog smoke
+/// reported 404s from every candidate).
 ///
 /// A card that omits `cache_read` or `cache_write` is filled with the **input** rate: no discount,
 /// no write premium. Omission is not $0. A consumer that subtracted cache tokens and then multiplied
@@ -164,13 +162,15 @@ pub fn wire_of_path(path: &str) -> WireFormat {
     }
 }
 
-/// Chat Completions vs Messages vs Responses, from a candidate path.
+/// Chat Completions vs Messages vs Responses vs Embeddings, from a candidate path.
 ///
 /// Distinct from [`wire_of_path`]: `/v1/chat/completions` and `/v1/responses` are both OpenAI-wire
 /// but different endpoints. The gateway translates when this candidate's path differs from the
 /// client's; it never sends a Messages body at Chat Completions (or the reverse).
 pub fn endpoint_of_path(path: &str) -> &'static str {
-    if path.ends_with("/messages") {
+    if path.ends_with("/embeddings") {
+        "embeddings"
+    } else if path.ends_with("/messages") {
         "messages"
     } else if path.contains("/responses") {
         "responses"
@@ -239,6 +239,53 @@ const fn openai_chat(native: &'static str, openrouter: &'static str) -> [Candida
             provider: ProviderId::OpenAi,
             upstream_model: native,
             path: "/v1/chat/completions",
+        },
+        Candidate {
+            provider: ProviderId::OpenRouter,
+            upstream_model: openrouter,
+            path: "/api/v1/chat/completions",
+        },
+    ]
+}
+
+/// OpenAI `/v1/embeddings`, then OpenRouter's `/api/v1/embeddings`. An embeddings row is only ever
+/// embeddings candidates: the gateway recognizes the row by its primary's path and never translates
+/// it to or from a generation endpoint. Ids and paths verified live 2026-09-30.
+const fn openai_embeddings(native: &'static str, openrouter: &'static str) -> [Candidate; 2] {
+    [
+        Candidate {
+            provider: ProviderId::OpenAi,
+            upstream_model: native,
+            path: "/v1/embeddings",
+        },
+        Candidate {
+            provider: ProviderId::OpenRouter,
+            upstream_model: openrouter,
+            path: "/api/v1/embeddings",
+        },
+    ]
+}
+
+/// OpenRouter Chat Completions as the only candidate: models whose first-party API no longer serves
+/// them to our keys (retired at Anthropic, or unavailable on OpenAI's API) but OpenRouter still
+/// does. Live-verified 2026-09-30 by `catalog_rows_are_servable`.
+const fn openrouter_only(openrouter: &'static str) -> [Candidate; 1] {
+    [Candidate {
+        provider: ProviderId::OpenRouter,
+        upstream_model: openrouter,
+        path: "/api/v1/chat/completions",
+    }]
+}
+
+/// OpenAI's `/v1/responses` first, then OpenRouter Chat Completions: models OpenAI serves only on
+/// the Responses API (the `-pro` and later `-codex` ids 404 on Chat Completions). A Chat Completions
+/// or Messages client is translated onto Responses for the first candidate.
+const fn openai_responses_first(native: &'static str, openrouter: &'static str) -> [Candidate; 2] {
+    [
+        Candidate {
+            provider: ProviderId::OpenAi,
+            upstream_model: native,
+            path: "/v1/responses",
         },
         Candidate {
             provider: ProviderId::OpenRouter,
@@ -499,13 +546,6 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
     // Current lineup (Fable 5.1 / Opus 5 / Sonnet 5 / Haiku 4.5) plus the still-served 4.x
     // snapshots Anthropic lists as legacy. Dateless 4.6+ ids are pinned snapshots, not aliases.
     ModelRoute {
-        model: "claude-3-haiku",
-        wire: WireFormat::Anthropic,
-        candidates: &claude("claude-3-haiku", "anthropic/claude-3-haiku"),
-        responses: &[],
-        price: price("0.25", "1.25", "0.025", "0.3125"),
-    },
-    ModelRoute {
         model: "claude-fable-5",
         wire: WireFormat::Anthropic,
         candidates: &claude("claude-fable-5", "anthropic/claude-fable-5"),
@@ -531,16 +571,9 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         price: price("1", "5", "0.1", "1.25"),
     },
     ModelRoute {
-        model: "claude-opus-4",
-        wire: WireFormat::Anthropic,
-        candidates: &claude("claude-opus-4", "anthropic/claude-opus-4"),
-        responses: &[],
-        price: price("15", "75", "1.5", "18.75"),
-    },
-    ModelRoute {
         model: "claude-opus-4-1",
-        wire: WireFormat::Anthropic,
-        candidates: &claude("claude-opus-4-1", "anthropic/claude-opus-4.1"),
+        wire: WireFormat::OpenAi,
+        candidates: &openrouter_only("anthropic/claude-opus-4.1"), // retired at Anthropic
         responses: &[],
         price: price("15", "75", "1.5", "18.75"),
     },
@@ -584,9 +617,16 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         price: price("5", "25", "0.5", "6.25"),
     },
     ModelRoute {
-        model: "claude-sonnet-4",
+        model: "claude-opus-5-5",
         wire: WireFormat::Anthropic,
-        candidates: &claude("claude-sonnet-4", "anthropic/claude-sonnet-4"),
+        candidates: &claude("claude-opus-5-5", "anthropic/claude-opus-5.5"),
+        responses: &[],
+        price: price("4", "20", "0.2", "5"),
+    },
+    ModelRoute {
+        model: "claude-sonnet-4",
+        wire: WireFormat::OpenAi,
+        candidates: &openrouter_only("anthropic/claude-sonnet-4"), // retired at Anthropic
         responses: &[],
         price: price("3", "15", "0.3", "3.75"),
     },
@@ -608,6 +648,13 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         model: "claude-sonnet-5",
         wire: WireFormat::Anthropic,
         candidates: &claude("claude-sonnet-5", "anthropic/claude-sonnet-5"),
+        responses: &[],
+        price: price("2", "10", "0.2", "2.5"),
+    },
+    ModelRoute {
+        model: "claude-sonnet-5-5",
+        wire: WireFormat::Anthropic,
+        candidates: &claude("claude-sonnet-5-5", "anthropic/claude-sonnet-5.5"),
         responses: &[],
         price: price("2", "10", "0.2", "2.5"),
     },
@@ -738,7 +785,7 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
     ModelRoute {
         model: "gpt-5-pro",
         wire: WireFormat::OpenAi,
-        candidates: &openai_chat("gpt-5-pro", "openai/gpt-5-pro"),
+        candidates: &openai_responses_first("gpt-5-pro", "openai/gpt-5-pro"),
         responses: &openai_responses("gpt-5-pro"),
         price: price("15", "120", "15", "15"), // no separate cache card; both rates equal input
     },
@@ -752,22 +799,22 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
     ModelRoute {
         model: "gpt-5.1-codex",
         wire: WireFormat::OpenAi,
-        candidates: &openai_chat("gpt-5.1-codex", "openai/gpt-5.1-codex"),
-        responses: &openai_responses("gpt-5.1-codex"),
+        candidates: &openrouter_only("openai/gpt-5.1-codex"), // not served to our OpenAI key
+        responses: &[],
         price: price("1.25", "10", "0.13", "1.25"), // cache_write unpublished; equals input
     },
     ModelRoute {
         model: "gpt-5.1-codex-max",
         wire: WireFormat::OpenAi,
-        candidates: &openai_chat("gpt-5.1-codex-max", "openai/gpt-5.1-codex-max"),
-        responses: &openai_responses("gpt-5.1-codex-max"),
+        candidates: &openrouter_only("openai/gpt-5.1-codex-max"), // not served to our OpenAI key
+        responses: &[],
         price: price("1.25", "10", "0.125", "1.25"), // cache_write unpublished; equals input
     },
     ModelRoute {
         model: "gpt-5.1-codex-mini",
         wire: WireFormat::OpenAi,
-        candidates: &openai_chat("gpt-5.1-codex-mini", "openai/gpt-5.1-codex-mini"),
-        responses: &openai_responses("gpt-5.1-codex-mini"),
+        candidates: &openrouter_only("openai/gpt-5.1-codex-mini"), // not served to our OpenAI key
+        responses: &[],
         price: price("0.25", "2", "0.03", "0.25"), // cache_write unpublished; equals input
     },
     ModelRoute {
@@ -778,30 +825,23 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         price: price("1.75", "14", "0.175", "1.75"), // cache_write unpublished; equals input
     },
     ModelRoute {
-        model: "gpt-5.2-chat",
-        wire: WireFormat::OpenAi,
-        candidates: &openai_chat("gpt-5.2-chat", "openai/gpt-5.2-chat"),
-        responses: &openai_responses("gpt-5.2-chat"),
-        price: price("1.75", "14", "0.175", "1.75"), // cache_write unpublished; equals input
-    },
-    ModelRoute {
         model: "gpt-5.2-codex",
         wire: WireFormat::OpenAi,
-        candidates: &openai_chat("gpt-5.2-codex", "openai/gpt-5.2-codex"),
-        responses: &openai_responses("gpt-5.2-codex"),
+        candidates: &openrouter_only("openai/gpt-5.2-codex"), // not served to our OpenAI key
+        responses: &[],
         price: price("1.75", "14", "0.175", "1.75"), // cache_write unpublished; equals input
     },
     ModelRoute {
         model: "gpt-5.2-pro",
         wire: WireFormat::OpenAi,
-        candidates: &openai_chat("gpt-5.2-pro", "openai/gpt-5.2-pro"),
+        candidates: &openai_responses_first("gpt-5.2-pro", "openai/gpt-5.2-pro"),
         responses: &openai_responses("gpt-5.2-pro"),
         price: price("21", "168", "21", "21"), // no separate cache card; both rates equal input
     },
     ModelRoute {
         model: "gpt-5.3-codex",
         wire: WireFormat::OpenAi,
-        candidates: &openai_chat("gpt-5.3-codex", "openai/gpt-5.3-codex"),
+        candidates: &openai_responses_first("gpt-5.3-codex", "openai/gpt-5.3-codex"),
         responses: &openai_responses("gpt-5.3-codex"),
         price: price("1.75", "14", "0.175", "1.75"), // cache_write unpublished; equals input
     },
@@ -829,7 +869,7 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
     ModelRoute {
         model: "gpt-5.4-pro",
         wire: WireFormat::OpenAi,
-        candidates: &openai_chat("gpt-5.4-pro", "openai/gpt-5.4-pro"),
+        candidates: &openai_responses_first("gpt-5.4-pro", "openai/gpt-5.4-pro"),
         responses: &openai_responses("gpt-5.4-pro"),
         price: price("30", "180", "30", "30"), // no separate cache card; both rates equal input
     },
@@ -843,7 +883,7 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
     ModelRoute {
         model: "gpt-5.5-pro",
         wire: WireFormat::OpenAi,
-        candidates: &openai_chat("gpt-5.5-pro", "openai/gpt-5.5-pro"),
+        candidates: &openai_responses_first("gpt-5.5-pro", "openai/gpt-5.5-pro"),
         responses: &openai_responses("gpt-5.5-pro"),
         price: price("30", "180", "30", "30"), // no separate cache card; both rates equal input
     },
@@ -857,8 +897,8 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
     ModelRoute {
         model: "gpt-5.6-luna-pro",
         wire: WireFormat::OpenAi,
-        candidates: &openai_chat("gpt-5.6-luna-pro", "openai/gpt-5.6-luna-pro"),
-        responses: &openai_responses("gpt-5.6-luna-pro"),
+        candidates: &openrouter_only("openai/gpt-5.6-luna-pro"), // not served to our OpenAI key
+        responses: &[],
         price: price("0.2", "1.2", "0.02", "0.25"),
     },
     ModelRoute {
@@ -871,8 +911,8 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
     ModelRoute {
         model: "gpt-5.6-sol-pro",
         wire: WireFormat::OpenAi,
-        candidates: &openai_chat("gpt-5.6-sol-pro", "openai/gpt-5.6-sol-pro"),
-        responses: &openai_responses("gpt-5.6-sol-pro"),
+        candidates: &openrouter_only("openai/gpt-5.6-sol-pro"), // not served to our OpenAI key
+        responses: &[],
         price: price("4", "20", "0.4", "5"),
     },
     ModelRoute {
@@ -885,8 +925,8 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
     ModelRoute {
         model: "gpt-5.6-terra-pro",
         wire: WireFormat::OpenAi,
-        candidates: &openai_chat("gpt-5.6-terra-pro", "openai/gpt-5.6-terra-pro"),
-        responses: &openai_responses("gpt-5.6-terra-pro"),
+        candidates: &openrouter_only("openai/gpt-5.6-terra-pro"), // not served to our OpenAI key
+        responses: &[],
         price: price("2", "12", "0.2", "2.5"),
     },
     ModelRoute {
@@ -899,8 +939,8 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
     ModelRoute {
         model: "gpt-6-astra-pro",
         wire: WireFormat::OpenAi,
-        candidates: &openai_chat("gpt-6-astra-pro", "openai/gpt-6-astra-pro"),
-        responses: &openai_responses("gpt-6-astra-pro"),
+        candidates: &openrouter_only("openai/gpt-6-astra-pro"), // not served to our OpenAI key
+        responses: &[],
         price: price("10", "50", "1", "12.5"),
     },
     // xAI Grok. Native ids from the 2026-09-17 xAI models table plus `grok-4.20-multi-agent`
@@ -1091,7 +1131,7 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
     ModelRoute {
         model: "o1-pro",
         wire: WireFormat::OpenAi,
-        candidates: &openai_chat("o1-pro", "openai/o1-pro"),
+        candidates: &openai_responses_first("o1-pro", "openai/o1-pro"),
         responses: &openai_responses("o1-pro"),
         price: price("150", "600", "150", "150"), // no separate cache card; both rates equal input
     },
@@ -1112,8 +1152,8 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
     ModelRoute {
         model: "o3-pro",
         wire: WireFormat::OpenAi,
-        candidates: &openai_chat("o3-pro", "openai/o3-pro"),
-        responses: &openai_responses("o3-pro"),
+        candidates: &openrouter_only("openai/o3-pro"), // not served to our OpenAI key
+        responses: &[],
         price: price("20", "80", "20", "20"), // no separate cache card; both rates equal input
     },
     ModelRoute {
@@ -1205,6 +1245,23 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &together("Qwen/Qwen3.8-Flash", "qwen/qwen3.8-flash"),
         responses: &[],
         price: price("0.15", "0.47", "0.016", "0.2"),
+    },
+    // Embeddings: input only. Output is priced 0 and there is no cache, so both cache rates are
+    // the input rate (the `ListPrice` rule for an unpublished rate). `text-embedding-ada-002` is
+    // left out: both providers answer it as `text-embedding-ada-002-v2`, a billed id no row names.
+    ModelRoute {
+        model: "text-embedding-3-large",
+        wire: WireFormat::OpenAi,
+        candidates: &openai_embeddings("text-embedding-3-large", "openai/text-embedding-3-large"),
+        responses: &[],
+        price: price("0.13", "0", "0.13", "0.13"),
+    },
+    ModelRoute {
+        model: "text-embedding-3-small",
+        wire: WireFormat::OpenAi,
+        candidates: &openai_embeddings("text-embedding-3-small", "openai/text-embedding-3-small"),
+        responses: &[],
+        price: price("0.02", "0", "0.02", "0.02"),
     },
     ModelRoute {
         model: "thinkingmachines/inkling",
@@ -1429,7 +1486,7 @@ mod tests {
                 let ep = endpoint_of_path(c.path);
                 assert_ne!(
                     ep, "other",
-                    "route {:?} candidate {:?} path {:?} is not Chat Completions, Messages, or Responses",
+                    "route {:?} candidate {:?} path {:?} is not Chat Completions, Messages, Responses, or Embeddings",
                     route.model, c.provider, c.path,
                 );
             }
@@ -1526,6 +1583,25 @@ mod tests {
             upstream_model: _,
             path: _,
         } = c;
+    }
+
+    /// The gateway decides a row is embeddings from its primary's path and never translates it,
+    /// so a row that mixed an embeddings candidate with a generation one would fail over onto a
+    /// different endpoint with the wrong body.
+    #[test]
+    fn embeddings_rows_are_only_embeddings() {
+        for route in MODEL_ROUTES {
+            let embeds = route
+                .candidates
+                .iter()
+                .filter(|c| c.path.ends_with("/embeddings"))
+                .count();
+            assert!(
+                embeds == 0 || (embeds == route.candidates.len() && route.responses.is_empty()),
+                "{} mixes embeddings and generation candidates",
+                route.model
+            );
+        }
     }
 
     #[test]
@@ -1682,7 +1758,12 @@ mod tests {
             let cache_read = micros("cache_read", route.model, p.cache_read);
             let cache_write = micros("cache_write", route.model, p.cache_write);
             assert!(input > 0, "{} input", route.model);
-            assert!(output > 0, "{} output", route.model);
+            // Embeddings produce no output tokens; everything else must price them.
+            let embeddings = route
+                .candidates
+                .first()
+                .is_some_and(|c| c.path.ends_with("/embeddings"));
+            assert!(output > 0 || embeddings, "{} output", route.model);
             assert!(
                 cache_read > 0 && cache_read <= input,
                 "{} cache_read {cache_read} vs input {input}",
@@ -1719,17 +1800,17 @@ mod tests {
             (opus.input, opus.output, opus.cache_read, opus.cache_write),
             ("5", "25", "0.5", "6.25")
         );
-        let haiku3 = for_model("claude-3-haiku");
-        assert!(haiku3.is_some(), "claude-3-haiku");
-        let haiku3 = haiku3.unwrap_or(&MODEL_ROUTES[0]).price;
+        let opus55 = for_model("claude-opus-5-5");
+        assert!(opus55.is_some(), "claude-opus-5-5");
+        let opus55 = opus55.unwrap_or(&MODEL_ROUTES[0]).price;
         assert_eq!(
             (
-                haiku3.input,
-                haiku3.output,
-                haiku3.cache_read,
-                haiku3.cache_write
+                opus55.input,
+                opus55.output,
+                opus55.cache_read,
+                opus55.cache_write
             ),
-            ("0.25", "1.25", "0.025", "0.3125")
+            ("4", "20", "0.2", "5")
         );
     }
 
@@ -2021,9 +2102,9 @@ mod tests {
     #[test]
     fn gpt_rows_carry_an_openai_responses_arm() {
         for route in MODEL_ROUTES.iter().filter(|r| {
-            r.candidates
-                .first()
-                .is_some_and(|c| c.provider == ProviderId::OpenAi)
+            r.candidates.first().is_some_and(|c| {
+                c.provider == ProviderId::OpenAi && !c.path.ends_with("/embeddings")
+            })
         }) {
             assert_eq!(
                 route.responses.len(),

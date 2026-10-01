@@ -14,6 +14,9 @@
 mod common;
 
 use beyond_ai::key::{VirtualKey, mint};
+
+/// `smart::PROBE_EVERY` (crate-private).
+const PROBE_EVERY: u64 = 8;
 use common::*;
 
 const MODEL: &str = "gpt-4o-mini";
@@ -131,6 +134,19 @@ async fn fails_over_to_the_next_candidate_when_the_primary_wont_connect() {
         200,
         "a dead primary must be invisible to the client",
     );
+    // ...to the response body. The headers say who served it.
+    let header = |name: &str| {
+        resp.headers()
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned)
+    };
+    assert_eq!(header("x-beyond-provider").as_deref(), Some("openrouter"));
+    assert_eq!(
+        header("x-beyond-upstream-model").as_deref(),
+        Some("openai/gpt-4o-mini")
+    );
+    assert_eq!(header("x-beyond-cache-status"), None, "not a replay");
 
     let cap = fallback.captured().expect("fallback served the request");
     // OpenRouter's mount, not OpenAI's — the path is rebuilt for the candidate that serves.
@@ -802,17 +818,11 @@ async fn every_candidate_5xx_relays_the_last_error() {
     assert_eq!(fallback.hits(), 1, "both candidates must have been tried");
 }
 
-/// A body past pingora's 64 KiB replay buffer is not provably replayable, so the 5xx is relayed
-/// rather than retried — and the case is **counted**, which is the number that decides whether
-/// covering it is worth the work.
-///
-/// Note what this does *not* claim. Retrying such a body is not unsafe: pingora would replay the
-/// buffered prefix and read the remainder from the socket. The rule exists so the decision is
-/// deterministic rather than a race against how fast the upstream rejected the request — an earlier
-/// version of this test passed or failed depending on whether the 256 KiB body had finished
-/// arriving, because both outcomes were correct behaviour under a looser gate.
+/// A body past pingora's 64 KiB replay buffer fails over like any other: the gateway holds the
+/// whole body and re-runs the request on the next candidate (see `FullBody`). Before, the 5xx was
+/// relayed and counted on `ai_failover_unreplayable_total`.
 #[tokio::test]
-async fn an_unreplayable_body_relays_the_5xx_and_is_counted() {
+async fn a_large_body_fails_over_on_a_5xx() {
     let nats_port = unused_nats_port();
     let (pubkey, sk) = test_keypair(1);
     let primary = MockUpstream::start(Mode::Status(500)).await;
@@ -832,35 +842,77 @@ async fn an_unreplayable_body_relays_the_5xx_and_is_counted() {
         .header("authorization", format!("Bearer {}", vkey(&sk)))
         .header("content-type", "application/json")
         .header("x-beyond-model", MODEL)
-        .body(big)
+        .body(big.clone())
         .send()
         .await
         .unwrap();
 
+    assert_eq!(resp.status().as_u16(), 200, "the fallback serves");
     assert_eq!(
-        resp.status().as_u16(),
-        500,
-        "an unreplayable body must relay the error, not attempt a retry it cannot complete",
+        resp.headers()
+            .get("x-beyond-provider")
+            .and_then(|v| v.to_str().ok()),
+        Some("openrouter")
     );
-    assert_eq!(
-        fallback.hits(),
-        0,
-        "the fallback must not be sent headers for a body we cannot resend",
+    assert_eq!(primary.hits(), 1);
+    assert_eq!(fallback.hits(), 1);
+    let cap = fallback.captured().expect("fallback served");
+    assert_eq!(cap.path, "/api/v1/chat/completions");
+    let sent = String::from_utf8(cap.body).unwrap();
+    assert!(
+        sent.contains(r#""model":"openai/gpt-4o-mini""#),
+        "{}",
+        &sent[..80]
+    );
+    assert!(
+        sent.len() > 256 * 1024,
+        "the whole body reached the fallback"
     );
     let metrics = gw.metrics().await;
-    assert!(
-        parse_metric(&metrics, "ai_failover_unreplayable_total", "") >= 1.0,
-        "the uncovered case must be measurable — it is what decides the next investment:\n{metrics}"
+    assert!(parse_metric(&metrics, "ai_candidate_failovers_total", "") >= 1.0);
+    assert_eq!(
+        parse_metric(&metrics, "ai_failover_unreplayable_total", ""),
+        0.0,
+        "{metrics}"
     );
 }
 
-/// The client-retry failover. A 529 on a body past the replay buffer cannot be retried in-gateway,
-/// so it is relayed — but the stock SDKs retry 529/5xx on their own, and that retry is a fresh
-/// request with a fresh body. It must land on the fallback: the primary's latest attempt failed, so
-/// the ranker puts it behind the never-tried fallback. Before, the penalty alone left the failing
-/// primary *measured* and so ahead of the unmeasured fallback, and the retry went straight back to it.
+/// When every candidate fails a large body, the client gets the last provider's own status.
 #[tokio::test]
-async fn an_sdk_retry_after_an_unreplayable_529_lands_on_the_fallback() {
+async fn a_large_body_relays_the_last_error_when_every_candidate_fails() {
+    let nats_port = unused_nats_port();
+    let (pubkey, sk) = test_keypair(1);
+    let primary = MockUpstream::start(Mode::Status(500)).await;
+    let fallback = MockUpstream::start(Mode::Status(503)).await;
+    let gw = Gateway::builder(nats_port, &primary.authority(), &b64(&pubkey))
+        .providers(&["openai", "openrouter"])
+        .provider_authority("openrouter", &fallback.authority())
+        .start()
+        .await;
+    let filler = "x".repeat(256 * 1024);
+    let resp = test_client()
+        .post(format!("{}/v1/chat/completions", gw.url()))
+        .header("authorization", format!("Bearer {}", vkey(&sk)))
+        .header("content-type", "application/json")
+        .body(format!(
+            r#"{{"messages":[{{"role":"user","content":"{filler}"}}],"model":"{MODEL}"}}"#
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        503,
+        "the last candidate's own status"
+    );
+    assert_eq!(primary.hits(), 1);
+    assert_eq!(fallback.hits(), 1);
+}
+
+/// Anthropic's `529 overloaded` on an agent-sized body fails over in the gateway. Before, it was
+/// relayed and only the SDK's own retry reached the fallback.
+#[tokio::test]
+async fn a_large_body_529_fails_over_in_the_gateway() {
     let nats_port = unused_nats_port();
     let (pubkey, sk) = test_keypair(1);
     let primary = MockUpstream::start(Mode::AnthropicStatus(529)).await;
@@ -876,36 +928,21 @@ async fn an_sdk_retry_after_an_unreplayable_529_lands_on_the_fallback() {
     let big = format!(
         r#"{{"model":"claude-opus-4-8","max_tokens":16,"messages":[{{"role":"user","content":"{filler}"}}]}}"#
     );
-    let send = || {
-        test_client()
-            .post(format!("{}/v1/messages", gw.url()))
-            .header("x-api-key", vkey(&sk))
-            .header("content-type", "application/json")
-            .body(big.clone())
-            .send()
-    };
-
-    let first = send().await.unwrap();
+    let resp = test_client()
+        .post(format!("{}/v1/messages", gw.url()))
+        .header("x-api-key", vkey(&sk))
+        .header("content-type", "application/json")
+        .body(big)
+        .send()
+        .await
+        .unwrap();
     assert_eq!(
-        first.status().as_u16(),
-        529,
-        "unreplayable: the 529 is relayed"
-    );
-    assert_eq!(fallback.hits(), 0);
-
-    // What the SDK does next.
-    let retry = send().await.unwrap();
-    assert_eq!(
-        retry.status().as_u16(),
+        resp.status().as_u16(),
         200,
-        "the retry must be served by the fallback: {}",
-        retry.text().await.unwrap()
+        "served by the fallback: {}",
+        resp.text().await.unwrap()
     );
-    assert_eq!(
-        primary.hits(),
-        1,
-        "the retry must not go back to the provider that just failed"
-    );
+    assert_eq!(primary.hits(), 1);
     assert_eq!(fallback.hits(), 1);
     let cap = fallback.captured().expect("fallback served");
     assert!(
@@ -1492,6 +1529,262 @@ async fn embeddings_path_with_a_claude_row_is_still_a_wire_mismatch() {
     );
 }
 
+/// A stock OpenAI SDK's `client.embeddings.create` on the managed drop-in: the catalog row routes
+/// it to the embeddings path, and the input tokens are billed.
+#[tokio::test]
+async fn v1_embeddings_route_through_the_catalog_and_bill_input() {
+    let nats_port = unused_nats_port();
+    let (pubkey, sk) = test_keypair(1);
+    let mock = MockUpstream::start(Mode::Embeddings).await;
+    let gw = Gateway::builder(nats_port, &mock.authority(), &b64(&pubkey))
+        .providers(&["openai", "openrouter"])
+        .start()
+        .await;
+
+    let resp = test_client()
+        .post(format!("{}/v1/embeddings", gw.url()))
+        .header("authorization", format!("Bearer {}", vkey(&sk)))
+        .header("content-type", "application/json")
+        .body(r#"{"model":"text-embedding-3-small","input":"hello world"}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let text = resp.text().await.unwrap();
+    assert!(text.contains(r#""object":"embedding""#), "{text}");
+
+    let cap = mock.captured().expect("forwarded");
+    assert_eq!(cap.path, "/v1/embeddings");
+    let body = String::from_utf8(cap.body).unwrap();
+    assert!(!body.contains("stream_options"), "{body}");
+
+    let line = gw
+        .wait_for_log_line(&["ai.usage", r#""model":"text-embedding-3-small""#])
+        .await;
+    assert!(line.contains(r#""input_tokens":5"#), "{line}");
+    assert!(line.contains(r#""output_tokens":0"#), "{line}");
+}
+
+/// Stock Python/Node SDKs send `Accept-Encoding: gzip` and providers honor it. The gateway must
+/// ask for `identity`, or the usage tail reads gzip and the request bills zero tokens.
+#[tokio::test]
+async fn managed_requests_ask_the_provider_for_an_uncompressed_body() {
+    let nats_port = unused_nats_port();
+    let (pubkey, sk) = test_keypair(1);
+    let mock = MockUpstream::start(Mode::Embeddings).await;
+    let gw = Gateway::builder(nats_port, &mock.authority(), &b64(&pubkey))
+        .providers(&["openai", "openrouter"])
+        .start()
+        .await;
+
+    let resp = test_client()
+        .post(format!("{}/v1/embeddings", gw.url()))
+        .header("authorization", format!("Bearer {}", vkey(&sk)))
+        .header("content-type", "application/json")
+        .header("accept-encoding", "gzip, deflate")
+        .body(r#"{"input":"hello world","model":"text-embedding-3-small"}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let cap = mock.captured().expect("forwarded");
+    assert_eq!(cap.accept_encoding.as_deref(), Some("identity"));
+
+    // BYO is a pure relay: the caller's own preference passes through.
+    let byo = test_client()
+        .post(format!("{}/v1/embeddings", gw.url()))
+        .header("authorization", "Bearer sk-someones-own-key")
+        .header("content-type", "application/json")
+        .header("accept-encoding", "gzip")
+        .body(r#"{"input":"hi","model":"text-embedding-3-small"}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(byo.status().as_u16(), 200);
+    assert_eq!(
+        mock.captured()
+            .expect("forwarded")
+            .accept_encoding
+            .as_deref(),
+        Some("gzip")
+    );
+}
+
+/// The failover candidate is OpenRouter's own embeddings path, with its own spelling of the id.
+#[tokio::test]
+async fn embeddings_fail_over_to_openrouter_embeddings() {
+    let nats_port = unused_nats_port();
+    let (pubkey, sk) = test_keypair(1);
+    let dead = MockUpstream::start(Mode::Status(503)).await;
+    let fallback = MockUpstream::start(Mode::Embeddings).await;
+    let gw = Gateway::builder(nats_port, &dead.authority(), &b64(&pubkey))
+        .providers(&["openai", "openrouter"])
+        .provider_authority("openrouter", &fallback.authority())
+        .start()
+        .await;
+
+    let resp = test_client()
+        .post(format!("{}/v1/embeddings", gw.url()))
+        .header("authorization", format!("Bearer {}", vkey(&sk)))
+        .header("content-type", "application/json")
+        .body(r#"{"model":"text-embedding-3-small","input":"hi"}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let cap = fallback.captured().expect("fallback served");
+    assert_eq!(cap.path, "/api/v1/embeddings");
+    let body = String::from_utf8(cap.body).unwrap();
+    assert!(
+        body.contains(r#""model":"openai/text-embedding-3-small""#),
+        "{body}"
+    );
+}
+
+/// A chat body naming an embeddings model is a 400, not a request forwarded to `/v1/embeddings`.
+#[tokio::test]
+async fn chat_completions_against_an_embeddings_row_is_a_wire_mismatch() {
+    let nats_port = unused_nats_port();
+    let (pubkey, sk) = test_keypair(1);
+    let mock = MockUpstream::start(Mode::Json).await;
+    let gw = Gateway::builder(nats_port, &mock.authority(), &b64(&pubkey))
+        .providers(&["openai", "openrouter"])
+        .start()
+        .await;
+
+    let resp = post_v1(
+        &test_client(),
+        &gw.url(),
+        &vkey(&sk),
+        r#"{"model":"text-embedding-3-small","messages":[{"role":"user","content":"hi"}]}"#.into(),
+    )
+    .await;
+    assert_eq!(resp.status().as_u16(), 400);
+    let text = resp.text().await.unwrap();
+    assert!(text.contains("POST /v1/embeddings"), "{text}");
+    assert_eq!(mock.hits(), 0);
+}
+
+/// Embeddings against a GPT row used to be a byte relay onto the row's chat path.
+#[tokio::test]
+async fn embeddings_against_a_chat_row_is_a_wire_mismatch() {
+    let nats_port = unused_nats_port();
+    let (pubkey, sk) = test_keypair(1);
+    let mock = MockUpstream::start(Mode::Json).await;
+    let gw = Gateway::builder(nats_port, &mock.authority(), &b64(&pubkey))
+        .providers(&["openai", "openrouter"])
+        .start()
+        .await;
+
+    let resp = test_client()
+        .post(format!("{}/v1/embeddings", gw.url()))
+        .header("authorization", format!("Bearer {}", vkey(&sk)))
+        .header("content-type", "application/json")
+        .body(r#"{"model":"gpt-4o-mini","input":"hi"}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 400);
+    assert_eq!(mock.hits(), 0);
+}
+
+/// `/auto` without `/v1` used to skip the endpoint check: an embeddings body relayed onto a chat
+/// path, and a Responses body onto `/v1/embeddings`, both answered 200.
+#[tokio::test]
+async fn auto_short_paths_get_the_same_endpoint_check() {
+    let nats_port = unused_nats_port();
+    let (pubkey, sk) = test_keypair(1);
+    let mock = MockUpstream::start(Mode::Json).await;
+    let gw = Gateway::builder(nats_port, &mock.authority(), &b64(&pubkey))
+        .providers(&["openai", "openrouter"])
+        .start()
+        .await;
+    for (path, body) in [
+        (
+            "/auto/embeddings",
+            r#"{"model":"gpt-4o-mini","input":"hi"}"#,
+        ),
+        (
+            "/auto/responses",
+            r#"{"model":"text-embedding-3-small","input":"hi","store":false}"#,
+        ),
+        // Session state against an embeddings row names the endpoint, not a field.
+        (
+            "/v1/responses",
+            r#"{"model":"text-embedding-3-small","input":"hi"}"#,
+        ),
+    ] {
+        let resp = test_client()
+            .post(format!("{}{path}", gw.url()))
+            .header("authorization", format!("Bearer {}", vkey(&sk)))
+            .header("content-type", "application/json")
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 400, "{path}");
+        let text = resp.text().await.unwrap();
+        assert!(!text.contains("cannot be honored"), "{path}: {text}");
+    }
+    assert_eq!(mock.hits(), 0);
+}
+
+/// Sub-resources are not their parent endpoint: a token count or a retrieve must not run (and
+/// bill) as a generation on the row's path.
+#[tokio::test]
+async fn sub_resources_of_an_endpoint_are_not_generations() {
+    let nats_port = unused_nats_port();
+    let (pubkey, sk) = test_keypair(1);
+    let mock = MockUpstream::start(Mode::AnthropicJson).await;
+    let gw = Gateway::builder(nats_port, &mock.authority(), &b64(&pubkey))
+        .providers(&["anthropic", "openrouter", "openai"])
+        .start()
+        .await;
+    for (path, body) in [
+        (
+            "/v1/messages/count_tokens",
+            r#"{"model":"claude-opus-4-8","messages":[{"role":"user","content":"hi"}]}"#,
+        ),
+        (
+            "/v1/responses/input_tokens",
+            r#"{"model":"gpt-4o-mini","input":"hi"}"#,
+        ),
+    ] {
+        let resp = test_client()
+            .post(format!("{}{path}", gw.url()))
+            .header("x-api-key", vkey(&sk))
+            .header("authorization", format!("Bearer {}", vkey(&sk)))
+            .header("content-type", "application/json")
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 400, "{path}");
+    }
+    assert_eq!(mock.hits(), 0, "nothing ran as a generation");
+}
+
+#[tokio::test]
+async fn a_trailing_slash_is_the_same_endpoint() {
+    let nats_port = unused_nats_port();
+    let (pubkey, sk) = test_keypair(1);
+    let mock = MockUpstream::start(Mode::Embeddings).await;
+    let gw = Gateway::builder(nats_port, &mock.authority(), &b64(&pubkey))
+        .providers(&["openai", "openrouter"])
+        .start()
+        .await;
+    let resp = test_client()
+        .post(format!("{}/v1/embeddings/", gw.url()))
+        .header("authorization", format!("Bearer {}", vkey(&sk)))
+        .header("content-type", "application/json")
+        .body(r#"{"model":"text-embedding-3-small","input":"hi"}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    assert_eq!(mock.captured().expect("forwarded").path, "/v1/embeddings");
+}
+
 /// OpenRouter (and other candidate) spellings are aliases for the catalog row.
 #[tokio::test]
 async fn v1_accepts_a_candidate_spelling_as_an_alias() {
@@ -1572,10 +1865,14 @@ async fn v1_models_lists_the_catalog() {
     assert_eq!(claude["pricing"]["output"], "25");
     assert_eq!(claude["pricing"]["cache_read"], "0.5");
     assert_eq!(claude["pricing"]["cache_write"], "6.25");
+    // Embeddings produce no output tokens, so only their output rate may be zero.
     assert!(
         data.iter().all(|m| {
+            let embeddings = m["id"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("text-embedding-"));
             m["pricing"]["input"].as_str().is_some_and(|s| s != "0")
-                && m["pricing"]["output"].as_str().is_some_and(|s| s != "0")
+                && (embeddings || m["pricing"]["output"].as_str().is_some_and(|s| s != "0"))
         }),
         "a catalog model without a list price bills as free: {v}"
     );
@@ -1739,8 +2036,9 @@ async fn split_over_n_requests_hits_both_primaries() {
     );
 }
 
-/// Cold start is catalog order. After a probe samples a faster fallback, later unpinned requests
-/// prefer it. `x-beyond-order` still pins the slow primary.
+/// Cold start is catalog order. After a probe samples a faster fallback, **new** callers prefer
+/// it, while a caller already served stays on its provider (session pin, so its prompt cache is not
+/// thrown away). `x-beyond-order` still pins the slow primary.
 #[tokio::test]
 async fn ttft_ranker_prefers_the_faster_candidate_after_a_probe() {
     let nats_port = unused_nats_port();
@@ -1757,6 +2055,18 @@ async fn ttft_ranker_prefers_the_faster_candidate_after_a_probe() {
 
     let client = test_client();
     let key = vkey(&sk);
+    // A distinct app per request: each one is a new caller with no pin.
+    let fresh = |n: u64| {
+        mint(
+            &VirtualKey {
+                tenant_id: 1_000 + n,
+                vpc_id: 7,
+                key_id: None,
+            },
+            1,
+            &sk,
+        )
+    };
 
     let first = post_auto(&client, &gw.url(), &key, Some(MODEL)).await;
     assert_eq!(first.status().as_u16(), 200);
@@ -1764,18 +2074,30 @@ async fn ttft_ranker_prefers_the_faster_candidate_after_a_probe() {
     assert_eq!(fast.hits(), 0, "the fallback is not probed on seq 0");
 
     // seq 1..=7 still exploit the only sampled arm; seq 8 probes openrouter; seq 9+ rank by EWMA.
-    for _ in 0..15 {
-        let resp = post_auto(&client, &gw.url(), &key, Some(MODEL)).await;
+    for n in 0..15 {
+        let resp = post_auto(&client, &gw.url(), &fresh(n), Some(MODEL)).await;
         assert_eq!(resp.status().as_u16(), 200);
     }
     assert!(
         fast.hits() >= 3,
-        "after the probe the faster arm must serve (slow={}, fast={})",
+        "after the probe the faster arm must serve new callers (slow={}, fast={})",
         slow.hits(),
         fast.hits()
     );
     let cap = fast.captured().expect("fast arm served at least once");
     assert_eq!(cap.path, "/api/v1/chat/completions");
+
+    // The first caller was served by openai; it stays there even though openrouter now ranks first.
+    let fast_before = fast.hits();
+    for _ in 0..(PROBE_EVERY + 1) {
+        let resp = post_auto(&client, &gw.url(), &key, Some(MODEL)).await;
+        assert_eq!(resp.status().as_u16(), 200);
+    }
+    assert_eq!(
+        fast.hits(),
+        fast_before,
+        "a pinned caller must stay on the provider holding its prompt cache, probe seed included"
+    );
 
     let slow_before_pin = slow.hits();
     let pinned = client
@@ -1794,4 +2116,46 @@ async fn ttft_ranker_prefers_the_faster_candidate_after_a_probe() {
         slow_before_pin + 1,
         "x-beyond-order must pin the slow primary even after the ranker learned the fast arm"
     );
+}
+
+/// A walk the caller shaped says nothing about where the key's other requests go: an
+/// `x-beyond-order` request must not re-pin the key to the (slower) provider it named.
+#[tokio::test]
+async fn an_order_header_does_not_pin_the_key() {
+    let nats_port = unused_nats_port();
+    let (pubkey, sk) = test_keypair(1);
+    let primary = MockUpstream::start(Mode::Json).await;
+    let fallback = MockUpstream::start(Mode::Slow(150)).await;
+    let gw = catalog_gateway(
+        nats_port,
+        &b64(&pubkey),
+        &primary.authority(),
+        &fallback.authority(),
+    )
+    .await;
+    let client = test_client();
+    let key = vkey(&sk);
+    // The key's ordinary traffic: served by (and pinned to) the fast primary.
+    let first = post_auto(&client, &gw.url(), &key, Some(MODEL)).await;
+    assert_eq!(first.status().as_u16(), 200);
+    assert_eq!(primary.hits(), 1);
+    // One debug request aimed at the slow fallback.
+    let ordered = client
+        .post(format!("{}/auto/chat/completions", gw.url()))
+        .header("authorization", format!("Bearer {key}"))
+        .header("content-type", "application/json")
+        .header("x-beyond-model", MODEL)
+        .header("x-beyond-order", "openrouter")
+        .body(body())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ordered.status().as_u16(), 200);
+    assert_eq!(fallback.hits(), 1, "the order header was honored");
+    for _ in 0..3 {
+        let resp = post_auto(&client, &gw.url(), &key, Some(MODEL)).await;
+        assert_eq!(resp.status().as_u16(), 200);
+    }
+    assert_eq!(primary.hits(), 4, "the key stayed on its provider");
+    assert_eq!(fallback.hits(), 1);
 }

@@ -373,6 +373,9 @@ fn provider_env_var(id: providers::ProviderId) -> Option<&'static str> {
 async fn catalog_rows_are_servable() {
     let mut checked = 0usize;
     let mut skipped: Vec<String> = Vec::new();
+    // Every failing row, not just the first: a stale row early in the table used to hide every
+    // row after it until someone fixed it and re-ran.
+    let mut failed: Vec<String> = Vec::new();
 
     for route in providers::catalog::MODEL_ROUTES {
         for candidate in route.candidates {
@@ -393,13 +396,26 @@ async fn catalog_rows_are_servable() {
             let (gw, vkey) = managed_gateway(&nats, spec.name, &key).await;
 
             // The body is the row's own wire. `max_tokens` is required by Anthropic and harmless to
-            // OpenAI, and 1 token keeps the bill to a fraction of a cent.
-            let body = format!(
-                r#"{{"model":"{}","max_tokens":1,"messages":[{{"role":"user","content":"hi"}}]}}"#,
-                route.model,
-            );
+            // OpenAI, and 1 token keeps the bill to a fraction of a cent. An embeddings row takes
+            // `input` instead.
+            // OpenAI itself rejects `max_tokens` on its reasoning models (`gpt-5*`, `o*`) and wants
+            // `max_completion_tokens`, which every OpenAI chat model accepts; other OpenAI-wire hosts
+            // keep `max_tokens`. Reasoning models think before any text (`o3` 400s at 16), so 256: enough for a "hi" on every OpenAI row, and it caps a `-pro` reasoning bill.
+            let body = if candidate.path.ends_with("/embeddings") {
+                format!(r#"{{"model":"{}","input":"hi"}}"#, route.model)
+            } else if candidate.provider == providers::ProviderId::OpenAi {
+                format!(
+                    r#"{{"model":"{}","max_completion_tokens":256,"messages":[{{"role":"user","content":"hi"}}]}}"#,
+                    route.model,
+                )
+            } else {
+                format!(
+                    r#"{{"model":"{}","max_tokens":1,"messages":[{{"role":"user","content":"hi"}}]}}"#,
+                    route.model,
+                )
+            };
             let mut req = test_client()
-                .post(format!("{}/auto/x", gw.url()))
+                .post(format!("{}/auto", gw.url()))
                 .header("authorization", format!("Bearer {vkey}"))
                 .header("content-type", "application/json")
                 .header("x-beyond-model", route.model);
@@ -409,16 +425,19 @@ async fn catalog_rows_are_servable() {
             let resp = req.body(body).send().await.expect("request sent");
             let status = resp.status().as_u16();
             let text = resp.text().await.unwrap_or_default();
-            assert_eq!(
-                status,
-                200,
-                "catalog row {:?} → {} {} (model {:?}) returned {status}: {}",
-                route.model,
-                spec.name,
-                candidate.path,
-                candidate.upstream_model,
-                text.chars().take(300).collect::<String>(),
-            );
+            if status != 200 {
+                let line = format!(
+                    "catalog row {:?} → {} {} (model {:?}) returned {status}: {}",
+                    route.model,
+                    spec.name,
+                    candidate.path,
+                    candidate.upstream_model,
+                    text.chars().take(300).collect::<String>(),
+                );
+                eprintln!("smoke[catalog]: FAILED {line}");
+                failed.push(line);
+                continue;
+            }
             // The provider echoes the id it actually ran, which is how a silently-rewritten or
             // aliased model shows up.
             eprintln!(
@@ -437,8 +456,15 @@ async fn catalog_rows_are_servable() {
         "no catalog candidate was checked — set at least one provider key",
     );
     eprintln!(
-        "smoke[catalog]: {checked} candidate(s) verified, {} skipped",
+        "smoke[catalog]: {checked} candidate(s) verified, {} failed, {} skipped",
+        failed.len(),
         skipped.len()
+    );
+    assert!(
+        failed.is_empty(),
+        "{} catalog candidate(s) failed:\n{}",
+        failed.len(),
+        failed.join("\n")
     );
 }
 
@@ -479,7 +505,7 @@ async fn model_route_fails_over_to_a_real_provider() {
     );
 
     let resp = test_client()
-        .post(format!("{}/auto/x", gw.url()))
+        .post(format!("{}/auto", gw.url()))
         .header("authorization", format!("Bearer {vkey}"))
         .header("content-type", "application/json")
         .header("anthropic-version", "2023-06-01")

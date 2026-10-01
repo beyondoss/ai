@@ -30,6 +30,29 @@
 //! Integer EWMA (`7/8` previous + `1/8` sample) in microseconds, atomics only — the request path
 //! does not allocate or take a lock. Per `(catalog row, candidate index)`, not per provider: Opus
 //! on Bedrock is not Haiku on Bedrock.
+//!
+//! # Session pins
+//!
+//! Ranking decides where a **new** caller goes; a pin keeps an existing one there. Provider prompt
+//! caches are per provider, so a walk that re-ranks every request moves an agent loop from
+//! Anthropic to Bedrock and back, and every move re-reads the whole prefix at full input price
+//! plus a cache write (1.25× vs 0.1× on Claude). Worse, the probe above lands on whichever request
+//! happens to draw a multiple of [`PROBE_EVERY`] — usually someone mid-session.
+//!
+//! The pin key is the verified identity (`tenant_id`, `vpc_id`, `key_id`) plus the catalog row:
+//! one virtual key is one app, and an app's sessions share system prompt and tool prefixes, so
+//! keeping the whole key on one provider is what the provider cache wants. After a 2xx, the
+//! serving candidate is pinned. While the pin is live, [`Router::rank`] puts that candidate first
+//! and does not probe. A pin yields when its candidate's latest attempt failed (the walk then fails
+//! over and the next 2xx re-pins), after [`PIN_IDLE_S`] without a 2xx (the provider cache has
+//! expired anyway), and after [`PIN_MAX_AGE_S`] so a pin taken during an outage drifts back to the
+//! ranked primary. An open breaker or a missing pool key needs no check here: `upstream_peer`
+//! skips the candidate, the next one serves, and that 2xx re-pins.
+//!
+//! One fixed table of [`PIN_SLOTS`] packed `AtomicU64`s, direct-mapped by hash: no allocation per
+//! request, no lock, no eviction pass. A collision overwrites; the cost is one re-rank. Pins are
+//! per pod like the EWMA. A key whose requests land on two pods can hold two pins, but each pod
+//! still stops bouncing it, and with a healthy primary both pods rank the same way.
 
 use crate::control::Walk;
 use providers::{MAX_CANDIDATES, ModelRoute, catalog::MODEL_ROUTES};
@@ -56,11 +79,33 @@ const MAX_US: u64 = 30_000_000;
 /// Floor applied to a failed attempt (connect / 5xx) so a 2ms 500 cannot beat a 200ms 200.
 const PENALTY_US: u64 = 5_000_000;
 
+/// Session-pin table size. 16384 × 8 B = 128 KiB, fixed at boot. Direct-mapped, so this bounds how
+/// many (key, model) pairs one pod can keep pinned before collisions start re-ranking some of them.
+const PIN_SLOTS: usize = 1 << 14;
+
+/// A pin with no 2xx for this long is dropped. Matches the default provider prompt-cache TTL
+/// (Anthropic's 5-minute ephemeral cache; OpenAI's in-memory prefix cache is the same order): once
+/// the cache is cold, sticking to its provider buys nothing.
+pub(crate) const PIN_IDLE_S: u64 = 300;
+
+/// A pin older than this is dropped even while in use, so a key pinned to a fallback during an
+/// outage returns to the ranked primary. One re-rank per key per hour is one cache miss.
+pub(crate) const PIN_MAX_AGE_S: u64 = 3600;
+
+/// Packed pin word: `tag:24 | candidate:4 | created_s:18 | last_s:18`. Seconds are since [`BASE`],
+/// modulo 2^18 (~72 h); ages are taken with wrapping subtraction, so they are exact for anything
+/// under 72 h, far past both limits. A word of `0` is an empty slot (the tag is never zero).
+const PIN_TIME_BITS: u32 = 18;
+const PIN_TIME_MASK: u64 = (1 << PIN_TIME_BITS) - 1;
+const PIN_IDX_SHIFT: u32 = 2 * PIN_TIME_BITS;
+const PIN_TAG_SHIFT: u32 = PIN_IDX_SHIFT + 4;
+
 static BASE: LazyLock<Instant> = LazyLock::new(Instant::now);
 
-/// Per-row EWMA table, parallel to [`MODEL_ROUTES`].
+/// Per-row EWMA table, parallel to [`MODEL_ROUTES`], plus the session-pin table.
 pub struct Router {
     rows: Box<[Row]>,
+    pins: Box<[AtomicU64]>,
 }
 
 struct Row {
@@ -100,6 +145,7 @@ impl Router {
     pub fn new() -> Self {
         Self {
             rows: MODEL_ROUTES.iter().map(|_| Row::new()).collect(),
+            pins: (0..PIN_SLOTS).map(|_| AtomicU64::new(0)).collect(),
         }
     }
 
@@ -108,7 +154,7 @@ impl Router {
     /// `ok` is a response the provider *answered* with (2xx / 3xx / 4xx, including 429). Connect
     /// failure and 5xx pass `ok = false` and take the penalty floor.
     pub fn observe(&self, route: &ModelRoute, catalog_idx: u8, elapsed_us: u64, ok: bool) {
-        let Some(row) = self.row(route) else {
+        let Some((_, row)) = self.row(route) else {
             return;
         };
         let i = usize::from(catalog_idx);
@@ -135,32 +181,82 @@ impl Router {
         row.last_ns[i].store(now_ns(), Ordering::Relaxed);
     }
 
-    /// Reorder `walk` by EWMA, or probe an unmeasured arm. Identity when the row is unknown or
-    /// `walk` is empty.
-    pub fn rank(&self, walk: Walk, route: &ModelRoute, seed: u64) -> Walk {
+    /// Reorder `walk`: a live session pin first, else EWMA order, else probe an unmeasured arm.
+    /// Identity when the row is unknown or `walk` is empty. The `bool` is whether a pin decided
+    /// the primary. `affinity` is [`affinity`]'s hash of the caller, `None` for no pinning.
+    pub fn rank(
+        &self,
+        walk: Walk,
+        route: &ModelRoute,
+        seed: u64,
+        affinity: Option<u64>,
+    ) -> (Walk, bool) {
         if walk.len == 0 {
-            return walk;
+            return (walk, false);
         }
-        let Some(row) = self.row(route) else {
-            return walk;
+        let Some((row_i, row)) = self.row(route) else {
+            return (walk, false);
         };
         // One clock read for every candidate. `effective` used to call `now_ns` itself, so a
         // row with three arms took three vDSO reads to answer one ranking.
         let now = now_ns();
-        if seed != 0 && seed.is_multiple_of(PROBE_EVERY) {
-            return probe(walk, |orig| self.effective(row, orig, now));
+        let score = |orig| self.effective(row, orig, now);
+        if let Some(aff) = affinity
+            && let Some(pinned) = self.pinned(pin_key(aff, row_i), now)
+            && walk.indices[..usize::from(walk.len)].contains(&pinned)
+            && !matches!(score(pinned), Tier::Failed(_))
+        {
+            // The rest keeps its EWMA order as failover. No probe: that would move this caller.
+            return (to_front(sort_measured(walk, score), pinned), true);
         }
-        sort_measured(walk, |orig| self.effective(row, orig, now))
+        if seed != 0 && seed.is_multiple_of(PROBE_EVERY) {
+            return (probe(walk, score), false);
+        }
+        (sort_measured(walk, score), false)
     }
 
-    fn row(&self, route: &ModelRoute) -> Option<&Row> {
+    /// Pin `affinity`'s caller on `route` to `route.candidates[catalog_idx]`. Called after a 2xx.
+    /// A live pin to the same candidate only refreshes its last-used second (and skips the store
+    /// entirely when that second has not changed, so a hot key does not bounce the cache line on
+    /// every response).
+    pub fn pin(&self, route: &ModelRoute, affinity: u64, catalog_idx: u8) {
+        if usize::from(catalog_idx) >= MAX_CANDIDATES {
+            return;
+        }
+        let Some((row_i, _)) = self.row(route) else {
+            return;
+        };
+        let key = pin_key(affinity, row_i);
+        let slot = &self.pins[slot_of(key)];
+        let tag = tag_of(key);
+        let now = secs(now_ns());
+        let old = slot.load(Ordering::Relaxed);
+        let created =
+            if old >> PIN_TAG_SHIFT == tag && pin_idx(old) == catalog_idx && pin_live(old, now) {
+                if old & PIN_TIME_MASK == now {
+                    return;
+                }
+                (old >> PIN_TIME_BITS) & PIN_TIME_MASK
+            } else {
+                now
+            };
+        slot.store(pack(tag, catalog_idx, created, now), Ordering::Relaxed);
+    }
+
+    /// The live pin for `key`, if any.
+    fn pinned(&self, key: u64, now_ns: u64) -> Option<u8> {
+        let w = self.pins[slot_of(key)].load(Ordering::Relaxed);
+        (w >> PIN_TAG_SHIFT == tag_of(key) && pin_live(w, secs(now_ns))).then(|| pin_idx(w))
+    }
+
+    fn row(&self, route: &ModelRoute) -> Option<(usize, &Row)> {
         // Name search, not the row's address. `MODEL_ROUTES` is a `const` slice, so each use
         // site can hold its own copy — pointer arithmetic against `as_ptr()` does not land on
         // the `&'static` row `for_model` returned.
         let i = MODEL_ROUTES
             .binary_search_by(|r| r.model.cmp(route.model))
             .ok()?;
-        self.rows.get(i)
+        Some((i, self.rows.get(i)?))
     }
 
     fn effective(&self, row: &Row, catalog_idx: u8, now: u64) -> Tier {
@@ -198,6 +294,61 @@ fn now_ns() -> u64 {
     BASE.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64
 }
 
+/// The pin identity for a verified managed caller. A virtual key is deterministic per
+/// `(tenant, app)`, so `(tenant_id, vpc_id, key_id)` is one app's key. Not keyed: tenant ids are
+/// verified before this runs, so nobody can aim collisions at a slot, and a collision only costs a
+/// re-rank anyway.
+pub fn affinity(tenant_id: u64, vpc_id: u64, key_id: Option<u64>) -> u64 {
+    let mut h = mix(tenant_id ^ 0x243F_6A88_85A3_08D3);
+    h = mix(h ^ vpc_id);
+    mix(h ^ key_id.map_or(0, |k| k ^ 0x1319_8A2E_0370_7344))
+}
+
+/// `splitmix64`'s finalizer: every input bit reaches every output bit.
+fn mix(mut z: u64) -> u64 {
+    z = z.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+fn pin_key(affinity: u64, row_i: usize) -> u64 {
+    mix(affinity ^ (row_i as u64).wrapping_mul(0xA076_1D64_78BD_642F))
+}
+
+/// Low bits pick the slot; the tag comes from the high bits, so the two are independent.
+fn slot_of(key: u64) -> usize {
+    (key as usize) & (PIN_SLOTS - 1)
+}
+
+/// 24-bit tag, never zero (zero marks an empty slot).
+fn tag_of(key: u64) -> u64 {
+    (key >> PIN_TAG_SHIFT).max(1)
+}
+
+fn secs(now_ns: u64) -> u64 {
+    (now_ns / 1_000_000_000) & PIN_TIME_MASK
+}
+
+fn pack(tag: u64, idx: u8, created: u64, last: u64) -> u64 {
+    (tag << PIN_TAG_SHIFT)
+        | (u64::from(idx) << PIN_IDX_SHIFT)
+        | ((created & PIN_TIME_MASK) << PIN_TIME_BITS)
+        | (last & PIN_TIME_MASK)
+}
+
+fn pin_idx(w: u64) -> u8 {
+    ((w >> PIN_IDX_SHIFT) & 0xF) as u8
+}
+
+fn pin_live(w: u64, now: u64) -> bool {
+    let last = w & PIN_TIME_MASK;
+    let created = (w >> PIN_TIME_BITS) & PIN_TIME_MASK;
+    let idle = now.wrapping_sub(last) & PIN_TIME_MASK;
+    let age = now.wrapping_sub(created) & PIN_TIME_MASK;
+    w != 0 && idle <= PIN_IDLE_S && age <= PIN_MAX_AGE_S
+}
+
 /// Sort by [`Tier`]: healthy measured fastest-first, then unmeasured, then failed. Ties keep the
 /// order the walk already had, so unmeasured candidates stay in catalog (or header) order.
 fn sort_measured(walk: Walk, score: impl Fn(u8) -> Tier) -> Walk {
@@ -220,28 +371,25 @@ fn sort_measured(walk: Walk, score: impl Fn(u8) -> Tier) -> Walk {
 /// Move the first unmeasured catalog index to slot 0; leave the rest in order. No-op when every
 /// slot is already measured (exploit-only) or the unmeasured one is already primary.
 fn probe(walk: Walk, score: impl Fn(u8) -> Tier) -> Walk {
-    let n = walk.len;
-    let mut pick = None;
-    for i in 0..n {
-        if score(walk.indices[i as usize]) == Tier::Unmeasured {
-            pick = Some(i);
-            break;
-        }
+    let n = usize::from(walk.len);
+    match walk.indices[..n]
+        .iter()
+        .find(|&&orig| score(orig) == Tier::Unmeasured)
+    {
+        Some(&orig) => to_front(walk, orig),
+        None => walk,
     }
-    let Some(pick) = pick else {
+}
+
+/// Move catalog index `orig` to slot 0; the others keep their relative order.
+fn to_front(walk: Walk, orig: u8) -> Walk {
+    let n = usize::from(walk.len);
+    let Some(pos) = walk.indices[..n].iter().position(|&i| i == orig) else {
         return walk;
     };
-    if pick == 0 {
-        return walk;
-    }
     let mut out = walk;
-    let primary = out.indices[pick as usize];
-    let mut i = pick;
-    while i > 0 {
-        out.indices[i as usize] = out.indices[i as usize - 1];
-        i -= 1;
-    }
-    out.indices[0] = primary;
+    out.indices.copy_within(0..pos, 1);
+    out.indices[0] = orig;
     out
 }
 
@@ -268,7 +416,7 @@ mod tests {
     fn no_samples_keeps_catalog_order() {
         let r = Router::new();
         let row = opus();
-        let walk = r.rank(Walk::identity(row.candidates.len()), row, 1);
+        let walk = r.rank(Walk::identity(row.candidates.len()), row, 1, None).0;
         assert_eq!(names(walk, row), ["anthropic", "bedrock", "openrouter"]);
     }
 
@@ -278,7 +426,7 @@ mod tests {
         let row = opus();
         r.observe(row, 0, 2_000_000, true);
         r.observe(row, 1, 100_000, true);
-        let walk = r.rank(Walk::identity(row.candidates.len()), row, 1);
+        let walk = r.rank(Walk::identity(row.candidates.len()), row, 1, None).0;
         assert_eq!(names(walk, row), ["bedrock", "anthropic", "openrouter"]);
     }
 
@@ -287,7 +435,7 @@ mod tests {
         let r = Router::new();
         let row = opus();
         r.observe(row, 0, 200_000, true);
-        let walk = r.rank(Walk::identity(row.candidates.len()), row, 1);
+        let walk = r.rank(Walk::identity(row.candidates.len()), row, 1, None).0;
         assert_eq!(names(walk, row), ["anthropic", "bedrock", "openrouter"]);
     }
 
@@ -297,7 +445,7 @@ mod tests {
         let row = opus();
         r.observe(row, 0, 1_000, false);
         r.observe(row, 1, 200_000, true);
-        let walk = r.rank(Walk::identity(row.candidates.len()), row, 1);
+        let walk = r.rank(Walk::identity(row.candidates.len()), row, 1, None).0;
         assert_eq!(names(walk, row)[0], "bedrock");
     }
 
@@ -309,7 +457,7 @@ mod tests {
         let row = opus();
         r.observe(row, 0, 200_000, true);
         r.observe(row, 0, 50_000, false);
-        let walk = r.rank(Walk::identity(row.candidates.len()), row, 1);
+        let walk = r.rank(Walk::identity(row.candidates.len()), row, 1, None).0;
         assert_eq!(names(walk, row), ["bedrock", "openrouter", "anthropic"]);
     }
 
@@ -319,7 +467,7 @@ mod tests {
         let row = opus();
         r.observe(row, 0, 50_000, false);
         r.observe(row, 0, 200_000, true);
-        let walk = r.rank(Walk::identity(row.candidates.len()), row, 1);
+        let walk = r.rank(Walk::identity(row.candidates.len()), row, 1, None).0;
         assert_eq!(names(walk, row)[0], "anthropic");
     }
 
@@ -330,7 +478,7 @@ mod tests {
         r.observe(row, 0, 9_000_000, false);
         r.observe(row, 1, 6_000_000, false);
         r.observe(row, 2, 7_000_000, false);
-        let walk = r.rank(Walk::identity(row.candidates.len()), row, 1);
+        let walk = r.rank(Walk::identity(row.candidates.len()), row, 1, None).0;
         assert_eq!(names(walk, row), ["bedrock", "openrouter", "anthropic"]);
     }
 
@@ -339,7 +487,9 @@ mod tests {
         let r = Router::new();
         let row = opus();
         r.observe(row, 0, 200_000, true);
-        let walk = r.rank(Walk::identity(row.candidates.len()), row, PROBE_EVERY);
+        let walk = r
+            .rank(Walk::identity(row.candidates.len()), row, PROBE_EVERY, None)
+            .0;
         assert_eq!(names(walk, row), ["bedrock", "anthropic", "openrouter"]);
     }
 
@@ -348,7 +498,7 @@ mod tests {
         let r = Router::new();
         let row = opus();
         r.observe(row, 0, 200_000, true);
-        let walk = r.rank(Walk::identity(row.candidates.len()), row, 0);
+        let walk = r.rank(Walk::identity(row.candidates.len()), row, 0, None).0;
         assert_eq!(names(walk, row), ["anthropic", "bedrock", "openrouter"]);
     }
 
@@ -370,8 +520,159 @@ mod tests {
             },
         };
         let walk = Walk::identity(3);
-        let ranked = r.rank(walk, &route, 1);
+        let ranked = r.rank(walk, &route, 1, None).0;
         assert_eq!(ranked.indices, walk.indices);
         assert_eq!(ranked.len, walk.len);
+    }
+
+    // ---- Session pins ----
+
+    const APP: u64 = 0xA11CE;
+
+    fn aff() -> u64 {
+        affinity(42, 7, Some(APP))
+    }
+
+    #[test]
+    fn a_pin_keeps_the_caller_on_a_slower_candidate() {
+        let r = Router::new();
+        let row = opus();
+        r.observe(row, 0, 2_000_000, true);
+        r.observe(row, 1, 100_000, true);
+        // Without a pin, Bedrock is faster and goes first.
+        let (walk, pinned) = r.rank(Walk::identity(row.candidates.len()), row, 1, Some(aff()));
+        assert!(!pinned);
+        assert_eq!(names(walk, row)[0], "bedrock");
+        // This caller was last served by Anthropic: it stays there, Bedrock is its failover.
+        r.pin(row, aff(), 0);
+        let (walk, pinned) = r.rank(Walk::identity(row.candidates.len()), row, 1, Some(aff()));
+        assert!(pinned);
+        assert_eq!(names(walk, row), ["anthropic", "bedrock", "openrouter"]);
+    }
+
+    /// The probe is what bounced sessions most: it moved whichever request drew the seed.
+    #[test]
+    fn a_pinned_caller_is_never_the_probe() {
+        let r = Router::new();
+        let row = opus();
+        r.observe(row, 0, 200_000, true);
+        r.pin(row, aff(), 0);
+        let (walk, pinned) = r.rank(
+            Walk::identity(row.candidates.len()),
+            row,
+            PROBE_EVERY,
+            Some(aff()),
+        );
+        assert!(pinned);
+        assert_eq!(names(walk, row)[0], "anthropic");
+        // An unpinned caller on the same seed still probes.
+        let (walk, _) = r.rank(Walk::identity(row.candidates.len()), row, PROBE_EVERY, None);
+        assert_eq!(names(walk, row)[0], "bedrock");
+    }
+
+    #[test]
+    fn a_pin_yields_when_its_candidate_just_failed() {
+        let r = Router::new();
+        let row = opus();
+        r.observe(row, 0, 200_000, true);
+        r.pin(row, aff(), 0);
+        r.observe(row, 0, 50_000, false);
+        let (walk, pinned) = r.rank(Walk::identity(row.candidates.len()), row, 1, Some(aff()));
+        assert!(!pinned);
+        assert_eq!(names(walk, row), ["bedrock", "openrouter", "anthropic"]);
+        // The failover's 2xx re-pins, and the caller stays there after Anthropic recovers.
+        r.pin(row, aff(), 1);
+        r.observe(row, 0, 200_000, true);
+        let (walk, pinned) = r.rank(Walk::identity(row.candidates.len()), row, 1, Some(aff()));
+        assert!(pinned);
+        assert_eq!(names(walk, row)[0], "bedrock");
+    }
+
+    #[test]
+    fn pins_are_per_caller_and_per_model() {
+        let r = Router::new();
+        let row = opus();
+        let other_row = providers::for_model("claude-haiku-4-5").expect("catalog row");
+        r.pin(row, aff(), 1);
+        let (_, pinned) = r.rank(
+            Walk::identity(row.candidates.len()),
+            row,
+            1,
+            Some(affinity(42, 7, Some(APP + 1))),
+        );
+        assert!(!pinned, "another key must not inherit the pin");
+        let (_, pinned) = r.rank(
+            Walk::identity(other_row.candidates.len()),
+            other_row,
+            1,
+            Some(aff()),
+        );
+        assert!(!pinned, "another model must not inherit the pin");
+    }
+
+    #[test]
+    fn a_pin_outside_the_filtered_walk_is_ignored() {
+        let r = Router::new();
+        let row = opus();
+        r.pin(row, aff(), 2);
+        // `x-beyond-only` left Anthropic and Bedrock; the pinned OpenRouter is not in the walk.
+        let walk = Walk {
+            indices: [0, 1, 0, 0, 0, 0, 0, 0],
+            len: 2,
+        };
+        let (out, pinned) = r.rank(walk, row, 1, Some(aff()));
+        assert!(!pinned);
+        assert_eq!(names(out, row), ["anthropic", "bedrock"]);
+    }
+
+    #[test]
+    fn refreshing_a_pin_keeps_its_creation_time() {
+        let r = Router::new();
+        let row = opus();
+        let (row_i, _) = r.row(row).expect("row");
+        let slot = &r.pins[slot_of(pin_key(aff(), row_i))];
+        r.pin(row, aff(), 0);
+        let first = slot.load(Ordering::Relaxed);
+        r.pin(row, aff(), 0);
+        let second = slot.load(Ordering::Relaxed);
+        assert_eq!(
+            (first >> PIN_TIME_BITS) & PIN_TIME_MASK,
+            (second >> PIN_TIME_BITS) & PIN_TIME_MASK
+        );
+        // Moving to another candidate starts a new pin.
+        r.pin(row, aff(), 1);
+        assert_eq!(pin_idx(slot.load(Ordering::Relaxed)), 1);
+    }
+
+    #[test]
+    fn a_pin_expires_when_idle_or_old() {
+        let tag = 0xABCDEF;
+        let now = 10_000;
+        assert!(pin_live(pack(tag, 0, now - 100, now - 10), now));
+        assert!(!pin_live(
+            pack(tag, 0, now - 400, now - PIN_IDLE_S - 1),
+            now
+        ));
+        assert!(!pin_live(
+            pack(tag, 0, now - PIN_MAX_AGE_S - 1, now - 1),
+            now
+        ));
+        assert!(!pin_live(0, now));
+    }
+
+    #[test]
+    fn pin_ages_survive_the_seconds_counter_wrapping() {
+        let tag = 0xABCDEF;
+        // Taken 20s before the 18-bit seconds counter wrapped; read 10s after.
+        let taken = PIN_TIME_MASK - 19;
+        let now = 10;
+        assert!(pin_live(pack(tag, 3, taken, taken), now));
+        assert_eq!(pin_idx(pack(tag, 3, taken, taken)), 3);
+    }
+
+    #[test]
+    fn the_tag_is_never_zero() {
+        assert_eq!(tag_of(0), 1);
+        assert_ne!(pack(tag_of(0), 0, 0, 0), 0);
     }
 }

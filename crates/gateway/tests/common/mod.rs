@@ -67,6 +67,43 @@ fn sweep_stale_port_dirs() {
     }
 }
 
+/// Ports [`free_port`] has handed out in this process.
+fn used_ports() -> &'static Mutex<std::collections::HashSet<u16>> {
+    static USED: OnceLock<Mutex<std::collections::HashSet<u16>>> = OnceLock::new();
+    USED.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+}
+
+/// The run-scoped reservation directory [`free_port`] claims ports in.
+static PORT_DIR: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
+
+/// Bind an in-process server to a `:0` port that is not reserved for a gateway subprocess.
+///
+/// [`free_port`] returns a port and then releases it so the subprocess can bind it, and the kernel
+/// may hand that same port to the next `bind(:0)` before the subprocess gets there. When the next
+/// `bind(:0)` was another test's `MockUpstream`, the first test's client "reached its gateway" and
+/// was answered by the other test's mock: one test saw no upstream hit, the other saw a hit it
+/// never sent. Skipping reserved ports (holding them so the kernel moves on) closes that.
+async fn bind_unreserved() -> TcpListener {
+    let dir = PORT_DIR.get_or_init(port_reservation_dir);
+    let mut held = Vec::new();
+    for _ in 0..1000 {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let reserved = used_ports()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains(&port)
+            || dir
+                .as_ref()
+                .is_some_and(|d| d.join(port.to_string()).exists());
+        if !reserved {
+            return listener;
+        }
+        held.push(listener);
+    }
+    panic!("could not bind an unreserved port after 1000 attempts");
+}
+
 /// Hand out a TCP port no other `free_port()` call in this test **run** has returned.
 ///
 /// Two layers, because there are two ways to collide:
@@ -89,12 +126,8 @@ fn sweep_stale_port_dirs() {
 /// In-process servers should still bind `:0` and read the port back (see `MockUpstream`), which has
 /// no window at all.
 pub fn free_port() -> u16 {
-    use std::collections::HashSet;
-    use std::sync::OnceLock;
-    static USED: OnceLock<Mutex<HashSet<u16>>> = OnceLock::new();
-    static DIR: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
-    let used = USED.get_or_init(|| Mutex::new(HashSet::new()));
-    let dir = DIR.get_or_init(port_reservation_dir);
+    let used = used_ports();
+    let dir = PORT_DIR.get_or_init(port_reservation_dir);
 
     let mut held = Vec::new();
     for _ in 0..1000 {
@@ -140,7 +173,7 @@ pub fn unused_nats_port() -> u16 {
     static SERVER: OnceLock<Nats> = OnceLock::new();
     SERVER
         .get_or_init(|| {
-            let mut nats = Nats::spawn("beyond-ai-nats-shared");
+            let mut nats = Nats::spawn_reaped("beyond-ai-nats-shared");
             let deadline = std::time::Instant::now() + Duration::from_secs(20);
             while std::time::Instant::now() < deadline {
                 if std::net::TcpStream::connect(("127.0.0.1", nats.port)).is_ok() {
@@ -225,6 +258,41 @@ impl Nats {
                 "-p",
                 &port.to_string(),
                 "-sd",
+                store_dir.to_str().unwrap(),
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn nats-server (on PATH? run via mise)");
+        Nats {
+            child,
+            port,
+            store_dir,
+        }
+    }
+
+    /// Like [`Self::spawn`], for a server that outlives every `Drop`: the per-process shared one
+    /// in [`unused_nats_port`], held in a `static`, whose destructor never runs. Under nextest every
+    /// test is its own process, so each run leaked one `nats-server` per test (thousands a day on a
+    /// busy machine). A shell watchdog polls this test process and stops the server, and removes its
+    /// store, within a second of the process exiting, however it exits.
+    fn spawn_reaped(store_prefix: &str) -> Self {
+        const WATCHDOG: &str = r#"nats-server -js -a 127.0.0.1 -p "$2" -sd "$3" >/dev/null 2>&1 &
+server=$!
+while kill -0 "$1" 2>/dev/null && kill -0 "$server" 2>/dev/null; do sleep 1; done
+kill "$server" 2>/dev/null
+wait "$server" 2>/dev/null
+rm -rf "$3""#;
+        let port = free_port();
+        let store_dir = std::env::temp_dir().join(format!("{store_prefix}-{port}"));
+        let _ = std::fs::create_dir_all(&store_dir);
+        let child = Command::new("sh")
+            .args([
+                "-c",
+                WATCHDOG,
+                "nats-watchdog",
+                &std::process::id().to_string(),
+                &port.to_string(),
                 store_dir.to_str().unwrap(),
             ])
             .stdout(std::process::Stdio::null())
@@ -371,6 +439,14 @@ pub enum Mode {
     /// The Anthropic twin: `message_start` (exact input/cache counts), [`STALL_DELTAS`] text deltas,
     /// then silence — no `message_delta`, so no output count.
     AnthropicStallSse,
+    /// An OpenAI embeddings response: vectors first, then `model`, then `usage` (input only).
+    Embeddings,
+    /// Reply with exactly this status, content type, and body — for fixtures that belong to one
+    /// test file (a provider's real stream shape, an error body with no `error` key).
+    Raw(u16, &'static str, &'static str),
+    /// Answer with this status, then never send the body: an upstream that fails and hangs. The
+    /// gateway must not wait on an attempt it abandoned.
+    StatusThenStall(u16),
 }
 
 /// Content deltas a `*StallSse` mode sends before it stalls. Each carries one short token, so an
@@ -441,6 +517,12 @@ pub struct Captured {
     /// Anthropic (and Bedrock Messages) require this; a stock OpenAI SDK never sends it. Recorded
     /// so a Chat Completions → Messages translate walk can prove the gateway injected it.
     pub anthropic_version: Option<String>,
+    /// What the gateway asked the provider to compress with. Managed traffic must ask for
+    /// `identity`: the usage tail, the cache and translation all read the body as plain bytes.
+    pub accept_encoding: Option<String>,
+    /// Recorded so a translate walk onto a conversation-binding Claude model can prove the gateway
+    /// sent the beta its `thinking.block_binding` needs (and that no other walk gets it).
+    pub anthropic_beta: Option<String>,
     pub body: Vec<u8>,
 }
 
@@ -451,6 +533,7 @@ pub struct MockUpstream {
     task: tokio::task::JoinHandle<()>,
 }
 
+const CANNED_EMBEDDINGS: &str = r#"{"object":"list","data":[{"object":"embedding","index":0,"embedding":[0.0023,-0.0093,0.0158]}],"model":"text-embedding-3-small","usage":{"prompt_tokens":5,"total_tokens":5}}"#;
 const CANNED_JSON: &str = r#"{"id":"chatcmpl-mock","object":"chat.completion","model":"gpt-4o-2024-08-06","choices":[{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}],"usage":{"prompt_tokens":11,"completion_tokens":7,"total_tokens":18}}"#;
 
 const CANNED_SSE: &str = "data: {\"id\":\"chatcmpl-mock\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4o-2024-08-06\",\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n\
@@ -580,6 +663,10 @@ fn canned_body(mode: Mode) -> (&'static str, Bytes) {
             "text/event-stream",
             Bytes::from_static(CANNED_SSE.as_bytes()),
         ),
+        Mode::Embeddings => (
+            "application/json",
+            Bytes::from_static(CANNED_EMBEDDINGS.as_bytes()),
+        ),
         Mode::AnthropicJson => (
             "application/json",
             Bytes::from_static(CANNED_ANTHROPIC_JSON.as_bytes()),
@@ -619,7 +706,7 @@ fn canned_body(mode: Mode) -> (&'static str, Bytes) {
         Mode::SseLarge => ("text/event-stream", Bytes::from(large_sse())),
         Mode::AnthropicSseLarge => ("text/event-stream", Bytes::from(anthropic_sse_large())),
         // The status is applied by `mock_handle`; the body is a stock error shape.
-        Mode::Status(_) => (
+        Mode::Status(_) | Mode::StatusThenStall(_) => (
             "application/json",
             Bytes::from_static(br#"{"error":{"message":"mock"}}"#),
         ),
@@ -629,6 +716,7 @@ fn canned_body(mode: Mode) -> (&'static str, Bytes) {
                 br#"{"type":"error","error":{"type":"api_error","message":"mock"}}"#,
             ),
         ),
+        Mode::Raw(_, content_type, body) => (content_type, Bytes::from_static(body.as_bytes())),
     }
 }
 
@@ -676,6 +764,8 @@ async fn mock_handle(
         beyond_only,
         beyond_split,
         anthropic_version,
+        accept_encoding,
+        anthropic_beta,
     ) = {
         let h = req.headers();
         let get = |k: &str| h.get(k).and_then(|v| v.to_str().ok()).map(String::from);
@@ -690,6 +780,8 @@ async fn mock_handle(
             get("x-beyond-only"),
             get("x-beyond-split"),
             get("anthropic-version"),
+            get("accept-encoding"),
+            get("anthropic-beta"),
         )
     };
     let body = req
@@ -726,6 +818,8 @@ async fn mock_handle(
         beyond_only,
         beyond_split,
         anthropic_version,
+        accept_encoding,
+        anthropic_beta,
         body,
     });
     // A slow upstream is still a *working* upstream; the point is to be slower than the client's
@@ -734,7 +828,10 @@ async fn mock_handle(
         sleep(Duration::from_millis(ms)).await;
     }
     let status = match mode {
-        Mode::Status(s) | Mode::AnthropicStatus(s) => s,
+        Mode::Status(s)
+        | Mode::AnthropicStatus(s)
+        | Mode::Raw(s, _, _)
+        | Mode::StatusThenStall(s) => s,
         Mode::ThrottleKey(_) if throttled => 429,
         _ => 200,
     };
@@ -753,7 +850,9 @@ async fn mock_handle(
     if status == 429 {
         builder = builder.header("retry-after", "7");
     }
-    let body = if matches!(mode, Mode::StallSse | Mode::AnthropicStallSse) {
+    let body = if matches!(mode, Mode::StatusThenStall(_)) {
+        Either::Right(StallingBody(None))
+    } else if matches!(mode, Mode::StallSse | Mode::AnthropicStallSse) {
         Either::Right(StallingBody(Some(payload)))
     } else {
         Either::Left(Full::new(payload))
@@ -765,7 +864,7 @@ impl MockUpstream {
     pub async fn start(mode: Mode) -> Self {
         // Bind `:0` and read the port back, keeping the listener open the whole time — no
         // free_port()→rebind window for another test to slip into (this is an in-process server).
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = bind_unreserved().await;
         let port = listener.local_addr().unwrap().port();
         let captured: Arc<Mutex<Option<Captured>>> = Arc::new(Mutex::new(None));
         let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -811,7 +910,7 @@ impl MockUpstream {
         // no default), pick ring to match the gateway. Idempotent across multiple mocks in one process.
         let _ = rustls::crypto::ring::default_provider().install_default();
 
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = bind_unreserved().await;
         let port = listener.local_addr().unwrap().port();
 
         let ck = rcgen::generate_simple_self_signed(vec![

@@ -159,17 +159,13 @@ pub struct Metrics {
     /// counter rather than a log line because a client that always disagrees would otherwise emit
     /// one warn per request forever; a non-zero rate here is a client bug to go and find.
     pub model_header_body_mismatch_total: IntCounter,
-    /// Model-routed requests that hit a retryable upstream status, had a candidate left to try, and
-    /// could **not** fail over because the request body was not provably replayable.
+    /// Requests that hit a retryable upstream status (a 5xx with a candidate left, a 429 with a key
+    /// left) and could **not** retry because the request body was not provably replayable.
     ///
-    /// Two ways to land here: the body exceeded pingora's 64 KiB replay buffer, or it had not
-    /// finished arriving when the upstream answered, so replayability was not yet knowable. Both are
-    /// counted together because both cost the same thing — a failover we declined to attempt.
-    ///
-    /// This is the measurement that decides whether the expensive fix is worth building. Covering
-    /// these requests means either patching pingora's private buffer limit or driving the retry
-    /// ourselves (see ARCHITECTURE.md); neither is worth starting until this counter says how often
-    /// the limit actually bites.
+    /// Managed catalog walks no longer land here for size: a body past pingora's 64 KiB replay
+    /// buffer is read in full and re-run as a subrequest that can fail over (`FullBody` in `proxy`).
+    /// What remains: `/{provider}/…` requests past the buffer, and small bodies that had not
+    /// finished arriving when the upstream answered, so replayability was not yet knowable.
     pub failover_unreplayable_total: IntCounter,
     /// Model-routed requests that gave up on a candidate and moved to the next one.
     ///
@@ -185,6 +181,14 @@ pub struct Metrics {
     /// a vendor". This one means "the credential was throttled and another key on the same provider
     /// served" — a 429 is not a vendor outage.
     pub key_walks_total: IntCounter,
+    /// Catalog walks whose primary came from a live session pin rather than the TTFT rank (see
+    /// `smart`'s "Session pins"). Against `ai_requests_total` it is the share of traffic being kept
+    /// on its provider's prompt cache; a sudden drop means pins are yielding (failures) or evicting.
+    pub session_pinned_total: IntCounter,
+    /// Managed requests re-run as a subrequest because finding `model` (or Responses session
+    /// state) took the whole body past pingora's 64 KiB replay buffer. Typical for stock Python
+    /// SDKs, which put `model` after `messages` / `input`.
+    pub full_body_relays_total: IntCounter,
     /// Labeled by kind: input|output|cache_read|cache_write. Cache tokens are also in the `ai.usage`
     /// billing log, but that ships with lag — the Prometheus counter is the alerting surface for
     /// "cache hit rate fell off a cliff after a deploy" (cache write ≈ 3× input, cache read ≈ 0.1×,
@@ -300,13 +304,21 @@ impl Metrics {
             "ai_key_walks_total",
             "Managed requests that retried the same provider with the next unused pool key after a 429",
         ))?;
+        let full_body_relays_total = IntCounter::with_opts(Opts::new(
+            "ai_full_body_relays_total",
+            "Managed requests re-run as a subrequest carrying a body read past the 64 KiB replay buffer",
+        ))?;
+        let session_pinned_total = IntCounter::with_opts(Opts::new(
+            "ai_session_pinned_total",
+            "Catalog walks whose primary provider came from a session pin",
+        ))?;
         let model_header_body_mismatch_total = IntCounter::with_opts(Opts::new(
             "ai_model_header_body_mismatch_total",
             "Model-routed requests whose routing header and body `model` disagreed",
         ))?;
         let failover_unreplayable_total = IntCounter::with_opts(Opts::new(
             "ai_failover_unreplayable_total",
-            "Retryable upstream statuses that could not fail over: body not provably replayable",
+            "5xx/429 retries declined because the body was not provably replayable (/{provider} or still uploading)",
         ))?;
         let rejections_total = IntCounterVec::new(
             Opts::new("ai_rejections_total", "Requests rejected before upstream"),
@@ -434,6 +446,8 @@ impl Metrics {
         r.register(Box::new(requests_total.clone()))?;
         r.register(Box::new(candidate_failovers_total.clone()))?;
         r.register(Box::new(key_walks_total.clone()))?;
+        r.register(Box::new(session_pinned_total.clone()))?;
+        r.register(Box::new(full_body_relays_total.clone()))?;
         r.register(Box::new(model_header_body_mismatch_total.clone()))?;
         r.register(Box::new(failover_unreplayable_total.clone()))?;
         r.register(Box::new(rejections_total.clone()))?;
@@ -465,6 +479,8 @@ impl Metrics {
             requests_total,
             candidate_failovers_total,
             key_walks_total,
+            session_pinned_total,
+            full_body_relays_total,
             model_header_body_mismatch_total,
             failover_unreplayable_total,
             rejections_total,

@@ -34,7 +34,7 @@ published `beyond-slipstream` — clones, CI-builds, and publishes anywhere.
 | **Cut-short estimate**                     | A managed 2xx stream that ended before its usage block (client cancel, upstream death) is billed an **estimate** flagged `usage_estimated`: input from the body's text bytes ÷ 5 (Anthropic keeps `message_start`'s exact count), output from the relayed delta events and text. Errs low.                                                                                                                                                                                               | A reported count, or a way to see hidden reasoning — both estimates are blind to thinking the stream never shows                             |
 | **Tenant slot**                            | One of `tenant_max_in_flight` concurrent requests a tenant may hold **on this process**; over it → 429 before the breaker and upstream. The bound on overspend while the allowance-set lags. Off by default.                                                                                                                                                                                                                                                                             | A rate limit or a quota — short fast requests never hit it; N replicas admit N × the limit                                                   |
 | **Control header** (`x-beyond-*`)          | Per-request caller input: `metadata` tags, `capture` on/off, `cache` on/off, catalog `order` / `only` / `split`. Managed only; stripped before the upstream                                                                                                                                                                                                                                                                                                                              | A way to 4xx a request — unusable values are dropped and counted; an `only` that leaves no keyed candidate is the same 503 as an unkeyed row |
-| **Smart router**                           | **Per-pod** EWMA of TTFT per catalog candidate. Default walk for managed `/auto` and `/v1` when `order`/`split` are absent. Probe of unmeasured arms every 8th request. `smart_router = false` restores static catalog order. Two replicas can rank the same row differently.                                                                                                                                                                                                            | Live Redis, cost sort, or a fleet-wide shared ranking — none of those                                                                        |
+| **Smart router**                           | **Per-pod** EWMA of TTFT per catalog candidate. Default walk for managed `/auto` and `/v1` when `order`/`split` are absent. Probe of unmeasured arms every 8th request. Ranks **new** callers only: a caller with a live session pin keeps its provider. `smart_router = false` restores static catalog order. Two replicas can rank the same row differently.                                                                                                                           | Live Redis, cost sort, or a fleet-wide shared ranking — none of those                                                                        |
 | **Snapshot**                               | On-disk deny-set cache (entries + NATS cursor) for edge/tunnel deployments. Allowance uses `{snapshot_path}.allowance`.                                                                                                                                                                                                                                                                                                                                                                  | Persistent store — a pure cache; delete it and the gateway re-scans NATS                                                                     |
 | **Virtual key** (`bai_v1` / `bai_v2`)      | Ed25519-signed token: v1 is `tenant_id`+`vpc_id` (16 B); v2 adds unique `key_id` (24 B). Same keyring.                                                                                                                                                                                                                                                                                                                                                                                   | A session or auth token — stateless, no server-side lookup                                                                                   |
 
@@ -104,6 +104,7 @@ Client (stock OpenAI/Anthropic SDK)
   │    x-goog-api-key) UNCONDITIONALLY → inject the next unused pool key in the
   │    provider's own scheme (never provider A's key on provider B)
   │  BYO: leave auth header unchanged
+  │  Managed: accept-encoding: identity (the gateway parses the body; gzip billed 0 tokens)
   │  Strip x-beyond-* control headers (ours; meaningless upstream)
   │  Set Host; path: verbatim for /{provider} (prefix stripped), or the candidate's
   │    own catalog path for a catalog walk (`/auto`, managed `/v1`). Model-routed: strip
@@ -133,7 +134,7 @@ Client (stock OpenAI/Anthropic SDK)
   ▼  response_filter (proxy.rs)
   │  Record TTFT; detect streaming (Content-Type: text/event-stream)
   │  Count upstream response by provider + status class
-  │  Set x-beyond-request-id header
+  │  Set x-beyond-request-id, x-beyond-provider, x-beyond-upstream-model (catalog walk)
   │  Translate walk: drop Content-Length (body length will change)
   │
   ▼  response_body_filter (proxy.rs)  — response relayed chunk-by-chunk; SSE is never fully buffered
@@ -252,6 +253,25 @@ restores static catalog order. Samples never leave the pod —
 `ai_smart_rank_scope{kind="process"}=1` is the honesty metric; this is not fleet-wide smart
 routing. `x-beyond-split` is the only cross-replica pin (hash of the request counter).
 
+**Session pins.** Ranking decides where a _new_ caller goes; a pin keeps an existing one there.
+Provider prompt caches are per provider, so re-ranking every request moved agent loops between
+Anthropic and Bedrock and re-bought the whole prefix on each move (a Claude cache write is 1.25×
+input against 0.1× for a read), and the every-8th probe landed on whoever drew the seed, usually
+someone mid-session. After a 2xx on a candidate walk, `(tenant_id, vpc_id, key_id)` plus the
+catalog row is pinned to the candidate that served. While the pin is live the walk puts that
+candidate first, keeps the rest in EWMA order as failover, and never probes. One virtual key is one
+app, and an app's sessions share their system prompt and tools, so one pin per key per model is
+the grain the provider cache wants. A pin yields when its candidate's latest attempt failed (the
+walk fails over, and the next 2xx re-pins), after 300s without a 2xx (the provider cache has
+expired anyway), and after 1h so a pin taken during an outage drifts back to the ranked primary.
+An open breaker or an unkeyed candidate needs no check: `upstream_peer` skips it and the 2xx that
+follows re-pins. The table is 16384 packed `AtomicU64`s per pod, direct-mapped by hash: a collision
+overwrites and costs one re-rank. Per pod like the EWMA; with a healthy primary two pods rank a new
+caller the same way. `ai_session_pinned_total` counts walks a pin decided. `order` / `split` walks skip ranking and so
+skip the pin; an `only` walk may follow the key's pin. Neither writes one: a walk the caller shaped
+says nothing about where the key's other requests should go, and one debug header must not route
+them for an hour.
+
 A managed request may also permute that list with headers, still on the same wire, without adding a
 provider the row does not already name (`ProviderSpec::name` on that row). Parsed in `control.rs`,
 stripped before the upstream, never a 4xx. `order` and `split` **pin** (the ranker does not run);
@@ -291,9 +311,26 @@ relay** so `store`, `previous_response_id`, `include`, and `truncation` pass thr
 those fields are in play. `store: false` one-shot Responses may still translate onto Chat
 Completions (lossy). Claude rows have no OpenAI store: Responses + session state is a **400**
 naming the field, not a hollow Messages call. Usage/billing still parse the upstream body/SSE;
-`ai.usage.model` is what the provider echoed. Other mismatches (`/v1/embeddings` with a Claude
-row) are still a **400**. Same-wire Responses (`/{provider}/v1/responses`) stays a byte relay.
-`/{provider}/…` never translates.
+`ai.usage.model` is what the provider echoed. Same-wire Responses (`/{provider}/v1/responses`)
+stays a byte relay. `/{provider}/…` never translates.
+
+**Embeddings rows.** `text-embedding-3-small` and `-large` are catalog rows whose candidates are
+embeddings paths (OpenAI `/v1/embeddings`, then OpenRouter `/api/v1/embeddings`), so a stock
+`client.embeddings.create` on managed `/v1` walks, fails over, and bills input tokens like any other
+row. A batch past 64 KiB (openai-python puts `input` before `model`) is read in full and re-run
+(see the peek below), which is also what lets it fail over on a 5xx or walk keys on a 429.
+The row's endpoint is `Endpoint::of_row`: `Embeddings` when its primary's
+path is, else what `wire` says.
+
+**Which paths name an endpoint.** `route::implied_endpoint` is an exact table:
+`/v1/chat/completions`, `/v1/messages`, `/v1/responses`, `/v1/embeddings` (under `/auto` the `/v1`
+is optional; a trailing slash is ignored). Bare `/v1` and `/auto` name none and relay onto the row's
+primary path. Everything else is a **400** naming the row's endpoint: embeddings against a
+generation row or the reverse (translation never involves embeddings), any other API path
+(`/v1/moderations`, …), and sub-resources such as `/v1/messages/count_tokens`,
+`/v1/responses/{id}` and `/v1/responses/input_tokens`. Those last ones used to match their parent
+by prefix and were forwarded to the candidate's generation path, where they ran and billed as a
+generation; `/auto/embeddings` and `/auto/responses` used to skip the check entirely.
 
 v1 mapping is lossy on extras a stock SDK does not need for a tool loop: Responses-only
 fields (`store`, `previous_response_id`, `include`, `truncation`, …) are dropped when leaving
@@ -303,9 +340,142 @@ ways: base64 data URIs ↔ Anthropic `base64` sources, and `http(s)` URLs ↔ An
 each upstream downloads the URL itself. Amazon Bedrock rejects `url` sources, so a URL image that
 fails over onto a Bedrock candidate gets Bedrock's 400 rather than an answer about a picture the
 model never saw; the walk is chosen before the body is read, so it cannot skip Bedrock for these
-requests. `thinking` /
-`redacted_thinking` blocks, `cache_control`, and `reasoning_effort` (mapped to Anthropic
-`thinking`) pass both ways so an agent workload round-trips. Tools, text, and usage still
+requests. `thinking` / `redacted_thinking` blocks, `cache_control`,
+`parallel_tool_calls: false` ↔ `tool_choice.disable_parallel_tool_use`, and `user` ↔
+`metadata.user_id` pass both ways so an agent workload round-trips. Onto Messages, thinking crosses
+only as a block Anthropic can verify — signed, or redacted — from the gateway's `thinking` array,
+thinking content parts, or OpenRouter's `reasoning_details` (a turn a Chat client got relayed from
+OpenRouter on failover). Bare `reasoning_content` / `reasoning` text is never signed and never
+becomes a block: an unsigned block is a 400 on every later turn ("thinking.signature: Field
+required"), while a turn without its thinking is accepted (measured on Haiku 4.5 and Sonnet 4.6).
+Onto a Claude model behind Chat Completions (OpenRouter's `anthropic/…`), signed blocks also ride
+`reasoning_details` (`reasoning.text` with its signature, `reasoning.encrypted` for a redacted
+block, `format: "anthropic-claude-v1"`): OpenRouter replays nothing else, and older Claude models
+400 a tool turn without its thinking ("a final `assistant` message must start with a thinking
+block", measured on claude-sonnet-4). A Responses client echoes the `reasoning` items the gateway
+minted (`rs_gw…`, Anthropic signature in `encrypted_content`); onto a Claude upstream they become
+that turn's signed thinking again, while OpenAI's own reasoning items stay dropped. Structured output maps
+`response_format` `json_schema` ↔ `output_config.format` ↔ Responses `text.format`; OpenAI JSON mode
+(`json_object`) has no schema to give Anthropic and is dropped (OpenAI already requires the prompt to
+ask for JSON). Inline PDFs map Chat `file` ↔ Anthropic base64 `document` ↔ Responses `input_file`.
+
+**Reasoning and sampling follow the upstream model.** `translate::request` takes the id this
+attempt's candidate receives and parses its Claude generation (`ClaudeGen`, any spelling:
+`claude-opus-4-8`, `anthropic/claude-opus-4.8`, Bedrock's `global.anthropic.…`). On 4.7 and later
+(and Fable, Mythos), `budget_tokens` and non-default `temperature` / `top_p` are 400s, so
+`reasoning_effort` becomes `thinking: {type: adaptive}` plus `output_config.effort`, "none" becomes an
+omitted `thinking` at effort `low` (several of these models reject `thinking: disabled`), and sampling
+is dropped. Sonnet 5.5 is the exception for "none": it rejects `disabled` and an omitted `thinking`
+is adaptive thinking, so "none" is `thinking: {type: between_tools}` at effort `low` (no extended
+thinking; nothing else may sit in that object, and effort must be `high` or below). When the
+history holds thinking and the request carries `block_binding` (below), which `between_tools`
+rejects, it stays adaptive at `low`: keeping the conversation answerable outranks skipping the
+thinking. 4.6 is the same with `xhigh` → `max`. Before 4.6, and for non-Claude models behind a
+Messages-compatible API, effort becomes `budget_tokens` held below `max_tokens` (at most half, at
+least 1024, none at all when `max_tokens` ≤ 1024), and sampling is dropped only alongside thinking.
+Before this, an OpenAI SDK sending `reasoning_effort` or `temperature` to `claude-opus-4-8` got a
+400. A client's own Anthropic `thinking` object on the OpenAI wire goes through the same mapping
+(`{type: enabled, budget_tokens}` is a 400 on 4.7+, `{type: enabled}` without a budget a 400
+everywhere). Where sampling survives it is clamped to Anthropic's 0–1, and `top_p` yields to
+`temperature` (Claude 4.5-era models reject both together). Budget thinking with a forced
+`tool_choice` is a 400 ("Thinking may not be enabled when tool_choice forces tool use"); the forced
+call is the client's contract and reasoning a hint, so the thinking goes. Adaptive thinking takes
+forced tool use (measured on 4.6, 4.8 and Opus 5).
+
+The other direction has the same problem. `translate::OpenAiModel` parses OpenAI's own ids
+(`gpt-4*`, `gpt-5*`, `gpt-6*`, `o*`; measured against Chat Completions and Responses on
+2026-09-30) and every OpenAI-bound mapping (Messages → Chat Completions, Responses → Chat
+Completions, Chat Completions / Messages → Responses) applies it: `max_tokens` becomes
+`max_completion_tokens` (a 400 otherwise on every reasoning model), `temperature` / `top_p` go
+unless the effort sent is `none` (reasoning models take only the default), and the effort is
+clamped to what the family accepts (next value up, else the highest): GPT-4.x has none (the field
+is "Unrecognized"), GPT-5 `minimal`–`high`, 5.1 `none`–`high`, 5.2+ `none`–`xhigh`, GPT-6
+`low`–`xhigh`, `-pro` variants `medium`–`xhigh` (`gpt-5-pro`: `high` only), o-series `low`–`high`.
+So `thinking: disabled` is `minimal` on GPT-5 and omitted on GPT-4.1, and `effort: max` is `xhigh`
+or `high`. OpenRouter's `openai/…` ids get only the effort clamp: OpenRouter renames `max_tokens`
+and drops sampling itself (measured) but passes `none` and `xhigh` through to a 400. gpt-oss, on
+any host and in any spelling, gets the same clamp to `low`–`high` (reasoning is mandatory: `none` is
+"Reasoning is mandatory for this endpoint", measured on OpenRouter). Other OpenAI-wire hosts (xAI,
+DeepSeek, Kimi, …) keep the body as sent, except that an effort only OpenAI's newer families define
+becomes the classic one: `xhigh` / `max` (what a large Anthropic `budget_tokens` or `effort: max`
+maps to) → `high`, `minimal` → `low`. `stop` on a
+model that rejects it (GPT-5+, o3, o4-mini) is still forwarded: dropping it would return text past
+the stop sequence the client asked for.
+
+**Forced tool use on models that reject it.** Claude Fable 5.1, Mythos 5.1, Opus 5.5 and Sonnet 5.5
+400 on `tool_choice` `any` / `tool` (`ClaudeModel::forced_tool_choice`). For those, Chat `required`
+or a named function becomes `auto` plus a closing mid-conversation system message ("Respond by
+calling one of the provided tools." / "Respond by calling the `get_time` tool."), which is
+Anthropic's documented migration for these models. The message is appended after the cache
+breakpoints, so the cached prefix is untouched, and only when the request ends on a user turn (the
+only place such a message is valid). It is an instruction, not a guarantee. Measured live
+(2026-09-30): `required` with no fitting tool ("tell me a joke") still called a tool 6/6 on Sonnet
+5.5 and Opus 5.5; a named tool that conflicts with the question was called 8/8, and Sonnet 5.5 also
+called the tool that fit the question alongside it 4/4. Limiting it to one call made Sonnet pick the
+fitting tool instead, so parallel calls stay allowed. Every other model keeps the hard `any` /
+`tool`. `allowed_tools` has no Messages subset: `required` over one tool forces that tool, over
+several forces any tool (trimming `tools` instead would rewrite the cached, thinking-bound prefix).
+
+**Preserved thinking on a translated conversation.** Fable 5.1, Opus 5.5 and Sonnet 5.5 bind each
+thinking block to the conversation that produced it (system, tools, every earlier message); a
+replayed block whose prefix changed is a 400 ("bound to a different conversation") on accounts
+created on or after 2026-08-31, and on any account whose request sets
+`thinking.block_binding.prefix_mismatch_behavior`. The translator keeps the prefix append-only
+where it can: a mid-conversation `system` / `developer` message stays in `messages` as a
+`role: "system"` message (Opus 4.8+, Fable, Mythos, Sonnet 5.5+) instead of being folded into
+top-level `system`, which used to rewrite the prefix, and the prompt cache, every time a client
+appended one. Messages accepts such a message only right after a user turn and before an assistant
+turn or at the end, so one placed elsewhere moves past the next user turn; with no user turn after
+it (the request ends on an assistant turn) it joins top-level `system`, as it does on every other
+model. The forced-tool instruction above cannot be made append-only: it exists only in the
+gateway's request, so the client's next turn replays that turn's thinking without it. So every
+translated request to one of those models on Anthropic's own API carries `block_binding:
+{prefix_mismatch_behavior: "drop_block"}` (on an explicit `{type: adaptive}` when the client sent
+no thinking; never with `between_tools`, which rejects it), and `proxy`'s `upstream_request_filter`
+adds the `thinking-binding-controls-2026-08-01` beta, merged with any the client sent, from the
+same model-id fact (`translate::messages_beta`), since headers leave before the body is
+translated. The API then drops that block and every thinking block after it instead of failing.
+Always set, not only when the history holds thinking: a thinking parameter that changes between
+turns restarts the prompt cache. Measured live on Sonnet 5.5 with enforcement on: turn 2 after a
+forced turn was the 400 without the field and a 200 with `thinking_dropped` with it; a client
+appending a system message kept every block valid across three turns, where hoisting 400ed.
+Bedrock and OpenRouter spellings get neither the field nor the header: whether those hosts accept
+the beta is unverified, and the field without it is a 400. No Bedrock candidate serves one of those
+models today; one that does would 400 a turn after a forced one on an enforced account.
+
+**Unmappable input is forwarded, not dropped.** `input_audio`, a `file_id` or URL document, a
+Files API image, a non-base64 data URI, `n` > 1, `logprobs`, audio output, Anthropic server and
+Anthropic-defined tools (`web_search_…`, `bash_…`, `text_editor_…`: as an empty-schema function the
+model would call one and nothing would run it), Responses hosted tools (`web_search`,
+`file_search`, …), OpenAI `custom` tools onto Messages, `mcp_servers`, a Responses `prompt`
+template, and `stop` onto Responses have no equivalent on the other wire and change what the
+client gets back. Translation runs in `request_body_filter`, after the request headers went
+upstream, so the gateway cannot answer 400 itself; the field is passed through and the provider's
+400 names it (each verified live, 2026-09-30). A non-http(s) image URL (`file://`) is never
+forwarded in any shape. Hints that change nothing about the response's shape (`seed`, penalties,
+`logit_bias`, `top_k`, a message's `name`) are dropped, and so are `prompt_cache_key`,
+`service_tier` and `verbosity` everywhere but OpenAI's own Chat Completions (which takes all three).
+Equivalents are mapped instead: legacy `functions` / `function_call` become the `tools` loop (a
+legacy call gets an id from its message position, reused by its `function` result); a
+Responses `custom` tool and its calls map to Chat Completions' `custom`, in requests and in
+responses both ways (a Responses `custom_tool_call` item with its raw `input` ↔ a Chat
+`tool_calls` entry of `type: "custom"`, streamed as `response.custom_tool_call_input.*` ↔
+`custom.input` deltas); `tool_choice` and `parallel_tool_calls` go onto Chat Completions only
+alongside `tools` (OpenAI 400s either without them; Messages and Responses accept both); a Responses named
+`tool_choice` or `allowed_tools` nests its name the Chat Completions way and back; consecutive
+Responses `function_call` items become one assistant message (OpenAI rejects the split form),
+joined to that turn's text; an assistant refusal is text on Messages; a mid-conversation Anthropic
+`system` message stays a Chat Completions `system` message in place; tool `strict` crosses both
+ways; structured output is `strict: true` onto OpenAI only when the schema qualifies (every object
+closed with `additionalProperties: false`, every property required; Anthropic allows optional
+ones); an Anthropic `tool_result` that is an error says so in the tool text (`Error: …`); a
+Responses `reasoning.summary` asks current Claude for `display: "summarized"`. Images or files a
+tool returned stay with it: inside the `tool_result` on Messages, and on Chat Completions (whose
+tool message holds text) as a user message right after the run of tool messages. Other hosts' tool
+call ids (`functions.get_weather:0`) become `^[a-zA-Z0-9_-]+$` on Messages, identically on the
+call and its result, with a hash of the original. An email address as `user` (Anthropic rejects
+it as `metadata.user_id`) becomes its FNV-1a hash, stable per user. Chat Completions → Responses
+sends `store: false` unless the client asked to store. Tools, text, and usage still
 round-trip. Anthropic requires `max_tokens`; a missing OpenAI value becomes 4096. OpenAI→Anthropic
 does not inject `stream_options`. Anthropic→OpenAI injects `include_usage` on the translated
 Chat Completions body when streaming; Responses→Chat Completions does the same because injection
@@ -313,18 +483,146 @@ follows the **upstream** endpoint. A stock OpenAI SDK also does not send `anthro
 gateway injects `2023-06-01` on a walk that lands on Messages. Usage/billing still parse the
 **upstream** body. Responses ↔ Messages is composed through Chat Completions.
 
+**Default cache breakpoints onto Messages.** OpenAI caches a repeated prefix by itself; Anthropic
+caches only up to an explicit `cache_control` marker, and a stock OpenAI SDK never sends one. So a
+Chat Completions or Responses client on a Claude row used to pay full input price for its whole
+prefix every turn. When a request translated onto Messages carries no `cache_control` anywhere,
+the gateway adds at most two `{"type":"ephemeral"}` markers: one on the last system block (or the
+last tool when there is no system; tools render first, so one marker covers both), and, once the
+request holds an assistant turn, one on the last non-thinking block of the last message so the next
+turn reads the conversation back. A single-turn request gets only the prefix marker, since a write
+costs 1.25× input and a one-shot never reads it. One client marker anywhere disables all of this.
+Same-wire Messages traffic is a byte relay and is never touched.
+
+**What the client gets back.** Responses are translated in `translate::response_json_status`
+(non-stream, withheld until end of stream) and `translate::SseBridge` (event by event). Every stream
+pairing meets in Chat Completions chunks held as values, so Messages → Responses parses each event
+once. Every Responses-upstream path (Responses → Chat Completions / Messages) is live for the
+Responses-only models the catalog routes to `/v1/responses`, and is held to the same mapping:
+
+- **Usage.** Anthropic's `input_tokens` counts only uncached prompt tokens; OpenAI's
+  `prompt_tokens` and Responses `input_tokens` count the whole prompt. So `prompt_tokens` =
+  `input_tokens` + `cache_read_input_tokens` + `cache_creation_input_tokens`, with
+  `prompt_tokens_details.cached_tokens` = cache reads and `cache_write_tokens` = cache writes (the
+  field OpenAI and OpenRouter use); the reverse subtracts. Responses usage always carries
+  `input_tokens_details` and `output_tokens_details` (the schema requires them). A `message_delta`'s
+  cumulative counts replace `message_start`'s. Billing is untouched: it parses the upstream body.
+- **Stop reasons.** `end_turn`/`stop_sequence` ↔ `stop`, `tool_use` ↔ `tool_calls`, `max_tokens` ↔
+  `length`, `refusal` ↔ `content_filter`. `model_context_window_exceeded` and `pause_turn` become
+  `length`: both leave the turn unfinished, and resending it is the remedy for either. A Responses
+  client gets `status: "incomplete"` with `incomplete_details.reason` `max_output_tokens` or
+  `content_filter`, and a terminal `response.incomplete`. OpenRouter's `native_finish_reason`, when
+  it is an Anthropic stop reason, reaches an Anthropic client exactly. OpenAI's `message.refusal`
+  becomes refusal text plus `stop_reason: "refusal"` (and a Responses `refusal` part); Anthropic's
+  `stop_details.explanation` becomes `message.refusal`. Tool calls under a plain `stop` are still
+  `tool_use`. No empty text block is invented.
+- **Thinking.** An Anthropic client only ever receives signed `thinking` or `redacted_thinking`.
+  OpenRouter streams Claude's signature in a later `reasoning_details` entry, so the bridge holds a
+  thinking block (up to 8 MiB) until its signature arrives and emits it whole; `reasoning.encrypted`
+  becomes `redacted_thinking`. Only payloads whose `format` is Anthropic's are trusted. Reasoning
+  that never gets a signature — DeepSeek, gpt-oss, OpenAI summaries, a block cut off mid-way — is
+  **dropped**: echoed back unsigned, it would 400 every later turn Anthropic serves. A Responses
+  client gets each thinking block as a `reasoning` item (text as a summary, signature as
+  `encrypted_content`); `redacted_thinking` has no Responses form and is dropped there. A Chat
+  client gets what it must send back: `reasoning_content` (the text) plus the `thinking` array
+  (the blocks). Streamed, the text arrives as `reasoning_content` deltas and each finished block —
+  signed, or redacted — as one `thinking` list entry with its own `index`, so openai-python's
+  accumulator (which requires an `index` on every list entry) keeps blocks apart and
+  `messages.append(final.choices[0].message)` echoes exactly the signed blocks. A block that never
+  got its signature is not offered for replay.
+- **The Responses stream** is the full lifecycle: `response.created`, `response.in_progress`, and per
+  item `output_item.added` → content events (`content_part.*`, `output_text.*`, `refusal.*`,
+  `function_call_arguments.*`, `reasoning_summary_part.*` / `reasoning_summary_text.*`) →
+  `output_item.done`, each with `sequence_number`, `output_index` and `item_id`, ending in
+  `response.completed` carrying the whole `output` and usage. An upstream error is an `error` event
+  (with the envelope under `error`, so an OpenAI SDK raises it) followed by `response.failed`, whose
+  `error.code` is one of the closed set the Responses schema allows (`server_error` when the
+  upstream's code is not; the `error` event keeps the upstream's own).
+- **Streams that fail or stop mid-way.** OpenRouter reports a provider that died mid-generation as
+  a chunk carrying `choices` _and_ an `error` (with `finish_reason: "error"`); that is an error, not
+  a finish, for a Messages or Responses client (a Chat client on the same wire gets the relay). A
+  stream that ends without saying how — no stop reason, no end marker — was cut short: the client
+  gets an error (`code: "stream_truncated"`; a Chat client then its `[DONE]`), never an invented
+  `end_turn` / `response.completed`. `proxy` reaches that flush only on a clean end of the upstream
+  body (a close-delimited body, or a provider that stopped writing); an upstream that drops a
+  chunked, sized or HTTP/2 body mid-way fails the request in Pingora, and the client's connection is
+  cut instead.
+- **Tool-call deltas** are keyed by `index`, else by `id`: an id repeated on every delta is one call,
+  a reused `index` with a new id is a new call, interleaved deltas land on their own call, and a call
+  opens only once its name is known.
+- **Errors.** Any non-2xx JSON body is an error, whatever its shape (Bedrock's `{"message"}` has no
+  `error` key); `message`, `type`, `code` and `param` survive, a string `error` is the message,
+  OpenRouter's `metadata.raw` is quoted after its message with the provider's name, and a numeric
+  `code` is a string on the OpenAI wire. OpenAI types with an Anthropic name get it
+  (`server_error` → `api_error`, rate limits → `rate_limit_error`).
+- **Fields.** Every `chat.completion` and chunk has `created` and one `id`; Responses objects have
+  `created_at`, items have `id`s (`msg_`, `fc_`, `rs_`) and function calls a `call_id`. An id the
+  upstream did not give is minted (`…_gw…`), never a shared constant.
+- **Not mapped:** server-tool blocks and hosted-tool items (only reachable through tools a
+  translated client cannot declare), `choices` past the first, logprobs.
+
+**Managed responses are never compressed upstream** (`accept-encoding: identity`; see "Usage
+Extraction"). For translation it matters as much as for billing: a gzipped body reached a translated
+client untranslated, or as plain text under `content-encoding: gzip`.
+
 `/{provider}/…` is the escape hatch and does not consult the catalog. This arm is reached only after
 a provider-table miss, so `/{provider}/…` traffic runs exactly the code it always did; `auto` is
 refused as a provider name at boot so config cannot shadow it.
 
-The name can live in the body because the gateway peeks it itself: pingora's 64 KiB retry buffer is
-enabled, at most that many bytes are read, and — if the buffer truncated — the prefix is prepended
-in `request_body_filter`. Untruncated peeks are replayed by pingora. Draining the body in
-`request_filter` and leaving Pingora with an empty forward hangs the upstream; that is why the peek
-replays rather than consuming. The peek feeds each new chunk to `ModelScanner` once and stops when
-the value closes (unless a cache hash or a Responses session field still needs the rest of a small
-body). It does not re-walk the accumulated prefix: a `model` placed after a long prompt, arriving
-in small reads, used to rescan every earlier byte on every chunk.
+The name can live in the body because the gateway peeks it itself. Pingora's 64 KiB retry buffer is
+enabled and `ModelScanner` is fed each new chunk once (a `model` after a long prompt is linear, not a
+rescan per chunk). One rule decides how much is read: **stop at `model` only while pingora can still
+replay what was read.**
+
+- **A small body** (declared under 64 KiB) stops at `model`. Pingora replays its own buffer on the
+  first attempt and on every failover.
+- **Anything else is read to the end:** a body declared larger than the buffer or of unknown length,
+  inbound Responses (`store` / `previous_response_id` pick the arm and can sit after `input`), a
+  cache lookup (it hashes the whole body), and any body whose `model` had not appeared by the time
+  the buffer truncated (stock Python SDKs put `model` **after** `messages` / `input`). A body that
+  outgrew the buffer leaves pingora nothing to send, since its retry buffer is gone and the client
+  has nothing more to read, so the request is re-run as a pingora **subrequest** carrying the body
+  (`AiProxy::relay_full_body`), whose response is piped to the client (`pipe_full_body`). The
+  subrequest runs this same proxy with a gateway-only context (`FullBody`: the chosen row and
+  Responses session field), so it does not peek again, does not charge the rate guardrail twice,
+  and does not count as a second request. It does its own auth, walk, translation and `ai.usage`.
+  Counted on `ai_full_body_relays_total`.
+- **No `model` in the whole body:** 404. **Past `MAX_REQUEST_BODY`:** 413.
+
+The pipe idle-watches the client while the subrequest runs, the way pingora's own proxy loop does
+(pingora's `pipe_subrequest` does not poll the client when the body is preset). A client that hangs
+up closes the subrequest's channels, so its upstream is aborted at once and a cut-short stream
+bills its estimate, instead of a hidden-reasoning model generating for minutes after an ESC.
+
+What the parent does for every attempt, so a relayed request behaves like any other:
+
+- **One request.** Every attempt carries the parent's request id and sequence (`FullBody`), so the
+  client's `x-beyond-request-id` names the row that bills, and `x-beyond-split` or the probe seed
+  cannot pick a different primary per attempt (a 429 key walk stays on its vendor). An abandoned
+  attempt (one that recorded a `RelayRetry`) still feeds the breaker and the ranker but writes no
+  `ai.usage` or `ai.payload` row.
+- **One tenant slot, taken before the read.** `tenant_max_in_flight` is checked before the body is
+  read in full (`SlotGuard`), so it bounds the bodies held in memory, not only requests in flight: a
+  tenant at its cap gets its 429 before uploading. The parent holds the slot across every attempt;
+  attempts neither take nor release one.
+- **Abandoned attempts wind down first.** The next attempt starts after the abandoned one finishes
+  (bounded at 2s), since it still holds that candidate's breaker permit and a half-open breaker has
+  one.
+- **A reset retries.** An upstream connection that fails before any response header (a reused
+  connection closed under us) is retried on the same candidate once, then the next, which pingora
+  cannot do for a body past its buffer.
+- **HTTP/2 clients.** Pingora builds a subrequest by rendering the parent's header as HTTP/1.1; an H2
+  parent renders as `HTTP/2`, which that parser rejects. The header is rendered as HTTP/1.1 with the
+  body's real `Content-Length` and a `Host` from `:authority`, then restored.
+- **No silent hang.** An attempt that ends with neither a response nor an error (a panic) is a 502,
+  never a connection left open with nothing written.
+- **`Expect: 100-continue`** is answered before the body is read (curl waits a second for it).
+
+Before this, a body whose `model` was past 64 KiB was a 404, and one where the read that found it
+also ended the body hung until the client timed out (openai-python batches of ~150 embeddings
+inputs, or any long agent turn). A Responses turn with `previous_response_id` past 64 KiB was taken
+for a one-shot and translated onto Chat Completions, which dropped the conversation. And no body
+past 64 KiB could fail over (see "Status-based failover, and where it stops").
 
 Three things differ from the provider-routed path, all consequences of the client no longer naming
 the provider:
@@ -384,7 +682,12 @@ the table covers the current 4 / 4.1 / 4o / 5 / 5.x / 6 and o-series ids OpenRou
 and the Groq/Together/Fireworks llama / qwen / open-weight ids people send (Groq
 `llama-3.3-70b-versatile` and `openai/gpt-oss-120b` also name Together and Fireworks as aliases;
 Kimi K3 / GLM-5.2 / MiniMax M3 do the same Together + Fireworks + OpenRouter shape). Those rows
-have no Responses arm — `previous_response_id` is OpenAI's store. Every row and candidate is
+have no Responses arm — `previous_response_id` is OpenAI's store. OpenAI serves some GPT ids only
+on the Responses API (`gpt-5-pro`, `gpt-5.x-pro`, `gpt-5.3-codex`, `o1-pro`): their OpenAI candidate
+is `/v1/responses` (a Chat Completions or Messages client is translated onto it), with OpenRouter
+Chat Completions as the failover. Rows whose first-party API no longer serves our keys (Claude
+Opus 4.1 and Sonnet 4, retired at Anthropic; older `-codex` and some `-pro` ids OpenAI does not
+serve this account) are OpenRouter-only. Every row and candidate is
 verified against the live providers by `catalog_rows_are_servable` in `tests/smoke.rs`, and the
 failover itself by `model_route_fails_over_to_a_real_provider`.
 
@@ -451,7 +754,11 @@ when the snapshot is newer than the downstream price table.
 
 ### Usage Extraction (`usage.rs`)
 
-The tail tap feeds the parser after `logging` fires. Two dialects:
+The tail tap feeds the parser after `logging` fires. It reads plain bytes, so managed requests go
+upstream with `Accept-Encoding: identity`: stock Python and Node SDKs send `gzip`, OpenAI and
+OpenRouter honor it, and a gzipped body parsed as no usage (a **zero-token** billing row) and filled
+the cache with gzip bytes that a hit replayed without their `Content-Encoding`. BYO requests keep
+the caller's own header. Two dialects:
 
 | Dialect   | Format     | Fields                                                                                                                                                           |
 | --------- | ---------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -594,6 +901,24 @@ bounds only control-plane-enabled capture.
 
 **Enablement expiry costs zero gateway code**: the control plane writes the `aicapture.{tenant}`
 entry with a slipstream TTL, and its expiry arrives as an ordinary `Delete` delta.
+
+### Served-by response headers
+
+Every response says what served it, so a client sees a failover or a cache replay without a log
+search:
+
+| Header                    | When                                        | Value                                                                       |
+| ------------------------- | ------------------------------------------- | --------------------------------------------------------------------------- |
+| `x-beyond-request-id`     | every response                              | the `request_id` on `ai.usage` / `ai.payload`                               |
+| `x-beyond-provider`       | every upstream response, and a cache replay | the provider that answered (on a replay, the one that originally served it) |
+| `x-beyond-upstream-model` | catalog walks (`/auto`, managed `/v1`)      | the model id as the gateway sent it to that provider                        |
+| `x-beyond-cache-status`   | cache replays only                          | `hit`                                                                       |
+
+Cost is deliberately **not** returned. The gateway never prices a request (see "Why the catalog has
+a list price and the request does not"): the billed amount is decided downstream and can differ
+from list price, so a gateway-computed figure could disagree with the invoice. A per-request cost
+lookup belongs to the control plane, keyed by `x-beyond-request-id`. The provider header value is
+precomputed per provider at boot (`Provider::name_header`), so it is a refcount bump per response.
 
 ### Capture is a tap, not a buffer
 
@@ -926,49 +1251,35 @@ Two deliberate non-cases, plus one same-provider retry:
 - **When every candidate 5xxes, the client gets the last provider's own status**, not a synthetic
   error. Better diagnostics than an exhausted retry loop produces.
 
-**Where it stops: bodies that cannot be replayed.** Failover rides pingora's retry, whose request
-buffer is `BODY_BUF_LIMIT` = 64 KiB, a private constant with no knob. Past it the body cannot be
-re-sent, so the 5xx is relayed rather than attempted — a retry there would hand the next upstream
-headers describing a body it never writes, hanging it until `read_timeout_secs`.
+**Bodies pingora cannot replay.** Pingora's retry replays its request buffer, which is
+`BODY_BUF_LIMIT` = 64 KiB, a private constant with no knob (checked against pingora 0.9.0 and main,
+2026-09-30; upstream PR cloudflare/pingora#816 would lift it). Past it pingora sends no body on a
+retry and never calls `request_body_filter`, so its own retry would hand the next upstream headers
+for a body it never writes.
 
-The gate is `is_body_done() && !retry_buffer_truncated()`, and the first half deserves an
-explanation because it is not the obvious one. Truncation reports on what has been buffered _so
-far_, so a provider that 5xxes fast — which is what a failing provider does — answers before a large
-body has finished streaming in, and the check reads `false` only because the bytes that would
-truncate it have not arrived yet.
+**On a managed catalog walk this no longer limits failover.** Every body past the buffer is read in
+full before the walk (see the peek above) and run as a `FullBody` subrequest. Inside it the body is
+still unreplayable to pingora, so where an ordinary walk would retry (a 5xx with another candidate
+left, a 429 with another pool key) the subrequest records the decision in its context (`RelayRetry`)
+and relays its response. The parent's pipe sees the decision before the response header reaches the
+client, abandons that attempt, and runs a new subrequest that skips the failed candidate or resumes
+the key walk. Same rules as above: one attempt per subrequest, the last candidate's own status when
+every one fails, `ai_candidate_failovers_total` / `ai_key_walks_total` as usual. The breaker and the
+TTFT ranker see each failed attempt, since each is a real request. The cost is holding the body in
+memory (the model splice already buffered it) and connecting only after it has fully arrived.
 
-Retrying there would not be _unsafe_: pingora replays the buffered prefix with
-`end_of_body = is_body_done()` and the duplex loop reads the remainder straight from the socket, so
-the next candidate does receive the whole body. It would be **timing-dependent** — the same request
-fails over or does not, depending on how quickly the upstream rejected it. On a path that decides
-which vendor gets billed, a deterministic rule is worth more than the extra failovers a looser one
-would win.
+**Where it still stops: `/{provider}/…` and BYO.** Those are not catalog walks, so a body past the
+buffer takes pingora's path. A 429 there is relayed rather than key-walked, counted on
+`ai_failover_unreplayable_total`. That also counts a small body whose 5xx or 429 arrived while it was
+still uploading: the gate is `is_body_done() && !retry_buffer_truncated()`, and truncation only
+reports on what has been buffered so far, so retrying before the upload finished would make the
+same request fail over or not depending on how fast the upstream rejected it. On a path that decides
+which vendor gets billed, a deterministic rule is worth more than the extra retries.
 
-The cost is real: a 5xx arriving while the client is still uploading is relayed rather than retried
-even when it would have replayed fine.
-
-`ai_failover_unreplayable_total` counts every request this excludes — both the too-large bodies and
-the not-yet-known ones, since both cost the same thing: a failover declined. That number is the input to
-whether covering them is worth building, and the options are not cheap: patch `BODY_BUF_LIMIT`
-(fork, or upstream a config knob) or drive the retry ourselves via pingora's `Subrequest` API
-(`allow_spawning_subrequest` — a full inner proxy request whose downstream is a channel, so the body
-comes from our buffer with no cap, at the cost of every filter re-entering on the inner request).
-Neither is worth starting before the counter says how often the limit actually bites. (Checked
-against pingora 0.9.0 and its main branch, 2026-09-30: the constant is unchanged. Swapping our own
-buffered copy in is not an option either — on a truncated retry pingora sends no body at all and
-never calls `request_body_filter`. Upstream PR cloudflare/pingora#816, early request-body
-buffering replayed across retries, would remove the limit.)
-
-**What covers it instead: the client's own retry.** The stock OpenAI and Anthropic SDKs retry 5xx
-and 529 by default, and that retry is a fresh request with a fresh body. The relayed 5xx marks the
-candidate failed in the TTFT ranker, which puts it behind every alternative, so the retry lands on
-the fallback. The cost is one extra round trip plus the SDK's backoff (≈0.5–1s) instead of an
-instant switch. Limits: clients that do not retry get the error; the ranker is per process, so a
-retry that reaches another replica may hit the failing provider once more (the per-provider breaker
-still cuts a sustained outage everywhere); and every catalog walk on that process avoids the failed
-candidate for up to 30s, not just the retry. `smart_router = false` or a pinned walk
-(`x-beyond-order` / `split`) turns it off. `an_sdk_retry_after_an_unreplayable_529_lands_on_the_fallback`
-pins it — and fails with the demotion removed.
+**The client's own retry is still a second line.** The stock OpenAI and Anthropic SDKs retry 5xx and
+529, and a relayed 5xx marks the candidate failed in the TTFT ranker, which puts it behind every
+alternative, so that retry lands on a fallback. `smart_router = false` or a pinned walk
+(`x-beyond-order` / `split`) turns the demotion off.
 
 **Pingora 0.9's default refuses to retry a non-idempotent method** — every LLM call is a `POST` —
 which silently disabled both walks above. `error_while_proxy` is overridden to keep 0.8's policy:
@@ -1140,36 +1451,38 @@ Secret-bearing fields (`pool_keys`, `nats_creds`) are held as `Secret<T>` — st
 
 Prometheus on the default registry, exposed at `/metrics` on `metrics_listen`.
 
-| Metric                                | Type      | Labels               | What It Measures                                                                                                           |
-| ------------------------------------- | --------- | -------------------- | -------------------------------------------------------------------------------------------------------------------------- |
-| `ai_requests_total`                   | Counter   | —                    | Total admitted requests                                                                                                    |
-| `ai_rejections_total`                 | Counter   | `reason`             | Rejected requests by cause (auth, deny_spend, quota, allowance_unavailable, deny_fraud, rate_limit, tenant_concurrency, …) |
-| `ai_upstream_responses_total`         | Counter   | `provider`, `status` | Upstream responses by provider and status class                                                                            |
-| `ai_tokens_total`                     | Counter   | `kind`               | input / output / cache_read / cache_write token counts                                                                     |
-| `ai_ttft_seconds`                     | Histogram | `provider`           | Time to first token (50ms–30s buckets)                                                                                     |
-| `ai_upstream_latency_seconds`         | Histogram | `provider`           | Full request latency (100ms–600s buckets)                                                                                  |
-| `ai_active_streams`                   | Gauge     | —                    | Open SSE streams                                                                                                           |
-| `ai_requests_in_flight`               | Gauge     | —                    | All in-flight requests (streaming + non-streaming)                                                                         |
-| `ai_deny_set_size`                    | Gauge     | —                    | Current number of denied tenants                                                                                           |
-| `ai_nats_connected`                   | Gauge     | —                    | 1 if the **deny-set** watcher is connected, 0 otherwise                                                                    |
-| `ai_allowance_set_size`               | Gauge     | —                    | Exhausted tenants + keys in the allowance-set                                                                              |
-| `ai_allowance_ready`                  | Gauge     | —                    | 1 after a successful allowance scan/snapshot (empty = remaining-ok); 0 = fail-closed                                       |
-| `ai_allowance_nats_connected`         | Gauge     | —                    | 1 if the **allowance-set** watcher is connected                                                                            |
-| `ai_capture_set_size`                 | Gauge     | —                    | Tenants with payload capture enabled (climbing and never falling ⇒ missing TTLs)                                           |
-| `ai_capture_nats_connected`           | Gauge     | —                    | 1 if the **capture-set** watcher is connected — separate watcher, separate connection                                      |
-| `ai_captures_total`                   | Counter   | —                    | Requests whose payloads were captured (post-sampling)                                                                      |
-| `ai_capture_bytes_total`              | Counter   | —                    | Payload bytes handed to the sink — the cost signal, ahead of the storage bill                                              |
-| `ai_capture_dropped_total`            | Counter   | —                    | Captures dropped on a full sink queue — distinguishes "lost it" from "capture was off"                                     |
-| `ai_control_header_errors_total`      | Counter   | —                    | `x-beyond-*` headers present but unusable (dropped; request still served)                                                  |
-| `ai_usage_parse_errors_total`         | Counter   | —                    | Managed 2xx responses with no parseable usage (emitted as a zero-token billing row)                                        |
-| `ai_cache_hits_total`                 | Counter   | —                    | Exact-match cache hits that replayed a stored 2xx and skipped the provider                                                 |
-| `ai_cache_scope`                      | Gauge     | `kind`               | Constant `1` with `kind="process"`: this pod's cache table, not a fleet store                                              |
-| `ai_smart_rank_scope`                 | Gauge     | `kind`               | Constant `1` with `kind="process"`: this pod's TTFT EWMA, not a fleet-wide ranking                                         |
-| `ai_candidate_failovers_total`        | Counter   | —                    | Model-routed requests that abandoned a candidate for the next one                                                          |
-| `ai_key_walks_total`                  | Counter   | —                    | Managed 429s that retried the same provider with the next unused pool key                                                  |
-| `ai_model_header_body_mismatch_total` | Counter   | —                    | Catalog-walk requests whose `x-beyond-model` and body `model` disagreed (header wins; client bug)                          |
-| `ai_failover_unreplayable_total`      | Counter   | —                    | 5xx/429 retries declined: request body not provably replayable (past 64 KiB, or still uploading)                           |
-| `ai_usage_estimated_total`            | Counter   | —                    | Managed streams cut short before their usage block, billed with estimated tokens                                           |
+| Metric                                | Type      | Labels               | What It Measures                                                                                                            |
+| ------------------------------------- | --------- | -------------------- | --------------------------------------------------------------------------------------------------------------------------- |
+| `ai_requests_total`                   | Counter   | —                    | Total admitted requests                                                                                                     |
+| `ai_rejections_total`                 | Counter   | `reason`             | Rejected requests by cause (auth, deny_spend, quota, allowance_unavailable, deny_fraud, rate_limit, tenant_concurrency, …)  |
+| `ai_upstream_responses_total`         | Counter   | `provider`, `status` | Upstream responses by provider and status class                                                                             |
+| `ai_tokens_total`                     | Counter   | `kind`               | input / output / cache_read / cache_write token counts                                                                      |
+| `ai_ttft_seconds`                     | Histogram | `provider`           | Time to first token (50ms–30s buckets)                                                                                      |
+| `ai_upstream_latency_seconds`         | Histogram | `provider`           | Full request latency (100ms–600s buckets)                                                                                   |
+| `ai_active_streams`                   | Gauge     | —                    | Open SSE streams                                                                                                            |
+| `ai_requests_in_flight`               | Gauge     | —                    | All in-flight requests (streaming + non-streaming)                                                                          |
+| `ai_deny_set_size`                    | Gauge     | —                    | Current number of denied tenants                                                                                            |
+| `ai_nats_connected`                   | Gauge     | —                    | 1 if the **deny-set** watcher is connected, 0 otherwise                                                                     |
+| `ai_allowance_set_size`               | Gauge     | —                    | Exhausted tenants + keys in the allowance-set                                                                               |
+| `ai_allowance_ready`                  | Gauge     | —                    | 1 after a successful allowance scan/snapshot (empty = remaining-ok); 0 = fail-closed                                        |
+| `ai_allowance_nats_connected`         | Gauge     | —                    | 1 if the **allowance-set** watcher is connected                                                                             |
+| `ai_capture_set_size`                 | Gauge     | —                    | Tenants with payload capture enabled (climbing and never falling ⇒ missing TTLs)                                            |
+| `ai_capture_nats_connected`           | Gauge     | —                    | 1 if the **capture-set** watcher is connected — separate watcher, separate connection                                       |
+| `ai_captures_total`                   | Counter   | —                    | Requests whose payloads were captured (post-sampling)                                                                       |
+| `ai_capture_bytes_total`              | Counter   | —                    | Payload bytes handed to the sink — the cost signal, ahead of the storage bill                                               |
+| `ai_capture_dropped_total`            | Counter   | —                    | Captures dropped on a full sink queue — distinguishes "lost it" from "capture was off"                                      |
+| `ai_control_header_errors_total`      | Counter   | —                    | `x-beyond-*` headers present but unusable (dropped; request still served)                                                   |
+| `ai_usage_parse_errors_total`         | Counter   | —                    | Managed 2xx responses with no parseable usage (emitted as a zero-token billing row)                                         |
+| `ai_cache_hits_total`                 | Counter   | —                    | Exact-match cache hits that replayed a stored 2xx and skipped the provider                                                  |
+| `ai_cache_scope`                      | Gauge     | `kind`               | Constant `1` with `kind="process"`: this pod's cache table, not a fleet store                                               |
+| `ai_smart_rank_scope`                 | Gauge     | `kind`               | Constant `1` with `kind="process"`: this pod's TTFT EWMA, not a fleet-wide ranking                                          |
+| `ai_candidate_failovers_total`        | Counter   | —                    | Model-routed requests that abandoned a candidate for the next one                                                           |
+| `ai_key_walks_total`                  | Counter   | —                    | Managed 429s that retried the same provider with the next unused pool key                                                   |
+| `ai_session_pinned_total`             | Counter   | —                    | Catalog walks whose primary came from a session pin instead of the TTFT rank                                                |
+| `ai_full_body_relays_total`           | Counter   | —                    | Managed requests re-run as a subrequest because routing needed the whole body past 64 KiB                                   |
+| `ai_model_header_body_mismatch_total` | Counter   | —                    | Catalog-walk requests whose `x-beyond-model` and body `model` disagreed (header wins; client bug)                           |
+| `ai_failover_unreplayable_total`      | Counter   | —                    | 5xx/429 retries declined on `/{provider}` or a still-uploading body: not provably replayable (catalog walks re-run instead) |
+| `ai_usage_estimated_total`            | Counter   | —                    | Managed streams cut short before their usage block, billed with estimated tokens                                            |
 
 ---
 
@@ -1207,7 +1520,21 @@ Prometheus on the default registry, exposed at `/metrics` on `metrics_listen`.
 ## Verification
 
 - **Unit (`cargo test --lib`):** key, route, peek, usage, deny, allowance, secret, config, cache, control,
-  smart, translate. `clippy --all-targets -D warnings` clean.
+  smart, translate. `clippy --all-targets -D warnings` clean. The response side of translate
+  (`src/translate_response_tests.rs`) feeds every stream whole, byte by byte and in 7-byte chunks
+  and requires the same events from each, and rebuilds client state the way the OpenAI and
+  Anthropic SDKs accumulate it (tool calls by `index`, blocks by `content[index]`, the Responses
+  item lifecycle, and openai-python's `accumulate_delta` for the message a Chat client echoes on
+  its next turn).
+- **Translated responses end to end (`tests/translate_response.rs`):** through the real proxy with
+  provider-shaped fixtures — the full Responses stream for a Claude and a GPT row, a custom tool
+  call reaching a Responses client, an OpenRouter thinking signature reaching a Messages client on
+  failover, cache-inclusive `prompt_tokens`, truncation as `incomplete`, a Bedrock-shaped 400, an
+  OpenRouter provider error and mid-stream failure keeping their message, a stream cut before its
+  end reaching the client as an error, and `accept-encoding: identity` on every managed upstream
+  request. `tests/translate_request.rs` reads what the upstream received, including a Chat
+  client's next turn built from what the gateway streamed it and signed thinking bound for
+  OpenRouter as `reasoning_details`.
 - **End-to-end (`tests/e2e.rs`, `mise run test:integration:rs`):** real `beyond-ai` binary + real
   nats-server + mock upstream. Covers managed key-swap + passthrough fidelity + usage metering
   (OpenAI JSON + SSE, **Anthropic `/v1/messages`** with `x-api-key` swap + metering), **BYO
@@ -1236,8 +1563,9 @@ Prometheus on the default registry, exposed at `/metrics` on `metrics_listen`.
   `ai.usage` has non-zero Anthropic tokens including cache/reasoning from the upstream parser;
   `cache_control` / `reasoning_effort` reach Anthropic fields and thinking blocks reappear on the
   client stream; the reverse with a GPT id on `/v1/messages`; same-wire walks still byte-relay;
-  `/{provider}` still 400s a Claude body to OpenAI; `/v1/embeddings` with a Claude row is still a
-  wire-mismatch 400). **Mixed-wire rows:** Anthropic 5xx fails onto OpenRouter Chat Completions with
+  `/{provider}` still 400s a Claude body to OpenAI; `/v1/embeddings` with a Claude or GPT row, and a
+  chat body against an embeddings row, are wire-mismatch 400s; `/v1/embeddings` on an embeddings
+  row reaches `/v1/embeddings`, fails over to OpenRouter's path and id, and bills input tokens). **Mixed-wire rows:** Anthropic 5xx fails onto OpenRouter Chat Completions with
   a Chat Completions body spliced from the original client; billing dialect is the serving
   candidate. **Responses** (`tests/translate.rs`): a stock `/v1/responses` body with `store: false`
   and a GPT catalog id is translated onto Chat Completions; the same body with `claude-*` lands on
