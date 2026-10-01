@@ -313,3 +313,51 @@ async fn dns_tries_the_next_address_when_the_first_is_dead() {
         mock.hits()
     );
 }
+
+/// A panic inside a proxy phase skips `logging`, which is where a request gives back what it holds.
+/// The request context's drop must give it back instead: the in-flight and SSE gauges return to 0
+/// and the tenant's only concurrency slot is free for its next request. `AI_FAULT_PANIC` (debug
+/// builds only) panics the first request to reach `response_body_filter`, mid-stream.
+/// claim: REL-17
+/// defect: D39
+#[tokio::test]
+async fn a_panic_in_a_proxy_phase_releases_what_the_request_held() {
+    let (pubkey, sk) = test_keypair(1);
+    let mock = MockUpstream::start(Mode::Sse).await;
+    let gw = Gateway::builder(unused_nats_port(), &mock.authority(), &b64(&pubkey))
+        .tenant_max_in_flight(1)
+        .env("AI_FAULT_PANIC", "response_body_filter")
+        .start()
+        .await;
+    let key = vkey(&sk, 39);
+    let send = || {
+        test_client()
+            .post(format!("{}/openai/v1/chat/completions", gw.url()))
+            .header("authorization", format!("Bearer {key}"))
+            .header("content-type", "application/json")
+            .body(STREAM_BODY)
+            .send()
+    };
+    // The panicking request: the connection dies mid-response, whatever the client makes of it.
+    let first = match send().await {
+        Ok(r) => r.text().await.map(|_| ()).map_err(|e| e.to_string()),
+        Err(e) => Err(e.to_string()),
+    };
+    assert!(
+        gw.log().contains("AI_FAULT_PANIC"),
+        "the fault did not fire (first request: {first:?}); log:\n{}",
+        gw.log()
+    );
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(5)
+        && (gw.metric("ai_requests_in_flight", "").await != 0.0
+            || gw.metric("ai_active_streams", "").await != 0.0)
+    {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(gw.metric("ai_requests_in_flight", "").await, 0.0);
+    assert_eq!(gw.metric("ai_active_streams", "").await, 0.0);
+    // The tenant's single slot came back: its next request is served, not 429.
+    let second = send().await.unwrap();
+    assert_eq!(second.status().as_u16(), 200);
+}

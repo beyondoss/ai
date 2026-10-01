@@ -252,6 +252,40 @@ pub struct GatewayState {
     /// Monotonic per-request counter, the low half of `request_id`. A relaxed `fetch_add` — the only
     /// requirement is uniqueness within the process, not cross-request ordering.
     request_seq: AtomicU64,
+
+    /// Debug builds only: a proxy phase to panic in, once (see [`Self::fault_point`]).
+    #[cfg(debug_assertions)]
+    fault: FaultPanic,
+}
+
+/// A test-only fault: `AI_FAULT_PANIC=<phase>` makes the first request to reach that phase panic.
+///
+/// Compiled into debug builds only (the test binaries the integration tests spawn); a release
+/// build has neither the field nor the env read, so production cannot be made to panic this way.
+/// Exists to prove that a panic in a proxy phase releases what the request held (`proxy::Ctx`).
+#[cfg(debug_assertions)]
+struct FaultPanic {
+    phase: Option<String>,
+    fired: std::sync::atomic::AtomicBool,
+}
+
+#[cfg(debug_assertions)]
+impl FaultPanic {
+    fn from_env() -> Self {
+        Self {
+            phase: std::env::var("AI_FAULT_PANIC")
+                .ok()
+                .filter(|p| !p.is_empty()),
+            fired: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    #[allow(clippy::panic)] // the whole point: a deliberate, test-only panic
+    fn hit(&self, phase: &str) {
+        if self.phase.as_deref() == Some(phase) && !self.fired.swap(true, Ordering::AcqRel) {
+            panic!("AI_FAULT_PANIC: injected panic in {phase}");
+        }
+    }
 }
 
 impl GatewayState {
@@ -363,6 +397,8 @@ impl GatewayState {
                 p
             },
             request_seq: AtomicU64::new(0),
+            #[cfg(debug_assertions)]
+            fault: FaultPanic::from_env(),
             config,
         }))
     }
@@ -398,6 +434,14 @@ impl GatewayState {
     /// The resolved provider for `name` (the request's first path segment, or the bare-path dialect
     /// default), or `None` if no such provider is registered — which `request_filter` turns into a
     /// 404.
+    /// A named point in the proxy phases where a debug build can be told to panic (see
+    /// `FaultPanic`). Compiles to nothing in a release build.
+    #[inline(always)]
+    pub fn fault_point(&self, _phase: &'static str) {
+        #[cfg(debug_assertions)]
+        self.fault.hit(_phase);
+    }
+
     pub fn provider(&self, name: &str) -> Option<&Arc<Provider>> {
         self.providers.get(name)
     }

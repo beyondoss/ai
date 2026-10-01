@@ -85,6 +85,7 @@ use pingora_proxy::{ProxyHttp, Session};
 use std::borrow::Cow;
 use std::fmt::Write as _;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
@@ -213,6 +214,106 @@ pub struct AiProxy {
     pub state: Arc<GatewayState>,
 }
 
+/// Requests that exist right now: incremented when pingora builds a request's context
+/// (`new_ctx`, once the request header has been read) and decremented when that context drops,
+/// after `logging` has written its billing row. `main`'s shutdown drain exits once this reaches 0.
+/// Process-wide rather than on [`GatewayState`] so a request pays no `Arc` clone for it.
+pub static LIVE_REQUESTS: AtomicUsize = AtomicUsize::new(0);
+
+/// Pingora's per-request context: the admitted request's state, plus what it holds that must be
+/// given back however the request ends.
+///
+/// `logging` releases everything in the ordinary course. A panic in any proxy phase skips
+/// `logging`, but it unwinds through pingora's request future and so drops this context, and
+/// [`Drop`] releases whatever `logging` did not: the in-flight gauge, the SSE gauge, the tenant
+/// concurrency slot, and an unresolved breaker permit (given back without an outcome, so a
+/// half-open breaker's only probe permit cannot be stranded by a gateway bug).
+///
+/// Derefs to the `Option<RequestCtx>` the hooks were written against.
+pub struct Ctx {
+    rc: Option<RequestCtx>,
+    held: Held,
+}
+
+/// The releasable state of one request. Kept beside, not inside, [`RequestCtx`]: none of it is
+/// touched per response chunk, and `RequestCtx`'s size is (see its size test).
+struct Held {
+    state: Arc<GatewayState>,
+    /// Set at the top of `request_filter`, so an error answered before admission (a body read
+    /// failure, say) still carries the request id.
+    request_id: Option<RequestId>,
+    /// Counted on `ai_requests_in_flight`.
+    in_flight: bool,
+    /// Counted on `ai_active_streams`.
+    active_stream: bool,
+    /// Holds one of this tenant's `tenant_max_in_flight` slots.
+    tenant: Option<u64>,
+}
+
+impl Held {
+    fn admit(&mut self) {
+        if !self.in_flight {
+            self.in_flight = true;
+            self.state.metrics.requests_in_flight.inc();
+        }
+    }
+
+    fn release_in_flight(&mut self) {
+        if std::mem::take(&mut self.in_flight) {
+            self.state.metrics.requests_in_flight.dec();
+        }
+    }
+
+    fn open_stream(&mut self) {
+        if !self.active_stream {
+            self.active_stream = true;
+            self.state.metrics.active_streams.inc();
+        }
+    }
+
+    fn release_stream(&mut self) {
+        if std::mem::take(&mut self.active_stream) {
+            self.state.metrics.active_streams.dec();
+        }
+    }
+
+    fn release_tenant(&mut self) {
+        if let Some(tenant) = self.tenant.take()
+            && let Some(slots) = self.state.tenant_slots.as_ref()
+        {
+            slots.release(tenant);
+        }
+    }
+}
+
+impl std::ops::Deref for Ctx {
+    type Target = Option<RequestCtx>;
+    fn deref(&self) -> &Self::Target {
+        &self.rc
+    }
+}
+
+impl std::ops::DerefMut for Ctx {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.rc
+    }
+}
+
+impl Drop for Ctx {
+    fn drop(&mut self) {
+        self.held.release_in_flight();
+        self.held.release_stream();
+        self.held.release_tenant();
+        if let Some(rc) = self.rc.as_mut()
+            && std::mem::take(&mut rc.breaker_pending)
+            && let Some(b) = rc.provider.breaker.as_ref()
+        {
+            b.release();
+        }
+        LIVE_REQUESTS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 /// Per-request context. `None` until `request_filter` admits the request; short-circuited
 /// requests (auth/deny failures) leave it `None`, so later filters no-op.
 pub struct RequestCtx {
@@ -321,10 +422,6 @@ pub struct RequestCtx {
     /// `usage::estimate_stream_output` / `estimate_body_output`. One add per chunk; nothing is
     /// scanned.
     resp_bytes: u32,
-    /// Whether this request holds one of its tenant's `tenant_max_in_flight` slots, released in
-    /// `logging` (which runs exactly once per admitted request — the same guarantee
-    /// `requests_in_flight` rests on).
-    tenant_slot: bool,
     /// How far the current attempt got toward a provider. Lets a billing row tell a request no
     /// provider was ever called for (every breaker open) from one that failed upstream.
     upstream_phase: UpstreamPhase,
@@ -1996,10 +2093,20 @@ enum Routed {
 
 #[async_trait]
 impl ProxyHttp for AiProxy {
-    type CTX = Option<RequestCtx>;
+    type CTX = Ctx;
 
     fn new_ctx(&self) -> Self::CTX {
-        None
+        LIVE_REQUESTS.fetch_add(1, Ordering::AcqRel);
+        Ctx {
+            rc: None,
+            held: Held {
+                state: Arc::clone(&self.state),
+                request_id: None,
+                in_flight: false,
+                active_stream: false,
+                tenant: None,
+            },
+        }
     }
 
     /// The request line pingora prints on its own error lines. Its default prints the path
@@ -2036,6 +2143,7 @@ impl ProxyHttp for AiProxy {
             Some(fb) => (fb.request_id, fb.request_seq),
             None => self.state.next_request_id_seq(),
         };
+        ctx.held.request_id = Some(request_id);
 
         // 1. Route by the **first path segment** = provider; forward the rest of the path verbatim
         // (native passthrough — the gateway holds no per-provider mount knowledge). A path with no
@@ -2928,7 +3036,7 @@ impl ProxyHttp for AiProxy {
         match cache_look {
             Some(Err(hit)) => {
                 Self::reply_cache_hit_boxed(session, &request_id, &hit).await?;
-                *ctx = Some(RequestCtx {
+                ctx.rc = Some(RequestCtx {
                     tenant_id,
                     vpc_id,
                     key_id,
@@ -2973,10 +3081,9 @@ impl ProxyHttp for AiProxy {
                     request_id,
                     input_tally: usage::InputTally::default(),
                     resp_bytes: 0,
-                    tenant_slot: false,
                     upstream_phase: UpstreamPhase::None,
                 });
-                self.state.metrics.requests_in_flight.inc();
+                ctx.held.admit();
                 return Ok(true);
             }
             Some(Ok((ck, max_bytes))) => {
@@ -3057,8 +3164,11 @@ impl ProxyHttp for AiProxy {
         // ledger existed, so recording is unchanged for the provider-routed path. The model-routed
         // path starts owing nothing and takes on its first permit in `upstream_peer`.
         let breaker_pending = model_route.is_none() && provider.breaker.is_some();
+        if tenant_slot {
+            ctx.held.tenant = Some(tenant_id);
+        }
 
-        *ctx = Some(RequestCtx {
+        ctx.rc = Some(RequestCtx {
             tenant_id,
             vpc_id,
             key_id,
@@ -3131,13 +3241,13 @@ impl ProxyHttp for AiProxy {
             request_id,
             input_tally: usage::InputTally::default(),
             resp_bytes: 0,
-            tenant_slot,
             upstream_phase: UpstreamPhase::None,
         });
-        // Admitted: count it in-flight. Balanced by the decrement in `logging`, which runs exactly
-        // once per admitted request (rejected requests leave `ctx` None and never reach that path,
-        // so the gauge can't leak). `active_streams` only covers SSE; this covers every request.
-        self.state.metrics.requests_in_flight.inc();
+        // Admitted: count it in-flight. Released in `logging`, or by `Ctx`'s drop if a panic
+        // skipped `logging`, so the gauge cannot leak. `active_streams` only covers SSE; this
+        // covers every request.
+        ctx.held.admit();
+        self.state.fault_point("request_filter");
         Ok(false)
     }
 
@@ -3154,6 +3264,7 @@ impl ProxyHttp for AiProxy {
                 "upstream_peer reached without request context",
             ));
         };
+        self.state.fault_point("upstream_peer");
 
         // Pingora calls this once per attempt, always before a body byte moves, so it is the one
         // place a retry's leftover request-body state can be cleared. No-op on the first attempt.
@@ -3874,7 +3985,8 @@ impl ProxyHttp for AiProxy {
         upstream_response: &mut ResponseHeader,
         ctx: &mut Self::CTX,
     ) -> Result<()> {
-        if let Some(rc) = ctx.as_mut() {
+        let Ctx { rc, held } = ctx;
+        if let Some(rc) = rc.as_mut() {
             // Headers arrived ≈ time-to-first-byte. Per-provider handle resolved once at boot (see
             // `ProviderMetrics`) — first-token latency is per-provider, so an unlabeled histogram
             // can't tell you which one regressed.
@@ -3926,8 +4038,9 @@ impl ProxyHttp for AiProxy {
             // `logging` once the stream completes — so the gauge reflects in-flight streams, not a
             // counter that only ever climbs. Non-streaming responses don't touch it.
             if rc.streaming {
-                self.state.metrics.active_streams.inc();
+                held.open_stream();
             }
+            self.state.fault_point("response_filter");
 
             // `x-beyond-*` is the gateway's namespace. A provider (or anything between us and it)
             // that sent its own `x-beyond-provider` or `x-beyond-cache-status` would otherwise reach
@@ -4009,6 +4122,7 @@ impl ProxyHttp for AiProxy {
         let Some(rc) = ctx.as_mut() else {
             return Ok(None);
         };
+        self.state.fault_point("response_body_filter");
         let chunk = body.as_deref().unwrap_or(&[]);
         if !chunk.is_empty() {
             // Tap the provider-reported (resolved/billed) model from the response *head* — the
@@ -4312,17 +4426,12 @@ impl ProxyHttp for AiProxy {
         e: Option<&pingora_core::Error>,
         ctx: &mut Self::CTX,
     ) {
-        let Some(rc) = ctx.as_mut() else { return };
-
-        // Balance the in-flight gauge incremented at admission. `logging` runs exactly once per
-        // admitted request — including on upstream errors and client disconnects — so the gauge
-        // always returns to baseline and can't drift upward.
-        self.state.metrics.requests_in_flight.dec();
-        if std::mem::take(&mut rc.tenant_slot)
-            && let Some(slots) = self.state.tenant_slots.as_ref()
-        {
-            slots.release(rc.tenant_id);
-        }
+        let Ctx { rc, held } = ctx;
+        // Balance the in-flight gauge and the tenant slot taken at admission. A panic that skips
+        // this is covered by `Ctx`'s drop.
+        held.release_in_flight();
+        held.release_tenant();
+        let Some(rc) = rc.as_mut() else { return };
 
         // An upstream error (DNS/connect timeout, read timeout, abort) lands here with `Some(e)` but
         // no `ai.usage` row (no parseable body) — and the earlier `warn!` in `upstream_peer` only
@@ -4526,12 +4635,8 @@ impl ProxyHttp for AiProxy {
                 .metrics
                 .upstream_latency_seconds
                 .observe(elapsed.as_secs_f64());
-            // Balance the `active_streams` increment from `response_filter`. `logging` runs exactly once
-            // per request (including on upstream errors / client disconnects), so a stream that opened is
-            // always accounted closed here — the gauge can't leak upward.
-            if rc.streaming {
-                m.active_streams.dec();
-            }
+            // Balance the `active_streams` increment from `response_filter` (or `Ctx`'s drop does).
+            held.release_stream();
         }
 
         // Emit the usage *fact* on a dedicated target — **managed only**. The event is an
@@ -4807,7 +4912,6 @@ mod tests {
             request_id: RequestId::new(),
             input_tally: usage::InputTally::default(),
             resp_bytes: 0,
-            tenant_slot: false,
             upstream_phase: UpstreamPhase::None,
         }
     }
