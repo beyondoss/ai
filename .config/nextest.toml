@@ -65,9 +65,19 @@ path = "junit.xml"
 
 # `mise run verify:live`'s second phase: the reconciled live cells (those claiming BIL-5), after
 # every other cell has finished, so no other suite's traffic is in their providers' usage reports
-# (verify/README.md). Same settings as `verify`, its own report.
+# (verify/README.md). Same settings as `verify`, its own report. `inherits` does not carry
+# `verify`'s overrides (measured: nextest 0.9.140 killed a long session at 180s), so they are
+# repeated here.
 [profile.verify-isolated]
 inherits = "verify"
+
+[[profile.verify-isolated.overrides]]
+filter = "binary_id(beyond-ai-verify::reconcile_live)"
+slow-timeout = { period = "60s", terminate-after = 18 }
+
+[[profile.verify-isolated.overrides]]
+filter = "binary_id(beyond-ai-verify::long_live)"
+slow-timeout = { period = "60s", terminate-after = 35 }
 
 [profile.verify-isolated.junit]
 path = "junit.xml"
