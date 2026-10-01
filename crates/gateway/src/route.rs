@@ -170,6 +170,70 @@ pub fn implied_endpoint(path: &str) -> Option<Endpoint> {
     }
 }
 
+/// A provider endpoint under one of the generation endpoints that a catalog walk can serve: the
+/// same row, the same model re-spelled per candidate, a fixed suffix on the candidate's path. Only
+/// candidates of the provider that defines it can serve it, and it never translates: a token count
+/// or a compaction is that provider's own API.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubResource {
+    /// Anthropic `POST /v1/messages/count_tokens` (Claude Code calls it). Free.
+    CountTokens,
+    /// OpenAI `POST /v1/responses/input_tokens`. Free.
+    InputTokens,
+    /// OpenAI `POST /v1/responses/compact` (Codex's remote compaction). Runs a model and reports
+    /// `usage`, so it bills like a generation.
+    Compact,
+}
+
+impl SubResource {
+    /// The sub-resource a catalog-walk path names, if any. Same rules as [`implied_endpoint`]:
+    /// `/v1` optional under `/auto`, trailing slash ignored.
+    pub fn of_path(path: &str) -> Option<Self> {
+        let rest = catalog_path_rest(path)?.trim_end_matches('/');
+        match rest.strip_prefix("/v1").unwrap_or(rest) {
+            "/messages/count_tokens" => Some(Self::CountTokens),
+            "/responses/input_tokens" => Some(Self::InputTokens),
+            "/responses/compact" => Some(Self::Compact),
+            _ => None,
+        }
+    }
+
+    /// Appended to a serving candidate's own path (`/v1/messages` → `/v1/messages/count_tokens`).
+    pub fn suffix(self) -> &'static str {
+        match self {
+            Self::CountTokens => "/count_tokens",
+            Self::InputTokens => "/input_tokens",
+            Self::Compact => "/compact",
+        }
+    }
+
+    /// Whether the provider charges for it, so the gateway writes a billing row.
+    pub fn billed(self) -> bool {
+        matches!(self, Self::Compact)
+    }
+
+    /// Whether this candidate can serve it: the defining provider, on the parent endpoint. Bedrock
+    /// and OpenRouter speak the parent wire but do not document these endpoints.
+    pub fn serves(self, c: &Candidate) -> bool {
+        match self {
+            Self::CountTokens => {
+                c.provider == providers::ProviderId::Anthropic && c.path.ends_with("/messages")
+            }
+            Self::InputTokens | Self::Compact => {
+                c.provider == providers::ProviderId::OpenAi && c.path.ends_with("/responses")
+            }
+        }
+    }
+
+    /// The provider that defines it, for the error when a row has no candidate that serves it.
+    pub fn provider_name(self) -> &'static str {
+        match self {
+            Self::CountTokens => "Anthropic",
+            Self::InputTokens | Self::Compact => "OpenAI",
+        }
+    }
+}
+
 /// Whether a catalog-walk path names no endpoint at all (bare `/v1` or `/auto`), so the row's
 /// primary picks the path.
 fn names_no_endpoint(path: &str) -> bool {
@@ -550,6 +614,41 @@ mod tests {
         assert_eq!(
             catalog_wire_action("/auto", Endpoint::Embeddings),
             WireAction::Relay
+        );
+    }
+
+    #[test]
+    fn sub_resources_are_an_exact_table() {
+        for (path, want) in [
+            ("/v1/messages/count_tokens", Some(SubResource::CountTokens)),
+            (
+                "/auto/messages/count_tokens/",
+                Some(SubResource::CountTokens),
+            ),
+            ("/v1/responses/input_tokens", Some(SubResource::InputTokens)),
+            ("/v1/responses/compact", Some(SubResource::Compact)),
+            ("/auto/v1/responses/compact", Some(SubResource::Compact)),
+            ("/v1/responses/resp_123", None),
+            ("/v1/messages/batches", None),
+            ("/v1/messages", None),
+            ("/openai/v1/responses/compact", None),
+        ] {
+            assert_eq!(SubResource::of_path(path), want, "{path}");
+        }
+        let claude = providers::for_model("claude-opus-4-8").expect("row");
+        let served: Vec<_> = claude
+            .candidates
+            .iter()
+            .filter(|c| SubResource::CountTokens.serves(c))
+            .map(|c| c.provider)
+            .collect();
+        assert_eq!(served, [providers::ProviderId::Anthropic]);
+        let gpt = providers::for_model("gpt-4o-mini").expect("row");
+        assert!(gpt.responses.iter().any(|c| SubResource::Compact.serves(c)));
+        assert!(
+            !gpt.candidates
+                .iter()
+                .any(|c| SubResource::Compact.serves(c))
         );
     }
 

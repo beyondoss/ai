@@ -312,6 +312,52 @@ async fn messages_client_keeps_the_thinking_signature_across_openrouter_failover
     assert_eq!(cap.path, "/api/v1/chat/completions");
 }
 
+/// A Chat client served by OpenRouter gets `role` and each reasoning entry's `format` once.
+/// OpenRouter repeats both on every chunk, and openai-python's `.stream()` concatenated them into a
+/// role of "assistantassistant…" for the next turn to send back.
+#[tokio::test]
+async fn chat_client_on_openrouter_gets_each_identity_field_once() {
+    let nats_port = unused_nats_port();
+    let (pubkey, sk) = test_keypair(1);
+    let fallback =
+        MockUpstream::start(Mode::Raw(200, "text/event-stream", OPENROUTER_CLAUDE_SSE)).await;
+    let gw = Gateway::builder(nats_port, &GatewayBuilder::dead_authority(), &b64(&pubkey))
+        .providers(&["anthropic", "openrouter"])
+        .provider_authority("openrouter", &fallback.authority())
+        .start()
+        .await;
+
+    let body = r#"{"model":"claude-opus-4-8","stream":true,"messages":[{"role":"user","content":"weather in Paris?"}]}"#;
+    let (status, text) = post(&gw, "/v1/chat/completions", &vkey(&sk), body.to_owned()).await;
+    assert_eq!(status, 200, "{text}\n{}", gw.log());
+    let deltas: Vec<Value> = events(&text)
+        .into_iter()
+        .filter_map(|(_, v)| v.pointer("/choices/0/delta").cloned())
+        .collect();
+    assert_eq!(deltas.len(), 4, "{text}");
+    let roles = deltas.iter().filter(|d| d.get("role").is_some()).count();
+    assert_eq!(roles, 1, "{text}");
+    assert_eq!(deltas[0]["role"], "assistant");
+    assert_eq!(
+        deltas[0]["reasoning_details"][0]["format"],
+        "anthropic-claude-v1"
+    );
+    assert!(
+        deltas[1]["reasoning_details"][0].get("format").is_none(),
+        "{text}"
+    );
+    assert_eq!(
+        deltas[1]["reasoning_details"][0]["signature"],
+        "EqIFCpwBsig"
+    );
+    assert_eq!(deltas[2]["tool_calls"][0]["id"], "toolu_bdrk_01");
+    assert!(text.ends_with("data: [DONE]\n\n"), "{text}");
+    assert_eq!(
+        fallback.captured().expect("OpenRouter served").path,
+        "/api/v1/chat/completions"
+    );
+}
+
 /// A Chat client on a Claude row: `prompt_tokens` is the whole prompt, cache included, and every
 /// chunk carries `created` (strictly typed clients reject a chunk without it).
 #[tokio::test]
