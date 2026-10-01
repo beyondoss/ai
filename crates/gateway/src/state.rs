@@ -54,6 +54,141 @@ struct DnsEntry {
     refresh_at: Instant,
 }
 
+/// A lookup's answer as its waiters see it: `None` until it is known (or `DNS_TIMEOUT` passed).
+type DnsAnswer = Option<std::result::Result<Arc<[SocketAddr]>, String>>;
+
+/// The DNS cache, and the lookups in flight for it (D89).
+#[derive(Default)]
+struct DnsCache {
+    entries: ArcSwap<HashMap<String, DnsEntry>>,
+    /// The one lookup running per authority (single flight). Its answer is published on the channel
+    /// when it lands, or as a timeout after `DNS_TIMEOUT`; the entry stays until the lookup itself
+    /// returns, so a `getaddrinfo` hung on the blocking pool is joined, never repeated. At most one
+    /// blocking lookup per provider authority is ever outstanding.
+    inflight: std::sync::Mutex<HashMap<String, tokio::sync::watch::Receiver<DnsAnswer>>>,
+}
+
+impl DnsCache {
+    /// Join the lookup in flight for `authority`, or start one in the background.
+    fn lookup_once<F, Fut>(
+        self: &Arc<Self>,
+        authority: &str,
+        lookup: F,
+    ) -> tokio::sync::watch::Receiver<DnsAnswer>
+    where
+        F: FnOnce(String) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = std::io::Result<Vec<SocketAddr>>> + Send + 'static,
+    {
+        let mut inflight = self
+            .inflight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(answer) = inflight.get(authority) {
+            return answer.clone();
+        }
+        let (tx, rx) = tokio::sync::watch::channel(None);
+        inflight.insert(authority.to_owned(), rx.clone());
+        drop(inflight);
+        let (dns, authority) = (Arc::clone(self), authority.to_owned());
+        tokio::spawn(async move { dns.run_lookup(authority, lookup, tx).await });
+        rx
+    }
+
+    async fn run_lookup<F, Fut>(
+        self: Arc<Self>,
+        authority: String,
+        lookup: F,
+        tx: tokio::sync::watch::Sender<DnsAnswer>,
+    ) where
+        F: FnOnce(String) -> Fut,
+        Fut: std::future::Future<Output = std::io::Result<Vec<SocketAddr>>>,
+    {
+        /// Ends the flight however the task ends (a panicking lookup included), so the next
+        /// request past `refresh_at` starts a new one.
+        struct Landed<'a>(&'a DnsCache, &'a str);
+        impl Drop for Landed<'_> {
+            fn drop(&mut self) {
+                self.0
+                    .inflight
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(self.1);
+            }
+        }
+        let _landed = Landed(&self, &authority);
+        let pending = lookup(authority.clone());
+        tokio::pin!(pending);
+        let looked_up = match tokio::time::timeout(DNS_TIMEOUT, &mut pending).await {
+            Ok(r) => r.map_err(|e| format!("{authority}: {e}")),
+            Err(_) => {
+                let timed_out = format!(
+                    "{authority}: lookup timed out after {}s",
+                    DNS_TIMEOUT.as_secs()
+                );
+                tx.send_replace(Some(self.settle(&authority, Err(timed_out))));
+                // Still in flight: wait the hung lookup out rather than start another beside it.
+                // A late answer still fills the cache.
+                if let Ok(addrs) = pending.await {
+                    let _ = self.settle(&authority, Ok(addrs));
+                }
+                return;
+            }
+        };
+        tx.send_replace(Some(self.settle(&authority, looked_up)));
+    }
+
+    /// Store a lookup's outcome and return the answer its waiters get. A failure keeps a still
+    /// servable entry (serve-stale), looked up again in `DNS_RETRY` rather than on every request.
+    fn settle(
+        &self,
+        authority: &str,
+        looked_up: std::result::Result<Vec<SocketAddr>, String>,
+    ) -> std::result::Result<Arc<[SocketAddr]>, String> {
+        let now = Instant::now();
+        let e = match looked_up {
+            Ok(addrs) if !addrs.is_empty() => {
+                let addrs: Arc<[SocketAddr]> = addrs.into();
+                let entry = DnsEntry {
+                    addrs: addrs.clone(),
+                    resolved_at: now,
+                    refresh_at: now + DNS_TTL,
+                };
+                // Sweep entries that are long dead while we're already paying for the clone.
+                // The keys are provider authorities from the boot-time registry, so the map is
+                // bounded by the provider count; this is belt-and-suspenders, a TTL drop, not an
+                // eviction policy. Anything still servable as stale is kept.
+                self.entries.rcu(|cur| {
+                    let mut next = HashMap::clone(cur);
+                    next.retain(|_, e| now.duration_since(e.resolved_at) < DNS_STALE_MAX);
+                    next.insert(authority.to_string(), entry.clone());
+                    next
+                });
+                return Ok(addrs);
+            }
+            Ok(_) => format!("{authority}: no addresses"),
+            Err(e) => e,
+        };
+        if let Some(entry) = self.entries.load().get(authority)
+            && now.duration_since(entry.resolved_at) < DNS_STALE_MAX
+        {
+            warn!(
+                authority,
+                error = %e,
+                age_s = now.duration_since(entry.resolved_at).as_secs(),
+                "upstream dns re-resolution failed; serving the last good answer",
+            );
+            self.entries.rcu(|cur| {
+                let mut next = HashMap::clone(cur);
+                if let Some(entry) = next.get_mut(authority) {
+                    entry.refresh_at = now + DNS_RETRY;
+                }
+                next
+            });
+        }
+        Err(e)
+    }
+}
+
 /// A process-unique request id, `{instance:x}-{seq:x}`. Two `u64`s in hex (≤16 chars each) plus the
 /// `-` separator never exceed 33 bytes, so it lives inline on the stack — no per-request heap
 /// allocation on the admitted path (it's minted for every request, including fast rejects).
@@ -266,7 +401,8 @@ pub struct GatewayState {
     /// `getaddrinfo` nor re-resolves the same provider host every request. `ArcSwap` so the common
     /// case — a cache hit, on every admitted request after warmup — is a lock-free atomic load; the
     /// only writes are the ~10 providers' entries refreshed once per `DNS_TTL`, applied via `rcu`.
-    dns_cache: ArcSwap<HashMap<String, DnsEntry>>,
+    /// `Arc` so a refresh can run in a task of its own (see [`DnsCache`]).
+    dns_cache: Arc<DnsCache>,
 
     /// The per-process instance token (8 OS-random bytes) already rendered as `{:x}-` — the high
     /// half of every `request_id`. It is constant for the life of the process, so it is formatted
@@ -417,7 +553,7 @@ impl GatewayState {
             tenant_slots: TenantSlots::new(config.tenant_max_in_flight),
             body_budget: BodyBudget::new(config.max_buffered_body_bytes),
             rate_limit,
-            dns_cache: ArcSwap::from_pointee(HashMap::new()),
+            dns_cache: Arc::new(DnsCache::default()),
             instance_prefix: {
                 // Rendered once. Infallible: 16 hex digits + `-` is exactly the capacity.
                 let mut p = InstancePrefix::new();
@@ -482,7 +618,8 @@ impl GatewayState {
 
     /// Resolve an `host:port` authority and pick the address for connect attempt `attempt`: the
     /// lookup's addresses in order, wrapping. Returns that address and how many there are, so a
-    /// caller whose connect failed can try the next one. Cached for `DNS_TTL`; a lookup is bounded
+    /// caller whose connect failed can try the next one. Cached for `DNS_TTL`, refreshed by one
+    /// background lookup per authority while callers keep the cached answer; a lookup is bounded
     /// by `DNS_TIMEOUT`; when re-resolution fails the last good answer is served for up to
     /// `DNS_STALE_MAX`. Uses `tokio::net::lookup_host` (runs `getaddrinfo` on the blocking pool —
     /// async-safe) instead of `HttpPeer::new`'s eager blocking resolve.
@@ -498,85 +635,43 @@ impl GatewayState {
         Ok((addr, addrs.len()))
     }
 
-    /// [`Self::resolve`]'s cache and serve-stale logic over an injectable `lookup`, so a test can
-    /// fail or hang the resolver.
+    /// [`Self::resolve`]'s cache, single flight and serve-stale over an injectable `lookup`, so a
+    /// test can fail or hang the resolver.
+    ///
+    /// A due refresh never makes a caller wait: the cached answer is served while one background
+    /// lookup runs (D89). Only a caller with nothing servable (cold, or past `DNS_STALE_MAX`) waits,
+    /// and concurrent ones share that one lookup and its answer, bounded by `DNS_TIMEOUT`.
     async fn resolve_all<F, Fut>(&self, authority: &str, lookup: F) -> Result<Arc<[SocketAddr]>>
     where
-        F: FnOnce(String) -> Fut,
-        Fut: std::future::Future<Output = std::io::Result<Vec<SocketAddr>>>,
+        F: FnOnce(String) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = std::io::Result<Vec<SocketAddr>>> + Send + 'static,
     {
         // Cache hit (the common case after warmup): a lock-free `ArcSwap` load — no mutex, no
         // syscall — so concurrent workers never serialize on a DNS lookup that's already resolved.
-        let cached = self.dns_cache.load().get(authority).cloned();
+        let cached = self.dns_cache.entries.load().get(authority).cloned();
+        let now = Instant::now();
         if let Some(entry) = &cached
-            && Instant::now() < entry.refresh_at
+            && now < entry.refresh_at
         {
             return Ok(entry.addrs.clone());
         }
-        let looked_up = match tokio::time::timeout(DNS_TIMEOUT, lookup(authority.to_string())).await
+        let mut answer = self.dns_cache.lookup_once(authority, lookup);
+        if let Some(entry) = cached
+            && now.duration_since(entry.resolved_at) < DNS_STALE_MAX
         {
-            Ok(Ok(addrs)) if !addrs.is_empty() => Ok(addrs),
-            Ok(Ok(_)) => Err(format!("{authority}: no addresses")),
-            Ok(Err(e)) => Err(format!("{authority}: {e}")),
-            Err(_) => Err(format!(
-                "{authority}: lookup timed out after {}s",
-                DNS_TIMEOUT.as_secs()
-            )),
+            return Ok(entry.addrs);
+        }
+        let landed = match answer.wait_for(Option::is_some).await {
+            Ok(a) => (*a).clone(),
+            Err(_) => None,
         };
-        let now = Instant::now();
-        let addrs: Arc<[SocketAddr]> = match looked_up {
-            Ok(addrs) => addrs.into(),
-            Err(e) => {
-                // Serve-stale: the last good answer, while it is recent enough to trust, and look
-                // again in `DNS_RETRY` rather than on every request.
-                if let Some(entry) = cached
-                    && now.duration_since(entry.resolved_at) < DNS_STALE_MAX
-                {
-                    warn!(
-                        authority,
-                        error = %e,
-                        age_s = now.duration_since(entry.resolved_at).as_secs(),
-                        "upstream dns re-resolution failed; serving the last good answer",
-                    );
-                    let addrs = entry.addrs.clone();
-                    let stale = DnsEntry {
-                        refresh_at: now + DNS_RETRY,
-                        ..entry
-                    };
-                    self.dns_cache.rcu(|cur| {
-                        let mut next = HashMap::clone(cur);
-                        next.insert(authority.to_string(), stale.clone());
-                        next
-                    });
-                    return Ok(addrs);
-                }
-                return Err(GatewayError::Dns(e));
-            }
-        };
-        // rcu the new/refreshed entry in. Two concurrent misses for the same host may both resolve
-        // and both rcu; that's harmless (same answer, last writer wins) and far cheaper than holding
-        // a lock across `getaddrinfo`. The clone-on-write copies a ~10-entry map — trivial, and only
-        // on the rare miss/refresh path, never on a hit.
-        //
-        // Sweep entries that are long dead while we're already paying for the clone. The cache keys
-        // are provider authorities, which come entirely from the boot-time registry (so in practice
-        // the map is bounded by the provider count, not by traffic) — this sweep is belt-and-
-        // suspenders against authorities ever becoming dynamic, and it's a *TTL* drop, not an
-        // eviction *policy*: there's no capacity contest here, so LRU/SIEVE would be machinery for a
-        // problem we don't have. We keep anything still servable as stale, so a provider whose
-        // entry just expired is never dropped out from under a concurrent resolve.
-        let entry = DnsEntry {
-            addrs: addrs.clone(),
-            resolved_at: now,
-            refresh_at: now + DNS_TTL,
-        };
-        self.dns_cache.rcu(|cur| {
-            let mut next = HashMap::clone(cur);
-            next.retain(|_, e| now.duration_since(e.resolved_at) < DNS_STALE_MAX);
-            next.insert(authority.to_string(), entry.clone());
-            next
-        });
-        Ok(addrs)
+        match landed {
+            Some(Ok(addrs)) => Ok(addrs),
+            Some(Err(e)) => Err(GatewayError::Dns(e)),
+            None => Err(GatewayError::Dns(format!(
+                "{authority}: lookup ended without an answer"
+            ))),
+        }
     }
 }
 
@@ -821,7 +916,7 @@ mod tests {
 
         // Second call is served from the TTL cache: same answer, and the entry is now present.
         assert_eq!(state.resolve("127.0.0.1:9", 0).await.unwrap().0, addr);
-        assert!(state.dns_cache.load().contains_key("127.0.0.1:9"));
+        assert!(state.dns_cache.entries.load().contains_key("127.0.0.1:9"));
 
         // A guaranteed-NXDOMAIN host (RFC 6761 reserves `.invalid`) → a Dns error, never a panic.
         assert!(matches!(
@@ -864,16 +959,14 @@ mod tests {
     async fn a_failed_re_resolution_serves_the_last_good_answer() {
         let state = GatewayState::new(AiConfig::default(), test_metrics()).unwrap();
         let good = addrs(&["10.0.0.1:443"]);
+        let primed = good.clone();
         let first = state
-            .resolve_all("stale.test:443", |_| {
-                let good = good.clone();
-                async move { Ok(good) }
-            })
+            .resolve_all("stale.test:443", move |_| async move { Ok(primed) })
             .await
             .unwrap();
         assert_eq!(&*first, &good[..]);
         // Expire the entry without waiting a TTL out.
-        state.dns_cache.rcu(|cur| {
+        state.dns_cache.entries.rcu(|cur| {
             let mut next = HashMap::clone(cur);
             if let Some(e) = next.get_mut("stale.test:443") {
                 e.refresh_at = Instant::now();
@@ -888,7 +981,7 @@ mod tests {
             .unwrap();
         assert_eq!(&*stale, &good[..], "served stale");
         // Past the stale bound it is an error again.
-        state.dns_cache.rcu(|cur| {
+        state.dns_cache.entries.rcu(|cur| {
             let mut next = HashMap::clone(cur);
             if let Some(e) = next.get_mut("stale.test:443") {
                 e.refresh_at = Instant::now();
@@ -942,7 +1035,6 @@ mod tests {
     /// claim: REL-20
     /// defect: D89
     #[tokio::test(start_paused = true)]
-    #[ignore = "D89 reproduced: every caller past refresh_at runs its own lookup and waits on it"]
     async fn a_due_refresh_is_one_background_lookup() {
         let state = GatewayState::new(AiConfig::default(), test_metrics()).unwrap();
         let good = addrs(&["10.0.0.1:443"]);
@@ -951,7 +1043,7 @@ mod tests {
             .resolve_all("refresh.test:443", move |_| async move { Ok(primed) })
             .await
             .unwrap();
-        state.dns_cache.rcu(|cur| {
+        state.dns_cache.entries.rcu(|cur| {
             let mut next = HashMap::clone(cur);
             if let Some(e) = next.get_mut("refresh.test:443") {
                 e.refresh_at = Instant::now();
@@ -970,7 +1062,6 @@ mod tests {
     /// claim: REL-20
     /// defect: D89
     #[tokio::test(start_paused = true)]
-    #[ignore = "D89 reproduced: every concurrent cold caller runs its own lookup"]
     async fn concurrent_cold_resolves_share_one_lookup() {
         let state = GatewayState::new(AiConfig::default(), test_metrics()).unwrap();
         let (answers, lookups) = hung_resolves(&state, "cold.test:443", 16).await;
@@ -979,5 +1070,19 @@ mod tests {
             assert_eq!(waited, DNS_TIMEOUT);
         }
         assert_eq!(lookups, 1, "one lookup, not one per caller");
+    }
+
+    /// A lookup that outlives its timeout stays the one in flight: later callers get its timeout at
+    /// once instead of starting another `getaddrinfo` beside the hung one.
+    #[tokio::test(start_paused = true)]
+    async fn a_hung_lookup_is_never_joined_by_a_second() {
+        let state = GatewayState::new(AiConfig::default(), test_metrics()).unwrap();
+        let (_, lookups) = hung_resolves(&state, "hung.test:443", 1).await;
+        assert_eq!(lookups, 1);
+        let (answers, lookups) = hung_resolves(&state, "hung.test:443", 4).await;
+        for (got, waited) in answers {
+            assert_eq!((got, waited), (None, Duration::ZERO));
+        }
+        assert_eq!(lookups, 0, "the hung lookup is still the one in flight");
     }
 }
