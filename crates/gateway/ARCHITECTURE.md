@@ -146,6 +146,9 @@ Client (stock OpenAI/Anthropic SDK)
   │    Session fields on a non-Responses candidate: skip or 400.
   │  Stream-only candidate (`catalog::stream_only`), client not streaming: splice
   │    `stream: true` (+ `include_usage`) first; the answer is assembled (below)
+  │  Chat Completions candidate: a same-wire `developer` message becomes `system` off
+  │    OpenAI / OpenRouter (`catalog::reads_developer_role`); a candidate whose thinking
+  │    breaks tools (`catalog::tool_thinking`) gets them with `reasoning.enabled: false`
   │
   ▼  Provider upstream  (OpenAI / Anthropic / Groq / DeepSeek / …)
   │
@@ -459,6 +462,27 @@ non-streaming upstream. The cache stores the assembled JSON (`application/json`)
 client's non-stream key, so a hit replays JSON. A streaming client on these rows is relayed as
 before.
 
+**Thinking and tools on Alibaba's Qwen backend.** Qwen3.7 Plus and Qwen3.8 Flash, at Together and
+at OpenRouter (whose only host is Alibaba), think by default and refuse a forced `tool_choice`
+(`"required"` or a named function) while thinking: 400 "The tool_choice parameter does not support
+being set to required or object in thinking mode" (D172). Thinking, Qwen3.7 Plus also writes about
+one tool call in eight as content text ("call\n{\"name\": ...}") with no `tool_calls`, at both
+hosts; never with thinking off (D171). Both candidates of each row behave the same, so skipping one
+cannot help; instead the body is adapted per attempt (`providers::catalog::tool_thinking`,
+`translate::thinking_off_for_tools`): a forced tool on either row, and any request offering tools on
+Qwen3.7 Plus whose client asked for no reasoning, goes with every root `reasoning` /
+`reasoning_effort` cut out by span and `"reasoning":{"enabled":false}` spliced first (Together's
+documented switch for hybrid models, and OpenRouter's unified one). A Qwen3.7 Plus client that did
+ask for reasoning gets it, with the risk. Applied after translation, so a Messages `tool_choice`
+`any` or a named tool is covered too.
+
+**`developer` off OpenAI.** A same-wire Chat Completions `developer` message is sent as `system` to
+any host but OpenAI and OpenRouter (`providers::catalog::reads_developer_role`,
+`translate::developer_as_system`: only the role values change). For a model that is not OpenAI's
+the two are one role; Together's Qwen backend refuses `developer` (400 "developer is not one of
+['system', 'assistant', 'user', 'tool', 'function']") and its Kimi K3, DeepSeek V4 Pro and GLM 5.2
+accept it but did not follow it, while OpenRouter maps it per upstream itself (D173).
+
 **Tool-count limits.** OpenAI Chat Completions takes at most 128 tools (400
 `array_above_max_length` "Expected an array with maximum length 128"); OpenAI's Responses API took
 600 in TOOL-1, xAI documents 350 per request on Responses, and Anthropic publishes no count limit
@@ -737,7 +761,7 @@ joined to that turn's text; consecutive same-role messages share one Messages tu
 own text block (two strings are never fused into one); an assistant refusal is text on Messages; a mid-conversation Anthropic
 `system` message stays a Chat Completions `system` message in place; a Responses `developer`
 message stays `developer` on OpenAI's own API and becomes `system` on every other Chat Completions
-host (DeepSeek, Mistral, OpenRouter, … know no `developer` role); tool `strict` crosses both
+host (DeepSeek, Mistral, OpenRouter, … know no `developer` role; a same-wire Chat body gets the same off OpenAI and OpenRouter, see "`developer` off OpenAI"); tool `strict` crosses both
 ways; structured output is `strict: true` onto OpenAI only when the schema qualifies (every object
 closed with `additionalProperties: false`, every property required; Anthropic allows optional
 ones); an Anthropic `tool_result` that is an error says so in the tool text (`Error: …`); a

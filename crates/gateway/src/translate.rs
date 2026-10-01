@@ -4688,6 +4688,92 @@ pub fn force_stream(body: &mut Vec<u8>, usage: bool) -> bool {
     true
 }
 
+/// A Chat Completions body for a host that does not read the `developer` role
+/// (`providers::catalog::reads_developer_role`, D173): each root `messages` element whose `role` is
+/// `"developer"` says `"system"` instead, which is what `developer` means for a model that is not
+/// OpenAI's. Only those role values change; every other byte stays as sent. One `memmem` keeps a
+/// body without `developer` unwalked. `true` when the body changed.
+pub fn developer_as_system(body: &mut Vec<u8>) -> bool {
+    if memchr::memmem::find(body, b"developer").is_none() {
+        return false;
+    }
+    let Some(messages) = peek::root_members(body)
+        .and_then(|m| m.into_iter().rev().find(|m| m.key_is(body, "messages")))
+    else {
+        return false;
+    };
+    if body.get(messages.value.0) != Some(&b'[') {
+        return false;
+    }
+    let Some(items) = peek::array_elements(body, messages.value.0) else {
+        return false;
+    };
+    let roles: Vec<(usize, usize)> = items
+        .iter()
+        .filter(|(start, _)| body[*start] == b'{')
+        .filter_map(|&(start, _)| {
+            let members = peek::object_members(body, start)?;
+            let role = members.iter().rev().find(|m| m.key_is(body, "role"))?;
+            (&body[role.value.0..role.value.1] == b"\"developer\"").then_some(role.value)
+        })
+        .collect();
+    for &(start, end) in roles.iter().rev() {
+        body.splice(start..end, b"\"system\"".iter().copied());
+    }
+    !roles.is_empty()
+}
+
+/// A Chat Completions body for a candidate whose thinking conflicts with tools
+/// (`providers::catalog::ToolThinking`, D171/D172): when it offers tools and the rule says so, every
+/// root `reasoning` and `reasoning_effort` member is cut out by span and
+/// `"reasoning":{"enabled":false}` goes first. A forced `tool_choice` (`"required"` or a named
+/// function) turns thinking off under either rule, since the candidate refuses it while thinking;
+/// under `OffWithTools` any tool request does, unless the client asked for reasoning itself.
+/// Every other byte stays as sent. `true` when the body changed.
+pub fn thinking_off_for_tools(body: &mut Vec<u8>, rule: providers::catalog::ToolThinking) -> bool {
+    use providers::catalog::ToolThinking;
+    if rule == ToolThinking::Free || memchr::memmem::find(body, b"\"tools\"").is_none() {
+        return false;
+    }
+    let Some(members) = peek::root_members(body) else {
+        return false;
+    };
+    let last = |key: &str| members.iter().rev().find(|m| m.key_is(body, key));
+    let offers_tools = last("tools").is_some_and(|m| {
+        body[m.value.0] == b'['
+            && peek::array_elements(body, m.value.0).is_some_and(|items| !items.is_empty())
+    });
+    if !offers_tools {
+        return false;
+    }
+    let forced = last("tool_choice").is_some_and(|m| {
+        let v = &body[m.value.0..m.value.1];
+        v == b"\"required\"" || v.first() == Some(&b'{')
+    });
+    let asked_reasoning = ["reasoning", "reasoning_effort"]
+        .iter()
+        .any(|k| last(k).is_some_and(|m| &body[m.value.0..m.value.1] != b"null"));
+    let off = forced || (rule == ToolThinking::OffWithTools && !asked_reasoning);
+    if !off {
+        return false;
+    }
+    let had_others = members
+        .iter()
+        .any(|m| !(m.key_is(body, "reasoning") || m.key_is(body, "reasoning_effort")));
+    peek::remove_root_members(body, "reasoning");
+    peek::remove_root_members(body, "reasoning_effort");
+    let Some(open) = body.iter().position(|b| !b.is_ascii_whitespace()) else {
+        return false;
+    };
+    let member: &[u8] = if had_others {
+        br#""reasoning":{"enabled":false},"#
+    } else {
+        br#""reasoning":{"enabled":false}"#
+    };
+    body.splice(open + 1..open + 1, member.iter().copied());
+    true
+}
+
 /// A same-wire Responses body, minus the `reasoning` items this gateway minted from Claude's
 /// thinking. A catalog walk relays the body byte for byte to an OpenAI Responses upstream (a
 /// Responses-first row, a GPT row's Responses arm, a mixed-row failover), where a foreign id and an
@@ -8234,6 +8320,69 @@ mod tests {
         assert_eq!(empty, br#"{"store":false}"#);
         let mut not_json = b"[1]".to_vec();
         assert!(!store_false(&mut not_json));
+    }
+
+    /// Only `developer` role values change; spacing, key order, a `developer` string elsewhere and
+    /// numbers as written stay.
+    /// claim: TRN-16
+    /// defect: D173
+    #[test]
+    fn developer_as_system_changes_only_the_roles() {
+        let mut body = br#"{"temperature": 1.50, "messages": [ {"content":"x", "role" : "developer"}, {"role":"user","content":"developer"} ]}"#.to_vec();
+        assert!(developer_as_system(&mut body));
+        assert_eq!(
+            String::from_utf8(body).unwrap(),
+            r#"{"temperature": 1.50, "messages": [ {"content":"x", "role" : "system"}, {"role":"user","content":"developer"} ]}"#
+        );
+        let mut none = br#"{"messages":[{"role":"user","content":"developer"}]}"#.to_vec();
+        assert!(!developer_as_system(&mut none));
+        let mut not_json = b"developer {".to_vec();
+        assert!(!developer_as_system(&mut not_json));
+    }
+
+    /// A forced tool turns thinking off under either rule (every `reasoning` / `reasoning_effort`
+    /// cut, `"reasoning":{"enabled":false}` first); unforced tools only under `OffWithTools` and
+    /// only when the client asked for no reasoning; no tools, or `Free`, leaves the body as sent.
+    /// claim: T1
+    /// defect: D171, D172
+    #[test]
+    fn thinking_off_for_tools_follows_the_rule() {
+        use providers::catalog::ToolThinking::{Free, OffWhenForced, OffWithTools};
+        let forced = br#"{"model":"m","tools":[{"type":"function"}],"tool_choice":"required","reasoning_effort":"high","n":1.50}"#;
+        let mut b = forced.to_vec();
+        assert!(thinking_off_for_tools(&mut b, OffWhenForced));
+        assert_eq!(
+            String::from_utf8(b).unwrap(),
+            r#"{"reasoning":{"enabled":false},"model":"m","tools":[{"type":"function"}],"tool_choice":"required","n":1.50}"#
+        );
+        let named = br#"{"tools":[{}],"tool_choice":{"type":"function","function":{"name":"f"}}}"#;
+        let mut b = named.to_vec();
+        assert!(thinking_off_for_tools(&mut b, OffWithTools));
+        assert!(b.starts_with(br#"{"reasoning":{"enabled":false},"tools""#));
+
+        let auto = br#"{"tools":[{}],"tool_choice":"auto"}"#;
+        let mut b = auto.to_vec();
+        assert!(!thinking_off_for_tools(&mut b, OffWhenForced));
+        assert!(thinking_off_for_tools(&mut b, OffWithTools));
+        let asked = br#"{"tools":[{}],"reasoning_effort":"low"}"#;
+        let mut b = asked.to_vec();
+        assert!(!thinking_off_for_tools(&mut b, OffWithTools));
+        let asked_null = br#"{"tools":[{}],"reasoning_effort":null}"#;
+        let mut b = asked_null.to_vec();
+        assert!(thinking_off_for_tools(&mut b, OffWithTools));
+
+        for (body, rule) in [
+            (&br#"{"tool_choice":"required"}"#[..], OffWithTools),
+            (
+                &br#"{"tools":[],"tool_choice":"required"}"#[..],
+                OffWithTools,
+            ),
+            (&forced[..], Free),
+        ] {
+            let mut b = body.to_vec();
+            assert!(!thinking_off_for_tools(&mut b, rule));
+            assert_eq!(b, body);
+        }
     }
 
     /// claim: E1

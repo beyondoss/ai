@@ -380,6 +380,73 @@ pub fn stream_only(c: &Candidate) -> bool {
         .any(|&(p, m)| p == c.provider && m == c.upstream_model)
 }
 
+/// What a candidate's default thinking does to a tool request, and so when the gateway asks it not
+/// to think (`"reasoning": {"enabled": false}`, Together's documented switch for hybrid models and
+/// OpenRouter's unified one; both backends here are Alibaba's).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolThinking {
+    /// Thinks and calls tools, forced or not.
+    Free,
+    /// Refuses a forced `tool_choice` (`"required"` or a named function) while thinking: 400 "The
+    /// tool_choice parameter does not support being set to required or object in thinking mode"
+    /// (D172). A forced request goes with thinking off, whatever reasoning the client asked for,
+    /// since thinking on is a certain 400 on every candidate of the row.
+    OffWhenForced,
+    /// As [`Self::OffWhenForced`], and while thinking it sometimes writes a tool call as content
+    /// text ("call\n{\"name\": \"get_weather\", ...}") with no `tool_calls` (D171). A request
+    /// offering tools goes with thinking off unless the client asked for reasoning itself
+    /// (`reasoning_effort` or `reasoning`), which it then gets as asked.
+    OffWithTools,
+}
+
+/// Candidates whose thinking and tools conflict. Measured 2026-10-01: forced `tool_choice` is a 400
+/// on Qwen3.7 Plus and Qwen3.8 Flash at Together and at OpenRouter (Alibaba), not on Qwen3.6 Plus or
+/// Qwen3.7 Max; with thinking off all four call the tool. With `auto` and thinking on, Qwen3.7 Plus
+/// answered a tool call as text 5 of 32 times at Together and 4 of 32 at OpenRouter (so skipping
+/// either candidate would not help), 0 of 48 with thinking off; Qwen3.8 Flash, 3.7 Max and 3.6 Plus
+/// 0 of 16 each.
+const TOOL_THINKING: &[(ProviderId, &str, ToolThinking)] = &[
+    (
+        ProviderId::Together,
+        "Qwen/Qwen3.7-Plus",
+        ToolThinking::OffWithTools,
+    ),
+    (
+        ProviderId::OpenRouter,
+        "qwen/qwen3.7-plus",
+        ToolThinking::OffWithTools,
+    ),
+    (
+        ProviderId::Together,
+        "Qwen/Qwen3.8-Flash",
+        ToolThinking::OffWhenForced,
+    ),
+    (
+        ProviderId::OpenRouter,
+        "qwen/qwen3.8-flash",
+        ToolThinking::OffWhenForced,
+    ),
+];
+
+/// See [`ToolThinking`] and [`TOOL_THINKING`].
+pub fn tool_thinking(c: &Candidate) -> ToolThinking {
+    TOOL_THINKING
+        .iter()
+        .find(|&&(p, m, _)| p == c.provider && m == c.upstream_model)
+        .map_or(ToolThinking::Free, |&(_, _, t)| t)
+}
+
+/// Whether a candidate's Chat Completions reads the `developer` role as OpenAI defines it. OpenAI
+/// does, and OpenRouter maps it per upstream itself (measured on Qwen3.8 Flash, Kimi K2.6 and GLM
+/// 5.2: each followed a developer instruction). Other Chat hosts are sent `system`, which every
+/// model honors: Together's Qwen backend refuses `developer` with a 400 ("developer is not one of
+/// ['system', 'assistant', 'user', 'tool', 'function']"), and its Kimi K3, DeepSeek V4 Pro and GLM
+/// 5.2 accept it but did not follow it (2026-10-01, D173). For a model that is not OpenAI's,
+/// `developer` is the system role by another name.
+pub const fn reads_developer_role(c: &Candidate) -> bool {
+    matches!(c.provider, ProviderId::OpenAi | ProviderId::OpenRouter)
+}
+
 /// Upper bound on candidates per row, so the gateway can track which are usable in a single `u8`
 /// bitmask with no per-request allocation.
 pub const MAX_CANDIDATES: usize = 8;
@@ -3907,6 +3974,55 @@ mod tests {
         );
     }
 
+    /// Qwen3.7 Plus (thinking garbles tool calls, refuses a forced one) and Qwen3.8 Flash (refuses
+    /// a forced one) on both their candidates, and no other candidate in the catalog.
+    /// claim: T1
+    /// defect: D171, D172
+    #[test]
+    fn qwen_candidates_whose_thinking_breaks_tools() {
+        use ToolThinking::{Free, OffWhenForced, OffWithTools};
+        for (model, want) in [
+            ("qwen/qwen3.7-plus", OffWithTools),
+            ("qwen/qwen3.8-flash", OffWhenForced),
+            ("qwen/qwen3.6-plus", Free),
+            ("qwen/qwen3.7-max", Free),
+        ] {
+            let row = for_model(model);
+            assert!(row.is_some(), "{model}");
+            if let Some(r) = row {
+                assert_eq!(r.candidates.len(), 2, "{model}");
+                for c in r.candidates {
+                    assert_eq!(tool_thinking(c), want, "{model} {:?}", c.provider);
+                }
+                assert_ne!(r.card.features & TOOLS, 0, "{model} keeps tools");
+            }
+        }
+        let marked = MODEL_ROUTES
+            .iter()
+            .flat_map(|r| r.candidates)
+            .filter(|c| tool_thinking(c) != Free)
+            .count();
+        assert_eq!(marked, 4);
+    }
+
+    /// `developer` is read as OpenAI defines it only by OpenAI and OpenRouter (which maps it per
+    /// upstream); every other Chat host is sent `system`.
+    /// claim: TRN-16
+    /// defect: D173
+    #[test]
+    fn only_openai_and_openrouter_read_the_developer_role() {
+        for r in MODEL_ROUTES {
+            for c in r.candidates.iter().chain(r.responses) {
+                assert_eq!(
+                    reads_developer_role(c),
+                    matches!(c.provider, ProviderId::OpenAi | ProviderId::OpenRouter),
+                    "{}",
+                    r.model
+                );
+            }
+        }
+    }
+
     /// Together's stream-only Qwen ids are exactly the four primaries measured, each a candidate
     /// on a Chat Completions path (the wire the gateway assembles a stream from), and nothing else
     /// is stream-only: their OpenRouter failovers answer a non-streaming request.
@@ -4035,10 +4151,13 @@ mod tests {
 
     /// The D155 rows: OpenRouter's GLM 5.2 is skipped by a schema request (Together holds the
     /// schema), and Kimi K2.6, Kimi K2.7 Code and Qwen3.6 Plus, whose every candidate answers
-    /// outside it, no longer advertise structured outputs. Qwen3.8 Flash keeps them: both its
-    /// candidates held the schema in 48 calls (its sweep failure was OpenRouter's 429, D156).
+    /// outside it, no longer advertise structured outputs (Qwen3.6 Plus is D170 too: Together, its
+    /// primary, answered `{"result": 391}` 3 of 8 streamed and 4 of 10 sweep runs, and OpenRouter's
+    /// Alibaba copy 2 of 24, so steering to OpenRouter would not enforce it). Qwen3.8 Flash keeps
+    /// them: both its candidates held the schema in 48 calls (its sweep failure was OpenRouter's
+    /// 429, D156).
     /// claim: CAT-6
-    /// defect: D155
+    /// defect: D155, D170
     #[test]
     fn structured_outputs_are_advertised_only_where_enforced() {
         let glm = for_model("z-ai/glm-5.2");

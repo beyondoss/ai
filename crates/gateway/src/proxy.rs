@@ -4985,6 +4985,14 @@ impl ProxyHttp for AiProxy {
                     let stream_only = a
                         .candidate_at(a.candidate)
                         .is_some_and(providers::catalog::stream_only);
+                    let reads_developer = a
+                        .candidate_at(a.candidate)
+                        .is_none_or(providers::catalog::reads_developer_role);
+                    let tool_thinking = a
+                        .candidate_at(a.candidate)
+                        .map_or(providers::catalog::ToolThinking::Free, |c| {
+                            providers::catalog::tool_thinking(c)
+                        });
                     if let Some(t) = a.translate.as_mut()
                         && let Some(to) = serving
                     {
@@ -5021,6 +5029,17 @@ impl ProxyHttp for AiProxy {
                         if t.client == to && to == route::Endpoint::ChatCompletions && !openai_host
                         {
                             changed |= peek::remove_root_nulls(&mut buf);
+                        }
+                        if to == route::Endpoint::ChatCompletions {
+                            // `developer` is `system` to a host that is not OpenAI's (D173); a
+                            // translated Responses body already says so.
+                            if t.client == to && !reads_developer {
+                                changed |= translate::developer_as_system(&mut buf);
+                            }
+                            // A candidate whose thinking breaks tools gets them with thinking off
+                            // (D171, D172): every candidate of its row refuses or garbles the
+                            // combination, so steering around it would not help.
+                            changed |= translate::thinking_off_for_tools(&mut buf, tool_thinking);
                         }
                         // A candidate that answers only streams, for a client that did not ask
                         // for one: ask it for the stream (with its usage) and assemble the answer
