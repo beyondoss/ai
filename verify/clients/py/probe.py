@@ -809,9 +809,23 @@ def cache_ttl_1h():
 
 def auto_cache():
     """K1 / B3: a multi-turn OpenAI-SDK conversation with a long system prompt and no
-    cache_control: turn 2 and later report cached tokens, and the row agrees."""
+    cache_control reads the cache after turn 1, and every row equals the cached tokens the client
+    saw.
+
+    Claude rows: the gateway places the breakpoints, and Anthropic documents a cache entry as
+    available once the response that wrote it begins, so turns 2 and 3, sent after it, must read.
+
+    OpenAI rows: caching is OpenAI's own and best effort. Its prompt-caching guide: "A request can
+    reuse a cached prefix only if it reaches a machine holding a matching entry that has not
+    expired", and on models before GPT-5.6 a stable `prompt_cache_key` (sent here; the gateway relays
+    it) "help[s] route related requests to the same cache ... Keys influence routing; they do not
+    pin requests to a machine or guarantee a cache hit." No turn is guaranteed a read (live
+    2026-10-01 on gpt-5.1: [0, 0, 6144]), so the oracle is a read on any later turn: that proves the
+    gateway kept the prefix byte-stable and metered the hit. No read at all is OpenAI's documented
+    miss, not a gateway fault: the cell is INCONCLUSIVE (`best_effort`), never a pass."""
     c = openai_client()
-    extra = {"prompt_cache_key": f"verify-{NONCE}"} if PROVIDER == "openai" else {}
+    best_effort = PROVIDER == "openai"
+    extra = {"prompt_cache_key": f"verify-{NONCE}"} if best_effort else {}
     msgs = [{"role": "system", "content": long_prefix()}]
     reads = []
     for q in ("Which city does fact 3 name?", "And fact 4?", "And fact 5?"):
@@ -819,9 +833,18 @@ def auto_cache():
         r = c.chat.completions.create(model=MODEL, max_completion_tokens=1024, messages=msgs, extra_body=extra)
         u = chat_usage(r.usage, r.service_tier)
         reads.append(u["cache_read"])
-        record("chat", u, **({"row_min": {"cache_read_tokens": 1}} if len(reads) > 1 else {}))
+        # The row must equal what the client saw either way; a read is required of the row only
+        # where the provider guarantees one.
+        record("chat", u, **({"row_min": {"cache_read_tokens": 1}} if len(reads) > 1 and not best_effort else {}))
         msgs.append({"role": "assistant", "content": r.choices[0].message.content or "ok"})
-    return all(x > 0 for x in reads[1:]), {"cache_read": reads}
+    detail = {"cache_read": reads}
+    if not best_effort:
+        return all(x > 0 for x in reads[1:]), detail
+    if any(x > 0 for x in reads[1:]):
+        return True, detail
+    detail["best_effort"] = (f"OpenAI served no cache read on turns 2-{len(reads)} (cache_read {reads}, "
+                             "prompt_cache_key sent); its prompt caching guarantees no hit")
+    return False, detail
 
 
 def langchain_cache():

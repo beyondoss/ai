@@ -5981,6 +5981,19 @@ impl ProxyHttp for AiProxy {
         // responses are the whole body; long ones are rotated into order here, once. Skipped on a
         // cache hit — there is no tail; tokens come from the stored entry.
         let mut usage_estimated = false;
+        // A free sub-resource (a token count) is not a billable call: it carries no usage block,
+        // writes no billing row, and is not a usage-shape regression. On every route: a catalog
+        // walk records it, a `/{provider}` route names it in the forwarded path.
+        let free = rc
+            .auto
+            .as_ref()
+            .and_then(|a| a.sub)
+            .or_else(|| {
+                rc.forward_path
+                    .as_deref()
+                    .and_then(route::SubResource::of_forward_path)
+            })
+            .is_some_and(|sub| !sub.billed());
         // Someone gave up waiting for the response head after the provider had the whole request
         // (a long reasoning turn, a huge prompt): the client, or the gateway's own read timeout
         // with the connection still up (D130). The provider cannot tell who hung up and bills that
@@ -6052,9 +6065,24 @@ impl ProxyHttp for AiProxy {
             // generated, and bills, the whole answer; we relayed part of it. Always estimated —
             // the 2xx is the proof the provider took the request.
             let body_cut = rc.managed && !rc.streaming && ok_2xx && parsed.is_none() && e.is_some();
+            // A non-stream 2xx that ended cleanly with no usage (OpenRouter's `"usage": null` on
+            // an answer that failed mid-generation, a shape change) is a turn the provider took
+            // and may bill, as a finished stream without usage is: estimated, never 0/0 (D195).
+            // Except a body that is only an error object (OpenRouter's error-in-200, `{"error":
+            // {...}}` with no answer), the non-stream form of an error-only stream: not work we
+            // were billed for. The tail is the whole body when the body fits in it.
+            let error_only_body = u64::from(rc.resp_bytes) <= tail.len() as u64
+                && json_is_error_object(tail) == Some(true);
+            let body_unmetered = rc.managed
+                && !free
+                && !rc.streaming
+                && ok_2xx
+                && parsed.is_none()
+                && e.is_none()
+                && !error_only_body;
             let output = if cut_short {
                 usage::estimate_stream_output(tail, u64::from(rc.resp_bytes))
-            } else if body_cut {
+            } else if body_cut || body_unmetered {
                 usage::estimate_body_output(tail, u64::from(rc.resp_bytes))
             } else {
                 0
@@ -6066,7 +6094,7 @@ impl ProxyHttp for AiProxy {
             // for. A finished stream whose usage we could not read (a shape change, a final event
             // we could not recover) is a turn the provider billed, never a silent 0/0.
             let started = parsed.is_some() || output > 0 || !usage::stream_carried_error(tail);
-            if (cut_short && started) || body_cut || no_head {
+            if (cut_short && started) || body_cut || body_unmetered || no_head {
                 usage_estimated = true;
                 let mut u = parsed.unwrap_or_default();
                 if u.input_tokens == 0 {
@@ -6081,19 +6109,6 @@ impl ProxyHttp for AiProxy {
         if usage_estimated {
             self.state.metrics.usage_estimated_total.inc();
         }
-        // A free sub-resource (a token count) is not a billable call: it carries no usage block,
-        // writes no billing row, and is not a usage-shape regression. On every route: a catalog
-        // walk records it, a `/{provider}` route names it in the forwarded path.
-        let free = rc
-            .auto
-            .as_ref()
-            .and_then(|a| a.sub)
-            .or_else(|| {
-                rc.forward_path
-                    .as_deref()
-                    .and_then(route::SubResource::of_forward_path)
-            })
-            .is_some_and(|sub| !sub.billed());
         // A managed 2xx response is *expected* to carry usage; `None` there means the provider's
         // usage block changed shape (a new API version, a wire change) and we're about to emit a
         // zero-token billing row that looks exactly like a (non-existent) legitimate zero-token

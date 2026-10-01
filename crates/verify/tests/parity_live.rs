@@ -1065,10 +1065,11 @@ impl Obs {
 fn post(dir: &Path, tag: &str, url: &str, headers: &[String], body: &Value) -> Result<Obs, Failed> {
     let mut retry = 0;
     loop {
+        let at = std::time::Instant::now();
         let r = post_once(dir, tag, url, headers, body);
         let wait = match &r {
-            Err(_) => common::sdk_backoff(retry),
-            Ok(o) => common::sdk_retry(o.status, retry, |h| o.header(h)),
+            Err(_) => common::sdk_backoff(retry, at.elapsed()),
+            Ok(o) => common::sdk_retry(o.status, retry, at.elapsed(), |h| o.header(h)),
         };
         if let Some(wait) = wait {
             retry += 1;
@@ -2529,6 +2530,7 @@ fn oracle_empty_reasoning_item() -> Result<(), Failed> {
 // --- Main ----------------------------------------------------------------------------------------
 
 fn main() {
+    common::started();
     let mut args = Arguments::from_args();
     let mut trials = Vec::new();
     let mut estimate_usd = 0.0;

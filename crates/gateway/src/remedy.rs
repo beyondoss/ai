@@ -5,7 +5,8 @@
 //! except advice about Beyond's own account with that provider: "add your own key", a billing or
 //! settings page, "your credit balance is too low". A gateway client holds no account there and
 //! cannot follow it, and the text names the upstream behind a row and describes Beyond's account
-//! state. Such a message becomes [`RATE_LIMITED`] or [`UNAVAILABLE`]; what a client can act on (a
+//! state. Such a message becomes [`RATE_LIMITED`] or [`UNAVAILABLE`] (or [`TOO_LARGE`], for a 429
+//! that says the request alone is over the limit, D196); what a client can act on (a
 //! context overflow, a bad parameter, a content-policy refusal) never carries one of these phrases
 //! and is left alone.
 //!
@@ -24,6 +25,21 @@ pub const RATE_LIMITED: &str = "The provider is rate-limited upstream; retry lat
 /// and the walk sends later requests to the row's next candidate (D180).
 pub const UNAVAILABLE: &str =
     "The provider cannot serve this request right now; retry later or use another model.";
+
+/// What a rate limit reads as when the provider said the request alone is over the limit, so no
+/// wait admits it (OpenAI's "Request too large for gpt-4.1 ... on tokens per min (TPM): Limit
+/// 1000000, Requested 1101959. The input or output tokens must be reduced in order to run
+/// successfully."): the client must shrink the request, and [`RATE_LIMITED`]'s "retry later"
+/// would send it round the same 429 forever (D196).
+pub const TOO_LARGE: &str = "The request is larger than the provider's per-minute token limit admits; \
+     reduce the input or output tokens. Retrying it unchanged will not succeed.";
+
+/// Phrases with which a 429 says the request by itself exceeds the limit (OpenAI's TPM "Request
+/// too large"), matched ASCII case-insensitively.
+const TOO_LARGE_PHRASES: &[&str] = &[
+    "request too large",
+    "must be reduced in order to run successfully",
+];
 
 /// The largest error body that is held whole to be checked. Real ones are under 2 KiB; a larger
 /// one streams through unchanged (the pool-key scrub still applies).
@@ -81,7 +97,8 @@ pub struct Neutralized {
 /// In the error object (`error` when it is an object, else the root: Bedrock's `{"message"}`,
 /// xAI's `{"code", "error": "<string>"}`): a `message` or string `error` carrying a remedy becomes
 /// [`UNAVAILABLE`] when the account is out of credit (an [`UNFUNDED`] phrase, or OpenAI's
-/// `insufficient_quota` code or type) or the status is not a 429, else [`RATE_LIMITED`].
+/// `insufficient_quota` code or type) or the status is not a 429, else [`TOO_LARGE`] when the
+/// message says the request alone is over the limit, else [`RATE_LIMITED`].
 /// OpenRouter's `metadata.raw` is removed when it carries one (the translation quotes it after the
 /// message), and `is_byok`, `limit_source` and `remedy_hint` are removed. Everything else —
 /// `type`, `code`, `param`, `metadata.provider_name` — is kept.
@@ -108,9 +125,12 @@ fn scrub(err: &mut Map<String, Value>, status: u16) -> Option<bool> {
     if quota {
         found = Found::Unfunded;
     }
+    let mut too_large = false;
     for field in ["message", "error"] {
         if let Some(s) = err.get(field).and_then(Value::as_str) {
             found = found.max(remedy(s));
+            let lower = s.to_ascii_lowercase();
+            too_large |= TOO_LARGE_PHRASES.iter().any(|p| lower.contains(p));
         }
     }
     if let Some(meta) = err.get_mut("metadata").and_then(Value::as_object_mut) {
@@ -127,6 +147,8 @@ fn scrub(err: &mut Map<String, Value>, status: u16) -> Option<bool> {
     if found != Found::None {
         let text = if found == Found::Unfunded || status != 429 {
             UNAVAILABLE
+        } else if too_large {
+            TOO_LARGE
         } else {
             RATE_LIMITED
         };

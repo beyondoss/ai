@@ -181,8 +181,7 @@ fn http() -> &'static reqwest::blocking::Client {
     static C: OnceLock<reqwest::blocking::Client> = OnceLock::new();
     C.get_or_init(|| {
         reqwest::blocking::Client::builder()
-            // Under nextest's 180s terminate-after, so a slow reasoning call fails by name.
-            .timeout(Duration::from_secs(170))
+            .timeout(REQUEST_TIMEOUT)
             .build()
             .unwrap()
     })
@@ -280,6 +279,108 @@ fn provider_window(provider: &str, id: &str) -> Option<u64> {
         "openrouter" | "together" => m["context_length"].as_u64(),
         _ => None,
     }
+}
+
+/// The tokens-per-minute limit OpenAI sets on the pool key's project for `model`, read with the
+/// admin key from the organization's own rate-limit listing (read-only:
+/// `GET /v1/organization/projects/{id}/rate_limits`, the project being the one whose key hint
+/// matches `OPENAI_API_KEY`). Cached for six hours like the model listings. `None` without
+/// `OPENAI_ADMIN_KEY`, or when the model has no listed limit.
+fn openai_tpm(model: &str) -> Option<u64> {
+    static LIMITS: OnceLock<Option<Value>> = OnceLock::new();
+    let limits = LIMITS.get_or_init(|| {
+        let path = sweep_dir().join("listing-openai-rate-limits.json");
+        if fresh(&path, Duration::from_secs(6 * 3600))
+            && let Some(v) = std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        {
+            return Some(v);
+        }
+        let (admin, pool) = (keys().get("OPENAI_ADMIN_KEY")?, key_of("openai")?);
+        let get = |url: &str| -> Option<Value> {
+            http()
+                .get(url)
+                .bearer_auth(admin)
+                .send()
+                .ok()?
+                .error_for_status()
+                .ok()?
+                .json()
+                .ok()
+        };
+        // Every page of a listing, following `last_id`.
+        let all = |base: &str| -> Option<Vec<Value>> {
+            let mut out = Vec::new();
+            let mut after: Option<String> = None;
+            loop {
+                let url = match &after {
+                    Some(a) => format!("{base}&after={a}"),
+                    None => base.to_owned(),
+                };
+                let page = get(&url)?;
+                out.extend(page["data"].as_array().cloned().unwrap_or_default());
+                match (page["has_more"].as_bool(), page["last_id"].as_str()) {
+                    (Some(true), Some(last)) => after = Some(last.to_owned()),
+                    _ => return Some(out),
+                }
+            }
+        };
+        let projects = all("https://api.openai.com/v1/organization/projects?limit=100")?;
+        let project = projects.iter().find_map(|p| {
+            let id = p["id"].as_str()?;
+            let keys = all(&format!(
+                "https://api.openai.com/v1/organization/projects/{id}/api_keys?limit=100"
+            ))?;
+            keys.iter()
+                .any(|k| hint_matches(k["redacted_value"].as_str().unwrap_or(""), pool))
+                .then(|| id.to_owned())
+        })?;
+        let mut tpm = Map::new();
+        for r in all(&format!(
+            "https://api.openai.com/v1/organization/projects/{project}/rate_limits?limit=100"
+        ))? {
+            if let (Some(m), Some(t)) = (r["model"].as_str(), r["max_tokens_per_1_minute"].as_u64())
+            {
+                tpm.insert(m.to_owned(), json!(t));
+            }
+        }
+        let v = Value::Object(tpm);
+        let _ = std::fs::write(&path, v.to_string());
+        Some(v)
+    });
+    // A long prompt is held to the model's `-long-context` limit where it has one ("Request too
+    // large for gpt-4.1 (for limit gpt-4.1-long-context) ... Limit 1000000"), which is the larger.
+    let l = limits.as_ref()?;
+    let base = l[model].as_u64();
+    let long = l[format!("{model}-long-context")].as_u64();
+    base.max(long)
+}
+
+/// Whether `key` is the key a redacted hint (`sk-proj-****wxyz`, `sk-...wxyz`) describes: the
+/// visible prefix and suffix both match.
+fn hint_matches(hint: &str, key: &str) -> bool {
+    let (pre, suf) = match hint.split_once("...") {
+        Some(parts) => parts,
+        None => match (hint.find('*'), hint.rfind('*')) {
+            (Some(a), Some(b)) => (&hint[..a], &hint[b + 1..]),
+            _ => return false,
+        },
+    };
+    !pre.is_empty() && !suf.is_empty() && key.starts_with(pre) && key.ends_with(suf)
+}
+
+/// Whether OpenAI's rate limiter can admit a prompt of `tokens` on `model` for the pool key.
+/// Measured 2026-10-01, both before any context check: a prompt over the TPM is refused at once,
+/// 429 "Request too large for gpt-4.1 ... TPM: Limit 1000000, Requested 1101959. The input or
+/// output tokens must be reduced" (the 1,101,954-word over-limit prompt; a context error never
+/// comes); and the limiter counts a request against the minute before comparing, so a lone
+/// 136,404-token gpt-5-pro request with nothing else in the minute answered, after 38-56s, 429
+/// "Rate limit reached ... Limit 200000, Used 136626, Requested 136626" (Retry-After 22s), every
+/// time. So a request is admitted only if twice its size fits the TPM. `true` when the limit is
+/// unknown: the trial runs, and the 429 is judged as the rate limit it is.
+fn openai_admits(model: &str, tokens: u64) -> bool {
+    openai_tpm(model).is_none_or(|tpm| 2 * tokens <= tpm)
 }
 
 /// `us.anthropic.claude-haiku-4-5-20251001-v1:0` → `claude-haiku-4-5-20251001`.
@@ -386,12 +487,19 @@ fn boot() -> Result<Gateway, String> {
     Err(format!("gateway never became ready: {}", tail(&log)))
 }
 
-fn cleanup() {
+/// Stops the gateway and nats-server. A failed run keeps the gateway's directory (its log holds
+/// every warning and billing row), so a failure can be read after the fact, not only re-run.
+fn cleanup(failed: bool) {
     for mut c in CHILDREN.lock().unwrap().drain(..) {
         let _ = c.kill();
         let _ = c.wait();
     }
-    let _ = std::fs::remove_dir_all(sweep_dir().join(format!("gw-{}", std::process::id())));
+    let dir = sweep_dir().join(format!("gw-{}", std::process::id()));
+    if failed && dir.exists() {
+        eprintln!("gateway log kept: {}", dir.join("gateway.log").display());
+    } else {
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }
 
 fn tail(path: &Path) -> String {
@@ -580,6 +688,31 @@ impl Reply {
         let end = s.floor_char_boundary(s.len().min(400));
         s[..end].to_owned()
     }
+
+    /// The status the answer stands for. OpenRouter answers an error during a non-streaming
+    /// generation with `200 OK`: a body holding only an `error` object, whose `code` is the HTTP
+    /// status it means, or a choice with `finish_reason: "error"` beside partial content
+    /// (https://openrouter.ai/docs/api-reference/errors). Either is the provider failing, not an
+    /// answer, so it is retried and judged as that status (502 when it names none).
+    fn meant_status(&self) -> u16 {
+        if self.status != 200 {
+            return self.status;
+        }
+        let j = &self.json;
+        let error_only =
+            j["error"].is_object() && j.get("choices").is_none() && j.get("output").is_none();
+        if error_only {
+            return j["error"]["code"]
+                .as_u64()
+                .and_then(|c| u16::try_from(c).ok())
+                .filter(|c| (400..600).contains(c))
+                .unwrap_or(502);
+        }
+        if j["choices"][0]["finish_reason"] == "error" {
+            return 502;
+        }
+        200
+    }
 }
 
 fn send(req: reqwest::blocking::RequestBuilder) -> Result<Reply, String> {
@@ -646,26 +779,39 @@ fn call(arm: &Arm, body: &Value, walk: Walk) -> Result<Reply, String> {
     // An answer the stock SDKs retry is retried as they do (common::sdk_retry): a stale pooled
     // upstream connection, or a provider's momentary overload, is not a catalog fact. If the last
     // answer is still the provider's own, on a candidate forced alone, the trial is INCONCLUSIVE.
+    // Retries stop where one more would not finish inside the test's time budget, and every
+    // request's timeout ends there too, so a cell reports instead of being killed by nextest.
     let mut retry = 0;
     loop {
-        let r = send(
-            http()
-                .post(format!("{}{path}", gw.base))
-                .bearer_auth(DEV_TOKEN)
-                .header("x-beyond-model", arm.row.model)
-                .header(walk_header, arm.provider())
-                .header("x-beyond-cache", "off")
-                .header("content-type", "application/json")
-                .body(bytes.clone()),
-        )?;
-        if !common::sdk_retryable(r.status, |h| r.header(h)) {
+        let mut req = http()
+            .post(format!("{}{path}", gw.base))
+            .bearer_auth(DEV_TOKEN)
+            .header("x-beyond-model", arm.row.model)
+            .header(walk_header, arm.provider())
+            .header("x-beyond-cache", "off")
+            .header("content-type", "application/json")
+            .body(bytes.clone());
+        if let Some(left) = common::time_left() {
+            req = req.timeout(left.min(REQUEST_TIMEOUT));
+        }
+        let at = Instant::now();
+        let r = send(req).map_err(|e| match common::time_left() {
+            Some(left) if left.is_zero() => format!(
+                "no answer inside the test's time budget ({:?}): {e}",
+                common::test_budget().unwrap_or_default()
+            ),
+            _ => e,
+        })?;
+        let status = r.meant_status();
+        if !common::sdk_retryable(status, |h| r.header(h)) {
             return Ok(r);
         }
-        if let Some(wait) = common::sdk_retry(r.status, retry, |h| r.header(h)) {
+        if let Some(wait) = common::sdk_retry(status, retry, at.elapsed(), |h| r.header(h)) {
             retry += 1;
             println!(
-                "retry {retry} in {wait:?} after HTTP {}: {}",
+                "retry {retry} in {wait:?} after HTTP {} ({:?}): {}",
                 r.status,
+                at.elapsed(),
                 r.excerpt()
             );
             std::thread::sleep(wait);
@@ -676,14 +822,94 @@ fn call(arm: &Arm, body: &Value, walk: Walk) -> Result<Reply, String> {
             && let Some(p) = &r.provider
         {
             common::provider_unavailable(format!(
-                "{p} answered {} on all {} attempts at {}: {}",
-                r.status,
+                "{p} answered {status} on all {} attempts at {}: {}",
                 retry + 1,
                 arm.cand.upstream_model,
                 r.excerpt()
             ));
         }
+        // The gateway's own 5xx because this candidate ended the connection without answering:
+        // the gateway logged the upstream error, and it is the peer's (see `peer_ended`). Forced
+        // alone, or after the provider had the whole request (the walk never resends one), no
+        // other candidate could have answered.
+        if r.provider.is_none()
+            && r.status >= 500
+            && let Some((p, err)) = r.request_id.as_deref().and_then(upstream_error)
+            && p == arm.provider()
+            && peer_ended(&err)
+            && (walk == Walk::Only || r.raw.contains("after receiving the request"))
+        {
+            common::provider_unavailable(format!(
+                "{p} ended the connection without answering on all {} attempts at {} \
+                 (the gateway logged: {err}); the gateway answered {}: {}",
+                retry + 1,
+                arm.cand.upstream_model,
+                r.status,
+                r.excerpt()
+            ));
+        }
         return Ok(r);
+    }
+}
+
+/// The longest one request may take: under nextest's 180s terminate-after, so a slow reasoning
+/// call fails by name.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(170);
+
+/// The upstream error the gateway logged for a request it could not answer with the provider's
+/// own response (`upstream request errored`): the provider it was talking to and the error.
+fn upstream_error(request_id: &str) -> Option<(String, String)> {
+    let gw = gateway().ok()?;
+    let f = std::fs::File::open(&gw.log).ok()?;
+    BufReader::new(f)
+        .lines()
+        .map_while(Result::ok)
+        .filter(|l| l.contains("upstream request errored") && l.contains(request_id))
+        .filter_map(|l| serde_json::from_str::<Value>(&l).ok())
+        .map(|v| v.get("fields").cloned().unwrap_or(v))
+        .filter(|f| f["request_id"] == request_id)
+        .last()
+        .map(|f| {
+            (
+                f["provider"].as_str().unwrap_or_default().to_owned(),
+                f["error"].as_str().unwrap_or_default().to_owned(),
+            )
+        })
+}
+
+/// Whether an upstream error the gateway logged (pingora's `Upstream <type> ... cause: ...`) is
+/// the provider ending the exchange without an answer: it refused or dropped the connection, or
+/// sent a reset or GOAWAY of its own (h2's "error received"), which RFC 9113 lets it send for its
+/// own reasons. Not when that frame names an error in what the gateway sent (a protocol, flow
+/// control, frame size, closed-stream or header compression error), and not the gateway's own
+/// timeouts or failures (`WriteTimedout`: D118, `ReadTimedout`, `InternalError`).
+fn peer_ended(err: &str) -> bool {
+    const GATEWAY_FAULT: &[&str] = &[
+        "unspecific protocol error detected",
+        "flow-control protocol violated",
+        "received frame when stream half-closed",
+        "frame with invalid size",
+        "unable to maintain the header compression context",
+    ];
+    let Some(rest) = err.strip_prefix("Upstream ") else {
+        return false;
+    };
+    if GATEWAY_FAULT.iter().any(|r| err.contains(r)) {
+        return false;
+    }
+    match rest.split_whitespace().next().unwrap_or_default() {
+        "ConnectionClosed"
+        | "ConnectRefused"
+        | "ConnectTimedout"
+        | "ConnectNoRoute"
+        | "ConnectError"
+        | "TLSHandshakeFailure"
+        | "TLSHandshakeTimedout" => true,
+        "H2Error" | "ReadError" => {
+            let lower = err.to_ascii_lowercase();
+            lower.contains("error received:") || lower.contains("reset by peer")
+        }
+        _ => false,
     }
 }
 
@@ -1020,6 +1246,13 @@ fn note(trial: &str, text: &str) {
 fn served(trial: &str, arm: &Arm, probe: &str, r: &Reply) -> Result<(Out, Value), String> {
     if r.status != 200 {
         return Err(format!("{probe}: HTTP {}: {}", r.status, r.excerpt()));
+    }
+    if r.meant_status() != 200 {
+        return Err(format!(
+            "{probe}: HTTP 200 carrying an error ({}): {}",
+            r.meant_status(),
+            r.excerpt()
+        ));
     }
     if r.provider.as_deref() != Some(arm.provider()) {
         return Err(format!(
@@ -1364,6 +1597,22 @@ fn cat3(trial: &str, arm: Arm, plan: Context) -> Result<(), Failed> {
             problems.push(format!(
                 "over-limit: HTTP {} (want a clean 4xx): {}",
                 r.status,
+                r.excerpt()
+            ));
+        } else if r.status == 429 {
+            // A rate limit is not the context answer, whatever its words ("exceeded the rate
+            // limit" matches `CONTEXT_WORDS`). The provider's own 429 means this trial cannot
+            // run on the pool key now: INCONCLUSIVE, never a pass.
+            if r.provider.as_deref() == Some(arm.provider()) {
+                common::provider_unavailable(format!(
+                    "{} rate-limited the over-limit prompt ({words} words) instead of answering \
+                     its context check: {}",
+                    arm.provider(),
+                    r.excerpt()
+                ));
+            }
+            problems.push(format!(
+                "over-limit: HTTP 429 is a rate limit, not a context error: {}",
                 r.excerpt()
             ));
         } else if !CONTEXT_WORDS.iter().any(|w| lower.contains(w)) {
@@ -2542,6 +2791,21 @@ fn openrouter_endpoints(id: &str) -> Result<Vec<Value>, String> {
     Err(last)
 }
 
+/// Whether an OpenRouter endpoint can be counted on to serve: it answered in the last 30 minutes
+/// (`uptime_last_30m` above 0), or it had no traffic to measure (`null`) and OpenRouter has not
+/// flagged it (`status` 0). An endpoint at 0% uptime answers 410 Gone (D182). One with no recent
+/// traffic and a negative `status` is not evidence of anything: Fireworks' `z-ai/glm-5.2`, whose
+/// serverless ended on 2026-09-25 (D181), lists `status` -5 and `uptime_last_30m` null, and so
+/// did SambaNova's `google/gemma-4-31b-it` (2026-10-01); counted live, either would vouch for a
+/// card capability no host serves. A flagged endpoint that is still answering (`status` -2 or
+/// -5 at 40-95% uptime, seen the same day) counts by its uptime.
+fn endpoint_live(e: &Value) -> bool {
+    match e["uptime_last_30m"].as_f64() {
+        Some(up) => up > 0.0,
+        None => e["status"].as_i64().unwrap_or(0) >= 0,
+    }
+}
+
 /// Bedrock's control plane, read with the same bearer key the runtime takes.
 fn bedrock_get(path: &str) -> Result<Value, String> {
     let key = key_of("bedrock").ok_or("no Bedrock key")?;
@@ -2658,9 +2922,8 @@ fn cat16(_trial: &str, row: &'static ModelRoute, cand: Candidate) -> Result<(), 
                 problems.push(format!("OpenRouter will remove {id} on {exp}"));
             }
             let eps = openrouter_endpoints(id)?;
-            let (live, dead): (Vec<&Value>, Vec<&Value>) = eps
-                .iter()
-                .partition(|e| e["uptime_last_30m"].as_f64() != Some(0.0));
+            let (live, dead): (Vec<&Value>, Vec<&Value>) =
+                eps.iter().partition(|e| endpoint_live(e));
             println!(
                 "openrouter {id}: {} live endpoints {:?}; down {:?}",
                 live.len(),
@@ -3031,7 +3294,25 @@ fn plan() -> (Vec<Planned>, Vec<String>) {
             }
             let window = u64::from(card.context_window);
             let theirs = provider_window(arm.provider(), arm.cand.upstream_model);
+            // A prompt OpenAI's rate limiter can never admit on our project gets a 429 every time,
+            // not the context answer the trial is about.
+            let tpm_skip = |words: u64, what: &str, skipped: &mut Vec<String>| {
+                let blocked =
+                    arm.provider() == "openai" && !openai_admits(arm.cand.upstream_model, words);
+                if blocked {
+                    skipped.push(format!(
+                        "{} {what}: a {words}-token prompt is over what OpenAI's rate limiter \
+                         admits on the pool key's project (2x the prompt must fit its {} TPM \
+                         for {})",
+                        name("CAT-3", route, m),
+                        openai_tpm(arm.cand.upstream_model).unwrap_or_default(),
+                        arm.cand.upstream_model
+                    ));
+                }
+                blocked
+            };
             let over = match theirs {
+                _ if tpm_skip(window + window / 20 + 2000, "over-limit", &mut skipped) => None,
                 Some(w) if w > window + window / 20 => {
                     skipped.push(format!(
                         "{} over-limit: {} serves a {w}-token window, over the card's {window}; \
@@ -3064,10 +3345,12 @@ fn plan() -> (Vec<Planned>, Vec<String>) {
                         "{} near-limit: 0.9x window estimated ${est:.3}, over the ${NEAR_CAP} cap",
                         name("CAT-3", route, m)
                     ));
-                } else {
+                    near_done = true;
+                } else if !tpm_skip(window * 9 / 10 - 500, "near-limit", &mut skipped) {
+                    // A rate-limited candidate leaves the near-limit call to the row's next one.
                     near = true;
+                    near_done = true;
                 }
-                near_done = true;
             }
             if over.is_some() || near {
                 let est = if near {
@@ -3146,6 +3429,146 @@ fn plan() -> (Vec<Planned>, Vec<String>) {
         }
     }
     (out, skipped)
+}
+
+// ---------------------------------------------------------------------------------------------
+// The sweep's own checks (hermetic; named after their functions, with no `::`, so `verify` reads
+// each as a tagged hermetic test, not a live cell)
+// ---------------------------------------------------------------------------------------------
+
+/// The time budget a live cell's retries must finish inside is the one nextest enforces, read
+/// from this workspace's `.config/nextest.toml`: 60s × 3 under `verify` and `verify-isolated`,
+/// the reconciliation and long-session overrides by binary, `ci`'s own, and none under `default`
+/// (which never terminates a test). A cell then reports INCONCLUSIVE instead of a nextest
+/// TIMEOUT (CAT-3 on gpt-5-pro, 2026-10-01: two 55s rate-limited attempts and 22s waits).
+/// claim: CAT-3
+fn retries_end_inside_the_nextest_budget() -> Result<(), Failed> {
+    let text = std::fs::read_to_string(repo_root().join(".config/nextest.toml"))
+        .map_err(|e| e.to_string())?;
+    let config: toml::Value = toml::from_str(&text).map_err(|e| e.to_string())?;
+    let min = |m: u64| Some(Duration::from_secs(m * 60));
+    let cases: &[(&str, Option<&str>, Option<Duration>)] = &[
+        ("verify", Some("beyond-ai-verify::catalog_live"), min(3)),
+        ("verify", Some("beyond-ai-verify::reconcile_live"), min(18)),
+        ("verify", Some("beyond-ai-verify::long_live"), min(35)),
+        ("verify-isolated", Some("beyond-ai-verify::live"), min(3)),
+        (
+            "verify-isolated",
+            Some("beyond-ai-verify::long_live"),
+            min(35),
+        ),
+        ("ci", Some("beyond-ai-verify::catalog_live"), min(3)),
+        ("default", Some("beyond-ai-verify::catalog_live"), None),
+        ("verify", None, min(3)),
+    ];
+    let wrong: Vec<String> = cases
+        .iter()
+        .filter_map(|&(profile, binary, want)| {
+            let got = common::budget_in(&config, profile, binary);
+            (got != want).then(|| format!("{profile} {binary:?}: {got:?}, want {want:?}"))
+        })
+        .collect();
+    if wrong.is_empty() {
+        Ok(())
+    } else {
+        Err(wrong.join("; ").into())
+    }
+}
+
+/// What makes a catalog cell INCONCLUSIVE rather than failed, on the two shapes of 2026-10-01:
+/// OpenRouter's error-in-200 (a body of only `error`, whose `code` is the status it means, or a
+/// choice with `finish_reason: "error"`) is read as that status, while a real answer, an empty
+/// answer and a Responses body (`"error": null`) stay 200; and a gateway 502 is the provider's
+/// only when the error the gateway logged is the peer ending the exchange, never a frame error
+/// against what the gateway sent, nor the gateway's own timeouts.
+/// claim: CAT-3, CAT-6, CAT-7
+fn provider_failures_are_attributed() -> Result<(), Failed> {
+    let reply = |status: u16, body: &str| Reply {
+        status,
+        provider: None,
+        upstream: None,
+        request_id: None,
+        headers: reqwest::header::HeaderMap::new(),
+        json: serde_json::from_str(body).unwrap_or(Value::Null),
+        raw: body.to_owned(),
+    };
+    let mut wrong = Vec::new();
+    for (status, body, want) in [
+        (
+            200,
+            r#"{"error":{"code":502,"message":"Provider returned error"}}"#,
+            502,
+        ),
+        (
+            200,
+            r#"{"error":{"code":429,"message":"rate limited"}}"#,
+            429,
+        ),
+        (200, r#"{"error":{"message":"no code"}}"#, 502),
+        (
+            200,
+            r#"{"id":"g","choices":[{"finish_reason":"error","message":{"content":""}}],"error":{"code":502}}"#,
+            502,
+        ),
+        (
+            200,
+            r#"{"id":"g","choices":[{"finish_reason":"stop","message":{"content":""}}]}"#,
+            200,
+        ),
+        (200, r#"{"id":"r","output":[],"error":null}"#, 200),
+        (400, r#"{"error":{"code":400,"message":"context"}}"#, 400),
+    ] {
+        let got = reply(status, body).meant_status();
+        if got != want {
+            wrong.push(format!("{status} {body}: means {got}, want {want}"));
+        }
+    }
+    for (err, want) in [
+        (
+            "Upstream ConnectionClosed context: Peer: openrouter.ai:443",
+            true,
+        ),
+        ("Upstream TLSHandshakeFailure context: unexpected eof", true),
+        (
+            "Upstream H2Error context: x cause: connection error received: not a result of an error",
+            true,
+        ),
+        (
+            "Upstream H2Error cause: stream error received: unexpected internal error encountered",
+            true,
+        ),
+        (
+            "Upstream ReadError cause: Connection reset by peer (os error 104)",
+            true,
+        ),
+        (
+            "Upstream H2Error cause: stream error received: flow-control protocol violated",
+            false,
+        ),
+        (
+            "Upstream H2Error cause: connection error detected: frame with invalid size",
+            false,
+        ),
+        (
+            "Upstream WriteTimedout context: while writing h2 request body, timeout: 60s",
+            false,
+        ),
+        ("Upstream ReadTimedout", false),
+        ("Internal InternalError", false),
+        (
+            "Downstream ReadError context: Peer: api.openai.com:443",
+            false,
+        ),
+    ] {
+        if peer_ended(err) != want {
+            wrong.push(format!("peer_ended({err:?}) != {want}"));
+        }
+    }
+    if wrong.is_empty() {
+        Ok(())
+    } else {
+        Err(wrong.join("; ").into())
+    }
 }
 
 fn run(name: &str, kind: &Kind) -> Result<(), Failed> {
@@ -3240,6 +3663,7 @@ fn summary() {
 }
 
 fn main() {
+    common::started();
     if std::env::var("VERIFY_CATALOG_SUMMARY").as_deref() == Ok("1") {
         summary();
         return;
@@ -3291,7 +3715,15 @@ fn main() {
     }
     // Live traffic: no reconciliation window may be open while it runs (see common::live_traffic).
     let _traffic = (!trials.is_empty() && !args.list).then(common::live_traffic);
+    trials.push(Trial::test(
+        "retries_end_inside_the_nextest_budget",
+        retries_end_inside_the_nextest_budget,
+    ));
+    trials.push(Trial::test(
+        "provider_failures_are_attributed",
+        provider_failures_are_attributed,
+    ));
     let conclusion = libtest_mimic::run(&args, trials);
-    cleanup();
+    cleanup(conclusion.has_failed());
     conclusion.exit();
 }

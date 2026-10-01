@@ -31,7 +31,7 @@ published `beyond-slipstream` — clones, CI-builds, and publishes anywhere.
 | **Capture-set**                            | Sparse map of `tenant_id`s with payload logging on; default-**off**; watched under its own prefix by its own watcher                                                                                                                                                                                                                                                                                                                                                                     | Retention policy — the gateway emits and forgets; the store owns TTL/erasure                                                                 |
 | **Capture tap**                            | Bounded **head**-keeping copy of each body, taken pre-rewrite; relayed bytes are untouched                                                                                                                                                                                                                                                                                                                                                                                               | A buffer — nothing is withheld, so it costs memcpy, never latency                                                                            |
 | **Response cache**                         | **Per-pod** exact-match store: identical managed catalog-walk request (pre-rewrite body + inbound path + `tenant_id` + effective candidate order) replays a stored 2xx on **this process**. Off unless `cache_ttl_secs > 0`. Miss is an unbuffered relay; fill is a tap. Replicas do not share entries.                                                                                                                                                                                  | Redis, semantic cache, a pool-key key, or a fleet-wide cache — none of those                                                                 |
-| **Cut-short estimate**                     | A managed request the provider took but whose usage never arrived — a 2xx stream ended early, a non-stream body cut off, a cancel before the response head — is billed an **estimate** flagged `usage_estimated`: input from the prompt text's pre-tokens, a lower bound (Anthropic keeps `message_start`'s exact count), output from the relayed delta events and text. Errs low.                                                                                                       | A reported count, or a way to see hidden reasoning — both estimates are blind to thinking the stream never shows                             |
+| **Cut-short estimate**                     | A managed request the provider took but whose usage never arrived — a 2xx stream ended early, a non-stream body cut off or answered without usage (D195), a cancel before the response head — is billed an **estimate** flagged `usage_estimated`: input from the prompt text's pre-tokens, a lower bound (Anthropic keeps `message_start`'s exact count), output from the relayed delta events and text. Errs low.                                                                      | A reported count, or a way to see hidden reasoning — both estimates are blind to thinking the stream never shows                             |
 | **Tenant slot**                            | One of `tenant_max_in_flight` concurrent requests a tenant may hold **on this process**; over it → 429 before the breaker and upstream. The bound on overspend while the allowance-set lags. Off by default.                                                                                                                                                                                                                                                                             | A rate limit or a quota — short fast requests never hit it; N replicas admit N × the limit                                                   |
 | **Control header** (`x-beyond-*`)          | Per-request caller input: `metadata` tags, `capture` on/off, `cache` on/off, catalog `order` / `only` / `split`. Managed only; stripped before the upstream                                                                                                                                                                                                                                                                                                                              | A way to 4xx a request — unusable values are dropped and counted; an `only` that leaves no keyed candidate is the same 503 as an unkeyed row |
 | **Smart router**                           | **Per-pod** EWMA of TTFT per catalog candidate. Default walk for managed `/auto` and `/v1` when `order`/`split` are absent. Probe of unmeasured arms every 8th request. Ranks **new** callers only: a caller with a live session pin keeps its provider. `smart_router = false` restores static catalog order. Two replicas can rank the same row differently.                                                                                                                           | Live Redis, cost sort, or a fleet-wide shared ranking — none of those                                                                        |
@@ -190,7 +190,8 @@ Client (stock OpenAI/Anthropic SDK)
   │
   ▼  logging (proxy.rs)
      Parse usage from tail (by dialect + streaming flag)
-     Managed 2xx stream cut short before its usage block (client cancel / upstream death):
+     Managed 2xx stream cut short before its usage block (client cancel / upstream death), or a
+       non-stream 2xx without usage that is not an error object (D195):
        estimate the missing side from the request tally + relayed events → usage_estimated
      Emit ai.usage fact: tenant, vpc, key_id, model, requested_model, routed_model, price_model,
        token counts + usage_wire + reasoning / 1h-cache-write / server-tool / service-tier
@@ -973,7 +974,11 @@ cache) also runs `remedy::neutralize` at end of body:
     "Upgrade to Dev Tier").
 - **What it becomes.** The message says what the error is, without the account behind it. A rate
   limit (a 429 that is not out of credit) reads "The provider is rate-limited upstream; retry
-  later.": waiting clears it. Out of credit or quota, whatever its status (Anthropic's is a 400,
+  later.": waiting clears it. A 429 that says the request alone is over the limit (OpenAI's TPM
+  "Request too large ... The input or output tokens must be reduced in order to run successfully")
+  is the exception, since no wait admits it: it reads "The request is larger than the provider's
+  per-minute token limit admits; reduce the input or output tokens. Retrying it unchanged will not
+  succeed." (D196; "retry later" sent clients round the same 429). Out of credit or quota, whatever its status (Anthropic's is a 400,
   OpenAI's a 429), or account advice on any other status, reads "The provider cannot serve this
   request right now; retry later or use another model.": true without saying why, and a retry is
   served, since the walk now leaves that provider out (D180, below). A `raw` carrying a phrase is
@@ -1520,9 +1525,18 @@ Two more endings the provider bills and we used to write as zero get the same tr
   whole answer. Input from the tally; output from the bytes inside JSON string values in the tail
   (generated text, not keys or structure), scaled to the bytes relayed and divided by 4.5. Managed
   responses count relayed bytes whether or not they stream.
+- **A non-stream 2xx that ended cleanly without usage** (D195): OpenRouter answers a generation
+  that failed partway with a 200 whose `usage` is `null` beside an empty or partial message
+  (live 2026-10-01 on `x-ai/grok-4.20-multi-agent`), and documents that the upstream may still bill
+  the prompt. Such a body wrote a 0/0 row while the same turn streamed was estimated. It is
+  estimated as a cut-off body is: input from the tally, output from the body's string values. A
+  body that is only an error object (OpenRouter's non-stream error-in-200, `{"error":{…}}` with no
+  answer; read whole when the body fits the tail) is the exception, as an error-only stream is: no
+  generation, a 0/0 row, not an estimate. A free sub-resource (a token count) is never estimated.
 
-A stream that ends **cleanly** without usage still counts on `ai_usage_parse_errors_total` (the
-wire-shape-change alarm) even though it is now billed an estimate. An estimated response is never
+A stream or non-stream body that ends **cleanly** without usage still counts on
+`ai_usage_parse_errors_total` (the wire-shape-change alarm) even though it is now billed an
+estimate. An estimated response is never
 stored in the response cache.
 
 ### Deny-Set (`deny.rs`)

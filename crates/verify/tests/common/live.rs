@@ -145,10 +145,14 @@ const SDK_MAX_DELAY: f64 = 8.0;
 const SDK_MAX_RETRY_AFTER: f64 = 120.0;
 
 /// Whether the SDK would retry an answer with `status`, and after how long, as retry number
-/// `retry` (0-based). `header` reads the answer's response headers. `None`: the SDK gives up.
+/// `retry` (0-based). `header` reads the answer's response headers; `attempt` is how long the
+/// attempt that got this answer took. `None`: the SDK gives up, or the wait and one more attempt
+/// as long as this one would not finish inside the test's time budget ([`fits`]), so the cell
+/// reports its last answer (INCONCLUSIVE, where it is the provider's) instead of being killed.
 pub fn sdk_retry(
     status: u16,
     retry: u32,
+    attempt: Duration,
     header: impl Fn(&str) -> Option<String>,
 ) -> Option<Duration> {
     if retry >= SDK_MAX_RETRIES {
@@ -165,19 +169,120 @@ pub fn sdk_retry(
         return None;
     }
     match retry_after {
-        Some(s) if s > 0.0 => Some(Duration::from_secs_f64(s)),
-        _ => sdk_backoff(retry),
+        Some(s) if s > 0.0 => Some(Duration::from_secs_f64(s)).filter(|&w| fits(w, attempt)),
+        _ => sdk_backoff(retry, attempt),
     }
 }
 
 /// The SDK's wait before retry number `retry` (0-based) when the server named none, as after a
-/// connection error; `None` once its retries are spent.
-pub fn sdk_backoff(retry: u32) -> Option<Duration> {
+/// connection error; `None` once its retries are spent, or when the wait and one more `attempt`
+/// would not fit the test's time budget.
+pub fn sdk_backoff(retry: u32, attempt: Duration) -> Option<Duration> {
     if retry >= SDK_MAX_RETRIES {
         return None;
     }
     let backoff = (SDK_INITIAL_DELAY * 2f64.powi(retry as i32)).min(SDK_MAX_DELAY);
-    Some(Duration::from_secs_f64(backoff * (1.0 - 0.25 * jitter())))
+    Some(Duration::from_secs_f64(backoff * (1.0 - 0.25 * jitter()))).filter(|&w| fits(w, attempt))
+}
+
+// --- Time budget ----------------------------------------------------------------------------------
+
+/// When this test process started. Each live binary's `main` calls it first, so the clock starts
+/// when nextest launched the test (nextest runs one test per process).
+pub fn started() -> std::time::Instant {
+    static AT: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    *AT.get_or_init(std::time::Instant::now)
+}
+
+/// What a cell still does after its last answer: read its billing rows (a catalog cell waits up
+/// to five seconds for its row to land, `catalog_live.rs` `ledger`), judge, and stop its gateway.
+pub const REPORT_RESERVE: Duration = Duration::from_secs(5);
+
+/// How long nextest lets this test run before it terminates it: the running profile's
+/// `slow-timeout` period × `terminate-after`. Read from the workspace's `.config/nextest.toml`
+/// for `NEXTEST_PROFILE`: the first of that profile's `[[profile.<name>.overrides]]` whose filter
+/// is `binary_id(<this binary>)` (`NEXTEST_BINARY_ID`), else the profile's own `slow-timeout`,
+/// following `inherits` and then `default` (overrides are not inherited, as in nextest). `None`
+/// outside nextest, or under a profile that never terminates a test.
+pub fn test_budget() -> Option<Duration> {
+    static BUDGET: std::sync::OnceLock<Option<Duration>> = std::sync::OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        let profile = std::env::var("NEXTEST_PROFILE").ok()?;
+        let root = std::env::var_os("NEXTEST_WORKSPACE_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../.."));
+        let text = std::fs::read_to_string(root.join(".config/nextest.toml")).ok()?;
+        let config: toml::Value = toml::from_str(&text).ok()?;
+        budget_in(
+            &config,
+            &profile,
+            std::env::var("NEXTEST_BINARY_ID").ok().as_deref(),
+        )
+    })
+}
+
+/// [`test_budget`] for `profile` and `binary` in a parsed nextest config.
+pub fn budget_in(config: &toml::Value, profile: &str, binary: Option<&str>) -> Option<Duration> {
+    let profiles = config.get("profile")?;
+    let overridden = binary.and_then(|b| {
+        let filter = format!("binary_id({b})");
+        profiles
+            .get(profile)?
+            .get("overrides")?
+            .as_array()?
+            .iter()
+            .find(|o| o.get("filter").and_then(toml::Value::as_str) == Some(filter.as_str()))?
+            .get("slow-timeout")
+            .cloned()
+    });
+    let mut slow = overridden;
+    let mut name = Some(profile.to_owned());
+    let mut seen = Vec::new();
+    while slow.is_none() {
+        let p = name.take()?;
+        if seen.contains(&p) {
+            return None;
+        }
+        let table = profiles.get(&p);
+        slow = table.and_then(|t| t.get("slow-timeout")).cloned();
+        name = table
+            .and_then(|t| t.get("inherits"))
+            .and_then(toml::Value::as_str)
+            .map(str::to_owned)
+            .or_else(|| (p != "default").then(|| "default".to_owned()));
+        seen.push(p);
+    }
+    let slow = slow?;
+    let period = parse_duration(slow.get("period")?.as_str()?)?;
+    let after = u32::try_from(slow.get("terminate-after")?.as_integer()?).ok()?;
+    Some(period * after)
+}
+
+/// A nextest duration (`"60s"`, `"10m"`, `"1h"`, `"500ms"`).
+fn parse_duration(s: &str) -> Option<Duration> {
+    let s = s.trim();
+    let split = s.find(|c: char| !c.is_ascii_digit())?;
+    let n: u64 = s[..split].parse().ok()?;
+    match &s[split..] {
+        "ms" => Some(Duration::from_millis(n)),
+        "s" => Some(Duration::from_secs(n)),
+        "m" => Some(Duration::from_secs(n * 60)),
+        "h" => Some(Duration::from_secs(n * 3600)),
+        _ => None,
+    }
+}
+
+/// The time left before nextest terminates this test, less [`REPORT_RESERVE`]; `None` when there
+/// is no budget.
+pub fn time_left() -> Option<Duration> {
+    let budget = test_budget()?;
+    Some(budget.saturating_sub(started().elapsed() + REPORT_RESERVE))
+}
+
+/// Whether waiting `wait` and then running an attempt as long as `attempt` still ends inside
+/// the test's time budget.
+pub fn fits(wait: Duration, attempt: Duration) -> bool {
+    time_left().is_none_or(|left| wait + attempt <= left)
 }
 
 /// Whether the SDK retries an answer with `status` at all: `x-should-retry` when the server sends
@@ -234,10 +339,11 @@ pub fn retrying(mut attempt: impl FnMut() -> Result<(), Failed>) -> Result<(), F
     let mut retry = 0;
     loop {
         UNAVAILABLE.with(|u| u.borrow_mut().take());
+        let at = std::time::Instant::now();
         let result = attempt();
         let why = UNAVAILABLE.with(|u| u.borrow_mut().take());
         match (result, why) {
-            (Err(e), Some(why)) => match sdk_backoff(retry) {
+            (Err(e), Some(why)) => match sdk_backoff(retry, at.elapsed()) {
                 Some(wait) => {
                     eprintln!("retrying the cell in {wait:?}, as the SDK would");
                     std::thread::sleep(wait);

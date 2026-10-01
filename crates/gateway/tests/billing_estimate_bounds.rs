@@ -248,3 +248,82 @@ async fn a_close_before_the_head_bills_nothing() {
     assert_eq!(row["input_tokens"], 0, "{row}");
     assert_eq!(row["output_tokens"], 0, "{row}");
 }
+
+/// POST the fault prompt as a non-stream Chat request on the OpenAI provider route and drain it.
+async fn post_non_stream(gw: &Gateway, key: &str) {
+    let resp = test_client()
+        .post(format!("{}/openai/v1/chat/completions", gw.url()))
+        .header("authorization", format!("Bearer {key}"))
+        .header("content-type", "application/json")
+        .body(format!(
+            r#"{{"model":"m","max_tokens":80,"messages":[{{"role":"user","content":"{FAULT_PROMPT}"}}]}}"#
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let _ = resp.bytes().await;
+}
+
+/// A non-stream 200 that ended cleanly with no usage block: OpenRouter's answer to a request whose
+/// generation failed (`"usage": null` beside an empty message; live 2026-10-01 on
+/// `x-ai/grok-4.20-multi-agent`, an 8-second answer billed 0/0), or a shape change. OpenRouter
+/// documents that the upstream may still bill the prompt, and a stream that finished without usage
+/// was already estimated (D123); the non-stream body wrote a zero row. Now it is estimated: input
+/// from the prompt, under its real count, and the row says it is an estimate.
+/// claim: BIL-20, BIL-12
+/// defect: D195
+#[tokio::test]
+async fn a_non_stream_answer_without_usage_is_billed_an_estimate() {
+    for (seed, body) in [
+        (
+            195u8,
+            r#"{"id":"gen-1","object":"chat.completion","model":"x-ai/grok-4.20-multi-agent","choices":[{"index":0,"finish_reason":"error","message":{"role":"assistant","content":""}}],"usage":null}"#,
+        ),
+        (
+            196u8,
+            r#"{"id":"gen-2","object":"chat.completion","model":"x-ai/grok-4.20","choices":[{"index":0,"finish_reason":"stop","message":{"role":"assistant","content":"Paris is sunny."}}]}"#,
+        ),
+    ] {
+        let (pubkey, sk) = test_keypair(seed);
+        let up = ScriptedUpstream::reply(200, "application/json", body.to_owned()).await;
+        let gw = Gateway::builder(unused_nats_port(), &up.authority(), &b64(&pubkey))
+            .providers(&["openai"])
+            .start()
+            .await;
+        post_non_stream(&gw, &billing_vkey(&sk, u64::from(seed))).await;
+        let row = one_row(&wait_usage_rows(&gw, 1, 15).await, &gw);
+        assert_eq!(row["upstream_status"], 200, "{row}");
+        assert_eq!(row["usage_estimated"], true, "{row}");
+        let input = row["input_tokens"].as_u64().unwrap_or(0);
+        assert!(
+            (1..=FAULT_PROMPT_TOKENS).contains(&input),
+            "the prompt is billed, under its real count: {row}"
+        );
+    }
+}
+
+/// OpenRouter's error-in-200 for a non-streaming request: a body holding only an `error` object,
+/// no answer (https://openrouter.ai/docs/api-reference/errors). Like a stream that carried only an
+/// error event, it is not a generation we were billed for: the row stays 0/0, not an estimate.
+/// claim: BIL-12, BIL-20
+/// defect: D195
+#[tokio::test]
+async fn a_non_stream_error_in_200_is_not_billed() {
+    let (pubkey, sk) = test_keypair(197);
+    let up = ScriptedUpstream::reply(
+        200,
+        "application/json",
+        r#"{"error":{"code":502,"message":"Provider returned error","metadata":{"provider_name":"xAI"}},"user_id":"u"}"#.to_owned(),
+    )
+    .await;
+    let gw = Gateway::builder(unused_nats_port(), &up.authority(), &b64(&pubkey))
+        .providers(&["openai"])
+        .start()
+        .await;
+    post_non_stream(&gw, &billing_vkey(&sk, 197)).await;
+    let row = one_row(&wait_usage_rows(&gw, 1, 15).await, &gw);
+    assert_eq!(row["usage_estimated"], false, "{row}");
+    assert_eq!(row["input_tokens"], 0, "{row}");
+    assert_eq!(row["output_tokens"], 0, "{row}");
+}

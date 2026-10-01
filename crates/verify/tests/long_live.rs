@@ -292,6 +292,7 @@ fn installed() -> bool {
 }
 
 fn main() {
+    common::started();
     let args = Arguments::from_args();
     // Reconciled trials run side by side in verify:live's isolated phase, so no two may share a
     // model: one's usage report would hold the other's tokens.

@@ -107,6 +107,34 @@ apart and keeps their claims from `PROVEN` without turning them `RED`; the gate 
 whose closing live cell was inconclusive. The cell's other problems stay in the message. An answer
 the gateway made itself stays a failure, as does a relayed one where failover was possible.
 
+Three more answers count as the provider's:
+
+- **An error in a 200.** OpenRouter answers an error during a non-streaming generation with
+  `200 OK`: a body of only an `error` object, whose `code` is the status it means, or a choice with
+  `finish_reason: "error"` ([its errors page](https://openrouter.ai/docs/api-reference/errors)).
+  The catalog sweep reads such a body as that status (502 when it names none), retries it as the
+  SDKs retry that status, and never takes it for an answer.
+- **A connection the provider ended.** The gateway answers 502 "upstream failed after receiving the
+  request" when the upstream closed, reset or sent GOAWAY without answering. The catalog sweep
+  reads the error the gateway logged for that request (`upstream request errored`): when it is the
+  candidate under test ending the exchange (a refused or dropped connection, a reset or GOAWAY the
+  peer sent), the cell is INCONCLUSIVE. A frame error against what the gateway sent, or a gateway
+  timeout (`WriteTimedout`, D118), stays a failure.
+- **A best-effort feature that didn't happen.** A probe whose oracle rests on something the provider
+  documents as best effort says so (`detail.best_effort`) when it misses: OpenAI's prompt-cache hits
+  (`auto_cache` on the GPT row). The cell is INCONCLUSIVE when its ledger is clean, a failure when
+  it is not.
+
+**Retries fit the test's time budget.** nextest terminates a test at its profile's `slow-timeout`
+period × `terminate-after` (180s under `verify`; the reconciliation and long-session binaries have
+their own). The retry loop (`common::sdk_retry`, `sdk_backoff`) reads that budget from
+`.config/nextest.toml` for `NEXTEST_PROFILE` and `NEXTEST_BINARY_ID`, and gives up a retry whose
+wait plus one more attempt as long as the last would not finish inside it, keeping five seconds to
+read the billing row and report. The catalog sweep also caps each request's timeout at the time
+left. So a cell reports its last answer (INCONCLUSIVE, where it is the provider's) instead of being
+killed as a TIMEOUT. Outside nextest there is no budget. A failed catalog run keeps its gateway's
+directory (`target/catalog-live/gw-<pid>/gateway.log`), so a failure can be read after the fact.
+
 | Suite                                                         | How a cell retries                                                                                                                                      |
 | ------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `live.rs` probes (SDK and raw HTTP)                           | The probe's client runs with retries off (one HTTP call, one row); the whole cell runs again on a new gateway.                                          |
@@ -220,15 +248,33 @@ and CAT-13 (BIL-9 and BIL-13 on the way) with raw HTTP. Its cells are named `CLA
 and count toward claim status like the client cells. `mise run verify:catalog` runs only the sweep
 and prints its cost (each billed call is priced from the ledger into
 `target/catalog-live/<VERIFY_CATALOG_SWEEP>.jsonl`). `VERIFY_CATALOG_PLAN=1` prints the trials, the
-estimated cost, and every trial left out with its reason (no key, over the per-call cost cap, or a
-provider window an over-limit prompt would be billed against).
+estimated cost, and every trial left out with its reason (no key, over the per-call cost cap, a
+provider window an over-limit prompt would be billed against, or a CAT-3 prompt OpenAI's rate
+limiter can never admit on the pool key's project).
+
+CAT-3 on OpenAI is held to the project's own tokens-per-minute limits, read with `OPENAI_ADMIN_KEY`
+from `GET /v1/organization/projects/{id}/rate_limits` (the project whose key hint matches
+`OPENAI_API_KEY`; a model's `-long-context` limit where it has one). The limiter answers before
+the context check: a prompt over the TPM is a 429 "Request too large" at once, and one over half of
+it a 429 "Rate limit reached ... Used N, Requested N" after up to a minute (the limiter counts the
+request against the minute before comparing; measured 2026-10-01 on gpt-4.1 and gpt-5-pro). So an
+over-limit or near-limit prompt is planned only when twice its size fits the limit. A 429 is never
+read as a context error: "exceeded the rate limit" used to match the context words, and
+`CAT-3::raw::openai::{gpt-4.1,gpt-5.2-pro,gpt-5.4-pro,gpt-5.5-pro,o1-pro}` passed on rate limits
+until 2026-10-01. Those over-limit trials are now left out with that reason.
 
 CAT-16 keeps the catalog current, from listing calls only (no completions, no gateway, free).
 `CAT-16::raw::PROVIDER::ROW`, one per candidate, fails when the vendor no longer offers it: not in
 its own models API (Anthropic by snapshot, xAI by alias), not in Together's serverless table, a
 Bedrock inference profile that is not `ACTIVE` or a foundation model that is `LEGACY`, or, on
 OpenRouter, no endpoint up in the last 30 minutes (one at 0% uptime answers 410) or none that takes a
-capability the card lists. It also fails when the vendor's deprecation page (Anthropic, OpenAI,
+capability the card lists. An endpoint counts as up when it answered in the last 30 minutes, or had
+no traffic to measure and OpenRouter has not flagged it: one with no recent traffic and a negative
+`status` (Fireworks' dead `z-ai/glm-5.2` lists `status` -5 and no uptime) vouches for nothing.
+These are listings: a capability an endpoint lists but fails to serve for a while (OpenRouter's
+error-in-200s on `x-ai/grok-4.20` for a minute on 2026-10-01, with every endpoint still listing
+`tools` and `structured_outputs`) is the provider being unavailable, which the CAT-6 cells report
+as INCONCLUSIVE. It also fails when the vendor's deprecation page (Anthropic, OpenAI,
 Together; for an OpenRouter slug, its maker's) retires the id, or a dated snapshot of it, without a
 `[[retired]]` entry in `catalog_truth.toml`, or when a recorded retirement is due. So a
 retirement shows up as a red cell, not a customer 404. `CAT-16::raw::{anthropic,openai,xai}::new-models`

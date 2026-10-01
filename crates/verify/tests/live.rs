@@ -458,6 +458,7 @@ fn gateway_bin() -> PathBuf {
 }
 
 fn main() {
+    common::started();
     let args = Arguments::from_args();
     let mut trials = Vec::new();
     if std::env::var("VERIFY_LIVE").as_deref() == Ok("1") {
@@ -567,7 +568,9 @@ fn run_cell(
     let mut retry = 0;
     loop {
         let mut retryable = None;
+        let at = std::time::Instant::now();
         let result = attempt_cell(rt, client, probe, route, keys, checks, &mut retryable);
+        let took = at.elapsed();
         let (Err(failure), Some((e, providers))) = (&result, retryable) else {
             return result;
         };
@@ -584,7 +587,7 @@ fn run_cell(
                 ""
             },
         );
-        match common::sdk_retry(status, retry, |h| error_header(&e, h)) {
+        match common::sdk_retry(status, retry, took, |h| error_header(&e, h)) {
             Some(wait) => {
                 eprintln!("{why}; retrying in {wait:?}, as the SDK would");
                 std::thread::sleep(wait);
@@ -733,8 +736,15 @@ fn attempt_cell(
         .and_then(|j| serde_json::from_str(j).ok())
         .ok_or_else(|| format!("probe printed no VERIFY line:\n{stdout}"))?;
 
+    // A probe whose oracle rests on something the provider documents as best effort (OpenAI's
+    // prompt cache hits) says so in `detail.best_effort` when it missed: the client saw nothing
+    // the gateway did wrong, and nothing that proves it right. Its calls still go to the ledger
+    // witness; a ledger problem is a failure, a clean ledger INCONCLUSIVE.
+    let best_effort = (checks.task && verdict["ok"] != true && verdict["calls"].is_array())
+        .then(|| verdict["detail"]["best_effort"].as_str().map(str::to_owned))
+        .flatten();
     // Witness 1: the client's own verdict.
-    if checks.task && verdict["ok"] != true {
+    if checks.task && verdict["ok"] != true && best_effort.is_none() {
         let rows = usage_rows(&log_path);
         *retryable = retryable_failure(&verdict, &rows, route);
         // A coding agent (harness.py, or harness_long.py's recorded cells) has already retried
@@ -864,7 +874,13 @@ fn attempt_cell(
     export_rows(&log_path);
     let _ = std::fs::remove_dir_all(&dir);
     if problems.is_empty() {
-        Ok(())
+        match best_effort {
+            None => Ok(()),
+            Some(why) => {
+                common::provider_unavailable(why);
+                Err(format!("client verdict: {}", verdict["detail"]).into())
+            }
+        }
     } else {
         Err(format!(
             "ledger disagrees with the client:\n  {}\n--- detail --- {}",

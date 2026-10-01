@@ -2065,3 +2065,31 @@ state = "fixed"
 test = "minimax_m2_7_is_not_served_through_dead_openrouter_hosts"
 fix = "1119025"
 note = "Fixed by removing the row: no candidate could serve its card. Dropping the structured-outputs bit alone would leave forced tool calls failing (CAT-6), and the gateway has no per-candidate way to keep OpenRouter off a host. MiniMax M3 (Together, Fireworks, OpenRouter) is the maker's current model and stays. Recorded in verify/catalog_truth.toml [[not_carried]] with MiniMax's own rate, so re-adding with a MiniMax pool key is the key plus the row. The new CAT-16 OpenRouter cell would have caught it from listings alone: no live endpoint takes structured outputs (checked by mutation: re-adding the bit turned CAT-16::raw::openrouter::minimaxai/minimax-m2.7 red). Supersedes D156's note that M2.7's structured-output requests stayed exposed."
+
+[[defect]]
+id = "D195"
+severity = "med"
+area = "Billing"
+title = "A non-stream 2xx that ended without usage was billed 0/0"
+impact = "When a provider answered a non-streaming request with a complete 200 whose usage was missing or null, the row wrote zero input and zero output, though the provider took the prompt and may bill it. OpenRouter does this when a generation fails partway (an empty or partial message beside \"usage\": null) and documents that the upstream may still charge the prompt. The same turn streamed was already billed an estimate (D123: a finished stream without usage is a billed turn, never a silent 0/0), so whether a customer paid for a failed turn depended on whether it streamed."
+confidence = "high"
+evidence = "live 2026-10-01 final run (target/final-live4.log): CAT-7::raw::openrouter::grok-4.20-multi-agent, a forced OpenRouter call that took 8.4s, answered 200 with usage null, and its ai.usage row billed input 0, output 0 (target/catalog-live/sweep.jsonl at 1790888529); the same minute CAT-6::raw::openrouter::grok-4.20 and ::grok-4.20-multi-agent got 200s with empty text and 0/0 rows. OpenRouter's errors page (https://openrouter.ai/docs/api-reference/errors): \"In some cases, you may still be charged for the prompt processing cost by the upstream provider, even if no content is generated\"; a non-stream request whose provider fails gets \"a 200 OK whose JSON body holds only an error object and no choices\", and one interrupted mid-generation gets the error \"in the final response alongside any partial content\" with finish_reason \"error\". Code: proxy.rs logging estimated a 2xx only when streaming (cut_short), cut off (body_cut, needs an error) or given up on (no_head); a clean non-stream 2xx with parsed usage None fell through to 0/0 with only the usage_parse_errors warning."
+claims = ["BIL-20", "BIL-12"]
+state = "fixed"
+test = "a_non_stream_answer_without_usage_is_billed_an_estimate"
+fix = ""
+note = "Fixed in proxy.rs logging: a managed, non-free, non-stream 2xx that ended cleanly with no parseable usage is estimated as a cut-off body is (input from the request tally, a lower bound; output from the string values in the body tail), flagged usage_estimated, and still counted on ai_usage_parse_errors_total. A body that is only an error object (OpenRouter's non-stream error-in-200, root key error, read whole when the body fits the 64 KiB tail) stays 0/0 and is not an estimate, as an error-only stream is (a_non_stream_error_in_200_is_not_billed). The provider's own charge for such a turn cannot be read back (OpenRouter's generation endpoint needs the id from a response that never named one), so the estimate errs low, as every estimate does (BIL-20). The catalog sweep now reads an error-in-200 as the status its error.code names and retries it, so a cell no longer passes or fails on one silently."
+
+[[defect]]
+id = "D196"
+severity = "low"
+area = "Contract"
+title = "OpenAI's \"Request too large\" TPM 429 was rewritten to \"retry later\""
+impact = "A request larger than the organization's tokens-per-minute limit can never be admitted: OpenAI says \"The input or output tokens must be reduced in order to run successfully\". Because the message also names Beyond's org id and links its rate-limits page (a provider-account remedy, D174), the gateway replaced it with \"The provider is rate-limited upstream; retry later.\", which tells the client the opposite of what to do. A client (and the catalog sweep's CAT-3 cells) retried the same 429 until it gave up."
+confidence = "high"
+evidence = "direct to OpenAI 2026-10-01, Chat Completions gpt-4.1 with the CAT-3 over-limit prompt (1,101,954 words): 429 in 2.1s, type tokens, code rate_limit_exceeded, \"Request too large for gpt-4.1 (for limit gpt-4.1-long-context) in organization org-... on tokens per min (TPM): Limit 1000000, Requested 1101959. The input or output tokens must be reduced in order to run successfully. Visit https://platform.openai.com/account/rate-limits to learn more.\", no Retry-After. Through the gateway the message read \"The provider is rate-limited upstream; retry later.\" (remedy::neutralize: platform.openai.com/account is in REMEDIES, and every non-unfunded 429 became RATE_LIMITED)."
+claims = ["T6"]
+state = "fixed"
+test = "a_request_over_the_tpm_limit_is_told_to_shrink_not_to_retry"
+fix = ""
+note = "Fixed in remedy.rs: a 429 whose message carries a remedy and says the request alone is over the limit (\"request too large\", \"must be reduced in order to run successfully\") reads remedy::TOO_LARGE, \"The request is larger than the provider's per-minute token limit admits; reduce the input or output tokens. Retrying it unchanged will not succeed.\"; the org id and link still go, and status, type and code are kept. A plain rate limit (\"Rate limit reached ... Please try again in 2s\") still reads RATE_LIMITED. Not changed: the status stays 429, so a stock SDK still retries it twice (the gateway relays the provider's status verbatim and has no x-should-retry of its own to send at end of body)."

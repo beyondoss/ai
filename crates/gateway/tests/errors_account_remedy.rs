@@ -137,3 +137,45 @@ async fn a_provider_account_remedy_never_reaches_the_client() {
         gw.log()
     );
 }
+
+/// OpenAI's TPM "Request too large" 429: the request alone is over the organization's
+/// tokens-per-minute limit (measured 2026-10-01 on gpt-4.1 with a 1,101,954-word prompt). It names
+/// Beyond's org id and rate-limits page, so the message is rewritten, but to what it means: shrink
+/// the request. "Retry later" sent a client (and the catalog sweep) round the same 429 until it
+/// gave up. Status, type and code stay.
+/// claim: T6
+/// defect: D196
+#[tokio::test]
+async fn a_request_over_the_tpm_limit_is_told_to_shrink_not_to_retry() {
+    const TOO_LARGE_429: &str = r#"{"error":{"message":"Request too large for gpt-4.1 (for limit gpt-4.1-long-context) in organization org-abc on tokens per min (TPM): Limit 1000000, Requested 1101959. The input or output tokens must be reduced in order to run successfully. Visit https://platform.openai.com/account/rate-limits to learn more.","type":"tokens","param":null,"code":"rate_limit_exceeded"}}"#;
+    let (pubkey, sk) = test_keypair(196);
+    let mock = MockUpstream::start(Mode::Raw(429, "application/json", TOO_LARGE_429)).await;
+    let gw = Gateway::builder(unused_nats_port(), &mock.authority(), &b64(&pubkey))
+        .providers(&["openai"])
+        .start()
+        .await;
+    let key = billing_vkey(&sk, 196);
+    let resp = test_client()
+        .post(format!("{}/v1/chat/completions", gw.url()))
+        .header("authorization", format!("Bearer {key}"))
+        .header("content-type", "application/json")
+        .body(r#"{"model":"gpt-4.1","messages":[{"role":"user","content":"hi"}]}"#)
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status().as_u16();
+    let text = resp.text().await.unwrap();
+    let v: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+    let message = v["error"]["message"].as_str().unwrap_or_default();
+    assert_eq!(status, 429, "{text}\n{}", gw.log());
+    assert_eq!(v["error"]["type"], "tokens", "{text}");
+    assert_eq!(v["error"]["code"], "rate_limit_exceeded", "{text}");
+    assert!(
+        message.contains("reduce the input or output tokens") && !message.contains("retry later"),
+        "the client is told to shrink the request: {text}"
+    );
+    assert!(
+        !text.contains("org-abc") && !text.contains("platform.openai.com"),
+        "the account behind the gateway stays out: {text}"
+    );
+}

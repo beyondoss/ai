@@ -189,6 +189,7 @@ fn installed(client: &str) -> bool {
 }
 
 fn main() {
+    common::started();
     let args = Arguments::from_args();
     let mut trials = Vec::new();
     if std::env::var("VERIFY_LIVE").as_deref() == Ok("1") {
