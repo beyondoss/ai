@@ -1146,7 +1146,13 @@ were removed by owner decision until there is an `AI_POOL_KEY_MISTRAL` (D156): w
 key, their only reachable candidate was OpenRouter, whose only host for each is Mistral on
 OpenRouter's own upstream key. That limit is shared with every OpenRouter customer, so it 429s
 whatever our traffic does, and a pool-key walk cannot help. The `mistral` provider and its
-`/mistral/…` route remain, so bringing them back is the key plus the rows. Likewise, a candidate the host
+`/mistral/…` route remain, so bringing them back is the key plus the rows. The Together-primary
+Qwen rows (Qwen3.6 Plus, 3.7 Plus, 3.7 Max, 3.8 Flash) keep OpenRouter as their failover, though
+OpenRouter's only host for them is Alibaba on that same kind of shared upstream limit. Together
+serves them first, and the failover works when OpenRouter's pool has room (live, 2026-10-01: all
+of their OpenRouter cells pass). When it is saturated, the failover attempt gets OpenRouter's 429,
+relayed with its `Retry-After` and with the account remedy rewritten (D174). Expect that
+occasionally on these failovers. It is not a gateway fault. Likewise, a candidate the host
 reserves for Enterprise or dedicated deployments is not listed
 (Groq `llama-3.1-8b-instant` / `llama-3.3-70b-versatile` / `minimaxai/minimax-m2.7`, the
 Fireworks Llama 4 / Kimi K2.6 / GLM 5.1 / GLM 5.2 / Llama 3.3 ids, Together Kimi K2.7 Code, GPT-OSS 20B,
