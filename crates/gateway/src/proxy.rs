@@ -1381,7 +1381,8 @@ const STATIC_KEY_HEADERS: [&str; 3] = ["x-api-key", "api-key", "x-goog-api-key"]
 /// with `OPENAI_ORG_ID` set), `cookie` / `proxy-authorization` / `x-goog-user-project` are someone
 /// else's credentials or billing selectors, and SDK telemetry (`x-stainless-*`) is noise. Framing
 /// headers stay so the body arrives intact, and `expect` stays so a client waiting on
-/// `100 Continue` is answered by the provider rather than by its own timeout.
+/// `100 Continue` is answered by the provider rather than by its own timeout (unless the gateway
+/// already answered it while reading the body, in which case `peek_body_model` removed it).
 const MANAGED_FORWARD_HEADERS: [&str; 8] = [
     "content-type",
     "content-length",
@@ -1763,6 +1764,11 @@ async fn peek_body_model(
 ) -> pingora_core::Result<BodyPeek> {
     if expects_continue(session) {
         session.write_continue_response().await?;
+        // The client has its `100 Continue`, from us. Forwarding `Expect` would make the provider
+        // send a second one, which the gateway relays: two interim responses for one request.
+        session
+            .req_header_mut()
+            .remove_header(&http::header::EXPECT);
     }
     session.as_mut().enable_retry_buffering();
     let mut buf = Vec::with_capacity(reserve.min(MAX_REQUEST_BODY));
