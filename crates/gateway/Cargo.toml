@@ -38,9 +38,6 @@ pingora-proxy = "0.9"
 # `ratelimit`'s credential pre-hash (4× SipHash-1-3, on a path charged before verify on every
 # request). Already compiled in via `pingora-limits` (its sketch's row hashes) — no build-graph cost.
 ahash = "0.8"
-# `usage::InputTally`: one SIMD (Teddy) pass for both binary-payload markers. Already in the tree via
-# `regex`, so no build-graph cost.
-aho-corasick = "1"
 arc-swap = "1"
 arrayvec = "0.7"
 async-trait.workspace = true

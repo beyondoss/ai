@@ -50,7 +50,9 @@ pub enum Fault {
     ResetMidStream { events: usize },
     /// Relay every SSE event, each delayed by `per_event`.
     SlowDrip { per_event: Duration },
-    /// Read the whole request, then go silent for `hold` without forwarding, then close.
+    /// Forward the request (the provider processes and bills it), hold its whole response back
+    /// for `hold`, then close: a provider still working on the request when the gateway's read
+    /// timeout expires, the connection up.
     StallBeforeHead { hold: Duration },
     /// Relay the head and the first `events` SSE events, then go silent for `hold`, then close.
     StallMidStream { events: usize, hold: Duration },
@@ -141,6 +143,9 @@ pub struct Record {
     pub head_ms: Option<u64>,
     /// Milliseconds from the request's arrival to the first body byte reaching the gateway.
     pub first_byte_ms: Option<u64>,
+    /// The provider answered and the proxy held the answer back (`StallBeforeHead`): the gateway
+    /// had the request delivered and waited on a live connection.
+    pub withheld: bool,
 }
 
 struct State {
@@ -313,11 +318,6 @@ impl State {
                     rst(down.s.get_ref().0);
                     return;
                 }
-                Fault::StallBeforeHead { hold } => {
-                    tokio::time::sleep(hold).await;
-                    self.update(idx, |r| r.done = true);
-                    return;
-                }
                 fault => {
                     let keep = self.forward(idx, &req, &body, fault, &mut down).await;
                     self.update(idx, |r| r.done = true);
@@ -404,6 +404,13 @@ impl State {
             rst(down.s.get_ref().0);
             drain(&mut up, &mut framing, &mut full).await;
             self.finish(idx, &full, sse, None);
+            return false;
+        }
+        if let Fault::StallBeforeHead { hold } = fault {
+            self.update(idx, |r| r.withheld = true);
+            drain(&mut up, &mut framing, &mut full).await;
+            self.finish(idx, &full, sse, None);
+            tokio::time::sleep(hold.saturating_sub(t0.elapsed())).await;
             return false;
         }
 

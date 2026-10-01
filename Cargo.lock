@@ -359,7 +359,6 @@ name = "beyond-ai"
 version = "0.1.0"
 dependencies = [
  "ahash",
- "aho-corasick",
  "arc-swap",
  "arrayvec",
  "async-trait",

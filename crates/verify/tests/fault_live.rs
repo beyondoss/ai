@@ -168,7 +168,8 @@ enum Case {
     SlowDrip,
     /// One stream goes silent after two events.
     StallMidStream,
-    /// One stream request gets no head at all (never forwarded).
+    /// One stream request reaches the provider (billed), whose answer is held back: no head
+    /// before the gateway's read timeout, on a live connection.
     StallHead,
     /// One stream gets the provider's 200 head (the provider accepted and is billing), then
     /// silence: no body byte reaches the gateway.
@@ -674,20 +675,19 @@ fn summarize(recs: &[Record]) -> String {
         .collect()
 }
 
-/// A generation the provider processed and the gateway saw at least the head of.
+/// A generation the provider processed (a 2xx) that the ledger owes a row: the gateway saw at
+/// least its head, or waited on it with the request delivered and the connection up until its read
+/// timeout gave up (D130: the gateway bills the prompt then, as for a client that gave up). A head
+/// the proxy wrote just as that timeout expired is owed one either way: an estimate whether the
+/// gateway read the head first (a cut stream) or not (its 504).
 ///
-/// A head the proxy wrote only as the gateway's read timeout expired may never have been
-/// read (the gateway answered 504 and closed): when the provider itself took that long to start,
-/// the generation counts as unseen rather than as a row the ledger owes.
+/// Not owed: a generation whose connection the proxy reset before any head (`ResetAfterForward`).
+/// The gateway reads a bare reset as the peer declining to answer and bills nothing (see
+/// `gave_up_waiting` in proxy.rs); the real edges answer a forwarded failure with an HTTP error.
 fn seen_generation(r: &Record) -> bool {
-    let raced = r.delivered == Delivery::Head
-        && r.stream
-        && r.head_ms
-            .is_some_and(|ms| ms + 1000 >= READ_TIMEOUT_SECS * 1000);
     r.forwarded
         && r.status.is_some_and(|s| (200..300).contains(&s))
-        && r.delivered >= Delivery::Head
-        && !raced
+        && (r.delivered >= Delivery::Head || r.withheld)
 }
 
 fn n(v: &Value) -> u64 {
@@ -1117,9 +1117,9 @@ fn proxy_problems(
             want(
                 "processed",
                 processed,
-                1,
-                1,
-                "the stalled request is never resent; the retry is served",
+                2,
+                2,
+                "the stalled generation and the SDK retry; the gateway never resends",
             );
         }
         Case::StallAfterHead => {

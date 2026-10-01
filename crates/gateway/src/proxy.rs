@@ -580,6 +580,24 @@ fn body_delivered(session: &mut Session, rc: &RequestCtx, e: Option<&pingora_cor
         })
 }
 
+/// Whether `e` ended a request because someone stopped waiting for its response, rather than the
+/// provider ending it: the client went away, or the gateway's `read_timeout_secs` expired on an
+/// upstream connection that was still up (D130). Once the provider has the whole request
+/// ([`body_delivered`]), it is working on, and billing, the prompt in both cases.
+///
+/// Not a reset or a close from the upstream before any head: that is the peer declining to answer,
+/// and real provider edges answer a request they forwarded and lost with an HTTP error (Cloudflare's
+/// 52x, Envoy's 503 local reply), so a bare close is billed nothing; an estimate errs low. Not a
+/// dead peer either (`ETIMEDOUT` from TCP keepalive or `TCP_USER_TIMEOUT`, a `ReadError`): nobody
+/// can say it ever read the request.
+fn gave_up_waiting(e: &pingora_core::Error) -> bool {
+    match e.esource() {
+        pingora_core::ErrorSource::Downstream => true,
+        pingora_core::ErrorSource::Upstream => e.etype() == &pingora_core::ErrorType::ReadTimedout,
+        _ => false,
+    }
+}
+
 /// Whether the upstream refused this request's HTTP/2 stream before processing any of it, so it
 /// is safe to resend whatever was written (D72). Two shapes, both guaranteed by RFC 9113:
 ///
@@ -4853,8 +4871,8 @@ impl ProxyHttp for AiProxy {
             if let Some(c) = rc.control.as_mut().and_then(|c| c.capture.as_mut()) {
                 c.push_req(chunk);
             }
-            // Managed only: the estimate feeds a billing row, and BYO emits none. One `memmem`
-            // pass for `;base64,` — the bytes are already hot from the scanner or buffer above.
+            // Managed only: the estimate feeds a billing row, and BYO emits none. The bytes are
+            // already hot from the scanner or buffer above.
             if rc.managed {
                 rc.input_tally.feed(chunk);
             }
@@ -5177,17 +5195,10 @@ impl ProxyHttp for AiProxy {
             // Same-endpoint candidates stay a byte relay, except a Chat Completions stream from a
             // vendor other than OpenAI: it relays through `SseBridge`, which drops the identity
             // fields OpenRouter repeats on every chunk (see `translate::ChatIdentity`).
-            // And a JSON error from such a vendor, which may not be in OpenAI's envelope (D100).
-            let relay_error = status >= 400
-                && !rc.streaming
-                && rc.auto.as_ref().is_some_and(|a| catalog_chat_relay(a));
-            if let Some(t) = rc.auto.as_mut().and_then(|a| a.translate.as_mut()) {
-                t.relay_error = relay_error;
-            }
-            if relay_error
-                || rc.auto.as_ref().is_some_and(|a| {
-                    catalog_translating(a) || (rc.streaming && catalog_chat_relay(a))
-                })
+            if rc
+                .auto
+                .as_ref()
+                .is_some_and(|a| catalog_translating(a) || (rc.streaming && catalog_chat_relay(a)))
             {
                 let streaming = rc.streaming;
                 let upstream = rc
@@ -5284,10 +5295,7 @@ impl ProxyHttp for AiProxy {
 
         // A translation, or a Chat Completions relay that `response_filter` gave a bridge.
         let translating = rc.auto.as_ref().is_some_and(|a| {
-            catalog_translating(a)
-                || a.translate
-                    .as_ref()
-                    .is_some_and(|t| t.sse.is_some() || t.relay_error)
+            catalog_translating(a) || a.translate.as_ref().is_some_and(|t| t.sse.is_some())
         });
         if translating {
             let streaming = rc.streaming;
@@ -5793,13 +5801,16 @@ impl ProxyHttp for AiProxy {
         // responses are the whole body; long ones are rotated into order here, once. Skipped on a
         // cache hit — there is no tail; tokens come from the stored entry.
         let mut usage_estimated = false;
-        // The client gave up before the response head, after the provider had the whole request (a
-        // long reasoning turn, a huge prompt). The provider bills that prompt either way; a request
-        // that never reached it (every breaker open, a connect failure) costs nothing and stays 0.
+        // Someone gave up waiting for the response head after the provider had the whole request
+        // (a long reasoning turn, a huge prompt): the client, or the gateway's own read timeout
+        // with the connection still up (D130). The provider cannot tell who hung up and bills that
+        // prompt either way. A request that never reached it (every breaker open, a connect
+        // failure) costs nothing and stays 0, and so does a peer that closed or reset the
+        // connection before answering: that is a refusal, not a wait (see `gave_up_waiting`).
         let no_head = rc.managed
             && cache_hit.is_none()
             && rc.upstream_status.is_none()
-            && e.is_some_and(|e| e.esource() == &pingora_core::ErrorSource::Downstream)
+            && e.is_some_and(gave_up_waiting)
             && body_delivered(session, rc, e);
         let parsed = if cache_hit.is_some() {
             cache_hit.as_ref().map(|h| h.usage)
@@ -5827,8 +5838,8 @@ impl ProxyHttp for AiProxy {
             // it generated before it noticed, so bill an estimate rather than the zero this used to
             // emit — which made "stream, then disconnect before the last event" free. Anthropic's
             // `message_start` already carries exact input and cache counts, so only the missing
-            // side is estimated. See `usage`'s estimate section for the measured divisors; both err
-            // low.
+            // side is estimated. See `usage`'s estimate section: input is a pre-token lower bound,
+            // output a measured divisor; both err low.
             let ok_2xx = rc.upstream_status.is_some_and(|s| (200..300).contains(&s));
             let cut_short = rc.managed
                 && rc.streaming
@@ -5841,12 +5852,6 @@ impl ProxyHttp for AiProxy {
                         parsed.is_none() || !usage::anthropic_stream_finished(tail)
                     }
                 };
-            // Only once the provider demonstrably started: Anthropic's `message_start` arrived, or
-            // at least one generated delta was relayed — or the stream **finished** cleanly. A
-            // finished 2xx stream whose usage we could not read (a shape change, a final event we
-            // could not recover) is a turn the provider billed; writing it as 0/0 was a silent
-            // free generation. A 200 stream carrying nothing but an error event
-            // (`overloaded_error` before any output) is not work we were billed for.
             // A non-stream 2xx that died before its `usage` (the body is last): the provider
             // generated, and bills, the whole answer; we relayed part of it. Always estimated —
             // the 2xx is the proof the provider took the request.
@@ -5858,9 +5863,13 @@ impl ProxyHttp for AiProxy {
             } else {
                 0
             };
-            let started = parsed.is_some()
-                || output > 0
-                || (e.is_none() && !usage::stream_carried_error(tail));
+            // The 2xx head is the provider's word that it took the request, and it bills the
+            // prompt from there: a stream that went silent or died before its first event is
+            // estimated too (D123), like one cut after a few. Only a 200 stream carrying nothing
+            // but an error event (`overloaded_error` before any output) is not work we were billed
+            // for. A finished stream whose usage we could not read (a shape change, a final event
+            // we could not recover) is a turn the provider billed, never a silent 0/0.
+            let started = parsed.is_some() || output > 0 || !usage::stream_carried_error(tail);
             if (cut_short && started) || body_cut || no_head {
                 usage_estimated = true;
                 let mut u = parsed.unwrap_or_default();

@@ -743,13 +743,14 @@ pub fn anthropic_stream_parts(parts: &[&[u8]]) -> Option<Usage> {
 // for everything it generated before it noticed. Emitting zero there was a free-generation hole:
 // stream a long answer, disconnect one event before the end, pay nothing.
 //
-// What follows estimates those rows instead. Both divisors were measured against real providers
-// (2026-09-30) and then rounded in the direction that **under**-counts, because an estimate is a
-// bill the customer cannot check against anything:
+// What follows estimates those rows instead, always in the direction that **under**-counts,
+// because an estimate is a bill the customer cannot check against anything.
+//
+// Input is a lower bound by construction (see [`InputTally`]). Output is measured from the
+// relayed stream with a divisor measured against real providers (2026-09-30) and rounded low:
 //
 // | Measured                               | OpenAI (gpt-4o-mini) | Claude Haiku 4.5 | Claude Sonnet 5 |
 // | -------------------------------------- | -------------------- | ---------------- | --------------- |
-// | JSON request-body bytes / input token  | 4.63                 | 3.95             | 3.00            |
 // | streamed text bytes / output token     | 4.32                 | 3.73             | 2.69            |
 // | output tokens / delta event            | 1.00                 | 2.95             | 4.85            |
 //
@@ -757,217 +758,448 @@ pub fn anthropic_stream_parts(parts: &[&[u8]]) -> Option<Usage> {
 // thinking display omitted, is billed for thinking the stream never shows. The row is flagged
 // `usage_estimated` so a downstream consumer can tell estimated rows from reported ones.
 
-/// Input bytes per token. 5 under-counts every provider measured above on whole JSON bodies, and
-/// [`InputTally`] counts only the string values in them, fewer bytes for the same tokens.
-const INPUT_BYTES_PER_TOKEN: u64 = 5;
-
 /// Streamed text bytes per output token, ×10 so the math stays in integers: 4.5.
 const OUTPUT_TEXT_BYTES_PER_TOKEN_X10: u64 = 45;
 
-/// Where a data URI's binary payload starts inside a string value (`data:image/png;base64,…`:
-/// OpenAI `image_url`, Responses `input_image` / `input_file`). The payload runs to the string's
-/// closing quote. An inline image is ~1 MB of base64 and ~1–2K tokens, so counting it as text would
-/// bill one picture as a novel. The other payload shape is the string value of a `data` key
-/// (Anthropic `base64` image and document sources, OpenAI `input_audio`); a `data` key holding
-/// something else (a tool schema property, say) is skipped too, which only ever under-counts.
-const BASE64_MARKER: &[u8] = b";base64,";
+/// The keys whose string values are prompt text on the three request wires: message `content`
+/// and `role`, content-block `text`, Anthropic `system`, Responses `instructions` / `input` /
+/// function-call `output`, tool-call `arguments`, and a tool's (or message's) `name` and
+/// `description`. Everything else is a request parameter (`model`, `type`, ids, `media_type`,
+/// enum knobs) or a binary payload (`data`, a data-URI `url` / `image_url`, `file_data`), none of
+/// which the provider tokenizes as text.
+const TEXT_KEYS: [&[u8]; 10] = [
+    b"content",
+    b"text",
+    b"role",
+    b"system",
+    b"instructions",
+    b"input",
+    b"output",
+    b"arguments",
+    b"name",
+    b"description",
+];
 
-/// [`InputTally::data`] once the string cannot be `data`.
-const DATA_MISS: u8 = 5;
+/// [`TEXT_KEYS`] as a trie over `a`..=`z`, one row per node: a key is matched exactly, byte by
+/// byte, with one byte of state and no buffer. Node 0 is the root; [`NO_KEY`] marks a missing
+/// child, where the key stops being one of them.
+const KEY_NODES: usize = 1 + {
+    let mut n = 0;
+    let mut i = 0;
+    while i < TEXT_KEYS.len() {
+        n += TEXT_KEYS[i].len();
+        i += 1;
+    }
+    n
+};
+const NO_KEY: u8 = u8::MAX;
 
-#[derive(Default, Clone, Copy, PartialEq, Eq)]
-enum TallyPhase {
-    /// Between strings: structure, numbers, literals. Nothing counts.
-    #[default]
-    Out,
-    /// After a `data` key: a string value is a payload.
-    AwaitPayload,
-    /// Inside a string.
-    Str,
-    /// Inside a string, past `;base64,`.
-    StrPayload,
-    /// A string closed; the next non-whitespace byte says whether it was a key (`:`).
-    After,
-    /// Inside a `data` key's string value.
-    Payload,
-}
+/// `(children, is a whole key)` per node.
+static KEY_TRIE: ([[u8; 26]; KEY_NODES], [bool; KEY_NODES]) = {
+    let mut next = [[NO_KEY; 26]; KEY_NODES];
+    let mut whole = [false; KEY_NODES];
+    let mut used = 1;
+    let mut i = 0;
+    while i < TEXT_KEYS.len() {
+        let mut node = 0;
+        let mut j = 0;
+        while j < TEXT_KEYS[i].len() {
+            let c = (TEXT_KEYS[i][j] - b'a') as usize;
+            if next[node][c] == NO_KEY {
+                next[node][c] = used as u8;
+                used += 1;
+            }
+            node = next[node][c] as usize;
+            j += 1;
+        }
+        whole[node] = true;
+        i += 1;
+    }
+    (next, whole)
+};
 
-/// Running count of a request body's prompt text, fed chunk by chunk as the body streams past.
+/// A lower bound on the input tokens of a request body, counted as the body streams past.
 ///
-/// Counts only the bytes of JSON string **values**. Keys, braces, numbers, literals and
-/// whitespace are not prompt text; counted, they outweighed a short prompt and billed an aborted
-/// stream more input than the same request completed (D99). A string is a key when the next byte
-/// past it that is not whitespace is `:`, so its length is held in `pending` until that byte
-/// arrives, perhaps in the next chunk. Binary payloads are skipped (see [`BASE64_MARKER`]). Any
-/// chunking counts the same. Nothing is buffered: 12 bytes of state however large the body,
-/// because it sits in `RequestCtx`, which is touched once per response chunk.
+/// It counts the **pre-tokens** of the prompt text, not bytes. A BPE tokenizer first splits text
+/// with a pre-tokenizer and never merges across those splits, so the pre-token count is at most the
+/// token count, whatever the vocabulary. The split rules counted are the ones the GPT tokenizers
+/// (`cl100k_base`, `o200k_base`, and Llama 3's, which copies them) state in their regex, keeping
+/// only those every measured tokenizer honors, and each doubt resolved by counting fewer:
+///
+/// - Whitespace separates words; no pre-token holds two words. Whitespace itself is not counted.
+/// - Inside a word, a run of letters is one pre-token, and an apostrophe between letters stays in
+///   it (`o200k` keeps `it's` whole).
+/// - A run of digits is one pre-token per three digits (`\p{N}{1,3}`).
+/// - A run of punctuation is one pre-token, except a single character directly before letters,
+///   which joins them (`(foo`, `.com`).
+/// - A byte past ASCII (and a `\u` escape) is invisible: whether it is a letter or punctuation
+///   decides how it splits, and the scan does not decode UTF-8. Leaving it out can only join what
+///   it separated. A word made only of such bytes is one pre-token.
+///
+/// Only the string **values** of [`TEXT_KEYS`] are text. Keys, numbers, the JSON structure, the
+/// model id and every other parameter are envelope. Counting them is what put a 24-token prompt's
+/// estimate at 40 (D99): on a short prompt the envelope outweighs the prompt. Binary payloads (an
+/// inline image's base64, ~1 MB for ~1–2K tokens) are skipped the same way, as values of keys that
+/// are not text.
+///
+/// The provider adds tokens of its own (role markers, the chat template, a system preamble, tool
+/// schemas rendered as text) that are not in the body, so its count is higher still. Measured
+/// 2026-10-01 over prose, code, Markdown, JSON, numbers, hex, base64-like text, French, Russian,
+/// CJK, emoji and punctuation runs: never above the tokenizer's count on `o200k_base`,
+/// `cl100k_base`, grok-4.3 (xAI's tokenize endpoint) or Claude Haiku 4.5 (`count_tokens`); about
+/// 0.8× of it on English prose and code for the GPT and grok tokenizers and 0.65× for Claude's
+/// denser one, far less on non-Latin scripts.
+///
+/// Text values run through a 9-state table, one lookup per byte; everything else is skipped with
+/// `memchr`. 12 bytes of state however large the body, because it sits in `RequestCtx`, which is
+/// touched once per response chunk.
 #[derive(Default, Clone, Copy)]
 pub struct InputTally {
-    text_bytes: u32,
-    /// Bytes of the string being read, or just closed, not yet known to be a value.
-    pending: u32,
-    phase: TallyPhase,
-    /// How much of [`BASE64_MARKER`] the string's content so far ends with.
-    marker: u8,
-    /// How much of `data` the string's content matches from its start; [`DATA_MISS`] once it
-    /// cannot be `data`.
-    data: u8,
-    /// The last chunk ended on a string's `\`; the next byte is escaped.
-    escaped: bool,
+    /// Pre-tokens counted so far.
+    units: u32,
+    /// Where the key being read is in [`KEY_TRIE`].
+    key: u8,
+    mode: Mode,
+    /// [`COLON`], [`KEY_HIT`], [`ESCAPE`].
+    flags: u8,
+    /// Where the word being read is ([`TALLY`]).
+    state: u8,
+    /// The `\u` hex digits still to skip.
+    aux: u8,
+}
+
+#[derive(Default, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    /// Between strings.
+    #[default]
+    Structure,
+    /// Inside a string that may be a key (or an array element).
+    Key,
+    /// Inside a string that is not text.
+    Skip,
+    /// Inside a text value.
+    Text,
+}
+
+/// The last structural byte before this string was `:`, so the string is a value.
+const COLON: u8 = 1;
+/// The last key matched [`TEXT_KEYS`].
+const KEY_HIT: u8 = 2;
+/// A backslash ended the previous chunk.
+const ESCAPE: u8 = 4;
+
+// Byte classes in text.
+const SPACE: u8 = 0;
+const LETTER: u8 = 1;
+const DIGIT: u8 = 2;
+const APOSTROPHE: u8 = 3;
+const PUNCT: u8 = 4;
+const WIDE: u8 = 5;
+
+static CLASS: [u8; 256] = {
+    let mut t = [PUNCT; 256];
+    let mut b = 0;
+    while b < 256 {
+        t[b] = match b as u8 {
+            b'a'..=b'z' | b'A'..=b'Z' => LETTER,
+            b'0'..=b'9' => DIGIT,
+            b' ' | b'\t' | b'\n' | b'\r' => SPACE,
+            b'\'' => APOSTROPHE,
+            0x80.. => WIDE,
+            _ => PUNCT,
+        };
+        b += 1;
+    }
+    t
+};
+
+// Where a word is: what it ends in so far.
+/// Between words.
+const NONE: u8 = 0;
+/// Only bytes past ASCII so far.
+const WIDE_ONLY: u8 = 1;
+const LETTERS: u8 = 2;
+/// An apostrophe right after letters: part of them if letters follow, punctuation otherwise.
+const LETTERS_APOSTROPHE: u8 = 3;
+/// One punctuation byte, not yet counted (it may join the letters after it).
+const PUNCT1: u8 = 4;
+/// Two or more, not yet counted.
+const PUNCT2: u8 = 5;
+/// Digits, by count mod 3: `DIGITS1` after the 1st, 4th, 7th …, which is when one is counted.
+const DIGITS1: u8 = 6;
+const DIGITS2: u8 = 7;
+const DIGITS3: u8 = 8;
+
+/// `(state, class) → next state | pre-tokens to add << 4`, indexed `state << 3 | class`.
+static TALLY: [u8; 128] = {
+    let mut t = [0u8; 128];
+    let mut s = 0u8;
+    while s <= DIGITS3 {
+        let mut c = 0u8;
+        while c <= WIDE {
+            let pending = matches!(s, LETTERS_APOSTROPHE | PUNCT1 | PUNCT2);
+            let from = if s == WIDE_ONLY { NONE } else { s };
+            let (next, add) = match c {
+                // A word ends: count the punctuation it ended in, or a word of only wide bytes.
+                SPACE => (NONE, (pending || s == WIDE_ONLY) as u8),
+                WIDE if s == NONE => (WIDE_ONLY, 0),
+                WIDE => (s, 0),
+                LETTER => match from {
+                    LETTERS | LETTERS_APOSTROPHE => (LETTERS, 0),
+                    // One punctuation byte joins the letters after it.
+                    PUNCT1 => (LETTERS, 1),
+                    PUNCT2 => (LETTERS, 2),
+                    _ => (LETTERS, 1),
+                },
+                DIGIT => match from {
+                    DIGITS1 => (DIGITS2, 0),
+                    DIGITS2 => (DIGITS3, 0),
+                    DIGITS3 => (DIGITS1, 1),
+                    LETTERS_APOSTROPHE | PUNCT1 | PUNCT2 => (DIGITS1, 2),
+                    _ => (DIGITS1, 1),
+                },
+                _ => match from {
+                    LETTERS if c == APOSTROPHE => (LETTERS_APOSTROPHE, 0),
+                    LETTERS_APOSTROPHE | PUNCT1 | PUNCT2 => (PUNCT2, 0),
+                    _ => (PUNCT1, 0),
+                },
+            };
+            t[((s << 3) | c) as usize] = next | (add << 4);
+            c += 1;
+        }
+        s += 1;
+    }
+    t
+};
+
+/// Classes per [`TALLY4`] step, and how many class tuples one step can see.
+const STEP: usize = 4;
+const TUPLES: usize = 6 * 6 * 6 * 6;
+
+/// [`TALLY`] composed four bytes at a time, indexed `state * TUPLES + tuple` with the four classes
+/// in base 6. The next state hangs on the previous one through a table load, and that chain, not
+/// the work per byte, bounds the loop: one load per four bytes instead of per byte (measured 3.4×
+/// on 100 KiB of source, to 1.3 GB/s). 11.4 KiB.
+static TALLY4: [u8; (DIGITS3 as usize + 1) * TUPLES] = {
+    let mut t = [0u8; (DIGITS3 as usize + 1) * TUPLES];
+    let mut s = 0;
+    while s <= DIGITS3 as usize {
+        let mut tuple = 0;
+        while tuple < TUPLES {
+            let (mut state, mut add, mut k, mut div) = (s as u8, 0u8, 0, TUPLES / 6);
+            while k < STEP {
+                let class = ((tuple / div) % 6) as u8;
+                let e = TALLY[((state << 3) | class) as usize];
+                add += e >> 4;
+                state = e & 15;
+                div /= 6;
+                k += 1;
+            }
+            t[s * TUPLES + tuple] = state | (add << 4);
+            tuple += 1;
+        }
+        s += 1;
+    }
+    t
+};
+
+/// One [`TALLY4`] step over four text bytes.
+#[inline(always)]
+fn quad(state: u8, q: &[u8]) -> u8 {
+    let c = |i: usize| usize::from(CLASS[usize::from(q[i])]);
+    let tuple = ((c(0) * 6 + c(1)) * 6 + c(2)) * 6 + c(3);
+    TALLY4[usize::from(state) * TUPLES + tuple]
 }
 
 impl InputTally {
     pub fn feed(&mut self, chunk: &[u8]) {
-        use TallyPhase::*;
-        let n = chunk.len();
         let mut i = 0;
-        while i < n {
-            match self.phase {
-                Out => match memchr::memchr(b'"', &chunk[i..]) {
-                    Some(k) => {
-                        i += k + 1;
-                        self.open_string();
+        while i < chunk.len() {
+            let rest = &chunk[i..];
+            match self.mode {
+                Mode::Structure => {
+                    let q = memchr::memchr(b'"', rest);
+                    let seg = &rest[..q.unwrap_or(rest.len())];
+                    if let Some(&b) = seg
+                        .iter()
+                        .rev()
+                        .find(|b| !matches!(b, b' ' | b'\t' | b'\n' | b'\r'))
+                    {
+                        self.set(COLON, b == b':');
                     }
-                    None => return,
-                },
-                AwaitPayload => {
-                    let b = chunk[i];
-                    i += 1;
-                    match b {
-                        b'"' => self.phase = Payload,
-                        b':' => {}
-                        _ if b.is_ascii_whitespace() => {}
-                        // Not a string: nothing to skip. (`b` is structure; `Out` ignores it.)
-                        _ => self.phase = Out,
-                    }
-                }
-                After => {
-                    let b = chunk[i];
-                    if b.is_ascii_whitespace() {
-                        i += 1;
-                        continue;
-                    }
-                    if b == b':' {
-                        i += 1;
-                        self.phase = if self.data == 4 && self.pending == 4 {
-                            AwaitPayload
+                    let Some(q) = q else { return };
+                    i += q + 1;
+                    if self.flags & COLON != 0 {
+                        self.mode = if self.flags & KEY_HIT != 0 {
+                            Mode::Text
                         } else {
-                            Out
+                            Mode::Skip
                         };
                     } else {
-                        self.text_bytes = self.text_bytes.saturating_add(self.pending);
-                        self.phase = Out;
+                        self.mode = Mode::Key;
+                        self.key = 0;
                     }
-                    self.pending = 0;
                 }
-                // Base64 has no escapes: the payload ends at the next quote.
-                Payload | StrPayload => match memchr::memchr(b'"', &chunk[i..]) {
-                    Some(k) => {
-                        i += k + 1;
-                        self.phase = if self.phase == Payload { Out } else { After };
+                Mode::Key => {
+                    let b = rest[0];
+                    i += 1;
+                    let node = usize::from(self.key) % KEY_NODES;
+                    if b == b'"' {
+                        self.set(KEY_HIT, KEY_TRIE.1[node]);
+                        self.close();
+                        continue;
                     }
-                    None => return,
-                },
-                Str => {
-                    if self.escaped {
-                        self.escaped = false;
-                        self.add_pending(1);
+                    let next = if b.is_ascii_lowercase() {
+                        KEY_TRIE.0[node][usize::from(b - b'a')]
+                    } else {
+                        NO_KEY
+                    };
+                    if next == NO_KEY {
+                        // Not a text key: the rest of it is skipped, an escape included.
+                        self.set(KEY_HIT, false);
+                        self.mode = Mode::Skip;
+                        if b == b'\\' {
+                            self.flags |= ESCAPE;
+                        }
+                    } else {
+                        self.key = next;
+                    }
+                }
+                Mode::Skip => {
+                    if self.flags & ESCAPE != 0 {
+                        self.flags &= !ESCAPE;
                         i += 1;
                         continue;
                     }
-                    let rest = &chunk[i..];
-                    let (end, stop) = match memchr::memchr2(b'"', b'\\', rest) {
-                        Some(k) => (k, Some(rest[k])),
-                        None => (rest.len(), None),
+                    let Some(k) = memchr::memchr2(b'"', b'\\', rest) else {
+                        return;
                     };
-                    if let Some(cut) = self.content(&rest[..end]) {
-                        i += cut;
-                        self.phase = StrPayload;
-                        continue;
-                    }
-                    i += end;
-                    match stop {
-                        Some(b'"') => {
-                            i += 1;
-                            self.phase = After;
-                        }
-                        Some(_) => {
-                            // An escape: it and the byte it escapes are text, and neither can be
-                            // part of `data` or the marker.
-                            i += 1;
-                            self.add_pending(1);
-                            self.escaped = true;
-                            self.data = DATA_MISS;
-                            self.marker = 0;
-                        }
-                        None => {}
+                    i += k + 1;
+                    if rest[k] == b'"' {
+                        self.close();
+                    } else {
+                        self.flags |= ESCAPE;
                     }
                 }
+                Mode::Text => i += self.text(rest),
             }
         }
     }
 
-    fn open_string(&mut self) {
-        self.phase = TallyPhase::Str;
-        self.pending = 0;
-        self.marker = 0;
-        self.data = 0;
-        self.escaped = false;
-    }
-
-    /// Account for a run of plain string content (no quote, no backslash). `Some(n)` when the
-    /// first `n` bytes complete [`BASE64_MARKER`]: the rest of the string is payload.
-    fn content(&mut self, seg: &[u8]) -> Option<usize> {
-        for &b in seg {
-            if self.data >= DATA_MISS {
-                break;
-            }
-            if self.data < 4 && b == b"data"[usize::from(self.data)] {
-                self.data += 1;
-            } else {
-                self.data = DATA_MISS;
-            }
-        }
-        let m = usize::from(self.marker);
-        if m > 0 {
-            let need = &BASE64_MARKER[m..];
-            let k = need.len().min(seg.len());
-            if seg[..k] == need[..k] {
-                self.add_pending(k);
-                if k == need.len() {
-                    self.marker = 0;
-                    return Some(k);
+    /// Read text-value bytes up to the closing quote, or the whole of `rest`; returns how many
+    /// were consumed.
+    fn text(&mut self, rest: &[u8]) -> usize {
+        let mut i = 0;
+        loop {
+            if self.aux > 0 {
+                // The hex digits of a `\u` escape, already classed as one wide byte.
+                let n = usize::from(self.aux).min(rest.len() - i);
+                i += n;
+                self.aux -= n as u8;
+                if self.aux > 0 {
+                    return i;
                 }
-                self.marker += k as u8;
-                return None;
             }
-            self.marker = 0;
+            let Some(&b) = rest.get(i) else { return i };
+            if self.flags & ESCAPE != 0 {
+                self.flags &= !ESCAPE;
+                i += 1;
+                let class = match b {
+                    b'u' => {
+                        self.aux = 4;
+                        WIDE
+                    }
+                    b'"' | b'\\' | b'/' => PUNCT,
+                    // `\n`, `\t`, `\r`, `\b`, `\f`.
+                    _ => SPACE,
+                };
+                self.step(class);
+                continue;
+            }
+            let seg = &rest[i..];
+            let Some(k) = memchr::memchr2(b'"', b'\\', seg) else {
+                self.run(seg);
+                return rest.len();
+            };
+            self.run(&seg[..k]);
+            i += k + 1;
+            if seg[k] == b'"' {
+                self.step(SPACE);
+                self.close();
+                return i;
+            }
+            self.flags |= ESCAPE;
         }
-        if let Some(p) = memchr::memmem::find(seg, BASE64_MARKER) {
-            let end = p + BASE64_MARKER.len();
-            self.add_pending(end);
-            return Some(end);
-        }
-        // A marker split across chunks: the content ends with a prefix of it.
-        let from = seg.len().saturating_sub(BASE64_MARKER.len() - 1);
-        if let Some(p) = memchr::memrchr(b';', &seg[from..]).map(|p| from + p)
-            && BASE64_MARKER.starts_with(&seg[p..])
-        {
-            self.marker = (seg.len() - p) as u8;
-        }
-        self.add_pending(seg.len());
-        None
     }
 
-    fn add_pending(&mut self, n: usize) {
-        self.pending = self
-            .pending
-            .saturating_add(u32::try_from(n).unwrap_or(u32::MAX));
+    /// Plain text bytes: no quote, no backslash.
+    fn run(&mut self, seg: &[u8]) {
+        // A space ends a word whatever came before it, so the text after a space starts from
+        // `NONE`: cut there, near the middle, and run the halves as two independent chains in one
+        // loop (measured 1.9× on English prose; source code splits at every `\n` escape first).
+        let cut = (seg.len() >= 256)
+            .then(|| memchr::memchr(b' ', &seg[seg.len() / 2..]))
+            .flatten()
+            .map_or(seg.len(), |sp| seg.len() / 2 + sp + 1);
+        let (a, b) = seg.split_at(cut);
+        let (mut sa, mut sb, mut units) = (self.state, NONE, 0u32);
+        let (mut qa, mut qb) = (a.chunks_exact(STEP), b.chunks_exact(STEP));
+        loop {
+            match (qa.next(), qb.next()) {
+                (Some(x), Some(y)) => {
+                    let (ea, eb) = (quad(sa, x), quad(sb, y));
+                    units += u32::from(ea >> 4) + u32::from(eb >> 4);
+                    (sa, sb) = (ea & 15, eb & 15);
+                }
+                (Some(x), None) => {
+                    let e = quad(sa, x);
+                    units += u32::from(e >> 4);
+                    sa = e & 15;
+                }
+                (None, Some(y)) => {
+                    let e = quad(sb, y);
+                    units += u32::from(e >> 4);
+                    sb = e & 15;
+                }
+                (None, None) => break,
+            }
+        }
+        for (state, rest) in [(&mut sa, qa.remainder()), (&mut sb, qb.remainder())] {
+            for &byte in rest {
+                let e = TALLY[usize::from((*state << 3) | CLASS[usize::from(byte)]) & 127];
+                units += u32::from(e >> 4);
+                *state = e & 15;
+            }
+        }
+        self.state = if b.is_empty() { sa } else { sb };
+        // A segment adds at most one pre-token per byte, and a body fits `u32`'s worth of them.
+        self.units = self.units.saturating_add(units);
     }
 
-    /// Estimated input tokens. Deliberately low; see the table above.
+    fn step(&mut self, class: u8) {
+        let e = TALLY[usize::from((self.state << 3) | class) & 127];
+        self.units = self.units.saturating_add(u32::from(e >> 4));
+        self.state = e & 15;
+    }
+
+    /// A string closed: whatever follows it is structure, and it was the last token.
+    fn close(&mut self) {
+        self.mode = Mode::Structure;
+        self.flags &= !(COLON | ESCAPE);
+        self.aux = 0;
+    }
+
+    fn set(&mut self, flag: u8, on: bool) {
+        if on {
+            self.flags |= flag;
+        } else {
+            self.flags &= !flag;
+        }
+    }
+
+    /// Estimated input tokens: a lower bound (see the type's docs).
     pub fn estimate_tokens(&self) -> u64 {
-        u64::from(self.text_bytes) / INPUT_BYTES_PER_TOKEN
+        u64::from(self.units)
     }
 }
 
@@ -1152,28 +1384,147 @@ mod tests {
         t
     }
 
+    /// Pre-tokens of `text` sent as a Chat message's content (the role, one more, taken off).
+    fn text_estimate(text: &str) -> u64 {
+        let body = serde_json::json!({"model": "gpt-4o-mini", "max_tokens": 80,
+            "messages": [{"role": "user", "content": text}]})
+        .to_string();
+        tally(&[body.as_bytes()]).estimate_tokens() - 1
+    }
+
+    /// Each text's estimate, and the fewest tokens any real tokenizer gave it (2026-10-01:
+    /// `o200k_base`, `cl100k_base`, grok-4.3's tokenize endpoint, Claude Haiku 4.5's
+    /// `count_tokens` less its framing). The estimate is a lower bound on every one, adversarial
+    /// shapes included: contractions, abbreviations, escapes, punctuation runs, digit groups.
     #[test]
-    fn input_tally_counts_text_and_skips_base64_payloads() {
-        let b64 = "A".repeat(10_000);
-        let body = format!(
-            r#"{{"messages":[{{"role":"user","content":[{{"type":"image_url","image_url":{{"url":"data:image/png;base64,{b64}"}}}},{{"type":"text","text":"hi"}}]}}]}}"#
-        );
-        let whole = tally(&[body.as_bytes()]);
-        let values = ["user", "image_url", "data:image/png;base64,", "text", "hi"];
-        assert_eq!(
-            u64::from(whole.text_bytes),
-            values.concat().len() as u64,
-            "every string value but the base64 payload is text"
-        );
-        // Any split point — including inside the marker and inside the payload — agrees.
-        for cut in [1, 60, 95, 98, 100, 101, 500, body.len() - 5] {
-            let (a, b) = body.as_bytes().split_at(cut);
-            assert_eq!(
-                tally(&[a, b]).text_bytes,
-                whole.text_bytes,
-                "split at {cut}"
-            );
+    fn input_estimate_never_exceeds_a_real_tokenizer() {
+        for (text, estimate, fewest) in [
+            (
+                "The quick brown fox jumps over the lazy dog. It's a well-known pangram; don't you think? We'll see.",
+                23,
+                24,
+            ),
+            (
+                "U.S.A. e.g. i.e. etc. Mr. Smith vs. Dr. Jones at 3.14159 on 2026-10-01T12:00:00Z www.example.com/a/b?c=d&e=f",
+                48,
+                50,
+            ),
+            (
+                "Count from 1 to 20, separated by spaces. Output only the numbers.",
+                15,
+                17,
+            ),
+            (
+                "(👋) (') it's DON'T dogs' '90s x'y ((foo (123 e.g. U.S.A. {\"city\":\"Paris\"} a-b_c ..//\n/ x86_64 gpt4o 1,000,000.00 v2.3.1-rc4 0x7fff_ffff 3am",
+                60,
+                71,
+            ),
+            ("He said \"hi\"\n\tand left\\back /slash \u{1} ctrl", 10, 13),
+            (
+                "getHTTPResponseCode parseJSONBody XMLHttpRequest snake_case_name kebab-case-name",
+                9,
+                15,
+            ),
+            (
+                "!!! ??? ... --- === +++ *** ### @@@ $$$ %%% ^^^ &&& ||| ~~~ ``` ;;; ::: <<< >>> [[[ ]]] {{{ }}}",
+                24,
+                32,
+            ),
+            (
+                "日本語のテキストを数えます。这是中文文本。한국어 텍스트입니다.",
+                2,
+                17,
+            ),
+            (
+                "café's naïve—test (é) (—x) a😀b 1😀2 ..😀x «quoted» “smart quotes” it’s Ünïcödé x²+y² €100 ½ 中a文b ①②③ ٣٤٥ Straße ﬁle",
+                23,
+                60,
+            ),
+            (
+                "Съешь же ещё этих мягких французских булок, да выпей чаю. 123 тест-тест.",
+                12,
+                25,
+            ),
+            ("hi", 1, 1),
+        ] {
+            assert_eq!(text_estimate(text), estimate, "{text}");
+            assert!(estimate <= fewest, "{text}");
         }
+    }
+
+    /// The fault trials' prompt (D99): gpt-4o-mini reports 24 prompt tokens for it, Claude 25. The
+    /// estimate counts the prompt and the role on every wire, never the envelope around them.
+    #[test]
+    fn input_estimate_ignores_the_envelope() {
+        let p = "Count from 1 to 20, separated by spaces. Output only the numbers.";
+        for body in [
+            format!(
+                r#"{{"messages":[{{"role":"user","content":"{p}"}}],"model":"gpt-4o-mini","max_tokens":80,"stream":true,"stream_options":{{"include_usage":true}}}}"#
+            ),
+            format!(
+                r#"{{"max_tokens":80,"messages":[{{"role":"user","content":[{{"type":"text","text":"{p}","cache_control":{{"type":"ephemeral"}}}}]}}],"model":"claude-haiku-4-5","stream":true,"metadata":{{"user_id":"u-1"}}}}"#
+            ),
+            format!(
+                r#"{{"model":"gpt-4o-mini","input":[{{"type":"message","role":"user","content":[{{"type":"input_text","text":"{p}"}}]}}],"stream":true,"reasoning":{{"effort":"low"}}}}"#
+            ),
+            format!(r#"{{ "model" : "gpt-4o-mini" , "input" : "{p}" , "user" : "role" }}"#),
+        ] {
+            let want = if body.contains(r#""input" : "#) {
+                15
+            } else {
+                16
+            };
+            assert_eq!(tally(&[body.as_bytes()]).estimate_tokens(), want, "{body}");
+        }
+    }
+
+    /// Instructions, a system prompt, tool definitions and tool-call arguments are text; ids,
+    /// `type`s and `model` are not.
+    #[test]
+    fn input_estimate_counts_every_text_field() {
+        let body = r#"{"model":"gpt-4o-mini","instructions":"Be terse.","system":[{"type":"text","text":"Hi there"}],"messages":[{"role":"assistant","tool_calls":[{"id":"call_abc123","type":"function","function":{"name":"get_weather","arguments":"{\"city\":\"Paris\"}"}}]},{"role":"tool","tool_call_id":"call_abc123","content":"sunny"}],"tools":[{"type":"function","function":{"name":"get_weather","description":"Look up weather.","parameters":{"type":"object","properties":{"city":{"type":"string","description":"City name"}}}}}]}"#;
+        // Be terse. (3) Hi there (2) assistant (1) get_weather (2) {"city":"Paris"} (5) tool (1)
+        // sunny (1) get_weather (2) Look up weather. (4) City name (2).
+        assert_eq!(tally(&[body.as_bytes()]).estimate_tokens(), 23);
+    }
+
+    /// An inline payload is a value of a key that is not text — a data URI under `url`, an
+    /// Anthropic source's or `input_audio`'s `data` — so ~1 MB of base64 adds nothing; and any
+    /// split point, inside a key, a payload, an escape or a word, agrees with the whole body.
+    #[test]
+    fn input_estimate_skips_payloads_at_any_split() {
+        let b64 = "iVBORw0KGgo".repeat(1000);
+        for body in [
+            format!(
+                r#"{{"messages":[{{"role":"user","content":[{{"type":"image_url","image_url":{{"url":"data:image/png;base64,{b64}"}}}},{{"type":"text","text":"what is this?"}}]}}]}}"#
+            ),
+            format!(
+                r#"{{"messages":[{{"role":"user","content":[{{"type":"image","source":{{"type":"base64","media_type":"image/png","data":"{b64}"}}}},{{"type":"text","text":"what is this?"}}]}}]}}"#
+            ),
+            format!(
+                r#"{{"input": [{{"role": "user", "content": [{{"type": "input_image", "image_url": "data:image/png;base64,{b64}"}}, {{"type": "input_text", "text": "what is this?"}}]}}], "input_audio": {{"data": "{b64}", "format": "wav"}}}}"#
+            ),
+            r#"{"messages":[{"role":"user","content":"café \"quoted\" it's 1234567 a\nb \\ end"}]}"#.to_owned(),
+        ] {
+            let whole = tally(&[body.as_bytes()]).estimate_tokens();
+            if body.contains("what is this?") {
+                // user (1) what is this? (4).
+                assert_eq!(whole, 5, "{}", &body[..60]);
+            } else {
+                // user (1) café (1) "quoted" (2) it's (1) 1234567 (3) a (1) b (1) \ (1) end (1).
+                assert_eq!(whole, 12, "{body}");
+            }
+            let edges = (1..body.len().min(160)).chain(body.len().saturating_sub(120)..body.len());
+            for cut in edges {
+                let (a, b) = body.as_bytes().split_at(cut);
+                assert_eq!(tally(&[a, b]).estimate_tokens(), whole, "split at {cut}");
+            }
+        }
+    }
+
+    #[test]
+    fn input_tally_is_small() {
+        assert_eq!(std::mem::size_of::<InputTally>(), 12);
     }
 
     #[test]
@@ -1194,84 +1545,28 @@ mod tests {
         assert_eq!(estimate_body_output(br#"{"a":"b\"#, 10), 0);
     }
 
-    #[test]
-    fn input_tally_is_twelve_bytes() {
-        assert_eq!(std::mem::size_of::<InputTally>(), 12);
-    }
-
-    /// Anthropic's image source is `{"type":"base64","data":"…"}` — no data URI — and OpenAI's
-    /// `input_audio` is `{"data":"…"}`. Both must be skipped, compact or spaced, at any split.
-    #[test]
-    fn input_tally_skips_data_key_payloads() {
-        let b64 = "B".repeat(10_000);
-        for (body, values) in [
-            (
-                format!(
-                    r#"{{"messages":[{{"role":"user","content":[{{"type":"image","source":{{"type":"base64","media_type":"image/png","data":"{b64}"}}}},{{"type":"text","text":"hi"}}]}}]}}"#
-                ),
-                "userimagebase64image/pngtexthi",
-            ),
-            (
-                format!(r#"{{"input_audio": {{"data": "{b64}", "format": "wav"}}}}"#),
-                "wav",
-            ),
-        ] {
-            let whole = tally(&[body.as_bytes()]);
-            assert_eq!(
-                u64::from(whole.text_bytes),
-                values.len() as u64,
-                "{}",
-                &body[..60]
-            );
-            for cut in 1..body.len().min(200) {
-                let (a, b) = body.as_bytes().split_at(cut);
-                assert_eq!(
-                    tally(&[a, b]).text_bytes,
-                    whole.text_bytes,
-                    "split at {cut}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn input_tally_without_images_is_the_string_values() {
-        let body = br#"{"model":"m","messages":[{"role":"user","content":"hello \"there\""}]}"#;
-        let values = r#"muserhello \"there\""#.len() as u64;
-        let t = tally(&[&body[..10], &body[10..]]);
-        assert_eq!(u64::from(t.text_bytes), values);
-        assert_eq!(t.estimate_tokens(), values / INPUT_BYTES_PER_TOKEN);
-    }
-
     /// A cut-short estimate never exceeds the provider's count (BIL-20). The JSON around a short
-    /// prompt (keys, the model id's quotes, `stream_options`, limits, numbers) is not prompt text:
-    /// the estimate counts only string values, so structure added to the same prompt changes
-    /// nothing, and the live stream-abort cell's request (29 prompt tokens at OpenAI) estimates
-    /// under 29.
+    /// prompt (keys, the model id, `stream_options`, limits, numbers, spacing) is not prompt text:
+    /// structure added to the same prompt changes nothing at any split, and the live stream-abort
+    /// cell's request (29 prompt tokens at OpenAI) estimates under 29.
     /// claim: BIL-20
     /// defect: D99
     #[test]
     fn input_estimate_counts_string_values_only() {
         let bare = br#"{"model":"gpt-4o-mini","messages":[{"role":"user","content":"Count from 1 to 40, one number per line."}]}"#;
         let dressed = br#"{"model": "gpt-4o-mini", "messages": [{"role": "user", "content": "Count from 1 to 40, one number per line."}], "stream": true, "stream_options": {"include_usage": true}, "max_tokens": 400, "temperature": 0, "n": 1}"#;
-        let values = "gpt-4o-miniuserCount from 1 to 40, one number per line.".len() as u64;
+        let want = tally(&[bare]).estimate_tokens();
+        assert!(want > 0 && want < 29, "{want}");
         for body in [&bare[..], &dressed[..]] {
-            let whole = tally(&[body]);
-            assert_eq!(
-                u64::from(whole.text_bytes),
-                values,
-                "{}",
-                String::from_utf8_lossy(body)
-            );
-            for cut in 1..body.len() {
+            for cut in 0..body.len() {
                 let (a, b) = body.split_at(cut);
                 assert_eq!(
-                    tally(&[a, b]).text_bytes,
-                    whole.text_bytes,
-                    "split at {cut}"
+                    tally(&[a, b]).estimate_tokens(),
+                    want,
+                    "{} split at {cut}",
+                    String::from_utf8_lossy(body)
                 );
             }
-            assert!(whole.estimate_tokens() < 29, "{}", whole.estimate_tokens());
         }
     }
 

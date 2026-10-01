@@ -1391,3 +1391,61 @@ mod translate {
         bencher.bench_local(|| bridge.feed(black_box(event), false));
     }
 }
+
+/// `usage::InputTally`: every managed request body streams through it.
+mod input_tally {
+    use super::*;
+    use beyond_ai::usage::InputTally;
+
+    /// A coding agent's prompt: ~100 KiB of source as message content.
+    fn code_body() -> Vec<u8> {
+        let src = include_str!("../src/proxy.rs");
+        let mut end = src.len().min(100 * 1024);
+        while !src.is_char_boundary(end) {
+            end -= 1;
+        }
+        let text = serde_json::to_string(&src[..end]).unwrap();
+        format!(r#"{{"model":"gpt-5","messages":[{{"role":"user","content":{text}}}]}}"#)
+            .into_bytes()
+    }
+
+    /// A ~1 MiB inline image and a line of text: nearly every byte is a skipped payload.
+    fn image_body() -> Vec<u8> {
+        let b64 = "iVBORw0KGgo".repeat(100_000);
+        format!(
+            r#"{{"model":"gpt-5","messages":[{{"role":"user","content":[{{"type":"image_url","image_url":{{"url":"data:image/png;base64,{b64}"}}}},{{"type":"text","text":"what is this?"}}]}}]}}"#
+        )
+        .into_bytes()
+    }
+
+    /// Fed in 16 KiB chunks, the way a body streams past `request_body_filter`.
+    fn feed(bencher: Bencher, body: Vec<u8>) {
+        bencher.counter(BytesCount::new(body.len())).bench(|| {
+            let mut t = InputTally::default();
+            for chunk in black_box(&body).chunks(16 * 1024) {
+                t.feed(chunk);
+            }
+            t.estimate_tokens()
+        });
+    }
+
+    #[divan::bench]
+    fn code(bencher: Bencher) {
+        feed(bencher, code_body());
+    }
+
+    /// ~108 KiB of English with no escapes: one long text segment.
+    #[divan::bench]
+    fn prose(bencher: Bencher) {
+        let text = "The quick brown fox jumps over the lazy dog, it's 42. ".repeat(2000);
+        feed(
+            bencher,
+            format!(r#"{{"messages":[{{"role":"user","content":"{text}"}}]}}"#).into_bytes(),
+        );
+    }
+
+    #[divan::bench]
+    fn image(bencher: Bencher) {
+        feed(bencher, image_body());
+    }
+}

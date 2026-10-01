@@ -1171,7 +1171,7 @@ fn a_non_2xx_body_is_an_error_whatever_its_shape() {
     let v = json_status(Chat, Messages, 404, &json!({"detail": "Not Found"}));
     assert_eq!(
         v,
-        json!({"type": "error", "error": {"type": "not_found_error", "message": "Not Found"}})
+        json!({"type": "error", "error": {"type": "api_error", "message": "Not Found"}})
     );
     // A 2xx with the same body is not second-guessed.
     let v = json_status(

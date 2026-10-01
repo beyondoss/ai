@@ -31,7 +31,7 @@ published `beyond-slipstream` — clones, CI-builds, and publishes anywhere.
 | **Capture-set**                            | Sparse map of `tenant_id`s with payload logging on; default-**off**; watched under its own prefix by its own watcher                                                                                                                                                                                                                                                                                                                                                                     | Retention policy — the gateway emits and forgets; the store owns TTL/erasure                                                                 |
 | **Capture tap**                            | Bounded **head**-keeping copy of each body, taken pre-rewrite; relayed bytes are untouched                                                                                                                                                                                                                                                                                                                                                                                               | A buffer — nothing is withheld, so it costs memcpy, never latency                                                                            |
 | **Response cache**                         | **Per-pod** exact-match store: identical managed catalog-walk request (pre-rewrite body + inbound path + `tenant_id` + effective candidate order) replays a stored 2xx on **this process**. Off unless `cache_ttl_secs > 0`. Miss is an unbuffered relay; fill is a tap. Replicas do not share entries.                                                                                                                                                                                  | Redis, semantic cache, a pool-key key, or a fleet-wide cache — none of those                                                                 |
-| **Cut-short estimate**                     | A managed request the provider took but whose usage never arrived — a 2xx stream ended early, a non-stream body cut off, a cancel before the response head — is billed an **estimate** flagged `usage_estimated`: input from the body's text bytes ÷ 5 (Anthropic keeps `message_start`'s exact count), output from the relayed delta events and text. Errs low.                                                                                                                         | A reported count, or a way to see hidden reasoning — both estimates are blind to thinking the stream never shows                             |
+| **Cut-short estimate**                     | A managed request the provider took but whose usage never arrived — a 2xx stream ended early, a non-stream body cut off, a cancel before the response head — is billed an **estimate** flagged `usage_estimated`: input from the prompt text's pre-tokens, a lower bound (Anthropic keeps `message_start`'s exact count), output from the relayed delta events and text. Errs low.                                                                                                       | A reported count, or a way to see hidden reasoning — both estimates are blind to thinking the stream never shows                             |
 | **Tenant slot**                            | One of `tenant_max_in_flight` concurrent requests a tenant may hold **on this process**; over it → 429 before the breaker and upstream. The bound on overspend while the allowance-set lags. Off by default.                                                                                                                                                                                                                                                                             | A rate limit or a quota — short fast requests never hit it; N replicas admit N × the limit                                                   |
 | **Control header** (`x-beyond-*`)          | Per-request caller input: `metadata` tags, `capture` on/off, `cache` on/off, catalog `order` / `only` / `split`. Managed only; stripped before the upstream                                                                                                                                                                                                                                                                                                                              | A way to 4xx a request — unusable values are dropped and counted; an `only` that leaves no keyed candidate is the same 503 as an unkeyed row |
 | **Smart router**                           | **Per-pod** EWMA of TTFT per catalog candidate. Default walk for managed `/auto` and `/v1` when `order`/`split` are absent. Probe of unmeasured arms every 8th request. Ranks **new** callers only: a caller with a live session pin keeps its provider. `smart_router = false` restores static catalog order. Two replicas can rank the same row differently.                                                                                                                           | Live Redis, cost sort, or a fleet-wide shared ranking — none of those                                                                        |
@@ -810,15 +810,7 @@ Responses-only models the catalog routes to `/v1/responses`, and is held to the 
   `error` key); `message`, `type`, `code` and `param` survive, a string `error` is the message,
   OpenRouter's `metadata.raw` is quoted after its message with the provider's name, and a numeric
   `code` is a string on the OpenAI wire. OpenAI types with an Anthropic name get it
-  (`server_error` → `api_error`, rate limits → `rate_limit_error`). A body that names no type
-  (xAI's `{"code": "invalid_image", "error": "<string>"}`) is typed by its status in the client's
-  vocabulary: on Messages 400 → `invalid_request_error`, 401 → `authentication_error`, 403 →
-  `permission_error`, 404 → `not_found_error`, 413 → `request_too_large`, 429 →
-  `rate_limit_error`; on the OpenAI wires every 4xx but 429 is `invalid_request_error`; 5xx is
-  `api_error`. A same-wire Chat Completions relay from a vendor other than OpenAI withholds a
-  non-2xx JSON body too, and rewrites it into OpenAI's envelope only when it is not already in it
-  (`{"error": {"message": …}}`), so an OpenAI SDK finds `message`, `type` and `code` on a grok
-  error. A context overflow carries what
+  (`server_error` → `api_error`, rate limits → `rate_limit_error`). A context overflow carries what
   each client's harness compacts on: OpenAI's `context_length_exceeded` reaches a Messages client
   with its message prefixed "prompt is too long: " (Claude Code's trigger), and Anthropic's "prompt
   is too long" reaches a Chat Completions or Responses client with code `context_length_exceeded`
@@ -1177,33 +1169,44 @@ A managed 2xx stream is **cut short** when its usage never arrived: no parseable
 OpenAI wire, no parseable usage or no `message_delta` event on the Anthropic wire (`message_start`
 alone parses, so a successful parse is not the same as a finished stream). The event is found
 structurally — an `event: message_delta` line or a `"type":"message_delta"` member — never as the
-bare words, which generated text can contain but cannot forge as a line or an unescaped member —
-and only once the provider
-demonstrably started: `message_start` arrived, at least one generated delta was relayed, or the
-stream **finished** cleanly without an error event (`"error":{`). That last case is a usage block we
-could not read — a provider shape change, a final event past recovery — on a turn the provider
-billed; it used to be a silent 0/0 row whenever the stream carried no text. A 200 stream carrying
-only an error event is not work we were billed for. Its row carries an estimate and
-`usage_estimated=true`; `ai_usage_estimated_total` counts them.
+bare words, which generated text can contain but cannot forge as a line or an unescaped member.
+The 2xx head is the provider's word that it took the request, and it bills the prompt from there, so
+a stream that goes silent or dies before its first event is estimated too (D123: it used to need
+`message_start`, a relayed delta or a clean finish, and a provider that answered 200 and stalled
+billed a generation the row wrote as 0/0). The one exception is a 200 stream carrying only an error
+event (`"error":{`, an `overloaded_error` before any output): not work we were billed for. A stream
+that **finished** cleanly without readable usage (a provider shape change, a final event past
+recovery) is a billed turn too. Its row carries an estimate and `usage_estimated=true`;
+`ai_usage_estimated_total` counts them.
 
 - **Input:** Anthropic's `message_start` is the first event and carries exact input and cache
-  counts, so those are kept. Otherwise the bytes of the request body's string **values** ÷ 5,
-  counted as the body streams past (`InputTally`, 12 bytes of state, a `memchr` walk from quote to
-  quote) with binary payloads excluded: data-URI payloads (`;base64,…`) and any string under a
-  `"data"` key (Anthropic `base64` image/document sources, OpenAI `input_audio`). Keys, structure,
-  numbers and literals are not prompt text: counted, they outweighed a short prompt, and an aborted
-  gpt stream billed 44 input tokens where the same request completed reported 29 (D99), the one
-  direction an estimate must not err (BIL-20). An inline image is ~1 MB of base64 and
-  ~1–2K tokens; counted as text, an Anthropic-format image served by an OpenAI-wire candidate
-  estimated 44,042 input tokens for a 42-token prompt.
+  counts, so those are kept. Otherwise the prompt text's **pre-tokens**, counted as the body streams
+  past (`InputTally`, 12 bytes of state). A BPE tokenizer splits text with a pre-tokenizer before
+  merging and never merges across a split, so the split count is at most the token count whatever
+  the vocabulary. The splits counted are the subset of the GPT tokenizers' stated regex
+  (`cl100k_base`, `o200k_base`, Llama 3's) every measured tokenizer honors: words split at
+  whitespace, one per letter run (an apostrophe between letters stays in it), one per three digits,
+  one per punctuation run unless it is a single byte before letters (`(foo`); a byte past ASCII is
+  left out, which can only join what it separated, and a word of only such bytes counts one. Only the
+  string values of prompt keys count (`content`, `text`, `role`, `system`, `instructions`, `input`,
+  `output`, `arguments`, `name`, `description`). Keys, structure, the model id and every other
+  parameter do not: counted as bytes ÷ 5 they billed a 24-token prompt at 40 (D99). Binary payloads
+  (a data URI under `url`, an Anthropic source's or `input_audio`'s `data`) are values of other
+  keys, skipped with `memchr` at ~100 GB/s; text is classified four bytes per table lookup, ~1.3
+  GB/s on source code and ~3 GB/s on prose (`benches/unit.rs` `input_tally`). Measured 2026-10-01
+  on prose, code, Markdown, JSON, numbers, hex, base64-like text, French, Russian, CJK, emoji and
+  punctuation runs: never above the count of `o200k_base`, `cl100k_base`, grok-4.3 (xAI's tokenize
+  endpoint) or Claude Haiku 4.5 (`count_tokens`), about 0.8× of it on English and code for the GPT
+  and grok tokenizers, 0.65× for Claude's denser one, and far less on non-Latin scripts. The
+  provider's own template tokens (role markers, a system preamble) are not in the body at all.
 - **Output:** only the 64 KiB tail is retained, so the tail is measured (delta events and text bytes
   per byte of stream) and scaled up to the bytes relayed over the whole stream — one add per managed
   stream chunk, no scan on the relay path (counting `data:` per chunk measured +9.5% on a 600 KiB
   Anthropic stream). The estimate is the larger of one token per delta
   event (exact on OpenAI) and text bytes ÷ 4.5 (the floor for providers that batch tokens).
 
-Both divisors were measured against live providers and rounded to under-count: an estimate is a bill
-the customer cannot check. On five real streams each cut at 50% and 99% of their bytes, the output
+The output divisor was measured against live providers and rounded to under-count: an estimate is a
+bill the customer cannot check. On five real streams each cut at 50% and 99% of their bytes, the output
 estimate ranged 0.94–1.05× on OpenAI Chat Completions and 0.86–1.05× on Responses (the one over-count:
 a Responses stream cut halfway, where the preamble events skew the byte scaling), 0.84–0.85× on
 Claude Haiku 4.5, 0.75–0.84× on Claude via OpenRouter, and 0.57–0.60× on
@@ -1212,12 +1215,20 @@ thinking display omitted — is invisible to both.
 
 Two more endings the provider bills and we used to write as zero get the same treatment:
 
-- **Cancelled before the response head**, after the provider had the whole request: a long
-  reasoning turn or a huge prompt the client gave up on. Input is estimated from the tally, output
-  is 0. "Had the whole request" is `body_delivered`: the connection was up
-  (`upstream_request_filter` ran), the client's body was read to its end, and nothing failed writing
-  it upstream. A request that never reached a provider — every breaker open, a connect failure, a
-  reset mid-upload — stays unbilled.
+- **Given up on before the response head**, after the provider had the whole request: a long
+  reasoning turn or a huge prompt the client gave up on, or that outlasted the gateway's own
+  `read_timeout_secs` (its 504) on a connection that was still up (D130). The provider cannot tell
+  who hung up and bills the prompt either way; billing only the client's cancel made the SDK's retry
+  of a 504 hide one (BIL-14). Input is estimated from the tally, output is 0 (`gave_up_waiting`).
+  "Had the whole request" is `body_delivered`: the connection was up (`upstream_request_filter`
+  ran), the client's body was read to its end, and nothing failed writing it upstream. A request
+  that never reached a provider (every breaker open, a connect failure, a reset mid-upload) stays
+  unbilled, and so does one the upstream **closed or reset** before any head (the gateway's 502): the
+  peer declined to answer, and nothing says it processed the request. The real edges in front of
+  Anthropic, OpenAI and OpenRouter answer a request they forwarded and then lost with an HTTP error
+  (Cloudflare's 52x, Envoy's 503 local reply), not a bare close, so the close is read as a refusal,
+  the side an estimate the customer cannot check errs on (BIL-20). A dead peer (TCP keepalive or
+  `TCP_USER_TIMEOUT`) is the same: it may never have read the request.
 - **A non-stream 2xx body cut off** before its `usage` (which is last): the provider generated the
   whole answer. Input from the tally; output from the bytes inside JSON string values in the tail
   (generated text, not keys or structure), scaled to the bytes relayed and divided by 4.5. Managed
@@ -1830,6 +1841,17 @@ like pingora's own reused-connection retry (D80). A clean end-of-file after the 
 resent: a server that read the request and hung up looks the same as one that closed first. That
 is the remaining stale keep-alive cost; pingora's pool watches idle connections for a close, which
 keeps it rare, and a client SDK's own retry covers it; a duplicated generation is not recoverable.
+The rule trusts the RST: a kernel resets on `close()` only when unread data is left in the socket,
+or on an abortive close (`SO_LINGER` 0). A server that read the request and then gave up would have
+to abort that way before any response byte to be resent wrongly, and the edges in front of the
+managed providers do not: Anthropic, OpenAI, OpenRouter, xAI and Together all sit behind Cloudflare,
+which answers a request it forwarded and lost with a 52x status (an origin reset is its 520), and all
+of them, Bedrock too, negotiate `h2` (checked 2026-10-01), where this HTTP/1.1 rule never applies
+and only an RFC 9113 refusal is resent. Narrower signals were weighed and rejected: "reset before the
+request was fully written" loses D80 itself (a small request is fully written into the socket buffer
+before the RST arrives), and the peer's TCP ACKs cannot tell the idle-close race (the kernel ACKs a
+request the application then closes on unread) from a request that was read. Each resend takes another
+connection, and is resent again only if that one fails the same way, within pingora's retry limit.
 
 **A stream the provider refused is not delivered.** An upstream HTTP/2 stream refused with
 `RST_STREAM(REFUSED_STREAM)` (RFC 9113 §8.7), or left above a GOAWAY's `last_stream_id` (§6.8), is

@@ -91,9 +91,6 @@ pub const MAX_TRANSLATE_BUFFER: usize = 32 * 1024 * 1024;
 pub struct TranslateState {
     /// Inbound endpoint — what the client sent and what it must receive.
     pub client: Endpoint,
-    /// A same-wire relay's error response, withheld like a translated body so it reaches the
-    /// client in its envelope (see [`response_json_tools`]).
-    pub relay_error: bool,
     /// SSE translator, created in `response_filter` once the upstream is known to stream.
     pub sse: Option<SseBridge>,
     /// Non-stream JSON, withheld until end-of-stream so we can map the object.
@@ -110,7 +107,6 @@ impl TranslateState {
     pub fn new(client: Endpoint) -> Self {
         Self {
             client,
-            relay_error: false,
             sse: None,
             json_buf: Vec::new(),
             tools: ToolNames::default(),
@@ -354,24 +350,14 @@ pub fn response_json_tools(
     tools: &ToolNames,
     gateway_cache: bool,
 ) -> Vec<u8> {
-    let failed = !(200..300).contains(&status);
-    if upstream == client && !failed {
+    if upstream == client {
         return body.to_vec();
     }
     let Ok(v) = serde_json::from_slice::<Value>(body) else {
         return body.to_vec();
     };
-    if upstream == client {
-        // A same-wire error in another vendor's shape (xAI's `{"code", "error": "<string>"}`)
-        // still reaches the client in its own envelope (D100); one already in it is untouched.
-        return if in_envelope(&v, client) {
-            body.to_vec()
-        } else {
-            encode(&map_error_status(&v, client, Some(status)))
-        };
-    }
-    if failed || looks_like_error(&v) {
-        return encode(&map_error_status(&v, client, failed.then_some(status)));
+    if !(200..300).contains(&status) || looks_like_error(&v) {
+        return encode(&map_error(&v, client));
     }
     encode(&map_response(upstream, client, &v, tools, gateway_cache))
 }
@@ -405,25 +391,6 @@ fn encode(v: &Value) -> Vec<u8> {
     serde_json::to_vec(v).unwrap_or_else(|_| {
         br#"{"error":{"message":"translate failed","type":"api_error"}}"#.to_vec()
     })
-}
-
-/// Whether an error body is already in `client`'s envelope: `{"error": {"message": …}}` on the
-/// OpenAI wires, `{"type": "error", "error": {"type", "message"}}` on Messages.
-fn in_envelope(v: &Value, client: Endpoint) -> bool {
-    let err = v.get("error");
-    let message = err
-        .and_then(|e| e.get("message"))
-        .is_some_and(Value::is_string);
-    match client {
-        Endpoint::Messages => {
-            message
-                && v.get("type").and_then(Value::as_str) == Some("error")
-                && err
-                    .and_then(|e| e.get("type"))
-                    .is_some_and(Value::is_string)
-        }
-        Endpoint::ChatCompletions | Endpoint::Responses | Endpoint::Embeddings => message,
-    }
 }
 
 fn looks_like_error(v: &Value) -> bool {
@@ -469,24 +436,7 @@ struct ErrorInfo {
 /// error with a whole HTML page gets it cut here, not relayed in full.
 const MAX_ERROR_MESSAGE: usize = 4096;
 
-/// The error type for an HTTP status, when the body names none, in `client`'s vocabulary:
-/// Anthropic types each status; OpenAI calls every client error but a rate limit
-/// `invalid_request_error`.
-fn status_error_type(status: Option<u16>, client: Endpoint) -> &'static str {
-    let anthropic = client == Endpoint::Messages;
-    match status {
-        Some(429) if anthropic => "rate_limit_error",
-        Some(429) => "rate_limit_exceeded",
-        Some(401) if anthropic => "authentication_error",
-        Some(403) if anthropic => "permission_error",
-        Some(404) if anthropic => "not_found_error",
-        Some(413) if anthropic => "request_too_large",
-        Some(400..500) => "invalid_request_error",
-        _ => "api_error",
-    }
-}
-
-fn error_info(v: &Value, status: Option<u16>, client: Endpoint) -> ErrorInfo {
+fn error_info(v: &Value) -> ErrorInfo {
     // `{"error": {…}}` (OpenAI, OpenRouter, Anthropic's envelope), a Responses `response.failed`
     // object, or a flat body: a Responses `error` event, Bedrock `{"message"}`, `{"detail"}`.
     let err = match v.get("error") {
@@ -558,7 +508,7 @@ fn error_info(v: &Value, status: Option<u16>, client: Endpoint) -> ErrorInfo {
         }
     }
     ErrorInfo {
-        typ: typ.unwrap_or_else(|| status_error_type(status, client).to_owned()),
+        typ: typ.unwrap_or_else(|| "api_error".to_owned()),
         message,
         code,
         param,
@@ -624,13 +574,7 @@ const ANTHROPIC_OVERFLOW: &str = "prompt is too long";
 const OPENAI_OVERFLOW: &str = "context_length_exceeded";
 
 fn map_error(v: &Value, client: Endpoint) -> Value {
-    map_error_status(v, client, None)
-}
-
-/// [`map_error`] for a response whose HTTP status is known: a body that names no error type gets
-/// the status's ([`status_error_type`]).
-fn map_error_status(v: &Value, client: Endpoint, status: Option<u16>) -> Value {
-    let mut info = error_info(v, status, client);
+    let mut info = error_info(v);
     // A context overflow says so in the words the client's harness acts on.
     let says_overflow = info.message.contains(ANTHROPIC_OVERFLOW);
     let coded_overflow = info.code.as_ref().and_then(Value::as_str) == Some(OPENAI_OVERFLOW);
