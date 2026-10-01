@@ -529,7 +529,10 @@ legacy call gets an id from its message position, reused by its `function` resul
 Responses `custom` tool and its calls map to Chat Completions' `custom`, in requests and in
 responses both ways (a Responses `custom_tool_call` item with its raw `input` ↔ a Chat
 `tool_calls` entry of `type: "custom"`, streamed as `response.custom_tool_call_input.*` ↔
-`custom.input` deltas); `tool_choice` and `parallel_tool_calls` go onto Chat Completions only
+`custom.input` deltas), and the tool message answering a `custom` call becomes a
+`custom_tool_call_output` onto Responses (OpenAI rejects a `function_call_output` for it); a custom
+call in history onto Messages keeps its name, its raw text as `tool_use.input: {"input": …}` (the
+input must be an object); `tool_choice` and `parallel_tool_calls` go onto Chat Completions only
 alongside `tools` (OpenAI 400s either without them; Messages and Responses accept both); a Responses named
 `tool_choice` or `allowed_tools` nests its name the Chat Completions way and back; consecutive
 Responses `function_call` items become one assistant message (OpenAI rejects the split form),

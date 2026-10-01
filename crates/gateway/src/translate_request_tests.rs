@@ -1066,7 +1066,7 @@ fn chat_onto_responses_maps_tools_choice_and_history_in_order() {
             "function_call:",
             "custom_tool_call:",
             "function_call_output:",
-            "function_call_output:",
+            "custom_tool_call_output:",
             "message:system",
             "message:user"
         ]
@@ -1622,7 +1622,6 @@ fn message_level_cache_control_survives_on_assistant_and_tool_messages() {
 /// claim: TRN-14
 /// defect: D48
 #[test]
-#[ignore = "D48 reproduced: a custom tool call in history becomes tool_use name \"\" input {} on Messages"]
 fn a_custom_tool_call_in_history_keeps_its_name_and_input_on_messages() {
     let patch = "*** Begin Patch\n*** End Patch";
     let chat_body = chat(json!({
@@ -1680,7 +1679,6 @@ fn a_custom_tool_call_in_history_keeps_its_name_and_input_on_messages() {
 /// claim: TRN-14
 /// defect: D48
 #[test]
-#[ignore = "D48 reproduced: Chat→Responses answers a custom_tool_call with function_call_output"]
 fn a_custom_tool_result_reaches_responses_as_custom_tool_call_output() {
     let v = c2r(
         &chat(json!({"messages": [

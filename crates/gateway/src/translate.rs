@@ -1757,9 +1757,18 @@ fn openai_assistant_content(m: &Value) -> Value {
     if let Some(calls) = m.get("tool_calls").and_then(Value::as_array) {
         for c in calls {
             let id = c.get("id").and_then(Value::as_str).unwrap_or("call_0");
-            let func = c.get("function").unwrap_or(c);
+            // A `custom` call's input is free-form text, and `tool_use.input` must be an object.
+            let (func, input) = match c.get("custom") {
+                Some(custom) => (
+                    custom,
+                    json!({ "input": custom.get("input").cloned().unwrap_or(json!("")) }),
+                ),
+                None => {
+                    let func = c.get("function").unwrap_or(c);
+                    (func, parse_arguments(func.get("arguments")))
+                }
+            };
             let name = func.get("name").and_then(Value::as_str).unwrap_or("");
-            let input = parse_arguments(func.get("arguments"));
             blocks.push(json!({
                 "type": "tool_use",
                 "id": id,
@@ -3293,6 +3302,8 @@ fn openai_req_to_responses(v: &Value, openai: OpenAiModel) -> Value {
     let mut input: Vec<Value> = Vec::new();
     if let Some(arr) = v.get("messages").and_then(Value::as_array) {
         let mut in_conversation = false;
+        // Ids of `custom` calls: their results are `custom_tool_call_output`, which OpenAI requires.
+        let mut custom_calls: Vec<&Value> = Vec::new();
         for m in arr {
             let role = m.get("role").and_then(Value::as_str).unwrap_or("");
             match role {
@@ -3313,7 +3324,10 @@ fn openai_req_to_responses(v: &Value, openai: OpenAiModel) -> Value {
                 })),
                 "tool" => {
                     in_conversation = true;
-                    input.push(chat_tool_to_function_call_output(m));
+                    let custom = m
+                        .get("tool_call_id")
+                        .is_some_and(|id| custom_calls.contains(&id));
+                    input.push(chat_tool_to_function_call_output(m, custom));
                 }
                 "assistant" => {
                     in_conversation = true;
@@ -3336,6 +3350,12 @@ fn openai_req_to_responses(v: &Value, openai: OpenAiModel) -> Value {
                         }));
                     }
                     if let Some(calls) = m.get("tool_calls").and_then(Value::as_array) {
+                        custom_calls.extend(
+                            calls
+                                .iter()
+                                .filter(|c| c.get("type").and_then(Value::as_str) == Some("custom"))
+                                .filter_map(|c| c.get("id")),
+                        );
                         input.extend(calls.iter().map(chat_tool_call_to_responses_item));
                     }
                 }
@@ -3418,16 +3438,17 @@ fn chat_image_to_responses(p: &Value) -> Value {
     m
 }
 
-/// A Chat Completions `tool` message → a Responses `function_call_output`, whose `output` is a
-/// string or a list of input parts (text, images, files).
-fn chat_tool_to_function_call_output(m: &Value) -> Value {
+/// A Chat Completions `tool` message → a Responses `function_call_output` (`custom_tool_call_output`
+/// when it answers a `custom` call), whose `output` is a string or a list of input parts (text,
+/// images, files).
+fn chat_tool_to_function_call_output(m: &Value, custom: bool) -> Value {
     let output = match m.get("content") {
         Some(Value::String(s)) => json!(s),
         Some(content @ Value::Array(_)) => chat_content_to_responses(Some(content), false),
         _ => json!(""),
     };
     json!({
-        "type": "function_call_output",
+        "type": if custom { "custom_tool_call_output" } else { "function_call_output" },
         "call_id": m.get("tool_call_id").cloned().unwrap_or(json!("call_0")),
         "output": output,
     })
