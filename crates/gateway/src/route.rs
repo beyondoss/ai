@@ -163,14 +163,95 @@ pub fn dialect_default(d: Dialect) -> &'static str {
 /// generation path, where it ran (and billed) as a generation. Under `/auto` the `/v1` is optional
 /// (`/auto/chat/completions`), and a trailing slash is ignored everywhere.
 pub fn implied_endpoint(path: &str) -> Option<Endpoint> {
+    catalog_endpoint(path)
+        .filter(|e| e.sub.is_none())
+        .map(|e| e.endpoint)
+}
+
+/// One endpoint the gateway meters: the suffix its path ends with below any provider's mount
+/// prefix, the endpoint it is (a sub-resource is its parent's), and the sub-resource, if it is one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EndpointPath {
+    pub suffix: &'static str,
+    pub endpoint: Endpoint,
+    pub sub: Option<SubResource>,
+}
+
+/// Every endpoint a managed key may reach, and so every one the gateway meters: the one table the
+/// managed allowlist (`proxy::is_managed_provider_endpoint`, a security boundary), the forwarded
+/// wire, the sub-resources and the catalog's endpoint names all read (D209). Read with
+/// [`forward_endpoint`] (a `/{provider}/…` path, by suffix) or [`catalog_endpoint`] (a `/v1` or
+/// `/auto` path, exact), each with one normalisation for its kind of path ([`normalize_endpoint_path`]).
+pub const ENDPOINT_PATHS: [EndpointPath; 7] = [
+    EndpointPath {
+        suffix: "/chat/completions",
+        endpoint: Endpoint::ChatCompletions,
+        sub: None,
+    },
+    EndpointPath {
+        suffix: "/messages",
+        endpoint: Endpoint::Messages,
+        sub: None,
+    },
+    EndpointPath {
+        suffix: "/responses",
+        endpoint: Endpoint::Responses,
+        sub: None,
+    },
+    EndpointPath {
+        suffix: "/embeddings",
+        endpoint: Endpoint::Embeddings,
+        sub: None,
+    },
+    EndpointPath {
+        suffix: "/messages/count_tokens",
+        endpoint: Endpoint::Messages,
+        sub: Some(SubResource::CountTokens),
+    },
+    EndpointPath {
+        suffix: "/responses/input_tokens",
+        endpoint: Endpoint::Responses,
+        sub: Some(SubResource::InputTokens),
+    },
+    EndpointPath {
+        suffix: "/responses/compact",
+        endpoint: Endpoint::Responses,
+        sub: Some(SubResource::Compact),
+    },
+];
+
+/// The normalisation every forwarded-path lookup applies (no query string): one trailing slash
+/// dropped. [`catalog_endpoint`] drops every trailing slash instead.
+fn normalize_endpoint_path(path: &str) -> &str {
+    path.strip_suffix('/').unwrap_or(path)
+}
+
+/// The [`ENDPOINT_PATHS`] row a path (no query string) ends with, under any mount prefix (`/v1`,
+/// `/api/v1`, `/openai/v1`, `/inference/v1`, `/anthropic/v1`, `/backend-api/codex`). A path that
+/// carries a query does not match: split it off first ([`forward_endpoint`] does).
+pub fn endpoint_of_path(path: &str) -> Option<&'static EndpointPath> {
+    let path = normalize_endpoint_path(path);
+    ENDPOINT_PATHS.iter().find(|e| path.ends_with(e.suffix))
+}
+
+/// The [`ENDPOINT_PATHS`] row a forwarded `/{provider}/…` path names (query allowed and ignored).
+pub fn forward_endpoint(path_and_query: &str) -> Option<&'static EndpointPath> {
+    endpoint_of_path(
+        path_and_query
+            .split_once('?')
+            .map_or(path_and_query, |(p, _)| p),
+    )
+}
+
+/// The [`ENDPOINT_PATHS`] row a catalog-walk path names, exactly: under `/auto` the `/v1` is
+/// optional, and every trailing slash is ignored. Deliberately looser than a forwarded path, which
+/// keeps the provider's own spelling (one trailing slash is the same resource, `//` one the
+/// provider 404s): a catalog path is the gateway's own name, so `/v1/messages//` is Messages
+/// (pinned by `prop_documented_paths_classify_as_the_table_says`).
+fn catalog_endpoint(path: &str) -> Option<&'static EndpointPath> {
     let rest = catalog_path_rest(path)?.trim_end_matches('/');
-    match rest.strip_prefix("/v1").unwrap_or(rest) {
-        "/chat/completions" => Some(Endpoint::ChatCompletions),
-        "/messages" => Some(Endpoint::Messages),
-        "/responses" => Some(Endpoint::Responses),
-        "/embeddings" => Some(Endpoint::Embeddings),
-        _ => None,
-    }
+    let rest = rest.strip_prefix("/v1").unwrap_or(rest);
+    ENDPOINT_PATHS.iter().find(|e| rest == e.suffix)
 }
 
 /// A provider endpoint under one of the generation endpoints that a catalog walk can serve: the
@@ -192,31 +273,13 @@ impl SubResource {
     /// The sub-resource a catalog-walk path names, if any. Same rules as [`implied_endpoint`]:
     /// `/v1` optional under `/auto`, trailing slash ignored.
     pub fn of_path(path: &str) -> Option<Self> {
-        let rest = catalog_path_rest(path)?.trim_end_matches('/');
-        match rest.strip_prefix("/v1").unwrap_or(rest) {
-            "/messages/count_tokens" => Some(Self::CountTokens),
-            "/responses/input_tokens" => Some(Self::InputTokens),
-            "/responses/compact" => Some(Self::Compact),
-            _ => None,
-        }
+        catalog_endpoint(path).and_then(|e| e.sub)
     }
 
     /// The sub-resource a forwarded upstream path names (`/{provider}/…` with the provider segment
     /// stripped, query allowed), so a provider-routed token count is as free as a catalog walk's.
     pub fn of_forward_path(path_and_query: &str) -> Option<Self> {
-        let path = path_and_query
-            .split_once('?')
-            .map_or(path_and_query, |(p, _)| p);
-        let path = path.strip_suffix('/').unwrap_or(path);
-        if path.ends_with("/messages/count_tokens") {
-            Some(Self::CountTokens)
-        } else if path.ends_with("/responses/input_tokens") {
-            Some(Self::InputTokens)
-        } else if path.ends_with("/responses/compact") {
-            Some(Self::Compact)
-        } else {
-            None
-        }
+        forward_endpoint(path_and_query).and_then(|e| e.sub)
     }
 
     /// Appended to a serving candidate's own path (`/v1/messages` → `/v1/messages/count_tokens`).
@@ -280,9 +343,7 @@ pub fn is_responses_path(path: &str) -> bool {
 /// Whether a forwarded (`/{provider}/…`, query stripped) path is the Responses generation
 /// endpoint itself, under any mount prefix: not a sub-resource or a stored response.
 pub fn forward_is_responses(path: &str) -> bool {
-    path.strip_suffix('/')
-        .unwrap_or(path)
-        .ends_with("/responses")
+    endpoint_of_path(path).is_some_and(|e| e.endpoint == Endpoint::Responses && e.sub.is_none())
 }
 
 /// Whether a catalog candidate path is the Responses endpoint.

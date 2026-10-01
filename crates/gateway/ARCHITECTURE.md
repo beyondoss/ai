@@ -535,7 +535,12 @@ served before this check). On `/{provider}/…` the method must be `POST` and th
 string excluded, must end in a generation endpoint: `/chat/completions`, `/messages`, `/responses`,
 `/embeddings`, `/messages/count_tokens`, `/responses/input_tokens` or `/responses/compact`. The
 suffix match covers every mount prefix (`/api/v1`, `/openai/v1`, `/inference/v1`, `/anthropic/v1`,
-`/backend-api/codex`). Everything else is refused before any upstream contact: 404 for an endpoint
+`/backend-api/codex`). That list is `route::ENDPOINT_PATHS`, the one table the forwarded wire,
+the sub-resources (`SubResource::of_forward_path`, `of_path`), the Chat stream-usage buffer and the
+catalog's endpoint names (`implied_endpoint`) read too, so the allowlist cannot drift from routing
+(D209; it was five copies). A forwarded path drops its query and one trailing slash (`//` is a path
+the provider 404s); a catalog path, the gateway's own name, drops every trailing slash.
+Everything else is refused before any upstream contact: 404 for an endpoint
 outside the list, whatever the method, and 405 for a wrong method on an allowed endpoint or a catalog
 path. Each refusal is a JSON error with `x-beyond-request-id`, counted as
 `ai_rejections_total{reason="managed_endpoint"}`. Without this, one tenant could list, read or delete

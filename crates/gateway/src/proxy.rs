@@ -2764,35 +2764,29 @@ fn requests_background(body: &[u8]) -> bool {
 }
 
 /// The `/{provider}/…` endpoints a managed key may reach: the metered generation calls and their
-/// token-count / compact sub-resources, matched by suffix so every provider's mount prefix
-/// (`/api/v1`, `/openai/v1`, `/inference/v1`, `/anthropic/v1`, `/backend-api/codex`) works.
-/// Everything else on a provider (files, batches, stored responses, fine-tuning, models) is refused
-/// for managed keys. `path` must not carry the query string.
-fn is_managed_provider_endpoint(path: &str) -> bool {
-    const ALLOWED: [&str; 7] = [
-        "/chat/completions",
-        "/messages",
-        "/responses",
-        "/embeddings",
-        "/messages/count_tokens",
-        "/responses/input_tokens",
-        "/responses/compact",
-    ];
-    let path = path.strip_suffix('/').unwrap_or(path);
-    ALLOWED.iter().any(|suffix| path.ends_with(suffix))
+/// token-count / compact sub-resources ([`route::ENDPOINT_PATHS`], the table every routing
+/// decision reads too, D209), matched by suffix so every provider's mount prefix (`/api/v1`,
+/// `/openai/v1`, `/inference/v1`, `/anthropic/v1`, `/backend-api/codex`) works. Everything else on
+/// a provider (files, batches, stored responses, fine-tuning, models) is refused for managed keys.
+/// A query string is ignored.
+fn is_managed_provider_endpoint(path_and_query: &str) -> bool {
+    route::forward_endpoint(path_and_query).is_some()
 }
 
-/// The wire a `/{provider}/…` forwarded path (query allowed) is answered on — the same
-/// [`route::Endpoint::of_upstream_path`] a catalog walk applies per candidate, so the two routes
-/// meter one endpoint the same way. A sub-resource reads as its parent (`/messages/count_tokens` is
-/// Messages; the Responses ones already contain `/responses`).
+/// The wire a `/{provider}/…` forwarded path (query allowed) is answered on: its
+/// [`route::ENDPOINT_PATHS`] row's (a sub-resource reads as its parent: `/messages/count_tokens`
+/// is Messages). A path in no row (a BYO key's files or models call) falls back to
+/// [`route::Endpoint::of_upstream_path`], what a catalog walk applies per candidate.
 fn wire_of_forward_path(path_and_query: &str) -> Dialect {
-    let path = path_and_query
-        .split_once('?')
-        .map_or(path_and_query, |(p, _)| p);
-    let path = path.strip_suffix('/').unwrap_or(path);
-    let path = path.strip_suffix("/count_tokens").unwrap_or(path);
-    route::Endpoint::of_upstream_path(path).wire()
+    match route::forward_endpoint(path_and_query) {
+        Some(e) => e.endpoint.wire(),
+        None => route::Endpoint::of_upstream_path(
+            path_and_query
+                .split_once('?')
+                .map_or(path_and_query, |(p, _)| p),
+        )
+        .wire(),
+    }
 }
 
 /// Whether the **forwarded** (provider-native) path targets the OpenAI Chat Completions endpoint.
@@ -2811,7 +2805,8 @@ fn wire_of_forward_path(path_and_query: &str) -> Dialect {
 /// usage chunk from OpenAI, therefore a zero-token billing row. The caller computes this in
 /// `request_filter` *before* appending the query for exactly that reason.
 fn is_streamable_path(forward_path: &str) -> bool {
-    forward_path.ends_with("/chat/completions")
+    route::endpoint_of_path(forward_path)
+        .is_some_and(|e| e.endpoint == route::Endpoint::ChatCompletions && e.sub.is_none())
 }
 
 /// Overwrite dialect + `stream_options` eligibility from **this** catalog candidate's path.
@@ -7824,6 +7819,85 @@ mod tests {
             Some("openai"),
             "an OpenAI key never goes to Anthropic, whatever the path"
         );
+    }
+
+    /// The managed allowlist (a security boundary) and every routing decision read one endpoint
+    /// table, so they cannot drift: for every endpoint, under every provider's mount prefix, with
+    /// a trailing slash or a query, the allowlist admits it, its wire, sub-resource and
+    /// streamability follow from its row, and the catalog spelling (`/v1`, `/auto`) names the
+    /// same endpoint. A path in no row is refused by the allowlist and names nothing.
+    /// claim: SEC-1, CAT-14
+    /// defect: D209
+    #[test]
+    fn the_allowlist_and_the_routing_tables_agree_for_every_endpoint() {
+        for e in &route::ENDPOINT_PATHS {
+            let generation = e.sub.is_none();
+            for prefix in [
+                "/v1",
+                "/api/v1",
+                "/openai/v1",
+                "/inference/v1",
+                "/anthropic/v1",
+                "/backend-api/codex",
+                "/openai/deployments/x",
+            ] {
+                let base = format!("{prefix}{}", e.suffix);
+                for path in [
+                    base.clone(),
+                    format!("{base}/"),
+                    format!("{base}?beta=true"),
+                ] {
+                    let bare = path.split_once('?').map_or(path.as_str(), |(p, _)| p);
+                    assert!(is_managed_provider_endpoint(&path), "{path}");
+                    assert_eq!(wire_of_forward_path(&path), e.endpoint.wire(), "{path}");
+                    assert_eq!(route::SubResource::of_forward_path(&path), e.sub, "{path}");
+                    assert_eq!(
+                        is_streamable_path(bare),
+                        generation && e.endpoint == route::Endpoint::ChatCompletions,
+                        "{path}"
+                    );
+                    assert_eq!(
+                        route::forward_is_responses(bare),
+                        generation && e.endpoint == route::Endpoint::Responses,
+                        "{path}"
+                    );
+                }
+                if generation {
+                    assert_eq!(
+                        route::Endpoint::of_upstream_path(&base),
+                        e.endpoint,
+                        "{base}"
+                    );
+                }
+            }
+            for path in [
+                format!("/v1{}", e.suffix),
+                format!("/auto{}", e.suffix),
+                format!("/auto/v1{}/", e.suffix),
+            ] {
+                assert_eq!(
+                    route::implied_endpoint(&path),
+                    generation.then_some(e.endpoint),
+                    "{path}"
+                );
+                assert_eq!(route::SubResource::of_path(&path), e.sub, "{path}");
+            }
+        }
+        for path in [
+            "/v1/files",
+            "/v1/models",
+            "/v1/batches",
+            "/v1/responses/resp_123",
+            "/v1/responses/resp_123/cancel",
+            "/v1/messages/batches",
+            "/v1/chat/completions/chatcmpl-1",
+            "/v1/fine_tuning/jobs",
+        ] {
+            assert!(!is_managed_provider_endpoint(path), "{path}");
+            assert_eq!(route::SubResource::of_forward_path(path), None, "{path}");
+            assert_eq!(route::implied_endpoint(path), None, "{path}");
+            assert!(!route::forward_is_responses(path), "{path}");
+        }
     }
 
     #[test]

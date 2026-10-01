@@ -2233,3 +2233,17 @@ state = "fixed"
 test = "every_lost_capture_line_is_counted_and_shutdown_drains_the_queue"
 fix = ""
 note = "Fixed: a line the destination refuses increments ai_capture_dropped_total, like a full-queue drop. CaptureSink::spawn also returns a CaptureDrain; finish(timeout) enqueues an empty line (no event produces one), on which the thread writes out everything queued before it, flushes and stops, and waits for it; a line enqueued after that is counted as dropped (the queue is disconnected). main.rs hands the drain to DrainOnTerm, and drain_then_exit finishes it before exit(0), bounded by 5 s or the rest of the grace period (a wedged pipeline cannot hold teardown up; the remainder is lost with a warn line). ai.usage is unchanged: it already uses the blocking writer. Not covered: pingora's own exit at the end of the grace period, with requests still in flight."
+
+[[defect]]
+id = "D209"
+severity = "low"
+area = "Security"
+title = "The endpoint table was written out five times, the managed allowlist among them"
+impact = "The endpoints a managed key may reach and how each is metered were spelled separately in proxy.rs is_managed_provider_endpoint (the SEC-1 allowlist), wire_of_forward_path (with its own /count_tokens strip), is_streamable_path, and route.rs implied_endpoint and SubResource::of_path / of_forward_path, each with its own normalisation (one trailing slash, every trailing slash, query or not). An endpoint added to one and not the others (a new sub-resource allowed but metered on the wrong wire or not marked free, or routed but not allowed) would drift silently; the allowlist is a security boundary."
+confidence = "high"
+evidence = "Code: the five tables listed in the title's sources, at proxy.rs is_managed_provider_endpoint, wire_of_forward_path, is_streamable_path and route.rs implied_endpoint, SubResource::of_path, SubResource::of_forward_path. Nothing tested that they agree; the new test the_allowlist_and_the_routing_tables_agree_for_every_endpoint reads the single table that replaces them."
+claims = ["SEC-1", "CAT-14"]
+state = "fixed"
+test = "the_allowlist_and_the_routing_tables_agree_for_every_endpoint"
+fix = ""
+note = "Fixed by one table, route::ENDPOINT_PATHS (suffix, endpoint, sub-resource), read through endpoint_of_path / forward_endpoint (by suffix under any mount prefix, query ignored) and catalog_endpoint (exact, /v1 optional under /auto), with one normalisation per kind of path (a forwarded path drops one trailing slash and, for path+query callers, its query; a catalog path drops every trailing slash, as prop_documented_paths_classify_as_the_table_says pins). is_managed_provider_endpoint, wire_of_forward_path (falls back to Endpoint::of_upstream_path only for a path in no row, a BYO key's), is_streamable_path, forward_is_responses (D202), implied_endpoint and SubResource::of_path / of_forward_path are lookups into it. Every existing test is unchanged and green (is_streamable_path still takes a path without its query, as is_streamable_path_must_be_given_the_path_without_the_query pins). No behavior change for any path the old tables classified, except that is_streamable_path now also accepts one trailing slash."
