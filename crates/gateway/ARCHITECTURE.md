@@ -721,9 +721,10 @@ What the parent does for every attempt, so a relayed request behaves like any ot
 - **Abandoned attempts wind down first.** The next attempt starts after the abandoned one finishes
   (bounded at 2s), since it still holds that candidate's breaker permit and a half-open breaker has
   one.
-- **A reset retries.** An upstream connection that fails before any response header (a reused
-  connection closed under us) is retried on the same candidate once, then the next, which pingora
-  cannot do for a body past its buffer.
+- **A reset retries only before delivery.** An upstream connection that fails before any response
+  header _and before the upstream had the whole body_ (a reset mid-upload, a write error) is retried
+  on the same candidate once, then the next, which pingora cannot do for a body past its buffer.
+  After delivery it is not retried at all — see "A delivered body is never sent twice" below.
 - **HTTP/2 clients.** Pingora builds a subrequest by rendering the parent's header as HTTP/1.1; an H2
   parent renders as `HTTP/2`, which that parser rejects. The header is rendered as HTTP/1.1 with the
   body's real `Content-Length` and a `Host` from `:authority`, then restored.
@@ -1512,7 +1513,23 @@ alternative, so that retry lands on a fallback. `smart_router = false` or a pinn
 **Pingora 0.9's default refuses to retry a non-idempotent method** — every LLM call is a `POST` —
 which silently disabled both walks above. `error_while_proxy` is overridden to keep 0.8's policy:
 our walks are marked retryable only after `body_replayable` has proven the body can be resent, and a
-reused-connection failure retries only when the replay buffer holds the whole body.
+reused-connection failure retries only when the replay buffer holds the whole body — and the body
+was not yet delivered.
+
+**A delivered body is never sent twice.** A failure with no response — a read timeout, a reset, a
+reused connection closed — after the upstream had the whole request means the provider may already
+be generating, and billing, the answer. Resending it, to the same candidate or the next, duplicates
+that spend (a 200 KiB body with a silent upstream used to reach each of two candidates twice, with
+waits up to 2 × `read_timeout_secs`). So `error_while_proxy` resends — pingora's reused-connection
+retry, or a `FullBody` reset retry — only when `body_delivered` is false: the connection never came
+up, the client's body was not read to its end, or writing it upstream failed (a reset mid-upload
+surfaces as a write error). Otherwise the walk ends, and `fail_to_proxy` answers with the gateway's
+JSON error and request id: 504 (`upstream timed out after receiving the request`) for a read
+timeout, 502 (`upstream failed after receiving the request`) for anything else, with `connection:
+close` since pingora drops the client connection after a proxy error. Small and large bodies follow
+the one rule. The cost is the classic stale keep-alive case: a pooled connection the server closed
+just as we wrote is no longer retried. Pingora's pool watches idle connections for a close, which
+keeps that rare, and a client SDK's own retry covers it; a duplicated generation is not recoverable.
 
 ### Why the catalog has a list price and the request does not
 

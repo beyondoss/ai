@@ -421,10 +421,16 @@ async fn a_relayed_failover_writes_one_usage_row_under_the_clients_id() {
     assert_eq!(rows, 1, "{}", gw.log());
 }
 
-/// A connection that fails before any response header (a reused connection closed under us) is
-/// retried from the held body, as the ordinary walk would for a small body.
+/// A connection that fails before any response header **after the upstream drained the whole
+/// body** (the mock reads it, then closes a reused connection) is not resent, to that candidate or
+/// the next: the provider may already be generating, and billing, the answer. The request ends
+/// with a JSON 502 and the fallback never sees the body.
+///
+/// This test used to expect the held body to be retried and every request to succeed — the
+/// unsafe behavior D09 removed. The mock's shape (drain, then close) is exactly the case the
+/// policy forbids resending, so the expectation changed with it.
 #[tokio::test]
-async fn a_reset_before_the_header_is_retried_from_the_held_body() {
+async fn a_reset_after_the_body_was_delivered_is_not_resent() {
     let (pubkey, sk) = test_keypair(1);
     let flaky = MockUpstream::start(Mode::CloseOnReusedConnection).await;
     let fallback = MockUpstream::start(Mode::Json).await;
@@ -433,7 +439,9 @@ async fn a_reset_before_the_header_is_retried_from_the_held_body() {
         .provider_authority("openrouter", &fallback.authority())
         .start()
         .await;
-    for _ in 0..4 {
+    const SENT: usize = 4;
+    let mut failed = 0;
+    for _ in 0..SENT {
         let resp = client()
             .post(format!("{}/v1/chat/completions", gw.url()))
             .header("authorization", format!("Bearer {}", vkey(&sk)))
@@ -443,6 +451,30 @@ async fn a_reset_before_the_header_is_retried_from_the_held_body() {
             .send()
             .await
             .unwrap();
-        assert_eq!(resp.status().as_u16(), 200);
+        match resp.status().as_u16() {
+            200 => {}
+            502 => {
+                failed += 1;
+                let text = resp.text().await.unwrap_or_default();
+                let v: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
+                assert!(v["error"]["message"].is_string(), "a JSON error: {text}");
+            }
+            s => panic!("unexpected status {s}; log:\n{}", gw.log()),
+        }
     }
+    assert!(
+        failed > 0,
+        "no reused connection was closed, so the scenario did not fire"
+    );
+    assert_eq!(
+        flaky.hits(),
+        SENT,
+        "a body was sent twice; log:\n{}",
+        gw.log()
+    );
+    assert_eq!(
+        fallback.hits(),
+        0,
+        "the fallback was handed a delivered body"
+    );
 }

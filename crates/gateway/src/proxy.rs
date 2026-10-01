@@ -560,7 +560,7 @@ impl RequestCtx {
 /// Kept as a table so `reject_bodies_are_valid_json` can walk it and assert each entry parses,
 /// carries the `type` and `message` it claims, and is reachable — a hand-written JSON literal is
 /// exactly the thing that rots silently otherwise.
-pub const REJECT_BODIES: [(&str, &str, &str); 13] = [
+pub const REJECT_BODIES: [(&str, &str, &str); 15] = [
     (
         "invalid_request_error",
         "unknown provider",
@@ -625,6 +625,16 @@ pub const REJECT_BODIES: [(&str, &str, &str); 13] = [
         "rate_limit_error",
         "too many concurrent requests",
         r#"{"error":{"message":"too many concurrent requests","type":"rate_limit_error"}}"#,
+    ),
+    (
+        "api_error",
+        "upstream timed out after receiving the request",
+        r#"{"error":{"message":"upstream timed out after receiving the request","type":"api_error"}}"#,
+    ),
+    (
+        "api_error",
+        "upstream failed after receiving the request",
+        r#"{"error":{"message":"upstream failed after receiving the request","type":"api_error"}}"#,
     ),
 ];
 
@@ -4094,14 +4104,99 @@ impl ProxyHttp for AiProxy {
         Ok(None)
     }
 
-    /// Keep pingora 0.8's retry policy for an error after the connection is up.
+    /// Answer a request pingora could not proxy.
+    ///
+    /// Pingora's own answer is a bare status with an empty body. For an upstream that failed after
+    /// it had the whole request — the walk ends there rather than resending (see
+    /// `error_while_proxy`) — the client gets the gateway's JSON error and request id instead: 504
+    /// for a read timeout, 502 otherwise. Every other failure keeps pingora's answer.
+    async fn fail_to_proxy(
+        &self,
+        session: &mut Session,
+        e: &pingora_core::Error,
+        ctx: &mut Self::CTX,
+    ) -> pingora_proxy::FailToProxy {
+        use pingora_core::ErrorSource;
+        use pingora_core::ErrorType::{
+            ConnectionClosed, HTTPStatus, ReadError, ReadTimedout, WriteError,
+        };
+        let unanswered = session.as_downstream().response_written().is_none();
+        let code = match e.etype() {
+            HTTPStatus(code) => *code,
+            _ => match e.esource() {
+                ErrorSource::Upstream => 502,
+                // The client is gone; nothing to answer.
+                ErrorSource::Downstream
+                    if matches!(e.etype(), WriteError | ReadError | ConnectionClosed) =>
+                {
+                    0
+                }
+                ErrorSource::Downstream => 400,
+                ErrorSource::Internal | ErrorSource::Unset => 500,
+            },
+        };
+        let after_delivery = unanswered
+            && e.esource() == &ErrorSource::Upstream
+            && !matches!(e.etype(), HTTPStatus(_))
+            && ctx
+                .as_ref()
+                .is_some_and(|rc| body_delivered(session, rc, Some(e)));
+        let request_id = ctx.as_ref().map_or("", |rc| rc.request_id.as_str());
+        if after_delivery {
+            // Pingora closes the client connection after a proxy error; say so (`connection:
+            // close`), as its own error responses do, so a pooled client does not send its next
+            // request into a socket about to close.
+            session.as_downstream_mut().set_keepalive(None);
+        }
+        let code = if after_delivery && matches!(e.etype(), ReadTimedout) {
+            let _ = Self::reject_boxed(
+                session,
+                request_id,
+                504,
+                "api_error",
+                "upstream timed out after receiving the request",
+            )
+            .await;
+            504
+        } else if after_delivery {
+            let _ = Self::reject_boxed(
+                session,
+                request_id,
+                502,
+                "api_error",
+                "upstream failed after receiving the request",
+            )
+            .await;
+            502
+        } else {
+            if code > 0 && unanswered {
+                let _ = session.respond_error(code).await;
+            }
+            code
+        };
+        pingora_proxy::FailToProxy {
+            error_code: code,
+            // Pingora closes the client connection after any proxy error whatever this says.
+            can_reuse_downstream: false,
+        }
+    }
+
+    /// Keep pingora 0.8's retry policy for an error after the connection is up — except that a
+    /// body the provider already has is never sent again.
     ///
     /// Pingora 0.9's default refuses to retry any non-idempotent method, and every LLM call is a
     /// `POST` — so the default silently turned off both retries this gateway decides for itself:
     /// the managed 429 key walk and the model-routed 5xx vendor walk. `upstream_response_filter`
     /// only marks those retryable after `body_replayable` has proven the body can be resent, which
-    /// is the safety condition the new default approximates with the method. A reused-connection
-    /// failure still retries only when the replay buffer holds the whole body, exactly as before.
+    /// is the safety condition the new default approximates with the method.
+    ///
+    /// A failure with no response (a reset, an early close, a read timeout) is resent only when it
+    /// happened before the upstream had the whole body ([`body_delivered`]): a reset mid-upload, a
+    /// write error. After that the provider may well be generating, and billing, the answer, so
+    /// sending the body again — to the same candidate or the next — duplicates the spend; the
+    /// request ends instead, with a JSON 504/502 (`fail_to_proxy`). That holds for pingora's own
+    /// reused-connection retry and for the `FullBody` reset retry alike. A 5xx or 429 is an
+    /// answer, not a failure, and keeps walking as before.
     fn error_while_proxy(
         &self,
         peer: &HttpPeer,
@@ -4110,11 +4205,15 @@ impl ProxyHttp for AiProxy {
         ctx: &mut Self::CTX,
         client_reused: bool,
     ) -> Box<pingora_core::Error> {
-        // A `FullBody` attempt whose upstream connection failed before any response header (a
-        // reset, an early close on a reused connection): pingora cannot resend a body past its
-        // buffer, but the parent holds it, so hand the retry back. Not for a downstream error:
-        // that is the parent having gone.
-        if e.esource() != &pingora_core::ErrorSource::Downstream
+        let delivered = ctx
+            .as_ref()
+            .is_some_and(|rc| body_delivered(session, rc, Some(&*e)));
+        // A `FullBody` attempt whose upstream connection failed before any response header and
+        // before the upstream had the whole body (a reset mid-upload): pingora cannot resend a
+        // body past its buffer, but the parent holds it, so hand the retry back. Not for a
+        // downstream error: that is the parent having gone.
+        if !delivered
+            && e.esource() != &pingora_core::ErrorSource::Downstream
             && session.as_downstream().response_written().is_none()
             && let Some(fb) = full_body_ctx(session)
             && let Some(rc) = ctx.as_mut()
@@ -4127,8 +4226,9 @@ impl ProxyHttp for AiProxy {
             rc.relay_abandoned = true;
         }
         let mut e = e.more_context(format!("Peer: {peer}"));
-        e.retry
-            .decide_reuse(client_reused && !session.as_ref().retry_buffer_truncated());
+        e.retry.decide_reuse(
+            client_reused && !delivered && !session.as_ref().retry_buffer_truncated(),
+        );
         e
     }
 

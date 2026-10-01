@@ -100,7 +100,6 @@ async fn a_429_key_walk_ends_the_same_for_small_and_large_bodies() {
 /// claim: REL-21
 /// defect: D51
 #[tokio::test]
-#[ignore = "D51 reproduced: all-candidate resets give small empty 502 vs large 503 'no provider key available'"]
 async fn resets_on_every_candidate_end_the_same_for_small_and_large_bodies() {
     let (pubkey, sk) = test_keypair(1);
     let mut outcomes = Vec::new();

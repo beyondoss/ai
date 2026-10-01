@@ -110,11 +110,12 @@ fn big_chat() -> String {
 
 /// A large-body request whose upstream received the whole body and then went silent until the read
 /// timeout. The provider is (in reality) generating and billing; sending it again duplicates that.
-/// At most one request per candidate once the body was delivered.
+/// At most one request per candidate once the body was delivered — and, by the decided policy, no
+/// failover to the next candidate either: the fallback would be a second generation of the same
+/// request. The walk ends with a JSON 504.
 /// claim: BIL-14, REL-21
 /// defect: D09
 #[tokio::test]
-#[ignore = "D09 reproduced: after a read timeout the full body is re-sent to the same candidate (2 hits each)"]
 async fn a_large_body_is_not_resent_to_a_candidate_that_received_it() {
     let (pubkey, sk) = test_keypair(73);
     let silent = || ScriptedUpstream::start(|_, _| vec![Step::Sleep(Duration::from_secs(30))]);
@@ -137,11 +138,22 @@ async fn a_large_body_is_not_resent_to_a_candidate_that_received_it() {
         .body(big_chat())
         .send()
         .await;
-    let status = res.map(|r| r.status().as_u16()).ok();
+    let (status, text) = match res {
+        Ok(r) => (
+            Some(r.status().as_u16()),
+            r.text().await.unwrap_or_default(),
+        ),
+        Err(_) => (None, String::new()),
+    };
+    // (1, 0), stricter than the original "at most once per candidate" (1, 1): the fallback must not
+    // be handed a body the primary may already be generating from.
     assert_eq!(
         (primary.hits(), fallback.hits()),
-        (1, 1),
+        (1, 0),
         "each candidate must receive the body at most once (client saw {status:?}); log:\n{}",
         gw.log()
     );
+    assert_eq!(status, Some(504), "{text}");
+    let json: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
+    assert!(json["error"]["message"].is_string(), "a JSON error: {text}");
 }
