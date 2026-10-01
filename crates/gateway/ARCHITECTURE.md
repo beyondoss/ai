@@ -58,8 +58,6 @@ Client (stock OpenAI/Anthropic SDK)
   │  │        Chat Completions ↔ Messages ↔ Responses ─► translate
   │  │        Responses + session state ─► GPT `/v1/responses` arm (relay) or 400 naming the field
   │  │        other mismatch ────────────────────────► 400
-  │  │      GET /v1/models ────────────────────────────────────► catalog list
-  │  │      BYO key on `/auto` (managed-only route) ───────────► 400
   │  │      BYO on `/v1` ─ dialect-default passthrough (no catalog); a BYO x-api-key picks
   │  │        Anthropic on every `/v1` path, not just `/v1/messages`
   │  │      no remaining candidate holds a pool key ──────────► 503
@@ -68,18 +66,23 @@ Client (stock OpenAI/Anthropic SDK)
   │  ├─ Rate guardrails (BEFORE verify — keeps forged-key floods at ns cost)
   │  │    per-credential count-min  ──────────────────────────────► 429
   │  │    global BYO aggregate (managed exempt)  ─────────────────► 429
-  │  ├─ Content-Length abuse guard  ──────────────────────────────► 413
-  │  └─ Identity branch:
-  │       bai_v1/v2.…  → Ed25519 verify → deny-set (tenant OR key_id, O(1))
-  │       │               │                    │
-  │       │             401 (bad sig)     402 Spend / 403 Fraud
-  │       │                                    │
-  │       │           allowance-set (tenant OR key_id; fail-closed if unread)
-  │       │             remaining-ok ───────────────────────────────────
-  │       │             exhausted ──────────────────────────────────── 402
-  │       │             unread ───────────────────────── 503 + Retry-After
-  │       │           pool key required ───────────────────────── 503
-  │       └─ BYO: pass through (no verify, no deny-set, no billing)
+  │  ├─ Content-Length abuse guard (declared > 100 MiB) ──────────► 413
+  │  ├─ Identity branch:
+  │  │    bai_v1/v2.…  → Ed25519 verify → deny-set (tenant OR key_id, O(1))
+  │  │    │               │                    │
+  │  │    │             401 (bad sig)     402 Spend / 403 Fraud
+  │  │    │                                    │
+  │  │    │           allowance-set (tenant OR key_id; fail-closed if unread)
+  │  │    │             remaining-ok ───────────────────────────────────
+  │  │    │             exhausted ──────────────────────────────────── 402
+  │  │    │             unread ───────────────────────── 503 + Retry-After
+  │  │    │           pool key required ───────────────────────── 503
+  │  │    └─ BYO: pass through (no verify, no deny-set, no billing)
+  │  ├─ BYO key on `/auto` (managed-only route) ──────────────────► 400
+  │  ├─ GET/HEAD /v1/models (after identity: a managed key must verify) ► catalog list
+  │  ├─ Managed endpoint allowlist (method + path) ──────────────► 404 / 405
+  │  ├─ Catalog walk: read the body to find `model` (≤ 64 KiB in hand, larger re-run
+  │  │    as a `FullBody` subrequest); past 100 MiB ──────────────► 413, before any upstream
   │  ├─ Managed only: parse x-beyond-* control headers (never 4xx; bad values counted)
   │  │    order / only / split, then TTFT rank unless order/split pinned, *before* first_usable / breaker skip
   │  │    capture decision = header (wins both ways) else capture-set rule ∧ 1-in-N sample
@@ -805,9 +808,9 @@ wire (`route::Endpoint::of_upstream_path`, a sub-resource reading as its parent)
 `/openrouter/api/v1/messages` meters with the Anthropic extractor and `/anthropic/v1/chat/completions`
 with the OpenAI one (and gets `include_usage`).
 
-That is what makes **Claude failover real today**: every Claude row (current Fable 5.1 / Opus 5 /
-Sonnet 5 / Haiku 4.5, plus the still-served 4.x snapshots including Opus 4 / 4.1 / 4.5 and
-Sonnet 4) routes to Anthropic first and falls back to OpenRouter's Chat Completions endpoint
+That is what makes **Claude failover real today**: every Claude row Anthropic still serves
+(Fable 5 / 5.1, Opus 5 / 5.5, Sonnet 5 / 5.5, Haiku 4.5, plus the 4.x snapshots Opus 4.5 / 4.6 /
+4.7 / 4.8 and Sonnet 4.5 / 4.6) routes to Anthropic first and falls back to OpenRouter's Chat Completions endpoint
 under the vendor-slug spelling (`claude-opus-5` → `anthropic/claude-opus-5`; `claude-opus-4-8` →
 `anthropic/claude-opus-4.8`). `claude-haiku-4-5` and `claude-opus-4-8` insert Amazon Bedrock's
 Messages API as an independent second source (`us.anthropic.claude-haiku-4-5-20251001-v1:0` /
@@ -1748,7 +1751,10 @@ crosses the proxy for anyone. BYO requests forward every client header untouched
 
 ## Configuration
 
-All fields configurable via `config.example.toml` and environment (`AI_` prefix, flat merge).
+Every field is set in the TOML config file (`config.example.toml` is the reference; an unknown key
+there is a boot failure). Scalar fields are also overridable by `AI_`-prefixed env vars (`AI_NATS_URL`,
+…), pool and signing keys by `AI_POOL_KEY_<NAME>` / `AI_SIGNING_KEY_<KID>`; the provider map fields
+(`provider_authorities.*`, `provider_dialects.*`, `provider_auth_schemes.*`) are file-only.
 Secret-bearing fields (`pool_keys`, `nats_creds`) are held as `Secret<T>` — stray `Debug` or
 `Serialize` output redacts to `"***"` and the value is zeroized on drop (`secret.rs`). The
 pool key's precomputed `HeaderValue` is marked sensitive, so HPACK never indexes it and its `Debug`
@@ -1788,10 +1794,17 @@ local plaintext mock.
 | `smart_router`                  | `true`                            | Rank managed catalog walks by **this process's** TTFT EWMA. `false` restores static catalog order. `x-beyond-order` / `split` pin either way. Not a fleet-wide ranking.                                                                                                                                                                                                                                                                                                                                                                 |
 | `tenant_max_in_flight`          | `0`                               | Most requests one tenant may hold open **on this process**. `0` disables. Over it → 429 with `Retry-After: 1` (`ai_rejections_total{reason="tenant_concurrency"}`), before the breaker. Bounds overspend while the allowance-set lags. Managed only.                                                                                                                                                                                                                                                                                    |
 | `nats_url`                      | `nats://localhost:4222`           | NATS server for the control-plane watchers. Unreachable → deny-set stale (fail-open), capture off, allowance fail-closed until a scan or `{snapshot_path}.allowance` lands.                                                                                                                                                                                                                                                                                                                                                             |
-| `nats_creds`                    | _(unset)_                         | NATS credentials file path. Required for authenticated clusters.                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
-| `listen_addr`                   | `0.0.0.0:8080`                    | Proxy listener address (client traffic).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| `nats_creds`                    | _(unset)_                         | Base64 NATS `.creds` contents (ECS via SOPS). Held as `Secret`. Takes priority over `nats_creds_file`.                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| `nats_creds_file`               | _(unset)_                         | Path to a NATS `.creds` file, used when `nats_creds` is unset. One of the two is required for authenticated clusters.                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| `config_bucket`                 | `ai-gateway`                      | slipstream bucket holding the `blackhole.*` (deny), `allowance.*` and `aicapture.*` sets.                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| `listen`                        | `0.0.0.0:8080`                    | Proxy listener address (client traffic). Plain HTTP; production keeps it internal (no public ingress).                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| `downstream_h2c`                | `true`                            | Also accept HTTP/2 cleartext on `listen` (Pingora peeks the preface; HTTP/1.1 clients are unaffected). `false` forces HTTP/1.1.                                                                                                                                                                                                                                                                                                                                                                                                         |
+| `worker_threads`                | `0`                               | Tokio worker threads for the proxy service. `0` = one per available core (Pingora alone would default to one). Set it explicitly under a CPU quota: the core count is the host's, not the cgroup's.                                                                                                                                                                                                                                                                                                                                     |
+| `upstream_tls`                  | `true`                            | TLS to the provider. `false` only for the plaintext test mock; with pool keys set it logs a loud warning.                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| `upstream_http2`                | `true`                            | Offer ALPN `h2` (HTTP/1.1 fallback) to TLS upstreams. `false` forces HTTP/1.1 without recompiling.                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| `upstream_verify_cert`          | `true`                            | Verify the upstream certificate and SNI. `false` only for the bench's self-signed TLS mock; never against a real provider.                                                                                                                                                                                                                                                                                                                                                                                                              |
 | `provider_authorities.auto`     | _(rejected)_                      | Reserved: `auto` is the model-routed segment, and a provider of that name would shadow it. Hard boot failure.                                                                                                                                                                                                                                                                                                                                                                                                                           |
-| `metrics_listen`                | `0.0.0.0:9090`                    | Internal admin/observability listener: `/metrics` (Prometheus scrape), `/livez`, `/readyz` (503 until the allowance-set is seeded on a managed deployment). Separate from the client listener — not externally reachable.                                                                                                                                                                                                                                                                                                               |
+| `metrics_listen`                | `0.0.0.0:9090`                    | Admin/observability listener: `/metrics` (Prometheus scrape), `/livez`, `/readyz` (503 until the allowance-set is seeded on a managed deployment). Separate from the client listener and unauthenticated. The default binds every interface, so anything that can reach the host on that port can read it; keep it off public ingress (or bind it to a private address).                                                                                                                                                                |
 
 ---
 
@@ -1838,7 +1851,7 @@ Prometheus on the default registry, exposed at `/metrics` on `metrics_listen`.
 
 | Metric                                | Type      | Labels               | What It Measures                                                                                                                                                           |
 | ------------------------------------- | --------- | -------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `ai_requests_total`                   | Counter   | —                    | Total admitted requests                                                                                                                                                    |
+| `ai_requests_total`                   | Counter   | —                    | Every client request received, rejected ones included (a `FullBody` re-run is not counted again)                                                                           |
 | `ai_rejections_total`                 | Counter   | `reason`             | Rejected requests by cause (auth, deny_spend, quota, allowance_unavailable, deny_fraud, rate_limit, tenant_concurrency, managed_endpoint, duplicate_model, body_memory, …) |
 | `ai_upstream_responses_total`         | Counter   | `provider`, `status` | Upstream responses by provider and status class                                                                                                                            |
 | `ai_tokens_total`                     | Counter   | `kind`               | input / output / cache_read / cache_write token counts                                                                                                                     |
@@ -1857,7 +1870,7 @@ Prometheus on the default registry, exposed at `/metrics` on `metrics_listen`.
 | `ai_capture_bytes_total`              | Counter   | —                    | Payload bytes handed to the sink — the cost signal, ahead of the storage bill                                                                                              |
 | `ai_capture_dropped_total`            | Counter   | —                    | Captures dropped on a full sink queue — distinguishes "lost it" from "capture was off"                                                                                     |
 | `ai_control_header_errors_total`      | Counter   | —                    | `x-beyond-*` headers present but unusable (dropped; request still served)                                                                                                  |
-| `ai_usage_parse_errors_total`         | Counter   | —                    | Managed 2xx responses with no parseable usage (emitted as a zero-token billing row)                                                                                        |
+| `ai_usage_parse_errors_total`         | Counter   | —                    | Managed 2xx responses that ended cleanly without parseable usage (billed an estimate or zero; free token counts excluded)                                                  |
 | `ai_cache_hits_total`                 | Counter   | —                    | Exact-match cache hits that replayed a stored 2xx and skipped the provider                                                                                                 |
 | `ai_cache_scope`                      | Gauge     | `kind`               | Constant `1` with `kind="process"`: this pod's cache table, not a fleet store                                                                                              |
 | `ai_smart_rank_scope`                 | Gauge     | `kind`               | Constant `1` with `kind="process"`: this pod's TTFT EWMA, not a fleet-wide ranking                                                                                         |
@@ -1984,10 +1997,14 @@ Prometheus on the default registry, exposed at `/metrics` on `metrics_listen`.
   breaker, and a genuinely broken provider still must. Verified non-vacuous — reverting the fix makes
   the first test fail.
 - **Live smoke (`tests/smoke.rs`, `mise run test:smoke`):** the real `beyond-ai` binary against the
-  **real** provider hosts over TLS, one per provider in `KNOWN_PROVIDERS`. Proves real TLS/SNI,
-  the `/v1` → base-path rewrite landing on a live mount (200, not 404), and BYO auth passthrough.
-  Every test is `#[ignore]` and skips unless its provider's API key env var is set — CI stays
-  hermetic; you only hit providers you have keys for.
+  **real** provider hosts over TLS, one per pool-keyed provider (every one in `KNOWN_PROVIDERS`
+  except `openai-codex`, whose subscription token is not an API key), plus Responses usage
+  metering, every catalog row and candidate (`catalog_rows_are_servable`) and a real catalog
+  failover. Each runs the **managed** path: the real key is the gateway's pool key and the client
+  presents a minted `bai_…` key, so it proves verify → deny-check → pool-key swap, real TLS/SNI,
+  and the base-path rewrite landing on a live mount (200, not 404). Every test is `#[ignore]` and
+  skips unless its provider's API key env var is set — CI stays hermetic; you only hit providers
+  you have keys for.
 
 ---
 

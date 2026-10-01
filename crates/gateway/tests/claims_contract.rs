@@ -1036,7 +1036,6 @@ fn readme_and_example_config_statements_hold() {
 /// claim: CAT-15
 /// defect: D55
 #[test]
-#[ignore = "D55 reproduced: ARCHITECTURE.md's configuration table names a field config does not have"]
 fn architecture_tables_name_real_modules_metrics_and_fields() {
     let arch = repo_file("crates/gateway/ARCHITECTURE.md");
     let mut wrong = Vec::new();
