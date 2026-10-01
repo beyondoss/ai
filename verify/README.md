@@ -165,3 +165,25 @@ VERIFY_LIVE=1 cargo test -p beyond-ai-verify --test tenancy_live -- --nocapture 
 ```
 
 `STALE` status will land with the run ledger.
+
+## Session trials (SES-1..3)
+
+`crates/verify/tests/session_live.rs` runs whole conversations where something changes between
+turns, named `CLAIMS::client::route::scenario`. SDK scenarios live in
+`verify/clients/py/session_probe.py`, coding-agent ones in `verify/clients/session_harness.py`.
+
+| Claim | What changes                          | How the trial does it                                                                                                                                                                                                                                 |
+| ----- | ------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| SES-1 | The primary provider dies mid-session | Every pool provider sits behind `verify/clients/py/upstream_proxy.py`, an HTTP to HTTPS reverse proxy (the gateway runs with `upstream_tls = false`). The primary's proxy exits after serving `k` requests, so later turns are refused and fail over. |
+| SES-2 | The client switches models            | Claude and GPT alternate each user turn (SDKs), or `pi --continue` / `opencode run --continue` run the next step on the other model and dialect.                                                                                                      |
+| SES-3 | Nothing; state lives upstream         | `previous_response_id` chains (openai-py, the Agents SDK), the Responses arm's only upstream dying, and `codex exec resume --last`.                                                                                                                   |
+
+Each SDK call names the provider that must serve it, and is held to exactly one `ai.usage` row there,
+with the tokens the client saw. A coding agent's rows are held to the order of its steps: the models
+it ran, or the primary first and the fallback last. Every scenario asserts recall of a per-run
+codename from turn 1, so a turn that lost its history fails. `VERIFY_SESSION_TRACE=1` prints what a
+passing trial saw (rows, proxy request logs, the client's detail).
+
+```sh
+VERIFY_LIVE=1 cargo test -p beyond-ai-verify --test session_live -- SES-1
+```
