@@ -363,10 +363,13 @@ output, so those cards list 272,000 (of 400,000) or 922,000 (of 1,050,000); a fa
 smaller window sets the row's (Ministral 3B's OpenRouter candidate, 131,072). One figure per row,
 not per candidate: the gateway counts no prompt tokens, so it could not choose a candidate by
 window anyway. The card lists the input kinds and capabilities the vendor lists **and every
-candidate serves on the endpoint it is reached on**: grok rows on xAI's Chat Completions list no
-file input (xAI reads PDFs on Responses only), `grok-4.20-multi-agent` no tools (xAI gates its
-client-side tools behind beta access), `gpt-4` lists the tools every candidate calls though its
-model page omits them. Where the vendor publishes no max output, OpenRouter's 0.9x /
+candidate serves on the endpoint it is reached on**: `grok-4.20-multi-agent` lists no tools (xAI
+gates its client-side tools behind beta access), `gpt-4` lists the tools every candidate calls
+though its model page omits them. A bit that one failover candidate refuses but the walk can steer
+around stays on the card, and a request using it skips that candidate (below): structured outputs
+on Bedrock, file input on OpenRouter's `x-ai/grok-build-0.1`. Grok rows list file input because
+every grok row reaches xAI over `/v1/responses`, where xAI reads PDFs (its Chat Completions answers
+400 "File content is not supported on /v1/chat/completions"). Where the vendor publishes no max output, OpenRouter's 0.9x /
 0.8x-of-window filler is replaced by `UNPUBLISHED_MAX_OUTPUT` (32,768), a conservative figure and
 not a vendor limit: the row lists it with `max_output_published: false`, and the gateway never
 enforces it. Prices, `created` and `owned_by` follow the model's maker (OpenAI's and xAI's
@@ -386,14 +389,19 @@ body before choosing, as a headerless walk always does. Then:
 - An image part (Chat `image_url`, Messages `image`, Responses `input_image`) on a row whose card
   lists no image input is a 400 naming the row (`ai_rejections_total{reason="modality"}`), before
   any upstream: o3-mini would ignore the image and bill an answer about nothing, gpt-4 would
-  answer 500. PDFs are not gated: OpenRouter extracts a PDF's text for any model.
+  answer 500. PDFs on a row without file input are not refused: OpenRouter extracts a PDF's text
+  for most models.
 - A body asking for a JSON-schema output (`response_format` / `output_config.format` /
   `text.format`) leaves Amazon Bedrock out of the walk (`providers::catalog::serves_structured_outputs`):
   Bedrock's Messages surface answers `output_config.format` with a 400 (Opus 4.8) or a 404 (Haiku
   4.5). It is left out of the order, failover and TTFT ranking alike, unless nothing else is usable
   (an `x-beyond-only: bedrock`), when Bedrock's own answer is the client's.
+- A body carrying a file part (Chat `file`, Messages `document`, Responses `input_file`) leaves a
+  candidate that reads none out of the walk the same way (`providers::catalog::serves_file_input`):
+  OpenRouter's `x-ai/grok-build-0.1` answers a PDF with 404 "No endpoints found that support file
+  input" (its other grok ids read the same PDF). Both checks are one mask, `route::unserved`.
 
-A large body reaches the same two checks in `relay_full_body`, which holds it whole.
+A large body reaches the same checks in `relay_full_body`, which holds it whole.
 
 A stock OpenAI or Anthropic SDK pointed at `/v1` with `model` in the JSON body is `/auto` without
 the header. Same-wire failover is a byte relay — the gateway rewrites ids, not API shapes, across
@@ -410,9 +418,25 @@ no Responses arm (Claude, DeepSeek, …) translate a one-shot and have no OpenAI
 an explicit `store: true`, a `previous_response_id` or a `conversation` is a **400** naming the
 field, not a hollow Messages call. A `conversation` (the Conversations API) is the same OpenAI-held
 history `previous_response_id` points into, so it is session state too: relayed on a row's
-Responses arm, refused elsewhere, never translated with the history dropped (D128). Usage/billing still parse the upstream body/SSE;
+Responses arm, refused elsewhere, never translated with the history dropped (D128). Grok rows have no Responses arm either (xAI's store is not
+OpenAI's, and no failover shares it), but their xAI candidate is `/v1/responses`: a Responses
+one-shot is relayed there as sent, except that it goes as `store: false`
+(`translate::store_false`), because xAI stores every response for 30 days unless told not to (its
+`store` defaults to true). Usage/billing still parse the upstream body/SSE;
 `ai.usage.model` is what the provider echoed. Same-wire Responses (`/{provider}/v1/responses`)
 stays a byte relay. `/{provider}/…` never translates.
+
+**Tool-count limits.** OpenAI Chat Completions takes at most 128 tools (400
+`array_above_max_length` "Expected an array with maximum length 128"); OpenAI's Responses API took
+600 in TOOL-1, xAI documents 350 per request on Responses, and Anthropic publishes no count limit
+(600 tested). A Messages client offering more than 128 tools on a row whose primary is Chat
+Completions and that has a Responses arm (the GPT rows before 5.4) walks that arm instead,
+translated onto `/v1/responses` (`route::tools_need_responses_arm`), so Claude Code with a few MCP
+servers works on `gpt-5-mini`. That walk has no OpenRouter failover: the arm is OpenAI only. The
+count is read from the body before
+the walk: a header-won Messages walk on such a row reads the body first (`route::walk_reads_tools`),
+and a large one is counted in `relay_full_body`. A Chat Completions client keeps its own endpoint,
+so above 128 it gets OpenAI's own 400 naming the limit, as it would calling OpenAI.
 
 **Chat Completions streams from vendors other than OpenAI** are the one same-endpoint walk that
 is not a pure byte relay. A stock SDK accumulates every string in a delta except `index` and
@@ -689,8 +713,9 @@ tool returned stay with it: inside the `tool_result` on Messages, and on Chat Co
 tool message holds text) as a user message right after the run of tool messages. Other hosts' tool
 call ids (`functions.get_weather:0`) become `^[a-zA-Z0-9_-]+$` on Messages, identically on the
 call and its result, with a hash of the original. An email address as `user` (Anthropic rejects
-it as `metadata.user_id`) becomes its FNV-1a hash, stable per user. Chat Completions → Responses
-sends `store: false` unless the client asked to store. Tools, text, and usage still
+it as `metadata.user_id`) becomes its FNV-1a hash, stable per user. Chat Completions or Messages → Responses
+sends `store: false` unless the client asked to store (OpenAI and xAI both store a response by
+default). Tools, text, and usage still
 round-trip. Anthropic requires `max_tokens`; a missing OpenAI value becomes 4096. On every catalog
 walk, translated or not, a root `max_tokens` / `max_completion_tokens` / `max_output_tokens` above
 the row's **published** max output (`ModelCard::output_cap`) is capped to it (never raised; spans
@@ -981,9 +1006,17 @@ the table covers the current 4 / 4.1 / 4o / 5 / 5.x / 6 and o-series ids OpenRou
 candidate is `/v1/responses` too: OpenAI's Chat Completions answers function tools with any
 reasoning effort with a 400 ("use /v1/responses or set reasoning_effort to 'none'"), and GPT-5.6
 and GPT-6 Astra reason by default, so every tool call failed there; a Chat Completions or Messages
-client is translated onto Responses. The same Chat Completions helper covers every other
-pool-keyed host: xAI `grok-*` (`grok-4.6` → `x-ai/grok-4.6`; `grok-4.20-multi-agent`'s xAI
-candidate is `/v1/responses`, the only endpoint xAI serves multi-agent on), DeepSeek (`deepseek-flash` →
+client is translated onto Responses. xAI `grok-*` rows reach xAI over `/v1/responses` too
+(`xai_responses_first`; OpenRouter Chat Completions failover, `grok-4.6` → `x-ai/grok-4.6`): xAI
+serves multi-agent only there, reads PDFs only there, and calls its Chat Completions deprecated
+(docs.x.ai "Migrating to Responses API"). Chat Completions and Messages clients are translated
+onto it with `store: false`; checked 2026-10-01 against xAI's docs and API, its Responses usage
+counts cached tokens inside `input_tokens` and reasoning inside `output_tokens`, which xAI's own
+per-request `cost_in_usd_ticks` matches exactly on every grok row (catalog sweep CAT-7). So a Chat
+client on a grok row now sees OpenAI's convention, `completion_tokens` with reasoning inside, where
+xAI's own Chat Completions reports reasoning beside it; and the translated answer carries no
+`cost_in_usd_ticks` (a Responses client gets xAI's usage as sent). The same
+Chat Completions helper covers every other pool-keyed host: DeepSeek (`deepseek-flash` →
 `deepseek/deepseek-v4.1-flash`; `deepseek-v4-pro` fails over to Together's
 `deepseek-ai/DeepSeek-V4-Pro-0813`, because OpenRouter's `deepseek/deepseek-v4-pro` is the older
 0423 snapshot), Mistral `-latest` aliases (including Ministral), and the Groq/Together llama /
@@ -1101,7 +1134,10 @@ the caller's own header. Two dialects:
 `completion_tokens`. xAI reports it beside it (`total_tokens = prompt_tokens + completion_tokens +
 reasoning_tokens`) and bills it at the output rate. When a body's arithmetic shows the second
 convention, `output_tokens` on the row is `completion_tokens + reasoning_tokens`. Before this, grok
-reasoning rows billed only the visible answer (a live grok-4.3 call: 7 of 174 output tokens).
+reasoning rows billed only the visible answer (a live grok-4.3 call: 7 of 174 output tokens). On
+Responses the same arithmetic runs on `input_tokens` / `output_tokens` / `total_tokens`: xAI's
+Responses API counts reasoning inside `output_tokens` (measured against its `cost_in_usd_ticks`),
+but its API reference example shows it beside, and either shape bills it once.
 
 **Provider counts are untrusted numbers.** Every sum of provider-supplied counts (this arithmetic,
 the translated `usage` a client is shown, and the cut-short estimators' scaling) saturates at
@@ -2380,7 +2416,10 @@ Prometheus on the default registry, exposed at `/metrics` on `metrics_listen`.
   chat body against an embeddings row, are wire-mismatch 400s; `/v1/embeddings` on an embeddings
   row reaches `/v1/embeddings`, fails over to OpenRouter's path and id, and bills input tokens). **Mixed-wire rows:** Anthropic 5xx fails onto OpenRouter Chat Completions with
   a Chat Completions body spliced from the original client; billing dialect is the serving
-  candidate. **Responses** (`tests/translate.rs`): a stock `/v1/responses` body with `store: false`
+  candidate. **Card-held walks** (`tests/catalog_capabilities.rs`, `tests/catalog_responses_arms.rs`):
+  a JSON-schema output skips Bedrock, a PDF skips OpenRouter's grok-build-0.1, a grok one-shot
+  reaches xAI's `/v1/responses` as `store: false`, and a Messages client with more than 128 tools
+  on a GPT row walks its Responses arm. **Responses** (`tests/translate.rs`): a stock `/v1/responses` body with `store: false`
   and a GPT catalog id is translated onto Chat Completions; the same body with `claude-*` lands on
   Messages. Managed `/v1/responses` + `gpt-4o` + `previous_response_id` hits OpenAI `/v1/responses`
   with the field intact; Claude + `previous_response_id` is 400 naming the field, no upstream

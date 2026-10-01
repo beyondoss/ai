@@ -64,7 +64,7 @@ touches = [
   "crates/gateway/src/proxy.rs",
   "crates/gateway/src/translate.rs",
 ]
-defects = ["D74", "D128"]
+defects = ["D74", "D128", "D145"]
 
 [[claim]]
 id = "E4"
@@ -1927,7 +1927,7 @@ touches = [
   "crates/gateway/src/route.rs",
   "crates/gateway/src/proxy.rs",
 ]
-defects = ["D106", "D112"]
+defects = ["D106", "D112", "D145"]
 
 [[claim]]
 id = "CAT-6"
@@ -2150,7 +2150,7 @@ group = "Translation detail"
 text = "Claude Code's request shape is accepted by native OpenAI"
 layer = "live"
 touches = ["crates/gateway/src/translate.rs", "crates/gateway/src/proxy.rs"]
-defects = ["D15"]
+defects = ["D15", "D146"]
 
 [[claim]]
 id = "TRN-11"
@@ -2361,7 +2361,7 @@ oracle = "SDK and harness requests with N tools around each provider's limit: su
 layer = "live"
 clients = ["openai-py", "anthropic-py", "claude-code", "codex"]
 touches = ["crates/gateway/src/translate.rs"]
-defects = ["D131"]
+defects = ["D131", "D146"]
 
 [[claim]]
 id = "TEN-1"

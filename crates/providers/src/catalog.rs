@@ -130,10 +130,12 @@ pub struct ModelRoute {
 ///   instead. A max output that is not such a fraction is kept.
 /// - `input` and `features` list what the vendor lists **and every candidate serves on the
 ///   endpoint the catalog sends it to**. A bit the vendor's model page does not name (structured
-///   outputs on `gpt-4`) is removed; so is one a candidate's endpoint refuses (file input on grok
-///   rows, which xAI serves on Responses only while these rows reach xAI over Chat Completions;
-///   function calling on `grok-4.20-multi-agent`, which xAI gates behind beta access; tools on
-///   `meta-llama/llama-4-scout`, which no OpenRouter host serves). One the page omits but every
+///   outputs on `gpt-4`) is removed; so is one a candidate's endpoint refuses (function calling on
+///   `grok-4.20-multi-agent`, which xAI gates behind beta access; tools on
+///   `meta-llama/llama-4-scout`, which no OpenRouter host serves). A bit one failover candidate
+///   refuses but the gateway can steer around is kept, and a request using it skips that
+///   candidate: structured outputs on Bedrock ([`serves_structured_outputs`]), file input on
+///   OpenRouter's `x-ai/grok-build-0.1` ([`serves_file_input`]). One the page omits but every
 ///   candidate serves is listed: function calling on `gpt-4`, the snapshot that introduced it.
 ///   The gateway refuses image input on a row whose card omits it, rather than let a candidate
 ///   ignore the image (o3-mini) or answer 500 (gpt-4).
@@ -323,6 +325,21 @@ const fn price(
 /// candidate from that request's walk.
 pub const fn serves_structured_outputs(c: &Candidate) -> bool {
     !matches!(c.provider, ProviderId::Bedrock)
+}
+
+/// Candidates that refuse file (PDF) input on a row whose card advertises it. OpenRouter routes
+/// `x-ai/grok-build-0.1` to no file-capable endpoint: 404 "No endpoints found that support file
+/// input" (measured 2026-10-01; its `x-ai/grok-4.20`, `grok-4.3`, `grok-4.5` and `grok-4.6` read
+/// the same PDF). A request carrying a file part leaves such a candidate out of its walk.
+const REFUSES_FILE_INPUT: &[(ProviderId, &str)] =
+    &[(ProviderId::OpenRouter, "x-ai/grok-build-0.1")];
+
+/// Whether a candidate reads a file (PDF) part: Chat Completions `file`, Messages `document`,
+/// Responses `input_file`. See [`REFUSES_FILE_INPUT`].
+pub fn serves_file_input(c: &Candidate) -> bool {
+    !REFUSES_FILE_INPUT
+        .iter()
+        .any(|&(p, m)| p == c.provider && m == c.upstream_model)
 }
 
 /// Upper bound on candidates per row, so the gateway can track which are usable in a single `u8`
@@ -519,15 +536,17 @@ const fn compat_chat(
     ]
 }
 
-const fn xai(native: &'static str, openrouter: &'static str) -> [Candidate; 2] {
-    compat_chat(ProviderId::XAi, native, "/v1/chat/completions", openrouter)
-}
-
-/// xAI's `/v1/responses`, then OpenRouter Chat Completions: xAI serves its multi-agent models on
-/// Responses only (Chat Completions answers 400 "Multi Agent requests are not allowed on chat
-/// completions"). A Chat Completions or Messages client is translated onto Responses for the first
-/// candidate, as for [`openai_responses_first`]; there is no Responses arm (`previous_response_id`
-/// would name xAI's store, which no failover shares).
+/// xAI's `/v1/responses`, then OpenRouter Chat Completions: every Grok row. xAI serves its
+/// multi-agent models on Responses only (Chat Completions answers 400 "Multi Agent requests are not
+/// allowed on chat completions"), reads PDFs on Responses only (Chat Completions answers 400 "File
+/// content is not supported on /v1/chat/completions. Please use /v1/responses instead."), and calls
+/// Chat Completions "Deprecated" ([migration guide]). A Chat Completions or Messages client is
+/// translated onto Responses for the first candidate, as for [`openai_responses_first`], with
+/// `store: false` unless it asked to store: xAI stores every response for 30 days by default. There
+/// is no Responses arm (`previous_response_id` would name xAI's store, which no failover shares), so
+/// a Responses client's one-shot is relayed to xAI with `store: false` too.
+///
+/// [migration guide]: https://docs.x.ai/developers/model-capabilities/text/comparison.md
 const fn xai_responses_first(native: &'static str, openrouter: &'static str) -> [Candidate; 2] {
     [
         Candidate {
@@ -1573,10 +1592,11 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         ),
     },
     // xAI Grok. Native ids from the 2026-09-17 xAI models table plus `grok-4.20-multi-agent`
-    // (OpenRouter `x-ai/grok-4.20-multi-agent`, 2026-09-19). No Responses arm — session state
-    // is OpenAI's store. xAI reads PDFs on `/v1/responses` only, and these rows reach it over Chat
-    // Completions, so their cards list no file input. Multi-agent is Responses-only at xAI, so that
-    // row's xAI candidate is `/v1/responses` (`xai_responses_first`).
+    // (OpenRouter `x-ai/grok-4.20-multi-agent`, 2026-09-19). Every row reaches xAI over
+    // `/v1/responses` (`xai_responses_first`): multi-agent is Responses-only at xAI, and xAI reads
+    // PDFs there only. No Responses arm — xAI's store is not OpenAI's, and no failover shares it.
+    // OpenRouter's `x-ai/grok-build-0.1` reads no PDF, so a file request skips it
+    // (`serves_file_input`).
     //
     // xAI bills a prompt of 200k tokens or more at 2x input, cache and output for the whole request.
     // These rows list the < 200k tier; such a request is under-listed by half. xAI publishes no max
@@ -1584,7 +1604,7 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
     ModelRoute {
         model: "grok-4.20",
         wire: WireFormat::OpenAi,
-        candidates: &xai("grok-4.20", "x-ai/grok-4.20"),
+        candidates: &xai_responses_first("grok-4.20", "x-ai/grok-4.20"),
         responses: &[],
         price: price("1.25", "2.5", "0.2", "1.25"), // cache_write unpublished; equals input
         card: card_unpublished_output(
@@ -1592,7 +1612,7 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
             "xai",
             1773014400,
             1_000_000,
-            IN_TEXT | IN_IMAGE,
+            IN_TEXT | IN_IMAGE | IN_FILE,
             TOOLS | REASONING | STRUCTURED_OUTPUTS,
         ),
     },
@@ -1614,7 +1634,7 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
     ModelRoute {
         model: "grok-4.3",
         wire: WireFormat::OpenAi,
-        candidates: &xai("grok-4.3", "x-ai/grok-4.3"),
+        candidates: &xai_responses_first("grok-4.3", "x-ai/grok-4.3"),
         responses: &[],
         price: price("1.25", "2.5", "0.2", "1.25"), // cache_write unpublished; equals input
         card: card_unpublished_output(
@@ -1622,14 +1642,14 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
             "xai",
             1776384000,
             1_000_000,
-            IN_TEXT | IN_IMAGE,
+            IN_TEXT | IN_IMAGE | IN_FILE,
             TOOLS | REASONING | STRUCTURED_OUTPUTS,
         ),
     },
     ModelRoute {
         model: "grok-4.5",
         wire: WireFormat::OpenAi,
-        candidates: &xai("grok-4.5", "x-ai/grok-4.5"),
+        candidates: &xai_responses_first("grok-4.5", "x-ai/grok-4.5"),
         responses: &[],
         price: price("2", "6", "0.3", "2"), // cache_write unpublished; equals input
         card: card_unpublished_output(
@@ -1637,14 +1657,14 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
             "xai",
             1782691200,
             500_000,
-            IN_TEXT | IN_IMAGE,
+            IN_TEXT | IN_IMAGE | IN_FILE,
             TOOLS | REASONING | STRUCTURED_OUTPUTS,
         ),
     },
     ModelRoute {
         model: "grok-4.6",
         wire: WireFormat::OpenAi,
-        candidates: &xai("grok-4.6", "x-ai/grok-4.6"),
+        candidates: &xai_responses_first("grok-4.6", "x-ai/grok-4.6"),
         responses: &[],
         price: price("2", "6", "0.5", "2"), // cache_write unpublished; equals input
         card: card_unpublished_output(
@@ -1652,14 +1672,14 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
             "xai",
             1785974400,
             500_000,
-            IN_TEXT | IN_IMAGE,
+            IN_TEXT | IN_IMAGE | IN_FILE,
             TOOLS | REASONING | STRUCTURED_OUTPUTS,
         ),
     },
     ModelRoute {
         model: "grok-build-0.1",
         wire: WireFormat::OpenAi,
-        candidates: &xai("grok-build-0.1", "x-ai/grok-build-0.1"),
+        candidates: &xai_responses_first("grok-build-0.1", "x-ai/grok-build-0.1"),
         responses: &[],
         price: price("1", "2", "0.2", "1"), // cache_write unpublished; equals input
         card: card_unpublished_output(
@@ -1667,7 +1687,7 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
             "xai",
             1776297600,
             256_000,
-            IN_TEXT | IN_IMAGE,
+            IN_TEXT | IN_IMAGE | IN_FILE,
             TOOLS | REASONING | STRUCTURED_OUTPUTS,
         ),
     },
@@ -3815,22 +3835,38 @@ mod tests {
     }
 
     /// xAI's Chat Completions answers file content with 400 "File content is not supported on
-    /// /v1/chat/completions. Please use /v1/responses instead.", so a row that reaches xAI there
-    /// cannot advertise file input.
+    /// /v1/chat/completions. Please use /v1/responses instead.", so every grok row reaches xAI over
+    /// Responses, and its card lists the file input xAI reads there. A failover candidate that reads
+    /// no PDF (OpenRouter's `x-ai/grok-build-0.1`) is the only one `serves_file_input` refuses.
     /// claim: CAT-5
     /// defect: D106
     #[test]
-    fn no_row_advertises_files_over_xai_chat_completions() {
+    fn grok_rows_read_files_over_xai_responses() {
         let mut grok = 0;
         for r in MODEL_ROUTES {
-            for c in r.candidates {
-                if c.provider == ProviderId::XAi && endpoint_of_path(c.path) == "chat/completions" {
-                    grok += 1;
-                    assert_eq!(r.card.input & IN_FILE, 0, "{}", r.model);
-                }
+            for c in r
+                .candidates
+                .iter()
+                .filter(|c| c.provider == ProviderId::XAi)
+            {
+                grok += 1;
+                assert_eq!(c.path, "/v1/responses", "{}", r.model);
+                assert!(
+                    r.responses.is_empty(),
+                    "{}: xAI's store is not OpenAI's",
+                    r.model
+                );
+                assert_ne!(r.card.input & IN_FILE, 0, "{}", r.model);
+                assert!(serves_file_input(c), "{}", r.model);
             }
         }
-        assert!(grok >= 5, "the grok rows are still on xAI Chat Completions");
+        assert!(grok >= 6, "only {grok} grok rows reach xAI");
+        let build = for_model("grok-build-0.1").map(|r| r.candidates);
+        assert_eq!(
+            build.map(|c| c.iter().map(serves_file_input).collect::<Vec<_>>()),
+            Some(vec![true, false]),
+            "OpenRouter's grok-build-0.1 reads no PDF"
+        );
     }
 
     /// OpenAI's Chat Completions refuses function tools with any reasoning effort on GPT-5.4 and

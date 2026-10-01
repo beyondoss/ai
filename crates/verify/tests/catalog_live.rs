@@ -50,7 +50,7 @@ use base64::Engine as _;
 use libtest_mimic::{Arguments, Failed, Trial};
 use providers::catalog::{
     Candidate, IN_FILE, IN_IMAGE, MODEL_ROUTES, ModelRoute, REASONING, STRUCTURED_OUTPUTS, TOOLS,
-    serves_structured_outputs,
+    serves_file_input, serves_structured_outputs,
 };
 use providers::{ProviderId, by_id};
 use serde_json::{Map, Value, json};
@@ -926,6 +926,8 @@ fn parse(wire: Wire, v: &Value) -> Out {
             o.input = u["input_tokens"].as_u64().unwrap_or(0);
             o.output = u["output_tokens"].as_u64().unwrap_or(0);
             o.reasoning = u["output_tokens_details"]["reasoning_tokens"].as_u64();
+            // xAI's Responses usage carries its charge.
+            o.provider_cost = u["cost_in_usd_ticks"].as_f64().map(|t| t / 1e10);
         }
     }
     o
@@ -1469,7 +1471,52 @@ fn cat5(trial: &str, arm: Arm) -> Result<(), Failed> {
             )),
         }
     }
-    if arm.has(IN_FILE) {
+    // A candidate that reads no PDF (OpenRouter's grok-build-0.1) must be skipped: ordered first,
+    // the walk serves the document elsewhere.
+    if arm.has(IN_FILE) && !serves_file_input(&arm.cand) {
+        let prompt = "What is the code word in the attached document? Reply with just that word.";
+        let r = call(
+            &arm,
+            &body(
+                &arm,
+                prompt,
+                Some(arm.short_max()),
+                Opts {
+                    file: true,
+                    ..Opts::default()
+                },
+            ),
+            Walk::Order,
+        )?;
+        let out = parse(arm.wire, &r.json);
+        if r.status != 200 {
+            problems.push(format!(
+                "pdf with {} first: HTTP {}: {}",
+                arm.provider(),
+                r.status,
+                r.excerpt()
+            ));
+        } else if r.provider.as_deref() == Some(arm.provider()) {
+            problems.push(format!(
+                "pdf was sent to {}, which reads none",
+                arm.provider()
+            ));
+        } else if !mentions(&out.text, FILE_WORD) {
+            problems.push(format!(
+                "pdf (served by {:?}): answer {:?} does not name {FILE_WORD}",
+                r.provider, out.text
+            ));
+        } else {
+            note(
+                trial,
+                &format!(
+                    "pdf skipped {} and was served by {:?}",
+                    arm.provider(),
+                    r.provider
+                ),
+            );
+        }
+    } else if arm.has(IN_FILE) {
         let prompt = "What is the code word in the attached document? Reply with just that word.";
         let r = call(
             &arm,
@@ -1782,10 +1829,21 @@ fn cat7(trial: &str, arm: Arm) -> Result<(), Failed> {
             "The quick brown fox jumps over the lazy dog.".repeat(25)
         );
         let max = (arm.wire != Wire::Embeddings).then(|| arm.short_max());
+        // xAI writes `cost_in_usd_ticks` into its own usage. A Chat client translated from xAI's
+        // Responses gets OpenAI's Chat usage, which has no cost field, so on an xAI Responses
+        // candidate the probe is a Responses client: a one-shot relayed with xAI's usage intact.
+        let probe = if arm.provider() == "xai" && arm.cand.path.ends_with("/responses") {
+            Arm {
+                wire: Wire::Responses,
+                ..arm
+            }
+        } else {
+            arm
+        };
         let r = call(
-            &arm,
+            &probe,
             &body(
-                &arm,
+                &probe,
                 &prompt,
                 max,
                 Opts {
@@ -1795,7 +1853,7 @@ fn cat7(trial: &str, arm: Arm) -> Result<(), Failed> {
             ),
             Walk::Only,
         )?;
-        match served(trial, &arm, "cost", &r) {
+        match served(trial, &probe, "cost", &r) {
             Ok((out, row)) => {
                 let ours = priced(arm.row, &row);
                 match out.provider_cost {
@@ -1852,15 +1910,6 @@ fn cat7(trial: &str, arm: Arm) -> Result<(), Failed> {
                                 p.cache_read, p.cache_write, r.json["provider"]
                             ));
                         }
-                    }
-                    // xAI reports `cost_in_usd_ticks` on Chat Completions; a Chat client translated
-                    // from xAI's Responses gets OpenAI's Chat usage, which has no cost field. The
-                    // listed-price check below still runs.
-                    None if arm.provider() == "xai" && arm.cand.path.ends_with("/responses") => {
-                        note(
-                            trial,
-                            "xAI Responses candidate: no per-call cost on a translated reply",
-                        );
                     }
                     other => problems.push(format!(
                         "{} reported no cost ({other:?}): usage {}",

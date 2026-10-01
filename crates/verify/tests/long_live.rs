@@ -58,7 +58,8 @@
 //! above OpenAI Chat Completions' 128-tool limit (measured: OpenAI's Responses API takes 600, and
 //! Anthropic, which publishes no count limit, takes 600), plus large schemas (12-deep nesting, a
 //! 1000-value enum). Below a provider's limit the call must succeed and call the last tool (no
-//! tool silently dropped); above it, a 4xx whose body names the limit (`128`), never a 5xx. And
+//! tool silently dropped); above it, a 4xx whose body names the limit (`128`), never a 5xx. A
+//! Messages client above 128 on a GPT row walks the row's Responses arm and must succeed (D131). And
 //! two harnesses offered ~150 MCP tools from a local stdio server (Codex sends them as one
 //! namespace): the agent must call the last one and report its secret.
 //!
@@ -208,9 +209,11 @@ const TOOL_CASES: &[(&str, Route, &str, Expect)] = &[
     ("openai-py",    GPT,    "chat_129",            Expect::Limit("128")),
     // OpenAI's Responses API has no 128 cap.
     ("openai-py",    GPT,    "responses_600",       Expect::Works),
-    // Translated Messages → a GPT row: the same cap, relayed as an Anthropic error.
+    // Translated Messages → a GPT row: up to 128 onto Chat Completions, more onto the row's
+    // Responses arm (D131).
     ("anthropic-py", GPT,    "messages_128",        Expect::Works),
-    ("anthropic-py", GPT,    "messages_129",        Expect::Limit("128")),
+    ("anthropic-py", GPT,    "messages_129",        Expect::Works),
+    ("anthropic-py", GPT,    "messages_300",        Expect::Works),
     // Anthropic: no count limit (600 tested), natively and from OpenAI-wire clients.
     ("anthropic-py", CLAUDE, "messages_600",        Expect::Works),
     ("openai-py",    CLAUDE, "chat_300",            Expect::Works),
@@ -229,12 +232,12 @@ const TOOL_CASES: &[(&str, Route, &str, Expect)] = &[
 
 /// `(client, route, expectation)`: a harness offered 150 MCP tools from a local stdio server.
 /// Works: it calls the last one and reports its secret. Limit: the refusal names the limit and the
-/// harness shows it (Claude Code's ~20 tools + 150 on a GPT row reach OpenAI Chat Completions:
-/// D131).
+/// harness shows it. Claude Code's ~20 tools + 150 on a GPT row are more than OpenAI Chat
+/// Completions takes, so they walk the row's Responses arm (D131).
 #[rustfmt::skip]
 const MCP_CASES: &[(&str, Route, Expect)] = &[
     ("claude-code", CLAUDE, Expect::Works),
-    ("claude-code", GPT,    Expect::Limit("128")),
+    ("claude-code", GPT,    Expect::Works),
     ("codex",       CODEX,  Expect::Works),
     // Codex's web_search is turned off for this one: D78 refuses it on any Claude row.
     ("codex",       CLAUDE, Expect::Works),

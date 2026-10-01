@@ -1387,6 +1387,11 @@ impl AiProxy {
                 .await;
         }
         let unserved = route::unserved(route.candidates, &body);
+        let responses_tools = route::tools_need_responses_arm(
+            route,
+            route::implied_endpoint(session.req_header().uri.path()),
+            &body,
+        );
         let body = Bytes::from(body);
         self.state.metrics.full_body_relays_total.inc();
         let mut skip = 0u8;
@@ -1407,6 +1412,7 @@ impl AiProxy {
                     session_field,
                     skip,
                     unserved,
+                    responses_tools,
                     keys,
                     reset,
                     resume,
@@ -2170,6 +2176,9 @@ struct FullBody {
     /// Catalog indices (bit per index) that cannot serve this body (`route::unserved`), read by the
     /// parent while it held the whole body.
     unserved: u8,
+    /// The walk takes the row's Responses arm for a tool count Chat Completions refuses
+    /// (`route::tools_need_responses_arm`), read by the parent while it held the whole body.
+    responses_tools: bool,
     /// Per catalog index, the pool key an earlier attempt's key walk moved to, or [`NO_KEY_WALK`]:
     /// start on the provider's first key not cooling off (`Provider::first_key`, D71/D83).
     keys: [u8; route::MAX_CANDIDATES],
@@ -3514,7 +3523,10 @@ impl ProxyHttp for AiProxy {
             && full_body.is_none()
             && !peeked
             && let Some(route) = model_route
-            && (responses || large || route::walk_reads_body(route))
+            && (responses
+                || large
+                || route::walk_reads_body(route)
+                || route::walk_reads_tools(route, session.req_header().uri.path()))
         {
             match self.take_slot_before_read(tenant_id) {
                 Ok(guard) => early_slot = guard,
@@ -3679,6 +3691,21 @@ impl ProxyHttp for AiProxy {
                     {
                         row.responses
                     }
+                    // More tools than Chat Completions takes, from a translated client: the
+                    // Responses arm takes them (`route::tools_need_responses_arm`, D131).
+                    None if match &full_body {
+                        Some(fb) => fb.responses_tools,
+                        None => body_complete.as_deref().is_some_and(|b| {
+                            route::tools_need_responses_arm(
+                                row,
+                                route::implied_endpoint(session.req_header().uri.path()),
+                                b,
+                            )
+                        }),
+                    } =>
+                    {
+                        row.responses
+                    }
                     None => row.candidates,
                 };
                 if inbound_responses
@@ -3736,7 +3763,9 @@ impl ProxyHttp for AiProxy {
                 // JSON-schema output) is not dispatched to, ranked or probed, unless nothing else
                 // can take the request, when the provider's own error is the answer.
                 let unserved = match (&full_body, body_complete.as_deref()) {
-                    (Some(fb), _) => fb.unserved,
+                    // The parent computed it against the row's candidates.
+                    (Some(fb), _) if std::ptr::eq(arms, row.candidates) => fb.unserved,
+                    (Some(_), _) => 0,
                     (None, Some(b)) => route::unserved(arms, b),
                     (None, None) => 0,
                 };
@@ -4961,7 +4990,13 @@ impl ProxyHttp for AiProxy {
                         } else if to == route::Endpoint::Responses {
                             let len = buf.len();
                             buf = translate::strip_gateway_reasoning(buf);
+                            // A row with no Responses arm walks its candidates only for a one-shot
+                            // (session state there is a 400): onto a Responses candidate (xAI's)
+                            // it must not be stored, and xAI stores by default.
                             changed |= buf.len() != len;
+                            if a.route.responses.is_empty() {
+                                changed |= translate::store_false(&mut buf);
+                            }
                         } else if to == route::Endpoint::ChatCompletions
                             && upstream_model.contains("claude")
                         {

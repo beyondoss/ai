@@ -631,6 +631,7 @@ async fn an_unpublished_max_output_is_not_a_cap() {
     ] {
         post(&gw, &sk, path, &body).await;
         let (_, got) = captured(&mock);
-        assert_eq!(got["max_tokens"], 64000, "{path}: {got}");
+        // Grok rows reach xAI over Responses (D106), so the limit arrives as its spelling there.
+        assert_eq!(got["max_output_tokens"], 64000, "{path}: {got}");
     }
 }

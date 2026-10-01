@@ -8,7 +8,8 @@
 //! with the real key, once **through the gateway** with a managed key, same model. The two answers
 //! are compared structurally, never textually (models are nondeterministic):
 //!
-//! * Same-dialect paths (a byte relay): HTTP status class, error type and code, the response's
+//! * Same-dialect paths (a byte relay): HTTP status class, the client's own error envelope (an
+//!   error not already in it, xAI's, is re-encoded: D100) and its type and code, the response's
 //!   type skeleton (keys, value types, content-block / item / object discriminants), the raw finish
 //!   reason, tool-call names, argument validity against the tool's schema, `json_schema` validity,
 //!   whether the code word came back, usage presence; for streams the event-type sequence modulo
@@ -154,11 +155,13 @@ const HAIKU: Model = Model {
     sampling: true,
     price: (1.0, 5.0),
 };
+// Every grok row reaches xAI over `/v1/responses` (D106): a Chat or Messages client is translated
+// onto it, and a Responses client relayed.
 const GROK: Model = Model {
     gw: "grok-4.3",
     direct: "grok-4.3",
     provider: XAI,
-    native: Dialect::Chat,
+    native: Dialect::Responses,
     openai_reasoning: false,
     always_reasons: true,
     sampling: true,
@@ -220,10 +223,10 @@ const PATHS: &[ParityPath] = &[
         claims: &["E2"],
     },
     ParityPath {
-        route: "xai-chat",
-        client: Dialect::Chat,
+        route: "xai-responses",
+        client: Dialect::Responses,
         model: GROK,
-        claims: &["E1"],
+        claims: &["E3"],
     },
     ParityPath {
         route: "openrouter-chat",
@@ -249,6 +252,12 @@ const PATHS: &[ParityPath] = &[
         client: Dialect::Messages,
         model: GPT5_MINI,
         claims: &["E2"],
+    },
+    ParityPath {
+        route: "xai-chat",
+        client: Dialect::Chat,
+        model: GROK,
+        claims: &["E1"],
     },
 ];
 
@@ -1771,9 +1780,11 @@ fn structured_ok(text: &str, schema: &Value) -> bool {
 
 /// Shape entries that may differ on a same-dialect relay. No documented gateway change shows in a
 /// non-stream body; the only exemption is model nondeterminism measured direct-vs-direct: whether
-/// grok returns its `reasoning_content` varies call to call.
+/// grok returns its `reasoning_content` (Chat) or a `reasoning` output item (Responses) varies call
+/// to call (measured 2026-10-01: the same Responses body, `store` set or not, streamed a summary on
+/// four calls of six).
 fn allowed_shape(m: &Model, entry: &str) -> bool {
-    m.always_reasons && entry.contains("reasoning_content")
+    m.always_reasons && (entry.contains("reasoning_content") || entry.contains("[reasoning]"))
 }
 
 /// Everything about `gw` that disagrees with `direct` for `case` on `path`.
@@ -1789,20 +1800,16 @@ fn compare(path: &ParityPath, case: &Case, direct: &Summary, gw: &Summary) -> Ve
     }
     match (&direct.error, &gw.error) {
         (Some(de), Some(ge)) => {
-            // Cross dialect: the client's own envelope. Same dialect: the provider's, whatever it
-            // is (xAI's isn't OpenAI's).
-            let envelope_bad = if cross {
-                !gw.error_envelope_ok
-            } else {
-                direct.error_envelope_ok != gw.error_envelope_ok
-            };
-            if envelope_bad {
+            // The client's own envelope, on every path: a same-endpoint error that is not already
+            // in it is re-encoded (D100: xAI's `{"code", "error": "<string>"}`). Type and code are
+            // compared on a same-dialect path only where the provider's own envelope carries them.
+            if !gw.error_envelope_ok {
                 p.push(format!(
                     "gateway error isn't in the {:?} client's envelope",
                     path.client
                 ));
             }
-            if !cross && de != ge {
+            if !cross && direct.error_envelope_ok && de != ge {
                 p.push(format!("error type/code: direct {de:?} gateway {ge:?}"));
             }
             return p;
@@ -1920,7 +1927,7 @@ fn compare(path: &ParityPath, case: &Case, direct: &Summary, gw: &Summary) -> Ve
                     // The injected usage chunk is documented.
                     (case.include_usage || *f != "usage")
                         // Whether grok streams its reasoning varies call to call, direct too.
-                        && (!path.model.always_reasons || *f != "reasoning")
+                        && (!path.model.always_reasons || !f.contains("reasoning"))
                 };
                 let mut v: Vec<String> = if path.model.always_reasons {
                     // ... and so does which deltas share a chunk with it: compare the delta kinds'
@@ -2088,10 +2095,12 @@ fn fragment(s: &Summary) -> String {
     )
 }
 
-fn price_of(m: &Model, u: &Option<Usage>, provider: &str) -> f64 {
+/// Output includes reasoning on every answer priced here: xAI reports it beside
+/// `completion_tokens` only on its Chat Completions, which no path calls since grok moved to
+/// Responses.
+fn price_of(m: &Model, u: &Option<Usage>) -> f64 {
     let Some(u) = u else { return 0.0 };
-    let out = u.output + if provider == "xai" { u.reasoning } else { 0 };
-    (u.input as f64 * m.price.0 + out as f64 * m.price.1) / 1e6
+    (u.input as f64 * m.price.0 + u.output as f64 * m.price.1) / 1e6
 }
 
 fn run_trial(
@@ -2126,8 +2135,7 @@ fn run_trial(
         )?;
         let ds = summarize(dd, &d_obs, case.include_usage);
         let gs = summarize(path.client, &g_obs, case.include_usage);
-        cost += price_of(&path.model, &ds.usage, path.model.provider.name)
-            + price_of(&path.model, &gs.usage, path.model.provider.name);
+        cost += price_of(&path.model, &ds.usage) + price_of(&path.model, &gs.usage);
         let mut problems = compare(&path, case, &ds, &gs);
         if case.stream && problems.is_empty() && ds.error.is_none() {
             problems.extend(incremental(&ds, &gs));

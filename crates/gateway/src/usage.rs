@@ -231,6 +231,7 @@ impl From<OpenAiUsage> for Usage {
             return Usage::from(OpenAiResponsesUsage {
                 input_tokens: u.input_tokens.unwrap_or(0),
                 output_tokens: u.output_tokens.unwrap_or(0),
+                total_tokens: u.total_tokens,
                 input_tokens_details: u.input_tokens_details,
                 output_tokens_details: u.output_tokens_details,
             });
@@ -284,6 +285,8 @@ struct OpenAiResponsesUsage {
     #[serde(default)]
     output_tokens: u64,
     #[serde(default)]
+    total_tokens: Option<u64>,
+    #[serde(default)]
     input_tokens_details: OpenAiResponsesInputDetails,
     #[serde(default)]
     output_tokens_details: OpenAiResponsesOutputDetails,
@@ -306,9 +309,24 @@ struct OpenAiResponsesOutputDetails {
 
 impl From<OpenAiResponsesUsage> for Usage {
     fn from(u: OpenAiResponsesUsage) -> Self {
+        // OpenAI and xAI (measured against xAI's `cost_in_usd_ticks`) count reasoning inside
+        // `output_tokens`. xAI's API reference shows it beside (`total_tokens = input + output +
+        // reasoning`), as its Chat Completions does; the arithmetic decides, as for Chat.
+        let reasoning = u.output_tokens_details.reasoning_tokens.unwrap_or(0);
+        let reasoning_outside = reasoning > 0
+            && u.total_tokens
+                == Some(
+                    u.input_tokens
+                        .saturating_add(u.output_tokens)
+                        .saturating_add(reasoning),
+                );
         Usage {
             input_tokens: u.input_tokens,
-            output_tokens: u.output_tokens,
+            output_tokens: u.output_tokens.saturating_add(if reasoning_outside {
+                reasoning
+            } else {
+                0
+            }),
             cache_read_tokens: u.input_tokens_details.cached_tokens,
             cache_write_tokens: u.input_tokens_details.cache_write_tokens,
             reasoning_tokens: u.output_tokens_details.reasoning_tokens,
@@ -2248,6 +2266,34 @@ mod tests {
         // Streaming terminal chunk, same rule.
         let sse = b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":202,\"completion_tokens\":7,\"total_tokens\":376,\"completion_tokens_details\":{\"reasoning_tokens\":167}}}\n\ndata: [DONE]\n\n";
         assert_eq!(openai_stream(sse).unwrap().output_tokens, 174);
+    }
+
+    /// xAI's Responses API counts reasoning inside `output_tokens`, as OpenAI does: a live
+    /// grok-4.3 body (139 output, 138 of them reasoning) whose `cost_in_usd_ticks` (4,021,500) is
+    /// 13 uncached + 192 cached input and 139 output at the listed rates. Its API reference example
+    /// shows reasoning beside `output_tokens` (32 + 9 + 110 = 151); that shape bills the reasoning
+    /// too. Non-stream and on `response.completed`.
+    ///
+    /// claim: BIL-9
+    /// defect: D23
+    #[test]
+    fn xai_responses_reasoning_is_billed_once_in_either_shape() {
+        let live = br#"{"object":"response","usage":{"input_tokens":205,
+            "input_tokens_details":{"cached_tokens":192},"output_tokens":139,
+            "output_tokens_details":{"reasoning_tokens":138},"total_tokens":344,
+            "num_sources_used":0,"num_server_side_tools_used":0,"cost_in_usd_ticks":4021500,
+            "context_details":{"input_tokens":205,"output_tokens":147}}}"#;
+        let u = openai_body(live).unwrap();
+        assert_eq!((u.input_tokens, u.cache_read_tokens), (205, 192));
+        assert_eq!(u.output_tokens, 139, "reasoning is inside output_tokens");
+        assert_eq!(u.reasoning_tokens, Some(138));
+        let documented = br#"{"usage":{"input_tokens":32,"input_tokens_details":{"cached_tokens":8},
+            "output_tokens":9,"output_tokens_details":{"reasoning_tokens":110},"total_tokens":151}}"#;
+        assert_eq!(openai_body(documented).unwrap().output_tokens, 119);
+        let sse = b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":32,\"input_tokens_details\":{\"cached_tokens\":8},\"output_tokens\":9,\"output_tokens_details\":{\"reasoning_tokens\":110},\"total_tokens\":151}}}\n\n";
+        assert_eq!(openai_stream(sse).unwrap().output_tokens, 119);
+        let sse_live = b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":205,\"input_tokens_details\":{\"cached_tokens\":192},\"output_tokens\":139,\"output_tokens_details\":{\"reasoning_tokens\":138},\"total_tokens\":344}}}\n\n";
+        assert_eq!(openai_stream(sse_live).unwrap().output_tokens, 139);
     }
 
     #[test]

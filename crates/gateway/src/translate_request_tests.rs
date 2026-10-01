@@ -1129,6 +1129,45 @@ fn messages_onto_responses_drops_thinking_and_cache_control() {
     assert_eq!(v["max_output_tokens"], 300);
 }
 
+/// Claude Code's `metadata.user_id` is ~150 characters; OpenAI's Responses API answers a `user`
+/// over 64 with 400 "string too long" (its Chat Completions and xAI's Responses take it). Onto
+/// OpenAI's Responses it becomes a stable hash; xAI and a short id get the client's own.
+/// claim: TOOL-1, TRN-10
+/// defect: D146
+#[test]
+fn a_long_user_id_fits_openai_responses() {
+    let long = format!(
+        "user_{}_account__session_{}",
+        "a".repeat(64),
+        "b".repeat(70)
+    );
+    let body = anth(json!({"metadata": {"user_id": long},
+                           "messages": [{"role": "user", "content": "hi"}]}));
+    let v = req(
+        Endpoint::Messages,
+        Endpoint::Responses,
+        &body,
+        "gpt-5.4-mini",
+    );
+    let user = v["user"].as_str().unwrap();
+    assert!(user.len() <= 64, "{user}");
+    let again = req(Endpoint::Messages, Endpoint::Responses, &body, "gpt-5-mini");
+    assert_eq!(again["user"], user, "the same user maps to the same id");
+    let chat = chat(json!({"user": long}));
+    assert_eq!(c2r(&chat, "gpt-5.5")["user"], user);
+    // xAI's Responses takes it as sent; a short id is untouched.
+    assert_eq!(
+        req(Endpoint::Messages, Endpoint::Responses, &body, "grok-4.3")["user"],
+        long.as_str()
+    );
+    let short = anth(json!({"metadata": {"user_id": "u-123"},
+                            "messages": [{"role": "user", "content": "hi"}]}));
+    assert_eq!(
+        req(Endpoint::Messages, Endpoint::Responses, &short, "gpt-5.4")["user"],
+        "u-123"
+    );
+}
+
 #[test]
 fn chat_only_fields_are_forwarded_onto_responses() {
     let v = c2r(

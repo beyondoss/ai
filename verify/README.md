@@ -103,11 +103,13 @@ multi-turn, unicode, stop sequences, max-token cut-offs, every `tool_choice`, pa
 results, `json_schema`, a base64 PNG carrying a code word, reasoning effort and two invalid requests,
 each streamed and not. Each request is sent directly to the provider with the real key and through a
 gateway that holds only that provider's pool key, on the same model. Same-dialect paths (OpenAI Chat
-and Responses, Anthropic Messages, xAI Chat, OpenRouter Chat) compare the answers' structure: status
-class, error type and code, the type skeleton, finish reason, tool names and argument validity,
+and Responses, Anthropic Messages, xAI Responses, OpenRouter Chat) compare the answers' structure:
+status class, the client's error envelope (an error not already in it, xAI's, is re-encoded: D100)
+and its type and code, the type skeleton, finish reason, tool names and argument validity,
 structured-output validity, whether the code word came back, usage, and for streams the event-type
 sequence, each event's keys, and that events still arrive spread out. Cross-dialect paths (Chat and
-Responses clients on Claude, a Messages client on GPT) compare the gateway's translation with the
+Responses clients on Claude, a Messages client on GPT, a Chat client on grok, which reaches xAI over
+Responses) compare the gateway's translation with the
 same request sent natively: status class, the client's error envelope, finish class, tools,
 structured output, the code word and input size. Every gateway answer must also match its
 `ai.usage` row.
@@ -117,7 +119,8 @@ path's key. A mismatch is retried once before it fails, so one nondeterministic 
 reported as a defect. Run the suite twice, and file only differences that reproduce. Allowed
 differences: values (only types are compared), headers, the usage chunk the gateway injects into a
 Chat stream, OpenRouter's repeated `delta.role` (dropped by `ChatIdentity`), and grok's reasoning
-visibility, which varies even between two direct calls. A run costs about $0.30; it prints an
+visibility (a Chat `reasoning_content`, a Responses `reasoning` item and its summary events), which
+varies even between two direct calls. A run costs about $0.30; it prints an
 estimate first and the measured cost last.
 
 ```sh

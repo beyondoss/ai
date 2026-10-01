@@ -3935,6 +3935,9 @@ fn responses_req_to_openai(v: &Value, up: Upstream, wrap_custom: bool) -> Value 
 /// The smallest `max_output_tokens` the Responses API accepts.
 const RESPONSES_MIN_OUTPUT_TOKENS: u64 = 16;
 
+/// The longest `user` OpenAI's Responses API accepts.
+const RESPONSES_MAX_USER: usize = 64;
+
 fn openai_req_to_responses(v: &Value, openai: OpenAiModel) -> Value {
     let mut out = Map::new();
     copy_if(&mut out, v, "model");
@@ -3994,6 +3997,16 @@ fn openai_req_to_responses(v: &Value, openai: OpenAiModel) -> Value {
         "top_logprobs",
     ] {
         copy_if(&mut out, v, key);
+    }
+    // OpenAI's Responses API caps `user` at 64 characters (400 "string too long"), though its Chat
+    // Completions and xAI's Responses take longer ones; Claude Code's `metadata.user_id` is ~150.
+    // A longer one becomes a hash of itself: the same user still maps to the same id (D146).
+    if openai.native
+        && let Some(Value::String(user)) = out.get("user")
+        && user.chars().count() > RESPONSES_MAX_USER
+    {
+        let hashed = format!("{:016x}", fnv1a64(user.as_bytes()));
+        out.insert("user".into(), json!(hashed));
     }
     // No Responses field, and each changes what the client gets back: forwarded for the provider to
     // reject by name. (`mcp_servers` arrives here from a Messages client.)
@@ -4589,6 +4602,43 @@ fn is_gateway_reasoning(item: &Value) -> bool {
                 .get("encrypted_content")
                 .and_then(Value::as_str)
                 .is_some_and(|c| c.starts_with(GATEWAY_SIGNATURE_PREFIX)))
+}
+
+/// A one-shot Responses body walked onto a Responses candidate of a row with no Responses arm
+/// (every grok row reaches xAI over `/v1/responses`), as `store: false`. Such a row walks its
+/// candidates only when the body carries no session state (`responses_session_field`: an explicit
+/// `store: true` or a `previous_response_id` is a 400 there), so an omitted or null `store` is a
+/// one-shot the client expects not to be kept; xAI stores every response for 30 days unless told
+/// not to (https://docs.x.ai/developers/model-capabilities/text/comparison.md). Every root `store`
+/// member is cut out by span and `"store":false` goes first; every other byte stays as sent. `true`
+/// when the body changed; a body already saying `store: false` once is untouched.
+pub fn store_false(body: &mut Vec<u8>) -> bool {
+    let Some(members) = peek::root_members(body) else {
+        return false;
+    };
+    let stores: Vec<_> = members.iter().filter(|m| m.key_is(body, "store")).collect();
+    if let [only] = stores.as_slice()
+        && &body[only.value.0..only.value.1] == b"false"
+    {
+        return false;
+    }
+    let had_others = members.len() > stores.len();
+    if !stores.is_empty() {
+        peek::remove_root_members(body, "store");
+    }
+    let Some(open) = body.iter().position(|b| !b.is_ascii_whitespace()) else {
+        return false;
+    };
+    if body[open] != b'{' {
+        return false;
+    }
+    let member: &[u8] = if had_others {
+        b"\"store\":false,"
+    } else {
+        b"\"store\":false"
+    };
+    body.splice(open + 1..open + 1, member.iter().copied());
+    true
 }
 
 /// A same-wire Responses body, minus the `reasoning` items this gateway minted from Claude's
@@ -8047,6 +8097,36 @@ mod tests {
         let out: Value = serde_json::from_slice(&encode(&spliced)).unwrap();
         assert_eq!(out["a"][RAW_JSON_KEY], "1, \"model\": \"other\"");
         assert!(out.get("model").is_none());
+    }
+
+    /// claim: E3
+    /// defect: D145
+    #[test]
+    fn store_false_is_added_once_and_nothing_else_moves() {
+        let mut omitted = br#" {"model":"grok-4.3", "input": "hi"}"#.to_vec();
+        assert!(store_false(&mut omitted));
+        assert_eq!(
+            omitted,
+            br#" {"store":false,"model":"grok-4.3", "input": "hi"}"#
+        );
+        let mut null = br#"{"store":null,"model":"m","input":"hi"}"#.to_vec();
+        assert!(store_false(&mut null));
+        assert_eq!(null, br#"{"store":false,"model":"m","input":"hi"}"#);
+        let mut twice = br#"{"model":"m","store":false,"store":null}"#.to_vec();
+        assert!(store_false(&mut twice));
+        let v: Value = serde_json::from_slice(&twice).unwrap();
+        assert_eq!(v["store"], false);
+        assert_eq!(
+            String::from_utf8(twice).unwrap().matches("store").count(),
+            1
+        );
+        let mut already = br#"{"model":"m","store":false}"#.to_vec();
+        assert!(!store_false(&mut already));
+        let mut empty = b"{}".to_vec();
+        assert!(store_false(&mut empty));
+        assert_eq!(empty, br#"{"store":false}"#);
+        let mut not_json = b"[1]".to_vec();
+        assert!(!store_false(&mut not_json));
     }
 
     #[test]

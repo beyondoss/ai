@@ -81,7 +81,7 @@ async fn an_error_already_in_the_clients_envelope_is_relayed_untouched() {
     let (pubkey, sk) = test_keypair(136);
     let mock = MockUpstream::start(Mode::Raw(400, "application/json", OPENAI_SHAPED)).await;
     let gw = Gateway::builder(unused_nats_port(), &mock.authority(), &b64(&pubkey))
-        .providers(&["xai"])
+        .providers(&["deepseek"])
         .start()
         .await;
     let resp = test_client()
@@ -91,7 +91,7 @@ async fn an_error_already_in_the_clients_envelope_is_relayed_untouched() {
             format!("Bearer {}", billing_vkey(&sk, 136)),
         )
         .header("content-type", "application/json")
-        .body(r#"{"model":"grok-4.3","messages":[{"role":"user","content":"hi"}]}"#)
+        .body(r#"{"model":"deepseek-flash","messages":[{"role":"user","content":"hi"}]}"#)
         .send()
         .await
         .unwrap();

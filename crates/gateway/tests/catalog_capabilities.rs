@@ -2,6 +2,7 @@
 //! picks a candidate.
 //!
 //! - A JSON-schema output request skips a candidate that cannot honor one (Amazon Bedrock).
+//! - A request carrying a PDF skips a candidate that reads none (OpenRouter's grok-build-0.1).
 //! - An image on a row whose card lists no image input is a 400 before any upstream sees it.
 //! - An OpenRouter candidate is asked not to compress a prompt that overflows its window.
 //!
@@ -262,4 +263,101 @@ async fn an_openrouter_candidate_is_asked_not_to_compress_the_prompt() {
     let _ = resp.bytes().await;
     let sent: Value = serde_json::from_slice(&openai.captured().unwrap().body).unwrap();
     assert!(sent.get("plugins").is_none(), "{sent}");
+}
+
+/// A Responses body as xAI answers one (reasoning inside `output_tokens`).
+const XAI_RESPONSE: &str = r#"{"id":"resp_1","object":"response","created_at":1,"status":"completed","model":"grok-build-0.1","output":[{"type":"message","id":"msg_1","role":"assistant","status":"completed","content":[{"type":"output_text","text":"MARIGOLD","annotations":[]}]}],"usage":{"input_tokens":30,"input_tokens_details":{"cached_tokens":0},"output_tokens":9,"output_tokens_details":{"reasoning_tokens":8},"total_tokens":39},"store":false}"#;
+
+/// Grok rows read PDFs again: every grok row reaches xAI over `/v1/responses`, which reads them
+/// (Chat Completions answered 400 "File content is not supported"), so their cards list file input.
+/// OpenRouter's `x-ai/grok-build-0.1` reads none (404 "No endpoints found that support file
+/// input"): a request carrying a file part, from any client dialect and however the walk was
+/// ordered, is never sent there and lands on xAI translated onto Responses. Without a file the
+/// caller's order holds; pinned to OpenRouter alone, it is still sent.
+/// claim: CAT-5
+/// defect: D106
+#[tokio::test]
+async fn a_pdf_request_skips_a_candidate_that_reads_none() {
+    let (pubkey, sk) = test_keypair(74);
+    let xai = MockUpstream::start(Mode::Raw(200, "application/json", XAI_RESPONSE)).await;
+    let openrouter = MockUpstream::start(Mode::Json).await;
+    let gw = Gateway::builder(unused_nats_port(), &xai.authority(), &b64(&pubkey))
+        .providers(&["xai", "openrouter"])
+        .provider_authority("openrouter", &openrouter.authority())
+        .start()
+        .await;
+    let key = billing_vkey(&sk, 74);
+    let pdf = "data:application/pdf;base64,JVBERi0xLjQK";
+    let order = [("x-beyond-order", "openrouter")];
+    let cases: [Case<'_>; 4] = [
+        // Chat client, header-won row: the body is read before the walk.
+        (
+            "/v1/chat/completions",
+            &[("x-beyond-model", "grok-build-0.1")],
+            json!({"model": "grok-build-0.1", "messages": [{"role": "user", "content": [
+                {"type": "file", "file": {"filename": "a.pdf", "file_data": pdf}},
+                {"type": "text", "text": "What is the code word?"}]}]}),
+        ),
+        // Messages client.
+        (
+            "/v1/messages",
+            &[],
+            json!({"model": "grok-build-0.1", "max_tokens": 64, "messages": [{"role": "user",
+                "content": [{"type": "document", "source": {"type": "base64",
+                    "media_type": "application/pdf", "data": "JVBERi0xLjQK"}},
+                    {"type": "text", "text": "What is the code word?"}]}]}),
+        ),
+        // Responses client: a one-shot, relayed to xAI's Responses.
+        (
+            "/v1/responses",
+            &[],
+            json!({"model": "grok-build-0.1", "input": [{"role": "user", "content": [
+                {"type": "input_file", "filename": "a.pdf", "file_data": pdf},
+                {"type": "input_text", "text": "What is the code word?"}]}]}),
+        ),
+        // Spacing in the client's JSON does not hide the part.
+        (
+            "/v1/chat/completions",
+            &[],
+            json!({"model": "grok-build-0.1", "messages": [{"role": "user", "content": [
+                {"type": "file", "file": {"filename": "a.pdf", "file_data": pdf}}]}]}),
+        ),
+    ];
+    for (path, extra, body) in &cases {
+        let mut headers = order.to_vec();
+        headers.extend_from_slice(extra);
+        let resp = post(&gw, &key, path, &headers, body).await;
+        assert_eq!(resp.status().as_u16(), 200, "{path}");
+        assert_eq!(provider_of(&resp).as_deref(), Some("xai"), "{path}");
+        let sent = xai.captured().unwrap();
+        assert_eq!(sent.path, "/v1/responses", "{path}");
+        let sent: Value = serde_json::from_slice(&sent.body).unwrap();
+        assert!(
+            sent.to_string().contains("\"input_file\""),
+            "{path}: the PDF reached xAI as input_file: {sent}"
+        );
+    }
+    assert_eq!(
+        openrouter.hits(),
+        0,
+        "a PDF reached OpenRouter's grok-build-0.1"
+    );
+
+    // Without a file, the caller's order holds.
+    let plain = json!({"model": "grok-build-0.1", "messages": [{"role": "user", "content": "hi"}]});
+    let resp = post(&gw, &key, "/v1/chat/completions", &order, &plain).await;
+    assert_eq!(resp.status().as_u16(), 200);
+    assert_eq!(provider_of(&resp).as_deref(), Some("openrouter"));
+
+    // OpenRouter alone: still sent, so the client gets the provider's answer rather than a 503.
+    let resp = post(
+        &gw,
+        &key,
+        "/v1/chat/completions",
+        &[("x-beyond-only", "openrouter")],
+        &cases[0].2,
+    )
+    .await;
+    assert_eq!(provider_of(&resp).as_deref(), Some("openrouter"));
+    assert_eq!(openrouter.hits(), 2);
 }

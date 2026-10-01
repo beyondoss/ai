@@ -326,7 +326,59 @@ pub fn walk_reads_body(row: &ModelRoute) -> bool {
             || row
                 .candidates
                 .iter()
-                .any(|c| !providers::catalog::serves_structured_outputs(c)))
+                .any(|c| !providers::catalog::serves_structured_outputs(c))
+            || (row.card.input & providers::catalog::IN_FILE != 0
+                && row
+                    .candidates
+                    .iter()
+                    .any(|c| !providers::catalog::serves_file_input(c))))
+}
+
+/// The most tools OpenAI Chat Completions accepts in one request: 400 `array_above_max_length`
+/// "Expected an array with maximum length 128" above it. OpenAI's Responses API took 600 (TOOL-1).
+pub const CHAT_TOOL_CAP: usize = 128;
+
+/// Whether a translated (Messages) request on `row` walks the row's Responses arm instead of its
+/// candidates: a row whose primary is Chat Completions and that has a Responses arm (the GPT rows
+/// before 5.4), and a body offering more than [`CHAT_TOOL_CAP`] tools. Chat Completions would refuse
+/// them; the arm is translated onto and takes them (D131). A Chat Completions client keeps its
+/// own endpoint (a byte relay, OpenAI's own limit and error), and a Responses client already walks
+/// the arm.
+pub fn tools_need_responses_arm(row: &ModelRoute, client: Option<Endpoint>, body: &[u8]) -> bool {
+    tool_count_decides_arm(row, client) && tool_count(body) > CHAT_TOOL_CAP
+}
+
+/// Whether a header-won walk on `row` from a client on `path` reads the body to count its tools
+/// ([`tools_need_responses_arm`]).
+pub fn walk_reads_tools(row: &ModelRoute, path: &str) -> bool {
+    tool_count_decides_arm(row, implied_endpoint(path))
+}
+
+/// A Messages client on a row whose primary is Chat Completions and that has a Responses arm.
+fn tool_count_decides_arm(row: &ModelRoute, client: Option<Endpoint>) -> bool {
+    client == Some(Endpoint::Messages)
+        && !row.responses.is_empty()
+        && row
+            .candidates
+            .first()
+            .is_some_and(|c| providers::catalog::endpoint_of_path(c.path) == "chat/completions")
+}
+
+/// Entries in the body's root `tools` array (the last `tools`, which a provider's parser keeps).
+/// Zero, with no structural scan, when the body never says `tools`.
+fn tool_count(body: &[u8]) -> usize {
+    if memchr::memmem::find(body, b"\"tools\"").is_none() {
+        return 0;
+    }
+    let Some(tools) = crate::peek::root_members(body)
+        .and_then(|m| m.into_iter().rev().find(|m| m.key_is(body, "tools")))
+    else {
+        return 0;
+    };
+    if body.get(tools.value.0) != Some(&b'[') {
+        return 0;
+    }
+    crate::peek::array_elements(body, tools.value.0).map_or(0, |items| items.len())
 }
 
 /// The input kind `body` carries that `row`'s card says it does not accept: `Some("image")` for an
@@ -373,20 +425,57 @@ fn carries_image(body: &[u8]) -> bool {
 
 /// Catalog indices (bit per index) of `arms` that cannot serve `body`: Bedrock candidates when the
 /// body asks for a JSON-schema output (`response_format` / `output_config.format` / `text.format`
-/// all name `json_schema`), which Bedrock's Messages surface refuses. The walk leaves them out,
-/// unless that would leave nothing, in which case the provider's own error is the answer. Zero, with
-/// no scan, on a row whose candidates all serve it.
+/// all name `json_schema`), which Bedrock's Messages surface refuses; and a candidate that reads no
+/// PDF (`providers::catalog::serves_file_input`) when the body carries a file part. The walk leaves
+/// them out, unless that would leave nothing, in which case the provider's own error is the answer.
+/// Zero, with no scan, on a row whose candidates all serve both.
 pub fn unserved(arms: &[Candidate], body: &[u8]) -> u8 {
-    let lacking = arms
-        .iter()
-        .take(MAX_CANDIDATES)
-        .enumerate()
-        .filter(|(_, c)| !providers::catalog::serves_structured_outputs(c))
-        .fold(0u8, |m, (i, _)| m | (1 << i));
-    if lacking == 0 || memchr::memmem::find(body, b"\"json_schema\"").is_none() {
-        return 0;
+    let mask = |serves: fn(&Candidate) -> bool| {
+        arms.iter()
+            .take(MAX_CANDIDATES)
+            .enumerate()
+            .filter(|(_, c)| !serves(c))
+            .fold(0u8, |m, (i, _)| m | (1 << i))
+    };
+    let mut out = 0;
+    let no_schema = mask(providers::catalog::serves_structured_outputs);
+    if no_schema != 0 && memchr::memmem::find(body, b"\"json_schema\"").is_some() {
+        out |= no_schema;
     }
-    lacking
+    let no_file = mask(providers::catalog::serves_file_input);
+    if no_file != 0 && carries_file(body) {
+        out |= no_file;
+    }
+    out
+}
+
+/// A file content part anywhere in the conversation: Chat Completions `file`, Messages
+/// `document` (tool results included), Responses `input_file`. The body is parsed only when it
+/// contains one of those type names at all.
+fn carries_file(body: &[u8]) -> bool {
+    fn walk(v: &serde_json::Value) -> bool {
+        match v {
+            serde_json::Value::Array(a) => a.iter().any(walk),
+            serde_json::Value::Object(o) => {
+                matches!(
+                    o.get("type").and_then(serde_json::Value::as_str),
+                    Some("file" | "document" | "input_file")
+                ) || o.values().any(walk)
+            }
+            _ => false,
+        }
+    }
+    let finder = |n: &[u8]| memchr::memmem::find(body, n).is_some();
+    if !(finder(b"\"file\"") || finder(b"\"document\"") || finder(b"\"input_file\"")) {
+        return false;
+    }
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return false;
+    };
+    ["messages", "input"]
+        .iter()
+        .filter_map(|k| v.get(k))
+        .any(walk)
 }
 
 /// One precomputed managed auth value: the formatted secret plus, when the bytes are header-safe,

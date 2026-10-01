@@ -697,6 +697,28 @@ created = 1787853604
 input_limit = 922_000
 limit_evidence = "OpenAI API: 400 context_length_exceeded \"Input tokens exceed the configured limit of 922000 tokens\" (catalog sweep 2026-10-01, CAT-3::raw::openai); the window counts the 128K max output."
 
+# xAI (every grok row reaches xAI over /v1/responses; checked 2026-10-01):
+# - File input: xAI reads inline PDFs (input_file with file_data) on Responses only. Chat
+#   Completions answers 400 "File content is not supported on /v1/chat/completions. Please use
+#   /v1/responses instead." Responses read the fixture PDF on every grok row.
+# - Storage: Responses stores every response for 30 days; `store` defaults to true
+#   (https://docs.x.ai/developers/model-capabilities/text/comparison.md "Control server-side storage
+#   (default: true)"; https://docs.x.ai/developers/model-capabilities/text/generate-text.md). The
+#   gateway sends store: false unless the client asked to store.
+# - Usage on Responses: input_tokens includes input_tokens_details.cached_tokens, and output_tokens
+#   includes output_tokens_details.reasoning_tokens (the OpenAI convention, unlike xAI's Chat
+#   Completions, which reports reasoning beside completion_tokens). Measured against xAI's own
+#   cost_in_usd_ticks: grok-4.3, 205 input (192 cached), 139 output (138 reasoning) = 4,021,500
+#   ticks = 13 x 1.25 + 192 x 0.20 + 139 x 2.50 per million. The reference example
+#   (https://docs.x.ai/developers/rest-api-reference/inference/responses.md) shows reasoning beside
+#   output_tokens (32 + 9 + 110 = 151 total); usage.rs bills either shape by its arithmetic.
+#   Cached tokens: https://docs.x.ai/developers/advanced-api-usage/prompt-caching/usage-and-pricing.md.
+# - Reasoning effort: reasoning.effort on grok-4.3, 4.5, 4.6; grok-4.20 and grok-build-0.1 answer
+#   400 "does not support parameter reasoningEffort" on Responses and Chat Completions alike
+#   (https://docs.x.ai/developers/model-capabilities/text/reasoning.md).
+# - Tools: function tools, tool_choice, parallel_tool_calls; at most 350 tools per request
+#   (https://docs.x.ai/developers/tools/function-calling.md). Streams use OpenAI's Responses event
+#   names (response.created ... response.completed, usage on response.completed).
 [[row]]
 model = "grok-4.20"
 source = [
@@ -711,6 +733,8 @@ cache_read = "0.20"
 context_window = 1_000_000
 created = 1773014400
 owned_by = "xai"
+input_present = ["image", "file"]
+note = "File input is read on xAI /v1/responses, where every grok row reaches xAI (see the comment above grok-4.20)."
 
 [[row]]
 model = "grok-4.20-multi-agent"
@@ -743,6 +767,8 @@ cache_read = "0.20"
 context_window = 1_000_000
 created = 1776384000
 owned_by = "xai"
+input_present = ["image", "file"]
+note = "File input is read on xAI /v1/responses, where every grok row reaches xAI (see the comment above grok-4.20)."
 
 [[row]]
 model = "grok-4.5"
@@ -758,6 +784,8 @@ cache_read = "0.30"
 context_window = 500_000
 created = 1782691200
 owned_by = "xai"
+input_present = ["image", "file"]
+note = "File input is read on xAI /v1/responses, where every grok row reaches xAI (see the comment above grok-4.20)."
 
 [[row]]
 model = "grok-4.6"
@@ -773,6 +801,8 @@ cache_read = "0.50"
 context_window = 500_000
 created = 1785974400
 owned_by = "xai"
+input_present = ["image", "file"]
+note = "File input is read on xAI /v1/responses, where every grok row reaches xAI (see the comment above grok-4.20)."
 
 [[row]]
 model = "grok-build-0.1"
@@ -788,6 +818,8 @@ cache_read = "0.20"
 context_window = 256_000
 created = 1776297600
 owned_by = "xai"
+input_present = ["image", "file"]
+note = "File input is read on xAI /v1/responses, where every grok row reaches xAI (see the comment above grok-4.20). OpenRouter x-ai/grok-build-0.1 answers a PDF with 404 \"No endpoints found that support file input\" (2026-10-01), so a file request skips it."
 
 [[row]]
 model = "llama-3.3-70b-versatile"
