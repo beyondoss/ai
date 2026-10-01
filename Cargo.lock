@@ -517,6 +517,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "beyond-ai-verify"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "toml",
+]
+
+[[package]]
 name = "beyond-slipstream"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

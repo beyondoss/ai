@@ -1,0 +1,779 @@
+# Suspected and confirmed defects. Found by five read-only code audits on 2026-10-01 (billing,
+# security, reliability, translation, catalog/contract) against main b10ed8b.
+#
+# state      suspected   found by reading code; no reproduction yet
+#            reproduced  `test` asserts the correct behavior, is #[ignore]d, and FAILS today
+#            fixed       `test` passes and is no longer ignored; `fix` names the commit
+#            refuted     `test` passes: the behavior was already correct; `note` says why
+#            accepted    a written decision keeps the behavior; `test` asserts it as documented
+# The gate enforces each state against the test results, so the file cannot drift from the code.
+
+[[defect]]
+id = "D01"
+severity = "critical"
+area = "Security"
+title = "Managed /{provider}/… forwards any path and method on the shared pool key"
+impact = "Any tenant can list, read and DELETE other tenants' OpenAI files, stored responses, stored completions and batches. Batches, files, fine-tuning and images run unmetered, and every GET poll of a stored response writes a new full billing row."
+confidence = "high"
+evidence = "proxy.rs:1700-1713, 3086-3111"
+claims = ["SEC-1"]
+state = "suspected"
+test = ""
+fix = ""
+note = ""
+
+[[defect]]
+id = "D02"
+severity = "critical"
+area = "Security"
+title = "Catalog paths accept any HTTP method"
+impact = "GET /auto/v1/chat/completions reaches OpenAI as 'list stored chat completions' for the whole pool-key project. The response can also be cached under the caller's key."
+confidence = "med-high"
+evidence = "proxy.rs:2115-2140; cache.rs key()"
+claims = ["SEC-2"]
+state = "suspected"
+test = ""
+fix = ""
+note = ""
+
+[[defect]]
+id = "D03"
+severity = "high"
+area = "Security"
+title = "A ?key= virtual key is forwarded upstream and logged"
+impact = "On /{provider}/… the bai_ key goes to the provider in the URL. Pingora's 'Fail to proxy' error line prints it, along with BYO Google keys."
+confidence = "high"
+evidence = "proxy.rs:1001, 1704-1712; pingora request_summary"
+claims = ["SEC-3", "SEC-4"]
+state = "suspected"
+test = ""
+fix = ""
+note = ""
+
+[[defect]]
+id = "D04"
+severity = "high"
+area = "Security"
+title = "Client org, project and beta headers ride on Beyond's pool key"
+impact = "openai-project and openai-organization can switch the project or org on our key. anthropic-beta can turn on premium pricing, MCP or code execution. SDK users with OPENAI_ORG_ID set get a 401."
+confidence = "med-high"
+evidence = "upstream_request_filter strips only auth and control headers"
+claims = ["SEC-6"]
+state = "suspected"
+test = ""
+fix = ""
+note = ""
+
+[[defect]]
+id = "D05"
+severity = "high"
+area = "Billing"
+title = "Provider-routed usage is parsed by provider dialect, not path"
+impact = "/openrouter/api/v1/messages bills zero (non-stream) or all-zero tokens with no flag (stream). /anthropic/v1/chat/completions bills zero."
+confidence = "high"
+evidence = "proxy.rs:2416"
+claims = ["BIL-1"]
+state = "suspected"
+test = ""
+fix = ""
+note = ""
+
+[[defect]]
+id = "D06"
+severity = "high"
+area = "Billing"
+title = "Clients can turn off exact metering"
+impact = "Sending stream_options:{include_usage:false} skips usage injection, so the stream bills a low estimate that can't see hidden reasoning tokens."
+confidence = "high"
+evidence = "peek.rs:309-312, 526"
+claims = ["BIL-2"]
+state = "suspected"
+test = ""
+fix = ""
+note = ""
+
+[[defect]]
+id = "D07"
+severity = "high"
+area = "Billing"
+title = "Cancels before the response head, and non-stream cut-offs, bill zero"
+impact = "A long o-series or long-prompt call the client cancels before headers costs us full price and bills 0. The same happens to a half-delivered non-stream body."
+confidence = "high"
+evidence = "proxy.rs:3797-3812"
+claims = ["BIL-3"]
+state = "suspected"
+test = ""
+fix = ""
+note = ""
+
+[[defect]]
+id = "D08"
+severity = "high"
+area = "Billing"
+title = "AI_LOG=warn silently drops every billing row"
+impact = "The log filter covers the ai.usage layer too, and stdout write errors are ignored."
+confidence = "high"
+evidence = "main.rs:73, 104-109"
+claims = ["BIL-4"]
+state = "suspected"
+test = ""
+fix = ""
+note = ""
+
+[[defect]]
+id = "D09"
+severity = "high"
+area = "Billing"
+title = "Large-body requests retry after the provider already has them"
+impact = "A read timeout after the body was sent triggers a re-run on the same candidate, then the next. That means duplicate generation and spend, plus waits up to 2×600s."
+confidence = "high"
+evidence = "proxy.rs:3610-3626, 870-889"
+claims = ["BIL-14", "REL-21"]
+state = "suspected"
+test = ""
+fix = ""
+note = ""
+
+[[defect]]
+id = "D10"
+severity = "high"
+area = "Reliability"
+title = "A bad pool key on one candidate black-holes the whole row"
+impact = "A fast 401/403 counts as a healthy, fast sample. The ranker promotes it, and nothing fails over on a 4xx."
+confidence = "high"
+evidence = "proxy.rs:3394, 3741"
+claims = ["REL-4"]
+state = "suspected"
+test = ""
+fix = ""
+note = ""
+
+[[defect]]
+id = "D11"
+severity = "high"
+area = "Reliability"
+title = "/readyz says ok while every managed request gets 402"
+impact = "Allowance fails closed until seeded, but readyz only checks the deny watcher. New pods, or NATS down at boot, black-hole managed traffic."
+confidence = "high"
+evidence = "admin.rs:136-145; proxy.rs:1969"
+claims = ["REL-5"]
+state = "suspected"
+test = ""
+fix = ""
+note = ""
+
+[[defect]]
+id = "D12"
+severity = "high"
+area = "Contract"
+title = "A stock responses.create() returns 400 on every non-GPT row"
+impact = "Omitting store counts as session state, so the default call from Vercel openai() or the Agents SDK fails on Claude, DeepSeek and the rest. /v1/models still advertises /v1/responses for those rows."
+confidence = "high"
+evidence = "translate.rs:1967-1986; proxy.rs:2232-2252"
+claims = ["TRN-1", "CAT-9"]
+state = "suspected"
+test = ""
+fix = ""
+note = ""
+
+[[defect]]
+id = "D13"
+severity = "high"
+area = "Translation"
+title = "Zero-argument tool calls stream arguments:\"\""
+impact = "Should be \"{}\". It breaks json.loads in the Agents SDK and Vercel's JSON check on Messages→Chat/Responses streams."
+confidence = "high"
+evidence = "translate.rs:4565-4615, 5932-5950"
+claims = ["TRN-9"]
+state = "suspected"
+test = ""
+fix = ""
+note = ""
+
+[[defect]]
+id = "D14"
+severity = "high"
+area = "Translation"
+title = "Thinking plus tools 400s on turn 2 for clients that don't echo thinking"
+impact = "On budget-thinking Claude, a client that drops our thinking blocks (Vercel, LangChain, likely Codex with id-less reasoning) sends a turn Anthropic rejects."
+confidence = "med-high"
+evidence = "translate.rs:1719-1759, 3656-3672"
+claims = ["TRN-7", "TRN-8"]
+state = "suspected"
+test = ""
+fix = ""
+note = ""
+
+[[defect]]
+id = "D15"
+severity = "high"
+area = "Translation"
+title = "Claude Code on a GPT row may send cache_control to native OpenAI"
+impact = "Claude Code always marks cache breakpoints. If OpenAI rejects the field, every Claude Code request on a GPT row fails. Needs a live check."
+confidence = "med-low"
+evidence = "translate.rs:2092, 2152, 2324, 2391"
+claims = ["TRN-10"]
+state = "suspected"
+test = ""
+fix = ""
+note = ""
+
+[[defect]]
+id = "D16"
+severity = "high"
+area = "Reliability"
+title = "Gateway-made errors are empty, with the wrong status"
+impact = "All candidates failing gives an empty 502. All breakers open gives a bare 500 instead of 503. A chunked body over 100 MiB gives a 500 or reset instead of 413. None carry x-beyond-request-id."
+confidence = "high"
+evidence = "proxy.rs:2771-2776, 3248-3256; no fail_to_proxy override"
+claims = ["REL-2", "CAT-11"]
+state = "suspected"
+test = ""
+fix = ""
+note = ""
+
+[[defect]]
+id = "D17"
+severity = "high"
+area = "Reliability"
+title = "The half-open breaker probe can wedge a provider forever"
+impact = "The probe permit resolves only at end of stream and is never reclaimed. A stalled probe 503s that provider until restart."
+confidence = "high"
+evidence = "circuit_breaker.rs:327; proxy.rs:3726-3753"
+claims = ["REL-6"]
+state = "suspected"
+test = ""
+fix = ""
+note = ""
+
+[[defect]]
+id = "D18"
+severity = "high"
+area = "Catalog"
+title = "Some fallbacks serve a different model"
+impact = "deepseek-reasoner falls back to OpenRouter R1 and deepseek-chat to V3: different models, windows and prices."
+confidence = "high"
+evidence = "catalog.rs:895-940"
+claims = ["CAT-2"]
+state = "suspected"
+test = ""
+fix = ""
+note = ""
+
+[[defect]]
+id = "D19"
+severity = "high"
+area = "Catalog"
+title = "List prices for non-OpenRouter primaries are OpenRouter's cheapest host"
+impact = "llama-3.3-70b lists $0.10/$0.32 against Groq's ~$0.59/$0.79. Three -pro rows are priced as their base model."
+confidence = "high"
+evidence = "catalog.rs price() rows"
+claims = ["CAT-7"]
+state = "suspected"
+test = ""
+fix = ""
+note = ""
+
+[[defect]]
+id = "D20"
+severity = "med"
+area = "Billing"
+title = "Responses stream final event over 64 KiB bills an estimate"
+impact = "response.completed echoes instructions, tools and output. When it's past the tail cap the exact usage is lost. Likely for Codex."
+confidence = "high"
+evidence = "usage.rs:426; proxy.rs:120"
+claims = ["BIL-15"]
+state = "suspected"
+test = ""
+fix = ""
+note = ""
+
+[[defect]]
+id = "D21"
+severity = "med"
+area = "Billing"
+title = "OpenRouter cache_write_tokens dropped"
+impact = "Claude via OpenRouter bills writes at input rate. The row and the client disagree."
+confidence = "high"
+evidence = "usage.rs:127 vs translate.rs:2629"
+claims = ["BIL-8"]
+state = "suspected"
+test = ""
+fix = ""
+note = ""
+
+[[defect]]
+id = "D22"
+severity = "med"
+area = "Billing"
+title = "Anthropic message_delta input and cache updates ignored"
+impact = "With server tools (web search), input grows mid-stream and the row under-bills."
+confidence = "med-high"
+evidence = "usage.rs:479-485"
+claims = ["BIL-8"]
+state = "suspected"
+test = ""
+fix = ""
+note = ""
+
+[[defect]]
+id = "D23"
+severity = "med"
+area = "Billing"
+title = "xAI reasoning tokens may be unbilled"
+impact = "xAI reports completion_tokens without reasoning. Verify live."
+confidence = "med"
+evidence = "usage.rs; catalog grok rows"
+claims = ["BIL-9"]
+state = "suspected"
+test = ""
+fix = ""
+note = ""
+
+[[defect]]
+id = "D24"
+severity = "med"
+area = "Billing"
+title = "Server-tool charges and priced variants not recorded"
+impact = "Web search per-call fees, 1h cache writes (2×), service_tier and long-context pricing all collapse into plain tokens."
+confidence = "high"
+evidence = "usage.rs:221-229"
+claims = ["BIL-10", "BIL-11"]
+state = "suspected"
+test = ""
+fix = ""
+note = ""
+
+[[defect]]
+id = "D25"
+severity = "med"
+area = "Billing"
+title = "input_tokens means different things on rows for the same model"
+impact = "OpenAI wire includes cached tokens, Anthropic excludes them. A Claude row served by OpenRouter vs Anthropic ships different semantics."
+confidence = "high"
+evidence = "usage.rs vs translate.rs:2583-2590"
+claims = ["BIL-7"]
+state = "suspected"
+test = ""
+fix = ""
+note = ""
+
+[[defect]]
+id = "D26"
+severity = "med"
+area = "Billing"
+title = "Rows for zero-cost endings look like real zero-token calls"
+impact = "No status field. On breaker exhaustion the row names a provider that was never called."
+confidence = "high"
+evidence = "proxy.rs:3959-3993"
+claims = ["BIL-12"]
+state = "suspected"
+test = ""
+fix = ""
+note = ""
+
+[[defect]]
+id = "D27"
+severity = "med"
+area = "Billing"
+title = "Provider-routed rows can't be priced, and Responses streams bill the alias"
+impact = "Echoed snapshot ids don't resolve in for_model. The Responses stream model under response.* isn't scanned."
+confidence = "high"
+evidence = "catalog.rs:2299; peek.rs:85-91"
+claims = ["BIL-13"]
+state = "suspected"
+test = ""
+fix = ""
+note = ""
+
+[[defect]]
+id = "D28"
+severity = "med"
+area = "Security"
+title = "Non-canonical kid encodings verify, so a key gets unlimited rate-limit buckets"
+impact = "bai_v1.01… and bai_v1.+1… are the same identity, but each gets its own bucket."
+confidence = "high"
+evidence = "key.rs:164; ratelimit.rs"
+claims = ["SEC-12"]
+state = "suspected"
+test = ""
+fix = ""
+note = ""
+
+[[defect]]
+id = "D29"
+severity = "med"
+area = "Security"
+title = "Mixed credentials leak a virtual key upstream"
+impact = "x-api-key: junk plus Bearer bai_… is treated as BYO and the bai_ key is forwarded."
+confidence = "med"
+evidence = "proxy.rs:997-1001"
+claims = ["SEC-11"]
+state = "suspected"
+test = ""
+fix = ""
+note = ""
+
+[[defect]]
+id = "D30"
+severity = "med"
+area = "Security"
+title = "A BYO Anthropic key is sent to OpenAI on bare /v1 non-messages paths"
+impact = "Anthropic SDK calls to /v1/files or models.retrieve go to api.openai.com carrying sk-ant-…."
+confidence = "med-high"
+evidence = "proxy.rs:1468-1475"
+claims = ["SEC-11"]
+state = "suspected"
+test = ""
+fix = ""
+note = ""
+
+[[defect]]
+id = "D31"
+severity = "med"
+area = "Security"
+title = "Response cache key omits the row, method and beta headers"
+impact = "Within a tenant, a gpt-5 request can get the cached gpt-5-mini answer."
+confidence = "high"
+evidence = "cache.rs key()"
+claims = ["SEC-14"]
+state = "suspected"
+test = ""
+fix = ""
+note = ""
+
+[[defect]]
+id = "D32"
+severity = "med"
+area = "Security"
+title = "One tenant can trip the shared circuit breaker"
+impact = "Oversized or stalled uploads count as upstream failures, so every tenant gets 503."
+confidence = "med"
+evidence = "proxy.rs:1060, 3256"
+claims = ["SEC-16"]
+state = "suspected"
+test = ""
+fix = ""
+note = ""
+
+[[defect]]
+id = "D33"
+severity = "med"
+area = "Security"
+title = "WebSocket upgrades pass with the pool key, unmetered"
+impact = "Over H1 upstream, /openai/v1/realtime is relayed and nothing is billed."
+confidence = "low-med"
+evidence = "no upgrade rejection"
+claims = ["SEC-20"]
+state = "suspected"
+test = ""
+fix = ""
+note = ""
+
+[[defect]]
+id = "D34"
+severity = "med"
+area = "Security"
+title = "Duplicate model keys escape the catalog row"
+impact = "{\"model\":\"cheap\",\"model\":\"o1-pro\"} routes as the cheap row and serves the second."
+confidence = "med"
+evidence = "peek.rs first-span rewrite"
+claims = ["SEC-21"]
+state = "suspected"
+test = ""
+fix = ""
+note = ""
+
+[[defect]]
+id = "D35"
+severity = "med"
+area = "Reliability"
+title = "Request-body memory is unbounded by default"
+impact = "Concurrent 100 MiB declared bodies are buffered up to three times. tenant_max_in_flight defaults to off."
+confidence = "med"
+evidence = "proxy.rs:116, 1206, 2044"
+claims = ["SEC-19"]
+state = "suspected"
+test = ""
+fix = ""
+note = ""
+
+[[defect]]
+id = "D36"
+severity = "med"
+area = "Reliability"
+title = "Nothing detects a stall faster than 600s"
+impact = "No first-byte, stall or total deadline, and no H2 ping. Ping-only streams never end."
+confidence = "high"
+evidence = "proxy.rs:618"
+claims = ["REL-7"]
+state = "suspected"
+test = ""
+fix = ""
+note = ""
+
+[[defect]]
+id = "D37"
+severity = "med"
+area = "Reliability"
+title = "A partial brownout never opens the breaker"
+impact = "Any success resets the failure count, so a 50% 5xx rate stays closed."
+confidence = "high"
+evidence = "circuit_breaker.rs:383"
+claims = ["REL-6"]
+state = "suspected"
+test = ""
+fix = ""
+note = ""
+
+[[defect]]
+id = "D38"
+severity = "med"
+area = "Reliability"
+title = "Shutdown always waits the full 600s grace"
+impact = "On Fargate (120s) every stop ends in SIGKILL, and in-flight streams lose their billing rows."
+confidence = "high"
+evidence = "main.rs:166-175; pingora server/mod.rs:811"
+claims = ["REL-16", "BIL-21"]
+state = "suspected"
+test = ""
+fix = ""
+note = ""
+
+[[defect]]
+id = "D39"
+severity = "med"
+area = "Reliability"
+title = "A panic leaks slots, permits and billing rows"
+impact = "Everything is released in logging, which a panic skips."
+confidence = "high"
+evidence = "proxy.rs:3704-3708"
+claims = ["REL-17"]
+state = "suspected"
+test = ""
+fix = ""
+note = ""
+
+[[defect]]
+id = "D40"
+severity = "med"
+area = "Reliability"
+title = "DNS is fragile"
+impact = "No serve-stale (despite the docs), only the first IP is tried, and lookups have no timeout."
+confidence = "high"
+evidence = "state.rs:408-417"
+claims = ["REL-20"]
+state = "suspected"
+test = ""
+fix = ""
+note = ""
+
+[[defect]]
+id = "D41"
+severity = "med"
+area = "Reliability"
+title = "A 200 with an error body counts as healthy and gets pinned"
+impact = "The OpenRouter error-in-200 pattern is promoted by the ranker and pinned for up to 1h."
+confidence = "high"
+evidence = "proxy.rs:3394-3398"
+claims = ["REL-8"]
+state = "suspected"
+test = ""
+fix = ""
+note = ""
+
+[[defect]]
+id = "D42"
+severity = "med"
+area = "Reliability"
+title = "Clients that stop reading are never released"
+impact = "No downstream write timeout. Holds the slot, the upstream connection and possibly the probe permit."
+confidence = "med"
+evidence = "pingora default"
+claims = ["REL-10"]
+state = "suspected"
+test = ""
+fix = ""
+note = ""
+
+[[defect]]
+id = "D43"
+severity = "med"
+area = "Reliability"
+title = "Gateway 429 and 503 lack Retry-After, and a transient fault returns 402"
+impact = "SDKs won't back off correctly. 'Allowance unavailable' is retryable, but 402 tells SDKs not to retry."
+confidence = "high"
+evidence = "proxy.rs:1969-1984, 2601-2611"
+claims = ["REL-19"]
+state = "suspected"
+test = ""
+fix = ""
+note = ""
+
+[[defect]]
+id = "D44"
+severity = "med"
+area = "Translation"
+title = "Consecutive same-role messages glued together"
+impact = "'Hello'+'World' becomes 'HelloWorld'."
+confidence = "high"
+evidence = "translate.rs:1042-1044"
+claims = ["TRN-3"]
+state = "suspected"
+test = ""
+fix = ""
+note = ""
+
+[[defect]]
+id = "D45"
+severity = "med"
+area = "Translation"
+title = "Parallel tool_use blocks interleave on Messages streams"
+impact = "start1 start2 … stop1 stop2 violates Anthropic's sequencing."
+confidence = "med"
+evidence = "translate.rs:5244-5262"
+claims = ["TRN-12"]
+state = "suspected"
+test = ""
+fix = ""
+note = ""
+
+[[defect]]
+id = "D46"
+severity = "med"
+area = "Translation"
+title = "Context-overflow errors lack the phrasing harnesses act on"
+impact = "Claude Code compacts on 'prompt is too long'; Codex compacts on context_length_exceeded, which the closed enum turns into server_error."
+confidence = "med"
+evidence = "translate.rs:407-438, 6019-6050"
+claims = ["TRN-18", "TRN-19"]
+state = "suspected"
+test = ""
+fix = ""
+note = ""
+
+[[defect]]
+id = "D47"
+severity = "med"
+area = "Translation"
+title = "Message-level cache_control on assistant or tool messages dropped"
+impact = "It also disables auto breakpoints, so the history cache misses."
+confidence = "med"
+evidence = "translate.rs:1597, 1719-1784"
+claims = ["TRN-4"]
+state = "suspected"
+test = ""
+fix = ""
+note = ""
+
+[[defect]]
+id = "D48"
+severity = "low"
+area = "Translation"
+title = "Custom tool history and outputs mis-mapped"
+impact = "name:\"\" onto Messages; function_call_output answers a custom call."
+confidence = "med"
+evidence = "translate.rs:1760-1772, 3402-3413"
+claims = ["TRN-14"]
+state = "suspected"
+test = ""
+fix = ""
+note = ""
+
+[[defect]]
+id = "D49"
+severity = "low"
+area = "Translation"
+title = "Explicit nulls, developer role and unknown input items"
+impact = "Null stop/audio cause spurious 400s. The developer role reaches non-OpenAI hosts. Unknown Responses items are silently dropped."
+confidence = "med"
+evidence = "translate.rs:464-478, 3218-3245, 3628-3646"
+claims = ["TRN-15", "TRN-16", "TRN-17"]
+state = "suspected"
+test = ""
+fix = ""
+note = ""
+
+[[defect]]
+id = "D50"
+severity = "low"
+area = "Translation"
+title = "start-block tool input ignored; rs_gw items can reach real OpenAI"
+impact = "Messages-compatible hosts lose their arguments. Mixed-row failover replays Anthropic signatures to OpenAI."
+confidence = "med"
+evidence = "translate.rs:4561-4573"
+claims = ["TRN-13", "TRN-20"]
+state = "suspected"
+test = ""
+fix = ""
+note = ""
+
+[[defect]]
+id = "D51"
+severity = "low"
+area = "Reliability"
+title = "Large-body path diverges from small-body semantics"
+impact = "A key walk can switch vendors. The final error after resets is wrong. Past 16 retries the provider body is lost."
+confidence = "high"
+evidence = "proxy.rs FullBody"
+claims = ["REL-21"]
+state = "suspected"
+test = ""
+fix = ""
+note = ""
+
+[[defect]]
+id = "D52"
+severity = "low"
+area = "Config"
+title = "Hyphenated providers can't get env pool keys; bad values silently disable features"
+impact = "bedrock-openai and fireworks-anthropic 503 on env-only deploys. circuit_breaker_window_secs=0 disables the breaker."
+confidence = "high"
+evidence = "config.rs:472-542; state.rs:134"
+claims = ["REL-15"]
+state = "suspected"
+test = ""
+fix = ""
+note = ""
+
+[[defect]]
+id = "D53"
+severity = "low"
+area = "Security"
+title = "Hygiene gaps"
+impact = "Pool key header not marked sensitive. Cleartext upstream gets no warning. Upstream x-beyond-* headers are spoofable. Capture is forceable. Metrics bind 0.0.0.0."
+confidence = "high"
+evidence = "route.rs:377; state.rs:284"
+claims = ["SEC-8", "SEC-22"]
+state = "suspected"
+test = ""
+fix = ""
+note = ""
+
+[[defect]]
+id = "D54"
+severity = "low"
+area = "Catalog"
+title = "Card details that look derived or wrong"
+impact = "About 20 max-output values are exactly 0.9× or 0.8× the window. gpt-4 claims structured outputs. deepseek-flash claims image input."
+confidence = "med"
+evidence = "catalog.rs cards"
+claims = ["CAT-6", "CAT-4"]
+state = "suspected"
+test = ""
+fix = ""
+note = ""
+
+[[defect]]
+id = "D55"
+severity = "med"
+area = "Docs"
+title = "About 23 false or stale statements"
+impact = "README: 'fail-open NATS' (managed gets 402), 'never buffers', '11 providers', the circuit-breaker description, a broken ARCHITECTURE link, env overrides for map keys. ARCHITECTURE: the Claude lineup, config field names, the 413 happy path. config.example: the fireworks-anthropic path, AWS_BEARER_TOKEN_BEDROCK."
+confidence = "high"
+evidence = "README.md; ARCHITECTURE.md; config.example.toml"
+claims = ["CAT-15"]
+state = "suspected"
+test = ""
+fix = ""
+note = ""

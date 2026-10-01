@@ -1,0 +1,20 @@
+[package]
+name = "beyond-ai-verify"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Claim registry, defect ledger and status/gate for the gateway verification suite"
+publish = false
+
+[[bin]]
+name = "verify"
+path = "src/main.rs"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+toml = "0.8"
+
+[lints]
+workspace = true

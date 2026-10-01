@@ -27,3 +27,14 @@ fail-fast = false
 # `global-timeout` below ever gets to fire, and the job sits until GitHub cancels it at 30 minutes with
 # no log. Four keeps the shards well under a minute each while leaving headroom for the children.
 test-threads = 4
+
+[profile.verify]
+# `mise run verify:status`: runs every test tagged with a claim or defect, ignored reproductions
+# included, and writes the JUnit report the `verify` tool computes status from. Failures are
+# expected here (a reproduced defect's test fails until it's fixed), so nothing stops early.
+fail-fast = false
+retries = 0
+slow-timeout = { period = "60s", terminate-after = 3 }
+
+[profile.verify.junit]
+path = "junit.xml"

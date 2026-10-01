@@ -105,3 +105,16 @@ run = "cargo run -q -p beyond-ai-fleet-sim --bin fleet-sim -- matrix"
 [tasks."sim:list"]
 description = "List the fleet simulator's scenarios and which substrate each one needs."
 run = "cargo run -q -p beyond-ai-fleet-sim --bin fleet-sim -- list"
+
+[tasks."verify:status"]
+description = "Run every claim/defect-tagged test (ignored reproductions included) and print each claim's computed status. See verify/README.md."
+run = """
+set -e
+expr=$(cargo run -q -p beyond-ai-verify -- filter)
+cargo nextest run --workspace --profile verify --run-ignored all --no-tests=pass -E "$expr" || true
+cargo run -q -p beyond-ai-verify -- status --junit target/nextest/verify/junit.xml "$@"
+"""
+
+[tasks."verify:gate"]
+description = "Fail on any inconsistency between verify/claims.toml, verify/defects.toml, test tags and the last verify:status run."
+run = "cargo run -q -p beyond-ai-verify -- gate --junit target/nextest/verify/junit.xml"
