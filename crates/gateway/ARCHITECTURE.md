@@ -533,7 +533,8 @@ responses both ways (a Responses `custom_tool_call` item with its raw `input` â†
 alongside `tools` (OpenAI 400s either without them; Messages and Responses accept both); a Responses named
 `tool_choice` or `allowed_tools` nests its name the Chat Completions way and back; consecutive
 Responses `function_call` items become one assistant message (OpenAI rejects the split form),
-joined to that turn's text; an assistant refusal is text on Messages; a mid-conversation Anthropic
+joined to that turn's text; consecutive same-role messages share one Messages turn, each keeping its
+own text block (two strings are never fused into one); an assistant refusal is text on Messages; a mid-conversation Anthropic
 `system` message stays a Chat Completions `system` message in place; tool `strict` crosses both
 ways; structured output is `strict: true` onto OpenAI only when the schema qualifies (every object
 closed with `additionalProperties: false`, every property required; Anthropic allows optional

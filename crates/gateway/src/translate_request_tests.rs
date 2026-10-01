@@ -1543,7 +1543,6 @@ fn a_tool_turn_without_echoed_thinking_is_still_accepted_on_budget_claude() {
 /// claim: TRN-3
 /// defect: D44
 #[test]
-#[ignore = "D44 reproduced: consecutive user strings merge into one string with no separator"]
 fn consecutive_user_messages_keep_their_text_apart() {
     let v = c2m(
         &chat(json!({"messages": [

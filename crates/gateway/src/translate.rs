@@ -1039,9 +1039,16 @@ fn merge_content(msg: &mut Value, add: Value) {
             n.extend(b.iter().cloned());
             *existing = Value::Array(n);
         }
-        (Value::String(a), Value::String(b)) => {
-            *existing = Value::String(format!("{a}{b}"));
+        // Two messages stay two blocks: fused, "Hello" + "World" would read "HelloWorld".
+        // An empty side adds nothing (Messages rejects an empty text block).
+        (Value::String(a), Value::String(b)) if !b.is_empty() => {
+            *existing = if a.is_empty() {
+                add.clone()
+            } else {
+                json!([{ "type": "text", "text": a }, { "type": "text", "text": b }])
+            };
         }
+        (Value::String(_), Value::String(_)) => {}
         (Value::String(a), Value::Array(b)) => {
             let mut n = vec![json!({ "type": "text", "text": a })];
             n.extend(b.iter().cloned());
