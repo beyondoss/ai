@@ -218,7 +218,7 @@ async fn responses_client_on_claude_gets_items_for_reasoning_text_and_calls() {
         types,
         ["reasoning", "message", "function_call", "function_call"]
     );
-    assert_eq!(out[0]["encrypted_content"], "EqQBsig==");
+    assert_eq!(out[0]["encrypted_content"], "rs_gw:EqQBsig==");
     assert_eq!(out[1]["content"][0]["text"], "Checking both.");
     assert_eq!(out[2]["call_id"], "toolu_a");
     assert_eq!(out[2]["arguments"], "{\"city\":\"Paris\"}");

@@ -422,8 +422,12 @@ Onto a Claude model behind Chat Completions (OpenRouter's `anthropic/…`), sign
 block, `format: "anthropic-claude-v1"`): OpenRouter replays nothing else, and older Claude models
 400 a tool turn without its thinking ("a final `assistant` message must start with a thinking
 block", measured on claude-sonnet-4). A Responses client echoes the `reasoning` items the gateway
-minted (`rs_gw…`, Anthropic signature in `encrypted_content`); onto a Claude upstream they become
-that turn's signed thinking again, while OpenAI's own reasoning items stay dropped. Structured output maps
+minted (`rs_gw…` id, `encrypted_content` = `rs_gw:` + the Anthropic signature; the prefix still
+marks an item a client replays without its id, as Codex and the Agents SDK do); onto a Claude
+upstream they become that turn's signed thinking again, while OpenAI's own reasoning items stay
+dropped. Budget-thinking Claude (before 4.6) 400s a tool loop whose final assistant turn does not
+open with its thinking block; when a client sent none back (Vercel, LangChain, a Responses client
+that drops reasoning items), that request goes without `thinking`, which Anthropic accepts. Structured output maps
 `response_format` `json_schema` ↔ `output_config.format` ↔ Responses `text.format`; OpenAI JSON mode
 (`json_object`) has no schema to give Anthropic and is dropped (OpenAI already requires the prompt to
 ask for JSON). Inline PDFs map Chat `file` ↔ Anthropic base64 `document` ↔ Responses `input_file`.

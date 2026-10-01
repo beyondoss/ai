@@ -683,8 +683,8 @@ fn claude_stream_reaches_responses_with_reasoning_text_and_calls() {
         json!([{"type":"summary_text","text":"Two cities, two calls."}])
     );
     assert_eq!(
-        out[0]["encrypted_content"], "EqQBsig==",
-        "the signature rides encrypted_content"
+        out[0]["encrypted_content"], "rs_gw:EqQBsig==",
+        "the signature rides encrypted_content, behind the gateway marker"
     );
     assert_eq!(out[1]["content"][0]["text"], "Checking both.");
     assert_eq!(out[2]["call_id"], "toolu_a");
@@ -1789,7 +1789,7 @@ fn every_thinking_block_streams_whole_under_its_own_index() {
         .filter(|i| i["type"] == "reasoning")
         .map(|i| &i["encrypted_content"])
         .collect();
-    assert_eq!(sigs, [&json!("S1"), &json!("S2")], "{resp:#}");
+    assert_eq!(sigs, [&json!("rs_gw:S1"), &json!("rs_gw:S2")], "{resp:#}");
 
     // A block that never got its signature is never offered for replay.
     let mut unsigned = blocks.to_vec();

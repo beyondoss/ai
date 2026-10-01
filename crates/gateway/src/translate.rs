@@ -598,6 +598,19 @@ fn openai_req_to_anthropic(v: &Value, claude: ClaudeModel) -> Value {
         place_system(&mut messages, &mut pending_system, &mut system_parts);
     }
     sanitize_tool_ids(&mut messages);
+    // Budget thinking in a tool loop: the final assistant turn must open with its thinking block.
+    // A client that did not send the signed block back (most Chat Completions and Responses SDKs)
+    // leaves nothing to replay, and Anthropic accepts the request without thinking, not with it.
+    if claude.reasoning == ClaudeGen::Budget
+        && out
+            .get("thinking")
+            .and_then(|t| t.get("type"))
+            .and_then(Value::as_str)
+            == Some("enabled")
+        && tool_turn_lacks_thinking(&messages)
+    {
+        out.remove("thinking");
+    }
     if !system_parts.is_empty() {
         out.insert("system".into(), anthropic_system_value(system_parts));
     }
@@ -656,6 +669,24 @@ fn thinking_off_between_tools(out: &mut Map<String, Value>, claude: ClaudeModel)
         return;
     }
     out.insert("thinking".into(), json!({ "type": "between_tools" }));
+}
+
+/// Whether the last assistant turn calls a tool without opening on a thinking block (signed or
+/// redacted: unsigned ones never reach here), which Anthropic rejects while thinking is enabled.
+fn tool_turn_lacks_thinking(messages: &[Value]) -> bool {
+    let Some(blocks) = messages
+        .iter()
+        .rev()
+        .find(|m| m.get("role").and_then(Value::as_str) == Some("assistant"))
+        .and_then(|m| m.get("content"))
+        .and_then(Value::as_array)
+    else {
+        return false;
+    };
+    !blocks.first().is_some_and(is_thinking_block)
+        && blocks
+            .iter()
+            .any(|b| b.get("type").and_then(Value::as_str) == Some("tool_use"))
 }
 
 /// Emit mid-conversation system messages where Messages accepts one: right after a user turn,
@@ -3718,17 +3749,42 @@ fn responses_input_to_messages(input: Option<&Value>, up: Upstream) -> Vec<Value
     out
 }
 
+/// Leads the `encrypted_content` of every `reasoning` item the gateway mints (see
+/// [`reasoning_item`]), ahead of the Anthropic signature. It marks the item as ours even when a
+/// client replays it without its `id` (Codex, the Agents SDK), and no provider's own encrypted
+/// reasoning can start with it: `:` is outside the base64 alphabet both use.
+const GATEWAY_SIGNATURE_PREFIX: &str = "rs_gw:";
+
+/// Whether a Responses input item is a `reasoning` item this gateway minted: our `rs_gw…` id
+/// (items minted before [`GATEWAY_SIGNATURE_PREFIX`]) or our prefix on its `encrypted_content`.
+fn is_gateway_reasoning(item: &Value) -> bool {
+    item.get("type").and_then(Value::as_str) == Some("reasoning")
+        && (item
+            .get("id")
+            .and_then(Value::as_str)
+            .is_some_and(|id| id.starts_with("rs_gw"))
+            || item
+                .get("encrypted_content")
+                .and_then(Value::as_str)
+                .is_some_and(|c| c.starts_with(GATEWAY_SIGNATURE_PREFIX)))
+}
+
 /// The Anthropic thinking block behind a `reasoning` item this gateway minted for a Responses
-/// client (see [`reasoning_item`]): its id is ours (`rs_gw…`), its summary is the block's text, and
+/// client (see [`reasoning_item`], [`is_gateway_reasoning`]): its summary is the block's text, and
 /// its `encrypted_content` is the block's Anthropic signature. Sent back to a Claude upstream it
 /// keeps a thinking + tool loop valid (older Claude models 400 a tool turn without its thinking).
 /// Any other reasoning item — OpenAI's own, or one without a signature — is `None`.
 fn gateway_reasoning_block(item: &Value) -> Option<Value> {
-    let id = item.get("id").and_then(Value::as_str)?;
-    if !id.starts_with("rs_gw") {
+    if !is_gateway_reasoning(item) {
         return None;
     }
-    let signature = non_empty_str(item, "encrypted_content")?;
+    let content = non_empty_str(item, "encrypted_content")?;
+    let signature = content
+        .strip_prefix(GATEWAY_SIGNATURE_PREFIX)
+        .unwrap_or(content);
+    if signature.is_empty() {
+        return None;
+    }
     let text: String = item
         .get("summary")
         .and_then(Value::as_array)
@@ -4038,8 +4094,8 @@ fn refusal_part(refusal: &str) -> Value {
 }
 
 /// A Responses `reasoning` item for a thinking block: its text as a summary, its Anthropic
-/// signature (when there was one) as `encrypted_content`. `redacted_thinking` has no text to show
-/// and no slot of its own on Responses, and is dropped.
+/// signature (when there was one) behind [`GATEWAY_SIGNATURE_PREFIX`] as `encrypted_content`.
+/// `redacted_thinking` has no text to show and no slot of its own on Responses, and is dropped.
 fn reasoning_item(block: &Value, id: String) -> Option<Value> {
     if block.get("type").and_then(Value::as_str) != Some("thinking") {
         return None;
@@ -4055,7 +4111,10 @@ fn reasoning_item(block: &Value, id: String) -> Option<Value> {
     item.insert("id".into(), json!(id));
     item.insert("summary".into(), summary);
     if let Some(sig) = non_empty_str(block, "signature") {
-        item.insert("encrypted_content".into(), json!(sig));
+        item.insert(
+            "encrypted_content".into(),
+            json!(format!("{GATEWAY_SIGNATURE_PREFIX}{sig}")),
+        );
     }
     Some(Value::Object(item))
 }

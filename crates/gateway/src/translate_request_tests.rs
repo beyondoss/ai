@@ -1304,6 +1304,35 @@ fn gateway_reasoning_items_come_back_as_signed_thinking() {
     assert!(!v.to_string().contains("SIG"), "{v}");
 }
 
+/// Codex and the Agents SDK replay a `reasoning` item without its `id`. The marker the gateway puts
+/// on `encrypted_content` still names it as ours, so a budget-thinking Claude turn keeps its signed
+/// thinking (and thinking stays on) instead of falling back to a request without thinking.
+#[test]
+fn an_id_less_gateway_reasoning_item_still_replays_its_signature() {
+    let body = json!({"model": "m", "store": false, "max_output_tokens": 4000,
+    "reasoning": {"effort": "high"},
+    "tools": [{"type": "function", "name": "get_weather", "parameters": weather_schema()}],
+    "input": [
+        {"role": "user", "content": "weather?"},
+        {"type": "reasoning", "summary": [{"type": "summary_text", "text": "t"}],
+         "encrypted_content": format!("{GATEWAY_SIGNATURE_PREFIX}SIG")},
+        {"type": "function_call", "call_id": "toolu_1", "name": "get_weather", "arguments": "{}"},
+        {"type": "function_call_output", "call_id": "toolu_1", "output": "sunny"},
+    ]});
+    let v = req(
+        Endpoint::Responses,
+        Endpoint::Messages,
+        &body,
+        "claude-sonnet-4-5",
+    );
+    assert_eq!(
+        v["messages"][1]["content"][0],
+        json!({"type": "thinking", "thinking": "t", "signature": "SIG"}),
+        "{v}"
+    );
+    assert_eq!(v["thinking"]["type"], "enabled", "{v}");
+}
+
 /// OpenAI's Chat Completions 400s `tool_choice` and `parallel_tool_calls` without `tools` ("only
 /// allowed when 'tools' are specified", measured); Messages and Responses accept both.
 #[test]
@@ -1463,7 +1492,6 @@ fn tool_loop_thinking_violation(v: &Value) -> Option<String> {
 /// claim: TRN-7, TRN-8
 /// defect: D14
 #[test]
-#[ignore = "D14 reproduced: thinking stays enabled while the final assistant tool turn has no thinking block"]
 fn a_tool_turn_without_echoed_thinking_is_still_accepted_on_budget_claude() {
     const MODEL: &str = "claude-sonnet-4-5";
     assert_eq!(ClaudeModel::of(MODEL).reasoning, ClaudeGen::Budget);
