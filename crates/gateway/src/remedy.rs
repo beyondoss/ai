@@ -10,6 +10,13 @@
 //! context overflow, a bad parameter, a content-policy refusal) never carries one of these phrases
 //! and is left alone.
 //!
+//! Two decisions, kept apart because only one of them is shared (D200). Whether the account is
+//! **out of credit** ([`Neutralized::unfunded`]) cools Beyond's pool key for every tenant, so it is
+//! read only from what the provider sets and the request cannot: the status, a `code` or `type`,
+//! or a provider's whole sentence ([`unfunded`]). The **message rewrite** is cosmetic and matches
+//! phrases, but only on a status about the account (401, 402, 403, 429), because a 400 or 404 may
+//! quote the tenant's own model name or parameter back.
+//!
 //! Run only on a managed error body (status >= 400, JSON, at most [`MAX_BODY`]) by the pool-key
 //! scrub in `proxy.rs`, once, at end of body. A 2xx is never parsed here. A BYO error is the
 //! caller's own account talking, so it is relayed as sent.
@@ -45,13 +52,14 @@ const TOO_LARGE_PHRASES: &[&str] = &[
 /// one streams through unchanged (the pool-key scrub still applies).
 pub const MAX_BODY: usize = 64 * 1024;
 
-/// Phrases that say the provider account the request was sent on is out of credit or quota,
-/// matched ASCII case-insensitively in the error's strings. Waiting does not clear these; the key
-/// is a candidate refusal (D180).
-const UNFUNDED: &[&str] = &[
+/// Phrases that occur only in advice about Beyond's account with the provider, matched ASCII
+/// case-insensitively in the error's strings. **Cosmetic only**: they choose what a message is
+/// rewritten to, and only on an account status ([`account_status`]). They never decide that a key
+/// is out of credit ([`unfunded`] reads structured fields): a provider quotes the request in its
+/// errors, so any of these can arrive in a tenant's own text (D200).
+const REMEDIES: &[&str] = &[
     // OpenAI (Gemini uses the same words): insufficient_quota, and its billing page.
     "check your plan and billing details",
-    "platform.openai.com/account/billing",
     // Anthropic's billing 400 ("Please go to Plans & Billing to upgrade or purchase credits").
     "credit balance is too low",
     "console.anthropic.com/settings",
@@ -61,24 +69,41 @@ const UNFUNDED: &[&str] = &[
     "console.x.ai",
     // OpenRouter's 402 ("Insufficient credits ... https://openrouter.ai/settings/credits").
     "insufficient credits",
-    "openrouter.ai/settings/credits",
     // DeepSeek's 402.
     "insufficient balance",
-];
-
-/// Phrases that occur only in other advice about that account, never in the client's mistake.
-const REMEDIES: &[&str] = &[
     // OpenRouter: the shared-pool 429 ("add your own key to accumulate your rate limits:
-    // https://openrouter.ai/settings/integrations"), its key and BYOK pages.
+    // https://openrouter.ai/settings/integrations"), its key, credits and BYOK pages.
     "add your own key",
     "openrouter.ai/settings",
-    // OpenAI's organization rate limit, which also names Beyond's org id and links its limits page.
+    // OpenAI's organization rate limit and billing pages (the rate limit also names Beyond's org id).
     "platform.openai.com/account",
     // Anthropic's organization rate limit: "contact sales" (it also names Beyond's org id).
     "anthropic.com/contact-sales",
     // Groq: the organization rate limit's "Upgrade to Dev Tier" billing link.
     "console.groq.com/settings",
 ];
+
+/// Anthropic's out-of-credit answer, a `400` `invalid_request_error`, compared whole: its type is
+/// the one every request mistake carries, so only the provider's exact sentence tells it apart. A
+/// prefix would not do: Anthropic's "`<field>`: Extra inputs are not permitted" starts with a name
+/// the tenant chose.
+const ANTHROPIC_NO_CREDIT: &str = "Your credit balance is too low to access the Anthropic API. \
+     Please go to Plans & Billing to upgrade or purchase credits.";
+
+/// xAI's spent-credits `403` (`permission_denied`, the code every permission error carries) is
+/// "Your team `<id>` has either used all ...": the team id is xAI's, and everything around it is
+/// compared whole.
+const XAI_NO_CREDIT: (&str, &str) = (
+    "Your team ",
+    " has either used all available credits or reached its monthly spending limit. To continue \
+     making API requests, please purchase more credits or raise your spending limit.",
+);
+
+/// OpenRouter's `402` for one request larger than the credit left can pay for ("This request
+/// requires more credits, or fewer max_tokens. You requested up to N tokens, but can only afford
+/// M ..."): the tenant chose that size, and a smaller request is still served, so it does not cool
+/// the key. Anchored at the start, which is OpenRouter's own text.
+const OPENROUTER_TOO_COSTLY: &str = "This request requires more credits";
 
 /// OpenRouter error metadata that describes Beyond's account with it, not the error.
 const ACCOUNT_METADATA: &[&str] = &["is_byok", "limit_source", "remedy_hint"];
@@ -87,7 +112,8 @@ const ACCOUNT_METADATA: &[&str] = &["is_byok", "limit_source", "remedy_hint"];
 #[derive(Debug, PartialEq, Eq)]
 pub struct Neutralized {
     pub body: Vec<u8>,
-    /// The provider said the account is out of credit or quota: cool the key (D180).
+    /// The provider said the account is out of credit or quota: cool the key (D180). Read from
+    /// structured fields only ([`unfunded`]), never from a phrase.
     pub unfunded: bool,
 }
 
@@ -95,13 +121,15 @@ pub struct Neutralized {
 /// when it has none (or is not a JSON object), so the caller relays the original bytes.
 ///
 /// In the error object (`error` when it is an object, else the root: Bedrock's `{"message"}`,
-/// xAI's `{"code", "error": "<string>"}`): a `message` or string `error` carrying a remedy becomes
-/// [`UNAVAILABLE`] when the account is out of credit (an [`UNFUNDED`] phrase, or OpenAI's
-/// `insufficient_quota` code or type) or the status is not a 429, else [`TOO_LARGE`] when the
-/// message says the request alone is over the limit, else [`RATE_LIMITED`].
-/// OpenRouter's `metadata.raw` is removed when it carries one (the translation quotes it after the
-/// message), and `is_byok`, `limit_source` and `remedy_hint` are removed. Everything else —
-/// `type`, `code`, `param`, `metadata.provider_name` — is kept.
+/// xAI's `{"code", "error": "<string>"}`): when the provider said the account is out of credit
+/// ([`unfunded`]), the `message` or string `error` becomes [`UNAVAILABLE`]. Otherwise, on an
+/// account status ([`account_status`]: a 401, 402, 403 or 429), one carrying a [`REMEDIES`] phrase
+/// becomes [`TOO_LARGE`] on a 429 that says the request alone is over the limit, [`RATE_LIMITED`]
+/// on any other 429, and [`UNAVAILABLE`] on the rest. On any other status (a 400 or 404 about the
+/// request, which may quote it) the message is left as the provider wrote it. OpenRouter's
+/// `metadata.raw` is removed when it is rewritten for the same reasons (the translation quotes it
+/// after the message), and `is_byok`, `limit_source` and `remedy_hint` are always removed.
+/// Everything else — `type`, `code`, `param`, `metadata.provider_name` — is kept.
 pub fn neutralize(body: &[u8], status: u16) -> Option<Neutralized> {
     let mut v: Value = serde_json::from_slice(body).ok()?;
     let root = v.as_object_mut()?;
@@ -115,37 +143,77 @@ pub fn neutralize(body: &[u8], status: u16) -> Option<Neutralized> {
     })
 }
 
+/// Whether a provider error says the account behind the key is out of credit or quota, read from
+/// what the provider sets and the request cannot (D200):
+///
+/// - a `402` (Payment Required: OpenRouter's insufficient credits, DeepSeek's insufficient balance,
+///   Anthropic's `billing_error`), except OpenRouter's one-request-too-costly answer
+///   ([`OPENROUTER_TOO_COSTLY`]);
+/// - OpenAI's `insufficient_quota` `code` or `type`, and Anthropic's `billing_error` `type`;
+/// - Anthropic's credit-balance `400` and xAI's spent-credits `403`, whose message is compared to
+///   the provider's whole sentence ([`ANTHROPIC_NO_CREDIT`], [`XAI_NO_CREDIT`]).
+///
+/// Never a phrase found somewhere in a message: providers quote the request in their errors (a
+/// model name, an unknown parameter, an extra field), so a tenant could otherwise cool Beyond's
+/// key for every tenant, for free and at will.
+fn unfunded(err: &Map<String, Value>, status: u16) -> bool {
+    let str_of = |k: &str| err.get(k).and_then(Value::as_str);
+    let message = str_of("message").or_else(|| str_of("error")).unwrap_or("");
+    if status == 402 {
+        return !message.starts_with(OPENROUTER_TOO_COSTLY);
+    }
+    if [str_of("code"), str_of("type")]
+        .iter()
+        .any(|v| matches!(v, Some("insufficient_quota" | "billing_error")))
+    {
+        return true;
+    }
+    if message.trim_end() == ANTHROPIC_NO_CREDIT {
+        return true;
+    }
+    let (head, tail) = XAI_NO_CREDIT;
+    message
+        .strip_prefix(head)
+        .and_then(|rest| rest.find(' ').map(|i| rest.split_at(i)))
+        .is_some_and(|(team, rest)| !team.is_empty() && rest.trim_end() == tail)
+}
+
+/// Whether `status` is one on which a provider talks about the account rather than the request: a
+/// refused (401), unfunded (402) or forbidden (403) credential, or a rate limit (429). A remedy
+/// phrase is rewritten only on these. A 400 or 404 is about the request and may quote it ("The
+/// model `X` does not exist"), so a phrase there may be the tenant's own words (D200).
+fn account_status(status: u16) -> bool {
+    matches!(status, 401..=403 | 429)
+}
+
 /// Rewrite `err` in place. `None` when nothing changed, else whether it is out of credit.
 fn scrub(err: &mut Map<String, Value>, status: u16) -> Option<bool> {
+    let unfunded = unfunded(err, status);
+    let account = unfunded || account_status(status);
     let mut changed = false;
-    let mut found = Found::None;
-    let quota = ["code", "type"]
-        .iter()
-        .any(|k| err.get(*k).and_then(Value::as_str) == Some("insufficient_quota"));
-    if quota {
-        found = Found::Unfunded;
-    }
+    let mut remedy = false;
     let mut too_large = false;
-    for field in ["message", "error"] {
-        if let Some(s) = err.get(field).and_then(Value::as_str) {
-            found = found.max(remedy(s));
-            let lower = s.to_ascii_lowercase();
-            too_large |= TOO_LARGE_PHRASES.iter().any(|p| lower.contains(p));
+    if account {
+        for field in ["message", "error"] {
+            if let Some(s) = err.get(field).and_then(Value::as_str) {
+                let lower = s.to_ascii_lowercase();
+                remedy |= has_remedy(&lower);
+                too_large |= TOO_LARGE_PHRASES.iter().any(|p| lower.contains(p));
+            }
         }
     }
     if let Some(meta) = err.get_mut("metadata").and_then(Value::as_object_mut) {
         for k in ACCOUNT_METADATA {
             changed |= meta.remove(*k).is_some();
         }
-        let raw = meta.get("raw").map_or(Found::None, remedy_in);
-        if raw != Found::None {
-            found = found.max(raw);
+        if account && meta.get("raw").is_some_and(remedy_in) {
+            remedy = true;
             meta.remove("raw");
             changed = true;
         }
     }
-    if found != Found::None {
-        let text = if found == Found::Unfunded || status != 429 {
+    if unfunded || remedy {
+        let text = if unfunded || status != 429 {
             UNAVAILABLE
         } else if too_large {
             TOO_LARGE
@@ -166,37 +234,22 @@ fn scrub(err: &mut Map<String, Value>, status: u16) -> Option<bool> {
         }
         changed = true;
     }
-    changed.then_some(found == Found::Unfunded)
+    changed.then_some(unfunded)
 }
 
-/// What a string says about the account, ordered so the strongest finding wins.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-enum Found {
-    None,
-    Remedy,
-    Unfunded,
-}
-
-/// The strongest finding among the strings in `v` (OpenRouter's `raw` is a string, or the
-/// upstream's own JSON).
-fn remedy_in(v: &Value) -> Found {
+/// Whether any string in `v` carries a remedy (OpenRouter's `raw` is a string, or the upstream's
+/// own JSON).
+fn remedy_in(v: &Value) -> bool {
     match v {
-        Value::String(s) => remedy(s),
-        Value::Array(a) => a.iter().map(remedy_in).max().unwrap_or(Found::None),
-        Value::Object(o) => o.values().map(remedy_in).max().unwrap_or(Found::None),
-        _ => Found::None,
+        Value::String(s) => has_remedy(&s.to_ascii_lowercase()),
+        Value::Array(a) => a.iter().any(remedy_in),
+        Value::Object(o) => o.values().any(remedy_in),
+        _ => false,
     }
 }
 
-fn remedy(s: &str) -> Found {
-    let lower = s.to_ascii_lowercase();
-    if UNFUNDED.iter().any(|r| lower.contains(r)) {
-        Found::Unfunded
-    } else if REMEDIES.iter().any(|r| lower.contains(r)) {
-        Found::Remedy
-    } else {
-        Found::None
-    }
+fn has_remedy(lower: &str) -> bool {
+    REMEDIES.iter().any(|r| lower.contains(r))
 }
 
 #[cfg(test)]
@@ -318,6 +371,90 @@ mod tests {
                     "rewrote {body}"
                 );
             }
+        }
+    }
+
+    /// A provider quoting the request: every out-of-credit phrase in a tenant's model name,
+    /// unknown parameter or extra field. Never unfunded (that would cool the shared key, D200), and
+    /// on a 400 or 404 never rewritten either. On an account status the phrase still reads as a
+    /// remedy (the cosmetic rewrite), but it is not unfunded there either.
+    #[test]
+    fn an_echoed_phrase_is_never_unfunded() {
+        for phrase in REMEDIES {
+            for body in [
+                format!(
+                    r#"{{"error":{{"message":"The model `{phrase}` does not exist or you do not have access to it.","type":"invalid_request_error","param":null,"code":"model_not_found"}}}}"#
+                ),
+                format!(
+                    r#"{{"error":{{"message":"Unrecognized request argument supplied: {phrase}","type":"invalid_request_error","param":null,"code":null}}}}"#
+                ),
+                format!(
+                    r#"{{"type":"error","error":{{"type":"invalid_request_error","message":"{phrase}: Extra inputs are not permitted"}}}}"#
+                ),
+            ] {
+                for status in [400, 404, 422] {
+                    assert!(
+                        neutralize(body.as_bytes(), status).is_none(),
+                        "{status} {body}"
+                    );
+                }
+                for status in [401, 403, 429] {
+                    let (_, unfunded) = rewritten(&body, status).unwrap();
+                    assert!(!unfunded, "{status} {body}");
+                }
+            }
+        }
+        // The anchored sentences, with tenant text around them.
+        for (status, body) in [
+            (
+                400,
+                r#"{"type":"error","error":{"type":"invalid_request_error","message":"Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits.: Extra inputs are not permitted"}}"#,
+            ),
+            (
+                400,
+                r#"{"type":"error","error":{"type":"invalid_request_error","message":"x: Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits."}}"#,
+            ),
+            (
+                403,
+                r#"{"code":"permission_denied","error":"Model Your team t-1 has either used all available credits or reached its monthly spending limit. To continue making API requests, please purchase more credits or raise your spending limit."}"#,
+            ),
+        ] {
+            assert!(
+                !rewritten(body, status).is_some_and(|(_, u)| u),
+                "{status} {body}"
+            );
+        }
+    }
+
+    /// The structured signals: a 402 (but not OpenRouter's one-request-too-costly), Anthropic's
+    /// `billing_error`, OpenAI's `insufficient_quota`.
+    #[test]
+    fn unfunded_is_read_from_structured_fields() {
+        for (status, body, want) in [
+            (
+                402,
+                r#"{"type":"error","error":{"type":"billing_error","message":"There's an issue with your billing."}}"#,
+                true,
+            ),
+            (
+                400,
+                r#"{"type":"error","error":{"type":"billing_error","message":"x"}}"#,
+                true,
+            ),
+            (
+                402,
+                r#"{"error":{"message":"This request requires more credits, or fewer max_tokens. You requested up to 64000 tokens, but can only afford 1234. To increase, visit https://openrouter.ai/settings/credits","code":402}}"#,
+                false,
+            ),
+            (
+                429,
+                r#"{"error":{"message":"x","type":"insufficient_quota","code":"insufficient_quota"}}"#,
+                true,
+            ),
+        ] {
+            let (v, got) = rewritten(body, status).unwrap_or_else(|| panic!("kept: {body}"));
+            assert_eq!(got, want, "{body}");
+            assert_eq!(v["error"]["message"], UNAVAILABLE, "{body}");
         }
     }
 }

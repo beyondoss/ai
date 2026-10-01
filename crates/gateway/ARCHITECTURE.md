@@ -965,36 +965,48 @@ pool-key scrub (`Redact`, which already rewrites error bodies, before translatio
 cache) also runs `remedy::neutralize` at end of body:
 
 - **What counts.** A `message`, a string `error` (xAI) or OpenRouter's `metadata.raw` containing,
-  case-insensitively, a phrase from one of two lists, and always OpenRouter's `metadata.is_byok`,
-  `limit_source` and `remedy_hint`.
-  - _Out of credit or quota_ (`remedy::UNFUNDED`): "check your plan and billing details",
-    `platform.openai.com/account/billing` (OpenAI's `insufficient_quota`, also matched by that code
-    or type; Gemini uses the same words); "credit balance is too low",
-    `console.anthropic.com/settings` (Anthropic's billing 400); "purchase more credits", "raise your
-    spending limit", `console.x.ai` (xAI's spent credits or spending limit, which name Beyond's team
-    id); "insufficient credits", `openrouter.ai/settings/credits` (OpenRouter's 402); "insufficient
-    balance" (DeepSeek's 402).
-  - _Other account advice_ (`remedy::REMEDIES`): "add your own key", `openrouter.ai/settings`
-    (OpenRouter's shared pool, its key and BYOK pages); `platform.openai.com/account` (OpenAI's
-    organization rate limit, which names Beyond's org id); `anthropic.com/contact-sales` (Anthropic's
-    organization rate limit, which names Beyond's org id); `console.groq.com/settings` (Groq's
-    "Upgrade to Dev Tier").
+  case-insensitively, a phrase from `remedy::REMEDIES`, on a status about the account (401, 402, 403
+  or 429), and always OpenRouter's `metadata.is_byok`, `limit_source` and `remedy_hint`. The
+  phrases: "check your plan and billing details" (OpenAI's `insufficient_quota`; Gemini uses the
+  same words); "credit balance is too low", `console.anthropic.com/settings` (Anthropic's billing
+  400); "purchase more credits", "raise your spending limit", `console.x.ai` (xAI's spent credits
+  or spending limit, which name Beyond's team id); "insufficient credits" (OpenRouter's 402);
+  "insufficient balance" (DeepSeek's 402); "add your own key", `openrouter.ai/settings`
+  (OpenRouter's shared pool, its key, credits and BYOK pages); `platform.openai.com/account`
+  (OpenAI's billing page and organization rate limit, which names Beyond's org id);
+  `anthropic.com/contact-sales` (Anthropic's organization rate limit, which names Beyond's org id);
+  `console.groq.com/settings` (Groq's "Upgrade to Dev Tier"). A 400 or 404 is about the request
+  and providers quote the request in it ("The model \`X\` does not exist", "Unrecognized request
+  argument supplied: X", "X: Extra inputs are not permitted"), so a phrase there may be the
+  tenant's own words and is relayed as written (D200).
+- **Out of credit is structured, never a phrase (D200).** Whether the account is out of credit
+  (`remedy::Neutralized::unfunded`, which cools Beyond's key for every tenant, below) is read only
+  from what the provider sets and the request cannot: a `402` (OpenRouter, DeepSeek, Anthropic's
+  `billing_error`), except OpenRouter's "This request requires more credits, or fewer max_tokens"
+  (one request bigger than the balance; a smaller one is served); OpenAI's `insufficient_quota`
+  `code` or `type` and Anthropic's `billing_error` `type`; and Anthropic's credit-balance `400` and
+  xAI's spent-credits `403`, whose message must equal the provider's whole sentence (a prefix would
+  not do: Anthropic's "X: Extra inputs are not permitted" starts with a name the tenant chose). A
+  phrase anywhere in a message once decided it, so a model named "insufficient balance" cooled the
+  key for every tenant, for free and repeatably.
 - **What it becomes.** The message says what the error is, without the account behind it. A rate
   limit (a 429 that is not out of credit) reads "The provider is rate-limited upstream; retry
   later.": waiting clears it. A 429 that says the request alone is over the limit (OpenAI's TPM
   "Request too large ... The input or output tokens must be reduced in order to run successfully")
   is the exception, since no wait admits it: it reads "The request is larger than the provider's
   per-minute token limit admits; reduce the input or output tokens. Retrying it unchanged will not
-  succeed." (D196; "retry later" sent clients round the same 429). Out of credit or quota, whatever its status (Anthropic's is a 400,
-  OpenAI's a 429), or account advice on any other status, reads "The provider cannot serve this
+  succeed." (D196; "retry later" sent clients round the same 429). Out of credit or quota, whatever
+  its status (Anthropic's is a 400, OpenAI's a 429), or account advice on a 401, 402 or 403, reads "The provider cannot serve this
   request right now; retry later or use another model.": true without saying why, and a retry is
   served, since the walk now leaves that provider out (D180, below). A `raw` carrying a phrase is
   removed (a translation quotes `raw` after the message, so it would repeat), and the three metadata
   keys are removed. `type`, `code`, `param`, `metadata.provider_name` and the status and headers are
   kept, so an SDK raises the same typed error and retries on the same `Retry-After`.
-- **What does not count.** Anything the client can act on carries none of those phrases and is
-  relayed as sent: a context overflow, an unknown or invalid parameter, a content-policy refusal, a
-  plain rate limit, OpenRouter quoting an upstream's own error. An OpenAI organization rate limit
+- **What does not count.** Anything the client can act on carries none of those phrases, or
+  arrives on a status about the request, and is relayed as sent: a context overflow, an unknown or
+  invalid parameter (even one named after a phrase), a content-policy refusal, a plain rate limit,
+  OpenRouter quoting an upstream's own error. An OpenRouter 404 naming its privacy settings page is
+  relayed too, since a 404 may quote the request. An OpenAI organization rate limit
   does lose its "try again in 2s" with the rest of the message; `Retry-After` still says when.
 - **Scope and cost.** Managed only: a BYO error is the caller's own account talking, and its remedy
   is one they can follow. Error paths only: a status >= 400 with a JSON body (<= 64 KiB) is held to
@@ -2093,7 +2105,8 @@ Two deliberate non-cases, plus one same-provider retry:
   rate limit: Anthropic's credit-balance `400`, OpenAI's `insufficient_quota` `429`. The walk decides
   on the response head, which reaches the client before the first body byte is read, so that
   request is relayed (its message rewritten, above). `Redact` reads the body
-  (`remedy::Neutralized::unfunded`), and `logging` cools that key as a `401` is cooled
+  (`remedy::Neutralized::unfunded`, from the status, `code`, `type` or a provider's whole sentence,
+  never a phrase a tenant could get echoed: D200), and `logging` cools that key as a `401` is cooled
   (`ai_key_auth_failures_total`). A catalog walk then leaves out every candidate whose provider has
   all its keys cooling (`Provider::cooling`) while another candidate can take the request, so the
   next request goes to the row's next candidate for `KEY_COOLDOWN` instead of failing on the same
