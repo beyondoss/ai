@@ -366,3 +366,40 @@ async fn a_claude_tool_turn_without_reasoning_details_goes_without_reasoning_on_
 
     assert!(bad.is_empty(), "{bad:#?}");
 }
+
+/// openai-python sends `user: null` (and other unset options as null) when a caller passes `None`.
+/// OpenRouter rejects `user: null` ("expected string, received null"). On a same-wire Chat relay
+/// to a non-OpenAI host, explicit nulls are omitted, as translation already omits them: on
+/// claude-sonnet-4 (OpenRouter only) and on a Claude row's OpenRouter failover alike. Every other
+/// byte is the client's.
+/// claim: TRN-15
+/// defect: D101
+#[tokio::test]
+#[ignore = "D101 reproduced: user: null is relayed to OpenRouter untouched"]
+async fn explicit_nulls_are_omitted_on_a_same_wire_chat_relay_to_openrouter() {
+    let nats_port = unused_nats_port();
+    let (pubkey, sk) = test_keypair(1);
+    let mock = MockUpstream::start(Mode::Json).await;
+    let gw = Gateway::builder(nats_port, &GatewayBuilder::dead_authority(), &b64(&pubkey))
+        .providers(&["anthropic", "openrouter"])
+        .provider_authority("openrouter", &mock.authority())
+        .start()
+        .await;
+    let mut bad = Vec::new();
+    for model in ["claude-sonnet-4", "claude-sonnet-4-5"] {
+        let body = json!({
+            "model": model, "user": null, "seed": null, "temperature": 0.5, "stop": null,
+            "messages": [{"role": "user", "content": "hi"}],
+        });
+        post(&gw, &sk, "/v1/chat/completions", &body).await;
+        let (cap, got) = captured(&mock);
+        assert_eq!(cap.path, "/api/v1/chat/completions");
+        let root = got.as_object().unwrap();
+        if root.values().any(Value::is_null) {
+            bad.push(format!("{model}: {got}"));
+        }
+        assert_eq!(got["temperature"], 0.5, "{got}");
+        assert_eq!(got["messages"], body["messages"], "nested values are the client's: {got}");
+    }
+    assert!(bad.is_empty(), "explicit nulls reached OpenRouter:\n{}", bad.join("\n"));
+}

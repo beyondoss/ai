@@ -235,3 +235,56 @@ async fn a_finished_stream_with_unparseable_usage_bills_a_flagged_estimate() {
     );
     wait_for_metric(&gw, "ai_usage_parse_errors_total", "", 1.0).await;
 }
+
+/// OpenAI's parser takes the **last** of duplicate keys and decodes escaped key names. A client
+/// that sends a second `stream_options`, or spells the key with an escape, must not switch off the
+/// usage chunk either: exactly one `stream_options` with `include_usage: true` reaches OpenAI, and
+/// the row is exact.
+/// claim: BIL-2
+/// defect: D88
+#[tokio::test]
+#[ignore = "D88 reproduced: a duplicate or escaped stream_options keeps include_usage false"]
+async fn duplicate_or_escaped_stream_options_cannot_turn_off_exact_metering() {
+    /// Usage only when OpenAI would send it (last key wins), and only when the body carries one
+    /// root `stream_options` however it is spelled.
+    fn strict(body: &[u8], n: usize) -> Vec<Step> {
+        let text = String::from_utf8_lossy(body);
+        let keys = text.matches("\"stream_options\"").count()
+            + text.matches("\"stream\\u005foptions\"").count();
+        if keys == 1 {
+            openai_stream_honoring_include_usage(body, n)
+        } else {
+            openai_stream_honoring_include_usage(b"{}", n)
+        }
+    }
+    let (pubkey, sk) = test_keypair(62);
+    let mock = ScriptedUpstream::start(strict).await;
+    let gw = Gateway::builder(unused_nats_port(), &mock.authority(), &b64(&pubkey))
+        .providers(&["openai"])
+        .start()
+        .await;
+    let key = billing_vkey(&sk, 62);
+    let url = format!("{}/openai/v1/chat/completions", gw.url());
+    let bodies = [
+        r#"{"model":"gpt-4o","stream":true,"stream_options":{"include_usage":true},"stream_options":{"include_usage":false},"messages":[{"role":"user","content":"hi"}]}"#,
+        r#"{"model":"gpt-4o","stream":true,"stream_options":{"include_usage":false},"messages":[{"role":"user","content":"hi"}],"stream_options":{"include_usage":false}}"#,
+        r#"{"model":"gpt-4o","stream":true,"stream_options":{"include_usage":false},"messages":[{"role":"user","content":"hi"}]}"#,
+    ];
+    for body in bodies {
+        let (status, text) = post(url.clone(), &key, body, &[]).await;
+        assert_eq!(status, 200, "{text}");
+    }
+    let rows = wait_usage_rows(&gw, 3, 5).await;
+    assert_eq!(rows.len(), 3, "{}", gw.log());
+    for (row, body) in rows.iter().zip(bodies) {
+        assert_eq!(
+            (
+                row["usage_estimated"].as_bool(),
+                row["input_tokens"].as_u64(),
+                row["output_tokens"].as_u64()
+            ),
+            (Some(false), Some(5), Some(9)),
+            "{body}: {row}"
+        );
+    }
+}

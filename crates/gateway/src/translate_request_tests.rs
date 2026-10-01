@@ -1929,3 +1929,42 @@ fn null_instructions_are_absent_on_chat() {
         );
     }
 }
+
+/// Stripping the gateway's reasoning items from a same-wire Responses body removes those items and
+/// nothing else: schema property order (a strict structured output's field order), spacing and
+/// number spellings stay as the client sent them, so the relay is still a byte relay and a prompt
+/// cache prefix still matches. A body with nothing to strip is returned byte for byte.
+/// claim: TRN-20, TRN-4
+/// defect: D90
+#[test]
+#[ignore = "D90 reproduced: strip_gateway_reasoning re-serializes and reorders the body"]
+fn stripping_gateway_reasoning_changes_only_the_stripped_items() {
+    let ours = r#"{"type":"reasoning","id":"rs_gw_1","summary":[],"encrypted_content":"rs_gw:SIG"}"#;
+    let theirs = r#"{"type": "reasoning", "id": "rs_abc", "encrypted_content": "gAAA"}"#;
+    let user = r#"{ "role":"user", "content":"hi" }"#;
+    let body = |items: &[&str]| {
+        format!(
+            r#"{{"model":"gpt-5", "text":{{"format":{{"type":"json_schema","name":"o","strict":true,
+  "schema":{{"type":"object","properties":{{"zeta":{{"type":"number"}},"alpha":{{"type":"string"}}}},
+  "required":["zeta","alpha"]}}}}}}, "temperature":1.0,
+  "input":[{}], "store":false}}"#,
+            items.join(",\n    ")
+        )
+    };
+    for (items, want) in [
+        (vec![user, ours, theirs], vec![user, theirs]),
+        (vec![ours, user], vec![user]),
+        (vec![user, ours], vec![user]),
+        (vec![ours, ours, user, ours], vec![user]),
+        (vec![ours], vec![]),
+        (vec![user, theirs], vec![user, theirs]),
+    ] {
+        let got = strip_gateway_reasoning(body(&items).into_bytes());
+        let got = String::from_utf8(got).unwrap();
+        assert_eq!(got, body(&want), "items {items:?}");
+        serde_json::from_str::<Value>(&got).expect("still JSON");
+    }
+    // Nothing to strip, even with `rs_gw` in the text: identical bytes.
+    let other = body(&[r#"{"role":"user","content":"what is rs_gw?"}"#]);
+    assert_eq!(strip_gateway_reasoning(other.clone().into_bytes()), other.into_bytes());
+}
