@@ -125,4 +125,15 @@ VERIFY_LIVE=1 cargo test -p beyond-ai-verify --test parity_live              # o
 PARITY_DUMP=1 VERIFY_LIVE=1 cargo test -p beyond-ai-verify --test parity_live -- chat-to-claude --nocapture
 ```
 
+## Catalog sweep
+
+`crates/verify/tests/catalog_live.rs` forces every in-scope catalog candidate (OpenAI, Anthropic,
+OpenRouter, xAI, Bedrock, Together) through a gateway with `x-beyond-only` and checks CAT-1..CAT-8
+and CAT-13 (BIL-9 and BIL-13 on the way) with raw HTTP. Its cells are named `CLAIMS::raw::ROUTE::ROW`
+and count toward claim status like the client cells. `mise run verify:catalog` runs only the sweep
+and prints its cost (each billed call is priced from the ledger into
+`target/catalog-live/<VERIFY_CATALOG_SWEEP>.jsonl`). `VERIFY_CATALOG_PLAN=1` prints the trials, the
+estimated cost, and every trial left out with its reason (no key, over the per-call cost cap, or a
+provider window an over-limit prompt would be billed against).
+
 `STALE` status will land with the run ledger.

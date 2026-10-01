@@ -17,7 +17,11 @@ serde_json.workspace = true
 toml = "0.8"
 
 [dev-dependencies]
+base64.workspace = true
+beyond-ai-providers = { path = "../providers" }
 libtest-mimic = "0.8"
+# Blocking HTTP for the catalog sweep, with the gateway crate's TLS pins (rustls, no OpenSSL).
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "rustls"] }
 serde_json.workspace = true
 
 [[test]]
@@ -30,6 +34,10 @@ harness = false
 
 [[test]]
 name = "parity_live"
+harness = false
+
+[[test]]
+name = "catalog_live"
 harness = false
 
 [lints]
