@@ -2119,7 +2119,7 @@ evidence = "Hermetic: an_echoed_out_of_credit_phrase_never_cools_the_pool_key. W
 claims = ["REL-4", "SEC-16", "T6"]
 state = "fixed"
 test = "an_echoed_out_of_credit_phrase_never_cools_the_pool_key"
-fix = "7641b45"
+fix = "cf89733"
 note = "Fixed in remedy.rs by keeping the two decisions apart. Out of credit (Neutralized::unfunded, which cools the shared key) is read only from what the provider sets and the request cannot: a 402 (OpenRouter, DeepSeek, Anthropic billing_error), except OpenRouter's \"This request requires more credits\" (one request bigger than the balance, anchored at the start); OpenAI's insufficient_quota code or type and Anthropic's billing_error type; and Anthropic's credit-balance 400 and xAI's spent-credits 403 compared to the provider's whole sentence (xAI's team id is the one variable part). The phrase list (now REMEDIES only) drives the cosmetic D174 rewrite, and only on a status about the account (401, 402, 403, 429): a 400 or 404 is about the request and may quote it, so it is relayed as written. Unit: remedy::tests::an_echoed_phrase_is_never_unfunded (every phrase in a model name, an unknown parameter and an extra field, on 400/404/422 untouched, on 401/403/429 never unfunded; the anchored sentences with tenant text around them) and unfunded_is_read_from_structured_fields. D180's two answers (Anthropic's credit-balance 400, OpenAI's insufficient_quota 429) still cool (an_unfunded_pool_key_sends_later_requests_to_the_next_candidate). Trade-off: an OpenRouter 404 naming its privacy-settings page is relayed verbatim; a different wording of Anthropic's or xAI's sentence would no longer cool (the safe direction: that request is relayed, as before D180)."
 
 [[defect]]
@@ -2133,7 +2133,7 @@ evidence = "Hermetic: control::tests::split_weights_near_u32_max_never_overflow.
 claims = ["R3", "CAT-12"]
 state = "fixed"
 test = "split_weights_near_u32_max_never_overflow"
-fix = "49d20ed"
+fix = "208b48f"
 note = "Fixed in control.rs: a weight above MAX_SPLIT_WEIGHT = u32::MAX / MAX_CANDIDATES makes the header malformed (counted on ai_control_header_errors_total, the default walk serves), derived so the sum of the at most MAX_CANDIDATES weights a walk adds always fits a u32; the pick accumulates with saturating_add as well, so weights handed to permute directly cannot panic either. The test runs 512 seeds each of [1, u32::MAX], [2^31, 2^31] and [u32::MAX, u32::MAX] through permute, and checks the parse bound on both sides."
 
 [[defect]]
@@ -2147,7 +2147,7 @@ evidence = "Hermetic: background_responses_are_refused_on_managed_keys_only. A m
 claims = ["BIL-2", "SEC-1"]
 state = "fixed"
 test = "background_responses_are_refused_on_managed_keys_only"
-fix = "f8f5fe1"
+fix = "481d713"
 note = "Fixed in proxy.rs: a managed Responses body whose root background member (name escapes decoded, any copy) is true gets a named 400 (\"background responses are not available with a managed key ...\"), counted as ai_rejections_total{reason=managed_endpoint}, as an Upgrade is refused. A catalog walk refuses it from the body request_filter already read, before any upstream; relay_full_body refuses from the body it holds. On /{provider}/.../responses the managed body is now buffered (RequestCtx::background_check, the same body budget as the Chat stream_options buffer) and the request aborted in request_body_filter before its last byte goes upstream, as a duplicate model is (D34), so no provider receives it whole (the test counts whole bodies). background: false is served; BYO keys relay it (their account can poll). Unit: requests_background_reads_the_root_member. Cost: a managed provider-route Responses body is now held until its end before the provider sees it."
 
 [[defect]]
@@ -2161,7 +2161,7 @@ evidence = "Hermetic: a_json_escaped_echo_of_the_pool_key_never_reaches_the_clie
 claims = ["SEC-7"]
 state = "fixed"
 test = "a_json_escaped_echo_of_the_pool_key_never_reaches_the_client"
-fix = "9396ee4"
+fix = "6a324f0"
 note = "Fixed in route.rs and proxy.rs: route::key_finders builds, once per pool key at boot, a searcher for the key as sent and for each spelling a JSON encoder writes / and + in (\\/; \\u002b, \\u002B; one encoder writes every occurrence alike, so at most 6), and Redact masks each of them on every path (streamed, non-JSON, held whole), holding back the longest spelling's tail per chunk. A held JSON error is masked again with the raw key after the remedy rewrite re-serializes it, and when it carries any other \\u escape and the key decodes from it, it is relayed re-serialized and masked. Unit: redact_scrubs_every_json_spelling_of_a_base64_key (streamed, held, held and rewritten; \\u002b, \\u002B and a \\u0041 spelling). Cost: error paths only; a key with no / or + still has one searcher."
 
 [[defect]]
@@ -2175,7 +2175,7 @@ evidence = "Hermetic: each_cooled_key_is_counted_with_its_reason. A 401, a 403 n
 claims = ["REL-4", "O3"]
 state = "fixed"
 test = "each_cooled_key_is_counted_with_its_reason"
-fix = "1581697"
+fix = "8bdffd9"
 note = "Fixed: ai_key_auth_failures_total is an IntCounterVec with a reason label (metrics::KeyCooled: revoked | unfunded | key_named_403), each child resolved at boot (exported at 0 from start, one fetch_add per bump, as ai_rejections_total). The is_candidate_refusal doc names every cooling path; ARCHITECTURE.md's metrics table, failure-mode rows and Modules table (remedy) are updated. Dashboards summing the series are unaffected (tenancy_live sums every line); the hermetic tests now read their reason's line."
 
 [[defect]]
@@ -2189,7 +2189,7 @@ evidence = "Hermetic: an_error_in_200_is_not_billed_whatever_its_key_order. A 20
 claims = ["BIL-12", "BIL-20"]
 state = "fixed"
 test = "an_error_in_200_is_not_billed_whatever_its_key_order"
-fix = "e9e3c4f"
+fix = "293da38"
 note = "Fixed in proxy.rs logging: json_is_error_only reads the root's members in any order: a non-null error member and none of choices, output or content (so a Responses answer's \"error\": null beside output, and OpenRouter's partial choices with finish_reason error, stay answers). It is parsed only on the path that needs it (a managed non-stream 2xx with no parsed usage), so no other response pays a parse. Still read only when the whole body fits the 64 KiB usage tail; a larger body has no root to read and is estimated (an error-in-200 is under 2 KiB in practice). Unit: json_is_error_only_reads_members_in_any_order."
 
 [[defect]]
@@ -2203,7 +2203,7 @@ evidence = "Code: proxy.rs relay_full_body, the (Ok(_) | Err(_), Some(decision))
 claims = ["REL-9", "REL-21"]
 state = "fixed"
 test = "a_full_body_attempt_that_lost_its_client_is_never_retried"
-fix = "3008660"
+fix = "85ef9a3"
 note = "Fixed in proxy.rs: relay_full_body decides through attempt_end, where a pipe that ended with an ErrorSource::Downstream error is AttemptEnd::Fail whatever the attempt recorded; an upstream error or an abandoned header with a recorded retry still retries, and a written response is done. Not covered: an upstream error that lands in the same instant as the client's close (the pipe reports the upstream one first, biased); the next attempt's pipe then sees the client gone at once and ends, but that attempt may already have connected."
 
 [[defect]]
@@ -2217,7 +2217,7 @@ evidence = "Code: proxy.rs relay_full_body, the (Ok(_), None) arm and the retry 
 claims = ["REL-17", "REL-21"]
 state = "fixed"
 test = "a_panicked_full_body_attempt_is_reported"
-fix = "3008660"
+fix = "85ef9a3"
 note = "Fixed in proxy.rs: reap_attempt awaits every attempt's JoinHandle (bounded by ABANDONED_ATTEMPT_GRACE, 2s, as before) and, when JoinError::is_panic, logs at error \"full-body attempt panicked\" with request_id and the panic message; the failing request's 502 then reads \"full-body attempt panicked\". It runs on every attempt that ends without a written response (retried or failed), so an abandoned attempt's panic is logged too."
 
 [[defect]]
@@ -2231,7 +2231,7 @@ evidence = "Code: capture_sink.rs drain thread (let _ = out.write_all(&line)); m
 claims = ["O2"]
 state = "fixed"
 test = "every_lost_capture_line_is_counted_and_shutdown_drains_the_queue"
-fix = "b2b9daa"
+fix = "30dbe25"
 note = "Fixed: a line the destination refuses increments ai_capture_dropped_total, like a full-queue drop. CaptureSink::spawn also returns a CaptureDrain; finish(timeout) enqueues an empty line (no event produces one), on which the thread writes out everything queued before it, flushes and stops, and waits for it; a line enqueued after that is counted as dropped (the queue is disconnected). main.rs hands the drain to DrainOnTerm, and drain_then_exit finishes it before exit(0), bounded by 5 s or the rest of the grace period (a wedged pipeline cannot hold teardown up; the remainder is lost with a warn line). ai.usage is unchanged: it already uses the blocking writer. Not covered: pingora's own exit at the end of the grace period, with requests still in flight."
 
 [[defect]]
@@ -2245,5 +2245,5 @@ evidence = "Code: the five tables listed in the title's sources, at proxy.rs is_
 claims = ["SEC-1", "CAT-14"]
 state = "fixed"
 test = "the_allowlist_and_the_routing_tables_agree_for_every_endpoint"
-fix = "0d5b085"
+fix = "8d04ec8"
 note = "Fixed by one table, route::ENDPOINT_PATHS (suffix, endpoint, sub-resource), read through endpoint_of_path / forward_endpoint (by suffix under any mount prefix, query ignored) and catalog_endpoint (exact, /v1 optional under /auto), with one normalisation per kind of path (a forwarded path drops one trailing slash and, for path+query callers, its query; a catalog path drops every trailing slash, as prop_documented_paths_classify_as_the_table_says pins). is_managed_provider_endpoint, wire_of_forward_path (falls back to Endpoint::of_upstream_path only for a path in no row, a BYO key's), is_streamable_path, forward_is_responses (D202), implied_endpoint and SubResource::of_path / of_forward_path are lookups into it. Every existing test is unchanged and green (is_streamable_path still takes a path without its query, as is_streamable_path_must_be_given_the_path_without_the_query pins). No behavior change for any path the old tables classified, except that is_streamable_path now also accepts one trailing slash."
