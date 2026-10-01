@@ -520,7 +520,7 @@ layer = "live"
 clients = ["codex"]
 failover_clients = ["codex"]
 touches = ["crates/gateway/src/", "crates/providers/src/"]
-defects = ["D74", "D75"]
+defects = ["D74", "D75", "D78"]
 
 [[claim]]
 id = "W3"
@@ -544,7 +544,7 @@ layer = "live"
 clients = ["pi"]
 failover_clients = ["pi"]
 touches = ["crates/gateway/src/", "crates/providers/src/"]
-defects = ["D36", "D77"]
+defects = ["D36", "D77", "D79"]
 
 [[claim]]
 id = "W5"
@@ -1394,7 +1394,7 @@ group = "Translation detail"
 text = "Thinking replay works for clients that don't echo thinking"
 layer = "both"
 touches = ["crates/gateway/src/translate.rs", "crates/gateway/src/proxy.rs"]
-defects = ["D14", "D77"]
+defects = ["D14", "D77", "D79"]
 
 [[claim]]
 id = "TRN-8"
@@ -1520,7 +1520,7 @@ group = "Translation detail"
 text = "Every documented lossy mapping is asserted as a negative claim"
 layer = "hermetic"
 touches = ["crates/gateway/src/translate.rs", "crates/gateway/src/proxy.rs"]
-defects = ["D68"]
+defects = ["D68", "D78"]
 
 [[claim]]
 id = "TRN-22"

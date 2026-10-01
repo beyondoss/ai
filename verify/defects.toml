@@ -1041,7 +1041,7 @@ evidence = "live 2026-10-01, Codex 0.159.3 exec via managed /v1/responses: gpt-5
 claims = ["W2", "E3", "CAT-9"]
 state = "fixed"
 test = "codex_on_a_chat_first_gpt_row_is_relayed_to_its_responses_arm"
-fix = "1ff3237"
+fix = "479eb3b"
 note = "Found by the W2 harness cell. Any inbound Responses request on a row with a Responses arm now walks that arm as a byte relay, store:false one-shots included (D50 stripping still applies; a failover stays inside the arm). Only rows without an arm translate, and D12's omitted-store rule is unchanged there."
 
 [[defect]]
@@ -1055,7 +1055,7 @@ evidence = "live 2026-10-01 W2::codex::claude::codex (claude-haiku-4-5): Anthrop
 claims = ["W2"]
 state = "fixed"
 test = "codex_tools_survive_translation_and_calls_map_back"
-fix = "c25cbec"
+fix = "9e4ec03"
 note = "Namespace members are flattened onto Chat/Messages as {namespace}__{name} ({namespace}{name} when it ends in _), and replayed calls carrying namespace use the same flat name; a custom grammar nests as Chat's {type, grammar: {syntax, definition}}; onto Messages a custom tool takes one input string with the grammar in its description. Per-request ToolNames map every returned call (JSON and SSE) back to {name, namespace} or a custom_tool_call with raw input. A Chat Completions client's custom tool onto Messages is still forwarded for Anthropic to reject by name (no reverse mapping on that path)."
 
 [[defect]]
@@ -1083,5 +1083,33 @@ evidence = "live 2026-10-01 W4::pi::openrouter::pi:chat: \"messages.1.content.0.
 claims = ["TRN-7", "W4"]
 state = "fixed"
 test = "a_claude_tool_turn_without_reasoning_details_goes_without_reasoning_on_openrouter"
-fix = "4650eca"
+fix = "1c3b589"
 note = "Found by the W4 harness cell. pi echoes thinking as a plain reasoning string with no signature. When a Chat body bound for a Claude model on a Chat host asks for reasoning (reasoning_effort, reasoning, include_reasoning, thinking) and its last assistant tool-call turn has no replayable reasoning_details, those keys are dropped: same-wire relay (memmem-gated parse) and translated Messages/Responses walks alike."
+
+[[defect]]
+id = "D78"
+severity = "high"
+area = "Translation"
+title = "Codex on a Claude row fails on its hosted web_search tool"
+impact = "Codex always offers its hosted web_search tool. On rows without an OpenAI Responses arm (every Claude row) the gateway forwards it as-is and Anthropic rejects the request (tools.12), so Codex can't run on Claude at all."
+confidence = "high"
+evidence = "live cell W2::codex::claude::codex after the D75 fix: Anthropic 400 on tools.12 (Codex's web_search)"
+claims = ["W2", "TRN-21"]
+state = "suspected"
+test = ""
+fix = ""
+note = "Proposed: map Responses' hosted web_search onto Anthropic's server tool (web_search_20250305) and its result blocks back onto web_search_call items; billed via server_tool_calls (D24)."
+
+[[defect]]
+id = "D79"
+severity = "high"
+area = "Translation"
+title = "Replayed reasoning on the final assistant turn 400s when thinking is off"
+impact = "The inverse of D77: a client with thinking disabled replays a turn whose gateway-minted reasoning becomes signed reasoning_details/thinking on the final assistant message; Anthropic (here via Bedrock behind OpenRouter) rejects it: 'When thinking is disabled, an assistant message in the final position cannot contain thinking.'"
+confidence = "high"
+evidence = "live cell W4::pi::openrouter::pi:responses (pi Responses mode, thinking off, OpenRouter claude-sonnet-4); predates D77"
+claims = ["TRN-7", "W4"]
+state = "suspected"
+test = ""
+fix = ""
+note = "Proposed: when the outgoing request has thinking/reasoning off, strip thinking/reasoning blocks from the final assistant turn (Anthropic's rule), on every path to a Claude model."
