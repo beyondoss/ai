@@ -1139,6 +1139,39 @@ mod tests {
         );
     }
 
+    /// A cut-short estimate never exceeds the provider's count (BIL-20). The JSON around a short
+    /// prompt (keys, the model id's quotes, `stream_options`, limits, numbers) is not prompt text:
+    /// the estimate counts only string values, so structure added to the same prompt changes
+    /// nothing, and the live stream-abort cell's request (29 prompt tokens at OpenAI) estimates
+    /// under 29.
+    /// claim: BIL-20
+    /// defect: D99
+    #[test]
+    #[ignore = "D99 reproduced: the input estimate counts JSON structure bytes"]
+    fn input_estimate_counts_string_values_only() {
+        let bare = br#"{"model":"gpt-4o-mini","messages":[{"role":"user","content":"Count from 1 to 40, one number per line."}]}"#;
+        let dressed = br#"{"model": "gpt-4o-mini", "messages": [{"role": "user", "content": "Count from 1 to 40, one number per line."}], "stream": true, "stream_options": {"include_usage": true}, "max_tokens": 400, "temperature": 0, "n": 1}"#;
+        let values = "gpt-4o-miniuserCount from 1 to 40, one number per line.".len() as u64;
+        for body in [&bare[..], &dressed[..]] {
+            let whole = tally(&[body]);
+            assert_eq!(
+                u64::from(whole.text_bytes),
+                values,
+                "{}",
+                String::from_utf8_lossy(body)
+            );
+            for cut in 1..body.len() {
+                let (a, b) = body.split_at(cut);
+                assert_eq!(
+                    tally(&[a, b]).text_bytes,
+                    whole.text_bytes,
+                    "split at {cut}"
+                );
+            }
+            assert!(whole.estimate_tokens() < 29, "{}", whole.estimate_tokens());
+        }
+    }
+
     fn openai_delta(text: &str) -> String {
         format!(
             "data: {{\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4o-mini\",\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"{text}\"}}}}]}}\n\n"
