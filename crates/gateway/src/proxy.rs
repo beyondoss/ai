@@ -1747,6 +1747,34 @@ const STREAM_OPTIONS_FRAG: &[u8] = br#""stream_options":{"include_usage":true},"
 /// Returns the body untouched when the id already matches, which is the common case: candidate 0
 /// usually spells the model the way the catalog names it, so the primary path does no memmove at all
 /// and only a failover pays for one.
+/// Cap each root-level output limit (`peek::OUTPUT_LIMIT_KEYS`) at `max`, the serving row's card
+/// `max_output_tokens`, in place. Never raises one; `max == 0` (an embeddings row) caps nothing.
+/// `true` when a value changed, so the caller re-scans the moved bytes.
+fn clamp_output_limits(body: &mut Vec<u8>, spans: &[Option<(usize, usize)>; 3], max: u32) -> bool {
+    if max == 0 {
+        return false;
+    }
+    // Back to front, so an earlier span's offsets survive a later splice.
+    let mut spans = *spans;
+    spans.sort_unstable_by(|a, b| b.cmp(a));
+    let mut changed = false;
+    for (start, end) in spans.into_iter().flatten() {
+        let Some(digits) = body.get(start..end) else {
+            continue;
+        };
+        // Digits only (the scan's own span), so a parse fails only past `u64`: over any cap.
+        let over = std::str::from_utf8(digits)
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .is_none_or(|n| n > u64::from(max));
+        if over {
+            body.splice(start..end, max.to_string().into_bytes());
+            changed = true;
+        }
+    }
+    changed
+}
+
 fn apply_model_rewrite(mut body: Vec<u8>, span: (usize, usize), replacement: &[u8]) -> Vec<u8> {
     let (start, end) = span;
     // Defensive: a span outside the buffer would panic on the splice. Unreachable — the span is
@@ -3575,17 +3603,29 @@ impl ProxyHttp for AiProxy {
                 // below, on the translated Chat Completions body. Same-endpoint Responses
                 // (session arm) is `from == to` and is a byte relay, less the reasoning items the
                 // gateway minted from Claude's thinking (see `translate::strip_gateway_reasoning`).
-                if let Some(a) = rc.auto.as_ref()
-                    && let Some(t) = a.translate.as_ref()
-                    && let Some(to) = catalog_serving_endpoint(a.as_ref())
-                {
-                    if t.client != to {
-                        let upstream_model =
-                            a.candidate_at(a.candidate).map_or("", |c| c.upstream_model);
-                        buf = translate::request(t.client, to, &buf, upstream_model);
-                        scan = peek::scan_buffered(&buf);
-                    } else if to == route::Endpoint::Responses {
-                        buf = translate::strip_gateway_reasoning(buf);
+                if let Some(a) = rc.auto.as_ref() {
+                    // An output limit past the row's maximum is a 400 by name; capped before the
+                    // translation, so what it derives (a thinking budget) fits under the cap too.
+                    let mut changed = clamp_output_limits(
+                        &mut buf,
+                        &scan.limit_spans,
+                        a.route.card.max_output_tokens,
+                    );
+                    if let Some(t) = a.translate.as_ref()
+                        && let Some(to) = catalog_serving_endpoint(a.as_ref())
+                    {
+                        if t.client != to {
+                            let upstream_model =
+                                a.candidate_at(a.candidate).map_or("", |c| c.upstream_model);
+                            buf = translate::request(t.client, to, &buf, upstream_model);
+                            changed = true;
+                        } else if to == route::Endpoint::Responses {
+                            let len = buf.len();
+                            buf = translate::strip_gateway_reasoning(buf);
+                            changed |= buf.len() != len;
+                        }
+                    }
+                    if changed {
                         scan = peek::scan_buffered(&buf);
                     }
                 }
@@ -4366,6 +4406,36 @@ mod tests {
 
     use crate::metrics::ProviderMetrics;
     use crate::route::AuthScheme;
+
+    /// Every limit over the cap is cut to it, back to front so offsets hold; one under it, or a
+    /// cap of zero, is left alone. A value past `u64` is over any cap.
+    #[test]
+    fn output_limits_are_capped_never_raised() {
+        let cap = |body: &str, max: u32| {
+            let mut buf = body.as_bytes().to_vec();
+            let scan = peek::scan_buffered(&buf);
+            let changed = clamp_output_limits(&mut buf, &scan.limit_spans, max);
+            (String::from_utf8(buf).unwrap(), changed)
+        };
+        assert_eq!(
+            cap(
+                r#"{"max_tokens":64000,"max_completion_tokens":99999999999999999999999}"#,
+                16384
+            ),
+            (
+                r#"{"max_tokens":16384,"max_completion_tokens":16384}"#.to_owned(),
+                true
+            )
+        );
+        assert_eq!(
+            cap(r#"{"max_output_tokens":100}"#, 16384),
+            (r#"{"max_output_tokens":100}"#.to_owned(), false)
+        );
+        assert_eq!(
+            cap(r#"{"max_tokens":64000}"#, 0),
+            (r#"{"max_tokens":64000}"#.to_owned(), false)
+        );
+    }
 
     /// A minimal `RequestCtx` for exercising the body-phase logic without a running proxy.
     fn test_ctx(inject_eligible: bool) -> RequestCtx {

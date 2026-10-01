@@ -562,7 +562,12 @@ call ids (`functions.get_weather:0`) become `^[a-zA-Z0-9_-]+$` on Messages, iden
 call and its result, with a hash of the original. An email address as `user` (Anthropic rejects
 it as `metadata.user_id`) becomes its FNV-1a hash, stable per user. Chat Completions → Responses
 sends `store: false` unless the client asked to store. Tools, text, and usage still
-round-trip. Anthropic requires `max_tokens`; a missing OpenAI value becomes 4096. OpenAI→Anthropic
+round-trip. Anthropic requires `max_tokens`; a missing OpenAI value becomes 4096. On every catalog
+walk, translated or not, a root `max_tokens` / `max_completion_tokens` / `max_output_tokens` above
+the row's card `max_output_tokens` is capped to it (never raised; spans found by the same
+`peek::scan_buffered` walk that finds `model`, spliced in place). Claude Code sends 32000 or 64000,
+which gpt-4o-class rows (16384) answered with a 400. The cap runs before translation, so a
+thinking budget derived from the limit fits under it too. OpenAI→Anthropic
 does not inject `stream_options`. Anthropic→OpenAI injects `include_usage` on the translated
 Chat Completions body when streaming; Responses→Chat Completions does the same because injection
 follows the **upstream** endpoint. A stock OpenAI SDK also does not send `anthropic-version`; the

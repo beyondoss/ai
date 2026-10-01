@@ -544,7 +544,6 @@ async fn gateway_reasoning_items_never_reach_an_openai_responses_upstream() {
 /// claim: TRN-5
 /// defect: D59
 #[tokio::test]
-#[ignore = "D59 reproduced: max_tokens above the row's max_output_tokens is forwarded unclamped"]
 async fn an_output_limit_above_the_model_maximum_is_clamped_to_it() {
     const GPT_4O_MINI_MAX_OUTPUT: u64 = 16_384;
     let nats_port = unused_nats_port();
