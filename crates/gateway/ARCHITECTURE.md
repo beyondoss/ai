@@ -1104,6 +1104,16 @@ tail keeps the last 64KB. OpenAI's parser walks those lines backwards and stops 
 block; the split is `memrchr`, the same reason the forward Anthropic walk uses `memchr` — a tail
 with no usage block still has to scan all 64 KiB.
 
+SSE lets one event carry its data on several `data:` lines, joined with `\n` (JSON whitespace), and
+the translator and every spec-following SDK join them. Both parsers read line by line, so a line
+that names `usage` but is not JSON alone sends them to a slow path that re-reads the view event by
+event, each event's `data:` lines joined (each line alone if the joined text is not one JSON value,
+for a stream with no blank lines between events). Before this, a usage event written that way
+billed an estimate or zero while the client was shown exact usage (D126). OpenAI and Anthropic
+write one line per event, so their streams take the slow path only when a retained head or tail
+was cut through a usage line (OpenAI's walk, which stops at the first usage block, not even then),
+and it bills what the fast path would. The 64 KiB Anthropic tail still measures 9.5 µs.
+
 **`input_tokens` follows its wire, and the row says which.** OpenAI's `prompt_tokens` (and the
 Responses API's `input_tokens`) include cached tokens; OpenRouter's also include its Claude cache
 writes. Anthropic's `input_tokens` excludes both cache reads and cache writes. So the same Claude

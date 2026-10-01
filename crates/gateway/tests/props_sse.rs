@@ -263,12 +263,6 @@ fn prop_translated_streams_preserve_content_and_usage() {
             if let Err(e) = check_content(&s, client, upstream, &seen) {
                 prop_assert!(false, "{e}\nout: {}", String::from_utf8_lossy(&out));
             }
-            // D126: the usage parsers read SSE line by line, so a usage event spread over two
-            // `data:` lines (legal SSE, which the bridge joins) bills nothing exact. The client
-            // side is checked above for every framing; the billing comparison skips that one.
-            if s.framing.multiline {
-                return Ok(());
-            }
             let up = billed(upstream, &bytes).map(|u| normalize(&u));
             let shown = billed(client, &out).map(|u| normalize(&u));
             prop_assert!(up.is_some(), "upstream usage must parse");

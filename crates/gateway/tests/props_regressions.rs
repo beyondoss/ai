@@ -105,7 +105,6 @@ fn input_estimate_ignores_how_the_body_is_chunked() {
 /// claim: B1
 /// defect: D126
 #[test]
-#[ignore = "D126 reproduced: a usage event spread over two data: lines is not parsed"]
 fn usage_spread_over_two_data_lines_is_billed() {
     let openai = concat!(
         "data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",

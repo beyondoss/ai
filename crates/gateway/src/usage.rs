@@ -574,6 +574,61 @@ fn might_carry_usage(finder: &memchr::memmem::Finder<'_>, payload: &[u8]) -> boo
 /// `OpenAiUsage::looks_anthropic_shaped`) is skipped, not counted: if every line is mismatched the
 /// scan runs off the front and returns `None`.
 pub fn openai_stream(sse: &[u8]) -> Option<Usage> {
+    // Scanned in **reverse**, returning at the first accepted usage. "Last accepted in forward
+    // order" and "first accepted in reverse order" select the same line by definition, so this is
+    // semantics-preserving — including the tricky cases: a trailing Anthropic-shaped `usage` is
+    // rejected in both directions and falls through to an earlier line, a trailing `"usage":null`
+    // deserializes to `None` in both and falls through, and the front-truncated first line of a
+    // 64 KiB tail is reached last here and fails `strip_prefix`/`from_slice` either way.
+    //
+    // Forward, the loop ran to completion and overwrote `found` on every hit, so on a 64 KiB tail
+    // of ~450 `data:` lines it parsed all 450 and discarded 449. Measured 80.1 µs / 261 allocations
+    // (serde_json's scratch `Vec`, one malloc+free per line whose ignored fields nest ≥2 deep —
+    // which every `choices[0].delta` chunk does) against 0.155 µs / 0 allocations for this.
+    let finder = memchr::memmem::Finder::new(b"usage");
+    // A line that names `usage` but is not JSON on its own: the front-truncated first line of a
+    // tail, or one line of an event written over several `data:` lines.
+    let mut broken = false;
+    for line in sse_data_lines_rev(sse) {
+        if !might_carry_usage(&finder, line) {
+            continue;
+        }
+        match openai_chunk_usage(line) {
+            Some(Some(u)) => return Some(u),
+            Some(None) => {}
+            None => broken = true,
+        }
+    }
+    // SSE lets one event carry its data on several `data:` lines, joined with `\n` (JSON
+    // whitespace), and a spec-following client joins them (D126). Only when some usage line did
+    // not parse alone are the events read whole, so a stream written one line per event (OpenAI's,
+    // every one measured) never pays for it.
+    if broken {
+        let mut found = None;
+        for_each_event(sse, |data| {
+            if let Some(u) = event_payloads(data, &finder, openai_chunk_usage).flatten() {
+                found = Some(u);
+            }
+        });
+        if found.is_some() {
+            return found;
+        }
+    }
+    // No whole line carried usage. The final event can be bigger than the tail: a Responses
+    // `response.completed` echoes the request's instructions and tools ahead of `usage`, so a
+    // Codex-sized prompt pushes it past 64 KiB and the tail starts mid-way through it. Only the
+    // tail's first line can be front-truncated (the tail ends where the stream does), and `usage`
+    // is the last thing in that event, so recover it the way a front-truncated body is recovered.
+    let first = &sse[..memchr::memchr(b'\n', sse).unwrap_or(sse.len())];
+    recover_trailing_usage::<OpenAiUsage>(first)
+        .filter(|u| !u.looks_anthropic_shaped())
+        .map(Usage::from)
+}
+
+/// One OpenAI stream payload's usage: `None` when it is not JSON, `Some(None)` when it carries no
+/// usage this dialect accepts. Chat Completions carries a top-level `usage`; Responses nests it
+/// under `response.completed.response.usage`.
+fn openai_chunk_usage(payload: &[u8]) -> Option<Option<Usage>> {
     #[derive(Deserialize)]
     struct ResponsesEnvelope {
         usage: Option<OpenAiResponsesUsage>,
@@ -588,49 +643,64 @@ pub fn openai_stream(sse: &[u8]) -> Option<Usage> {
         #[serde(default, deserialize_with = "de_service_tier")]
         service_tier: Option<ServiceTier>,
     }
-    // Scanned in **reverse**, returning at the first accepted usage. "Last accepted in forward
-    // order" and "first accepted in reverse order" select the same line by definition, so this is
-    // semantics-preserving — including the tricky cases: a trailing Anthropic-shaped `usage` is
-    // rejected in both directions and falls through to an earlier line, a trailing `"usage":null`
-    // deserializes to `None` in both and falls through, and the front-truncated first line of a
-    // 64 KiB tail is reached last here and fails `strip_prefix`/`from_slice` either way.
-    //
-    // Forward, the loop ran to completion and overwrote `found` on every hit, so on a 64 KiB tail
-    // of ~450 `data:` lines it parsed all 450 and discarded 449. Measured 80.1 µs / 261 allocations
-    // (serde_json's scratch `Vec`, one malloc+free per line whose ignored fields nest ≥2 deep —
-    // which every `choices[0].delta` chunk does) against 0.155 µs / 0 allocations for this.
-    let finder = memchr::memmem::Finder::new(b"usage");
-    for line in sse_data_lines_rev(sse) {
-        if !might_carry_usage(&finder, line) {
-            continue;
-        }
-        if let Ok(chunk) = serde_json::from_slice::<Chunk>(line) {
-            if let Some(u) = chunk.usage {
-                if !u.looks_anthropic_shaped() {
-                    return Some(Usage {
-                        service_tier: chunk.service_tier,
-                        ..Usage::from(u)
-                    });
-                }
-            } else if let Some(r) = chunk.response
-                && let Some(u) = r.usage
-            {
-                return Some(Usage {
-                    service_tier: r.service_tier,
-                    ..Usage::from(u)
-                });
+    let chunk = serde_json::from_slice::<Chunk>(payload).ok()?;
+    Some(if let Some(u) = chunk.usage {
+        (!u.looks_anthropic_shaped()).then(|| Usage {
+            service_tier: chunk.service_tier,
+            ..Usage::from(u)
+        })
+    } else {
+        chunk.response.and_then(|r| {
+            r.usage.map(|u| Usage {
+                service_tier: r.service_tier,
+                ..Usage::from(u)
+            })
+        })
+    })
+}
+
+/// Calls `f` with each SSE event's `data:` payloads, in order; an event ends at a blank line. The
+/// slow path for an event written over several `data:` lines (see [`openai_stream`]).
+fn for_each_event<'a>(sse: &'a [u8], mut f: impl FnMut(&[&'a [u8]])) {
+    let mut data: Vec<&'a [u8]> = Vec::new();
+    for line in sse_lines(sse) {
+        if line.trim_ascii().is_empty() {
+            if !data.is_empty() {
+                f(&data);
+                data.clear();
             }
+        } else if let Some(payload) = strip_sse_data(line) {
+            data.push(payload);
         }
     }
-    // No whole line carried usage. The final event can be bigger than the tail: a Responses
-    // `response.completed` echoes the request's instructions and tools ahead of `usage`, so a
-    // Codex-sized prompt pushes it past 64 KiB and the tail starts mid-way through it. Only the
-    // tail's first line can be front-truncated (the tail ends where the stream does), and `usage`
-    // is the last thing in that event, so recover it the way a front-truncated body is recovered.
-    let first = &sse[..memchr::memchr(b'\n', sse).unwrap_or(sse.len())];
-    recover_trailing_usage::<OpenAiUsage>(first)
-        .filter(|u| !u.looks_anthropic_shaped())
-        .map(Usage::from)
+    if !data.is_empty() {
+        f(&data);
+    }
+}
+
+/// Run `parse` over one event's payloads: its `data:` lines joined with `\n`, as SSE dispatches
+/// them, or each line alone when the joined text is not one JSON value (a stream that separates
+/// its events with no blank line). `parse` returns `None` for text that is not JSON. The result is
+/// the last parsed payload's.
+fn event_payloads<T>(
+    data: &[&[u8]],
+    finder: &memchr::memmem::Finder<'_>,
+    mut parse: impl FnMut(&[u8]) -> Option<T>,
+) -> Option<T> {
+    if let [one] = data {
+        return might_carry_usage(finder, one).then(|| parse(one)).flatten();
+    }
+    let joined = data.join(&b'\n');
+    if !might_carry_usage(finder, &joined) {
+        return None;
+    }
+    if let Some(t) = parse(&joined) {
+        return Some(t);
+    }
+    data.iter()
+        .filter(|l| might_carry_usage(finder, l))
+        .filter_map(|l| parse(l))
+        .last()
 }
 
 /// Anthropic streaming over a single contiguous buffer. See [`anthropic_stream_parts`], which this
@@ -657,6 +727,49 @@ pub fn anthropic_stream(sse: &[u8]) -> Option<Usage> {
 /// Parts are scanned in order and may safely overlap: every field is *assigned*, never accumulated,
 /// so a short response whose head and tail cover the same bytes reads the same as one that doesn't.
 pub fn anthropic_stream_parts(parts: &[&[u8]]) -> Option<Usage> {
+    // Forward, and genuinely a full pass: input/cache tokens ride on `message_start` at the head
+    // while the running output count rides on the last `message_delta`, so unlike `openai_stream`
+    // there is no single winning line to stop at. What we *can* skip is the JSON parse for every
+    // line that cannot carry a usage block at all — on an Anthropic stream that is every
+    // `content_block_delta`, which is nearly the entire tail. Measured 62.3 µs → 9.4 µs on a 64 KiB
+    // tail (the `memchr` line split accounts for ~15 µs of that; the pre-filter for the rest).
+    let finder = memchr::memmem::Finder::new(b"usage");
+    let mut usage = Usage::default();
+    let mut saw_any = false;
+    // A line naming `usage` that is not JSON alone (see `openai_stream`): read the events whole.
+    let mut broken = false;
+    for part in parts {
+        for line in sse_lines(part) {
+            let Some(line) = strip_sse_data(line) else {
+                continue;
+            };
+            if !might_carry_usage(&finder, line) {
+                continue;
+            }
+            broken |= !anthropic_apply(&mut usage, &mut saw_any, line);
+        }
+    }
+    // The slow path re-reads every event in order, since each field is assigned in stream order
+    // (D126). A head or tail cut mid-event also lands here, and bills what the fast path did.
+    if broken {
+        usage = Usage::default();
+        saw_any = false;
+        for part in parts {
+            for_each_event(part, |data| {
+                event_payloads(data, &finder, |p| {
+                    anthropic_apply(&mut usage, &mut saw_any, p).then_some(())
+                });
+            });
+        }
+    }
+    saw_any.then_some(Usage {
+        wire: Some(Dialect::Anthropic),
+        ..usage
+    })
+}
+
+/// Fold one Anthropic stream payload into `usage`. `false` when it is not JSON.
+fn anthropic_apply(usage: &mut Usage, saw_any: &mut bool, payload: &[u8]) -> bool {
     #[derive(Deserialize)]
     struct Message {
         usage: Option<AnthropicUsage>,
@@ -667,73 +780,51 @@ pub fn anthropic_stream_parts(parts: &[&[u8]]) -> Option<Usage> {
         message: Option<Message>,
         usage: Option<AnthropicUsage>,
     }
-    // Forward, and genuinely a full pass: input/cache tokens ride on `message_start` at the head
-    // while the running output count rides on the last `message_delta`, so unlike `openai_stream`
-    // there is no single winning line to stop at. What we *can* skip is the JSON parse for every
-    // line that cannot carry a usage block at all — on an Anthropic stream that is every
-    // `content_block_delta`, which is nearly the entire tail. Measured 62.3 µs → 9.4 µs on a 64 KiB
-    // tail (the `memchr` line split accounts for ~15 µs of that; the pre-filter for the rest).
-    let finder = memchr::memmem::Finder::new(b"usage");
-    let mut usage = Usage::default();
-    let mut saw_any = false;
-    for part in parts {
-        for line in sse_lines(part) {
-            let Some(line) = strip_sse_data(line) else {
-                continue;
-            };
-            if !might_carry_usage(&finder, line) {
-                continue;
-            }
-            let Ok(chunk) = serde_json::from_slice::<Chunk>(line) else {
-                continue;
-            };
-            if let Some(u) = chunk.message.and_then(|m| m.usage)
-                && !u.looks_openai_shaped()
-            {
-                usage.input_tokens = u.input_tokens;
-                usage.cache_read_tokens = u.cache_read_input_tokens;
-                usage.cache_write_tokens = u.cache_creation_input_tokens;
-                usage.cache_write_1h_tokens = u.cache_creation.ephemeral_1h_input_tokens;
-                usage.service_tier = u.service_tier;
-                saw_any = true;
-            }
-            if let Some(u) = chunk.usage
-                && !u.looks_openai_shaped()
-            {
-                // message_delta carries the running output token count — and, cumulatively, input
-                // and cache counts too, which grow past `message_start`'s when a server tool (web
-                // search) feeds results back mid-turn. Present wins; absent (zero, by
-                // `serde(default)`) keeps what `message_start` said.
-                if u.output_tokens > 0 {
-                    usage.output_tokens = u.output_tokens;
-                }
-                if u.input_tokens > 0 {
-                    usage.input_tokens = u.input_tokens;
-                }
-                if u.cache_read_input_tokens > 0 {
-                    usage.cache_read_tokens = u.cache_read_input_tokens;
-                }
-                if u.cache_creation_input_tokens > 0 {
-                    usage.cache_write_tokens = u.cache_creation_input_tokens;
-                }
-                if u.cache_creation.ephemeral_1h_input_tokens > 0 {
-                    usage.cache_write_1h_tokens = u.cache_creation.ephemeral_1h_input_tokens;
-                }
-                // Cumulative, and only ever on the delta: the searches run mid-turn.
-                if u.server_tool_use.web_search_requests > 0 {
-                    usage.server_tool_calls = u.server_tool_use.web_search_requests;
-                }
-                if let Some(rt) = u.output_tokens_details.thinking_tokens {
-                    usage.reasoning_tokens = Some(rt);
-                }
-                saw_any = true;
-            }
-        }
+    let Ok(chunk) = serde_json::from_slice::<Chunk>(payload) else {
+        return false;
+    };
+    if let Some(u) = chunk.message.and_then(|m| m.usage)
+        && !u.looks_openai_shaped()
+    {
+        usage.input_tokens = u.input_tokens;
+        usage.cache_read_tokens = u.cache_read_input_tokens;
+        usage.cache_write_tokens = u.cache_creation_input_tokens;
+        usage.cache_write_1h_tokens = u.cache_creation.ephemeral_1h_input_tokens;
+        usage.service_tier = u.service_tier;
+        *saw_any = true;
     }
-    saw_any.then_some(Usage {
-        wire: Some(Dialect::Anthropic),
-        ..usage
-    })
+    if let Some(u) = chunk.usage
+        && !u.looks_openai_shaped()
+    {
+        // message_delta carries the running output token count — and, cumulatively, input
+        // and cache counts too, which grow past `message_start`'s when a server tool (web
+        // search) feeds results back mid-turn. Present wins; absent (zero, by
+        // `serde(default)`) keeps what `message_start` said.
+        if u.output_tokens > 0 {
+            usage.output_tokens = u.output_tokens;
+        }
+        if u.input_tokens > 0 {
+            usage.input_tokens = u.input_tokens;
+        }
+        if u.cache_read_input_tokens > 0 {
+            usage.cache_read_tokens = u.cache_read_input_tokens;
+        }
+        if u.cache_creation_input_tokens > 0 {
+            usage.cache_write_tokens = u.cache_creation_input_tokens;
+        }
+        if u.cache_creation.ephemeral_1h_input_tokens > 0 {
+            usage.cache_write_1h_tokens = u.cache_creation.ephemeral_1h_input_tokens;
+        }
+        // Cumulative, and only ever on the delta: the searches run mid-turn.
+        if u.server_tool_use.web_search_requests > 0 {
+            usage.server_tool_calls = u.server_tool_use.web_search_requests;
+        }
+        if let Some(rt) = u.output_tokens_details.thinking_tokens {
+            usage.reasoning_tokens = Some(rt);
+        }
+        *saw_any = true;
+    }
+    true
 }
 
 // --- Estimates for a stream cut short -----------------------------------------------------------

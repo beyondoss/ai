@@ -173,8 +173,6 @@ fn prop_streams_bill_like_their_bodies() {
             script(),
         ),
         |(d, s)| {
-            // D126: a usage event spread over two `data:` lines is not parsed; excluded while open.
-            prop_assume!(!s.framing.multiline);
             let (body, stream) = (s.body(d), s.stream(d, None, None));
             let (b, st) = match d {
                 Endpoint::Messages => (
@@ -215,8 +213,6 @@ fn prop_partial_views_bill_like_the_whole_stream() {
             any::<usize>(),
         ),
         |(d, s, a, b)| {
-            // D126: a usage event spread over two `data:` lines is not parsed; excluded while open.
-            prop_assume!(!s.framing.multiline);
             let stream = s.stream(d, None, None);
             let n = stream.len();
             match d {
