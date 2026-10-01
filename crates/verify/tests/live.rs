@@ -414,12 +414,34 @@ struct Checks {
     e7: bool,
 }
 
+/// A free port below the kernel's ephemeral range. Other suites on this host take theirs from
+/// `bind(0)` and release them before their gateway binds; Pingora binds with `SO_REUSEPORT`, so a
+/// port two gateways both picked is shared silently and some requests land on the other one.
 fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let _ = NEXT.compare_exchange(
+        0,
+        u64::from(std::process::id())
+            ^ std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos() as u64,
+        Ordering::Relaxed,
+        Ordering::Relaxed,
+    );
+    loop {
+        // splitmix64: consecutive seeds scatter across the range.
+        let mut z = NEXT
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        let port = 20_000 + ((z ^ (z >> 31)) % 12_000) as u16;
+        if TcpListener::bind(("127.0.0.1", port)).is_ok() {
+            return port;
+        }
+    }
 }
 
 /// Kills its process on drop, so a failing cell never leaks a gateway or nats-server.
