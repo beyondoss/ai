@@ -32,7 +32,7 @@ touches = [
   "crates/gateway/src/proxy.rs",
   "crates/gateway/src/translate.rs",
 ]
-defects = ["D63", "D147", "D152"]
+defects = ["D63", "D147", "D172"]
 
 [[claim]]
 id = "E2"
@@ -48,7 +48,7 @@ touches = [
   "crates/gateway/src/proxy.rs",
   "crates/gateway/src/translate.rs",
 ]
-defects = ["D147", "D152"]
+defects = ["D147", "D172"]
 
 [[claim]]
 id = "E3"
@@ -158,7 +158,7 @@ clients = [
 ]
 failover_clients = ["openai-py", "anthropic-py", "claude-code", "pi"]
 touches = ["crates/gateway/src/translate.rs", "crates/gateway/src/proxy.rs"]
-defects = ["D63", "D127", "D151", "D152"]
+defects = ["D63", "D127", "D171", "D172"]
 
 [[claim]]
 id = "T2"
@@ -209,7 +209,7 @@ clients = [
 ]
 failover_clients = []
 touches = ["crates/gateway/src/translate.rs", "crates/gateway/src/proxy.rs"]
-defects = ["D150"]
+defects = ["D170"]
 
 [[claim]]
 id = "T5"
@@ -1940,7 +1940,7 @@ touches = [
   "crates/gateway/src/route.rs",
   "crates/gateway/src/proxy.rs",
 ]
-defects = ["D54", "D62", "D105", "D107", "D113", "D114", "D115", "D150", "D151"]
+defects = ["D54", "D62", "D105", "D107", "D113", "D114", "D115", "D170", "D171"]
 
 [[claim]]
 id = "CAT-7"
@@ -2204,7 +2204,7 @@ group = "Translation detail"
 text = "The developer role is mapped for non-OpenAI Chat hosts"
 layer = "live"
 touches = ["crates/gateway/src/translate.rs", "crates/gateway/src/proxy.rs"]
-defects = ["D49", "D153"]
+defects = ["D49", "D173"]
 
 [[claim]]
 id = "TRN-17"

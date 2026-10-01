@@ -1882,10 +1882,10 @@ claims = ["CAT-1", "CAT-2", "E1", "E2", "E3"]
 state = "fixed"
 test = "a_non_stream_call_on_a_stream_only_candidate_gets_a_whole_answer"
 fix = "60dea1e"
-note = "Found by the live catalog sweep. Together publishes no stream-only flag in its model listing; the four ids were found by sending each Together id in the catalog a non-streaming request. Fixed: providers::catalog::stream_only names the four candidates; an attempt on one whose client did not stream sends stream: true with stream_options.include_usage spliced first (translate::force_stream, every other byte as sent) and assembles the stream into the client's JSON body with the bridge a Responses client's stream already uses (SseBridge::assembling: it writes no event and keeps the response.completed object, which is then mapped like any non-stream Responses body). Per attempt, so OpenRouter's failover copy gets the client's own body; billing reads the stream's usage chunk (one exact row); the cache stores the assembled JSON; a stream cut short is stream_truncated in the client's envelope and a cut-short estimate. Also held by a_tool_call_streamed_by_a_stream_only_candidate_arrives_whole, a_failover_from_a_stream_only_candidate_sends_the_client_body, an_assembled_answer_is_cached_as_json, a_cut_short_stream_becomes_an_error_and_an_estimate, force_stream_asks_for_one_stream_and_moves_nothing_else, an_assembling_bridge_writes_one_body_at_the_end and stream_only_candidates_are_together_qwen_on_chat. Live 2026-10-01: CAT-1::raw::together and CAT-2::raw::all pass on all four rows, as do BIL-13, CAT-4, CAT-5, CAT-7 and CAT-6+BIL-9 there; the stock-SDK basic cells (openai-py, openai-node, anthropic-py, anthropic-ts, ai-sdk, Responses) pass on qwen3.8-flash. CAT-6 on these rows now runs, and found D150 and D151."
+note = "Found by the live catalog sweep. Together publishes no stream-only flag in its model listing; the four ids were found by sending each Together id in the catalog a non-streaming request. Fixed: providers::catalog::stream_only names the four candidates; an attempt on one whose client did not stream sends stream: true with stream_options.include_usage spliced first (translate::force_stream, every other byte as sent) and assembles the stream into the client's JSON body with the bridge a Responses client's stream already uses (SseBridge::assembling: it writes no event and keeps the response.completed object, which is then mapped like any non-stream Responses body). Per attempt, so OpenRouter's failover copy gets the client's own body; billing reads the stream's usage chunk (one exact row); the cache stores the assembled JSON; a stream cut short is stream_truncated in the client's envelope and a cut-short estimate. Also held by a_tool_call_streamed_by_a_stream_only_candidate_arrives_whole, a_failover_from_a_stream_only_candidate_sends_the_client_body, an_assembled_answer_is_cached_as_json, a_cut_short_stream_becomes_an_error_and_an_estimate, force_stream_asks_for_one_stream_and_moves_nothing_else, an_assembling_bridge_writes_one_body_at_the_end and stream_only_candidates_are_together_qwen_on_chat. Live 2026-10-01: CAT-1::raw::together and CAT-2::raw::all pass on all four rows, as do BIL-13, CAT-4, CAT-5, CAT-7 and CAT-6+BIL-9 there; the stock-SDK basic cells (openai-py, openai-node, anthropic-py, anthropic-ts, ai-sdk, Responses) pass on qwen3.8-flash. CAT-6 on these rows now runs, and found D170 and D171."
 
 [[defect]]
-id = "D150"
+id = "D170"
 severity = "med"
 area = "Catalog"
 title = "Together's Qwen3.6 Plus does not hold a strict json_schema output"
@@ -1899,7 +1899,7 @@ fix = ""
 note = "Found by D147's live re-run. Options: drop structured outputs from the card, or leave Together out of a json_schema walk (as serves_structured_outputs does for Bedrock) so OpenRouter serves it."
 
 [[defect]]
-id = "D151"
+id = "D171"
 severity = "med"
 area = "Catalog"
 title = "Together's Qwen3.7 Plus sometimes returns a tool call as text"
@@ -1913,7 +1913,7 @@ fix = ""
 note = "Found by D147's live re-run. The assembly was checked against the captured streams (each assembled into Chat, Messages and Responses bodies with every argument intact)."
 
 [[defect]]
-id = "D152"
+id = "D172"
 severity = "med"
 area = "Catalog"
 title = "A forced tool_choice on Together's thinking Qwen rows is a 400"
@@ -1927,7 +1927,7 @@ fix = ""
 note = "Found by D147's live re-run. Options: turn thinking off when a tool is forced (as thinking_off_between_tools does for Claude), or send tool_choice auto. The catalog sweep's CAT-6 already retries with auto, so it does not see this."
 
 [[defect]]
-id = "D153"
+id = "D173"
 severity = "low"
 area = "Translation"
 title = "A developer message on Together's Qwen rows is a 400"
