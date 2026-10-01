@@ -16,5 +16,8 @@ path = "src/lib.rs"
 # (see `agent::gateway_credential::provider_for_base_url`).
 [dependencies]
 
+[dev-dependencies]
+serde_json.workspace = true
+
 [lints]
 workspace = true

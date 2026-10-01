@@ -293,11 +293,24 @@ permuted sequence and otherwise behave as they do today.
 Not in this surface: cost sort, weighted load-balance across keys, `MODEL_ROUTES` edits, or parsing
 Vercel `providerOptions` from the body.
 
-`GET /v1/models` (and `HEAD`) lists the catalog in OpenAI list shape, plus a `wire` field
-(`openai` / `anthropic`) so a caller can pick the matching SDK, and a `pricing` object on every
-row (USD per million tokens: `input`, `output`, `cache_read`, `cache_write`; the list's
-`pricing_unit` says so once). Served after identity, before the body peek, so an empty GET is not
-a missing-model 404.
+`GET /v1/models` (and `HEAD`) lists the catalog in OpenAI list shape. The Anthropic SDK reads it
+too: each row has `display_name`, and the list has `has_more: false`. Each row adds:
+
+| Field                                                      | From                                                                      |
+| ---------------------------------------------------------- | ------------------------------------------------------------------------- |
+| `wire` (`openai` / `anthropic`)                            | the row; it tells a caller which SDK matches                              |
+| `context_window`, `max_output_tokens`                      | `ModelCard`; `max_output_tokens` is `null` on embeddings                  |
+| `input_modalities` (`text` `image` `file` `audio` `video`) | `ModelCard`                                                               |
+| `output_modalities` (`text` / `embeddings`)                | the row's endpoint                                                        |
+| `capabilities` (`tools` `reasoning` `structured_outputs`)  | `ModelCard`                                                               |
+| `endpoints`                                                | all three generation paths (translation serves each), or `/v1/embeddings` |
+| `pricing` (`input` `output` `cache_read` `cache_write`)    | `ListPrice`, USD per million tokens (`pricing_unit` says so once)         |
+
+`providers::catalog::ModelCard` is generated like the price table: from Anthropic's `GET
+/v1/models` for the Claude rows it still lists, and otherwise from OpenRouter's public card for
+the row's OpenRouter candidate. It describes the model, not one deployment, so a Groq- or
+Fireworks-primary row may serve a smaller window. The body is built once and cached. It is served
+after identity and before the body peek, so an empty GET is not a missing-model 404.
 
 A stock OpenAI or Anthropic SDK pointed at `/v1` with `model` in the JSON body is `/auto` without
 the header. Same-wire failover is a byte relay — the gateway rewrites ids, not API shapes, across

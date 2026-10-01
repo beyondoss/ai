@@ -1908,7 +1908,8 @@ async fn v1_accepts_a_candidate_spelling_as_an_alias() {
     assert_eq!(fallback.hits(), 0);
 }
 
-/// Stock OpenAI/Anthropic SDKs list models at GET /v1/models — the catalog, with each row's wire.
+/// Stock OpenAI/Anthropic SDKs list models at GET /v1/models — the catalog, with each row's wire,
+/// card and price.
 #[tokio::test]
 async fn v1_models_lists_the_catalog() {
     let nats_port = unused_nats_port();
@@ -1956,6 +1957,34 @@ async fn v1_models_lists_the_catalog() {
     assert_eq!(claude["pricing"]["output"], "25");
     assert_eq!(claude["pricing"]["cache_read"], "0.5");
     assert_eq!(claude["pricing"]["cache_write"], "6.25");
+    // The card: enough to size a prompt, cap output and pick a model by what it supports.
+    assert_eq!(claude["display_name"], "Claude Opus 4.8");
+    assert_eq!(claude["owned_by"], "anthropic");
+    assert_eq!(claude["context_window"], 1_000_000);
+    assert_eq!(claude["max_output_tokens"], 128_000);
+    assert_eq!(
+        claude["input_modalities"],
+        serde_json::json!(["text", "image", "file"])
+    );
+    assert_eq!(claude["output_modalities"], serde_json::json!(["text"]));
+    assert_eq!(
+        claude["capabilities"],
+        serde_json::json!(["tools", "reasoning", "structured_outputs"])
+    );
+    assert_eq!(
+        claude["endpoints"],
+        serde_json::json!(["/v1/chat/completions", "/v1/messages", "/v1/responses"])
+    );
+    let embed = data
+        .iter()
+        .find(|m| m["id"] == "text-embedding-3-small")
+        .expect("text-embedding-3-small");
+    assert_eq!(
+        embed["output_modalities"],
+        serde_json::json!(["embeddings"])
+    );
+    assert_eq!(embed["endpoints"], serde_json::json!(["/v1/embeddings"]));
+    assert!(embed["max_output_tokens"].is_null(), "{embed}");
     // Embeddings produce no output tokens, so only their output rate may be zero.
     assert!(
         data.iter().all(|m| {
