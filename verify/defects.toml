@@ -1429,10 +1429,10 @@ area = "Translation"
 title = "Responses onto Chat turns instructions: null into a system message with null content"
 impact = "A stock responses.create(instructions=None) on a row translated onto Chat Completions (grok, Together rows) sends messages[0] = a system message whose content is null; xAI answers 422 and Together 400, so the call fails where it succeeds on GPT and Claude rows."
 confidence = "high"
-evidence = "live 2026-10-01 TRN-15::openai-py::xai::explicit_nulls -> 422 \"Failed to deserialize the JSON body into the target type: messages[0]: data did not match any variant of untagged enum Content\"; TRN-15::openai-py::together::explicit_nulls -> 400 \"Input validation error\". One null at a time through the gateway (POST /v1/responses, store false) on grok-4.3 and llama-3.3-70b-versatile: instructions null fails; temperature, top_p, tools, tool_choice, previous_response_id null -> 200."
+evidence = "live 2026-10-01 TRN-15::openai-py::xai::explicit_nulls -> 422 'messages[0]: data did not match any variant of untagged enum Content'; TRN-15::openai-py::together::explicit_nulls -> 400. Reproduced hermetically: translate::request_tests::null_instructions_are_absent_on_chat gets messages[0] = {role: system, content: null} on grok-4.3 and a Together Llama."
 claims = ["TRN-15"]
-state = "suspected"
-test = ""
+state = "reproduced"
+test = "null_instructions_are_absent_on_chat"
 fix = ""
 note = "Found by live cells TRN-15::openai-py::xai::explicit_nulls and TRN-15::openai-py::together::explicit_nulls. responses_to_chat should treat a null instructions as absent, the way copy_if treats other nulls."
 
