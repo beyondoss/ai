@@ -801,7 +801,15 @@ Responses-only models the catalog routes to `/v1/responses`, and is held to the 
   `error` key); `message`, `type`, `code` and `param` survive, a string `error` is the message,
   OpenRouter's `metadata.raw` is quoted after its message with the provider's name, and a numeric
   `code` is a string on the OpenAI wire. OpenAI types with an Anthropic name get it
-  (`server_error` → `api_error`, rate limits → `rate_limit_error`). A context overflow carries what
+  (`server_error` → `api_error`, rate limits → `rate_limit_error`). A body that names no type
+  (xAI's `{"code": "invalid_image", "error": "<string>"}`) is typed by its status in the client's
+  vocabulary: on Messages 400 → `invalid_request_error`, 401 → `authentication_error`, 403 →
+  `permission_error`, 404 → `not_found_error`, 413 → `request_too_large`, 429 →
+  `rate_limit_error`; on the OpenAI wires every 4xx but 429 is `invalid_request_error`; 5xx is
+  `api_error`. A same-wire Chat Completions relay from a vendor other than OpenAI withholds a
+  non-2xx JSON body too, and rewrites it into OpenAI's envelope only when it is not already in it
+  (`{"error": {"message": …}}`), so an OpenAI SDK finds `message`, `type` and `code` on a grok
+  error. A context overflow carries what
   each client's harness compacts on: OpenAI's `context_length_exceeded` reaches a Messages client
   with its message prefixed "prompt is too long: " (Claude Code's trigger), and Anthropic's "prompt
   is too long" reaches a Chat Completions or Responses client with code `context_length_exceeded`

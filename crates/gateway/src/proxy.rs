@@ -5153,10 +5153,17 @@ impl ProxyHttp for AiProxy {
             // Same-endpoint candidates stay a byte relay, except a Chat Completions stream from a
             // vendor other than OpenAI: it relays through `SseBridge`, which drops the identity
             // fields OpenRouter repeats on every chunk (see `translate::ChatIdentity`).
-            if rc
-                .auto
-                .as_ref()
-                .is_some_and(|a| catalog_translating(a) || (rc.streaming && catalog_chat_relay(a)))
+            // And a JSON error from such a vendor, which may not be in OpenAI's envelope (D100).
+            let relay_error = status >= 400
+                && !rc.streaming
+                && rc.auto.as_ref().is_some_and(|a| catalog_chat_relay(a));
+            if let Some(t) = rc.auto.as_mut().and_then(|a| a.translate.as_mut()) {
+                t.relay_error = relay_error;
+            }
+            if relay_error
+                || rc.auto.as_ref().is_some_and(|a| {
+                    catalog_translating(a) || (rc.streaming && catalog_chat_relay(a))
+                })
             {
                 let streaming = rc.streaming;
                 let upstream = rc
@@ -5253,7 +5260,10 @@ impl ProxyHttp for AiProxy {
 
         // A translation, or a Chat Completions relay that `response_filter` gave a bridge.
         let translating = rc.auto.as_ref().is_some_and(|a| {
-            catalog_translating(a) || a.translate.as_ref().is_some_and(|t| t.sse.is_some())
+            catalog_translating(a)
+                || a.translate
+                    .as_ref()
+                    .is_some_and(|t| t.sse.is_some() || t.relay_error)
         });
         if translating {
             let streaming = rc.streaming;
