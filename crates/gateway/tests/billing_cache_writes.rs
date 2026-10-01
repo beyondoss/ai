@@ -83,7 +83,7 @@ fn client_usage(text: &str) -> Value {
         .filter_map(|l| l.strip_prefix("data:"))
         .filter_map(|d| serde_json::from_str::<Value>(d.trim()).ok())
         .filter_map(|v| pick(&v))
-        .last()
+        .next_back()
         .expect("a usage chunk")
 }
 
@@ -97,7 +97,6 @@ fn n(v: &Value, k: &str) -> Option<u64> {
 /// claim: E7, BIL-6
 /// defect: D76
 #[tokio::test]
-#[ignore = "D76 reproduced: gateway-added cache writes are billed at the cache-write rate"]
 async fn gateway_added_breakpoints_bill_their_writes_as_input() {
     for (body, ctype, request) in [
         (ANTHROPIC_WRITE, "application/json", CHAT_UNMARKED),
@@ -143,7 +142,6 @@ async fn gateway_added_breakpoints_bill_their_writes_as_input() {
 /// claim: E7, BIL-6
 /// defect: D76
 #[tokio::test]
-#[ignore = "D76 reproduced: gateway-added cache writes are billed at the cache-write rate"]
 async fn a_responses_client_sees_gateway_cache_writes_as_input() {
     let up = ScriptedUpstream::reply(200, "application/json", ANTHROPIC_WRITE.to_owned()).await;
     let (row, text, _gw) = call(&up, "/v1/responses", RESPONSES_UNMARKED).await;

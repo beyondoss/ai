@@ -4633,9 +4633,12 @@ impl ProxyHttp for AiProxy {
                         && let Some(to) = serving
                     {
                         t.tools = translate::ToolNames::default();
+                        t.gateway_cache = false;
                         if t.client != to {
-                            // The tool names this attempt's response maps calls back through.
-                            (buf, t.tools) =
+                            // The tool names this attempt's response maps calls back through, and
+                            // whether its cache breakpoints are the gateway's (per attempt: a
+                            // failover candidate on another wire re-decides both).
+                            (buf, t.tools, t.gateway_cache) =
                                 translate::request_with_tools(t.client, to, &buf, upstream_model);
                             changed = true;
                         } else if to == route::Endpoint::Responses {
@@ -4882,7 +4885,9 @@ impl ProxyHttp for AiProxy {
                     && streaming
                 {
                     t.sse = Some(
-                        translate::SseBridge::new(t.client, upstream).with_tools(t.tools.clone()),
+                        translate::SseBridge::new(t.client, upstream)
+                            .with_tools(t.tools.clone())
+                            .with_gateway_cache(t.gateway_cache),
                     );
                 }
                 upstream_response.remove_header("content-length");
@@ -4981,9 +4986,11 @@ impl ProxyHttp for AiProxy {
                 .unwrap_or_else(|| route::Endpoint::of_wire(dialect));
             let out = if let Some(t) = rc.auto.as_mut().and_then(|a| a.translate.as_mut()) {
                 if streaming {
-                    let (client, tools) = (t.client, &t.tools);
+                    let (client, tools, gateway_cache) = (t.client, &t.tools, t.gateway_cache);
                     let sse = t.sse.get_or_insert_with(|| {
-                        translate::SseBridge::new(client, upstream).with_tools(tools.clone())
+                        translate::SseBridge::new(client, upstream)
+                            .with_tools(tools.clone())
+                            .with_gateway_cache(gateway_cache)
                     });
                     let out = sse.feed(chunk, end_of_stream);
                     if sse.pending_len() > translate::MAX_TRANSLATE_BUFFER {
@@ -5001,6 +5008,7 @@ impl ProxyHttp for AiProxy {
                             status,
                             &t.json_buf,
                             &t.tools,
+                            t.gateway_cache,
                         )
                     } else {
                         Vec::new()
@@ -5536,7 +5544,18 @@ impl ProxyHttp for AiProxy {
                 "managed 2xx response ended cleanly without parseable usage; billing an estimate or zero",
             );
         }
-        let usage = parsed.unwrap_or_default();
+        let mut usage = parsed.unwrap_or_default();
+        // Writes caused by breakpoints the gateway added bill as input (see
+        // `Usage::bill_gateway_cache_writes`). A cache hit replays the fill's already-billed usage.
+        if cache_hit.is_none()
+            && rc
+                .auto
+                .as_ref()
+                .and_then(|a| a.translate.as_ref())
+                .is_some_and(|t| t.gateway_cache)
+        {
+            usage.bill_gateway_cache_writes(usage.wire.unwrap_or(rc.dialect));
+        }
 
         let m = &self.state.metrics;
         if cache_hit.is_some() {
@@ -5675,6 +5694,10 @@ impl ProxyHttp for AiProxy {
                 // Priced variants and per-call fees (see `usage::Usage`). The 1-hour writes are a
                 // subset of `cache_write_tokens`, not additional to them.
                 cache_write_1h_tokens = usage.cache_write_1h_tokens,
+                // Cache writes from breakpoints the gateway added, already in `input_tokens` and
+                // not in `cache_write_tokens` (the gateway chose to cache, so they bill as input).
+                // For reconciling against the provider's usage, which calls them cache writes.
+                gateway_cache_write_tokens = usage.gateway_cache_write_tokens,
                 server_tool_calls = usage.server_tool_calls,
                 service_tier = usage.service_tier.as_deref(),
                 // `Some(0)` (reported, none used) vs `None` (not reported at all — an unreasoning

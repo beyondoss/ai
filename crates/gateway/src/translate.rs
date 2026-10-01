@@ -61,7 +61,8 @@
 //!   `low`–`high` in place of `xhigh` / `max` / `minimal`.
 //! - **Added onto Messages:** default `cache_control` breakpoints when the client set none (see
 //!   `auto_cache_breakpoints`). An OpenAI SDK never marks anything, and without a marker Anthropic
-//!   caches nothing.
+//!   caches nothing. The writes those markers cause are the gateway's choice, so the client is shown
+//!   them as input, as they are billed (see [`request_with_tools`]).
 //! - **Added onto Responses:** `store: false` unless the client asked to store; Chat Completions
 //!   stores nothing by default, Responses stores everything.
 //! - **Required mapping:** system/messages/`input`, `max_tokens`/`max_output_tokens`, stop,
@@ -93,6 +94,9 @@ pub struct TranslateState {
     /// How this attempt's request reshaped a Responses client's tools; set per attempt by
     /// [`request_with_tools`] and read by the response translation.
     pub tools: ToolNames,
+    /// This attempt's request carries cache breakpoints the gateway added (see
+    /// [`request_with_tools`]). Its cache writes are the gateway's cost, billed and shown as input.
+    pub gateway_cache: bool,
 }
 
 impl TranslateState {
@@ -102,6 +106,7 @@ impl TranslateState {
             sse: None,
             json_buf: Vec::new(),
             tools: ToolNames::default(),
+            gateway_cache: false,
         }
     }
 
@@ -129,32 +134,33 @@ pub fn request(from: Endpoint, to: Endpoint, body: &[u8], upstream_model: &str) 
     request_with_tools(from, to, body, upstream_model).0
 }
 
-/// [`request`], plus the [`ToolNames`] the response must map the upstream's tool calls back
-/// through (empty unless a Responses body's tools were reshaped).
+/// [`request`], plus what the response translation must follow: the [`ToolNames`] the upstream's
+/// tool calls map back through (empty unless a Responses body's tools were reshaped), and whether
+/// the gateway added default cache breakpoints (see `auto_cache_breakpoints`). When it did, the
+/// client never asked for caching: the writes those breakpoints cause are the gateway's
+/// optimization, billed and shown to the client as input.
 pub fn request_with_tools(
     from: Endpoint,
     to: Endpoint,
     body: &[u8],
     upstream_model: &str,
-) -> (Vec<u8>, ToolNames) {
+) -> (Vec<u8>, ToolNames, bool) {
     if from == to {
-        return (body.to_vec(), ToolNames::default());
+        return (body.to_vec(), ToolNames::default(), false);
     }
     let Ok(v) = serde_json::from_slice::<Value>(body) else {
-        return (body.to_vec(), ToolNames::default());
+        return (body.to_vec(), ToolNames::default(), false);
     };
     if !v.is_object() {
-        return (body.to_vec(), ToolNames::default());
+        return (body.to_vec(), ToolNames::default(), false);
     }
     let names = if from == Endpoint::Responses {
         ToolNames::of_responses(&v, to == Endpoint::Messages)
     } else {
         ToolNames::default()
     };
-    (
-        encode(&map_request(from, to, &v, Upstream::of(upstream_model))),
-        names,
-    )
+    let (out, gateway_cache) = map_request(from, to, &v, Upstream::of(upstream_model));
+    (encode(&out), names, gateway_cache)
 }
 
 /// How a Responses client's tools were reshaped on the way to a Chat Completions or Messages
@@ -274,12 +280,15 @@ impl Upstream {
     }
 }
 
-fn map_request(from: Endpoint, to: Endpoint, v: &Value, up: Upstream) -> Value {
+/// The mapped body, and whether the gateway added cache breakpoints to it.
+fn map_request(from: Endpoint, to: Endpoint, v: &Value, up: Upstream) -> (Value, bool) {
     // Legacy `functions` / `function_call` are the same tool loop in an older shape.
     let chat = (from == Endpoint::ChatCompletions).then(|| legacy_functions_to_tools(v));
     let chat = chat.as_ref().and_then(Option::as_ref).unwrap_or(v);
-    match (from, to) {
-        (Endpoint::ChatCompletions, Endpoint::Messages) => openai_req_to_anthropic(chat, up.claude),
+    let out = match (from, to) {
+        (Endpoint::ChatCompletions, Endpoint::Messages) => {
+            return openai_req_to_anthropic(chat, up.claude);
+        }
         (Endpoint::Messages, Endpoint::ChatCompletions) => {
             claude_chat_reasoning_guard(anthropic_req_to_openai(v, up), up)
         }
@@ -296,14 +305,15 @@ fn map_request(from: Endpoint, to: Endpoint, v: &Value, up: Upstream) -> Value {
             if let (Some(r), Some(obj)) = (v.get("reasoning"), chat.as_object_mut()) {
                 obj.insert("reasoning".into(), r.clone());
             }
-            openai_req_to_anthropic(&chat, up.claude)
+            return openai_req_to_anthropic(&chat, up.claude);
         }
         (Endpoint::Messages, Endpoint::Responses) => {
             openai_req_to_responses(&anthropic_req_to_openai(v, up), up.openai)
         }
         (a, b) if a == b => v.clone(),
         _ => v.clone(),
-    }
+    };
+    (out, false)
 }
 
 /// Map a non-stream JSON response from `upstream` into `client`. Error objects are reshaped
@@ -321,17 +331,20 @@ pub fn response_json_status(
     status: u16,
     body: &[u8],
 ) -> Vec<u8> {
-    response_json_tools(upstream, client, status, body, &ToolNames::default())
+    response_json_tools(upstream, client, status, body, &ToolNames::default(), false)
 }
 
 /// [`response_json_status`] for a request whose tools were reshaped (see [`ToolNames`]): each tool
-/// call comes back under the name, namespace and kind the client offered.
+/// call comes back under the name, namespace and kind the client offered. `gateway_cache`: the
+/// request's cache breakpoints were the gateway's, so its cache writes show as input (see
+/// [`request_with_tools`]).
 pub fn response_json_tools(
     upstream: Endpoint,
     client: Endpoint,
     status: u16,
     body: &[u8],
     tools: &ToolNames,
+    gateway_cache: bool,
 ) -> Vec<u8> {
     if upstream == client {
         return body.to_vec();
@@ -342,17 +355,25 @@ pub fn response_json_tools(
     if !(200..300).contains(&status) || looks_like_error(&v) {
         return encode(&map_error(&v, client));
     }
-    encode(&map_response(upstream, client, &v, tools))
+    encode(&map_response(upstream, client, &v, tools, gateway_cache))
 }
 
-fn map_response(upstream: Endpoint, client: Endpoint, v: &Value, tools: &ToolNames) -> Value {
+fn map_response(
+    upstream: Endpoint,
+    client: Endpoint,
+    v: &Value,
+    tools: &ToolNames,
+    gateway_cache: bool,
+) -> Value {
     match (upstream, client) {
-        (Endpoint::Messages, Endpoint::ChatCompletions) => anthropic_resp_to_openai(v),
+        (Endpoint::Messages, Endpoint::ChatCompletions) => {
+            anthropic_resp_to_openai(v, gateway_cache)
+        }
         (Endpoint::ChatCompletions, Endpoint::Messages) => openai_resp_to_anthropic(v),
         (Endpoint::ChatCompletions, Endpoint::Responses) => openai_resp_to_responses(v, tools),
         (Endpoint::Responses, Endpoint::ChatCompletions) => responses_resp_to_openai(v),
         (Endpoint::Messages, Endpoint::Responses) => {
-            openai_resp_to_responses(&anthropic_resp_to_openai(v), tools)
+            openai_resp_to_responses(&anthropic_resp_to_openai(v, gateway_cache), tools)
         }
         (Endpoint::Responses, Endpoint::Messages) => {
             openai_resp_to_anthropic(&responses_resp_to_openai(v))
@@ -592,7 +613,9 @@ fn map_error(v: &Value, client: Endpoint) -> Value {
 
 // --- request: OpenAI → Anthropic --------------------------------------------
 
-fn openai_req_to_anthropic(v: &Value, claude: ClaudeModel) -> Value {
+/// The mapped body, and whether the gateway added cache breakpoints (see
+/// `auto_cache_breakpoints`).
+fn openai_req_to_anthropic(v: &Value, claude: ClaudeModel) -> (Value, bool) {
     let mut out = Map::new();
     copy_if(&mut out, v, "model");
     let max_tokens = max_tokens_of(v).unwrap_or(DEFAULT_MAX_TOKENS);
@@ -766,7 +789,7 @@ fn openai_req_to_anthropic(v: &Value, claude: ClaudeModel) -> Value {
         out.insert("system".into(), anthropic_system_value(system_parts));
     }
     out.insert("messages".into(), Value::Array(messages));
-    auto_cache_breakpoints(&mut out);
+    let gateway_cache = auto_cache_breakpoints(&mut out);
     // After the breakpoints, so the instruction sits past the cached prefix. A mid-conversation
     // system message must follow a user turn (or another system message that does); when the
     // request ends on an assistant turn (a prefill, which these models also reject), there is
@@ -788,7 +811,7 @@ fn openai_req_to_anthropic(v: &Value, claude: ClaudeModel) -> Value {
     if claude.binding_controls {
         bind_thinking_with_drop_block(&mut out);
     }
-    Value::Object(out)
+    (Value::Object(out), gateway_cache)
 }
 
 /// "No reasoning" on a model whose lowest setting is `between_tools` (Sonnet 5.5): it rejects
@@ -1226,9 +1249,11 @@ fn legacy_functions_to_tools(v: &Value) -> Option<Value> {
 ///
 /// Prefixes shorter than the model's minimum (1024 tokens on most Claude models) are simply not
 /// cached; the marker costs nothing there.
-fn auto_cache_breakpoints(out: &mut Map<String, Value>) {
+///
+/// Returns whether it added any marker: the writes they cause are then the gateway's cost.
+fn auto_cache_breakpoints(out: &mut Map<String, Value>) -> bool {
     if has_cache_control(out) {
-        return;
+        return false;
     }
     let ephemeral = || json!({ "type": "ephemeral" });
     let mut marked_prefix = false;
@@ -1253,18 +1278,19 @@ fn auto_cache_breakpoints(out: &mut Map<String, Value>) {
             .and_then(Value::as_object_mut)
     {
         last.insert("cache_control".into(), ephemeral());
+        marked_prefix = true;
     }
     let Some(messages) = out.get_mut("messages").and_then(Value::as_array_mut) else {
-        return;
+        return marked_prefix;
     };
     if !messages
         .iter()
         .any(|m| m.get("role").and_then(Value::as_str) == Some("assistant"))
     {
-        return;
+        return marked_prefix;
     }
     let Some(last) = messages.last_mut() else {
-        return;
+        return marked_prefix;
     };
     if let Some(Value::String(t)) = last.get("content")
         && !t.is_empty()
@@ -1280,7 +1306,9 @@ fn auto_cache_breakpoints(out: &mut Map<String, Value>) {
         .and_then(Value::as_object_mut)
     {
         block.insert("cache_control".into(), ephemeral());
+        return true;
     }
+    marked_prefix
 }
 
 /// Whether the translated request already carries a `cache_control` on a tool, a system block,
@@ -2997,6 +3025,17 @@ impl Usage {
         }
     }
 
+    /// When `on`, cache writes become uncached input: the gateway added the breakpoints that caused
+    /// them, and bills them at the input rate (see [`request_with_tools`]). The whole prompt is
+    /// unchanged; only the cache-write share moves.
+    fn writes_as_input(mut self, on: bool) -> Self {
+        if on {
+            self.uncached = self.uncached.saturating_add(self.cache_write);
+            self.cache_write = 0;
+        }
+        self
+    }
+
     fn prompt(&self) -> u64 {
         self.uncached
             .saturating_add(self.cache_read)
@@ -3285,7 +3324,8 @@ fn is_thinking_block(block: &Value) -> bool {
     )
 }
 
-fn anthropic_resp_to_openai(v: &Value) -> Value {
+/// `gateway_cache`: the request's breakpoints were the gateway's, so its writes show as input.
+fn anthropic_resp_to_openai(v: &Value, gateway_cache: bool) -> Value {
     let mut text = String::new();
     let mut reasoning = String::new();
     let mut thinking: Vec<Value> = Vec::new();
@@ -3351,7 +3391,9 @@ fn anthropic_resp_to_openai(v: &Value) -> Value {
             "finish_reason": map_stop_to_openai(stop),
             "logprobs": Value::Null,
         }],
-        "usage": Usage::from_anthropic(v.get("usage").unwrap_or(&Value::Null)).to_chat(),
+        "usage": Usage::from_anthropic(v.get("usage").unwrap_or(&Value::Null))
+            .writes_as_input(gateway_cache)
+            .to_chat(),
     })
 }
 
@@ -4908,6 +4950,14 @@ impl SseBridge {
         self
     }
 
+    /// Show the response's cache writes as input: the request's breakpoints were the gateway's
+    /// (see [`request_with_tools`]). Only a Messages upstream reports cache writes this way.
+    #[must_use]
+    pub fn with_gateway_cache(mut self, on: bool) -> Self {
+        self.ant_to_oai.gateway_cache = on;
+        self
+    }
+
     /// Bytes held for an event whose terminating blank line has not arrived yet.
     pub fn pending_len(&self) -> usize {
         self.buf.len()
@@ -5118,6 +5168,8 @@ struct AntToOai {
     /// `thinking` list entries sent so far: the next one's `index`.
     thinking_blocks: u32,
     usage: Usage,
+    /// The request's cache breakpoints were the gateway's: its writes show as input.
+    gateway_cache: bool,
 }
 
 /// A client `tool_use` block streaming to a Chat client.
@@ -5303,7 +5355,10 @@ impl AntToOai {
                     items.push(self.meta.chunk(json!({ "refusal": why }), None));
                 }
                 items.push(self.meta.chunk(json!({}), Some(map_stop_to_openai(stop))));
-                items.push(self.meta.usage(self.usage.to_chat()));
+                items.push(
+                    self.meta
+                        .usage(self.usage.writes_as_input(self.gateway_cache).to_chat()),
+                );
             }
             "content_block_stop" => {
                 if let Some(tool) = self.open_tool.take()

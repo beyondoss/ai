@@ -1879,3 +1879,36 @@ fn only_gateway_reasoning_items_are_stripped_from_a_responses_relay() {
         ])
     );
 }
+
+/// `request_with_tools` says whether the breakpoints are the gateway's: true only when it added one,
+/// false when the client marked anything (the writes are then the client's) or nothing was cacheable.
+#[test]
+fn request_reports_gateway_added_breakpoints() {
+    let caching = |body: Value| {
+        request_with_tools(
+            Endpoint::ChatCompletions,
+            Endpoint::Messages,
+            &serde_json::to_vec(&body).unwrap(),
+            "claude-opus-4-8",
+        )
+        .2
+    };
+    let sys = json!({"role": "system", "content": "be terse"});
+    let user = json!({"role": "user", "content": "hi"});
+    assert!(caching(json!({"model": "m", "messages": [sys, user]})));
+    assert!(!caching(json!({"model": "m", "messages": [user]})));
+    let marked = json!({"role": "system", "content": [
+        {"type": "text", "text": "be terse", "cache_control": {"type": "ephemeral"}}
+    ]});
+    assert!(!caching(json!({"model": "m", "messages": [marked, user]})));
+    // Same wire: a byte relay, never marked.
+    assert!(
+        !request_with_tools(
+            Endpoint::Messages,
+            Endpoint::Messages,
+            b"{}",
+            "claude-opus-4-8"
+        )
+        .2
+    );
+}

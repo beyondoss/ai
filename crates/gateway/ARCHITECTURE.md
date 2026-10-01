@@ -643,6 +643,21 @@ each system or user text block, on an assistant turn's last non-thinking block, 
 message's `tool_result`.
 Same-wire Messages traffic is a byte relay and is never touched.
 
+**Who pays for a cache write: whoever chose to cache.** When the gateway added the markers
+(`translate::request_with_tools` reports it per attempt, into `TranslateState::gateway_cache`), the
+client never asked for caching, so the writes they cause are the gateway's optimization and bill at
+the input rate. The row folds them into `input_tokens` (on the `anthropic` wire, whose
+`input_tokens` excludes writes; the `openai` wire's already includes them), reports
+`cache_write_tokens` and `cache_write_1h_tokens` as 0, and records the count in
+`gateway_cache_write_tokens` so the row still reconciles against the provider's usage, which calls
+them cache writes (`Usage::bill_gateway_cache_writes`). The client is shown the same: the translated
+`prompt_tokens` / Responses `input_tokens` is the whole prompt as before, with
+`cache_write_tokens: 0`. An OpenAI-wire harness (the AI SDK's openai-compatible provider, pi's
+Responses provider) reads no cache-write field and prices the whole prompt less cache reads at
+input, which now matches the bill. A client that sent `cache_control` itself asked for the writes
+and is billed and shown true cache writes, exactly as calling Anthropic directly; whether its wire
+can display them is a limitation it shares with direct use. Cache reads are unaffected either way.
+
 **What the client gets back.** Responses are translated in `translate::response_json_status`
 (non-stream, withheld until end of stream) and `translate::SseBridge` (event by event). Every stream
 pairing meets in Chat Completions chunks held as values, so Messages → Responses parses each event
@@ -655,7 +670,9 @@ Responses-only models the catalog routes to `/v1/responses`, and is held to the 
   `prompt_tokens_details.cached_tokens` = cache reads and `cache_write_tokens` = cache writes (the
   field OpenAI and OpenRouter use); the reverse subtracts. Responses usage always carries
   `input_tokens_details` and `output_tokens_details` (the schema requires them). A `message_delta`'s
-  cumulative counts replace `message_start`'s. Billing is untouched: it parses the upstream body.
+  cumulative counts replace `message_start`'s. Billing parses the upstream body. On a request whose
+  cache breakpoints the gateway added, cache writes show as uncached input to the client and on the
+  row alike (see above).
 - **Stop reasons.** `end_turn`/`stop_sequence` ↔ `stop`, `tool_use` ↔ `tool_calls`, `max_tokens` ↔
   `length`, `refusal` ↔ `content_filter`. `model_context_window_exceeded` and `pause_turn` become
   `length`: both leave the turn unfinished, and resending it is the remedy for either. A Responses
@@ -996,11 +1013,12 @@ in `upstream_peer` → connected in `upstream_request_filter`) is what tells the
 
 **Priced variants and per-call fees** ride on the row next to the token counts:
 
-| Row field               | Source                                                                                                                                   |
-| ----------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
-| `cache_write_1h_tokens` | Anthropic `usage.cache_creation.ephemeral_1h_input_tokens` — a subset of `cache_write_tokens` (2×)                                       |
-| `server_tool_calls`     | Anthropic `usage.server_tool_use.web_search_requests` (cumulative, on `message_delta` when streamed)                                     |
-| `service_tier`          | `service_tier` as echoed: Chat Completions root, Responses `response`, Anthropic `usage`; absent if not echoed or not `[a-z0-9_-]{1,16}` |
+| Row field                    | Source                                                                                                                                   |
+| ---------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| `cache_write_1h_tokens`      | Anthropic `usage.cache_creation.ephemeral_1h_input_tokens` — a subset of `cache_write_tokens` (2×)                                       |
+| `gateway_cache_write_tokens` | Cache writes caused by breakpoints the gateway added: already in `input_tokens`, not in `cache_write_tokens` (billed at input)           |
+| `server_tool_calls`          | Anthropic `usage.server_tool_use.web_search_requests` (cumulative, on `message_delta` when streamed)                                     |
+| `service_tier`               | `service_tier` as echoed: Chat Completions root, Responses `response`, Anthropic `usage`; absent if not echoed or not `[a-z0-9_-]{1,16}` |
 
 OpenAI reports no hosted-tool call count in `usage`, so `server_tool_calls` is 0 there. A
 malformed `service_tier` never fails the usage parse: it reads as absent.

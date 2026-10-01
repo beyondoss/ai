@@ -29,6 +29,11 @@ pub struct Usage {
     /// Cache writes at the 1-hour TTL (Anthropic `cache_creation.ephemeral_1h_input_tokens`): a
     /// subset of `cache_write_tokens`, priced at 2× input where the 5-minute ones are 1.25×.
     pub cache_write_1h_tokens: u64,
+    /// Cache writes caused by breakpoints the gateway added (the client sent no `cache_control`).
+    /// Already folded into `input_tokens` and absent from `cache_write_tokens`: the gateway chose to
+    /// cache, so they bill at the input rate. Kept so the row reconciles against the provider's
+    /// usage, which reports them as cache writes. See [`Usage::bill_gateway_cache_writes`].
+    pub gateway_cache_write_tokens: u64,
     /// Server-side tool calls the provider ran and prices per call (Anthropic
     /// `server_tool_use.web_search_requests`). OpenAI reports no such count in `usage`.
     pub server_tool_calls: u64,
@@ -38,6 +43,26 @@ pub struct Usage {
     /// cache-written) tokens, Anthropic's excludes both cache reads and writes. Set by the extractor
     /// that read it; `None` when nothing was read (an estimate), where the request's wire answers.
     pub wire: Option<Dialect>,
+}
+
+impl Usage {
+    /// Bill this request's cache writes as input: the gateway added the breakpoints that caused
+    /// them (`translate::request_with_tools`), so they are its optimization, not the client's
+    /// request. `wire` is the convention `input_tokens` follows: Anthropic's excludes cache writes,
+    /// so they are added; OpenAI's (OpenRouter's) already includes them. Either way the row's
+    /// whole prompt is unchanged and a pricer charges the writes at the input rate.
+    pub fn bill_gateway_cache_writes(&mut self, wire: Dialect) {
+        let writes = self.cache_write_tokens;
+        if writes == 0 {
+            return;
+        }
+        if wire == Dialect::Anthropic {
+            self.input_tokens = self.input_tokens.saturating_add(writes);
+        }
+        self.cache_write_tokens = 0;
+        self.cache_write_1h_tokens = 0;
+        self.gateway_cache_write_tokens = writes;
+    }
 }
 
 /// Deserialize a `service_tier` string into a [`ServiceTier`], leniently: anything else — `null`,
@@ -337,6 +362,7 @@ impl From<AnthropicUsage> for Usage {
             server_tool_calls: u.server_tool_use.web_search_requests,
             service_tier: u.service_tier,
             wire: Some(Dialect::Anthropic),
+            gateway_cache_write_tokens: 0,
         }
     }
 }
@@ -1851,6 +1877,46 @@ data: {\"type\":\"message_delta\",\"usage\":{\"input_tokens\":2500,\"cache_read_
         assert_eq!(
             (u.input_tokens, u.cache_read_tokens, u.output_tokens),
             (2500, 800, 300)
+        );
+    }
+
+    /// Gateway-caused cache writes move to input on either wire, and the whole prompt is kept:
+    /// Anthropic's `input_tokens` excludes writes (so they are added), OpenAI's already holds them.
+    #[test]
+    fn gateway_cache_writes_bill_as_input_on_both_wires() {
+        let base = Usage {
+            input_tokens: 50,
+            cache_read_tokens: 300,
+            cache_write_tokens: 2000,
+            cache_write_1h_tokens: 0,
+            ..Default::default()
+        };
+        let mut a = base;
+        a.bill_gateway_cache_writes(Dialect::Anthropic);
+        assert_eq!(
+            (a.input_tokens, a.cache_read_tokens, a.cache_write_tokens),
+            (2050, 300, 0)
+        );
+        assert_eq!(a.gateway_cache_write_tokens, 2000);
+        let mut o = Usage {
+            input_tokens: 2350,
+            ..base
+        };
+        o.bill_gateway_cache_writes(Dialect::OpenAi);
+        assert_eq!((o.input_tokens, o.cache_write_tokens), (2350, 0));
+        assert_eq!(o.gateway_cache_write_tokens, 2000);
+        // No writes, nothing to move.
+        let mut none = Usage {
+            cache_write_tokens: 0,
+            ..base
+        };
+        none.bill_gateway_cache_writes(Dialect::Anthropic);
+        assert_eq!(
+            none,
+            Usage {
+                cache_write_tokens: 0,
+                ..base
+            }
         );
     }
 }
