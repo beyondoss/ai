@@ -499,6 +499,7 @@ async fn h2c_multiplexing_survives_a_cancel_and_a_reject() {
 /// Continue` or a final status promptly, so the client never sits out its own expect timeout,
 /// and a request it rejects is refused without waiting for the body.
 /// claim: REL-12
+/// defect: D73
 #[tokio::test]
 async fn expect_100_continue_never_stalls() {
     let (pubkey, sk) = test_keypair(113);

@@ -145,7 +145,7 @@ evidence = "proxy.rs:3394, 3741"
 claims = ["REL-4"]
 state = "fixed"
 test = "a_401_candidate_does_not_black_hole_the_row"
-fix = "8427fe2"
+fix = "78a577d"
 note = "A managed walk's 401/403/402 now fails over to the next candidate (replayable body or FullBody re-run), takes the ranker's failure penalty, is never pinned, and resolves its breaker permit as a success; the last candidate's own status is relayed (a_401_on_every_candidate_is_relayed_and_opens_no_breaker). An OpenAI 429 with insufficient_quota in its body is not detected (decided on the head) and stays a key walk."
 
 [[defect]]
@@ -159,7 +159,7 @@ evidence = "admin.rs:136-145; proxy.rs:1969"
 claims = ["REL-5"]
 state = "fixed"
 test = "readyz_is_not_ready_while_allowance_is_unseeded"
-fix = "9bec7d3"
+fix = "32e2ae1"
 note = "/readyz is 503 {\"status\":\"not_ready\",\"reason\":...} while ai_allowance_ready is 0 on a deployment with signing_keys; BYO-only deployments are exempt, and once seeded the set never goes unready."
 
 [[defect]]
@@ -229,7 +229,7 @@ evidence = "proxy.rs:2771-2776, 3248-3256; no fail_to_proxy override"
 claims = ["REL-2", "CAT-11"]
 state = "fixed"
 test = "all_breakers_open_on_a_catalog_walk_is_a_json_503"
-fix = "8ff0c35"
+fix = "88164d3"
 note = "fail_to_proxy (merged with D09's after-delivery override) answers every gateway-ended request with the JSON envelope, content-type and x-beyond-request-id: all candidates failing to connect 502, all breakers open 503 + Retry-After, upstream timeout 504, chunked body over the cap 413 (all four reproductions plus an_upstream_timeout_is_a_json_504 pass)."
 
 [[defect]]
@@ -243,7 +243,7 @@ evidence = "circuit_breaker.rs:327; proxy.rs:3726-3753"
 claims = ["REL-6"]
 state = "fixed"
 test = "a_stalled_half_open_probe_does_not_wedge_the_provider"
-fix = "0de7f7c"
+fix = "3dc89ab"
 note = "The breaker permit resolves at the response head (2xx-4xx success, 5xx failure), not at end of stream, and a half-open probe permit unresolved for a whole reset timeout is reclaimed (unit test for a header that never comes)."
 
 [[defect]]
@@ -495,7 +495,7 @@ evidence = "proxy.rs:116, 1206, 2044"
 claims = ["SEC-19"]
 state = "fixed"
 test = "concurrent_large_uploads_have_bounded_memory"
-fix = "f58649d"
+fix = "dec656a"
 note = "New max_buffered_body_bytes (512 MiB): a catalog body past the replay buffer reserves 2x its size (its read plus the FullBody copy), a /{provider} splice body 1x, before reading when declared and as it grows when chunked; over it is a JSON 503 + Retry-After (reason=body_memory). The 8 x 90 MiB reproduction now admits two and refuses the rest. A translated large body briefly holds a third copy that is not reserved."
 
 [[defect]]
@@ -509,7 +509,7 @@ evidence = "proxy.rs:618"
 claims = ["REL-7"]
 state = "fixed"
 test = "a_streaming_header_stall_fails_well_under_read_timeout_by_default"
-fix = "d60b902"
+fix = "47aa861"
 note = "New stream_idle_timeout_secs (120, capped by read_timeout_secs) is the per-read upstream bound for a request that asks for a stream, so a header stall or silent gap ends in a JSON 504 (not resent). Pingora 0.9 has one per-read upstream timeout and no hook to change it after the head, so one bound covers first byte and gaps: no separate first_byte_timeout_secs. Streaming is known when the body is read before connecting (catalog walks, FullBody, any other small declared body); a large body on /{provider} or BYO keeps read_timeout_secs. Bound changed: the test asserts the 120s default sits well under read_timeout and observes the stall end at a configured 2s (waiting 120s in a test is not useful); a_slow_non_streaming_answer_is_not_cut_at_the_stream_bound pins the scope. Risk: a hidden-reasoning stream silent for over 120s is now cut."
 
 [[defect]]
@@ -523,7 +523,7 @@ evidence = "circuit_breaker.rs:383"
 claims = ["REL-6"]
 state = "fixed"
 test = "a_half_failing_provider_opens_the_breaker"
-fix = "0de7f7c"
+fix = "3dc89ab"
 note = "Windowed breaker opens on a failure rate: at least circuit_breaker_threshold failures in the window that are also at least half the window's outcomes (successes are counted, no longer a reset). Background errors on a busy provider stay closed (unit test)."
 
 [[defect]]
@@ -537,7 +537,7 @@ evidence = "main.rs:166-175; pingora server/mod.rs:811"
 claims = ["REL-16", "BIL-21"]
 state = "fixed"
 test = "an_idle_gateway_exits_promptly_on_sigterm"
-fix = "5c4bae6"
+fix = "7010389"
 note = "A custom ShutdownSignalWatch starts a drain on SIGTERM that exits once LIVE_REQUESTS (request contexts, dropped after logging) is 0; pingora's grace sleep stays the upper bound. Idle exit ~0.3s; sigterm_drains_an_in_flight_request_then_exits shows an in-flight request finishes with its billing row first."
 
 [[defect]]
@@ -551,7 +551,7 @@ evidence = "proxy.rs:3704-3708"
 claims = ["REL-17"]
 state = "fixed"
 test = "a_panic_in_a_proxy_phase_releases_what_the_request_held"
-fix = "bf3cc39"
+fix = "9785e77"
 note = "Pingora's CTX is proxy::Ctx, whose Drop releases what logging did not: in-flight and SSE gauges, the tenant slot, the body budget, and an unresolved breaker permit (returned without an outcome). Debug builds take AI_FAULT_PANIC=<phase> (compiled out of release). A panicking request still writes no billing row."
 
 [[defect]]
@@ -565,7 +565,7 @@ evidence = "state.rs:408-417"
 claims = ["REL-20"]
 state = "fixed"
 test = "dns_tries_the_next_address_when_the_first_is_dead"
-fix = "d43b501"
+fix = "e0226c5"
 note = "resolve() keeps every address in lookup order and connect retries walk them (provider routes via their connect retries, catalog candidates before the walk moves on: a_catalog_candidate_is_tried_on_its_next_address). Lookups are bounded at 5s and a failed re-resolution serves the last good answer for up to 10 min (unit tests with a failing and a hung resolver)."
 
 [[defect]]
@@ -579,7 +579,7 @@ evidence = "proxy.rs:3394-3398"
 claims = ["REL-8"]
 state = "fixed"
 test = "a_200_with_an_error_body_is_not_pinned"
-fix = "8427fe2"
+fix = "78a577d"
 note = "A 2xx's ranker sample and pin wait for the body's first bytes (at most 1 KiB): a root error object or an SSE stream whose first event is an error counts as a failure and pins nothing. Both reproductions pass."
 
 [[defect]]
@@ -593,7 +593,7 @@ evidence = "pingora default"
 claims = ["REL-10"]
 state = "fixed"
 test = "a_client_that_stops_reading_is_released"
-fix = "2d3c6f8"
+fix = "4602d08"
 note = "New client_write_timeout_secs (60) sets the downstream write timeout, so a client that stops reading is cut and its slots released. Bound changed: the test asserts the 60s default and configures 3s to observe the release inside its 20s window."
 
 [[defect]]
@@ -607,7 +607,7 @@ evidence = "proxy.rs:1969-1984, 2601-2611"
 claims = ["REL-19"]
 state = "fixed"
 test = "gateway_429_and_503_carry_retry_after"
-fix = "b49b750"
+fix = "c9afd96"
 note = "Every gateway-made 429/503 carries Retry-After (rate limit and tenant cap 1, open breaker the seconds left until half-open, allowance unavailable 5); allowance unavailable is a retryable 503, quota exhausted stays 402."
 
 [[defect]]
@@ -733,7 +733,7 @@ evidence = "config.rs:472-542; state.rs:134"
 claims = ["REL-15"]
 state = "fixed"
 test = "env_pool_key_reaches_a_hyphenated_provider"
-fix = "9e85443"
+fix = "93331fb"
 note = "AI_POOL_KEY_<NAME> maps _ to - when the lowercased name matches no provider; circuit_breaker_window_secs = 0 and circuit_breaker_reset_secs = 0 with the breaker on are boot failures. Not done: rejecting a grace period above shutdown_runtime_timeout_secs, which would refuse the default config (600 vs 10) and D38's own 3s-grace test."
 
 [[defect]]
@@ -1001,3 +1001,31 @@ state = "reproduced"
 test = "a_revoked_first_pool_key_walks_to_the_next"
 fix = ""
 note = "Found by the claim-coverage pass (claims_reliability.rs). Rotation that puts the new key first ([new, old]) drops nothing (a_rolling_pool_key_rotation_drops_nothing)."
+
+[[defect]]
+id = "D72"
+severity = "med"
+area = "Reliability"
+title = "A request right after an upstream HTTP/2 GOAWAY can 502 instead of retrying"
+impact = "A stream refused by GOAWAY (above the server's last processed stream id) was never processed and is safe to resend, but the 'never resend a delivered body' rule (D09) treats it as delivered. Under load, a provider's routine H2 connection recycling surfaces as client 502s."
+confidence = "high"
+evidence = "claims_reliability.rs::upstream_goaway_is_handled fails under full-suite load (sequential #3: 502), passes 10/10 alone"
+claims = ["REL-22", "REL-1"]
+state = "suspected"
+test = ""
+fix = ""
+note = "Needs a deterministic reproduction (refuse the stream with GOAWAY last_stream_id below it) and a retry rule for refused streams."
+
+[[defect]]
+id = "D73"
+severity = "low"
+area = "Reliability"
+title = "Two 100 Continue responses for one request"
+impact = "After the gateway answered Expect: 100-continue itself, it forwarded Expect upstream and relayed the provider's 100 too. Strict clients misparse the second interim response as the final one."
+confidence = "high"
+evidence = "claims_reliability.rs::expect_100_continue_never_stalls: raw response carried two 'HTTP/1.1 100 Continue' blocks"
+claims = ["REL-12"]
+state = "fixed"
+test = "expect_100_continue_never_stalls"
+fix = "dabe80e"
+note = "peek_body_model removes Expect from the forwarded request once it has answered 100 Continue."

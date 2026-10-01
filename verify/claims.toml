@@ -981,7 +981,7 @@ group = "Reliability"
 text = "Every upstream failure class has a bounded, documented client outcome"
 layer = "both"
 touches = ["crates/gateway/src/proxy.rs", "crates/gateway/src/circuit_breaker.rs", "crates/gateway/src/smart.rs", "crates/gateway/src/state.rs", "crates/gateway/src/admin.rs", "crates/gateway/src/store_watch.rs", "crates/gateway/src/main.rs", "crates/gateway/src/config.rs"]
-defects = ["D57"]
+defects = ["D57", "D72"]
 
 [[claim]]
 id = "REL-2"
@@ -1080,7 +1080,7 @@ group = "Reliability"
 text = "Expect: 100-continue never stalls or hangs"
 layer = "hermetic"
 touches = ["crates/gateway/src/proxy.rs", "crates/gateway/src/circuit_breaker.rs", "crates/gateway/src/smart.rs", "crates/gateway/src/state.rs", "crates/gateway/src/admin.rs", "crates/gateway/src/store_watch.rs", "crates/gateway/src/main.rs", "crates/gateway/src/config.rs"]
-defects = []
+defects = ["D73"]
 
 [[claim]]
 id = "REL-13"
@@ -1170,7 +1170,7 @@ group = "Reliability"
 text = "Upstream H2 multiplexing and GOAWAY are handled"
 layer = "both"
 touches = ["crates/gateway/src/proxy.rs", "crates/gateway/src/circuit_breaker.rs", "crates/gateway/src/smart.rs", "crates/gateway/src/state.rs", "crates/gateway/src/admin.rs", "crates/gateway/src/store_watch.rs", "crates/gateway/src/main.rs", "crates/gateway/src/config.rs"]
-defects = []
+defects = ["D72"]
 
 
 # --- Catalog truth -----------------------------------------------------------------------------
