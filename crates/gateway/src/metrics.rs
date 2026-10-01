@@ -160,6 +160,36 @@ impl Rejection {
     }
 }
 
+/// Why a pool key was cooled off — the closed label set of `ai_key_auth_failures_total` (D204).
+/// `Revoked` and `KeyNamed403` mean the key needs replacing; `Unfunded` means its account needs
+/// funding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeyCooled {
+    /// The provider answered 401.
+    Revoked,
+    /// The provider's error says the account is out of credit or quota (D180, D200).
+    Unfunded,
+    /// A 403 whose body names the key itself (`invalid_api_key`, `authentication_error`; D84).
+    KeyNamed403,
+}
+
+impl KeyCooled {
+    pub const ALL: [KeyCooled; 3] = [
+        KeyCooled::Revoked,
+        KeyCooled::Unfunded,
+        KeyCooled::KeyNamed403,
+    ];
+
+    /// The `reason=` label value.
+    pub fn label(self) -> &'static str {
+        match self {
+            KeyCooled::Revoked => "revoked",
+            KeyCooled::Unfunded => "unfunded",
+            KeyCooled::KeyNamed403 => "key_named_403",
+        }
+    }
+}
+
 pub struct Metrics {
     pub requests_total: IntCounter,
     /// Labeled by reason ("auth", "deny_spend", "deny_fraud") so we can see *why* we rejected.
@@ -212,8 +242,12 @@ pub struct Metrics {
     /// Managed responses where a pool key drew a 401, a 403 whose body names the key (revoked,
     /// invalid), or an out-of-credit answer (D180). Each one cools that key off for later requests;
     /// a 401 also walks to the next key when there is one (also counted on `key_walks_total`). Any
-    /// rate here means a pool key needs replacing or its account funding.
-    pub key_auth_failures_total: IntCounter,
+    /// rate here means a pool key needs replacing or its account funding; `reason` says which
+    /// ([`KeyCooled`]). Bump it with [`Self::key_cooled`].
+    pub key_auth_failures_total: IntCounterVec,
+    /// The `key_auth_failures_total` children, resolved once at boot, indexed as
+    /// [`KeyCooled::ALL`]. Pre-resolved so every reason is exported at 0 from boot, too.
+    key_cooled: [IntCounter; 3],
     /// Catalog walks whose primary came from a live session pin rather than the TTFT rank (see
     /// `smart`'s "Session pins"). Against `ai_requests_total` it is the share of traffic being kept
     /// on its provider's prompt cache; a sudden drop means pins are yielding (failures) or evicting.
@@ -341,10 +375,15 @@ impl Metrics {
             "ai_key_walks_total",
             "Managed requests that retried the same provider with the next unused pool key after a 429 or 401",
         ))?;
-        let key_auth_failures_total = IntCounter::with_opts(Opts::new(
-            "ai_key_auth_failures_total",
-            "Managed responses where a pool key drew a 401, a 403 naming the key, or an out-of-credit answer (D180); the key is cooled off for later requests",
-        ))?;
+        let key_auth_failures_total = IntCounterVec::new(
+            Opts::new(
+                "ai_key_auth_failures_total",
+                "Managed responses that cooled a pool key off for later requests, by reason: revoked (a 401), key_named_403 (a 403 naming the key), unfunded (an out-of-credit answer)",
+            ),
+            &["reason"],
+        )?;
+        let key_cooled =
+            KeyCooled::ALL.map(|r| key_auth_failures_total.with_label_values(&[r.label()]));
         let full_body_relays_total = IntCounter::with_opts(Opts::new(
             "ai_full_body_relays_total",
             "Managed requests re-run as a subrequest carrying a body read past the 64 KiB replay buffer",
@@ -527,6 +566,7 @@ impl Metrics {
             candidate_failovers_total,
             key_walks_total,
             key_auth_failures_total,
+            key_cooled,
             session_pinned_total,
             full_body_relays_total,
             model_header_body_mismatch_total,
@@ -570,6 +610,17 @@ impl Metrics {
     #[inline]
     pub fn rejection(&self, reason: Rejection) -> &IntCounter {
         &self.rejections[reason.as_index()]
+    }
+
+    /// Count a pool key cooled off for `reason` on `ai_key_auth_failures_total` (D204).
+    #[inline]
+    pub fn key_cooled(&self, reason: KeyCooled) {
+        let i = match reason {
+            KeyCooled::Revoked => 0,
+            KeyCooled::Unfunded => 1,
+            KeyCooled::KeyNamed403 => 2,
+        };
+        self.key_cooled[i].inc();
     }
 
     /// Add a metered response's token counts, skipping the ones that are zero.

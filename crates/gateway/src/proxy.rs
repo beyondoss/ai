@@ -66,7 +66,7 @@
 use crate::cache;
 use crate::capture::CaptureBufs;
 use crate::key;
-use crate::metrics::Rejection;
+use crate::metrics::{KeyCooled, Rejection};
 use crate::route::{self, Dialect, Provider};
 use crate::state::{GatewayState, RequestId};
 use crate::terminal::TerminalTracker;
@@ -846,7 +846,11 @@ fn is_pool_key_failure(status: u16) -> bool {
 /// A managed catalog walk's status that another candidate (holding a different key, at a different
 /// vendor) may well not return: refused (401), unfunded (402), or forbidden (403). A candidate
 /// failure for this request like a 5xx, but nothing about the provider's health: never a breaker
-/// failure, and only a 401 ([`is_pool_key_failure`]) cools or walks keys.
+/// failure. Only a 401 ([`is_pool_key_failure`]) walks keys, and cools its key at the head. A
+/// relayed answer can cool its key from `logging` too, read from the body: a 403 that names the
+/// key ([`body_names_the_key`]), and an out-of-credit answer under any status (a 402, Anthropic's
+/// credit-balance 400, OpenAI's `insufficient_quota` 429: `remedy::Neutralized::unfunded`). Each
+/// is counted on `ai_key_auth_failures_total` by reason (`metrics::KeyCooled`).
 fn is_candidate_refusal(status: u16) -> bool {
     (401..=403).contains(&status)
 }
@@ -4652,7 +4656,7 @@ impl ProxyHttp for AiProxy {
         // `is_pool_key_failure`).
         let key_auth = rc.managed && is_pool_key_failure(status);
         if key_auth {
-            self.state.metrics.key_auth_failures_total.inc();
+            self.state.metrics.key_cooled(KeyCooled::Revoked);
             rc.provider.mark_key_bad(rc.pool_key);
         }
 
@@ -6102,7 +6106,7 @@ impl ProxyHttp for AiProxy {
             // refused: cool it so later requests start past it, as a 401 does at the head (D84).
             // This request already answered; it does not walk.
             if rc.managed && rc.upstream_status == Some(403) && body_names_the_key(tail) {
-                self.state.metrics.key_auth_failures_total.inc();
+                self.state.metrics.key_cooled(KeyCooled::KeyNamed403);
                 rc.provider.mark_key_bad(rc.pool_key);
             }
             // A relayed managed error that says the account is out of credit or quota (Anthropic's
@@ -6111,7 +6115,7 @@ impl ProxyHttp for AiProxy {
             // is cooled: later requests start past it, and a catalog walk leaves the provider out
             // once all its keys cool (D180). This request already answered.
             if rc.managed && rc.redact.as_ref().is_some_and(|r| r.unfunded) {
-                self.state.metrics.key_auth_failures_total.inc();
+                self.state.metrics.key_cooled(KeyCooled::Unfunded);
                 warn!(
                     request_id = %rc.request_id,
                     provider = rc.provider.name.as_str(),

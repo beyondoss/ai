@@ -891,7 +891,11 @@ async fn a_revoked_pool_key_cools_off_and_the_last_401_is_relayed() {
         assert_eq!(status_of(&gw, path, &key, CHAT).await, 200);
     }
     assert_eq!(up.hits(), 5, "sk-old is tried by the first request only");
-    assert_eq!(gw.metric("ai_key_auth_failures_total", "").await, 1.0);
+    assert_eq!(
+        gw.metric("ai_key_auth_failures_total", r#"reason="revoked""#)
+            .await,
+        1.0
+    );
 
     valid.lock().unwrap().clear();
     let before = up.hits();
@@ -947,7 +951,11 @@ async fn a_request_specific_403_neither_walks_nor_cools_the_pool_key() {
         ["Bearer sk-a", "Bearer sk-a"],
         "a request-specific 403 walked or cooled the pool key"
     );
-    assert_eq!(gw.metric("ai_key_auth_failures_total", "").await, 0.0);
+    assert_eq!(
+        gw.metric("ai_key_auth_failures_total", r#"reason="key_named_403""#)
+            .await,
+        0.0
+    );
 
     bad_key.store(true, Ordering::SeqCst);
     seen.lock().unwrap().clear();
@@ -958,7 +966,11 @@ async fn a_request_specific_403_neither_walks_nor_cools_the_pool_key() {
         ["Bearer sk-a", "Bearer sk-b"],
         "a 403 naming the key is relayed, and cools that key for the next request"
     );
-    assert_eq!(gw.metric("ai_key_auth_failures_total", "").await, 2.0);
+    assert_eq!(
+        gw.metric("ai_key_auth_failures_total", r#"reason="key_named_403""#)
+            .await,
+        2.0
+    );
 }
 
 // --- drain ---------------------------------------------------------------------------------------

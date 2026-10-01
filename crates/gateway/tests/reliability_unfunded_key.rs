@@ -149,7 +149,9 @@ async fn an_echoed_out_of_credit_phrase_never_cools_the_pool_key() {
                 ));
             }
         }
-        let cooled = gw.metric("ai_key_auth_failures_total", "").await;
+        let cooled = gw
+            .metric("ai_key_auth_failures_total", r#"reason="unfunded""#)
+            .await;
         if echo.hits() != 3 || fallback.hits() != 0 || cooled != 0.0 {
             failures.push(format!(
                 "{provider} {status}: {} hits on the provider, {} on the fallback, {cooled} keys cooled",
@@ -163,4 +165,48 @@ async fn an_echoed_out_of_credit_phrase_never_cools_the_pool_key() {
         }
     }
     assert!(failures.is_empty(), "{}", failures.join("\n\n"));
+}
+
+/// Every way a pool key is cooled is counted on `ai_key_auth_failures_total` with its reason, so
+/// an operator can tell a key to replace (`revoked`: a 401; `key_named_403`: a 403 whose body names
+/// the key) from an account to fund (`unfunded`). Each answer counts once, under its own reason.
+/// claim: REL-4, O3
+/// defect: D204
+#[tokio::test]
+async fn each_cooled_key_is_counted_with_its_reason() {
+    const BAD_KEY: &str = r#"{"error":{"message":"Incorrect API key provided","type":"invalid_request_error","code":"invalid_api_key"}}"#;
+    let (pubkey, sk) = test_keypair(204);
+    let key = billing_vkey(&sk, 204);
+    let mut failures = Vec::new();
+    for (status, body, reason) in [
+        (401, BAD_KEY, "revoked"),
+        (403, BAD_KEY, "key_named_403"),
+        (429, OPENAI_NO_QUOTA, "unfunded"),
+    ] {
+        let mock = MockUpstream::start(Mode::Raw(status, "application/json", body)).await;
+        let gw = Gateway::builder(unused_nats_port(), &mock.authority(), &b64(&pubkey))
+            .providers(&["openai"])
+            .start()
+            .await;
+        let resp = test_client()
+            .post(format!("{}/openai/v1/chat/completions", gw.url()))
+            .header("authorization", format!("Bearer {key}"))
+            .header("content-type", "application/json")
+            .body(r#"{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}]}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), status);
+        let _ = resp.text().await;
+        let metrics = gw.metrics().await;
+        for other in ["revoked", "key_named_403", "unfunded"] {
+            let label = format!("reason=\"{other}\"");
+            let got = parse_metric(&metrics, "ai_key_auth_failures_total{", &label);
+            let want = if other == reason { 1.0 } else { 0.0 };
+            if got != want {
+                failures.push(format!("{status}: {label} = {got}, want {want}"));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }

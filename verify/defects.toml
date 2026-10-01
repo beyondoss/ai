@@ -2163,3 +2163,17 @@ state = "fixed"
 test = "a_json_escaped_echo_of_the_pool_key_never_reaches_the_client"
 fix = ""
 note = "Fixed in route.rs and proxy.rs: route::key_finders builds, once per pool key at boot, a searcher for the key as sent and for each spelling a JSON encoder writes / and + in (\\/; \\u002b, \\u002B; one encoder writes every occurrence alike, so at most 6), and Redact masks each of them on every path (streamed, non-JSON, held whole), holding back the longest spelling's tail per chunk. A held JSON error is masked again with the raw key after the remedy rewrite re-serializes it, and when it carries any other \\u escape and the key decodes from it, it is relayed re-serialized and masked. Unit: redact_scrubs_every_json_spelling_of_a_base64_key (streamed, held, held and rewritten; \\u002b, \\u002B and a \\u0041 spelling). Cost: error paths only; a key with no / or + still has one searcher."
+
+[[defect]]
+id = "D204"
+severity = "low"
+area = "Observability"
+title = "ai_key_auth_failures_total could not tell a revoked key from an unfunded account"
+impact = "D180 counted an out-of-credit answer on ai_key_auth_failures_total, the counter for a 401 and a 403 naming the key, with no label. An operator paged on it could not tell a key to replace from an account to fund without reading warn lines, and the metric docs still described only revoked keys in places. The doc comment on is_candidate_refusal said only a 401 cools a key, which D84 (a 403 naming the key) and D180 (an unfunded answer) had made false, and remedy.rs was missing from the ARCHITECTURE.md Modules table."
+confidence = "high"
+evidence = "Hermetic: each_cooled_key_is_counted_with_its_reason. A 401, a 403 naming the key and OpenAI's insufficient_quota 429 each incremented the same unlabeled series; no reason=\"revoked\"|\"key_named_403\"|\"unfunded\" line existed. Code: metrics.rs key_auth_failures_total: IntCounter, bumped at proxy.rs upstream_response_filter (401) and twice in logging."
+claims = ["REL-4", "O3"]
+state = "fixed"
+test = "each_cooled_key_is_counted_with_its_reason"
+fix = ""
+note = "Fixed: ai_key_auth_failures_total is an IntCounterVec with a reason label (metrics::KeyCooled: revoked | unfunded | key_named_403), each child resolved at boot (exported at 0 from start, one fetch_add per bump, as ai_rejections_total). The is_candidate_refusal doc names every cooling path; ARCHITECTURE.md's metrics table, failure-mode rows and Modules table (remedy) are updated. Dashboards summing the series are unaffected (tenancy_live sums every line); the hermetic tests now read their reason's line."
