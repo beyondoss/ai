@@ -1485,7 +1485,6 @@ async fn a_stream_the_upstream_refused_is_retried() {
 /// claim: REL-22, REL-6
 /// defect: D91
 #[tokio::test]
-#[ignore = "D91 reproduced: refused streams are resent up to pingora's retry limit, never feed the breaker, and are reported as failing after delivery"]
 async fn a_provider_that_keeps_refusing_streams_is_resent_once_and_trips_the_breaker() {
     let (pubkey, sk) = test_keypair(224);
     let key = billing_vkey(&sk, 2204);

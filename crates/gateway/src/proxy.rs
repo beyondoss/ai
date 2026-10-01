@@ -428,6 +428,10 @@ pub struct RequestCtx {
     /// response and re-running. It still feeds the breaker and the ranker; it writes no `ai.usage`
     /// or `ai.payload` row (the attempt that serves does).
     relay_abandoned: bool,
+    /// This attempt is the one resend a refused H2 stream gets on its candidate (D72, D91). A
+    /// second refusal there is a provider failure: fail over, or end the request. Cleared when the
+    /// walk moves to a new candidate.
+    refused_resent: bool,
     /// Whether an `allow()` on `provider`'s breaker is outstanding and still owes exactly one
     /// `record_*`.
     ///
@@ -3768,6 +3772,7 @@ impl ProxyHttp for AiProxy {
                     pool_key: 0,
                     same_provider_retry: false,
                     relay_abandoned: false,
+                    refused_resent: false,
                     breaker_pending: false,
                     auto: model_route.map(|route| {
                         Box::new(ModelRouting {
@@ -3934,6 +3939,7 @@ impl ProxyHttp for AiProxy {
             pool_key,
             same_provider_retry: false,
             relay_abandoned: false,
+            refused_resent: false,
             breaker_pending,
             auto: model_route.map(|route| {
                 Box::new(ModelRouting {
@@ -4115,8 +4121,9 @@ impl ProxyHttp for AiProxy {
                     .unwrap_or_else(|| p.first_key());
                 rc.provider = p.clone();
                 apply_serving_candidate(rc);
-                // A new candidate starts at its first address.
+                // A new candidate starts at its first address, with its own refused-stream resend.
                 rc.attempt = 0;
+                rc.refused_resent = false;
                 if let Some(a) = rc.auto.as_mut() {
                     a.attempted = true;
                 }
@@ -5179,12 +5186,24 @@ impl ProxyHttp for AiProxy {
             e.set_retry(false);
             return e;
         };
-        if refused {
+        // A refused stream gets one resend on its candidate (D72). Refused again there, the
+        // provider is failing to take work (its stream limit, a drain that never ends): a provider
+        // failure like any other, so the walk fails over and the breaker hears of it (D91), rather
+        // than a tight loop of resends up to pingora's retry limit.
+        let resend_refused = refused && !rc.refused_resent;
+        if resend_refused {
             warn!(
                 request_id = %rc.request_id,
                 provider = rc.provider.name.as_str(),
                 error = %e,
-                "upstream refused the stream unprocessed (GOAWAY / REFUSED_STREAM); resending",
+                "upstream refused the stream unprocessed (GOAWAY / REFUSED_STREAM); resending once",
+            );
+        } else if refused {
+            warn!(
+                request_id = %rc.request_id,
+                provider = rc.provider.name.as_str(),
+                error = %e,
+                "upstream refused the stream again; treating it as a provider failure",
             );
         }
         let walk = rc
@@ -5205,6 +5224,15 @@ impl ProxyHttp for AiProxy {
                 } else {
                     None
                 };
+                // A same-candidate retry is the connection's fault (or a stream refused before
+                // any processing), not the provider's: give the permit back without an outcome,
+                // as a small body keeps it for its own same-candidate retry.
+                if retry == Some(RelayRetry::Reset(orig))
+                    && std::mem::take(&mut rc.breaker_pending)
+                    && let Some(b) = rc.provider.breaker.as_ref()
+                {
+                    b.release();
+                }
                 if let Some(retry) = retry {
                     rc.relay_abandoned = fb.record(retry);
                 }
@@ -5217,9 +5245,11 @@ impl ProxyHttp for AiProxy {
             return e;
         }
         match walk {
-            // A reused connection, or a stream the provider refused: the same candidate again on a
-            // fresh one, keeping its breaker permit (it was the connection, not the provider).
-            Some(_) if client_reused || refused => {
+            // A reused connection, or a stream the provider refused for the first time: the same
+            // candidate again on a fresh one, keeping its breaker permit (it was the connection,
+            // not the provider).
+            Some(_) if resend_refused || (client_reused && !refused) => {
+                rc.refused_resent |= refused;
                 rc.same_provider_retry = true;
                 e.set_retry(true);
             }
@@ -5230,9 +5260,14 @@ impl ProxyHttp for AiProxy {
                 e.set_retry(true);
             }
             Some(_) => e.set_retry(false),
-            // Provider-routed: there is no next candidate; pingora's rule, a reused connection is
-            // retried once.
-            None if refused => e.set_retry(true),
+            // Provider-routed: there is no next candidate. A refused stream is resent once; refused
+            // again, the error stands (`logging` records it against the breaker). Otherwise
+            // pingora's rule: a reused connection is retried once.
+            None if resend_refused => {
+                rc.refused_resent = true;
+                e.set_retry(true);
+            }
+            None if refused => e.set_retry(false),
             None => e.retry.decide_reuse(client_reused),
         }
         e
@@ -5249,8 +5284,9 @@ impl ProxyHttp for AiProxy {
     /// timeout a 504, a chunked body over the cap a 413. An upstream that failed after it had the
     /// whole request (the walk ends there rather than resending, see `error_while_proxy`) says so:
     /// `upstream timed out after receiving the request` (504) or `upstream failed after receiving
-    /// the request` (502). A client that is already gone gets nothing, and a response that already
-    /// started cannot be replaced.
+    /// the request` (502). A stream the provider refused twice says it was not processed (502). A
+    /// client that is already gone gets nothing, and a response that already started cannot be
+    /// replaced.
     async fn fail_to_proxy(
         &self,
         session: &mut Session,
@@ -5283,7 +5319,14 @@ impl ProxyHttp for AiProxy {
                 .rc
                 .as_ref()
                 .is_some_and(|rc| body_delivered(session, rc, Some(e)));
-        let status = match (after_delivery, status) {
+        // A stream the provider refused (D72) was not processed, however much of the body went
+        // out: say exactly that, so a client knows its own retry is safe (D91).
+        let refused = upstream_refused_stream(e);
+        let status = match (after_delivery && !refused, status) {
+            _ if refused => {
+                msg = "the provider refused the stream; it was not processed";
+                502
+            }
             (true, 504) => {
                 msg = "upstream timed out after receiving the request";
                 504
@@ -5979,6 +6022,7 @@ mod tests {
             pool_key: 0,
             same_provider_retry: false,
             relay_abandoned: false,
+            refused_resent: false,
             breaker_pending: false,
             auto: None,
             control: None,
