@@ -33,7 +33,6 @@ const STREAM_BODY: &str =
 /// claim: REL-5
 /// defect: D11
 #[tokio::test]
-#[ignore = "D11 reproduced: /readyz is 200 (body degraded) while every managed request gets 402 allowance unavailable"]
 async fn readyz_is_not_ready_while_allowance_is_unseeded() {
     let (pubkey, sk) = test_keypair(1);
     let mock = MockUpstream::start(Mode::Json).await;

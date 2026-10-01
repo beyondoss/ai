@@ -335,6 +335,7 @@ fn main() {
         "ai-admin".to_string(),
         HttpServer::new_app(AdminApp {
             metrics: state.metrics.clone(),
+            managed: !state.config.signing_keys.is_empty(),
         }),
     );
     admin.add_tcp(&metrics_listen);

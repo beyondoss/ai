@@ -2,14 +2,19 @@
 //! `/metrics`.
 //!
 //! Matches the Beyond service convention (cf. `auth`, `objects`): the body is `{"status",
-//! "version"}` and there are two probes. **Both always return HTTP 200** once the process is
-//! answering, because the gateway is **fail-open by design** for deny/capture — auth + key swap
-//! come from boot config, and a NATS outage degrades only the (stale) deny-set, never liveness. So
-//! readiness must *not* gate on NATS: a cold boot with NATS down can still answer `/readyz` 200,
-//! even while managed traffic 402s fail-closed on an unread allowance-set. A non-200 would pull a
-//! healthy-enough gateway out of the load balancer for no reason.
+//! "version"}` and there are two probes. `livez` always returns HTTP 200 once the process is
+//! answering. The gateway is **fail-open by design** for deny/capture — auth + key swap come from
+//! boot config, and a NATS outage degrades only the (stale) deny-set — so readiness does not gate on
+//! NATS connectivity as such.
 //!
-//! `readyz` does, however, carry a distinct *body* signal that `livez` doesn't: when the deny-set
+//! It does gate on the **allowance-set**, which is fail-closed: until the first scan or snapshot is
+//! stored, every managed request is refused. A pod in that state answers no managed traffic at all,
+//! so `readyz` is `503` with a body naming the reason (`"status":"not_ready"`), and the load
+//! balancer sends traffic to a pod that can serve it. Once seeded the set never becomes unready
+//! again (a later NATS outage keeps the last-known set), so this only holds a pod back at boot. A
+//! BYO-only deployment (no `signing_keys`) never consults the allowance-set and is ready at once.
+//!
+//! `readyz` also carries a distinct *body* signal that `livez` doesn't: when the deny-set
 //! watcher is disconnected from NATS, `readyz` reports `"status":"degraded"` (still 200). This lets
 //! an operator alert on "readyz has been degraded for >N minutes" — the spend/fraud enforcement is
 //! stale — without ever risking an LB eviction. `livez` is pure liveness: 200/`"ok"` whenever the
@@ -49,6 +54,12 @@ macro_rules! health_body {
 pub const HEALTH_OK: &str = health_body!("ok");
 pub const HEALTH_DEGRADED: &str = health_body!("degraded");
 pub const HEALTH_NOT_FOUND: &str = health_body!("not_found");
+/// `readyz` while the allowance-set is unseeded: every managed request would be refused.
+pub const HEALTH_ALLOWANCE_UNSEEDED: &str = concat!(
+    r#"{"status":"not_ready","reason":"allowance set not seeded: managed requests are refused until the control plane is read","version":""#,
+    env!("CARGO_PKG_VERSION"),
+    r#""}"#
+);
 
 /// Floor for the `/metrics` buffer hint, and its value before any scrape has been seen. Only the
 /// *cold* scrape depends on it being in the right ballpark — see [`AdminApp::metrics`].
@@ -61,6 +72,9 @@ pub struct AdminApp {
     /// Read-only handle to the metric gauges. Used by `/readyz` to reflect NATS connectivity in the
     /// health body (never to gate the HTTP status — see module docs).
     pub metrics: Arc<Metrics>,
+    /// Whether this deployment serves managed keys (`signing_keys` configured). Only then does an
+    /// unseeded allowance-set make the pod unready.
+    pub managed: bool,
 }
 
 impl AdminApp {
@@ -119,10 +133,14 @@ impl ServeHttp for AdminApp {
         match session.req_header().uri.path() {
             // Pure liveness: 200/ok whenever the process can answer.
             "/livez" => Self::health(200, HEALTH_OK),
-            // Readiness: always 200 (fail-open — never pull a serving gateway from the LB), but the
-            // body reports `degraded` when the deny-set watcher is disconnected from NATS, so an
+            // Readiness: 503 while the allowance-set is unseeded (every managed request would be
+            // refused). Otherwise 200 — a NATS outage after seeding never pulls a serving gateway
+            // from the LB — with a `degraded` body when the deny-set watcher is disconnected, so an
             // operator can alert on stale spend/fraud enforcement without an eviction.
             "/readyz" => {
+                if self.managed && self.metrics.allowance_ready.get() != 1 {
+                    return Self::health(503, HEALTH_ALLOWANCE_UNSEEDED);
+                }
                 let health = if self.metrics.nats_connected.get() == 1 {
                     HEALTH_OK
                 } else {
@@ -149,6 +167,7 @@ mod tests {
             (HEALTH_OK, "ok"),
             (HEALTH_DEGRADED, "degraded"),
             (HEALTH_NOT_FOUND, "not_found"),
+            (HEALTH_ALLOWANCE_UNSEEDED, "not_ready"),
         ] {
             let v: serde_json::Value = serde_json::from_str(body).unwrap();
             assert_eq!(v["status"], status, "body: {body}");
