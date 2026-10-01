@@ -28,6 +28,18 @@ fail-fast = false
 # no log. Four keeps the shards well under a minute each while leaving headroom for the children.
 test-threads = 4
 
+[profile.deep]
+# The weekly property run (.github/workflows/deep.yml) at PROPTEST_CASES=100000 with PROPS_SECS=5400:
+# one property can take far longer than `ci`'s 180s kill. A test is terminated after 100 minutes
+# (past the 90-minute PROPS_SECS box, so the box ends a runaway property first, with its case count),
+# and the whole run after 5 hours, under the job's 330-minute timeout. No retries: a property
+# failure prints the PROPS_SEED that replays it, and a retry with a fresh seed would hide it.
+slow-timeout = { period = "60s", terminate-after = 100 }
+global-timeout = "300m"
+retries = 0
+fail-fast = false
+test-threads = 4
+
 [profile.verify]
 # `mise run verify:status`: runs every test tagged with a claim or defect, ignored reproductions
 # included, and writes the JUnit report the `verify` tool computes status from. Failures are

@@ -2300,7 +2300,9 @@ Prometheus on the default registry, exposed at `/metrics` on `metrics_listen`.
   duplicate wins) on `model`, `stream`, `stream_options` and the output limits; that no field that
   changes the answer is silently dropped; and that the route tables classify any path as
   documented. Each property runs `PROPTEST_CASES` cases (default 2000), stopped after
-  `PROPS_SECS` (default 60); a failure prints the `PROPS_SEED` that replays it. Every
+  `PROPS_SECS` (default 60); the weekly deep job (`.github/workflows/deep.yml`, nextest profile
+  `deep`) runs 100,000 each with the box raised so all of them run. A failure prints the
+  `PROPS_SEED` that replays it. Every
   counterexample that was a real defect is a named regression in `tests/props_regressions.rs`
   (and `tests/billing_streams.rs` for the metering bypass); the generators skip that exact shape,
   naming the defect, until it is fixed.

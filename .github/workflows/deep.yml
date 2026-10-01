@@ -37,11 +37,15 @@ jobs:
       - name: missed mutants
         if: failure()
         run: cat mutants.out/missed.txt 2>/dev/null || true
-  # The property tests (translator, usage parsers, body scanners) at 100x the PR case count.
+  # The property tests (translator, usage parsers, body scanners) at 50x the PR case count. Every
+  # property runs all 100,000 cases: PROPS_SECS (each property's wall-clock box, 60s by default) is
+  # raised past anything a property needs, and the `deep` nextest profile lifts `ci`'s 180s
+  # per-test kill and 10-minute run cap to match. The box stays as a backstop below the per-test
+  # kill, so a property that somehow runs away still reports how many cases it ran.
   properties:
     name: property tests (deep)
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 330
     steps:
       - uses: actions/checkout@v7
       - uses: jdx/mise-action@v4
@@ -49,6 +53,7 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: nextest
-      - run: cargo nextest run -p beyond-ai --profile ci -E 'test(/prop/)' </dev/null
+      - run: cargo nextest run -p beyond-ai --profile deep -E 'test(/prop/)' </dev/null
         env:
           PROPTEST_CASES: "100000"
+          PROPS_SECS: "5400"

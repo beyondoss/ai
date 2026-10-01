@@ -7,9 +7,9 @@
 //! Scale: each property runs `PROPTEST_CASES` cases (proptest's own variable; `PROPS_CASES` is an
 //! alias; default 2000), and stops drawing new ones after `PROPS_SECS` seconds (default 60), so a
 //! run stays bounded on a loaded machine and under nextest's `ci` terminate-after (180 s). The
-//! weekly deep job (`PROPTEST_CASES=100000 cargo nextest run -p beyond-ai --profile ci -E
-//! 'test(/prop/)'`) runs as many of its cases as fit the box; raise `PROPS_SECS` (and the profile's
-//! timeouts) to run all of them. Every property's name starts with `prop_`. A failure prints its
+//! weekly deep job (`.github/workflows/deep.yml`: `PROPTEST_CASES=100000 PROPS_SECS=5400 cargo
+//! nextest run -p beyond-ai --profile deep -E 'test(/prop/)'`) raises the box and the profile's
+//! timeouts so every property runs all of its cases. Every property's name starts with `prop_`. A failure prints its
 //! `PROPS_SEED`; set it to replay the same cases.
 
 #![allow(dead_code)]
