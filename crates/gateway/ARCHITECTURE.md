@@ -1149,6 +1149,37 @@ Off by default: the right ceiling depends on how many agents a tenant legitimate
 Checked after deny, before the exact-match cache, so an exhausted key cannot be served from a
 cached 2xx.
 
+### Revocation: how fast a change lands, and streams in flight
+
+The contract for a written or deleted `blackhole.{tenant}`, `blackhole.key.{id}`,
+`allowance.{tenant}` or `allowance.key.{id}` entry (SEC-17, TEN-1):
+
+- **A connected gateway applies it within 2s.** The path has no gateway-side timer: the NATS KV
+  watch pushes the delta (a JetStream push consumer, `watch_prefix_from`), `recv_many` takes it as
+  soon as one is queued, and one `rcu` publishes the new set. Every `request_filter` loads the set
+  afresh, so the first request admitted after the publish sees it. The real cost is one NATS
+  delivery: 17–50 ms live (`tenancy_live.rs`). The 2s is the stated bound with that headroom, and
+  `a_deny_lands_within_the_bound_and_in_flight_streams_finish` holds it. A delete restores service
+  the same way.
+- **A disconnected gateway applies it after reconnecting.** While the watch is down the last-known
+  set keeps serving (fail-open for deny; allowance after its seed), so a change written during the
+  outage is not in force. The watcher reconnects on a backoff of 1s doubling to 30s
+  (`RECONNECT_BACKOFF_MAX`), then resumes strictly after its saved revision and replays what it
+  missed (or rescans if the history was compacted). Once NATS is reachable again, the change lands
+  within one backoff step, at most 30s plus the connect. A connection that dies silently is
+  detected by the NATS client's own ping (async-nats 0.46 pings every 60s and drops the connection
+  at the third tick with two pings unanswered, so within about three minutes), and until then the
+  set is stale. `/readyz` reports `degraded` while the deny watcher is disconnected.
+- **A stream already in flight runs to completion and is billed exactly.** Deny and allowance are
+  checked once, at admission in `request_filter`, before the cache and `upstream_peer`. Nothing
+  later consults them: not a pingora retry, a catalog failover or a key walk inside the admitted
+  request, the response relay, or `logging`, which writes the normal row with the provider's own
+  usage. The control plane revokes the next request, not a generation already paid for. The one
+  re-check is a large-body request's next attempt (`relay_full_body`, after a 5xx, 429 or reset),
+  which is a subrequest of its own and goes through `request_filter` again, so it is refused if the
+  change landed in between. The attempt it replaces was never relayed to the client, so no stream
+  is cut.
+
 ### Control surface (`control.rs`) and payload capture (`capture.rs`)
 
 The `x-beyond-*` headers are the per-request control surface, parsed once in `request_filter` after

@@ -1090,6 +1090,74 @@ async fn a_deny_lands_within_the_bound_and_in_flight_streams_finish() {
         "the in-flight stream was admitted before the deny"
     );
     assert!(body.contains("[DONE]"), "and runs to completion: {body}");
+    // Billed exactly: the in-flight stream's row (the process's first request, seq 0) is the
+    // provider's own usage, not refused or estimated.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let row = loop {
+        let first = usage_rows_of(&gw).into_iter().find(|r| {
+            r["request_id"]
+                .as_str()
+                .is_some_and(|id| id.ends_with("-0"))
+        });
+        match first {
+            Some(row) => break row,
+            None if Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            None => panic!("no row for the in-flight stream; log:\n{}", gw.log()),
+        }
+    };
+    assert_eq!(row["outcome"], "ok", "{row}");
+    assert_eq!(row["usage_estimated"], false, "{row}");
+    assert_eq!(
+        (row["input_tokens"].as_u64(), row["output_tokens"].as_u64()),
+        (Some(5), Some(9)),
+        "{row}"
+    );
+}
+
+/// The bound and the in-flight policy the test above pins are the documented contract, and the
+/// numbers ARCHITECTURE.md derives them from are the code's: a control-plane change is pushed (no
+/// gateway-side timer), applied before the next admission, bounded at 2s while the watch is
+/// connected; after a NATS outage it lands once the watcher's reconnect backoff (capped at
+/// `RECONNECT_BACKOFF_MAX`) reattaches and replays. A stream admitted before it runs to completion
+/// and is billed exactly.
+/// claim: SEC-17, TEN-1
+/// defect: D121
+#[test]
+fn architecture_states_the_revocation_bound_and_in_flight_policy() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let arch = std::fs::read_to_string(root.join("ARCHITECTURE.md")).unwrap();
+    let watch = std::fs::read_to_string(root.join("src/store_watch.rs")).unwrap();
+    let heading = "### Revocation: how fast a change lands, and streams in flight";
+    let start = arch
+        .find(heading)
+        .unwrap_or_else(|| panic!("ARCHITECTURE.md has no {heading:?} section"));
+    let section = &arch[start + heading.len()..];
+    let section = &section[..section.find("\n### ").unwrap_or(section.len())];
+
+    let cap = watch
+        .lines()
+        .find_map(|l| {
+            l.strip_prefix("const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(")?
+                .strip_suffix(");")
+        })
+        .expect("store_watch.rs defines RECONNECT_BACKOFF_MAX in whole seconds");
+    for needle in [
+        "no gateway-side timer",
+        "within 2s",
+        &format!("{cap}s"),
+        "`request_filter`",
+        "runs to completion",
+        "billed exactly",
+        "`blackhole.",
+        "`allowance.",
+    ] {
+        assert!(
+            section.contains(needle),
+            "the revocation section does not state {needle:?}:\n{section}"
+        );
+    }
 }
 
 // --- SEC-18 --------------------------------------------------------------------------------------
