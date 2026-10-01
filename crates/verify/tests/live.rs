@@ -136,13 +136,15 @@ const POOLED: Route = Route {
     dead: &[],
     serves: "",
 };
-/// [`POOLED`] on Claude Sonnet 5.5, whose minimum cacheable prompt is below pi's whole prompt
-/// (~2.5k; measured 2026-10-01: a 1,400-token system prompt was written to the cache); on Haiku
+/// [`POOLED`] on Claude Sonnet 4.6, whose minimum cacheable prompt is below pi's whole prompt
+/// (~2.5k; measured 2026-10-01: a 1,056-token system prompt was written to the cache); on Haiku
 /// 4.5 (4096) pi's session never caches, so a pin can't show it. Sonnet 4.5, this route's row
-/// until then, retires 2026-11-30.
+/// until then, retires 2026-11-30; 4.6 is its price tier and still takes the
+/// `thinking.type.enabled` pi sends, which Sonnet 5 and 5.5 refuse (400 "Use
+/// thinking.type.adaptive", measured on this cell 2026-10-01).
 const POOLED_SONNET: Route = Route {
     name: "pooled-sonnet",
-    model: "claude-sonnet-5-5",
+    model: "claude-sonnet-4-6",
     pools: &[
         ("anthropic", "ANTHROPIC_API_KEY"),
         ("openrouter", "OPENROUTER_API_KEY"),

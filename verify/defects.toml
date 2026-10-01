@@ -216,7 +216,7 @@ claims = ["TRN-10"]
 state = "refuted"
 test = "live:W1+TRN-10::claude-code::gpt::claude-code"
 fix = ""
-note = "Refuted live: Claude Code (pinned 2.1.286) fixes the fixture repo on gpt-5-mini through the gateway (Messages translated onto native OpenAI Chat), with cache_control and metadata.user_id in its requests; OpenAI accepted every turn. Also checked by hand 2026-10-01 on gpt-5-mini and gpt-4o-mini with and without adaptive thinking."
+note = "Refuted live: Claude Code (pinned 2.1.286) fixes the fixture repo on gpt-5-mini through the gateway (Messages translated onto native OpenAI Chat), with cache_control and metadata.user_id in its requests; OpenAI accepted every turn. Also checked by hand 2026-10-01 on gpt-5-mini and gpt-4o-mini with and without adaptive thinking. Re-run 2026-10-01 on gpt-5.1, the GPT route since gpt-5-mini was scheduled to retire: passed."
 
 [[defect]]
 id = "D16"
