@@ -314,6 +314,15 @@ naming the field, not a hollow Messages call. Usage/billing still parse the upst
 `ai.usage.model` is what the provider echoed. Same-wire Responses (`/{provider}/v1/responses`)
 stays a byte relay. `/{provider}/…` never translates.
 
+**Chat Completions streams from vendors other than OpenAI** are the one same-endpoint walk that
+is not a pure byte relay. A stock SDK accumulates every string in a delta except `index` and
+`type`. OpenRouter repeats `delta.role` on every chunk and `format` on every `reasoning_details`
+entry, so openai-python's `.stream()` built a role of `"assistantassistant…"` for the next turn to
+send back. These streams go through `SseBridge` in relay mode: an event is forwarded byte for byte
+unless it repeats an identity field, which `translate::ChatIdentity` drops. The identity fields are
+`role`, a reasoning entry's `id`/`format`, and a tool call's `id`/name, each tracked per choice and
+per entry. OpenAI's own streams stay a zero-copy relay.
+
 **Embeddings rows.** `text-embedding-3-small` and `-large` are catalog rows whose candidates are
 embeddings paths (OpenAI `/v1/embeddings`, then OpenRouter `/api/v1/embeddings`), so a stock
 `client.embeddings.create` on managed `/v1` walks, fails over, and bills input tokens like any other
@@ -327,10 +336,26 @@ path is, else what `wire` says.
 is optional; a trailing slash is ignored). Bare `/v1` and `/auto` name none and relay onto the row's
 primary path. Everything else is a **400** naming the row's endpoint: embeddings against a
 generation row or the reverse (translation never involves embeddings), any other API path
-(`/v1/moderations`, …), and sub-resources such as `/v1/messages/count_tokens`,
-`/v1/responses/{id}` and `/v1/responses/input_tokens`. Those last ones used to match their parent
-by prefix and were forwarded to the candidate's generation path, where they ran and billed as a
-generation; `/auto/embeddings` and `/auto/responses` used to skip the check entirely.
+(`/v1/moderations`, …), and stateful sub-resources such as `/v1/responses/{id}`. Sub-resources
+used to match their parent by prefix and were forwarded to the candidate's generation path, where
+they ran and billed as a generation; `/auto/embeddings` and `/auto/responses` used to skip the
+check entirely.
+
+**Sub-resources** (`route::SubResource`, also an exact table) are a provider's own API under its
+generation endpoint, so they are forwarded, never translated:
+
+| Path                         | Walks                                  | Billed                    |
+| ---------------------------- | -------------------------------------- | ------------------------- |
+| `/v1/messages/count_tokens`  | Anthropic candidates on `/v1/messages` | no — no ai.usage row      |
+| `/v1/responses/input_tokens` | OpenAI candidates on `/v1/responses`   | no — no ai.usage row      |
+| `/v1/responses/compact`      | OpenAI candidates on `/v1/responses`   | yes — its top-level usage |
+
+The walk keeps only the candidates that serve the path (OpenAI's `/v1/responses` is in a GPT row's
+Responses arm, or first in a Responses-first row's candidates), appends the suffix to the serving
+candidate's path, and keeps failover and key rotation. It skips the TTFT ranker and pins: a token
+count answers in a fraction of a generation's time and would skew both. A row with no serving
+candidate is a 400 naming the missing provider (`count_tokens` on a GPT row, `compact` on a Claude
+row). OpenRouter candidates are never used for them.
 
 v1 mapping is lossy on extras a stock SDK does not need for a tool loop: Responses-only
 fields (`store`, `previous_response_id`, `include`, `truncation`, …) are dropped when leaving
@@ -760,12 +785,12 @@ OpenRouter honor it, and a gzipped body parsed as no usage (a **zero-token** bil
 the cache with gzip bytes that a hit replayed without their `Content-Encoding`. BYO requests keep
 the caller's own header. Two dialects:
 
-| Dialect   | Format     | Fields                                                                                                                                                           |
-| --------- | ---------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| OpenAI    | JSON body  | `usage.prompt_tokens`, `usage.completion_tokens`, `usage.prompt_tokens_details.cached_tokens`, `usage.completion_tokens_details.reasoning_tokens`                |
-| OpenAI    | SSE stream | Terminal `data:` line (before `[DONE]`), same fields (Responses API: nested `response.usage`, `output_tokens_details.reasoning_tokens`)                          |
-| Anthropic | JSON body  | `usage.input_tokens`, `usage.output_tokens`, `usage.cache_read_input_tokens`, `usage.cache_creation_input_tokens`, `usage.output_tokens_details.thinking_tokens` |
-| Anthropic | SSE stream | `message_delta` event with `usage` block (thinking tokens on the same block)                                                                                     |
+| Dialect   | Format     | Fields                                                                                                                                                                                                                                                                                                     |
+| --------- | ---------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| OpenAI    | JSON body  | `usage.prompt_tokens`, `usage.completion_tokens`, `usage.prompt_tokens_details.cached_tokens`, `usage.completion_tokens_details.reasoning_tokens` (Responses API: `usage.input_tokens`, `usage.output_tokens`, `usage.input_tokens_details.cached_tokens`, `usage.output_tokens_details.reasoning_tokens`) |
+| OpenAI    | SSE stream | Terminal `data:` line (before `[DONE]`), same fields (Responses API: nested `response.usage`, `output_tokens_details.reasoning_tokens`)                                                                                                                                                                    |
+| Anthropic | JSON body  | `usage.input_tokens`, `usage.output_tokens`, `usage.cache_read_input_tokens`, `usage.cache_creation_input_tokens`, `usage.output_tokens_details.thinking_tokens`                                                                                                                                           |
+| Anthropic | SSE stream | `message_delta` event with `usage` block (thinking tokens on the same block)                                                                                                                                                                                                                               |
 
 Missing or zero usage fields deserialize to zero (safe default) — **except** `reasoning_tokens`
 (`Usage::reasoning_tokens: Option<u64>`), which stays `None` when the provider didn't report it at
@@ -784,7 +809,10 @@ its `usage` block parsed by the wrong dialect's parser. Because both parsers' fi
 zero-usage response. `openai_body`/`openai_stream` and `anthropic_body`/`anthropic_stream` now check
 for the _other_ dialect's characteristic field names (Anthropic's `input_tokens`/`output_tokens` vs
 OpenAI's `prompt_tokens`/`completion_tokens`) before accepting a parse, and return `None` on a match —
-tripping `usage_parse_errors_total` (see Metrics) instead of a silent zero-billing row.
+tripping `usage_parse_errors_total` (see Metrics) instead of a silent zero-billing row. A non-stream
+Responses body (`/v1/responses`, `/v1/responses/compact`) uses Anthropic's key names too; its
+`total_tokens`, which Anthropic never sends, is what tells it apart. Before that check, every
+non-stream `/v1/responses` call billed zero.
 
 ### Streams cut short (`usage.rs` estimates)
 

@@ -62,6 +62,16 @@ struct OpenAiUsage {
     input_tokens: Option<u64>,
     #[serde(default)]
     output_tokens: Option<u64>,
+    /// Present on both OpenAI usage shapes and never on Anthropic's: what tells a non-stream
+    /// Responses body (`/v1/responses`, `/v1/responses/compact`), whose `usage` uses Anthropic's
+    /// `input_tokens`/`output_tokens` names, apart from a dialect-misconfigured Anthropic vendor.
+    #[serde(default)]
+    total_tokens: Option<u64>,
+    /// The Responses API's detail blocks, read only when [`Self::is_responses_shaped`].
+    #[serde(default)]
+    input_tokens_details: OpenAiResponsesInputDetails,
+    #[serde(default)]
+    output_tokens_details: OpenAiResponsesOutputDetails,
 }
 
 #[derive(Deserialize, Default)]
@@ -80,15 +90,29 @@ struct OpenAiCompletionDetails {
 }
 
 impl OpenAiUsage {
-    /// See the doc comment on the `input_tokens`/`output_tokens` fields: both present is Anthropic's
-    /// unambiguous fingerprint (OpenAI chat/completions never emits these key names in `usage`).
+    /// `input_tokens`/`output_tokens` plus `total_tokens`: a non-stream Responses body.
+    fn is_responses_shaped(&self) -> bool {
+        self.input_tokens.is_some() && self.output_tokens.is_some() && self.total_tokens.is_some()
+    }
+
+    /// See the doc comment on the `input_tokens`/`output_tokens` fields: both present without
+    /// `total_tokens` is Anthropic's unambiguous fingerprint (chat/completions never emits these key
+    /// names in `usage`, and the Responses API always adds `total_tokens`).
     fn looks_anthropic_shaped(&self) -> bool {
-        self.input_tokens.is_some() && self.output_tokens.is_some()
+        self.input_tokens.is_some() && self.output_tokens.is_some() && self.total_tokens.is_none()
     }
 }
 
 impl From<OpenAiUsage> for Usage {
     fn from(u: OpenAiUsage) -> Self {
+        if u.is_responses_shaped() {
+            return Usage::from(OpenAiResponsesUsage {
+                input_tokens: u.input_tokens.unwrap_or(0),
+                output_tokens: u.output_tokens.unwrap_or(0),
+                input_tokens_details: u.input_tokens_details,
+                output_tokens_details: u.output_tokens_details,
+            });
+        }
         Usage {
             input_tokens: u.prompt_tokens,
             output_tokens: u.completion_tokens,
@@ -107,11 +131,11 @@ impl From<OpenAiUsage> for Usage {
     }
 }
 
-/// The Responses API's `usage` block — nested under `response.completed.response.usage`, not
-/// top-level like chat/completions, and named `input_tokens`/`output_tokens` (Anthropic-style) rather
-/// than `prompt_tokens`/`completion_tokens`. This shape is only ever reached through the `response`
-/// envelope (see `openai_stream`), which Anthropic's wire never carries — so it needs no dialect-
-/// mismatch guard of its own.
+/// The Responses API's `usage` block — named `input_tokens`/`output_tokens` (Anthropic-style) rather
+/// than `prompt_tokens`/`completion_tokens`. Streamed, it is nested under
+/// `response.completed.response.usage` (see `openai_stream`), an envelope Anthropic's wire never
+/// carries, so it needs no dialect-mismatch guard there. A non-stream body carries it top-level and
+/// reaches it through [`OpenAiUsage::is_responses_shaped`].
 #[derive(Deserialize, Default)]
 struct OpenAiResponsesUsage {
     #[serde(default)]
@@ -1328,6 +1352,26 @@ mod tests {
             )
             .is_none(),
             "an anthropic stream with no usage-bearing event meters nothing"
+        );
+    }
+
+    #[test]
+    fn non_stream_responses_usage_bills() {
+        // A non-stream `/v1/responses` (or `/v1/responses/compact`) body: Anthropic's key names, plus
+        // the `total_tokens` and detail blocks Anthropic never sends. Shape verified live against
+        // `/v1/responses/compact`.
+        let body = br#"{"object":"response.compaction","output":[],"usage":{"input_tokens":121,
+            "input_tokens_details":{"cache_write_tokens":0,"cached_tokens":64},"output_tokens":40,
+            "output_tokens_details":{"reasoning_tokens":12},"total_tokens":161}}"#;
+        assert_eq!(
+            openai_body(body).unwrap(),
+            Usage {
+                input_tokens: 121,
+                output_tokens: 40,
+                cache_read_tokens: 64,
+                cache_write_tokens: 0,
+                reasoning_tokens: Some(12),
+            }
         );
     }
 

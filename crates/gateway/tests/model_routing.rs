@@ -1729,25 +1729,114 @@ async fn auto_short_paths_get_the_same_endpoint_check() {
     assert_eq!(mock.hits(), 0);
 }
 
-/// Sub-resources are not their parent endpoint: a token count or a retrieve must not run (and
-/// bill) as a generation on the row's path.
+/// Claude Code's `count_tokens` reaches Anthropic's own endpoint, with the model re-spelled for the
+/// candidate. Free on the provider side, so no billing row. Before, it was forwarded to
+/// `/v1/messages` and ran as a billed generation.
 #[tokio::test]
-async fn sub_resources_of_an_endpoint_are_not_generations() {
+async fn count_tokens_reaches_anthropic_and_is_not_billed() {
     let nats_port = unused_nats_port();
     let (pubkey, sk) = test_keypair(1);
-    let mock = MockUpstream::start(Mode::AnthropicJson).await;
+    let mock =
+        MockUpstream::start(Mode::Raw(200, "application/json", r#"{"input_tokens":9}"#)).await;
     let gw = Gateway::builder(nats_port, &mock.authority(), &b64(&pubkey))
         .providers(&["anthropic", "openrouter", "openai"])
         .start()
         .await;
-    for (path, body) in [
+    let resp = test_client()
+        .post(format!("{}/v1/messages/count_tokens", gw.url()))
+        .header("x-api-key", vkey(&sk))
+        .header("anthropic-version", "2023-06-01")
+        .header("content-type", "application/json")
+        .body(r#"{"messages":[{"role":"user","content":"hi"}],"model":"claude-opus-4-8"}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    assert_eq!(resp.text().await.unwrap(), r#"{"input_tokens":9}"#);
+    let cap = mock.captured().expect("forwarded");
+    assert_eq!(cap.path, "/v1/messages/count_tokens");
+    let body = String::from_utf8(cap.body).unwrap();
+    assert!(body.contains(r#""model":"claude-opus-4-8""#), "{body}");
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(
+        !gw.log().contains("\"target\":\"ai.usage\""),
+        "a token count is free: {}",
+        gw.log()
+    );
+    let metrics = gw.metrics().await;
+    assert_eq!(
+        parse_metric(&metrics, "ai_usage_parse_errors_total", ""),
+        0.0
+    );
+}
+
+/// Codex's remote compaction and OpenAI's input-token count reach `/v1/responses/*` on the GPT
+/// row's Responses arm. Compaction runs a model, so it bills from its usage block.
+#[tokio::test]
+async fn responses_compact_and_input_tokens_reach_openai() {
+    let nats_port = unused_nats_port();
+    let (pubkey, sk) = test_keypair(1);
+    let mock = MockUpstream::start(Mode::Raw(
+        200,
+        "application/json",
+        r#"{"id":"resp_1","object":"response.compaction","output":[],"model":"gpt-4o-mini","usage":{"input_tokens":121,"output_tokens":40,"total_tokens":161}}"#,
+    ))
+    .await;
+    let gw = Gateway::builder(nats_port, &mock.authority(), &b64(&pubkey))
+        .providers(&["openai", "openrouter"])
+        .start()
+        .await;
+    for path in ["/v1/responses/compact", "/v1/responses/input_tokens"] {
+        let resp = test_client()
+            .post(format!("{}{path}", gw.url()))
+            .header("authorization", format!("Bearer {}", vkey(&sk)))
+            .header("content-type", "application/json")
+            .body(r#"{"model":"gpt-4o-mini","input":"hi"}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 200, "{path}");
+        assert_eq!(mock.captured().expect("forwarded").path, path);
+    }
+    let line = gw
+        .wait_for_log_line(&["\"target\":\"ai.usage\"", r#""input_tokens":121"#])
+        .await;
+    assert!(line.contains(r#""output_tokens":40"#), "{line}");
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let rows = gw
+        .log()
+        .lines()
+        .filter(|l| l.contains("\"target\":\"ai.usage\""))
+        .count();
+    assert_eq!(rows, 1, "compaction bills; the token count does not");
+}
+
+/// A sub-resource only its provider defines: a model with no such upstream is a 400 naming it,
+/// and a sub-resource the catalog does not serve (`responses/{id}`) stays a 400.
+#[tokio::test]
+async fn sub_resources_without_their_provider_are_a_400() {
+    let nats_port = unused_nats_port();
+    let (pubkey, sk) = test_keypair(1);
+    let mock = MockUpstream::start(Mode::Json).await;
+    let gw = Gateway::builder(nats_port, &mock.authority(), &b64(&pubkey))
+        .providers(&["anthropic", "openrouter", "openai"])
+        .start()
+        .await;
+    for (path, body, needle) in [
         (
             "/v1/messages/count_tokens",
-            r#"{"model":"claude-opus-4-8","messages":[{"role":"user","content":"hi"}]}"#,
+            r#"{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}]}"#,
+            "no Anthropic upstream",
         ),
         (
-            "/v1/responses/input_tokens",
+            "/v1/responses/compact",
+            r#"{"model":"claude-opus-4-8","input":"hi"}"#,
+            "no OpenAI upstream",
+        ),
+        (
+            "/v1/responses/resp_123",
             r#"{"model":"gpt-4o-mini","input":"hi"}"#,
+            "",
         ),
     ] {
         let resp = test_client()
@@ -1760,6 +1849,8 @@ async fn sub_resources_of_an_endpoint_are_not_generations() {
             .await
             .unwrap();
         assert_eq!(resp.status().as_u16(), 400, "{path}");
+        let text = resp.text().await.unwrap();
+        assert!(text.contains(needle), "{path}: {text}");
     }
     assert_eq!(mock.hits(), 0, "nothing ran as a generation");
 }

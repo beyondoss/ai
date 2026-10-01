@@ -2013,3 +2013,109 @@ fn a_stream_that_ends_without_saying_how_is_an_error_for_every_client() {
         "response.completed"
     );
 }
+
+/// openai-python's `accumulate_delta`, which builds `.stream()`'s final message: a string adds
+/// to the one before it unless its key is `index` or `type`, objects merge, and a list of objects
+/// merges by each entry's `index`.
+fn sdk_accumulate(acc: &mut Map<String, Value>, delta: &Map<String, Value>) {
+    for (k, d) in delta {
+        let Some(a) = acc.get_mut(k) else {
+            acc.insert(k.clone(), d.clone());
+            continue;
+        };
+        if a.is_null() || k == "index" || k == "type" {
+            *a = d.clone();
+            continue;
+        }
+        match (a, d) {
+            (Value::String(a), Value::String(d)) => a.push_str(d),
+            (Value::Object(a), Value::Object(d)) => sdk_accumulate(a, d),
+            (Value::Array(a), Value::Array(d)) => {
+                for e in d {
+                    let i = e["index"].as_u64().unwrap() as usize;
+                    match a.get_mut(i) {
+                        Some(x) => {
+                            sdk_accumulate(x.as_object_mut().unwrap(), e.as_object().unwrap())
+                        }
+                        None => a.insert(i, e.clone()),
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn sdk_message(evs: &[Event]) -> Value {
+    let mut msg = Map::new();
+    for c in chunks(evs) {
+        if let Some(d) = c.pointer("/choices/0/delta").and_then(Value::as_object) {
+            sdk_accumulate(&mut msg, d);
+        }
+    }
+    Value::Object(msg)
+}
+
+#[test]
+fn a_chat_relay_sends_each_identity_field_once() {
+    // As OpenRouter sent it, the SDK's message is unusable on the next turn.
+    let raw = sdk_message(&events(OPENROUTER_CLAUDE_SSE));
+    assert!(
+        raw["role"]
+            .as_str()
+            .unwrap()
+            .starts_with("assistantassistant"),
+        "{raw}"
+    );
+
+    let evs = stream(Chat, Chat, OPENROUTER_CLAUDE_SSE);
+    let msg = sdk_message(&evs);
+    assert_eq!(msg["role"], "assistant", "{msg}");
+    let rd = &msg["reasoning_details"][0];
+    assert_eq!(rd["format"], "anthropic-claude-v1", "{msg}");
+    assert_eq!(rd["text"], "The user wants two lookups.");
+    assert_eq!(rd["signature"], "EqIFCpwBsig");
+    let calls = msg["tool_calls"].as_array().unwrap();
+    assert_eq!(calls.len(), 2, "{msg}");
+    assert_eq!(calls[0]["id"], "toolu_bdrk_01");
+    assert_eq!(calls[0]["function"]["name"], "get_weather");
+    assert_eq!(calls[0]["function"]["arguments"], r#"{"city": "Paris"}"#);
+    assert_eq!(calls[1]["id"], "toolu_bdrk_02");
+    assert_eq!(calls[1]["function"]["arguments"], r#"{"city": "Rome"}"#);
+
+    // Everything but the repeats arrives as sent: usage, finish reasons, `[DONE]`.
+    assert_eq!(chat_usage(&evs)["prompt_tokens"], 597);
+    assert_eq!(finish_reason(&evs), "tool_calls");
+    assert_eq!(evs.last().unwrap().1, "[DONE]");
+    assert_eq!(
+        chunks(&evs).len(),
+        chunks(&events(OPENROUTER_CLAUDE_SSE)).len()
+    );
+}
+
+#[test]
+fn a_chat_relay_forwards_untouched_events_byte_for_byte() {
+    // OpenAI's own stream sends each identity field once: nothing is re-written, and a comment
+    // (OpenRouter's keep-alive) passes through too.
+    let src = format!(": OPENROUTER PROCESSING\n\n{OPENAI_PARALLEL_SSE}");
+    assert_eq!(run(Chat, Chat, &[src.as_bytes()]), src);
+}
+
+#[test]
+fn identity_fields_are_tracked_per_choice_and_entry() {
+    let mut id = ChatIdentity::default();
+    let mut first = json!({"choices":[
+        {"index":0,"delta":{"role":"assistant","reasoning_details":[{"index":0,"format":"f"}]}},
+        {"index":1,"delta":{"role":"assistant"}}]});
+    assert!(!id.strip(&mut first), "a first sighting is kept: {first}");
+    let mut again = json!({"choices":[
+        {"index":1,"delta":{"role":"assistant","content":"x"}},
+        {"index":0,"delta":{"reasoning_details":[{"index":0,"format":"f"},{"index":1,"format":"f"}]}}]});
+    assert!(id.strip(&mut again));
+    assert_eq!(
+        again,
+        json!({"choices":[
+            {"index":1,"delta":{"content":"x"}},
+            {"index":0,"delta":{"reasoning_details":[{"index":0},{"index":1,"format":"f"}]}}]})
+    );
+}
