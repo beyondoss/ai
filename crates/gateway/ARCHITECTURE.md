@@ -1170,10 +1170,13 @@ only an error event is not work we were billed for. Its row carries an estimate 
 `usage_estimated=true`; `ai_usage_estimated_total` counts them.
 
 - **Input:** Anthropic's `message_start` is the first event and carries exact input and cache
-  counts, so those are kept. Otherwise the request body's text bytes ÷ 5, counted as the body
-  streams past (`InputTally`, 12 bytes of state, one two-pattern SIMD pass at ~34 GB/s) with binary
-  payloads excluded: data-URI payloads (`;base64,…`) and any string under a `"data"` key (Anthropic
-  `base64` image/document sources, OpenAI `input_audio`). An inline image is ~1 MB of base64 and
+  counts, so those are kept. Otherwise the bytes of the request body's string **values** ÷ 5,
+  counted as the body streams past (`InputTally`, 12 bytes of state, a `memchr` walk from quote to
+  quote) with binary payloads excluded: data-URI payloads (`;base64,…`) and any string under a
+  `"data"` key (Anthropic `base64` image/document sources, OpenAI `input_audio`). Keys, structure,
+  numbers and literals are not prompt text: counted, they outweighed a short prompt, and an aborted
+  gpt stream billed 44 input tokens where the same request completed reported 29 (D99), the one
+  direction an estimate must not err (BIL-20). An inline image is ~1 MB of base64 and
   ~1–2K tokens; counted as text, an Anthropic-format image served by an OpenAI-wire candidate
   estimated 44,042 input tokens for a 42-token prompt.
 - **Output:** only the 64 KiB tail is retained, so the tail is measured (delta events and text bytes

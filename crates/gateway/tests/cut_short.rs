@@ -61,6 +61,20 @@ async fn usage_row(gw: &Gateway) -> serde_json::Value {
     v.get("fields").cloned().unwrap_or(v)
 }
 
+/// Bytes of every string value in a JSON body (keys, structure and numbers excluded): what the input
+/// estimate counts (D99). The fixtures here carry no escapes, so decoded and raw lengths agree.
+fn string_value_bytes(body: &str) -> u64 {
+    fn walk(v: &serde_json::Value) -> u64 {
+        match v {
+            serde_json::Value::String(s) => s.len() as u64,
+            serde_json::Value::Array(a) => a.iter().map(walk).sum(),
+            serde_json::Value::Object(m) => m.values().map(walk).sum(),
+            _ => 0,
+        }
+    }
+    walk(&serde_json::from_str(body).unwrap())
+}
+
 /// claim: B2, BIL-3, BIL-20
 #[tokio::test]
 async fn a_cancelled_openai_stream_is_billed_an_estimate() {
@@ -88,8 +102,8 @@ async fn a_cancelled_openai_stream_is_billed_an_estimate() {
     );
     assert_eq!(
         row["input_tokens"].as_u64(),
-        Some(body.len() as u64 / 5),
-        "input is estimated from the request body at 5 bytes/token: {row}"
+        Some(string_value_bytes(&body) / 5),
+        "input is estimated from the request's string values at 5 bytes/token: {row}"
     );
     wait_for_metric(&gw, "ai_usage_estimated_total", "", 1.0).await;
 }
@@ -151,7 +165,7 @@ async fn base64_images_do_not_inflate_the_input_estimate() {
     assert_eq!(row["usage_estimated"], true, "{row}");
     assert_eq!(
         row["input_tokens"].as_u64(),
-        Some((body.len() - image.len()) as u64 / 5),
+        Some((string_value_bytes(&body) - image.len() as u64) / 5),
         "the base64 payload is not text: {row}"
     );
 }
@@ -237,7 +251,7 @@ async fn anthropic_format_images_do_not_inflate_the_input_estimate() {
     assert_eq!(row["usage_estimated"], true, "{row}");
     assert_eq!(
         row["input_tokens"].as_u64(),
-        Some((body.len() - image.len()) as u64 / 5),
+        Some((string_value_bytes(&body) - image.len() as u64) / 5),
         "an Anthropic base64 source is not text: {row}"
     );
 }

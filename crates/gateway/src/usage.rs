@@ -757,112 +757,211 @@ pub fn anthropic_stream_parts(parts: &[&[u8]]) -> Option<Usage> {
 // thinking display omitted, is billed for thinking the stream never shows. The row is flagged
 // `usage_estimated` so a downstream consumer can tell estimated rows from reported ones.
 
-/// JSON-escaped request-body bytes per input token. 5 under-counts every provider measured above.
+/// Input bytes per token. 5 under-counts every provider measured above on whole JSON bodies, and
+/// [`InputTally`] counts only the string values in them, fewer bytes for the same tokens.
 const INPUT_BYTES_PER_TOKEN: u64 = 5;
 
 /// Streamed text bytes per output token, ×10 so the math stays in integers: 4.5.
 const OUTPUT_TEXT_BYTES_PER_TOKEN_X10: u64 = 45;
 
-/// Where binary payloads start in a request body — the bytes that are not text. An inline image is
-/// ~1 MB of base64 and ~1–2K tokens, so counting it as text would bill one picture as a novel.
-///
-/// - `;base64,` — a data URI (`data:image/png;base64,…`): OpenAI `image_url`, Responses
-///   `input_image` / `input_file`. The payload runs to the string's closing quote.
-/// - `"data":` — the value of any `data` key: Anthropic `base64` image and document sources,
-///   OpenAI `input_audio`. The payload is the next string. A `data` key holding something else (a
-///   tool schema property, say) is skipped too, which only ever under-counts.
-///
-/// Both are at most 8 bytes, so a 7-byte carry catches either split across two chunks.
-const PAYLOAD_MARKERS: [&[u8]; 2] = [b";base64,", br#""data":"#];
-const MARKER_CARRY: usize = 7;
+/// Where a data URI's binary payload starts inside a string value (`data:image/png;base64,…`:
+/// OpenAI `image_url`, Responses `input_image` / `input_file`). The payload runs to the string's
+/// closing quote. An inline image is ~1 MB of base64 and ~1–2K tokens, so counting it as text would
+/// bill one picture as a novel. The other payload shape is the string value of a `data` key
+/// (Anthropic `base64` image and document sources, OpenAI `input_audio`); a `data` key holding
+/// something else (a tool schema property, say) is skipped too, which only ever under-counts.
+const BASE64_MARKER: &[u8] = b";base64,";
 
-static PAYLOAD_FINDER: std::sync::LazyLock<aho_corasick::AhoCorasick> =
-    std::sync::LazyLock::new(|| {
-        aho_corasick::AhoCorasick::new(PAYLOAD_MARKERS).unwrap_or_else(|_| unreachable!())
-    });
+/// [`InputTally::data`] once the string cannot be `data`.
+const DATA_MISS: u8 = 5;
 
-/// Running count of a request body's text bytes, fed chunk by chunk as the body streams past.
+#[derive(Default, Clone, Copy, PartialEq, Eq)]
+enum TallyPhase {
+    /// Between strings: structure, numbers, literals. Nothing counts.
+    #[default]
+    Out,
+    /// After a `data` key: a string value is a payload.
+    AwaitPayload,
+    /// Inside a string.
+    Str,
+    /// Inside a string, past `;base64,`.
+    StrPayload,
+    /// A string closed; the next non-whitespace byte says whether it was a key (`:`).
+    After,
+    /// Inside a `data` key's string value.
+    Payload,
+}
+
+/// Running count of a request body's prompt text, fed chunk by chunk as the body streams past.
 ///
-/// Excludes binary payloads (see [`PAYLOAD_MARKERS`]). A marker split across two chunks is still
-/// found: the last few bytes of each chunk are carried into the next. Nothing is buffered — 12
-/// bytes of state however large the body, because it sits in `RequestCtx`, which is touched once
-/// per response chunk.
+/// Counts only the bytes of JSON string **values**. Keys, braces, numbers, literals and
+/// whitespace are not prompt text; counted, they outweighed a short prompt and billed an aborted
+/// stream more input than the same request completed (D99). A string is a key when the next byte
+/// past it that is not whitespace is `:`, so its length is held in `pending` until that byte
+/// arrives, perhaps in the next chunk. Binary payloads are skipped (see [`BASE64_MARKER`]). Any
+/// chunking counts the same. Nothing is buffered: 12 bytes of state however large the body,
+/// because it sits in `RequestCtx`, which is touched once per response chunk.
 #[derive(Default, Clone, Copy)]
 pub struct InputTally {
     text_bytes: u32,
-    /// Low bits ([`CARRY_LEN`]): how many of `carry`'s bytes are live. High bits: the phase —
-    /// [`AWAIT_OPEN`] (after `"data":`, before its string opens) or [`IN_PAYLOAD`].
-    state: u8,
-    carry: [u8; MARKER_CARRY],
+    /// Bytes of the string being read, or just closed, not yet known to be a value.
+    pending: u32,
+    phase: TallyPhase,
+    /// How much of [`BASE64_MARKER`] the string's content so far ends with.
+    marker: u8,
+    /// How much of `data` the string's content matches from its start; [`DATA_MISS`] once it
+    /// cannot be `data`.
+    data: u8,
+    /// The last chunk ended on a string's `\`; the next byte is escaped.
+    escaped: bool,
 }
 
-const CARRY_LEN: u8 = 0x0f;
-const AWAIT_OPEN: u8 = 0x40;
-const IN_PAYLOAD: u8 = 0x80;
-
 impl InputTally {
-    pub fn feed(&mut self, mut chunk: &[u8]) {
-        loop {
-            if self.state & (AWAIT_OPEN | IN_PAYLOAD) != 0 {
-                // Base64 has no escapes, so the payload ends at the next quote; after `"data":`,
-                // the next quote opens the payload.
-                let Some(q) = memchr::memchr(b'"', chunk) else {
-                    // Whitespace between `"data":` and its string is text; a payload is not.
-                    if self.state & AWAIT_OPEN != 0 {
-                        self.count(chunk.len());
+    pub fn feed(&mut self, chunk: &[u8]) {
+        use TallyPhase::*;
+        let n = chunk.len();
+        let mut i = 0;
+        while i < n {
+            match self.phase {
+                Out => match memchr::memchr(b'"', &chunk[i..]) {
+                    Some(k) => {
+                        i += k + 1;
+                        self.open_string();
                     }
-                    return;
-                };
-                if self.state & AWAIT_OPEN != 0 {
-                    self.count(q + 1);
-                    self.state = IN_PAYLOAD;
-                    chunk = &chunk[q + 1..];
-                    continue;
+                    None => return,
+                },
+                AwaitPayload => {
+                    let b = chunk[i];
+                    i += 1;
+                    match b {
+                        b'"' => self.phase = Payload,
+                        b':' => {}
+                        _ if b.is_ascii_whitespace() => {}
+                        // Not a string: nothing to skip. (`b` is structure; `Out` ignores it.)
+                        _ => self.phase = Out,
+                    }
                 }
-                self.state = 0;
-                chunk = &chunk[q..];
-            }
-            let found = self.take_split_marker(chunk).or_else(|| {
-                PAYLOAD_FINDER
-                    .find(chunk)
-                    .map(|m| (m.end(), m.pattern().as_usize()))
-            });
-            match found {
-                Some((end, pattern)) => {
-                    self.count(end);
-                    chunk = &chunk[end..];
-                    self.state = if pattern == 0 { IN_PAYLOAD } else { AWAIT_OPEN };
+                After => {
+                    let b = chunk[i];
+                    if b.is_ascii_whitespace() {
+                        i += 1;
+                        continue;
+                    }
+                    if b == b':' {
+                        i += 1;
+                        self.phase = if self.data == 4 && self.pending == 4 {
+                            AwaitPayload
+                        } else {
+                            Out
+                        };
+                    } else {
+                        self.text_bytes = self.text_bytes.saturating_add(self.pending);
+                        self.phase = Out;
+                    }
+                    self.pending = 0;
                 }
-                None => {
-                    self.count(chunk.len());
-                    let keep = chunk.len().min(MARKER_CARRY);
-                    self.carry[..keep].copy_from_slice(&chunk[chunk.len() - keep..]);
-                    self.state = keep as u8;
-                    return;
+                // Base64 has no escapes: the payload ends at the next quote.
+                Payload | StrPayload => match memchr::memchr(b'"', &chunk[i..]) {
+                    Some(k) => {
+                        i += k + 1;
+                        self.phase = if self.phase == Payload { Out } else { After };
+                    }
+                    None => return,
+                },
+                Str => {
+                    if self.escaped {
+                        self.escaped = false;
+                        self.add_pending(1);
+                        i += 1;
+                        continue;
+                    }
+                    let rest = &chunk[i..];
+                    let (end, stop) = match memchr::memchr2(b'"', b'\\', rest) {
+                        Some(k) => (k, Some(rest[k])),
+                        None => (rest.len(), None),
+                    };
+                    if let Some(cut) = self.content(&rest[..end]) {
+                        i += cut;
+                        self.phase = StrPayload;
+                        continue;
+                    }
+                    i += end;
+                    match stop {
+                        Some(b'"') => {
+                            i += 1;
+                            self.phase = After;
+                        }
+                        Some(_) => {
+                            // An escape: it and the byte it escapes are text, and neither can be
+                            // part of `data` or the marker.
+                            i += 1;
+                            self.add_pending(1);
+                            self.escaped = true;
+                            self.data = DATA_MISS;
+                            self.marker = 0;
+                        }
+                        None => {}
+                    }
                 }
             }
         }
     }
 
-    /// Where a marker that *began* in the previous chunk ends in this one, if it did, and which.
-    fn take_split_marker(&mut self, chunk: &[u8]) -> Option<(usize, usize)> {
-        // Only reached outside a payload, where `state` is exactly the carry length.
-        let carried = usize::from(std::mem::take(&mut self.state) & CARRY_LEN);
-        if carried == 0 {
-            return None;
-        }
-        let mut joined = [0u8; 2 * MARKER_CARRY];
-        let n = chunk.len().min(MARKER_CARRY);
-        joined[..carried].copy_from_slice(&self.carry[..carried]);
-        joined[carried..carried + n].copy_from_slice(&chunk[..n]);
-        let m = PAYLOAD_FINDER.find(&joined[..carried + n])?;
-        // A marker wholly inside `chunk` is the ordinary search's to find.
-        (m.start() < carried).then(|| (m.end() - carried, m.pattern().as_usize()))
+    fn open_string(&mut self) {
+        self.phase = TallyPhase::Str;
+        self.pending = 0;
+        self.marker = 0;
+        self.data = 0;
+        self.escaped = false;
     }
 
-    fn count(&mut self, n: usize) {
-        self.text_bytes = self
-            .text_bytes
+    /// Account for a run of plain string content (no quote, no backslash). `Some(n)` when the
+    /// first `n` bytes complete [`BASE64_MARKER`]: the rest of the string is payload.
+    fn content(&mut self, seg: &[u8]) -> Option<usize> {
+        for &b in seg {
+            if self.data >= DATA_MISS {
+                break;
+            }
+            if self.data < 4 && b == b"data"[usize::from(self.data)] {
+                self.data += 1;
+            } else {
+                self.data = DATA_MISS;
+            }
+        }
+        let m = usize::from(self.marker);
+        if m > 0 {
+            let need = &BASE64_MARKER[m..];
+            let k = need.len().min(seg.len());
+            if seg[..k] == need[..k] {
+                self.add_pending(k);
+                if k == need.len() {
+                    self.marker = 0;
+                    return Some(k);
+                }
+                self.marker += k as u8;
+                return None;
+            }
+            self.marker = 0;
+        }
+        if let Some(p) = memchr::memmem::find(seg, BASE64_MARKER) {
+            let end = p + BASE64_MARKER.len();
+            self.add_pending(end);
+            return Some(end);
+        }
+        // A marker split across chunks: the content ends with a prefix of it.
+        let from = seg.len().saturating_sub(BASE64_MARKER.len() - 1);
+        if let Some(p) = memchr::memrchr(b';', &seg[from..]).map(|p| from + p)
+            && BASE64_MARKER.starts_with(&seg[p..])
+        {
+            self.marker = (seg.len() - p) as u8;
+        }
+        self.add_pending(seg.len());
+        None
+    }
+
+    fn add_pending(&mut self, n: usize) {
+        self.pending = self
+            .pending
             .saturating_add(u32::try_from(n).unwrap_or(u32::MAX));
     }
 
@@ -1060,10 +1159,11 @@ mod tests {
             r#"{{"messages":[{{"role":"user","content":[{{"type":"image_url","image_url":{{"url":"data:image/png;base64,{b64}"}}}},{{"type":"text","text":"hi"}}]}}]}}"#
         );
         let whole = tally(&[body.as_bytes()]);
+        let values = ["user", "image_url", "data:image/png;base64,", "text", "hi"];
         assert_eq!(
             u64::from(whole.text_bytes),
-            (body.len() - b64.len()) as u64,
-            "every byte but the base64 payload is text"
+            values.concat().len() as u64,
+            "every string value but the base64 payload is text"
         );
         // Any split point — including inside the marker and inside the payload — agrees.
         for cut in [1, 60, 95, 98, 100, 101, 500, body.len() - 5] {
@@ -1104,16 +1204,22 @@ mod tests {
     #[test]
     fn input_tally_skips_data_key_payloads() {
         let b64 = "B".repeat(10_000);
-        for body in [
-            format!(
-                r#"{{"messages":[{{"role":"user","content":[{{"type":"image","source":{{"type":"base64","media_type":"image/png","data":"{b64}"}}}},{{"type":"text","text":"hi"}}]}}]}}"#
+        for (body, values) in [
+            (
+                format!(
+                    r#"{{"messages":[{{"role":"user","content":[{{"type":"image","source":{{"type":"base64","media_type":"image/png","data":"{b64}"}}}},{{"type":"text","text":"hi"}}]}}]}}"#
+                ),
+                "userimagebase64image/pngtexthi",
             ),
-            format!(r#"{{"input_audio": {{"data": "{b64}", "format": "wav"}}}}"#),
+            (
+                format!(r#"{{"input_audio": {{"data": "{b64}", "format": "wav"}}}}"#),
+                "wav",
+            ),
         ] {
             let whole = tally(&[body.as_bytes()]);
             assert_eq!(
                 u64::from(whole.text_bytes),
-                (body.len() - b64.len()) as u64,
+                values.len() as u64,
                 "{}",
                 &body[..60]
             );
@@ -1129,14 +1235,12 @@ mod tests {
     }
 
     #[test]
-    fn input_tally_without_images_is_the_body_length() {
-        let body = br#"{"model":"m","messages":[{"role":"user","content":"hello there"}]}"#;
+    fn input_tally_without_images_is_the_string_values() {
+        let body = br#"{"model":"m","messages":[{"role":"user","content":"hello \"there\""}]}"#;
+        let values = r#"muserhello \"there\""#.len() as u64;
         let t = tally(&[&body[..10], &body[10..]]);
-        assert_eq!(u64::from(t.text_bytes), body.len() as u64);
-        assert_eq!(
-            t.estimate_tokens(),
-            body.len() as u64 / INPUT_BYTES_PER_TOKEN
-        );
+        assert_eq!(u64::from(t.text_bytes), values);
+        assert_eq!(t.estimate_tokens(), values / INPUT_BYTES_PER_TOKEN);
     }
 
     /// A cut-short estimate never exceeds the provider's count (BIL-20). The JSON around a short
@@ -1147,7 +1251,6 @@ mod tests {
     /// claim: BIL-20
     /// defect: D99
     #[test]
-    #[ignore = "D99 reproduced: the input estimate counts JSON structure bytes"]
     fn input_estimate_counts_string_values_only() {
         let bare = br#"{"model":"gpt-4o-mini","messages":[{"role":"user","content":"Count from 1 to 40, one number per line."}]}"#;
         let dressed = br#"{"model": "gpt-4o-mini", "messages": [{"role": "user", "content": "Count from 1 to 40, one number per line."}], "stream": true, "stream_options": {"include_usage": true}, "max_tokens": 400, "temperature": 0, "n": 1}"#;
