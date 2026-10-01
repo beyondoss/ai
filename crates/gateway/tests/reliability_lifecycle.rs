@@ -277,7 +277,6 @@ async fn concurrent_large_uploads_have_bounded_memory() {
 /// claim: REL-20
 /// defect: D40
 #[tokio::test]
-#[ignore = "D40 reproduced: only the first resolved address (::1, dead) is tried; 502"]
 async fn dns_tries_the_next_address_when_the_first_is_dead() {
     let addrs: Vec<_> = tokio::net::lookup_host("localhost:80")
         .await
@@ -391,5 +390,52 @@ async fn sigterm_drains_an_in_flight_request_then_exits() {
     assert!(
         gw.log().contains("\"target\":\"ai.usage\""),
         "the drained request's billing row was not written"
+    );
+}
+
+/// The catalog walk does the same: a candidate whose first address is dead is tried on its next
+/// address before the walk gives up on it.
+/// claim: REL-20
+/// defect: D40
+#[tokio::test]
+async fn a_catalog_candidate_is_tried_on_its_next_address() {
+    let addrs: Vec<_> = tokio::net::lookup_host("localhost:80")
+        .await
+        .map(|a| a.collect())
+        .unwrap_or_default();
+    let v6_first = addrs.first().is_some_and(|a| a.is_ipv6());
+    if !(v6_first && addrs.iter().any(|a| a.is_ipv4())) {
+        eprintln!("SKIP: localhost does not resolve ::1 before 127.0.0.1 here ({addrs:?})");
+        return;
+    }
+    let (pubkey, sk) = test_keypair(1);
+    let mock = MockUpstream::start(Mode::Json).await;
+    let gw = Gateway::builder(unused_nats_port(), &mock.authority(), &b64(&pubkey))
+        .providers(&["openai", "openrouter"])
+        .provider_authority("openai", &format!("localhost:{}", mock.port))
+        .provider_authority("openrouter", &GatewayBuilder::dead_authority())
+        .start()
+        .await;
+    let resp = test_client()
+        .post(format!("{}/auto/chat/completions", gw.url()))
+        .header("authorization", format!("Bearer {}", vkey(&sk, 40)))
+        .header("content-type", "application/json")
+        .header("x-beyond-model", "gpt-4o-mini")
+        .header("x-beyond-order", "openai,openrouter")
+        .body(r#"{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        (
+            resp.status().as_u16(),
+            resp.headers()
+                .get("x-beyond-provider")
+                .and_then(|v| v.to_str().ok())
+                .map(String::from)
+        ),
+        (200, Some("openai".to_string())),
+        "upstream hits {}",
+        mock.hits()
     );
 }

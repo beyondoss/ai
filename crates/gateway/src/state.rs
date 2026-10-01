@@ -31,6 +31,29 @@ use tracing::warn;
 /// How long a resolved upstream address is reused before re-resolving.
 const DNS_TTL: Duration = Duration::from_secs(60);
 
+/// A lookup that has not answered in this long has failed. `getaddrinfo` has no deadline of its
+/// own, and a resolver that hangs would otherwise stall every request to that provider.
+const DNS_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// When re-resolution fails, the last good answer is served for up to this long after it was
+/// resolved (serve-stale): a resolver outage should not take down providers whose addresses have
+/// not changed.
+const DNS_STALE_MAX: Duration = Duration::from_secs(600);
+
+/// While serving stale, how long before the next re-resolution attempt, so an outage does not
+/// cost every request a lookup timeout.
+const DNS_RETRY: Duration = Duration::from_secs(5);
+
+/// One cached resolution: every address the lookup returned, in its order.
+#[derive(Clone)]
+struct DnsEntry {
+    addrs: Arc<[SocketAddr]>,
+    /// When the lookup that produced `addrs` succeeded. Bounds serve-stale.
+    resolved_at: Instant,
+    /// When to look the name up again.
+    refresh_at: Instant,
+}
+
 /// A process-unique request id, `{instance:x}-{seq:x}`. Two `u64`s in hex (≤16 chars each) plus the
 /// `-` separator never exceed 33 bytes, so it lives inline on the stack — no per-request heap
 /// allocation on the admitted path (it's minted for every request, including fast rejects).
@@ -239,7 +262,7 @@ pub struct GatewayState {
     /// `getaddrinfo` nor re-resolves the same provider host every request. `ArcSwap` so the common
     /// case — a cache hit, on every admitted request after warmup — is a lock-free atomic load; the
     /// only writes are the ~10 providers' entries refreshed once per `DNS_TTL`, applied via `rcu`.
-    dns_cache: ArcSwap<HashMap<String, (SocketAddr, Instant)>>,
+    dns_cache: ArcSwap<HashMap<String, DnsEntry>>,
 
     /// The per-process instance token (8 OS-random bytes) already rendered as `{:x}-` — the high
     /// half of every `request_id`. It is constant for the life of the process, so it is formatted
@@ -452,22 +475,79 @@ impl GatewayState {
         self.by_id[id.index()].as_ref()
     }
 
-    /// Resolve an `host:port` authority to a `SocketAddr`, cached for `DNS_TTL`. Uses
-    /// `tokio::net::lookup_host` (runs `getaddrinfo` on the blocking pool — async-safe) instead of
-    /// `HttpPeer::new`'s eager blocking resolve.
-    pub async fn resolve(&self, authority: &str) -> Result<SocketAddr> {
+    /// Resolve an `host:port` authority and pick the address for connect attempt `attempt`: the
+    /// lookup's addresses in order, wrapping. Returns that address and how many there are, so a
+    /// caller whose connect failed can try the next one. Cached for `DNS_TTL`; a lookup is bounded
+    /// by `DNS_TIMEOUT`; when re-resolution fails the last good answer is served for up to
+    /// `DNS_STALE_MAX`. Uses `tokio::net::lookup_host` (runs `getaddrinfo` on the blocking pool —
+    /// async-safe) instead of `HttpPeer::new`'s eager blocking resolve.
+    pub async fn resolve(&self, authority: &str, attempt: u8) -> Result<(SocketAddr, usize)> {
+        let addrs = self
+            .resolve_all(authority, |a| async move {
+                tokio::net::lookup_host(a)
+                    .await
+                    .map(|it| it.collect::<Vec<_>>())
+            })
+            .await?;
+        let addr = addrs[usize::from(attempt) % addrs.len()];
+        Ok((addr, addrs.len()))
+    }
+
+    /// [`Self::resolve`]'s cache and serve-stale logic over an injectable `lookup`, so a test can
+    /// fail or hang the resolver.
+    async fn resolve_all<F, Fut>(&self, authority: &str, lookup: F) -> Result<Arc<[SocketAddr]>>
+    where
+        F: FnOnce(String) -> Fut,
+        Fut: std::future::Future<Output = std::io::Result<Vec<SocketAddr>>>,
+    {
         // Cache hit (the common case after warmup): a lock-free `ArcSwap` load — no mutex, no
         // syscall — so concurrent workers never serialize on a DNS lookup that's already resolved.
-        if let Some((addr, at)) = self.dns_cache.load().get(authority)
-            && at.elapsed() < DNS_TTL
+        let cached = self.dns_cache.load().get(authority).cloned();
+        if let Some(entry) = &cached
+            && Instant::now() < entry.refresh_at
         {
-            return Ok(*addr);
+            return Ok(entry.addrs.clone());
         }
-        let addr = tokio::net::lookup_host(authority)
-            .await
-            .map_err(|e| GatewayError::Dns(format!("{authority}: {e}")))?
-            .next()
-            .ok_or_else(|| GatewayError::Dns(format!("{authority}: no addresses")))?;
+        let looked_up = match tokio::time::timeout(DNS_TIMEOUT, lookup(authority.to_string())).await
+        {
+            Ok(Ok(addrs)) if !addrs.is_empty() => Ok(addrs),
+            Ok(Ok(_)) => Err(format!("{authority}: no addresses")),
+            Ok(Err(e)) => Err(format!("{authority}: {e}")),
+            Err(_) => Err(format!(
+                "{authority}: lookup timed out after {}s",
+                DNS_TIMEOUT.as_secs()
+            )),
+        };
+        let now = Instant::now();
+        let addrs: Arc<[SocketAddr]> = match looked_up {
+            Ok(addrs) => addrs.into(),
+            Err(e) => {
+                // Serve-stale: the last good answer, while it is recent enough to trust, and look
+                // again in `DNS_RETRY` rather than on every request.
+                if let Some(entry) = cached
+                    && now.duration_since(entry.resolved_at) < DNS_STALE_MAX
+                {
+                    warn!(
+                        authority,
+                        error = %e,
+                        age_s = now.duration_since(entry.resolved_at).as_secs(),
+                        "upstream dns re-resolution failed; serving the last good answer",
+                    );
+                    let addrs = entry.addrs.clone();
+                    let stale = DnsEntry {
+                        refresh_at: now + DNS_RETRY,
+                        ..entry
+                    };
+                    self.dns_cache.rcu(|cur| {
+                        let mut next = HashMap::clone(cur);
+                        next.insert(authority.to_string(), stale.clone());
+                        next
+                    });
+                    return Ok(addrs);
+                }
+                return Err(GatewayError::Dns(e));
+            }
+        };
         // rcu the new/refreshed entry in. Two concurrent misses for the same host may both resolve
         // and both rcu; that's harmless (same answer, last writer wins) and far cheaper than holding
         // a lock across `getaddrinfo`. The clone-on-write copies a ~10-entry map — trivial, and only
@@ -478,17 +558,20 @@ impl GatewayState {
         // the map is bounded by the provider count, not by traffic) — this sweep is belt-and-
         // suspenders against authorities ever becoming dynamic, and it's a *TTL* drop, not an
         // eviction *policy*: there's no capacity contest here, so LRU/SIEVE would be machinery for a
-        // problem we don't have. We keep anything within `2 × DNS_TTL` so a still-live provider whose
-        // entry just expired (and is about to be refreshed) is never dropped out from under a
-        // concurrent resolve.
-        let now = Instant::now();
+        // problem we don't have. We keep anything still servable as stale, so a provider whose
+        // entry just expired is never dropped out from under a concurrent resolve.
+        let entry = DnsEntry {
+            addrs: addrs.clone(),
+            resolved_at: now,
+            refresh_at: now + DNS_TTL,
+        };
         self.dns_cache.rcu(|cur| {
             let mut next = HashMap::clone(cur);
-            next.retain(|_, (_, at)| now.duration_since(*at) < DNS_TTL * 2);
-            next.insert(authority.to_string(), (addr, now));
+            next.retain(|_, e| now.duration_since(e.resolved_at) < DNS_STALE_MAX);
+            next.insert(authority.to_string(), entry.clone());
             next
         });
-        Ok(addr)
+        Ok(addrs)
     }
 }
 
@@ -726,17 +809,94 @@ mod tests {
         let state = GatewayState::new(config, test_metrics()).unwrap();
 
         // An IP literal resolves through `lookup_host` without real DNS — deterministic, offline-safe.
-        let addr = state.resolve("127.0.0.1:9").await.unwrap();
+        let (addr, n) = state.resolve("127.0.0.1:9", 0).await.unwrap();
         assert_eq!(addr, "127.0.0.1:9".parse().unwrap());
+        assert_eq!(n, 1);
 
         // Second call is served from the TTL cache: same answer, and the entry is now present.
-        assert_eq!(state.resolve("127.0.0.1:9").await.unwrap(), addr);
+        assert_eq!(state.resolve("127.0.0.1:9", 0).await.unwrap().0, addr);
         assert!(state.dns_cache.load().contains_key("127.0.0.1:9"));
 
         // A guaranteed-NXDOMAIN host (RFC 6761 reserves `.invalid`) → a Dns error, never a panic.
         assert!(matches!(
-            state.resolve("nonexistent.invalid:80").await,
+            state.resolve("nonexistent.invalid:80", 0).await,
             Err(GatewayError::Dns(_))
         ));
+    }
+
+    fn addrs(list: &[&str]) -> Vec<SocketAddr> {
+        list.iter().map(|a| a.parse().unwrap()).collect()
+    }
+
+    /// Every address is kept, in the lookup's order, and connect attempts walk them.
+    #[tokio::test]
+    async fn resolve_keeps_every_address_in_order() {
+        let state = GatewayState::new(AiConfig::default(), test_metrics()).unwrap();
+        let got = state
+            .resolve_all("multi.test:443", |_| async {
+                Ok(addrs(&["[::1]:443", "127.0.0.1:443"]))
+            })
+            .await
+            .unwrap();
+        assert_eq!(&*got, &addrs(&["[::1]:443", "127.0.0.1:443"])[..]);
+    }
+
+    /// A lookup that hangs is cut at `DNS_TIMEOUT`, and with no earlier answer it is an error.
+    #[tokio::test(start_paused = true)]
+    async fn a_hung_lookup_times_out() {
+        let state = GatewayState::new(AiConfig::default(), test_metrics()).unwrap();
+        let start = tokio::time::Instant::now();
+        let got = state
+            .resolve_all("hang.test:443", |_| std::future::pending())
+            .await;
+        assert!(matches!(got, Err(GatewayError::Dns(ref e)) if e.contains("timed out")));
+        assert_eq!(start.elapsed(), DNS_TIMEOUT);
+    }
+
+    /// When re-resolution fails or hangs, the last good answer is served, within `DNS_STALE_MAX`.
+    #[tokio::test]
+    async fn a_failed_re_resolution_serves_the_last_good_answer() {
+        let state = GatewayState::new(AiConfig::default(), test_metrics()).unwrap();
+        let good = addrs(&["10.0.0.1:443"]);
+        let first = state
+            .resolve_all("stale.test:443", |_| {
+                let good = good.clone();
+                async move { Ok(good) }
+            })
+            .await
+            .unwrap();
+        assert_eq!(&*first, &good[..]);
+        // Expire the entry without waiting a TTL out.
+        state.dns_cache.rcu(|cur| {
+            let mut next = HashMap::clone(cur);
+            if let Some(e) = next.get_mut("stale.test:443") {
+                e.refresh_at = Instant::now();
+            }
+            next
+        });
+        let stale = state
+            .resolve_all("stale.test:443", |_| async {
+                Err(std::io::Error::other("resolver down"))
+            })
+            .await
+            .unwrap();
+        assert_eq!(&*stale, &good[..], "served stale");
+        // Past the stale bound it is an error again.
+        state.dns_cache.rcu(|cur| {
+            let mut next = HashMap::clone(cur);
+            if let Some(e) = next.get_mut("stale.test:443") {
+                e.refresh_at = Instant::now();
+                e.resolved_at = Instant::now() - DNS_STALE_MAX;
+            }
+            next
+        });
+        assert!(
+            state
+                .resolve_all("stale.test:443", |_| async {
+                    Err(std::io::Error::other("resolver down"))
+                })
+                .await
+                .is_err()
+        );
     }
 }

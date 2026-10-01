@@ -551,6 +551,8 @@ struct ModelRouting {
     /// A 2xx whose TTFT sample and session pin wait on the body's first bytes (see
     /// `settle_health`). `None` once settled, and for every non-2xx.
     health: Option<PendingHealth>,
+    /// How many addresses the current candidate resolved to; `RequestCtx::attempt` indexes them.
+    addrs: u8,
     /// The walk made at least one upstream attempt (it connected, or tried to). Distinguishes
     /// "every candidate failed" (502) from "every candidate's breaker was open" (503) when the walk
     /// runs out.
@@ -3349,6 +3351,7 @@ impl ProxyHttp for AiProxy {
                             cache: Some(cache::Pending::Hit(hit)),
                             translate: None,
                             health: None,
+                            addrs: 0,
                             attempted: false,
                             open_retry_after: None,
                         })
@@ -3514,6 +3517,7 @@ impl ProxyHttp for AiProxy {
                     cache: pending_cache,
                     translate: translate_state,
                     health: None,
+                    addrs: 0,
                     attempted: false,
                     open_retry_after: None,
                 })
@@ -3550,16 +3554,18 @@ impl ProxyHttp for AiProxy {
         // place a retry's leftover request-body state can be cleared. No-op on the first attempt.
         rc.reset_request_body_phase();
 
-        // Same-provider key walk after a managed 429. Stay on this provider, keep the outstanding
-        // breaker permit (429 is a success, not a failure), and do not enter the candidate walk —
-        // that walk would send this provider's remaining keys to a different vendor.
+        // Same-provider key walk after a managed 429, a stale pooled connection, or the next
+        // address of a candidate whose first one refused the connection. Stay on this provider,
+        // keep the outstanding breaker permit (429 is a success, not a failure), and do not enter
+        // the candidate walk — that walk would send this provider's remaining keys to a different
+        // vendor.
         if rc.same_provider_retry {
             rc.same_provider_retry = false;
             if let Some(a) = rc.auto.as_mut() {
                 a.attempt_start = Instant::now();
             }
-            let addr = match self.state.resolve(&rc.provider.authority).await {
-                Ok(a) => a,
+            let addr = match self.state.resolve(&rc.provider.authority, rc.attempt).await {
+                Ok((a, _)) => a,
                 Err(e) => {
                     warn!(
                         request_id = %rc.request_id,
@@ -3669,16 +3675,19 @@ impl ProxyHttp for AiProxy {
                     .unwrap_or(0);
                 rc.provider = p.clone();
                 apply_serving_candidate(rc);
+                // A new candidate starts at its first address.
+                rc.attempt = 0;
                 if let Some(a) = rc.auto.as_mut() {
                     a.attempted = true;
                 }
 
-                match self.state.resolve(&p.authority).await {
-                    Ok(addr) => {
+                match self.state.resolve(&p.authority, 0).await {
+                    Ok((addr, addrs)) => {
                         // Time this attempt from here, so a candidate that burned its connect
                         // timeout does not charge that to whichever provider ends up serving.
                         if let Some(a) = rc.auto.as_mut() {
                             a.attempt_start = Instant::now();
+                            a.addrs = u8::try_from(addrs).unwrap_or(u8::MAX);
                         }
                         rc.set_forward_path(candidate.path);
                         if let Some(sub) = rc.auto.as_ref().and_then(|a| a.sub)
@@ -3717,8 +3726,10 @@ impl ProxyHttp for AiProxy {
         // Resolve via the TTL cache (async, non-blocking) rather than `HttpPeer::new`'s eager
         // blocking `getaddrinfo`. SNI/Host = the configured host; TLS on for real providers (the
         // e2e harness flips `upstream_tls=false` for a plaintext mock).
-        let addr = match self.state.resolve(&rc.provider.authority).await {
-            Ok(a) => a,
+        // Each connect retry (`fail_to_connect`) takes the next resolved address, so a name whose
+        // first address is dead (`localhost` → `::1` first) still connects.
+        let addr = match self.state.resolve(&rc.provider.authority, rc.attempt).await {
+            Ok((a, _)) => a,
             Err(e) => {
                 // DNS failures are rare and usually mean a misconfigured `provider_authorities`
                 // override — so keep the diagnostic (provider name + authority + the resolver error,
@@ -4761,7 +4772,27 @@ impl ProxyHttp for AiProxy {
             // `MAX_CONNECT_RETRIES` attempts per candidate would multiply the client's worst case by
             // three for no additional coverage. And it keeps the ledger trivial — exactly one
             // `allow()`, one attempt, and one `record_*` per candidate.
-            if let Some((usable, at)) = rc.auto.as_ref().map(|a| (a.usable, a.candidate)) {
+            if let Some((usable, at, addrs)) =
+                rc.auto.as_ref().map(|a| (a.usable, a.candidate, a.addrs))
+            {
+                // This candidate resolved to more than one address and an untried one remains:
+                // try it before giving up on the candidate. Same provider, same breaker permit
+                // (one address refusing is not the provider failing).
+                if rc.attempt.saturating_add(1) < addrs {
+                    rc.attempt += 1;
+                    rc.same_provider_retry = true;
+                    rc.provider.metrics.connect_retries_total.inc();
+                    warn!(
+                        request_id = %rc.request_id,
+                        provider = rc.provider.name.as_str(),
+                        candidate = at,
+                        address = rc.attempt,
+                        error = %e,
+                        "upstream connect failed; trying the candidate's next address",
+                    );
+                    e.set_retry(true);
+                    return e;
+                }
                 // The failure itself is recorded by `upstream_peer`'s prologue, when it moves off
                 // this candidate. Recording here as well would double-count whenever there is no
                 // next candidate, since `logging` would then also resolve the still-pending permit —
