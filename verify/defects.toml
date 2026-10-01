@@ -325,10 +325,10 @@ impact = "xAI reports completion_tokens without reasoning. Verify live."
 confidence = "med"
 evidence = "usage.rs; catalog grok rows"
 claims = ["BIL-9"]
-state = "suspected"
-test = ""
-fix = ""
-note = "needs live: call an xAI grok reasoning model and compare usage.completion_tokens with completion_tokens_details.reasoning_tokens and xAI's billed usage, to see whether reasoning is left out of completion_tokens."
+state = "fixed"
+test = "reasoning_reported_beside_completion_tokens_is_billed_as_output"
+fix = "01c1c2b"
+note = "Confirmed live 2026-10-01 (grok-4.3: prompt 202, completion 7, reasoning 167, total 376; xAI bills 174 output). Output now adds reasoning when total = prompt + completion + reasoning."
 
 [[defect]]
 id = "D24"
