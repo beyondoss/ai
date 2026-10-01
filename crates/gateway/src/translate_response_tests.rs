@@ -2145,7 +2145,6 @@ fn claude_zero_arg_call_sse() -> String {
 /// claim: TRN-9
 /// defect: D13
 #[test]
-#[ignore = "D13 reproduced: Messages→Chat/Responses streams a zero-argument call as arguments:\"\""]
 fn a_streamed_zero_argument_call_has_json_arguments() {
     // The non-stream body is the baseline: it already says "{}".
     let body = json_resp(
@@ -2330,7 +2329,6 @@ fn a_mid_stream_overflow_or_quota_code_survives_response_failed() {
 /// claim: TRN-13
 /// defect: D50
 #[test]
-#[ignore = "D50 reproduced: content_block_start tool_use input is ignored when no input_json_delta follows"]
 fn a_tool_input_sent_in_the_start_block_reaches_the_client() {
     let src = ant_sse(&[
         json!({"type": "message_start", "message": {"id": "msg_1", "type": "message",

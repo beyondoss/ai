@@ -4609,15 +4609,28 @@ struct AntToOai {
     meta: ChunkMeta,
     /// Tool calls opened so far: the next one's Chat `index`.
     tools: u32,
-    /// The Chat `index` of the block now open, when it is a client `tool_use`. Anthropic blocks
-    /// never interleave, so a JSON delta belongs to it; one for any other block (a server tool's
-    /// input) must not land on a client call's arguments.
-    open_tool: Option<u32>,
+    /// The block now open, when it is a client `tool_use`. Anthropic blocks never interleave, so a
+    /// JSON delta belongs to it; one for any other block (a server tool's input) must not land on a
+    /// client call's arguments.
+    open_tool: Option<OpenTool>,
     /// The thinking block now open, gathered until its `content_block_stop`.
     open_thinking: Option<HeldThinking>,
     /// `thinking` list entries sent so far: the next one's `index`.
     thinking_blocks: u32,
     usage: Usage,
+}
+
+/// A client `tool_use` block streaming to a Chat client.
+struct OpenTool {
+    /// Its Chat `index`.
+    index: u32,
+    /// Whether any argument bytes went out. A block that closes with none still owes the client
+    /// JSON arguments: the input `content_block_start` carried (a Messages-compatible host may
+    /// send it whole there), else `{}` (a zero-argument call streams one empty delta). `""` is
+    /// not JSON, and the non-stream body says `{}`.
+    sent: bool,
+    /// `content_block_start`'s `input`, when it was not the usual empty object.
+    start_input: Option<String>,
 }
 
 /// A streaming Anthropic thinking block, held whole so it can be sent back.
@@ -4688,7 +4701,14 @@ impl AntToOai {
                     Some("tool_use") => {
                         let index = self.tools;
                         self.tools = self.tools.saturating_add(1);
-                        self.open_tool = Some(index);
+                        self.open_tool = Some(OpenTool {
+                            index,
+                            sent: false,
+                            start_input: block
+                                .get("input")
+                                .filter(|i| i.as_object().is_some_and(|o| !o.is_empty()))
+                                .map(value_string),
+                        });
                         json!({ "tool_calls": [{
                             "index": index,
                             "id": id_or_fresh(block.get("id"), "call"),
@@ -4732,11 +4752,14 @@ impl AntToOai {
                         None => return,
                     },
                     Some("input_json_delta") => {
-                        match (self.open_tool, non_empty_str(d, "partial_json")) {
-                            (Some(index), Some(p)) => json!({ "tool_calls": [{
-                                "index": index,
-                                "function": { "arguments": p },
-                            }] }),
+                        match (self.open_tool.as_mut(), non_empty_str(d, "partial_json")) {
+                            (Some(tool), Some(p)) => {
+                                tool.sent = true;
+                                json!({ "tool_calls": [{
+                                    "index": tool.index,
+                                    "function": { "arguments": p },
+                                }] })
+                            }
                             _ => return,
                         }
                     }
@@ -4783,7 +4806,18 @@ impl AntToOai {
                 items.push(self.meta.usage(self.usage.to_chat()));
             }
             "content_block_stop" => {
-                self.open_tool = None;
+                if let Some(tool) = self.open_tool.take()
+                    && !tool.sent
+                {
+                    let args = tool.start_input.unwrap_or_else(|| "{}".to_owned());
+                    items.push(self.meta.chunk(
+                        json!({ "tool_calls": [{
+                            "index": tool.index,
+                            "function": { "arguments": args },
+                        }] }),
+                        None,
+                    ));
+                }
                 // A thinking block is whole now. Unsigned (or past the cap), it could never be sent
                 // back, so it is not offered for replay; its text already streamed.
                 if let Some(held) = self.open_thinking.take()

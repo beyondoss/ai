@@ -635,7 +635,10 @@ Responses-only models the catalog routes to `/v1/responses`, and is held to the 
   cut instead.
 - **Tool-call deltas** are keyed by `index`, else by `id`: an id repeated on every delta is one call,
   a reused `index` with a new id is a new call, interleaved deltas land on their own call, and a call
-  opens only once its name is known.
+  opens only once its name is known. A `tool_use` block that closes with no argument bytes still
+  gives a Chat or Responses client JSON: the `input` its `content_block_start` carried (a
+  Messages-compatible host may send it whole there), else `{}` (a zero-argument call), as the
+  non-stream body does.
 - **Errors.** Any non-2xx JSON body is an error, whatever its shape (Bedrock's `{"message"}` has no
   `error` key); `message`, `type`, `code` and `param` survive, a string `error` is the message,
   OpenRouter's `metadata.raw` is quoted after its message with the provider's name, and a numeric
