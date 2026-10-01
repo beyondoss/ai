@@ -195,8 +195,63 @@ def embeddings():
     return ok, {"dims": len(r.data[0].embedding)}
 
 
+def langchain_chat():
+    """E1 / T1 via LangChain: ChatOpenAI with a bound tool, then the answer."""
+    from langchain_core.messages import HumanMessage, ToolMessage
+    from langchain_openai import ChatOpenAI
+    llm = ChatOpenAI(model=MODEL, base_url=f"{BASE}/v1", api_key=KEY, http_client=http(), max_retries=0,
+                     max_completion_tokens=1024)
+    r = llm.invoke("Reply with the single word: pong")
+    record("chat", _lc_usage(r))
+    bound = llm.bind_tools([WEATHER], tool_choice="get_weather")
+    msgs = [HumanMessage("What's the weather in Paris? Use the tool.")]
+    ai = bound.invoke(msgs)
+    record("chat", _lc_usage(ai))
+    if not ai.tool_calls:
+        return False, {"why": "no tool call"}
+    msgs += [ai, ToolMessage("Sunny, 31C", tool_call_id=ai.tool_calls[0]["id"])]
+    final = llm.bind_tools([WEATHER]).invoke(msgs)
+    record("chat", _lc_usage(final))
+    return bool(r.content) and "31" in str(final.content), {"final": str(final.content)[:120]}
+
+
+def _lc_usage(m):
+    u = m.usage_metadata or {}
+    return {"input_total": u.get("input_tokens", 0), "output": u.get("output_tokens", 0),
+            "cache_read": (u.get("input_token_details") or {}).get("cache_read", 0)}
+
+
+def agents_sdk():
+    """E3 / T1 via the OpenAI Agents SDK (Responses by default): a tool-using agent run."""
+    import asyncio
+    from agents import Agent, Runner, function_tool, set_default_openai_client, set_tracing_disabled
+    from openai import AsyncOpenAI
+    set_tracing_disabled(True)
+    set_default_openai_client(AsyncOpenAI(base_url=f"{BASE}/v1", api_key=KEY, max_retries=0,
+                                          http_client=httpx.AsyncClient(event_hooks={"response": [_ahook]}, timeout=120)))
+
+    @function_tool
+    def get_weather(city: str) -> str:
+        """Weather for a city."""
+        return f"Sunny in {city}, 31C"
+
+    agent = Agent(name="weather", instructions="Use the tool, then answer in one sentence.",
+                  model=MODEL, tools=[get_weather])
+    res = asyncio.run(Runner.run(agent, "What's the weather in Paris?"))
+    for resp in res.raw_responses:
+        u = resp.usage
+        record("responses", {"input_total": u.input_tokens, "output": u.output_tokens,
+                             "cache_read": getattr(getattr(u, "input_tokens_details", None), "cached_tokens", 0) or 0})
+    used = any(getattr(i, "type", "") == "tool_call_item" for i in res.new_items)
+    return used and "31" in str(res.final_output), {"final": str(res.final_output)[:120]}
+
+
+async def _ahook(resp):
+    _ids.append(resp.headers.get("x-beyond-request-id"))
+
+
 PROBES = {f.__name__: f for f in [chat_basic, messages_basic, responses_basic, models_list,
-                                  tools_chat, tools_messages, embeddings]}
+                                  tools_chat, tools_messages, embeddings, langchain_chat, agents_sdk]}
 
 if __name__ == "__main__":
     name = sys.argv[1]

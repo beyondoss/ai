@@ -87,81 +87,46 @@ const EMBED: Route = Route {
 #[derive(Clone, Copy)]
 enum Runtime {
     Python,
+    Node,
 }
 
-struct Cell {
-    claims: &'static str,
-    client: &'static str,
-    runtime: Runtime,
-    probe: &'static str,
-    routes: &'static [Route],
-    /// Claims a failover-route cell additionally proves.
-    failover_claims: &'static str,
-}
+/// `(claims, client, runtime, probe, routes, extra claims on the failover route)`. One line per
+/// client × probe; the routes expand it into cells.
+type Cell = (
+    &'static str,
+    &'static str,
+    Runtime,
+    &'static str,
+    &'static [Route],
+    &'static str,
+);
 
 const GEN: &[Route] = &[CLAUDE, GPT, OPENROUTER, FAILOVER];
+const SESSION: &[Route] = &[CLAUDE, GPT, OPENROUTER];
+const ONE: &[Route] = &[GPT];
 
-fn cells() -> Vec<Cell> {
-    use Runtime::Python;
-    vec![
-        Cell {
-            claims: "E1+B1+S1",
-            client: "openai-py",
-            runtime: Python,
-            probe: "chat_basic",
-            routes: GEN,
-            failover_claims: "R1",
-        },
-        Cell {
-            claims: "E2+B1+S1",
-            client: "anthropic-py",
-            runtime: Python,
-            probe: "messages_basic",
-            routes: GEN,
-            failover_claims: "R1",
-        },
-        Cell {
-            claims: "E3+TRN-1+CAT-9+B1",
-            client: "openai-py",
-            runtime: Python,
-            probe: "responses_basic",
-            routes: &[CLAUDE, GPT, OPENROUTER],
-            failover_claims: "",
-        },
-        Cell {
-            claims: "E4",
-            client: "openai-py",
-            runtime: Python,
-            probe: "models_list",
-            routes: &[GPT],
-            failover_claims: "",
-        },
-        Cell {
-            claims: "T1+B1",
-            client: "openai-py",
-            runtime: Python,
-            probe: "tools_chat",
-            routes: GEN,
-            failover_claims: "R1",
-        },
-        Cell {
-            claims: "T1+B1",
-            client: "anthropic-py",
-            runtime: Python,
-            probe: "tools_messages",
-            routes: GEN,
-            failover_claims: "R1",
-        },
-        Cell {
-            claims: "M1+B1",
-            client: "openai-py",
-            runtime: Python,
-            probe: "embeddings",
-            routes: &[EMBED],
-            failover_claims: "",
-        },
-    ]
-}
+#[rustfmt::skip]
+const CELLS: &[Cell] = &[
+    // Python SDKs and frameworks.
+    ("E1+B1+S1",          "openai-py",     Runtime::Python, "chat_basic",       GEN,      "R1"),
+    ("E2+B1+S1",          "anthropic-py",  Runtime::Python, "messages_basic",   GEN,      "R1"),
+    ("E3+TRN-1+CAT-9+B1", "openai-py",     Runtime::Python, "responses_basic",  SESSION,  ""),
+    ("E4",                "openai-py",     Runtime::Python, "models_list",      ONE,      ""),
+    ("E4",                "anthropic-py",  Runtime::Python, "models_list",      ONE,      ""),
+    ("T1+B1",             "openai-py",     Runtime::Python, "tools_chat",       GEN,      "R1"),
+    ("T1+B1",             "anthropic-py",  Runtime::Python, "tools_messages",   GEN,      "R1"),
+    ("M1+B1",             "openai-py",     Runtime::Python, "embeddings",       &[EMBED], ""),
+    ("E1+T1+B1",          "langchain",     Runtime::Python, "langchain_chat",   GEN,      "R1"),
+    ("E3+T1+B1",          "openai-agents", Runtime::Python, "agents_sdk",       SESSION,  ""),
+    // Node SDKs.
+    ("E1+B1+S1+S2",       "openai-node",   Runtime::Node,   "chat_basic",       GEN,      "R1"),
+    ("E2+B1+S1",          "anthropic-ts",  Runtime::Node,   "messages_basic",   GEN,      "R1"),
+    ("E3+TRN-1+CAT-9+B1", "openai-node",   Runtime::Node,   "responses_basic",  SESSION,  ""),
+    ("E4",                "openai-node",   Runtime::Node,   "models_list",      ONE,      ""),
+    ("E4",                "anthropic-ts",  Runtime::Node,   "models_list",      ONE,      ""),
+    ("E1+T1+B1+S2",       "ai-sdk",        Runtime::Node,   "ai_sdk_openai",    GEN,      "R1"),
+    ("E2+T1+B1",          "ai-sdk",        Runtime::Node,   "ai_sdk_anthropic", GEN,      "R1"),
+];
 
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
@@ -190,12 +155,24 @@ fn env_keys() -> BTreeMap<String, String> {
 fn interpreter(rt: Runtime) -> PathBuf {
     match rt {
         Runtime::Python => repo_root().join("verify/clients/py/.venv/bin/python"),
+        Runtime::Node => PathBuf::from("node"),
     }
 }
 
 fn probe_script(rt: Runtime) -> PathBuf {
     match rt {
         Runtime::Python => repo_root().join("verify/clients/py/probe.py"),
+        Runtime::Node => repo_root().join("verify/clients/node/probe.mjs"),
+    }
+}
+
+/// The runtime's pinned dependencies are installed (the venv / `npm ci`).
+fn installed(rt: Runtime) -> bool {
+    match rt {
+        Runtime::Python => interpreter(rt).exists(),
+        Runtime::Node => repo_root()
+            .join("verify/clients/node/node_modules/openai")
+            .exists(),
     }
 }
 
@@ -210,22 +187,22 @@ fn main() {
     let mut trials = Vec::new();
     if std::env::var("VERIFY_LIVE").as_deref() == Ok("1") {
         let keys = env_keys();
-        for cell in cells() {
-            for route in cell.routes {
+        for &(claims, client, rt, probe, routes, failover_claims) in CELLS {
+            for route in routes {
                 let have_keys = route
                     .pools
                     .iter()
                     .all(|(_, var)| keys.get(*var).is_some_and(|v| !v.is_empty()));
-                if !have_keys || !interpreter(cell.runtime).exists() || !gateway_bin().exists() {
+                if !have_keys || !installed(rt) || !gateway_bin().exists() {
                     continue;
                 }
-                let claims = if route.name == "failover" && !cell.failover_claims.is_empty() {
-                    format!("{}+{}", cell.claims, cell.failover_claims)
+                let claims = if route.name == "failover" && !failover_claims.is_empty() {
+                    format!("{claims}+{failover_claims}")
                 } else {
-                    cell.claims.to_owned()
+                    claims.to_owned()
                 };
-                let name = format!("{claims}::{}::{}::{}", cell.client, route.name, cell.probe);
-                let (rt, probe, route, keys) = (cell.runtime, cell.probe, *route, keys.clone());
+                let name = format!("{claims}::{client}::{}::{probe}", route.name);
+                let (route, keys) = (*route, keys.clone());
                 trials.push(Trial::test(name, move || run_cell(rt, probe, route, &keys)));
             }
         }
