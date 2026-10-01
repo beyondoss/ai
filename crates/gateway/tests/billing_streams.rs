@@ -165,7 +165,6 @@ data: {\"type\":\"message_stop\"}\n\n";
 /// claim: BIL-8
 /// defect: D22
 #[tokio::test]
-#[ignore = "D22 reproduced: message_delta's cumulative input_tokens=2500/cache_read=800 ignored; row keeps message_start's 10/0"]
 async fn anthropic_cumulative_message_delta_usage_supersedes_message_start() {
     let (pubkey, sk) = test_keypair(63);
     let mock = MockUpstream::start(Mode::Raw(

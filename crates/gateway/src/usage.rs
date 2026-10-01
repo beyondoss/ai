@@ -451,7 +451,7 @@ pub fn anthropic_stream(sse: &[u8]) -> Option<Usage> {
 
 /// Anthropic streaming: input + cache tokens arrive in `message_start.message.usage`; output (and
 /// reasoning/thinking tokens) accumulate in `message_delta.usage` (last delta is the cumulative
-/// total). A `usage` block that looks OpenAI-shaped (dialect mismatch — see
+/// total). A `message_delta` that also reports input or cache counts supersedes `message_start`'s. A `usage` block that looks OpenAI-shaped (dialect mismatch — see
 /// `AnthropicUsage::looks_openai_shaped`) is skipped entirely: if every line is mismatched, `saw_any`
 /// stays `false` and the function returns `None`.
 ///
@@ -506,9 +506,21 @@ pub fn anthropic_stream_parts(parts: &[&[u8]]) -> Option<Usage> {
             if let Some(u) = chunk.usage
                 && !u.looks_openai_shaped()
             {
-                // message_delta carries the running output token count.
+                // message_delta carries the running output token count — and, cumulatively, input
+                // and cache counts too, which grow past `message_start`'s when a server tool (web
+                // search) feeds results back mid-turn. Present wins; absent (zero, by
+                // `serde(default)`) keeps what `message_start` said.
                 if u.output_tokens > 0 {
                     usage.output_tokens = u.output_tokens;
+                }
+                if u.input_tokens > 0 {
+                    usage.input_tokens = u.input_tokens;
+                }
+                if u.cache_read_input_tokens > 0 {
+                    usage.cache_read_tokens = u.cache_read_input_tokens;
+                }
+                if u.cache_creation_input_tokens > 0 {
+                    usage.cache_write_tokens = u.cache_creation_input_tokens;
                 }
                 if let Some(rt) = u.output_tokens_details.thinking_tokens {
                     usage.reasoning_tokens = Some(rt);
@@ -1507,7 +1519,6 @@ mod verify_billing {
     /// claim: BIL-8
     /// defect: D22
     #[test]
-    #[ignore = "D22 reproduced: anthropic_stream_parts reads input/cache only from message_start"]
     fn anthropic_stream_takes_cumulative_input_from_message_delta() {
         let sse = b"data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10,\"cache_read_input_tokens\":0,\"output_tokens\":1}}}\n\n\
 data: {\"type\":\"message_delta\",\"usage\":{\"input_tokens\":2500,\"cache_read_input_tokens\":800,\"cache_creation_input_tokens\":0,\"output_tokens\":300}}\n\n";
