@@ -825,8 +825,14 @@ impl InputTally {
 /// Whether an Anthropic stream reached its `message_delta` — the event carrying the final output
 /// count. `message_start` alone parses as usage too (input and cache tokens), so a parse succeeding
 /// is not the same as the stream finishing.
+///
+/// The check is structural: an `event: message_delta` line, or a `"type":"message_delta"` member.
+/// Generated text cannot forge either — inside a JSON string a newline is `\n` and a quote is
+/// `\"` — so a model writing the words `message_delta` does not finish a cut-short stream.
 pub fn anthropic_stream_finished(tail: &[u8]) -> bool {
-    memchr::memmem::find(tail, b"message_delta").is_some()
+    memchr::memmem::find(tail, b"\nevent: message_delta").is_some()
+        || memchr::memmem::find(tail, br#""type":"message_delta""#).is_some()
+        || memchr::memmem::find(tail, br#""type": "message_delta""#).is_some()
 }
 
 /// Whether a stream carried an error event: Anthropic's `{"type":"error","error":{…}}`, OpenAI's
@@ -1127,6 +1133,10 @@ mod tests {
             "{started}event: message_delta\ndata: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"end_turn\"}},\"usage\":{{\"output_tokens\":5}}}}\n\n"
         );
         assert!(anthropic_stream_finished(finished.as_bytes()));
+        let text = format!(
+            "{started}event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"delta\":{{\"type\":\"text_delta\",\"text\":\"event: message_delta \\\"type\\\":\\\"message_delta\\\"\"}}}}\n\n"
+        );
+        assert!(!anthropic_stream_finished(text.as_bytes()), "{text}");
     }
 
     #[test]

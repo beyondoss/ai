@@ -462,7 +462,6 @@ async fn a_cache_hit_row_replays_the_fill_under_its_own_id() {
 /// claim: BIL-22
 /// defect: D70
 #[tokio::test]
-#[ignore = "D70 reproduced: a cancelled Anthropic stream whose text contains \"message_delta\" bills output_tokens=0, usage_estimated=false"]
 async fn generated_message_delta_text_does_not_hide_a_cut_short_anthropic_stream() {
     let (pubkey, sk) = test_keypair(108);
     let mut sse = String::from(

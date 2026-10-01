@@ -995,8 +995,11 @@ while the provider still bills us for what it generated before it noticed. Emitt
 "stream a long answer, disconnect one event before the end" free.
 
 A managed 2xx stream is **cut short** when its usage never arrived: no parseable usage on the
-OpenAI wire, no parseable usage or no `message_delta` on the Anthropic wire (`message_start` alone
-parses, so a successful parse is not the same as a finished stream) — and only once the provider
+OpenAI wire, no parseable usage or no `message_delta` event on the Anthropic wire (`message_start`
+alone parses, so a successful parse is not the same as a finished stream). The event is found
+structurally — an `event: message_delta` line or a `"type":"message_delta"` member — never as the
+bare words, which generated text can contain but cannot forge as a line or an unescaped member —
+and only once the provider
 demonstrably started: `message_start` arrived, at least one generated delta was relayed, or the
 stream **finished** cleanly without an error event (`"error":{`). That last case is a usage block we
 could not read — a provider shape change, a final event past recovery — on a turn the provider
