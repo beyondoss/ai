@@ -1137,10 +1137,10 @@ impact = "relay_full_body sets only=Some(candidate) on RelayRetry::Key and never
 confidence = "high"
 evidence = "proxy.rs relay_full_body (RelayRetry::Key sets only=Some(candidate)), upstream_peer usable mask; reproduced: a 200 KiB body after a 429 on sk-a and a 500 on sk-b relays the 500 (primary 2 hits, fallback 0) where a small body fails over"
 claims = ["R1", "R5", "REL-21"]
-state = "reproduced"
+state = "fixed"
 test = "a_5xx_after_a_key_walk_fails_over_for_small_and_large_bodies"
-fix = ""
-note = "Found by the independent branch review (2026-10-01) of a54c22c."
+fix = "6457aa9"
+note = "Found by the independent branch review (2026-10-01) of a54c22c. Fixed: a FullBody re-run after a key walk puts that candidate first in its walk (FullBody::resume) instead of making it the only usable one, so the next key's 5xx fails over like a small body; a Candidate retry clears it."
 
 [[defect]]
 id = "D82"
@@ -1151,10 +1151,10 @@ impact = "bare /v1 routes to Anthropic whenever any non-managed x-api-key is pre
 confidence = "high"
 evidence = "proxy.rs bare_default_provider_name / has_byo_anthropic_key; reproduced: x-api-key: stray beside Bearer sk-proj-… on /v1/chat/completions reaches the Anthropic upstream (200, anthropic 1 hit)"
 claims = ["SEC-11"]
-state = "reproduced"
+state = "fixed"
 test = "bare_v1_byo_routes_by_the_forwarded_credential"
-fix = ""
-note = "Found by the independent branch review (2026-10-01) of a54c22c."
+fix = "4d188dd"
+note = "Found by the independent branch review (2026-10-01) of a54c22c. Fixed: byo_credential_dialect reads every x-api-key line (Anthropic unless the key's shape says otherwise) and every Bearer token (sk-ant- Anthropic, other sk- OpenAI; opaque says nothing); with no vote the path picks; BYO keys for two providers on bare /v1 are a 400."
 
 [[defect]]
 id = "D83"
@@ -1165,10 +1165,10 @@ impact = "FullBody keys start at 0 and upstream_peer uses fb.keys[orig], never f
 confidence = "high"
 evidence = "proxy.rs relay_full_body (keys start at 0), upstream_peer fb.keys lookup; reproduced: after sk-a cools, three 200 KiB requests still hit sk-a (4 revoked-key hits, want 1)"
 claims = ["REL-14", "R5"]
-state = "reproduced"
+state = "fixed"
 test = "a_large_body_starts_past_a_cooling_pool_key"
-fix = ""
-note = "Found by the independent branch review (2026-10-01) of a54c22c."
+fix = "6457aa9"
+note = "Found by the independent branch review (2026-10-01) of a54c22c. Fixed: FullBody keys start at NO_KEY_WALK, and upstream_peer falls back to Provider::first_key() for a candidate with no key walk, so a re-run skips cooling keys."
 
 [[defect]]
 id = "D84"
@@ -1179,10 +1179,10 @@ impact = "Request-specific 403s (OpenRouter moderation, model not allowed, Anthr
 confidence = "high"
 evidence = "proxy.rs upstream_response_filter key_auth = 401|403, is_pool_key_failure = 401..=403; reproduced: a model-permission 403 walks sk-a→sk-b and cools sk-a (upstream saw sk-a, sk-b, sk-a, sk-b)"
 claims = ["REL-4", "REL-14", "SEC-15"]
-state = "reproduced"
+state = "fixed"
 test = "a_request_specific_403_neither_walks_nor_cools_the_pool_key"
-fix = ""
-note = "Found by the independent branch review (2026-10-01) of a54c22c."
+fix = "b7e4d75"
+note = "Found by the independent branch review (2026-10-01) of a54c22c. Fixed: is_pool_key_failure is a 401 only, used by both the walk and the cooldown; 401/402/403 stay catalog candidate refusals (is_candidate_refusal, breaker-neutral). A relayed managed 403 whose body names the key (invalid_api_key / authentication_error) cools it from logging; that request does not walk."
 
 [[defect]]
 id = "D85"
@@ -1207,10 +1207,10 @@ impact = "logging's !client_still_uploading drops into record_success; a hung pr
 confidence = "high"
 evidence = "proxy.rs logging: the no-head, no-provider-outcome arm calls record_success; reproduced: a half-open probe whose client stalls mid-upload closes the breaker, and 3 concurrent callers all reach the broken provider (want 1 probe, 2×503)"
 claims = ["REL-6", "SEC-16"]
-state = "reproduced"
+state = "fixed"
 test = "a_probe_with_no_provider_outcome_leaves_the_breaker_half_open"
-fix = ""
-note = "Found by the independent branch review (2026-10-01) of a54c22c."
+fix = "89bb6d5"
+note = "Found by the independent branch review (2026-10-01) of a54c22c. Fixed: logging releases the permit (CircuitBreaker::release) when no head arrived and the error is not a provider outcome. A claimed half-open permit is now stamped at its handout, so a released permit claimed again is not immediately reclaimable (which admitted a second probe)."
 
 [[defect]]
 id = "D87"
@@ -1249,10 +1249,10 @@ impact = "After refresh_at every concurrent request runs its own lookup_host (5s
 confidence = "high"
 evidence = "state.rs resolve_all; reproduced: 16 callers past refresh_at against a hung resolver each wait the 5s timeout; 16 cold callers start 16 lookups (concurrent_cold_resolves_share_one_lookup)"
 claims = ["REL-20"]
-state = "reproduced"
+state = "fixed"
 test = "a_due_refresh_is_one_background_lookup"
-fix = ""
-note = "Found by the independent branch review (2026-10-01) of a54c22c."
+fix = "6fc0677"
+note = "Found by the independent branch review (2026-10-01) of a54c22c. Fixed: one lookup per authority runs in a background task (DnsCache::lookup_once); callers with a servable entry are served at once, cold callers share the lookup's answer, and a lookup hung past DNS_TIMEOUT stays in flight until it returns (at most one blocking getaddrinfo per authority). Also pinned by concurrent_cold_resolves_share_one_lookup and a_hung_lookup_is_never_joined_by_a_second."
 
 [[defect]]
 id = "D90"
@@ -1277,10 +1277,10 @@ impact = "A provider at its H2 max-concurrent-streams that keeps refusing is ret
 confidence = "high"
 evidence = "proxy.rs error_while_proxy (refused ⇒ same-provider retry, unbounded) and fail_to_proxy; reproduced: an upstream that refuses every stream gets 16 sends and the client reads 'upstream failed after receiving the request'"
 claims = ["REL-22", "REL-6"]
-state = "reproduced"
+state = "fixed"
 test = "a_provider_that_keeps_refusing_streams_is_resent_once_and_trips_the_breaker"
-fix = ""
-note = "Found by the independent branch review (2026-10-01) of a54c22c."
+fix = "b8a61fc"
+note = "Found by the independent branch review (2026-10-01) of a54c22c. Fixed: one resend per candidate (RequestCtx::refused_resent); a second refusal fails over (breaker failure recorded as the walk moves on) or ends the request (logging records it); fail_to_proxy answers 'the provider refused the stream; it was not processed'. A FullBody Reset retry releases its permit."
 
 [[defect]]
 id = "D92"
@@ -1291,10 +1291,10 @@ impact = "retain_managed_client_headers clones header names into a Vec on nearly
 confidence = "high"
 evidence = "proxy.rs new_ctx (Arc::clone of the state), retain_managed_client_headers (Vec of names), response_filter (memmem Finder per response); reproduced: new_ctx raises the state Arc's strong count (3, want 2)"
 claims = ["S1"]
-state = "reproduced"
+state = "fixed"
 test = "new_ctx_pays_no_arc_clone"
-fix = ""
-note = "Found by the independent branch review (2026-10-01) of a54c22c."
+fix = "f098424"
+note = "Found by the independent branch review (2026-10-01) of a54c22c. Fixed: AiProxy and the request context hold a &'static GatewayState (no per-request Arc clone; LIVE_REQUESTS stays for D38); remove_headers_where sweeps headers via stack batches (no Vec); each PoolAuth carries a boot-built memmem Finder used by response_filter and Redact. Structure pinned by remove_headers_where_removes_every_match_in_stack_batches and a_pool_key_carries_its_boot_built_searcher."
 
 [[defect]]
 id = "D93"
@@ -1305,10 +1305,10 @@ impact = "With the global EnvFilter removed and no max_level_hint on the usage l
 confidence = "high"
 evidence = "main.rs init_tracing: the ai.usage layer's filter_fn has no max level hint; reproduced: a subscriber with that layer reports max_level_hint None (TRACE)"
 claims = ["BIL-4"]
-state = "reproduced"
+state = "fixed"
 test = "the_billing_log_layer_caps_the_max_level_at_info"
-fix = ""
-note = "Found by the independent branch review (2026-10-01) of a54c22c."
+fix = "ac17cff"
+note = "Found by the independent branch review (2026-10-01) of a54c22c. Fixed: usage::usage_log_filter carries a max level hint of INFO, so the subscriber's max level (and LogTracer's) is INFO under the default AI_LOG."
 
 [[defect]]
 id = "D94"
@@ -1361,10 +1361,10 @@ impact = "Failures are 14-bit, successes 16-bit; past 16383 successes in a windo
 confidence = "high"
 evidence = "circuit_breaker.rs record_success (successes cap 65535) vs record_failure_windowed (failures cap 16383); reproduced: 20001 failures against 20000 successes in one window stay Closed at 16383"
 claims = ["REL-6"]
-state = "reproduced"
+state = "fixed"
 test = "a_failure_majority_opens_a_window_with_more_successes_than_the_failure_count_holds"
-fix = ""
-note = "Found by the independent branch review (2026-10-01) of a54c22c."
+fix = "6022576"
+note = "Found by the independent branch review (2026-10-01) of a54c22c. Fixed: windowed successes saturate at the failure count's 14-bit cap. Docs now describe the window as fixed (anchored at its first failure), which it is; it was not made rolling."
 
 [[defect]]
 id = "D98"
