@@ -829,10 +829,10 @@ impact = "Claude Code sends max_tokens 32000/64000; translated onto gpt-4o-mini 
 confidence = "high"
 evidence = "live 2026-10-01: Messages max_tokens=64000 to gpt-4o-mini -> 400 'max_tokens is too large: 64000. This model supports at most 16384'; translate.rs ~2001-2003"
 claims = ["TRN-5", "W1"]
-state = "suspected"
-test = ""
+state = "reproduced"
+test = "an_output_limit_above_the_model_maximum_is_clamped_to_it"
 fix = ""
-note = "Found during the D15 live check."
+note = "Found during the D15 live check. Reproduced e2e (tests/translate_request.rs): Messages max_tokens 64000 on gpt-4o-mini reaches OpenAI as max_completion_tokens 64000, and a same-wire Chat max_tokens 64000 is relayed as sent; the card max_output_tokens (16384) is never consulted."
 
 [[defect]]
 id = "D60"

@@ -537,3 +537,61 @@ async fn gateway_reasoning_items_never_reach_an_openai_responses_upstream() {
         "a gateway reasoning item reached OpenAI: {got}"
     );
 }
+
+/// A client's output limit above what the serving model can produce is a 400 from the provider
+/// ("max_tokens is too large: 64000. This model supports at most 16384"): Claude Code sends 32000
+/// or 64000 on every request, so on a gpt-4o-class row every one failed. The walk caps the forwarded
+/// limit at the row's card `max_output_tokens`, translated or not, and never raises one.
+/// claim: TRN-5
+/// defect: D59
+#[tokio::test]
+#[ignore = "D59 reproduced: max_tokens above the row's max_output_tokens is forwarded unclamped"]
+async fn an_output_limit_above_the_model_maximum_is_clamped_to_it() {
+    const GPT_4O_MINI_MAX_OUTPUT: u64 = 16_384;
+    let nats_port = unused_nats_port();
+    let (pubkey, sk) = test_keypair(1);
+    let mock = MockUpstream::start(Mode::Json).await;
+    let gw = Gateway::builder(nats_port, &mock.authority(), &b64(&pubkey))
+        .providers(&["openai", "openrouter", "anthropic"])
+        .start()
+        .await;
+    let user = json!([{"role": "user", "content": "hi"}]);
+
+    // Claude Code's shape on a GPT row: translated onto Chat Completions.
+    let text = post(
+        &gw,
+        &sk,
+        "/v1/messages",
+        &json!({"model": "gpt-4o-mini", "max_tokens": 64000, "messages": user}),
+    )
+    .await;
+    assert!(text.contains(r#""type":"message""#), "{text}");
+    let (cap, got) = captured(&mock);
+    assert_eq!(cap.path, "/v1/chat/completions");
+    assert_eq!(
+        got["max_completion_tokens"], GPT_4O_MINI_MAX_OUTPUT,
+        "{got}"
+    );
+
+    // Same wire: the byte relay is capped too, under the client's own key.
+    post(
+        &gw,
+        &sk,
+        "/v1/chat/completions",
+        &json!({"model": "gpt-4o-mini", "max_tokens": 64000, "messages": user}),
+    )
+    .await;
+    let (_, got) = captured(&mock);
+    assert_eq!(got["max_tokens"], GPT_4O_MINI_MAX_OUTPUT, "{got}");
+
+    // A limit within the model's reach is left alone.
+    post(
+        &gw,
+        &sk,
+        "/v1/chat/completions",
+        &json!({"model": "gpt-4o-mini", "max_completion_tokens": 1000, "messages": user}),
+    )
+    .await;
+    let (_, got) = captured(&mock);
+    assert_eq!(got["max_completion_tokens"], 1000, "{got}");
+}
