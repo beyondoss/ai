@@ -160,7 +160,7 @@ claims = ["REL-5"]
 state = "reproduced"
 test = "readyz_is_not_ready_while_allowance_is_unseeded"
 fix = ""
-note = "NATS down at boot: managed request gets 402 'allowance unavailable' while /readyz answers 200 {\"status\":\"degraded\"}. Not hermetically reached: NATS up but allowance not yet seeded, where the body would be 'ok'."
+note = "Also: readyz never consults ai_allowance_ready, so nothing alerts while managed traffic is refused. NATS down at boot: managed request gets 402 'allowance unavailable' while /readyz answers 200 {\"status\":\"degraded\"}. Not hermetically reached: NATS up but allowance not yet seeded, where the body would be 'ok'."
 
 [[defect]]
 id = "D12"
@@ -791,3 +791,31 @@ state = "suspected"
 test = ""
 fix = ""
 note = "Observed end to end in the D05 and D20 reproductions; needs its own reproduction test."
+
+[[defect]]
+id = "D57"
+severity = "high"
+area = "Reliability"
+title = "A small-body catalog walk gets no failover when the primary resets after reading the body"
+impact = "The body is replayable, yet the fallback is never tried: one attempt, then an empty 502. The large-body path retries and fails over, so the two sizes diverge more than D51 describes."
+confidence = "high"
+evidence = "found by the reliability reproductions (reliability_large_body.rs, small-body arm)"
+claims = ["REL-1", "REL-21"]
+state = "suspected"
+test = ""
+fix = ""
+note = "Observed in the D51 reproduction; needs its own reproduction test."
+
+[[defect]]
+id = "D58"
+severity = "low"
+area = "Reliability"
+title = "bai_v1 keys share one session pin per tenant and vpc"
+impact = "A v1 key carries no key_id, so every key a tenant holds shares one pin. One workload's provider choice steers the tenant's other workloads."
+confidence = "high"
+evidence = "smart.rs pin key (tenant, vpc, key_id); key.rs v1 payload has no key_id"
+claims = ["SEC-15"]
+state = "suspected"
+test = ""
+fix = ""
+note = ""

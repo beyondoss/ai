@@ -689,7 +689,7 @@ group = "Security and isolation"
 text = "Pins, ranker and limiter state can't be steered across tenants"
 layer = "hermetic"
 touches = ["crates/gateway/src/proxy.rs", "crates/gateway/src/key.rs", "crates/gateway/src/route.rs", "crates/gateway/src/cache.rs", "crates/gateway/src/control.rs", "crates/gateway/src/secret.rs"]
-defects = []
+defects = ["D58"]
 
 [[claim]]
 id = "SEC-16"
@@ -981,7 +981,7 @@ group = "Reliability"
 text = "Every upstream failure class has a bounded, documented client outcome"
 layer = "both"
 touches = ["crates/gateway/src/proxy.rs", "crates/gateway/src/circuit_breaker.rs", "crates/gateway/src/smart.rs", "crates/gateway/src/state.rs", "crates/gateway/src/admin.rs", "crates/gateway/src/store_watch.rs", "crates/gateway/src/main.rs", "crates/gateway/src/config.rs"]
-defects = []
+defects = ["D57"]
 
 [[claim]]
 id = "REL-2"
@@ -1161,7 +1161,7 @@ group = "Reliability"
 text = "The large-body path matches small-body semantics"
 layer = "hermetic"
 touches = ["crates/gateway/src/proxy.rs", "crates/gateway/src/circuit_breaker.rs", "crates/gateway/src/smart.rs", "crates/gateway/src/state.rs", "crates/gateway/src/admin.rs", "crates/gateway/src/store_watch.rs", "crates/gateway/src/main.rs", "crates/gateway/src/config.rs"]
-defects = ["D09", "D51"]
+defects = ["D09", "D51", "D57"]
 
 [[claim]]
 id = "REL-22"
