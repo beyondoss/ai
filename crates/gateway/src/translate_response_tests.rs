@@ -2224,7 +2224,6 @@ fn messages_block_sequencing_violation(evs: &[Event]) -> Option<String> {
 /// claim: TRN-12
 /// defect: D45
 #[test]
-#[ignore = "D45 reproduced: parallel tool_use blocks open start1 start2 … stop1 stop2 on a Messages stream"]
 fn parallel_tool_use_blocks_are_sequential_on_a_messages_stream() {
     let sequential = concat!(
         "data: {\"id\":\"c\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_a\",\"function\":{\"name\":\"f\",\"arguments\":\"{\\\"a\\\":1}\"}}]}}]}\n\n",

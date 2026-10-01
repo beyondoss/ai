@@ -5199,6 +5199,14 @@ struct OaiToAnt {
     /// The open text block's index. Anthropic blocks are sequential: anything else closes it.
     text_block: Option<usize>,
     calls: ToolCalls,
+    /// The call whose `tool_use` block is open (an index into `calls`). Parallel calls stream one
+    /// block at a time: Anthropic never opens a block before closing the last.
+    live: Option<usize>,
+    /// Calls ready to show while another is live, in order. Their arguments gather in
+    /// [`ChatCall::args`] until the live block closes, which it does only once its arguments are
+    /// complete JSON (nothing more can follow) or the stream ends: an upstream may interleave
+    /// argument deltas across calls.
+    queued: Vec<usize>,
     /// Thinking held back until its signature arrives. See [`is_replayable_thinking`].
     thinking: Gather,
     stop: Option<&'static str>,
@@ -5334,12 +5342,59 @@ impl OaiToAnt {
         }
     }
 
+    /// Close the live block and show every queued call after it, each start to stop.
     fn close_calls(&mut self, out: &mut Vec<u8>) {
-        for call in &mut self.calls.calls {
-            if call.opened && !call.closed {
-                call.closed = true;
-                block_stop(out, call.slot);
+        self.close_live(out);
+        for at in std::mem::take(&mut self.queued) {
+            self.show_call(at, out);
+            self.close_live(out);
+        }
+    }
+
+    fn close_live(&mut self, out: &mut Vec<u8>) {
+        if let Some(call) = self.live.take().and_then(|at| self.calls.calls.get_mut(at)) {
+            call.closed = true;
+            block_stop(out, call.slot);
+        }
+    }
+
+    /// Open `at`'s block with every argument byte gathered so far; it becomes the live call.
+    fn show_call(&mut self, at: usize, out: &mut Vec<u8>) {
+        let idx = self.next_index();
+        let Some(call) = self.calls.calls.get_mut(at) else {
+            return;
+        };
+        call.slot = idx;
+        block_start(
+            out,
+            idx,
+            &json!({ "type": "tool_use", "id": call.id, "name": call.name, "input": {} }),
+        );
+        if !call.args.is_empty() {
+            block_delta(
+                out,
+                idx,
+                &json!({ "type": "input_json_delta", "partial_json": call.args }),
+            );
+        }
+        self.live = Some(at);
+    }
+
+    /// While calls wait, close the live block once its arguments are whole and show the next.
+    fn advance_calls(&mut self, out: &mut Vec<u8>) {
+        while !self.queued.is_empty() {
+            let whole = self.live.is_none_or(|at| {
+                self.calls
+                    .calls
+                    .get(at)
+                    .is_none_or(|c| serde_json::from_str::<serde::de::IgnoredAny>(&c.args).is_ok())
+            });
+            if !whole {
+                return;
             }
+            self.close_live(out);
+            let at = self.queued.remove(0);
+            self.show_call(at, out);
         }
     }
 
@@ -5403,26 +5458,17 @@ impl OaiToAnt {
         for step in steps {
             match step {
                 CallStep::Open(at) => {
-                    let idx = self.next_index();
-                    let Some(call) = self.calls.calls.get_mut(at) else {
-                        continue;
-                    };
-                    call.slot = idx;
-                    block_start(
-                        out,
-                        idx,
-                        &json!({ "type": "tool_use", "id": call.id, "name": call.name, "input": {} }),
-                    );
-                    if !call.args.is_empty() {
-                        block_delta(
-                            out,
-                            idx,
-                            &json!({ "type": "input_json_delta", "partial_json": call.args }),
-                        );
+                    if self.live.is_none() {
+                        self.show_call(at, out);
+                    } else {
+                        self.queued.push(at);
                     }
                 }
+                // A queued call's arguments are already in its `args`, shown when it opens.
                 CallStep::Args(at, args) => {
-                    if let Some(call) = self.calls.calls.get(at) {
+                    if self.live == Some(at)
+                        && let Some(call) = self.calls.calls.get(at)
+                    {
                         block_delta(
                             out,
                             call.slot,
@@ -5431,6 +5477,7 @@ impl OaiToAnt {
                     }
                 }
             }
+            self.advance_calls(out);
         }
     }
 
