@@ -114,7 +114,6 @@ fn responses_stream_with_a_huge_final_event() -> &'static str {
 /// claim: BIL-15
 /// defect: D20
 #[tokio::test]
-#[ignore = "D20 reproduced: a >64 KiB response.completed leaves the tail mid-line; the row is an estimate"]
 async fn a_responses_stream_with_a_huge_final_event_bills_exact_usage() {
     let (pubkey, sk) = test_keypair(62);
     let mock = MockUpstream::start(Mode::Raw(

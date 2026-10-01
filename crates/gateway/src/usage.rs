@@ -439,7 +439,15 @@ pub fn openai_stream(sse: &[u8]) -> Option<Usage> {
             }
         }
     }
-    None
+    // No whole line carried usage. The final event can be bigger than the tail: a Responses
+    // `response.completed` echoes the request's instructions and tools ahead of `usage`, so a
+    // Codex-sized prompt pushes it past 64 KiB and the tail starts mid-way through it. Only the
+    // tail's first line can be front-truncated (the tail ends where the stream does), and `usage`
+    // is the last thing in that event, so recover it the way a front-truncated body is recovered.
+    let first = &sse[..memchr::memchr(b'\n', sse).unwrap_or(sse.len())];
+    recover_trailing_usage::<OpenAiUsage>(first)
+        .filter(|u| !u.looks_anthropic_shaped())
+        .map(Usage::from)
 }
 
 /// Anthropic streaming over a single contiguous buffer. See [`anthropic_stream_parts`], which this
@@ -1488,7 +1496,6 @@ mod verify_billing {
     /// claim: BIL-15
     /// defect: D20
     #[test]
-    #[ignore = "D20 reproduced: openai_stream returns None on a tail that starts mid-way through response.completed"]
     fn openai_stream_reads_usage_from_a_final_event_larger_than_the_tail() {
         let instructions = "You are a coding agent. ".repeat(4 * 1024);
         let sse = format!(

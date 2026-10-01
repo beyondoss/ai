@@ -900,6 +900,13 @@ tail keeps the last 64KB. OpenAI's parser walks those lines backwards and stops 
 block; the split is `memrchr`, the same reason the forward Anthropic walk uses `memchr` — a tail
 with no usage block still has to scan all 64 KiB.
 
+A final event can itself be bigger than the tail: a Responses `response.completed` echoes the
+request's instructions and tools ahead of `usage`, so a Codex-sized prompt puts it past 64 KiB and
+the tail begins mid-way through it. When no whole line carries usage, the tail's first line — the
+only one that can be front-truncated — is searched for its last `"usage"` and the object after it
+is deserialized, the same recovery a front-truncated non-stream body gets. One `memrchr` over at
+most the tail, and only on a miss.
+
 **Dialect-mismatch guard:** a config-added provider whose `provider_dialects` value doesn't match its
 actual wire (e.g. an Anthropic-wire vendor left at the default OpenAI dialect) would otherwise have
 its `usage` block parsed by the wrong dialect's parser. Because both parsers' fields are
