@@ -507,7 +507,6 @@ async fn stock_responses_create_without_store_works_on_a_claude_row() {
 /// claim: TRN-20
 /// defect: D50
 #[tokio::test]
-#[ignore = "D50 reproduced: a gateway-minted rs_gw reasoning item is byte-relayed to OpenAI /v1/responses"]
 async fn gateway_reasoning_items_never_reach_an_openai_responses_upstream() {
     let nats_port = unused_nats_port();
     let (pubkey, sk) = test_keypair(1);

@@ -3573,16 +3573,21 @@ impl ProxyHttp for AiProxy {
                 // than forwarding the previous candidate's wire. OpenAI→Anthropic drops
                 // `stream_options` here; Anthropic→OpenAI leaves `include_usage` to the inject
                 // below, on the translated Chat Completions body. Same-endpoint Responses
-                // (session arm) is `from == to` and is a byte relay.
+                // (session arm) is `from == to` and is a byte relay, less the reasoning items the
+                // gateway minted from Claude's thinking (see `translate::strip_gateway_reasoning`).
                 if let Some(a) = rc.auto.as_ref()
                     && let Some(t) = a.translate.as_ref()
                     && let Some(to) = catalog_serving_endpoint(a.as_ref())
-                    && t.client != to
                 {
-                    let upstream_model =
-                        a.candidate_at(a.candidate).map_or("", |c| c.upstream_model);
-                    buf = translate::request(t.client, to, &buf, upstream_model);
-                    scan = peek::scan_buffered(&buf);
+                    if t.client != to {
+                        let upstream_model =
+                            a.candidate_at(a.candidate).map_or("", |c| c.upstream_model);
+                        buf = translate::request(t.client, to, &buf, upstream_model);
+                        scan = peek::scan_buffered(&buf);
+                    } else if to == route::Endpoint::Responses {
+                        buf = translate::strip_gateway_reasoning(buf);
+                        scan = peek::scan_buffered(&buf);
+                    }
                 }
                 if rc.model.is_empty()
                     && let Some(m) = scan.model

@@ -425,7 +425,10 @@ block", measured on claude-sonnet-4). A Responses client echoes the `reasoning` 
 minted (`rs_gw…` id, `encrypted_content` = `rs_gw:` + the Anthropic signature; the prefix still
 marks an item a client replays without its id, as Codex and the Agents SDK do); onto a Claude
 upstream they become that turn's signed thinking again, while OpenAI's own reasoning items stay
-dropped. Budget-thinking Claude (before 4.6) 400s a tool loop whose final assistant turn does not
+dropped. The reverse holds on a same-wire Responses walk: a catalog walk that relays a Responses body
+to an OpenAI Responses upstream (a Responses-first row, a GPT row's Responses arm, a mixed-row
+failover) first strips the gateway's own reasoning items, whose id and Anthropic signature OpenAI
+rejects; one `memmem` for `rs_gw` keeps every other body a byte relay. Budget-thinking Claude (before 4.6) 400s a tool loop whose final assistant turn does not
 open with its thinking block; when a client sent none back (Vercel, LangChain, a Responses client
 that drops reasoning items), that request goes without `thinking`, which Anthropic accepts. Structured output maps
 `response_format` `json_schema` ↔ `output_config.format` ↔ Responses `text.format`; OpenAI JSON mode

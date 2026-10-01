@@ -1804,3 +1804,29 @@ fn unknown_responses_input_items_are_forwarded_not_dropped() {
     }
     assert!(dropped.is_empty(), "silently dropped: {dropped:?}");
 }
+
+/// A same-wire Responses relay loses only the reasoning items the gateway minted (by id, or by the
+/// `encrypted_content` marker when the id is gone); OpenAI's own stay, and a body with none of ours
+/// is relayed byte for byte.
+#[test]
+fn only_gateway_reasoning_items_are_stripped_from_a_responses_relay() {
+    let plain = br#"{"model":"gpt-5", "input":[{"type":"reasoning","id":"rs_68ab","encrypted_content":"gAAAA"}]}"#;
+    assert_eq!(strip_gateway_reasoning(plain.to_vec()), plain);
+
+    let body = json!({"model": "gpt-5", "input": [
+        {"role": "user", "content": "hi"},
+        {"type": "reasoning", "id": "rs_gw18f2a0001", "encrypted_content": "SIG"},
+        {"type": "reasoning", "encrypted_content": format!("{GATEWAY_SIGNATURE_PREFIX}SIG")},
+        {"type": "reasoning", "id": "rs_68ab", "encrypted_content": "gAAAA"},
+    ]});
+    let out: Value =
+        serde_json::from_slice(&strip_gateway_reasoning(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+    assert_eq!(
+        out["input"],
+        json!([
+            {"role": "user", "content": "hi"},
+            {"type": "reasoning", "id": "rs_68ab", "encrypted_content": "gAAAA"},
+        ])
+    );
+}

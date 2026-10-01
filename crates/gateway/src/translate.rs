@@ -2,7 +2,9 @@
 //!
 //! Triggered when the inbound path names Chat Completions, Messages, or Responses (including the
 //! `/auto` suffix) and the catalog row speaks a different one of those three. Same-wire walks stay
-//! a byte relay — including `/{provider}/v1/responses`. `/{provider}/…` never translates.
+//! a byte relay — including `/{provider}/v1/responses` — except that a catalog walk's Responses
+//! body loses the reasoning items this gateway minted (see [`strip_gateway_reasoning`]).
+//! `/{provider}/…` never translates.
 //!
 //! Responses ↔ Messages is composed through Chat Completions so thinking / `cache_control` /
 //! `reasoning_effort` keep the slice-1 mappings.
@@ -3781,6 +3783,29 @@ fn is_gateway_reasoning(item: &Value) -> bool {
                 .get("encrypted_content")
                 .and_then(Value::as_str)
                 .is_some_and(|c| c.starts_with(GATEWAY_SIGNATURE_PREFIX)))
+}
+
+/// A same-wire Responses body, minus the `reasoning` items this gateway minted from Claude's
+/// thinking. A catalog walk relays the body byte for byte to an OpenAI Responses upstream (a
+/// Responses-first row, a GPT row's Responses arm, a mixed-row failover), where a foreign id and an
+/// Anthropic signature as `encrypted_content` mean nothing and are rejected. One `memmem` decides:
+/// a body without `rs_gw` is returned untouched, unparsed.
+pub fn strip_gateway_reasoning(body: Vec<u8>) -> Vec<u8> {
+    if memchr::memmem::find(&body, b"rs_gw").is_none() {
+        return body;
+    }
+    let Ok(mut v) = serde_json::from_slice::<Value>(&body) else {
+        return body;
+    };
+    let Some(items) = v.get_mut("input").and_then(Value::as_array_mut) else {
+        return body;
+    };
+    let before = items.len();
+    items.retain(|i| !is_gateway_reasoning(i));
+    if items.len() == before {
+        return body;
+    }
+    encode(&v)
 }
 
 /// The Anthropic thinking block behind a `reasoning` item this gateway minted for a Responses
