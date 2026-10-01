@@ -1716,6 +1716,19 @@ fn is_managed_provider_endpoint(path: &str) -> bool {
     ALLOWED.iter().any(|suffix| path.ends_with(suffix))
 }
 
+/// The wire a `/{provider}/…` forwarded path (query allowed) is answered on — the same
+/// [`route::Endpoint::of_upstream_path`] a catalog walk applies per candidate, so the two routes
+/// meter one endpoint the same way. A sub-resource reads as its parent (`/messages/count_tokens` is
+/// Messages; the Responses ones already contain `/responses`).
+fn wire_of_forward_path(path_and_query: &str) -> Dialect {
+    let path = path_and_query
+        .split_once('?')
+        .map_or(path_and_query, |(p, _)| p);
+    let path = path.strip_suffix('/').unwrap_or(path);
+    let path = path.strip_suffix("/count_tokens").unwrap_or(path);
+    route::Endpoint::of_upstream_path(path).wire()
+}
+
 fn is_streamable_path(forward_path: &str) -> bool {
     forward_path.ends_with("/chat/completions")
 }
@@ -2713,7 +2726,18 @@ impl ProxyHttp for AiProxy {
         // Reading the wrong one hands an Anthropic response to the OpenAI usage extractor,
         // which does not error — it trips the dialect-mismatch guard and emits a **zero-token
         // billing row**.
-        let dialect = model_route.map_or(provider.dialect, |r| r.wire);
+        //
+        // A provider-routed request is the same problem without a catalog: `/{provider}/…`
+        // forwards a path, and that path — not the provider — says which wire answers. OpenRouter
+        // serves Messages at `/api/v1/messages` and Anthropic serves Chat Completions at
+        // `/v1/chat/completions`, so the provider's default dialect metered both as zero.
+        let dialect = match model_route {
+            Some(r) => r.wire,
+            None if provider_route => forward_path
+                .as_deref()
+                .map_or(provider.dialect, wire_of_forward_path),
+            None => provider.dialect,
+        };
         if model_route.is_some() {
             // From the arm this request will actually walk, not the row's Chat Completions primary:
             // a Responses walk must not inherit `stream_options` injection.
@@ -5046,6 +5070,25 @@ mod tests {
         // Exactly at the cap is fine.
         let ok = "a".repeat(MAX_MODEL_LEN);
         assert_eq!(sanitize_model(ok.clone()), ok);
+    }
+
+    #[test]
+    fn a_provider_route_takes_its_wire_from_the_forwarded_path() {
+        for (path, wire) in [
+            ("/api/v1/messages", Dialect::Anthropic),
+            ("/v1/messages?beta=true", Dialect::Anthropic),
+            ("/v1/messages/count_tokens", Dialect::Anthropic),
+            ("/v1/messages/", Dialect::Anthropic),
+            ("/v1/chat/completions", Dialect::OpenAi),
+            (
+                "/openai/deployments/x/chat/completions?api-version=1",
+                Dialect::OpenAi,
+            ),
+            ("/v1/responses/compact", Dialect::OpenAi),
+            ("/v1/embeddings", Dialect::OpenAi),
+        ] {
+            assert_eq!(wire_of_forward_path(path), wire, "{path}");
+        }
     }
 
     #[test]

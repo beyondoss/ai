@@ -28,7 +28,6 @@ async fn post(url: String, key: &str, body: &str, extra: &[(&str, &str)]) -> (u1
 /// claim: BIL-1
 /// defect: D05
 #[tokio::test]
-#[ignore = "D05 reproduced: /openrouter/api/v1/messages bills 0 tokens (OpenAI extractor on an Anthropic body)"]
 async fn openrouter_messages_path_is_metered_with_the_anthropic_extractor() {
     let (pubkey, sk) = test_keypair(51);
     let json = MockUpstream::start(Mode::AnthropicJson).await;
@@ -55,7 +54,6 @@ async fn openrouter_messages_path_is_metered_with_the_anthropic_extractor() {
 /// claim: BIL-1
 /// defect: D05
 #[tokio::test]
-#[ignore = "D05 reproduced: an Anthropic stream on /openrouter/api/v1/messages bills an estimate, not message_start/message_delta"]
 async fn openrouter_messages_stream_is_metered_with_the_anthropic_extractor() {
     let (pubkey, sk) = test_keypair(52);
     let sse = MockUpstream::start(Mode::AnthropicSse).await;
