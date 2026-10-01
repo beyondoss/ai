@@ -17,10 +17,10 @@ impact = "Any tenant can list, read and DELETE other tenants' OpenAI files, stor
 confidence = "high"
 evidence = "proxy.rs:1700-1713, 3086-3111"
 claims = ["SEC-1"]
-state = "suspected"
-test = ""
-fix = ""
-note = ""
+state = "fixed"
+test = "a_managed_key_reaches_only_generation_endpoints_on_a_provider_route"
+fix = "5fb2c3a"
+note = "Fixed directly, without a reproduction step, by the managed endpoint allowlist."
 
 [[defect]]
 id = "D02"
@@ -31,10 +31,10 @@ impact = "GET /auto/v1/chat/completions reaches OpenAI as 'list stored chat comp
 confidence = "med-high"
 evidence = "proxy.rs:2115-2140; cache.rs key()"
 claims = ["SEC-2"]
-state = "suspected"
-test = ""
-fix = ""
-note = ""
+state = "fixed"
+test = "catalog_paths_take_post_only_from_a_managed_key"
+fix = "5fb2c3a"
+note = "Fixed directly, without a reproduction step: catalog paths are POST-only for managed keys."
 
 [[defect]]
 id = "D03"
