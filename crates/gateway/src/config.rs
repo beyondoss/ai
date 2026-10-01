@@ -346,9 +346,10 @@ pub struct AiConfig {
     /// of whose key is used. `0` disables the breaker entirely. Default is generous so normal
     /// background 5xx noise never trips it.
     pub circuit_breaker_threshold: u32,
-    /// Rolling window (seconds) over which `circuit_breaker_threshold` failures are counted. Failures
-    /// older than the window are forgotten — so it trips on a *burst* of failures, not on a slow trickle
-    /// spread across a healthy day.
+    /// Fixed window (seconds) over which `circuit_breaker_threshold` failures are counted. A window
+    /// starts at its first failure; the first failure after it ends starts a new one with every count
+    /// back at zero — so it trips on a *burst* of failures, not on a slow trickle spread across a
+    /// healthy day.
     pub circuit_breaker_window_secs: u64,
     /// How long the breaker stays open before allowing a half-open probe request (seconds). Long enough
     /// to let a provider recover, short enough that recovery is detected promptly.

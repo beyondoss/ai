@@ -35,7 +35,9 @@
 //!   failures are at least half of the outcomes recorded since the window's first failure. A
 //!   success does not erase the count, so a backend failing every other request (a partial
 //!   brownout) opens it; a busy healthy backend with background errors does not, because its
-//!   successes outnumber them. Outcomes outside the window are forgotten.
+//!   successes outnumber them. The window is fixed, not rolling: it starts at its first failure,
+//!   and the first failure after it expires starts a new one with both counts reset. The two
+//!   counts saturate at the same value, so a failure majority can always trip it.
 //!
 //! # Example
 //!
@@ -164,7 +166,8 @@ impl CircuitBreakerConfig {
 /// - Bits 62-63: State (0=closed, 1=open, 2=half-open)
 /// - Bits 48-61: Failure count (14 bits, max 16383)
 /// - Bits 32-47: Half-open permits remaining (16 bits) in HALF_OPEN. In CLOSED windowed mode, the
-///   successes recorded since the current window's first failure (saturating), which is what makes
+///   successes recorded since the current window's first failure (saturating at the failure count's
+///   14-bit cap, so failures can always catch up), which is what makes
 ///   the trip decision a failure *rate*.
 /// - Bits 0-31: Timestamp (seconds since a process-wide **monotonic** base — see
 ///   `CircuitBreaker::system_clock` — so it would take 136 years of process uptime to wrap). In
@@ -418,7 +421,9 @@ impl CircuitBreaker {
                 (STATE_CLOSED, FailurePolicy::Windowed { window, .. })
                     if now.saturating_sub(ts) < window.as_secs() =>
                 {
-                    if successes >= PERMIT_MASK {
+                    // Saturate at the failure count's own cap, not the field's: past it the
+                    // failures (14 bits) could never catch up, and the rate rule never trip.
+                    if successes >= FAILURE_MASK {
                         return;
                     }
                     Self::pack(STATE_CLOSED, failures, successes + 1, ts)
@@ -1257,7 +1262,6 @@ mod tests {
     /// claim: REL-6
     /// defect: D97
     #[test]
-    #[ignore = "D97 reproduced: successes count to 65535 but failures stop at 16383, so a busy window can never trip"]
     fn a_failure_majority_opens_a_window_with_more_successes_than_the_failure_count_holds() {
         let cb = CircuitBreaker::with_clock(
             CircuitBreakerConfig::windowed(3, Duration::from_secs(60))
