@@ -279,7 +279,10 @@ for the body's first bytes: a `200` whose body is an error object (OpenRouter's 
 as a failure, not a fast healthy sample (`settle_health`, at most 1 KiB read). A candidate whose **latest** attempt failed ranks behind every other
 candidate — unmeasured ones included — until it answers again or its sample goes stale (30s). That
 is what turns a client's own retry into a failover; see "Status-based failover, and where it stops". Unmeasured arms stay failover until a deterministic probe (every 8th
-request, skipping seq `0`) promotes one. A sample older than 30s is treated as unmeasured so a
+request, skipping seq `0`) promotes the first one that can be dispatched: an arm with no pool key
+here (Bedrock on a deployment without it) never gets a sample, so a probe that could pick it would
+pick it every time, `upstream_peer` would skip it, and a keyed arm behind it would never be
+measured (D119). A sample older than 30s is treated as unmeasured so a
 recovered arm is retried. Ranking reads the monotonic clock once per request and reuses that
 instant for every candidate's staleness check. `smart_router = false`
 restores static catalog order. Samples never leave the pod —

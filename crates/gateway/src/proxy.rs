@@ -3412,6 +3412,27 @@ impl ProxyHttp for AiProxy {
                     || control::Walk::identity(arms.len()),
                     |c| c.catalog_walk(arms, request_seq),
                 );
+                // Bit `orig` ⇒ `arms[orig]` can be sent to: registered here with a pool key, not
+                // skipped by a large-body re-run or held off by a key walk, and serving this
+                // sub-resource. Computed before ranking so the probe only promotes an arm that can
+                // actually take the request (D119); the usable mask below is this, by walk slot.
+                let mut dispatchable = 0u8;
+                for (orig, c) in arms.iter().enumerate().take(route::MAX_CANDIDATES) {
+                    let orig = orig as u8;
+                    let keyed = self
+                        .state
+                        .provider_by_id(c.provider)
+                        .is_some_and(|p| p.has_pool_key());
+                    // A re-run of a large body skips the candidates earlier attempts failed on,
+                    // and a key walk stays on its candidate.
+                    let failed = full_body.as_ref().is_some_and(|fb| {
+                        fb.skip & (1 << orig) != 0 || fb.only.is_some_and(|only| only != orig)
+                    });
+                    let serves = sub.is_none_or(|sub| sub.serves(c));
+                    if keyed && !failed && serves {
+                        dispatchable |= 1 << orig;
+                    }
+                }
                 if self.state.config.smart_router
                     && sub.is_none()
                     && std::ptr::eq(arms, row.candidates)
@@ -3424,7 +3445,7 @@ impl ProxyHttp for AiProxy {
                     let (ranked, pinned) =
                         self.state
                             .smart
-                            .rank(walk, row, request_seq, Some(affinity));
+                            .rank(walk, row, request_seq, Some(affinity), dispatchable);
                     walk = ranked;
                     if pinned {
                         self.state.metrics.session_pinned_total.inc();
@@ -3445,23 +3466,10 @@ impl ProxyHttp for AiProxy {
                 // later attempt reads this instead of re-deriving it.
                 let mut usable = 0u8;
                 for i in 0..walk.len {
-                    let Some(orig) = walk.catalog_index(i) else {
-                        continue;
-                    };
-                    let Some(c) = arms.get(usize::from(orig)) else {
-                        continue;
-                    };
-                    let keyed = self
-                        .state
-                        .provider_by_id(c.provider)
-                        .is_some_and(|p| p.has_pool_key());
-                    // A re-run of a large body skips the candidates earlier attempts failed on,
-                    // and a key walk stays on its candidate.
-                    let failed = full_body.as_ref().is_some_and(|fb| {
-                        fb.skip & (1 << orig) != 0 || fb.only.is_some_and(|only| only != orig)
-                    });
-                    let serves = sub.is_none_or(|sub| sub.serves(c));
-                    if keyed && !failed && serves {
+                    if walk
+                        .catalog_index(i)
+                        .is_some_and(|orig| dispatchable & (1 << orig) != 0)
+                    {
                         usable |= 1 << i;
                     }
                 }

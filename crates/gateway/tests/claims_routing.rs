@@ -147,3 +147,45 @@ async fn the_breaker_opens_on_a_broken_provider_and_recovers() {
         assert_eq!(byo().await.status().as_u16(), 200, "closed again, #{i}");
     }
 }
+
+/// The ranker's probe (every 8th request) measures a fallback the gateway can actually dispatch.
+/// A Claude row deployed without Bedrock is anthropic → bedrock (unkeyed) → openrouter: the probe
+/// must skip the unkeyed Bedrock arm and promote OpenRouter, or OpenRouter is never measured,
+/// ranked or pinned and only ever serves as failover.
+/// claim: R7
+/// defect: D119
+#[tokio::test]
+async fn the_probe_skips_an_unkeyed_candidate() {
+    let (pubkey, sk) = test_keypair(61);
+    let anthropic = MockUpstream::start(Mode::AnthropicJson).await;
+    let openrouter = MockUpstream::start(Mode::Json).await;
+    let gw = Gateway::builder(unused_nats_port(), &anthropic.authority(), &b64(&pubkey))
+        .providers(&["anthropic", "openrouter"])
+        .provider_authority("openrouter", &openrouter.authority())
+        .start()
+        .await;
+    let body = r#"{"model":"claude-haiku-4-5","messages":[{"role":"user","content":"hi"}]}"#;
+    // seq 0..=16, each from a fresh tenant so no session pin decides the primary. Seq 8 and 16
+    // are probe slots.
+    let mut served = Vec::new();
+    for t in 0..17 {
+        let resp = test_client()
+            .post(format!("{}/v1/chat/completions", gw.url()))
+            .header(
+                "authorization",
+                format!("Bearer {}", billing_vkey(&sk, 7000 + t)),
+            )
+            .header("content-type", "application/json")
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 200);
+        served.push(provider_of(&resp).unwrap_or_default());
+    }
+    assert_eq!(
+        served[8], "openrouter",
+        "the seq-8 probe lands on the keyed, unmeasured arm: {served:?}"
+    );
+    assert_eq!(anthropic.hits() + openrouter.hits(), 17);
+}

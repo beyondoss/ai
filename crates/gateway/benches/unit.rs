@@ -1129,6 +1129,7 @@ mod smart_rank {
                 black_box(row),
                 black_box(1),
                 black_box(Some(aff)),
+                black_box(u8::MAX),
             )
         });
     }
@@ -1150,6 +1151,7 @@ mod smart_rank {
                 black_box(row),
                 black_box(1),
                 black_box(Some(aff)),
+                black_box(u8::MAX),
             )
         });
     }
@@ -1171,6 +1173,7 @@ mod smart_rank {
                 black_box(row),
                 black_box(1),
                 black_box(Some(aff)),
+                black_box(u8::MAX),
             )
         });
     }
