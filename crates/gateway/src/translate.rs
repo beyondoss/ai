@@ -1992,6 +1992,13 @@ fn is_http_url(url: &str) -> bool {
     url.starts_with("https://") || url.starts_with("http://")
 }
 
+/// Whether a translated image or file URL may go upstream at all: an http(s) URL the upstream
+/// fetches, or inline data. Any other scheme (`file://`) names something on the client's machine
+/// and is never forwarded in any shape, on any wire pair.
+fn is_forwardable_url(url: &str) -> bool {
+    is_http_url(url) || url.starts_with("data:")
+}
+
 fn parse_data_uri(url: &str) -> Option<(&str, &str)> {
     let rest = url.strip_prefix("data:")?;
     let (meta, data) = rest.split_once(";base64,")?;
@@ -3468,7 +3475,7 @@ fn chat_content_to_responses(content: Option<&Value>, assistant: bool) -> Value 
                         "refusal": p.get("refusal").cloned().unwrap_or(json!("")),
                     })),
                     Some("refusal") => p.get("refusal").map(text),
-                    Some("image_url") => Some(chat_image_to_responses(p)),
+                    Some("image_url") => chat_image_to_responses(p),
                     Some("file") => {
                         let mut m = Map::new();
                         m.insert("type".into(), json!("input_file"));
@@ -3488,17 +3495,20 @@ fn chat_content_to_responses(content: Option<&Value>, assistant: bool) -> Value 
     }
 }
 
-fn chat_image_to_responses(p: &Value) -> Value {
+fn chat_image_to_responses(p: &Value) -> Option<Value> {
     let Some(url) = p.pointer("/image_url/url").and_then(Value::as_str) else {
-        return p.clone();
+        return Some(p.clone());
     };
+    if !is_forwardable_url(url) {
+        return None;
+    }
     let mut m = json!({ "type": "input_image", "image_url": url });
     if let Some(detail) = p.pointer("/image_url/detail")
         && let Some(obj) = m.as_object_mut()
     {
         obj.insert("detail".into(), detail.clone());
     }
-    m
+    Some(m)
 }
 
 /// A Chat Completions `tool` message → a Responses `function_call_output` (`custom_tool_call_output`
@@ -3953,6 +3963,9 @@ fn responses_part_to_openai(part: &Value) -> Option<Value> {
                 // for the provider to reject by name, not answered without the picture.
                 _ => return Some(part.clone()),
             };
+            if !is_forwardable_url(url) {
+                return None;
+            }
             let mut image_url = json!({ "url": url });
             if let (Some(d), Some(obj)) = (part.get("detail"), image_url.as_object_mut()) {
                 obj.insert("detail".into(), d.clone());
@@ -3963,8 +3976,13 @@ fn responses_part_to_openai(part: &Value) -> Option<Value> {
             }
             Some(m)
         }
-        // A `file_url` document has no Chat Completions `file` field: forwarded as-is.
-        "input_file" if part.get("file_url").is_some() => Some(part.clone()),
+        // A `file_url` document has no Chat Completions `file` field: forwarded as-is, unless it
+        // names a local file.
+        "input_file" if part.get("file_url").is_some() => part
+            .get("file_url")
+            .and_then(Value::as_str)
+            .is_none_or(is_forwardable_url)
+            .then(|| part.clone()),
         "input_file" => {
             let mut file = Map::new();
             for key in ["file_data", "file_id", "filename"] {
@@ -7238,6 +7256,34 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(v["messages"][0]["content"], "see");
+    }
+
+    /// The same between Responses and Chat Completions: a `file://` image or `file_url` document
+    /// is dropped, an https one is kept.
+    #[test]
+    fn local_file_urls_are_not_forwarded_from_responses() {
+        let resp = json!({
+            "model": "m",
+            "input": [{
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "see"},
+                    {"type": "input_image", "image_url": "file:///etc/passwd"},
+                    {"type": "input_file", "file_url": "file:///etc/shadow"},
+                    {"type": "input_file", "file_url": "https://example.com/q3.pdf"}
+                ]
+            }]
+        });
+        let chat: Value = serde_json::from_slice(&request(
+            Endpoint::Responses,
+            Endpoint::ChatCompletions,
+            &serde_json::to_vec(&resp).unwrap(),
+            OPUS,
+        ))
+        .unwrap();
+        let text = chat.to_string();
+        assert!(!text.contains("file://"), "{chat}");
+        assert!(text.contains("https://example.com/q3.pdf"), "{chat}");
     }
 
     #[test]

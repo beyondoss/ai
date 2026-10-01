@@ -553,8 +553,9 @@ back. Only records of a hosted tool the provider ran itself (`web_search_call`, 
 dropped: the client wrote none of it, and the answer that used it follows as a message. An explicit
 `null` (how OpenAI SDKs send an unset option) is "not set" and is never forwarded. Translation runs in `request_body_filter`, after the request headers went
 upstream, so the gateway cannot answer 400 itself; the field is passed through and the provider's
-400 names it (each verified live, 2026-09-30). A non-http(s) image URL (`file://`) is never
-forwarded in any shape. Hints that change nothing about the response's shape (`seed`, penalties,
+400 names it (each verified live, 2026-09-30). A non-http(s) image or file URL (`file://`) is never
+forwarded in any shape, on any wire pair (Chat Completions ↔ Responses included); inline `data:`
+URIs are not URLs and pass. Hints that change nothing about the response's shape (`seed`, penalties,
 `logit_bias`, `top_k`, a message's `name`) are dropped, and so are `prompt_cache_key`,
 `service_tier` and `verbosity` everywhere but OpenAI's own Chat Completions (which takes all three).
 Equivalents are mapped instead: legacy `functions` / `function_call` become the `tools` loop (a

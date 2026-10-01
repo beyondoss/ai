@@ -217,7 +217,6 @@ fn file_image() -> Value {
 /// claim: TRN-21
 /// defect: D68
 #[test]
-#[ignore = "D68 reproduced: a file:// image URL is forwarded on a Chat Completions -> Responses walk"]
 fn a_file_image_url_never_reaches_a_responses_upstream() {
     let v = translate(
         Endpoint::ChatCompletions,
