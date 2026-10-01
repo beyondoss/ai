@@ -87,6 +87,37 @@ const DEFAULT_MAX_TOKENS: u64 = 4096;
 /// let one upstream grow the gateway's memory without bound.
 pub const MAX_TRANSLATE_BUFFER: usize = 32 * 1024 * 1024;
 
+/// The most heap translating `body` onto another wire takes at its peak (D216): the parsed `Value`,
+/// the translated `Value` and the encoded output, bounded from the body's length and structure
+/// ([`peek::structure`], one pass, no parse) as
+/// `5 × len + 2048 × non-empty objects + 128 × structural tokens`.
+///
+/// Measured with divan's allocation profiler (`benches/unit.rs`, `translate_heap`: peak live bytes
+/// of `request`, 4 MiB bodies, 2026-10-01), on the shapes that cost a `Value` the most per byte:
+///
+/// | body                                                 | heap per byte | estimate |
+/// | ---------------------------------------------------- | ------------: | -------: |
+/// | one long string                                      |           4.0 |      5.0 |
+/// | Chat content parts `{"a":1}` (and Responses items)   |         249.2 |    309.0 |
+/// | Chat text parts `{"type":"text","text":"a"}`         |          76.9 |    104.6 |
+/// | Responses messages `{"role":"user","content":"hi"}`  |          65.8 |     89.0 |
+/// | Chat messages `{"role":"user","content":"hi"}`       |          44.9 |     89.0 |
+/// | tool schema of `{"a":1}` objects                     |         168.3 |    309.0 |
+/// | tool schema of numbers / empty arrays / `{}`         |    34.0 / 28.7 / 28.7 | 69 / 90 / 90 |
+/// | a 300,000-member object                              |          23.9 |     30.0 |
+///
+/// A string costs ~4 bytes per byte (its text in both `Value`s and the output). Everything else
+/// hangs off a node: a non-empty object costs 1.3-1.9 KiB across the two `Value`s (a `BTreeMap`
+/// leaf node each, ~0.6 KiB, plus its entries), any other node under 128 bytes. The estimate covers
+/// every measured shape; on an ordinary agent history it is ~2x the truth.
+pub fn translation_heap(body: &[u8]) -> usize {
+    let s = peek::structure(body);
+    body.len()
+        .saturating_mul(5)
+        .saturating_add(s.objects.saturating_mul(2048))
+        .saturating_add(s.tokens.saturating_mul(128))
+}
+
 /// Per-request translate state, boxed on [`crate::proxy`]'s model-routed path only.
 pub struct TranslateState {
     /// Inbound endpoint — what the client sent and what it must receive.
@@ -1249,13 +1280,14 @@ fn chat_tool_turn_lacks_reasoning(messages: &[Value]) -> bool {
 /// A same-wire Chat Completions body relayed to a Claude model on a Chat host, less its reasoning
 /// controls when its tool turn has no thinking to replay (see
 /// [`drop_unreplayable_chat_reasoning`]), and less its assistant messages' thinking when it asks
-/// for none (see [`drop_chat_reasoning_when_off`]). One `memmem` decides: a body that never
-/// mentions reasoning or thinking is returned untouched, unparsed. `upstream_model` is the id the
-/// candidate will receive.
+/// for none (see [`drop_chat_reasoning_when_off`]). Both rules read only keys that open with
+/// `"reasoning` or `"thinking` (`reasoning_effort`, `reasoning_details`, a `thinking` list) and
+/// `include_reasoning`, so a body that spells none of them as a quoted key prefix is returned
+/// untouched and unparsed: prose that says "reasoning" never does, since a quote inside a JSON
+/// string is escaped. `upstream_model` is the id the candidate will receive.
 pub fn claude_chat_relay_reasoning(body: Vec<u8>, upstream_model: &str) -> Vec<u8> {
-    if memchr::memmem::find(&body, b"reasoning").is_none()
-        && memchr::memmem::find(&body, b"thinking").is_none()
-    {
+    let says = |needle: &[u8]| memchr::memmem::find(&body, needle).is_some();
+    if !(says(b"\"reasoning") || says(b"\"thinking") || says(b"\"include_reasoning\"")) {
         return body;
     }
     let Ok(mut v) = serde_json::from_slice::<Value>(&body) else {
@@ -1660,39 +1692,41 @@ fn push_anth_message(messages: &mut Vec<Value>, role: &str, content: Value) {
     messages.push(json!({ "role": role, "content": content }));
 }
 
+/// Append `add` to `msg`'s content, in place. Each block moves once: a run of same-role messages
+/// merges in time linear in its length (copying the gathered blocks on every merge made a long run
+/// quadratic, D217).
 fn merge_content(msg: &mut Value, add: Value) {
-    let existing = msg.get_mut("content");
-    let Some(existing) = existing else {
+    let Some(existing) = msg.get_mut("content") else {
         msg["content"] = add;
         return;
     };
-    match (&*existing, &add) {
-        (Value::Array(a), Value::Array(b)) => {
-            let mut n = a.clone();
-            n.extend(b.iter().cloned());
-            *existing = Value::Array(n);
-        }
+    let text = |t: String| json!({ "type": "text", "text": t });
+    match (existing, add) {
+        (Value::Array(a), Value::Array(b)) => a.extend(b),
+        (Value::Array(a), Value::String(b)) => a.push(text(b)),
         // Two messages stay two blocks: fused, "Hello" + "World" would read "HelloWorld".
         // An empty side adds nothing (Messages rejects an empty text block).
-        (Value::String(a), Value::String(b)) if !b.is_empty() => {
+        (Value::String(_), Value::String(b)) if b.is_empty() => {}
+        (existing @ Value::String(_), Value::String(b)) => {
+            let Value::String(a) = std::mem::take(existing) else {
+                return;
+            };
             *existing = if a.is_empty() {
-                add.clone()
+                Value::String(b)
             } else {
-                json!([{ "type": "text", "text": a }, { "type": "text", "text": b }])
+                Value::Array(vec![text(a), text(b)])
             };
         }
-        (Value::String(_), Value::String(_)) => {}
-        (Value::String(a), Value::Array(b)) => {
-            let mut n = vec![json!({ "type": "text", "text": a })];
-            n.extend(b.iter().cloned());
+        (existing @ Value::String(_), Value::Array(b)) => {
+            let Value::String(a) = std::mem::take(existing) else {
+                return;
+            };
+            let mut n = Vec::with_capacity(b.len().saturating_add(1));
+            n.push(text(a));
+            n.extend(b);
             *existing = Value::Array(n);
         }
-        (Value::Array(a), Value::String(b)) => {
-            let mut n = a.clone();
-            n.push(json!({ "type": "text", "text": b }));
-            *existing = Value::Array(n);
-        }
-        _ => *existing = add,
+        (existing, add) => *existing = add,
     }
 }
 
@@ -2649,24 +2683,56 @@ fn copy_if(out: &mut Map<String, Value>, v: &Value, key: &str) {
 /// which translates rather than 400s. An `item_reference` input item that stands for an earlier
 /// turn is session state too (D175, [`turn_reference_in_input`]): a pointer into a store that a
 /// row with no Responses arm cannot resolve (the gateway stores no customer content). One inside a
-/// tool step is not: it is dropped. Unparseable JSON is `Some("store")` so a catalog walk
-/// fail-closes onto a real Responses arm rather than silently stripping session state.
+/// tool step is not: it is dropped. A body that is not one well-formed object is `Some("store")`
+/// so a catalog walk fail-closes onto a real Responses arm rather than silently stripping session
+/// state.
+///
+/// Read by span, never into a `Value` (D215): this runs on every Responses body before the walk,
+/// up to `MAX_REQUEST_BODY`, and a `Value` costs 10-250 bytes of heap per byte of JSON. Each field
+/// is the last of its key, as a provider's parser keeps it.
 pub fn responses_session_field(body: &[u8], responses_arm: bool) -> Option<&'static str> {
-    let Ok(v) = serde_json::from_slice::<Value>(body) else {
-        return Some("store");
+    const FAIL_CLOSED: Option<&str> = Some("store");
+    let Some(open) = peek::root_open(body) else {
+        return FAIL_CLOSED;
     };
-    if previous_response_id_set(&v) {
+    let (mut previous, mut conversation, mut store, mut input) = (None, None, None, None);
+    let mut members = peek::members(body, open);
+    for m in members.by_ref() {
+        let Some(m) = m else {
+            return FAIL_CLOSED;
+        };
+        if m.key_is(body, "previous_response_id") {
+            previous = Some(m.value);
+        } else if m.key_is(body, "conversation") {
+            conversation = Some(m.value);
+        } else if m.key_is(body, "store") {
+            store = Some(m.value);
+        } else if m.key_is(body, "input") {
+            input = Some(m.value);
+        }
+    }
+    let trailing = members.end().and_then(|end| body.get(end..));
+    if !trailing.is_some_and(|t| t.iter().all(u8::is_ascii_whitespace)) {
+        return FAIL_CLOSED;
+    }
+    let raw = |span: (usize, usize)| body.get(span.0..span.1).unwrap_or_default();
+    // An id string or `{"id": …}`; an empty id or `null` is not set.
+    let set =
+        |span: Option<(usize, usize)>| span.is_some_and(|s| !matches!(raw(s), b"null" | b"\"\""));
+    if set(previous) {
         return Some("previous_response_id");
     }
-    if conversation_set(&v) {
+    if set(conversation) {
         return Some("conversation");
     }
-    if turn_reference_in_input(&v) {
-        return Some("item_reference");
+    match input.map(|span| turn_reference_in_input(body, span)) {
+        Some(None) => return FAIL_CLOSED,
+        Some(Some(true)) => return Some("item_reference"),
+        _ => {}
     }
-    match v.get("store") {
-        Some(Value::Bool(false)) => None,
-        Some(Value::Null) | None => responses_arm.then_some("store"),
+    match store.map(raw) {
+        Some(b"false") => None,
+        Some(b"null") | None => responses_arm.then_some("store"),
         _ => Some("store"),
     }
 }
@@ -2683,26 +2749,59 @@ pub fn responses_session_field(body: &[u8], responses_arm: bool) -> Option<&'sta
 /// made the call, wherever in the run it sits: the call and its output say what that step did, so
 /// the reference is dropped (translation skips it, [`strip_item_references`] cuts it from a
 /// Responses relay). A reference in a step without a call is an earlier answer, a turn the model
-/// would answer without: `true`, refused. One pass over `input`, no allocation.
-fn turn_reference_in_input(v: &Value) -> bool {
-    let Some(items) = v.get("input").and_then(Value::as_array) else {
-        return false;
-    };
+/// would answer without: `true`, refused. `span` is `input`'s value; `None` when it is a malformed
+/// array. A `memmem` keeps an `input` that never says `item_reference` unwalked; otherwise one pass
+/// over its items by span, no allocation.
+fn turn_reference_in_input(body: &[u8], span: (usize, usize)) -> Option<bool> {
+    let region = body.get(span.0..span.1).unwrap_or_default();
+    if region.first() != Some(&b'[') || memchr::memmem::find(region, b"item_reference").is_none() {
+        return Some(false);
+    }
     let (mut refs, mut calls) = (false, false);
-    for item in items {
-        match item.get("type").and_then(Value::as_str) {
-            Some("item_reference") => refs = true,
-            Some("function_call" | "custom_tool_call") => calls = true,
-            Some("reasoning") => {}
-            _ => {
+    for item in peek::elements(body, span.0) {
+        let (start, _) = item?;
+        match item_type(body, start)? {
+            ItemKind::Reference => refs = true,
+            ItemKind::Call => calls = true,
+            ItemKind::Reasoning => {}
+            ItemKind::Other => {
                 if refs && !calls {
-                    return true;
+                    return Some(true);
                 }
                 (refs, calls) = (false, false);
             }
         }
     }
-    refs && !calls
+    Some(refs && !calls)
+}
+
+/// What a Responses `input` item is, for [`turn_reference_in_input`].
+enum ItemKind {
+    Reference,
+    Call,
+    Reasoning,
+    Other,
+}
+
+/// The kind of the `input` item starting at `start`, from its last `type` member, read by span.
+/// `None` when the item is a malformed object.
+fn item_type(body: &[u8], start: usize) -> Option<ItemKind> {
+    if body.get(start) != Some(&b'{') {
+        return Some(ItemKind::Other);
+    }
+    let Some(typ) = peek::last_member(body, start, "type")? else {
+        return Some(ItemKind::Other);
+    };
+    let is = |want: &str| peek::str_is(body, typ.value, want);
+    Some(if is("item_reference") {
+        ItemKind::Reference
+    } else if is("function_call") || is("custom_tool_call") {
+        ItemKind::Call
+    } else if is("reasoning") {
+        ItemKind::Reasoning
+    } else {
+        ItemKind::Other
+    })
 }
 
 /// The 400 for a Responses session field a row cannot honor. An `item_reference` also says how to
@@ -2716,23 +2815,6 @@ pub fn session_field_refusal(field: &str, model: &str) -> String {
         )
     } else {
         format!("{field} cannot be honored for {model} (no Responses upstream)")
-    }
-}
-
-/// A `conversation` is an id string or `{"id": …}`; an empty id or `null` is not set.
-fn conversation_set(v: &Value) -> bool {
-    match v.get("conversation") {
-        Some(Value::String(s)) => !s.is_empty(),
-        Some(Value::Null) | None => false,
-        Some(_) => true,
-    }
-}
-
-fn previous_response_id_set(v: &Value) -> bool {
-    match v.get("previous_response_id") {
-        Some(Value::String(s)) => !s.is_empty(),
-        Some(Value::Null) | None => false,
-        Some(_) => true,
     }
 }
 
@@ -4654,6 +4736,19 @@ const GATEWAY_SIGNATURE_PREFIX: &str = "rs_gw:";
 
 /// Whether a Responses input item is a `reasoning` item this gateway minted: our `rs_gw…` id
 /// (items minted before [`GATEWAY_SIGNATURE_PREFIX`]) or our prefix on its `encrypted_content`.
+/// [`is_gateway_reasoning`] for the item object at `start`, read by span: an item can be most of a
+/// 100 MiB body, and a `Value` of it would cost many times that (D215).
+fn is_gateway_reasoning_span(body: &[u8], start: usize) -> bool {
+    let field = |key: &str| peek::last_member(body, start, key).flatten();
+    let starts = |key: &str, prefix: &str| {
+        field(key)
+            .and_then(|m| peek::str_value(body, m.value))
+            .is_some_and(|v| v.starts_with(prefix))
+    };
+    field("type").is_some_and(|m| peek::str_is(body, m.value, "reasoning"))
+        && (starts("id", "rs_gw") || starts("encrypted_content", GATEWAY_SIGNATURE_PREFIX))
+}
+
 fn is_gateway_reasoning(item: &Value) -> bool {
     item.get("type").and_then(Value::as_str) == Some("reasoning")
         && (item
@@ -4684,23 +4779,7 @@ pub fn store_false(body: &mut Vec<u8>) -> bool {
     {
         return false;
     }
-    let had_others = members.len() > stores.len();
-    if !stores.is_empty() {
-        peek::remove_root_members(body, "store");
-    }
-    let Some(open) = body.iter().position(|b| !b.is_ascii_whitespace()) else {
-        return false;
-    };
-    if body[open] != b'{' {
-        return false;
-    }
-    let member: &[u8] = if had_others {
-        b"\"store\":false,"
-    } else {
-        b"\"store\":false"
-    };
-    body.splice(open + 1..open + 1, member.iter().copied());
-    true
+    peek::set_root_member(body, "store", b"false")
 }
 
 /// Cut every `item_reference` out of a Responses body walked onto a Responses candidate of a row
@@ -4726,16 +4805,15 @@ pub fn strip_item_references(body: &mut Vec<u8>) -> bool {
     let Some(items) = peek::array_elements(body, input.value.0) else {
         return false;
     };
+    // Each item's `type` by span: one item can be most of a 100 MiB body (D215).
     let refs: Vec<bool> = items
         .iter()
         .map(|&(s, e)| {
-            let item = &body[s..e];
-            memchr::memmem::find(item, NEEDLE).is_some()
-                && serde_json::from_slice::<Value>(item)
-                    .is_ok_and(|v| v.get("type").and_then(Value::as_str) == Some("item_reference"))
+            memchr::memmem::find(body.get(s..e).unwrap_or_default(), NEEDLE).is_some()
+                && matches!(item_type(body, s), Some(ItemKind::Reference))
         })
         .collect();
-    peek::remove_items(body, &items, |k| refs[k])
+    peek::remove_items(body, &items, |k| refs.get(k).copied().unwrap_or(false))
 }
 
 /// A body for a candidate that answers only streams (`providers::catalog::stream_only`, D147),
@@ -4757,27 +4835,10 @@ pub fn force_stream(body: &mut Vec<u8>, usage: bool) -> bool {
     {
         return false;
     }
-    let had_others = members
-        .iter()
-        .any(|m| !(m.key_is(body, "stream") || (usage && m.key_is(body, "stream_options"))));
-    peek::remove_root_members(body, "stream");
     if usage {
-        peek::remove_root_members(body, "stream_options");
+        peek::set_root_member(body, "stream_options", br#"{"include_usage":true}"#);
     }
-    let Some(open) = body.iter().position(|b| !b.is_ascii_whitespace()) else {
-        return false;
-    };
-    if body[open] != b'{' {
-        return false;
-    }
-    let member: &[u8] = match (usage, had_others) {
-        (true, true) => br#""stream":true,"stream_options":{"include_usage":true},"#,
-        (true, false) => br#""stream":true,"stream_options":{"include_usage":true}"#,
-        (false, true) => br#""stream":true,"#,
-        (false, false) => br#""stream":true"#,
-    };
-    body.splice(open + 1..open + 1, member.iter().copied());
-    true
+    peek::set_root_member(body, "stream", b"true")
 }
 
 /// A Chat Completions body for a host that does not read the `developer` role
@@ -4802,17 +4863,25 @@ pub fn developer_as_system(body: &mut Vec<u8>) -> bool {
     };
     let roles: Vec<(usize, usize)> = items
         .iter()
-        .filter(|(start, _)| body[*start] == b'{')
         .filter_map(|&(start, _)| {
-            let members = peek::object_members(body, start)?;
-            let role = members.iter().rev().find(|m| m.key_is(body, "role"))?;
-            (&body[role.value.0..role.value.1] == b"\"developer\"").then_some(role.value)
+            let role = peek::last_member(body, start, "role").flatten()?;
+            (body.get(role.value.0..role.value.1) == Some(b"\"developer\"")).then_some(role.value)
         })
         .collect();
-    for &(start, end) in roles.iter().rev() {
-        body.splice(start..end, b"\"system\"".iter().copied());
+    if roles.is_empty() {
+        return false;
     }
-    !roles.is_empty()
+    // One pass: a splice per role moved the whole tail each time.
+    let mut out = Vec::with_capacity(body.len());
+    let mut at = 0;
+    for &(start, end) in &roles {
+        out.extend_from_slice(body.get(at..start).unwrap_or_default());
+        out.extend_from_slice(b"\"system\"");
+        at = end;
+    }
+    out.extend_from_slice(body.get(at..).unwrap_or_default());
+    *body = out;
+    true
 }
 
 /// A Chat Completions body for a candidate whose thinking conflicts with tools
@@ -4849,21 +4918,8 @@ pub fn thinking_off_for_tools(body: &mut Vec<u8>, rule: providers::catalog::Tool
     if !off {
         return false;
     }
-    let had_others = members
-        .iter()
-        .any(|m| !(m.key_is(body, "reasoning") || m.key_is(body, "reasoning_effort")));
-    peek::remove_root_members(body, "reasoning");
     peek::remove_root_members(body, "reasoning_effort");
-    let Some(open) = body.iter().position(|b| !b.is_ascii_whitespace()) else {
-        return false;
-    };
-    let member: &[u8] = if had_others {
-        br#""reasoning":{"enabled":false},"#
-    } else {
-        br#""reasoning":{"enabled":false}"#
-    };
-    body.splice(open + 1..open + 1, member.iter().copied());
-    true
+    peek::set_root_member(body, "reasoning", br#"{"enabled":false}"#)
 }
 
 /// A same-wire Responses body, minus the `reasoning` items this gateway minted from Claude's
@@ -4895,12 +4951,11 @@ pub fn strip_gateway_reasoning(mut body: Vec<u8>) -> Vec<u8> {
     let ours: Vec<bool> = items
         .iter()
         .map(|&(s, e)| {
-            let item = &body[s..e];
-            memchr::memmem::find(item, b"rs_gw").is_some()
-                && serde_json::from_slice::<Value>(item).is_ok_and(|v| is_gateway_reasoning(&v))
+            memchr::memmem::find(body.get(s..e).unwrap_or_default(), b"rs_gw").is_some()
+                && is_gateway_reasoning_span(&body, s)
         })
         .collect();
-    peek::remove_items(&mut body, &items, |k| ours[k]);
+    peek::remove_items(&mut body, &items, |k| ours.get(k).copied().unwrap_or(false));
     body
 }
 
@@ -8613,7 +8668,11 @@ mod tests {
         let call = |id: &str| json!({"type": "function_call", "call_id": id, "name": "f", "arguments": "{}"});
         let out = |id: &str| json!({"type": "function_call_output", "call_id": id, "output": "ok"});
         let user = |t: &str| json!({"role": "user", "content": t});
-        let turn = |input: Vec<Value>| turn_reference_in_input(&json!({"input": input}));
+        let refused = |v: Value| {
+            responses_session_field(&serde_json::to_vec(&v).unwrap(), false)
+                == Some("item_reference")
+        };
+        let turn = |input: Vec<Value>| refused(json!({"store": false, "input": input}));
         // Turns: followed by a user message, at the end of input, alone, or before an output with
         // no call in its step.
         assert!(turn(vec![user("a"), r(), user("b")]));
@@ -8676,8 +8735,8 @@ mod tests {
         ]));
         // No reference, or no input array: nothing to refuse.
         assert!(!turn(vec![user("a"), call("c"), out("c")]));
-        assert!(!turn_reference_in_input(&json!({"input": "hi"})));
-        assert!(!turn_reference_in_input(&json!({})));
+        assert!(!refused(json!({"store": false, "input": "hi"})));
+        assert!(!refused(json!({"store": false})));
     }
 
     /// A Responses relay off a row with no Responses arm loses every `item_reference` and nothing

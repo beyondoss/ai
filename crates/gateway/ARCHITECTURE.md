@@ -431,6 +431,33 @@ the whole body before choosing, as a headerless walk always does. Then:
 
 A large body reaches the same checks in `relay_full_body`, which holds it whole.
 
+**Every admission check reads the body by span, never into a `serde_json::Value`** (D215). A body
+can be 100 MiB, and a `Value` costs 10-250 bytes of heap per byte of JSON (a `BTreeMap` node per
+object): an 8 MiB Responses history of tiny items raised the gateway's peak RSS by 870 MB through
+`responses_session_field` and the file check alone. The session check walks the root members
+(`peek::members`) and, only when `input` says `item_reference`, its items' `type`s
+(`peek::elements`, `peek::last_member`); a body whose root is not one well-formed object is still
+session state (fail closed). The image and file checks are gated on each type name as a quoted
+string (`"image_url"`, `"image"`, `"input_image"`; `"file"`, `"document"`, `"input_file"`), which
+prose never spells (a quote inside a JSON string is escaped), then a walk of the root members and a
+`"type"` scan of `messages` / `input` / `system` (`peek::has_typed_member`). The item edits of a
+Responses relay (`strip_item_references`, `strip_gateway_reasoning`) read each item's fields by
+span too. The same 8 MiB body now raises peak RSS by 17 MB, about two copies of itself
+(`tests/body_memory.rs`).
+
+**Translation is held to the body budget** (D216). Translating builds a `Value` of the body and
+another of the result, so its heap is bounded before it starts: `translate::translation_heap`
+counts the body's non-empty objects and structural tokens in one pass (`peek::structure`) and
+charges `5 × len + 2048 × objects + 128 × tokens`, a bound measured over the costliest shapes (one
+long string 4.0 bytes of heap per byte; `{"a":1}` parts 249; ordinary chat messages 45; see the
+table on the function). For a body past the replay buffer that charge is held in
+`max_buffered_body_bytes` for the translation step (`concurrency::BudgetHold`, released on drop):
+a body whose charge exceeds the whole budget is a 413 naming translation
+(`ai_rejections_total{reason="translate_too_large"}`), one that does not fit beside the bodies in
+flight is the budget's 503 with `Retry-After`. The request head may already be with the candidate;
+no body byte is. With the default 512 MiB budget a 16 MiB prompt (80 MiB charged) and a 2 MiB
+history of 65,536 messages (~180 MiB) translate; 4 MiB of `{"a":1}` items (~1.2 GiB) is refused.
+
 A stock OpenAI or Anthropic SDK pointed at `/v1` with `model` in the JSON body is `/auto` without
 the header. Same-wire failover is a byte relay — the gateway rewrites ids, not API shapes, across
 candidates in a row. When the inbound path names a different Chat Completions / Messages /
@@ -798,7 +825,9 @@ alongside `tools` (OpenAI 400s either without them; Messages and Responses accep
 `tool_choice` or `allowed_tools` nests its name the Chat Completions way and back; consecutive
 Responses `function_call` items become one assistant message (OpenAI rejects the split form),
 joined to that turn's text; consecutive same-role messages share one Messages turn, each keeping its
-own text block (two strings are never fused into one); an assistant refusal is text on Messages; a mid-conversation Anthropic
+own text block (two strings are never fused into one), merged in place so a long run costs time
+linear in its length (each merge copied the turn so far: 256 KiB of queued user turns took 4.4 s of
+CPU, D217); an assistant refusal is text on Messages; a mid-conversation Anthropic
 `system` message stays a Chat Completions `system` message in place; a Responses `developer`
 message stays `developer` on OpenAI's own API and becomes `system` on every other Chat Completions
 host (DeepSeek, Mistral, OpenRouter, … know no `developer` role; a same-wire Chat body gets the same off OpenAI and OpenRouter, see "`developer` off OpenAI"); tool `strict` crosses both
@@ -2610,7 +2639,7 @@ local plaintext mock.
 | `tcp_keepalive_idle_secs`       | `15`                              | TCP keepalive on upstream and client sockets: first probe after this many idle seconds; `0` disables.                                                                                                                                                                                                                                                                                                                                                                                   |
 | `tcp_keepalive_interval_secs`   | `5`                               | Seconds between keepalive probes.                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
 | `tcp_keepalive_count`           | `3`                               | Unanswered probes before the kernel drops the peer: a vanished host fails within idle + interval × count (30s). Upstream sockets also get `TCP_USER_TIMEOUT` of the same bound.                                                                                                                                                                                                                                                                                                         |
-| `max_buffered_body_bytes`       | `536870912` (512 MiB)             | Most request-body bytes the process holds at once. A catalog walk's body past the 64 KiB replay buffer reserves twice its size (its read, and the `FullBody` re-run's copy), a `/{provider}` usage-splice body its size; a declared length reserves before a byte is read, a chunked body as it grows. Over it → 503 with `Retry-After` (`ai_rejections_total{reason="body_memory"}`). Bodies within the replay buffer are not counted. `0` disables.                                   |
+| `max_buffered_body_bytes`       | `536870912` (512 MiB)             | Most request-body bytes the process holds at once. A catalog walk's body past the 64 KiB replay buffer reserves twice its size (its read, and the `FullBody` re-run's copy), a `/{provider}` usage-splice body its size; a declared length reserves before a byte is read, a chunked body as it grows. Over it → 503 with `Retry-After` (`ai_rejections_total{reason="body_memory"}`). Translating such a body also holds its measured heap (`translate::translation_heap`) for the step; more than the whole budget → 413 (`reason="translate_too_large"`). Bodies within the replay buffer are not counted. `0` disables. |
 | `shutdown_grace_period_secs`    | `600`                             | SIGTERM drain window for in-flight requests (= `read_timeout_secs` so a deploy never truncates a stream). An upper bound, not a wait: the process exits as soon as the last request context drops (its billing row written), so an idle gateway stops in well under a second. Capped by the orchestrator's stop timeout (ECS Fargate: 120s).                                                                                                                                            |
 | `shutdown_runtime_timeout_secs` | `10`                              | Final runtime-teardown backstop after the drain window.                                                                                                                                                                                                                                                                                                                                                                                                                                 |
 | `capture_max_bytes`             | `262144`                          | Per-direction cap on a captured payload; the default a per-tenant entry overrides. Bounded by the log pipeline's per-record limit. This and per-tenant values clamp to 4 MiB (`MAX_CAPTURE_BYTES`).                                                                                                                                                                                                                                                                                     |

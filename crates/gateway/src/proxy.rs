@@ -1724,6 +1724,40 @@ impl AiProxy {
         pingora_core::Error::new_str("translated response exceeds buffer limit")
     }
 
+    /// Hold, in the process body budget, the heap translating `body` will take
+    /// ([`translate::translation_heap`]) for as long as the hold lives (D216). A body past the
+    /// replay buffer only, like every other budget charge: smaller ones are bounded by concurrency.
+    /// Never exempt on a `FullBody` re-run, whose parent reserved two copies of the body, not the
+    /// `Value`s built from it. A translation that needs more than the whole budget is a 413 naming
+    /// translation; one that does not fit now is the budget's retryable 503. With the budget off
+    /// there is nothing to hold, and nothing is refused.
+    fn hold_translation_heap(
+        &self,
+        body: &[u8],
+    ) -> Result<Option<crate::concurrency::BudgetHold<'_>>> {
+        let Some(budget) = self.state.body_budget.as_ref() else {
+            return Ok(None);
+        };
+        if body.len() <= BODY_PEEK_LIMIT {
+            return Ok(None);
+        }
+        let heap = translate::translation_heap(body);
+        if heap > budget.limit() {
+            self.state
+                .metrics
+                .rejection(Rejection::TranslateTooLarge)
+                .inc();
+            return Err(gateway_error(413, TRANSLATE_TOO_LARGE).into_down());
+        }
+        match budget.hold(heap) {
+            Some(hold) => Ok(Some(hold)),
+            None => {
+                self.state.metrics.rejection(Rejection::BodyMemory).inc();
+                Err(gateway_error(503, "too many large request bodies in flight").into_down())
+            }
+        }
+    }
+
     async fn reply_cache_hit_boxed(
         session: &mut Session,
         request_id: &str,
@@ -2616,6 +2650,10 @@ fn default_retry_after(status: u16, msg: &str) -> Option<u64> {
 /// An error the gateway raises with the status and message the client should see. Carried in
 /// `ErrorType::CustomCode` so [`failure_response`] can answer with exactly this rather than a
 /// generic line for the status.
+/// The 413 for a body whose translation would take more heap than the whole body budget (D216).
+const TRANSLATE_TOO_LARGE: &str = "request body is too large to translate onto this model's API \
+     within the gateway's memory budget; send it on the model's own API, or send less";
+
 fn gateway_error(status: u16, msg: &'static str) -> Box<pingora_core::Error> {
     pingora_core::Error::new(pingora_core::ErrorType::CustomCode(msg, status))
 }
@@ -5341,6 +5379,9 @@ impl ProxyHttp for AiProxy {
                         t.tools = translate::ToolNames::default();
                         t.gateway_cache = false;
                         if t.client != to {
+                            // Translation builds `Value`s of the body: its heap is held in the
+                            // body budget for the step, or the body is refused (D216).
+                            let _heap = self.hold_translation_heap(&buf)?;
                             // The tool names this attempt's response maps calls back through, and
                             // whether its cache breakpoints are the gateway's (per attempt: a
                             // failover candidate on another wire re-decides both).

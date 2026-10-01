@@ -1692,6 +1692,40 @@ fn consecutive_user_messages_keep_their_text_apart() {
     );
 }
 
+/// A long run of same-role messages (queued user turns; an assistant turn whose parallel calls a
+/// client split across messages) merges in time linear in its length, and every message keeps its
+/// block. Each merge used to copy every block gathered so far: 256 KiB of user turns took 4.4 s of
+/// CPU in a release build, 1 MiB over a minute, all on one request.
+/// claim: TRN-3
+/// defect: D217
+#[test]
+fn a_long_run_of_same_role_messages_merges_in_linear_time() {
+    let users = vec![json!({"role": "user", "content": "hi"}); 6000];
+    let calls = vec![
+        json!({"role": "assistant", "content": null, "tool_calls": [
+            {"id": "c", "type": "function", "function": {"name": "f", "arguments": "{}"}}
+        ]});
+        3000
+    ];
+    let start = std::time::Instant::now();
+    let v = c2m(
+        &chat(json!({"messages": users.into_iter().chain(calls).collect::<Vec<_>>()})),
+        "claude-haiku-4-5",
+    );
+    let took = start.elapsed();
+    let blocks = |role: &str| -> usize {
+        v["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|m| m["role"] == role)
+            .map(|m| m["content"].as_array().map_or(1, Vec::len))
+            .sum()
+    };
+    assert_eq!((blocks("user"), blocks("assistant")), (6000, 3000));
+    assert!(took < std::time::Duration::from_secs(2), "took {took:?}");
+}
+
 /// A Chat client's `cache_control` on a whole assistant or tool message (the same message-level
 /// marker the gateway honours on user and system messages) must reach the Messages block it
 /// becomes. Placed mid-history, so the automatic last-message breakpoint cannot stand in for it.

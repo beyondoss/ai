@@ -1880,11 +1880,21 @@ impl Gateway {
 
     /// Resident set size of the gateway process, in KiB, from `/proc/<pid>/status`.
     pub fn rss_kib(&self) -> u64 {
+        self.proc_status_kib("VmRSS:")
+    }
+
+    /// The gateway process's peak resident set size so far (`VmHWM`), in KiB: a transient spike
+    /// that a later `rss_kib` sample would miss still shows here.
+    pub fn peak_rss_kib(&self) -> u64 {
+        self.proc_status_kib("VmHWM:")
+    }
+
+    fn proc_status_kib(&self, field: &str) -> u64 {
         let status = std::fs::read_to_string(format!("/proc/{}/status", self.child.id()))
             .unwrap_or_default();
         status
             .lines()
-            .find(|l| l.starts_with("VmRSS:"))
+            .find(|l| l.starts_with(field))
             .and_then(|l| l.split_whitespace().nth(1))
             .and_then(|v| v.parse().ok())
             .unwrap_or(0)

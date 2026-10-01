@@ -65,6 +65,32 @@ impl BodyBudget {
     pub fn used(&self) -> usize {
         self.used.load(Ordering::Acquire)
     }
+
+    /// The whole budget: a reservation larger than this can never be granted.
+    pub fn limit(&self) -> usize {
+        self.limit
+    }
+
+    /// Reserve `n` bytes for as long as the returned hold lives; `None` (nothing reserved) when that
+    /// would cross the limit. For memory held across one synchronous step, such as the `Value`s a
+    /// translation builds (`translate::translation_heap`, D216): the hold releases on drop, a panic
+    /// included.
+    pub fn hold(&self, n: usize) -> Option<BudgetHold<'_>> {
+        self.try_reserve(n)
+            .then_some(BudgetHold { budget: self, n })
+    }
+}
+
+/// Bytes reserved in a [`BodyBudget`] until dropped. See [`BodyBudget::hold`].
+pub struct BudgetHold<'a> {
+    budget: &'a BodyBudget,
+    n: usize,
+}
+
+impl Drop for BudgetHold<'_> {
+    fn drop(&mut self) {
+        self.budget.release(self.n);
+    }
 }
 
 /// Shard count. A power of two so the shard is a shift of a multiplicative hash. 64 shards keep

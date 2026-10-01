@@ -86,12 +86,16 @@ pub enum Rejection {
     /// A managed Responses request to a provider's store with no `id_signing_keys` configured:
     /// 503, fail-closed, rather than relaying ids every tenant could resolve.
     IdSigningUnset,
+    /// Translating this request body onto the candidate's API would take more heap than the whole
+    /// `max_buffered_body_bytes` budget (`translate::translation_heap`, D216). 413 before any
+    /// upstream.
+    TranslateTooLarge,
 }
 
 impl Rejection {
     /// Every variant, in `as_index` order. The array in `Metrics` is built from this, so adding a
     /// variant without adding it here fails the exhaustive `match` in `as_index`.
-    pub(crate) const ALL: [Rejection; 22] = [
+    pub(crate) const ALL: [Rejection; 23] = [
         Rejection::Auth,
         Rejection::DenySpend,
         Rejection::DenyFraud,
@@ -114,6 +118,7 @@ impl Rejection {
         Rejection::Modality,
         Rejection::ForeignId,
         Rejection::IdSigningUnset,
+        Rejection::TranslateTooLarge,
     ];
 
     /// The `reason=` label value. `RateLimit` keeps the original `"rate_limit"` string so existing
@@ -142,6 +147,7 @@ impl Rejection {
             Rejection::Modality => "modality",
             Rejection::ForeignId => "foreign_id",
             Rejection::IdSigningUnset => "id_signing_unset",
+            Rejection::TranslateTooLarge => "translate_too_large",
         }
     }
 
@@ -169,6 +175,7 @@ impl Rejection {
             Rejection::Modality => 19,
             Rejection::ForeignId => 20,
             Rejection::IdSigningUnset => 21,
+            Rejection::TranslateTooLarge => 22,
         }
     }
 }

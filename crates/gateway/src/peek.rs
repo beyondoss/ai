@@ -682,7 +682,10 @@ pub fn remove_root_members(body: &mut Vec<u8>, key: &str) -> bool {
 /// Whether a quoted JSON key containing escapes decodes to `want`. Only reached for a root key with a
 /// backslash in it, which real clients never send, so the allocation is off every ordinary path.
 fn escaped_key_is(quoted: &[u8], want: &str) -> bool {
-    serde_json::from_slice::<String>(quoted).is_ok_and(|k| k == want)
+    // A decoded byte takes at most six raw ones (`\u00XX`), plus the two quotes: a longer string
+    // cannot decode to `want`, and is not decoded (it may be a whole prompt).
+    let most = want.len().saturating_mul(6).saturating_add(2);
+    quoted.len() <= most && serde_json::from_slice::<String>(quoted).is_ok_and(|k| k == want)
 }
 
 // ---- Span edits ------------------------------------------------------------------------------------
@@ -862,15 +865,466 @@ pub fn remove_items(
             }
         }
     }
-    for &(s, e) in cuts.iter().rev() {
-        body.drain(s..e);
-    }
+    splice_out(body, &cuts);
     !cuts.is_empty()
+}
+
+/// Cut every `(start, end)` span (ascending, disjoint, in bounds) out of `body` in one pass: each
+/// kept byte moves at most once, so a body with many cuts (a long history of references, every
+/// `null` option) costs O(len), not a tail move per cut.
+fn splice_out(body: &mut Vec<u8>, cuts: &[(usize, usize)]) {
+    let mut write = match cuts.first() {
+        Some(&(s, _)) => s,
+        None => return,
+    };
+    for (k, &(_, end)) in cuts.iter().enumerate() {
+        let next = cuts.get(k.saturating_add(1)).map_or(body.len(), |c| c.0);
+        // Spans are ascending and disjoint (`remove_items` builds them in order): `end <= next`.
+        if end < next {
+            body.copy_within(end..next, write);
+            write = write.saturating_add(next.saturating_sub(end));
+        }
+    }
+    body.truncate(write);
+}
+
+// ---- Span reads without a DOM ----------------------------------------------------------------------
+//
+// The admission checks (session state, image and file parts, item references) read a handful of
+// fields out of bodies up to `MAX_REQUEST_BODY`. A `serde_json::Value` of such a body costs 10-80
+// bytes of heap per byte of JSON (a `BTreeMap` node per object), so one 90 MiB request could take
+// gigabytes. These walk spans instead: no allocation beyond the caller's own, O(len) time.
+
+/// The members of the object whose `{` is at `open`, in order, one at a time: `Some(member)` per
+/// member, then `None` once if the object is malformed (after which the iterator ends). See
+/// [`members`].
+pub struct Members<'a> {
+    b: &'a [u8],
+    at: usize,
+    first: bool,
+    done: bool,
+    close: Option<usize>,
+}
+
+/// Iterate the members of the object whose `{` is at `open` without collecting them.
+pub fn members(b: &[u8], open: usize) -> Members<'_> {
+    Members {
+        b,
+        at: open.saturating_add(1),
+        first: true,
+        done: b.get(open) != Some(&b'{'),
+        close: None,
+    }
+}
+
+impl Members<'_> {
+    /// Offset just past the closing `}`, once the iterator has reached it.
+    pub fn end(&self) -> Option<usize> {
+        self.close
+    }
+
+    /// The next member; `Ok(None)` at the closing brace, `Err(())` on malformed JSON.
+    fn step(&mut self) -> Result<Option<Member>, ()> {
+        let b = self.b;
+        let mut i = skip_ws(b, self.at);
+        if std::mem::take(&mut self.first) {
+            if b.get(i) == Some(&b'}') {
+                self.close = Some(i.saturating_add(1));
+                return Ok(None);
+            }
+        } else {
+            match b.get(i) {
+                Some(b',') => i = skip_ws(b, i.saturating_add(1)),
+                Some(b'}') => {
+                    self.close = Some(i.saturating_add(1));
+                    return Ok(None);
+                }
+                _ => return Err(()),
+            }
+        }
+        if b.get(i) != Some(&b'"') {
+            return Err(());
+        }
+        let key_end = string_end(b, i).ok_or(())?;
+        let key = (i.saturating_add(1), key_end.saturating_sub(1));
+        i = skip_ws(b, key_end);
+        if b.get(i) != Some(&b':') {
+            return Err(());
+        }
+        let start = skip_ws(b, i.saturating_add(1));
+        let end = value_end(b, start).ok_or(())?;
+        self.at = end;
+        Ok(Some(Member {
+            key,
+            value: (start, end),
+        }))
+    }
+}
+
+impl Iterator for Members<'_> {
+    type Item = Option<Member>;
+
+    fn next(&mut self) -> Option<Option<Member>> {
+        if self.done {
+            return None;
+        }
+        match self.step() {
+            Ok(Some(m)) => Some(Some(m)),
+            Ok(None) => {
+                self.done = true;
+                None
+            }
+            Err(()) => {
+                self.done = true;
+                Some(None)
+            }
+        }
+    }
+}
+
+/// The elements of the array whose `[` is at `open`, one span at a time, as [`Members`] yields
+/// members: `Some(span)` per element, then `None` once if the array is malformed.
+pub struct Elements<'a> {
+    b: &'a [u8],
+    at: usize,
+    first: bool,
+    done: bool,
+}
+
+/// Iterate the elements of the array whose `[` is at `open` without collecting them.
+pub fn elements(b: &[u8], open: usize) -> Elements<'_> {
+    Elements {
+        b,
+        at: open.saturating_add(1),
+        first: true,
+        done: b.get(open) != Some(&b'['),
+    }
+}
+
+impl Elements<'_> {
+    fn step(&mut self) -> Result<Option<(usize, usize)>, ()> {
+        let b = self.b;
+        let mut i = skip_ws(b, self.at);
+        if std::mem::take(&mut self.first) {
+            if b.get(i) == Some(&b']') {
+                return Ok(None);
+            }
+        } else {
+            match b.get(i) {
+                Some(b',') => i = skip_ws(b, i.saturating_add(1)),
+                Some(b']') => return Ok(None),
+                _ => return Err(()),
+            }
+        }
+        let end = value_end(b, i).ok_or(())?;
+        self.at = end;
+        Ok(Some((i, end)))
+    }
+}
+
+impl Iterator for Elements<'_> {
+    type Item = Option<(usize, usize)>;
+
+    fn next(&mut self) -> Option<Option<(usize, usize)>> {
+        if self.done {
+            return None;
+        }
+        match self.step() {
+            Ok(Some(span)) => Some(Some(span)),
+            Ok(None) => {
+                self.done = true;
+                None
+            }
+            Err(()) => {
+                self.done = true;
+                Some(None)
+            }
+        }
+    }
+}
+
+/// Offset of the root object's `{`, when the body (past leading whitespace) is an object.
+pub fn root_open(b: &[u8]) -> Option<usize> {
+    let open = skip_ws(b, 0);
+    (b.get(open) == Some(&b'{')).then_some(open)
+}
+
+/// The last member keyed `key` (as a provider's parser keeps it) of the object whose `{` is at
+/// `open`: `Some(None)` when it has none, `None` when `open` is not a well-formed object.
+pub fn last_member(b: &[u8], open: usize, key: &str) -> Option<Option<Member>> {
+    if b.get(open) != Some(&b'{') {
+        return None;
+    }
+    let mut last = None;
+    for m in members(b, open) {
+        let m = m?;
+        if m.key_is(b, key) {
+            last = Some(m);
+        }
+    }
+    Some(last)
+}
+
+/// The JSON string at `span` (its quotes included), decoded: borrowed when it carries no escape,
+/// otherwise decoded once. `None` when `span` is not a string.
+pub fn str_value(b: &[u8], span: (usize, usize)) -> Option<std::borrow::Cow<'_, str>> {
+    match b.get(span.0..span.1)? {
+        [b'"', inner @ .., b'"'] if !inner.contains(&b'\\') => std::str::from_utf8(inner)
+            .ok()
+            .map(std::borrow::Cow::Borrowed),
+        quoted @ [b'"', .., b'"'] => serde_json::from_slice::<String>(quoted)
+            .ok()
+            .map(std::borrow::Cow::Owned),
+        _ => None,
+    }
+}
+
+/// Whether the JSON string at `span` (its quotes included) decodes to `want`. A raw compare, unless
+/// the string carries an escape, which a provider's parser decodes and so must we; only then is it
+/// decoded, and only when its length could still match.
+pub fn str_is(b: &[u8], span: (usize, usize), want: &str) -> bool {
+    let Some(quoted) = b.get(span.0..span.1) else {
+        return false;
+    };
+    match quoted {
+        [b'"', inner @ .., b'"'] if !inner.contains(&b'\\') => inner == want.as_bytes(),
+        [b'"', .., b'"'] => escaped_key_is(quoted, want),
+        _ => false,
+    }
+}
+
+/// Whether a `"type"` member anywhere inside `span` has a string value that is one of `types`: an
+/// image or file content part, at any depth (tool results included).
+///
+/// No walk of the structure: in valid JSON every `"` not escaped by an odd run of backslashes is a
+/// string delimiter, and string contents never hold one, so the bytes `"type"`, `:`, `"<value>"`
+/// with an unescaped opening quote are exactly a member `type: <value>`. The scan is one `memmem`
+/// pass plus O(1) per hit. A key or value spelled with escapes (`"type"`) is not read as one;
+/// no client sends them. A part that names its type twice counts if either is listed: refused, or
+/// steered, rather than guessed at.
+pub fn has_typed_member(b: &[u8], span: (usize, usize), types: &[&str]) -> bool {
+    const KEY: &[u8] = b"\"type\"";
+    let Some(region) = b.get(span.0..span.1) else {
+        return false;
+    };
+    memchr::memmem::find_iter(region, KEY).any(|at| {
+        let at = span.0.saturating_add(at);
+        if escaped_at(b, at) {
+            return false;
+        }
+        let colon = skip_ws(b, at.saturating_add(KEY.len()));
+        if b.get(colon) != Some(&b':') {
+            return false;
+        }
+        let open = skip_ws(b, colon.saturating_add(1));
+        if b.get(open) != Some(&b'"') || open >= span.1 {
+            return false;
+        }
+        string_end(b, open).is_some_and(|end| types.iter().any(|t| str_is(b, (open, end), t)))
+    })
+}
+
+/// Whether the byte at `at` is escaped: preceded by an odd run of backslashes.
+fn escaped_at(b: &[u8], at: usize) -> bool {
+    let before = b.get(..at).unwrap_or_default();
+    before.iter().rev().take_while(|&&c| c == b'\\').count() % 2 == 1
+}
+
+/// Replace every root member keyed `key` (escaped spellings included) with one `"key":value`, placed
+/// first; every other byte stays as sent. `key` must need no escaping, and `value` must be one JSON
+/// value. `false`, untouched, when the root is not a well-formed object.
+pub fn set_root_member(body: &mut Vec<u8>, key: &str, value: &[u8]) -> bool {
+    let Some(found) = root_members(body) else {
+        return false;
+    };
+    let spans: Vec<(usize, usize)> = found.iter().map(Member::span).collect();
+    let hit: Vec<bool> = found.iter().map(|m| m.key_is(body, key)).collect();
+    let had_others = hit.iter().any(|h| !h);
+    remove_items(body, &spans, |k| hit.get(k).copied().unwrap_or(false));
+    // Still an object: only whole members were cut, never its braces.
+    let Some(open) = root_open(body) else {
+        return false;
+    };
+    let mut member = Vec::with_capacity(key.len().saturating_add(value.len()).saturating_add(4));
+    member.push(b'"');
+    member.extend_from_slice(key.as_bytes());
+    member.extend_from_slice(b"\":");
+    member.extend_from_slice(value);
+    if had_others {
+        member.push(b',');
+    }
+    let at = open.saturating_add(1);
+    body.splice(at..at, member);
+    true
+}
+
+/// What a `serde_json::Value` of a body would hold, counted from its bytes without parsing it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Structure {
+    /// Objects with at least one member: each costs a `BTreeMap` node in a `Value`.
+    pub objects: usize,
+    /// Every `{`, `[`, `,` and `:` outside a string. Each value past the first is announced by one
+    /// (a member's key and value by the `,` or `{` before it and its `:`), so this bounds the
+    /// values, keys and strings the `Value` would hold.
+    pub tokens: usize,
+}
+
+/// [`Structure`] of `b`, in one pass: string contents are skipped with `memchr`.
+pub fn structure(b: &[u8]) -> Structure {
+    let mut s = Structure::default();
+    let mut i = 0usize;
+    while let Some(rest) = b.get(i..) {
+        let q = memchr::memchr(b'"', rest).map_or(b.len(), |q| i.saturating_add(q));
+        for (at, &c) in b.get(i..q).unwrap_or_default().iter().enumerate() {
+            if !matches!(c, b'{' | b'[' | b',' | b':') {
+                continue;
+            }
+            s.tokens = s.tokens.saturating_add(1);
+            // An object is empty when only whitespace stands between its braces.
+            let next = skip_ws(b, i.saturating_add(at).saturating_add(1));
+            if c == b'{' && b.get(next) != Some(&b'}') {
+                s.objects = s.objects.saturating_add(1);
+            }
+        }
+        match string_end(b, q) {
+            Some(end) => i = end,
+            None => break,
+        }
+    }
+    s
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The iterators agree with the collecting walks, end at the closing bracket, and report a
+    /// malformed container once.
+    #[test]
+    fn members_and_elements_walk_without_collecting() {
+        let b = br#" { "a" : [1, {"b":2}, "x\"]"] , "c":{} } "#;
+        let open = root_open(b).unwrap();
+        let mut it = members(b, open);
+        let got: Vec<Member> = it.by_ref().map(Option::unwrap).collect();
+        assert_eq!(got, object_members(b, open).unwrap());
+        assert_eq!(it.end(), Some(b.len() - 1));
+        let arr = got[0].value.0;
+        let spans: Vec<(usize, usize)> = elements(b, arr).map(Option::unwrap).collect();
+        assert_eq!(spans, array_elements(b, arr).unwrap());
+        assert_eq!(members(b"{}", 0).count(), 0);
+        assert_eq!(elements(b"[ ]", 0).count(), 0);
+        for bad in [
+            &br#"{"a":1 "b":2}"#[..],
+            br#"{"a"}"#,
+            br#"{"a":1,"#,
+            b"{1:2}",
+        ] {
+            let items: Vec<Option<Member>> = members(bad, 0).collect();
+            assert_eq!(
+                items.last(),
+                Some(&None),
+                "{}",
+                String::from_utf8_lossy(bad)
+            );
+        }
+        assert_eq!(elements(b"[1 2]", 0).last(), Some(None));
+        assert_eq!(members(b"[1]", 0).count(), 0, "not an object");
+    }
+
+    #[test]
+    fn last_member_and_str_reads() {
+        let b = br#"{"type":"a","type":"image","n":null}"#;
+        let m = last_member(b, 0, "type").unwrap().unwrap();
+        assert!(str_is(b, m.value, "image"));
+        assert_eq!(str_value(b, m.value).as_deref(), Some("image"));
+        assert_eq!(last_member(b, 0, "none"), Some(None));
+        assert_eq!(last_member(b"[1]", 0, "type"), None);
+        let n = last_member(b, 0, "n").unwrap().unwrap();
+        assert!(!str_is(b, n.value, "null"));
+        assert_eq!(str_value(b, n.value), None);
+        // A string far longer than the name is not decoded to be compared.
+        let long = format!(r#"{{"k":"{}"}}"#, "\\u0041".repeat(10_000));
+        let m = last_member(long.as_bytes(), 0, "k").unwrap().unwrap();
+        assert!(!str_is(long.as_bytes(), m.value, "A"));
+    }
+
+    /// A `"type"` member is found at any depth inside the span, never inside a string, and only
+    /// with one of the listed values.
+    #[test]
+    fn has_typed_member_reads_only_real_type_members() {
+        let types = ["image_url", "image"];
+        let hit = |b: &[u8]| has_typed_member(b, (0, b.len()), &types);
+        assert!(hit(
+            br#"[{"type":"text"},{"content":[{"type" : "image", "x":1}]}]"#
+        ));
+        assert!(hit(br#"{"type":"image_url"}"#));
+        assert!(!hit(br#"[{"type":"text","text":"\"type\":\"image\""}]"#));
+        assert!(!hit(
+            br#"[{"type":"text","text":"say \\"},{"type":"input_image"}]"#
+        ));
+        assert!(!hit(br#"[{"name":"type","value":"image"}]"#));
+        assert!(!hit(br#"[{"type":"images"}]"#));
+        // A string ending in an escaped backslash leaves the next quote unescaped.
+        assert!(hit(br#"[{"text":"a\\","type":"image"}]"#));
+    }
+
+    /// The one root-member splice behind `store_false`, `force_stream` and
+    /// `thinking_off_for_tools`: every member under the key goes, one goes first, the rest of the
+    /// bytes stay as sent.
+    #[test]
+    fn set_root_member_replaces_every_spelling_and_keeps_the_rest() {
+        let set = |body: &str, key: &str, value: &str| {
+            let mut b = body.as_bytes().to_vec();
+            let changed = set_root_member(&mut b, key, value.as_bytes());
+            (changed, String::from_utf8(b).unwrap())
+        };
+        assert_eq!(
+            set(
+                r#" {"a":1, "store":true,"b" : [2],"store":null}"#,
+                "store",
+                "false"
+            ),
+            (true, r#" {"store":false,"a":1, "b" : [2]}"#.to_owned())
+        );
+        assert_eq!(
+            set(r#"{"store":true}"#, "store", "false"),
+            (true, r#"{"store":false}"#.to_owned())
+        );
+        assert_eq!(set("{}", "s", "true"), (true, r#"{"s":true}"#.to_owned()));
+        assert_eq!(set("[1]", "s", "true"), (false, "[1]".to_owned()));
+        assert_eq!(set(r#"{"a":"#, "s", "true"), (false, r#"{"a":"#.to_owned()));
+    }
+
+    /// Many cuts cost one pass, and land exactly where `remove_items` asked.
+    #[test]
+    fn remove_items_cuts_many_items_in_one_pass() {
+        let items: Vec<String> = (0..2000).map(|i| format!(r#"{{"k":{i}}}"#)).collect();
+        let mut body = format!("[{}]", items.join(",")).into_bytes();
+        let spans = array_elements(&body, 0).unwrap();
+        assert!(remove_items(&mut body, &spans, |k| k % 3 != 1));
+        let want: Vec<&String> = items.iter().skip(1).step_by(3).collect();
+        let want = format!(
+            "[{}]",
+            want.iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        assert_eq!(String::from_utf8(body).unwrap(), want);
+    }
+
+    #[test]
+    fn structure_counts_objects_and_tokens_outside_strings() {
+        assert_eq!(
+            structure(br#"{"a":[1,{"b":"{[,:]}"},{ },[]]}"#),
+            Structure {
+                objects: 2,
+                tokens: 10
+            }
+        );
+        assert_eq!(structure(b""), Structure::default());
+        assert_eq!(structure(br#""unterminated {"#), Structure::default());
+    }
 
     /// Only a root member whose value is the literal `null` is removed (D101): not a string that
     /// starts with `n`, not a nested `null`, not a role named user.

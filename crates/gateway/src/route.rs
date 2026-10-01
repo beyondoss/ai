@@ -473,31 +473,52 @@ pub fn refused_input(row: &ModelRoute, body: &[u8]) -> Option<&'static str> {
 }
 
 /// An image content part anywhere in the conversation: Chat Completions `image_url`, Messages
-/// `image` (tool results included), Responses `input_image`. The body is parsed only when it
-/// contains the bytes `image` at all.
+/// `image` (tool results included), Responses `input_image`.
 fn carries_image(body: &[u8]) -> bool {
-    fn walk(v: &serde_json::Value) -> bool {
-        match v {
-            serde_json::Value::Array(a) => a.iter().any(walk),
-            serde_json::Value::Object(o) => {
-                matches!(
-                    o.get("type").and_then(serde_json::Value::as_str),
-                    Some("image_url" | "image" | "input_image")
-                ) || o.values().any(walk)
-            }
-            _ => false,
-        }
-    }
-    if memchr::memmem::find(body, b"image").is_none() {
+    carries_part(
+        body,
+        &["image_url", "image", "input_image"],
+        &[b"\"image_url\"", b"\"image\"", b"\"input_image\""],
+        &["messages", "input", "system"],
+    )
+}
+
+/// Whether a content part whose `type` is one of `types` sits anywhere under one of the root
+/// `keys` (the last of each, as a provider's parser keeps it).
+///
+/// Read by span, never into a `Value` (D215): this runs on catalog-walk bodies up to
+/// `MAX_REQUEST_BODY` before any upstream, and a `Value` costs 10-250 bytes of heap per byte of
+/// JSON. The gate is each type name as a quoted string (`quoted`, the same names in quotes): prose
+/// that mentions an image or a file never spells one, since a quote inside a JSON string is
+/// escaped, so a body without one is answered by `memmem` alone. Past the gate, one walk of the
+/// root members and a `"type"` scan of the chosen values ([`crate::peek::has_typed_member`]). A
+/// body whose root is not one object carries nothing, as an unparseable one did.
+fn carries_part(body: &[u8], types: &[&str], quoted: &[&[u8]], keys: &[&str]) -> bool {
+    if !quoted
+        .iter()
+        .any(|q| memchr::memmem::find(body, q).is_some())
+    {
         return false;
     }
-    let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) else {
+    let Some(open) = crate::peek::root_open(body) else {
         return false;
     };
-    ["messages", "input", "system"]
+    // At most three keys: the last span of each.
+    let mut spans = [None; 3];
+    for m in crate::peek::members(body, open) {
+        let Some(m) = m else {
+            return false;
+        };
+        for (span, key) in spans.iter_mut().zip(keys) {
+            if m.key_is(body, key) {
+                *span = Some(m.value);
+            }
+        }
+    }
+    spans
         .iter()
-        .filter_map(|k| v.get(k))
-        .any(walk)
+        .flatten()
+        .any(|&span| crate::peek::has_typed_member(body, span, types))
 }
 
 /// Catalog indices (bit per index) of `arms` that cannot serve `body`: Bedrock candidates when the
@@ -527,32 +548,14 @@ pub fn unserved(arms: &[Candidate], body: &[u8]) -> u8 {
 }
 
 /// A file content part anywhere in the conversation: Chat Completions `file`, Messages
-/// `document` (tool results included), Responses `input_file`. The body is parsed only when it
-/// contains one of those type names at all.
+/// `document` (tool results included), Responses `input_file`. See [`carries_part`].
 fn carries_file(body: &[u8]) -> bool {
-    fn walk(v: &serde_json::Value) -> bool {
-        match v {
-            serde_json::Value::Array(a) => a.iter().any(walk),
-            serde_json::Value::Object(o) => {
-                matches!(
-                    o.get("type").and_then(serde_json::Value::as_str),
-                    Some("file" | "document" | "input_file")
-                ) || o.values().any(walk)
-            }
-            _ => false,
-        }
-    }
-    let finder = |n: &[u8]| memchr::memmem::find(body, n).is_some();
-    if !(finder(b"\"file\"") || finder(b"\"document\"") || finder(b"\"input_file\"")) {
-        return false;
-    }
-    let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) else {
-        return false;
-    };
-    ["messages", "input"]
-        .iter()
-        .filter_map(|k| v.get(k))
-        .any(walk)
+    carries_part(
+        body,
+        &["file", "document", "input_file"],
+        &[b"\"file\"", b"\"document\"", b"\"input_file\""],
+        &["messages", "input"],
+    )
 }
 
 /// One precomputed managed auth value: the formatted secret plus, when the bytes are header-safe,
