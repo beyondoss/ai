@@ -1971,3 +1971,63 @@ fn stripping_gateway_reasoning_changes_only_the_stripped_items() {
         other.into_bytes()
     );
 }
+
+/// The message carrying `role` in a translated body's `messages` / `input`, if any.
+fn with_role<'a>(v: &'a Value, list: &str, role: &str) -> Option<&'a Value> {
+    v[list]
+        .as_array()?
+        .iter()
+        .find(|m| m.get("role").and_then(Value::as_str) == Some(role))
+}
+
+/// A message whose role no dialect has (a typo, a framework's private role) is forwarded whole,
+/// in place, with its role unchanged, so the provider's 400 names it, as it does called directly.
+/// It never becomes user speech the model answers.
+/// claim: T6, TRN-21
+/// defect: D103
+#[test]
+#[ignore = "D103 reproduced: Chat Completions onto Messages turns an unknown role into a user turn"]
+fn an_unknown_role_is_forwarded_onto_messages() {
+    let body = chat(json!({"messages": [
+        {"role": "user", "content": "hi"},
+        {"role": "robot", "content": "Say OK."},
+    ]}));
+    let out = c2m(&body, "claude-haiku-4-5");
+    let m = with_role(&out, "messages", "robot").unwrap_or_else(|| panic!("{out}"));
+    assert_eq!(m["content"], "Say OK.", "{out}");
+    assert_eq!(out["messages"].as_array().unwrap().len(), 2, "in place: {out}");
+    // Responses onto Messages walks the same mapping.
+    let r = json!({"model": "m", "input": [{"role": "robot", "content": "Say OK."}]});
+    let out = req(Endpoint::Responses, Endpoint::Messages, &r, "claude-haiku-4-5");
+    assert!(with_role(&out, "messages", "robot").is_some(), "{out}");
+}
+
+/// claim: T6, TRN-21
+/// defect: D103
+#[test]
+#[ignore = "D103 reproduced: Messages onto Chat Completions turns an unknown role into a user turn"]
+fn an_unknown_role_is_forwarded_onto_chat() {
+    let body = anth(json!({"messages": [
+        {"role": "user", "content": "hi"},
+        {"role": "robot", "content": "Say OK."},
+    ]}));
+    let out = m2c(&body, "gpt-5-mini");
+    let m = with_role(&out, "messages", "robot").unwrap_or_else(|| panic!("{out}"));
+    assert_eq!(m["content"], "Say OK.", "{out}");
+    assert_eq!(out["messages"][1]["role"], "robot", "in place: {out}");
+}
+
+/// claim: T6, TRN-21
+/// defect: D103
+#[test]
+#[ignore = "D103 reproduced: Chat Completions onto Responses turns an unknown role into a user turn"]
+fn an_unknown_role_is_forwarded_onto_responses() {
+    let body = chat(json!({"messages": [
+        {"role": "user", "content": "hi"},
+        {"role": "robot", "content": "Say OK."},
+    ]}));
+    let out = c2r(&body, "gpt-5-mini");
+    let m = with_role(&out, "input", "robot").unwrap_or_else(|| panic!("{out}"));
+    assert_eq!(m["content"], "Say OK.", "{out}");
+    assert_eq!(out["input"][1]["role"], "robot", "in place: {out}");
+}

@@ -1445,8 +1445,8 @@ impact = "A message whose role no dialect has (a typo, a framework's private rol
 confidence = "high"
 evidence = "Differential parity, reproduced in two full runs (2026-10-01, seed 1): T6+TRN-21::raw::chat-to-claude::parity_error_role, ::responses-to-claude::parity_error_role and ::messages-to-gpt::parity_error_role (stream and not) — direct 400, gateway 200. Minimized: POST /v1/chat/completions {\"model\":\"claude-haiku-4-5\",\"max_tokens\":20,\"messages\":[{\"role\":\"robot\",\"content\":\"Say OK.\"}]} through the gateway -> 200 {\"choices\":[{\"finish_reason\":\"stop\",\"message\":{\"content\":\"OK.\",\"role\":\"assistant\"}}],...}; the same messages sent to Anthropic directly -> 400 {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"messages: Unexpected role \\\"robot\\\". Allowed roles are \\\"user\\\", \\\"assistant\\\" or \\\"system\\\"\"}}, and to OpenAI Chat directly -> 400 invalid_request_error / invalid_value, param messages[0].role. /v1/responses with input [{\"role\":\"robot\",\"content\":\"Say OK.\"}] on claude-haiku-4-5 -> 200 'OK.'; /v1/messages with role robot on gpt-5-mini -> 200 'OK' (OpenAI direct: 400 invalid_value). Code: translate.rs chat->messages `_ => // user (and anything else treated as user)` (~738), messages->chat `_ => messages.extend(anthropic_user_to_openai(m))` (~2405), chat->responses `_ => role: user` (~3711)."
 claims = ["T6", "TRN-21"]
-state = "suspected"
-test = ""
+state = "reproduced"
+test = "an_unknown_role_is_forwarded_onto_messages"
 fix = ""
 note = "Found by crates/verify/tests/parity_live.rs. Proposed: forward a message with an unrecognized role whole, in place, with its role unchanged (as an unknown Responses input item already is), so the provider's 400 names it."
 
