@@ -127,6 +127,7 @@ Client (stock OpenAI/Anthropic SDK)
   │  Injection-eligible (managed + OpenAI dialect + path suffix /chat/completions):
   │    buffer full body → ONE fused walk (peek::scan_buffered) yielding `model`, its byte
   │    span, and the splice offset → inject stream_options.include_usage → re-frame chunked
+  │    (a client-sent stream_options is rewritten to include_usage:true, never left off)
   │  Model-routed: a client body with two root `model` keys (any spelling) ─────── 400
   │  Model-routed: same buffer, and `model` is spliced to the serving candidate's own id
   │    (rewrite first — the injection offset precedes the value, so it cannot move)
@@ -1308,6 +1309,13 @@ gateway injects this field server-side so callers using stock SDKs get metered w
 cooperation. The request is buffered (`MAX_REQUEST_BODY` cap), the field injected, and the body
 re-framed as chunked upstream. Scoped to managed + OpenAI-dialect + streaming only — BYO and
 non-streaming requests remain pure passthrough.
+
+A client that sends `stream_options` itself does not get to turn metering off: `include_usage:
+false` is rewritten to `true`, an object without it gains it, and a non-object value is replaced
+by `{"include_usage":true}` (`proxy::force_include_usage`, which parses only that value, and only on
+the requests that send one). Without the usage chunk the row would be an estimate that cannot see
+hidden reasoning. The visible cost: such a client receives one chunk it did not ask for, OpenAI's
+usage chunk with `choices: []`, which every OpenAI SDK already accepts.
 
 ### Why the deny-set watch resumes from a saved revision
 

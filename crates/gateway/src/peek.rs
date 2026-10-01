@@ -373,6 +373,11 @@ pub struct BufferedScan {
     /// Where to splice the `stream_options` fragment, as [`plan_stream_usage_injection`] would have
     /// reported it.
     pub inject_at: Option<usize>,
+    /// Where the value of a root `stream_options` begins, when the body streams **and** already
+    /// carries one. The client may have turned usage off (`include_usage: false`) or left it out
+    /// (`{}`); either way OpenAI would send no usage chunk, so the caller rewrites that value (see
+    /// `proxy::force_include_usage`). `None` whenever `inject_at` is `Some`, and for a non-stream.
+    pub stream_options_at: Option<usize>,
     /// Byte range of the root-level `model` **value**, exclusive of its quotes — the span to
     /// overwrite when a model-routed request has to be re-spelled for the candidate serving it.
     ///
@@ -427,6 +432,7 @@ pub fn scan_buffered(body: &[u8]) -> BufferedScan {
         return BufferedScan {
             model: None,
             inject_at: None,
+            stream_options_at: None,
             model_span: None,
             duplicate_model: false,
             limit_spans: [None; 3],
@@ -444,6 +450,8 @@ pub fn scan_buffered(body: &[u8]) -> BufferedScan {
     let mut last_key_is_model = false;
     let mut stream_true = false;
     let mut saw_stream_options = false;
+    // The closing quote of the root `stream_options` key; its value follows the next `:`.
+    let mut stream_options_key_end = 0usize;
     // Accumulated (unescaped) `model` value, and whether we're inside it. A `Vec` rather than a
     // slice because escapes must be resolved, exactly as `ModelScanner` does.
     let mut capturing_model = false;
@@ -484,8 +492,9 @@ pub fn scan_buffered(body: &[u8]) -> BufferedScan {
                         let key = &body[key_start..j];
                         // Unlike the planner we cannot return early on `stream_options`: the model
                         // may still be ahead of us. Record it and keep walking.
-                        if key == b"stream_options" {
+                        if key == b"stream_options" && !saw_stream_options {
                             saw_stream_options = true;
+                            stream_options_key_end = j;
                         }
                         last_key_is_stream = key == b"stream";
                         last_key_is_model = key == b"model"
@@ -570,9 +579,22 @@ pub fn scan_buffered(body: &[u8]) -> BufferedScan {
         j += 1;
     }
 
+    // The `stream_options` value: past the key's closing quote, whitespace, `:`, whitespace.
+    let stream_options_at = (stream_true && saw_stream_options)
+        .then(|| {
+            let rest = &body[stream_options_key_end + 1..];
+            let colon = rest.iter().position(|b| !b.is_ascii_whitespace())?;
+            (rest[colon] == b':').then_some(())?;
+            let value = rest[colon + 1..]
+                .iter()
+                .position(|b| !b.is_ascii_whitespace())?;
+            Some(stream_options_key_end + 1 + colon + 1 + value)
+        })
+        .flatten();
     BufferedScan {
         model,
         inject_at: (stream_true && !saw_stream_options).then_some(insert_at),
+        stream_options_at,
         model_span,
         duplicate_model: model_keys > 1,
         limit_spans,

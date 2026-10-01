@@ -52,7 +52,6 @@ fn openai_stream_honoring_include_usage(body: &[u8], _n: usize) -> Vec<Step> {
 /// claim: BIL-2
 /// defect: D06
 #[tokio::test]
-#[ignore = "D06 reproduced: stream_options {include_usage:false} or {} skips injection; the row is an estimate"]
 async fn a_client_cannot_turn_off_exact_stream_metering() {
     let (pubkey, sk) = test_keypair(61);
     let mock = ScriptedUpstream::start(openai_stream_honoring_include_usage).await;

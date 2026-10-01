@@ -33,8 +33,9 @@
 //! → 400. `GET /v1/models` lists the catalog.
 //!
 //! One deliberate exception to the no-buffer rule: a **managed** OpenAI Chat Completions request is
-//! buffered and gets `stream_options.include_usage` injected when it streams without it — otherwise
-//! OpenAI emits no usage chunk and the request couldn't be metered. We can't set that option in a
+//! buffered and gets `stream_options.include_usage` injected when it streams without it (or forced
+//! to `true` when the client sent `stream_options` itself) — otherwise OpenAI emits no usage chunk
+//! and the request couldn't be metered. We can't set that option in a
 //! client SDK we don't control, so the gateway guarantees it, out of the box. Scoped to exactly that
 //! path (managed + OpenAI dialect + chat/completions); BYO and everything else stay pure passthrough.
 //! The Responses API needs no such injection — it always reports usage on its terminal event — so it
@@ -1831,6 +1832,47 @@ fn apply_model_rewrite(mut body: Vec<u8>, span: (usize, usize), replacement: &[u
     }
     body.splice(start..end, replacement.iter().copied());
     body
+}
+
+/// Make a client-sent `stream_options` (value at `at`) ask for usage: `include_usage: false` becomes
+/// `true`, an object without it gains it, and a non-object value is replaced by
+/// `{"include_usage":true}`. Billing is not the client's to switch off — without the usage chunk the
+/// row is an estimate that cannot see hidden reasoning. The client may now receive one extra chunk it
+/// did not ask for: OpenAI's usage chunk, `choices: []`, which every SDK already accepts.
+///
+/// Returns `model_span` moved by the edit when it lay after it. Parses only the `stream_options`
+/// value (a few bytes), and only on the rare request that sends one; the value is re-serialized, so
+/// its other members keep their meaning but not their spacing.
+fn force_include_usage(
+    mut body: Vec<u8>,
+    at: usize,
+    model_span: Option<(usize, usize)>,
+) -> (Vec<u8>, Option<(usize, usize)>) {
+    use serde_json::Value;
+    let Some(rest) = body.get(at..) else {
+        return (body, model_span);
+    };
+    let mut values = serde_json::Deserializer::from_slice(rest).into_iter::<Value>();
+    let Some(Ok(value)) = values.next() else {
+        return (body, model_span);
+    };
+    let end = at + values.byte_offset();
+    let mut options = match value {
+        Value::Object(m) if m.get("include_usage") == Some(&Value::Bool(true)) => {
+            return (body, model_span);
+        }
+        Value::Object(m) => m,
+        _ => serde_json::Map::new(),
+    };
+    options.insert("include_usage".to_owned(), Value::Bool(true));
+    let Ok(replacement) = serde_json::to_vec(&options) else {
+        return (body, model_span);
+    };
+    let (removed, added) = (end - at, replacement.len());
+    body.splice(at..end, replacement);
+    let shift = |i: usize| i + added - removed;
+    let model_span = model_span.map(|(s, e)| if s > at { (shift(s), shift(e)) } else { (s, e) });
+    (body, model_span)
 }
 
 fn apply_stream_usage_injection(mut body: Vec<u8>, at: Option<usize>) -> Vec<u8> {
@@ -3700,8 +3742,14 @@ impl ProxyHttp for AiProxy {
                 //
                 // Done before the `stream_options` splice, and safe in that order because
                 // `inject_at` points just past the root `{` and so always precedes the model value:
-                // rewriting the value cannot move it.
-                let buf = match (rc.auto.as_ref(), scan.model_span) {
+                // rewriting the value cannot move it. A client-sent `stream_options` can sit on
+                // either side of `model`, so that rewrite runs first and hands back the span it
+                // may have shifted.
+                let (buf, model_span) = match scan.stream_options_at {
+                    Some(at) if rc.inject_eligible => force_include_usage(buf, at, scan.model_span),
+                    _ => (buf, scan.model_span),
+                };
+                let buf = match (rc.auto.as_ref(), model_span) {
                     (Some(a), Some(span)) => match a.candidate_at(a.candidate) {
                         Some(c) => apply_model_rewrite(buf, span, c.upstream_model.as_bytes()),
                         None => buf,
@@ -5229,6 +5277,49 @@ mod tests {
             tail.push(&body[..USAGE_TAIL_CAP]);
         }
         assert_eq!(tail.contiguous().len(), USAGE_TAIL_CAP);
+    }
+
+    #[test]
+    fn a_client_sent_stream_options_always_asks_for_usage() {
+        for (body, want_span_moves) in [
+            (
+                r#"{"model":"gpt-4o","stream":true,"stream_options":{"include_usage":false}}"#,
+                false,
+            ),
+            (
+                r#"{"stream_options":{},"stream":true,"model":"gpt-4o"}"#,
+                true,
+            ),
+            (
+                r#"{"stream":true,"stream_options": null ,"model":"gpt-4o"}"#,
+                true,
+            ),
+            (
+                r#"{"stream":true,"stream_options":{"x":1},"model":"gpt-4o"}"#,
+                true,
+            ),
+        ] {
+            let scan = peek::scan_buffered(body.as_bytes());
+            assert_eq!(scan.inject_at, None, "{body}");
+            let at = scan
+                .stream_options_at
+                .expect("stream_options value located");
+            let (out, span) = force_include_usage(body.as_bytes().to_vec(), at, scan.model_span);
+            let v: serde_json::Value = serde_json::from_slice(&out).expect("still JSON");
+            assert_eq!(v["stream_options"]["include_usage"], true, "{body}");
+            let (s, e) = span.expect("span");
+            assert_eq!(&out[s..e], b"gpt-4o", "{body}");
+            assert_eq!(span != scan.model_span, want_span_moves, "{body}");
+        }
+        // Already asking: untouched, byte for byte.
+        let body = br#"{"stream":true,"stream_options":{ "include_usage" : true }}"#;
+        let at = peek::scan_buffered(body)
+            .stream_options_at
+            .expect("located");
+        assert_eq!(force_include_usage(body.to_vec(), at, None).0, body);
+        // A non-stream body's stream_options is not ours to touch.
+        let off = br#"{"stream":false,"stream_options":{"include_usage":false}}"#;
+        assert_eq!(peek::scan_buffered(off).stream_options_at, None);
     }
 
     #[test]
