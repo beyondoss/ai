@@ -660,3 +660,60 @@ async fn openrouter_provider_errors_keep_the_provider_message() {
         "Provider returned error (Anthropic): prompt is too long: 250000 tokens > 200000 maximum"
     );
 }
+
+/// xAI's error body is its own shape (`{"code": "invalid_image", "error": "<string>"}`, captured
+/// live from grok-4.3 on a corrupt PNG). It reaches each client in that client's envelope: an
+/// OpenAI SDK on a same-wire grok relay gets `{"error": {message, type, code, param}}`, and an
+/// Anthropic SDK gets the 400 typed `invalid_request_error`, not `api_error`.
+/// claim: T6
+/// defect: D100
+#[tokio::test]
+#[ignore = "D100 reproduced: xAI's error body is relayed as-is and typed api_error on Messages"]
+async fn xai_errors_arrive_in_the_clients_envelope() {
+    const XAI_400: &str = r#"{"code":"invalid_image","error":"code: 'Client specified an invalid argument', message: \"Invalid PNG image.\""}"#;
+    let (pubkey, sk) = test_keypair(1);
+    let mock = ScriptedUpstream::start(|_, _| {
+        vec![Step::Write(http_response(
+            400,
+            "application/json",
+            XAI_400.as_bytes(),
+        ))]
+    })
+    .await;
+    let gw = Gateway::builder(unused_nats_port(), &mock.authority(), &b64(&pubkey))
+        .providers(&["xai", "openrouter"])
+        .start()
+        .await;
+    let key = vkey(&sk);
+    let user = r#""messages":[{"role":"user","content":"hi"}]"#;
+
+    let (status, text) = post(
+        &gw,
+        "/v1/chat/completions",
+        &key,
+        format!(r#"{{"model":"grok-4.20",{user}}}"#),
+    )
+    .await;
+    assert_eq!(status, 400, "{text}");
+    let v: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(v["error"]["type"], "invalid_request_error", "{v}");
+    assert_eq!(v["error"]["code"], "invalid_image", "{v}");
+    assert!(
+        v["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("Invalid PNG image")),
+        "{v}"
+    );
+
+    let (status, text) = post(
+        &gw,
+        "/v1/messages",
+        &key,
+        format!(r#"{{"model":"grok-4.20","max_tokens":16,{user}}}"#),
+    )
+    .await;
+    assert_eq!(status, 400, "{text}");
+    let v: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(v["type"], "error", "{v}");
+    assert_eq!(v["error"]["type"], "invalid_request_error", "{v}");
+}

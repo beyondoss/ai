@@ -1401,10 +1401,10 @@ area = "Translation"
 title = "xAI errors don't arrive in the client's envelope"
 impact = "On a grok row, an OpenAI SDK gets xAI's own error shape relayed as-is ({\"code\": ..., \"error\": \"<string>\"}), so the SDK's error body is a bare string with no message, type or code to branch on. Translated onto Messages, the same 400 is typed api_error rather than invalid_request_error. The SDK still raises its typed 400; code that reads the envelope does not find it."
 confidence = "high"
-evidence = "live 2026-10-01 (corrupt base64 PNG, grok-4.3): T6::openai-py::xai::typed_error -> BadRequestError, e.body = \"code: 'Client specified an invalid argument', message: \\\"Invalid PNG image.\" (a string; the same probe on claude-haiku-4-5 and gpt-5-mini gets {message, type, code}). T6::anthropic-py::xai::typed_error -> {\"type\":\"error\",\"error\":{\"code\":\"invalid_image\",\"message\":...,\"type\":\"api_error\"}} on a 400. Raw through the gateway: POST /v1/chat/completions -> 400 {\"code\":\"invalid_image\",\"error\":\"code: 'Client specified an invalid argument', ...\"}."
+evidence = "live 2026-10-01 (corrupt base64 PNG, grok-4.3): T6::openai-py::xai::typed_error -> e.body a bare string; T6::anthropic-py::xai::typed_error -> a 400 typed api_error. Reproduced hermetically (translate_response.rs): xAI's {code, error: <string>} body reaches a Chat client on grok-4.20 untouched (no error object), and a Messages client typed api_error."
 claims = ["T6"]
-state = "suspected"
-test = ""
+state = "reproduced"
+test = "xai_errors_arrive_in_the_clients_envelope"
 fix = ""
 note = "Found by live cells T6::openai-py::xai::typed_error and T6::anthropic-py::xai::typed_error. The Chat case is a same-wire byte relay of xAI's body; the Messages case is map_error choosing api_error for a 4xx whose body names no type."
 
