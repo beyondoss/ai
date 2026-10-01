@@ -53,7 +53,11 @@
 //! A row whose primary is a direct vendor also needs an entry in `verify/catalog_truth.toml`: the
 //! vendor's published price and card values with the URL they came from (or a reasoned entry in
 //! its `unverified` list). `catalog_matches_vendor_truth` holds the table to that file, and a
-//! retired or non-serverless id recorded there can never come back as a candidate.
+//! retired or non-serverless id recorded there can never come back as a candidate. A scheduled
+//! retirement (`retires`) fails `no_catalog_row_outlives_its_retirement` on its date, and the live
+//! cells `CAT-16::raw::*` (`crates/verify/tests/catalog_live.rs`) check every candidate against its
+//! vendor's own listing and deprecation notices, and every first-party release in a carried family
+//! against the table, so neither a retirement nor a new model goes unnoticed.
 
 use crate::{ProviderId, WireFormat};
 
@@ -276,14 +280,18 @@ const fn card_unpublished_output(
 /// gpt-5.6-sol lists OpenAI's standard $4 / $20, which OpenAI bills the pool key, while OpenRouter
 /// passes on OpenAI's announced half-price promotion (`[[promo]]` in the truth file). A row whose
 /// primary is OpenRouter lists its maker's own published rate where there is one (Moonshot's Kimi,
-/// Z.ai's GLM, MiniMax's M2.7, Anthropic's and OpenAI's retired-at-source ids), never OpenRouter's
+/// Z.ai's GLM, OpenAI's ids OpenRouter serves alone), never OpenRouter's
 /// cheapest host; only a row whose maker publishes none (open weights; OpenAI ids its pricing page
 /// no longer lists) uses OpenRouter's public `https://openrouter.ai/api/v1/models` card.
 ///
 /// `claude-3-haiku`, `claude-opus-4` and `gpt-5.2-chat` were removed on 2026-09-30: no provider
 /// serves them any more (the catalog smoke reported 404s from every candidate). `deepseek-chat`,
 /// `deepseek-reasoner` and `mistral-nemo` were removed on 2026-10-01: their vendors retired them,
-/// and the fallbacks served a different model under the name. The seven Mistral rows
+/// and the fallbacks served a different model under the name. Later that day `claude-opus-4-1`,
+/// `claude-sonnet-4`, `gpt-5.1-codex`, `-codex-max`, `-codex-mini` and `gpt-5.2-codex` went the
+/// same way (retired by Anthropic and OpenAI; OpenRouter still served them from Bedrock and
+/// Azure: D181), and `minimaxai/minimax-m2.7`, whose one candidate (OpenRouter) sends every
+/// forced tool call and JSON-schema request to hosts that answer 410 Gone (D182). The seven Mistral rows
 /// (`mistral-large-latest`, `mistral-medium-latest`, `mistral-small-latest`, `ministral-3b-latest`,
 /// `ministral-8b-latest`, `ministral-14b-latest`, `codestral-latest`) were removed the same day by
 /// owner decision (D156): with no Mistral pool key their only reachable candidate was OpenRouter,
@@ -578,9 +586,10 @@ const fn openai_embeddings(native: &'static str, openrouter: &'static str) -> [C
     ]
 }
 
-/// OpenRouter Chat Completions as the only candidate: models whose first-party API no longer serves
-/// them to our keys (retired at Anthropic, unavailable on OpenAI's API, or reserved for Enterprise
-/// or dedicated deployments at Groq, Fireworks or Together) but OpenRouter still does.
+/// OpenRouter Chat Completions as the only candidate: models whose first-party API does not serve
+/// them to our keys (unavailable on OpenAI's API, or reserved for Enterprise or dedicated
+/// deployments at Groq, Fireworks or Together) but OpenRouter does. Not a home for a model its
+/// maker retired: that row is removed (`verify/catalog_truth.toml` `[[retired]]`).
 /// Live-verified 2026-09-30 by `catalog_rows_are_servable`.
 const fn openrouter_only(openrouter: &'static str) -> [Candidate; 1] {
     [Candidate {
@@ -769,27 +778,6 @@ const fn kimi_k3() -> [Candidate; 3] {
     ]
 }
 
-/// Together + Fireworks + OpenRouter for GLM-5.2. Fireworks spells the version separator as `p`.
-const fn glm_5_2() -> [Candidate; 3] {
-    [
-        Candidate {
-            provider: ProviderId::Together,
-            upstream_model: "zai-org/GLM-5.2",
-            path: "/v1/chat/completions",
-        },
-        Candidate {
-            provider: ProviderId::Fireworks,
-            upstream_model: "accounts/fireworks/models/glm-5p2",
-            path: "/inference/v1/chat/completions",
-        },
-        Candidate {
-            provider: ProviderId::OpenRouter,
-            upstream_model: "z-ai/glm-5.2",
-            path: "/api/v1/chat/completions",
-        },
-    ]
-}
-
 /// Together + Fireworks + OpenRouter for MiniMax M3.
 const fn minimax_m3() -> [Candidate; 3] {
     [
@@ -885,22 +873,6 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
             64_000,
             IN_TEXT | IN_IMAGE | IN_FILE,
             TOOLS | REASONING | STRUCTURED_OUTPUTS,
-        ),
-    },
-    ModelRoute {
-        model: "claude-opus-4-1",
-        wire: WireFormat::OpenAi,
-        candidates: &openrouter_only("anthropic/claude-opus-4.1"), // retired at Anthropic
-        responses: &[],
-        price: price("15", "75", "1.5", "18.75"),
-        card: card(
-            "Claude Opus 4.1",
-            "anthropic",
-            1754411591,
-            200_000,
-            32_000,
-            IN_TEXT | IN_IMAGE | IN_FILE,
-            TOOLS | REASONING,
         ),
     },
     ModelRoute {
@@ -1001,22 +973,6 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
             128_000,
             IN_TEXT | IN_IMAGE | IN_FILE,
             TOOLS | REASONING | STRUCTURED_OUTPUTS,
-        ),
-    },
-    ModelRoute {
-        model: "claude-sonnet-4",
-        wire: WireFormat::OpenAi,
-        candidates: &openrouter_only("anthropic/claude-sonnet-4"), // retired at Anthropic
-        responses: &[],
-        price: price("3", "15", "0.3", "3.75"),
-        card: card(
-            "Claude Sonnet 4",
-            "anthropic",
-            1747930371,
-            200_000,
-            64_000,
-            IN_TEXT | IN_IMAGE | IN_FILE,
-            TOOLS | REASONING,
         ),
     },
     ModelRoute {
@@ -1339,54 +1295,6 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         ),
     },
     ModelRoute {
-        model: "gpt-5.1-codex",
-        wire: WireFormat::OpenAi,
-        candidates: &openrouter_only("openai/gpt-5.1-codex"), // not served to our OpenAI key
-        responses: &[],
-        price: price("1.25", "10", "0.13", "1.25"), // cache_write unpublished; equals input
-        card: card(
-            "GPT-5.1-Codex",
-            "openai",
-            1762988221,
-            272_000,
-            128_000,
-            IN_TEXT | IN_IMAGE,
-            TOOLS | REASONING | STRUCTURED_OUTPUTS,
-        ),
-    },
-    ModelRoute {
-        model: "gpt-5.1-codex-max",
-        wire: WireFormat::OpenAi,
-        candidates: &openrouter_only("openai/gpt-5.1-codex-max"), // not served to our OpenAI key
-        responses: &[],
-        price: price("1.25", "10", "0.125", "1.25"), // cache_write unpublished; equals input
-        card: card(
-            "GPT-5.1-Codex-Max",
-            "openai",
-            1763671532,
-            272_000,
-            128_000,
-            IN_TEXT | IN_IMAGE,
-            TOOLS | REASONING | STRUCTURED_OUTPUTS,
-        ),
-    },
-    ModelRoute {
-        model: "gpt-5.1-codex-mini",
-        wire: WireFormat::OpenAi,
-        candidates: &openrouter_only("openai/gpt-5.1-codex-mini"), // not served to our OpenAI key
-        responses: &[],
-        price: price("0.25", "2", "0.03", "0.25"), // cache_write unpublished; equals input
-        card: card(
-            "GPT-5.1-Codex-Mini",
-            "openai",
-            1763007109,
-            272_000,
-            128_000,
-            IN_TEXT | IN_IMAGE,
-            TOOLS | REASONING | STRUCTURED_OUTPUTS,
-        ),
-    },
-    ModelRoute {
         model: "gpt-5.2",
         wire: WireFormat::OpenAi,
         candidates: &openai_chat("gpt-5.2", "openai/gpt-5.2"),
@@ -1399,22 +1307,6 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
             272_000,
             128_000,
             IN_TEXT | IN_IMAGE | IN_FILE,
-            TOOLS | REASONING | STRUCTURED_OUTPUTS,
-        ),
-    },
-    ModelRoute {
-        model: "gpt-5.2-codex",
-        wire: WireFormat::OpenAi,
-        candidates: &openrouter_only("openai/gpt-5.2-codex"), // not served to our OpenAI key
-        responses: &[],
-        price: price("1.75", "14", "0.175", "1.75"), // cache_write unpublished; equals input
-        card: card(
-            "GPT-5.2-Codex",
-            "openai",
-            1766164985,
-            272_000,
-            128_000,
-            IN_TEXT | IN_IMAGE,
             TOOLS | REASONING | STRUCTURED_OUTPUTS,
         ),
     },
@@ -1674,6 +1566,102 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
             TOOLS | REASONING | STRUCTURED_OUTPUTS,
         ),
     },
+    ModelRoute {
+        model: "gpt-6-luna",
+        wire: WireFormat::OpenAi,
+        candidates: &openai_responses_first("gpt-6-luna", "openai/gpt-6-luna"),
+        responses: &openai_responses("gpt-6-luna"),
+        price: price("0.1", "0.5", "0.01", "0.125"),
+        card: card(
+            "GPT-6 Luna",
+            "openai",
+            1789406102,
+            922_000,
+            128_000,
+            IN_TEXT | IN_IMAGE | IN_FILE,
+            TOOLS | REASONING | STRUCTURED_OUTPUTS,
+        ),
+    },
+    ModelRoute {
+        model: "gpt-6-luna-pro",
+        wire: WireFormat::OpenAi,
+        candidates: &openrouter_only("openai/gpt-6-luna-pro"), // not served to our OpenAI key
+        responses: &[],
+        price: price("0.1", "0.5", "0.01", "0.125"),
+        card: card(
+            "GPT-6 Luna Pro",
+            "openai",
+            1790100791,
+            922_000,
+            128_000,
+            IN_TEXT | IN_IMAGE | IN_FILE,
+            TOOLS | REASONING | STRUCTURED_OUTPUTS,
+        ),
+    },
+    ModelRoute {
+        model: "gpt-6-sol",
+        wire: WireFormat::OpenAi,
+        candidates: &openai_responses_first("gpt-6-sol", "openai/gpt-6-sol"),
+        responses: &openai_responses("gpt-6-sol"),
+        price: price("2", "10", "0.2", "2.5"),
+        card: card(
+            "GPT-6 Sol",
+            "openai",
+            1789405937,
+            922_000,
+            128_000,
+            IN_TEXT | IN_IMAGE | IN_FILE,
+            TOOLS | REASONING | STRUCTURED_OUTPUTS,
+        ),
+    },
+    ModelRoute {
+        model: "gpt-6-sol-pro",
+        wire: WireFormat::OpenAi,
+        candidates: &openrouter_only("openai/gpt-6-sol-pro"), // not served to our OpenAI key
+        responses: &[],
+        price: price("2", "10", "0.2", "2.5"),
+        card: card(
+            "GPT-6 Sol Pro",
+            "openai",
+            1790100781,
+            922_000,
+            128_000,
+            IN_TEXT | IN_IMAGE | IN_FILE,
+            TOOLS | REASONING | STRUCTURED_OUTPUTS,
+        ),
+    },
+    ModelRoute {
+        model: "gpt-6.1-sol",
+        wire: WireFormat::OpenAi,
+        candidates: &openai_responses_first("gpt-6.1-sol", "openai/gpt-6.1-sol"),
+        responses: &openai_responses("gpt-6.1-sol"),
+        price: price("2", "10", "0.1", "2.5"),
+        card: card(
+            "GPT-6.1 Sol",
+            "openai",
+            1790552874,
+            922_000,
+            128_000,
+            IN_TEXT | IN_IMAGE | IN_FILE,
+            TOOLS | REASONING | STRUCTURED_OUTPUTS,
+        ),
+    },
+    ModelRoute {
+        model: "gpt-6.1-sol-pro",
+        wire: WireFormat::OpenAi,
+        candidates: &openrouter_only("openai/gpt-6.1-sol-pro"), // not served to our OpenAI key
+        responses: &[],
+        price: price("2", "10", "0.1", "2.5"),
+        card: card(
+            "GPT-6.1 Sol Pro",
+            "openai",
+            1790702886,
+            922_000,
+            128_000,
+            IN_TEXT | IN_IMAGE | IN_FILE,
+            TOOLS | REASONING | STRUCTURED_OUTPUTS,
+        ),
+    },
     // xAI Grok. Native ids from the 2026-09-17 xAI models table plus `grok-4.20-multi-agent`
     // (OpenRouter `x-ai/grok-4.20-multi-agent`, 2026-09-19). Every row reaches xAI over
     // `/v1/responses` (`xai_responses_first`): multi-agent is Responses-only at xAI, and xAI reads
@@ -1760,6 +1748,21 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         ),
     },
     ModelRoute {
+        model: "grok-4.7",
+        wire: WireFormat::OpenAi,
+        candidates: &xai_responses_first("grok-4.7", "x-ai/grok-4.7"),
+        responses: &[],
+        price: price("2", "6", "0.5", "2"), // cache_write unpublished; equals input
+        card: card_unpublished_output(
+            "Grok 4.7",
+            "xai",
+            1788307200,
+            500_000,
+            IN_TEXT | IN_IMAGE | IN_FILE,
+            TOOLS | REASONING | STRUCTURED_OUTPUTS,
+        ),
+    },
+    ModelRoute {
         model: "grok-build-0.1",
         wire: WireFormat::OpenAi,
         candidates: &xai_responses_first("grok-build-0.1", "x-ai/grok-build-0.1"),
@@ -1778,9 +1781,9 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
     // primary is a host that serves the model to a standard serverless key: Groq for GPT-OSS and
     // Qwen3.8 27B, Together for Llama 3.3 / Qwen / Kimi / GLM / MiniMax / Inkling. A candidate the
     // host reserves for Enterprise or dedicated deployments is not listed (Groq
-    // `llama-3.1-8b-instant`, `llama-3.3-70b-versatile` and `minimaxai/minimax-m2.7`; Fireworks
-    // Llama 4, Kimi K2.6, GLM 5.1 and Llama 3.3; Together Kimi K2.7 Code, GPT-OSS 20B, Gemma 4 31B
-    // and Qwen2.5 7B Turbo): it fails over on every request. Rows left with only OpenRouter are
+    // `llama-3.1-8b-instant` and `llama-3.3-70b-versatile`; Fireworks Llama 4, Kimi K2.6, GLM 5.1,
+    // GLM 5.2 and Llama 3.3; Together Kimi K2.7 Code, GPT-OSS 20B, Gemma 4 31B and Qwen2.5 7B
+    // Turbo): it fails over on every request. Rows left with only OpenRouter are
     // `openrouter_only`, and keep their names so existing clients still resolve. Groq caches only
     // GPT-OSS; Together publishes no cache-write rate, so those rates equal input.
     ModelRoute {
@@ -1880,21 +1883,6 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         ),
     },
     ModelRoute {
-        model: "minimaxai/minimax-m2.7",
-        wire: WireFormat::OpenAi,
-        candidates: &openrouter_only("minimax/minimax-m2.7"), // Groq: Enterprise-only
-        responses: &[],
-        price: price("0.3", "1.2", "0.06", "0.375"), // MiniMax's own pay-as-you-go rate
-        card: card_unpublished_output(
-            "MiniMax M2.7",
-            "minimax",
-            1773836697,
-            204_800,
-            IN_TEXT,
-            TOOLS | REASONING | STRUCTURED_OUTPUTS,
-        ),
-    },
-    ModelRoute {
         model: "moonshotai/kimi-k2.6",
         wire: WireFormat::OpenAi,
         candidates: &openrouter_only("moonshotai/kimi-k2.6"), // Fireworks: serverless deprecated
@@ -1958,7 +1946,9 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
     ModelRoute {
         model: "o1-pro",
         wire: WireFormat::OpenAi,
-        candidates: &openai_responses_first("o1-pro", "openai/o1-pro"),
+        // No OpenRouter failover: its one `openai/o1-pro` endpoint lists no `tools`, which the
+        // card (and OpenAI) offer, so a tool request that failed over would 404 there.
+        candidates: &openai_responses("o1-pro"),
         responses: &openai_responses("o1-pro"),
         price: price("150", "600", "150", "150"), // no separate cache card; both rates equal input
         card: card(
@@ -2283,7 +2273,8 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
     ModelRoute {
         model: "z-ai/glm-5.2",
         wire: WireFormat::OpenAi,
-        candidates: &glm_5_2(),
+        // Fireworks' glm-5p2: serverless ended 2026-09-25 (on-demand deployments only).
+        candidates: &together("zai-org/GLM-5.2", "z-ai/glm-5.2"),
         responses: &[],
         price: price("1.4", "4.4", "0.26", "1.4"), // cache_write unpublished; equals input
         card: card_unpublished_output(
@@ -3093,6 +3084,20 @@ mod tests {
                 "openai/gpt-5.6-sol",
             ),
             (
+                "gpt-6.1-sol",
+                WireFormat::OpenAi,
+                ProviderId::OpenAi,
+                "gpt-6.1-sol",
+                "openai/gpt-6.1-sol",
+            ),
+            (
+                "grok-4.7",
+                WireFormat::OpenAi,
+                ProviderId::XAi,
+                "grok-4.7",
+                "x-ai/grok-4.7",
+            ),
+            (
                 "grok-4.6",
                 WireFormat::OpenAi,
                 ProviderId::XAi,
@@ -3184,32 +3189,46 @@ mod tests {
         }
     }
 
+    /// MiniMax M3 is served by Together, Fireworks and OpenRouter. GLM 5.2 is Together and
+    /// OpenRouter: Fireworks ended `glm-5p2` serverless on 2026-09-25 (its model page FAQ), so a
+    /// serverless key can no longer reach it (`verify/catalog_truth.toml` `[[not_serverless]]`).
     #[test]
     fn glm_5_2_and_minimax_m3_name_together_fireworks_and_openrouter() {
-        for (name, together_id, fireworks_id, openrouter) in [
-            (
-                "z-ai/glm-5.2",
-                "zai-org/GLM-5.2",
-                "accounts/fireworks/models/glm-5p2",
-                "z-ai/glm-5.2",
-            ),
-            (
-                "minimax/minimax-m3",
-                "MiniMaxAI/MiniMax-M3",
-                "accounts/fireworks/models/minimax-m3",
-                "minimax/minimax-m3",
-            ),
-        ] {
-            assert!(for_model(name).is_some(), "{name} must be in the catalog");
-            if let Some(row) = for_model(name) {
-                assert_eq!(row.candidates.len(), 3, "{name}");
-                assert_eq!(row.candidates[0].provider, ProviderId::Together, "{name}");
-                assert_eq!(row.candidates[0].upstream_model, together_id, "{name}");
-                assert_eq!(row.candidates[1].provider, ProviderId::Fireworks, "{name}");
-                assert_eq!(row.candidates[1].upstream_model, fireworks_id, "{name}");
-                assert_eq!(row.candidates[2].provider, ProviderId::OpenRouter, "{name}");
-                assert_eq!(row.candidates[2].upstream_model, openrouter, "{name}");
-            }
+        let m3 = for_model("minimax/minimax-m3");
+        assert!(m3.is_some(), "minimax/minimax-m3 must be in the catalog");
+        if let Some(row) = m3 {
+            let ids: Vec<_> = row
+                .candidates
+                .iter()
+                .map(|c| (c.provider, c.upstream_model))
+                .collect();
+            assert_eq!(
+                ids,
+                [
+                    (ProviderId::Together, "MiniMaxAI/MiniMax-M3"),
+                    (
+                        ProviderId::Fireworks,
+                        "accounts/fireworks/models/minimax-m3"
+                    ),
+                    (ProviderId::OpenRouter, "minimax/minimax-m3"),
+                ]
+            );
+        }
+        let glm = for_model("z-ai/glm-5.2");
+        assert!(glm.is_some(), "z-ai/glm-5.2 must be in the catalog");
+        if let Some(row) = glm {
+            let ids: Vec<_> = row
+                .candidates
+                .iter()
+                .map(|c| (c.provider, c.upstream_model))
+                .collect();
+            assert_eq!(
+                ids,
+                [
+                    (ProviderId::Together, "zai-org/GLM-5.2"),
+                    (ProviderId::OpenRouter, "z-ai/glm-5.2"),
+                ]
+            );
         }
     }
 
@@ -3525,53 +3544,222 @@ mod tests {
         }
     }
 
-    /// No candidate (or Responses arm) names an id its vendor has retired or does not serve to a
-    /// standard serverless key, and no row is named after a retired id. Such a candidate fails over
-    /// on every request; a retired name served by a fallback is a different model under that name.
-    /// claim: CAT-1, CAT-2
-    /// defect: D61, D108
+    /// Today's date as `YYYY-MM-DD` (UTC), for the `retires` dates in `verify/catalog_truth.toml`.
+    fn today() -> String {
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        civil(i64::try_from(secs / 86_400).unwrap_or(0))
+    }
+
+    /// Days since 1970-01-01 → `YYYY-MM-DD` (Howard Hinnant's `civil_from_days`).
+    fn civil(days: i64) -> String {
+        let z = days + 719_468;
+        let era = z.div_euclid(146_097);
+        let doe = z.rem_euclid(146_097);
+        let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let d = doy - (153 * mp + 2) / 5 + 1;
+        let m = if mp < 10 { mp + 3 } else { mp - 9 };
+        let y = yoe + era * 400 + i64::from(m <= 2);
+        format!("{y:04}-{m:02}-{d:02}")
+    }
+
+    #[test]
+    fn civil_dates_are_correct() {
+        assert_eq!(civil(0), "1970-01-01");
+        assert_eq!(civil(20_727), "2026-10-01");
+        assert_eq!(civil(11_016), "2000-02-29");
+    }
+
+    fn is_iso_date(s: &str) -> bool {
+        let b = s.as_bytes();
+        b.len() == 10
+            && b[4] == b'-'
+            && b[7] == b'-'
+            && b.iter()
+                .enumerate()
+                .all(|(i, c)| i == 4 || i == 7 || c.is_ascii_digit())
+    }
+
+    /// One `[[retired]]` entry: the row (`model`) and/or the candidate (`provider`, `id`) it names,
+    /// and its date: `retired` (past) or `retires` (scheduled).
+    struct Retirement<'a> {
+        model: Option<&'a str>,
+        candidate: Option<(&'a str, &'a str)>,
+        retired: Option<&'a str>,
+        retires: Option<&'a str>,
+    }
+
+    impl Retirement<'_> {
+        /// Whether this entry names the row or one of its candidates (or the row's own id as a
+        /// candidate spelling: a re-added `claude-opus-4-1` with an Anthropic candidate).
+        fn touches(&self, r: &ModelRoute) -> bool {
+            self.model == Some(r.model)
+                || r.candidates.iter().chain(r.responses).any(|c| {
+                    self.candidate == Some((by_id(c.provider).name, c.upstream_model))
+                        || self.model == Some(c.upstream_model)
+                })
+        }
+    }
+
+    fn retirements(t: &toml::Table) -> Vec<Retirement<'_>> {
+        truth_array(t, "retired")
+            .iter()
+            .map(|e| {
+                let field = |k: &str| e.get(k).and_then(toml::Value::as_str);
+                Retirement {
+                    model: field("model"),
+                    candidate: field("provider").zip(field("id")),
+                    retired: field("retired"),
+                    retires: field("retires"),
+                }
+            })
+            .collect()
+    }
+
+    /// Every `[[retired]]`, `[[not_serverless]]` and `[[not_carried]]` entry is well formed: a
+    /// source URL, a known provider, and for a retirement exactly one ISO date (`retired` or
+    /// `retires`) and a row or a candidate it names. No candidate (or Responses arm) names an id
+    /// its vendor does not serve to a standard serverless key: such a candidate fails over on
+    /// every request.
+    /// claim: CAT-1, CAT-2, CAT-16
+    /// defect: D61, D108, D181
     #[test]
     fn no_candidate_is_retired_or_not_serverless() {
         let t = truth();
-        let mut dead = std::collections::BTreeSet::new();
-        let mut retired_ids = std::collections::BTreeSet::new();
-        for (list, retired) in [("retired", true), ("not_serverless", false)] {
+        let known = |p: &str| gateway_providers().any(|g| g.name == p);
+        for list in ["retired", "not_serverless", "not_carried"] {
             for e in truth_array(&t, list) {
-                let provider = e["provider"].as_str().expect("provider");
-                let id = e["id"].as_str().expect("id");
-                assert!(
-                    e.get("source")
-                        .and_then(toml::Value::as_str)
-                        .is_some_and(|s| s.starts_with("https://")),
-                    "{list} {provider}/{id}: needs a source URL"
+                let field = |k: &str| e.get(k).and_then(toml::Value::as_str);
+                let label = format!(
+                    "{list} {}/{}",
+                    field("provider").or(field("model")).unwrap_or("?"),
+                    field("id").unwrap_or("")
                 );
                 assert!(
-                    gateway_providers().any(|p| p.name == provider),
-                    "{list} {provider}/{id}: unknown provider"
+                    field("source").is_some_and(|s| s.starts_with("https://")),
+                    "{label}: needs a source URL"
                 );
-                dead.insert((provider, id));
-                if retired {
-                    retired_ids.insert(id);
+                if let Some(p) = field("provider") {
+                    assert!(known(p), "{label}: unknown provider");
+                    assert!(field("id").is_some(), "{label}: a provider needs an id");
+                }
+                match list {
+                    "retired" => {
+                        assert!(
+                            field("model").is_some() || field("id").is_some(),
+                            "{label}: names neither a row nor a candidate"
+                        );
+                        let dates: Vec<_> = ["retired", "retires"]
+                            .into_iter()
+                            .filter_map(field)
+                            .collect();
+                        assert!(
+                            dates.len() == 1 && is_iso_date(dates[0]),
+                            "{label}: needs exactly one of retired / retires, as YYYY-MM-DD"
+                        );
+                        assert!(field("note").is_some(), "{label}: needs a note");
+                    }
+                    "not_carried" => {
+                        assert!(field("reason").is_some(), "{label}: needs a reason");
+                        let (p, id) = (field("provider").unwrap_or(""), field("id").unwrap_or(""));
+                        assert!(
+                            for_model(id).is_none()
+                                && !MODEL_ROUTES.iter().any(|r| {
+                                    r.candidates.iter().chain(r.responses).any(|c| {
+                                        by_id(c.provider).name == p && c.upstream_model == id
+                                    })
+                                }),
+                            "{label}: is in the catalog, so it is carried"
+                        );
+                    }
+                    _ => {
+                        assert!(field("provider").is_some(), "{label}: needs a provider");
+                    }
                 }
             }
         }
-        assert!(!dead.is_empty(), "the truth file lists no dead ids");
+        let dead: std::collections::BTreeSet<(&str, &str)> = truth_array(&t, "not_serverless")
+            .iter()
+            .filter_map(|e| {
+                let field = |k: &str| e.get(k).and_then(toml::Value::as_str);
+                field("provider").zip(field("id"))
+            })
+            .collect();
+        assert!(
+            !dead.is_empty(),
+            "the truth file lists no not_serverless ids"
+        );
         for r in MODEL_ROUTES {
-            assert!(
-                !retired_ids.contains(r.model),
-                "{}: row is named after a retired model",
-                r.model
-            );
             for c in r.candidates.iter().chain(r.responses) {
                 let key = (by_id(c.provider).name, c.upstream_model);
                 assert!(
                     !dead.contains(&key),
-                    "{}: candidate {}/{} is retired or not serverless",
+                    "{}: candidate {}/{} is not serverless",
                     r.model,
                     key.0,
                     key.1
                 );
             }
+        }
+    }
+
+    /// Every catalog row is absent from `[[retired]]` or carries a future `retires` date: a model
+    /// its vendor retired (`retired`) can't be re-added, as a row name or as a candidate, and a row
+    /// whose retirement date has come fails here until it is removed, so the vendor's 404 never
+    /// reaches a customer under our name. A client's request for a retired row is a 404, never a
+    /// remap to the vendor's successor.
+    /// claim: CAT-1, CAT-2, CAT-16
+    /// defect: D181
+    #[test]
+    fn no_catalog_row_outlives_its_retirement() {
+        let t = truth();
+        let today = today();
+        let all = retirements(&t);
+        assert!(
+            all.iter().any(|e| e.retired.is_some()) && all.iter().any(|e| e.retires.is_some()),
+            "the truth file records no retirement"
+        );
+        for r in MODEL_ROUTES {
+            for e in all.iter().filter(|e| e.touches(r)) {
+                let what = e
+                    .candidate
+                    .map_or_else(|| r.model.to_owned(), |(p, id)| format!("{p}/{id}"));
+                assert!(
+                    e.retired.is_none(),
+                    "{}: {what} was retired on {}",
+                    r.model,
+                    e.retired.unwrap_or_default()
+                );
+                let day = e.retires.unwrap_or_default();
+                assert!(
+                    day > today.as_str(),
+                    "{}: {what} retires {day} (today is {today}): remove it from the catalog and \
+                     record the entry as retired",
+                    r.model
+                );
+            }
+        }
+        // The rows retired on 2026-10-01 (D181) stay out under their names.
+        for gone in [
+            "claude-opus-4-1",
+            "claude-sonnet-4",
+            "gpt-5.1-codex",
+            "gpt-5.1-codex-max",
+            "gpt-5.1-codex-mini",
+            "gpt-5.2-codex",
+        ] {
+            assert!(
+                MODEL_ROUTES.iter().all(|r| r.model != gone),
+                "{gone} is retired"
+            );
+            assert!(
+                all.iter()
+                    .any(|e| e.model == Some(gone) && e.retired.is_some()),
+                "{gone}: no [[retired]] entry"
+            );
         }
     }
 
@@ -3612,6 +3800,22 @@ mod tests {
             }
         }
         assert_eq!(by_id(ProviderId::Mistral).env_var, Some("MISTRAL_API_KEY"));
+    }
+
+    /// MiniMax M2.7 is not a row (D182). Its one candidate was OpenRouter (Groq's copy is
+    /// Enterprise-only, Together's is not serverless, and there is no MiniMax pool key), and
+    /// OpenRouter routes every forced tool call and every JSON-schema request for it to Mara or
+    /// SambaNova, which answer 410 Gone (6 of 6 forced calls, 2026-10-01; their endpoints are at 0%
+    /// uptime), so two capabilities its card listed failed on every request. MiniMax M3, carried
+    /// on Together, Fireworks and OpenRouter, is the maker's current model. Bring M2.7 back with a
+    /// MiniMax key (MiniMax sells it).
+    /// claim: CAT-6, CAT-16
+    /// defect: D182
+    #[test]
+    fn minimax_m2_7_is_not_served_through_dead_openrouter_hosts() {
+        assert!(for_model("minimaxai/minimax-m2.7").is_none());
+        assert!(for_model("minimax/minimax-m2.7").is_none());
+        assert!(for_model("minimax/minimax-m3").is_some());
     }
 
     /// deepseek-v4-pro's failover is the same snapshot (V4-Pro-0813 on Together), not OpenRouter's
@@ -4092,8 +4296,7 @@ mod tests {
                 serves,
                 [
                     (ProviderId::Together, true),
-                    (ProviderId::Fireworks, true),
-                    (ProviderId::OpenRouter, false),
+                    (ProviderId::OpenRouter, false)
                 ]
             );
         }
@@ -4124,7 +4327,6 @@ mod tests {
             ("z-ai/glm-5.1", ("1.4", "4.4", "0.26")),
             ("moonshotai/kimi-k2.7-code", ("0.95", "4", "0.19")),
             ("moonshotai/kimi-k2.6", ("0.95", "4", "0.16")),
-            ("minimaxai/minimax-m2.7", ("0.3", "1.2", "0.06")),
             ("qwen/qwen3.8-flash", ("0.09", "0.282", "0.09")),
             // OpenAI's standard rate, which it bills the pool key; the promotion is recorded apart.
             ("gpt-5.6-sol", ("4", "20", "0.4")),

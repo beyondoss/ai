@@ -600,8 +600,8 @@ span (`peek::remove_items`), so every other byte of a stripped body (key order, 
 property order, spacing) is still the client's, and a prompt-cache prefix still matches. Budget-thinking Claude (before 4.6) 400s a tool loop whose final assistant turn does not
 open with its thinking block; when a client sent none back (Vercel, LangChain, a Responses client
 that drops reasoning items), that request goes without `thinking`, which Anthropic accepts. The
-same rule covers a Claude model behind Chat Completions (OpenRouter's `anthropic/…`: an
-OpenRouter-only row like claude-sonnet-4, or any Claude row's OpenRouter failover), on a same-wire
+same rule covers a Claude model behind Chat Completions (OpenRouter's `anthropic/…`: any
+Claude row's OpenRouter candidate), on a same-wire
 relay and a translated walk alike: when the request asks for reasoning (`reasoning_effort`,
 `reasoning`, `include_reasoning`, `thinking`) and its last assistant tool-call turn carries no
 `reasoning_details` OpenRouter can replay (a signed `reasoning.text` or an encrypted entry), those
@@ -1116,10 +1116,10 @@ Messages API as an independent second source (`us.anthropic.claude-haiku-4-5-202
 `us.anthropic.claude-opus-4-8`) before OpenRouter. GPT rows do the same shape on the Chat
 Completions wire (`gpt-5.2` → `openai/gpt-5.2`) plus an OpenAI-only `/v1/responses` arm —
 the table covers the current 4 / 4.1 / 4o / 5 / 5.x / 6 and o-series ids OpenRouter listed on
-2026-09-19. From GPT-5.4 on (`gpt-5.4*`, `gpt-5.5`, `gpt-5.6-*`, `gpt-6-astra`) the OpenAI
+2026-09-19. From GPT-5.4 on (`gpt-5.4*`, `gpt-5.5`, `gpt-5.6-*`, `gpt-6-*`, `gpt-6.1-sol`) the OpenAI
 candidate is `/v1/responses` too: OpenAI's Chat Completions answers function tools with any
 reasoning effort with a 400 ("use /v1/responses or set reasoning_effort to 'none'"), and GPT-5.6
-and GPT-6 Astra reason by default, so every tool call failed there; a Chat Completions or Messages
+and GPT-6 reason by default, so every tool call failed there; a Chat Completions or Messages
 client is translated onto Responses. xAI `grok-*` rows reach xAI over `/v1/responses` too
 (`xai_responses_first`; OpenRouter Chat Completions failover, `grok-4.6` → `x-ai/grok-4.6`): xAI
 serves multi-agent only there, reads PDFs only there, and calls its Chat Completions deprecated
@@ -1136,7 +1136,8 @@ Chat Completions helper covers every other pool-keyed host: DeepSeek (`deepseek-
 0423 snapshot), and the Groq/Together llama /
 qwen / open-weight ids people send (`openai/gpt-oss-120b` names Groq, Together and Fireworks:
 one of OpenRouter's hosts answers a forced tool call with an empty `finish_reason: "error"` 200;
-Kimi K3 / GLM-5.2 / MiniMax M3 do the Together + Fireworks + OpenRouter shape). A
+Kimi K3 / MiniMax M3 do the Together + Fireworks + OpenRouter shape, and GLM-5.2 Together +
+OpenRouter since Fireworks ended its serverless on 2026-09-25). A
 fallback must serve the model the row names, so a retired vendor id is removed with its row
 (`deepseek-chat`, `deepseek-reasoner` and `mistral-nemo`, whose OpenRouter fallbacks were other
 models). The Mistral `-latest` rows (Large, Medium, Small, Ministral 3B / 8B / 14B, Codestral)
@@ -1147,19 +1148,45 @@ whatever our traffic does, and a pool-key walk cannot help. The `mistral` provid
 `/mistral/…` route remain, so bringing them back is the key plus the rows. Likewise, a candidate the host
 reserves for Enterprise or dedicated deployments is not listed
 (Groq `llama-3.1-8b-instant` / `llama-3.3-70b-versatile` / `minimaxai/minimax-m2.7`, the
-Fireworks Llama 4 / Kimi K2.6 / GLM 5.1 / Llama 3.3 ids, Together Kimi K2.7 Code, GPT-OSS 20B,
+Fireworks Llama 4 / Kimi K2.6 / GLM 5.1 / GLM 5.2 / Llama 3.3 ids, Together Kimi K2.7 Code, GPT-OSS 20B,
 Gemma 4 31B and Qwen2.5 7B Turbo).
 Rows left with only OpenRouter keep their names as OpenRouter-only rows. These ids are recorded in
 `verify/catalog_truth.toml`, and `no_candidate_is_retired_or_not_serverless` keeps them out. Those
 rows have no Responses arm — `previous_response_id` is OpenAI's store. OpenAI serves some GPT ids only
 on the Responses API (`gpt-5-pro`, `gpt-5.x-pro`, `gpt-5.3-codex`, `o1-pro`): their OpenAI candidate
 is `/v1/responses` (a Chat Completions or Messages client is translated onto it), with OpenRouter
-Chat Completions as the failover. Rows whose first-party API no longer serves our keys (Claude
-Opus 4.1 and Sonnet 4, retired at Anthropic; older `-codex` and some `-pro` ids OpenAI does not
-serve this account; the Groq/Fireworks/Together ids above that a serverless key cannot reach)
-are OpenRouter-only. Every row and candidate is
+Chat Completions as the failover (not on `o1-pro`: OpenRouter's one endpoint for it takes no tools).
+Rows whose first-party API does not serve our keys (the `-pro` ids OpenAI does not serve this
+account; the Groq/Fireworks/Together ids above that a serverless key cannot reach) are
+OpenRouter-only. Every row and candidate is
 verified against the live providers by `catalog_rows_are_servable` in `tests/smoke.rs`, and the
 failover itself by `model_route_fails_over_to_a_real_provider`.
+
+**A model its maker retires leaves the catalog, even where another host still runs it.** Claude
+Opus 4.1 and Sonnet 4 (retired at Anthropic 2026-08-05 and 2026-06-15) and GPT-5.1-Codex / -Max /
+-Mini and GPT-5.2-Codex (shut down by OpenAI 2026-07-23, still in its `/v1/models` listing) were
+OpenRouter-only rows served from Bedrock or Azure; they were removed (D181), and a request for one
+is a catalog miss (404). The gateway never remaps a requested model to the vendor's successor.
+MiniMax M2.7 went too (D182): its one candidate, OpenRouter, sends every forced tool call and
+JSON-schema request for it to hosts that answer 410 Gone, so no candidate could serve its card.
+`verify/catalog_truth.toml` `[[retired]]` records each retirement with the vendor's notice: a
+`retired` date keeps the row and its candidates from coming back
+(`no_candidate_is_retired_or_not_serverless`, `no_catalog_row_outlives_its_retirement`), and a
+scheduled `retires` date keeps the row until that day, when the same test fails until it is
+removed (Claude Sonnet 4.5 on 2026-11-30; gpt-4, gpt-4-turbo, gpt-4.1-nano, o1, o1-pro, o3-mini and
+o4-mini on 2026-10-23; gpt-5, -mini, -nano, -pro, o3 and o3-pro on 2026-12-11). `GET /v1/models`
+does not carry the date: neither the OpenAI list shape nor Anthropic's `/v1/models` has a
+deprecation field. The live cells `CAT-16::raw::{provider}::{row}` (`crates/verify/tests/catalog_live.rs`,
+listing calls only) hold every candidate to its vendor today: listed by the vendor's own models
+API (Together: in its serverless table; Bedrock: an `ACTIVE` inference profile over a model that
+is not `LEGACY`), or, on OpenRouter, at least one endpoint up in the last 30 minutes and one that
+takes each capability the card lists; and every deprecation notice the vendor (or, for an
+OpenRouter slug, its maker) publishes for the id is recorded. `CAT-16::raw::{anthropic,openai,xai}::new-models`
+fails on a model those vendors list in a family the catalog carries (Claude; GPT and the o-series;
+Grok; text generation only, aliases not snapshots) that is neither a row nor recorded in
+`[[not_carried]]` with a reason, so a release shows up as a red cell. Together and OpenRouter list
+hundreds of models, so their gaps (recent models in the namespaces the catalog carries) are a
+report, `VERIFY_CATALOG_GAPS=1`, not a failure.
 
 **What that failover does and does not cover.** On the two Bedrock-backed rows, Bedrock is the
 independent second source: a different account, a different network path, and AWS's own serving of

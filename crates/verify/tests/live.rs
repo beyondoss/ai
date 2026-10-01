@@ -75,9 +75,10 @@ const CODEX: Route = Route {
     dead: &[],
     serves: "openai",
 };
+/// The Claude row with only an OpenRouter key: OpenRouter's Chat Completions serves it.
 const OPENROUTER: Route = Route {
     name: "openrouter",
-    model: "claude-sonnet-4",
+    model: "claude-haiku-4-5",
     pools: &[("openrouter", "OPENROUTER_API_KEY")],
     dead: &[],
     serves: "openrouter",
@@ -277,8 +278,8 @@ const CELLS: &[Cell] = &[
     ("E2+T1+B1",          "ai-sdk",        Runtime::Node,   "ai_sdk_anthropic", GEN,      "R1"),
     // The AI SDK's default OpenAI model is Responses (`openai(model)`, no `.chat`), most apps' call;
     // `@ai-sdk/openai-compatible` is the generic provider apps wire a gateway in with. T4 only
-    // where the gateway serves a JSON schema: not Bedrock alone, not claude-sonnet-4 (its card
-    // lists no structured outputs).
+    // where the gateway serves a JSON schema: not Bedrock alone. OpenRouter's JSON schema on Claude
+    // is CAT-6's (the catalog sweep, every Claude row's OpenRouter candidate).
     ("E3+TRN-1+T1+T4+B1", "ai-sdk",        Runtime::Node,   "ai_sdk_responses", &[CLAUDE, GPT, FAILOVER, XAI, TOGETHER], "R1"),
     ("E3+TRN-1+T1+B1",    "ai-sdk",        Runtime::Node,   "ai_sdk_responses", &[OPENROUTER, BEDROCK], ""),
     ("E3+B1",             "ai-sdk",        Runtime::Node,   "ai_sdk_conversation", GEN,   ""),

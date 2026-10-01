@@ -31,8 +31,29 @@
 #   (the ListPrice rule for an unpublished rate);
 # - every direct-vendor catalog row has a [[row]] here or an `unverified` entry with a reason.
 #
-# `[[retired]]` and `[[not_serverless]]` are (provider, id) pairs the vendor no longer serves to a
-# standard key. No catalog candidate may name one (`no_candidate_is_retired_or_not_serverless`).
+# `[[not_serverless]]` entries are (provider, id) pairs the vendor no longer serves to a standard
+# key. No catalog candidate may name one (`no_candidate_is_retired_or_not_serverless`).
+#
+# `[[retired]]` records each vendor retirement, past or scheduled, with the vendor's deprecation
+# notice as `source`. An entry names a candidate (`provider` + `id`, the id as that provider spells
+# it, or a dated snapshot of it), a catalog row (`model`: the row and all its candidates), or both,
+# and carries exactly one date:
+# - `retired`: the vendor no longer serves it. No row may be named `model`, and no candidate may
+#   name the (provider, id). A client's request for it is a 404, never a remap to a successor.
+# - `retires`: the vendor has announced the date. The row or candidate stays until then;
+#   `no_catalog_row_outlives_its_retirement` fails once that date is today or past, so the row is
+#   removed (and the entry turned into `retired`) before a customer's request reaches a vendor
+#   404. `/v1/models` has no deprecation field to carry it (the OpenAI list shape and Anthropic's
+#   `/v1/models` define none), so it is recorded here only.
+# The live cell `CAT-16::raw::{provider}::{row}` (crates/verify/tests/catalog_live.rs) holds each
+# candidate to the vendor's own listing and deprecation notices, so a retirement the vendor
+# announces shows up as a red cell, and a deprecation notice naming a candidate with no entry
+# here fails it.
+#
+# `[[not_carried]]` records a first-party model, in a family the catalog carries, that is
+# deliberately not a row, with the reason. `CAT-16::raw::{anthropic,openai,xai}::new-models`
+# fails on a vendor-listed model in a carried family that is neither a row nor recorded here, so a
+# new release surfaces as a visible gap.
 #
 # `[[schema_unenforced]]` records a candidate that accepts a JSON-schema output request
 # (`response_format` `json_schema`, `strict: true`) and answers outside the schema, with the
@@ -697,6 +718,60 @@ created = 1787853604
 input_limit = 922_000
 limit_evidence = "OpenAI API: 400 context_length_exceeded \"Input tokens exceed the configured limit of 922000 tokens\" (catalog sweep 2026-10-01, CAT-3::raw::openai); the window counts the 128K max output."
 
+[[row]]
+model = "gpt-6-luna"
+source = [
+  "https://api.openai.com/v1/models",
+  "https://developers.openai.com/api/docs/pricing.md",
+  "https://developers.openai.com/api/docs/models/gpt-6-luna.md",
+]
+date = "2026-10-01"
+input = "0.1"
+output = "0.5"
+cache_read = "0.01"
+cache_write = "0.125"
+context_window = 1_050_000
+max_output_tokens = 128_000
+created = 1789406102
+input_limit = 922_000
+limit_evidence = "The model page: \"Maximum input tokens: 922,000\" of the 1,050,000 window (the window counts the 128K max output)."
+
+[[row]]
+model = "gpt-6-sol"
+source = [
+  "https://api.openai.com/v1/models",
+  "https://developers.openai.com/api/docs/pricing.md",
+  "https://developers.openai.com/api/docs/models/gpt-6-sol.md",
+]
+date = "2026-10-01"
+input = "2"
+output = "10"
+cache_read = "0.2"
+cache_write = "2.5"
+context_window = 1_050_000
+max_output_tokens = 128_000
+created = 1789405937
+input_limit = 922_000
+limit_evidence = "The model page: \"Maximum input tokens: 922,000\" of the 1,050,000 window (the window counts the 128K max output)."
+
+[[row]]
+model = "gpt-6.1-sol"
+source = [
+  "https://api.openai.com/v1/models",
+  "https://developers.openai.com/api/docs/pricing.md",
+  "https://developers.openai.com/api/docs/models/gpt-6.1-sol.md",
+]
+date = "2026-10-01"
+input = "2"
+output = "10"
+cache_read = "0.1"
+cache_write = "2.5"
+context_window = 1_050_000
+max_output_tokens = 128_000
+created = 1790552874
+input_limit = 922_000
+limit_evidence = "The model page: \"Maximum input tokens: 922,000\" of the 1,050,000 window (the window counts the 128K max output)."
+
 # xAI (every grok row reaches xAI over /v1/responses; checked 2026-10-01):
 # - File input: xAI reads inline PDFs (input_file with file_data) on Responses only. Chat
 #   Completions answers 400 "File content is not supported on /v1/chat/completions. Please use
@@ -800,6 +875,23 @@ output = "6.00"
 cache_read = "0.50"
 context_window = 500_000
 created = 1785974400
+owned_by = "xai"
+input_present = ["image", "file"]
+note = "File input is read on xAI /v1/responses, where every grok row reaches xAI (see the comment above grok-4.20)."
+
+[[row]]
+model = "grok-4.7"
+source = [
+  "https://api.x.ai/v1/models",
+  "https://docs.x.ai/developers/pricing.md",
+  "https://docs.x.ai/developers/models/grok-4.7.md",
+]
+date = "2026-10-01"
+input = "2.00"
+output = "6.00"
+cache_read = "0.50"
+context_window = 500_000
+created = 1788307200
 owned_by = "xai"
 input_present = ["image", "file"]
 note = "File input is read on xAI /v1/responses, where every grok row reaches xAI (see the comment above grok-4.20)."
@@ -1135,52 +1227,6 @@ cache_read = "0.03"
 context_window = 1_048_575
 
 [[row]]
-model = "gpt-5.1-codex"
-source = ["https://api.openai.com/v1/models"]
-date = "2026-10-01"
-input_limit = 272_000
-limit_evidence = "Served through OpenRouter by OpenAI, which caps GPT-5-family input at the 400K window less the 128K max output (\"Input tokens exceed the configured limit of 272000 tokens\")."
-created = 1762988221
-note = "OpenRouter-primary (OpenAI does not serve it to the pool key); created is OpenAI's listing."
-
-[[row]]
-model = "gpt-5.1-codex-max"
-source = ["https://api.openai.com/v1/models"]
-date = "2026-10-01"
-input_limit = 272_000
-limit_evidence = "Served through OpenRouter by OpenAI, which caps GPT-5-family input at the 400K window less the 128K max output (\"Input tokens exceed the configured limit of 272000 tokens\")."
-created = 1763671532
-note = "OpenRouter-primary (OpenAI does not serve it to the pool key); created is OpenAI's listing."
-
-[[row]]
-model = "gpt-5.1-codex-mini"
-source = ["https://api.openai.com/v1/models"]
-date = "2026-10-01"
-input_limit = 272_000
-limit_evidence = "Served through OpenRouter by OpenAI, which caps GPT-5-family input at the 400K window less the 128K max output (\"Input tokens exceed the configured limit of 272000 tokens\")."
-created = 1763007109
-note = "OpenRouter-primary (OpenAI does not serve it to the pool key); created is OpenAI's listing."
-
-[[row]]
-model = "gpt-5.2-codex"
-source = ["https://api.openai.com/v1/models"]
-date = "2026-10-01"
-input_limit = 272_000
-limit_evidence = "Served through OpenRouter by OpenAI, which caps GPT-5-family input at the 400K window less the 128K max output (\"Input tokens exceed the configured limit of 272000 tokens\")."
-created = 1766164985
-note = "OpenRouter-primary (OpenAI does not serve it to the pool key); created is OpenAI's listing."
-
-[[row]]
-model = "minimaxai/minimax-m2.7"
-source = ["https://platform.minimax.io/docs/guides/pricing-paygo.md"]
-date = "2026-10-01"
-input = "0.3"
-output = "1.2"
-cache_read = "0.06"
-cache_write = "0.375"
-note = "OpenRouter-primary (Groq's id is Enterprise-only); MiniMax's own MiniMax-M2.7 row. OpenRouter lists 0.21 / 0.84, its cheapest host."
-
-[[row]]
 model = "moonshotai/kimi-k2.6"
 source = ["https://platform.moonshot.ai/docs/pricing/chat.md"]
 date = "2026-10-01"
@@ -1238,6 +1284,194 @@ id = "open-mistral-nemo-2407"
 source = "https://docs.mistral.ai/models/mistral-nemo-12b-24-07"
 retired = "2026-07-31"
 note = "Dated id of mistral-nemo."
+
+[[retired]]
+model = "claude-opus-4-1"
+provider = "anthropic"
+id = "claude-opus-4-1-20250805"
+source = "https://platform.claude.com/docs/en/about-claude/model-deprecations"
+retired = "2026-08-05"
+note = "Deprecated 2026-06-05, retired on the Claude API 2026-08-05 (replacement claude-opus-4-8). The row was OpenRouter-only (anthropic/claude-opus-4.1, whose one host was Amazon Bedrock, LEGACY there until 2027-01-08); removed by owner decision: a model its maker retired is not served under its name (D181)."
+
+[[retired]]
+provider = "openrouter"
+id = "anthropic/claude-opus-4.1"
+source = "https://platform.claude.com/docs/en/about-claude/model-deprecations"
+retired = "2026-08-05"
+note = "OpenRouter's slug for claude-opus-4-1-20250805 (D181)."
+
+[[retired]]
+model = "claude-sonnet-4"
+provider = "anthropic"
+id = "claude-sonnet-4-20250514"
+source = "https://platform.claude.com/docs/en/about-claude/model-deprecations"
+retired = "2026-06-15"
+note = "Deprecated 2026-04-14, retired on the Claude API 2026-06-15 (replacement claude-sonnet-4-6). The row was OpenRouter-only (anthropic/claude-sonnet-4, Bedrock-served; Bedrock lists it LEGACY, end of life 2026-10-14). Removed with claude-opus-4-1 (D181)."
+
+[[retired]]
+provider = "openrouter"
+id = "anthropic/claude-sonnet-4"
+source = "https://platform.claude.com/docs/en/about-claude/model-deprecations"
+retired = "2026-06-15"
+note = "OpenRouter's slug for claude-sonnet-4-20250514 (D181)."
+
+[[retired]]
+model = "gpt-5.1-codex"
+provider = "openrouter"
+id = "openai/gpt-5.1-codex"
+source = "https://developers.openai.com/api/docs/deprecations"
+retired = "2026-07-23"
+note = "\"Legacy GPT model snapshots (July 2026 shutdown)\": shut down 2026-07-23 (replacement gpt-5.6-sol). OpenAI's /v1/models still lists it on 2026-10-01; OpenRouter serves it from Azure only. The row was OpenRouter-only (D181)."
+
+[[retired]]
+model = "gpt-5.1-codex-max"
+provider = "openrouter"
+id = "openai/gpt-5.1-codex-max"
+source = "https://developers.openai.com/api/docs/deprecations"
+retired = "2026-07-23"
+note = "Shut down 2026-07-23 (replacement gpt-5.6-sol); still in OpenAI's /v1/models listing. OpenRouter-only row, Azure-served (D181)."
+
+[[retired]]
+model = "gpt-5.1-codex-mini"
+provider = "openrouter"
+id = "openai/gpt-5.1-codex-mini"
+source = "https://developers.openai.com/api/docs/deprecations"
+retired = "2026-07-23"
+note = "Shut down 2026-07-23 (replacement gpt-5.6-terra); still in OpenAI's /v1/models listing. OpenRouter-only row, Azure-served (D181)."
+
+[[retired]]
+model = "gpt-5.2-codex"
+provider = "openrouter"
+id = "openai/gpt-5.2-codex"
+source = "https://developers.openai.com/api/docs/deprecations"
+retired = "2026-07-23"
+note = "Shut down 2026-07-23 (replacement gpt-5.6-sol); still in OpenAI's /v1/models listing. OpenRouter-only row, Azure-served (D181)."
+
+[[retired]]
+provider = "openai"
+id = "gpt-5-codex"
+source = "https://developers.openai.com/api/docs/deprecations"
+retired = "2026-07-23"
+note = "Shut down 2026-07-23; still in OpenAI's /v1/models listing, so recorded to keep it out of the new-models gap list. Never a row."
+
+[[retired]]
+model = "claude-sonnet-4-5"
+provider = "anthropic"
+id = "claude-sonnet-4-5-20250929"
+source = "https://platform.claude.com/docs/en/about-claude/model-deprecations"
+retires = "2026-11-30"
+note = "Deprecated 2026-09-30, retires on the Claude API 2026-11-30 (replacement claude-sonnet-5-5). Still ACTIVE on Bedrock, which sets its own schedule; the row goes with its primary (D181)."
+
+[[retired]]
+model = "gpt-4"
+provider = "openai"
+id = "gpt-4-0613"
+source = "https://developers.openai.com/api/docs/deprecations"
+retires = "2026-10-23"
+note = "\"Legacy GPT model snapshots\" (announced 2026-04-22): gpt-4-0613 | gpt-4, shutdown 2026-10-23, replacement gpt-5.6-sol (D181)."
+
+[[retired]]
+model = "gpt-4-turbo"
+provider = "openai"
+id = "gpt-4-turbo-2024-04-09"
+source = "https://developers.openai.com/api/docs/deprecations"
+retires = "2026-10-23"
+note = "gpt-4-turbo | gpt-4-turbo-2024-04-09: shutdown 2026-10-23, replacement gpt-5.6-sol (D181)."
+
+[[retired]]
+model = "gpt-4.1-nano"
+provider = "openai"
+id = "gpt-4.1-nano-2025-04-14"
+source = "https://developers.openai.com/api/docs/deprecations"
+retires = "2026-10-23"
+note = "gpt-4.1-nano | gpt-4.1-nano-2025-04-14: shutdown 2026-10-23, replacement gpt-5.6-luna. The BIL-5 OpenAI reconciliation batch runs on it (verify/README.md) and must move first (D181)."
+
+[[retired]]
+provider = "openai"
+id = "gpt-4o-2024-05-13"
+source = "https://developers.openai.com/api/docs/deprecations"
+retires = "2026-10-23"
+note = "Only the 2024-05-13 snapshot shuts down 2026-10-23. Recorded because it is a dated snapshot of the gpt-4o id; the row is not affected only while OpenAI's gpt-4o alias points at a later snapshot (gpt-4o-2024-08-06 on 2026-10-01). It names no row, so the gpt-4o row is not held to that date (D181)."
+
+[[retired]]
+model = "o1"
+provider = "openai"
+id = "o1-2024-12-17"
+source = "https://developers.openai.com/api/docs/deprecations"
+retires = "2026-10-23"
+note = "o1-2024-12-17 | o1: shutdown 2026-10-23, replacement gpt-5.6-sol (D181)."
+
+[[retired]]
+model = "o1-pro"
+provider = "openai"
+id = "o1-pro-2025-03-19"
+source = "https://developers.openai.com/api/docs/deprecations"
+retires = "2026-10-23"
+note = "o1-pro-2025-03-19 | o1-pro: shutdown 2026-10-23, replacement gpt-5.6-sol with reasoning.mode pro (D181)."
+
+[[retired]]
+model = "o3-mini"
+provider = "openai"
+id = "o3-mini-2025-01-31"
+source = "https://developers.openai.com/api/docs/deprecations"
+retires = "2026-10-23"
+note = "o3-mini-2025-01-31 | o3-mini: shutdown 2026-10-23, replacement gpt-5.6-sol (D181)."
+
+[[retired]]
+model = "o4-mini"
+provider = "openai"
+id = "o4-mini-2025-04-16"
+source = "https://developers.openai.com/api/docs/deprecations"
+retires = "2026-10-23"
+note = "o4-mini-2025-04-16 | o4-mini: shutdown 2026-10-23, replacement gpt-5.6-terra (D181)."
+
+[[retired]]
+model = "gpt-5"
+provider = "openai"
+id = "gpt-5-2025-08-07"
+source = "https://developers.openai.com/api/docs/deprecations"
+retires = "2026-12-11"
+note = "\"GPT-5 and o3 model deprecations\" (2026-06-11): gpt-5-2025-08-07 shuts down 2026-12-11 (replacement gpt-5.6-sol). It is the only snapshot behind the gpt-5 alias (D181)."
+
+[[retired]]
+model = "gpt-5-mini"
+provider = "openai"
+id = "gpt-5-mini-2025-08-07"
+source = "https://developers.openai.com/api/docs/deprecations"
+retires = "2026-12-11"
+note = "gpt-5-mini-2025-08-07, the only snapshot behind gpt-5-mini: shutdown 2026-12-11, replacement gpt-5.6-terra (D181)."
+
+[[retired]]
+model = "gpt-5-nano"
+provider = "openai"
+id = "gpt-5-nano-2025-08-07"
+source = "https://developers.openai.com/api/docs/deprecations"
+retires = "2026-12-11"
+note = "gpt-5-nano-2025-08-07, the only snapshot behind gpt-5-nano: shutdown 2026-12-11, replacement gpt-5.6-luna (D181)."
+
+[[retired]]
+model = "gpt-5-pro"
+provider = "openai"
+id = "gpt-5-pro-2025-10-06"
+source = "https://developers.openai.com/api/docs/deprecations"
+retires = "2026-12-11"
+note = "gpt-5-pro-2025-10-06, the only snapshot behind gpt-5-pro: shutdown 2026-12-11, replacement gpt-5.6-sol with reasoning.mode pro (D181)."
+
+[[retired]]
+model = "o3"
+provider = "openai"
+id = "o3-2025-04-16"
+source = "https://developers.openai.com/api/docs/deprecations"
+retires = "2026-12-11"
+note = "o3-2025-04-16, the only snapshot behind o3: shutdown 2026-12-11, replacement gpt-5.6-sol (D181)."
+
+[[retired]]
+model = "o3-pro"
+provider = "openai"
+id = "o3-pro-2025-06-10"
+source = "https://developers.openai.com/api/docs/deprecations"
+retires = "2026-12-11"
+note = "o3-pro-2025-06-10: shutdown 2026-12-11, replacement gpt-5.6-sol with reasoning.mode pro. The row is OpenRouter-only (openai/o3-pro, OpenAI-hosted) (D181)."
 
 [[not_serverless]]
 provider = "fireworks"
@@ -1322,6 +1556,111 @@ id = "minimaxai/minimax-m2.7"
 source = "https://console.groq.com/docs/models"
 date = "2026-10-01"
 note = "Tagged \"Enterprise\", price \"ContactSales\"."
+
+[[not_serverless]]
+provider = "fireworks"
+id = "accounts/fireworks/models/glm-5p2"
+source = "https://fireworks.ai/models/fireworks/glm-5p2"
+date = "2026-10-01"
+note = "Model page FAQ \"Is GLM 5.2 being deprecated on Fireworks?\": \"Only on serverless, starting on September 25, 2026. On-demand deployment will continue to be available.\" OpenRouter's Fireworks endpoint for z-ai/glm-5.2 is down (status -5, uptime 0). Removed from the z-ai/glm-5.2 row (D181)."
+
+[[not_serverless]]
+provider = "together"
+id = "MiniMaxAI/MiniMax-M2.7"
+source = "https://docs.together.ai/docs/serverless/models"
+date = "2026-10-01"
+note = "Listed with a price in Together's /v1/models but absent from the serverless table; a serverless key gets 400 model_not_available \"Unable to access non-serverless model\" (2026-10-01). So it cannot be a primary for minimaxai/minimax-m2.7."
+
+[[not_serverless]]
+provider = "together"
+id = "moonshotai/Kimi-K2.6"
+source = "https://docs.together.ai/docs/deprecations"
+date = "2026-10-01"
+note = "Serverless deprecated 2026-08-19; a serverless key gets 400 endpoint_not_ready \"all configured deployments are stopped\" (2026-10-01)."
+
+[[not_serverless]]
+provider = "together"
+id = "zai-org/GLM-5.1"
+source = "https://docs.together.ai/docs/deprecations"
+date = "2026-10-01"
+note = "Serverless deprecated 2026-07-10; a serverless key gets 400 model_not_available (2026-10-01)."
+
+[[not_carried]]
+provider = "openrouter"
+id = "minimax/minimax-m2.7"
+source = "https://openrouter.ai/api/v1/models/minimax/minimax-m2.7/endpoints"
+date = "2026-10-01"
+reason = "Removed (D182): OpenRouter sends every forced tool call and JSON-schema request for MiniMax M2.7 to Mara or SambaNova, at 0% uptime, which answer 410 Gone (6 of 6 forced calls, CAT-6 2026-10-01). Groq's copy is Enterprise-only, Together's is not serverless, and we hold no MiniMax key; MiniMax M3 is carried. Re-add with a MiniMax pool key (MiniMax's own rate: $0.30 / $1.20 / cache read $0.06 / write $0.375, https://platform.minimax.io/docs/guides/pricing-paygo.md)."
+
+[[not_carried]]
+provider = "xai"
+id = "grok-4.20-0309-non-reasoning"
+source = "https://api.x.ai/v1/models"
+date = "2026-10-01"
+reason = "Alias grok-4.20-non-reasoning. OpenRouter lists no x-ai/grok-4.20-non-reasoning, so the grok row shape (xAI Responses, then OpenRouter) has no failover; a client wanting no reasoning sends grok-4.20 with reasoning effort none."
+
+[[not_carried]]
+provider = "openai"
+id = "gpt-3.5-turbo"
+source = "https://developers.openai.com/api/docs/deprecations"
+date = "2026-10-01"
+reason = "Legacy family the catalog never carried; OpenAI shuts gpt-3.5-turbo-0125 | gpt-3.5-turbo down 2026-10-23."
+
+[[not_carried]]
+provider = "openai"
+id = "gpt-3.5-turbo-16k"
+source = "https://api.openai.com/v1/models"
+date = "2026-10-01"
+reason = "Legacy gpt-3.5 family the catalog never carried."
+
+[[not_carried]]
+provider = "openai"
+id = "gpt-3.5-turbo-0125"
+source = "https://developers.openai.com/api/docs/deprecations"
+date = "2026-10-01"
+reason = "Legacy gpt-3.5 snapshot; shutdown 2026-10-23."
+
+[[not_carried]]
+provider = "openai"
+id = "gpt-3.5-turbo-1106"
+source = "https://developers.openai.com/api/docs/deprecations"
+date = "2026-10-01"
+reason = "Legacy gpt-3.5 snapshot; OpenAI listed its shutdown for 2026-09-28 and still lists it."
+
+[[not_carried]]
+provider = "openrouter"
+id = "qwen/qwen3.8-max-0902"
+source = "https://openrouter.ai/api/v1/models/qwen/qwen3.8-max-0902/endpoints"
+date = "2026-10-01"
+reason = "Qwen3.8 Max: Alibaba sells it ($2 / $6, https://www.alibabacloud.com/help/en/model-studio/model-pricing), but OpenRouter's only host is Alibaba on OpenRouter's own key and Together does not list it: the single shared-pool host D156 removed the Mistral rows for. qwen/qwen3.8-max-prime is Alibaba's faster tier of the same model."
+
+[[not_carried]]
+provider = "openrouter"
+id = "z-ai/glm-5.3-prime"
+source = "https://docs.z.ai/guides/overview/pricing.md"
+date = "2026-10-01"
+reason = "Not on Z.ai's own price table; OpenRouter's only host is Alibaba (a speed tier, like Qwen's Prime). Single shared-pool host (D156)."
+
+[[not_carried]]
+provider = "openrouter"
+id = "z-ai/glm-5.3-flashx"
+source = "https://docs.z.ai/guides/overview/pricing.md"
+date = "2026-10-01"
+reason = "Z.ai prices it ($0.37 / $1.25), but OpenRouter's only host is Z.AI on OpenRouter's key and Together does not serve it (D156)."
+
+[[not_carried]]
+provider = "openrouter"
+id = "meta/muse-spark-1.3"
+source = "https://llama.developer.meta.com/docs/pricing-rate-limits"
+date = "2026-10-01"
+reason = "Meta's flagship ($1.25 / $4.25 on Meta's Model API), but we hold no Meta key and OpenRouter's only host is Meta on OpenRouter's key (D156). Add it with a Meta pool key."
+
+[[not_carried]]
+provider = "openrouter"
+id = "thinkingmachines/inkling-small"
+source = "https://docs.together.ai/docs/deprecations"
+date = "2026-10-01"
+reason = "Together, its serverless host, deprecated it 2026-09-15; OpenRouter's only host is DeepInfra, and the maker sells no API."
 
 [[promo]]
 model = "gpt-5.6-sol"

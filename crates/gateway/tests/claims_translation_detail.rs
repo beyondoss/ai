@@ -481,7 +481,7 @@ async fn max_tokens_reaches_a_reasoning_model_as_max_completion_tokens() {
 
 /// openai-python sends `user: null` for `user=None`. OpenAI and the translated Claude path take it
 /// as "not set"; OpenRouter 400s it ("user: Invalid input: expected string, received null"), so a
-/// same-wire relay to OpenRouter failed on claude-sonnet-4 and on every Claude row's failover. A
+/// same-wire relay to OpenRouter failed on every Claude row's OpenRouter failover. A
 /// root `user: null` leaves the relayed body (wherever it sits, however it is spaced); a real
 /// `user`, and a `user` key deeper in the body, are relayed untouched.
 /// claim: TRN-15
@@ -490,29 +490,30 @@ async fn max_tokens_reaches_a_reasoning_model_as_max_completion_tokens() {
 async fn a_null_user_is_not_relayed_to_openrouter() {
     let (pubkey, sk) = test_keypair(1);
     let mock = MockUpstream::start(Mode::Json).await;
+    // No Anthropic or Bedrock key: OpenRouter serves the Claude row.
     let gw = Gateway::builder(unused_nats_port(), &mock.authority(), &b64(&pubkey))
-        .providers(&["anthropic", "openrouter"])
+        .providers(&["openrouter"])
         .start()
         .await;
     let msgs = r#""messages":[{"role":"user","content":"hi"}]"#;
     let mut wrong = Vec::new();
     for (body, user) in [
         (
-            format!(r#"{{"model":"claude-sonnet-4","user":null,{msgs}}}"#),
+            format!(r#"{{"model":"claude-sonnet-4-5","user":null,{msgs}}}"#),
             None,
         ),
         (
-            format!(r#"{{"model":"claude-sonnet-4",{msgs}, "user" : null }}"#),
+            format!(r#"{{"model":"claude-sonnet-4-5",{msgs}, "user" : null }}"#),
             None,
         ),
         (
             format!(
-                r#"{{"user":null,"model":"claude-sonnet-4",{msgs},"metadata":{{"user":null}}}}"#
+                r#"{{"user":null,"model":"claude-sonnet-4-5",{msgs},"metadata":{{"user":null}}}}"#
             ),
             None,
         ),
         (
-            format!(r#"{{"model":"claude-sonnet-4","user":"u-1",{msgs}}}"#),
+            format!(r#"{{"model":"claude-sonnet-4-5","user":"u-1",{msgs}}}"#),
             Some("u-1"),
         ),
     ] {

@@ -135,7 +135,7 @@ const probes = {
   // (no `.chat`), as most application code calls it. Generate, a tool loop, and Output.object where
   // the cell claims T4: not on a Bedrock-only gateway (the walk leaves Bedrock out of a json_schema
   // request, so there its own refusal is the answer) nor on a row whose card lists no structured
-  // outputs (claude-sonnet-4, whose only candidate is OpenRouter's Bedrock-only endpoint).
+  // outputs.
   async ai_sdk_responses() {
     const model = createOpenAI({ baseURL: `${BASE}/v1`, apiKey: KEY, fetch: recordingFetch })(MODEL);
     const [basic, detail] = await aiSdk(model, "responses");

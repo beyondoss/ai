@@ -1884,7 +1884,7 @@ touches = [
   "crates/gateway/src/route.rs",
   "crates/gateway/src/proxy.rs",
 ]
-defects = ["D61", "D105", "D108", "D147", "D156"]
+defects = ["D61", "D105", "D108", "D147", "D156", "D181"]
 
 [[claim]]
 id = "CAT-2"
@@ -1897,7 +1897,7 @@ touches = [
   "crates/gateway/src/route.rs",
   "crates/gateway/src/proxy.rs",
 ]
-defects = ["D18", "D61", "D147", "D156"]
+defects = ["D18", "D61", "D147", "D156", "D181"]
 
 [[claim]]
 id = "CAT-3"
@@ -1949,7 +1949,21 @@ touches = [
   "crates/gateway/src/route.rs",
   "crates/gateway/src/proxy.rs",
 ]
-defects = ["D54", "D62", "D105", "D107", "D113", "D114", "D115", "D155", "D156", "D170", "D171"]
+defects = [
+  "D54",
+  "D62",
+  "D105",
+  "D107",
+  "D113",
+  "D114",
+  "D115",
+  "D155",
+  "D156",
+  "D170",
+  "D171",
+  "D181",
+  "D182",
+]
 
 [[claim]]
 id = "CAT-7"
@@ -2069,6 +2083,18 @@ touches = [
   "crates/gateway/config.example.toml",
 ]
 defects = ["D55", "D98"]
+
+[[claim]]
+id = "CAT-16"
+priority = "P0"
+group = "Catalog truth"
+text = "The catalog is current: every candidate is offered by its vendor today (listed by the vendor's own models API, or with a live OpenRouter endpoint for each capability the card lists), every vendor retirement notice for it is recorded and none is due, a model its maker retired is not a row, and every Anthropic, OpenAI and xAI model in a family the catalog carries is a row or a recorded decision"
+layer = "both"
+touches = [
+  "crates/providers/src/",
+  "verify/catalog_truth.toml",
+]
+defects = ["D181", "D182"]
 
 # --- Translation detail ------------------------------------------------------------------------
 [[claim]]

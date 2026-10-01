@@ -132,13 +132,14 @@ env = { VERIFY_LIVE = "1" }
 run = "mise run verify:status"
 
 [tasks."verify:catalog"]
-description = "Live catalog sweep only (crates/verify/tests/catalog_live.rs): every in-scope candidate through this tree's gateway, then the cost summary. ~$2-3 per run; reads keys from .env. VERIFY_CATALOG_PLAN=1 prints the plan and estimate instead."
+description = "Live catalog sweep only (crates/verify/tests/catalog_live.rs): every in-scope candidate through this tree's gateway, then the cost summary and the Together/OpenRouter gap report. ~$2-3 per run; reads keys from .env. VERIFY_CATALOG_PLAN=1 prints the plan and estimate instead."
 env = { VERIFY_LIVE = "1" }
 run = """
 set -e
 cargo build -q -p beyond-ai
 cargo nextest run -p beyond-ai-verify --test catalog_live --profile verify --no-fail-fast "$@" || true
 VERIFY_CATALOG_SUMMARY=1 cargo test -q -p beyond-ai-verify --test catalog_live
+VERIFY_CATALOG_GAPS=1 cargo test -q -p beyond-ai-verify --test catalog_live
 """
 
 [tasks."verify:gate"]

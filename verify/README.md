@@ -213,6 +213,28 @@ and prints its cost (each billed call is priced from the ledger into
 estimated cost, and every trial left out with its reason (no key, over the per-call cost cap, or a
 provider window an over-limit prompt would be billed against).
 
+CAT-16 keeps the catalog current, from listing calls only (no completions, no gateway, free).
+`CAT-16::raw::PROVIDER::ROW`, one per candidate, fails when the vendor no longer offers it: not in
+its own models API (Anthropic by snapshot, xAI by alias), not in Together's serverless table, a
+Bedrock inference profile that is not `ACTIVE` or a foundation model that is `LEGACY`, or, on
+OpenRouter, no endpoint up in the last 30 minutes (one at 0% uptime answers 410) or none that takes a
+capability the card lists. It also fails when the vendor's deprecation page (Anthropic, OpenAI,
+Together; for an OpenRouter slug, its maker's) retires the id, or a dated snapshot of it, without a
+`[[retired]]` entry in `catalog_truth.toml`, or when a recorded retirement is due. So a
+retirement shows up as a red cell, not a customer 404. `CAT-16::raw::{anthropic,openai,xai}::new-models`
+fails on a model those vendors list in a family the catalog carries (Claude; GPT and the
+o-series; Grok; text generation, aliases not dated snapshots) that is neither a row nor recorded
+in `[[not_carried]]` with a reason, so a release is a visible gap. Together and OpenRouter list
+hundreds of models, so their gaps are a report, not a failure: `VERIFY_CATALOG_GAPS=1` prints recent
+models in the namespaces the catalog carries that are not in it (`mise run verify:catalog` prints
+it last). The hermetic `no_catalog_row_outlives_its_retirement` fails on the day a recorded
+`retires` date comes, so a scheduled retirement is acted on before the vendor's 404.
+
+```sh
+VERIFY_LIVE=1 cargo nextest run -p beyond-ai-verify --test catalog_live --profile verify -E 'test(/^CAT-16::/)'
+VERIFY_CATALOG_GAPS=1 cargo test -q -p beyond-ai-verify --test catalog_live
+```
+
 ## Tenancy sessions (TEN-1, TEN-2)
 
 `crates/verify/tests/tenancy_live.rs` runs real SDK sessions while the control plane changes under

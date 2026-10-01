@@ -131,7 +131,7 @@ async fn codex_on_a_chat_first_gpt_row_is_relayed_to_its_responses_arm() {
 const CLAUDE_CODEX_TOOL_JSON: &str = r#"{"id":"msg_mock","type":"message","role":"assistant","model":"claude-opus-4-8","content":[{"type":"tool_use","id":"toolu_1","name":"multi_agent_v1__spawn_agent","input":{"task":"fix"}},{"type":"tool_use","id":"toolu_2","name":"apply_patch","input":{"input":"*** Begin Patch\n*** End Patch\n"}}],"stop_reason":"tool_use","usage":{"input_tokens":13,"output_tokens":7}}"#;
 
 /// The same answer from a Chat Completions host.
-const CHAT_CODEX_TOOL_JSON: &str = r#"{"id":"chatcmpl-mock","object":"chat.completion","model":"anthropic/claude-sonnet-4","choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"multi_agent_v1__spawn_agent","arguments":"{\"task\":\"fix\"}"}},{"id":"call_2","type":"custom","custom":{"name":"apply_patch","input":"*** Begin Patch\n*** End Patch\n"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":11,"completion_tokens":7,"total_tokens":18}}"#;
+const CHAT_CODEX_TOOL_JSON: &str = r#"{"id":"chatcmpl-mock","object":"chat.completion","model":"anthropic/claude-sonnet-4.5","choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"multi_agent_v1__spawn_agent","arguments":"{\"task\":\"fix\"}"}},{"id":"call_2","type":"custom","custom":{"name":"apply_patch","input":"*** Begin Patch\n*** End Patch\n"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":11,"completion_tokens":7,"total_tokens":18}}"#;
 
 /// What Codex must get back either way: the namespace call under its own name and namespace, and
 /// `apply_patch` as a `custom_tool_call` with raw input.
@@ -232,19 +232,19 @@ async fn codex_tools_survive_translation_and_calls_map_back() {
     );
     assert_codex_calls(&resp);
 
-    // Chat Completions: a Claude row OpenRouter serves.
+    // Chat Completions: a Claude row OpenRouter serves (no Anthropic or Bedrock key).
     let nats_port = unused_nats_port();
     let (pubkey, sk) = test_keypair(1);
     let mock = MockUpstream::start(Mode::Raw(200, "application/json", CHAT_CODEX_TOOL_JSON)).await;
     let gw = Gateway::builder(nats_port, &mock.authority(), &b64(&pubkey))
-        .providers(&["anthropic", "openai", "openrouter"])
+        .providers(&["openai", "openrouter"])
         .start()
         .await;
     let resp = post(
         &gw,
         &sk,
         "/v1/responses",
-        &codex_body("claude-sonnet-4", history),
+        &codex_body("claude-sonnet-4-5", history),
     )
     .await;
     let (cap, got) = captured(&mock);
@@ -312,8 +312,8 @@ async fn a_claude_tool_turn_without_reasoning_details_goes_without_reasoning_on_
          "format": "anthropic-claude-v1", "index": 0}]});
 
     let mut bad = Vec::new();
-    // Same wire (claude-sonnet-4 is OpenRouter-only), and a Claude row's OpenRouter failover.
-    for model in ["claude-sonnet-4", "claude-sonnet-4-5"] {
+    // A Claude row's OpenRouter failover (Anthropic is unreachable).
+    for model in ["claude-sonnet-4-5"] {
         post(&gw, &sk, "/v1/chat/completions", &turn2(model, pi.clone())).await;
         let (cap, got) = captured(&mock);
         assert_eq!(cap.path, "/api/v1/chat/completions");
@@ -338,7 +338,7 @@ async fn a_claude_tool_turn_without_reasoning_details_goes_without_reasoning_on_
         &gw,
         &sk,
         "/v1/responses",
-        &json!({"model": "claude-sonnet-4", "store": false, "reasoning": {"effort": "medium"},
+        &json!({"model": "claude-sonnet-4-5", "store": false, "reasoning": {"effort": "medium"},
             "tools": [{"type": "function", "name": "get_weather", "parameters": {"type": "object"}}],
             "input": [
                 {"role": "user", "content": "weather in Paris?"},
@@ -357,7 +357,7 @@ async fn a_claude_tool_turn_without_reasoning_details_goes_without_reasoning_on_
         &gw,
         &sk,
         "/v1/chat/completions",
-        &json!({"model": "claude-sonnet-4", "reasoning_effort": "medium", "tools": [weather_tool()],
+        &json!({"model": "claude-sonnet-4-5", "reasoning_effort": "medium", "tools": [weather_tool()],
             "messages": [{"role": "user", "content": "weather in Paris?"}]}),
     )
     .await;
@@ -369,9 +369,8 @@ async fn a_claude_tool_turn_without_reasoning_details_goes_without_reasoning_on_
 
 /// openai-python sends `user: null` (and other unset options as null) when a caller passes `None`.
 /// OpenRouter rejects `user: null` ("expected string, received null"). On a same-wire Chat relay
-/// to a non-OpenAI host, explicit nulls are omitted, as translation already omits them: on
-/// claude-sonnet-4 (OpenRouter only) and on a Claude row's OpenRouter failover alike. Every other
-/// byte is the client's.
+/// to a non-OpenAI host, explicit nulls are omitted, as translation already omits them: here on a
+/// Claude row's OpenRouter failover. Every other byte is the client's.
 /// claim: TRN-15
 /// defect: D101
 #[tokio::test]
@@ -385,7 +384,7 @@ async fn explicit_nulls_are_omitted_on_a_same_wire_chat_relay_to_openrouter() {
         .start()
         .await;
     let mut bad = Vec::new();
-    for model in ["claude-sonnet-4", "claude-sonnet-4-5"] {
+    for model in ["claude-sonnet-4-5"] {
         let body = json!({
             "model": model, "user": null, "seed": null, "temperature": 0.5, "stop": null,
             "messages": [{"role": "user", "content": "hi"}],
@@ -411,7 +410,7 @@ async fn explicit_nulls_are_omitted_on_a_same_wire_chat_relay_to_openrouter() {
 }
 
 /// pi in Responses mode with thinking off replays a tool turn whose `reasoning` item the gateway
-/// minted from Claude's signed thinking. On claude-sonnet-4 (OpenRouter, served by Bedrock) the
+/// minted from Claude's signed thinking. On a Claude row's OpenRouter failover (served by Bedrock) the
 /// thinking rode `reasoning_details` on the tool loop of a request that does not think,
 /// and Bedrock 400s that: "When thinking is disabled, an `assistant` message in the final position
 /// cannot contain `thinking`", for every call of the loop. It goes without; a request that thinks
@@ -429,7 +428,7 @@ async fn a_replayed_thinking_turn_without_thinking_on_reaches_openrouter_without
         .start()
         .await;
     let turn2 = |reasoning: Option<Value>| {
-        let mut body = json!({"model": "claude-sonnet-4", "store": false, "stream": false,
+        let mut body = json!({"model": "claude-sonnet-4-5", "store": false, "stream": false,
         "tools": [{"type": "function", "name": "get_weather", "parameters": {"type": "object"}}],
         "input": [
             {"role": "user", "content": [{"type": "input_text", "text": "weather in Paris?"}]},
@@ -502,19 +501,26 @@ fn codex_web_search_body(model: &str) -> Value {
 /// defect: D78
 #[tokio::test]
 async fn codex_runs_on_a_claude_row_without_its_hosted_web_search() {
-    for (raw, model, path) in [
-        (CLAUDE_CODEX_TOOL_JSON, "claude-opus-4-8", "/v1/messages"),
+    for (raw, model, path, providers) in [
+        (
+            CLAUDE_CODEX_TOOL_JSON,
+            "claude-opus-4-8",
+            "/v1/messages",
+            &["anthropic", "openai", "openrouter"][..],
+        ),
+        // No Anthropic or Bedrock key: OpenRouter serves the Claude row.
         (
             CHAT_CODEX_TOOL_JSON,
-            "claude-sonnet-4",
+            "claude-sonnet-4-5",
             "/api/v1/chat/completions",
+            &["openai", "openrouter"][..],
         ),
     ] {
         let nats_port = unused_nats_port();
         let (pubkey, sk) = test_keypair(1);
         let mock = MockUpstream::start(Mode::Raw(200, "application/json", raw)).await;
         let gw = Gateway::builder(nats_port, &mock.authority(), &b64(&pubkey))
-            .providers(&["anthropic", "openai", "openrouter"])
+            .providers(providers)
             .start()
             .await;
         let resp = post(&gw, &sk, "/v1/responses", &codex_web_search_body(model)).await;

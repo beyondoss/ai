@@ -172,15 +172,16 @@ const GROK: Model = Model {
     sampling: true,
     price: (1.25, 2.5),
 };
-const SONNET4_OR: Model = Model {
-    gw: "claude-sonnet-4",
-    direct: "anthropic/claude-sonnet-4",
+/// Claude Haiku 4.5 through a gateway holding only the OpenRouter key: its OpenRouter candidate.
+const HAIKU_OR: Model = Model {
+    gw: "claude-haiku-4-5",
+    direct: "anthropic/claude-haiku-4.5",
     provider: OPENROUTER,
     native: Dialect::Chat,
     openai_reasoning: false,
     always_reasons: false,
     sampling: true,
-    price: (3.0, 15.0),
+    price: (1.0, 5.0),
 };
 
 /// One comparison path: a client dialect, a model, and the claims every trial on it proves.
@@ -236,7 +237,7 @@ const PATHS: &[ParityPath] = &[
     ParityPath {
         route: "openrouter-chat",
         client: Dialect::Chat,
-        model: SONNET4_OR,
+        model: HAIKU_OR,
         claims: &["E1"],
     },
     // Cross dialect: the gateway translates.

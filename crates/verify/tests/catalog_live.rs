@@ -25,6 +25,11 @@
 //! |                    |             | else card = `verify/catalog_truth.toml` (vendor-doc verified) |
 //! | `CAT-8`            | row         | name / created / owner against the provider's model endpoint  |
 //! | `CAT-13`           | provider    | `/{provider}/` passthrough, managed (billed) and BYO (not)    |
+//! | `CAT-16`           | candidate   | the vendor still offers it: listed by its own models API (or  |
+//! |                    |             | live endpoints on OpenRouter), no retirement due, every       |
+//! |                    |             | vendor deprecation notice recorded in `catalog_truth.toml`    |
+//! | `CAT-16`           | vendor      | `new-models`: every Anthropic / OpenAI / xAI model in a       |
+//! |                    |             | carried family is a row or recorded in `[[not_carried]]`      |
 //!
 //! Scope (CAT-1): OpenAI, Anthropic, OpenRouter, xAI, Bedrock and Together candidates. Groq,
 //! DeepSeek and Fireworks are out of scope by owner decision; `openai-codex` has no key. The
@@ -32,6 +37,10 @@
 //! A trial that can't run (no key, over the per-call cost cap, a window the provider exceeds so an
 //! over-limit request would be billed) is not listed — `VERIFY_CATALOG_PLAN=1` prints each skip and
 //! its reason, and the estimated cost of what is listed.
+//!
+//! CAT-16 makes listing calls only (no completions), so it costs nothing and needs no gateway.
+//! `VERIFY_CATALOG_GAPS=1` prints, without failing, recent Together and OpenRouter models in the
+//! vendor namespaces the catalog carries that are not in it.
 //!
 //! Cost: every billed call appends a record to `target/catalog-live/<sweep>.jsonl`
 //! (`VERIFY_CATALOG_SWEEP`, default `sweep`), priced from the ledger's tokens at the card;
@@ -205,6 +214,7 @@ fn listing(provider: &str) -> Option<&'static Value> {
     let v = cached.or_else(|| {
         let req = match provider {
             "openrouter" => http().get("https://openrouter.ai/api/v1/models"),
+            "openrouter-embeddings" => http().get("https://openrouter.ai/api/v1/embeddings/models"),
             "anthropic" => http()
                 .get("https://api.anthropic.com/v1/models?limit=1000")
                 .header("x-api-key", key_of("anthropic")?)
@@ -2299,6 +2309,634 @@ fn cat13(_trial: &str, m: Mount, byo: bool) -> Result<(), Failed> {
 }
 
 // ---------------------------------------------------------------------------------------------
+// CAT-16: catalog currency (listing calls only, no completions)
+// ---------------------------------------------------------------------------------------------
+
+/// A vendor page (deprecation notices, Together's serverless table), fetched once and cached on
+/// disk for six hours, like the model listings.
+fn page(name: &str, url: &str) -> Option<&'static str> {
+    static CACHE: OnceLock<Mutex<BTreeMap<String, Option<&'static str>>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(Default::default);
+    let mut cache = cache.lock().unwrap();
+    if let Some(v) = cache.get(name) {
+        return *v;
+    }
+    let path = sweep_dir().join(format!("page-{name}.md"));
+    let text = fresh(&path, Duration::from_secs(6 * 3600))
+        .then(|| std::fs::read_to_string(&path).ok())
+        .flatten()
+        .or_else(|| {
+            let t = http()
+                .get(url)
+                .send()
+                .ok()?
+                .error_for_status()
+                .ok()?
+                .text()
+                .ok()?;
+            let _ = std::fs::write(&path, &t);
+            Some(t)
+        });
+    let leaked: Option<&'static str> = text.map(|t| &*Box::leak(t.into_boxed_str()));
+    cache.insert(name.to_owned(), leaked);
+    leaked
+}
+
+/// Where each vendor publishes its retirements, as markdown tables of (date, model).
+fn deprecation_page(provider: &str) -> Option<(&'static str, &'static str)> {
+    Some(match provider {
+        "anthropic" => (
+            "anthropic-deprecations",
+            "https://platform.claude.com/docs/en/about-claude/model-deprecations.md",
+        ),
+        "openai" => (
+            "openai-deprecations",
+            "https://developers.openai.com/api/docs/deprecations.md",
+        ),
+        "together" => (
+            "together-deprecations",
+            "https://docs.together.ai/docs/deprecations.md",
+        ),
+        _ => return None,
+    })
+}
+
+/// `October 23, 2026`, `Oct 1, 2026`, `2026-09-24` (also with U+2011 hyphens) → `YYYY-MM-DD`.
+fn doc_date(cell: &str) -> Option<String> {
+    let s = cell.trim().replace('\u{2011}', "-");
+    let b = s.as_bytes();
+    if b.len() == 10
+        && b[4] == b'-'
+        && b[7] == b'-'
+        && s.replace('-', "").bytes().all(|c| c.is_ascii_digit())
+    {
+        return Some(s);
+    }
+    const MONTHS: [&str; 12] = [
+        "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec",
+    ];
+    let mut words = s.split([' ', ',']).filter(|w| !w.is_empty());
+    let (m, d, y) = (words.next()?, words.next()?, words.next()?);
+    if words.next().is_some() {
+        return None;
+    }
+    let m = MONTHS
+        .iter()
+        .position(|p| m.len() >= 3 && m.to_ascii_lowercase().starts_with(p))?
+        + 1;
+    let (d, y): (u32, u32) = (d.parse().ok()?, y.parse().ok()?);
+    Some(format!("{y:04}-{m:02}-{d:02}"))
+}
+
+/// Every `(model id, retirement date)` a vendor's deprecation page lists: each markdown table with
+/// a date column and a model column (not the replacement), outside fine-tuning sections. A model
+/// cell may hold several backticked ids (OpenAI: `` `gpt-4-0613` \| `gpt-4` ``); a cell that is
+/// not a plain date (`Not sooner than ...`, `To be announced`) lists nothing.
+fn deprecations(provider: &str) -> Option<Vec<(String, String)>> {
+    let (name, url) = deprecation_page(provider)?;
+    let text = page(name, url)?;
+    let mut out = Vec::new();
+    let mut cols: Option<(usize, usize)> = None;
+    let mut skip_section = false;
+    for line in text.lines().map(str::trim) {
+        if line.starts_with('#') {
+            skip_section = line.to_ascii_lowercase().contains("fine-tun");
+            cols = None;
+            continue;
+        }
+        if !line.starts_with('|') {
+            cols = None;
+            continue;
+        }
+        let cells: Vec<&str> = line.trim_matches('|').split(" | ").map(str::trim).collect();
+        let Some((date_col, model_col)) = cols else {
+            let lower: Vec<String> = cells.iter().map(|c| c.to_ascii_lowercase()).collect();
+            let date_col = lower.iter().position(|c| c.contains("date"));
+            let model_col = lower.iter().position(|c| {
+                (c.contains("model") || c == "system")
+                    && !["replacement", "price", "type"]
+                        .iter()
+                        .any(|w| c.contains(w))
+            });
+            cols = date_col.zip(model_col);
+            continue;
+        };
+        if skip_section || cells.len() <= date_col.max(model_col) {
+            continue;
+        }
+        let Some(date) = doc_date(cells[date_col]) else {
+            continue;
+        };
+        let cell = cells[model_col];
+        let ids: Vec<&str> = if cell.contains('`') {
+            cell.split('`').skip(1).step_by(2).collect()
+        } else {
+            vec![cell]
+        };
+        for id in ids
+            .into_iter()
+            .map(str::trim)
+            .filter(|i| !i.is_empty() && !i.contains(' '))
+        {
+            out.push((id.to_owned(), date.clone()));
+        }
+    }
+    Some(out)
+}
+
+/// An id without its dated snapshot suffix (`-YYYY-MM-DD`, `-YYYYMMDD`, `-MMDD`).
+fn undated(id: &str) -> &str {
+    let b = id.as_bytes();
+    let n = b.len();
+    let digits = |r: std::ops::Range<usize>| b[r].iter().all(u8::is_ascii_digit);
+    if n > 11
+        && b[n - 11] == b'-'
+        && b[n - 6] == b'-'
+        && b[n - 3] == b'-'
+        && digits(n - 10..n - 6)
+        && digits(n - 5..n - 3)
+        && digits(n - 2..n)
+    {
+        &id[..n - 11]
+    } else if n > 9 && b[n - 9] == b'-' && digits(n - 8..n) {
+        &id[..n - 9]
+    } else if n > 5 && b[n - 5] == b'-' && digits(n - 4..n) {
+        &id[..n - 5]
+    } else {
+        id
+    }
+}
+
+/// Today, `YYYY-MM-DD` (UTC).
+fn today() -> String {
+    let secs = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let z = i64::try_from(secs / 86_400).unwrap_or(0) + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+/// The `verify/catalog_truth.toml` entries of one array (`retired`, `not_carried`).
+fn truth_entries(list: &str) -> &'static [toml::Value] {
+    truth_file()
+        .get(list)
+        .and_then(toml::Value::as_array)
+        .map_or(&[], Vec::as_slice)
+}
+
+fn field<'a>(e: &'a toml::Value, k: &str) -> Option<&'a str> {
+    e.get(k).and_then(toml::Value::as_str)
+}
+
+/// The `[[retired]]` entry recording a vendor retirement of `id` at `provider`, or of `row`.
+fn retirement(provider: &str, id: &str, row: Option<&str>) -> Option<&'static toml::Value> {
+    truth_entries("retired").iter().find(|e| {
+        (field(e, "provider") == Some(provider) && field(e, "id") == Some(id))
+            || (row.is_some() && field(e, "model") == row)
+    })
+}
+
+/// The date an entry records: `retired` (past) or `retires` (scheduled).
+fn retirement_date(e: &toml::Value) -> Option<&str> {
+    field(e, "retired").or_else(|| field(e, "retires"))
+}
+
+/// OpenRouter's endpoints for a model. Uncached: it is the live state.
+fn openrouter_endpoints(id: &str) -> Result<Vec<Value>, String> {
+    let url = format!("https://openrouter.ai/api/v1/models/{id}/endpoints");
+    let mut last = String::new();
+    for attempt in 0..3 {
+        if attempt > 0 {
+            std::thread::sleep(Duration::from_secs(2 * attempt));
+        }
+        match http().get(&url).send() {
+            Ok(r) if r.status().is_success() => {
+                let v: Value = r.json().map_err(|e| e.to_string())?;
+                return Ok(v["data"]["endpoints"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default());
+            }
+            Ok(r) if r.status().as_u16() == 404 => return Err(format!("{url}: 404")),
+            Ok(r) => last = format!("{url}: HTTP {}", r.status()),
+            Err(e) => last = format!("{url}: {e}"),
+        }
+    }
+    Err(last)
+}
+
+/// Bedrock's control plane, read with the same bearer key the runtime takes.
+fn bedrock_get(path: &str) -> Result<Value, String> {
+    let key = key_of("bedrock").ok_or("no Bedrock key")?;
+    let url = format!("https://bedrock.us-east-1.amazonaws.com{path}");
+    let r = http()
+        .get(&url)
+        .bearer_auth(key)
+        .send()
+        .map_err(|e| format!("{url}: {e}"))?;
+    let status = r.status();
+    let body: Value = r.json().unwrap_or(Value::Null);
+    if status.is_success() {
+        Ok(body)
+    } else {
+        Err(format!("{url}: HTTP {status} {body}"))
+    }
+}
+
+/// CAT-16 for one candidate: the vendor still offers it, today.
+///
+/// - Anthropic, OpenAI, xAI: listed by the vendor's own `/v1/models` (Anthropic by snapshot, xAI by
+///   alias). Together: listed as a chat model and in the serverless models table. Bedrock: the
+///   inference profile is `ACTIVE` and its foundation model is not `LEGACY` (a `LEGACY` model needs
+///   a `[[retired]]` entry with AWS's end-of-life date). OpenRouter: listed, and at least one
+///   endpoint answered in the last 30 minutes (an endpoint at 0% uptime answers 410 Gone); a card
+///   capability (tools, structured outputs where the candidate serves them) needs a live endpoint
+///   that lists it.
+/// - Every retirement the vendor's deprecation page lists for the id, or a dated snapshot of it,
+///   is recorded in `verify/catalog_truth.toml` `[[retired]]`, and none recorded for the row is
+///   due: a retirement date of today or earlier fails.
+fn cat16(_trial: &str, row: &'static ModelRoute, cand: Candidate) -> Result<(), Failed> {
+    let provider = by_id(cand.provider).name;
+    let id = cand.upstream_model;
+    let today = today();
+    let mut problems = Vec::new();
+    match provider {
+        "anthropic" | "openai" | "xai" => {
+            if listing(provider).is_none() {
+                return Err(format!("{provider}'s /v1/models could not be read").into());
+            }
+            match listed(provider, id) {
+                Some(m) => println!("{provider} lists {id} as {}", m["id"]),
+                None => problems.push(format!("{provider}'s /v1/models no longer lists {id}")),
+            }
+        }
+        "together" => {
+            match listed("together", id) {
+                Some(m) if m["type"] == "chat" => println!("together lists {id} ({})", m["type"]),
+                Some(m) => problems.push(format!("together lists {id} as {}, not chat", m["type"])),
+                None => problems.push(format!("together's /v1/models no longer lists {id}")),
+            }
+            let table = page(
+                "together-serverless",
+                "https://docs.together.ai/docs/serverless/models.md",
+            )
+            .ok_or("Together's serverless models page could not be read")?;
+            if !table.contains(&format!("| {id} |")) {
+                problems.push(format!(
+                    "{id} is not in Together's serverless models table (docs.together.ai/docs/serverless/models)"
+                ));
+            }
+        }
+        "bedrock" => {
+            let p = bedrock_get(&format!("/inference-profiles/{id}"))?;
+            println!("bedrock profile {id}: {}", p["status"]);
+            if p["status"] != "ACTIVE" {
+                problems.push(format!("inference profile {id} is {}", p["status"]));
+            }
+            let models = bedrock_get("/foundation-models?byProvider=anthropic")?;
+            let arns: Vec<&str> = p["models"]
+                .as_array()
+                .map(|a| a.iter().filter_map(|m| m["modelArn"].as_str()).collect())
+                .unwrap_or_default();
+            let fm = models["modelSummaries"].as_array().and_then(|a| {
+                a.iter().find(|m| {
+                    m["modelArn"]
+                        .as_str()
+                        .is_some_and(|arn| arns.contains(&arn))
+                })
+            });
+            match fm {
+                None => problems.push(format!("no us-east-1 foundation model behind {id}")),
+                Some(m) => {
+                    let life = &m["modelLifecycle"];
+                    println!("bedrock {}: {life}", m["modelId"]);
+                    match life["status"].as_str() {
+                        Some("ACTIVE") => {}
+                        Some("LEGACY") => {
+                            let eol = life["endOfLifeTime"].as_str().unwrap_or("?");
+                            if retirement(provider, id, None).is_none() {
+                                problems.push(format!(
+                                    "{} is LEGACY on Bedrock (end of life {eol}): record it in [[retired]]",
+                                    m["modelId"]
+                                ));
+                            }
+                        }
+                        other => problems.push(format!("{} is {other:?} on Bedrock", m["modelId"])),
+                    }
+                }
+            }
+        }
+        "openrouter" => {
+            let listed_here = listed("openrouter", id).is_some()
+                || listing("openrouter-embeddings").is_some_and(|l| {
+                    l["data"]
+                        .as_array()
+                        .is_some_and(|a| a.iter().any(|m| m["id"] == id))
+                });
+            if !listed_here {
+                problems.push(format!("OpenRouter no longer lists {id}"));
+            }
+            if let Some(exp) = listed("openrouter", id).and_then(|m| m["expiration_date"].as_str())
+            {
+                problems.push(format!("OpenRouter will remove {id} on {exp}"));
+            }
+            let eps = openrouter_endpoints(id)?;
+            let (live, dead): (Vec<&Value>, Vec<&Value>) = eps
+                .iter()
+                .partition(|e| e["uptime_last_30m"].as_f64() != Some(0.0));
+            println!(
+                "openrouter {id}: {} live endpoints {:?}; down {:?}",
+                live.len(),
+                live.iter()
+                    .map(|e| e["provider_name"].as_str().unwrap_or("?"))
+                    .collect::<Vec<_>>(),
+                dead.iter()
+                    .map(|e| e["provider_name"].as_str().unwrap_or("?"))
+                    .collect::<Vec<_>>(),
+            );
+            if live.is_empty() {
+                problems.push(format!(
+                    "{id} has no live OpenRouter endpoint ({} listed, all at 0% uptime)",
+                    eps.len()
+                ));
+            }
+            let lists = |param: &str| {
+                live.iter().any(|e| {
+                    e["supported_parameters"]
+                        .as_array()
+                        .is_some_and(|a| a.iter().any(|p| p == param))
+                })
+            };
+            if row.card.features & TOOLS != 0 && !lists("tools") {
+                problems.push(format!(
+                    "the card lists tools, but no live OpenRouter endpoint for {id} takes them"
+                ));
+            }
+            if row.card.features & STRUCTURED_OUTPUTS != 0
+                && serves_structured_outputs(&cand)
+                && !lists("structured_outputs")
+            {
+                problems.push(format!(
+                    "the card lists structured outputs, but no live OpenRouter endpoint for {id} \
+                     takes them (a json_schema request has nowhere to go)"
+                ));
+            }
+        }
+        _ => return Err(format!("{provider}: no listing to check").into()),
+    }
+    // The deprecation notices of the vendor, and of the model's maker when OpenRouter serves a
+    // first-party model (`openai/o3-pro` is OpenAI's `o3-pro`; `anthropic/claude-opus-4.1` is
+    // Anthropic's `claude-opus-4-1`): a maker's retirement retires the model under its name, even
+    // where another host still runs it.
+    let mut sources: Vec<(&str, Vec<String>)> = vec![(provider, vec![id.to_owned()])];
+    if provider == "openrouter"
+        && let Some((maker, model)) = id.split_once('/')
+        && deprecation_page(maker).is_some()
+    {
+        sources.push((
+            maker,
+            vec![
+                model.to_owned(),
+                model.replace('.', "-"),
+                row.model.to_owned(),
+            ],
+        ));
+    }
+    for (vendor, names) in sources {
+        if deprecation_page(vendor).is_none() {
+            continue;
+        }
+        let notices =
+            deprecations(vendor).ok_or(format!("{vendor}'s deprecation page could not be read"))?;
+        for (dep, date) in notices
+            .iter()
+            .filter(|(d, _)| names.iter().any(|n| d == n || undated(d) == n))
+        {
+            let recorded =
+                retirement(vendor, dep, None).or_else(|| retirement(provider, id, Some(row.model)));
+            match recorded {
+                None => problems.push(format!(
+                    "{vendor}'s deprecation page retires {dep} on {date}; no [[retired]] entry \
+                     in verify/catalog_truth.toml"
+                )),
+                Some(e) => println!(
+                    "{vendor} retires {dep} on {date}: recorded ({})",
+                    retirement_date(e).unwrap_or("?")
+                ),
+            }
+        }
+    }
+    // Nothing recorded for this row or candidate is due.
+    for e in truth_entries("retired") {
+        let touches = field(e, "model") == Some(row.model)
+            || (field(e, "provider") == Some(provider) && field(e, "id") == Some(id));
+        if let (true, Some(date)) = (touches, retirement_date(e))
+            && date <= today.as_str()
+        {
+            problems.push(format!(
+                "{provider}/{id} on {} was due to retire on {date}",
+                row.model
+            ));
+        }
+    }
+    if problems.is_empty() {
+        Ok(())
+    } else {
+        Err(problems.join("; ").into())
+    }
+}
+
+/// The models a first-party vendor lists in a family the catalog carries (Claude; GPT and the
+/// o-series; Grok), as `(id, aliases)`. Not counted: dated snapshots (the catalog lists aliases),
+/// and models that are not text generation (audio, realtime, transcription, speech, image,
+/// search, embeddings, moderation, video) or are ChatGPT's moving `chat-latest` aliases.
+fn first_party_models(vendor: &str) -> Option<Vec<(String, Vec<String>)>> {
+    const NOT_TEXT: &[&str] = &[
+        "audio",
+        "realtime",
+        "transcribe",
+        "tts",
+        "image",
+        "search",
+        "live",
+        "chat-latest",
+        "instruct",
+        "imagine",
+        "video",
+        "voice",
+        "embedding",
+        "moderation",
+    ];
+    let l = listing(vendor)?;
+    let items = l
+        .get("data")
+        .or_else(|| l.get("models"))
+        .and_then(Value::as_array)?;
+    let family = |id: &str| match vendor {
+        "anthropic" => id.starts_with("claude-"),
+        "openai" => {
+            id.starts_with("gpt-")
+                || (id.starts_with('o') && id.as_bytes().get(1).is_some_and(u8::is_ascii_digit))
+        }
+        "xai" => id.starts_with("grok-"),
+        _ => false,
+    };
+    Some(
+        items
+            .iter()
+            .filter_map(|m| {
+                let id = m["id"].as_str()?;
+                let aliases: Vec<String> = m["aliases"]
+                    .as_array()
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|x| x.as_str().map(str::to_owned))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                // Anthropic lists only snapshots: the alias is the undated id.
+                // OpenAI lists dated snapshots beside their alias; xAI's ids may carry a date and
+                // name the alias in `aliases`.
+                let keep = family(id)
+                    && !NOT_TEXT.iter().any(|w| id.contains(w))
+                    && (vendor != "openai" || undated(id) == id);
+                keep.then(|| (id.to_owned(), aliases))
+            })
+            .collect(),
+    )
+}
+
+/// Whether an id (or its undated form) is a catalog row or a candidate at `provider`.
+fn carried(provider: &str, id: &str) -> bool {
+    let base = undated(id);
+    MODEL_ROUTES.iter().any(|r| {
+        r.model == id
+            || r.model == base
+            || r.candidates.iter().chain(r.responses).any(|c| {
+                by_id(c.provider).name == provider
+                    && (c.upstream_model == id || c.upstream_model == base)
+            })
+    })
+}
+
+/// Whether `[[not_carried]]`, `[[retired]]` or `[[not_serverless]]` records the id at `provider`
+/// (a deliberate gap).
+fn recorded_gap(provider: &str, id: &str) -> bool {
+    let base = undated(id);
+    ["not_carried", "retired", "not_serverless"]
+        .iter()
+        .any(|list| {
+            truth_entries(list).iter().any(|e| {
+                (field(e, "provider") == Some(provider)
+                    && field(e, "id").is_some_and(|x| x == id || x == base))
+                    || field(e, "model").is_some_and(|x| x == id || x == base)
+            })
+        })
+}
+
+/// CAT-16 for a first-party vendor: every model it lists in a family the catalog carries is a
+/// row, or a recorded decision (`[[not_carried]]`, `[[retired]]`), so a new release is a red cell.
+fn cat16_new_models(_trial: &str, vendor: &str) -> Result<(), Failed> {
+    let models =
+        first_party_models(vendor).ok_or(format!("{vendor}'s /v1/models could not be read"))?;
+    let mut gaps = Vec::new();
+    for (id, aliases) in &models {
+        let names: Vec<&str> = std::iter::once(id.as_str())
+            .chain(aliases.iter().map(String::as_str))
+            .collect();
+        if names
+            .iter()
+            .any(|n| carried(vendor, n) || recorded_gap(vendor, n))
+        {
+            continue;
+        }
+        gaps.push(id.clone());
+    }
+    println!(
+        "{vendor}: {} models in carried families, {} gaps",
+        models.len(),
+        gaps.len()
+    );
+    if gaps.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "{vendor} lists {} model(s) in a family the catalog carries that are neither a row nor \
+             recorded in verify/catalog_truth.toml [[not_carried]]: {}",
+            gaps.len(),
+            gaps.join(", ")
+        )
+        .into())
+    }
+}
+
+/// `VERIFY_CATALOG_GAPS=1`: a report, never a failure, of recent models on Together and
+/// OpenRouter in the vendor namespaces the catalog already carries (`qwen/`, `z-ai/`, ...) that
+/// are neither candidates nor recorded as not carried. These hosts list hundreds of models, most
+/// of them niche, so a gap here is a prompt to look, not a defect.
+fn gaps_report() {
+    const RECENT: i64 = 120 * 86_400;
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(0));
+    for host in ["openrouter", "together"] {
+        let namespaces: std::collections::BTreeSet<&str> = MODEL_ROUTES
+            .iter()
+            .flat_map(|r| r.candidates.iter())
+            .filter(|c| by_id(c.provider).name == host)
+            .filter_map(|c| c.upstream_model.split_once('/').map(|(ns, _)| ns))
+            .collect();
+        let Some(items) = listing(host).and_then(|l| {
+            l.get("data")
+                .and_then(Value::as_array)
+                .or_else(|| l.as_array())
+        }) else {
+            println!("{host}: listing unavailable");
+            continue;
+        };
+        let mut rows: Vec<(i64, &str)> = items
+            .iter()
+            .filter_map(|m| Some((m["created"].as_i64()?, m["id"].as_str()?)))
+            .filter(|(created, id)| {
+                now - created < RECENT
+                    && !id.contains(':')
+                    && id
+                        .split_once('/')
+                        .is_some_and(|(ns, _)| namespaces.contains(ns))
+                    && !carried(host, id)
+                    && !recorded_gap(host, id)
+            })
+            .filter(|(_, id)| {
+                host != "together"
+                    || items.iter().any(|m| {
+                        m["id"] == *id
+                            && m["type"] == "chat"
+                            && m["pricing"]["input"].as_f64().unwrap_or(0.0) > 0.0
+                    })
+            })
+            .collect();
+        rows.sort_by(|a, b| b.cmp(a));
+        println!(
+            "{host}: {} models from the last 120 days in carried namespaces ({}) are not in the \
+             catalog:",
+            rows.len(),
+            namespaces.iter().copied().collect::<Vec<_>>().join(", ")
+        );
+        for (created, id) in rows {
+            println!("  {:>3} days ago  {id}", (now - created) / 86_400);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
 // Plan
 // ---------------------------------------------------------------------------------------------
 
@@ -2314,6 +2952,8 @@ enum Kind {
     Bil13(Arm),
     Cat8(&'static ModelRoute),
     Cat13(Mount, bool),
+    Cat16(&'static ModelRoute, Candidate),
+    Cat16NewModels(&'static str),
 }
 
 struct Planned {
@@ -2446,6 +3086,25 @@ fn plan() -> (Vec<Planned>, Vec<String>) {
                 });
             }
         }
+        // CAT-16: listing calls only. One cell per distinct in-scope (provider, id) of the row (a
+        // GPT row's Responses arm is the same OpenAI id as its first candidate).
+        let mut seen = Vec::new();
+        for c in row.candidates.iter().chain(row.responses) {
+            if !in_scope(c) || seen.contains(&(c.provider, c.upstream_model)) {
+                continue;
+            }
+            let route = if seen.iter().any(|(p, _)| *p == c.provider) {
+                "openai-responses"
+            } else {
+                by_id(c.provider).name
+            };
+            seen.push((c.provider, c.upstream_model));
+            out.push(Planned {
+                name: name("CAT-16", route, row.model),
+                kind: Kind::Cat16(row, *c),
+                est: 0.0,
+            });
+        }
         if arms.len() >= 2 {
             let est = arms.iter().map(|a| a.est(30, 16)).sum();
             out.push(Planned {
@@ -2479,6 +3138,17 @@ fn plan() -> (Vec<Planned>, Vec<String>) {
     skipped.push(
         "CAT-13 openai-codex (managed, byo): no key (ChatGPT subscription OAuth only)".into(),
     );
+    for vendor in ["anthropic", "openai", "xai"] {
+        if key_of(vendor).is_some() {
+            out.push(Planned {
+                name: name("CAT-16", vendor, "new-models"),
+                kind: Kind::Cat16NewModels(vendor),
+                est: 0.0,
+            });
+        } else {
+            skipped.push(format!("CAT-16 {vendor} new-models: no key"));
+        }
+    }
     (out, skipped)
 }
 
@@ -2495,6 +3165,8 @@ fn run(name: &str, kind: &Kind) -> Result<(), Failed> {
         Kind::Cat7(a) => cat7(name, a),
         Kind::Cat8(r) => cat8(name, r),
         Kind::Cat13(m, byo) => cat13(name, m, byo),
+        Kind::Cat16(r, c) => cat16(name, r, c),
+        Kind::Cat16NewModels(v) => cat16_new_models(name, v),
     }
 }
 
@@ -2576,6 +3248,10 @@ fn main() {
         summary();
         return;
     }
+    if std::env::var("VERIFY_CATALOG_GAPS").as_deref() == Ok("1") {
+        gaps_report();
+        return;
+    }
     let live = std::env::var("VERIFY_LIVE").as_deref() == Ok("1");
     if std::env::var("VERIFY_CATALOG_PLAN").as_deref() == Ok("1") {
         let (planned, skipped) = plan();
@@ -2605,9 +3281,14 @@ fn main() {
     }
     let args = Arguments::from_args();
     let mut trials = Vec::new();
-    if live && gateway_bin().exists() {
+    if live {
+        let gateway = gateway_bin().exists();
         for p in plan().0 {
             let Planned { name, kind, .. } = p;
+            // The currency cells read vendor listings only; every other cell needs the gateway.
+            if !gateway && !matches!(kind, Kind::Cat16(..) | Kind::Cat16NewModels(_)) {
+                continue;
+            }
             let n = name.clone();
             trials.push(Trial::test(name, move || common::judge(|| run(&n, &kind))));
         }

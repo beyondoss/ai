@@ -366,7 +366,7 @@ async fn a_streamed_claude_turn_reaches_anthropic_signed_on_the_next_turn() {
     assert_eq!(turn[1]["input"], json!({"city": "Paris"}));
 }
 
-/// An Anthropic SDK thinking + tool loop on a Claude row only OpenRouter serves. OpenRouter replays
+/// An Anthropic SDK thinking + tool loop on a Claude row OpenRouter serves (Anthropic unreachable). OpenRouter replays
 /// Claude's thinking from `reasoning_details` alone; without it turn 2 was a 400 ("a final
 /// `assistant` message must start with a thinking block").
 /// claim: T2
@@ -382,7 +382,7 @@ async fn anthropic_sdk_thinking_reaches_openrouter_as_reasoning_details() {
         .await;
 
     let body = json!({
-        "model": "claude-sonnet-4", "max_tokens": 2000,
+        "model": "claude-sonnet-4-5", "max_tokens": 2000,
         "thinking": {"type": "enabled", "budget_tokens": 1024},
         "tools": [{"name": "get_weather", "input_schema": {"type": "object", "properties": {"city": {"type": "string"}}}}],
         "messages": [
