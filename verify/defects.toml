@@ -833,3 +833,45 @@ state = "suspected"
 test = ""
 fix = ""
 note = "Found during the D15 live check."
+
+[[defect]]
+id = "D60"
+severity = "critical"
+area = "Catalog"
+title = "List prices disagree with the primary vendor on about a dozen rows"
+impact = "gpt-5.6-sol is listed at half OpenAI's standard rate on all four prices (we copied the Batch/Flex card). Groq gpt-oss-20b/120b are 70-76% low, and Together glm-5.2, gemma-4-31b, qwen-2.5-7b, qwen3.5-9b and qwen3.6-plus plus Groq qwen3.8-27b are 25-88% low. qwen3.8-flash is 67% high. Every consumer pricing from /v1/models under- or over-bills these rows."
+confidence = "high"
+evidence = "verify/catalog_truth_2026-10-01.md (vendor pages fetched and parsed 2026-10-01, URLs quoted)"
+claims = ["CAT-7"]
+state = "suspected"
+test = ""
+fix = ""
+note = ""
+
+[[defect]]
+id = "D61"
+severity = "high"
+area = "Catalog"
+title = "Primary candidates that the vendor no longer serves to a standard key"
+impact = "Retired: deepseek-chat and deepseek-reasoner (2026-07-24), mistral-nemo (2026-07-31). Not serverless on Fireworks: llama-4-maverick, llama-4-scout, kimi-k2.6, glm-5.1 (and Fireworks' llama-3.3 candidate). Dedicated-only on Together: kimi-k2.7-code. Groq enterprise-only: llama-3.1-8b-instant, llama-3.3-70b-versatile, minimax-m2.7. These rows fail over on every request, or serve a different model under the row's name."
+confidence = "high"
+evidence = "verify/catalog_truth_2026-10-01.md"
+claims = ["CAT-1", "CAT-2"]
+state = "suspected"
+test = ""
+fix = ""
+note = ""
+
+[[defect]]
+id = "D62"
+severity = "med"
+area = "Catalog"
+title = "Model cards overstate context windows and use derived max-output values"
+impact = "Context windows overstated: qwen3.8-27b (1M vs 131k), grok-4.20 (2M vs 1M), minimax-m3, codestral, claude-sonnet-4-5 (1M vs 200K), llama-4-scout. ministral-3b is understated. 26 max-output values are OpenRouter-derived 0.9x/0.8x of context, and where the vendor publishes a figure it differs (e.g. deepseek-flash 384K vs 943,718). Structured outputs are claimed on gpt-4, gpt-4-turbo, gpt-5.2-pro and gpt-5.4-pro without vendor support. Clients size prompts and outputs from these cards."
+confidence = "high"
+evidence = "verify/catalog_truth_2026-10-01.md"
+claims = ["CAT-3", "CAT-4", "CAT-6"]
+state = "suspected"
+test = ""
+fix = ""
+note = "Supersedes the narrower D54 guesses; deepseek-flash image input is CORRECT per DeepSeek (D54's suspicion refuted)."

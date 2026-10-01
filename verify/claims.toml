@@ -1181,7 +1181,7 @@ group = "Catalog truth"
 text = "Every candidate of every row, including Responses arms, serves its model live, and the echoed model matches"
 layer = "live"
 touches = ["crates/providers/src/", "crates/gateway/src/route.rs", "crates/gateway/src/proxy.rs"]
-defects = []
+defects = ["D61"]
 
 [[claim]]
 id = "CAT-2"
@@ -1190,7 +1190,7 @@ group = "Catalog truth"
 text = "Fallback candidates serve the same model as the primary"
 layer = "live"
 touches = ["crates/providers/src/", "crates/gateway/src/route.rs", "crates/gateway/src/proxy.rs"]
-defects = ["D18"]
+defects = ["D18", "D61"]
 
 [[claim]]
 id = "CAT-3"
@@ -1199,7 +1199,7 @@ group = "Catalog truth"
 text = "context_window is accepted near the limit on every candidate"
 layer = "live"
 touches = ["crates/providers/src/", "crates/gateway/src/route.rs", "crates/gateway/src/proxy.rs"]
-defects = []
+defects = ["D62"]
 
 [[claim]]
 id = "CAT-4"
@@ -1208,7 +1208,7 @@ group = "Catalog truth"
 text = "max_output_tokens is accepted on every candidate"
 layer = "live"
 touches = ["crates/providers/src/", "crates/gateway/src/route.rs", "crates/gateway/src/proxy.rs"]
-defects = ["D54"]
+defects = ["D54", "D62"]
 
 [[claim]]
 id = "CAT-5"
@@ -1226,7 +1226,7 @@ group = "Catalog truth"
 text = "Every advertised capability works per candidate; the rest fail cleanly"
 layer = "live"
 touches = ["crates/providers/src/", "crates/gateway/src/route.rs", "crates/gateway/src/proxy.rs"]
-defects = ["D54"]
+defects = ["D54", "D62"]
 
 [[claim]]
 id = "CAT-7"
@@ -1235,7 +1235,7 @@ group = "Catalog truth"
 text = "List prices equal the declared source of truth"
 layer = "live"
 touches = ["crates/providers/src/", "crates/gateway/src/route.rs", "crates/gateway/src/proxy.rs"]
-defects = ["D19"]
+defects = ["D19", "D60"]
 
 [[claim]]
 id = "CAT-8"

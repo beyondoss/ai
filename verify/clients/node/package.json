@@ -1,0 +1,18 @@
+{
+  "name": "beyond-verify-clients",
+  "private": true,
+  "type": "module",
+  "description": "Pinned real clients the verification suite drives through the gateway. Exact versions on purpose: a red cell must mean our code changed, not the client.",
+  "dependencies": {
+    "@ai-sdk/anthropic": "4.0.71",
+    "@ai-sdk/openai": "4.0.83",
+    "@ai-sdk/openai-compatible": "3.0.62",
+    "@anthropic-ai/claude-code": "2.1.286",
+    "@anthropic-ai/sdk": "0.131.0",
+    "@mariozechner/pi-coding-agent": "0.73.1",
+    "@openai/codex": "0.159.3",
+    "ai": "7.0.126",
+    "openai": "7.25.0",
+    "opencode-ai": "1.18.34"
+  }
+}
