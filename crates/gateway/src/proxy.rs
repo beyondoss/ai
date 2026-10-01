@@ -816,7 +816,7 @@ impl AiProxy {
         slot_held: bool,
     ) -> Result<bool> {
         let session_field = if route::is_responses_path(session.req_header().uri.path()) {
-            translate::responses_session_field(&body)
+            translate::responses_session_field(&body, !route.responses.is_empty())
         } else {
             None
         };
@@ -2405,9 +2405,10 @@ impl ProxyHttp for AiProxy {
             model_route.is_some() && route::is_responses_path(session.req_header().uri.path());
         let session_field = match &full_body {
             Some(fb) => fb.session_field,
-            None if inbound_responses => {
-                translate::responses_session_field(body_complete.as_deref().unwrap_or(&[]))
-            }
+            None if inbound_responses => translate::responses_session_field(
+                body_complete.as_deref().unwrap_or(&[]),
+                model_route.is_some_and(|r| !r.responses.is_empty()),
+            ),
             None => None,
         };
         // `/v1/messages/count_tokens`, `/v1/responses/compact`, … (see `route::SubResource`).

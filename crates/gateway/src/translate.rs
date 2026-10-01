@@ -1961,10 +1961,12 @@ fn copy_if(out: &mut Map<String, Value>, v: &Value, key: &str) {
 
 /// Root-level Responses session field that cannot be honored off `/v1/responses`.
 ///
-/// `None` means the body is a `store: false` one-shot (no `previous_response_id`). Unparseable
-/// JSON is `Some("store")` so a catalog walk fail-closes onto a real Responses arm rather than
-/// silently stripping session state.
-pub fn responses_session_field(body: &[u8]) -> Option<&'static str> {
+/// `None` means the body is a one-shot: `store: false` and no `previous_response_id`. An omitted
+/// (or `null`) `store` is OpenAI's default `true`, so it is session state only where the row has a
+/// Responses arm to keep it (`responses_arm`); elsewhere it is the stock `responses.create()` call,
+/// which translates rather than 400s. Unparseable JSON is `Some("store")` so a catalog walk
+/// fail-closes onto a real Responses arm rather than silently stripping session state.
+pub fn responses_session_field(body: &[u8], responses_arm: bool) -> Option<&'static str> {
     let Ok(v) = serde_json::from_slice::<Value>(body) else {
         return Some("store");
     };
@@ -1973,6 +1975,7 @@ pub fn responses_session_field(body: &[u8]) -> Option<&'static str> {
     }
     match v.get("store") {
         Some(Value::Bool(false)) => None,
+        Some(Value::Null) | None => responses_arm.then_some("store"),
         _ => Some("store"),
     }
 }
@@ -6735,16 +6738,23 @@ mod tests {
     #[test]
     fn responses_session_field_names_previous_response_id_first() {
         let body = br#"{"model":"gpt-4o","previous_response_id":"resp_1","store":false}"#;
-        assert_eq!(responses_session_field(body), Some("previous_response_id"));
+        assert_eq!(
+            responses_session_field(body, false),
+            Some("previous_response_id")
+        );
+        // An omitted store is session state only where a Responses arm can keep it.
         let omitted = br#"{"model":"gpt-4o","input":"hi"}"#;
-        assert_eq!(responses_session_field(omitted), Some("store"));
+        assert_eq!(responses_session_field(omitted, true), Some("store"));
+        assert_eq!(responses_session_field(omitted, false), None);
+        let null = br#"{"model":"gpt-4o","store":null}"#;
+        assert_eq!(responses_session_field(null, false), None);
         let stored = br#"{"model":"gpt-4o","store":true}"#;
-        assert_eq!(responses_session_field(stored), Some("store"));
+        assert_eq!(responses_session_field(stored, false), Some("store"));
         let one_shot = br#"{"model":"gpt-4o","store":false,"input":"hi"}"#;
-        assert_eq!(responses_session_field(one_shot), None);
+        assert_eq!(responses_session_field(one_shot, true), None);
         let empty_prev = br#"{"model":"gpt-4o","previous_response_id":"","store":false}"#;
-        assert_eq!(responses_session_field(empty_prev), None);
-        assert_eq!(responses_session_field(b"not-json"), Some("store"));
+        assert_eq!(responses_session_field(empty_prev, true), None);
+        assert_eq!(responses_session_field(b"not-json", false), Some("store"));
     }
 
     #[test]

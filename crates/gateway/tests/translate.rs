@@ -930,6 +930,19 @@ async fn claude_responses_with_previous_response_id_is_400() {
         "400 must name the field: {text}"
     );
     assert!(text.contains("claude-opus-4-8"), "{text}");
+
+    // An explicit `store: true` asks for the same state; only an omitted store is a one-shot.
+    let resp = test_client()
+        .post(format!("{}/v1/responses", gw.url()))
+        .header("authorization", format!("Bearer {}", vkey(&sk)))
+        .header("content-type", "application/json")
+        .body(r#"{"model":"claude-opus-4-8","input":"hi","store":true}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 400);
+    let text = resp.text().await.unwrap();
+    assert!(text.contains("store cannot be honored"), "{text}");
     assert_eq!(mock.hits(), 0, "must not become a hollow Messages call");
 }
 

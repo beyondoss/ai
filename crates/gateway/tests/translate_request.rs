@@ -450,7 +450,6 @@ async fn the_binding_beta_goes_only_with_the_field() {
 /// claim: TRN-1, CAT-9
 /// defect: D12
 #[tokio::test]
-#[ignore = "D12 reproduced: /v1/responses without store on a Claude row is 400 \"store cannot be honored\""]
 async fn stock_responses_create_without_store_works_on_a_claude_row() {
     let nats_port = unused_nats_port();
     let (pubkey, sk) = test_keypair(1);

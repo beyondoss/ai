@@ -334,8 +334,10 @@ explicitly `false`). GPT rows list a parallel OpenAI `/v1/responses` arm for tha
 relay** so `store`, `previous_response_id`, `include`, and `truncation` pass through. A Responses
 5xx may walk another Responses candidate; it does not walk onto Chat Completions/Messages while
 those fields are in play. `store: false` one-shot Responses may still translate onto Chat
-Completions (lossy). Claude rows have no OpenAI store: Responses + session state is a **400**
-naming the field, not a hollow Messages call. Usage/billing still parse the upstream body/SSE;
+Completions (lossy). Rows with no Responses arm (Claude, DeepSeek, …) have no OpenAI store: an
+**omitted** `store` there is the stock `responses.create()` call and translates as a one-shot, while
+an explicit `store: true` or a `previous_response_id` is a **400** naming the field, not a hollow
+Messages call. Usage/billing still parse the upstream body/SSE;
 `ai.usage.model` is what the provider echoed. Same-wire Responses (`/{provider}/v1/responses`)
 stays a byte relay. `/{provider}/…` never translates.
 
