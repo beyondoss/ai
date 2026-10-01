@@ -516,10 +516,11 @@ pub struct PoolAuth {
     pub header: Option<http::HeaderValue>,
     /// Where the bare key starts in `value` (after the scheme's `Bearer `), for [`Self::key`].
     key_at: usize,
-    /// A searcher for [`Self::key`], built once at boot: every managed error response is scanned
-    /// for an echo of the key (`proxy::Redact`), and building a searcher per response repeated the
-    /// key's preprocessing on each one (D92). Holds a copy of the key, like `header`.
-    finder: memchr::memmem::Finder<'static>,
+    /// Searchers for [`Self::key`] ([`key_finders`]: the key itself first, then the spellings a JSON
+    /// encoder may give it), built once at boot: every managed error response is scanned for an
+    /// echo of the key (`proxy::Redact`), and building a searcher per response repeated the key's
+    /// preprocessing on each one (D92). Each holds a copy of the key, like `header`.
+    finders: Box<[memchr::memmem::Finder<'static>]>,
     /// When this key's last refusal (a 401, a 403 naming the key, or an out-of-credit answer:
     /// D180) cools off, in ms since [`clock_ms`]'s epoch; 0 when it has none. A cooling key is
     /// skipped as a request's *first* key, and a provider whose keys all cool is skipped by a
@@ -536,14 +537,50 @@ impl PoolAuth {
         self.value.expose().get(self.key_at..).unwrap_or("")
     }
 
-    /// The boot-built searcher for [`Self::key`].
+    /// The boot-built searcher for [`Self::key`] as sent.
     pub fn finder(&self) -> &memchr::memmem::Finder<'static> {
-        &self.finder
+        &self.finders[0]
+    }
+
+    /// Every boot-built searcher for [`Self::key`]: as sent, then each escaped spelling.
+    pub fn finders(&self) -> &[memchr::memmem::Finder<'static>] {
+        &self.finders
     }
 
     fn cooling(&self, now_ms: u64) -> bool {
         self.bad_until_ms.load(Ordering::Relaxed) > now_ms
     }
+}
+
+/// Searchers for every spelling of `key` an upstream echo may use: the key as sent first, then, for
+/// a key holding `/` or `+` (a Bedrock `ABSK…` key is base64), the spellings a JSON encoder writes
+/// them in: `\/` for `/`, and `+` or `+` for `+` (one encoder writes every occurrence
+/// the same way). A JSON client decodes each of those to the key, so each is scrubbed (D203). Never
+/// empty: an empty key yields one empty searcher, which the scrub skips.
+pub fn key_finders(key: &str) -> Box<[memchr::memmem::Finder<'static>]> {
+    let slashes: &[&str] = if key.contains('/') {
+        &["/", "\\/"]
+    } else {
+        &["/"]
+    };
+    let pluses: &[&str] = if key.contains('+') {
+        &["+", "\\u002b", "\\u002B"]
+    } else {
+        &["+"]
+    };
+    let mut spellings: Vec<String> = Vec::with_capacity(slashes.len() * pluses.len());
+    for slash in slashes {
+        for plus in pluses {
+            let s = key.replace('/', slash).replace('+', plus);
+            if !spellings.contains(&s) {
+                spellings.push(s);
+            }
+        }
+    }
+    spellings
+        .iter()
+        .map(|s| memchr::memmem::Finder::new(s.as_bytes()).into_owned())
+        .collect()
 }
 
 /// How long a pool key that drew a 401 (or a 403 naming the key, or an out-of-credit answer) is
@@ -658,15 +695,12 @@ impl Provider {
                         h
                     });
                 let key_at = auth.value_prefix().map_or(0, str::len);
-                let finder = memchr::memmem::Finder::new(
-                    value.expose().get(key_at..).unwrap_or("").as_bytes(),
-                )
-                .into_owned();
+                let finders = key_finders(value.expose().get(key_at..).unwrap_or(""));
                 PoolAuth {
                     value,
                     header,
                     key_at,
-                    finder,
+                    finders,
                     bad_until_ms: AtomicU64::new(0),
                 }
             })

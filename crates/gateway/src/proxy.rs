@@ -507,7 +507,9 @@ pub struct RequestCtx {
 /// error message would otherwise hand Beyond's key to the client. Each occurrence is overwritten in
 /// place with [`REDACTED`] padded to the key's length, so the body keeps its length. The last
 /// `key.len() - 1` bytes of each chunk are held back until the next one, so a key split across
-/// chunks is caught too; memory is bounded by the key, not the body.
+/// chunks is caught too; memory is bounded by the key, not the body. Each JSON-escaped spelling of
+/// the key (`\/`, `+`: [`route::key_finders`]) is overwritten the same way, since a JSON client
+/// decodes it to the key (D203).
 ///
 /// **Account remedy.** A JSON error (`whole`) is held until its end, at most
 /// [`remedy::MAX_BODY`], and handed to [`remedy::neutralize`] after the key is masked: "add your
@@ -530,16 +532,20 @@ const REDACTED: &[u8] = b"[redacted]";
 impl Redact {
     /// Scrub `chunk` (with the bytes held back from the last one) and return what may be relayed
     /// now: everything at `end_of_stream`, nothing while a `whole` body is held, otherwise all but
-    /// a key-sized tail. `key` is the pool key's boot-built searcher
-    /// ([`route::PoolAuth::finder`]), if the attempt sent one.
+    /// a key-sized tail. `keys` are the pool key's boot-built searchers
+    /// ([`route::PoolAuth::finders`]: the key as sent, then its JSON-escaped spellings), empty when
+    /// the attempt sent none.
     fn feed(
         &mut self,
-        key: Option<&memchr::memmem::Finder<'_>>,
+        keys: &[memchr::memmem::Finder<'_>],
         chunk: Option<Bytes>,
         end_of_stream: bool,
     ) -> Option<Bytes> {
-        let key = key.filter(|k| !k.needle().is_empty());
-        if key.is_none() && !self.whole && self.carry.is_empty() {
+        let keys = match keys.first() {
+            Some(k) if !k.needle().is_empty() => keys,
+            _ => &[],
+        };
+        if keys.is_empty() && !self.whole && self.carry.is_empty() {
             return chunk;
         }
         let mut buf = std::mem::take(&mut self.carry);
@@ -552,16 +558,33 @@ impl Redact {
             }
             self.whole = false;
         }
-        if let Some(key) = key {
+        for key in keys {
             mask_all(&mut buf, key);
         }
         if self.whole {
             if let Some(n) = remedy::neutralize(&buf, self.status) {
                 buf = n.body;
                 self.unfunded = n.unfunded;
+                // The rewrite decoded every string and wrote it back unescaped: an echo in a
+                // spelling no searcher knew (`A` for `A`) is now the key as sent (D203).
+                if let Some(key) = keys.first() {
+                    mask_all(&mut buf, key);
+                }
+            } else if let Some(key) = keys.first()
+                && memchr::memmem::find(&buf, b"\\u").is_some()
+                && let Some(mut plain) = serde_json::from_slice::<serde_json::Value>(&buf)
+                    .ok()
+                    .and_then(|v| serde_json::to_vec(&v).ok())
+                && mask_all(&mut plain, key)
+            {
+                // Any other `\uXXXX` spelling of the key: a JSON client decodes it to the key, so
+                // the body is relayed decoded and masked (D203). Only a body with such an escape
+                // and the key behind it is re-serialized.
+                buf = plain;
             }
         } else if !end_of_stream {
-            let keep = key.map_or(0, |k| k.needle().len() - 1).min(buf.len());
+            let longest = keys.iter().map(|k| k.needle().len()).max().unwrap_or(0);
+            let keep = longest.saturating_sub(1).min(buf.len());
             self.carry = buf.split_off(buf.len() - keep);
         }
         Some(Bytes::from(buf))
@@ -5477,12 +5500,12 @@ impl ProxyHttp for AiProxy {
         // First, so nothing downstream — translation, capture, the cache, the usage tail — ever
         // holds the pool key (D66).
         if let Some(r) = rc.redact.as_mut() {
-            let key = rc
+            let keys = rc
                 .provider
                 .pool_auth
                 .get(usize::from(rc.pool_key))
-                .map(route::PoolAuth::finder);
-            *body = r.feed(key, body.take(), end_of_stream);
+                .map_or(&[][..], route::PoolAuth::finders);
+            *body = r.feed(keys, body.take(), end_of_stream);
         }
         let chunk = body.as_deref().unwrap_or(&[]);
         // A catalog walk's 2xx waits here for its health verdict (see `response_filter`): the
@@ -7239,10 +7262,14 @@ mod tests {
                 let mut chunks: Vec<&[u8]> = head.chunks(step).collect();
                 chunks.push(tail);
                 for c in chunks {
-                    let got = r.feed(Some(key), Some(Bytes::copy_from_slice(c)), false);
+                    let got = r.feed(
+                        std::slice::from_ref(key),
+                        Some(Bytes::copy_from_slice(c)),
+                        false,
+                    );
                     out.extend_from_slice(got.as_deref().unwrap_or(&[]));
                 }
-                out.extend_from_slice(&r.feed(Some(key), None, true).unwrap());
+                out.extend_from_slice(&r.feed(std::slice::from_ref(key), None, true).unwrap());
                 let text = String::from_utf8(out).unwrap();
                 assert_eq!(text.len(), body.len(), "{split}/{step}");
                 assert!(!text.contains("sk-pool-secret"), "{split}/{step}: {text}");
@@ -7261,10 +7288,14 @@ mod tests {
             ..Redact::default()
         };
         for c in remedy.as_bytes().chunks(5) {
-            let got = r.feed(Some(key), Some(Bytes::copy_from_slice(c)), false);
+            let got = r.feed(
+                std::slice::from_ref(key),
+                Some(Bytes::copy_from_slice(c)),
+                false,
+            );
             assert!(got.unwrap().is_empty());
         }
-        let out = r.feed(Some(key), None, true).unwrap();
+        let out = r.feed(std::slice::from_ref(key), None, true).unwrap();
         assert_eq!(
             &out[..],
             format!(
@@ -7285,13 +7316,13 @@ mod tests {
         };
         let mut out = r
             .feed(
-                Some(key),
+                std::slice::from_ref(key),
                 Some(Bytes::copy_from_slice(big.as_bytes())),
                 false,
             )
             .unwrap()
             .to_vec();
-        out.extend_from_slice(&r.feed(Some(key), None, true).unwrap());
+        out.extend_from_slice(&r.feed(std::slice::from_ref(key), None, true).unwrap());
         assert_eq!(out.len(), big.len());
         assert!(!out.windows(raw.len()).any(|w| w == raw));
 
@@ -7299,6 +7330,62 @@ mod tests {
         let mut buf = *b"x=abc;";
         assert!(mask_all(&mut buf, &memchr::memmem::Finder::new(b"abc")));
         assert_eq!(&buf, b"x=[re;");
+    }
+
+    /// A base64 key (`/`, `+`) echoed in a JSON encoder's spelling (`\/`, `+`, `+`) is
+    /// scrubbed on every path: streamed in small chunks, held whole with no remedy, and held whole
+    /// and re-serialized by the remedy rewrite, which decodes any escape (`A`) back to the key.
+    /// claim: SEC-7
+    #[test]
+    fn redact_scrubs_every_json_spelling_of_a_base64_key() {
+        let key = "ABSKa2V5/cGFy+dA==";
+        let keys = route::key_finders(key);
+        assert_eq!(keys.len(), 6, "2 slash spellings x 3 plus spellings");
+        for echo in [
+            key.to_owned(),
+            r"ABSKa2V5\/cGFy+dA==".to_owned(),
+            r"ABSKa2V5\/cGFy+dA==".to_owned(),
+            r"ABSKa2V5/cGFy+dA==".to_owned(),
+        ] {
+            for (whole, status, remedy) in [
+                (false, 401, ""),
+                (true, 401, ""),
+                (true, 401, " see https://openrouter.ai/settings/keys"),
+            ] {
+                let body = format!(
+                    r#"{{"error":{{"message":"bad key {echo}{remedy}","param":"{echo}","raw":"ABSKa2V5\/cGFy+dA=="}}}}"#
+                );
+                let mut r = Redact {
+                    whole,
+                    status,
+                    ..Redact::default()
+                };
+                let mut out = Vec::new();
+                for c in body.as_bytes().chunks(3) {
+                    let got = r.feed(&keys, Some(Bytes::copy_from_slice(c)), false);
+                    out.extend_from_slice(got.as_deref().unwrap_or(&[]));
+                }
+                out.extend_from_slice(&r.feed(&keys, None, true).unwrap());
+                let text = String::from_utf8(out).unwrap();
+                let decoded = serde_json::from_str::<serde_json::Value>(&text)
+                    .unwrap()
+                    .to_string();
+                let rewritten = !remedy.is_empty();
+                assert!(
+                    !text.contains(key) && !text.contains(&echo),
+                    "{echo} whole={whole} remedy={rewritten}: {text}"
+                );
+                // A held JSON body is also clean as a JSON client reads it: the `raw` field's
+                // `A` spelling decodes to the key. A streamed one is scrubbed of the
+                // spellings an encoder writes.
+                if whole {
+                    assert!(
+                        !decoded.contains(key),
+                        "{echo} whole remedy={rewritten}: {text}"
+                    );
+                }
+            }
+        }
     }
 
     /// Every spelling of a credential location is read, and a virtual key in any of them makes the

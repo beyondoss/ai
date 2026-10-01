@@ -168,8 +168,8 @@ Client (stock OpenAI/Anthropic SDK)
   │    length), holding back a key-sized tail per chunk to catch a split key. A JSON error
   │    (<= 64 KiB) is held whole instead and, once masked, has any provider-account remedy
   │    rewritten (`remedy::neutralize`, D174). Everything below (translation, capture, cache,
-  │    usage tail) sees the scrubbed bytes. The key searcher is built once per pool key at boot
-  │    (`PoolAuth::finder`), not per response
+  │    usage tail) sees the scrubbed bytes. The key searchers (the key, and its JSON-escaped
+  │    spellings, D203) are built once per pool key at boot (`PoolAuth::finders`), not per response
   │  Translate path: convert SSE event-by-event into the inbound dialect (do not wait for `[DONE]`
   │    before forwarding deltas). Non-stream: map the JSON object, including error envelopes.
   │    Assembled walk (stream-only candidate, non-stream client): the stream is read by a quiet
@@ -2399,7 +2399,11 @@ managed or BYO) and the hop-by-hop ones.
   `metadata.raw`, is scrubbed too) and before capture and the cache. A 2xx body is an answer and is
   **not** scanned: a streamed answer would pay the scan on every chunk, and an echo of a credential
   belongs in an error. Real providers already mask all but the last 4 characters; this does not
-  depend on it.
+  depend on it. A key holding `/` or `+` (Bedrock's base64 `ABSK…` keys) is also searched in the
+  spellings a JSON encoder writes them in (`\/`, `+`, `+`; `route::key_finders`, built at
+  boot), on every path, and a held JSON error is masked again after the remedy rewrite
+  re-serializes it, or re-serialized and masked when it carries any other `\u` escape of the key,
+  since a JSON client decodes each of those to the key (D203).
 - Pingora's own error line prints `ProxyHttp::request_summary`, overridden to log the path without
   its query, so a `?key=` credential (managed, or a BYO Google key) never reaches the log.
 - A BYO key reaches only the provider it belongs to: on bare `/v1` the forwarded credential picks the provider (`x-api-key` or an `sk-ant-…` key → Anthropic, any other `sk-…` → OpenAI), and keys for two providers on one request are a 400.

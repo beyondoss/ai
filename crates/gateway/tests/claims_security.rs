@@ -488,6 +488,65 @@ async fn an_upstream_echo_of_the_pool_key_never_reaches_the_client() {
     );
 }
 
+/// A Bedrock API key (`ABSK…`) is base64, so it carries `/` and `+`, and a JSON encoder may write
+/// those as `\/` and `+`. An echo spelled so is the same key to any JSON client, and the
+/// remedy rewrite used to decode it (`\/` to `/`) when it re-serialized the body. Neither the raw
+/// key nor an escaped spelling reaches the client, in a 401 whose JSON carries no remedy (relayed
+/// as sent), one with a remedy (rewritten and re-serialized), and a non-JSON one (streamed).
+/// claim: SEC-7
+/// defect: D203
+#[tokio::test]
+async fn a_json_escaped_echo_of_the_pool_key_never_reaches_the_client() {
+    const KEY: &str = "ABSKQmVkcm9ja0FQSUtleS1h/YmNk+ZWZn/aGlq";
+    const PLAIN: &str = r#"{"message":"The security token included in the request is invalid: ABSKQmVkcm9ja0FQSUtleS1h\/YmNk+ZWZn\/aGlq"}"#;
+    const REMEDY: &str = r#"{"error":{"message":"Invalid key; manage keys at https://openrouter.ai/settings/keys","code":401,"param":"ABSKQmVkcm9ja0FQSUtleS1h\/YmNk+ZWZn\/aGlq"}}"#;
+    const TEXT: &str = r#"invalid credential "ABSKQmVkcm9ja0FQSUtleS1h\/YmNk+ZWZn\/aGlq""#;
+    let (pubkey, sk) = test_keypair(203);
+    let vk = vkey(&sk, 203);
+    let escaped = KEY.replace('/', "\\/");
+    let mut leaks = Vec::new();
+    for (content_type, body) in [
+        ("application/json", PLAIN),
+        ("application/json", REMEDY),
+        ("text/plain", TEXT),
+    ] {
+        let up = MockUpstream::start(Mode::Raw(401, content_type, body)).await;
+        let gw = Gateway::builder(unused_nats_port(), &up.authority(), &b64(&pubkey))
+            .providers(&["openai"])
+            .pool_keys("openai", &[KEY])
+            .start()
+            .await;
+        let resp = test_client()
+            .post(format!("{}/openai/v1/chat/completions", gw.url()))
+            .header("authorization", format!("Bearer {vk}"))
+            .header("content-type", "application/json")
+            .body(CHAT)
+            .send()
+            .await
+            .unwrap();
+        let status = resp.status().as_u16();
+        let text = resp.text().await.unwrap_or_default();
+        // What a JSON client reads: every string value, decoded.
+        let decoded = serde_json::from_str::<serde_json::Value>(&text)
+            .map(|v| v.to_string().replace("\\/", "/"))
+            .unwrap_or_default();
+        let fragments = ["ABSKQmVkcm9ja0FQSUtleS1h", "YmNk", "aGlq"];
+        if status != 401
+            || text.contains(KEY)
+            || text.contains(&escaped)
+            || decoded.contains(KEY)
+            || fragments.iter().all(|f| text.contains(f))
+        {
+            leaks.push(format!("{content_type} {status}: {text}"));
+        }
+    }
+    assert!(
+        leaks.is_empty(),
+        "pool key reached the client:\n{}",
+        leaks.join("\n\n")
+    );
+}
+
 // --- SEC-9 ---------------------------------------------------------------------------------------
 
 /// Every `x-beyond-*` request header is the gateway's own namespace, and none reaches a provider on
