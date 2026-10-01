@@ -777,3 +777,17 @@ state = "suspected"
 test = ""
 fix = ""
 note = ""
+
+[[defect]]
+id = "D56"
+severity = "high"
+area = "Billing"
+title = "A finished stream whose usage can't be parsed bills 0/0 with no estimate flag"
+impact = "Any unparseable usage block on a completed managed 2xx stream becomes a silent zero-token row (usage_estimated=false) whenever the output estimator sees no complete data: line. Only the parse-error counter and a warn line notice. D05 and D20 are two instances; any future provider usage-shape change would be a third."
+confidence = "high"
+evidence = "proxy.rs cut_short gate: estimate applied only when estimated output > 0 (found by the billing reproduction agent)"
+claims = ["BIL-6", "BIL-12", "BIL-15"]
+state = "suspected"
+test = ""
+fix = ""
+note = "Observed end to end in the D05 and D20 reproductions; needs its own reproduction test."
