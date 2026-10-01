@@ -603,8 +603,8 @@ async fn an_output_limit_above_the_model_maximum_is_clamped_to_it() {
     assert_eq!(got["max_completion_tokens"], 1000, "{got}");
 }
 
-/// The clamp enforces only a limit the vendor publishes. Where it publishes none (Grok, Codestral,
-/// Kimi, …) the card lists a conservative placeholder for `/v1/models`, which is not a cap: Claude
+/// The clamp enforces only a limit the vendor publishes. Where it publishes none (Grok, Kimi,
+/// MiniMax, …) the card lists a conservative placeholder for `/v1/models`, which is not a cap: Claude
 /// Code's 64000 on a Grok row reaches xAI as sent, rather than being cut to the placeholder and
 /// ending with `finish_reason: length`.
 /// claim: TRN-5, CAT-4

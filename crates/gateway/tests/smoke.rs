@@ -366,7 +366,7 @@ fn provider_env_var(id: providers::ProviderId) -> Option<&'static str> {
 ///
 /// Skips any candidate whose key is absent, so a partial keyring smokes what it can.
 ///
-/// Every catalog pair is in this walk — Claude, GPT, Grok, DeepSeek, Mistral, and the
+/// Every catalog pair is in this walk — Claude, GPT, Grok, DeepSeek, and the
 /// Groq/Together/Fireworks llama / qwen / Kimi / GLM / MiniMax / gpt-oss rows. A new row is
 /// hit automatically when its provider key is in the environment; do not add a parallel
 /// allowlist here.

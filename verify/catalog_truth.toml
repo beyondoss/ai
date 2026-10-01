@@ -248,17 +248,6 @@ context_window = 1_000_000
 max_output_tokens = 128_000
 
 [[row]]
-model = "codestral-latest"
-source = [
-  "https://docs.mistral.ai/models/codestral-25-08",
-  "https://docs.mistral.ai/models",
-]
-date = "2026-10-01"
-input = "0.3"
-output = "0.9"
-context_window = 131_072
-
-[[row]]
 model = "deepseek-flash"
 source = ["https://api-docs.deepseek.com/quick_start/pricing"]
 date = "2026-10-01"
@@ -867,74 +856,6 @@ input = "0.30"
 output = "1.20"
 cache_read = "0.06"
 context_window = 524_288
-
-[[row]]
-model = "ministral-14b-latest"
-source = [
-  "https://docs.mistral.ai/models/ministral-3-14b-25-12",
-  "https://docs.mistral.ai/models",
-]
-date = "2026-10-01"
-input = "0.2"
-output = "0.2"
-context_window = 262_144
-
-[[row]]
-model = "ministral-3b-latest"
-source = [
-  "https://docs.mistral.ai/models/ministral-3-3b-25-12",
-  "https://docs.mistral.ai/models",
-]
-date = "2026-10-01"
-input = "0.1"
-output = "0.1"
-context_window = 262_144
-input_limit = 131_072
-limit_evidence = "The OpenRouter candidate (mistralai/ministral-3b-2512): 400 \"This endpoint's maximum context length is 131072 tokens\" (catalog sweep 2026-10-01, CAT-3::raw::openrouter::ministral-3b-latest)."
-
-[[row]]
-model = "ministral-8b-latest"
-source = [
-  "https://docs.mistral.ai/models/ministral-3-8b-25-12",
-  "https://docs.mistral.ai/models",
-]
-date = "2026-10-01"
-input = "0.15"
-output = "0.15"
-context_window = 262_144
-
-[[row]]
-model = "mistral-large-latest"
-source = [
-  "https://docs.mistral.ai/models/mistral-large-3-25-12",
-  "https://docs.mistral.ai/models",
-]
-date = "2026-10-01"
-input = "0.5"
-output = "1.5"
-context_window = 262_144
-
-[[row]]
-model = "mistral-medium-latest"
-source = [
-  "https://docs.mistral.ai/models/mistral-medium-3-5-26-04",
-  "https://docs.mistral.ai/models",
-]
-date = "2026-10-01"
-input = "1.5"
-output = "7.5"
-context_window = 262_144
-
-[[row]]
-model = "mistral-small-latest"
-source = [
-  "https://docs.mistral.ai/models/mistral-small-4-0-26-03",
-  "https://docs.mistral.ai/models",
-]
-date = "2026-10-01"
-input = "0.15"
-output = "0.6"
-context_window = 262_144
 
 [[row]]
 model = "moonshotai/kimi-k3"

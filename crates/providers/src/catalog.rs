@@ -120,9 +120,9 @@ pub struct ModelRoute {
 ///   model docs and come down where a limit is lower in practice. OpenAI's GPT-5 family counts the
 ///   output inside the published window and caps input at the window less the 128K max output
 ///   (272,000 of 400,000; 922,000 of 1,050,000; the API says "Input tokens exceed the configured
-///   limit of 272000 tokens"). A failover host that serves a smaller window (OpenRouter's
-///   Ministral 3B, 131,072) sets the row's. `verify/catalog_truth.toml` records the vendor's figure
-///   and, beside it, the lower `input_limit` / `output_limit` with its evidence. One limit per row
+///   limit of 272000 tokens"). A failover host that serves a smaller window sets the row's, and so does a
+///   primary that refuses below its vendor's figure (Together's Qwen3.8 2.4T A95B, 1,010,000).
+///   `verify/catalog_truth.toml` records the vendor's figure and, beside it, the lower `input_limit` / `output_limit` with its evidence. One limit per row
 ///   rather than one per candidate: the gateway does not count prompt tokens, so it could not
 ///   choose between candidates by window anyway, and a client only ever sees the row.
 /// - Where the vendor publishes no max output, a figure that was a fraction of the window
@@ -283,7 +283,14 @@ const fn card_unpublished_output(
 /// `claude-3-haiku`, `claude-opus-4` and `gpt-5.2-chat` were removed on 2026-09-30: no provider
 /// serves them any more (the catalog smoke reported 404s from every candidate). `deepseek-chat`,
 /// `deepseek-reasoner` and `mistral-nemo` were removed on 2026-10-01: their vendors retired them,
-/// and the fallbacks served a different model under the name.
+/// and the fallbacks served a different model under the name. The seven Mistral rows
+/// (`mistral-large-latest`, `mistral-medium-latest`, `mistral-small-latest`, `ministral-3b-latest`,
+/// `ministral-8b-latest`, `ministral-14b-latest`, `codestral-latest`) were removed the same day by
+/// owner decision (D156): with no Mistral pool key their only reachable candidate was OpenRouter,
+/// whose sole host for each is Mistral on OpenRouter's shared upstream pool, which refused most
+/// requests with 429. They come back with `AI_POOL_KEY_MISTRAL`: `ProviderId::Mistral` and its
+/// spec are kept, so each row is again `compat_chat(ProviderId::Mistral, ..)` plus its
+/// `verify/catalog_truth.toml` entry (the 2026-10-01 audit has the vendor facts).
 ///
 /// A card that omits `cache_read` or `cache_write` is filled with the **input** rate: no discount,
 /// no write premium. Omission is not $0. A consumer that subtracted cache tokens and then multiplied
@@ -676,15 +683,6 @@ const fn deepseek(native: &'static str, openrouter: &'static str) -> [Candidate;
     )
 }
 
-const fn mistral(native: &'static str, openrouter: &'static str) -> [Candidate; 2] {
-    compat_chat(
-        ProviderId::Mistral,
-        native,
-        "/v1/chat/completions",
-        openrouter,
-    )
-}
-
 const fn groq(native: &'static str, openrouter: &'static str) -> [Candidate; 2] {
     compat_chat(
         ProviderId::Groq,
@@ -816,7 +814,7 @@ const fn minimax_m3() -> [Candidate; 3] {
 /// Every routable model, **sorted by `model`** — [`for_model`] binary-searches it.
 ///
 /// Native ids are the providers' own published aliases (Anthropic Models overview, OpenAI
-/// Models catalog, xAI / DeepSeek / Mistral / Groq / Together / Fireworks catalogs, 2026-09-19).
+/// Models catalog, xAI / DeepSeek / Groq / Together / Fireworks catalogs, 2026-09-19).
 /// OpenRouter spellings were taken from the live `https://openrouter.ai/api/v1/models` list the
 /// same day (446 models). `catalog_rows_are_servable` re-verifies each pair against the real
 /// providers whenever the keys are present.
@@ -1083,26 +1081,6 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
             128_000,
             IN_TEXT | IN_IMAGE | IN_FILE,
             TOOLS | REASONING | STRUCTURED_OUTPUTS,
-        ),
-    },
-    // Mistral `-latest` aliases (GA only). Magistral and Devstral are retired as of 2026-09;
-    // a guessed still-served alias 404s and looks like the client's fault. `mistral-nemo`
-    // (`open-mistral-nemo-2407`) was retired 2026-07-31 and its row removed. Mistral publishes no
-    // per-model cache rate ("up to 90%" is not a rate) and no max output, so cache rates equal input
-    // and max output is `UNPUBLISHED_MAX_OUTPUT`. Its "256k" / "128k" windows are 262,144 / 131,072.
-    ModelRoute {
-        model: "codestral-latest",
-        wire: WireFormat::OpenAi,
-        candidates: &mistral("codestral-latest", "mistralai/codestral-2508"),
-        responses: &[],
-        price: price("0.3", "0.9", "0.3", "0.3"), // no published cache rates; both equal input
-        card: card_unpublished_output(
-            "Codestral 2508",
-            "mistralai",
-            1754079630,
-            131_072,
-            IN_TEXT | IN_FILE,
-            TOOLS | STRUCTURED_OUTPUTS,
         ),
     },
     // DeepSeek. The only served names are `deepseek-flash` (V4.1-Flash) and `deepseek-v4-pro`
@@ -1917,96 +1895,6 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         ),
     },
     ModelRoute {
-        model: "ministral-14b-latest",
-        wire: WireFormat::OpenAi,
-        candidates: &mistral("ministral-14b-latest", "mistralai/ministral-14b-2512"),
-        responses: &[],
-        price: price("0.2", "0.2", "0.2", "0.2"), // no published cache rates; both equal input
-        card: card_unpublished_output(
-            "Ministral 3 14B 2512",
-            "mistralai",
-            1764681735,
-            262_144,
-            IN_TEXT | IN_IMAGE,
-            TOOLS | STRUCTURED_OUTPUTS,
-        ),
-    },
-    ModelRoute {
-        model: "ministral-3b-latest",
-        wire: WireFormat::OpenAi,
-        candidates: &mistral("ministral-3b-latest", "mistralai/ministral-3b-2512"),
-        responses: &[],
-        price: price("0.1", "0.1", "0.1", "0.1"), // no published cache rates; both equal input
-        card: card_unpublished_output(
-            "Ministral 3 3B 2512",
-            "mistralai",
-            1764681560,
-            131_072,
-            IN_TEXT | IN_IMAGE,
-            TOOLS | STRUCTURED_OUTPUTS,
-        ),
-    },
-    ModelRoute {
-        model: "ministral-8b-latest",
-        wire: WireFormat::OpenAi,
-        candidates: &mistral("ministral-8b-latest", "mistralai/ministral-8b-2512"),
-        responses: &[],
-        price: price("0.15", "0.15", "0.15", "0.15"), // no published cache rates; both equal input
-        card: card_unpublished_output(
-            "Ministral 3 8B 2512",
-            "mistralai",
-            1764681654,
-            262_144,
-            IN_TEXT | IN_IMAGE,
-            TOOLS | STRUCTURED_OUTPUTS,
-        ),
-    },
-    ModelRoute {
-        model: "mistral-large-latest",
-        wire: WireFormat::OpenAi,
-        candidates: &mistral("mistral-large-latest", "mistralai/mistral-large-2512"),
-        responses: &[],
-        price: price("0.5", "1.5", "0.5", "0.5"), // no published cache rates; both equal input
-        card: card_unpublished_output(
-            "Mistral Large 3 2512",
-            "mistralai",
-            1764624472,
-            262_144,
-            IN_TEXT | IN_IMAGE | IN_FILE,
-            TOOLS | STRUCTURED_OUTPUTS,
-        ),
-    },
-    ModelRoute {
-        model: "mistral-medium-latest",
-        wire: WireFormat::OpenAi,
-        candidates: &mistral("mistral-medium-latest", "mistralai/mistral-medium-3-5"),
-        responses: &[],
-        price: price("1.5", "7.5", "1.5", "1.5"), // no published cache rates; both equal input
-        card: card_unpublished_output(
-            "Mistral Medium 3.5",
-            "mistralai",
-            1777570439,
-            262_144,
-            IN_TEXT | IN_IMAGE | IN_FILE,
-            TOOLS | REASONING | STRUCTURED_OUTPUTS,
-        ),
-    },
-    ModelRoute {
-        model: "mistral-small-latest",
-        wire: WireFormat::OpenAi,
-        candidates: &mistral("mistral-small-latest", "mistralai/mistral-small-2603"),
-        responses: &[],
-        price: price("0.15", "0.6", "0.15", "0.15"), // no published cache rates; both equal input
-        card: card_unpublished_output(
-            "Mistral Small 4",
-            "mistralai",
-            1773695685,
-            262_144,
-            IN_TEXT | IN_IMAGE,
-            TOOLS | REASONING | STRUCTURED_OUTPUTS,
-        ),
-    },
-    ModelRoute {
         model: "moonshotai/kimi-k2.6",
         wire: WireFormat::OpenAi,
         candidates: &openrouter_only("moonshotai/kimi-k2.6"), // Fireworks: serverless deprecated
@@ -2557,11 +2445,13 @@ mod tests {
     /// The floor was 100 until 2026-10-01, when three retired models (`deepseek-chat`,
     /// `deepseek-reasoner`, `mistral-nemo`) left the table. A row must never serve a different model
     /// under its name, so the floor came down rather than padding the table with rows to meet it.
+    /// It came down again, to 90, when the seven Mistral rows left (D156): a row nobody can be
+    /// served on is not a row.
     #[test]
-    fn catalog_lists_at_least_95_models() {
+    fn catalog_lists_at_least_90_models() {
         assert!(
-            MODEL_ROUTES.len() >= 95,
-            "MODEL_ROUTES has {} rows; keep the managed catalog at 95+",
+            MODEL_ROUTES.len() >= 90,
+            "MODEL_ROUTES has {} rows; keep the managed catalog at 90+",
             MODEL_ROUTES.len(),
         );
     }
@@ -3217,13 +3107,6 @@ mod tests {
                 "deepseek/deepseek-v4.1-flash",
             ),
             (
-                "mistral-large-latest",
-                WireFormat::OpenAi,
-                ProviderId::Mistral,
-                "mistral-large-latest",
-                "mistralai/mistral-large-2512",
-            ),
-            (
                 "qwen/qwen3.8-27b",
                 WireFormat::OpenAi,
                 ProviderId::Groq,
@@ -3356,7 +3239,7 @@ mod tests {
         }
     }
 
-    /// GPT / o-series only. Other OpenAI-wire rows (Grok, DeepSeek, Mistral, llama, qwen) have no
+    /// GPT / o-series only. Other OpenAI-wire rows (Grok, DeepSeek, llama, qwen, Kimi) have no
     /// OpenAI store, so a Responses session-state walk must not list an arm.
     #[test]
     fn gpt_rows_carry_an_openai_responses_arm() {
@@ -3692,6 +3575,45 @@ mod tests {
         }
     }
 
+    /// No row rests on OpenRouter's shared Mistral pool (D156). With no Mistral pool key, a Mistral
+    /// row's only reachable candidate was OpenRouter, whose sole host for every Mistral id is
+    /// Mistral on OpenRouter's own upstream key: a limit every OpenRouter customer draws on, which
+    /// refused 8 of 10 quiet-minute calls on `mistral-large-2512`. The owner removed the rows
+    /// rather than list models we cannot serve. The general rule (no row depends solely on an
+    /// OpenRouter host we hold no direct key for) is not expressible from this table: it knows
+    /// neither which pool keys a deployment holds nor how many hosts OpenRouter has behind a slug.
+    /// So this pins the instance: the seven rows are gone, no candidate names Mistral or an
+    /// OpenRouter `mistralai/` slug, and the provider stays defined so `AI_POOL_KEY_MISTRAL` can
+    /// bring the rows back.
+    /// claim: CAT-1
+    /// defect: D156
+    #[test]
+    fn no_row_rests_on_openrouters_shared_mistral_pool() {
+        for gone in [
+            "mistral-large-latest",
+            "mistral-medium-latest",
+            "mistral-small-latest",
+            "ministral-3b-latest",
+            "ministral-8b-latest",
+            "ministral-14b-latest",
+            "codestral-latest",
+        ] {
+            assert!(for_model(gone).is_none(), "{gone} needs a Mistral pool key");
+        }
+        for r in MODEL_ROUTES {
+            for c in r.candidates.iter().chain(r.responses) {
+                assert_ne!(c.provider, ProviderId::Mistral, "{}", r.model);
+                assert!(
+                    !c.upstream_model.starts_with("mistralai/"),
+                    "{}: {} is OpenRouter's shared Mistral pool",
+                    r.model,
+                    c.upstream_model
+                );
+            }
+        }
+        assert_eq!(by_id(ProviderId::Mistral).env_var, Some("MISTRAL_API_KEY"));
+    }
+
     /// deepseek-v4-pro's failover is the same snapshot (V4-Pro-0813 on Together), not OpenRouter's
     /// 0423. The rows whose fallbacks served V3 and R1 under DeepSeek's retired names are gone.
     /// claim: CAT-2
@@ -3886,16 +3808,13 @@ mod tests {
     /// defect: D110
     #[test]
     fn cards_state_a_failover_hosts_smaller_window() {
-        for (model, window) in [
-            ("ministral-3b-latest", 131_072),
-            ("qwen/qwen3.8-2.4t-a95b", 1_010_000),
-        ] {
-            assert_eq!(
-                for_model(model).map(|r| r.card.context_window),
-                Some(window),
-                "{model}"
-            );
-        }
+        // The measured window (Together's 400 at 1,010,000) sets the card. Ministral 3B, whose
+        // OpenRouter failover served 131,072 of Mistral's 262,144, left with the Mistral rows
+        // (D156).
+        assert_eq!(
+            for_model("qwen/qwen3.8-2.4t-a95b").map(|r| r.card.context_window),
+            Some(1_010_000)
+        );
     }
 
     /// gpt-4's 8,192-token window holds prompt and output together, so the vendor's 8,192 max

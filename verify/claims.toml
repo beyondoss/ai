@@ -1863,7 +1863,7 @@ defects = ["D72", "D91"]
 id = "CAT-1"
 priority = "P0"
 group = "Catalog truth"
-text = "Every candidate on an in-scope provider (OpenAI, Anthropic, OpenRouter, xAI, Bedrock), including Responses arms, serves its model live, and the echoed model matches. Together, Mistral, Groq, DeepSeek and Fireworks primaries are out of scope by decision (2026-10-01); their rows are reachable through OpenRouter."
+text = "Every candidate on an in-scope provider (OpenAI, Anthropic, OpenRouter, xAI, Bedrock), including Responses arms, serves its model live, and the echoed model matches. Together, Groq, DeepSeek and Fireworks primaries are out of scope by decision (2026-10-01); their rows are reachable through OpenRouter. The Mistral rows were removed until there is a Mistral key (D156)."
 layer = "live"
 touches = [
   "crates/providers/src/",

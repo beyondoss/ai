@@ -26,8 +26,9 @@
 //! | `CAT-8`            | row         | name / created / owner against the provider's model endpoint  |
 //! | `CAT-13`           | provider    | `/{provider}/` passthrough, managed (billed) and BYO (not)    |
 //!
-//! Scope (CAT-1): OpenAI, Anthropic, OpenRouter, xAI, Bedrock and Together candidates. Mistral,
-//! Groq, DeepSeek and Fireworks are out of scope by owner decision; `openai-codex` has no key.
+//! Scope (CAT-1): OpenAI, Anthropic, OpenRouter, xAI, Bedrock and Together candidates. Groq,
+//! DeepSeek and Fireworks are out of scope by owner decision; `openai-codex` has no key. The
+//! Mistral rows were removed from the catalog until there is a Mistral key (D156).
 //! A trial that can't run (no key, over the per-call cost cap, a window the provider exceeds so an
 //! over-limit request would be billed) is not listed — `VERIFY_CATALOG_PLAN=1` prints each skip and
 //! its reason, and the estimated cost of what is listed.

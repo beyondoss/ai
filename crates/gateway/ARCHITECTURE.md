@@ -367,7 +367,8 @@ request sized from the card is accepted wherever the walk lands: the primary ven
 `context_window` and `max_output_tokens`, lowered where a candidate enforces less. OpenAI's GPT-5
 family counts output inside the published window and caps input at the window less the max
 output, so those cards list 272,000 (of 400,000) or 922,000 (of 1,050,000); a failover host with a
-smaller window sets the row's (Ministral 3B's OpenRouter candidate, 131,072). One figure per row,
+smaller window sets the row's, as does a primary that refuses below its vendor's figure (Together's
+Qwen3.8 2.4T A95B, 1,010,000). One figure per row,
 not per candidate: the gateway counts no prompt tokens, so it could not choose a candidate by
 window anyway. The card lists the input kinds and capabilities the vendor lists **and every
 candidate serves on the endpoint it is reached on**: `grok-4.20-multi-agent` lists no tools (xAI
@@ -778,7 +779,7 @@ walk, translated or not, a root `max_tokens` / `max_completion_tokens` / `max_ou
 the row's **published** max output (`ModelCard::output_cap`) is capped to it (never raised; spans
 found by the same `peek::scan_buffered` walk that finds `model`, spliced in place). Claude Code sends
 32000 or 64000, which gpt-4o-class rows (16384) answered with a 400. A row whose vendor publishes no
-max output (Grok, Mistral, Kimi, …) lists the `UNPUBLISHED_MAX_OUTPUT` placeholder and is not
+max output (Grok, Kimi, MiniMax, …) lists the `UNPUBLISHED_MAX_OUTPUT` placeholder and is not
 capped: cutting 64000 to a figure that is not the vendor's would end answers early with
 `finish_reason: length`. The catalog models one card per row, not a limit per candidate, so the
 row's card is the limit on every candidate. The cap runs before translation, so a
@@ -1076,13 +1077,19 @@ xAI's own Chat Completions reports reasoning beside it; and the translated answe
 Chat Completions helper covers every other pool-keyed host: DeepSeek (`deepseek-flash` →
 `deepseek/deepseek-v4.1-flash`; `deepseek-v4-pro` fails over to Together's
 `deepseek-ai/DeepSeek-V4-Pro-0813`, because OpenRouter's `deepseek/deepseek-v4-pro` is the older
-0423 snapshot), Mistral `-latest` aliases (including Ministral), and the Groq/Together llama /
+0423 snapshot), and the Groq/Together llama /
 qwen / open-weight ids people send (`openai/gpt-oss-120b` names Groq, Together and Fireworks:
 one of OpenRouter's hosts answers a forced tool call with an empty `finish_reason: "error"` 200;
 Kimi K3 / GLM-5.2 / MiniMax M3 do the Together + Fireworks + OpenRouter shape). A
 fallback must serve the model the row names, so a retired vendor id is removed with its row
 (`deepseek-chat`, `deepseek-reasoner` and `mistral-nemo`, whose OpenRouter fallbacks were other
-models), and a candidate the host reserves for Enterprise or dedicated deployments is not listed
+models). The Mistral `-latest` rows (Large, Medium, Small, Ministral 3B / 8B / 14B, Codestral)
+were removed by owner decision until there is an `AI_POOL_KEY_MISTRAL` (D156): with no Mistral
+key, their only reachable candidate was OpenRouter, whose only host for each is Mistral on
+OpenRouter's own upstream key. That limit is shared with every OpenRouter customer, so it 429s
+whatever our traffic does, and a pool-key walk cannot help. The `mistral` provider and its
+`/mistral/…` route remain, so bringing them back is the key plus the rows. Likewise, a candidate the host
+reserves for Enterprise or dedicated deployments is not listed
 (Groq `llama-3.1-8b-instant` / `llama-3.3-70b-versatile` / `minimaxai/minimax-m2.7`, the
 Fireworks Llama 4 / Kimi K2.6 / GLM 5.1 / Llama 3.3 ids, Together Kimi K2.7 Code, GPT-OSS 20B,
 Gemma 4 31B and Qwen2.5 7B Turbo).
