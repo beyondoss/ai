@@ -439,7 +439,6 @@ fn vkey(sk: &ed25519_dalek::SigningKey) -> String {
 /// claim: TRN-5
 /// defect: D63
 #[tokio::test]
-#[ignore = "D63 reproduced: a same-wire walk relays max_tokens to OpenAI reasoning models"]
 async fn max_tokens_reaches_a_reasoning_model_as_max_completion_tokens() {
     let (pubkey, sk) = test_keypair(1);
     let mock = MockUpstream::start(Mode::Json).await;

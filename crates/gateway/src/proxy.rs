@@ -2344,6 +2344,65 @@ fn clamp_output_limits(body: &mut Vec<u8>, spans: &[Option<(usize, usize)>; 3], 
     changed
 }
 
+/// Whether a catalog candidate is native OpenAI Chat Completions, which takes the output limit as
+/// `max_completion_tokens` on every model and rejects `max_tokens` on its reasoning models.
+fn native_openai_chat(c: &route::Candidate) -> bool {
+    c.provider == providers::ProviderId::OpenAi
+        && route::Endpoint::of_upstream_path(c.path) == route::Endpoint::ChatCompletions
+}
+
+/// Respell a root `max_tokens` as `max_completion_tokens`, in place. `keys` is
+/// [`peek::BufferedScan::limit_keys`]. When both are present the explicit `max_completion_tokens`
+/// wins and the `max_tokens` member is removed. `true` when the body changed, so the caller
+/// re-scans the moved bytes.
+fn rename_max_tokens(body: &mut Vec<u8>, keys: &[Option<usize>; 3]) -> bool {
+    const KEY: &[u8] = br#""max_tokens""#;
+    let Some(at) = keys[0] else {
+        return false;
+    };
+    if body.get(at..at + KEY.len()) != Some(KEY) {
+        return false;
+    }
+    if keys[1].is_none() {
+        body.splice(
+            at + 1..at + KEY.len() - 1,
+            b"max_completion_tokens".iter().copied(),
+        );
+        return true;
+    }
+    // Both spellings. Find the end of the `max_tokens` value without building it, then remove
+    // the member and one adjacent comma.
+    let skip_ws = |mut i: usize| {
+        while body.get(i).is_some_and(u8::is_ascii_whitespace) {
+            i += 1;
+        }
+        i
+    };
+    let colon = skip_ws(at + KEY.len());
+    if body.get(colon) != Some(&b':') {
+        return false;
+    }
+    let value = skip_ws(colon + 1);
+    let mut values = serde_json::Deserializer::from_slice(&body[value..])
+        .into_iter::<serde::de::IgnoredAny>();
+    if !matches!(values.next(), Some(Ok(_))) {
+        return false;
+    }
+    let end = value + values.byte_offset();
+    let after = skip_ws(end);
+    let range = if body.get(after) == Some(&b',') {
+        at..after + 1
+    } else {
+        // The last member: take the comma before it instead.
+        match body[..at].iter().rposition(|b| !b.is_ascii_whitespace()) {
+            Some(comma) if body[comma] == b',' => comma..end,
+            _ => at..end,
+        }
+    };
+    body.drain(range);
+    true
+}
+
 fn apply_model_rewrite(mut body: Vec<u8>, span: (usize, usize), replacement: &[u8]) -> Vec<u8> {
     let (start, end) = span;
     // Defensive: a span outside the buffer would panic on the splice. Unreachable — the span is
@@ -4386,6 +4445,13 @@ impl ProxyHttp for AiProxy {
                     if changed {
                         scan = peek::scan_buffered(&buf);
                     }
+                    // Native OpenAI Chat takes `max_completion_tokens` on every model and 400s
+                    // `max_tokens` on its reasoning ones; a translated body already says the former.
+                    if a.candidate_at(a.candidate).is_some_and(native_openai_chat)
+                        && rename_max_tokens(&mut buf, &scan.limit_keys)
+                    {
+                        scan = peek::scan_buffered(&buf);
+                    }
                 }
                 if rc.model.is_empty()
                     && let Some(m) = scan.model
@@ -5423,6 +5489,50 @@ mod tests {
 
     use crate::metrics::ProviderMetrics;
     use crate::route::AuthScheme;
+
+    /// `max_tokens` is respelled for native OpenAI Chat; with both spellings the explicit
+    /// `max_completion_tokens` stays and the `max_tokens` member goes, whatever its value and
+    /// position, leaving valid JSON.
+    #[test]
+    fn max_tokens_is_respelled_max_completion_tokens() {
+        let rename = |body: &str| {
+            let mut buf = body.as_bytes().to_vec();
+            let scan = peek::scan_buffered(&buf);
+            let changed = rename_max_tokens(&mut buf, &scan.limit_keys);
+            let out = String::from_utf8(buf).unwrap();
+            serde_json::from_str::<serde_json::Value>(&out).expect(&out);
+            (out, changed)
+        };
+        for (body, want, changed) in [
+            (
+                r#"{"model":"o3","max_tokens":256}"#,
+                r#"{"model":"o3","max_completion_tokens":256}"#,
+                true,
+            ),
+            (
+                r#"{"max_tokens" : null, "model":"o3"}"#,
+                r#"{"max_completion_tokens" : null, "model":"o3"}"#,
+                true,
+            ),
+            (
+                r#"{"max_tokens":256, "max_completion_tokens":512}"#,
+                r#"{ "max_completion_tokens":512}"#,
+                true,
+            ),
+            (
+                r#"{"max_completion_tokens":512, "max_tokens" : {"x":[1,"}"]} }"#,
+                r#"{"max_completion_tokens":512 }"#,
+                true,
+            ),
+            (
+                r#"{"max_completion_tokens":512,"messages":[{"max_tokens":1}]}"#,
+                r#"{"max_completion_tokens":512,"messages":[{"max_tokens":1}]}"#,
+                false,
+            ),
+        ] {
+            assert_eq!(rename(body), (want.to_owned(), changed), "{body}");
+        }
+    }
 
     /// Every limit over the cap is cut to it, back to front so offsets hold; one under it, or a
     /// cap of zero, is left alone. A value past `u64` is over any cap.

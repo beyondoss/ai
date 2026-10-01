@@ -429,6 +429,10 @@ pub struct BufferedScan {
     /// (first occurrence of each): the span a catalog walk caps at the serving model's maximum.
     /// A value that is not a plain non-negative integer is not recorded.
     pub limit_spans: [Option<(usize, usize)>; 3],
+    /// Offset of each root-level output limit key's opening quote, indexed like
+    /// [`OUTPUT_LIMIT_KEYS`] (first occurrence of each, whatever its value): where a walk onto
+    /// native OpenAI Chat Completions renames `max_tokens`.
+    pub limit_keys: [Option<usize>; 3],
 }
 
 /// The fields that cap a response's length, whichever wire the body speaks.
@@ -470,6 +474,7 @@ pub fn scan_buffered(body: &[u8]) -> BufferedScan {
             model_span: None,
             duplicate_model: false,
             limit_spans: [None; 3],
+            limit_keys: [None; 3],
         };
     }
     let insert_at = i + 1;
@@ -498,6 +503,7 @@ pub fn scan_buffered(body: &[u8]) -> BufferedScan {
     // The output limit whose value comes next, as an index into `OUTPUT_LIMIT_KEYS`.
     let mut limit_key: Option<usize> = None;
     let mut limit_spans: [Option<(usize, usize)>; 3] = [None; 3];
+    let mut limit_keys: [Option<usize>; 3] = [None; 3];
 
     let mut j = i;
     while j < n {
@@ -536,6 +542,9 @@ pub fn scan_buffered(body: &[u8]) -> BufferedScan {
                                 && escaped_key_is(&body[key_start - 1..=j], "model"));
                         model_keys += u32::from(last_key_is_model);
                         limit_key = OUTPUT_LIMIT_KEYS.iter().position(|k| *k == key);
+                        if let Some(k) = limit_key {
+                            limit_keys[k].get_or_insert(key_start - 1);
+                        }
                     }
                 } else if capturing_model {
                     capturing_model = false;
@@ -632,6 +641,7 @@ pub fn scan_buffered(body: &[u8]) -> BufferedScan {
         model_span,
         duplicate_model: model_keys > 1,
         limit_spans,
+        limit_keys,
     }
 }
 
@@ -655,6 +665,13 @@ mod tests {
         assert_eq!(text(scan.limit_spans[0]), Some(&b"64000"[..]));
         assert_eq!(scan.limit_spans[1], None, "a string is no limit");
         assert_eq!(scan.limit_spans[2], None, "a negative is no limit");
+        let key = |at: Option<usize>| at.map(|a| &body[a..a + 12]);
+        assert_eq!(key(scan.limit_keys[0]), Some(&br#""max_tokens""#[..]));
+        assert_eq!(
+            scan.limit_keys[1].map(|a| &body[a..a + 23]),
+            Some(&br#""max_completion_tokens""#[..]),
+            "a key is recorded whatever its value"
+        );
         assert_eq!(scan.model.as_deref(), Some("m"));
     }
 

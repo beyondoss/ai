@@ -15,7 +15,6 @@ use serde_json::Value;
 /// claim: E1, T1
 /// defect: D63
 #[tokio::test]
-#[ignore = "D63 reproduced: a same-wire Chat walk relays max_tokens unchanged to a GPT-5 row"]
 async fn a_chat_max_tokens_reaches_a_gpt5_row_as_max_completion_tokens() {
     let (pubkey, sk) = test_keypair(74);
     let mock = MockUpstream::start(Mode::OpenAiToolJson).await;

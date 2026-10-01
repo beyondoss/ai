@@ -55,7 +55,6 @@ async fn forwarded_body(providers: &[&'static str], model: &str, body: &str) -> 
 /// claim: E1, TRN-5
 /// defect: D63
 #[tokio::test]
-#[ignore = "D63 reproduced: a stock max_tokens reaches native OpenAI as max_tokens, which its reasoning models reject"]
 async fn a_stock_max_tokens_reaches_native_openai_as_max_completion_tokens() {
     let body = r#"{"model":"MODEL","max_tokens":1024,"messages":[{"role":"user","content":"hi"}]}"#;
     for model in ["gpt-5-mini", "o3", "gpt-4o-mini"] {

@@ -590,7 +590,12 @@ walk, translated or not, a root `max_tokens` / `max_completion_tokens` / `max_ou
 the row's card `max_output_tokens` is capped to it (never raised; spans found by the same
 `peek::scan_buffered` walk that finds `model`, spliced in place). Claude Code sends 32000 or 64000,
 which gpt-4o-class rows (16384) answered with a 400. The cap runs before translation, so a
-thinking budget derived from the limit fits under it too. OpenAI→Anthropic
+thinking budget derived from the limit fits under it too. When the serving candidate is native
+OpenAI Chat Completions (provider `openai`, `/v1/chat/completions`), a same-wire relay also respells
+a root `max_tokens` as `max_completion_tokens`, which every OpenAI chat model accepts and which
+its reasoning models require; with both present, the explicit `max_completion_tokens` stays and
+the `max_tokens` member is removed (key offsets from the same scan, edited in place). Other
+OpenAI-wire hosts keep `max_tokens`, the spelling they document. OpenAI→Anthropic
 does not inject `stream_options`. Anthropic→OpenAI injects `include_usage` on the translated
 Chat Completions body when streaming; Responses→Chat Completions does the same because injection
 follows the **upstream** endpoint. A stock OpenAI SDK also does not send `anthropic-version`; the

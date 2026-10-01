@@ -576,7 +576,7 @@ async fn an_output_limit_above_the_model_maximum_is_clamped_to_it() {
         "{got}"
     );
 
-    // Same wire: the byte relay is capped too, under the client's own key.
+    // Same wire: the byte relay is capped too (and, on native OpenAI, respelled).
     post(
         &gw,
         &sk,
@@ -585,7 +585,11 @@ async fn an_output_limit_above_the_model_maximum_is_clamped_to_it() {
     )
     .await;
     let (_, got) = captured(&mock);
-    assert_eq!(got["max_tokens"], GPT_4O_MINI_MAX_OUTPUT, "{got}");
+    assert_eq!(
+        got["max_completion_tokens"], GPT_4O_MINI_MAX_OUTPUT,
+        "{got}"
+    );
+    assert!(got.get("max_tokens").is_none(), "{got}");
 
     // A limit within the model's reach is left alone.
     post(
