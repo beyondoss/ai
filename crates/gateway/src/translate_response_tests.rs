@@ -1171,7 +1171,8 @@ fn a_non_2xx_body_is_an_error_whatever_its_shape() {
     let v = json_status(Chat, Messages, 404, &json!({"detail": "Not Found"}));
     assert_eq!(
         v,
-        json!({"type": "error", "error": {"type": "api_error", "message": "Not Found"}})
+        json!({"type": "error", "error": {"type": "not_found_error", "message": "Not Found"}}),
+        "a body naming no type is typed from its status"
     );
     // A 2xx with the same body is not second-guessed.
     let v = json_status(
@@ -1185,6 +1186,48 @@ fn a_non_2xx_body_is_an_error_whatever_its_shape() {
     assert_eq!(
         response_json_status(Messages, Chat, 502, b"<html>bad gateway</html>"),
         b"<html>bad gateway</html>"
+    );
+}
+
+/// D100: the same endpoint on another vendor still owes the client its API's envelope. xAI's flat
+/// `{"code", "error": "<string>"}` and Bedrock's `{"message"}` are re-encoded, typed from the
+/// status; a body already in the envelope is relayed byte for byte.
+#[test]
+fn a_same_endpoint_error_is_put_in_the_clients_envelope() {
+    let xai = json!({"code": "invalid_image", "error": "Invalid PNG image."});
+    let v = json_status(Chat, Chat, 400, &xai);
+    assert_eq!(v["error"]["message"], "Invalid PNG image.", "{v}");
+    assert_eq!(v["error"]["type"], "invalid_request_error", "{v}");
+    assert_eq!(v["error"]["code"], "invalid_image", "{v}");
+    let v = json_status(
+        Messages,
+        Messages,
+        429,
+        &json!({"message": "Too many requests"}),
+    );
+    assert_eq!(
+        v,
+        json!({"type": "error", "error": {"type": "rate_limit_error", "message": "Too many requests"}})
+    );
+    for (endpoint, body) in [
+        (
+            Chat,
+            r#"{"error":{"message":"bad","type":"invalid_request_error","param":null,"code":null}}"#,
+        ),
+        (
+            Messages,
+            r#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#,
+        ),
+    ] {
+        assert_eq!(
+            response_json_status(endpoint, endpoint, 400, body.as_bytes()),
+            body.as_bytes()
+        );
+    }
+    // A 2xx on the same endpoint is never parsed.
+    assert_eq!(
+        response_json_status(Chat, Chat, 200, b"{\"error\":\"x\"}"),
+        b"{\"error\":\"x\"}"
     );
 }
 

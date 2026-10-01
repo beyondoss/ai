@@ -668,7 +668,6 @@ async fn openrouter_provider_errors_keep_the_provider_message() {
 /// claim: T6
 /// defect: D100
 #[tokio::test]
-#[ignore = "D100 reproduced: xAI's error body is relayed as-is and typed api_error on Messages"]
 async fn xai_errors_arrive_in_the_clients_envelope() {
     const XAI_400: &str = r#"{"code":"invalid_image","error":"code: 'Client specified an invalid argument', message: \"Invalid PNG image.\""}"#;
     let (pubkey, sk) = test_keypair(1);

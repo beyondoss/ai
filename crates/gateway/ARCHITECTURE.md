@@ -154,7 +154,8 @@ Client (stock OpenAI/Anthropic SDK)
   │    x-beyond-upstream-model (catalog walk)
   │  Managed: drop any header whose value carries the pool key this attempt sent; a
   │    status >= 400 arms the body scrub below
-  │  Translate walk: drop Content-Length (body length will change)
+  │  Translate walk, or a same-endpoint catalog error (re-encoded into the client's
+  │    envelope when it is another vendor's shape): drop Content-Length (body length will change)
   │
   ▼  response_body_filter (proxy.rs)  — response relayed chunk-by-chunk; SSE is never fully buffered
   │  Managed >= 400, first: overwrite the pool key with `[redacted]***` (same length, so
@@ -810,7 +811,14 @@ Responses-only models the catalog routes to `/v1/responses`, and is held to the 
   `error` key); `message`, `type`, `code` and `param` survive, a string `error` is the message,
   OpenRouter's `metadata.raw` is quoted after its message with the provider's name, and a numeric
   `code` is a string on the OpenAI wire. OpenAI types with an Anthropic name get it
-  (`server_error` → `api_error`, rate limits → `rate_limit_error`). A context overflow carries what
+  (`server_error` → `api_error`, rate limits → `rate_limit_error`), and a body that names no type is
+  typed from its status (Anthropic's closed set on Messages: 400 `invalid_request_error`, 404
+  `not_found_error`, 429 `rate_limit_error`, 529 `overloaded_error`…; on the OpenAI endpoints 4xx
+  `invalid_request_error`, 429 `rate_limit_error`, else `api_error`). The same endpoint on another
+  vendor gets this too: a catalog walk buffers a non-stream error from a same-endpoint candidate and
+  re-encodes it unless it is already the client API's envelope, so xAI's `{"code", "error":
+  "<string>"}` reaches an OpenAI SDK as `{"error": {"message", "type", "code"}}` (D100), while
+  OpenAI's own errors and OpenRouter's are relayed byte for byte. A context overflow carries what
   each client's harness compacts on: OpenAI's `context_length_exceeded` reaches a Messages client
   with its message prefixed "prompt is too long: " (Claude Code's trigger), and Anthropic's "prompt
   is too long" reaches a Chat Completions or Responses client with code `context_length_exceeded`

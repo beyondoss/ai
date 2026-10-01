@@ -350,14 +350,24 @@ pub fn response_json_tools(
     tools: &ToolNames,
     gateway_cache: bool,
 ) -> Vec<u8> {
-    if upstream == client {
+    let ok = (200..300).contains(&status);
+    if upstream == client && ok {
         return body.to_vec();
     }
     let Ok(v) = serde_json::from_slice::<Value>(body) else {
         return body.to_vec();
     };
-    if !(200..300).contains(&status) || looks_like_error(&v) {
-        return encode(&map_error(&v, client));
+    // The same endpoint on another vendor's error shape (xAI's `{"code", "error": "<string>"}`,
+    // Bedrock's `{"message"}`): an SDK reads the envelope its own API sends, so anything else is
+    // re-encoded in it. One already in it is relayed as it came, byte for byte (D100).
+    if upstream == client {
+        if in_client_envelope(&v, client) {
+            return body.to_vec();
+        }
+        return encode(&map_error(&v, client, status));
+    }
+    if !ok || looks_like_error(&v) {
+        return encode(&map_error(&v, client, status));
     }
     encode(&map_response(upstream, client, &v, tools, gateway_cache))
 }
@@ -421,9 +431,41 @@ fn looks_like_error(v: &Value) -> bool {
     v.get("type").and_then(Value::as_str) != Some("message")
 }
 
+/// Whether an error body is already the client API's own envelope: `{"error": {"message", …}}`
+/// on the OpenAI endpoints, `{"type": "error", "error": {"type", "message"}}` on Messages.
+fn in_client_envelope(v: &Value, client: Endpoint) -> bool {
+    let err = v.get("error");
+    let has = |k: &str| err.and_then(|e| e.get(k)).is_some_and(Value::is_string);
+    match client {
+        Endpoint::Messages => {
+            v.get("type").and_then(Value::as_str) == Some("error") && has("type") && has("message")
+        }
+        Endpoint::ChatCompletions | Endpoint::Responses | Endpoint::Embeddings => has("message"),
+    }
+}
+
+/// The error type an HTTP status means when the body names none (D100: xAI's 400 has no type,
+/// and `api_error` told a Messages client its invalid image was a server fault). Anthropic's
+/// closed set on Messages; on the OpenAI endpoints the gateway's own envelope's words.
+fn status_error_type(status: u16, client: Endpoint) -> &'static str {
+    match (client, status) {
+        (Endpoint::Messages, 401) => "authentication_error",
+        (Endpoint::Messages, 402) => "billing_error",
+        (Endpoint::Messages, 403) => "permission_error",
+        (Endpoint::Messages, 404) => "not_found_error",
+        (Endpoint::Messages, 413) => "request_too_large",
+        (Endpoint::Messages, 504) => "timeout_error",
+        (Endpoint::Messages, 529) => "overloaded_error",
+        (_, 429) => "rate_limit_error",
+        (_, 400..=499) => "invalid_request_error",
+        _ => "api_error",
+    }
+}
+
 /// Everything an upstream error says, whichever dialect said it.
 struct ErrorInfo {
-    typ: String,
+    /// The body's own error type, if it named one.
+    typ: Option<String>,
     message: String,
     code: Option<Value>,
     param: Option<Value>,
@@ -508,7 +550,7 @@ fn error_info(v: &Value) -> ErrorInfo {
         }
     }
     ErrorInfo {
-        typ: typ.unwrap_or_else(|| "api_error".to_owned()),
+        typ,
         message,
         code,
         param,
@@ -573,8 +615,14 @@ const ANTHROPIC_OVERFLOW: &str = "prompt is too long";
 /// OpenAI's code for the same; Codex and the Agents SDK compact on it.
 const OPENAI_OVERFLOW: &str = "context_length_exceeded";
 
-fn map_error(v: &Value, client: Endpoint) -> Value {
+/// `v` in the client's error envelope. `status` is the response's HTTP status (200 for an error
+/// carried inside a 2xx stream or body), which types an error whose body names no type.
+fn map_error(v: &Value, client: Endpoint, status: u16) -> Value {
     let mut info = error_info(v);
+    let typ = info
+        .typ
+        .take()
+        .unwrap_or_else(|| status_error_type(status, client).to_owned());
     // A context overflow says so in the words the client's harness acts on.
     let says_overflow = info.message.contains(ANTHROPIC_OVERFLOW);
     let coded_overflow = info.code.as_ref().and_then(Value::as_str) == Some(OPENAI_OVERFLOW);
@@ -586,7 +634,7 @@ fn map_error(v: &Value, client: Endpoint) -> Value {
             let mut err = Map::new();
             err.insert(
                 "type".into(),
-                json!(anthropic_error_type(&info.typ, info.code.as_ref())),
+                json!(anthropic_error_type(&typ, info.code.as_ref())),
             );
             err.insert("message".into(), json!(info.message));
             // Not Anthropic fields, but an SDK hands the whole body to the caller: keep them.
@@ -604,7 +652,7 @@ fn map_error(v: &Value, client: Endpoint) -> Value {
             }
             let mut err = Map::new();
             err.insert("message".into(), json!(info.message));
-            err.insert("type".into(), json!(info.typ));
+            err.insert("type".into(), json!(typ));
             err.insert("param".into(), openai_error_field(info.param));
             err.insert("code".into(), openai_error_field(info.code));
             if let Some(meta) = info.metadata {
@@ -5158,10 +5206,11 @@ impl SseBridge {
                     Endpoint::ChatCompletions => out.extend(sse_data(&value_string(&map_error(
                         &v,
                         Endpoint::ChatCompletions,
+                        200,
                     )))),
                     Endpoint::Messages => out.extend(sse_named(
                         "error",
-                        &value_string(&map_error(&v, Endpoint::Messages)),
+                        &value_string(&map_error(&v, Endpoint::Messages, 200)),
                     )),
                     Endpoint::Responses => self.oai_to_resp.error(&v, out),
                     Endpoint::Embeddings => {}
@@ -6984,7 +7033,7 @@ impl OaiToResp {
             self.start(out);
         }
         self.completed = true;
-        let envelope = map_error(v, Endpoint::Responses);
+        let envelope = map_error(v, Endpoint::Responses, 200);
         let err = envelope.get("error").cloned().unwrap_or(Value::Null);
         let field = |k: &str| err.get(k).cloned().unwrap_or(Value::Null);
         let (code, message, param) = (field("code"), field("message"), field("param"));

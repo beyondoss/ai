@@ -2638,6 +2638,16 @@ fn catalog_translating(auto: &ModelRouting) -> bool {
     catalog_serving_endpoint(auto).is_some_and(|up| t.client != up)
 }
 
+/// A non-stream error from a same-endpoint candidate, buffered (it is small, and capped by
+/// `MAX_TRANSLATE_BUFFER`) so a vendor's own error shape reaches the client in its API's envelope
+/// (`translate::response_json_tools`, D100). One already in that envelope is relayed unchanged.
+fn catalog_error_relay(auto: &ModelRouting, status: Option<u16>, streaming: bool) -> bool {
+    !streaming
+        && status.is_some_and(|s| s >= 400)
+        && auto.translate.is_some()
+        && !catalog_translating(auto)
+}
+
 /// A Chat Completions client served by a Chat Completions candidate of a vendor other than OpenAI,
 /// whose stream may repeat what OpenAI's sends once (see `translate::ChatIdentity`).
 fn catalog_chat_relay(auto: &ModelRouting) -> bool {
@@ -5195,11 +5205,11 @@ impl ProxyHttp for AiProxy {
             // Same-endpoint candidates stay a byte relay, except a Chat Completions stream from a
             // vendor other than OpenAI: it relays through `SseBridge`, which drops the identity
             // fields OpenRouter repeats on every chunk (see `translate::ChatIdentity`).
-            if rc
-                .auto
-                .as_ref()
-                .is_some_and(|a| catalog_translating(a) || (rc.streaming && catalog_chat_relay(a)))
-            {
+            if rc.auto.as_ref().is_some_and(|a| {
+                catalog_translating(a)
+                    || (rc.streaming && catalog_chat_relay(a))
+                    || catalog_error_relay(a, rc.upstream_status, rc.streaming)
+            }) {
                 let streaming = rc.streaming;
                 let upstream = rc
                     .auto
@@ -5293,9 +5303,12 @@ impl ProxyHttp for AiProxy {
             }
         }
 
-        // A translation, or a Chat Completions relay that `response_filter` gave a bridge.
+        // A translation, a Chat Completions relay that `response_filter` gave a bridge, or a
+        // same-endpoint error put in the client's envelope.
         let translating = rc.auto.as_ref().is_some_and(|a| {
-            catalog_translating(a) || a.translate.as_ref().is_some_and(|t| t.sse.is_some())
+            catalog_translating(a)
+                || a.translate.as_ref().is_some_and(|t| t.sse.is_some())
+                || catalog_error_relay(a, rc.upstream_status, rc.streaming)
         });
         if translating {
             let streaming = rc.streaming;
