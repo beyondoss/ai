@@ -223,7 +223,6 @@ async fn a_chunked_body_over_the_cap_on_the_catalog_path_is_a_413() {
 /// claim: REL-19
 /// defect: D43
 #[tokio::test]
-#[ignore = "D43 reproduced: gateway 429/503 carry no Retry-After; allowance unavailable is 402"]
 async fn gateway_429_and_503_carry_retry_after() {
     let (pubkey, sk) = test_keypair(1);
     let client = test_client();

@@ -721,9 +721,9 @@ pub const REJECT_BODIES: [(&str, &str, &str); 15] = [
         r#"{"error":{"message":"quota exhausted","type":"insufficient_quota"}}"#,
     ),
     (
-        "insufficient_quota",
+        "api_error",
         "allowance unavailable",
-        r#"{"error":{"message":"allowance unavailable","type":"insufficient_quota"}}"#,
+        r#"{"error":{"message":"allowance unavailable","type":"api_error"}}"#,
     ),
     (
         "rate_limit_error",
@@ -817,6 +817,28 @@ impl AiProxy {
         typ: &str,
         msg: &str,
     ) -> Result<bool> {
+        Self::reject_retry_after(
+            session,
+            request_id,
+            status,
+            typ,
+            msg,
+            default_retry_after(status, msg),
+        )
+        .await
+    }
+
+    /// [`Self::reject`] with an explicit `Retry-After` (seconds). `reject` derives one for every
+    /// 429 and 503 (see [`default_retry_after`]); the open-breaker 503 knows better, the seconds
+    /// left until it half-opens.
+    async fn reject_retry_after(
+        session: &mut Session,
+        request_id: &str,
+        status: u16,
+        typ: &str,
+        msg: &str,
+        retry_after: Option<u64>,
+    ) -> Result<bool> {
         warn!(request_id, status, error_type = typ, "request rejected");
         // `typ` and `msg` are always a pair of literals from `RejectBody`, so the body is one of a
         // handful of compile-time constants and `error_body` hands back a `Bytes::from_static` —
@@ -830,10 +852,15 @@ impl AiProxy {
         // one `HeaderValue` allocation inside pingora, but no `String` of our own.
         let mut len_buf = ArrayString::<20>::new();
         let _ = write!(len_buf, "{}", body.len());
-        let mut resp = ResponseHeader::build(status, Some(3))?;
+        let mut resp = ResponseHeader::build(status, Some(4))?;
         resp.insert_header("content-type", "application/json")?;
         resp.insert_header("content-length", len_buf.as_str())?;
         resp.insert_header(REQUEST_ID_HEADER, request_id)?;
+        if let Some(secs) = retry_after {
+            let mut ra = ArrayString::<20>::new();
+            let _ = write!(ra, "{secs}");
+            resp.insert_header(http::header::RETRY_AFTER, ra.as_str())?;
+        }
         session.write_response_header(Box::new(resp), false).await?;
         session.write_response_body(Some(body), true).await?;
         Ok(true)
@@ -1795,6 +1822,17 @@ async fn pipe_full_body(
     }
 }
 
+/// The `Retry-After` (seconds) on a gateway-made rejection: every 429 and 503 carries one, so a
+/// stock SDK backs off rather than hammering or giving up. A rate limit or a tenant's concurrency
+/// cap frees up within a second; an allowance-set not yet read takes a few; anything else gets 1.
+fn default_retry_after(status: u16, msg: &str) -> Option<u64> {
+    match status {
+        503 if msg == "allowance unavailable" => Some(5),
+        429 | 503 => Some(1),
+        _ => None,
+    }
+}
+
 /// An error the gateway raises with the status and message the client should see. Carried in
 /// `ErrorType::CustomCode` so [`failure_response`] can answer with exactly this rather than a
 /// generic line for the status.
@@ -2526,6 +2564,8 @@ impl ProxyHttp for AiProxy {
                         )
                         .await;
                     }
+                    // Not seeded yet: transient, so a retryable 503 with `Retry-After`, not the
+                    // 402 an SDK treats as final ("quota exhausted" above is the final one).
                     crate::allowance::AllowanceReject::Unavailable => {
                         self.state
                             .metrics
@@ -2534,8 +2574,8 @@ impl ProxyHttp for AiProxy {
                         return Self::reject_boxed(
                             session,
                             &request_id,
-                            402,
-                            "insufficient_quota",
+                            503,
+                            "api_error",
                             "allowance unavailable",
                         )
                         .await;
@@ -3241,13 +3281,15 @@ impl ProxyHttp for AiProxy {
                 slots.release(tenant_id);
             }
             self.state.metrics.rejection(Rejection::CircuitOpen).inc();
-            return Self::reject_boxed(
+            let retry_after = Some(breaker.retry_after_secs());
+            return Box::pin(Self::reject_retry_after(
                 session,
                 &request_id,
                 503,
                 "api_error",
                 "provider temporarily unavailable",
-            )
+                retry_after,
+            ))
             .await;
         }
         // A permit is now outstanding against this provider (see `RequestCtx::breaker_pending`).

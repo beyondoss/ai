@@ -647,7 +647,7 @@ async fn allowance_exhaust_does_not_connect_upstream() {
 }
 
 #[tokio::test]
-async fn allowance_unready_402s_without_connecting() {
+async fn allowance_unready_503s_without_connecting() {
     let nats_port = closed_port();
     let (pubkey, sk) = test_keypair(25);
     let mock = MockUpstream::start(Mode::Json).await;
@@ -665,7 +665,7 @@ async fn allowance_unready_402s_without_connecting() {
         &sk,
     );
     let client = test_client();
-    wait_for_status(402, {
+    wait_for_status(503, {
         let (c, u, k) = (client.clone(), gw.url(), vkey.clone());
         move || {
             let (c, u, k) = (c.clone(), u.clone(), k.clone());
