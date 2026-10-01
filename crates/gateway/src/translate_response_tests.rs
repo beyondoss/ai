@@ -2187,3 +2187,175 @@ fn a_streamed_zero_argument_call_has_json_arguments() {
         "Messages→Responses stream (deltas, .done, completed item): {evs:#?}"
     );
 }
+
+// ---- verification phase 0: translation detail (D44-D50) ----------------------------------------
+
+/// Anthropic streams one content block at a time: each `content_block_start` follows the previous
+/// block's `content_block_stop`, and deltas land only on the open block. Returns the first breach.
+fn messages_block_sequencing_violation(evs: &[Event]) -> Option<String> {
+    let mut open: Option<u64> = None;
+    for (name, v) in evs {
+        let idx = v["index"].as_u64();
+        match name.as_str() {
+            "content_block_start" => {
+                if let Some(o) = open {
+                    return Some(format!("block {idx:?} started while block {o} is open"));
+                }
+                open = idx;
+            }
+            "content_block_delta" if idx != open => {
+                return Some(format!("delta for block {idx:?} while {open:?} is open"));
+            }
+            "content_block_stop" => {
+                if idx != open {
+                    return Some(format!("stop for block {idx:?} while {open:?} is open"));
+                }
+                open = None;
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Parallel tool calls from a Chat upstream reach a Messages client as sequential blocks
+/// (start, deltas, stop, then the next start), whether the upstream sends the calls one after
+/// another or interleaves their argument deltas. The Anthropic SDK accumulates either way, but
+/// harnesses that act on `content_block_stop` (or assert one open block) see two open at once.
+/// claim: TRN-12
+/// defect: D45
+#[test]
+#[ignore = "D45 reproduced: parallel tool_use blocks open start1 start2 … stop1 stop2 on a Messages stream"]
+fn parallel_tool_use_blocks_are_sequential_on_a_messages_stream() {
+    let sequential = concat!(
+        "data: {\"id\":\"c\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_a\",\"function\":{\"name\":\"f\",\"arguments\":\"{\\\"a\\\":1}\"}}]}}]}\n\n",
+        "data: {\"id\":\"c\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":1,\"id\":\"call_b\",\"function\":{\"name\":\"g\",\"arguments\":\"{\\\"b\\\":2}\"}}]}}]}\n\n",
+        "data: {\"id\":\"c\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":2}}\n\n",
+    );
+    let interleaved = concat!(
+        "data: {\"id\":\"c\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_a\",\"function\":{\"name\":\"f\",\"arguments\":\"\"}},{\"index\":1,\"id\":\"call_b\",\"function\":{\"name\":\"g\",\"arguments\":\"\"}}]}}]}\n\n",
+        "data: {\"id\":\"c\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"a\\\":\"}}]}}]}\n\n",
+        "data: {\"id\":\"c\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":1,\"function\":{\"arguments\":\"{\\\"b\\\":2}\"}}]}}]}\n\n",
+        "data: {\"id\":\"c\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"1}\"}}]}}]}\n\n",
+        "data: {\"id\":\"c\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":2}}\n\n",
+    );
+    let mut bad = Vec::new();
+    for (what, src) in [("sequential", sequential), ("interleaved", interleaved)] {
+        let evs = stream(Chat, Messages, src);
+        // The calls themselves still arrive whole; only the sequencing is in question.
+        let content = anthropic_content(&evs);
+        assert_eq!(content.len(), 2, "{what}: {content:#?}");
+        assert_eq!(content[0]["input"], json!({"a": 1}), "{what}");
+        assert_eq!(content[1]["input"], json!({"b": 2}), "{what}");
+        if let Some(why) = messages_block_sequencing_violation(&evs) {
+            let order: Vec<String> = evs
+                .iter()
+                .filter(|(n, _)| n.starts_with("content_block_"))
+                .map(|(n, v)| format!("{}{}", &n["content_block_".len()..], v["index"]))
+                .collect();
+            bad.push(format!("{what}: {why} ({})", order.join(" ")));
+        }
+    }
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+}
+
+/// An upstream context-overflow error, translated for each client, carries what that client's
+/// harness compacts on: Claude Code looks for "prompt is too long" in a Messages error, Codex and
+/// the Agents SDK for code `context_length_exceeded` in a Chat or Responses one.
+/// claim: TRN-18
+/// defect: D46
+#[test]
+#[ignore = "D46 reproduced: translated context-overflow errors lack \"prompt is too long\" / code context_length_exceeded"]
+fn a_context_overflow_error_carries_what_each_harness_compacts_on() {
+    let openai = json!({"error": {
+        "message": "This model's maximum context length is 128000 tokens. However, your messages resulted in 130512 tokens. Please reduce the length of the messages.",
+        "type": "invalid_request_error", "param": "messages", "code": "context_length_exceeded"}});
+    let anthropic = json!({"type": "error", "error": {"type": "invalid_request_error",
+        "message": "prompt is too long: 210345 tokens > 200000 maximum"}});
+    let mut bad = Vec::new();
+
+    let m = json_status(Chat, Messages, 400, &openai);
+    let msg = m["error"]["message"].as_str().unwrap_or("").to_lowercase();
+    if !msg.contains("prompt is too long") {
+        bad.push(format!("Chat upstream → Messages client: {m}"));
+    }
+    for client in [Chat, Responses] {
+        let c = json_status(Messages, client, 400, &anthropic);
+        if c["error"]["code"] != "context_length_exceeded" {
+            bad.push(format!("Messages upstream → {client:?} client: {c}"));
+        }
+    }
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+}
+
+/// A mid-stream error reaches a Responses client's `response.failed` with its code intact when it
+/// is one a harness acts on: Codex compacts on `context_length_exceeded` and stops retrying on
+/// `insufficient_quota`, both read from `response.failed`'s `error.code`, which real OpenAI fills
+/// with those values though the published enum omits them.
+/// claim: TRN-19
+/// defect: D46
+#[test]
+#[ignore = "D46 reproduced: response.failed error.code turns context_length_exceeded / insufficient_quota into server_error"]
+fn a_mid_stream_overflow_or_quota_code_survives_response_failed() {
+    let mut bad = Vec::new();
+    for (code, typ) in [
+        ("context_length_exceeded", "invalid_request_error"),
+        ("insufficient_quota", "insufficient_quota"),
+    ] {
+        let src = format!(
+            concat!(
+                "data: {{\"id\":\"c\",\"model\":\"gpt-5\",\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"par\"}}}}]}}\n\n",
+                "data: {{\"error\":{{\"message\":\"boom\",\"type\":\"{typ}\",\"code\":\"{code}\"}}}}\n\n",
+                "data: [DONE]\n\n",
+            ),
+            typ = typ,
+            code = code,
+        );
+        let evs = stream(Chat, Responses, &src);
+        assert_eq!(one(&evs, "error")["code"], code, "the error event keeps it");
+        let failed = &one(&evs, "response.failed")["response"];
+        if failed["error"]["code"] != code {
+            bad.push(format!(
+                "{code}: response.failed carries {}",
+                failed["error"]
+            ));
+        }
+    }
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+}
+
+/// A Messages-compatible host may send a tool call's whole input on `content_block_start` and no
+/// `input_json_delta` after it. The input is the call's arguments, so a Chat or Responses client
+/// must receive it rather than `""` / `{}`.
+/// claim: TRN-13
+/// defect: D50
+#[test]
+#[ignore = "D50 reproduced: content_block_start tool_use input is ignored when no input_json_delta follows"]
+fn a_tool_input_sent_in_the_start_block_reaches_the_client() {
+    let src = ant_sse(&[
+        json!({"type": "message_start", "message": {"id": "msg_1", "type": "message",
+        "role": "assistant", "model": "claude-haiku-4-5", "content": [],
+        "usage": {"input_tokens": 10, "output_tokens": 1}}}),
+        json!({"type": "content_block_start", "index": 0, "content_block": {"type": "tool_use",
+        "id": "toolu_01", "name": "get_weather", "input": {"city": "Paris"}}}),
+        json!({"type": "content_block_stop", "index": 0}),
+        json!({"type": "message_delta", "delta": {"stop_reason": "tool_use"}, "usage": {"output_tokens": 12}}),
+        json!({"type": "message_stop"}),
+    ]);
+    let mut bad = Vec::new();
+
+    let chat = stream(Messages, Chat, &src);
+    let calls = chat_tool_calls(&chat);
+    let args = calls.first().map(|c| c.2.clone()).unwrap_or_default();
+    if serde_json::from_str::<Value>(&args).ok() != Some(json!({"city": "Paris"})) {
+        bad.push(format!("Messages→Chat arguments: {args:?}"));
+    }
+
+    let evs = stream(Messages, Responses, &src);
+    let resp = assert_responses_lifecycle(&evs, "response.completed");
+    let item_args = resp["output"][0]["arguments"].as_str().unwrap_or("");
+    if serde_json::from_str::<Value>(item_args).ok() != Some(json!({"city": "Paris"})) {
+        bad.push(format!("Messages→Responses item arguments: {item_args:?}"));
+    }
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+}

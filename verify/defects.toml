@@ -619,10 +619,10 @@ impact = "'Hello'+'World' becomes 'HelloWorld'."
 confidence = "high"
 evidence = "translate.rs:1042-1044"
 claims = ["TRN-3"]
-state = "suspected"
-test = ""
+state = "reproduced"
+test = "consecutive_user_messages_keep_their_text_apart"
 fix = ""
-note = ""
+note = "Reproduced (src/translate_request_tests.rs): Chat->Messages [{user:'Hello'},{user:'World'}] becomes one user message with content 'HelloWorld'. push_anth_message merges same-role turns and merge_content joins two strings with format!(\"{a}{b}\"); string+array and array+array merges already keep separate blocks, so only the string+string arm fuses."
 
 [[defect]]
 id = "D45"
@@ -633,10 +633,10 @@ impact = "start1 start2 … stop1 stop2 violates Anthropic's sequencing."
 confidence = "med"
 evidence = "translate.rs:5244-5262"
 claims = ["TRN-12"]
-state = "suspected"
-test = ""
+state = "reproduced"
+test = "parallel_tool_use_blocks_are_sequential_on_a_messages_stream"
 fix = ""
-note = ""
+note = "Reproduced (src/translate_response_tests.rs): a Chat upstream's two parallel tool calls reach a Messages client as start0 delta0 start1 delta1 stop0 stop1 when sent one after the other, and start0 start1 delta0 delta1 delta0 stop0 stop1 when interleaved. OaiToAnt::call_steps opens each call's block without closing the previous one; all blocks close together in close_calls at finish. Accumulated inputs are still correct ({a:1}, {b:2}); only the sequencing breaks."
 
 [[defect]]
 id = "D46"
@@ -647,10 +647,10 @@ impact = "Claude Code compacts on 'prompt is too long'; Codex compacts on contex
 confidence = "med"
 evidence = "translate.rs:407-438, 6019-6050"
 claims = ["TRN-18", "TRN-19"]
-state = "suspected"
-test = ""
+state = "reproduced"
+test = "a_context_overflow_error_carries_what_each_harness_compacts_on"
 fix = ""
-note = ""
+note = "Reproduced (src/translate_response_tests.rs), both halves. (b) a_context_overflow_error_carries_what_each_harness_compacts_on: OpenAI 400 code context_length_exceeded reaches a Messages client as invalid_request_error with OpenAI's 'This model's maximum context length is ...' message (no 'prompt is too long'); Anthropic 400 'prompt is too long: 210345 tokens > 200000 maximum' reaches Chat and Responses clients with code:null. (a) a_mid_stream_overflow_or_quota_code_survives_response_failed: a Chat upstream mid-stream error with code context_length_exceeded or insufficient_quota reaches a Responses client's `error` event intact, but response.failed.error.code is 'server_error' (responses_error_code's closed list). Whether Claude Code / Codex then compact is live-only."
 
 [[defect]]
 id = "D47"
@@ -661,10 +661,10 @@ impact = "It also disables auto breakpoints, so the history cache misses."
 confidence = "med"
 evidence = "translate.rs:1597, 1719-1784"
 claims = ["TRN-4"]
-state = "suspected"
-test = ""
+state = "reproduced"
+test = "message_level_cache_control_survives_on_assistant_and_tool_messages"
 fix = ""
-note = ""
+note = "Reproduced (src/translate_request_tests.rs): Chat->Messages with cache_control on a mid-history assistant message and on a tool message: neither the assistant text block nor the tool_result carries it (openai_assistant_content only copies part-level cache_control; openai_tool_result reads none). Correction to impact: auto breakpoints were NOT disabled here (has_cache_control saw nothing, so the tools and the last user message got automatic breakpoints); they are disabled only when the client also marked a user or system message, which then leaves the dropped assistant/tool breakpoints unreplaced."
 
 [[defect]]
 id = "D48"
@@ -675,10 +675,10 @@ impact = "name:\"\" onto Messages; function_call_output answers a custom call."
 confidence = "med"
 evidence = "translate.rs:1760-1772, 3402-3413"
 claims = ["TRN-14"]
-state = "suspected"
-test = ""
+state = "reproduced"
+test = "a_custom_tool_call_in_history_keeps_its_name_and_input_on_messages"
 fix = ""
-note = ""
+note = "Reproduced (src/translate_request_tests.rs), both halves. A custom tool call in history ({type:custom, custom:{name:apply_patch, input:...}}) becomes tool_use {name:'', input:{}} on Messages, from Chat history and from a Responses custom_tool_call alike (openai_assistant_content reads only function.name / arguments). a_custom_tool_result_reaches_responses_as_custom_tool_call_output: Chat->Responses maps the call to custom_tool_call but the answering tool message to function_call_output (chat_tool_to_function_call_output never looks up the call's type)."
 
 [[defect]]
 id = "D49"
@@ -689,10 +689,10 @@ impact = "Null stop/audio cause spurious 400s. The developer role reaches non-Op
 confidence = "med"
 evidence = "translate.rs:464-478, 3218-3245, 3628-3646"
 claims = ["TRN-15", "TRN-16", "TRN-17"]
-state = "suspected"
-test = ""
+state = "reproduced"
+test = "explicit_nulls_are_not_forwarded_upstream"
 fix = ""
-note = ""
+note = "Reproduced (src/translate_request_tests.rs), all three sub-behaviors. explicit_nulls_are_not_forwarded_upstream: Chat->Messages forwards audio:null, top_logprobs:null and web_search_options:null (copy_if copies nulls; stop:null is already dropped on that path), and Chat->Responses forwards stop:null (and the other three). a_responses_developer_message_is_system_on_a_non_openai_chat_host: Responses->Chat onto deepseek-chat keeps role 'developer' (roles [user, developer, user]). unknown_responses_input_items_are_forwarded_not_dropped: item_reference, local_shell_call, computer_call_output and compaction all vanish from the Chat body (the catch-all in responses_input_to_messages). The upstream 400s themselves are not exercised."
 
 [[defect]]
 id = "D50"
@@ -703,10 +703,10 @@ impact = "Messages-compatible hosts lose their arguments. Mixed-row failover rep
 confidence = "med"
 evidence = "translate.rs:4561-4573"
 claims = ["TRN-13", "TRN-20"]
-state = "suspected"
-test = ""
+state = "reproduced"
+test = "a_tool_input_sent_in_the_start_block_reaches_the_client"
 fix = ""
-note = ""
+note = "Reproduced, both halves. a_tool_input_sent_in_the_start_block_reaches_the_client (src/translate_response_tests.rs): an Anthropic stream whose tool_use content_block_start carries input {city:Paris} with no input_json_delta reaches Chat as arguments '' and Responses as a function_call item with arguments '' (content_block_start always emits arguments ''). gateway_reasoning_items_never_reach_an_openai_responses_upstream (tests/translate_request.rs): POST /v1/responses store:false on gpt-5.3-codex (a Responses-first row) carrying an rs_gw reasoning item is byte-relayed to OpenAI /v1/responses with the item and its Claude signature (encrypted_content) intact: from == to skips translate::request and nothing strips rs_gw ids. OpenAI's actual rejection is live-only. On a Chat-first GPT row store:false is translated onto Chat, where the item is dropped."
 
 [[defect]]
 id = "D51"

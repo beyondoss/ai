@@ -1534,3 +1534,252 @@ fn a_tool_turn_without_echoed_thinking_is_still_accepted_on_budget_claude() {
 
     assert!(bad.is_empty(), "{}", bad.join("\n"));
 }
+
+// ---- verification phase 0: translation detail (D44-D50) ----------------------------------------
+
+/// Two consecutive user messages onto Messages, which wants one user turn: the turn may merge, but
+/// each message keeps its own text block (or a separator), never `"Hello" + "World"` fused into one
+/// word.
+/// claim: TRN-3
+/// defect: D44
+#[test]
+#[ignore = "D44 reproduced: consecutive user strings merge into one string with no separator"]
+fn consecutive_user_messages_keep_their_text_apart() {
+    let v = c2m(
+        &chat(json!({"messages": [
+            {"role": "user", "content": "Hello"},
+            {"role": "user", "content": "World"},
+        ]})),
+        "claude-haiku-4-5",
+    );
+    let texts: Vec<String> = v["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| m["role"] == "user")
+        .flat_map(|m| match &m["content"] {
+            Value::String(s) => vec![s.clone()],
+            Value::Array(bs) => bs
+                .iter()
+                .filter_map(|b| b["text"].as_str().map(str::to_owned))
+                .collect(),
+            _ => Vec::new(),
+        })
+        .collect();
+    assert!(
+        !texts.iter().any(|t| t.contains("HelloWorld")),
+        "the two messages fused: {v}"
+    );
+    assert!(
+        texts.iter().any(|t| t.contains("Hello")) && texts.iter().any(|t| t.contains("World")),
+        "{v}"
+    );
+}
+
+/// A Chat client's `cache_control` on a whole assistant or tool message (the same message-level
+/// marker the gateway honours on user and system messages) must reach the Messages block it
+/// becomes. Placed mid-history, so the automatic last-message breakpoint cannot stand in for it.
+/// claim: TRN-4
+/// defect: D47
+#[test]
+#[ignore = "D47 reproduced: message-level cache_control on assistant and tool messages is dropped"]
+fn message_level_cache_control_survives_on_assistant_and_tool_messages() {
+    let cc = json!({"type": "ephemeral"});
+    let v = c2m(
+        &chat(json!({
+            "tools": [{"type": "function", "function": {"name": "get_weather", "parameters": weather_schema()}}],
+            "messages": [
+                {"role": "user", "content": "weather in Paris?"},
+                {"role": "assistant", "content": "Let me check.", "cache_control": cc,
+                 "tool_calls": [{"id": "toolu_01", "type": "function",
+                    "function": {"name": "get_weather", "arguments": "{\"city\":\"Paris\"}"}}]},
+                {"role": "tool", "tool_call_id": "toolu_01", "content": "sunny", "cache_control": cc},
+                {"role": "assistant", "content": "It is sunny."},
+                {"role": "user", "content": "thanks"},
+            ],
+        })),
+        "claude-haiku-4-5",
+    );
+    let msgs = v["messages"].as_array().unwrap();
+    let marked = |m: &Value| {
+        m["content"].as_array().is_some_and(|bs| {
+            bs.iter().any(|b| {
+                b.get("cache_control") == Some(&cc)
+                    || b["content"].as_array().is_some_and(|inner| {
+                        inner.iter().any(|x| x.get("cache_control") == Some(&cc))
+                    })
+            })
+        })
+    };
+    assert!(
+        marked(&msgs[1]),
+        "assistant message lost its cache_control: {v}"
+    );
+    assert!(marked(&msgs[2]), "tool message lost its cache_control: {v}");
+}
+
+/// A custom (free-form) tool call in Chat or Responses history, onto Messages: the `tool_use`
+/// keeps the tool's name and its input. `name: ""` is a 400, and `input: {}` erases what the model
+/// wrote.
+/// claim: TRN-14
+/// defect: D48
+#[test]
+#[ignore = "D48 reproduced: a custom tool call in history becomes tool_use name \"\" input {} on Messages"]
+fn a_custom_tool_call_in_history_keeps_its_name_and_input_on_messages() {
+    let patch = "*** Begin Patch\n*** End Patch";
+    let chat_body = chat(json!({
+        "tools": [{"type": "custom", "custom": {"name": "apply_patch", "format": {"type": "text"}}}],
+        "messages": [
+            {"role": "user", "content": "fix it"},
+            {"role": "assistant", "content": null, "tool_calls": [
+                {"id": "call_1", "type": "custom", "custom": {"name": "apply_patch", "input": patch}}]},
+            {"role": "tool", "tool_call_id": "call_1", "content": "applied"},
+        ],
+    }));
+    let resp_body = json!({
+        "model": "m", "store": false, "max_output_tokens": 4000,
+        "tools": [{"type": "custom", "name": "apply_patch", "format": {"type": "text"}}],
+        "input": [
+            {"role": "user", "content": "fix it"},
+            {"type": "custom_tool_call", "call_id": "call_1", "name": "apply_patch", "input": patch},
+            {"type": "custom_tool_call_output", "call_id": "call_1", "output": "applied"},
+        ],
+    });
+    let mut bad = Vec::new();
+    for (what, v) in [
+        ("Chat→Messages", c2m(&chat_body, "claude-haiku-4-5")),
+        (
+            "Responses→Messages",
+            req(
+                Endpoint::Responses,
+                Endpoint::Messages,
+                &resp_body,
+                "claude-haiku-4-5",
+            ),
+        ),
+    ] {
+        let tool_use = v["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|m| m["content"].as_array())
+            .flatten()
+            .find(|b| b["type"] == "tool_use")
+            .cloned()
+            .unwrap_or(Value::Null);
+        if tool_use["name"] != "apply_patch"
+            || !tool_use["input"].to_string().contains("Begin Patch")
+        {
+            bad.push(format!("{what}: {tool_use}"));
+        }
+    }
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+}
+
+/// The tool message answering a custom call, onto a Responses row, is a
+/// `custom_tool_call_output`: OpenAI rejects a `function_call_output` whose call was a
+/// `custom_tool_call`.
+/// claim: TRN-14
+/// defect: D48
+#[test]
+#[ignore = "D48 reproduced: Chat→Responses answers a custom_tool_call with function_call_output"]
+fn a_custom_tool_result_reaches_responses_as_custom_tool_call_output() {
+    let v = c2r(
+        &chat(json!({"messages": [
+            {"role": "user", "content": "fix it"},
+            {"role": "assistant", "content": null, "tool_calls": [
+                {"id": "call_1", "type": "custom", "custom": {"name": "apply_patch", "input": "*** Begin Patch"}}]},
+            {"role": "tool", "tool_call_id": "call_1", "content": "applied"},
+        ]})),
+        "gpt-5",
+    );
+    let types: Vec<&str> = v["input"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|i| i["type"].as_str())
+        .collect();
+    assert!(types.contains(&"custom_tool_call"), "{v}");
+    assert!(
+        types.contains(&"custom_tool_call_output") && !types.contains(&"function_call_output"),
+        "{types:?}: {v}"
+    );
+}
+
+/// OpenAI SDKs and frameworks send unset optional fields as explicit `null`. A null means "not
+/// set", so it must not reach an upstream that has no such field (Messages has no `audio`,
+/// Responses has no `stop`): forwarding it trades a working request for a 400 by name.
+/// claim: TRN-15
+/// defect: D49
+#[test]
+#[ignore = "D49 reproduced: explicit null audio/stop/web_search_options/top_logprobs are forwarded"]
+fn explicit_nulls_are_not_forwarded_upstream() {
+    let nulls = json!({"stop": null, "audio": null, "top_logprobs": null,
+        "web_search_options": null});
+    let mut bad = Vec::new();
+    for (what, v) in [
+        (
+            "Chat→Messages",
+            c2m(&chat(nulls.clone()), "claude-haiku-4-5"),
+        ),
+        ("Chat→Responses", c2r(&chat(nulls), "gpt-5")),
+    ] {
+        for key in ["stop", "audio", "top_logprobs", "web_search_options"] {
+            if v.get(key).is_some_and(Value::is_null) {
+                bad.push(format!("{what}: {key}: null forwarded"));
+            }
+        }
+    }
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+}
+
+/// A Responses `developer` message onto a non-OpenAI Chat Completions host (DeepSeek, Mistral,
+/// most OpenAI-compatible servers) becomes `system`: those hosts only know system / user /
+/// assistant / tool.
+/// claim: TRN-16
+/// defect: D49
+#[test]
+#[ignore = "D49 reproduced: a Responses developer message reaches a non-OpenAI Chat host as role developer"]
+fn a_responses_developer_message_is_system_on_a_non_openai_chat_host() {
+    let v = r2c(
+        &json!({"model": "m", "store": false, "input": [
+            {"role": "user", "content": "hi"},
+            {"role": "developer", "content": "Answer in French."},
+            {"role": "user", "content": "how are you?"},
+        ]}),
+        "deepseek-chat",
+    );
+    let r = roles(&v);
+    assert!(!r.contains(&"developer"), "{r:?}: {v}");
+}
+
+/// Responses input items the gateway has no mapping for must reach the upstream so it rejects
+/// them by name, never silently vanish: an `item_reference` is the turn's content, and a dropped
+/// `computer_call_output` / `local_shell_call` leaves the model answering a different history.
+/// claim: TRN-17
+/// defect: D49
+#[test]
+#[ignore = "D49 reproduced: unknown Responses input items are silently dropped on Chat"]
+fn unknown_responses_input_items_are_forwarded_not_dropped() {
+    let mut dropped = Vec::new();
+    for item in [
+        json!({"type": "item_reference", "id": "msg_abc123"}),
+        json!({"type": "local_shell_call", "id": "lsh_1", "call_id": "call_1", "status": "completed",
+            "action": {"type": "exec", "command": ["ls"], "env": {}}}),
+        json!({"type": "computer_call_output", "call_id": "call_2",
+            "output": {"type": "computer_screenshot", "image_url": "data:image/png;base64,AAAA"}}),
+        json!({"type": "compaction", "id": "cmp_1", "encrypted_content": "opaque"}),
+    ] {
+        let typ = item["type"].as_str().unwrap().to_owned();
+        let v = r2c(
+            &json!({"model": "m", "store": false, "input": [
+                {"role": "user", "content": "hi"}, item,
+            ]}),
+            "gpt-4o-mini",
+        );
+        if !v.to_string().contains(&typ) {
+            dropped.push(typ);
+        }
+    }
+    assert!(dropped.is_empty(), "silently dropped: {dropped:?}");
+}

@@ -499,3 +499,42 @@ async fn stock_responses_create_without_store_works_on_a_claude_row() {
     assert_eq!(got["messages"][0]["content"], "hi", "{got}");
     assert!(got.get("store").is_none(), "{got}");
 }
+
+/// A Responses client's next turn after a Claude turn carries the `reasoning` item the gateway
+/// minted (`rs_gw…`, Claude's signature as `encrypted_content`). When that turn is served by a
+/// real OpenAI Responses upstream (a Responses-first row like Codex's, or a mixed-row failover), the item
+/// means nothing there and OpenAI rejects the foreign id / encrypted content: it must not be
+/// relayed.
+/// claim: TRN-20
+/// defect: D50
+#[tokio::test]
+#[ignore = "D50 reproduced: a gateway-minted rs_gw reasoning item is byte-relayed to OpenAI /v1/responses"]
+async fn gateway_reasoning_items_never_reach_an_openai_responses_upstream() {
+    let nats_port = unused_nats_port();
+    let (pubkey, sk) = test_keypair(1);
+    let mock = MockUpstream::start(Mode::Json).await;
+    let gw = Gateway::builder(nats_port, &mock.authority(), &b64(&pubkey))
+        .providers(&["openai", "openrouter", "anthropic"])
+        .start()
+        .await;
+
+    let body = json!({
+        "model": "gpt-5.3-codex", "store": false,
+        "input": [
+            {"role": "user", "content": "weather in Paris?"},
+            {"type": "reasoning", "id": "rs_gw18f2c3a4b5d60001", "encrypted_content": "EqQBClaudeSig==",
+             "summary": [{"type": "summary_text", "text": "Need weather."}]},
+            {"type": "function_call", "call_id": "toolu_01", "name": "get_weather",
+             "arguments": "{\"city\":\"Paris\"}"},
+            {"type": "function_call_output", "call_id": "toolu_01", "output": "sunny"},
+        ],
+    });
+    post(&gw, &sk, "/v1/responses", &body).await;
+
+    let (cap, got) = captured(&mock);
+    assert_eq!(cap.path, "/v1/responses", "served by the Responses arm");
+    assert!(
+        !got.to_string().contains("rs_gw"),
+        "a gateway reasoning item reached OpenAI: {got}"
+    );
+}
