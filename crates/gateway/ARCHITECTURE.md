@@ -775,6 +775,11 @@ signed      = "bai_v2" "." kid "." payload_b64  // Ed25519 message
 sig_b64     = base64url(sig)                    // no padding, 86 chars
 ```
 
+`kid` must be the canonical decimal `mint` writes: digits only, no sign, no leading zero. The
+signed bytes are rebuilt from the parsed kid, so without this `bai_v1.01.…` and `bai_v1.+1.…` would
+verify as the same key while the rate guard, which keys on the raw token, gave each spelling its own
+bucket.
+
 `vpc_id` is still not an access check — decoded and emitted on `ai.usage` only. `key_id` is
 emitted on `ai.usage` (`None` for v1).
 

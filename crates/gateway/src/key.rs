@@ -161,6 +161,12 @@ impl Keyring {
             _ => return Err(KeyError::Malformed),
         };
 
+        // Canonical decimal only: `u32::from_str` also accepts `+1` and `01`, and the signed bytes
+        // are rebuilt from the *parsed* kid, so every such spelling would verify as the same key
+        // while the rate guard (keyed on the raw token) gave each its own bucket.
+        if !is_canonical_kid(kid_str) {
+            return Err(KeyError::Malformed);
+        }
         let kid: Kid = kid_str.parse().map_err(|_| KeyError::Malformed)?;
 
         // Decode the fixed-size fields straight onto the stack — no per-request heap allocation on
@@ -200,6 +206,13 @@ impl Keyring {
             _ => Err(KeyError::BadVersion),
         }
     }
+}
+
+/// Whether `s` is the one decimal spelling `mint` writes for a kid: ASCII digits, no sign, and no
+/// leading zero (except `0` itself).
+fn is_canonical_kid(s: &str) -> bool {
+    let b = s.as_bytes();
+    !b.is_empty() && b.iter().all(u8::is_ascii_digit) && (b.len() == 1 || b[0] != b'0')
 }
 
 /// Upper bound on `{prefix}.{kid}.{payload}`: prefix (6) + `.` + a `u32` kid (≤ 10 digits) + `.`
@@ -469,6 +482,36 @@ mod tests {
         assert_eq!(
             ring.verify("sk-openai.1.aaaa.bbbb"),
             Err(KeyError::Malformed)
+        );
+    }
+
+    /// claim: SEC-12
+    /// defect: D28
+    #[test]
+    fn only_the_canonical_kid_spelling_verifies() {
+        let (sk, vk) = test_keypair(9);
+        let ring = ring_with(1, vk);
+        let id = VirtualKey {
+            tenant_id: 5,
+            vpc_id: 6,
+            key_id: None,
+        };
+        let token = mint(&id, 1, &sk);
+        assert_eq!(ring.verify(&token), Ok(id));
+        let rest = token.strip_prefix("bai_v1.1.").unwrap();
+        for kid in ["01", "+1", "001", "1 ", " 1", ""] {
+            let respelled = format!("bai_v1.{kid}.{rest}");
+            assert_eq!(
+                ring.verify(&respelled),
+                Err(KeyError::Malformed),
+                "kid {kid:?} must not verify as kid 1"
+            );
+        }
+        let (sk0, vk0) = test_keypair(10);
+        let ring0 = ring_with(0, vk0);
+        assert!(
+            ring0.verify(&mint(&id, 0, &sk0)).is_ok(),
+            "kid 0 is canonical"
         );
     }
 
