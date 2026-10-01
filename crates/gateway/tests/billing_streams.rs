@@ -211,7 +211,6 @@ data: [DONE]\n\n";
 /// claim: BIL-6, BIL-12, BIL-15
 /// defect: D56
 #[tokio::test]
-#[ignore = "D56 reproduced: a clean [DONE] stream with unparseable usage and no text bills 0/0, usage_estimated=false"]
 async fn a_finished_stream_with_unparseable_usage_bills_a_flagged_estimate() {
     let (pubkey, sk) = test_keypair(64);
     let mock =

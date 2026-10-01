@@ -4319,11 +4319,18 @@ impl ProxyHttp for AiProxy {
                 && ok_2xx
                 && match rc.dialect {
                     Dialect::OpenAi => parsed.is_none(),
-                    Dialect::Anthropic => !usage::anthropic_stream_finished(tail),
+                    // A `message_delta` that arrived but did not parse is as missing as one that
+                    // never came.
+                    Dialect::Anthropic => {
+                        parsed.is_none() || !usage::anthropic_stream_finished(tail)
+                    }
                 };
             // Only once the provider demonstrably started: Anthropic's `message_start` arrived, or
-            // at least one generated delta was relayed. A 200 stream carrying nothing but an error
-            // event (`overloaded_error` before any output) is not work we were billed for.
+            // at least one generated delta was relayed — or the stream **finished** cleanly. A
+            // finished 2xx stream whose usage we could not read (a shape change, a final event we
+            // could not recover) is a turn the provider billed; writing it as 0/0 was a silent
+            // free generation. A 200 stream carrying nothing but an error event
+            // (`overloaded_error` before any output) is not work we were billed for.
             // A non-stream 2xx that died before its `usage` (the body is last): the provider
             // generated, and bills, the whole answer; we relayed part of it. Always estimated —
             // the 2xx is the proof the provider took the request.
@@ -4335,7 +4342,10 @@ impl ProxyHttp for AiProxy {
             } else {
                 0
             };
-            if (cut_short && (parsed.is_some() || output > 0)) || body_cut || no_head {
+            let started = parsed.is_some()
+                || output > 0
+                || (e.is_none() && !usage::stream_carried_error(tail));
+            if (cut_short && started) || body_cut || no_head {
                 usage_estimated = true;
                 let mut u = parsed.unwrap_or_default();
                 if u.input_tokens == 0 {

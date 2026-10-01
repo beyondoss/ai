@@ -979,11 +979,14 @@ while the provider still bills us for what it generated before it noticed. Emitt
 "stream a long answer, disconnect one event before the end" free.
 
 A managed 2xx stream is **cut short** when its usage never arrived: no parseable usage on the
-OpenAI wire, no `message_delta` on the Anthropic wire (`message_start` alone parses, so a successful
-parse is not the same as a finished stream) — and only once the provider demonstrably started
-(`message_start` arrived, or at least one generated delta was relayed): a 200 stream carrying only an
-error event is not work we were billed for. Its row carries an estimate and `usage_estimated=true`;
-`ai_usage_estimated_total` counts them.
+OpenAI wire, no parseable usage or no `message_delta` on the Anthropic wire (`message_start` alone
+parses, so a successful parse is not the same as a finished stream) — and only once the provider
+demonstrably started: `message_start` arrived, at least one generated delta was relayed, or the
+stream **finished** cleanly without an error event (`"error":{`). That last case is a usage block we
+could not read — a provider shape change, a final event past recovery — on a turn the provider
+billed; it used to be a silent 0/0 row whenever the stream carried no text. A 200 stream carrying
+only an error event is not work we were billed for. Its row carries an estimate and
+`usage_estimated=true`; `ai_usage_estimated_total` counts them.
 
 - **Input:** Anthropic's `message_start` is the first event and carries exact input and cache
   counts, so those are kept. Otherwise the request body's text bytes ÷ 5, counted as the body

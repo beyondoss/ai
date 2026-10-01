@@ -822,6 +822,14 @@ pub fn anthropic_stream_finished(tail: &[u8]) -> bool {
     memchr::memmem::find(tail, b"message_delta").is_some()
 }
 
+/// Whether a stream carried an error event: Anthropic's `{"type":"error","error":{…}}`, OpenAI's
+/// `{"error":{…}}`, OpenRouter's mid-stream `"error":{…}` on a chunk. A `null` error (Responses
+/// events carry `"error":null`) is not one, which is why the object brace is part of the needle.
+/// Generated text cannot match: inside a JSON string the quotes are escaped.
+pub fn stream_carried_error(tail: &[u8]) -> bool {
+    memchr::memmem::find(tail, br#""error":{"#).is_some()
+}
+
 /// Estimate the output tokens of a stream that ended before its usage block.
 ///
 /// Only the tail is retained, so this measures the tail — delta events and generated text per
