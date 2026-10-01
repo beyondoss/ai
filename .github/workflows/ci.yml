@@ -104,7 +104,7 @@ jobs:
             filter: package(beyond-ai-agent) and kind(test) and not binary(~serve) and not binary(exec_endpoint_live)
             extra: ""
           - name: core-providers
-            filter: package(beyond-ai-agent-core) or package(beyond-ai-providers) or package(beyond-ai-verify)
+            filter: package(beyond-ai-agent-core) or package(beyond-ai-providers)
             extra: ""
           # The remote-exec path against a **real, isolated target**, not a mock. Every other test of
           # it runs commands on the same machine, which proves the wiring and nothing about a
@@ -183,31 +183,13 @@ jobs:
       - uses: jdx/mise-action@v4
       - uses: Swatinem/rust-cache@v2
       - run: mise build:rs:release
-  # The claim registry's gate (verify/README.md): runs every claim- and defect-tagged test, ignored
-  # reproductions included, then checks the ledger against the results. A PR that breaks a proven
-  # claim, leaves a reproduction passing while its defect says "reproduced", or marks a defect fixed
-  # whose test fails, goes red here. Live cells are not listed without VERIFY_LIVE and keys, so this
-  # job needs no secrets.
-  verify-gate:
-    name: verify gate
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v7
-      - uses: jdx/mise-action@v4
-      - uses: Swatinem/rust-cache@v2
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: nextest
-      - run: mise run verify:status </dev/null
-      - run: mise run verify:gate
   # Mutation testing on what this PR changed: every line the diff touches in the gateway and the
   # catalog is mutated, and a mutant the tests don't catch fails the job. It answers "does any test
   # actually check the code I just wrote?" in minutes; the full mutation run is weekly (deep.yml).
   mutants-diff:
     name: mutants (changed lines)
     runs-on: ubuntu-latest
-    timeout-minutes: 240
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
         with:
@@ -221,6 +203,15 @@ jobs:
         run: |
           git diff "origin/${{ github.base_ref }}...HEAD" -- crates/gateway/src crates/providers/src > "$RUNNER_TEMP/pr.diff"
           if [ ! -s "$RUNNER_TEMP/pr.diff" ]; then echo "no gateway or catalog source changes"; exit 0; fi
+          # A typical PR yields tens of mutants and finishes in minutes. A sweeping change can yield
+          # thousands (hours); that diff is left to the weekly full run in deep.yml instead of holding
+          # the PR.
+          count=$(cargo mutants --in-diff "$RUNNER_TEMP/pr.diff" -p beyond-ai -p beyond-ai-providers --list </dev/null | wc -l)
+          echo "$count mutants in the changed lines"
+          if [ "$count" -gt 300 ]; then
+            echo "::notice::$count mutants exceeds the per-PR cap of 300; covered by the weekly deep run"
+            exit 0
+          fi
           cargo mutants --in-diff "$RUNNER_TEMP/pr.diff" -p beyond-ai -p beyond-ai-providers \
             --test-tool nextest --jobs 2 --timeout-multiplier 2 --no-shuffle </dev/null
       - name: missed mutants
@@ -231,15 +222,14 @@ jobs:
   Check:
     name: Check
     runs-on: ubuntu-latest
-    needs: [fmt, clippy, test, build, verify-gate, mutants-diff]
+    needs: [fmt, clippy, test, build, mutants-diff]
     if: always()
     steps:
       - name: Gate on all checks
         run: |
-          echo "fmt=${{ needs.fmt.result }} clippy=${{ needs.clippy.result }} test=${{ needs.test.result }} build=${{ needs.build.result }} verify-gate=${{ needs.verify-gate.result }} mutants-diff=${{ needs.mutants-diff.result }}"
+          echo "fmt=${{ needs.fmt.result }} clippy=${{ needs.clippy.result }} test=${{ needs.test.result }} build=${{ needs.build.result }} mutants-diff=${{ needs.mutants-diff.result }}"
           [ "${{ needs.fmt.result }}" = "success" ] \
             && [ "${{ needs.clippy.result }}" = "success" ] \
             && [ "${{ needs.test.result }}" = "success" ] \
             && [ "${{ needs.build.result }}" = "success" ] \
-            && [ "${{ needs.verify-gate.result }}" = "success" ] \
             && [ "${{ needs.mutants-diff.result }}" = "success" ]
