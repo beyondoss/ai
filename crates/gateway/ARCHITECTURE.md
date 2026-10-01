@@ -1283,7 +1283,10 @@ filters are exact complements: `ai.usage`, `ai.payload`, and every other target.
 
 `AI_LOG` filters the diagnostic and payload layers only. The `ai.usage` layer has no level filter:
 billing rows are not diagnostics, and when one global filter covered every layer, `AI_LOG=warn`
-silently dropped every row. A row whose stdout write fails (a closed or broken pipe) is counted on
+silently dropped every row. It does give `tracing` a max level hint of INFO (the rows' level,
+`usage::usage_log_filter`): a filter with no hint made the whole subscriber's max level TRACE, so
+`LogTracer` dispatched every pingora `debug!`/`trace!` record only for each layer to drop it. A row
+whose stdout write fails (a closed or broken pipe) is counted on
 `ai_usage_write_errors_total` and reported on stderr, the only record left of it.
 
 The hazard this removes is real: a synchronous multi-KB write means that if the log shipper stops

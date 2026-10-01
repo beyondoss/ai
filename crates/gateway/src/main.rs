@@ -167,8 +167,9 @@ fn init_tracing(metrics: &Metrics, queue_depth: usize) {
 
     // Three layers, split by target, because the three kinds of line want different guarantees.
     //
-    //  * `ai.usage` — billing rows, not diagnostics. Its own layer with **no** level filter: an
-    //    operator turning `AI_LOG` down to `warn` must not silently stop billing, which is what one
+    //  * `ai.usage` — billing rows, not diagnostics. Its own layer with **no** `AI_LOG` filter (only a
+    //    max level hint of INFO, so pingora debug/trace records are never dispatched): an operator
+    //    turning `AI_LOG` down to `warn` must not silently stop billing, which is what one
     //    global filter over every layer did. The **blocking** stdout writer: at a few hundred bytes
     //    each the synchronous write is free, and a row must never be dropped — a failed write is
     //    counted (`UsageStdout`).

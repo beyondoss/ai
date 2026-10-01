@@ -14,9 +14,13 @@ use tracing_subscriber::filter::{FilterFn, filter_fn};
 pub const USAGE_TARGET: &str = "ai.usage";
 
 /// The filter for the billing-row log layer: the [`USAGE_TARGET`] only, and under no `AI_LOG`
-/// level, so an operator turning diagnostics down never stops billing.
+/// level, so an operator turning diagnostics down never stops billing. It still caps the most
+/// verbose level it wants at INFO (the rows' level): a filter with no hint makes the whole
+/// subscriber's max level TRACE, and `LogTracer` then dispatches every pingora `debug!`/`trace!`
+/// record only for every layer to drop it.
 pub fn usage_log_filter() -> FilterFn<impl Fn(&tracing::Metadata<'_>) -> bool> {
     filter_fn(|meta| meta.target() == USAGE_TARGET)
+        .with_max_level_hint(tracing::level_filters::LevelFilter::INFO)
 }
 
 /// A provider-echoed service tier (`default`, `flex`, `priority`, `standard`, …). Inline and `Copy`
@@ -1012,7 +1016,6 @@ mod tests {
     /// claim: BIL-4
     /// defect: D93
     #[test]
-    #[ignore = "D93 reproduced: the billing layer gives no max level hint, so the subscriber's max level is TRACE"]
     fn the_billing_log_layer_caps_the_max_level_at_info() {
         use tracing::Subscriber as _;
         use tracing_subscriber::layer::{Layer as _, SubscriberExt as _};
