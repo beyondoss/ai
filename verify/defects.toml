@@ -776,7 +776,7 @@ claims = ["CAT-15"]
 state = "suspected"
 test = ""
 fix = ""
-note = ""
+note = "README fixed in the commit that adds this note (provider count, buffering, circuit breaker, NATS fail-closed allowance, slipstream sets, env overrides, broken links, managed endpoint scope). ARCHITECTURE.md and config.example.toml items remain."
 
 [[defect]]
 id = "D56"

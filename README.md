@@ -287,13 +287,13 @@ docker run --rm -p 8080:8080 \
 
 ## What It Does
 
-- **Managed keys** (`bai_v1…`) — Ed25519-verified, stateless. Swaps to the pool key. Attributes usage to tenant + VPC. Deny-set checked (spend/fraud).
-- **BYO keys** — any other token passes through to the provider untouched. No key-swap, no deny-set, no attribution, no `ai.usage` billing event (aggregate throughput metrics still count it).
-- **11 providers, zero config** — openai, anthropic, openrouter, fireworks, groq, deepseek, together, cerebras, mistral, xai, bedrock. Add more in `config.toml` under `[provider_authorities]`.
-- **Never buffers** — request and response stream through; a SIMD scanner extracts `model` in O(1) memory. 64KB tail taps usage without holding the body.
-- **List prices on the catalog, token facts on the request** — `GET /v1/models` publishes a standard list price for every catalog model (USD per million tokens). `ai.usage` stays token counts (stdout → logfwd/OTLP → ClickHouse). A closed downstream consumer applies that card, or a contract rate; slipstream carries only the deny-set.
-- **Rate guardrail** — per-key request ceiling (`rate_limit_rps`). Circuit breaker against runaway keys. Deny-set owns spend control.
-- **Fail-open NATS** — auth works without NATS. A NATS outage stales the deny-set; existing allows stay allowed.
+- **Managed keys** (`bai_v1…` / `bai_v2…`): Ed25519-verified and stateless. The gateway swaps in the pool key, attributes usage to tenant and VPC, and checks the deny-set (spend/fraud) and the allowance-set (quota). They reach only `POST` generation endpoints: chat/completions, messages, responses, embeddings, and the count_tokens/compact sub-resources. On managed `/v1` and `/auto` the request walks the model catalog, with failover and translation between the OpenAI and Anthropic wires.
+- **BYO keys**: any other token is forwarded to the provider unchanged. There is no key swap, deny-set, attribution or `ai.usage` billing event; aggregate throughput metrics still count it. `GET /v1/models` is the exception: it is always answered from the gateway's catalog.
+- **12 providers, zero config**: openai, anthropic, openrouter, fireworks, groq, deepseek, together, cerebras, mistral, xai, bedrock and openai-codex (BYO only). Add more in `config.toml` under `[provider_authorities]`.
+- **Streams responses**: SSE is relayed event by event and never held whole. A 64 KB tail taps usage. Request bodies are buffered where routing needs them: managed catalog walks (to rewrite `model`), usage injection on managed OpenAI streams, Responses, bodies over 64 KB, and translated non-stream responses (up to 32 MiB).
+- **List prices on the catalog, token facts on the request**: `GET /v1/models` publishes a standard list price for every catalog model (USD per million tokens). `ai.usage` stays token counts (stdout → logfwd/OTLP → ClickHouse). A closed downstream consumer applies that card, or a contract rate. Slipstream (NATS) carries the deny-set, the allowance-set and the capture-set.
+- **Guardrails**: a per-key request ceiling (`rate_limit_rps`), an optional per-tenant concurrency cap, and a per-provider circuit breaker that stops sending traffic to a provider returning 5xx or failing to connect. The deny-set and allowance-set own spend control.
+- **NATS outages**: the deny-set fails open (a NATS outage stales it; existing allows stay allowed). The allowance-set fails closed: until it has been read once, from NATS or an on-disk snapshot, managed requests get 402 `allowance unavailable`. Run NATS (or seed `snapshot_path`) before serving managed traffic.
 
 ## Providers
 
@@ -313,11 +313,11 @@ client = OpenAI(base_url="http://ai.internal/groq/openai/v1", api_key="bai_v1...
 
 Bedrock's Anthropic Messages surface is `/bedrock/anthropic/v1/messages` — same SDK as Anthropic, different first segment.
 
-An unknown first segment is a 404. See `route::KNOWN_PROVIDERS` for each provider's native base path.
+An unknown first segment is a 404. See `providers::gateway_providers` (crates/providers/src/lib.rs) for each provider's native base path.
 
 ## Config
 
-All config keys are overridable by `AI_`-prefixed env vars (`AI_NATS_URL`, `AI_POOL_KEY_OPENAI`, …). See `config.example.toml` for the full reference.
+Scalar config keys are overridable by `AI_`-prefixed env vars (`AI_NATS_URL`, …), and pool and signing keys by `AI_POOL_KEY_<NAME>` / `AI_SIGNING_KEY_<KID>`. Map keys (`provider_authorities.*`, `provider_dialects.*`, `provider_auth_schemes.*`) are config-file only. See `crates/gateway/config.example.toml` for the full reference.
 
 Required to serve managed traffic:
 
@@ -345,7 +345,7 @@ mise run bench               # unit micro-benchmarks + end-to-end throughput
 
 ## Architecture
 
-[ARCHITECTURE.md](ARCHITECTURE.md) — request flow, module map, key invariants.
+[crates/gateway/ARCHITECTURE.md](crates/gateway/ARCHITECTURE.md) — request flow, module map, key invariants.
 
 ## Third-Party Notices
 
