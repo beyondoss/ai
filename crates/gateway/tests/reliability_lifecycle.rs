@@ -67,7 +67,6 @@ async fn readyz_is_not_ready_while_allowance_is_unseeded() {
 /// claim: REL-16, BIL-21
 /// defect: D38
 #[tokio::test]
-#[ignore = "D38 reproduced: idle gateway still running 15s after SIGTERM (waits the full grace)"]
 async fn an_idle_gateway_exits_promptly_on_sigterm() {
     let (pubkey, _sk) = test_keypair(1);
     let mock = MockUpstream::start(Mode::Json).await;
@@ -84,7 +83,6 @@ async fn an_idle_gateway_exits_promptly_on_sigterm() {
 /// claim: REL-16, BIL-21
 /// defect: D38
 #[tokio::test]
-#[ignore = "D38 reproduced: idle gateway with 3s grace exits only after the full 3s"]
 async fn an_idle_gateway_with_a_short_grace_exits_before_the_grace() {
     let (pubkey, _sk) = test_keypair(1);
     let mock = MockUpstream::start(Mode::Json).await;
@@ -360,4 +358,39 @@ async fn a_panic_in_a_proxy_phase_releases_what_the_request_held() {
     // The tenant's single slot came back: its next request is served, not 429.
     let second = send().await.unwrap();
     assert_eq!(second.status().as_u16(), 200);
+}
+
+/// The drain waits for in-flight work: a request already running when SIGTERM lands finishes with
+/// its answer and its billing row, and the process exits right after it, not at the grace's end.
+/// claim: REL-16, BIL-21
+/// defect: D38
+#[tokio::test]
+async fn sigterm_drains_an_in_flight_request_then_exits() {
+    let (pubkey, sk) = test_keypair(1);
+    let mock = MockUpstream::start(Mode::Slow(1500)).await;
+    let mut gw = Gateway::start(unused_nats_port(), &mock.authority(), &b64(&pubkey)).await;
+    let (url, key) = (gw.url(), vkey(&sk, 38));
+    let held = tokio::spawn(async move {
+        test_client()
+            .post(format!("{url}/openai/v1/chat/completions"))
+            .header("authorization", format!("Bearer {key}"))
+            .header("content-type", "application/json")
+            .body(r#"{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}"#)
+            .send()
+            .await
+            .map(|r| r.status().as_u16())
+    });
+    wait_for_metric(&gw, "ai_requests_in_flight", "", 1.0).await;
+    gw.sigterm();
+    let exited = gw.wait_exit(Duration::from_secs(15)).await;
+    let status = held.await.unwrap();
+    assert_eq!(status.ok(), Some(200), "the in-flight request was cut");
+    assert!(
+        exited.is_some_and(|t| t < Duration::from_secs(5)),
+        "exit after the drain: {exited:?}"
+    );
+    assert!(
+        gw.log().contains("\"target\":\"ai.usage\""),
+        "the drained request's billing row was not written"
+    );
 }

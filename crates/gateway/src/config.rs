@@ -222,7 +222,8 @@ pub struct AiConfig {
     /// longest a request can live is `read_timeout_secs`, so a drain window of at least that
     /// guarantees every accepted request finishes — Pingora stops *accepting* new connections the
     /// instant SIGTERM lands, so this only ever waits out the existing longest stream, not new work.
-    /// Slower rollouts are the deliberate price of not mangling responses.
+    /// Slower rollouts are the deliberate price of not mangling responses. It is an upper bound,
+    /// not a wait: the process exits as soon as no request is left in flight (see `main`'s drain).
     ///
     /// **The orchestrator must grant the same window**, or it caps us: the platform SIGKILLs at its
     /// own stop timeout regardless of this value. Set k8s `terminationGracePeriodSeconds` (or the EC2

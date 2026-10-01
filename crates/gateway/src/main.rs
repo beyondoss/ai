@@ -14,19 +14,23 @@ use beyond_ai::capture_sink::CaptureSink;
 use beyond_ai::config::AiConfig;
 use beyond_ai::doctor;
 use beyond_ai::metrics::Metrics;
-use beyond_ai::proxy::AiProxy;
+use beyond_ai::proxy::{AiProxy, LIVE_REQUESTS};
 use beyond_ai::state::GatewayState;
 use beyond_ai::store_watch::{Allowance, Capture, Deny, WatcherService};
 use clap::{Parser, Subcommand};
 use pingora_core::apps::HttpServerOptions;
 use pingora_core::apps::http_app::HttpServer;
-use pingora_core::server::Server;
 use pingora_core::server::configuration::ServerConf;
+use pingora_core::server::{
+    RunArgs, Server, ShutdownSignal, ShutdownSignalWatch, UnixShutdownSignalWatch,
+};
 use pingora_core::services::background::background_service;
 use pingora_core::services::listening::Service as ListeningService;
 use pingora_proxy::ProxyServiceBuilder;
 use std::path::Path;
 use std::process::exit;
+use std::sync::atomic::Ordering;
+use std::time::{Duration, Instant};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::filter::{FilterExt, filter_fn};
 use tracing_subscriber::layer::{Layer, SubscriberExt};
@@ -61,6 +65,57 @@ fn load_config(path: Option<&Path>) -> AiConfig {
             eprintln!("failed to load config: {e}");
             exit(1);
         }
+    }
+}
+
+/// Pingora's own signal watch, plus a drain that ends the process as soon as nothing is in flight.
+///
+/// On SIGTERM pingora stops accepting and then sleeps the whole `grace_period_seconds` before it
+/// tears the runtimes down, whether or not anything is still running: an idle gateway took the full
+/// 600 s to stop, so every deploy on a platform with a shorter stop timeout (ECS Fargate: 120 s)
+/// ended in SIGKILL. The drain watches [`LIVE_REQUESTS`] (every request context, dropped only after
+/// its `logging`, billing row included) and exits the moment it reaches zero. Pingora's sleep stays
+/// the upper bound: a request still running when the grace ends is cut as before.
+struct DrainOnTerm {
+    grace: Duration,
+}
+
+#[async_trait::async_trait]
+impl ShutdownSignalWatch for DrainOnTerm {
+    async fn recv(&self) -> ShutdownSignal {
+        let signal = UnixShutdownSignalWatch.recv().await;
+        if matches!(signal, ShutdownSignal::GracefulTerminate) {
+            let grace = self.grace;
+            // A plain thread: pingora's main thread is about to block in its grace sleep, and the
+            // service runtimes are what is being drained.
+            let spawned = std::thread::Builder::new()
+                .name("ai-drain".into())
+                .spawn(move || drain_then_exit(grace));
+            if let Err(e) = spawned {
+                tracing::warn!(error = %e, "could not start the shutdown drain; waiting out the grace period");
+            }
+        }
+        signal
+    }
+}
+
+/// How long the drain lets pingora's shutdown broadcast land (listeners stop accepting, idle
+/// keep-alive connections drop) before it trusts a zero [`LIVE_REQUESTS`].
+const DRAIN_SETTLE: Duration = Duration::from_millis(200);
+
+fn drain_then_exit(grace: Duration) {
+    let start = Instant::now();
+    std::thread::sleep(DRAIN_SETTLE);
+    while start.elapsed() < grace {
+        let live = LIVE_REQUESTS.load(Ordering::Acquire);
+        if live == 0 {
+            tracing::info!(
+                after_ms = start.elapsed().as_millis() as u64,
+                "drained: no request in flight; exiting"
+            );
+            exit(0);
+        }
+        std::thread::sleep(Duration::from_millis(50));
     }
 }
 
@@ -294,5 +349,10 @@ fn main() {
         downstream_h2c,
         "starting beyond-ai"
     );
-    server.run_forever();
+    server.run(RunArgs {
+        shutdown_signal: Box::new(DrainOnTerm {
+            grace: Duration::from_secs(grace_period_secs),
+        }),
+    });
+    exit(0);
 }
