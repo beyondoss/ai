@@ -184,12 +184,18 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: mise build:rs:release
   # Mutation testing on what this PR changed: every line the diff touches in the gateway and the
-  # catalog is mutated, and a mutant the tests don't catch fails the job. It answers "does any test
-  # actually check the code I just wrote?" in minutes; the full mutation run is weekly (deep.yml).
+  # catalog is mutated, and a mutant the tests don't catch fails the job. Cost scales with the diff
+  # (each mutant is a rebuild plus a test run), so the mutants are split across 8 runners: a typical
+  # PR finishes in minutes, a sweeping one (~1,100 mutants) in about two hours, and nothing is
+  # skipped. The full mutation run over the whole files is weekly (deep.yml).
   mutants-diff:
-    name: mutants (changed lines)
+    name: mutants (changed lines, ${{ matrix.shard }}/8)
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]
     steps:
       - uses: actions/checkout@v7
         with:
@@ -203,17 +209,9 @@ jobs:
         run: |
           git diff "origin/${{ github.base_ref }}...HEAD" -- crates/gateway/src crates/providers/src > "$RUNNER_TEMP/pr.diff"
           if [ ! -s "$RUNNER_TEMP/pr.diff" ]; then echo "no gateway or catalog source changes"; exit 0; fi
-          # A typical PR yields tens of mutants and finishes in minutes. A sweeping change can yield
-          # thousands (hours); that diff is left to the weekly full run in deep.yml instead of holding
-          # the PR.
-          count=$(cargo mutants --in-diff "$RUNNER_TEMP/pr.diff" -p beyond-ai -p beyond-ai-providers --list </dev/null | wc -l)
-          echo "$count mutants in the changed lines"
-          if [ "$count" -gt 300 ]; then
-            echo "::notice::$count mutants exceeds the per-PR cap of 300; covered by the weekly deep run"
-            exit 0
-          fi
           cargo mutants --in-diff "$RUNNER_TEMP/pr.diff" -p beyond-ai -p beyond-ai-providers \
-            --test-tool nextest --jobs 2 --timeout-multiplier 2 --no-shuffle </dev/null
+            --shard ${{ matrix.shard }}/8 --test-tool nextest --jobs 2 --timeout-multiplier 2 \
+            --no-shuffle </dev/null
       - name: missed mutants
         if: failure()
         run: cat mutants.out/missed.txt 2>/dev/null || true
