@@ -81,7 +81,9 @@ class Recorder:
 
     def __init__(self, upstream):
         u = urllib.parse.urlparse(upstream)
-        self.host, self.port = u.hostname, u.port
+        # An https upstream is a provider called directly (a baseline, never billed by us).
+        self.tls = u.scheme == "https"
+        self.host, self.port = u.hostname, u.port or (443 if self.tls else 80)
         self.calls = []
         self.progress = {}
         self.lock = threading.Lock()
@@ -123,7 +125,8 @@ class Recorder:
                         if k.lower() not in ("host", "content-length", "transfer-encoding", "connection",
                                              "keep-alive", "accept-encoding")}
                 hdrs["content-length"] = str(len(body))
-                conn = http.client.HTTPConnection(rec.host, rec.port, timeout=900)
+                conn = (http.client.HTTPSConnection if rec.tls else http.client.HTTPConnection)(
+                    rec.host, rec.port, timeout=900)
                 try:
                     conn.request(self.command, self.path, body=body, headers=hdrs)
                     resp = conn.getresponse()
@@ -142,6 +145,8 @@ class Recorder:
                 self.send_header("transfer-encoding", "chunked")
                 self.end_headers()
                 head, size, tail_buf = b"", 0, b""
+                scan = UsageScan(resp.getheader("content-type") or "")
+                deltas = 0
                 # Bytes relayed so far on each response still in flight (a cell that cuts a
                 # client off mid-stream waits on this).
                 rec.progress[id(call)] = (call, 0)
@@ -152,6 +157,16 @@ class Recorder:
                             break
                         size += len(chunk)
                         rec.progress[id(call)] = (call, size)
+                        scan.feed(chunk)
+                        # When the stream's first byte and first content delta reached the client,
+                        # and how many delta events it carried (S1).
+                        now = time.time()
+                        call.setdefault("t_first_byte", now)
+                        n = (chunk.count(b"content_block_delta") + chunk.count(b'"delta":{"content"')
+                             + chunk.count(b"output_text.delta"))
+                        if n:
+                            call.setdefault("t_first_delta", now)
+                            deltas += n
                         if len(head) < 4096 and resp.status >= 400:
                             head += chunk[:4096]
                         tail_buf = (tail_buf + chunk)[-3000:]
@@ -164,7 +179,9 @@ class Recorder:
                 finally:
                     conn.close()
                     rec.progress.pop(id(call), None)
-                    call.update(t1=time.time(), resp_bytes=size)
+                    call.update(t1=time.time(), resp_bytes=size, deltas=deltas)
+                    if resp.status < 300 and (u := scan.usage()) is not None:
+                        call["seen_usage"] = u
                     if head:
                         call["error_body"] = head.decode("utf-8", "replace")[:1500]
                     call["resp_tail"] = tail_buf.decode("utf-8", "replace")
@@ -191,6 +208,77 @@ class Recorder:
             for c in calls[:-3]:
                 c.pop("resp_tail", None)
         return calls
+
+
+class UsageScan:
+    """The usage a response showed its client, read from the bytes the recorder relays: the final
+    usage of an SSE stream (Messages `message_start` merged with `message_delta`, a Chat chunk's
+    `usage`, a Responses terminal event) or of a JSON body. Normalized as a probe's are (live.rs
+    `call_problems`): input_total includes cached tokens, cache_read is the cache-read count."""
+
+    def __init__(self, content_type):
+        self.sse = "text/event-stream" in content_type
+        self.buf = b""
+        self.anthropic = {}
+        self.openai = None
+        self.kind = None
+
+    def feed(self, chunk):
+        self.buf += chunk
+        if not self.sse:
+            return
+        *lines, self.buf = self.buf.split(b"\n")
+        for line in lines:
+            if line.startswith(b"data:"):
+                self.event(line[5:].strip())
+
+    def event(self, data):
+        if not data or data == b"[DONE]":
+            return
+        try:
+            v = json.loads(data)
+        except ValueError:
+            return
+        if not isinstance(v, dict):
+            return
+        t = v.get("type")
+        if t == "message_start":
+            self.kind = "messages"
+            self.anthropic.update({k: x for k, x in ((v.get("message") or {}).get("usage") or {}).items()
+                                   if x is not None})
+        elif t == "message_delta":
+            self.kind = "messages"
+            self.anthropic.update({k: x for k, x in (v.get("usage") or {}).items() if x is not None})
+        elif isinstance(t, str) and t.startswith("response.") and isinstance(v.get("response"), dict):
+            if v["response"].get("usage"):
+                self.kind, self.openai = "responses", v["response"]["usage"]
+        elif t == "message":
+            self.kind, self.anthropic = "messages", dict(v.get("usage") or {})
+        elif v.get("object") == "response" and v.get("usage"):
+            self.kind, self.openai = "responses", v["usage"]
+        elif v.get("usage") and "choices" in v:
+            self.kind, self.openai = "chat", v["usage"]
+
+    def usage(self):
+        if not self.sse:
+            self.event(self.buf.strip())
+
+        def n(d, k):
+            return (d or {}).get(k) or 0
+
+        if self.kind == "messages":
+            u = self.anthropic
+            cr, cw = n(u, "cache_read_input_tokens"), n(u, "cache_creation_input_tokens")
+            return {"input_total": n(u, "input_tokens") + cr + cw, "output": n(u, "output_tokens"), "cache_read": cr}
+        if self.kind == "chat":
+            u = self.openai
+            return {"input_total": n(u, "prompt_tokens"), "output": n(u, "completion_tokens"),
+                    "cache_read": n(u.get("prompt_tokens_details"), "cached_tokens")}
+        if self.kind == "responses":
+            u = self.openai
+            return {"input_total": n(u, "input_tokens"), "output": n(u, "output_tokens"),
+                    "cache_read": n(u.get("input_tokens_details"), "cached_tokens")}
+        return None
 
 
 def summarize(path, body):
@@ -226,6 +314,23 @@ def summarize(path, body):
             replayed += sum(1 for b in m["content"] if isinstance(b, dict) and (
                 (b.get("type") == "thinking" and b.get("signature")) or b.get("type") == "redacted_thinking"))
     out["replayed_thinking"] = replayed
+    # The history a turn replays (S2): every role it names, its assistant messages, and those that
+    # carry neither text nor a tool call (an accumulator that lost the message). Images sent (T3).
+    roles, turns, empty, images = set(), 0, 0, 0
+    for m in msgs if isinstance(msgs, list) else []:
+        if not isinstance(m, dict):
+            continue
+        if isinstance(m.get("role"), str):
+            roles.add(m["role"])
+        content = m.get("content")
+        if m.get("role") == "assistant":
+            turns += 1
+            if not content and not m.get("tool_calls"):
+                empty += 1
+        for part in content if isinstance(content, list) else []:
+            if isinstance(part, dict) and part.get("type") in ("image", "image_url", "input_image"):
+                images += 1
+    out.update(roles=sorted(roles), assistant_turns=turns, assistant_empty=empty, images=images)
     # Only the last message asks for the summary: a summary kept in the history afterwards may
     # quote the prompt (gpt-5-mini's do), and that turn isn't a compaction.
     # (Claude Code can follow it with a role "system" note, so: the last user message.)
@@ -1035,10 +1140,18 @@ def mcp_session(harness):
 # | big      | the task, and its requests are over 64 KiB (Claude Code's always are)       | R5     |
 # | pin      | the task on a two-provider row: one provider every turn, cache read from turn 2 | R4 |
 # | cache    | the task, no `cache_control` in any request, cache read from turn 2         | K1     |
-# | thinking | the task with thinking on; a later turn replays signed thinking / encrypted reasoning | T2 |
+# | thinking | the task with thinking on; a later turn replays signed thinking / encrypted reasoning | T2, E2 |
+# | vision   | pi reads a PNG fixture (`@codeword.png`, sent base64) and copies its code word | T3   |
+# | stream   | Claude Code streams a long answer, directly and through the gateway: TTFT and spread compared | S1 |
 # | context  | Claude Code's `/context`, which counts tokens (free: no row)                | E5     |
 # | abort    | Claude Code interrupted (SIGINT) mid-stream: that call is billed an estimate | B2    |
 # | byo      | Claude Code with the managed key, a forged one (401, nothing billed), and the provider's own key through /anthropic (served, no row) | A1 |
+#
+# Claims that hold the client's usage to the ledger (E1, E2, B3) get each served call's usage as the
+# client saw it on the wire (`UsageScan`) as `usage`, which `recorded_problems` compares with the
+# row: input, output and cache reads. With S2, every turn after the first must replay the history
+# the harness accumulated from its streamed answers (only known roles, no assistant message that
+# lost both its text and its tool calls), and be accepted.
 
 BILLED_SUFFIXES = ("/v1/messages", "/v1/chat/completions", "/v1/responses", "/v1/responses/compact",
                    "/v1/embeddings")
@@ -1059,7 +1172,33 @@ def run_task(rec, target):
     return H.main(target)
 
 
+CLAIMS = set(os.environ.get("VERIFY_CLAIMS", "").split("+"))
+ROLES = {"system", "developer", "user", "assistant", "tool"}
+
+
 def cell(spec):
+    ok, calls, detail, extra = cell_session(spec)
+    if CLAIMS & {"E1", "E2", "B3"}:
+        for c in served(calls):
+            if c.get("seen_usage") is None:
+                ok, detail["why"] = False, f"no usage found in the response to {c.get('request_id')}"
+            else:
+                c["usage"] = c["seen_usage"]
+    if "S2" in CLAIMS:
+        done = served(calls)
+        later = done[1:]
+        bad = [(c.get("request_id"), c.get("roles"), c.get("assistant_empty")) for c in later
+               if not c.get("assistant_turns") or c.get("assistant_empty") or not set(c.get("roles") or ()) <= ROLES]
+        detail["s2"] = {"turns": len(done), "streamed": [c.get("stream") for c in done], "bad": bad}
+        if not later or bad or not all(c.get("stream") for c in done):
+            ok, detail["why"] = False, ("S2: every turn must stream, and every turn after the first must replay "
+                                        "the accumulated assistant messages cleanly")
+        if any(billed(c) and (c.get("status") or 0) >= 400 for c in calls):
+            ok, detail["why"] = False, "S2: a turn was refused"
+    return ok, calls, detail, extra
+
+
+def cell_session(spec):
     target, _, scenario = spec.partition("+")
     harness = target.partition(":")[0]
     H.TIMEOUT = 420
@@ -1106,9 +1245,23 @@ def cell(spec):
             if any(billed(c) and (c.get("status") or 0) >= 400 for c in calls):
                 ok, detail["why"] = False, "a turn was refused"
         return ok, calls, detail, extra
+    if scenario == "vision":
+        if harness != "pi":
+            return False, rec.stop(), {"why": "scenario vision is pi only"}, extra
+        home = pathlib.Path(tempfile.mkdtemp(prefix="verify-cell-vision-"))
+        try:
+            ok, detail = pi_vision(rec, home, target.partition(":")[2])
+        finally:
+            calls = rec.stop()
+            shutil.rmtree(home, ignore_errors=True)
+        sent = [c.get("images") for c in served(calls)]
+        detail["images_sent"] = sent
+        if not any(sent):
+            ok, detail["why"] = False, "no served request carried the image"
+        return ok, calls, detail, extra
     if harness != "claude-code":
         return False, rec.stop(), {"why": f"scenario {scenario} is Claude Code only"}, extra
-    fn = {"context": cc_context, "abort": cc_abort, "byo": cc_byo}.get(scenario)
+    fn = {"context": cc_context, "abort": cc_abort, "byo": cc_byo, "stream": cc_stream}.get(scenario)
     if fn is None:
         return False, rec.stop(), {"why": f"unknown scenario {scenario}"}, extra
     home = pathlib.Path(tempfile.mkdtemp(prefix=f"verify-cell-{scenario}-"))
@@ -1120,6 +1273,115 @@ def cell(spec):
         calls = rec.stop()
         shutil.rmtree(home, ignore_errors=True)
     return ok, calls, detail, extra
+
+
+def pi_vision(rec, home, mode):
+    """T3: pi attaches a PNG (`@file`; pi sends images base64, and has no PDF or image-URL input)
+    and the model copies the code word it shows."""
+    work = home / "repo"
+    work.mkdir()
+    shutil.copy(ROOT / "fixtures" / "codeword.png", work / "codeword.png")
+    env = clean_env(home)
+    agent_dir = pi_setup(home, rec.base, mode, H.catalog())
+    env["PI_CODING_AGENT_DIR"] = str(agent_dir)
+    cmd = [str(BIN / "pi"), "-p", "--mode", "json", "--provider", "beyond", "--model", MODEL, "--no-session",
+           "--no-tools", "@codeword.png",
+           "What words and digits does this image show? Reply with exactly them and nothing else."]
+    code, out, err = H.run(cmd, work, env)
+    msgs = [e["message"] for e in H.json_lines(out)
+            if e.get("type") == "message_end" and e.get("message", {}).get("role") == "assistant"]
+    text = " ".join(b.get("text", "") for m in msgs for b in m.get("content") or [] if isinstance(b, dict))
+    ok = code == 0 and "4821" in text and "KESTREL" in text.upper()
+    return ok, {"exit": code, "text": text[:200], "stderr_tail": err[-400:]}
+
+
+# S1's budget: the gateway's time to first token may exceed the direct call's by at most the larger
+# of the direct TTFT itself and a second (provider TTFT varies run to run by about that much), and a
+# stream that took the provider a while must arrive spread out through the gateway too, at the wire
+# and in Claude Code's own delta events: per delta, at least a fifth of the direct spread
+# (parity_live.rs `incremental`'s ratio). Per delta, because the two answers differ in length (how
+# long the model thinks varies run to run); a buffered stream arrives all at once, whatever its length.
+S1_SLACK_S = 1.0
+S1_MIN_SPREAD = 0.2
+
+
+def cc_stream(rec, home, work):
+    """S1: Claude Code streams the same long answer twice, first straight to Anthropic (the
+    provider key, through a second recorder that relays to api.anthropic.com), then through the
+    gateway. Both recorders time the answer as it reaches Claude Code (first content delta, last
+    byte), and Claude Code's own `--include-partial-messages` events are timed as it emits them."""
+    prompt = ("Write the whole numbers from one to one hundred and twenty in words, one per line, "
+              "and nothing else. Do not use any tools.")
+
+    def once(recorder, key):
+        env = clean_env(home)
+        claude_env(env, recorder.base)
+        env["ANTHROPIC_API_KEY"] = key
+        cmd = [str(BIN / "claude"), "-p", prompt, "--model", MODEL, "--dangerously-skip-permissions",
+               "--output-format", "stream-json", "--verbose", "--include-partial-messages"]
+        p = subprocess.Popen(cmd, cwd=work, env={**env, "PWD": str(work)}, stdin=subprocess.DEVNULL,
+                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+        timer = threading.Timer(150, p.kill)
+        timer.start()
+        seen, result = [], {}
+        try:
+            for line in p.stdout:
+                t = time.time()
+                try:
+                    e = json.loads(line)
+                except ValueError:
+                    continue
+                ev = e.get("event") or {}
+                # Text and thinking alike: on Haiku 4.5 Claude Code often thinks first, and then most
+                # of the answer's time is its thinking.
+                delta = (ev.get("delta") or {}).get("type")
+                if (e.get("type") == "stream_event" and ev.get("type") == "content_block_delta"
+                        and delta in ("text_delta", "thinking_delta")):
+                    seen.append(t)
+                elif e.get("type") == "result":
+                    result = e
+            p.wait()
+        finally:
+            timer.cancel()
+        # The relay records a call once its last chunk is written; let every one finish.
+        end = time.time() + 10
+        while recorder.progress and time.time() < end:
+            time.sleep(0.05)
+        time.sleep(0.2)
+        main = max((c for c in recorder.calls if billed(c) and c.get("t_first_delta")),
+                   key=lambda c: c.get("deltas", 0), default=None)
+        out = {"exit": p.returncode, "result": (result.get("result") or "")[:60],
+               "client_deltas": len(seen), "client_spread_s": round(seen[-1] - seen[0], 3) if seen else 0}
+        if main:
+            out.update(request_id=main.get("request_id"), wire_deltas=main.get("deltas"),
+                       ttft_s=round(main["t_first_delta"] - main["t0"], 3),
+                       wire_spread_s=round(main["t1"] - main["t_first_delta"], 3))
+        return out
+
+    direct_rec = Recorder("https://api.anthropic.com")
+    try:
+        direct = once(direct_rec, os.environ["VERIFY_BYO_KEY"])
+    finally:
+        direct_rec.stop()
+    gw = once(rec, KEY)
+    detail = {"direct": direct, "gateway": gw, "slack_s": S1_SLACK_S, "min_spread": S1_MIN_SPREAD}
+    why = []
+    for name, r in (("direct", direct), ("gateway", gw)):
+        if r["exit"] != 0 or "ttft_s" not in r:
+            why.append(f"{name}: Claude Code exited {r['exit']} or its answer never streamed")
+    if not why:
+        if direct["wire_spread_s"] < 0.4 or direct["wire_deltas"] < 4 or direct["client_deltas"] < 4:
+            why.append("the direct answer was too short to measure a spread")
+        budget = direct["ttft_s"] + max(direct["ttft_s"], S1_SLACK_S)
+        if gw["ttft_s"] > budget:
+            why.append(f"gateway TTFT {gw['ttft_s']}s over budget {budget:.3f}s")
+        for k, n in (("wire_spread_s", "wire_deltas"), ("client_spread_s", "client_deltas")):
+            if gw[k] / max(gw[n], 1) < direct[k] / max(direct[n], 1) * S1_MIN_SPREAD:
+                why.append(f"stream buffered: {k} gateway {gw[k]}s over {gw[n]} deltas, "
+                           f"direct {direct[k]}s over {direct[n]}")
+    if why:
+        detail["why"] = "; ".join(why)
+    return not why, detail
 
 
 def cc_cmd(prompt, *more):
@@ -1224,6 +1486,9 @@ if __name__ == "__main__":
             ok, detail = False, {"exception": f"{type(e).__name__}: {e}", "trace": traceback.format_exc()[-1500:]}
         for c in calls:
             c.pop("resp_tail", None)
+        if os.environ.get("VERIFY_CELL_TRACE"):
+            # What a passing cell saw (the Rust cell prints the detail only on a failure).
+            print("CELL " + json.dumps({"ok": bool(ok), "detail": detail, "calls": calls}, default=str), file=sys.stderr)
         print("VERIFY " + json.dumps({"ok": bool(ok), "recorded": True, "calls": calls, "detail": detail, **extra},
                                      default=str))
         sys.exit(0)

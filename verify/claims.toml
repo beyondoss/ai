@@ -188,6 +188,7 @@ text = "Images (base64 and URL) and PDFs in every direction"
 oracle = "model reads a fixture value out of the image/PDF"
 layer = "both"
 clients = ["openai-py", "anthropic-py", "ai-sdk", "pi", "raw"]
+client_note = "pi sends only base64 images: pi 0.73.1 has no image-URL or PDF input. Its `@file` argument (dist/cli/file-processor.js) attaches a file as a base64 image only when its sniffed type is JPEG, PNG, GIF or WebP (dist/utils/mime.js), and inlines any other file, a PDF included, as UTF-8 text. So pi's cells (`pi:{chat,messages,responses}+vision`) read the PNG fixture on each of its three wires, native and translated, on Claude and GPT; URLs and PDFs are the SDK and raw cells'."
 failover_clients = []
 touches = ["crates/gateway/src/translate.rs", "crates/gateway/src/proxy.rs"]
 defects = []

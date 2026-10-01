@@ -132,19 +132,27 @@ WEATHER = {"type": "function", "function": {"name": "get_weather", "description"
 
 
 def chat_basic():
-    """E1: Chat Completions, non-stream then stream with the SDK's own accumulator."""
+    """E1: Chat Completions, non-stream then stream with the SDK's own accumulator. S2: the message
+    the accumulator built (its role as accumulated, its text) goes back as the next turn's history,
+    and that turn is accepted: a repeated `delta.role` would have made the role "assistantassistant"."""
     c = openai_client()
     r = c.chat.completions.create(model=MODEL, max_tokens=1024,
                                   messages=[{"role": "user", "content": "Reply with the single word: pong"}])
     record("chat", chat_usage(r.usage))
     ok = bool(r.choices[0].message.content) and r.choices[0].message.role == "assistant"
-    with c.chat.completions.stream(model=MODEL, max_tokens=1024,
-                                   messages=[{"role": "user", "content": "Count from 1 to 5."}]) as s:
+    history = [{"role": "user", "content": "Count from 1 to 5."}]
+    with c.chat.completions.stream(model=MODEL, max_tokens=1024, messages=history) as s:
         final = s.get_final_completion()
     record("chat", chat_usage(final.usage))
     msg = final.choices[0].message
     ok = ok and bool(msg.content) and msg.role == "assistant"
-    return ok, {"nonstream": r.choices[0].message.content, "stream_role": msg.role}
+    history += [{"role": msg.role, "content": msg.content},
+                {"role": "user", "content": "Now reply with only the next number after the last one you wrote."}]
+    nxt = c.chat.completions.create(model=MODEL, max_tokens=1024, messages=history)
+    record("chat", chat_usage(nxt.usage))
+    ok = ok and bool(nxt.choices[0].message.content)
+    return ok, {"nonstream": r.choices[0].message.content, "stream_role": msg.role,
+                "next_turn": nxt.choices[0].message.content}
 
 
 def messages_basic():
@@ -298,6 +306,52 @@ def agents_sdk():
 
 async def _ahook(resp):
     _hook(resp)
+
+
+def agents_chat():
+    """E1 via the OpenAI Agents SDK on Chat Completions (`OpenAIChatCompletionsModel`, the model
+    apps use with any OpenAI-compatible endpoint): a tool-using run, then the same streamed. The
+    SDK asks no stream usage of a non-OpenAI base URL (`include_usage` unset), so a streamed turn's
+    usage is the chunk the gateway adds; each turn's usage is the ModelResponse the SDK built."""
+    import asyncio
+    from agents import Agent, OpenAIChatCompletionsModel, Runner, function_tool, set_tracing_disabled
+    from openai import AsyncOpenAI
+    set_tracing_disabled(True)
+    client = AsyncOpenAI(base_url=f"{BASE}/v1", api_key=KEY, max_retries=0,
+                         http_client=httpx.AsyncClient(event_hooks={"response": [_ahook]}, timeout=120))
+
+    @function_tool
+    def get_weather(city: str) -> str:
+        """Weather for a city."""
+        return f"Sunny in {city}, 31C"
+
+    agent = Agent(name="weather", instructions="Use the tool, then answer in one sentence.",
+                  model=OpenAIChatCompletionsModel(model=MODEL, openai_client=client), tools=[get_weather])
+
+    def rec(res):
+        for resp in res.raw_responses:
+            u = resp.usage
+            record("chat", {"input_total": u.input_tokens, "output": u.output_tokens,
+                            "cache_read": getattr(u.input_tokens_details, "cached_tokens", 0) or 0})
+
+    async def both():
+        # One event loop for both runs: the client's pooled connections belong to it.
+        res = await Runner.run(agent, "What's the weather in Paris?")
+        sres = Runner.run_streamed(agent, "What's the weather in Rome?")
+        events = [e.type async for e in sres.stream_events()]
+        return res, sres, events
+
+    res, sres, events = asyncio.run(both())
+    rec(res)
+    rec(sres)
+    detail = {}
+    ok = True
+    for name, r in (("run", res), ("streamed", sres)):
+        kinds = [getattr(i, "type", "") for i in r.new_items]
+        turns = len(r.raw_responses)
+        detail[name] = {"items": kinds, "turns": turns, "final": str(r.final_output)[:120]}
+        ok = ok and "tool_call_item" in kinds and turns >= 2 and "31" in str(r.final_output)
+    return ok and "raw_response_event" in events, detail
 
 
 # --- Endpoint, translation and billing detail -------------------------------------------------
@@ -1556,7 +1610,7 @@ def h2_burst():
 
 PROBES = {f.__name__: f for f in [
     chat_basic, messages_basic, responses_basic, models_list, tools_chat, tools_messages, embeddings,
-    langchain_chat, agents_sdk, responses_count_compact, count_tokens, thinking_replay, reasoning_replay,
+    langchain_chat, agents_sdk, agents_chat, responses_count_compact, count_tokens, thinking_replay, reasoning_replay,
     agents_reasoning, vision_chat, vision_messages, structured_chat, structured_messages, langchain_structured,
     reasoning_effort, typed_error, steer_providers, session_pin, big_body, stream_abort, cancel_before_head,
     stream_no_usage, prompt_cache, cache_ttl_1h, auto_cache, langchain_cache, byo_key, provider_routed,

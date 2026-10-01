@@ -154,8 +154,13 @@ check the ledger in aggregate. Its other cells run behind `harness_long.py`'s re
 (`harness_long.py cell <harness>+<scenario>`), and every call it made is held to the ledger by
 request id: a served call has exactly one row on the route's provider, a free or refused one bills
 nothing, and no row is left over. A scenario can ask more of a call (an estimate for a stream the
-agent was interrupted in, a cache read from turn 2, one provider for the whole session). A claim's
-`client_note` says why a client it would name can't exercise it.
+agent was interrupted in, a cache read from turn 2, one provider for the whole session). Where the
+cell's claims hold the client's usage to the ledger (E1, E2, B3), the usage each response showed
+the harness on the wire (input, output, cache reads) must equal its row, as a probe's must. Claude
+Code's S1 cell streams one answer straight to Anthropic (through a second recorder) and then
+through the gateway, and compares time to first token and how spread out each stream arrives. A
+claim's `client_note` says why a client it would name can't exercise it, or what part of the claim
+it can.
 
 ```sh
 VERIFY_LIVE=1 cargo nextest run -p beyond-ai-verify --test live -E 'test(/::stream_abort$/)'

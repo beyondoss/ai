@@ -208,7 +208,7 @@ const CLAUDE_GPT: &[Route] = &[CLAUDE, GPT];
 const CELLS: &[Cell] = &[
     // Python SDKs and frameworks. The basic cells carry the generic ledger claims (BIL-6/7/13):
     // every cell checks them, these name them across every translation pair.
-    ("E1+B1+S1+BIL-6+BIL-7+BIL-13", "openai-py", Runtime::Python, "chat_basic",   GEN,      "R1"),
+    ("E1+B1+S1+S2+BIL-6+BIL-7+BIL-13", "openai-py", Runtime::Python, "chat_basic", GEN,     "R1"),
     ("E2+B1+S1+BIL-6+BIL-7+BIL-13", "anthropic-py", Runtime::Python, "messages_basic", GEN, "R1"),
     ("E3+TRN-1+CAT-9+B1", "openai-py",     Runtime::Python, "responses_basic",  SESSION,  ""),
     ("TRN-1+B1+BIL-6",    "openai-py",     Runtime::Python, "responses_basic",  &[FAILOVER, BEDROCK, XAI, TOGETHER], ""),
@@ -219,6 +219,7 @@ const CELLS: &[Cell] = &[
     ("M1+B1",             "openai-py",     Runtime::Python, "embeddings",       &[EMBED], ""),
     ("E1+T1+B1",          "langchain",     Runtime::Python, "langchain_chat",   GEN,      "R1"),
     ("E3+T1+B1+TRN-24",   "openai-agents", Runtime::Python, "agents_sdk",       SESSION,  ""),
+    ("E1",                "openai-agents", Runtime::Python, "agents_chat",      SESSION,  ""),
     // Endpoint and billing detail (Python).
     ("E5+B4+BIL-1",       "openai-py",     Runtime::Python, "responses_count_compact", ONE, ""),
     ("E5+B4",             "anthropic-py",  Runtime::Python, "count_tokens",     &[CLAUDE], ""),
@@ -340,13 +341,26 @@ const CELLS: &[Cell] = &[
     ("R1",                "pi",            Runtime::Recorded, "pi:messages+task", &[FAILOVER], ""),
     ("R5",                "claude-code",   Runtime::Recorded, "claude-code+big", &[CLAUDE, FAILOVER], "R1"),
     ("T2+E3",             "codex",         Runtime::Recorded, "codex+thinking", &[CODEX, CLAUDE], ""),
-    ("T2",                "claude-code",   Runtime::Recorded, "claude-code+thinking", &[CLAUDE], ""),
+    ("T2+E2",             "claude-code",   Runtime::Recorded, "claude-code+thinking", &[CLAUDE], ""),
     ("T2",                "pi",            Runtime::Recorded, "pi:messages+thinking", &[CLAUDE], ""),
-    ("R4",                "claude-code",   Runtime::Recorded, "claude-code+pin", &[POOLED], ""),
-    ("R4",                "pi",            Runtime::Recorded, "pi:messages+pin", &[POOLED_SONNET], ""),
+    ("R4+B3",             "claude-code",   Runtime::Recorded, "claude-code+pin", &[POOLED], ""),
+    ("R4+B3",             "pi",            Runtime::Recorded, "pi:messages+pin", &[POOLED_SONNET], ""),
     ("E5+B4",             "claude-code",   Runtime::Recorded, "claude-code+context", &[CLAUDE], ""),
     ("B2",                "claude-code",   Runtime::Recorded, "claude-code+abort", &[CLAUDE], ""),
     ("A1",                "claude-code",   Runtime::Recorded, "claude-code+byo", &[CLAUDE], ""),
+    // Chat Completions from the coding agents that speak it (E1), each call's usage as the harness
+    // saw it on the wire held to its row; opencode's turns replay the history it accumulated from
+    // its streamed answers (S2, on the rows whose Chat stream the gateway builds or OpenRouter
+    // sends, not OpenAI's own).
+    ("E1+S2",             "opencode",      Runtime::Recorded, "opencode+task",  &[CLAUDE, OPENROUTER], ""),
+    ("E1",                "opencode",      Runtime::Recorded, "opencode+task",  &[GPT],    ""),
+    ("E1",                "pi",            Runtime::Recorded, "pi:chat+task",   SESSION,  ""),
+    // T3: pi attaches an image on each of its three wires, native and translated.
+    ("T3",                "pi",            Runtime::Recorded, "pi:chat+vision", CLAUDE_GPT, ""),
+    ("T3",                "pi",            Runtime::Recorded, "pi:messages+vision", CLAUDE_GPT, ""),
+    ("T3",                "pi",            Runtime::Recorded, "pi:responses+vision", CLAUDE_GPT, ""),
+    // S1: Claude Code's stream timed straight from Anthropic and through the gateway.
+    ("S1",                "claude-code",   Runtime::Recorded, "claude-code+stream", &[CLAUDE], ""),
 ];
 
 /// `(client, probe, route, claims)`: claims a cell carries on one route only, where the behavior
@@ -686,9 +700,13 @@ fn attempt_cell(
         .env("VERIFY_CLAIMS", &checks.claims)
         .env("VERIFY_GATEWAY_PID", gw.0.id().to_string());
     // A BYO probe sends the provider's own key through /{provider}/, the way a customer with
-    // their own key would; a leak probe looks for the pool key in everything it was sent. Only
-    // those probes see a real key.
-    if probe.starts_with("byo") || probe.ends_with("+byo") || probe.starts_with("leak") {
+    // their own key would; a leak probe looks for the pool key in everything it was sent; an S1
+    // stream cell calls the provider directly for its baseline. Only those probes see a real key.
+    if probe.starts_with("byo")
+        || probe.ends_with("+byo")
+        || probe.starts_with("leak")
+        || probe.ends_with("+stream")
+    {
         cmd.env("VERIFY_BYO_KEY", &keys[route.pools[0].1]);
     }
     let out = cmd
@@ -963,6 +981,11 @@ fn recorded_problems(verdict: &Value, log: &Path, route: Route) -> Vec<String> {
         if row["usage_estimated"] == true {
             problems.push(format!("{label}: a completed call billed as an estimate"));
         }
+        // The usage the harness was shown on the wire, where the cell's claims hold it to the
+        // ledger (E1, E2, B3).
+        if let Some(u) = call["usage"].as_object() {
+            problems.extend(usage_problems(&label, u, row));
+        }
         if call["client_gone"] != true && n(&row["output_tokens"]) == 0 {
             problems.push(format!(
                 "{label}: a completed call billed no output ({row})"
@@ -1135,6 +1158,21 @@ fn call_problems(call: &Value, rows: &[Value], route: Route) -> Vec<String> {
         }
         return problems;
     };
+    problems.extend(usage_problems(&label, u, row));
+    if row["usage_estimated"] == true {
+        problems.push(format!(
+            "{label}: row is an estimate on a completed call ({row})"
+        ));
+    }
+    problems
+}
+
+/// The usage a client was shown (`input_total`, `output`, and the optional breakouts) against its
+/// row, normalized for the row's wire: tokens, cache reads (B3 / BIL-8), reasoning (BIL-9) and
+/// the service tier (BIL-11).
+fn usage_problems(label: &str, u: &serde_json::Map<String, Value>, row: &Value) -> Vec<String> {
+    let n = |v: &Value| v.as_u64().unwrap_or(0);
+    let mut problems = Vec::new();
     let anthropic_wire = match row["usage_wire"].as_str() {
         Some(w) => w == "anthropic",
         None => matches!(row["provider"].as_str(), Some("anthropic" | "bedrock")),
@@ -1185,11 +1223,6 @@ fn call_problems(call: &Value, rows: &[Value], route: Route) -> Vec<String> {
         problems.push(format!(
             "{label}: client was shown service_tier {tier}, row records {} ({row})",
             row["service_tier"]
-        ));
-    }
-    if row["usage_estimated"] == true {
-        problems.push(format!(
-            "{label}: row is an estimate on a completed call ({row})"
         ));
     }
     problems
