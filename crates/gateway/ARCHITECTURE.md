@@ -127,6 +127,7 @@ Client (stock OpenAI/Anthropic SDK)
   │  Injection-eligible (managed + OpenAI dialect + path suffix /chat/completions):
   │    buffer full body → ONE fused walk (peek::scan_buffered) yielding `model`, its byte
   │    span, and the splice offset → inject stream_options.include_usage → re-frame chunked
+  │  Model-routed: a client body with two root `model` keys (any spelling) ─────── 400
   │  Model-routed: same buffer, and `model` is spliced to the serving candidate's own id
   │    (rewrite first — the injection offset precedes the value, so it cannot move)
   │  Wire-mismatched catalog walk (Chat Completions ↔ Messages ↔ Responses): map the
@@ -1428,6 +1429,13 @@ to serve.
   path names a different one of those three; any other inbound-path vs row mismatch is a 400.
   `/{provider}/…` is not allowlisted and never translates. `GET /v1/models` lists the catalog.
 - Request body size ≤ `MAX_REQUEST_BODY` (declared `Content-Length` + streaming running total)
+- One root `model` key on a catalog walk. The walk routes on one and rewrites one, while most JSON
+  parsers take the _last_, so `{"model":"cheap",…,"model":"o1-pro"}` would route as the cheap row
+  and be served as o1-pro. `peek::scan_buffered` counts root `model` keys on the client body, before
+  any translation, and decodes a key spelled with escapes (`"mod\u0065l"`), since the provider
+  would. A second one aborts the request with a 400 before a body byte goes upstream
+  (`ai_rejections_total{reason="duplicate_model"}`). The 400 is pingora's bare status: request
+  headers have already left by the time the whole body is in.
 - Per-credential request rate within ceiling; aggregate BYO rate within ceiling
 
 **What passes through unchecked:**
@@ -1579,38 +1587,38 @@ Secret-bearing fields (`pool_keys`, `nats_creds`) are held as `Secret<T>` — st
 
 Prometheus on the default registry, exposed at `/metrics` on `metrics_listen`.
 
-| Metric                                | Type      | Labels               | What It Measures                                                                                                                             |
-| ------------------------------------- | --------- | -------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
-| `ai_requests_total`                   | Counter   | —                    | Total admitted requests                                                                                                                      |
-| `ai_rejections_total`                 | Counter   | `reason`             | Rejected requests by cause (auth, deny_spend, quota, allowance_unavailable, deny_fraud, rate_limit, tenant_concurrency, managed_endpoint, …) |
-| `ai_upstream_responses_total`         | Counter   | `provider`, `status` | Upstream responses by provider and status class                                                                                              |
-| `ai_tokens_total`                     | Counter   | `kind`               | input / output / cache_read / cache_write token counts                                                                                       |
-| `ai_ttft_seconds`                     | Histogram | `provider`           | Time to first token (50ms–30s buckets)                                                                                                       |
-| `ai_upstream_latency_seconds`         | Histogram | `provider`           | Full request latency (100ms–600s buckets)                                                                                                    |
-| `ai_active_streams`                   | Gauge     | —                    | Open SSE streams                                                                                                                             |
-| `ai_requests_in_flight`               | Gauge     | —                    | All in-flight requests (streaming + non-streaming)                                                                                           |
-| `ai_deny_set_size`                    | Gauge     | —                    | Current number of denied tenants                                                                                                             |
-| `ai_nats_connected`                   | Gauge     | —                    | 1 if the **deny-set** watcher is connected, 0 otherwise                                                                                      |
-| `ai_allowance_set_size`               | Gauge     | —                    | Exhausted tenants + keys in the allowance-set                                                                                                |
-| `ai_allowance_ready`                  | Gauge     | —                    | 1 after a successful allowance scan/snapshot (empty = remaining-ok); 0 = fail-closed                                                         |
-| `ai_allowance_nats_connected`         | Gauge     | —                    | 1 if the **allowance-set** watcher is connected                                                                                              |
-| `ai_capture_set_size`                 | Gauge     | —                    | Tenants with payload capture enabled (climbing and never falling ⇒ missing TTLs)                                                             |
-| `ai_capture_nats_connected`           | Gauge     | —                    | 1 if the **capture-set** watcher is connected — separate watcher, separate connection                                                        |
-| `ai_captures_total`                   | Counter   | —                    | Requests whose payloads were captured (post-sampling)                                                                                        |
-| `ai_capture_bytes_total`              | Counter   | —                    | Payload bytes handed to the sink — the cost signal, ahead of the storage bill                                                                |
-| `ai_capture_dropped_total`            | Counter   | —                    | Captures dropped on a full sink queue — distinguishes "lost it" from "capture was off"                                                       |
-| `ai_control_header_errors_total`      | Counter   | —                    | `x-beyond-*` headers present but unusable (dropped; request still served)                                                                    |
-| `ai_usage_parse_errors_total`         | Counter   | —                    | Managed 2xx responses with no parseable usage (emitted as a zero-token billing row)                                                          |
-| `ai_cache_hits_total`                 | Counter   | —                    | Exact-match cache hits that replayed a stored 2xx and skipped the provider                                                                   |
-| `ai_cache_scope`                      | Gauge     | `kind`               | Constant `1` with `kind="process"`: this pod's cache table, not a fleet store                                                                |
-| `ai_smart_rank_scope`                 | Gauge     | `kind`               | Constant `1` with `kind="process"`: this pod's TTFT EWMA, not a fleet-wide ranking                                                           |
-| `ai_candidate_failovers_total`        | Counter   | —                    | Model-routed requests that abandoned a candidate for the next one                                                                            |
-| `ai_key_walks_total`                  | Counter   | —                    | Managed 429s that retried the same provider with the next unused pool key                                                                    |
-| `ai_session_pinned_total`             | Counter   | —                    | Catalog walks whose primary came from a session pin instead of the TTFT rank                                                                 |
-| `ai_full_body_relays_total`           | Counter   | —                    | Managed requests re-run as a subrequest because routing needed the whole body past 64 KiB                                                    |
-| `ai_model_header_body_mismatch_total` | Counter   | —                    | Catalog-walk requests whose `x-beyond-model` and body `model` disagreed (header wins; client bug)                                            |
-| `ai_failover_unreplayable_total`      | Counter   | —                    | 5xx/429 retries declined on `/{provider}` or a still-uploading body: not provably replayable (catalog walks re-run instead)                  |
-| `ai_usage_estimated_total`            | Counter   | —                    | Managed streams cut short before their usage block, billed with estimated tokens                                                             |
+| Metric                                | Type      | Labels               | What It Measures                                                                                                                                              |
+| ------------------------------------- | --------- | -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `ai_requests_total`                   | Counter   | —                    | Total admitted requests                                                                                                                                       |
+| `ai_rejections_total`                 | Counter   | `reason`             | Rejected requests by cause (auth, deny_spend, quota, allowance_unavailable, deny_fraud, rate_limit, tenant_concurrency, managed_endpoint, duplicate_model, …) |
+| `ai_upstream_responses_total`         | Counter   | `provider`, `status` | Upstream responses by provider and status class                                                                                                               |
+| `ai_tokens_total`                     | Counter   | `kind`               | input / output / cache_read / cache_write token counts                                                                                                        |
+| `ai_ttft_seconds`                     | Histogram | `provider`           | Time to first token (50ms–30s buckets)                                                                                                                        |
+| `ai_upstream_latency_seconds`         | Histogram | `provider`           | Full request latency (100ms–600s buckets)                                                                                                                     |
+| `ai_active_streams`                   | Gauge     | —                    | Open SSE streams                                                                                                                                              |
+| `ai_requests_in_flight`               | Gauge     | —                    | All in-flight requests (streaming + non-streaming)                                                                                                            |
+| `ai_deny_set_size`                    | Gauge     | —                    | Current number of denied tenants                                                                                                                              |
+| `ai_nats_connected`                   | Gauge     | —                    | 1 if the **deny-set** watcher is connected, 0 otherwise                                                                                                       |
+| `ai_allowance_set_size`               | Gauge     | —                    | Exhausted tenants + keys in the allowance-set                                                                                                                 |
+| `ai_allowance_ready`                  | Gauge     | —                    | 1 after a successful allowance scan/snapshot (empty = remaining-ok); 0 = fail-closed                                                                          |
+| `ai_allowance_nats_connected`         | Gauge     | —                    | 1 if the **allowance-set** watcher is connected                                                                                                               |
+| `ai_capture_set_size`                 | Gauge     | —                    | Tenants with payload capture enabled (climbing and never falling ⇒ missing TTLs)                                                                              |
+| `ai_capture_nats_connected`           | Gauge     | —                    | 1 if the **capture-set** watcher is connected — separate watcher, separate connection                                                                         |
+| `ai_captures_total`                   | Counter   | —                    | Requests whose payloads were captured (post-sampling)                                                                                                         |
+| `ai_capture_bytes_total`              | Counter   | —                    | Payload bytes handed to the sink — the cost signal, ahead of the storage bill                                                                                 |
+| `ai_capture_dropped_total`            | Counter   | —                    | Captures dropped on a full sink queue — distinguishes "lost it" from "capture was off"                                                                        |
+| `ai_control_header_errors_total`      | Counter   | —                    | `x-beyond-*` headers present but unusable (dropped; request still served)                                                                                     |
+| `ai_usage_parse_errors_total`         | Counter   | —                    | Managed 2xx responses with no parseable usage (emitted as a zero-token billing row)                                                                           |
+| `ai_cache_hits_total`                 | Counter   | —                    | Exact-match cache hits that replayed a stored 2xx and skipped the provider                                                                                    |
+| `ai_cache_scope`                      | Gauge     | `kind`               | Constant `1` with `kind="process"`: this pod's cache table, not a fleet store                                                                                 |
+| `ai_smart_rank_scope`                 | Gauge     | `kind`               | Constant `1` with `kind="process"`: this pod's TTFT EWMA, not a fleet-wide ranking                                                                            |
+| `ai_candidate_failovers_total`        | Counter   | —                    | Model-routed requests that abandoned a candidate for the next one                                                                                             |
+| `ai_key_walks_total`                  | Counter   | —                    | Managed 429s that retried the same provider with the next unused pool key                                                                                     |
+| `ai_session_pinned_total`             | Counter   | —                    | Catalog walks whose primary came from a session pin instead of the TTFT rank                                                                                  |
+| `ai_full_body_relays_total`           | Counter   | —                    | Managed requests re-run as a subrequest because routing needed the whole body past 64 KiB                                                                     |
+| `ai_model_header_body_mismatch_total` | Counter   | —                    | Catalog-walk requests whose `x-beyond-model` and body `model` disagreed (header wins; client bug)                                                             |
+| `ai_failover_unreplayable_total`      | Counter   | —                    | 5xx/429 retries declined on `/{provider}` or a still-uploading body: not provably replayable (catalog walks re-run instead)                                   |
+| `ai_usage_estimated_total`            | Counter   | —                    | Managed streams cut short before their usage block, billed with estimated tokens                                                                              |
 
 ---
 

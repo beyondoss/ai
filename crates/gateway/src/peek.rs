@@ -375,6 +375,11 @@ pub struct BufferedScan {
     /// value's length. `None` whenever [`Self::model`] is `None`, and the two always describe the
     /// same occurrence — the first root-level `model`.
     pub model_span: Option<(usize, usize)>,
+    /// The root object has more than one `model` key. JSON parsers disagree on which one wins
+    /// (most take the last), so a catalog walk that routed on one and rewrote one cannot know which
+    /// the provider would serve. A key spelled with escapes (`"mod\u0065l"`) counts: it decodes to
+    /// `model` at the provider.
+    pub duplicate_model: bool,
 }
 
 /// One structural walk producing both answers, for the path that already has the whole body.
@@ -406,6 +411,7 @@ pub fn scan_buffered(body: &[u8]) -> BufferedScan {
             model: None,
             inject_at: None,
             model_span: None,
+            duplicate_model: false,
         };
     }
     let insert_at = i + 1;
@@ -428,6 +434,7 @@ pub fn scan_buffered(body: &[u8]) -> BufferedScan {
     // Where the value's raw bytes begin (just past the opening quote), and the finished span.
     let mut model_start = 0usize;
     let mut model_span: Option<(usize, usize)> = None;
+    let mut model_keys = 0u32;
 
     let mut j = i;
     while j < n {
@@ -460,7 +467,10 @@ pub fn scan_buffered(body: &[u8]) -> BufferedScan {
                             saw_stream_options = true;
                         }
                         last_key_is_stream = key == b"stream";
-                        last_key_is_model = key == b"model";
+                        last_key_is_model = key == b"model"
+                            || (key.contains(&b'\\')
+                                && escaped_key_is(&body[key_start - 1..=j], "model"));
+                        model_keys += u32::from(last_key_is_model);
                     }
                 } else if capturing_model {
                     capturing_model = false;
@@ -525,7 +535,14 @@ pub fn scan_buffered(body: &[u8]) -> BufferedScan {
         model,
         inject_at: (stream_true && !saw_stream_options).then_some(insert_at),
         model_span,
+        duplicate_model: model_keys > 1,
     }
+}
+
+/// Whether a quoted JSON key containing escapes decodes to `want`. Only reached for a root key with a
+/// backslash in it, which real clients never send, so the allocation is off every ordinary path.
+fn escaped_key_is(quoted: &[u8], want: &str) -> bool {
+    serde_json::from_slice::<String>(quoted).is_ok_and(|k| k == want)
 }
 
 #[cfg(test)]
@@ -648,6 +665,36 @@ mod tests {
                 String::from_utf8_lossy(body),
             );
         }
+    }
+
+    /// claim: SEC-21
+    /// defect: D34
+    #[test]
+    fn a_second_root_model_key_is_flagged_however_it_is_spelled() {
+        for body in [
+            br#"{"model":"cheap","messages":[],"model":"o1-pro"}"#.as_slice(),
+            br#"{"model":"cheap","mod\u0065l":"o1-pro"}"#,
+            br#"{"mod\u0065l":"o1-pro","model":"cheap"}"#,
+        ] {
+            let scan = scan_buffered(body);
+            assert!(scan.duplicate_model, "{}", String::from_utf8_lossy(body));
+        }
+        for body in [
+            br#"{"model":"cheap","messages":[{"model":"nested"}],"metadata":{"model":"x"}}"#
+                .as_slice(),
+            br#"{"model":"cheap","system":"\"model\":\"o1-pro\""}"#,
+            br#"{"models":["a"],"model":"cheap"}"#,
+        ] {
+            assert!(
+                !scan_buffered(body).duplicate_model,
+                "{}",
+                String::from_utf8_lossy(body)
+            );
+        }
+        // An escaped spelling alone is still the model: its value is what gets rewritten.
+        let scan = scan_buffered(br#"{"mod\u0065l":"o1-pro"}"#);
+        assert_eq!(scan.model.as_deref(), Some("o1-pro"));
+        assert!(scan.model_span.is_some());
     }
 
     #[test]

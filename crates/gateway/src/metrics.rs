@@ -69,12 +69,15 @@ pub enum Rejection {
     /// where one tenant could reach another's stored data and the spend is unmetered. Also a
     /// managed request carrying `Upgrade` (WebSocket), which would be an unmetered opaque relay.
     ManagedEndpoint,
+    /// A catalog-walk body with more than one root `model` key. The walk routed and rewrote one;
+    /// the provider might serve the other.
+    DuplicateModel,
 }
 
 impl Rejection {
     /// Every variant, in `as_index` order. The array in `Metrics` is built from this, so adding a
     /// variant without adding it here fails the exhaustive `match` in `as_index`.
-    pub(crate) const ALL: [Rejection; 17] = [
+    pub(crate) const ALL: [Rejection; 18] = [
         Rejection::Auth,
         Rejection::DenySpend,
         Rejection::DenyFraud,
@@ -92,6 +95,7 @@ impl Rejection {
         Rejection::TenantConcurrency,
         Rejection::ResponseTooLarge,
         Rejection::ManagedEndpoint,
+        Rejection::DuplicateModel,
     ];
 
     /// The `reason=` label value. `RateLimit` keeps the original `"rate_limit"` string so existing
@@ -115,6 +119,7 @@ impl Rejection {
             Rejection::TenantConcurrency => "tenant_concurrency",
             Rejection::ResponseTooLarge => "response_too_large",
             Rejection::ManagedEndpoint => "managed_endpoint",
+            Rejection::DuplicateModel => "duplicate_model",
         }
     }
 
@@ -137,6 +142,7 @@ impl Rejection {
             Rejection::TenantConcurrency => 14,
             Rejection::ResponseTooLarge => 15,
             Rejection::ManagedEndpoint => 16,
+            Rejection::DuplicateModel => 17,
         }
     }
 }

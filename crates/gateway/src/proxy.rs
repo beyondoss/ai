@@ -3550,6 +3550,22 @@ impl ProxyHttp for AiProxy {
             if end_of_stream {
                 // One structural walk for every answer (see `peek::scan_buffered`).
                 let mut buf = std::mem::take(&mut rc.req_buf);
+                let mut scan = peek::scan_buffered(&buf);
+                // Two root `model` keys on a catalog walk: the row came from one and the rewrite
+                // below edits one, but the provider's parser picks its own (usually the last). Refused
+                // rather than guessed, before a body byte goes upstream. Checked on the client's
+                // body, ahead of translation, which re-serializes and would hide it.
+                if rc.auto.is_some() && scan.duplicate_model {
+                    self.state
+                        .metrics
+                        .rejection(Rejection::DuplicateModel)
+                        .inc();
+                    return Err(pingora_core::Error::explain(
+                        pingora_core::ErrorType::HTTPStatus(400),
+                        "duplicate root model key",
+                    )
+                    .into_down());
+                }
                 // Wire mismatch on this *candidate*: map the inbound JSON onto this path's
                 // endpoint *before* the model splice. Keep the original client body in `req_buf`
                 // (cleared and replayed per attempt) so a mixed-row failover re-translates rather
@@ -3565,8 +3581,8 @@ impl ProxyHttp for AiProxy {
                     let upstream_model =
                         a.candidate_at(a.candidate).map_or("", |c| c.upstream_model);
                     buf = translate::request(t.client, to, &buf, upstream_model);
+                    scan = peek::scan_buffered(&buf);
                 }
-                let scan = peek::scan_buffered(&buf);
                 if rc.model.is_empty()
                     && let Some(m) = scan.model
                 {
