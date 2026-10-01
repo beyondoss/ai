@@ -27,6 +27,7 @@ fn body() -> String {
 ///
 /// The threshold is 2 and the client abandons 5 requests, so a gateway that counted downstream
 /// aborts would have opened the breaker several times over and started rejecting.
+/// claim: REL-9, REL-6
 #[tokio::test]
 async fn client_cancellations_do_not_open_the_providers_breaker() {
     let nats_port = unused_nats_port();
@@ -104,6 +105,7 @@ async fn client_cancellations_do_not_open_the_providers_breaker() {
 
 /// The other half of the same rule: a genuinely broken provider must still trip the breaker. Without
 /// this, "stop blaming the provider for client aborts" could be satisfied by never blaming it at all.
+/// claim: REL-6
 #[tokio::test]
 async fn upstream_failures_still_open_the_breaker() {
     let nats_port = unused_nats_port();
@@ -151,6 +153,7 @@ async fn upstream_failures_still_open_the_breaker() {
 /// The mock kills any request that is not the first on its connection, so the scenario fires the
 /// moment pingora reuses a pooled connection — whenever that happens to be, rather than on a fixed
 /// request number that may well land on a fresh connection under load.
+/// claim: REL-1
 #[tokio::test]
 async fn a_reused_connection_failure_after_the_body_is_not_resent() {
     let nats_port = unused_nats_port();

@@ -46,7 +46,7 @@ async fn post(
     req.body(body).send().await.unwrap()
 }
 
-/// claim: K2
+/// claim: K2, BIL-17
 #[tokio::test]
 async fn two_identical_managed_v1_requests_hit_the_cache() {
     let nats = unused_nats_port();

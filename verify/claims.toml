@@ -934,7 +934,7 @@ group = "Billing integrity"
 text = "Free sub-resources write no row on any route"
 layer = "hermetic"
 touches = ["crates/gateway/src/usage.rs", "crates/gateway/src/proxy.rs", "crates/gateway/src/peek.rs", "crates/gateway/src/main.rs"]
-defects = []
+defects = ["D69"]
 
 [[claim]]
 id = "BIL-19"
@@ -970,7 +970,7 @@ group = "Billing integrity"
 text = "Cut-short detection can't be fooled by generated text"
 layer = "hermetic"
 touches = ["crates/gateway/src/usage.rs", "crates/gateway/src/proxy.rs", "crates/gateway/src/peek.rs", "crates/gateway/src/main.rs"]
-defects = []
+defects = ["D70"]
 
 
 # --- Reliability -------------------------------------------------------------------------------
@@ -1098,7 +1098,7 @@ group = "Reliability"
 text = "Two signing kids rotate cleanly, and a rolling pool-key rotation drops nothing"
 layer = "both"
 touches = ["crates/gateway/src/proxy.rs", "crates/gateway/src/circuit_breaker.rs", "crates/gateway/src/smart.rs", "crates/gateway/src/state.rs", "crates/gateway/src/admin.rs", "crates/gateway/src/store_watch.rs", "crates/gateway/src/main.rs", "crates/gateway/src/config.rs"]
-defects = []
+defects = ["D71"]
 
 [[claim]]
 id = "REL-15"

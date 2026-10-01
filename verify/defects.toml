@@ -959,3 +959,45 @@ state = "reproduced"
 test = "a_file_image_url_never_reaches_a_responses_upstream"
 fix = ""
 note = "Reproduced with translate::request (tests/claims_translation.rs): Chat -> Responses on gpt-5-pro keeps input_image.image_url = file:///etc/passwd."
+
+[[defect]]
+id = "D69"
+severity = "med"
+area = "Billing"
+title = "Provider-routed token counts write zero-token billing rows"
+impact = "POST /anthropic/v1/messages/count_tokens and /openai/v1/responses/input_tokens with a managed key each write an ai.usage row with 0/0 tokens and trip ai_usage_parse_errors_total. Claude Code calls count_tokens constantly, so a provider-routed agent fills the billing table with fabricated zero-cost calls and keeps the usage-shape alarm firing. Only the catalog walk knows the sub-resource is free."
+confidence = "high"
+evidence = "proxy.rs logging(): `free` is derived from rc.auto.sub, which is None on /{provider} routes"
+claims = ["BIL-18"]
+state = "reproduced"
+test = "token_counts_write_no_row_on_a_provider_route"
+fix = ""
+note = "Found by the claim-coverage pass (claims_billing.rs)."
+
+[[defect]]
+id = "D70"
+severity = "med"
+area = "Billing"
+title = "Generated text containing \"message_delta\" hides a cut-short Anthropic stream"
+impact = "anthropic_stream_finished is a substring search for message_delta anywhere in the tail, so a cancelled stream whose model output mentions message_delta (an agent editing SSE code) is treated as finished: no estimate, output_tokens=0, usage_estimated=false. The output the provider billed goes unbilled."
+confidence = "high"
+evidence = "usage.rs anthropic_stream_finished: memmem::find(tail, b\"message_delta\")"
+claims = ["BIL-22"]
+state = "reproduced"
+test = "generated_message_delta_text_does_not_hide_a_cut_short_anthropic_stream"
+fix = ""
+note = "Found by the claim-coverage pass (claims_billing.rs). The OpenAI side is not affected: generated text is JSON-escaped inside the delta."
+
+[[defect]]
+id = "D71"
+severity = "med"
+area = "Reliability"
+title = "A revoked first pool key 401s every request; only a 429 walks keys"
+impact = "Every request starts on pool key 0, and a managed 401/403 is relayed instead of walking to the next key. Rotating by appending the new key and then revoking the old one at the provider black-holes all traffic for that provider until the config is redeployed. A pool-key 401 is never the client's fault."
+confidence = "high"
+evidence = "proxy.rs upstream_response_filter: key walk only on status == 429; RequestCtx.pool_key starts at 0"
+claims = ["REL-14"]
+state = "reproduced"
+test = "a_revoked_first_pool_key_walks_to_the_next"
+fix = ""
+note = "Found by the claim-coverage pass (claims_reliability.rs). Rotation that puts the new key first ([new, old]) drops nothing (a_rolling_pool_key_rotation_drops_nothing)."
