@@ -1141,6 +1141,37 @@ fn sanitize_model(model: String) -> Cow<'static, str> {
     }
 }
 
+/// The catalog row a billing row prices against: the provider-echoed id first, then the requested
+/// one, each tried as spelled and then with a dated snapshot suffix removed. `None` when neither
+/// names a row — an unpriced model, which a consumer must not silently price as something else.
+///
+/// The catalog lists aliases (`gpt-5`) and vendor slugs (`openai/gpt-5`), never the snapshots a
+/// provider echoes (`gpt-5-2025-08-07`, `claude-sonnet-4-5-20250929`), so without the strip a
+/// provider-routed row's `model` matches nothing. Runs once per billing row, on strings that are
+/// already in hand.
+fn price_model(billed: &str, requested: &str) -> Option<&'static str> {
+    [billed, requested].into_iter().find_map(|m| {
+        route::model_route(m)
+            .or_else(|| strip_snapshot_date(m).and_then(route::model_route))
+            .map(|r| r.model)
+    })
+}
+
+/// `m` without a trailing `-YYYY-MM-DD` (OpenAI) or `-YYYYMMDD` (Anthropic) snapshot date.
+fn strip_snapshot_date(m: &str) -> Option<&str> {
+    let digits = |s: &str, n: usize| s.len() == n && s.bytes().all(|b| b.is_ascii_digit());
+    let (head, last) = m.rsplit_once('-')?;
+    if digits(last, 8) {
+        return Some(head);
+    }
+    if !digits(last, 2) {
+        return None;
+    }
+    let (head, month) = head.rsplit_once('-')?;
+    let (head, year) = head.rsplit_once('-')?;
+    (digits(month, 2) && digits(year, 4)).then_some(head)
+}
+
 /// Set OpenRouter's attribution headers when (and only when) `provider_name` is `"openrouter"`
 /// **and** the request is managed — every other provider, and every BYO request regardless of
 /// provider, is untouched. Task #22 (pi-parity, Medium): pi gates this dashboard-attribution
@@ -4289,6 +4320,9 @@ impl ProxyHttp for AiProxy {
                     .filter(|m| !m.is_empty())
                     .unwrap_or(requested_model)
             };
+            // The catalog row to price this row at. A model-routed row already names it; a
+            // provider-routed one resolves it from what the provider echoed or the client asked for.
+            let price_model = routed_model.or_else(|| price_model(billed_model, requested_model));
             let usage_provider = cache_hit
                 .as_ref()
                 .map(|h| h.provider.as_ref())
@@ -4311,6 +4345,8 @@ impl ProxyHttp for AiProxy {
                 // path; its value is marking the route, not carrying a second id. `&'static` from
                 // the catalog and charset-checked by a catalog test, so it needs no `sanitize_model`.
                 routed_model,
+                // The catalog row id the row prices at (see `price_model`); absent when unpriced.
+                price_model,
                 stream = usage_stream,
                 cache_hit = cache_hit.is_some(),
                 // True when the stream was cut short before its usage block and the token counts
@@ -4944,6 +4980,26 @@ mod tests {
         assert_eq!(query_param("key=solo", "key"), Some("solo"));
         assert_eq!(query_param("a=1&b=2", "key"), None);
         assert_eq!(query_param("", "key"), None);
+    }
+
+    #[test]
+    fn price_model_resolves_echoed_snapshots_and_vendor_slugs() {
+        assert_eq!(price_model("gpt-5-2025-08-07", "gpt-5"), Some("gpt-5"));
+        assert_eq!(price_model("gpt-5-2025-08-07", "x"), Some("gpt-5"));
+        assert_eq!(
+            price_model("claude-opus-4-8-20260101", "x"),
+            Some("claude-opus-4-8")
+        );
+        assert_eq!(
+            price_model("anthropic/claude-opus-4.8", "x"),
+            Some("claude-opus-4-8")
+        );
+        // The echo names nothing priced, the request does.
+        assert_eq!(price_model("unknown", "gpt-5"), Some("gpt-5"));
+        assert_eq!(price_model("my-finetune-2025-08-07", "nope"), None);
+        // Not a date: left alone.
+        assert_eq!(strip_snapshot_date("gpt-4o-mini"), None);
+        assert_eq!(strip_snapshot_date("model-12-34"), None);
     }
 
     #[test]

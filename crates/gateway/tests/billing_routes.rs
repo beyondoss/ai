@@ -171,7 +171,6 @@ data: {\"type\":\"response.completed\",\"sequence_number\":2,\"response\":{\"id\
 /// claim: BIL-13
 /// defect: D27
 #[tokio::test]
-#[ignore = "D27 reproduced: Responses stream row has model=gpt-5 (the alias), not the echoed gpt-5-2025-08-07"]
 async fn a_responses_stream_bills_the_echoed_snapshot() {
     let (pubkey, sk) = test_keypair(55);
     let mock =
@@ -196,4 +195,6 @@ async fn a_responses_stream_bills_the_echoed_snapshot() {
     );
     assert_eq!(row["requested_model"], "gpt-5", "{row}");
     assert_eq!(row["model"], "gpt-5-2025-08-07", "{row}");
+    // A provider-routed row names the catalog row it prices at, through the snapshot suffix.
+    assert_eq!(row["price_model"], "gpt-5", "{row}");
 }

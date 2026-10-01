@@ -80,6 +80,11 @@ impl ModelScanner {
     /// fell back to the requested alias in the billing log — the exact reconciliation gap
     /// `resp_model_scanner` exists to close, silently open for one of the two dialects.
     ///
+    /// A Responses stream has the same shape under a different key: `response.created` (and
+    /// `response.completed`) carry the pinned snapshot as `response.model`, and no event has a root
+    /// `model` at all. So a root `response` key opens the same one-level nested scan; without it a
+    /// Responses stream billed under the requested alias.
+    ///
     /// Kept opt-in rather than always-on so request-body scanning cannot start picking up a nested
     /// `model` that isn't the one the client asked for.
     pub fn for_response() -> Self {
@@ -150,7 +155,8 @@ impl ModelScanner {
                             // Only a *root* `message` opens the nested scan — a `message` key inside
                             // the message object itself must not re-arm it.
                             if self.accept_message_nesting && self.depth == 1 {
-                                self.last_key_is_message = self.cur == b"message";
+                                self.last_key_is_message =
+                                    self.cur == b"message" || self.cur == b"response";
                             }
                         }
                         Cap::ModelValue => {
@@ -805,6 +811,20 @@ mod tests {
         // The strict scanner used on request bodies must NOT pick it up — that is the whole reason
         // the nesting is opt-in.
         assert_eq!(scan(message_start), None);
+    }
+
+    #[test]
+    fn response_scanner_reads_a_responses_streams_nested_model() {
+        let created = b"event: response.created\ndata: {\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"id\":\"resp_1\",\"status\":\"in_progress\",\"model\":\"gpt-5-2025-08-07\",\"output\":[]}}\n\n";
+        assert_eq!(
+            scan_response(created).as_deref(),
+            Some("gpt-5-2025-08-07")
+        );
+        // Still exactly one level: a model inside the response's tools is not the response's.
+        assert_eq!(
+            scan_response(br#"{"response":{"tools":[{"model":"NESTED"}]}}"#),
+            None
+        );
     }
 
     #[test]

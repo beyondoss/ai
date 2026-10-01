@@ -167,8 +167,8 @@ Client (stock OpenAI/Anthropic SDK)
      Parse usage from tail (by dialect + streaming flag)
      Managed 2xx stream cut short before its usage block (client cancel / upstream death):
        estimate the missing side from the request tally + relayed events → usage_estimated
-     Emit ai.usage fact: tenant, vpc, key_id, model, requested_model, routed_model, token counts +
-       reasoning breakout, + x-beyond-metadata tags (managed only) → blocking stdout, lossless
+     Emit ai.usage fact: tenant, vpc, key_id, model, requested_model, routed_model, price_model,
+       token counts + reasoning breakout, + x-beyond-metadata tags (managed only) → blocking stdout, lossless
      Cache hit: same row with `cache_hit` and the stored tokens; no parse, no upstream latency
      Capturing: emit ai.payload (both bodies, truncation + completeness flags), correlated by
        request_id → bounded queue, DROPPED on overflow so a stalled sink can't backpressure
@@ -874,7 +874,15 @@ The billing fact carries **two model fields**:
 
 `model` is what reconciles against the provider's invoice (which itemizes by pinned snapshot, e.g.
 `gpt-4o-2024-08-06`, not alias). `requested_model` serves product analytics and as a fallback rate
-when the snapshot is newer than the downstream price table.
+when the snapshot is newer than the downstream price table. The response scanner reads a root
+`model`, or one nested a single level under a root `message` (Anthropic `message_start`) or
+`response` (Responses `response.created` / `response.completed`) key.
+
+A third field, `price_model`, names the catalog row the row prices at. A model-routed row already
+knows it (`routed_model`); a provider-routed one resolves `model`, then `requested_model`, through
+`providers::catalog::for_model`, each as spelled and then without a dated snapshot suffix
+(`-YYYY-MM-DD`, `-YYYYMMDD`), since the catalog lists aliases and vendor slugs, never snapshots.
+Absent when neither names a row: an unpriced model.
 
 ### Usage Extraction (`usage.rs`)
 
