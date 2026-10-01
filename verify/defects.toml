@@ -1107,10 +1107,10 @@ area = "Translation"
 title = "Replayed reasoning on the final assistant turn 400s when thinking is off"
 impact = "The inverse of D77: a client with thinking disabled replays a turn whose gateway-minted reasoning becomes signed reasoning_details/thinking on the final assistant message; Anthropic (here via Bedrock behind OpenRouter) rejects it: 'When thinking is disabled, an assistant message in the final position cannot contain thinking.'"
 confidence = "high"
-evidence = "live cell W4::pi::openrouter::pi:responses (pi Responses mode, thinking off, OpenRouter claude-sonnet-4); predates D77"
+evidence = "live cell W4::pi::openrouter::pi:responses (pi Responses mode, thinking off, OpenRouter claude-sonnet-4); predates D77. Reproduced hermetically: translate::request_tests::replayed_thinking_leaves_the_final_assistant_turn_when_thinking_is_off: a Responses replay of gateway-minted reasoning with no reasoning requested reaches claude-haiku-4-5 (Anthropic and Bedrock spellings) with a signed thinking block in the final assistant turn, and OpenRouter claude-sonnet-4 with reasoning_details on it."
 claims = ["TRN-7", "W4"]
-state = "suspected"
-test = ""
+state = "reproduced"
+test = "replayed_thinking_leaves_the_final_assistant_turn_when_thinking_is_off"
 fix = ""
 note = "Proposed: when the outgoing request has thinking/reasoning off, strip thinking/reasoning blocks from the final assistant turn (Anthropic's rule), on every path to a Claude model."
 

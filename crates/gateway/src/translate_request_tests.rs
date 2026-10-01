@@ -2076,3 +2076,93 @@ fn openai_held_responses_items_are_dropped_only_when_translating() {
     let raw = serde_json::to_vec(&body).unwrap();
     assert_eq!(strip_gateway_reasoning(raw.clone()), raw);
 }
+
+/// A turn the gateway minted from Claude's thinking, replayed by a client whose request has
+/// thinking off: Anthropic rejects thinking in the final assistant message then ("When thinking is
+/// disabled, an assistant message in the final position cannot contain thinking"). Earlier
+/// assistant turns may keep theirs (the API ignores them), and a request with thinking on keeps
+/// everything.
+/// claim: TRN-7, W4
+/// defect: D79
+#[test]
+#[ignore = "D79 reproduced: replayed thinking reaches the final assistant turn with thinking off"]
+fn replayed_thinking_leaves_the_final_assistant_turn_when_thinking_is_off() {
+    let rs = |n: u32| {
+        json!({"type": "reasoning", "id": format!("rs_gw_{n}"),
+            "summary": [{"type": "summary_text", "text": "Need weather."}],
+            "encrypted_content": format!("rs_gw:SIG{n}")})
+    };
+    let call = |id: &str| {
+        json!({"type": "function_call", "call_id": id, "name": "get_weather",
+            "arguments": "{\"city\":\"Paris\"}"})
+    };
+    let out = |id: &str| json!({"type": "function_call_output", "call_id": id, "output": "sunny"});
+    let input = json!([
+        {"role": "user", "content": "weather in Paris?"},
+        rs(1), call("call_1"), out("call_1"),
+        rs(2), call("call_2"), out("call_2"),
+    ]);
+    let tools = json!([{"type": "function", "name": "get_weather",
+        "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}}]);
+    let body = |reasoning: Option<Value>| {
+        let mut b = json!({"model": "m", "store": false, "tools": tools, "input": input});
+        if let Some(r) = reasoning {
+            b["reasoning"] = r;
+        }
+        b
+    };
+    let assistants = |v: &Value, list: &str| -> Vec<Value> {
+        v[list]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|m| m["role"] == "assistant")
+            .cloned()
+            .collect()
+    };
+    let msg_thinks = |m: &Value| {
+        m["content"]
+            .as_array()
+            .is_some_and(|bs| bs.iter().any(|b| b["type"] == "thinking"))
+    };
+
+    // Onto Messages (Anthropic, Bedrock): Haiku 4.5 runs without thinking when it is omitted.
+    for model in ["claude-haiku-4-5", "global.anthropic.claude-haiku-4-5-20251001-v1:0"] {
+        let off = req(Endpoint::Responses, Endpoint::Messages, &body(None), model);
+        let a = assistants(&off, "messages");
+        assert!(msg_thinks(&a[0]), "{model}: an earlier turn keeps its thinking: {off}");
+        assert!(!msg_thinks(a.last().unwrap()), "{model}: {off}");
+        let on = req(
+            Endpoint::Responses,
+            Endpoint::Messages,
+            &body(Some(json!({"effort": "medium"}))),
+            model,
+        );
+        assert!(msg_thinks(assistants(&on, "messages").last().unwrap()), "{model}: {on}");
+    }
+
+    // Onto OpenRouter Chat: the replay rides `reasoning_details`.
+    let model = "anthropic/claude-sonnet-4";
+    let off = r2c(&body(None), model);
+    let a = assistants(&off, "messages");
+    assert!(a.last().unwrap().get("reasoning_details").is_none(), "{off}");
+    assert!(a[0].get("reasoning_details").is_some(), "{off}");
+    let on = r2c(&body(Some(json!({"effort": "medium"}))), model);
+    assert!(
+        assistants(&on, "messages").last().unwrap().get("reasoning_details").is_some(),
+        "{on}"
+    );
+
+    // Same wire to OpenRouter: the client's own replay, thinking off.
+    let chat_body = json!({"model": model, "messages": [
+        {"role": "user", "content": "weather?"},
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "toolu_1", "type": "function",
+            "function": {"name": "get_weather", "arguments": "{}"}}],
+         "reasoning_details": [{"type": "reasoning.text", "text": "t", "signature": "SIG",
+            "format": "anthropic-claude-v1", "index": 0}]},
+        {"role": "tool", "tool_call_id": "toolu_1", "content": "sunny"},
+    ]});
+    let relayed = claude_chat_relay_reasoning(serde_json::to_vec(&chat_body).unwrap());
+    let relayed: Value = serde_json::from_slice(&relayed).unwrap();
+    assert!(relayed["messages"][1].get("reasoning_details").is_none(), "{relayed}");
+}
