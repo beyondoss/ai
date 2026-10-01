@@ -1039,10 +1039,10 @@ impact = "Codex sends store:false on every turn, so on every Chat-first GPT row 
 confidence = "high"
 evidence = "live 2026-10-01, Codex 0.159.3 exec via managed /v1/responses: gpt-5-mini -> 400 \"Invalid value: 'namespace'. Supported values are: 'function' and 'custom'\" (tools[4]); gpt-5.5 -> 400 \"Missing required parameter: 'tools[3].custom.format.grammar'\". The identical captured bodies POSTed to api.openai.com/v1/responses return 200 on both models. translate.rs:2048-2060 (responses_session_field: store:false -> None) and proxy.rs ~2484 (None -> row.candidates, the Chat arm, though row.responses is non-empty). Reproduced hermetically (harness_shapes.rs): the Codex body on gpt-5-mini reaches /v1/chat/completions."
 claims = ["W2", "E3", "CAT-9"]
-state = "reproduced"
+state = "fixed"
 test = "codex_on_a_chat_first_gpt_row_is_relayed_to_its_responses_arm"
-fix = ""
-note = "Found by the W2 harness cell. W2 now runs Codex on gpt-5.3-codex (a Responses-first row) so the cell exercises Codex itself; this defect keeps W2 red until a Chat-first GPT row relays Codex unchanged."
+fix = "1ff3237"
+note = "Found by the W2 harness cell. Any inbound Responses request on a row with a Responses arm now walks that arm as a byte relay, store:false one-shots included (D50 stripping still applies; a failover stays inside the arm). Only rows without an arm translate, and D12's omitted-store rule is unchanged there."
 
 [[defect]]
 id = "D75"
@@ -1053,10 +1053,10 @@ impact = "On every translated row (all Claude rows, and GPT rows per D74) Codex'
 confidence = "high"
 evidence = "live 2026-10-01 W2::codex::claude::codex (claude-haiku-4-5): Anthropic 400 \"tools.4: Input tag 'namespace' found using 'type' does not match any of the expected tags\". gpt-5.5 (D74 path): OpenAI 400 \"Missing required parameter: 'tools[3].custom.format.grammar'\". translate.rs:3534-3560 responses_tool_to_openai returns any non-function/custom tool unchanged and copies a custom tool's `format` as-is. Reproduced hermetically (harness_shapes.rs): the namespace tool and the custom tool reach Anthropic as sent."
 claims = ["W2"]
-state = "reproduced"
+state = "fixed"
 test = "codex_tools_survive_translation_and_calls_map_back"
-fix = ""
-note = "W2::codex::openrouter passes: OpenRouter accepts the request with the namespace tool in it. A namespace's member functions have a Chat/Messages shape; its hosted siblings (web_search, tool_search) are a separate question (forwarded on purpose so the provider rejects them by name)."
+fix = "c25cbec"
+note = "Namespace members are flattened onto Chat/Messages as {namespace}__{name} ({namespace}{name} when it ends in _), and replayed calls carrying namespace use the same flat name; a custom grammar nests as Chat's {type, grammar: {syntax, definition}}; onto Messages a custom tool takes one input string with the grammar in its description. Per-request ToolNames map every returned call (JSON and SSE) back to {name, namespace} or a custom_tool_call with raw input. A Chat Completions client's custom tool onto Messages is still forwarded for Anthropic to reject by name (no reverse mapping on that path)."
 
 [[defect]]
 id = "D76"
@@ -1081,7 +1081,7 @@ impact = "D14's fix covers translated walks onto Anthropic, not a same-wire Chat
 confidence = "high"
 evidence = "live 2026-10-01 W4::pi::openrouter::pi:chat: \"messages.1.content.0.type: Expected `thinking` or `redacted_thinking`, but found `text`. When `thinking` is enabled, a final `assistant` message must start with a thinking block\". Direct: Chat turn 1 with reasoning_effort=medium + one tool on claude-sonnet-4 -> 200 with reasoning_details; turn 2 echoing only the tool call -> 400 (provider Amazon Bedrock via OpenRouter). The same two turns on claude-haiku-4-5 (translated to Anthropic) -> 200. Reproduced hermetically (harness_shapes.rs): pi's turn 2 reaches OpenRouter with reasoning_effort, same wire and translated."
 claims = ["TRN-7", "W4"]
-state = "reproduced"
+state = "fixed"
 test = "a_claude_tool_turn_without_reasoning_details_goes_without_reasoning_on_openrouter"
-fix = ""
-note = "Found by the W4 harness cell. pi echoes thinking as a plain `reasoning` string with no signature, and round-trips reasoning_details only for reasoning.encrypted entries tied to a tool call."
+fix = "4650eca"
+note = "Found by the W4 harness cell. pi echoes thinking as a plain reasoning string with no signature. When a Chat body bound for a Claude model on a Chat host asks for reasoning (reasoning_effort, reasoning, include_reasoning, thinking) and its last assistant tool-call turn has no replayable reasoning_details, those keys are dropped: same-wire relay (memmem-gated parse) and translated Messages/Responses walks alike."
