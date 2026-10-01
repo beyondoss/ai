@@ -187,7 +187,9 @@ reported as a defect. Run the suite twice, and file only differences that reprod
 differences: values (only types are compared), headers, the usage chunk the gateway injects into a
 Chat stream, OpenRouter's repeated `delta.role` (dropped by `ChatIdentity`), and grok's reasoning
 visibility (a Chat `reasoning_content`, a Responses `reasoning` item and its summary events), which
-varies even between two direct calls. A run costs about $0.30; it prints an
+varies even between two direct calls, as does whether an OpenAI reasoning model that did no
+reasoning (zero reasoning tokens on both answers) emits an empty `reasoning` output item (5 direct
+calls of 120 of one gpt-5-mini body came back without it). A run costs about $0.30; it prints an
 estimate first and the measured cost last.
 
 ```sh

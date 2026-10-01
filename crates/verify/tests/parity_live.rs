@@ -27,7 +27,9 @@
 //! Allowed differences (crates/gateway/ARCHITECTURE.md): ids, timestamps and other values (only
 //! types are compared), `x-beyond-*` headers (headers aren't compared), and the usage chunk the
 //! gateway injects into an OpenAI-wire Chat stream whose client didn't ask for one ("inject
-//! stream_options.include_usage").
+//! stream_options.include_usage"). Two more are the provider's own nondeterminism, measured
+//! direct-vs-direct (`allowed_shape`): grok's reasoning visibility, and whether an OpenAI reasoning
+//! model that did no reasoning emits an empty `reasoning` output item.
 //!
 //! A mismatch is retried once (both sides) before it fails, so a single nondeterministic answer
 //! doesn't read as a defect; the trial's stderr says when the first attempt disagreed.
@@ -1818,12 +1820,28 @@ fn structured_ok(text: &str, schema: &Value) -> bool {
 }
 
 /// Shape entries that may differ on a same-dialect relay. No documented gateway change shows in a
-/// non-stream body; the only exemption is model nondeterminism measured direct-vs-direct: whether
-/// grok returns its `reasoning_content` (Chat) or a `reasoning` output item (Responses) varies call
-/// to call (measured 2026-10-01: the same Responses body, `store` set or not, streamed a summary on
-/// four calls of six).
-fn allowed_shape(m: &Model, entry: &str) -> bool {
+/// non-stream body; the only exemptions are model nondeterminism measured direct-vs-direct:
+/// - whether grok returns its `reasoning_content` (Chat) or a `reasoning` output item (Responses)
+///   varies call to call (measured 2026-10-01: the same Responses body, `store` set or not,
+///   streamed a summary on four calls of six);
+/// - `empty_reasoning` (see [`empty_reasoning_varies`]).
+fn allowed_shape(m: &Model, entry: &str, empty_reasoning: bool) -> bool {
     m.always_reasons && (entry.contains("reasoning_content") || entry.contains("[reasoning]"))
+        || empty_reasoning && entry.starts_with("$.output[reasoning]")
+}
+
+/// Whether an empty `reasoning` output item may be on one side only. An OpenAI reasoning model
+/// that did no reasoning (`reasoning_tokens` 0 on both answers) sometimes emits the item (no
+/// summary, an `encrypted_content`) and sometimes not, for the same body sent directly: measured
+/// 2026-10-01 on gpt-5-mini, effort `minimal`, parity's `tools_forced` body, 5 calls of 120 came
+/// back with only the `function_call` (19 output tokens instead of 33). The gateway relays that
+/// body byte for byte (12 of 12 upstream bodies captured identical to the client's), so which
+/// answer a side gets is the draw. An item carrying reasoning tokens is still compared.
+fn empty_reasoning_varies(m: &Model, direct: &Summary, gw: &Summary) -> bool {
+    m.openai_reasoning
+        && [direct, gw]
+            .iter()
+            .all(|s| s.usage.as_ref().is_some_and(|u| u.reasoning == 0))
 }
 
 /// Everything about `gw` that disagrees with `direct` for `case` on `path`.
@@ -1945,15 +1963,16 @@ fn compare(path: &ParityPath, case: &Case, direct: &Summary, gw: &Summary) -> Ve
                 direct.finish_raw, gw.finish_raw
             ));
         }
+        let empty_reasoning = empty_reasoning_varies(&path.model, direct, gw);
         let missing: Vec<&String> = direct
             .shape
             .difference(&gw.shape)
-            .filter(|e| !allowed_shape(&path.model, e))
+            .filter(|e| !allowed_shape(&path.model, e, empty_reasoning))
             .collect();
         let extra: Vec<&String> = gw
             .shape
             .difference(&direct.shape)
-            .filter(|e| !allowed_shape(&path.model, e))
+            .filter(|e| !allowed_shape(&path.model, e, empty_reasoning))
             .collect();
         if !missing.is_empty() || !extra.is_empty() {
             p.push(format!(
@@ -1967,6 +1986,8 @@ fn compare(path: &ParityPath, case: &Case, direct: &Summary, gw: &Summary) -> Ve
                     (case.include_usage || *f != "usage")
                         // Whether grok streams its reasoning varies call to call, direct too.
                         && (!path.model.always_reasons || !f.contains("reasoning"))
+                        // So does whether an OpenAI model that did no reasoning emits the item.
+                        && !(empty_reasoning && f.ends_with(":reasoning"))
                 };
                 let mut v: Vec<String> = if path.model.always_reasons {
                     // ... and so does which deltas share a chunk with it: compare the delta kinds'
@@ -2431,6 +2452,71 @@ fn usage_rows(log: &Path) -> Vec<Value> {
         .collect()
 }
 
+// --- The oracle's own check ----------------------------------------------------------------------
+
+/// The empty-`reasoning`-item allowance, hermetic: the pair that failed live on 2026-10-01 (one
+/// side with gpt-5-mini's empty item, one without) passes, and it stops passing as soon as both
+/// answers report reasoning tokens, or on a model that isn't an OpenAI reasoning model.
+fn oracle_empty_reasoning_item() -> Result<(), Failed> {
+    let answer = |with_item: bool, reasoning_tokens: u64| {
+        let mut output = vec![json!({
+            "id": "fc_1", "type": "function_call", "status": "completed",
+            "arguments": "{\"city\":\"Hanoi\"}", "call_id": "call_1", "name": "get_weather",
+        })];
+        if with_item {
+            output.insert(
+                0,
+                json!({"id": "rs_1", "type": "reasoning", "content": [],
+                       "encrypted_content": "gAAAA", "summary": []}),
+            );
+        }
+        let body = json!({
+            "id": "resp_1", "object": "response", "status": "completed", "output": output,
+            "usage": {"input_tokens": 84, "output_tokens": if with_item { 33 } else { 19 },
+                      "output_tokens_details": {"reasoning_tokens": reasoning_tokens}},
+        });
+        let o = Obs {
+            status: 200,
+            content_type: "application/json".into(),
+            request_id: Some("req".into()),
+            body: Some(body),
+            events: Vec::new(),
+            raw: String::new(),
+            headers: Vec::new(),
+        };
+        summarize(Dialect::Responses, &o, false)
+    };
+    let case = corpus(1)
+        .into_iter()
+        .find(|c| c.name == "tools_forced")
+        .ok_or("no tools_forced case")?;
+    let responses = *PATHS
+        .iter()
+        .find(|p| p.route == "openai-responses")
+        .ok_or("no openai-responses path")?;
+    let shape_problem = |path: &ParityPath, d: &Summary, g: &Summary| {
+        compare(path, &case, d, g)
+            .iter()
+            .any(|p| p.starts_with("shape:"))
+    };
+    for (d, g) in [(true, false), (false, true)] {
+        if shape_problem(&responses, &answer(d, 0), &answer(g, 0)) {
+            return Err(format!("empty item on one side only (direct {d}) is flagged").into());
+        }
+        if !shape_problem(&responses, &answer(d, 12), &answer(g, 12)) {
+            return Err(format!("item with reasoning tokens (direct {d}) is not flagged").into());
+        }
+        let other = ParityPath {
+            model: GPT4O_MINI,
+            ..responses
+        };
+        if !shape_problem(&other, &answer(d, 0), &answer(g, 0)) {
+            return Err(format!("non-reasoning model (direct {d}) is not flagged").into());
+        }
+    }
+    Ok(())
+}
+
 // --- Main ----------------------------------------------------------------------------------------
 
 fn main() {
@@ -2485,6 +2571,10 @@ fn main() {
     let list = args.list;
     // Live traffic: no reconciliation window may be open while it runs (see common::live_traffic).
     let _traffic = (!trials.is_empty() && !args.list).then(common::live_traffic);
+    trials.push(Trial::test(
+        "parity_oracle::empty_reasoning_item",
+        oracle_empty_reasoning_item,
+    ));
     let conclusion = libtest_mimic::run(&args, trials);
     gateways().lock().unwrap().clear();
     if !list && estimate_usd > 0.0 {
