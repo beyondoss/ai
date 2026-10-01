@@ -75,7 +75,7 @@ evidence = "proxy.rs:2416"
 claims = ["BIL-1"]
 state = "fixed"
 test = "openrouter_messages_path_is_metered_with_the_anthropic_extractor"
-fix = "6ddcef9"
+fix = "e2a582a"
 note = "Fixed: on /{provider}/... the dialect, and stream_options eligibility, come from the forwarded path (route::Endpoint::of_upstream_path, a sub-resource reading as its parent), as a catalog walk takes them from the serving candidate's path. Both reproductions bill 13/7 exact."
 
 [[defect]]
@@ -89,7 +89,7 @@ evidence = "peek.rs:309-312, 526"
 claims = ["BIL-2"]
 state = "fixed"
 test = "a_client_cannot_turn_off_exact_stream_metering"
-fix = "459d63a"
+fix = "de0c840"
 note = "Fixed: scan_buffered also locates a client-sent stream_options value on a stream; force_include_usage rewrites include_usage:false to true or adds it (or replaces a non-object value), shifting the model span when it follows. The client may see one extra usage chunk (choices: [])."
 
 [[defect]]
@@ -103,7 +103,7 @@ evidence = "proxy.rs:3797-3812"
 claims = ["BIL-3"]
 state = "fixed"
 test = "a_cancel_before_the_response_head_is_billed_an_estimate"
-fix = "5095a6f"
+fix = "d7b951e"
 note = "Fixed: a cancel before the response head after body_delivered (connected, client body read to its end, no upstream write error) bills input from the tally, output 0; a non-stream 2xx cut off bills input from the tally and output from the string values in the relayed tail. Both usage_estimated=true; requests that never reached a provider stay unbilled. Upstream-side failures before the head (read timeout, reset) are outcome=upstream_error and stay unbilled."
 
 [[defect]]
@@ -117,7 +117,7 @@ evidence = "main.rs:73, 104-109"
 claims = ["BIL-4"]
 state = "fixed"
 test = "ai_log_warn_still_emits_usage_rows"
-fix = "16e650c"
+fix = "1f91590"
 note = "Fixed: ai.usage has its own fmt layer with no level filter; AI_LOG filters the diagnostic and payload layers only. A failed stdout write is counted on ai_usage_write_errors_total and reported on stderr."
 
 [[defect]]
@@ -131,7 +131,7 @@ evidence = "proxy.rs:3610-3626, 870-889"
 claims = ["BIL-14", "REL-21"]
 state = "fixed"
 test = "a_large_body_is_not_resent_to_a_candidate_that_received_it"
-fix = "7b6af00"
+fix = "4836699"
 note = "Fixed: error_while_proxy resends (pingora's reused-connection retry, or the FullBody reset retry) only when body_delivered is false; otherwise the walk ends with a JSON 504 (read timeout) or 502 from a new fail_to_proxy. The reproduction's assertion was tightened from (1, 1) to (1, 0) plus a JSON 504: the decided policy forbids failing over a delivered body too. large_bodies::a_reset_before_the_header_is_retried_from_the_held_body and cancellation::a_reused_connection_failure_is_retried_and_the_body_survives encoded the old resend (their mock drains the body before closing) and now assert no resend and a JSON 502."
 
 [[defect]]
@@ -285,7 +285,7 @@ evidence = "usage.rs:426; proxy.rs:120"
 claims = ["BIL-15"]
 state = "fixed"
 test = "openai_stream_reads_usage_from_a_final_event_larger_than_the_tail"
-fix = "f816efb"
+fix = "37c2565"
 note = "Fixed: when no whole line of the tail carries usage, openai_stream recovers the last usage object from the tail's first (front-truncated) line, like recover_trailing_usage for bodies; O(tail), only on a miss. The e2e bills 24000/5 exact."
 
 [[defect]]
@@ -299,7 +299,7 @@ evidence = "usage.rs:127 vs translate.rs:2629"
 claims = ["BIL-8"]
 state = "fixed"
 test = "openrouter_cache_write_tokens_reach_the_row"
-fix = "a3fa2ce"
+fix = "db68cb6"
 note = "Fixed: prompt_tokens_details.cache_write_tokens (and Responses input_tokens_details.cache_write_tokens) populate cache_write_tokens."
 
 [[defect]]
@@ -313,7 +313,7 @@ evidence = "usage.rs:479-485"
 claims = ["BIL-8"]
 state = "fixed"
 test = "anthropic_cumulative_message_delta_usage_supersedes_message_start"
-fix = "d27f034"
+fix = "9eec187"
 note = "Fixed: a message_delta's input_tokens and cache counts, when present (non-zero), supersede message_start's."
 
 [[defect]]
@@ -341,7 +341,7 @@ evidence = "usage.rs:221-229"
 claims = ["BIL-10", "BIL-11"]
 state = "fixed"
 test = "priced_variants_and_server_tool_calls_reach_the_row"
-fix = "098f684"
+fix = "50f24de"
 note = "Fixed: rows carry cache_write_1h_tokens (cache_creation.ephemeral_1h_input_tokens), server_tool_calls (server_tool_use.web_search_requests) and service_tier (as echoed; lenient, never fails the parse). The reproduction's needle for the call count was changed from \"web_search\" to the decided field name \"server_tool_calls\"; the asserted value (3) is unchanged."
 
 [[defect]]
@@ -355,7 +355,7 @@ evidence = "usage.rs vs translate.rs:2583-2590"
 claims = ["BIL-7"]
 state = "fixed"
 test = "a_claude_row_normalizes_input_tokens_the_same_on_both_wires"
-fix = "098f684"
+fix = "50f24de"
 note = "Fixed by contract, not by changing input_tokens: every row carries usage_wire (openai | anthropic), set by the extractor that parsed it, naming which convention input_tokens follows. The reproduction now normalizes through usage_wire (anthropic: input + cache_read + cache_write) and asserts both rows report 1000."
 
 [[defect]]
@@ -369,7 +369,7 @@ evidence = "proxy.rs:3959-3993"
 claims = ["BIL-12"]
 state = "fixed"
 test = "zero_cost_endings_carry_their_outcome"
-fix = "9bb5527"
+fix = "3361aa0"
 note = "Fixed: rows carry upstream_status (absent without a response head) and outcome (ok | upstream_error | client_cancelled | no_candidate | cut_short); provider is omitted when no candidate was attempted (RequestCtx::upstream_phase). The reproduction also asserts the exact values."
 
 [[defect]]
@@ -383,7 +383,7 @@ evidence = "catalog.rs:2299; peek.rs:85-91"
 claims = ["BIL-13"]
 state = "fixed"
 test = "a_responses_stream_bills_the_echoed_snapshot"
-fix = "78babd8"
+fix = "c7add21"
 note = "Fixed: the response model scanner opens its one-level nested scan under a root response key too, so Responses streams bill response.model. Every row carries price_model: routed_model, or the catalog row for_model resolves from the echoed then requested model, each also without a dated snapshot suffix; absent when unpriced. The reproduction also asserts price_model=gpt-5."
 
 [[defect]]
@@ -719,7 +719,7 @@ evidence = "proxy.rs FullBody"
 claims = ["REL-21"]
 state = "fixed"
 test = "resets_on_every_candidate_end_the_same_for_small_and_large_bodies"
-fix = "7b6af00"
+fix = "4836699"
 note = "Fixed as a consequence of D09: a reset after the body was delivered is no longer resent on either path, so all-candidate resets end the same for small and large bodies (a JSON 502 after one attempt); no 'no provider key available'."
 
 [[defect]]
@@ -789,7 +789,7 @@ evidence = "proxy.rs cut_short gate: estimate applied only when estimated output
 claims = ["BIL-6", "BIL-12", "BIL-15"]
 state = "fixed"
 test = "a_finished_stream_with_unparseable_usage_bills_a_flagged_estimate"
-fix = "994cd7a"
+fix = "02a7497"
 note = "Reproduced (clean [DONE] stream, no text, usage with prompt_tokens as a string: 0/0, usage_estimated=false), then fixed: a stream that finished cleanly without an error event counts as started, so it bills an estimate (usage_estimated=true), still counted on ai_usage_parse_errors_total; an Anthropic message_delta that did not parse counts as missing."
 
 [[defect]]
