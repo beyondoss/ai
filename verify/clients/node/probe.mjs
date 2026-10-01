@@ -272,6 +272,46 @@ const CORRUPT_PNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfAAAA";
 const WEATHER_TOOL = { name: "get_weather", description: "Weather for a city", input_schema: { type: "object", properties: { city: { type: "string" } }, required: ["city"] } };
 
 Object.assign(probes, {
+  // T1 via openai-node: a forced Chat tool call with fixed args, the result fed back on a streamed
+  // second turn (include_usage), and the final answer uses it.
+  async tools_chat() {
+    const c = openai();
+    const tools = [{ type: "function", function: { name: WEATHER_TOOL.name, description: WEATHER_TOOL.description, parameters: WEATHER_TOOL.input_schema } }];
+    const msgs = [{ role: "user", content: "What's the weather in Paris? Use the tool." }];
+    const r = await c.chat.completions.create({ model: MODEL, max_tokens: 1024, messages: msgs, tools, tool_choice: { type: "function", function: { name: "get_weather" } } });
+    record("chat", chatUsage(r.usage));
+    const tc = r.choices[0].message.tool_calls?.[0];
+    if (!tc) return [false, { why: "no tool call", message: r.choices[0].message }];
+    const args = JSON.parse(tc.function.arguments || "{}");
+    msgs.push(r.choices[0].message);
+    msgs.push({ role: "tool", tool_call_id: tc.id, content: "Sunny, 31C, code ZEBRA-7" });
+    const s = await c.chat.completions.create({ model: MODEL, max_tokens: 1024, stream: true, stream_options: { include_usage: true }, messages: msgs, tools });
+    let text = "", usage = null;
+    for await (const chunk of s) {
+      if (chunk.usage) usage = chunk.usage;
+      for (const ch of chunk.choices ?? []) text += ch.delta?.content ?? "";
+    }
+    record("chat", chatUsage(usage));
+    return [tc.function.name === "get_weather" && /paris/i.test(args.city ?? "") && /31/.test(text), { args, final: text.slice(0, 200) }];
+  },
+
+  // T1 via @anthropic-ai/sdk: a forced Messages tool call with fixed args (streamed), the
+  // tool_result fed back, and the final answer uses it.
+  async tools_messages() {
+    const c = anthropic();
+    const msgs = [{ role: "user", content: "What's the weather in Paris? Use the tool." }];
+    const r = await c.messages.stream({ model: MODEL, max_tokens: 1024, messages: msgs, tools: [WEATHER_TOOL], tool_choice: { type: "tool", name: "get_weather" } }).finalMessage();
+    record("messages", messagesUsage(r.usage));
+    const tu = r.content.find((b) => b.type === "tool_use");
+    if (!tu) return [false, { why: "no tool_use", types: r.content.map((b) => b.type) }];
+    msgs.push({ role: "assistant", content: r.content });
+    msgs.push({ role: "user", content: [{ type: "tool_result", tool_use_id: tu.id, content: "Sunny, 31C, code ZEBRA-7" }] });
+    const f = await c.messages.create({ model: MODEL, max_tokens: 1024, messages: msgs, tools: [WEATHER_TOOL] });
+    record("messages", messagesUsage(f.usage));
+    const text = f.content.filter((b) => b.type === "text").map((b) => b.text).join("");
+    return [tu.name === "get_weather" && /paris/i.test(tu.input?.city ?? "") && /31/.test(text), { input: tu.input, final: text.slice(0, 200) }];
+  },
+
   // T2 via anthropic-ts: thinking plus a tool; turn 2 replays the signed thinking block.
   async thinking_replay() {
     const c = anthropic();

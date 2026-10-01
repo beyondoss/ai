@@ -158,6 +158,7 @@ clients = [
   "raw",
 ]
 failover_clients = ["openai-py", "anthropic-py", "claude-code", "pi"]
+client_note = "A coding agent (claude-code, codex, opencode, pi) chooses its own tools and arguments, so its cells can't force one with fixed args. They hold the rest of the oracle on the wire instead (`harness_long.py cell <harness>+task` behind the recording proxy): a served turn replays one of the agent's own tool calls with its result, paired by id (`tool_round_trips`), no turn feeding a result back is refused, and the fixture test passes, which needs those results (the agent reads calc.py and runs the test through its tools). Each runs native and translated: Claude Code on Claude and GPT (Messages to Chat), Codex on its own row and Claude (Responses to Messages), opencode and pi's Chat mode on Claude (Chat to Messages), OpenRouter and GPT. The forced-tool, fixed-args half is the SDK and raw cells'."
 touches = ["crates/gateway/src/translate.rs", "crates/gateway/src/proxy.rs"]
 defects = ["D63", "D127", "D171", "D172", "D175"]
 

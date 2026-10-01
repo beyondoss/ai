@@ -2461,7 +2461,11 @@ fn usage_rows(log: &Path) -> Vec<Value> {
 
 /// The empty-`reasoning`-item allowance, hermetic: the pair that failed live on 2026-10-01 (one
 /// side with gpt-5-mini's empty item, one without) passes, and it stops passing as soon as both
-/// answers report reasoning tokens, or on a model that isn't an OpenAI reasoning model.
+/// answers report reasoning tokens, or on a model that isn't an OpenAI reasoning model. It guards
+/// the oracle of the `openai-responses` parity cells (E3), and runs with or without `VERIFY_LIVE`.
+/// Its trial is named after the function, with no `::`, so `verify` reads it as this tagged
+/// hermetic test, not as a live cell (`CLAIMS::client::...`).
+/// claim: E3
 fn oracle_empty_reasoning_item() -> Result<(), Failed> {
     let answer = |with_item: bool, reasoning_tokens: u64| {
         let mut output = vec![json!({
@@ -2577,7 +2581,7 @@ fn main() {
     // Live traffic: no reconciliation window may be open while it runs (see common::live_traffic).
     let _traffic = (!trials.is_empty() && !args.list).then(common::live_traffic);
     trials.push(Trial::test(
-        "parity_oracle::empty_reasoning_item",
+        "oracle_empty_reasoning_item",
         oracle_empty_reasoning_item,
     ));
     let conclusion = libtest_mimic::run(&args, trials);

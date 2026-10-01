@@ -23,6 +23,12 @@ async fn provider_route_rejects_files_api() {
 
 A test may claim several claims. The tag lines go directly above the attributes and the `fn`.
 
+Every test in a live binary (`tests/*_live.rs`, `tests/live.rs`) whose name holds `::` is read as a
+live cell, `CLAIMS::client::...`, and its claims must be known ids. A hermetic check inside one (a
+`libtest-mimic` trial, not a `#[test]`) is named exactly after its function, with no `::`, and
+the function carries the `/// claim:` tag, so it counts as a tagged hermetic test
+(`oracle_empty_reasoning_item` in `parity_live.rs`).
+
 ## Defect lifecycle
 
 | State        | What the gate requires                                                          |
@@ -156,8 +162,10 @@ check the ledger in aggregate. Its other cells run behind `harness_long.py`'s re
 request id: a served call has exactly one row on the route's provider, a free or refused one bills
 nothing, and no row is left over. A scenario can ask more of a call (an estimate for a stream the
 agent was interrupted in, a cache read from turn 2, one provider for the whole session). Where the
-cell's claims hold the client's usage to the ledger (E1, E2, B3), the usage each response showed
-the harness on the wire (input, output, cache reads) must equal its row, as a probe's must. Claude
+cell's claims hold the client's usage to the ledger (E1, E2, B3, B1), the usage each response showed
+the harness on the wire (input, output, cache reads) must equal its row, as a probe's must. Where
+they claim T1, a served turn must replay one of the agent's own tool calls with its result, paired
+by id, and no turn feeding a result back may be refused. Claude
 Code's S1 cell streams one answer straight to Anthropic (through a second recorder) and then
 through the gateway, and compares time to first token and how spread out each stream arrives. A
 claim's `client_note` says why a client it would name can't exercise it, or what part of the claim

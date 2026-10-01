@@ -331,6 +331,31 @@ def summarize(path, body):
             if isinstance(part, dict) and part.get("type") in ("image", "image_url", "input_image"):
                 images += 1
     out.update(roles=sorted(roles), assistant_turns=turns, assistant_empty=empty, images=images)
+    # Tool round trips the history replays (T1): results whose id names a tool call the same history
+    # carries. Chat: an assistant's `tool_calls` and a `tool` message's `tool_call_id`. Messages:
+    # `tool_use` and `tool_result` blocks. Responses: `*_call` items and `*_call_output` items by
+    # `call_id` (function, custom and shell tools alike).
+    call_ids, result_ids = set(), []
+    for m in msgs if isinstance(msgs, list) else []:
+        if not isinstance(m, dict):
+            continue
+        for tc in m.get("tool_calls") or [] if m.get("role") == "assistant" else []:
+            if isinstance(tc, dict):
+                call_ids.add(tc.get("id"))
+        if m.get("role") == "tool":
+            result_ids.append(m.get("tool_call_id"))
+        t = m.get("type")
+        if isinstance(t, str) and t.endswith("_call_output"):
+            result_ids.append(m.get("call_id"))
+        elif isinstance(t, str) and t.endswith("_call") and m.get("call_id"):
+            call_ids.add(m.get("call_id"))
+        for b in m.get("content") if isinstance(m.get("content"), list) else []:
+            if isinstance(b, dict) and b.get("type") == "tool_use":
+                call_ids.add(b.get("id"))
+            elif isinstance(b, dict) and b.get("type") == "tool_result":
+                result_ids.append(b.get("tool_use_id"))
+    call_ids.discard(None)
+    out["tool_round_trips"] = sum(1 for r in result_ids if r in call_ids)
     # Only the last message asks for the summary: a summary kept in the history afterwards may
     # quote the prompt (gpt-5-mini's do), and that turn isn't a compaction.
     # (Claude Code can follow it with a role "system" note, so: the last user message.)
@@ -1136,7 +1161,7 @@ def mcp_session(harness):
 #
 # | scenario | what the harness does                                                      | claims |
 # | -------- | -------------------------------------------------------------------------- | ------ |
-# | task     | harness.py's fixture task (fix calc.py)                                     | R1, E3 |
+# | task     | harness.py's fixture task (fix calc.py)                                     | R1, E3, T1 |
 # | big      | the task, and its requests are over 64 KiB (Claude Code's always are)       | R5     |
 # | pin      | the task on a two-provider row: one provider every turn, cache read from turn 2 | R4 |
 # | cache    | the task, no `cache_control` in any request, cache read from turn 2         | K1     |
@@ -1147,9 +1172,10 @@ def mcp_session(harness):
 # | abort    | Claude Code interrupted (SIGINT) mid-stream: that call is billed an estimate | B2    |
 # | byo      | Claude Code with the managed key, a forged one (401, nothing billed), and the provider's own key through /anthropic (served, no row) | A1 |
 #
-# Claims that hold the client's usage to the ledger (E1, E2, B3) get each served call's usage as the
-# client saw it on the wire (`UsageScan`) as `usage`, which `recorded_problems` compares with the
-# row: input, output and cache reads. With S2, every turn after the first must replay the history
+# Claims that hold the client's usage to the ledger (E1, E2, B3, B1) get each served call's usage as
+# the client saw it on the wire (`UsageScan`) as `usage`, which `recorded_problems` compares with
+# the row: input, output and cache reads. With T1, a served turn must replay one of the agent's tool
+# calls with its result (`tool_round_trips`), and no turn feeding a result back may be refused. With S2, every turn after the first must replay the history
 # the harness accumulated from its streamed answers (only known roles, no assistant message that
 # lost both its text and its tool calls), and be accepted.
 
@@ -1178,12 +1204,24 @@ ROLES = {"system", "developer", "user", "assistant", "tool"}
 
 def cell(spec):
     ok, calls, detail, extra = cell_session(spec)
-    if CLAIMS & {"E1", "E2", "B3"}:
+    if CLAIMS & {"E1", "E2", "B3", "B1"}:
         for c in served(calls):
             if c.get("seen_usage") is None:
                 ok, detail["why"] = False, f"no usage found in the response to {c.get('request_id')}"
             else:
                 c["usage"] = c["seen_usage"]
+    if "T1" in CLAIMS:
+        # The agent's tool calls went out through the gateway and came back: a later turn replays
+        # a call with its result (ids paired), the gateway served that turn, no turn carrying a
+        # result was refused, and the task's outcome (the fixture test passes) needed the results.
+        done = served(calls)
+        trips = [c.get("tool_round_trips") or 0 for c in done]
+        refused = [c.get("request_id") for c in calls
+                   if billed(c) and (c.get("status") or 0) >= 400 and c.get("tool_round_trips")]
+        detail["t1"] = {"round_trips_per_turn": trips, "refused": refused}
+        if not any(trips) or refused:
+            ok, detail["why"] = False, ("T1: no served turn replayed a tool call with its result"
+                                        if not any(trips) else "T1: a turn feeding a tool result back was refused")
     if "S2" in CLAIMS:
         done = served(calls)
         later = done[1:]

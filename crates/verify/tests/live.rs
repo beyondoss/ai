@@ -297,6 +297,8 @@ const CELLS: &[Cell] = &[
     ("T6",                "ai-sdk",        Runtime::Node,   "ai_sdk_error",     CLAUDE_GPT, ""),
     ("K1",                "openai-node",   Runtime::Node,   "auto_cache",       &[CLAUDE], ""),
     ("K1",                "ai-sdk",        Runtime::Node,   "ai_sdk_cache",     &[CLAUDE], ""),
+    ("T1+B1",             "openai-node",   Runtime::Node,   "tools_chat",       GEN,      "R1"),
+    ("T1+B1",             "anthropic-ts",  Runtime::Node,   "tools_messages",   GEN,      "R1"),
     // Coding agents fixing a failing test in a fixture repo (W*). pi runs once per API mode; pi
     // and opencode take models only from config, generated from /v1/models. Codex's GPT row is a
     // Codex-native one (D74 kept it off the Chat-first GPT row).
@@ -353,12 +355,18 @@ const CELLS: &[Cell] = &[
     ("B2",                "claude-code",   Runtime::Recorded, "claude-code+abort", &[CLAUDE], ""),
     ("A1",                "claude-code",   Runtime::Recorded, "claude-code+byo", &[CLAUDE], ""),
     // Chat Completions from the coding agents that speak it (E1), each call's usage as the harness
-    // saw it on the wire held to its row; opencode's turns replay the history it accumulated from
-    // its streamed answers (S2, on the rows whose Chat stream the gateway builds or OpenRouter
-    // sends, not OpenAI's own).
-    ("E1+S2",             "opencode",      Runtime::Recorded, "opencode+task",  &[CLAUDE, OPENROUTER], ""),
-    ("E1",                "opencode",      Runtime::Recorded, "opencode+task",  &[GPT],    ""),
-    ("E1",                "pi",            Runtime::Recorded, "pi:chat+task",   SESSION,  ""),
+    // saw it on the wire held to its row (E1, B1); opencode's turns replay the history it
+    // accumulated from its streamed answers (S2, on the rows whose Chat stream the gateway builds
+    // or OpenRouter sends, not OpenAI's own). Each fixes the fixture through its own tool loop: a
+    // served turn must feed a tool call's result back (T1), relayed on GPT and OpenRouter,
+    // translated to Messages on Claude.
+    ("E1+S2+T1+B1",       "opencode",      Runtime::Recorded, "opencode+task",  &[CLAUDE, OPENROUTER], ""),
+    ("E1+T1+B1",          "opencode",      Runtime::Recorded, "opencode+task",  &[GPT],    ""),
+    ("E1+T1+B1",          "pi",            Runtime::Recorded, "pi:chat+task",   SESSION,  ""),
+    // The same tool loop and per-call usage from Claude Code (Messages: native on Claude, translated
+    // to Chat on GPT) and Codex (Responses: native on its own row, translated to Messages on Claude).
+    ("T1+B1",             "claude-code",   Runtime::Recorded, "claude-code+task", CLAUDE_GPT, ""),
+    ("T1+B1",             "codex",         Runtime::Recorded, "codex+task",     &[CODEX, CLAUDE], ""),
     // T3: pi attaches an image on each of its three wires, native and translated.
     ("T3",                "pi",            Runtime::Recorded, "pi:chat+vision", CLAUDE_GPT, ""),
     ("T3",                "pi",            Runtime::Recorded, "pi:messages+vision", CLAUDE_GPT, ""),
@@ -986,7 +994,7 @@ fn recorded_problems(verdict: &Value, log: &Path, route: Route) -> Vec<String> {
             problems.push(format!("{label}: a completed call billed as an estimate"));
         }
         // The usage the harness was shown on the wire, where the cell's claims hold it to the
-        // ledger (E1, E2, B3).
+        // ledger (E1, E2, B3, B1).
         if let Some(u) = call["usage"].as_object() {
             problems.extend(usage_problems(&label, u, row));
         }
