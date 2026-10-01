@@ -125,7 +125,8 @@ Client (stock OpenAI/Anthropic SDK)
   │    own catalog path for a catalog walk (`/auto`, managed `/v1`)
   │  OpenRouter + managed only: dashboard-attribution headers (HTTP-Referer, X-OpenRouter-*)
   │
-  ▼  request_body_filter (proxy.rs)  — streamed through, except where a rewrite needs the whole body
+  ▼  request_body_filter (proxy.rs)  — streamed through, except where a rewrite or a refusal check
+  │    needs the whole body
   │  Enforce running size cap (chunked-safe) ──────────────────── 413
   │  Capturing: copy chunk into the head-bounded request buffer — PRE-rewrite, so the
   │    capture is what the client sent, not what we spliced (never withheld)
@@ -135,6 +136,8 @@ Client (stock OpenAI/Anthropic SDK)
   │    buffer full body → ONE fused walk (peek::scan_buffered) yielding `model`, its byte
   │    span, and the splice offset → inject stream_options.include_usage → re-frame chunked
   │    (a client-sent stream_options is rewritten to include_usage:true, never left off)
+  │  Managed /{provider}/…/responses: buffered (same body budget); root `background: true`
+  │    ─────── 400, aborted before the last byte goes upstream (D202). BYO streams through.
   │  Model-routed: a client body with two root `model` keys (any spelling) ─────── 400
   │  Model-routed: same buffer, and `model` is spliced to the serving candidate's own id
   │    (rewrite first — the injection offset precedes the value, so it cannot move)
