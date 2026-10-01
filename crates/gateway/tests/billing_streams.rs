@@ -268,7 +268,7 @@ async fn duplicate_or_escaped_stream_options_cannot_turn_off_exact_metering() {
     let bodies = [
         r#"{"model":"gpt-4o","stream":true,"stream_options":{"include_usage":true},"stream_options":{"include_usage":false},"messages":[{"role":"user","content":"hi"}]}"#,
         r#"{"model":"gpt-4o","stream":true,"stream_options":{"include_usage":false},"messages":[{"role":"user","content":"hi"}],"stream_options":{"include_usage":false}}"#,
-        r#"{"model":"gpt-4o","stream":true,"stream_options":{"include_usage":false},"messages":[{"role":"user","content":"hi"}]}"#,
+        r#"{"model":"gpt-4o","stream":true,"stream\u005foptions":{"include_usage":false},"messages":[{"role":"user","content":"hi"}]}"#,
     ];
     for body in bodies {
         let (status, text) = post(url.clone(), &key, body, &[]).await;
