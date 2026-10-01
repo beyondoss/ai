@@ -1096,9 +1096,9 @@ confidence = "high"
 evidence = "live cell W2::codex::claude::codex after the D75 fix: Anthropic 400 on tools.12 (Codex's web_search). Reproduced hermetically: translate::request_tests::codex_web_search_maps_onto_anthropic_or_is_dropped (the hosted web_search tool reaches claude-haiku-4-5, Bedrock and grok verbatim) and translate::response_tests::claude_web_search_comes_back_as_a_web_search_call (server_tool_use / web_search_tool_result blocks vanish from the Responses output, stream and non-stream)."
 claims = ["W2", "TRN-21"]
 state = "fixed"
-test = "claude_web_search_comes_back_as_a_web_search_call"
-fix = "e113861"
-note = "Proposed: map Responses' hosted web_search onto Anthropic's server tool (web_search_20250305) and its result blocks back onto web_search_call items; billed via server_tool_calls (D24). Fixed as proposed on Anthropic's own API (allowed_domains and an approximate user_location carried over); dropped on Bedrock (no web search) and on every Chat Completions host. server_tool_use + web_search_tool_result come back as one web_search_call item (action search + query; completed or failed), non-stream and stream (output_item.added, web_search_call.in_progress/searching/completed, output_item.done). Billed from usage.server_tool_use.web_search_requests. Also tested by translate::request_tests::codex_web_search_maps_onto_anthropic_or_is_dropped."
+test = "hosted_web_search_is_dropped_leaving_responses_unless_chosen"
+fix = "32fa772"
+note = "Proposed: map Responses' hosted web_search onto Anthropic's server tool (web_search_20250305) and its result blocks back onto web_search_call items; billed via server_tool_calls (D24). Fixed in 32fa772 by a documented drop, not a translation. Codex 0.1x sends {\"type\":\"web_search\",\"external_web_access\":false} on every request (captured 2026-10-01): its default cached mode, OpenAI's own index, which no other provider has. The hosted search is the model's to use or not and the client runs nothing for it, so leaving Responses it is now dropped unless tool_choice names it (then forwarded for the provider to reject). Anthropic's server web_search was rejected as a stand-in: it always fetches the live web (what Codex's default opts out of), bills per search, and a Claude row's OpenRouter and Bedrock candidates would each need their own spelling, so failover would change what the tool does. E2E: codex_runs_on_a_claude_row_without_its_hosted_web_search. Live re-run 2026-10-01: W2+TRN-24::codex::claude::codex and ::openrouter::codex pass. Superseded (integration): a parallel fix mapped the tool onto web_search_20250305 and back; it was dropped for the semantic and billing change above."
 
 [[defect]]
 id = "D79"
@@ -1110,9 +1110,9 @@ confidence = "high"
 evidence = "live cell W4::pi::openrouter::pi:responses (pi Responses mode, thinking off, OpenRouter claude-sonnet-4); predates D77. Reproduced hermetically: translate::request_tests::replayed_thinking_leaves_the_final_assistant_turn_when_thinking_is_off: a Responses replay of gateway-minted reasoning with no reasoning requested reaches claude-haiku-4-5 (Anthropic and Bedrock spellings) with a signed thinking block in the final assistant turn, and OpenRouter claude-sonnet-4 with reasoning_details on it."
 claims = ["TRN-7", "W4"]
 state = "fixed"
-test = "replayed_thinking_leaves_the_final_assistant_turn_when_thinking_is_off"
-fix = "3c3cd88"
-note = "Proposed: when the outgoing request has thinking/reasoning off, strip thinking/reasoning blocks from the final assistant turn (Anthropic's rule), on every path to a Claude model. Fixed: the final assistant message (the last one when only tool results follow it) loses thinking / redacted_thinking blocks onto Messages (Anthropic, Bedrock) when thinking is disabled or omitted on a model that then runs without it (Claude 4.x and older), and loses reasoning_details and the thinking list onto a Claude model behind Chat Completions when no reasoning key asks for it, same wire and translated. Earlier turns keep theirs."
+test = "replayed_thinking_is_dropped_when_thinking_is_off"
+fix = "32fa772"
+note = "Proposed: when the outgoing request has thinking/reasoning off, strip thinking/reasoning blocks from the final assistant turn (Anthropic's rule), on every path to a Claude model. Fixed in 32fa772. Measured direct on OpenRouter claude-sonnet-4 (Bedrock): the 400 fires for the last tool-call assistant turn and for the first call of a two-round tool loop (pi's live failure was messages.1 a round later); a turn answered by a new user message is accepted; Anthropic's own API accepts all of these. A request that does not think (no reasoning key onto Chat for a Claude model, translated and same-wire; thinking disabled or omitted before 4.7, onto Messages) now drops the thinking its assistant messages carry, rather than guessing the turn boundary. Adaptive-generation models keep theirs. E2E: a_replayed_thinking_turn_without_thinking_on_reaches_openrouter_without_it. Live re-run 2026-10-01: all nine W4::pi cells pass, W4::pi::openrouter::pi:responses included. Superseded (integration): a parallel final-assistant-message-only fix still 400ed on Bedrock and was dropped."
 
 [[defect]]
 id = "D80"
@@ -1420,7 +1420,7 @@ claims = ["TRN-15"]
 state = "fixed"
 test = "explicit_nulls_are_omitted_on_a_same_wire_chat_relay_to_openrouter"
 fix = "572d763"
-note = "Found by live cells TRN-15::openai-py::openrouter::explicit_nulls and TRN-15::openai-py::failover::explicit_nulls. Fixed: a same-wire Chat Completions relay to a non-OpenAI host drops every root member whose value is null, by span (peek::remove_root_nulls, one memmem gate); nested values and every other byte are the client's."
+note = "Found by live cells TRN-15::openai-py::openrouter::explicit_nulls and TRN-15::openai-py::failover::explicit_nulls. Fixed: a same-wire Chat Completions relay to a non-OpenAI host drops every root member whose value is null, by span (peek::remove_root_nulls, one memmem gate); nested values and every other byte are the client's. Also held by a_null_user_is_not_relayed_to_openrouter and peek::tests::remove_root_nulls_removes_only_root_nulls. Live re-run 2026-10-01 (on the user-only variant): TRN-15::openai-py::{openrouter,failover,claude,gpt,bedrock}::explicit_nulls pass. Superseded (integration): a parallel fix removed only a root user: null via a scan_buffered field; the general rule was kept."
 
 [[defect]]
 id = "D102"
@@ -1434,7 +1434,7 @@ claims = ["TRN-15"]
 state = "fixed"
 test = "null_instructions_are_absent_on_chat"
 fix = "d71b6bc"
-note = "Found by live cells TRN-15::openai-py::xai::explicit_nulls and TRN-15::openai-py::together::explicit_nulls. Fixed: responses_req_to_openai treats instructions: null as absent (no system message), as copy_if treats other nulls."
+note = "Found by live cells TRN-15::openai-py::xai::explicit_nulls and TRN-15::openai-py::together::explicit_nulls. Fixed: responses_req_to_openai treats instructions: null as absent (no system message), as copy_if treats other nulls. Also held by null_instructions_add_no_system_message. Live re-run 2026-10-01: TRN-15::openai-py::xai::explicit_nulls and ::together::explicit_nulls pass."
 
 [[defect]]
 id = "D103"
