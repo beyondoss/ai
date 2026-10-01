@@ -121,7 +121,8 @@ that provider's pool key, sends a fixed batch through it (non-stream and stream,
 pairing, a ~3k-token system prompt reused so cache writes and reads occur, and Responses on
 OpenAI), and sums the batch's `ai.usage` rows, normalized by `usage_wire`. It then reads the
 provider's organization usage report for the same minutes, filtered to the pool key's id and the
-batch's model (`gpt-4.1-nano`, `claude-sonnet-4-5`). It runs in verify:live's isolated phase (see
+batch's model (`gpt-4.1-mini`, `claude-sonnet-5-5`; a report row matches the model or a dated
+snapshot of it, never another model it prefixes). It runs in verify:live's isolated phase (see
 [One live run, one proof](#one-live-run-one-proof)), so no other request is in those minutes. It
 passes only when uncached input, cache reads, cache writes and output agree exactly (and the request
 count, where OpenAI reports one). So it proves that every token the provider charged our key for is
@@ -194,7 +195,8 @@ Chat stream, OpenRouter's repeated `delta.role` (dropped by `ChatIdentity`), and
 visibility (a Chat `reasoning_content`, a Responses `reasoning` item and its summary events), which
 varies even between two direct calls, as does whether an OpenAI reasoning model that did no
 reasoning (zero reasoning tokens on both answers) emits an empty `reasoning` output item (5 direct
-calls of 120 of one gpt-5-mini body came back without it). A run costs about $0.30; it prints an
+calls of 120 of one gpt-5-mini body came back without it). The GPT paths run on gpt-5.1, sent
+effort `none` (its lowest) where a case asks for no reasoning. A run costs about $0.30; it prints an
 estimate first and the measured cost last.
 
 ```sh
@@ -222,9 +224,12 @@ capability the card lists. It also fails when the vendor's deprecation page (Ant
 Together; for an OpenRouter slug, its maker's) retires the id, or a dated snapshot of it, without a
 `[[retired]]` entry in `catalog_truth.toml`, or when a recorded retirement is due. So a
 retirement shows up as a red cell, not a customer 404. `CAT-16::raw::{anthropic,openai,xai}::new-models`
-fails on a model those vendors list in a family the catalog carries (Claude; GPT and the
-o-series; Grok; text generation, aliases not dated snapshots) that is neither a row nor recorded
-in `[[not_carried]]` with a reason, so a release is a visible gap. Together and OpenRouter list
+fails on any model those vendors list (xAI's `/v1/models`, image and video models included) in a
+family the catalog carries (Claude; GPT, `chatgpt-` and `chat-latest`, and the o-series; Grok)
+that is not a row, a vendor-listed alias of a row, a dated snapshot of one, or recorded in
+`[[not_carried]]` (with a reason) or `[[retired]]`, so a release is a visible gap. Nothing in a
+family is skipped by name or modality: an audio, realtime, image or video model is recorded in
+`[[not_carried]]` one by one, saying which endpoint it needs that the gateway doesn't serve. Together and OpenRouter list
 hundreds of models, so their gaps are a report, not a failure: `VERIFY_CATALOG_GAPS=1` prints recent
 models in the namespaces the catalog carries that are not in it (`mise run verify:catalog` prints
 it last). The hermetic `no_catalog_row_outlives_its_retirement` fails on the day a recorded
@@ -308,8 +313,8 @@ billed for a refusal, and no row without a call.
   down so auto-compaction happens mid-session. The trial checks that the repo's tests pass, that
   compaction shows in both the harness's events and on the wire, and that the ledger is complete.
   Two sessions reconcile against the provider's usage report (the BIL-5 method): pi on
-  `claude-sonnet-5` and Claude Code (translated) on `gpt-5`. Where the provider's admin key is
-  set they claim BIL-5 too (`LNG-1+BIL-5::claude-code::gpt-5::long_task_uncompacted`,
+  `claude-sonnet-5` and Claude Code (translated) on `gpt-5.1`. Where the provider's admin key is
+  set they claim BIL-5 too (`LNG-1+BIL-5::claude-code::gpt-5.1::long_task_uncompacted`,
   `LNG-1+LNG-2+BIL-5::pi::claude-sonnet-5::long_task_messages`), which runs them in verify:live's
   isolated phase.
 - LNG-2: the per-turn cache share (`cache_read / input_total`) over the same sessions, plus

@@ -52,8 +52,10 @@
 #
 # `[[not_carried]]` records a first-party model, in a family the catalog carries, that is
 # deliberately not a row, with the reason. `CAT-16::raw::{anthropic,openai,xai}::new-models`
-# fails on a vendor-listed model in a carried family that is neither a row nor recorded here, so a
-# new release surfaces as a visible gap.
+# fails on a vendor-listed model in a carried family that is not a row, a vendor-listed alias or
+# dated snapshot of one, nor recorded here or in `[[retired]]`, so a new release surfaces as a
+# visible gap. No model is skipped by name or modality: audio, realtime, image and video models
+# are recorded here one by one, with the endpoint they need that the gateway doesn't serve.
 #
 # `[[schema_unenforced]]` records a candidate that accepts a JSON-schema output request
 # (`response_format` `json_schema`, `strict: true`) and answers outside the schema, with the
@@ -270,7 +272,10 @@ max_output_tokens = 128_000
 
 [[row]]
 model = "deepseek-flash"
-source = ["https://api-docs.deepseek.com/quick_start/pricing"]
+source = [
+  "https://api-docs.deepseek.com/quick_start/pricing",
+  "https://docs.together.ai/docs/serverless/models",
+]
 date = "2026-10-01"
 input = "0.30"
 output = "1.20"
@@ -278,7 +283,7 @@ cache_read = "0.006"
 context_window = 1_048_576
 max_output_tokens = 384_000
 input_present = ["image"]
-note = "DeepSeek-V4.1-Flash. Vision supported. Off-peak $0.15 / $0.003 / $0.60."
+note = "DeepSeek-V4.1-Flash. Vision supported. Off-peak $0.15 / $0.003 / $0.60. Together serves the same model serverless as deepseek-ai/DeepSeek-V4.1-Flash (its serverless table; /v1/models type chat, 1,048,576 context, $0.30 / $1.20 / cached $0.006, DeepSeek's peak rate) and read an image (codeword.png, 2026-10-01). OpenRouter's listing (GET /api/v1/models/deepseek/deepseek-v4.1-flash/endpoints) names Hugging Face id deepseek-ai/DeepSeek-V4.1-Flash, input text and image."
 
 [[row]]
 model = "deepseek-v4-pro"
@@ -293,7 +298,7 @@ cache_read = "0.044"
 context_window = 1_048_576
 max_output_tokens = 384_000
 input_absent = ["image"]
-note = "DeepSeek-V4-Pro-0813. \"Vision: Not supported\". Off-peak $0.66 / $0.022 / $1.98. Together serves the same snapshot as deepseek-ai/DeepSeek-V4-Pro-0813."
+note = "DeepSeek-V4-Pro-0813. \"Vision: Not supported\". Off-peak $0.66 / $0.022 / $1.98. Together serves the same snapshot as deepseek-ai/DeepSeek-V4-Pro-0813. So does OpenRouter's deepseek/deepseek-v4-pro-0813 (GET /api/v1/models/deepseek/deepseek-v4-pro-0813/endpoints: \"DeepSeek V4 Pro 0813 ... the GA release of DeepSeek V4 Pro\", Hugging Face id deepseek-ai/DeepSeek-V4-Pro-0813, input text only, 1,048,576 context, 21 endpoints, DeepSeek's own among them, 2026-10-01); its bare deepseek/deepseek-v4-pro is the 0423 snapshot."
 
 [[row]]
 model = "gpt-4"
@@ -1661,6 +1666,286 @@ id = "thinkingmachines/inkling-small"
 source = "https://docs.together.ai/docs/deprecations"
 date = "2026-10-01"
 reason = "Together, its serverless host, deprecated it 2026-09-15; OpenRouter's only host is DeepInfra, and the maker sells no API."
+
+[[retired]]
+provider = "openai"
+id = "gpt-5-chat-latest"
+source = "https://developers.openai.com/api/docs/deprecations"
+retired = "2026-07-23"
+note = "\"GPT-5 Chat points to the GPT-5 snapshot previously used in ChatGPT.\" Shut down 2026-07-23 (replacement gpt-5.6-sol); still in OpenAI's /v1/models listing. A text model (Chat Completions and Responses), never a row."
+
+[[retired]]
+provider = "openai"
+id = "gpt-5.1-chat-latest"
+source = "https://developers.openai.com/api/docs/deprecations"
+retired = "2026-07-23"
+note = "ChatGPT's GPT-5.1 Instant on the API. Shut down 2026-07-23 (replacement gpt-5.6-sol); still listed. Never a row."
+
+[[retired]]
+provider = "openai"
+id = "gpt-5.2-chat-latest"
+source = "https://developers.openai.com/api/docs/deprecations"
+retired = "2026-08-10"
+note = "\"2026-05-08: gpt-5.2-chat-latest and gpt-5.3-chat-latest model snapshots\": shut down 2026-08-10 (replacement gpt-5.6-sol); still listed. Never a row (the OpenRouter-only gpt-5.2-chat row went 2026-09-30)."
+
+[[retired]]
+provider = "openai"
+id = "gpt-5.3-chat-latest"
+source = "https://developers.openai.com/api/docs/deprecations"
+retired = "2026-08-10"
+note = "Shut down 2026-08-10 (replacement gpt-5.6-sol); its model page says \"This model has been deprecated\". Still listed. Never a row."
+
+[[retired]]
+provider = "openai"
+id = "gpt-3.5-turbo-instruct"
+source = "https://developers.openai.com/api/docs/deprecations"
+retired = "2026-09-28"
+note = "Legacy Completions model (gpt-3.5-turbo-instruct-0914 is its snapshot): shut down 2026-09-28 (replacement gpt-5.6-terra); still listed. Never a row: the gateway serves no /v1/completions."
+
+[[retired]]
+provider = "openai"
+id = "gpt-4o-search-preview"
+source = "https://developers.openai.com/api/docs/deprecations"
+retired = "2026-07-23"
+note = "Its default and only snapshot, gpt-4o-search-preview-2025-03-11, shut down 2026-07-23 (replacement gpt-5.6-terra); the alias is still listed. Never a row."
+
+[[retired]]
+provider = "openai"
+id = "gpt-4o-mini-search-preview"
+source = "https://developers.openai.com/api/docs/deprecations"
+retired = "2026-07-23"
+note = "Its only snapshot, gpt-4o-mini-search-preview-2025-03-11, shut down 2026-07-23 (replacement gpt-5.6-terra); the alias is still listed. Never a row."
+
+[[not_carried]]
+provider = "openai"
+id = "chat-latest"
+source = "https://developers.openai.com/api/docs/models/chat-latest"
+date = "2026-10-01"
+reason = "Moving alias: \"points to the latest Instant model currently used in ChatGPT ... The underlying model snapshot will be regularly updated\" ($5 / $30). A row's card and price would describe whatever ChatGPT runs that week, with no dated snapshot to pin; OpenAI recommends gpt-6-astra (carried) for API use."
+
+[[not_carried]]
+provider = "openai"
+id = "gpt-5-search-api"
+source = "https://developers.openai.com/api/docs/pricing"
+date = "2026-10-01"
+reason = "Search model ($1.25 / $10 tokens, \"Search\" in the pricing table): every web search it runs is billed per call on top of tokens ($10 / 1k calls), which a per-token card cannot list and the ledger does not meter on OpenAI. gpt-5-search-api-2025-10-14 is its snapshot."
+
+[[not_carried]]
+provider = "openai"
+id = "gpt-live-1"
+source = "https://developers.openai.com/api/docs/models/gpt-live-1"
+date = "2026-10-01"
+reason = "Full-duplex voice model, served only at v1/live/sessions (Chat Completions, Responses and Realtime: \"Not supported\"), billed $0.05 per session minute. The gateway serves Chat Completions, Responses, Messages and embeddings only."
+
+[[not_carried]]
+provider = "openai"
+id = "gpt-live-transcribe"
+source = "https://developers.openai.com/api/docs/models/gpt-live-transcribe"
+date = "2026-10-01"
+reason = "Speech-to-text, served only at v1/realtime/transcription_sessions. The gateway serves Chat Completions, Responses, Messages and embeddings only."
+
+[[not_carried]]
+provider = "openai"
+id = "gpt-transcribe"
+source = "https://developers.openai.com/api/docs/models/gpt-transcribe"
+date = "2026-10-01"
+reason = "Speech-to-text at v1/audio/transcriptions and v1/realtime/transcription_sessions. The gateway serves Chat Completions, Responses, Messages and embeddings only."
+
+[[not_carried]]
+provider = "openai"
+id = "gpt-4o-transcribe"
+source = "https://developers.openai.com/api/docs/deprecations"
+date = "2026-10-01"
+reason = "Speech-to-text at v1/audio/transcriptions; shuts down 2027-02-26 (replacement gpt-transcribe). The gateway serves Chat Completions, Responses, Messages and embeddings only."
+
+[[not_carried]]
+provider = "openai"
+id = "gpt-4o-mini-transcribe"
+source = "https://developers.openai.com/api/docs/deprecations"
+date = "2026-10-01"
+reason = "Speech-to-text at v1/audio/transcriptions (snapshots -2025-03-20, shutting down 2027-01-20, and -2025-12-15); shuts down 2027-02-26. The gateway serves Chat Completions, Responses, Messages and embeddings only."
+
+[[not_carried]]
+provider = "openai"
+id = "gpt-4o-transcribe-diarize"
+source = "https://developers.openai.com/api/docs/deprecations"
+date = "2026-10-01"
+reason = "Speech-to-text with diarization at v1/audio/transcriptions; shuts down 2027-02-26. The gateway serves Chat Completions, Responses, Messages and embeddings only."
+
+[[not_carried]]
+provider = "openai"
+id = "gpt-4o-mini-tts"
+source = "https://developers.openai.com/api/docs/models/gpt-4o-mini-tts"
+date = "2026-10-01"
+reason = "Text-to-speech at v1/audio/speech (snapshots -2025-03-20 and -2025-12-15). The gateway serves Chat Completions, Responses, Messages and embeddings only."
+
+[[not_carried]]
+provider = "openai"
+id = "gpt-audio"
+source = "https://developers.openai.com/api/docs/deprecations"
+date = "2026-10-01"
+reason = "Audio in and out on Chat Completions (\"For audio inputs and outputs with Chat Completions API\"); its audio tokens have their own rates, which a card and the ledger do not carry. Shuts down 2027-01-20 (replacement gpt-audio-1.5); gpt-audio-2025-08-28 is its snapshot."
+
+[[not_carried]]
+provider = "openai"
+id = "gpt-audio-1.5"
+source = "https://developers.openai.com/api/docs/models/gpt-audio-1.5"
+date = "2026-10-01"
+reason = "Audio in and out on Chat Completions; audio tokens have their own rates, which a card and the ledger do not carry."
+
+[[not_carried]]
+provider = "openai"
+id = "gpt-audio-mini"
+source = "https://developers.openai.com/api/docs/deprecations"
+date = "2026-10-01"
+reason = "Audio in and out on Chat Completions; audio tokens have their own rates, which a card and the ledger do not carry. Shuts down 2027-01-20 (replacement gpt-audio-1.5); -2025-10-06 shut down 2026-07-23, -2025-12-15 is listed."
+
+[[not_carried]]
+provider = "openai"
+id = "gpt-realtime"
+source = "https://developers.openai.com/api/docs/deprecations"
+date = "2026-10-01"
+reason = "Realtime API (v1/realtime, speech in and out); shuts down 2027-01-20 (replacement gpt-realtime-2.1); gpt-realtime-2025-08-28 is its snapshot. The gateway serves Chat Completions, Responses, Messages and embeddings only."
+
+[[not_carried]]
+provider = "openai"
+id = "gpt-realtime-1.5"
+source = "https://developers.openai.com/api/docs/models/gpt-realtime-2.1"
+date = "2026-10-01"
+reason = "Realtime API (v1/realtime) only. The gateway serves Chat Completions, Responses, Messages and embeddings only."
+
+[[not_carried]]
+provider = "openai"
+id = "gpt-realtime-2"
+source = "https://developers.openai.com/api/docs/models/gpt-realtime-2"
+date = "2026-10-01"
+reason = "Realtime API (v1/realtime) only. The gateway serves Chat Completions, Responses, Messages and embeddings only."
+
+[[not_carried]]
+provider = "openai"
+id = "gpt-realtime-2.1"
+source = "https://developers.openai.com/api/docs/models/gpt-realtime-2.1"
+date = "2026-10-01"
+reason = "Realtime API (v1/realtime) only: \"Realtime | v1/realtime | Supported\", every other endpoint not. The gateway serves Chat Completions, Responses, Messages and embeddings only."
+
+[[not_carried]]
+provider = "openai"
+id = "gpt-realtime-2.1-mini"
+source = "https://developers.openai.com/api/docs/models/gpt-realtime-2.1"
+date = "2026-10-01"
+reason = "Realtime API (v1/realtime) only. The gateway serves Chat Completions, Responses, Messages and embeddings only."
+
+[[not_carried]]
+provider = "openai"
+id = "gpt-realtime-mini"
+source = "https://developers.openai.com/api/docs/deprecations"
+date = "2026-10-01"
+reason = "Realtime API (v1/realtime); shuts down 2027-01-20 (replacement gpt-realtime-2.1-mini); -2025-12-15 is its listed snapshot. The gateway serves Chat Completions, Responses, Messages and embeddings only."
+
+[[not_carried]]
+provider = "openai"
+id = "gpt-realtime-translate"
+source = "https://developers.openai.com/api/docs/models/gpt-realtime-translate"
+date = "2026-10-01"
+reason = "Speech-to-speech translation at v1/realtime/translations only. The gateway serves Chat Completions, Responses, Messages and embeddings only."
+
+[[not_carried]]
+provider = "openai"
+id = "gpt-realtime-whisper"
+source = "https://developers.openai.com/api/docs/models/gpt-realtime-whisper"
+date = "2026-10-01"
+reason = "Speech-to-text at v1/realtime/transcription_sessions only. The gateway serves Chat Completions, Responses, Messages and embeddings only."
+
+[[not_carried]]
+provider = "openai"
+id = "gpt-image-1"
+source = "https://developers.openai.com/api/docs/deprecations"
+date = "2026-10-01"
+reason = "Image generation (v1/images/generations and edits); shuts down 2026-10-23. The gateway serves Chat Completions, Responses, Messages and embeddings only."
+
+[[not_carried]]
+provider = "openai"
+id = "gpt-image-1-mini"
+source = "https://developers.openai.com/api/docs/deprecations"
+date = "2026-10-01"
+reason = "Image generation; shuts down 2026-12-01 (replacement gpt-image-2.5-sunburst or -flare). The gateway serves Chat Completions, Responses, Messages and embeddings only."
+
+[[not_carried]]
+provider = "openai"
+id = "gpt-image-1.5"
+source = "https://developers.openai.com/api/docs/deprecations"
+date = "2026-10-01"
+reason = "Image generation; shuts down 2026-12-01. The gateway serves Chat Completions, Responses, Messages and embeddings only."
+
+[[not_carried]]
+provider = "openai"
+id = "gpt-image-2"
+source = "https://developers.openai.com/api/docs/models/gpt-image-2"
+date = "2026-10-01"
+reason = "Image generation (v1/images/generations and edits); gpt-image-2-2026-04-21 is its snapshot. The gateway serves Chat Completions, Responses, Messages and embeddings only."
+
+[[not_carried]]
+provider = "openai"
+id = "gpt-image-2.5-flare"
+source = "https://developers.openai.com/api/docs/models/gpt-image-2.5-flare"
+date = "2026-10-01"
+reason = "Image generation (\"Output modalities: image\"; v1/images/generations and edits); -2026-09-08 is its snapshot. The gateway serves Chat Completions, Responses, Messages and embeddings only."
+
+[[not_carried]]
+provider = "openai"
+id = "gpt-image-2.5-sunburst"
+source = "https://developers.openai.com/api/docs/models/gpt-image-2.5-flare"
+date = "2026-10-01"
+reason = "Image generation, gpt-image-2.5-flare's sibling; -2026-09-08 is its snapshot. The gateway serves Chat Completions, Responses, Messages and embeddings only."
+
+[[not_carried]]
+provider = "openai"
+id = "chatgpt-image-latest"
+source = "https://developers.openai.com/api/docs/models/chatgpt-image-latest"
+date = "2026-10-01"
+reason = "\"Previous image model used in ChatGPT\": image generation, a moving alias; shuts down 2026-12-01. The gateway serves Chat Completions, Responses, Messages and embeddings only."
+
+[[not_carried]]
+provider = "xai"
+id = "grok-imagine-image"
+source = "https://api.x.ai/v1/image-generation-models"
+date = "2026-10-01"
+reason = "Image generation (output modalities [\"image\"]; billed per image), listed by /v1/models beside the language models. The gateway serves Chat Completions, Responses, Messages and embeddings only."
+
+[[not_carried]]
+provider = "xai"
+id = "grok-imagine-image-2.0"
+source = "https://api.x.ai/v1/image-generation-models"
+date = "2026-10-01"
+reason = "Image generation (output [\"image\"], priced per image by quality and resolution). The gateway serves Chat Completions, Responses, Messages and embeddings only."
+
+[[not_carried]]
+provider = "xai"
+id = "grok-imagine-image-quality"
+source = "https://api.x.ai/v1/image-generation-models"
+date = "2026-10-01"
+reason = "Image generation (output [\"image\"]; alias grok-imagine-image-pro). The gateway serves Chat Completions, Responses, Messages and embeddings only."
+
+[[not_carried]]
+provider = "xai"
+id = "grok-imagine-video"
+source = "https://api.x.ai/v1/video-generation-models"
+date = "2026-10-01"
+reason = "Video generation (output modalities [\"video\"]). The gateway serves Chat Completions, Responses, Messages and embeddings only."
+
+[[not_carried]]
+provider = "xai"
+id = "grok-imagine-video-1.5"
+source = "https://api.x.ai/v1/video-generation-models"
+date = "2026-10-01"
+reason = "Video generation (output [\"video\"]; aliases grok-imagine-video-1.5-preview, -2026-05-30). The gateway serves Chat Completions, Responses, Messages and embeddings only."
+
+[[not_carried]]
+provider = "xai"
+id = "grok-imagine-video-1.5-lite"
+source = "https://api.x.ai/v1/video-generation-models"
+date = "2026-10-01"
+reason = "Video generation (output [\"video\"]). The gateway serves Chat Completions, Responses, Messages and embeddings only."
 
 [[promo]]
 model = "gpt-5.6-sol"

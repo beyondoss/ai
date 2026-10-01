@@ -195,7 +195,7 @@ async fn more_tools_than_chat_takes_walk_the_responses_arm() {
         .await;
     let key = billing_vkey(&sk, 76);
     let user = json!([{"role": "user", "content": "Call the last tool."}]);
-    let header = [("x-beyond-model", "gpt-5-mini")];
+    let header = [("x-beyond-model", "gpt-5.1")];
     for (tools, pad, headers, want) in [
         (129, 8, &[][..], "/v1/responses"),
         (129, 8, &header[..], "/v1/responses"),
@@ -204,7 +204,7 @@ async fn more_tools_than_chat_takes_walk_the_responses_arm() {
         (128, 8, &[][..], "/v1/chat/completions"),
         (128, 8, &header[..], "/v1/chat/completions"),
     ] {
-        let body = json!({"model": "gpt-5-mini", "max_tokens": 64, "messages": user,
+        let body = json!({"model": "gpt-5.1", "max_tokens": 64, "messages": user,
                           "tools": messages_tools(tools, pad)});
         let _ = post(&gw, &key, "/v1/messages", headers, &body).await;
         let (path, v) = sent(&openai);
@@ -220,7 +220,7 @@ async fn more_tools_than_chat_takes_walk_the_responses_arm() {
         }
     }
     // The translated Responses answer reaches the Messages client.
-    let body = json!({"model": "gpt-5-mini", "max_tokens": 64, "messages": user,
+    let body = json!({"model": "gpt-5.1", "max_tokens": 64, "messages": user,
                       "tools": messages_tools(150, 8)});
     let resp = post(&gw, &key, "/v1/messages", &[], &body).await;
     assert_eq!(resp.status().as_u16(), 200);
@@ -228,7 +228,7 @@ async fn more_tools_than_chat_takes_walk_the_responses_arm() {
     assert_eq!(v["type"], "message", "{v}");
 
     // A Chat client keeps Chat Completions.
-    let chat = json!({"model": "gpt-5-mini", "messages": user,
+    let chat = json!({"model": "gpt-5.1", "messages": user,
                       "tools": (0..129).map(|i| json!({"type": "function", "function": {
                           "name": format!("tool_{i}"), "parameters": {"type": "object"}}}))
                           .collect::<Vec<_>>()});

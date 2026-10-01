@@ -57,7 +57,7 @@ async fn forwarded_body(providers: &[&'static str], model: &str, body: &str) -> 
 #[tokio::test]
 async fn a_stock_max_tokens_reaches_native_openai_as_max_completion_tokens() {
     let body = r#"{"model":"MODEL","max_tokens":1024,"messages":[{"role":"user","content":"hi"}]}"#;
-    for model in ["gpt-5-mini", "o3", "gpt-4o-mini"] {
+    for model in ["gpt-5.1", "gpt-5.2", "gpt-4o-mini"] {
         let sent = forwarded_body(&["openai"], model, body).await;
         assert_eq!(sent["max_completion_tokens"], 1024, "{model}: {sent}");
         assert!(
@@ -74,6 +74,6 @@ async fn a_stock_max_tokens_reaches_native_openai_as_max_completion_tokens() {
 #[tokio::test]
 async fn an_explicit_max_completion_tokens_is_kept() {
     let body = r#"{"model":"MODEL","max_completion_tokens":512,"messages":[{"role":"user","content":"hi"}]}"#;
-    let sent = forwarded_body(&["openai"], "gpt-5-mini", body).await;
+    let sent = forwarded_body(&["openai"], "gpt-5.1", body).await;
     assert_eq!(sent["max_completion_tokens"], 512, "{sent}");
 }

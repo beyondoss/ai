@@ -177,7 +177,7 @@ async fn a_chat_stream_closed_at_done_is_ok_and_cached() {
 /// defect: D120
 #[tokio::test]
 async fn a_messages_stream_closed_at_message_stop_is_ok_and_cached() {
-    let body = r#"{"model":"claude-sonnet-4-5","max_tokens":64,"stream":true,"messages":[{"role":"user","content":"hi"}]}"#;
+    let body = r#"{"model":"claude-sonnet-4-6","max_tokens":64,"stream":true,"messages":[{"role":"user","content":"hi"}]}"#;
     let (row, cache) = closes_after_terminal(
         82,
         "anthropic",
@@ -214,7 +214,7 @@ async fn a_responses_stream_closed_at_response_completed_is_ok_and_cached() {
 /// defect: D120
 #[tokio::test]
 async fn a_translated_stream_closed_at_done_is_ok_and_cached() {
-    let body = r#"{"model":"claude-sonnet-4-5","stream":true,"messages":[{"role":"user","content":"hi"}]}"#;
+    let body = r#"{"model":"claude-sonnet-4-6","stream":true,"messages":[{"role":"user","content":"hi"}]}"#;
     let (row, cache) = closes_after_terminal(
         84,
         "anthropic",

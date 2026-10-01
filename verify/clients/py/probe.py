@@ -689,9 +689,11 @@ def session_pin():
 
 def _filler(n_bytes):
     words = ["granite", "meadow", "lantern", "harbor", "cobalt", "thistle", "ember", "quarry", "saffron", "willow"]
-    out, i = [], 0
-    while sum(len(w) + 1 for w in out) < n_bytes:
-        out.append(f"{words[i % 10]}{i % 97}")
+    out, i, size = [], 0, 0
+    while size < n_bytes:
+        w = f"{words[i % 10]}{i % 97}"
+        out.append(w)
+        size += len(w) + 1
         i += 1
     return " ".join(out)
 
@@ -1046,10 +1048,11 @@ def explicit_nulls():
 
 def context_overflow():
     """TRN-18: a prompt past the window is refused with what harnesses compact on: OpenAI's code
-    context_length_exceeded, or Anthropic's "prompt is too long" phrasing, and bills nothing."""
+    context_length_exceeded, or Anthropic's "prompt is too long" phrasing, and bills nothing.
+    700 KB of filler is ~167k tokens (0.24 per byte in o200k_base): past a 128k window."""
     import anthropic
     import openai
-    big = _filler(60_000)
+    big = _filler(700_000)
     try:
         if CLIENT == "anthropic":
             anthropic_client().messages.create(model=MODEL, max_tokens=64, messages=[{"role": "user", "content": big}])

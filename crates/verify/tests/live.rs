@@ -59,9 +59,14 @@ const CLAUDE: Route = Route {
     dead: &[],
     serves: "anthropic",
 };
+/// The GPT row: a reasoning model whose primary is OpenAI's own Chat Completions (Chat clients are
+/// relayed, Messages clients translated onto it), with a Responses arm. gpt-5.1 is the cheapest
+/// such row OpenAI has not scheduled to retire (gpt-5-mini goes 2026-12-11; gpt-5.4 and later
+/// reach OpenAI over Responses, D114). It reasons only when asked (effort `none` by default), so
+/// a cell that doesn't ask pays for no reasoning.
 const GPT: Route = Route {
     name: "gpt",
-    model: "gpt-5-mini",
+    model: "gpt-5.1",
     pools: &[("openai", "OPENAI_API_KEY")],
     dead: &[],
     serves: "openai",
@@ -131,11 +136,13 @@ const POOLED: Route = Route {
     dead: &[],
     serves: "",
 };
-/// [`POOLED`] on Claude Sonnet 4.5, whose minimum cacheable prompt (1024 tokens) is below pi's
-/// whole prompt (~2.5k); on Haiku 4.5 (4096) pi's session never caches, so a pin can't show it.
+/// [`POOLED`] on Claude Sonnet 5.5, whose minimum cacheable prompt is below pi's whole prompt
+/// (~2.5k; measured 2026-10-01: a 1,400-token system prompt was written to the cache); on Haiku
+/// 4.5 (4096) pi's session never caches, so a pin can't show it. Sonnet 4.5, this route's row
+/// until then, retires 2026-11-30.
 const POOLED_SONNET: Route = Route {
     name: "pooled-sonnet",
-    model: "claude-sonnet-4-5",
+    model: "claude-sonnet-5-5",
     pools: &[
         ("anthropic", "ANTHROPIC_API_KEY"),
         ("openrouter", "OPENROUTER_API_KEY"),
@@ -151,15 +158,9 @@ const SONNET: Route = Route {
     dead: &[],
     serves: "anthropic",
 };
-/// An 8k-window row: a context overflow costs ~40 KB of prompt and is rejected before billing.
-const GPT4: Route = Route {
-    name: "gpt4",
-    model: "gpt-4",
-    pools: &[("openai", "OPENAI_API_KEY")],
-    dead: &[],
-    serves: "openai",
-};
-/// A 16k-output row, for max_tokens clamping.
+/// A 16k-output row, for max_tokens clamping, and the smallest window OpenAI serves on a row not
+/// scheduled to retire (128k), for a context overflow (TRN-18) that is rejected before billing.
+/// That cell was on gpt-4's 8k window until gpt-4 was scheduled to retire (2026-10-23).
 const GPT4O_MINI: Route = Route {
     name: "gpt4o-mini",
     model: "gpt-4o-mini",
@@ -264,8 +265,8 @@ const CELLS: &[Cell] = &[
     ("TRN-11",            "openai-py",     Runtime::Python, "strict_tools",     &[CLAUDE], ""),
     ("TRN-15",            "openai-py",     Runtime::Python, "explicit_nulls",   GEN,      ""),
     ("TRN-16+TRN-2",      "openai-py",     Runtime::Python, "developer_role",   &[XAI, TOGETHER], ""),
-    ("TRN-18",            "openai-py",     Runtime::Python, "context_overflow", &[GPT4], ""),
-    ("TRN-18",            "anthropic-py",  Runtime::Python, "context_overflow", &[GPT4], ""),
+    ("TRN-18",            "openai-py",     Runtime::Python, "context_overflow", &[GPT4O_MINI], ""),
+    ("TRN-18",            "anthropic-py",  Runtime::Python, "context_overflow", &[GPT4O_MINI], ""),
     ("W5+TRN-24",         "openai-agents", Runtime::Python, "agents_handoff",   CLAUDE_GPT, ""),
     ("W6",                "langchain",     Runtime::Python, "langchain_agent",  CLAUDE_GPT, ""),
     // Node SDKs.
@@ -296,7 +297,7 @@ const CELLS: &[Cell] = &[
     ("K1",                "ai-sdk",        Runtime::Node,   "ai_sdk_cache",     &[CLAUDE], ""),
     // Coding agents fixing a failing test in a fixture repo (W*). pi runs once per API mode; pi
     // and opencode take models only from config, generated from /v1/models. Codex's GPT row is a
-    // Codex-native one (D74 keeps it off gpt-5-mini).
+    // Codex-native one (D74 kept it off the Chat-first GPT row).
     ("W1",                "claude-code",   Runtime::Harness, "claude-code",     SESSION,  ""),
     ("W2+TRN-24",         "codex",         Runtime::Harness, "codex",           CODEX_ROWS, ""),
     ("W3",                "opencode",      Runtime::Harness, "opencode",        SESSION,  ""),
@@ -306,7 +307,7 @@ const CELLS: &[Cell] = &[
     // The same sessions for E7, in their own cells so a cost mismatch never reads as a failed task
     // (and a failed task never hides one): the harness's model list, and the session cost it
     // displays against the ledger. Claude Code only where its own price table knows the model
-    // (not gpt-5-mini); Codex displays no cost and can't list the catalog.
+    // (not the GPT row); Codex displays no cost and can't list the catalog.
     ("E7",                "claude-code",   Runtime::Harness, "claude-code",     &[CLAUDE, OPENROUTER], ""),
     ("E7",                "opencode",      Runtime::Harness, "opencode",        SESSION,  ""),
     ("E7",                "pi",            Runtime::Harness, "pi:chat",         SESSION,  ""),

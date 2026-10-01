@@ -72,7 +72,7 @@ const ANTHROPIC: (&str, &str) = ("anthropic", "ANTHROPIC_API_KEY");
 const OPENROUTER: (&str, &str) = ("openrouter", "OPENROUTER_API_KEY");
 const BEDROCK: (&str, &str) = ("bedrock", "AWS_BEARER_TOKEN_BEDROCK");
 const OPENAI: (&str, &str) = ("openai", "OPENAI_API_KEY");
-const SWITCH: &str = "claude-haiku-4-5=anthropic,gpt-5-mini=openai";
+const SWITCH: &str = "claude-haiku-4-5=anthropic,gpt-5.1=openai";
 
 const fn ses(
     claims: &'static str,
@@ -132,10 +132,10 @@ const SCENARIOS: &[Scenario] = &[
     // SES-3: previous_response_id chains on a Chat-first GPT row (its Responses arm) and a
     // Responses-first row (gpt-5.3-codex), the Agents SDK, the arm's only upstream dying, and a
     // stateless Codex session resumed from its own transcript.
-    ses("SES-3", "openai-py",     "gpt",   "responses_chain", Kind::Probe, "gpt-5-mini",    &[OPENAI]),
+    ses("SES-3", "openai-py",     "gpt",   "responses_chain", Kind::Probe, "gpt-5.1",       &[OPENAI]),
     ses("SES-3", "openai-py",     "codex", "responses_chain", Kind::Probe, "gpt-5.3-codex", &[OPENAI]),
-    ses("SES-3", "openai-agents", "gpt",   "agents_chain",    Kind::Probe, "gpt-5-mini",    &[OPENAI]),
-    dies(ses("SES-3", "openai-py", "openai-dies-openrouter", "responses_failover", Kind::Probe, "gpt-5-mini", &[OPENAI, OPENROUTER]), "openai", 1, "openrouter"),
+    ses("SES-3", "openai-agents", "gpt",   "agents_chain",    Kind::Probe, "gpt-5.1",       &[OPENAI]),
+    dies(ses("SES-3", "openai-py", "openai-dies-openrouter", "responses_failover", Kind::Probe, "gpt-5.1", &[OPENAI, OPENROUTER]), "openai", 1, "openrouter"),
     ses("SES-3", "codex",         "codex", "codex-resume",    Kind::Harness, "gpt-5.3-codex", &[OPENAI]),
 ];
 

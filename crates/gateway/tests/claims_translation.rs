@@ -27,14 +27,14 @@ async fn a_chat_max_tokens_reaches_a_gpt5_row_as_max_completion_tokens() {
         .header("authorization", format!("Bearer {}", billing_vkey(&sk, 74)))
         .header("content-type", "application/json")
         .body(
-            r#"{"model":"gpt-5-mini","max_tokens":256,"messages":[{"role":"user","content":"weather?"}],"tools":[{"type":"function","function":{"name":"get_weather","parameters":{"type":"object","properties":{}}}}]}"#,
+            r#"{"model":"gpt-5.1","max_tokens":256,"messages":[{"role":"user","content":"weather?"}],"tools":[{"type":"function","function":{"name":"get_weather","parameters":{"type":"object","properties":{}}}}]}"#,
         )
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status().as_u16(), 200);
     let sent: Value = serde_json::from_slice(&mock.captured().unwrap().body).unwrap();
-    assert_eq!(sent["model"], "gpt-5-mini", "{sent}");
+    assert_eq!(sent["model"], "gpt-5.1", "{sent}");
     assert!(
         sent.get("max_tokens").is_none(),
         "OpenAI 400s max_tokens on a reasoning model: {sent}"

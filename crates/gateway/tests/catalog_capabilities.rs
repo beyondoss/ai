@@ -215,9 +215,10 @@ async fn a_structured_output_request_skips_a_candidate_that_does_not_enforce_it(
 }
 
 /// A row whose card lists no image input refuses an image part with a 400 naming the row, on
-/// every client dialect and whether or not a header named the row, and no upstream is contacted:
-/// o3-mini would answer "I can't view images" and bill it, gpt-4 would answer 500. Text on the
-/// same row, and an image on a row that reads images, are served.
+/// every client dialect and whether or not a header named the row, and no upstream is contacted
+/// (o3-mini answered "I can't view images" and billed it, gpt-4 answered 500). Text on the same
+/// row, and an image on a row that reads images, are served. The text-only row is
+/// deepseek-v4-pro (DeepSeek: "Vision: Not supported"); gpt-4 and o3-mini retire 2026-10-23.
 /// claim: CAT-5
 /// defect: D112
 #[tokio::test]
@@ -225,7 +226,7 @@ async fn an_image_on_a_text_only_row_is_refused_before_any_upstream() {
     let (pubkey, sk) = test_keypair(72);
     let mock = MockUpstream::start(Mode::Json).await;
     let gw = Gateway::builder(unused_nats_port(), &mock.authority(), &b64(&pubkey))
-        .providers(&["openai"])
+        .providers(&["openai", "deepseek"])
         .start()
         .await;
     let key = billing_vkey(&sk, 72);
@@ -234,27 +235,27 @@ async fn an_image_on_a_text_only_row_is_refused_before_any_upstream() {
         (
             "/v1/chat/completions",
             &[],
-            json!({"model": "gpt-4", "messages": [{"role": "user", "content": [
+            json!({"model": "deepseek-v4-pro", "messages": [{"role": "user", "content": [
                 {"type": "text", "text": "What is this?"},
                 {"type": "image_url", "image_url": {"url": png}}]}]}),
         ),
         (
             "/v1/chat/completions",
-            &[("x-beyond-model", "o3-mini")],
-            json!({"model": "o3-mini", "messages": [{"role": "user", "content": [
+            &[("x-beyond-model", "deepseek-v4-pro")],
+            json!({"model": "deepseek-v4-pro", "messages": [{"role": "user", "content": [
                 {"type": "image_url", "image_url": {"url": png}}]}]}),
         ),
         (
             "/v1/responses",
             &[],
-            json!({"model": "o3-mini", "input": [{"role": "user", "content": [
+            json!({"model": "deepseek-v4-pro", "input": [{"role": "user", "content": [
                 {"type": "input_text", "text": "What is this?"},
                 {"type": "input_image", "image_url": png}]}]}),
         ),
         (
             "/v1/messages",
-            &[("x-beyond-model", "gpt-4")],
-            json!({"model": "gpt-4", "max_tokens": 16, "messages": [{"role": "user", "content": [
+            &[("x-beyond-model", "deepseek-v4-pro")],
+            json!({"model": "deepseek-v4-pro", "max_tokens": 16, "messages": [{"role": "user", "content": [
                 {"type": "image", "source": {"type": "base64", "media_type": "image/png",
                                              "data": "iVBORw0KGgo="}}]}]}),
         ),
@@ -269,7 +270,7 @@ async fn an_image_on_a_text_only_row_is_refused_before_any_upstream() {
     assert_eq!(mock.hits(), 0, "a refused image reached the provider");
     wait_for_metric(&gw, "ai_rejections_total", "modality", 4.0).await;
 
-    let text = json!({"model": "gpt-4", "messages": [{"role": "user",
+    let text = json!({"model": "deepseek-v4-pro", "messages": [{"role": "user",
                       "content": "Describe an image of a cat."}]});
     let resp = post(&gw, &key, "/v1/chat/completions", &[], &text).await;
     assert_eq!(resp.status().as_u16(), 200);
@@ -298,7 +299,7 @@ async fn an_openrouter_candidate_is_asked_not_to_compress_the_prompt() {
         .await;
     let key = billing_vkey(&sk, 73);
     let only = |p: &'static str| [("x-beyond-only", p)];
-    let body = json!({"model": "gpt-4", "messages": [{"role": "user", "content": "hi"}],
+    let body = json!({"model": "gpt-4o-mini", "messages": [{"role": "user", "content": "hi"}],
                       "stream": true});
 
     let resp = post(
@@ -316,11 +317,11 @@ async fn an_openrouter_candidate_is_asked_not_to_compress_the_prompt() {
         sent["plugins"],
         json!([{"id": "context-compression", "enabled": false}])
     );
-    assert_eq!(sent["model"], "openai/gpt-4");
+    assert_eq!(sent["model"], "openai/gpt-4o-mini");
     assert_eq!(sent["stream_options"]["include_usage"], true);
 
     // A Messages client translated onto OpenRouter Chat Completions gets the same.
-    let messages = json!({"model": "gpt-4", "max_tokens": 16,
+    let messages = json!({"model": "gpt-4o-mini", "max_tokens": 16,
                           "messages": [{"role": "user", "content": "hi"}]});
     let resp = post(&gw, &key, "/v1/messages", &only("openrouter"), &messages).await;
     assert_eq!(resp.status().as_u16(), 200);
@@ -328,7 +329,7 @@ async fn an_openrouter_candidate_is_asked_not_to_compress_the_prompt() {
     assert_eq!(sent["plugins"][0]["enabled"], false);
 
     // The client's own plugins are its choice.
-    let own = json!({"model": "gpt-4", "messages": [{"role": "user", "content": "hi"}],
+    let own = json!({"model": "gpt-4o-mini", "messages": [{"role": "user", "content": "hi"}],
                      "plugins": [{"id": "web"}]});
     let resp = post(&gw, &key, "/v1/chat/completions", &only("openrouter"), &own).await;
     assert_eq!(resp.status().as_u16(), 200);

@@ -175,11 +175,11 @@ async fn openrouter_cache_write_tokens_reach_the_row() {
 }
 
 const RESPONSES_SNAPSHOT_SSE: &str = "event: response.created\n\
-data: {\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"id\":\"resp_1\",\"object\":\"response\",\"status\":\"in_progress\",\"model\":\"gpt-5-2025-08-07\",\"output\":[],\"usage\":null}}\n\n\
+data: {\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"id\":\"resp_1\",\"object\":\"response\",\"status\":\"in_progress\",\"model\":\"gpt-5.1-2025-11-13\",\"output\":[],\"usage\":null}}\n\n\
 event: response.output_text.delta\n\
 data: {\"type\":\"response.output_text.delta\",\"sequence_number\":1,\"item_id\":\"msg_1\",\"output_index\":0,\"content_index\":0,\"delta\":\"hi\"}\n\n\
 event: response.completed\n\
-data: {\"type\":\"response.completed\",\"sequence_number\":2,\"response\":{\"id\":\"resp_1\",\"object\":\"response\",\"status\":\"completed\",\"model\":\"gpt-5-2025-08-07\",\"output\":[{\"type\":\"message\",\"id\":\"msg_1\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"hi\"}]}],\"usage\":{\"input_tokens\":12,\"output_tokens\":5,\"total_tokens\":17,\"input_tokens_details\":{\"cached_tokens\":0},\"output_tokens_details\":{\"reasoning_tokens\":0}}}}\n\n";
+data: {\"type\":\"response.completed\",\"sequence_number\":2,\"response\":{\"id\":\"resp_1\",\"object\":\"response\",\"status\":\"completed\",\"model\":\"gpt-5.1-2025-11-13\",\"output\":[{\"type\":\"message\",\"id\":\"msg_1\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"hi\"}]}],\"usage\":{\"input_tokens\":12,\"output_tokens\":5,\"total_tokens\":17,\"input_tokens_details\":{\"cached_tokens\":0},\"output_tokens_details\":{\"reasoning_tokens\":0}}}}\n\n";
 
 /// A Responses stream echoes the pinned snapshot under `response.model`. The row bills that
 /// snapshot, as it does for Chat Completions and Messages streams.
@@ -197,7 +197,7 @@ async fn a_responses_stream_bills_the_echoed_snapshot() {
     let (status, text) = post(
         format!("{}/openai/v1/responses", gw.url()),
         &billing_vkey(&sk, 55),
-        r#"{"model":"gpt-5","stream":true,"input":"hi"}"#,
+        r#"{"model":"gpt-5.1","stream":true,"input":"hi"}"#,
         &[],
     )
     .await;
@@ -208,8 +208,8 @@ async fn a_responses_stream_bills_the_echoed_snapshot() {
         Some(12),
         "usage parsed: {row}"
     );
-    assert_eq!(row["requested_model"], "gpt-5", "{row}");
-    assert_eq!(row["model"], "gpt-5-2025-08-07", "{row}");
+    assert_eq!(row["requested_model"], "gpt-5.1", "{row}");
+    assert_eq!(row["model"], "gpt-5.1-2025-11-13", "{row}");
     // A provider-routed row names the catalog row it prices at, through the snapshot suffix.
-    assert_eq!(row["price_model"], "gpt-5", "{row}");
+    assert_eq!(row["price_model"], "gpt-5.1", "{row}");
 }

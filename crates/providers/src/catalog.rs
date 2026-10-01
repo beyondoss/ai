@@ -683,15 +683,6 @@ const fn xai_responses_first(native: &'static str, openrouter: &'static str) -> 
     ]
 }
 
-const fn deepseek(native: &'static str, openrouter: &'static str) -> [Candidate; 2] {
-    compat_chat(
-        ProviderId::DeepSeek,
-        native,
-        "/v1/chat/completions",
-        openrouter,
-    )
-}
-
 const fn groq(native: &'static str, openrouter: &'static str) -> [Candidate; 2] {
     compat_chat(
         ProviderId::Groq,
@@ -710,10 +701,12 @@ const fn together(native: &'static str, openrouter: &'static str) -> [Candidate;
     )
 }
 
-/// DeepSeek V4 Pro, then Together's copy of the **same snapshot** (`DeepSeek-V4-Pro-0813`).
-/// OpenRouter's `deepseek/deepseek-v4-pro` is the older 0423 snapshot, so it is not a failover for
-/// this row: a fallback must serve the model the row names, not a neighbour.
-const fn deepseek_v4_pro() -> [Candidate; 2] {
+/// DeepSeek V4 Pro, then Together's and OpenRouter's copies of the **same snapshot**
+/// (`DeepSeek-V4-Pro-0813`; OpenRouter's `deepseek/deepseek-v4-pro-0813`, Hugging Face id
+/// `deepseek-ai/DeepSeek-V4-Pro-0813`). OpenRouter's bare `deepseek/deepseek-v4-pro` is the older
+/// 0423 snapshot, so it is not a failover for this row: a fallback must serve the model the row
+/// names, not a neighbour.
+const fn deepseek_v4_pro() -> [Candidate; 3] {
     [
         Candidate {
             provider: ProviderId::DeepSeek,
@@ -724,6 +717,35 @@ const fn deepseek_v4_pro() -> [Candidate; 2] {
             provider: ProviderId::Together,
             upstream_model: "deepseek-ai/DeepSeek-V4-Pro-0813",
             path: "/v1/chat/completions",
+        },
+        Candidate {
+            provider: ProviderId::OpenRouter,
+            upstream_model: "deepseek/deepseek-v4-pro-0813",
+            path: "/api/v1/chat/completions",
+        },
+    ]
+}
+
+/// DeepSeek V4.1 Flash, then Together's serverless copy (`deepseek-ai/DeepSeek-V4.1-Flash`, at
+/// DeepSeek's peak rate, images read), then OpenRouter's (`deepseek/deepseek-v4.1-flash`, Hugging
+/// Face id `deepseek-ai/DeepSeek-V4.1-Flash`). A direct pool provider goes before OpenRouter's
+/// shared host spread, as on the Kimi K3 and MiniMax M3 rows.
+const fn deepseek_flash() -> [Candidate; 3] {
+    [
+        Candidate {
+            provider: ProviderId::DeepSeek,
+            upstream_model: "deepseek-flash",
+            path: "/v1/chat/completions",
+        },
+        Candidate {
+            provider: ProviderId::Together,
+            upstream_model: "deepseek-ai/DeepSeek-V4.1-Flash",
+            path: "/v1/chat/completions",
+        },
+        Candidate {
+            provider: ProviderId::OpenRouter,
+            upstream_model: "deepseek/deepseek-v4.1-flash",
+            path: "/api/v1/chat/completions",
         },
     ]
 }
@@ -1050,7 +1072,7 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
     ModelRoute {
         model: "deepseek-flash",
         wire: WireFormat::OpenAi,
-        candidates: &deepseek("deepseek-flash", "deepseek/deepseek-v4.1-flash"),
+        candidates: &deepseek_flash(),
         responses: &[],
         price: price("0.3", "1.2", "0.006", "0.3"), // peak rate (off-peak is half); cache_write unpublished, equals input
         card: card(
@@ -3105,13 +3127,6 @@ mod tests {
                 "x-ai/grok-4.6",
             ),
             (
-                "deepseek-flash",
-                WireFormat::OpenAi,
-                ProviderId::DeepSeek,
-                "deepseek-flash",
-                "deepseek/deepseek-v4.1-flash",
-            ),
-            (
                 "qwen/qwen3.8-27b",
                 WireFormat::OpenAi,
                 ProviderId::Groq,
@@ -3818,28 +3833,45 @@ mod tests {
         assert!(for_model("minimax/minimax-m3").is_some());
     }
 
-    /// deepseek-v4-pro's failover is the same snapshot (V4-Pro-0813 on Together), not OpenRouter's
-    /// 0423. The rows whose fallbacks served V3 and R1 under DeepSeek's retired names are gone.
+    /// Each DeepSeek row's failovers serve the same snapshot: V4-Pro-0813 on Together and on
+    /// OpenRouter (`deepseek/deepseek-v4-pro-0813`, not the bare slug, which is 0423), and
+    /// V4.1-Flash on Together and OpenRouter. The rows whose fallbacks served V3 and R1 under
+    /// DeepSeek's retired names are gone.
     /// claim: CAT-2
     /// defect: D18
     #[test]
-    fn deepseek_v4_pro_fails_over_to_the_same_snapshot() {
-        let row = for_model("deepseek-v4-pro");
-        assert!(row.is_some(), "deepseek-v4-pro must be in the catalog");
-        if let Some(row) = row {
-            let got: Vec<_> = row
-                .candidates
-                .iter()
-                .map(|c| (c.provider, c.upstream_model))
-                .collect();
-            assert_eq!(
-                got,
+    fn deepseek_rows_fail_over_to_the_same_snapshot() {
+        for (model, card, want) in [
+            (
+                "deepseek-v4-pro",
+                "DeepSeek V4 Pro 0813",
                 [
                     (ProviderId::DeepSeek, "deepseek-v4-pro"),
                     (ProviderId::Together, "deepseek-ai/DeepSeek-V4-Pro-0813"),
-                ]
-            );
-            assert_eq!(row.card.name, "DeepSeek V4 Pro 0813");
+                    (ProviderId::OpenRouter, "deepseek/deepseek-v4-pro-0813"),
+                ],
+            ),
+            (
+                "deepseek-flash",
+                "DeepSeek V4.1 Flash",
+                [
+                    (ProviderId::DeepSeek, "deepseek-flash"),
+                    (ProviderId::Together, "deepseek-ai/DeepSeek-V4.1-Flash"),
+                    (ProviderId::OpenRouter, "deepseek/deepseek-v4.1-flash"),
+                ],
+            ),
+        ] {
+            let row = for_model(model);
+            assert!(row.is_some(), "{model} must be in the catalog");
+            if let Some(row) = row {
+                let got: Vec<_> = row
+                    .candidates
+                    .iter()
+                    .map(|c| (c.provider, c.upstream_model))
+                    .collect();
+                assert_eq!(got, want, "{model}");
+                assert_eq!(row.card.name, card, "{model}");
+            }
         }
         for gone in ["deepseek-chat", "deepseek-reasoner", "mistral-nemo"] {
             assert!(for_model(gone).is_none(), "{gone} is retired at its vendor");

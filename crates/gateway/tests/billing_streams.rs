@@ -155,11 +155,11 @@ fn responses_stream_with_a_huge_final_event() -> &'static str {
     let instructions = "You are a coding agent. ".repeat(4 * 1024); // ~96 KiB
     let sse = format!(
         "event: response.created\n\
-         data: {{\"type\":\"response.created\",\"sequence_number\":0,\"response\":{{\"id\":\"resp_1\",\"object\":\"response\",\"status\":\"in_progress\",\"model\":\"gpt-5-2025-08-07\",\"output\":[],\"usage\":null}}}}\n\n\
+         data: {{\"type\":\"response.created\",\"sequence_number\":0,\"response\":{{\"id\":\"resp_1\",\"object\":\"response\",\"status\":\"in_progress\",\"model\":\"gpt-5.1-2025-11-13\",\"output\":[],\"usage\":null}}}}\n\n\
          event: response.output_text.delta\n\
          data: {{\"type\":\"response.output_text.delta\",\"sequence_number\":1,\"item_id\":\"msg_1\",\"output_index\":0,\"content_index\":0,\"delta\":\"hi\"}}\n\n\
          event: response.completed\n\
-         data: {{\"type\":\"response.completed\",\"sequence_number\":2,\"response\":{{\"id\":\"resp_1\",\"object\":\"response\",\"status\":\"completed\",\"model\":\"gpt-5-2025-08-07\",\"instructions\":\"{instructions}\",\"output\":[{{\"type\":\"message\",\"id\":\"msg_1\",\"role\":\"assistant\",\"content\":[{{\"type\":\"output_text\",\"text\":\"hi\"}}]}}],\"usage\":{{\"input_tokens\":24000,\"output_tokens\":5,\"total_tokens\":24005,\"input_tokens_details\":{{\"cached_tokens\":0}},\"output_tokens_details\":{{\"reasoning_tokens\":0}}}}}}}}\n\n"
+         data: {{\"type\":\"response.completed\",\"sequence_number\":2,\"response\":{{\"id\":\"resp_1\",\"object\":\"response\",\"status\":\"completed\",\"model\":\"gpt-5.1-2025-11-13\",\"instructions\":\"{instructions}\",\"output\":[{{\"type\":\"message\",\"id\":\"msg_1\",\"role\":\"assistant\",\"content\":[{{\"type\":\"output_text\",\"text\":\"hi\"}}]}}],\"usage\":{{\"input_tokens\":24000,\"output_tokens\":5,\"total_tokens\":24005,\"input_tokens_details\":{{\"cached_tokens\":0}},\"output_tokens_details\":{{\"reasoning_tokens\":0}}}}}}}}\n\n"
     );
     Box::leak(sse.into_boxed_str())
 }
@@ -184,7 +184,7 @@ async fn a_responses_stream_with_a_huge_final_event_bills_exact_usage() {
     let (status, text) = post(
         format!("{}/openai/v1/responses", gw.url()),
         &billing_vkey(&sk, 62),
-        r#"{"model":"gpt-5","stream":true,"input":"hi"}"#,
+        r#"{"model":"gpt-5.1","stream":true,"input":"hi"}"#,
         &[],
     )
     .await;

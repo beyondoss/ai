@@ -29,7 +29,8 @@
 //! |                    |             | live endpoints on OpenRouter), no retirement due, every       |
 //! |                    |             | vendor deprecation notice recorded in `catalog_truth.toml`    |
 //! | `CAT-16`           | vendor      | `new-models`: every Anthropic / OpenAI / xAI model in a       |
-//! |                    |             | carried family is a row or recorded in `[[not_carried]]`      |
+//! |                    |             | carried family, whatever its modality, is a row (or its alias |
+//! |                    |             | or dated snapshot) or in `[[not_carried]]` / `[[retired]]`    |
 //!
 //! Scope (CAT-1): OpenAI, Anthropic, OpenRouter, xAI, Bedrock and Together candidates. Groq,
 //! DeepSeek and Fireworks are out of scope by owner decision; `openai-codex` has no key. The
@@ -224,6 +225,11 @@ fn listing(provider: &str) -> Option<&'static Value> {
                 .bearer_auth(key_of("openai")?),
             "xai" => http()
                 .get("https://api.x.ai/v1/language-models")
+                .bearer_auth(key_of("xai")?),
+            // Every model xAI serves, image and video generation too (`language-models` lists
+            // text output only): what CAT-16 new-models holds to the catalog.
+            "xai-all" => http()
+                .get("https://api.x.ai/v1/models")
                 .bearer_auth(key_of("xai")?),
             "together" => http()
                 .get("https://api.together.xyz/v1/models")
@@ -2192,11 +2198,14 @@ struct Mount {
     key: &'static str,
 }
 
+/// The OpenAI-model mounts use gpt-4o-mini: the cheapest OpenAI row not scheduled to retire, and
+/// not a reasoning model, so the body's `max_tokens` passes through as sent (gpt-4.1-nano, their
+/// model until then, retires 2026-10-23).
 const MOUNTS: &[Mount] = &[
     Mount {
         name: "openai",
         path: "/openai/v1/chat/completions",
-        model: "gpt-4.1-nano",
+        model: "gpt-4o-mini",
         anthropic_wire: false,
         key: "openai",
     },
@@ -2210,7 +2219,7 @@ const MOUNTS: &[Mount] = &[
     Mount {
         name: "openrouter",
         path: "/openrouter/api/v1/chat/completions",
-        model: "openai/gpt-4.1-nano",
+        model: "openai/gpt-4o-mini",
         anthropic_wire: false,
         key: "openrouter",
     },
@@ -2754,28 +2763,15 @@ fn cat16(_trial: &str, row: &'static ModelRoute, cand: Candidate) -> Result<(), 
     }
 }
 
-/// The models a first-party vendor lists in a family the catalog carries (Claude; GPT and the
-/// o-series; Grok), as `(id, aliases)`. Not counted: dated snapshots (the catalog lists aliases),
-/// and models that are not text generation (audio, realtime, transcription, speech, image,
-/// search, embeddings, moderation, video) or are ChatGPT's moving `chat-latest` aliases.
+/// Every model a first-party vendor lists in a family the catalog carries, as `(id, aliases)`:
+/// Claude; GPT (`gpt-`, and ChatGPT's `chatgpt-` and `chat-latest`) and the o-series; Grok. No id
+/// in a family is left out by its name or modality: [`cat16_new_models`] holds each to a row, a
+/// vendor-listed alias of a row, a dated snapshot of one ([`undated`]), or a recorded decision.
+/// Models outside the gateway's endpoints (audio, realtime, transcription, image and video
+/// generation, the Live API) are recorded one by one in `[[not_carried]]` with the reason. xAI is
+/// read from `/v1/models`, which lists its image and video models beside the language models.
 fn first_party_models(vendor: &str) -> Option<Vec<(String, Vec<String>)>> {
-    const NOT_TEXT: &[&str] = &[
-        "audio",
-        "realtime",
-        "transcribe",
-        "tts",
-        "image",
-        "search",
-        "live",
-        "chat-latest",
-        "instruct",
-        "imagine",
-        "video",
-        "voice",
-        "embedding",
-        "moderation",
-    ];
-    let l = listing(vendor)?;
+    let l = listing(if vendor == "xai" { "xai-all" } else { vendor })?;
     let items = l
         .get("data")
         .or_else(|| l.get("models"))
@@ -2784,6 +2780,8 @@ fn first_party_models(vendor: &str) -> Option<Vec<(String, Vec<String>)>> {
         "anthropic" => id.starts_with("claude-"),
         "openai" => {
             id.starts_with("gpt-")
+                || id.starts_with("chatgpt-")
+                || id == "chat-latest"
                 || (id.starts_with('o') && id.as_bytes().get(1).is_some_and(u8::is_ascii_digit))
         }
         "xai" => id.starts_with("grok-"),
@@ -2802,13 +2800,11 @@ fn first_party_models(vendor: &str) -> Option<Vec<(String, Vec<String>)>> {
                             .collect()
                     })
                     .unwrap_or_default();
-                // Anthropic lists only snapshots: the alias is the undated id.
-                // OpenAI lists dated snapshots beside their alias; xAI's ids may carry a date and
+                // Anthropic lists only snapshots: the alias is the undated id. OpenAI lists dated
+                // snapshots beside their alias, each checked through its undated form (so a
+                // snapshot whose alias is gone is still caught); xAI's ids may carry a date and
                 // name the alias in `aliases`.
-                let keep = family(id)
-                    && !NOT_TEXT.iter().any(|w| id.contains(w))
-                    && (vendor != "openai" || undated(id) == id);
-                keep.then(|| (id.to_owned(), aliases))
+                family(id).then(|| (id.to_owned(), aliases))
             })
             .collect(),
     )

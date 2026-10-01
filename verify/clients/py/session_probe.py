@@ -161,7 +161,7 @@ def failover_chat():
 # --- SES-2: the user switches models between turns -------------------------------------------------
 
 def plan():
-    """`VERIFY_MODELS` = `claude-haiku-4-5=anthropic,gpt-5-mini=openai`: user turn t uses entry t mod n."""
+    """`VERIFY_MODELS` = `claude-haiku-4-5=anthropic,gpt-5.1=openai`: user turn t uses entry t mod n."""
     return [tuple(x.split("=")) for x in os.environ["VERIFY_MODELS"].split(",")]
 
 

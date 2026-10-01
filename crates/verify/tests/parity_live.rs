@@ -120,8 +120,9 @@ struct Model {
     provider: Provider,
     /// The dialect a direct call uses for a cross-dialect comparison (the row's primary).
     native: Dialect,
-    /// An OpenAI reasoning model: no sampling, `max_completion_tokens`, effort `minimal` by default.
-    openai_reasoning: bool,
+    /// An OpenAI reasoning model (no sampling, `max_completion_tokens`), and the lowest effort it
+    /// takes, sent when a case doesn't ask for reasoning: `minimal` on GPT-5, `none` from GPT-5.1.
+    openai_reasoning: Option<&'static str>,
     /// Reasons whether asked or not (grok): give it room before its answer.
     always_reasons: bool,
     /// Accepts `temperature: 0`.
@@ -135,27 +136,30 @@ const GPT4O_MINI: Model = Model {
     direct: "gpt-4o-mini",
     provider: OPENAI,
     native: Dialect::Chat,
-    openai_reasoning: false,
+    openai_reasoning: None,
     always_reasons: false,
     sampling: true,
     price: (0.15, 0.6),
 };
-const GPT5_MINI: Model = Model {
-    gw: "gpt-5-mini",
-    direct: "gpt-5-mini",
+/// The GPT reasoning row: OpenAI Chat Completions first, with a Responses arm. gpt-5-mini, these
+/// paths' row until then, retires 2026-12-11; gpt-5.1 is the cheapest Chat-first reasoning row
+/// that doesn't (gpt-5.4 and later reach OpenAI over Responses, D114).
+const GPT5_1: Model = Model {
+    gw: "gpt-5.1",
+    direct: "gpt-5.1",
     provider: OPENAI,
     native: Dialect::Chat,
-    openai_reasoning: true,
+    openai_reasoning: Some("none"),
     always_reasons: false,
     sampling: false,
-    price: (0.25, 2.0),
+    price: (1.25, 10.0),
 };
 const HAIKU: Model = Model {
     gw: "claude-haiku-4-5",
     direct: "claude-haiku-4-5",
     provider: ANTHROPIC,
     native: Dialect::Messages,
-    openai_reasoning: false,
+    openai_reasoning: None,
     always_reasons: false,
     sampling: true,
     price: (1.0, 5.0),
@@ -167,7 +171,7 @@ const GROK: Model = Model {
     direct: "grok-4.3",
     provider: XAI,
     native: Dialect::Responses,
-    openai_reasoning: false,
+    openai_reasoning: None,
     always_reasons: true,
     sampling: true,
     price: (1.25, 2.5),
@@ -178,7 +182,7 @@ const HAIKU_OR: Model = Model {
     direct: "anthropic/claude-haiku-4.5",
     provider: OPENROUTER,
     native: Dialect::Chat,
-    openai_reasoning: false,
+    openai_reasoning: None,
     always_reasons: false,
     sampling: true,
     price: (1.0, 5.0),
@@ -219,7 +223,7 @@ const PATHS: &[ParityPath] = &[
     ParityPath {
         route: "openai-responses",
         client: Dialect::Responses,
-        model: GPT5_MINI,
+        model: GPT5_1,
         claims: &["E3"],
     },
     ParityPath {
@@ -256,7 +260,7 @@ const PATHS: &[ParityPath] = &[
     ParityPath {
         route: "messages-to-gpt",
         client: Dialect::Messages,
-        model: GPT5_MINI,
+        model: GPT5_1,
         claims: &["E2"],
     },
     ParityPath {
@@ -655,7 +659,7 @@ fn max_tokens(case: &Case, m: &Model) -> u32 {
     }
     if m.always_reasons {
         2000
-    } else if m.openai_reasoning {
+    } else if m.openai_reasoning.is_some() {
         1200
     } else {
         300
@@ -725,7 +729,7 @@ fn render(case: &Case, d: Dialect, m: &Model, model_id: &str) -> Value {
             if let Some(s) = &case.stop {
                 b.insert("stop".into(), json!(s));
             }
-            let key = if m.openai_reasoning {
+            let key = if m.openai_reasoning.is_some() {
                 "max_completion_tokens"
             } else {
                 "max_tokens"
@@ -736,8 +740,8 @@ fn render(case: &Case, d: Dialect, m: &Model, model_id: &str) -> Value {
             }
             if case.reasoning {
                 b.insert("reasoning_effort".into(), json!("low"));
-            } else if m.openai_reasoning {
-                b.insert("reasoning_effort".into(), json!("minimal"));
+            } else if let Some(quiet) = m.openai_reasoning {
+                b.insert("reasoning_effort".into(), json!(quiet));
             }
             if case.stream {
                 b.insert("stream".into(), json!(true));
@@ -808,8 +812,8 @@ fn render(case: &Case, d: Dialect, m: &Model, model_id: &str) -> Value {
             }
             if case.reasoning {
                 b.insert("reasoning".into(), json!({"effort": "low"}));
-            } else if m.openai_reasoning {
-                b.insert("reasoning".into(), json!({"effort": "minimal"}));
+            } else if let Some(quiet) = m.openai_reasoning {
+                b.insert("reasoning".into(), json!({"effort": quiet}));
             }
             if case.stream {
                 b.insert("stream".into(), json!(true));
@@ -884,7 +888,7 @@ fn render(case: &Case, d: Dialect, m: &Model, model_id: &str) -> Value {
                     "thinking".into(),
                     json!({"type": "enabled", "budget_tokens": 1024}),
                 );
-            } else if m.openai_reasoning {
+            } else if m.openai_reasoning.is_some() {
                 b.insert("thinking".into(), json!({"type": "disabled"}));
             }
             if case.stream {
@@ -1839,7 +1843,7 @@ fn allowed_shape(m: &Model, entry: &str, empty_reasoning: bool) -> bool {
 /// body byte for byte (12 of 12 upstream bodies captured identical to the client's), so which
 /// answer a side gets is the draw. An item carrying reasoning tokens is still compared.
 fn empty_reasoning_varies(m: &Model, direct: &Summary, gw: &Summary) -> bool {
-    m.openai_reasoning
+    m.openai_reasoning.is_some()
         && [direct, gw]
             .iter()
             .all(|s| s.usage.as_ref().is_some_and(|u| u.reasoning == 0))
@@ -2282,7 +2286,7 @@ fn estimate(path: &ParityPath, case: &Case) -> f64 {
         900.0
     } else if path.model.always_reasons {
         600.0
-    } else if path.model.openai_reasoning {
+    } else if path.model.openai_reasoning.is_some() {
         250.0
     } else {
         60.0

@@ -44,7 +44,7 @@ const openai = createOpenAI({
   apiKey: process.env.BAI_KEY,
 });
 await generateText({
-  model: openai("claude-sonnet-4-5"),
+  model: openai("claude-sonnet-5-5"),
   messages,
   providerOptions: { openai: { store: false } },
 });

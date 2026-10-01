@@ -256,9 +256,9 @@ confidence = "high"
 evidence = "catalog.rs:895-940"
 claims = ["CAT-2"]
 state = "fixed"
-test = "deepseek_v4_pro_fails_over_to_the_same_snapshot"
+test = "deepseek_rows_fail_over_to_the_same_snapshot"
 fix = "054f927"
-note = "Fixed: deepseek-chat and deepseek-reasoner rows removed (retired 2026-07-24; their OpenRouter fallbacks were V3 and R1). deepseek-v4-pro now fails over to Together deepseek-ai/DeepSeek-V4-Pro-0813, the same snapshot as native, instead of OpenRouter 0423."
+note = "Fixed: deepseek-chat and deepseek-reasoner rows removed (retired 2026-07-24; their OpenRouter fallbacks were V3 and R1). deepseek-v4-pro now fails over to Together deepseek-ai/DeepSeek-V4-Pro-0813, the same snapshot as native, instead of OpenRouter 0423. 2026-10-01: OpenRouter now serves the same snapshot as deepseek/deepseek-v4-pro-0813, added third; deepseek-flash fails over to Together deepseek-ai/DeepSeek-V4.1-Flash, then OpenRouter (the test now holds both rows to their snapshot)."
 
 [[defect]]
 id = "D19"

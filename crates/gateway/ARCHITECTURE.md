@@ -498,7 +498,7 @@ accept it but did not follow it, while OpenRouter maps it per upstream itself (D
 (600 tested). A Messages client offering more than 128 tools on a row whose primary is Chat
 Completions and that has a Responses arm (the GPT rows before 5.4) walks that arm instead,
 translated onto `/v1/responses` (`route::tools_need_responses_arm`), so Claude Code with a few MCP
-servers works on `gpt-5-mini`. That walk has no OpenRouter failover: the arm is OpenAI only. The
+servers works on `gpt-5.1`. That walk has no OpenRouter failover: the arm is OpenAI only. The
 count is read from the body before
 the walk: a header-won Messages walk on such a row reads the body first (`route::walk_reads_tools`),
 and a large one is counted in `relay_full_body`. A Chat Completions client keeps its own endpoint,
@@ -1130,10 +1130,11 @@ per-request `cost_in_usd_ticks` matches exactly on every grok row (catalog sweep
 client on a grok row now sees OpenAI's convention, `completion_tokens` with reasoning inside, where
 xAI's own Chat Completions reports reasoning beside it; and the translated answer carries no
 `cost_in_usd_ticks` (a Responses client gets xAI's usage as sent). The same
-Chat Completions helper covers every other pool-keyed host: DeepSeek (`deepseek-flash` →
-`deepseek/deepseek-v4.1-flash`; `deepseek-v4-pro` fails over to Together's
-`deepseek-ai/DeepSeek-V4-Pro-0813`, because OpenRouter's `deepseek/deepseek-v4-pro` is the older
-0423 snapshot), and the Groq/Together llama /
+Chat Completions helper covers every other pool-keyed host: DeepSeek (`deepseek-flash` fails
+over to Together's `deepseek-ai/DeepSeek-V4.1-Flash`, then `deepseek/deepseek-v4.1-flash`;
+`deepseek-v4-pro` to Together's `deepseek-ai/DeepSeek-V4-Pro-0813`, then OpenRouter's
+`deepseek/deepseek-v4-pro-0813`, the same snapshot: OpenRouter's bare `deepseek/deepseek-v4-pro` is
+the older 0423), and the Groq/Together llama /
 qwen / open-weight ids people send (`openai/gpt-oss-120b` names Groq, Together and Fireworks:
 one of OpenRouter's hosts answers a forced tool call with an empty `finish_reason: "error"` 200;
 Kimi K3 / MiniMax M3 do the Together + Fireworks + OpenRouter shape, and GLM-5.2 Together +

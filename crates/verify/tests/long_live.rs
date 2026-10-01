@@ -28,7 +28,7 @@
 //!   equal the provider's usage report for the pool key, model and minutes (the BIL-5 method,
 //!   reused from `reconcile_live.rs`). Two sessions reconcile, claiming BIL-5 as well, so they run
 //!   in verify:live's isolated phase with no other live traffic (`recon::Window`): pi on
-//!   `claude-sonnet-5` and Claude Code (translated) on `gpt-5`. A failure lists the minutes
+//!   `claude-sonnet-5` and Claude Code (translated) on `gpt-5.1`. A failure lists the minutes
 //!   that differ, to tell another suite's traffic (a catalog sweep) from ours.
 //!
 //! # LNG-2: caching over a long session
@@ -134,18 +134,23 @@ const SONNET5: Route = Route {
     pools: ANTHROPIC,
     serves: "anthropic",
 };
+/// A GPT row whose primary is OpenAI Chat Completions (its 128-tool limit) with a Responses arm
+/// (D131). gpt-5.1: the cheapest such reasoning row not scheduled to retire (gpt-5-mini, this
+/// route's row until then, goes 2026-12-11).
 const GPT: Route = Route {
     name: "gpt",
-    model: "gpt-5-mini",
+    model: "gpt-5.1",
     pools: OPENAI,
     serves: "openai",
 };
 /// The GPT row of the reconciled translated session (`recon::Window`). Cheaper rows fail
 /// the task for their own reasons: gpt-4.1-mini stops after step 1, gpt-5-nano edits the tests,
 /// gpt-5-mini answers the turn after a compaction with another summary, and gpt-5.4-mini is D114.
-const GPT5: Route = Route {
-    name: "gpt-5",
-    model: "gpt-5",
+/// gpt-5, the session's row until then, retires 2026-12-11; gpt-5.1 is its successor at the same
+/// price, Chat-first like it, so Claude Code's Messages are still translated onto Chat.
+const GPT51: Route = Route {
+    name: "gpt-5.1",
+    model: "gpt-5.1",
     pools: OPENAI,
     serves: "openai",
 };
@@ -181,7 +186,7 @@ const SESSIONS: &[Session] = &[
     // summary quotes Claude Code's compaction prompt verbatim ("CRITICAL: Respond with TEXT ONLY")
     // into the new context, and the session stalls (5 of 6 tries on gpt-5 and gpt-5-mini; the
     // gateway relays both turns intact). Compaction is covered on the Claude rows.
-    ("LNG-1",       "claude-code", "claude-code:uncompacted", GPT5, Some(Provider::OpenAi)),
+    ("LNG-1",       "claude-code", "claude-code:uncompacted", GPT51, Some(Provider::OpenAi)),
     // D114: refused at the first turn (Messages thinking + tools -> Chat reasoning_effort + tools).
     ("LNG-1",       "claude-code", "claude-code", GPT54MINI, None),
     // Not reconciled: gpt-5.3-codex is the one row Codex runs on (D74), and live.rs,

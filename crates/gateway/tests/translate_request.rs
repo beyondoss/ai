@@ -47,9 +47,11 @@ fn captured(mock: &MockUpstream) -> (Captured, Value) {
 }
 
 /// An Anthropic SDK (Claude Code's shape: `max_tokens`, `temperature`, thinking off, a screenshot
-/// in a tool result) on a GPT-5 row. OpenAI 400s `max_tokens` and non-default sampling on every
-/// reasoning model and `reasoning_effort: "none"` on GPT-5, and a tool message cannot hold the
-/// image, so each used to be a 400 or an answer about a picture the model never saw.
+/// in a tool result) on a GPT-5.1 row. OpenAI 400s `max_tokens` on every reasoning model, and
+/// non-default sampling unless the effort is `none` (GPT-5.1's lowest, which thinking off maps
+/// to; GPT-5's was `minimal`, where the temperature was dropped), and a tool message cannot hold
+/// the image, so each used to be a 400 or an answer about a picture the model never saw. The row
+/// was gpt-5-nano until it was scheduled to retire (2026-12-11).
 /// claim: T5, T3
 #[tokio::test]
 async fn anthropic_sdk_on_a_gpt5_row_sends_what_openai_accepts() {
@@ -62,7 +64,7 @@ async fn anthropic_sdk_on_a_gpt5_row_sends_what_openai_accepts() {
         .await;
 
     let body = json!({
-        "model": "gpt-5-nano",
+        "model": "gpt-5.1",
         "max_tokens": 512,
         "temperature": 0.2,
         "thinking": {"type": "disabled"},
@@ -82,11 +84,11 @@ async fn anthropic_sdk_on_a_gpt5_row_sends_what_openai_accepts() {
 
     let (cap, got) = captured(&mock);
     assert_eq!(cap.path, "/v1/chat/completions");
-    assert_eq!(got["model"], "gpt-5-nano");
+    assert_eq!(got["model"], "gpt-5.1");
     assert_eq!(got["max_completion_tokens"], 512, "{got}");
     assert!(got.get("max_tokens").is_none(), "{got}");
-    assert!(got.get("temperature").is_none(), "{got}");
-    assert_eq!(got["reasoning_effort"], "minimal", "GPT-5's lowest: {got}");
+    assert_eq!(got["reasoning_effort"], "none", "GPT-5.1's lowest: {got}");
+    assert_eq!(got["temperature"], 0.2, "kept with effort none: {got}");
     let roles: Vec<&str> = got["messages"]
         .as_array()
         .unwrap()
@@ -382,7 +384,7 @@ async fn anthropic_sdk_thinking_reaches_openrouter_as_reasoning_details() {
         .await;
 
     let body = json!({
-        "model": "claude-sonnet-4-5", "max_tokens": 2000,
+        "model": "claude-sonnet-4-6", "max_tokens": 2000,
         "thinking": {"type": "enabled", "budget_tokens": 1024},
         "tools": [{"name": "get_weather", "input_schema": {"type": "object", "properties": {"city": {"type": "string"}}}}],
         "messages": [

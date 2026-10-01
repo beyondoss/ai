@@ -75,7 +75,10 @@ const OPENAI: Recon = Recon {
     name: "openai",
     pool_var: "OPENAI_API_KEY",
     admin_var: "OPENAI_ADMIN_KEY",
-    model: "gpt-4.1-nano",
+    // Not a reasoning model, so the batch's tokens are the same on every run, and its Chat
+    // primary has a Responses arm. gpt-4.1-nano, the batch's row until then, retires 2026-10-23;
+    // gpt-4.1-mini is the same family (same caching), and no other live suite pins it.
+    model: "gpt-4.1-mini",
     batch: &[
         // Native Chat, three turns on one system prompt (OpenAI caches a ≥1024-token prefix).
         (Endpoint::Chat, false),
@@ -99,7 +102,11 @@ const ANTHROPIC: Recon = Recon {
     name: "anthropic",
     pool_var: "ANTHROPIC_API_KEY",
     admin_var: "ANTHROPIC_ADMIN_KEY",
-    model: "claude-sonnet-4-5",
+    // Its minimum cacheable prompt is below the batch's system prompt (measured 2026-10-01: a
+    // 1,400-token prompt was written), so writes and reads occur. claude-sonnet-4-5, the batch's
+    // row until then, retires 2026-11-30. pi's long session reconciles `claude-sonnet-5` in the
+    // same phase; [`model_matches`] keeps the two reports apart.
+    model: "claude-sonnet-5-5",
     batch: &[
         // Native Messages with a cache_control breakpoint: a write, then reads.
         (Endpoint::Messages, false),
@@ -738,13 +745,25 @@ pub(crate) fn pool_key_id(provider: Provider, pool: &str, admin: &str) -> Result
     }
 }
 
-/// The report's model is dated (`gpt-4.1-nano-2025-04-14`); the catalog row's upstream id is its
-/// prefix.
+/// The report's model may be dated (`gpt-4.1-mini-2025-04-14`, `claude-sonnet-4-5-20250929`):
+/// the catalog row's upstream id followed by a date, and nothing else. Any other suffix is another
+/// model: `claude-sonnet-5` must not take `claude-sonnet-5-5`'s tokens (both reconcile in the
+/// same isolated phase), nor `gpt-4.1` take `gpt-4.1-mini`'s.
 fn model_matches(reported: &str, model: &str) -> bool {
+    let date = |d: &str| {
+        let b = d.as_bytes();
+        let digits = |r: std::ops::Range<usize>| b[r].iter().all(u8::is_ascii_digit);
+        match b.len() {
+            8 => digits(0..8),
+            10 => digits(0..4) && b[4] == b'-' && digits(5..7) && b[7] == b'-' && digits(8..10),
+            _ => false,
+        }
+    };
     reported == model
         || reported
             .strip_prefix(model)
-            .is_some_and(|rest| rest.starts_with('-'))
+            .and_then(|rest| rest.strip_prefix('-'))
+            .is_some_and(date)
 }
 
 /// OpenAI's completions usage (Chat Completions and Responses both report here). `input_tokens`
