@@ -101,6 +101,10 @@ pub struct TranslateState {
     /// This attempt's request carries cache breakpoints the gateway added (see
     /// [`request_with_tools`]). Its cache writes are the gateway's cost, billed and shown as input.
     pub gateway_cache: bool,
+    /// This attempt asked a stream-only candidate for a stream the client did not ask for
+    /// ([`force_stream`]); a streamed answer is assembled into one body
+    /// ([`SseBridge::assembling`]). Set per attempt.
+    pub assemble: bool,
 }
 
 impl TranslateState {
@@ -111,6 +115,7 @@ impl TranslateState {
             json_buf: Vec::new(),
             tools: ToolNames::default(),
             gateway_cache: false,
+            assemble: false,
         }
     }
 
@@ -4641,6 +4646,48 @@ pub fn store_false(body: &mut Vec<u8>) -> bool {
     true
 }
 
+/// A body for a candidate that answers only streams (`providers::catalog::stream_only`, D147),
+/// asking for a stream when the client did not: every root `stream` member (and, with `usage`,
+/// every `stream_options`) is cut out by span, and `"stream":true` (with
+/// `"stream_options":{"include_usage":true}`, so a Chat Completions stream ends in its usage chunk)
+/// goes first; every other byte stays as sent. `false`, untouched, when the body already streams
+/// (its last `stream` is `true`, as the provider's parser reads it): the client then gets the
+/// stream it asked for.
+pub fn force_stream(body: &mut Vec<u8>, usage: bool) -> bool {
+    let Some(members) = peek::root_members(body) else {
+        return false;
+    };
+    if members
+        .iter()
+        .rev()
+        .find(|m| m.key_is(body, "stream"))
+        .is_some_and(|m| &body[m.value.0..m.value.1] == b"true")
+    {
+        return false;
+    }
+    let had_others = members
+        .iter()
+        .any(|m| !(m.key_is(body, "stream") || (usage && m.key_is(body, "stream_options"))));
+    peek::remove_root_members(body, "stream");
+    if usage {
+        peek::remove_root_members(body, "stream_options");
+    }
+    let Some(open) = body.iter().position(|b| !b.is_ascii_whitespace()) else {
+        return false;
+    };
+    if body[open] != b'{' {
+        return false;
+    }
+    let member: &[u8] = match (usage, had_others) {
+        (true, true) => br#""stream":true,"stream_options":{"include_usage":true},"#,
+        (true, false) => br#""stream":true,"stream_options":{"include_usage":true}"#,
+        (false, true) => br#""stream":true,"#,
+        (false, false) => br#""stream":true"#,
+    };
+    body.splice(open + 1..open + 1, member.iter().copied());
+    true
+}
+
 /// A same-wire Responses body, minus the `reasoning` items this gateway minted from Claude's
 /// thinking. A catalog walk relays the body byte for byte to an OpenAI Responses upstream (a
 /// Responses-first row, a GPT row's Responses arm, a mixed-row failover), where a foreign id and an
@@ -5401,6 +5448,42 @@ impl SseBridge {
     pub fn with_gateway_cache(mut self, on: bool) -> Self {
         self.ant_to_oai.gateway_cache = on;
         self
+    }
+
+    /// A bridge that assembles an upstream stream into one non-streaming answer instead of
+    /// relaying it, for a client that did not ask for a stream from a candidate that answers only
+    /// streams (`providers::catalog::stream_only`, D147). It reads the stream the way a Responses
+    /// client's bridge does, since that already builds the whole response (`response.completed`
+    /// repeats every output item and the usage), but writes no event: [`Self::feed`] returns
+    /// nothing, and [`Self::assembled`] gives the body once the upstream has ended. Reasoning,
+    /// refusals, tool calls (arguments as the model wrote them) and the finish reason come through
+    /// as a Responses client's stream would carry them. Not for a Responses upstream, which a
+    /// Responses client's bridge relays.
+    pub fn assembling(upstream: Endpoint) -> Self {
+        debug_assert_ne!(upstream, Endpoint::Responses);
+        let mut bridge = Self::new(Endpoint::Responses, upstream);
+        bridge.oai_to_resp.quiet = true;
+        bridge
+    }
+
+    /// The `client`'s non-streaming body for an [`Self::assembling`] bridge whose upstream has
+    /// ended: the finished response mapped like any non-stream Responses body, or an error in the
+    /// client's envelope (the upstream's own, or `stream_truncated` for a stream that ended without
+    /// saying how). The status line has already gone out as the upstream's 200, so an error comes
+    /// with it, as an error-in-200 from a non-streaming upstream does.
+    pub fn assembled(&mut self, client: Endpoint) -> Vec<u8> {
+        match self.oai_to_resp.whole.take() {
+            Some(Whole::Done(resp)) if client == Endpoint::Responses => encode(&resp),
+            Some(Whole::Done(resp)) => encode(&map_response(
+                Endpoint::Responses,
+                client,
+                &resp,
+                &ToolNames::default(),
+                false,
+            )),
+            Some(Whole::Failed(err)) => encode(&map_error(&err, client, 200)),
+            None => encode(&map_error(&truncated_stream_error(), client, 200)),
+        }
     }
 
     /// Bytes held for an event whose terminating blank line has not arrived yet.
@@ -6673,10 +6756,25 @@ struct OaiToResp {
     completed: bool,
     /// How the request's tools were reshaped, to name each call the way the client offered it.
     tools: ToolNames,
+    /// Assembling (see [`SseBridge::assembling`]): no event is written, and the end is kept in
+    /// `whole` instead.
+    quiet: bool,
+    whole: Option<Whole>,
+}
+
+/// How an assembled stream ended.
+enum Whole {
+    /// The finished Responses object, as `response.completed` (or `response.incomplete`) carries it.
+    Done(Value),
+    /// The upstream's error body, as it came (or the gateway's `stream_truncated`).
+    Failed(Value),
 }
 
 impl OaiToResp {
     fn emit(&mut self, out: &mut Vec<u8>, typ: &str, mut body: Value) {
+        if self.quiet {
+            return;
+        }
         if let Some(m) = body.as_object_mut() {
             m.insert("type".into(), json!(typ));
             m.insert("sequence_number".into(), json!(self.seq));
@@ -7294,7 +7392,11 @@ impl OaiToResp {
         } else {
             "response.incomplete"
         };
-        self.emit(out, terminal, json!({ "response": resp }));
+        if self.quiet {
+            self.whole = Some(Whole::Done(resp));
+        } else {
+            self.emit(out, terminal, json!({ "response": resp }));
+        }
         self.completed = true;
     }
 
@@ -7307,6 +7409,11 @@ impl OaiToResp {
     /// upstream's message instead of ending on a missing `response.completed`.
     fn error(&mut self, v: &Value, out: &mut Vec<u8>) {
         if self.completed {
+            return;
+        }
+        if self.quiet {
+            self.completed = true;
+            self.whole = Some(Whole::Failed(v.clone()));
             return;
         }
         if !self.started {
@@ -8127,6 +8234,90 @@ mod tests {
         assert_eq!(empty, br#"{"store":false}"#);
         let mut not_json = b"[1]".to_vec();
         assert!(!store_false(&mut not_json));
+    }
+
+    /// claim: E1
+    /// defect: D147
+    #[test]
+    fn force_stream_asks_for_one_stream_and_moves_nothing_else() {
+        const ON: &str = r#""stream":true,"stream_options":{"include_usage":true}"#;
+        let mut omitted = br#" {"model":"m", "messages": []}"#.to_vec();
+        assert!(force_stream(&mut omitted, true));
+        assert_eq!(
+            String::from_utf8(omitted).unwrap(),
+            format!(r#" {{{ON},"model":"m", "messages": []}}"#)
+        );
+        let mut off =
+            br#"{"stream":false,"model":"m","stream_options":{"include_usage":false}}"#.to_vec();
+        assert!(force_stream(&mut off, true));
+        let v: Value = serde_json::from_slice(&off).unwrap();
+        assert_eq!(v["stream"], true);
+        assert_eq!(v["stream_options"]["include_usage"], true);
+        let text = String::from_utf8(off).unwrap();
+        assert_eq!(text.matches("\"stream\"").count(), 1, "{text}");
+        assert_eq!(text.matches("stream_options").count(), 1, "{text}");
+        let mut messages = br#"{"model":"m","stream":null}"#.to_vec();
+        assert!(force_stream(&mut messages, false));
+        assert_eq!(messages, br#"{"stream":true,"model":"m"}"#);
+        // The provider reads the last `stream`: a body that streams is the client's own stream.
+        let mut streams = br#"{"stream":false,"model":"m","stream":true}"#.to_vec();
+        assert!(!force_stream(&mut streams, true));
+        assert_eq!(streams, br#"{"stream":false,"model":"m","stream":true}"#);
+        let mut empty = b"{}".to_vec();
+        assert!(force_stream(&mut empty, true));
+        assert_eq!(String::from_utf8(empty).unwrap(), format!("{{{ON}}}"));
+        let mut not_json = b"[1]".to_vec();
+        assert!(!force_stream(&mut not_json, true));
+    }
+
+    /// An assembling bridge writes nothing while the stream runs and hands the client its whole
+    /// body at the end: a refusal and an `incomplete` finish (the output limit) map as a
+    /// non-streaming answer carries them.
+    /// claim: E1, E2
+    /// defect: D147
+    #[test]
+    fn an_assembling_bridge_writes_one_body_at_the_end() {
+        let sse = concat!(
+            "data: {\"id\":\"c1\",\"created\":5,\"model\":\"q\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Par\"}}]}\n\n",
+            "data: {\"id\":\"c1\",\"created\":5,\"model\":\"q\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"tial\"},\"finish_reason\":\"length\"}]}\n\n",
+            "data: {\"id\":\"c1\",\"choices\":[],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":2}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        for (client, check) in [
+            (
+                Endpoint::ChatCompletions,
+                (|v: &Value| {
+                    assert_eq!(v["choices"][0]["message"]["content"], "Partial", "{v}");
+                    assert_eq!(v["choices"][0]["finish_reason"], "length", "{v}");
+                    assert_eq!(v["usage"]["completion_tokens"], 2, "{v}");
+                    assert_eq!(v["model"], "q", "{v}");
+                }) as fn(&Value),
+            ),
+            (Endpoint::Messages, |v: &Value| {
+                assert_eq!(v["content"][0]["text"], "Partial", "{v}");
+                assert_eq!(v["stop_reason"], "max_tokens", "{v}");
+                assert_eq!(v["usage"]["output_tokens"], 2, "{v}");
+            }),
+            (Endpoint::Responses, |v: &Value| {
+                assert_eq!(v["status"], "incomplete", "{v}");
+                assert_eq!(v["output"][0]["content"][0]["text"], "Partial", "{v}");
+                assert_eq!(v["usage"]["input_tokens"], 3, "{v}");
+            }),
+        ] {
+            let mut bridge = SseBridge::assembling(Endpoint::ChatCompletions);
+            let (head, tail) = sse.as_bytes().split_at(70);
+            assert!(bridge.feed(head, false).is_empty());
+            assert!(bridge.feed(tail, true).is_empty());
+            let v: Value = serde_json::from_slice(&bridge.assembled(client)).unwrap();
+            check(&v);
+        }
+        // An error event mid-stream is the client's error, in its own envelope.
+        let mut bridge = SseBridge::assembling(Endpoint::ChatCompletions);
+        let err = "data: {\"error\":{\"message\":\"overloaded\",\"type\":\"server_error\"}}\n\n";
+        assert!(bridge.feed(err.as_bytes(), true).is_empty());
+        let v: Value = serde_json::from_slice(&bridge.assembled(Endpoint::Messages)).unwrap();
+        assert_eq!(v["type"], "error", "{v}");
+        assert_eq!(v["error"]["message"], "overloaded", "{v}");
     }
 
     #[test]

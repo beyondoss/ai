@@ -342,6 +342,26 @@ pub fn serves_file_input(c: &Candidate) -> bool {
         .any(|&(p, m)| p == c.provider && m == c.upstream_model)
 }
 
+/// Candidates that answer only streams. Together serves these Qwen models only with
+/// `"stream": true`; a request without it is a 400 `streaming_required` ("This model only supports
+/// streaming", measured 2026-10-01 on every Together id in the table: these four, no others). For a
+/// client that did not ask for a stream, the gateway asks such a candidate for one and assembles it
+/// into the client's ordinary JSON answer (D147). Each is on a Chat Completions path, the wire the
+/// assembly reads.
+const STREAM_ONLY: &[(ProviderId, &str)] = &[
+    (ProviderId::Together, "Qwen/Qwen3.6-Plus"),
+    (ProviderId::Together, "Qwen/Qwen3.7-Plus"),
+    (ProviderId::Together, "Qwen/Qwen3.7-Max"),
+    (ProviderId::Together, "Qwen/Qwen3.8-Flash"),
+];
+
+/// Whether a candidate answers only streams. See [`STREAM_ONLY`].
+pub fn stream_only(c: &Candidate) -> bool {
+    STREAM_ONLY
+        .iter()
+        .any(|&(p, m)| p == c.provider && m == c.upstream_model)
+}
+
 /// Upper bound on candidates per row, so the gateway can track which are usable in a single `u8`
 /// bitmask with no per-request allocation.
 pub const MAX_CANDIDATES: usize = 8;
@@ -3866,6 +3886,40 @@ mod tests {
             build.map(|c| c.iter().map(serves_file_input).collect::<Vec<_>>()),
             Some(vec![true, false]),
             "OpenRouter's grok-build-0.1 reads no PDF"
+        );
+    }
+
+    /// Together's stream-only Qwen ids are exactly the four primaries measured, each a candidate
+    /// on a Chat Completions path (the wire the gateway assembles a stream from), and nothing else
+    /// is stream-only: their OpenRouter failovers answer a non-streaming request.
+    /// claim: CAT-1
+    /// defect: D147
+    #[test]
+    fn stream_only_candidates_are_together_qwen_on_chat() {
+        let mut seen = Vec::new();
+        for r in MODEL_ROUTES {
+            for c in r.candidates.iter().chain(r.responses) {
+                if stream_only(c) {
+                    assert_eq!(c.path, "/v1/chat/completions", "{}", r.model);
+                    assert_eq!(c.provider, ProviderId::Together, "{}", r.model);
+                    seen.push(r.model);
+                }
+            }
+        }
+        seen.sort_unstable();
+        assert_eq!(
+            seen,
+            [
+                "qwen/qwen3.6-plus",
+                "qwen/qwen3.7-max",
+                "qwen/qwen3.7-plus",
+                "qwen/qwen3.8-flash"
+            ]
+        );
+        let flash = for_model("qwen/qwen3.8-flash").map(|r| r.candidates);
+        assert_eq!(
+            flash.map(|c| c.iter().map(stream_only).collect::<Vec<_>>()),
+            Some(vec![true, false]),
         );
     }
 

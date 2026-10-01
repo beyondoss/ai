@@ -954,6 +954,7 @@ impl RequestCtx {
         if let Some(t) = self.auto.as_mut().and_then(|a| a.translate.as_mut()) {
             t.sse = None;
             t.json_buf.clear();
+            t.assemble = false;
         }
         // The first attempt has nothing to undo, and that is the only attempt the vast majority of
         // requests ever make — so pay one compare rather than three stores on the hot path. A zero
@@ -2645,6 +2646,12 @@ fn catalog_translating(auto: &ModelRouting) -> bool {
         return false;
     };
     catalog_serving_endpoint(auto).is_some_and(|up| t.client != up)
+}
+
+/// This attempt asked a stream-only candidate for a stream its client did not ask for, and
+/// assembles it into one body (D147; see `translate::SseBridge::assembling`).
+fn catalog_assembling(auto: &ModelRouting) -> bool {
+    auto.translate.as_ref().is_some_and(|t| t.assemble)
 }
 
 /// A non-stream error from a same-endpoint candidate, buffered (it is small, and capped by
@@ -4975,6 +4982,9 @@ impl ProxyHttp for AiProxy {
                     let openai_host = a
                         .candidate_at(a.candidate)
                         .is_some_and(|c| c.provider == providers::ProviderId::OpenAi);
+                    let stream_only = a
+                        .candidate_at(a.candidate)
+                        .is_some_and(providers::catalog::stream_only);
                     if let Some(t) = a.translate.as_mut()
                         && let Some(to) = serving
                     {
@@ -5012,6 +5022,17 @@ impl ProxyHttp for AiProxy {
                         {
                             changed |= peek::remove_root_nulls(&mut buf);
                         }
+                        // A candidate that answers only streams, for a client that did not ask
+                        // for one: ask it for the stream (with its usage) and assemble the answer
+                        // into the client's own body (D147). Per attempt, like the tools: a
+                        // failover candidate gets the client's body as it came.
+                        t.assemble = stream_only
+                            && to != route::Endpoint::Responses
+                            && translate::force_stream(
+                                &mut buf,
+                                to == route::Endpoint::ChatCompletions,
+                            );
+                        changed |= t.assemble;
                     }
                     if changed {
                         scan = peek::scan_buffered(&buf);
@@ -5225,6 +5246,10 @@ impl ProxyHttp for AiProxy {
                 upstream_response.insert_header(UPSTREAM_MODEL_HEADER, c.upstream_model)?;
             }
 
+            // An assembled answer (D147): the upstream streams, the client gets one JSON body.
+            if rc.streaming && rc.auto.as_ref().is_some_and(|a| catalog_assembling(a)) {
+                upstream_response.insert_header("content-type", "application/json")?;
+            }
             if let Some(cache::Pending::Fill { content_type, .. }) =
                 rc.auto.as_mut().and_then(|a| a.cache.as_mut())
             {
@@ -5242,7 +5267,7 @@ impl ProxyHttp for AiProxy {
             // fields OpenRouter repeats on every chunk (see `translate::ChatIdentity`).
             if rc.auto.as_ref().is_some_and(|a| {
                 catalog_translating(a)
-                    || (rc.streaming && catalog_chat_relay(a))
+                    || (rc.streaming && (catalog_chat_relay(a) || catalog_assembling(a)))
                     || catalog_error_relay(a, rc.upstream_status, rc.streaming)
             }) {
                 let streaming = rc.streaming;
@@ -5254,8 +5279,13 @@ impl ProxyHttp for AiProxy {
                 if let Some(t) = rc.auto.as_mut().and_then(|a| a.translate.as_mut())
                     && streaming
                 {
-                    t.sse = Some(
+                    let bridge = if t.assemble {
+                        translate::SseBridge::assembling(upstream)
+                    } else {
                         translate::SseBridge::new(t.client, upstream)
+                    };
+                    t.sse = Some(
+                        bridge
                             .with_tools(t.tools.clone())
                             .with_gateway_cache(t.gateway_cache),
                     );
@@ -5362,9 +5392,13 @@ impl ProxyHttp for AiProxy {
                             .with_tools(tools.clone())
                             .with_gateway_cache(gateway_cache)
                     });
-                    let out = sse.feed(chunk, end_of_stream);
+                    let mut out = sse.feed(chunk, end_of_stream);
                     if sse.pending_len() > translate::MAX_TRANSLATE_BUFFER {
                         return Err(self.translate_overflow(&rc.request_id, "sse_event"));
+                    }
+                    // An assembling bridge writes nothing until the upstream has ended.
+                    if t.assemble && end_of_stream {
+                        out = sse.assembled(client);
                     }
                     out
                 } else {
@@ -5397,7 +5431,10 @@ impl ProxyHttp for AiProxy {
                     tap.push(&out);
                 }
             }
-            if rc.managed && rc.streaming {
+            if rc.managed
+                && rc.streaming
+                && !rc.auto.as_ref().is_some_and(|a| catalog_assembling(a))
+            {
                 rc.terminal.feed(&out);
             }
             *body = Some(Bytes::from(out));

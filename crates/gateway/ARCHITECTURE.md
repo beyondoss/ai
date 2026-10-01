@@ -144,6 +144,8 @@ Client (stock OpenAI/Anthropic SDK)
   │    `include_usage` on the translated Chat Completions body if it streams.
   │    Inbound Responses, same-endpoint: byte relay (session fields pass through).
   │    Session fields on a non-Responses candidate: skip or 400.
+  │  Stream-only candidate (`catalog::stream_only`), client not streaming: splice
+  │    `stream: true` (+ `include_usage`) first; the answer is assembled (below)
   │
   ▼  Provider upstream  (OpenAI / Anthropic / Groq / DeepSeek / …)
   │
@@ -164,6 +166,8 @@ Client (stock OpenAI/Anthropic SDK)
   │    The key searcher is built once per pool key at boot (`PoolAuth::finder`), not per response
   │  Translate path: convert SSE event-by-event into the inbound dialect (do not wait for `[DONE]`
   │    before forwarding deltas). Non-stream: map the JSON object, including error envelopes.
+  │    Assembled walk (stream-only candidate, non-stream client): the stream is read by a quiet
+  │    `SseBridge::assembling` and the client's JSON body is written once, at end of stream
   │    Both held buffers (the non-stream body; one not-yet-terminated SSE event) are capped at
   │    MAX_TRANSLATE_BUFFER (32 MiB) — past it the response is aborted
   │    (ai_rejections_total{reason="response_too_large"}). A stream as a whole is never capped.
@@ -425,6 +429,29 @@ one-shot is relayed there as sent, except that it goes as `store: false`
 `store` defaults to true). Usage/billing still parse the upstream body/SSE;
 `ai.usage.model` is what the provider echoed. Same-wire Responses (`/{provider}/v1/responses`)
 stays a byte relay. `/{provider}/…` never translates.
+
+**Stream-only candidates.** Together serves Qwen3.6 Plus, Qwen3.7 Plus, Qwen3.7 Max and Qwen3.8
+Flash only as streams: a request without `"stream": true` is a 400 `streaming_required` (D147).
+`providers::catalog::stream_only` names those candidates. When one serves an attempt whose client
+did not ask for a stream, the body goes out with `"stream":true,"stream_options":{"include_usage":true}`
+spliced first and any `stream` / `stream_options` the client sent cut out by span
+(`translate::force_stream`; onto a Messages path only `stream`). Every other byte is unchanged.
+The streamed answer is
+assembled into the client's ordinary JSON body: `TranslateState::assemble` gives the attempt a
+`SseBridge::assembling` bridge. That is the bridge a Responses client's stream already uses, which
+builds the whole response for `response.completed`, but it writes no event. At the upstream's end
+of stream, `assembled` maps that response like any non-stream Responses body (or encodes it as is
+for a Responses client). There is one aggregator, not a second one per wire. The client gets
+`content-type: application/json` and nothing until the upstream ends, as with a non-stream answer.
+The decision is per attempt, so a failover candidate that answers non-streaming requests
+(OpenRouter's copy of each row) gets the client's own body. Billing reads the upstream stream:
+`ai.usage` has one row with the usage chunk's exact tokens, and its `stream` is `true` because that
+is what the provider served and billed. A stream that ends without a finish reason or usage
+reaches the client as the `stream_truncated` error in its envelope, and the row is the cut-short
+estimate. The status line is already the upstream's 200 by then, as with an error-in-200 from a
+non-streaming upstream. The cache stores the assembled JSON (`application/json`) under the
+client's non-stream key, so a hit replays JSON. A streaming client on these rows is relayed as
+before.
 
 **Tool-count limits.** OpenAI Chat Completions takes at most 128 tools (400
 `array_above_max_length` "Expected an array with maximum length 128"); OpenAI's Responses API took
