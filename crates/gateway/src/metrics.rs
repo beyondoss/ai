@@ -75,12 +75,15 @@ pub enum Rejection {
     /// Buffering this request's body would take the process past `max_buffered_body_bytes`. 503
     /// with `Retry-After`: the memory frees as the bodies in flight finish.
     BodyMemory,
+    /// A catalog-walk body carries input the row's card does not accept (an image on a text-only
+    /// row). 400 before any upstream, which would ignore the image or answer 500.
+    Modality,
 }
 
 impl Rejection {
     /// Every variant, in `as_index` order. The array in `Metrics` is built from this, so adding a
     /// variant without adding it here fails the exhaustive `match` in `as_index`.
-    pub(crate) const ALL: [Rejection; 19] = [
+    pub(crate) const ALL: [Rejection; 20] = [
         Rejection::Auth,
         Rejection::DenySpend,
         Rejection::DenyFraud,
@@ -100,6 +103,7 @@ impl Rejection {
         Rejection::ManagedEndpoint,
         Rejection::DuplicateModel,
         Rejection::BodyMemory,
+        Rejection::Modality,
     ];
 
     /// The `reason=` label value. `RateLimit` keeps the original `"rate_limit"` string so existing
@@ -125,6 +129,7 @@ impl Rejection {
             Rejection::ManagedEndpoint => "managed_endpoint",
             Rejection::DuplicateModel => "duplicate_model",
             Rejection::BodyMemory => "body_memory",
+            Rejection::Modality => "modality",
         }
     }
 
@@ -149,6 +154,7 @@ impl Rejection {
             Rejection::ManagedEndpoint => 16,
             Rejection::DuplicateModel => 17,
             Rejection::BodyMemory => 18,
+            Rejection::Modality => 19,
         }
     }
 }

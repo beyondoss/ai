@@ -1225,6 +1225,26 @@ impl AiProxy {
         .await
     }
 
+    /// The body carries input the row's card says it does not accept (`route::refused_input`): a
+    /// 400 naming the row and the kind, before any upstream sees it.
+    async fn reject_refused_input(
+        &self,
+        session: &mut Session,
+        request_id: &str,
+        row: &route::ModelRoute,
+        kind: &str,
+    ) -> Result<bool> {
+        self.state.metrics.rejection(Rejection::Modality).inc();
+        Self::reject_message_boxed(
+            session,
+            request_id,
+            400,
+            "invalid_request_error",
+            format!("{} does not accept {kind} input", row.model),
+        )
+        .await
+    }
+
     /// Holding this request's body would cross `max_buffered_body_bytes`: a retryable 503, since
     /// the memory frees as the bodies in flight finish.
     async fn reject_body_memory(&self, session: &mut Session, request_id: &str) -> Result<bool> {
@@ -1342,6 +1362,12 @@ impl AiProxy {
         } else {
             None
         };
+        if let Some(kind) = route::refused_input(route, &body) {
+            return self
+                .reject_refused_input(session, &request_id, route, kind)
+                .await;
+        }
+        let unserved = route::unserved(route.candidates, &body);
         let body = Bytes::from(body);
         self.state.metrics.full_body_relays_total.inc();
         let mut skip = 0u8;
@@ -1361,6 +1387,7 @@ impl AiProxy {
                     route,
                     session_field,
                     skip,
+                    unserved,
                     keys,
                     reset,
                     resume,
@@ -2121,6 +2148,9 @@ struct FullBody {
     session_field: Option<&'static str>,
     /// Catalog indices (bit per index) an earlier attempt failed over from.
     skip: u8,
+    /// Catalog indices (bit per index) that cannot serve this body (`route::unserved`), read by the
+    /// parent while it held the whole body.
+    unserved: u8,
     /// Per catalog index, the pool key an earlier attempt's key walk moved to, or [`NO_KEY_WALK`]:
     /// start on the provider's first key not cooling off (`Provider::first_key`, D71/D83).
     keys: [u8; route::MAX_CANDIDATES],
@@ -2599,6 +2629,44 @@ fn catalog_chat_relay(auto: &ModelRouting) -> bool {
             c.provider != providers::ProviderId::OpenAi
                 && route::Endpoint::of_upstream_path(c.path) == route::Endpoint::ChatCompletions
         })
+}
+
+/// OpenRouter's context compression is on by default for every endpoint of 8K context or less: a
+/// prompt over the window has its middle dropped and is answered, where every other host (and
+/// OpenRouter with compression off) answers the context error. The gateway relays what the client
+/// sent or a context error, never an answer to a prompt it did not send, so a catalog walk to an
+/// OpenRouter Chat Completions candidate turns it off, the way OpenRouter documents
+/// (`plugins: [{"id": "context-compression", "enabled": false}]`).
+const OPENROUTER_NO_COMPRESSION: &[u8] =
+    br#""plugins":[{"id":"context-compression","enabled":false}],"#;
+
+/// An OpenRouter Chat Completions catalog candidate.
+fn openrouter_chat(c: &route::Candidate) -> bool {
+    c.provider == providers::ProviderId::OpenRouter
+        && route::Endpoint::of_upstream_path(c.path) == route::Endpoint::ChatCompletions
+}
+
+/// Splice [`OPENROUTER_NO_COMPRESSION`] just inside the root object. A body that already names
+/// `plugins` is the client's choice and is left as sent, as is anything that is not a non-empty
+/// JSON object (the provider rejects it by name).
+fn disable_openrouter_compression(mut body: Vec<u8>) -> Vec<u8> {
+    if memchr::memmem::find(&body, br#""plugins""#).is_some() {
+        return body;
+    }
+    let Some(open) = body.iter().position(|b| !b.is_ascii_whitespace()) else {
+        return body;
+    };
+    let next = body
+        .get(open + 1..)
+        .and_then(|rest| rest.iter().find(|b| !b.is_ascii_whitespace()));
+    if body.get(open) != Some(&b'{') || matches!(next, None | Some(b'}')) {
+        return body;
+    }
+    body.splice(
+        open + 1..open + 1,
+        OPENROUTER_NO_COMPRESSION.iter().copied(),
+    );
+    body
 }
 
 /// The fragment spliced into a streaming OpenAI chat body. Always followed by a comma, since the
@@ -3416,7 +3484,7 @@ impl ProxyHttp for AiProxy {
             && full_body.is_none()
             && !peeked
             && let Some(route) = model_route
-            && (responses || large)
+            && (responses || large || route::walk_reads_body(route))
         {
             match self.take_slot_before_read(tenant_id) {
                 Ok(guard) => early_slot = guard,
@@ -3523,6 +3591,14 @@ impl ProxyHttp for AiProxy {
                     )
                     .await;
                 }
+                if let Some(kind) = body_complete
+                    .as_deref()
+                    .and_then(|b| route::refused_input(row, b))
+                {
+                    return self
+                        .reject_refused_input(session, &request_id, row, kind)
+                        .await;
+                }
                 // A Responses request walks the row's Responses arm whenever the row has one,
                 // `store: false` one-shots included: there it is a byte relay, and translation onto
                 // Chat Completions would lose what only Responses has (Codex's `namespace` tools,
@@ -3602,6 +3678,20 @@ impl ProxyHttp for AiProxy {
                     if keyed && !failed && serves {
                         dispatchable |= 1 << orig;
                     }
+                }
+                // A candidate that cannot serve this body (`route::unserved`: Bedrock and a
+                // JSON-schema output) is not dispatched to, ranked or probed, unless nothing else
+                // can take the request, when the provider's own error is the answer.
+                let unserved = match (&full_body, body_complete.as_deref()) {
+                    (Some(fb), _) => fb.unserved,
+                    (None, Some(b)) => route::unserved(arms, b),
+                    (None, None) => 0,
+                };
+                let walked = (0..walk.len)
+                    .filter_map(|i| walk.catalog_index(i))
+                    .fold(0u8, |m, orig| m | (1 << orig));
+                if dispatchable & walked & !unserved != 0 {
+                    dispatchable &= !unserved;
                 }
                 if self.state.config.smart_router
                     && sub.is_none()
@@ -4875,6 +4965,10 @@ impl ProxyHttp for AiProxy {
                     apply_stream_usage_injection(buf, scan.inject_at)
                 } else {
                     buf
+                };
+                let buf = match rc.auto.as_ref().and_then(|a| a.candidate_at(a.candidate)) {
+                    Some(c) if openrouter_chat(c) => disable_openrouter_compression(buf),
+                    _ => buf,
                 };
                 *body = Some(Bytes::from(buf));
             } else {

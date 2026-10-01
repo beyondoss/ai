@@ -353,15 +353,44 @@ too: each row has `display_name`, and the list has `has_more: false`. Each row a
 | `endpoints`                                                | all three generation paths (translation serves each), or `/v1/embeddings` |
 | `pricing` (`input` `output` `cache_read` `cache_write`)    | `ListPrice`, USD per million tokens (`pricing_unit` says so once)         |
 
-`providers::catalog::ModelCard` takes `context_window` and `max_output_tokens` from the
-**primary** vendor's model docs where it publishes them, and lists only the input kinds and
-capabilities that vendor lists. Where the vendor publishes no max output, OpenRouter's 0.9x /
+`providers::catalog::ModelCard` states the limits **every** candidate of the row enforces, so a
+request sized from the card is accepted wherever the walk lands: the primary vendor's
+`context_window` and `max_output_tokens`, lowered where a candidate enforces less. OpenAI's GPT-5
+family counts output inside the published window and caps input at the window less the max
+output, so those cards list 272,000 (of 400,000) or 922,000 (of 1,050,000); a failover host with a
+smaller window sets the row's (Ministral 3B's OpenRouter candidate, 131,072). One figure per row,
+not per candidate: the gateway counts no prompt tokens, so it could not choose a candidate by
+window anyway. The card lists the input kinds and capabilities the vendor lists **and every
+candidate serves on the endpoint it is reached on**: grok rows on xAI's Chat Completions list no
+file input (xAI reads PDFs on Responses only), `grok-4.20-multi-agent` no tools (xAI gates its
+client-side tools behind beta access), `gpt-4` lists the tools every candidate calls though its
+model page omits them. Where the vendor publishes no max output, OpenRouter's 0.9x /
 0.8x-of-window filler is replaced by `UNPUBLISHED_MAX_OUTPUT` (32,768), a conservative figure and
-not a vendor limit. OpenRouter-primary rows, and facts no vendor publishes, still come from
-OpenRouter's public card. Each checked value is recorded with its source URL in
-`verify/catalog_truth.toml`, and `catalog_matches_vendor_truth` / `capability_bits_match_vendor_truth`
-hold the table to it. The body is built once and cached. It is served after identity and before
-the body peek, so an empty GET is not a missing-model 404.
+not a vendor limit. Prices, `created` and `owned_by` follow the model's maker (OpenAI's and xAI's
+own `/v1/models` listings; Moonshot's and Z.ai's price tables for their OpenRouter-only rows),
+never OpenRouter's listing; facts no vendor publishes, and open-weight rows whose maker sells no
+API, still come from OpenRouter's public card. Each checked value is recorded with its source URL
+in `verify/catalog_truth.toml`, with any lower served limit beside it (`input_limit` /
+`output_limit` and their evidence), and `catalog_matches_vendor_truth` /
+`capability_bits_match_vendor_truth` hold the table to it. The body is built once and cached. It is
+served after identity and before the body peek, so an empty GET is not a missing-model 404.
+
+**The card holds the request.** A header-won catalog walk normally relays a small body without
+reading it first; on a row where the body decides something (`route::walk_reads_body`: a card
+without image input, or a candidate that cannot honor an advertised capability) it reads the whole
+body before choosing, as a headerless walk always does. Then:
+
+- An image part (Chat `image_url`, Messages `image`, Responses `input_image`) on a row whose card
+  lists no image input is a 400 naming the row (`ai_rejections_total{reason="modality"}`), before
+  any upstream: o3-mini would ignore the image and bill an answer about nothing, gpt-4 would
+  answer 500. PDFs are not gated: OpenRouter extracts a PDF's text for any model.
+- A body asking for a JSON-schema output (`response_format` / `output_config.format` /
+  `text.format`) leaves Amazon Bedrock out of the walk (`providers::catalog::serves_structured_outputs`):
+  Bedrock's Messages surface answers `output_config.format` with a 400 (Opus 4.8) or a 404 (Haiku
+  4.5). It is left out of the order, failover and TTFT ranking alike, unless nothing else is usable
+  (an `x-beyond-only: bedrock`), when Bedrock's own answer is the client's.
+
+A large body reaches the same two checks in `relay_full_body`, which holds it whole.
 
 A stock OpenAI or Anthropic SDK pointed at `/v1` with `model` in the JSON body is `/auto` without
 the header. Same-wire failover is a byte relay — the gateway rewrites ids, not API shapes, across
@@ -452,8 +481,7 @@ ways: base64 data URIs ↔ Anthropic `base64` sources, and `http(s)` URLs ↔ An
 (passed through unchanged between Chat Completions and Responses). The gateway fetches nothing —
 each upstream downloads the URL itself. Amazon Bedrock rejects `url` sources, so a URL image that
 fails over onto a Bedrock candidate gets Bedrock's 400 rather than an answer about a picture the
-model never saw; the walk is chosen before the body is read, so it cannot skip Bedrock for these
-requests. `thinking` / `redacted_thinking` blocks, `cache_control`,
+model never saw (the walk leaves Bedrock out only for structured outputs, above). `thinking` / `redacted_thinking` blocks, `cache_control`,
 `parallel_tool_calls: false` ↔ `tool_choice.disable_parallel_tool_use`, and `user` ↔
 `metadata.user_id` pass both ways so an agent workload round-trips. Onto Messages, thinking crosses
 only as a block Anthropic can verify — signed, or redacted — from the gateway's `thinking` array,
@@ -827,6 +855,13 @@ the provider:
   is spliced to whatever the serving candidate calls it (`peek::scan_buffered` reports the value's
   byte span). Because the body may change length, catalog-walk requests are buffered and re-framed
   exactly as the injection path is; the two are one predicate (`RequestCtx::rewrites_body`).
+- **OpenRouter is asked not to compress.** OpenRouter's context compression is on by default for
+  endpoints of 8K context or less: an over-window prompt has its middle dropped and is answered
+  (gpt-4 through OpenRouter returned 200 to a 10,601-word prompt). An attempt on an OpenRouter
+  Chat Completions candidate gets `"plugins":[{"id":"context-compression","enabled":false}]`
+  spliced just inside the root object, OpenRouter's documented switch, so it answers the context
+  error every other host does. A body that already names `plugins` is the client's choice and is
+  left as sent.
 - **It is managed-only on `/auto`, and on `/v1` only for managed keys.** A BYO token belongs to one
   provider, so selecting among candidates would be a guess and failing over would hand one vendor's
   key to another. BYO on `/auto` → 400. BYO on `/v1` is unchanged dialect-default passthrough.
@@ -868,20 +903,27 @@ under the vendor-slug spelling (`claude-opus-5` → `anthropic/claude-opus-5`; `
 `anthropic/claude-opus-4.8`). `claude-haiku-4-5` and `claude-opus-4-8` insert Amazon Bedrock's
 Messages API as an independent second source (`us.anthropic.claude-haiku-4-5-20251001-v1:0` /
 `us.anthropic.claude-opus-4-8`) before OpenRouter. GPT rows do the same shape on the Chat
-Completions wire (`gpt-6-astra` → `openai/gpt-6-astra`) plus an OpenAI-only `/v1/responses` arm —
+Completions wire (`gpt-5.2` → `openai/gpt-5.2`) plus an OpenAI-only `/v1/responses` arm —
 the table covers the current 4 / 4.1 / 4o / 5 / 5.x / 6 and o-series ids OpenRouter listed on
-2026-09-19. The same Chat Completions helper covers every other pool-keyed host: xAI `grok-*`
-(`grok-4.6` → `x-ai/grok-4.6`, plus `grok-4.20-multi-agent`), DeepSeek (`deepseek-flash` →
+2026-09-19. From GPT-5.4 on (`gpt-5.4*`, `gpt-5.5`, `gpt-5.6-*`, `gpt-6-astra`) the OpenAI
+candidate is `/v1/responses` too: OpenAI's Chat Completions answers function tools with any
+reasoning effort with a 400 ("use /v1/responses or set reasoning_effort to 'none'"), and GPT-5.6
+and GPT-6 Astra reason by default, so every tool call failed there; a Chat Completions or Messages
+client is translated onto Responses. The same Chat Completions helper covers every other
+pool-keyed host: xAI `grok-*` (`grok-4.6` → `x-ai/grok-4.6`; `grok-4.20-multi-agent`'s xAI
+candidate is `/v1/responses`, the only endpoint xAI serves multi-agent on), DeepSeek (`deepseek-flash` →
 `deepseek/deepseek-v4.1-flash`; `deepseek-v4-pro` fails over to Together's
 `deepseek-ai/DeepSeek-V4-Pro-0813`, because OpenRouter's `deepseek/deepseek-v4-pro` is the older
 0423 snapshot), Mistral `-latest` aliases (including Ministral), and the Groq/Together llama /
-qwen / open-weight ids people send (`openai/gpt-oss-120b` names Groq, Together, Fireworks and
-OpenRouter; Kimi K3 / GLM-5.2 / MiniMax M3 do the Together + Fireworks + OpenRouter shape). A
+qwen / open-weight ids people send (`openai/gpt-oss-120b` names Groq, Together and Fireworks:
+one of OpenRouter's hosts answers a forced tool call with an empty `finish_reason: "error"` 200;
+Kimi K3 / GLM-5.2 / MiniMax M3 do the Together + Fireworks + OpenRouter shape). A
 fallback must serve the model the row names, so a retired vendor id is removed with its row
 (`deepseek-chat`, `deepseek-reasoner` and `mistral-nemo`, whose OpenRouter fallbacks were other
 models), and a candidate the host reserves for Enterprise or dedicated deployments is not listed
 (Groq `llama-3.1-8b-instant` / `llama-3.3-70b-versatile` / `minimaxai/minimax-m2.7`, the
-Fireworks Llama 4 / Kimi K2.6 / GLM 5.1 / Llama 3.3 ids, Together Kimi K2.7 Code and GPT-OSS 20B).
+Fireworks Llama 4 / Kimi K2.6 / GLM 5.1 / Llama 3.3 ids, Together Kimi K2.7 Code, GPT-OSS 20B,
+Gemma 4 31B and Qwen2.5 7B Turbo).
 Rows left with only OpenRouter keep their names as OpenRouter-only rows. These ids are recorded in
 `verify/catalog_truth.toml`, and `no_candidate_is_retired_or_not_serverless` keeps them out. Those
 rows have no Responses arm — `previous_response_id` is OpenAI's store. OpenAI serves some GPT ids only
@@ -2070,7 +2112,7 @@ Prometheus on the default registry, exposed at `/metrics` on `metrics_listen`.
 | Metric                                | Type      | Labels               | What It Measures                                                                                                                                                           |
 | ------------------------------------- | --------- | -------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `ai_requests_total`                   | Counter   | —                    | Every client request received, rejected ones included (a `FullBody` re-run is not counted again)                                                                           |
-| `ai_rejections_total`                 | Counter   | `reason`             | Rejected requests by cause (auth, deny_spend, quota, allowance_unavailable, deny_fraud, rate_limit, tenant_concurrency, managed_endpoint, duplicate_model, body_memory, …) |
+| `ai_rejections_total`                 | Counter   | `reason`             | Rejected requests by cause (auth, deny_spend, quota, allowance_unavailable, deny_fraud, rate_limit, tenant_concurrency, managed_endpoint, duplicate_model, modality, etc.) |
 | `ai_upstream_responses_total`         | Counter   | `provider`, `status` | Upstream responses by provider and status class                                                                                                                            |
 | `ai_tokens_total`                     | Counter   | `kind`               | input / output / cache_read / cache_write token counts                                                                                                                     |
 | `ai_ttft_seconds`                     | Histogram | `provider`           | Time to first token (50ms–30s buckets)                                                                                                                                     |

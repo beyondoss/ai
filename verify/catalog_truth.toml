@@ -5,8 +5,28 @@
 # omitted, never guessed. Prices are USD per million tokens, as the vendor wrote them; the standard
 # tier only (not batch/flex; DeepSeek peak; xAI < 200k prompt; OpenAI <= 272K input).
 #
+# A row whose primary is OpenRouter may also have an entry when the model's maker sells it through
+# its own API and publishes the facts (Z.ai's GLM, Moonshot's Kimi, OpenAI's Codex ids): the card
+# then follows the maker, never OpenRouter's listing.
+#
+# Two fields record a limit the row's candidates enforce below the vendor's published figure. The
+# card states the smaller one, so a request sized from it is accepted wherever the walk lands:
+# - `input_limit`: the most input tokens every candidate accepts, when lower than `context_window`
+#   (OpenAI's GPT-5 family counts output inside the window and caps input at the window less the
+#   max output; a failover host serving a smaller window).
+# - `output_limit`: the most output tokens one request can ask for, when lower than
+#   `max_output_tokens`.
+# Either needs `limit_evidence`: the measurement or document that sets it.
+#
+# `created` (Unix seconds) and `owned_by` are the vendor's own model listing (`GET /v1/models` at
+# api.openai.com / api.x.ai), not OpenRouter's listing date.
+#
+# `[[promo]]` records a vendor-announced promotional rate that some route charges while the card
+# keeps the standard rate (the catalog_live CAT-7 check accepts a charge at that rate until `until`).
+#
 # `catalog_matches_vendor_truth` (crates/providers/src/catalog.rs) asserts:
-# - every recorded field equals the catalog row's value;
+# - every recorded field equals the catalog row's value (`context_window` / `max_output_tokens`
+#   yield to `input_limit` / `output_limit` where recorded);
 # - a row that records `input` but omits `cache_read` / `cache_write` lists the input rate there
 #   (the ListPrice rule for an unpublished rate);
 # - every direct-vendor catalog row has a [[row]] here or an `unverified` entry with a reason.
@@ -255,16 +275,9 @@ input_absent = ["image"]
 note = "DeepSeek-V4-Pro-0813. \"Vision: Not supported\". Off-peak $0.66 / $0.022 / $1.98. Together serves the same snapshot as deepseek-ai/DeepSeek-V4-Pro-0813."
 
 [[row]]
-model = "google/gemma-4-31b-it"
-source = ["https://www.together.ai/pricing"]
-date = "2026-10-01"
-input = "0.39"
-output = "0.97"
-note = "google/gemma-4-31B-it is absent from the docs serverless table but listed serverless on the pricing page. Context not published."
-
-[[row]]
 model = "gpt-4"
 source = [
+  "https://api.openai.com/v1/models",
   "https://developers.openai.com/api/docs/pricing.md",
   "https://developers.openai.com/api/docs/models/gpt-4.md",
 ]
@@ -273,12 +286,17 @@ input = "30"
 output = "60"
 context_window = 8192
 max_output_tokens = 8192
-features_absent = ["tools", "structured_outputs"]
-note = "Shutdown 2026-10-23. Feature list is \"fine_tuning, streaming\" only."
+features_absent = ["structured_outputs"]
+input_limit = 8191
+output_limit = 4096
+limit_evidence = "The 8,192 window holds prompt and output together, so the vendor's 8,192 max output is refused with any prompt (\"you requested 8206 tokens (14 in the messages, 8192 in the completion)\", CAT-4::raw::openai::gpt-4). The card takes OpenRouter's published figures for its candidate: context_length 8191 (\"This endpoint's maximum context length is 8191 tokens\") and max_completion_tokens 4096."
+created = 1687882411
+note = "Shutdown 2026-10-23. Feature list is \"fine_tuning, streaming\" only, yet every candidate (OpenAI Chat and Responses, OpenRouter) returns a forced function call (CAT-6::raw::openai::gpt-4): gpt-4-0613 is the snapshot that introduced function calling. The card lists tools; structured outputs stay off."
 
 [[row]]
 model = "gpt-4-turbo"
 source = [
+  "https://api.openai.com/v1/models",
   "https://developers.openai.com/api/docs/pricing.md",
   "https://developers.openai.com/api/docs/models/gpt-4-turbo.md",
 ]
@@ -290,11 +308,13 @@ max_output_tokens = 4096
 input_present = ["image"]
 features_present = ["tools"]
 features_absent = ["structured_outputs"]
+created = 1712361441
 note = "Shutdown 2026-10-23."
 
 [[row]]
 model = "gpt-4.1"
 source = [
+  "https://api.openai.com/v1/models",
   "https://developers.openai.com/api/docs/pricing.md",
   "https://developers.openai.com/api/docs/models/gpt-4.1.md",
 ]
@@ -304,10 +324,12 @@ output = "8"
 cache_read = "0.5"
 context_window = 1_047_576
 max_output_tokens = 32_768
+created = 1744316542
 
 [[row]]
 model = "gpt-4.1-mini"
 source = [
+  "https://api.openai.com/v1/models",
   "https://developers.openai.com/api/docs/pricing.md",
   "https://developers.openai.com/api/docs/models/gpt-4.1-mini.md",
 ]
@@ -317,10 +339,12 @@ output = "1.6"
 cache_read = "0.1"
 context_window = 1_047_576
 max_output_tokens = 32_768
+created = 1744318173
 
 [[row]]
 model = "gpt-4.1-nano"
 source = [
+  "https://api.openai.com/v1/models",
   "https://developers.openai.com/api/docs/pricing.md",
   "https://developers.openai.com/api/docs/models/gpt-4.1-nano.md",
 ]
@@ -330,11 +354,13 @@ output = "0.4"
 cache_read = "0.025"
 context_window = 1_047_576
 max_output_tokens = 32_768
+created = 1744321707
 note = "Shutdown 2026-10-23."
 
 [[row]]
 model = "gpt-4o"
 source = [
+  "https://api.openai.com/v1/models",
   "https://developers.openai.com/api/docs/pricing.md",
   "https://developers.openai.com/api/docs/models/gpt-4o.md",
 ]
@@ -344,10 +370,12 @@ output = "10"
 cache_read = "1.25"
 context_window = 128_000
 max_output_tokens = 16_384
+created = 1715367049
 
 [[row]]
 model = "gpt-4o-mini"
 source = [
+  "https://api.openai.com/v1/models",
   "https://developers.openai.com/api/docs/pricing.md",
   "https://developers.openai.com/api/docs/models/gpt-4o-mini.md",
 ]
@@ -357,10 +385,12 @@ output = "0.6"
 cache_read = "0.075"
 context_window = 128_000
 max_output_tokens = 16_384
+created = 1721172741
 
 [[row]]
 model = "gpt-5"
 source = [
+  "https://api.openai.com/v1/models",
   "https://developers.openai.com/api/docs/pricing.md",
   "https://developers.openai.com/api/docs/models/gpt-5.md",
 ]
@@ -370,11 +400,15 @@ output = "10"
 cache_read = "0.125"
 context_window = 400_000
 max_output_tokens = 128_000
+created = 1754425777
+input_limit = 272_000
+limit_evidence = "OpenAI API: 400 context_length_exceeded \"Input tokens exceed the configured limit of 272000 tokens\" (catalog sweep 2026-10-01, CAT-3::raw::openai); the window counts the 128K max output."
 note = "Default snapshot shuts down 2026-12-11."
 
 [[row]]
 model = "gpt-5-mini"
 source = [
+  "https://api.openai.com/v1/models",
   "https://developers.openai.com/api/docs/pricing.md",
   "https://developers.openai.com/api/docs/models/gpt-5-mini.md",
 ]
@@ -384,11 +418,15 @@ output = "2"
 cache_read = "0.025"
 context_window = 400_000
 max_output_tokens = 128_000
+created = 1754425928
+input_limit = 272_000
+limit_evidence = "OpenAI API: 400 context_length_exceeded \"Input tokens exceed the configured limit of 272000 tokens\" (catalog sweep 2026-10-01, CAT-3::raw::openai); the window counts the 128K max output."
 note = "Default snapshot shuts down 2026-12-11."
 
 [[row]]
 model = "gpt-5-nano"
 source = [
+  "https://api.openai.com/v1/models",
   "https://developers.openai.com/api/docs/pricing.md",
   "https://developers.openai.com/api/docs/models/gpt-5-nano.md",
 ]
@@ -398,23 +436,32 @@ output = "0.4"
 cache_read = "0.005"
 context_window = 400_000
 max_output_tokens = 128_000
+created = 1754426384
+input_limit = 272_000
+limit_evidence = "OpenAI API: 400 context_length_exceeded \"Input tokens exceed the configured limit of 272000 tokens\" (catalog sweep 2026-10-01, CAT-3::raw::openai); the window counts the 128K max output."
 note = "Default snapshot shuts down 2026-12-11."
 
 [[row]]
 model = "gpt-5-pro"
 source = [
+  "https://api.openai.com/v1/models",
   "https://developers.openai.com/api/docs/pricing.md",
   "https://developers.openai.com/api/docs/models/gpt-5-pro.md",
 ]
 date = "2026-10-01"
 input = "15"
 output = "120"
+context_window = 400_000
 max_output_tokens = 272_000
+input_limit = 128_000
+limit_evidence = "The window less the 272K max output: the rule OpenAI's API enforces on every measured GPT-5-family row (input cap = window - max output). Not measurable on the pool key: its gpt-5-pro TPM is 200,000, and Responses' context error names no number."
+created = 1759469822
 note = "Responses only. Default snapshot shuts down 2026-12-11."
 
 [[row]]
 model = "gpt-5.1"
 source = [
+  "https://api.openai.com/v1/models",
   "https://developers.openai.com/api/docs/pricing.md",
   "https://developers.openai.com/api/docs/models/gpt-5.1.md",
 ]
@@ -424,10 +471,14 @@ output = "10"
 cache_read = "0.125"
 context_window = 400_000
 max_output_tokens = 128_000
+created = 1762800673
+input_limit = 272_000
+limit_evidence = "OpenAI API: 400 context_length_exceeded \"Input tokens exceed the configured limit of 272000 tokens\" (catalog sweep 2026-10-01, CAT-3::raw::openai); the window counts the 128K max output."
 
 [[row]]
 model = "gpt-5.2"
 source = [
+  "https://api.openai.com/v1/models",
   "https://developers.openai.com/api/docs/pricing.md",
   "https://developers.openai.com/api/docs/models/gpt-5.2.md",
 ]
@@ -437,10 +488,14 @@ output = "14"
 cache_read = "0.175"
 context_window = 400_000
 max_output_tokens = 128_000
+created = 1765313051
+input_limit = 272_000
+limit_evidence = "OpenAI API: 400 context_length_exceeded \"Input tokens exceed the configured limit of 272000 tokens\" (catalog sweep 2026-10-01, CAT-3::raw::openai); the window counts the 128K max output."
 
 [[row]]
 model = "gpt-5.2-pro"
 source = [
+  "https://api.openai.com/v1/models",
   "https://developers.openai.com/api/docs/pricing.md",
   "https://developers.openai.com/api/docs/models/gpt-5.2-pro.md",
 ]
@@ -448,11 +503,13 @@ date = "2026-10-01"
 input = "21"
 output = "168"
 features_absent = ["structured_outputs"]
+created = 1765343983
 note = "Responses only."
 
 [[row]]
 model = "gpt-5.3-codex"
 source = [
+  "https://api.openai.com/v1/models",
   "https://developers.openai.com/api/docs/pricing.md",
   "https://developers.openai.com/api/docs/models/gpt-5.3-codex.md",
 ]
@@ -462,10 +519,14 @@ output = "14"
 cache_read = "0.175"
 context_window = 400_000
 max_output_tokens = 128_000
+created = 1770537915
+input_limit = 272_000
+limit_evidence = "The window less the 128K max output, as OpenAI enforces on every measured GPT-5-family row (Chat Completions names the cap; Responses, this model's only endpoint, answers \"Your input exceeds the context window of this model\" without a number)."
 
 [[row]]
 model = "gpt-5.4"
 source = [
+  "https://api.openai.com/v1/models",
   "https://developers.openai.com/api/docs/pricing.md",
   "https://developers.openai.com/api/docs/models/gpt-5.4.md",
 ]
@@ -475,11 +536,15 @@ output = "15"
 cache_read = "0.25"
 context_window = 1_050_000
 max_output_tokens = 128_000
+created = 1772691852
+input_limit = 922_000
+limit_evidence = "OpenAI API: 400 context_length_exceeded \"Input tokens exceed the configured limit of 922000 tokens\" (catalog sweep 2026-10-01, CAT-3::raw::openai); the window counts the 128K max output."
 note = ">272K input: 2x input, 1.5x output (not listed)."
 
 [[row]]
 model = "gpt-5.4-mini"
 source = [
+  "https://api.openai.com/v1/models",
   "https://developers.openai.com/api/docs/pricing.md",
   "https://developers.openai.com/api/docs/models/gpt-5.4-mini.md",
 ]
@@ -489,10 +554,14 @@ output = "4.5"
 cache_read = "0.075"
 context_window = 400_000
 max_output_tokens = 128_000
+created = 1773451123
+input_limit = 272_000
+limit_evidence = "OpenAI API: 400 context_length_exceeded \"Input tokens exceed the configured limit of 272000 tokens\" (catalog sweep 2026-10-01, CAT-3::raw::openai); the window counts the 128K max output."
 
 [[row]]
 model = "gpt-5.4-nano"
 source = [
+  "https://api.openai.com/v1/models",
   "https://developers.openai.com/api/docs/pricing.md",
   "https://developers.openai.com/api/docs/models/gpt-5.4-nano.md",
 ]
@@ -502,10 +571,14 @@ output = "1.25"
 cache_read = "0.02"
 context_window = 400_000
 max_output_tokens = 128_000
+created = 1773450870
+input_limit = 272_000
+limit_evidence = "OpenAI API: 400 context_length_exceeded \"Input tokens exceed the configured limit of 272000 tokens\" (catalog sweep 2026-10-01, CAT-3::raw::openai); the window counts the 128K max output."
 
 [[row]]
 model = "gpt-5.4-pro"
 source = [
+  "https://api.openai.com/v1/models",
   "https://developers.openai.com/api/docs/pricing.md",
   "https://developers.openai.com/api/docs/models/gpt-5.4-pro.md",
 ]
@@ -513,11 +586,13 @@ date = "2026-10-01"
 input = "30"
 output = "180"
 features_absent = ["structured_outputs"]
+created = 1772659601
 note = ">272K input tier not listed."
 
 [[row]]
 model = "gpt-5.5"
 source = [
+  "https://api.openai.com/v1/models",
   "https://developers.openai.com/api/docs/pricing.md",
   "https://developers.openai.com/api/docs/models/gpt-5.5.md",
 ]
@@ -527,11 +602,15 @@ output = "30"
 cache_read = "0.5"
 context_window = 1_050_000
 max_output_tokens = 128_000
+created = 1776824847
+input_limit = 922_000
+limit_evidence = "OpenAI API: 400 context_length_exceeded \"Input tokens exceed the configured limit of 922000 tokens\" (catalog sweep 2026-10-01, CAT-3::raw::openai); the window counts the 128K max output."
 note = ">272K input tier not listed."
 
 [[row]]
 model = "gpt-5.5-pro"
 source = [
+  "https://api.openai.com/v1/models",
   "https://developers.openai.com/api/docs/pricing.md",
   "https://developers.openai.com/api/docs/models/gpt-5.5-pro.md",
 ]
@@ -540,11 +619,15 @@ input = "30"
 output = "180"
 context_window = 1_050_000
 max_output_tokens = 128_000
+created = 1776894349
+input_limit = 922_000
+limit_evidence = "The window less the 128K max output, as OpenAI enforces on every measured GPT-5-family row; Responses-only, and its error names no number."
 note = ">272K input tier not listed."
 
 [[row]]
 model = "gpt-5.6-luna"
 source = [
+  "https://api.openai.com/v1/models",
   "https://developers.openai.com/api/docs/pricing.md",
   "https://developers.openai.com/api/docs/models/gpt-5.6-luna.md",
 ]
@@ -555,10 +638,14 @@ cache_read = "0.02"
 cache_write = "0.25"
 context_window = 1_050_000
 max_output_tokens = 128_000
+created = 1782228658
+input_limit = 922_000
+limit_evidence = "OpenAI API: 400 context_length_exceeded \"Input tokens exceed the configured limit of 922000 tokens\" (catalog sweep 2026-10-01, CAT-3::raw::openai); the window counts the 128K max output."
 
 [[row]]
 model = "gpt-5.6-sol"
 source = [
+  "https://api.openai.com/v1/models",
   "https://developers.openai.com/api/docs/pricing.md",
   "https://developers.openai.com/api/docs/models/gpt-5.6-sol.md",
 ]
@@ -569,11 +656,15 @@ cache_read = "0.40"
 cache_write = "5.00"
 context_window = 1_050_000
 max_output_tokens = 128_000
+created = 1782228018
+input_limit = 922_000
+limit_evidence = "OpenAI API: 400 context_length_exceeded \"Input tokens exceed the configured limit of 922000 tokens\" (catalog sweep 2026-10-01, CAT-3::raw::openai); the window counts the 128K max output."
 note = "Standard tier. The $2 / $10 row is Batch/Flex. \"Promotional pricing is available at least through November 21, 2026\" (not listed)."
 
 [[row]]
 model = "gpt-5.6-terra"
 source = [
+  "https://api.openai.com/v1/models",
   "https://developers.openai.com/api/docs/pricing.md",
   "https://developers.openai.com/api/docs/models/gpt-5.6-terra.md",
 ]
@@ -584,10 +675,14 @@ cache_read = "0.2"
 cache_write = "2.5"
 context_window = 1_050_000
 max_output_tokens = 128_000
+created = 1782228459
+input_limit = 922_000
+limit_evidence = "OpenAI API: 400 context_length_exceeded \"Input tokens exceed the configured limit of 922000 tokens\" (catalog sweep 2026-10-01, CAT-3::raw::openai); the window counts the 128K max output."
 
 [[row]]
 model = "gpt-6-astra"
 source = [
+  "https://api.openai.com/v1/models",
   "https://developers.openai.com/api/docs/pricing.md",
   "https://developers.openai.com/api/docs/models/gpt-6-astra.md",
 ]
@@ -598,10 +693,14 @@ cache_read = "1"
 cache_write = "12.5"
 context_window = 1_050_000
 max_output_tokens = 128_000
+created = 1787853604
+input_limit = 922_000
+limit_evidence = "OpenAI API: 400 context_length_exceeded \"Input tokens exceed the configured limit of 922000 tokens\" (catalog sweep 2026-10-01, CAT-3::raw::openai); the window counts the 128K max output."
 
 [[row]]
 model = "grok-4.20"
 source = [
+  "https://api.x.ai/v1/models",
   "https://docs.x.ai/developers/pricing.md",
   "https://docs.x.ai/developers/models/grok-4.20.md",
 ]
@@ -610,10 +709,13 @@ input = "1.25"
 output = "2.50"
 cache_read = "0.20"
 context_window = 1_000_000
+created = 1773014400
+owned_by = "xai"
 
 [[row]]
 model = "grok-4.20-multi-agent"
 source = [
+  "https://api.x.ai/v1/models",
   "https://docs.x.ai/developers/pricing.md",
   "https://docs.x.ai/developers/models/grok-4.20-multi-agent.md",
 ]
@@ -622,11 +724,15 @@ input = "1.25"
 output = "2.50"
 cache_read = "0.20"
 context_window = 1_000_000
-features_present = ["tools"]
+features_absent = ["tools"]
+created = 1773014400
+owned_by = "xai"
+note = "xAI's page says \"Function calling: Yes\", but the API answers a function tool with 400 \"Client-side tools for multi-agent models require beta access\" (2026-10-01, /v1/responses, standard key), and Chat Completions refuses multi-agent outright. features_absent records what the pool key can use."
 
 [[row]]
 model = "grok-4.3"
 source = [
+  "https://api.x.ai/v1/models",
   "https://docs.x.ai/developers/pricing.md",
   "https://docs.x.ai/developers/models/grok-4.3.md",
 ]
@@ -635,10 +741,13 @@ input = "1.25"
 output = "2.50"
 cache_read = "0.20"
 context_window = 1_000_000
+created = 1776384000
+owned_by = "xai"
 
 [[row]]
 model = "grok-4.5"
 source = [
+  "https://api.x.ai/v1/models",
   "https://docs.x.ai/developers/pricing.md",
   "https://docs.x.ai/developers/models/grok-4.5.md",
 ]
@@ -647,10 +756,13 @@ input = "2.00"
 output = "6.00"
 cache_read = "0.30"
 context_window = 500_000
+created = 1782691200
+owned_by = "xai"
 
 [[row]]
 model = "grok-4.6"
 source = [
+  "https://api.x.ai/v1/models",
   "https://docs.x.ai/developers/pricing.md",
   "https://docs.x.ai/developers/models/grok-4.6.md",
 ]
@@ -659,10 +771,13 @@ input = "2.00"
 output = "6.00"
 cache_read = "0.50"
 context_window = 500_000
+created = 1785974400
+owned_by = "xai"
 
 [[row]]
 model = "grok-build-0.1"
 source = [
+  "https://api.x.ai/v1/models",
   "https://docs.x.ai/developers/pricing.md",
   "https://docs.x.ai/developers/models/grok-build-0.1.md",
 ]
@@ -671,6 +786,8 @@ input = "1.00"
 output = "2.00"
 cache_read = "0.20"
 context_window = 256_000
+created = 1776297600
+owned_by = "xai"
 
 [[row]]
 model = "llama-3.3-70b-versatile"
@@ -729,6 +846,8 @@ date = "2026-10-01"
 input = "0.1"
 output = "0.1"
 context_window = 262_144
+input_limit = 131_072
+limit_evidence = "The OpenRouter candidate (mistralai/ministral-3b-2512): 400 \"This endpoint's maximum context length is 131072 tokens\" (catalog sweep 2026-10-01, CAT-3::raw::openrouter::ministral-3b-latest)."
 
 [[row]]
 model = "ministral-8b-latest"
@@ -789,6 +908,7 @@ context_window = 1_048_576
 [[row]]
 model = "o1"
 source = [
+  "https://api.openai.com/v1/models",
   "https://developers.openai.com/api/docs/pricing.md",
   "https://developers.openai.com/api/docs/models/o1.md",
 ]
@@ -798,11 +918,13 @@ output = "60"
 cache_read = "7.5"
 context_window = 200_000
 max_output_tokens = 100_000
+created = 1734375816
 note = "Shutdown 2026-10-23."
 
 [[row]]
 model = "o1-pro"
 source = [
+  "https://api.openai.com/v1/models",
   "https://developers.openai.com/api/docs/pricing.md",
   "https://developers.openai.com/api/docs/models/o1-pro.md",
 ]
@@ -810,11 +932,13 @@ date = "2026-10-01"
 input = "150"
 output = "600"
 features_present = ["tools"]
+created = 1742251791
 note = "Shutdown 2026-10-23."
 
 [[row]]
 model = "o3"
 source = [
+  "https://api.openai.com/v1/models",
   "https://developers.openai.com/api/docs/pricing.md",
   "https://developers.openai.com/api/docs/models/o3.md",
 ]
@@ -824,10 +948,12 @@ output = "8"
 cache_read = "0.5"
 context_window = 200_000
 max_output_tokens = 100_000
+created = 1744225308
 
 [[row]]
 model = "o3-mini"
 source = [
+  "https://api.openai.com/v1/models",
   "https://developers.openai.com/api/docs/pricing.md",
   "https://developers.openai.com/api/docs/models/o3-mini.md",
 ]
@@ -838,11 +964,13 @@ cache_read = "0.55"
 context_window = 200_000
 max_output_tokens = 100_000
 input_absent = ["image"]
+created = 1737146383
 note = "Shutdown 2026-10-23. Text only."
 
 [[row]]
 model = "o4-mini"
 source = [
+  "https://api.openai.com/v1/models",
   "https://developers.openai.com/api/docs/pricing.md",
   "https://developers.openai.com/api/docs/models/o4-mini.md",
 ]
@@ -852,6 +980,7 @@ output = "4.4"
 cache_read = "0.275"
 context_window = 200_000
 max_output_tokens = 100_000
+created = 1744225351
 note = "Shutdown 2026-10-23."
 
 [[row]]
@@ -893,14 +1022,6 @@ cache_read = "0.0375"
 context_window = 131_072
 max_output_tokens = 65_536
 note = "Preview."
-
-[[row]]
-model = "qwen/qwen-2.5-7b-instruct"
-source = ["https://www.together.ai/pricing"]
-date = "2026-10-01"
-input = "0.30"
-output = "0.30"
-note = "Qwen/Qwen2.5-7B-Instruct-Turbo is absent from the docs serverless table; the pricing page still lists it."
 
 [[row]]
 model = "qwen/qwen3.5-9b"
@@ -957,6 +1078,8 @@ date = "2026-10-01"
 input = "2.00"
 output = "6.00"
 cache_read = "0.25"
+input_limit = 1_010_000
+limit_evidence = "Together (the primary): 400 \"This model's maximum context length is 1010000 tokens\" (catalog sweep 2026-10-01, CAT-3::raw::together::qwen/qwen3.8-2.4t-a95b). Together publishes no window."
 note = "Cached: pricing page $0.25, docs table $0.50. Context not published."
 
 [[row]]
@@ -980,21 +1103,23 @@ source = [
 ]
 date = "2026-10-01"
 input = "0.09"
-output = "0.28"
+output = "0.282"
 context_window = 1_000_000
-note = "Output: pricing page $0.28, docs table $0.282."
+note = "Output: docs table and Together's /v1/models $0.282; the pricing page rounds to $0.28."
 
 [[row]]
 model = "text-embedding-3-large"
 source = ["https://developers.openai.com/api/docs/pricing.md"]
 date = "2026-10-01"
 input = "0.13"
+created = 1705953180
 
 [[row]]
 model = "text-embedding-3-small"
 source = ["https://developers.openai.com/api/docs/pricing.md"]
 date = "2026-10-01"
 input = "0.02"
+created = 1705948997
 
 [[row]]
 model = "thinkingmachines/inkling"
@@ -1043,6 +1168,81 @@ input = "0.15"
 output = "0.50"
 cache_read = "0.03"
 context_window = 1_048_575
+
+[[row]]
+model = "gpt-5.1-codex"
+source = ["https://api.openai.com/v1/models"]
+date = "2026-10-01"
+input_limit = 272_000
+limit_evidence = "Served through OpenRouter by OpenAI, which caps GPT-5-family input at the 400K window less the 128K max output (\"Input tokens exceed the configured limit of 272000 tokens\")."
+created = 1762988221
+note = "OpenRouter-primary (OpenAI does not serve it to the pool key); created is OpenAI's listing."
+
+[[row]]
+model = "gpt-5.1-codex-max"
+source = ["https://api.openai.com/v1/models"]
+date = "2026-10-01"
+input_limit = 272_000
+limit_evidence = "Served through OpenRouter by OpenAI, which caps GPT-5-family input at the 400K window less the 128K max output (\"Input tokens exceed the configured limit of 272000 tokens\")."
+created = 1763671532
+note = "OpenRouter-primary (OpenAI does not serve it to the pool key); created is OpenAI's listing."
+
+[[row]]
+model = "gpt-5.1-codex-mini"
+source = ["https://api.openai.com/v1/models"]
+date = "2026-10-01"
+input_limit = 272_000
+limit_evidence = "Served through OpenRouter by OpenAI, which caps GPT-5-family input at the 400K window less the 128K max output (\"Input tokens exceed the configured limit of 272000 tokens\")."
+created = 1763007109
+note = "OpenRouter-primary (OpenAI does not serve it to the pool key); created is OpenAI's listing."
+
+[[row]]
+model = "gpt-5.2-codex"
+source = ["https://api.openai.com/v1/models"]
+date = "2026-10-01"
+input_limit = 272_000
+limit_evidence = "Served through OpenRouter by OpenAI, which caps GPT-5-family input at the 400K window less the 128K max output (\"Input tokens exceed the configured limit of 272000 tokens\")."
+created = 1766164985
+note = "OpenRouter-primary (OpenAI does not serve it to the pool key); created is OpenAI's listing."
+
+[[row]]
+model = "minimaxai/minimax-m2.7"
+source = ["https://platform.minimax.io/docs/guides/pricing-paygo.md"]
+date = "2026-10-01"
+input = "0.3"
+output = "1.2"
+cache_read = "0.06"
+cache_write = "0.375"
+note = "OpenRouter-primary (Groq's id is Enterprise-only); MiniMax's own MiniMax-M2.7 row. OpenRouter lists 0.21 / 0.84, its cheapest host."
+
+[[row]]
+model = "moonshotai/kimi-k2.6"
+source = ["https://platform.moonshot.ai/docs/pricing/chat.md"]
+date = "2026-10-01"
+input = "0.95"
+output = "4.00"
+cache_read = "0.16"
+context_window = 262_144
+note = "OpenRouter-primary; Moonshot's own K2 table (cache hit $0.16, miss $0.95, output $4.00). No cache-write rate."
+
+[[row]]
+model = "moonshotai/kimi-k2.7-code"
+source = ["https://platform.moonshot.ai/docs/pricing/chat.md"]
+date = "2026-10-01"
+input = "0.95"
+output = "4.00"
+cache_read = "0.19"
+context_window = 262_144
+note = "OpenRouter-primary; Moonshot's own K2 table (cache hit $0.19, miss $0.95, output $4.00). OpenRouter lists 0.6712 / 3.35, its cheapest host, not the maker's rate."
+
+[[row]]
+model = "z-ai/glm-5.1"
+source = ["https://docs.z.ai/guides/overview/pricing.md"]
+date = "2026-10-01"
+input = "1.4"
+output = "4.4"
+cache_read = "0.26"
+note = "OpenRouter-primary; Z.ai's own text-model table. OpenRouter lists 0.9646 / 3.0316, its cheapest host, not the maker's rate."
 
 [[retired]]
 provider = "deepseek"
@@ -1116,6 +1316,20 @@ note = "Only in the dedicated (PTU) table; absent from the serverless docs table
 
 [[not_serverless]]
 provider = "together"
+id = "google/gemma-4-31B-it"
+source = "https://docs.together.ai/docs/serverless/models"
+date = "2026-10-01"
+note = "Absent from the serverless models table; a serverless key gets 400 model_not_available \"Unable to access non-serverless model google/gemma-4-31B-it\" (catalog sweep 2026-10-01)."
+
+[[not_serverless]]
+provider = "together"
+id = "Qwen/Qwen2.5-7B-Instruct-Turbo"
+source = "https://docs.together.ai/docs/serverless/models"
+date = "2026-10-01"
+note = "Absent from the serverless models table; a serverless key gets 400 model_not_available (catalog sweep 2026-10-01)."
+
+[[not_serverless]]
+provider = "together"
 id = "openai/gpt-oss-20b"
 source = "https://docs.together.ai/docs/serverless/models"
 date = "2026-10-01"
@@ -1141,3 +1355,19 @@ id = "minimaxai/minimax-m2.7"
 source = "https://console.groq.com/docs/models"
 date = "2026-10-01"
 note = "Tagged \"Enterprise\", price \"ContactSales\"."
+
+[[promo]]
+model = "gpt-5.6-sol"
+input = "2.00"
+output = "10.00"
+until = "2026-11-21"
+source = "https://developers.openai.com/api/docs/pricing.md"
+note = "\"GPT-5.6 Sol's promotional pricing is available at least through November 21, 2026.\" OpenRouter, routed to OpenAI, charges it; OpenAI bills the pool key the standard $4 / $20 (organization costs report, 2026-10-01: 4,289 input tokens $0.017156, 1,394 output $0.02788). The card keeps the standard rate: it is what the primary charges, and one row has one list price."
+
+[[promo]]
+model = "gpt-5.6-sol-pro"
+input = "2.00"
+output = "10.00"
+until = "2026-11-21"
+source = "https://developers.openai.com/api/docs/pricing.md"
+note = "OpenRouter lists $4 / $20 and charges half (CAT-7::raw::openrouter::gpt-5.6-sol-pro, 2026-10-01): the gpt-5.6-sol promotion."

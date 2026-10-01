@@ -17,7 +17,8 @@
 //! |                    |             | candidate (no failover); rows <= 200k also take 0.9x once     |
 //! | `CAT-4`            | candidate   | `max_tokens` = card `max_output_tokens` is accepted           |
 //! | `CAT-5`            | candidate   | advertised image / PDF input is read; unadvertised image 4xx  |
-//! | `CAT-6`            | candidate   | forced tool call, json_schema output; no tools: clean 4xx     |
+//! | `CAT-6`            | candidate   | forced tool call, json_schema output; no tools: clean 4xx;    |
+//! |                    |             | a candidate that can't honor json_schema is skipped           |
 //! | `CAT-6+BIL-9`      | candidate   | reasoning reported; ledger output counts it exactly once      |
 //! | `CAT-7`            | candidate   | ledger tokens x card = provider-reported cost (OpenRouter,    |
 //! |                    |             | xAI) within 2%; listed price (Together, xAI, OpenRouter);     |
@@ -49,6 +50,7 @@ use base64::Engine as _;
 use libtest_mimic::{Arguments, Failed, Trial};
 use providers::catalog::{
     Candidate, IN_FILE, IN_IMAGE, MODEL_ROUTES, ModelRoute, REASONING, STRUCTURED_OUTPUTS, TOOLS,
+    serves_structured_outputs,
 };
 use providers::{ProviderId, by_id};
 use serde_json::{Map, Value, json};
@@ -743,9 +745,9 @@ fn tool_params() -> Value {
 fn body(arm: &Arm, prompt: &str, max: Option<u32>, o: Opts) -> Value {
     let mut m = Map::new();
     m.insert("model".into(), json!(arm.row.model));
-    // Not with tools: gpt-5.4 and later 400 function tools with any reasoning_effort on Chat
-    // Completions, and gpt-5.6 / gpt-6 even with none sent (D114).
-    let low_effort = arm.provider() == "openai" && arm.can(REASONING) && !arm.pro() && !o.tools;
+    // With tools too: that is the request OpenAI's Chat Completions refuses on gpt-5.4 and later,
+    // which those rows now reach over Responses (D114).
+    let low_effort = arm.provider() == "openai" && arm.can(REASONING) && !arm.pro();
     match arm.wire {
         Wire::Embeddings => {
             m.insert("input".into(), json!(prompt));
@@ -1573,8 +1575,52 @@ fn cat6(trial: &str, arm: Arm) -> Result<(), Failed> {
             )),
         }
     }
-    // Structured outputs.
-    if arm.can(STRUCTURED_OUTPUTS) {
+    // Structured outputs. A candidate that cannot honor them (Bedrock) must be skipped: ordered
+    // first, the walk serves the request elsewhere.
+    if arm.can(STRUCTURED_OUTPUTS) && !serves_structured_outputs(&arm.cand) {
+        let r = call(
+            &arm,
+            &body(
+                &arm,
+                "What is 17 times 23? Answer in the required JSON format.",
+                max,
+                Opts {
+                    schema: true,
+                    ..Opts::default()
+                },
+            ),
+            Walk::Order,
+        )?;
+        let out = parse(arm.wire, &r.json);
+        let v: Value = serde_json::from_str(out.text.trim()).unwrap_or(Value::Null);
+        if r.status != 200 {
+            problems.push(format!(
+                "json_schema with {} first: HTTP {}: {}",
+                arm.provider(),
+                r.status,
+                r.excerpt()
+            ));
+        } else if r.provider.as_deref() == Some(arm.provider()) {
+            problems.push(format!(
+                "json_schema was sent to {}, which cannot honor it",
+                arm.provider()
+            ));
+        } else if !v["answer"].is_i64() {
+            problems.push(format!(
+                "json_schema (served by {:?}): {:?} does not validate",
+                r.provider, out.text
+            ));
+        } else {
+            note(
+                trial,
+                &format!(
+                    "json_schema skipped {} and was served by {:?}",
+                    arm.provider(),
+                    r.provider
+                ),
+            );
+        }
+    } else if arm.can(STRUCTURED_OUTPUTS) {
         let r = call(
             &arm,
             &body(
@@ -1656,9 +1702,10 @@ fn cat6_reasoning(trial: &str, arm: Arm) -> Result<(), Failed> {
                     ));
                 }
                 let billed = row["output_tokens"].as_u64().unwrap_or(0);
-                // OpenAI's convention: completion_tokens includes reasoning. xAI reports it
-                // beside completion_tokens (D23), so its total is the sum.
-                let total = if arm.provider() == "xai" {
+                // OpenAI's convention: completion_tokens includes reasoning. xAI's Chat Completions
+                // reports it beside completion_tokens (D23), so its total is the sum; its Responses
+                // (the multi-agent candidate) counts it inside output_tokens, as OpenAI does.
+                let total = if arm.provider() == "xai" && !arm.cand.path.ends_with("/responses") {
                     out.output + reasoning
                 } else {
                     out.output
@@ -1681,19 +1728,42 @@ fn cat6_reasoning(trial: &str, arm: Arm) -> Result<(), Failed> {
     }
 }
 
-/// The `verify/catalog_truth.toml` entry for a row.
-fn truth(row: &str) -> Option<&'static toml::Value> {
+fn truth_file() -> &'static toml::Value {
     static T: OnceLock<toml::Value> = OnceLock::new();
-    let t = T.get_or_init(|| {
+    T.get_or_init(|| {
         std::fs::read_to_string(repo_root().join("verify/catalog_truth.toml"))
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(toml::Value::Table(Default::default()))
-    });
-    t.get("row")?
+    })
+}
+
+/// The `verify/catalog_truth.toml` entry for a row.
+fn truth(row: &str) -> Option<&'static toml::Value> {
+    truth_file()
+        .get("row")?
         .as_array()?
         .iter()
         .find(|r| r.get("model").and_then(|m| m.as_str()) == Some(row))
+}
+
+/// A row's vendor-announced promotional (input, output) rate, USD per million, while it lasts.
+fn promo(row: &str) -> Option<(f64, f64)> {
+    let p = truth_file()
+        .get("promo")?
+        .as_array()?
+        .iter()
+        .find(|r| r.get("model").and_then(|m| m.as_str()) == Some(row))?;
+    let until = rfc3339(&format!("{}T23:59:59Z", p.get("until")?.as_str()?))?;
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+    if i64::try_from(now).ok()? > until {
+        return None;
+    }
+    let rate = |k: &str| p.get(k)?.as_str()?.parse::<f64>().ok();
+    Some((rate("input")?, rate("output")?))
 }
 
 fn price_eq(card: &str, listed: f64) -> bool {
@@ -1747,7 +1817,24 @@ fn cat7(trial: &str, arm: Arm) -> Result<(), Failed> {
                                     | ("anthropic", "Anthropic" | "Amazon Bedrock" | "Google")
                                     | ("x-ai" | "xai", "xAI")
                             );
-                        if off.abs() > COST_TOLERANCE && !first_party {
+                        // A vendor-announced promotion (`[[promo]]` in catalog_truth.toml) that this
+                        // route charges while the card keeps the standard rate.
+                        let promo = promo(arm.row.model).filter(|(input, output)| {
+                            let p = |k: &str| row[k].as_u64().unwrap_or(0) as f64;
+                            let at =
+                                (p("input_tokens") * input + p("output_tokens") * output) / 1e6;
+                            ((at - theirs) / theirs).abs() <= COST_TOLERANCE
+                        });
+                        if off.abs() > COST_TOLERANCE && promo.is_some() {
+                            note(
+                                trial,
+                                &format!(
+                                    "{} charged the documented promotional rate ${theirs:.8} vs \
+                                     card ${ours:.8}; the card keeps the standard rate",
+                                    arm.provider()
+                                ),
+                            );
+                        } else if off.abs() > COST_TOLERANCE && !first_party {
                             note(
                                 trial,
                                 &format!(
@@ -1766,6 +1853,15 @@ fn cat7(trial: &str, arm: Arm) -> Result<(), Failed> {
                             ));
                         }
                     }
+                    // xAI reports `cost_in_usd_ticks` on Chat Completions; a Chat client translated
+                    // from xAI's Responses gets OpenAI's Chat usage, which has no cost field. The
+                    // listed-price check below still runs.
+                    None if arm.provider() == "xai" && arm.cand.path.ends_with("/responses") => {
+                        note(
+                            trial,
+                            "xAI Responses candidate: no per-call cost on a translated reply",
+                        );
+                    }
                     other => problems.push(format!(
                         "{} reported no cost ({other:?}): usage {}",
                         arm.provider(),
@@ -1779,7 +1875,9 @@ fn cat7(trial: &str, arm: Arm) -> Result<(), Failed> {
     // Listed price.
     let primary = by_id(arm.row.candidates[0].provider).name;
     match arm.provider() {
-        "openrouter" if primary == "openrouter" => {
+        // An OpenRouter-primary row whose maker publishes its own rate follows the maker (the
+        // vendor-truth check below), not OpenRouter's cheapest host.
+        "openrouter" if primary == "openrouter" && truth(arm.row.model).is_none() => {
             if let Some(m) = listed("openrouter", arm.cand.upstream_model) {
                 let per_m = |k: &str| {
                     m["pricing"][k]
@@ -1915,11 +2013,25 @@ fn rfc3339(s: &str) -> Option<i64> {
     Some((era * 146_097 + doe - 719_468) * 86_400 + hh * 3600 + mm * 60 + ss)
 }
 
-/// Where CAT-8 reads a row's metadata: the primary's endpoint, or OpenRouter's for a primary out of
-/// scope.
-fn meta_source(row: &ModelRoute) -> Option<(&'static str, &'static str)> {
+/// Where CAT-8 reads a row's metadata: the primary's endpoint, or, for an OpenRouter-primary row
+/// whose maker (OpenAI, Anthropic, xAI) lists the id, the maker's; else OpenRouter's.
+fn meta_source(row: &'static ModelRoute) -> Option<(&'static str, &'static str)> {
     let p = row.candidates[0];
     let name = by_id(p.provider).name;
+    if name == "openrouter" {
+        let maker = match row.card.owned_by {
+            "openai" => Some("openai"),
+            "anthropic" => Some("anthropic"),
+            "xai" => Some("xai"),
+            _ => None,
+        };
+        if let Some(m) = maker
+            && key_of(m).is_some()
+            && listed(m, row.model).is_some()
+        {
+            return Some((m, row.model));
+        }
+    }
     match name {
         "anthropic" | "openai" | "xai" | "together" | "openrouter" => {
             Some((name, p.upstream_model))

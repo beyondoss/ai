@@ -315,6 +315,80 @@ pub fn catalog_wire_action(path: &str, row: Endpoint) -> WireAction {
     }
 }
 
+/// Whether a managed catalog walk on `row` reads the whole body before it chooses candidates, even
+/// when a header named the row. A headerless walk reads it anyway (to find `model`); this makes a
+/// header-won one do the same where the body decides something: the row's card refuses image input
+/// ([`refused_input`]), or a candidate cannot serve a capability the card advertises
+/// ([`unserved`]). Embeddings rows never: their bodies carry neither.
+pub fn walk_reads_body(row: &ModelRoute) -> bool {
+    Endpoint::of_row(row) != Endpoint::Embeddings
+        && (row.card.input & providers::catalog::IN_IMAGE == 0
+            || row
+                .candidates
+                .iter()
+                .any(|c| !providers::catalog::serves_structured_outputs(c)))
+}
+
+/// The input kind `body` carries that `row`'s card says it does not accept: `Some("image")` for an
+/// image part on a row without image input. The walk answers 400 before any upstream sees it: a
+/// candidate would otherwise ignore the image and bill an answer about nothing (o3-mini, Together's
+/// gpt-oss-120b) or fail with a 500 (gpt-4). Only image input is gated. A PDF on a row without file
+/// input is left to the candidate, because OpenRouter extracts a PDF's text for any model.
+pub fn refused_input(row: &ModelRoute, body: &[u8]) -> Option<&'static str> {
+    if Endpoint::of_row(row) == Endpoint::Embeddings
+        || row.card.input & providers::catalog::IN_IMAGE != 0
+    {
+        return None;
+    }
+    carries_image(body).then_some("image")
+}
+
+/// An image content part anywhere in the conversation: Chat Completions `image_url`, Messages
+/// `image` (tool results included), Responses `input_image`. The body is parsed only when it
+/// contains the bytes `image` at all.
+fn carries_image(body: &[u8]) -> bool {
+    fn walk(v: &serde_json::Value) -> bool {
+        match v {
+            serde_json::Value::Array(a) => a.iter().any(walk),
+            serde_json::Value::Object(o) => {
+                matches!(
+                    o.get("type").and_then(serde_json::Value::as_str),
+                    Some("image_url" | "image" | "input_image")
+                ) || o.values().any(walk)
+            }
+            _ => false,
+        }
+    }
+    if memchr::memmem::find(body, b"image").is_none() {
+        return false;
+    }
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return false;
+    };
+    ["messages", "input", "system"]
+        .iter()
+        .filter_map(|k| v.get(k))
+        .any(walk)
+}
+
+/// Catalog indices (bit per index) of `arms` that cannot serve `body`: Bedrock candidates when the
+/// body asks for a JSON-schema output (`response_format` / `output_config.format` / `text.format`
+/// all name `json_schema`), which Bedrock's Messages surface refuses. The walk leaves them out,
+/// unless that would leave nothing, in which case the provider's own error is the answer. Zero, with
+/// no scan, on a row whose candidates all serve it.
+pub fn unserved(arms: &[Candidate], body: &[u8]) -> u8 {
+    let lacking = arms
+        .iter()
+        .take(MAX_CANDIDATES)
+        .enumerate()
+        .filter(|(_, c)| !providers::catalog::serves_structured_outputs(c))
+        .fold(0u8, |m, (i, _)| m | (1 << i));
+    if lacking == 0 || memchr::memmem::find(body, b"\"json_schema\"").is_none() {
+        return 0;
+    }
+    lacking
+}
+
 /// One precomputed managed auth value: the formatted secret plus, when the bytes are header-safe,
 /// a ready-to-insert [`http::HeaderValue`].
 ///

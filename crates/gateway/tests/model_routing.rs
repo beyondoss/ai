@@ -437,12 +437,15 @@ async fn a_large_body_survives_a_failover_intact() {
 
     let cap = fallback.captured().expect("fallback served the request");
     let received = String::from_utf8(cap.body).unwrap();
-    // The rewrite lengthens the id by exactly the vendor prefix; nothing else may change.
+    // The rewrite lengthens the id by exactly the vendor prefix, and OpenRouter is asked not to
+    // compress the prompt (D109); nothing else may change.
+    const NO_COMPRESSION: &str = r#""plugins":[{"id":"context-compression","enabled":false}],"#;
     assert_eq!(
         received.len(),
-        sent + "openai/".len(),
+        sent + "openai/".len() + NO_COMPRESSION.len(),
         "the body must arrive whole, differing only by the rewritten model id",
     );
+    assert!(received.starts_with(&format!("{{{NO_COMPRESSION}")));
     assert!(received.contains(r#""model":"openai/gpt-4o-mini""#));
     assert!(
         received.contains(&filler),
