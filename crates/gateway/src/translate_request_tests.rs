@@ -1420,3 +1420,117 @@ fn unknown_hosts_get_the_classic_efforts() {
         json!({"model": "m", "store": false, "input": "hi", "reasoning": {"effort": "minimal"}});
     assert_eq!(r2c(&r, "x-ai/grok-4.6")["reasoning_effort"], "low");
 }
+
+// ---- verification phase 0: thinking + tools for clients that drop thinking ---------------------
+
+/// Anthropic's rule for a tool loop with thinking on: "a final `assistant` message must start with
+/// a thinking block (preceding the lastmost set of `tool_use` and `tool_result` blocks)". A body
+/// passes when thinking is off (absent or `disabled`) or the last assistant turn opens with a
+/// `thinking` / `redacted_thinking` block. `None` means Anthropic accepts it; `Some` says why not.
+fn tool_loop_thinking_violation(v: &Value) -> Option<String> {
+    let thinking_on = matches!(
+        v.pointer("/thinking/type").and_then(Value::as_str),
+        Some("enabled" | "adaptive")
+    );
+    if !thinking_on {
+        return None;
+    }
+    let last = v["messages"]
+        .as_array()?
+        .iter()
+        .rev()
+        .find(|m| m["role"] == "assistant")?;
+    let blocks = last["content"].as_array()?;
+    let has_tool_use = blocks.iter().any(|b| b["type"] == "tool_use");
+    let opens_with_thinking = matches!(
+        blocks.first().and_then(|b| b["type"].as_str()),
+        Some("thinking" | "redacted_thinking")
+    );
+    (has_tool_use && !opens_with_thinking).then(|| {
+        format!(
+            "thinking is {} but the final assistant turn starts with {}: {v}",
+            v["thinking"], blocks[0]["type"]
+        )
+    })
+}
+
+/// Turn 2 of a thinking + tool loop on budget-thinking Claude, from clients that do not send our
+/// thinking back: Vercel / LangChain on Chat Completions (the assistant echo carries the tool call,
+/// maybe `reasoning_content`, never our `thinking` list), a Responses client that drops reasoning
+/// items, and Codex / the Agents SDK replaying the reasoning item without its `id` (the gateway
+/// only recognises its own `rs_gw…` ids). Each must become a body Anthropic accepts: replay a
+/// verifiable block, or turn thinking off for the request.
+/// claim: TRN-7, TRN-8
+/// defect: D14
+#[test]
+#[ignore = "D14 reproduced: thinking stays enabled while the final assistant tool turn has no thinking block"]
+fn a_tool_turn_without_echoed_thinking_is_still_accepted_on_budget_claude() {
+    const MODEL: &str = "claude-sonnet-4-5";
+    assert_eq!(ClaudeModel::of(MODEL).reasoning, ClaudeGen::Budget);
+    let mut bad = Vec::new();
+    let turn2 = |assistant: Value| {
+        chat(json!({
+            "reasoning_effort": "high",
+            "tools": [{"type": "function", "function": {"name": "get_weather", "parameters": weather_schema()}}],
+            "messages": [
+                {"role": "user", "content": "weather in Paris?"},
+                assistant,
+                {"role": "tool", "tool_call_id": "toolu_01", "content": "sunny"},
+            ],
+        }))
+    };
+
+    // Control: a client that echoes our signed `thinking` list already produces a valid body, so
+    // the check below is not vacuous.
+    let echoed = c2m(
+        &turn2(json!({"role": "assistant", "content": null,
+            "thinking": [{"type": "thinking", "thinking": "Need weather.", "signature": "SIG"}],
+            "tool_calls": [{"id": "toolu_01", "type": "function",
+            "function": {"name": "get_weather", "arguments": "{\"city\":\"Paris\"}"}}]})),
+        MODEL,
+    );
+    assert_eq!(echoed["thinking"]["type"], "enabled", "{echoed}");
+    assert_eq!(tool_loop_thinking_violation(&echoed), None);
+
+    // Chat Completions: the echo a stock SDK rebuilds (tool call, reasoning text, no `thinking`).
+    for assistant in [
+        json!({"role": "assistant", "content": null, "tool_calls": [{"id": "toolu_01", "type": "function",
+            "function": {"name": "get_weather", "arguments": "{\"city\":\"Paris\"}"}}]}),
+        json!({"role": "assistant", "content": "", "reasoning_content": "Need weather.",
+            "tool_calls": [{"id": "toolu_01", "type": "function",
+            "function": {"name": "get_weather", "arguments": "{\"city\":\"Paris\"}"}}]}),
+    ] {
+        if let Some(why) = tool_loop_thinking_violation(&c2m(&turn2(assistant), MODEL)) {
+            bad.push(format!("Chat→Messages: {why}"));
+        }
+    }
+
+    // Responses: reasoning dropped, and reasoning replayed without its id.
+    let call = json!({"type": "function_call", "call_id": "toolu_01", "name": "get_weather",
+        "arguments": "{\"city\":\"Paris\"}"});
+    let output = json!({"type": "function_call_output", "call_id": "toolu_01", "output": "sunny"});
+    let id_less = json!({"type": "reasoning", "encrypted_content": "EqQBsig==",
+        "summary": [{"type": "summary_text", "text": "Need weather."}]});
+    for (what, input) in [
+        (
+            "no reasoning item",
+            json!([{"role": "user", "content": "weather in Paris?"}, call, output]),
+        ),
+        (
+            "id-less reasoning item",
+            json!([{"role": "user", "content": "weather in Paris?"}, id_less, call, output]),
+        ),
+    ] {
+        let body = json!({
+            "model": "m", "store": false, "max_output_tokens": 4000, "reasoning": {"effort": "high"},
+            "tools": [{"type": "function", "name": "get_weather", "parameters": weather_schema()}],
+            "input": input,
+        });
+        let v = req(Endpoint::Responses, Endpoint::Messages, &body, MODEL);
+        if let Some(why) = tool_loop_thinking_violation(&v) {
+            bad.push(format!("Responses→Messages ({what}): {why}"));
+        }
+    }
+
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+}

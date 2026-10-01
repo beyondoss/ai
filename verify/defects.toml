@@ -171,10 +171,10 @@ impact = "Omitting store counts as session state, so the default call from Verce
 confidence = "high"
 evidence = "translate.rs:1967-1986; proxy.rs:2232-2252"
 claims = ["TRN-1", "CAT-9"]
-state = "suspected"
-test = ""
+state = "reproduced"
+test = "stock_responses_create_without_store_works_on_a_claude_row"
 fix = ""
-note = ""
+note = "Reproduced e2e (tests/translate_request.rs): POST /v1/responses {model:claude-opus-4-8, input:hi} with no store returns 400 invalid_request_error 'store cannot be honored for claude-opus-4-8 (no Responses upstream)' and never reaches the upstream, while GET /v1/models lists /v1/responses for that row. responses_session_field treats any store other than literal false (omitted, true, unparseable) as session state, and proxy.rs rejects it when the row has no Responses arm; store:false translates fine. Whether omitted store should mean a one-shot is a product decision (OpenAI's default is store:true); the test asserts the stock call succeeds, the other honest option is to stop advertising /v1/responses on these rows."
 
 [[defect]]
 id = "D13"
@@ -185,10 +185,10 @@ impact = "Should be \"{}\". It breaks json.loads in the Agents SDK and Vercel's 
 confidence = "high"
 evidence = "translate.rs:4565-4615, 5932-5950"
 claims = ["TRN-9"]
-state = "suspected"
-test = ""
+state = "reproduced"
+test = "a_streamed_zero_argument_call_has_json_arguments"
 fix = ""
-note = ""
+note = "Reproduced (src/translate_response_tests.rs): an Anthropic zero-arg tool_use stream (input:{}, one input_json_delta with partial_json:'') accumulates to arguments:'' on Messages->Chat (content_block_start emits '' and empty deltas are dropped) and to '' in the Responses deltas, function_call_arguments.done and the completed function_call item (ToolCalls.args stays empty through close_calls). The non-stream body already gives '{}'."
 
 [[defect]]
 id = "D14"
@@ -199,10 +199,10 @@ impact = "On budget-thinking Claude, a client that drops our thinking blocks (Ve
 confidence = "med-high"
 evidence = "translate.rs:1719-1759, 3656-3672"
 claims = ["TRN-7", "TRN-8"]
-state = "suspected"
-test = ""
+state = "reproduced"
+test = "a_tool_turn_without_echoed_thinking_is_still_accepted_on_budget_claude"
 fix = ""
-note = ""
+note = "Reproduced (src/translate_request_tests.rs) on claude-sonnet-4-5 (ClaudeGen::Budget): turn 2 of a tool loop with reasoning on keeps thinking {type:enabled,budget_tokens:2000} while the final assistant turn starts with tool_use, for Chat echoes without our thinking list (with or without reasoning_content) and Responses input with no reasoning item or an id-less reasoning item (gateway_reasoning_block only accepts rs_gw ids). A control echo carrying the signed thinking list passes. Asserted against Anthropic's documented rule ('a final assistant message must start with a thinking block'); the live 400 itself is not exercised here, and adaptive-generation models were not checked."
 
 [[defect]]
 id = "D15"

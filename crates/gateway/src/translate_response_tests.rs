@@ -2119,3 +2119,71 @@ fn identity_fields_are_tracked_per_choice_and_entry() {
             {"index":0,"delta":{"reasoning_details":[{"index":0},{"index":1,"format":"f"}]}}]})
     );
 }
+
+// ---- verification phase 0: zero-argument tool calls --------------------------------------------
+
+/// A Claude turn calling a tool that takes no arguments, as Anthropic streams it: the block opens
+/// with `input: {}` and its one `input_json_delta` carries an empty `partial_json`.
+fn claude_zero_arg_call_sse() -> String {
+    ant_sse(&[
+        json!({"type": "message_start", "message": {"id": "msg_1", "type": "message",
+        "role": "assistant", "model": "claude-haiku-4-5", "content": [],
+        "usage": {"input_tokens": 10, "output_tokens": 1}}}),
+        json!({"type": "content_block_start", "index": 0,
+        "content_block": {"type": "tool_use", "id": "toolu_01", "name": "get_time", "input": {}}}),
+        json!({"type": "content_block_delta", "index": 0,
+        "delta": {"type": "input_json_delta", "partial_json": ""}}),
+        json!({"type": "content_block_stop", "index": 0}),
+        json!({"type": "message_delta", "delta": {"stop_reason": "tool_use"}, "usage": {"output_tokens": 12}}),
+        json!({"type": "message_stop"}),
+    ])
+}
+
+/// A zero-argument tool call streamed from Claude must reach a Chat or Responses client as
+/// `arguments: "{}"`, the same string the non-stream body carries. `""` is not JSON: the Agents
+/// SDK `json.loads` it and Vercel's AI SDK rejects it as invalid tool input.
+/// claim: TRN-9
+/// defect: D13
+#[test]
+#[ignore = "D13 reproduced: Messages→Chat/Responses streams a zero-argument call as arguments:\"\""]
+fn a_streamed_zero_argument_call_has_json_arguments() {
+    // The non-stream body is the baseline: it already says "{}".
+    let body = json_resp(
+        Messages,
+        Chat,
+        &anthropic_msg(
+            json!([{"type": "tool_use", "id": "toolu_01", "name": "get_time", "input": {}}]),
+            "tool_use",
+            json!({"input_tokens": 10, "output_tokens": 12}),
+        ),
+    );
+    assert_eq!(
+        body["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"],
+        "{}"
+    );
+
+    let src = claude_zero_arg_call_sse();
+
+    // Messages → Chat: the arguments an OpenAI SDK accumulates.
+    let chat = stream(Messages, Chat, &src);
+    let calls = chat_tool_calls(&chat);
+    assert_eq!(calls.len(), 1, "{chat:#?}");
+    assert_eq!(calls[0].1, "get_time");
+    assert_eq!(calls[0].2, "{}", "Messages→Chat stream: {chat:#?}");
+
+    // Messages → Responses: the deltas, the `.done` event and the completed item all agree.
+    let evs = stream(Messages, Responses, &src);
+    let resp = assert_responses_lifecycle(&evs, "response.completed");
+    let deltas: String = named(&evs, "response.function_call_arguments.delta")
+        .iter()
+        .map(|v| v["delta"].as_str().unwrap())
+        .collect();
+    let done = one(&evs, "response.function_call_arguments.done");
+    let item = &resp["output"][0];
+    assert_eq!(item["type"], "function_call", "{resp:#}");
+    assert_eq!(
+        (deltas.as_str(), &done["arguments"], &item["arguments"]),
+        ("{}", &json!("{}"), &json!("{}")),
+        "Messages→Responses stream (deltas, .done, completed item): {evs:#?}"
+    );
+}

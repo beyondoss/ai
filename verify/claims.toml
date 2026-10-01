@@ -59,6 +59,18 @@ touches = ["crates/providers/src/catalog.rs", "crates/gateway/src/proxy.rs"]
 defects = []
 
 [[claim]]
+id = "E7"
+priority = "P0"
+group = "Endpoints and SDK compatibility"
+text = "Agent harnesses list every catalog model with its context window, output limit and pricing, and the session cost they display matches the billing rows"
+oracle = "harness model list = /v1/models ids; limits and prices match the card; displayed session cost = sum of ai.usage rows priced at the card, within rounding. A harness that can't discover models gets config generated from /v1/models, never hand-written"
+layer = "live"
+clients = ["opencode", "pi", "codex", "claude-code", "ai-sdk"]
+failover_clients = []
+touches = ["crates/providers/src/catalog.rs", "crates/gateway/src/proxy.rs"]
+defects = []
+
+[[claim]]
 id = "E5"
 priority = "P1"
 group = "Endpoints and SDK compatibility"

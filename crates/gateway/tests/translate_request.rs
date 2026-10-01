@@ -442,3 +442,60 @@ async fn the_binding_beta_goes_only_with_the_field() {
     assert_eq!(cap.anthropic_beta, None, "same-wire Messages is untouched");
     assert!(got.get("thinking").is_none(), "{got}");
 }
+
+/// A stock `client.responses.create(model=..., input=...)` sends no `store` (OpenAI defaults it to
+/// true). /v1/models lists `/v1/responses` for a Claude row, so that default call must succeed
+/// there, translated onto Messages. Today an omitted `store` counts as session state, and a row
+/// with no Responses arm answers 400 "store cannot be honored".
+/// claim: TRN-1, CAT-9
+/// defect: D12
+#[tokio::test]
+#[ignore = "D12 reproduced: /v1/responses without store on a Claude row is 400 \"store cannot be honored\""]
+async fn stock_responses_create_without_store_works_on_a_claude_row() {
+    let nats_port = unused_nats_port();
+    let (pubkey, sk) = test_keypair(1);
+    let mock = MockUpstream::start(Mode::AnthropicJson).await;
+    let gw = Gateway::builder(nats_port, &mock.authority(), &b64(&pubkey))
+        .providers(&["anthropic", "openai", "openrouter"])
+        .start()
+        .await;
+
+    // The catalog advertises the endpoint for this row.
+    let models: Value = test_client()
+        .get(format!("{}/v1/models", gw.url()))
+        .header("authorization", format!("Bearer {}", vkey(&sk)))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let row = models["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["id"] == "claude-opus-4-8")
+        .expect("claude-opus-4-8 is listed");
+    assert!(
+        row["endpoints"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("/v1/responses")),
+        "{row}"
+    );
+
+    let text = post(
+        &gw,
+        &sk,
+        "/v1/responses",
+        &json!({"model": "claude-opus-4-8", "input": "hi"}),
+    )
+    .await;
+    let resp: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(resp["object"], "response", "{resp}");
+
+    let (cap, got) = captured(&mock);
+    assert_eq!(cap.path, "/v1/messages");
+    assert_eq!(got["messages"][0]["content"], "hi", "{got}");
+    assert!(got.get("store").is_none(), "{got}");
+}
