@@ -255,10 +255,10 @@ impact = "deepseek-reasoner falls back to OpenRouter R1 and deepseek-chat to V3:
 confidence = "high"
 evidence = "catalog.rs:895-940"
 claims = ["CAT-2"]
-state = "suspected"
-test = ""
-fix = ""
-note = "DeepSeek's pricing page (2026-10-01) lists only deepseek-flash (V4.1-Flash) and deepseek-v4-pro (V4-Pro-0813): the native deepseek-chat and deepseek-reasoner names our rows use appear retired, so those rows likely always fail over to OpenRouter's older V3/R1. deepseek-v4-pro falls back to OpenRouter's V4 Pro 0423, a different snapshot from native 0813. Needs a DeepSeek key to confirm the native 404."
+state = "fixed"
+test = "deepseek_v4_pro_fails_over_to_the_same_snapshot"
+fix = "054f927"
+note = "Fixed: deepseek-chat and deepseek-reasoner rows removed (retired 2026-07-24; their OpenRouter fallbacks were V3 and R1). deepseek-v4-pro now fails over to Together deepseek-ai/DeepSeek-V4-Pro-0813, the same snapshot as native, instead of OpenRouter 0423."
 
 [[defect]]
 id = "D19"
@@ -269,10 +269,10 @@ impact = "llama-3.3-70b lists $0.10/$0.32 against Groq's ~$0.59/$0.79. Three -pr
 confidence = "high"
 evidence = "catalog.rs price() rows"
 claims = ["CAT-7"]
-state = "suspected"
-test = ""
-fix = ""
-note = "deepseek-v4-pro lists 0.95526/1.91052 against DeepSeek's peak 1.32/3.96 (off-peak 0.66/1.98): output under-listed by half at peak. DeepSeek prices peak hours at 2x, which a single list price cannot express."
+state = "fixed"
+test = "direct_primaries_are_priced_at_their_vendor_rate"
+fix = "054f927"
+note = "Fixed: every direct-vendor primary is priced at that vendor's standard rate, recorded with its URL in verify/catalog_truth.toml. llama-3.3-70b is now Together $1.04/$1.04 (Groq's id is Enterprise-only); deepseek-v4-pro is DeepSeek peak 1.32/3.96/0.044; off-peak (half) is documented, not listed."
 
 [[defect]]
 id = "D20"
@@ -759,10 +759,10 @@ impact = "About 20 max-output values are exactly 0.9× or 0.8× the window. gpt-
 confidence = "med"
 evidence = "catalog.rs cards"
 claims = ["CAT-6", "CAT-4"]
-state = "suspected"
-test = ""
-fix = ""
-note = ""
+state = "fixed"
+test = "suspect_cards_are_corrected"
+fix = "054f927"
+note = "Fixed with D62: gpt-4 lists no structured outputs or tools (OpenAI lists neither), and no row has a 0.9x/0.8x-of-window max output. The deepseek-flash image-input part was refuted: DeepSeek lists vision, so IN_IMAGE stays."
 
 [[defect]]
 id = "D55"
@@ -843,10 +843,10 @@ impact = "gpt-5.6-sol is listed at half OpenAI's standard rate on all four price
 confidence = "high"
 evidence = "verify/catalog_truth_2026-10-01.md (vendor pages fetched and parsed 2026-10-01, URLs quoted)"
 claims = ["CAT-7"]
-state = "suspected"
-test = ""
-fix = ""
-note = ""
+state = "fixed"
+test = "catalog_matches_vendor_truth"
+fix = "054f927"
+note = "Fixed: every listed row repriced to the primary vendor's standard rate. verify/catalog_truth.toml records 80 direct-vendor rows with source URLs; the test fails on drift, or on a direct-vendor row with no entry."
 
 [[defect]]
 id = "D61"
@@ -857,10 +857,10 @@ impact = "Retired: deepseek-chat and deepseek-reasoner (2026-07-24), mistral-nem
 confidence = "high"
 evidence = "verify/catalog_truth_2026-10-01.md"
 claims = ["CAT-1", "CAT-2"]
-state = "suspected"
-test = ""
-fix = ""
-note = ""
+state = "fixed"
+test = "no_candidate_is_retired_or_not_serverless"
+fix = "054f927"
+note = "Fixed: retired rows removed; non-serverless Fireworks (llama-4-maverick/scout, kimi-k2.6, glm-5.1, llama-3.3), Together (kimi-k2.7-code, gpt-oss-20b) and Enterprise-only Groq candidates removed; seven rows are now OpenRouter-only. The ids are recorded in catalog_truth.toml."
 
 [[defect]]
 id = "D62"
@@ -871,10 +871,10 @@ impact = "Context windows overstated: qwen3.8-27b (1M vs 131k), grok-4.20 (2M vs
 confidence = "high"
 evidence = "verify/catalog_truth_2026-10-01.md"
 claims = ["CAT-3", "CAT-4", "CAT-6"]
-state = "suspected"
-test = ""
-fix = ""
-note = "Supersedes the narrower D54 guesses; deepseek-flash image input is CORRECT per DeepSeek (D54's suspicion refuted)."
+state = "fixed"
+test = "capability_bits_match_vendor_truth"
+fix = "054f927"
+note = "Fixed: windows corrected (qwen3.8-27b, grok-4.20 x2, minimax-m3, codestral, claude-sonnet-4-5, llama-4-scout, ministral-3b, glm-5.x); derived max outputs replaced by vendor figures or UNPUBLISHED_MAX_OUTPUT; structured outputs removed from gpt-4, gpt-4-turbo, gpt-5.2-pro and gpt-5.4-pro; TOOLS added where the vendor lists it."
 
 [[defect]]
 id = "D63"
