@@ -847,7 +847,7 @@ async fn mock_handle(
         Mode::ThrottleKey(_) if throttled => 429,
         _ => 200,
     };
-    let (ct, payload) = if status == 429 {
+    let (ct, payload) = if status == 429 && !matches!(mode, Mode::Raw(..)) {
         (
             "application/json",
             Bytes::from_static(br#"{"error":{"message":"mock"}}"#),

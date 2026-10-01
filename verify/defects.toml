@@ -1995,3 +1995,17 @@ state = "fixed"
 test = "concurrent_requests_share_an_upstream_h2_connection"
 fix = "678f398"
 note = "Found by the REL-22 live cell written to close its coverage gap. Fixed: build_peer sets max_h2_streams = UPSTREAM_H2_MAX_STREAMS (100, RFC 9113's recommended floor; the provider's SETTINGS_MAX_CONCURRENT_STREAMS still caps it). Live after: the same 24-stream burst holds 1 connection to OpenAI and 2 to Anthropic. Requests that arrive in the same instant can still each open one before the first is back in pingora's pool with room (hermetic: 0-10 of 32), so the test bounds sharing at half. GOAWAY and refused streams on a shared connection were already handled (D72)."
+
+[[defect]]
+id = "D174"
+severity = "low"
+area = "Security"
+title = "A provider-account remedy (OpenRouter's \"add your own key\") reaches the client"
+impact = "OpenRouter's shared-pool 429 tells the caller to \"add your own key to accumulate your rate limits: https://openrouter.ai/settings/integrations\", with metadata is_byok, limit_source upstream_provider_shared_pool and remedy_hint. A gateway client holds no OpenRouter account and cannot act on it, and the text names OpenRouter as the upstream behind the row and describes Beyond's account with it. It reached Chat clients byte for byte (the /openrouter route and a same-endpoint catalog walk) and Messages clients translated, where the gateway quotes metadata.raw after the message, so the remedy appeared twice. Other providers' account remedies (OpenAI's \"check your plan and billing details\", Anthropic's \"credit balance is too low\", xAI's spending limit) reveal Beyond's account state the same way."
+confidence = "high"
+evidence = "Seen live in the 2026-10-01 catalog sweep (D156: 31 shared-pool 429s relayed with the remedy). Hermetic: a_provider_account_remedy_never_reaches_the_client, a mock OpenRouter 429 with that body: /openrouter/v1/chat/completions and /v1/chat/completions relay it verbatim, /v1/messages answers \"... add your own key ... https://openrouter.ai/settings/integrations (Mistral): ... add your own key ...\"."
+claims = ["T6"]
+state = "reproduced"
+test = "a_provider_account_remedy_never_reaches_the_client"
+fix = ""
+note = "Severity low, area Security: an information disclosure (the upstream vendor and Beyond's account state with it), and advice a client cannot follow; no credential, no tenant data and no billing is involved, and the status, type and Retry-After the client acts on were already right. Owner decision 2026-10-01: provider errors stay verbatim except provider-account remedies, which are rewritten to a neutral message. No existing claim covers upstream non-disclosure in errors (SEC-7 is the pool key only), so this is filed on T6, the error-envelope claim, whose oracle is the provider's message."
