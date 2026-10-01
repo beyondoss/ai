@@ -66,7 +66,8 @@ pub enum Rejection {
     /// A managed key asked for something other than a metered generation call: a method other
     /// than POST on a catalog path, or a `/{provider}/…` endpoint outside the generation allowlist
     /// (files, batches, stored responses, fine-tuning, …). Those would run on the shared pool key,
-    /// where one tenant could reach another's stored data and the spend is unmetered.
+    /// where one tenant could reach another's stored data and the spend is unmetered. Also a
+    /// managed request carrying `Upgrade` (WebSocket), which would be an unmetered opaque relay.
     ManagedEndpoint,
 }
 

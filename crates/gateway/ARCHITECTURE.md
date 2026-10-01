@@ -366,6 +366,10 @@ path. Each refusal is a JSON error with `x-beyond-request-id`, counted as
 files, stored responses and batches that another tenant created through the same pool key, and run
 unmetered batches, fine-tuning and images. BYO keys belong to the caller and are not checked.
 
+A managed request carrying `Upgrade` (a WebSocket: OpenAI Realtime, Codex) is a 400 on any path,
+checked first and counted under the same `managed_endpoint` reason. An upgraded connection is an
+opaque relay that no usage tap can meter, so it is refused by name rather than left to the path list.
+
 **Which paths name an endpoint.** `route::implied_endpoint` is an exact table:
 `/v1/chat/completions`, `/v1/messages`, `/v1/responses`, `/v1/embeddings` (under `/auto` the `/v1`
 is optional; a trailing slash is ignored). Bare `/v1` and `/auto` name none and relay onto the row's
@@ -1281,9 +1285,8 @@ sufficient on its own:
   next to the HTTP+SSE path already working and covered by tests.
 - **Gateway-side**: Codex traffic that goes through this gateway at all uses `RouteOverride::Prefixed`
   (the `/openai-codex` `KNOWN_PROVIDERS` row) — still relayed through Pingora, not bypassed like
-  Copilot's `RouteOverride::Direct`. This gateway has no WebSocket-upgrade proxying (no `Connection:
-  Upgrade`/`101 Switching Protocols` handling anywhere in `src/`); it is an HTTP request/response (and
-  SSE-response) relay only. A client-side WebSocket transport for Codex could not be relayed through this
+  Copilot's `RouteOverride::Direct`. This gateway has no WebSocket-upgrade proxying (a managed `Upgrade` request is a 400;
+  see "Managed endpoint allowlist"); it is an HTTP request/response (and SSE-response) relay only. A client-side WebSocket transport for Codex could not be relayed through this
   gateway as-is — it would have to bypass the gateway entirely (a Copilot-style `Direct` route straight
   to `chatgpt.com`'s WebSocket endpoint), sidestepping this gateway's pooling, metering, and rate-limiting
   for that traffic, which is a real behavior change beyond just "add a transport option."

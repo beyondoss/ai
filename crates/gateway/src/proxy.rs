@@ -2218,6 +2218,23 @@ impl ProxyHttp for AiProxy {
         // BYO keys are the caller's own and pass through untouched.
         if managed && full_body.is_none() {
             let req = session.req_header();
+            // A protocol upgrade (WebSocket: OpenAI Realtime, Codex) would turn the request into an
+            // opaque relay on the pool key that no usage tap can meter. Refused whatever the path,
+            // so the allowlist below is not the only thing standing in its way.
+            if req.headers.contains_key(http::header::UPGRADE) {
+                self.state
+                    .metrics
+                    .rejection(Rejection::ManagedEndpoint)
+                    .inc();
+                return Self::reject_message_boxed(
+                    session,
+                    &request_id,
+                    400,
+                    "invalid_request_error",
+                    "protocol upgrades (WebSocket) are not available with a managed key".to_owned(),
+                )
+                .await;
+            }
             let method_ok = req.method == http::Method::POST;
             let endpoint_ok = !provider_route
                 || forward_path

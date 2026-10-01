@@ -190,3 +190,66 @@ async fn a_translated_walk_merges_its_own_beta_with_the_allowed_client_tokens() 
         Some("interleaved-thinking-2025-05-14,thinking-binding-controls-2026-08-01")
     );
 }
+
+/// Send one raw HTTP/1.1 request (so `Connection: Upgrade` goes out exactly as written) and read
+/// the response.
+async fn raw_request(port: u16, request: String) -> RawResponse {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut s = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .unwrap();
+    s.write_all(request.as_bytes()).await.unwrap();
+    // Read until the head and its `content-length` body are in: the connection stays open.
+    let mut buf = Vec::new();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let mut chunk = [0u8; 4096];
+        let n = match tokio::time::timeout_at(deadline, s.read(&mut chunk)).await {
+            Ok(Ok(n)) if n > 0 => n,
+            _ => break,
+        };
+        buf.extend_from_slice(&chunk[..n]);
+        let resp = parse_raw_response(&buf);
+        let want = resp
+            .header("content-length")
+            .and_then(|v| v.parse::<usize>().ok());
+        if want.is_some_and(|len| resp.body.len() >= len) {
+            return resp;
+        }
+    }
+    parse_raw_response(&buf)
+}
+
+/// A managed WebSocket upgrade would be an opaque, unmetered relay on the pool key. It is refused
+/// with a 400 before any upstream contact, on a generation path as much as on `/realtime`.
+/// claim: SEC-20
+/// defect: D33
+#[tokio::test]
+async fn a_managed_upgrade_is_refused_before_the_upstream() {
+    let (pubkey, sk) = test_keypair(1);
+    let mock = MockUpstream::start(Mode::Json).await;
+    let gw = Gateway::builder(unused_nats_port(), &mock.authority(), &b64(&pubkey))
+        .providers(&["openai"])
+        .start()
+        .await;
+    let vk = managed_key(&sk);
+    for (method, path, body) in [
+        ("POST", "/openai/v1/chat/completions", CHAT),
+        ("GET", "/openai/v1/realtime?model=gpt-realtime", ""),
+        ("POST", "/v1/chat/completions", CHAT),
+    ] {
+        let req = format!(
+            "{method} {path} HTTP/1.1\r\nhost: 127.0.0.1\r\nauthorization: Bearer {vk}\r\n\
+             connection: Upgrade\r\nupgrade: websocket\r\nsec-websocket-version: 13\r\n\
+             sec-websocket-key: dGhlIHNhbXBsZSBub25jZQ==\r\ncontent-type: application/json\r\n\
+             content-length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let resp = raw_request(gw.port, req).await;
+        assert_eq!(resp.status, 400, "{method} {path}: {resp:?}");
+        let text = String::from_utf8_lossy(&resp.body);
+        assert!(text.contains("managed key"), "{text}");
+        assert!(resp.header("x-beyond-request-id").is_some());
+    }
+    assert_eq!(mock.hits(), 0, "no upgrade may reach the provider");
+}
