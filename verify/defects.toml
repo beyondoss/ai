@@ -1655,10 +1655,10 @@ impact = "When OpenRouter rejects a multi-megabyte prompt before reading all of 
 confidence = "med"
 evidence = "live 2026-10-01 catalog sweep 1: 12 CAT-3/CAT-5 cells on openrouter timed out at 180s (e.g. CAT-3::raw::openrouter::gpt-5, CAT-3::raw::openrouter::claude-opus-4-5). Their gateway logs: \"Upstream h2 body send error: Upstream WriteTimedout context: while writing h2 request body, timeout: 60s\", then \"Fail to proxy: Upstream H2Error ... connection error received: not a result of an error, status: 502\" about 6 minutes after the request. The same 2.5 MB body sent to OpenRouter directly returns 400 in 0.6s. Sweep 3 caps concurrent multi-megabyte uploads at three and saw no timeouts."
 claims = ["CAT-3", "REL-1"]
-state = "suspected"
-test = ""
+state = "reproduced"
+test = "an_h2_answer_before_the_body_is_read_is_relayed_promptly"
 fix = ""
-note = "Related to D81 / D83 (large-body handling) but a different path: here the upstream answered and the answer was dropped."
+note = "Related to D81 / D83 (large-body handling) but a different path: here the upstream answered and the answer was dropped. Root cause (2026-10-01, hermetic, tests/reliability_early_response.rs with an h2-crate TLS upstream): pingora-proxy 0.9's h2 loop (bidirection_down_to_up) awaits send_body_to2 inside a select branch, so while a body write waits on the peer's HTTP/2 flow-control credit its response pipe (already filled by pipe_up_to_down_response) is not read; no ProxyHttp hook runs during that wait. Two outcomes follow. (1) A provider that answers early and stops crediting the window has its answer relayed only when write_timeout_secs fires (an_h2_answer_before_the_body_is_read_is_relayed_promptly: 20s at a 20s bound); pingora then drains the response. (2) A provider that stops crediting without answering: at the write timeout pingora stops sending but neither resets the stream (its own 'TODO: implement for write timeouts?') nor fails the request, and waits on read_timeout_secs (600s) for an answer the provider cannot give, since it holds a partial body (an_abandoned_h2_upload_ends_at_the_write_bound). The live cells match (2), not (1): had OpenRouter answered, pingora would have relayed the 400 at 60s, inside the 180s client timeout; instead the request hung until OpenRouter's idle GOAWAY(NO_ERROR) ~6 min later ('connection error received: not a result of an error'), then 502. Why OpenRouter withheld credit under 16 concurrent multi-MB uploads (each on its own connection: max_h2_streams is pingora's default 1) is OpenRouter's side and not reproducible hermetically. A provider that answers then sends RST_STREAM(NO_ERROR) (RFC 9113 8.1) is already fine (an_h2_answer_then_reset_no_error_is_relayed). No timeout value fixes either case. The fix is in pingora-proxy: race the blocked write against the response pipe, end the upload on an error head (RFC 2616 8.2.2: cease transmitting on an error status) with RST_STREAM(CANCEL), and reset the stream when a write fails. That 40-line patch to proxy_h2.rs was validated against a local copy (all three tests pass, full beyond-ai suite 843/843) but is not landed: it needs pingora-proxy vendored or patched upstream, which is the owner's call. The HTTP/1.1 path has the same shape (send_body_to1 awaited inside proxy_handle_upstream's select) but kernel socket buffers make it far less likely to block."
 
 [[defect]]
 id = "D119"
@@ -1669,10 +1669,10 @@ impact = "Every 8th request is meant to promote the first unmeasured candidate s
 confidence = "high"
 evidence = "live 2026-10-01, TEN-2 pin cells on claude-haiku-4-5 with Anthropic and OpenRouter keyed and Bedrock unkeyed: 20 sequential calls from 20 fresh bai_v2 keys (each its own pin) were all served by anthropic, including seq 8 and 16, the probe slots (TEN-2+SEC-15::{anthropic-py,openai-py}::pooled::pin_isolation, first run). With Bedrock keyed too (route pooled3), seq 8 lands on bedrock (key pa09) in every run. Code: smart.rs probe() picks the first walk index whose effective() is Tier::Unmeasured; the walk passed to rank() is the row's identity walk, ranked before the usable (keyed) mask is computed in proxy.rs (~3432-3470)."
 claims = ["R7"]
-state = "suspected"
-test = ""
-fix = ""
-note = "Found by crates/verify/tests/tenancy_live.rs, whose pin cells now key Bedrock so the probe can reach a second provider. Proposed: skip unkeyed (and breaker-open) candidates when choosing the probe target."
+state = "fixed"
+test = "the_probe_skips_an_unkeyed_candidate"
+fix = "c2e954f"
+note = "Found by crates/verify/tests/tenancy_live.rs, whose pin cells now key Bedrock so the probe can reach a second provider. Proposed: skip unkeyed (and breaker-open) candidates when choosing the probe target. Fixed in c2e954f: proxy.rs computes a dispatchable mask per catalog index (pool key here, not skipped by a large-body re-run or a key walk, serves the sub-resource) before ranking and passes it to Router::rank, whose probe promotes only the first unmeasured dispatchable candidate; the usable walk-slot mask is now derived from the same mask. Tests: the_probe_skips_an_unkeyed_candidate (claude-haiku-4-5 with anthropic and openrouter keyed, bedrock not: the seq-8 probe lands on openrouter) and smart::tests::the_probe_skips_a_candidate_that_cannot_be_dispatched. Breaker-open candidates are not excluded: a breaker opens on failures, which rank Failed, not Unmeasured, and allow() mutates breaker state, so it is not consulted while ranking."
 
 [[defect]]
 id = "D120"
@@ -1683,10 +1683,10 @@ impact = "openai-python's Stream breaks out at `data: [DONE]` and closes the res
 confidence = "high"
 evidence = "live 2026-10-01 TEN-2+SEC-14+K2::openai-py::gpt4o-mini::cache_isolation, twice in a row before the cell was made tolerant: the first streamed turn's row was {stream:true, outcome:client_cancelled, usage_estimated:false, input 18, output 13, upstream_status 200}; the client had read every chunk through [DONE] with usage; the gateway logged 'Fail to proxy: Downstream ConnectionClosed ... Prematurely before response body is complete'; the identical turn replayed by the same tenant then missed (no x-beyond-cache-status). Tenant B's identical stream seconds later was logged ok and cached. openai/_streaming.py (openai==3.22.1): `if sse.data.startswith(\"[DONE]\"): break`, then `finally: response.close()`. proxy.rs logging fills the cache only when `e.is_none()` (~5729)."
 claims = ["K2"]
-state = "suspected"
-test = ""
-fix = ""
-note = "Found by crates/verify/tests/tenancy_live.rs. The cell now tolerates a miss on a streamed turn (never a cross-tenant hit). Proposed: treat a downstream close after the terminal [DONE] / message_stop was relayed as a completed response (outcome ok, fill allowed)."
+state = "fixed"
+test = "a_chat_stream_closed_at_done_is_ok_and_cached"
+fix = "3ad4e7c"
+note = "Found by crates/verify/tests/tenancy_live.rs. The cell now tolerates a miss on a streamed turn (never a cross-tenant hit). Proposed: treat a downstream close after the terminal [DONE] / message_stop was relayed as a completed response (outcome ok, fill allowed). Fixed in 3ad4e7c (with D122): terminal::TerminalTracker reads the bytes the client is sent (post-translate) on a managed stream and says whether they end with a whole terminal event ([DONE], message_stop, response.completed or response.incomplete, through the blank line that dispatches it), reading only each chunk's last event in 3 bytes of state. logging treats a downstream error after that as completion: outcome ok, cache fill, capture complete. No timer: pingora awaits each chunk's write to the client before it polls the client again, so a terminal event the tracker saw was written unless the write itself failed (WriteError/WriteTimedout), which stays client_cancelled. Tests (tests/billing_terminal_close.rs, an upstream that holds its end of stream 1.5s after the terminal event): Chat, Messages, Responses and a translated Chat-on-Claude stream are each ok and replayed from the cache; a client that closes before [DONE] stays client_cancelled and is not cached."
 
 [[defect]]
 id = "D121"
@@ -1697,10 +1697,10 @@ impact = "SEC-17 and TEN-1 promise a revocation that applies within a stated bou
 confidence = "high"
 evidence = "crates/gateway/ARCHITECTURE.md Deny-Set and Allowance-Set sections (~1086-1116), the request-flow diagram (~70-80) and the failure-modes table: no bound, no in-flight behavior. crates/gateway/tests/claims_security.rs ~1020-1023 states both. Live 2026-10-01 (tenancy_live.rs): a written deny or allowance refused the next request in 17-50 ms; deleting it restored service at the first poll; every in-flight stream ran to completion and its row was exact."
 claims = ["SEC-17", "TEN-1"]
-state = "suspected"
-test = ""
-fix = ""
-note = "Found while building crates/verify/tests/tenancy_live.rs, whose TEN-1 cells assert the policy the hermetic test pins (2s bound; in-flight streams finish, billed exactly). Fix: state both in the Deny-Set / Allowance-Set sections."
+state = "fixed"
+test = "architecture_states_the_revocation_bound_and_in_flight_policy"
+fix = "a4fdbda"
+note = "Found while building crates/verify/tests/tenancy_live.rs, whose TEN-1 cells assert the policy the hermetic test pins (2s bound; in-flight streams finish, billed exactly). Fix: state both in the Deny-Set / Allowance-Set sections. Fixed in a4fdbda: ARCHITECTURE.md 'Revocation: how fast a change lands, and streams in flight'. Derived from the code: the delta is pushed by the NATS KV watch (no gateway-side timer), drained by recv_many and published by one rcu, and request_filter loads the set per request, so a connected gateway applies it before the next admission; the cost is one NATS delivery (17-50 ms live) and 2s is the stated bound over it. While disconnected the last-known set serves (fail-open), and the change lands once the watcher reconnects (backoff 1s doubling to RECONNECT_BACKOFF_MAX, 30s) and replays from its cursor; a silently dead NATS connection is found by async-nats 0.46's ping (60s interval, dropped at the third tick with two unanswered). Deny and allowance are checked once at admission, so an in-flight stream runs to completion and is billed from the provider's usage; the one re-check is a large-body request's next attempt (relay_full_body), whose predecessor was never relayed. architecture_states_the_revocation_bound_and_in_flight_policy reads that section and RECONNECT_BACKOFF_MAX from store_watch.rs; the SEC-17 test now also asserts the in-flight row is ok, exact and not estimated."
 
 [[defect]]
 id = "D122"
@@ -1711,10 +1711,10 @@ impact = "Codex closes its stream as soon as it has read response.completed. The
 confidence = "high"
 evidence = "live 2026-10-01 SES-3::codex::codex::codex-resume, four runs: 6, 6, 6 and 4 of the session's 6 gpt-5.3-codex rows (stream true) have outcome client_cancelled, upstream_status 200, usage_estimated false and exact tokens (e.g. input 9972, cache_read 8576, output 88), while Codex fixed the fixture and resumed the session successfully. Every other harness in the same runs (Claude Code, pi, opencode) bills outcome ok. proxy.rs outcome(): any Downstream error source is client_cancelled, checked before whether the terminal event was already relayed."
 claims = ["BIL-12"]
-state = "suspected"
-test = ""
-fix = ""
-note = "Found by crates/verify/tests/session_live.rs (SES-3::codex::codex::codex-resume). Same root cause as D120 (openai-py closing at [DONE]), seen here on the ledger rather than the cache. Proposed: a stream whose terminal event (response.completed / message_stop / [DONE]) was already relayed is ok when the client then closes."
+state = "fixed"
+test = "a_responses_stream_closed_at_response_completed_is_ok_and_cached"
+fix = "3ad4e7c"
+note = "Found by crates/verify/tests/session_live.rs (SES-3::codex::codex::codex-resume). Same root cause as D120 (openai-py closing at [DONE]), seen here on the ledger rather than the cache. Proposed: a stream whose terminal event (response.completed / message_stop / [DONE]) was already relayed is ok when the client then closes. Fixed in 3ad4e7c with D120 (same root cause): a downstream close after the client was sent its whole terminal event (here response.completed) is a completed request, outcome ok. Test: a_responses_stream_closed_at_response_completed_is_ok_and_cached."
 
 [[defect]]
 id = "D123"
