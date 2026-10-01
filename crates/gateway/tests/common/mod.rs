@@ -523,6 +523,8 @@ pub struct Captured {
     /// Recorded so a translate walk onto a conversation-binding Claude model can prove the gateway
     /// sent the beta its `thinking.block_binding` needs (and that no other walk gets it).
     pub anthropic_beta: Option<String>,
+    /// Every header the upstream received, for assertions about what must *not* be forwarded.
+    pub headers: hyper::HeaderMap,
     pub body: Vec<u8>,
 }
 
@@ -784,6 +786,7 @@ async fn mock_handle(
             get("anthropic-beta"),
         )
     };
+    let headers = req.headers().clone();
     let body = req
         .into_body()
         .collect()
@@ -820,6 +823,7 @@ async fn mock_handle(
         anthropic_version,
         accept_encoding,
         anthropic_beta,
+        headers,
         body,
     });
     // A slow upstream is still a *working* upstream; the point is to be slower than the client's

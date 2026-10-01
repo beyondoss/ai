@@ -981,24 +981,60 @@ fn query_param<'a>(query: &'a str, name: &str) -> Option<&'a str> {
 /// recognized shape is a **plain static key** (no OAuth/signing), so one neutral virtual key works
 /// in any of them: Anthropic's `x-api-key`, Azure OpenAI's `api-key`, Google Gemini's
 /// `x-goog-api-key` (header, falling back to the `?key=` query param — Gemini accepts either),
-/// OpenAI's `Authorization: Bearer`. Header checks first since they're the common case and cheaper
-/// (no query parse); query param last since it's the least-preferred shape (keys in a URL end up in
-/// proxy/access logs). Borrowed from the request — no per-request copy.
+/// OpenAI's `Authorization: Bearer` (scheme matched case-insensitively). Borrowed from the request —
+/// no per-request copy. Empty values count as absent.
+///
+/// **A managed key anywhere wins.** When the locations disagree — junk in `x-api-key` beside
+/// `Bearer bai_v1…`, say — the request is managed, and `upstream_request_filter` then strips every
+/// credential location. Taking the first location instead classified that request as BYO, which
+/// forwards headers untouched and so sent the virtual key to the provider. Otherwise the first
+/// location in the order above wins; the query param is last since keys in a URL end up in
+/// proxy/access logs.
 fn extract_virtual_key(req: &pingora::http::RequestHeader) -> Option<&str> {
-    for header in STATIC_KEY_HEADERS {
-        if let Some(v) = req.headers.get(header).and_then(|v| v.to_str().ok()) {
-            return Some(v);
-        }
-    }
-    if let Some(v) = req
+    let headers = STATIC_KEY_HEADERS
+        .iter()
+        .filter_map(|h| req.headers.get(*h).and_then(|v| v.to_str().ok()));
+    let bearer = req
         .headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-    {
-        return Some(v);
+        .and_then(|v| {
+            v.get(..7)
+                .filter(|s| s.eq_ignore_ascii_case("bearer "))
+                .map(|_| &v[7..])
+        });
+    let query = req.uri.query().and_then(|q| query_param(q, "key"));
+    let mut first = None;
+    for v in headers.chain(bearer).chain(query) {
+        if v.is_empty() {
+            continue;
+        }
+        if key::is_managed_prefix(v) {
+            return Some(v);
+        }
+        first = first.or(Some(v));
     }
-    req.uri.query().and_then(|q| query_param(q, "key"))
+    first
+}
+
+/// `path_and_query` without its `key` query params, or `None` when it carries none. Other params
+/// (Azure's `api-version`) keep their order. Managed requests only: a `?key=` there is the virtual
+/// key, which must not reach the provider, while a BYO `?key=` is the caller's own Gemini key.
+fn strip_key_param(path_and_query: &str) -> Option<String> {
+    let (path, query) = path_and_query.split_once('?')?;
+    let is_key = |pair: &&str| pair.split_once('=').map_or(*pair, |(k, _)| k) == "key";
+    if !query.split('&').any(|p| is_key(&p)) {
+        return None;
+    }
+    let mut out = String::with_capacity(path_and_query.len());
+    out.push_str(path);
+    let mut sep = '?';
+    for pair in query.split('&').filter(|p| !is_key(p)) {
+        out.push(sep);
+        out.push_str(pair);
+        sep = '&';
+    }
+    Some(out)
 }
 
 /// Upper bound on a model id we'll record. Real ids are short (`claude-opus-4-8`,
@@ -1503,8 +1539,27 @@ fn clip_catalog_name(name: &str) -> &str {
 /// Gemini's `/v1beta/…` doesn't qualify — with the dialect picking openai/anthropic
 /// ([`dialect_for_path`]); `None` for anything else, which the caller turns into a 404 rather than
 /// silently guessing a provider (Task #7, pi-parity).
-fn bare_default_provider_name(path: &str) -> Option<&'static str> {
-    route::is_default_prefix(path).then(|| route::dialect_default(dialect_for_path(path)))
+///
+/// `anthropic_key`: the request carries a non-managed `x-api-key`, which is Anthropic's credential
+/// header. That picks Anthropic whatever the path, so an Anthropic SDK call to `/v1/files` or
+/// `/v1/models/{id}` never reaches OpenAI carrying `sk-ant-…`. The path alone picked OpenAI for
+/// everything but `/v1/messages`.
+fn bare_default_provider_name(path: &str, anthropic_key: bool) -> Option<&'static str> {
+    let dialect = if anthropic_key {
+        Dialect::Anthropic
+    } else {
+        dialect_for_path(path)
+    };
+    route::is_default_prefix(path).then(|| route::dialect_default(dialect))
+}
+
+/// Whether the request presents a BYO Anthropic credential: a non-empty `x-api-key` that is not a
+/// managed key.
+fn has_byo_anthropic_key(req: &pingora::http::RequestHeader) -> bool {
+    req.headers
+        .get("x-api-key")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| !v.is_empty() && !key::is_managed_prefix(v))
 }
 
 /// Whether the **forwarded** (provider-native) path targets the OpenAI Chat Completions endpoint.
@@ -1675,6 +1730,20 @@ impl ProxyHttp for AiProxy {
         None
     }
 
+    /// The request line pingora prints on its own error lines. Its default prints the path
+    /// **with** the query, which is where a Gemini-style `?key=` credential (a virtual key or a
+    /// BYO Google key) lives. Logged without the query.
+    fn request_summary(&self, session: &Session, _ctx: &Self::CTX) -> String {
+        let req = session.req_header();
+        let host = req
+            .headers
+            .get(http::header::HOST)
+            .and_then(|v| v.to_str().ok())
+            .or_else(|| req.uri.host())
+            .unwrap_or("");
+        format!("{} {}, Host: {host}", req.method, req.uri.path())
+    }
+
     fn allow_spawning_subrequest(&self, _session: &Session, _ctx: &Self::CTX) -> bool {
         // Needed for `relay_full_body`, which is the only place the gateway spawns one.
         true
@@ -1731,7 +1800,8 @@ impl ProxyHttp for AiProxy {
                     forward_path: Some(with_query(rest)),
                     streamable: is_streamable_path(rest),
                 }
-            } else if let Some(name) = bare_default_provider_name(path) {
+            } else if let Some(name) = bare_default_provider_name(path, has_byo_anthropic_key(req))
+            {
                 // Bare default: dialect picks the BYO provider; managed traffic becomes a catalog
                 // walk after identity. Path is forwarded unchanged for BYO (`None`).
                 match self.state.provider(name) {
@@ -2026,6 +2096,12 @@ impl ProxyHttp for AiProxy {
             (identity.tenant_id, identity.vpc_id, identity.key_id, true)
         } else {
             (0, 0, None, false)
+        };
+        // A managed `?key=` is the virtual key: never forward it. Catalog walks already send the
+        // candidate's own path with no query, so only `/{provider}/…` carries one.
+        let forward_path = match forward_path {
+            Some(fp) if managed => Some(strip_key_param(&fp).unwrap_or(fp)),
+            fp => fp,
         };
 
         // Catalog walk is **managed-only**. BYO on `/auto` 400s before any peek — a BYO token
@@ -4511,10 +4587,61 @@ mod tests {
         assert_eq!(extract_virtual_key(&req), Some("header-secret"));
     }
 
+    /// claim: SEC-11
+    /// defect: D29
+    #[test]
+    fn a_managed_key_in_any_location_makes_the_request_managed() {
+        const VK: &str = "bai_v1.1.payload.sig";
+        for headers in [
+            &[
+                ("x-api-key", "junk"),
+                ("authorization", "Bearer bai_v1.1.payload.sig"),
+            ][..],
+            &[
+                ("x-api-key", ""),
+                ("authorization", "Bearer bai_v1.1.payload.sig"),
+            ][..],
+            &[("api-key", "sk-real"), ("x-goog-api-key", VK)][..],
+            &[
+                ("x-api-key", "sk-ant-real"),
+                ("authorization", "bearer bai_v1.1.payload.sig"),
+            ][..],
+        ] {
+            let req = req_with_headers("/openai/v1/chat/completions", headers);
+            assert_eq!(extract_virtual_key(&req), Some(VK), "{headers:?}");
+        }
+        let req = req_with_headers(
+            "/openai/v1/chat/completions?key=bai_v1.1.payload.sig",
+            &[("authorization", "Bearer sk-byo")],
+        );
+        assert_eq!(extract_virtual_key(&req), Some(VK));
+        // No managed key anywhere: the first non-empty location, as before.
+        let req = req_with_headers(
+            "/v1/chat/completions",
+            &[("x-api-key", ""), ("authorization", "Bearer sk-byo")],
+        );
+        assert_eq!(extract_virtual_key(&req), Some("sk-byo"));
+    }
+
     #[test]
     fn extract_virtual_key_returns_none_when_absent() {
         let req = req_with_headers("/v1/chat/completions", &[]);
         assert_eq!(extract_virtual_key(&req), None);
+    }
+
+    #[test]
+    fn strip_key_param_drops_only_the_credential() {
+        assert_eq!(
+            strip_key_param("/v1/x?key=bai_v1.a.b.c&api-version=2024").as_deref(),
+            Some("/v1/x?api-version=2024")
+        );
+        assert_eq!(
+            strip_key_param("/v1/x?a=1&key=s&b=2&key=t").as_deref(),
+            Some("/v1/x?a=1&b=2")
+        );
+        assert_eq!(strip_key_param("/v1/x?key=s").as_deref(), Some("/v1/x"));
+        assert_eq!(strip_key_param("/v1/x?keys=1&monkey=2"), None);
+        assert_eq!(strip_key_param("/v1/x"), None);
     }
 
     #[test]
@@ -4581,26 +4708,55 @@ mod tests {
         // then routed it to OpenAI — a silent misroute that 404s against `api.openai.com` instead of
         // failing with a clear "unknown provider" error. Boundary-checking must reject it.
         assert_eq!(
-            bare_default_provider_name("/v1beta/models/gemini-2.5-pro:generateContent"),
+            bare_default_provider_name("/v1beta/models/gemini-2.5-pro:generateContent", false),
             None,
             "/v1beta must NOT be routed to OpenAI (or any provider) via the bare-default path"
         );
-        assert_eq!(bare_default_provider_name("/v1beta"), None);
+        assert_eq!(bare_default_provider_name("/v1beta", false), None);
 
         // The real bare-default shape still resolves correctly, dialect-picked.
         assert_eq!(
-            bare_default_provider_name("/v1/messages"),
+            bare_default_provider_name("/v1/messages", false),
             Some("anthropic")
         );
         assert_eq!(
-            bare_default_provider_name("/v1/chat/completions"),
+            bare_default_provider_name("/v1/chat/completions", false),
             Some("openai")
         );
-        assert_eq!(bare_default_provider_name("/v1"), Some("openai"));
+        assert_eq!(bare_default_provider_name("/v1", false), Some("openai"));
 
         // Other near-miss prefixes must also be rejected, not just /v1beta.
-        assert_eq!(bare_default_provider_name("/v10/messages"), None);
-        assert_eq!(bare_default_provider_name("/v2/messages"), None);
+        assert_eq!(bare_default_provider_name("/v10/messages", false), None);
+        assert_eq!(bare_default_provider_name("/v2/messages", false), None);
+    }
+
+    /// claim: SEC-11
+    /// defect: D30
+    #[test]
+    fn a_byo_x_api_key_on_bare_v1_routes_to_anthropic_on_every_path() {
+        for path in [
+            "/v1/files",
+            "/v1/models/claude-opus-4-8",
+            "/v1/chat/completions",
+            "/v1",
+        ] {
+            assert_eq!(
+                bare_default_provider_name(path, true),
+                Some("anthropic"),
+                "{path}"
+            );
+        }
+        assert_eq!(bare_default_provider_name("/v1beta/x", true), None);
+        let req = req_with_headers("/v1/files", &[("x-api-key", "sk-ant-byo")]);
+        assert!(has_byo_anthropic_key(&req));
+        for headers in [
+            &[("x-api-key", "bai_v1.1.p.s")][..],
+            &[("x-api-key", "")][..],
+            &[("authorization", "Bearer sk-ant-byo")][..],
+        ] {
+            let req = req_with_headers("/v1/files", headers);
+            assert!(!has_byo_anthropic_key(&req), "{headers:?}");
+        }
     }
 
     #[test]

@@ -60,9 +60,11 @@ Client (stock OpenAI/Anthropic SDK)
   │  │        other mismatch ────────────────────────► 400
   │  │      GET /v1/models ────────────────────────────────────► catalog list
   │  │      BYO key on `/auto` (managed-only route) ───────────► 400
-  │  │      BYO on `/v1` ─ dialect-default passthrough (no catalog)
+  │  │      BYO on `/v1` ─ dialect-default passthrough (no catalog); a BYO x-api-key picks
+  │  │        Anthropic on every `/v1` path, not just `/v1/messages`
   │  │      no remaining candidate holds a pool key ──────────► 503
   │  ├─ Extract key: x-api-key / api-key / x-goog-api-key / Authorization Bearer / ?key= query param
+  │  │    a managed (bai_v1/v2) value in ANY of them wins; empty values count as absent
   │  ├─ Rate guardrails (BEFORE verify — keeps forged-key floods at ns cost)
   │  │    per-credential count-min  ──────────────────────────────► 429
   │  │    global BYO aggregate (managed exempt)  ─────────────────► 429
@@ -102,7 +104,8 @@ Client (stock OpenAI/Anthropic SDK)
   ▼  upstream_request_filter (proxy.rs)
   │  Managed: remove every static-key header (authorization, x-api-key, api-key,
   │    x-goog-api-key) UNCONDITIONALLY → inject the next unused pool key in the
-  │    provider's own scheme (never provider A's key on provider B)
+  │    provider's own scheme (never provider A's key on provider B); a `key=` query
+  │    param is dropped from the forwarded path (other params kept)
   │  BYO: leave auth header unchanged
   │  Managed: accept-encoding: identity (the gateway parses the body; gzip billed 0 tokens)
   │  Strip x-beyond-* control headers (ours; meaningless upstream)
@@ -226,7 +229,10 @@ The routing rule: **first path segment = provider name**. `/groq/openai/v1/chat/
 to Groq and forwards `/openai/v1/chat/completions` verbatim. A bare path that is _exactly_ `/v1` or
 starts with `/v1/` (boundary-checked — `route::is_default_prefix`, not a raw string-prefix test) is
 the drop-in default: BYO dialect-picks OpenAI or Anthropic; a **managed** request there is a catalog
-walk (see below). A lookalike like Google Gemini's `/v1beta/…` does **not** qualify and 404s as an
+walk (see below). The BYO pick is Anthropic for `/v1/messages…` **or** for any `/v1` path carrying a
+non-managed `x-api-key` (Anthropic's credential header), else OpenAI. Picking by path alone sent an
+Anthropic SDK's `/v1/files` or `/v1/models/{id}` call to OpenAI with its `sk-ant-…` key attached. A
+BYO `x-api-key` on a gateway with no Anthropic provider configured is a 404, never an OpenAI call. A lookalike like Google Gemini's `/v1beta/…` does **not** qualify and 404s as an
 unknown provider instead of being silently absorbed into the OpenAI default. Unknown segment → 404.
 
 ### Model routing (`/auto`, managed `/v1`, `providers::catalog`)
@@ -1421,6 +1427,17 @@ to serve.
   Messages ↔ Responses is translated so the client sees the inbound dialect. Usage taps stay on
   the upstream body.
 - BYO token validity — forwarded as-is; the provider rejects it if invalid
+
+**Where a credential may travel:**
+
+- A managed key reaches no provider in any location. Every static-key header and `Authorization`
+  are stripped, and a `?key=` query param is removed from the forwarded path. When the credential
+  locations disagree (`x-api-key: junk` beside `Bearer bai_v1…`, or an empty `x-api-key`), a
+  managed value in **any** location makes the request managed. First-location-wins classified that
+  as BYO, and BYO headers are forwarded untouched, so the virtual key reached the provider.
+- Pingora's own error line prints `ProxyHttp::request_summary`, overridden to log the path without
+  its query, so a `?key=` credential (managed, or a BYO Google key) never reaches the log.
+- A BYO key reaches only the provider it belongs to: on bare `/v1`, `x-api-key` routes to Anthropic.
 - `vpc_id` in the virtual key — decoded and emitted in billing facts, not used for access control
 
 **What the catalog allowlists (managed `/v1` and `/auto` only):**
