@@ -1485,6 +1485,26 @@ mod input_tally {
         feed(bencher, code_body());
     }
 
+    /// ~1 MiB of source (a large agent turn): a `\n` escape every ~40 bytes.
+    #[divan::bench]
+    fn code_1mb(bencher: Bencher) {
+        let src = [
+            include_str!("../src/proxy.rs"),
+            include_str!("../src/translate.rs"),
+        ]
+        .concat();
+        let mut end = src.len().min(1024 * 1024);
+        while !src.is_char_boundary(end) {
+            end -= 1;
+        }
+        let text = serde_json::to_string(&src[..end]).unwrap();
+        feed(
+            bencher,
+            format!(r#"{{"model":"gpt-5","messages":[{{"role":"user","content":{text}}}]}}"#)
+                .into_bytes(),
+        );
+    }
+
     /// ~108 KiB of English with no escapes: one long text segment.
     #[divan::bench]
     fn prose(bencher: Bencher) {
@@ -1607,5 +1627,370 @@ mod signed_id {
         bencher
             .counter(BytesCount::new(body.len()))
             .bench(|| s.unsign_request(42, black_box(body.as_bytes()), true));
+    }
+}
+
+/// Prose that mentions `image`, `file`, `document`, `reasoning` and `thinking` as words, never as
+/// JSON keys or type values: the shape of a coding agent's long prompt, which loose substring
+/// gates took for a reason to parse the whole body.
+fn prose_body(len: usize) -> Vec<u8> {
+    let line = "We keep thinking about the image file and the document; the reasoning is in the input_file note. ";
+    let text = line.repeat(len / line.len() + 1);
+    format!(
+        r#"{{"model":"m","stream":true,"messages":[{{"role":"system","content":"You are helpful."}},{{"role":"user","content":"{text}"}}]}}"#
+    )
+    .into_bytes()
+}
+
+/// Peak heap of `translate::request` per shape of JSON: the measurement behind
+/// `translate::translation_heap`'s constants. Read the `max alloc` bytes column against the body
+/// size (`BytesCount`). Run with `cargo bench --bench unit -- translate_heap`.
+mod translate_heap {
+    use super::*;
+    use beyond_ai::route::Endpoint;
+    use beyond_ai::translate;
+
+    const N: usize = 4 << 20;
+
+    fn rep(s: &str, k: usize) -> String {
+        vec![s; k].join(",")
+    }
+
+    fn tools(x: &str) -> String {
+        format!(
+            r#"{{"model":"m","messages":[{{"role":"user","content":"hi"}}],"tools":[{{"type":"function","function":{{"name":"f","parameters":{{"type":"object","x":[{x}]}}}}}}]}}"#
+        )
+    }
+
+    /// (name, client wire, upstream wire, body). Each is the body shape that costs a `Value` the
+    /// most per byte on its path: many tiny containers or scalars, which `serde_json` stores at
+    /// 32+ bytes each (a `BTreeMap` leaf node per non-empty object), copied again into the
+    /// translated `Value`.
+    fn shapes() -> Vec<(&'static str, Endpoint, Endpoint, String)> {
+        use Endpoint::{ChatCompletions as Chat, Messages, Responses};
+        vec![
+            (
+                "chat_messages",
+                Chat,
+                Messages,
+                format!(
+                    r#"{{"model":"m","messages":[{}]}}"#,
+                    rep(r#"{"role":"user","content":"hi"}"#, N / 32)
+                ),
+            ),
+            (
+                "chat_text_parts",
+                Chat,
+                Messages,
+                format!(
+                    r#"{{"model":"m","messages":[{{"role":"user","content":[{}]}}]}}"#,
+                    rep(r#"{"type":"text","text":"a"}"#, N / 27)
+                ),
+            ),
+            (
+                "chat_unknown_parts",
+                Chat,
+                Messages,
+                format!(
+                    r#"{{"model":"m","messages":[{{"role":"user","content":[{}]}}]}}"#,
+                    rep(r#"{"a":1}"#, N / 8)
+                ),
+            ),
+            (
+                "chat_schema_objects",
+                Chat,
+                Messages,
+                tools(&rep(r#"{"a":1}"#, N / 8)),
+            ),
+            (
+                "chat_schema_empty_objects",
+                Chat,
+                Messages,
+                tools(&rep("{}", N / 3)),
+            ),
+            (
+                "chat_schema_empty_arrays",
+                Chat,
+                Messages,
+                tools(&rep("[]", N / 3)),
+            ),
+            (
+                "chat_schema_numbers",
+                Chat,
+                Messages,
+                tools(&rep("1", N / 2)),
+            ),
+            (
+                "chat_schema_empty_strings",
+                Chat,
+                Messages,
+                tools(&rep(r#""""#, N / 3)),
+            ),
+            (
+                "chat_schema_wide_object",
+                Chat,
+                Messages,
+                format!(
+                    r#"{{"model":"m","messages":[{{"role":"user","content":"hi"}}],"tools":[{{"type":"function","function":{{"name":"f","parameters":{{{}}}}}}}]}}"#,
+                    (0..N / 12)
+                        .map(|i| format!(r#""{i:x}":0"#))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                ),
+            ),
+            (
+                "chat_long_string",
+                Chat,
+                Messages,
+                format!(
+                    r#"{{"model":"m","messages":[{{"role":"user","content":"{}"}}]}}"#,
+                    "a".repeat(N)
+                ),
+            ),
+            (
+                "responses_unknown_items",
+                Responses,
+                Chat,
+                format!(
+                    r#"{{"model":"m","store":false,"input":[{}]}}"#,
+                    rep(r#"{"a":1}"#, N / 8)
+                ),
+            ),
+            (
+                "responses_unknown_items_to_messages",
+                Responses,
+                Messages,
+                format!(
+                    r#"{{"model":"m","store":false,"input":[{}]}}"#,
+                    rep(r#"{"a":1}"#, N / 8)
+                ),
+            ),
+            (
+                "responses_empty_items_to_messages",
+                Responses,
+                Messages,
+                format!(
+                    r#"{{"model":"m","store":false,"input":[{}]}}"#,
+                    rep("{}", N / 3)
+                ),
+            ),
+            (
+                "responses_messages_to_messages",
+                Responses,
+                Messages,
+                format!(
+                    r#"{{"model":"m","store":false,"input":[{}]}}"#,
+                    rep(r#"{"role":"user","content":"hi"}"#, N / 32)
+                ),
+            ),
+            (
+                "messages_tool_input_objects",
+                Messages,
+                Chat,
+                format!(
+                    r#"{{"model":"m","max_tokens":5,"messages":[{{"role":"assistant","content":[{{"type":"tool_use","id":"t","name":"f","input":{{"x":[{}]}}}}]}}]}}"#,
+                    rep(r#"{"a":1}"#, N / 8)
+                ),
+            ),
+            (
+                "messages_tool_input_floats",
+                Messages,
+                Chat,
+                format!(
+                    r#"{{"model":"m","max_tokens":5,"messages":[{{"role":"assistant","content":[{{"type":"tool_use","id":"t","name":"f","input":{{"x":[{}]}}}}]}}]}}"#,
+                    rep("1.5", N / 4)
+                ),
+            ),
+            (
+                "messages_system_parts",
+                Messages,
+                Chat,
+                format!(
+                    r#"{{"model":"m","max_tokens":5,"system":[{}],"messages":[{{"role":"user","content":"hi"}}]}}"#,
+                    rep(r#"{"type":"text","text":"a"}"#, N / 27)
+                ),
+            ),
+            (
+                "messages_unknown_blocks_to_responses",
+                Messages,
+                Responses,
+                format!(
+                    r#"{{"model":"m","max_tokens":5,"messages":[{{"role":"user","content":[{}]}}]}}"#,
+                    rep(r#"{"a":1}"#, N / 8)
+                ),
+            ),
+        ]
+    }
+
+    const NAMES: [&str; 18] = [
+        "chat_messages",
+        "chat_text_parts",
+        "chat_unknown_parts",
+        "chat_schema_objects",
+        "chat_schema_empty_objects",
+        "chat_schema_empty_arrays",
+        "chat_schema_numbers",
+        "chat_schema_empty_strings",
+        "chat_schema_wide_object",
+        "chat_long_string",
+        "responses_unknown_items",
+        "responses_unknown_items_to_messages",
+        "responses_empty_items_to_messages",
+        "responses_messages_to_messages",
+        "messages_tool_input_objects",
+        "messages_tool_input_floats",
+        "messages_system_parts",
+        "messages_unknown_blocks_to_responses",
+    ];
+
+    #[divan::bench(args = NAMES, sample_count = 1, sample_size = 1)]
+    fn request(bencher: Bencher, name: &str) {
+        let (_, from, to, body) = shapes().into_iter().find(|s| s.0 == name).unwrap();
+        let body = body.into_bytes();
+        bencher
+            .counter(BytesCount::of_slice(&body))
+            .bench(|| translate::request(from, to, black_box(&body), "claude-sonnet-4-5"));
+    }
+}
+
+/// Admission-path body checks (`route::refused_input`, `route::unserved`,
+/// `translate::responses_session_field`) and the same-wire Claude relay's reasoning gate.
+mod body_gates {
+    use super::*;
+    use beyond_ai::{route, translate};
+    use providers::catalog::{IN_IMAGE, MODEL_ROUTES, serves_file_input};
+
+    fn no_image_row() -> &'static route::ModelRoute {
+        MODEL_ROUTES
+            .iter()
+            .find(|r| {
+                r.card.input & IN_IMAGE == 0
+                    && route::Endpoint::of_row(r) != route::Endpoint::Embeddings
+            })
+            .expect("a row without image input")
+    }
+
+    fn file_gap_row() -> &'static route::ModelRoute {
+        MODEL_ROUTES
+            .iter()
+            .find(|r| r.candidates.iter().any(|c| !serves_file_input(c)))
+            .expect("a row with a candidate that reads no PDF")
+    }
+
+    #[divan::bench]
+    fn refused_input_prose_500k(bencher: Bencher) {
+        let body = prose_body(500 * 1024);
+        let row = no_image_row();
+        bencher
+            .counter(BytesCount::of_slice(&body))
+            .bench(|| route::refused_input(black_box(row), black_box(&body)));
+    }
+
+    #[divan::bench]
+    fn unserved_prose_500k(bencher: Bencher) {
+        let body = prose_body(500 * 1024);
+        let row = file_gap_row();
+        bencher
+            .counter(BytesCount::of_slice(&body))
+            .bench(|| route::unserved(black_box(row.candidates), black_box(&body)));
+    }
+
+    #[divan::bench]
+    fn claude_chat_relay_reasoning_prose_500k(bencher: Bencher) {
+        let body = prose_body(500 * 1024);
+        bencher
+            .counter(BytesCount::of_slice(&body))
+            .with_inputs(|| body.clone())
+            .bench_local_values(|b| {
+                translate::claude_chat_relay_reasoning(b, black_box("anthropic/claude-sonnet-4.5"))
+            });
+    }
+
+    /// A Responses body with `n` small input items: a long agent history.
+    fn responses_items(n: usize) -> Vec<u8> {
+        let items = vec![r#"{"type":"message","role":"user","content":"hi"}"#; n].join(",");
+        format!(r#"{{"model":"m","store":false,"input":[{items}]}}"#).into_bytes()
+    }
+
+    #[divan::bench(args = [1_000, 100_000])]
+    fn responses_session_field_items(bencher: Bencher, n: usize) {
+        let body = responses_items(n);
+        bencher
+            .counter(BytesCount::of_slice(&body))
+            .bench(|| translate::responses_session_field(black_box(&body), black_box(false)));
+    }
+}
+
+/// A same-wire Chat Completions stream relayed from a host other than OpenAI (`SseBridge`'s
+/// relay, which drops the identity fields OpenRouter repeats on every chunk).
+mod chat_relay {
+    use super::*;
+    use beyond_ai::route::Endpoint;
+    use beyond_ai::translate::SseBridge;
+
+    const FIRST: &[u8] = b"data: {\"id\":\"gen-1\",\"provider\":\"Anthropic\",\"model\":\"anthropic/claude-sonnet-4.5\",\"object\":\"chat.completion.chunk\",\"created\":1790000000,\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Hello\"},\"finish_reason\":null,\"native_finish_reason\":null,\"logprobs\":null}]}\n\n";
+
+    /// OpenRouter's every later chunk: `role` again.
+    const REPEAT_ROLE: &[u8] = b"data: {\"id\":\"gen-1\",\"provider\":\"Anthropic\",\"model\":\"anthropic/claude-sonnet-4.5\",\"object\":\"chat.completion.chunk\",\"created\":1790000000,\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\" world, how are you\"},\"finish_reason\":null,\"native_finish_reason\":null,\"logprobs\":null}]}\n\n";
+
+    /// A host that sends `role` once: nothing to drop.
+    const PLAIN: &[u8] = b"data: {\"id\":\"gen-1\",\"model\":\"m\",\"object\":\"chat.completion.chunk\",\"created\":1790000000,\"choices\":[{\"index\":0,\"delta\":{\"content\":\" world, how are you\"},\"finish_reason\":null}]}\n\n";
+
+    fn bridge() -> SseBridge {
+        let mut b = SseBridge::new(Endpoint::ChatCompletions, Endpoint::ChatCompletions);
+        let _ = b.feed(FIRST, false);
+        b
+    }
+
+    #[divan::bench]
+    fn repeated_role_event(bencher: Bencher) {
+        let mut b = bridge();
+        bencher.bench_local(|| b.feed(black_box(REPEAT_ROLE), false));
+    }
+
+    #[divan::bench]
+    fn plain_event(bencher: Bencher) {
+        let mut b = bridge();
+        bencher.bench_local(|| b.feed(black_box(PLAIN), false));
+    }
+}
+
+/// `SseBridge::feed` handed many events in one chunk (a provider that batches, or a reader that
+/// fell behind): each event used to drain the buffer from the front.
+mod sse_feed {
+    use super::*;
+    use beyond_ai::route::Endpoint;
+    use beyond_ai::translate::SseBridge;
+
+    #[divan::bench(args = [16, 1024])]
+    fn messages_to_chat_batch(bencher: Bencher, n: usize) {
+        let start = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":3,\"output_tokens\":1}}}\n\nevent: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n";
+        let delta = "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hello\"}}\n\n";
+        let batch = delta.repeat(n).into_bytes();
+        bencher
+            .counter(BytesCount::of_slice(&batch))
+            .with_inputs(|| {
+                let mut b = SseBridge::new(Endpoint::ChatCompletions, Endpoint::Messages);
+                let _ = b.feed(start.as_bytes(), false);
+                b
+            })
+            .bench_local_refs(|b| b.feed(black_box(&batch), false));
+    }
+
+    /// A Chat upstream onto a Messages client: call 0 is live with 64 KiB of arguments that closed
+    /// but are not valid JSON, and each delta of queued call 1 asks whether call 0 is whole.
+    #[divan::bench]
+    fn queued_call_delta_behind_invalid_live_call(bencher: Bencher) {
+        let args =
+            serde_json::to_string(&format!("{{\"a\":\"{}\"}}}}", "x".repeat(64 * 1024))).unwrap();
+        let open0 = format!(
+            "data: {{\"id\":\"c\",\"model\":\"m\",\"choices\":[{{\"index\":0,\"delta\":{{\"tool_calls\":[{{\"index\":0,\"id\":\"call_0\",\"type\":\"function\",\"function\":{{\"name\":\"f\",\"arguments\":{args}}}}}]}}}}]}}\n\n"
+        );
+        let open1 = "data: {\"id\":\"c\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":1,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"g\",\"arguments\":\"\"}}]}}]}\n\n";
+        let delta1 = b"data: {\"id\":\"c\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":1,\"function\":{\"arguments\":\"x\"}}]}}]}\n\n";
+        let mut b = SseBridge::new(Endpoint::Messages, Endpoint::ChatCompletions);
+        let _ = b.feed(open0.as_bytes(), false);
+        let _ = b.feed(open1.as_bytes(), false);
+        bencher.bench_local(|| b.feed(black_box(delta1), false));
     }
 }
