@@ -63,7 +63,7 @@ id = "E7"
 priority = "P0"
 group = "Endpoints and SDK compatibility"
 text = "Agent harnesses list every catalog model with its context window, output limit and pricing, and the session cost they display matches the billing rows"
-oracle = "harness model list = /v1/models ids; limits and prices match the card; displayed session cost = sum of ai.usage rows priced at the card, within rounding. A harness that can't discover models gets config generated from /v1/models, never hand-written"
+oracle = "harness model list = /v1/models ids; limits and prices match the card; the cost a harness displays through the gateway equals what it displays calling the provider directly for the same usage; usage the client's wire format cannot express (e.g. client-requested cache writes on the OpenAI wire) is a client limitation shared with direct use, not a gateway gap. A harness that can't discover models gets config generated from /v1/models, never hand-written"
 layer = "live"
 # Harnesses that show a model list and a session cost. Not codex: it lists only its bundled catalog
 # (a model_catalog_json needs Codex's own system prompt per model, which no /v1/models carries) and

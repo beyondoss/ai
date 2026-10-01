@@ -1067,8 +1067,8 @@ impact = "On a Claude row reached over Chat Completions or Responses, the gatewa
 confidence = "high"
 evidence = "live 2026-10-01 E7::opencode::claude (claude-haiku-4-5): opencode displayed $0.013819, the ledger priced at the card is $0.015957 (-13.4%), the whole gap being cache_write_tokens x 0.25 x $1/M. Per step, opencode's own tokens show cache.write 0 and the writes folded into input. @ai-sdk/openai-compatible 3.0.62 reads only prompt_tokens_details.cached_tokens. Breakpoints: translate.rs:961-1010 (auto_cache_breakpoints)."
 claims = ["E7"]
-state = "suspected"
-test = ""
+state = "reproduced"
+test = "gateway_added_breakpoints_bill_their_writes_as_input"
 fix = ""
 note = "Not the client's misreading of our usage: real OpenRouter reports the same shape (cached_tokens = reads only, cache_write_tokens separate; probed 2026-10-01 on anthropic/claude-haiku-4.5), so the gap exists only because the gateway turned caching on. pi's Responses provider also reads no cache writes; its Chat provider does."
 
