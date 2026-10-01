@@ -4889,6 +4889,9 @@ impl ProxyHttp for AiProxy {
                     let serving = catalog_serving_endpoint(a.as_ref());
                     let upstream_model =
                         a.candidate_at(a.candidate).map_or("", |c| c.upstream_model);
+                    let openai_host = a
+                        .candidate_at(a.candidate)
+                        .is_some_and(|c| c.provider == providers::ProviderId::OpenAi);
                     if let Some(t) = a.translate.as_mut()
                         && let Some(to) = serving
                     {
@@ -4913,6 +4916,12 @@ impl ProxyHttp for AiProxy {
                             let len = buf.len();
                             buf = translate::claude_chat_relay_reasoning(buf);
                             changed |= buf.len() != len;
+                        }
+                        // Same-wire Chat to another host: an explicit null is "not set", as
+                        // translation treats it; OpenRouter 400s `user: null` (D101).
+                        if t.client == to && to == route::Endpoint::ChatCompletions && !openai_host
+                        {
+                            changed |= peek::remove_root_nulls(&mut buf);
                         }
                     }
                     if changed {

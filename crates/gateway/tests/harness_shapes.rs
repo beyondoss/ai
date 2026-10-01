@@ -375,7 +375,6 @@ async fn a_claude_tool_turn_without_reasoning_details_goes_without_reasoning_on_
 /// claim: TRN-15
 /// defect: D101
 #[tokio::test]
-#[ignore = "D101 reproduced: user: null is relayed to OpenRouter untouched"]
 async fn explicit_nulls_are_omitted_on_a_same_wire_chat_relay_to_openrouter() {
     let nats_port = unused_nats_port();
     let (pubkey, sk) = test_keypair(1);

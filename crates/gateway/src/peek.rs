@@ -626,6 +626,24 @@ pub fn scan_buffered(body: &[u8]) -> BufferedScan {
     }
 }
 
+/// Remove every root member whose value is `null`, by span: how OpenAI SDKs send an unset option,
+/// which OpenAI reads as "not set" and other Chat Completions hosts may reject (OpenRouter 400s
+/// `user: null`). One `memmem` keeps a body without `null` unwalked. `true` when the body changed.
+pub fn remove_root_nulls(body: &mut Vec<u8>) -> bool {
+    if memchr::memmem::find(body, b"null").is_none() {
+        return false;
+    }
+    let Some(members) = root_members(body) else {
+        return false;
+    };
+    let spans: Vec<(usize, usize)> = members.iter().map(Member::span).collect();
+    let null: Vec<bool> = members
+        .iter()
+        .map(|m| &body[m.value.0..m.value.1] == b"null")
+        .collect();
+    remove_items(body, &spans, |k| null[k])
+}
+
 /// Remove every root member whose key decodes to `key` (escaped spellings included), by span. `true`
 /// when the body changed.
 pub fn remove_root_members(body: &mut Vec<u8>, key: &str) -> bool {
