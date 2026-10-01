@@ -773,10 +773,10 @@ impact = "README: 'fail-open NATS' (managed gets 402), 'never buffers', '11 prov
 confidence = "high"
 evidence = "README.md; ARCHITECTURE.md; config.example.toml"
 claims = ["CAT-15"]
-state = "suspected"
-test = ""
+state = "reproduced"
+test = "architecture_tables_name_real_modules_metrics_and_fields"
 fix = ""
-note = "README fixed in the commit that adds this note (provider count, buffering, circuit breaker, NATS fail-closed allowance, slipstream sets, env overrides, broken links, managed endpoint scope). ARCHITECTURE.md and config.example.toml items remain."
+note = "README fixed in the commit that adds this note (provider count, buffering, circuit breaker, NATS fail-closed allowance, slipstream sets, env overrides, broken links, managed endpoint scope). ARCHITECTURE.md and config.example.toml items remain. Reproduced 2026-09-30 by the mechanical doc lint (tests/claims_contract.rs): ARCHITECTURE.md's configuration table names `listen_addr` (the field is `listen`), and config.example.toml's 'Known providers (zero-config defaults)' list omits openai-codex. The README checks (provider count and list, config keys and defaults, links) and the example config's keys and defaults pass in readme_and_example_config_statements_hold. The prose items (Claude lineup, 413 happy path, fireworks-anthropic path, AWS_BEARER_TOKEN_BEDROCK) are not mechanically checked."
 
 [[defect]]
 id = "D56"
@@ -815,10 +815,10 @@ impact = "A v1 key carries no key_id, so every key a tenant holds shares one pin
 confidence = "high"
 evidence = "smart.rs pin key (tenant, vpc, key_id); key.rs v1 payload has no key_id"
 claims = ["SEC-15"]
-state = "suspected"
-test = ""
+state = "accepted"
+test = "pins_limits_and_slots_do_not_cross_tenants"
 fix = ""
-note = ""
+note = "Behavior is the documented design, not a cross-tenant leak: the pin key is the verified identity (tenant_id, vpc_id, key_id) plus the row (ARCHITECTURE.md 'Session pins': one virtual key is one app). bai_v1 minting is deterministic per (tenant, vpc), so a tenant holds exactly one v1 credential per VPC (re-minting under a rotated kid is the same identity); a shared pin per (tenant, vpc) is therefore per-key pinning. A tenant that needs workloads pinned apart uses bai_v2 keys with distinct key_ids. The test pins that: tenant A's v1 pin does not move a v2 sibling key of A or tenant B, and neither moves A; rate-limit buckets and concurrency slots are per credential / per tenant."
 
 [[defect]]
 id = "D59"
@@ -903,3 +903,59 @@ state = "fixed"
 test = "translated_usage_counts_reasoning_reported_beside_completion_tokens"
 fix = "c166c7b"
 note = "translate::Usage::from_chat adds reasoning to output when total = prompt + completion + reasoning, matching usage::openai_body (D23)."
+
+[[defect]]
+id = "D65"
+severity = "high"
+area = "Security"
+title = "Repeated, encoded or oddly spaced credentials forward the virtual key upstream"
+impact = "The managed-key classifier reads the first value of each credential location. A request whose first x-api-key line or first ?key= param is junk, whose Bearer has two spaces, or whose query names the key k%65y (which Google decodes as key) is classified BYO, or keeps the param, and the bai_ virtual key reaches the provider verbatim, in a header or the query string."
+confidence = "high"
+evidence = "proxy.rs extract_virtual_key (headers.get = first value, query_param = first match, `Bearer ` sliced at 7 bytes); strip_key_param matches the literal name `key` only"
+claims = ["SEC-3", "SEC-11"]
+state = "reproduced"
+test = "repeated_or_respelled_credentials_never_forward_a_virtual_key"
+fix = ""
+note = "All four spellings reproduce against /openai/v1/chat/completions (tests/claims_security.rs): ?key=junk&key=<vk>; Bearer <vk> plus ?k%65y=<vk>; two x-api-key lines (junk, <vk>); `Bearer  <vk>` (two spaces)."
+
+[[defect]]
+id = "D66"
+severity = "med"
+area = "Security"
+title = "An upstream that echoes the pool key hands it to the client"
+impact = "The gateway relays upstream error bodies and response headers without scrubbing Beyond's own pool keys. A provider (or a proxy in between) that echoes the credential it received, in a 401 message or a debug header, gives a managed client Beyond's provider key. Holds on provider routes, same-wire catalog walks, and translated walks (the translated error keeps the upstream message)."
+confidence = "high"
+evidence = "proxy.rs response_filter / response_body_filter: no pool-key redaction; translate keeps error.message"
+claims = ["SEC-7"]
+state = "reproduced"
+test = "an_upstream_echo_of_the_pool_key_never_reaches_the_client"
+fix = ""
+note = "Real OpenAI masks all but the last 4 characters of a bad key in its 401; the reproduction uses a full echo to prove the gateway does no scrubbing of its own. Gateway-made responses carry no pool key (gateway_made_responses_never_carry_a_pool_key passes)."
+
+[[defect]]
+id = "D67"
+severity = "low"
+area = "Security"
+title = "BYO requests forward x-beyond-model and unknown x-beyond-* headers"
+impact = "upstream_request_filter strips the six control headers on every route, but x-beyond-model only on catalog walks, and BYO requests forward every other client header. A BYO request carrying x-beyond-model, or any x-beyond-* name the gateway does not define, reaches the provider. Managed requests strip the whole namespace (allowlist)."
+confidence = "high"
+evidence = "proxy.rs upstream_request_filter: MODEL_HEADER removed only when rc.auto is set; CONTROL_HEADERS is a fixed list of six"
+claims = ["SEC-9"]
+state = "reproduced"
+test = "client_x_beyond_headers_never_reach_the_upstream_on_any_route"
+fix = ""
+note = "Reproduced on BYO /openai/v1/chat/completions and BYO /v1/chat/completions: x-beyond-model and x-beyond-trace reach the upstream."
+
+[[defect]]
+id = "D68"
+severity = "low"
+area = "Translation"
+title = "A file:// image URL is forwarded between Chat Completions and Responses"
+impact = "ARCHITECTURE.md: 'A non-http(s) image URL (file://) is never forwarded in any shape.' Onto Messages it is dropped, but a Chat Completions image_url becomes a Responses input_image (and back) with the file:// URL intact."
+confidence = "high"
+evidence = "translate.rs Chat Completions <-> Responses image part mapping passes the URL through without the scheme check the Messages mapping applies"
+claims = ["TRN-21"]
+state = "reproduced"
+test = "a_file_image_url_never_reaches_a_responses_upstream"
+fix = ""
+note = "Reproduced with translate::request (tests/claims_translation.rs): Chat -> Responses on gpt-5-pro keeps input_image.image_url = file:///etc/passwd."

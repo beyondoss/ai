@@ -257,7 +257,7 @@ async fn a_managed_upgrade_is_refused_before_the_upstream() {
 /// `x-beyond-*` response headers are the gateway's. One sent by the upstream is dropped before the
 /// gateway adds its own, so a client never reads a provider's (or a middlebox's) claim about who
 /// served it or whether it was a cache replay.
-/// claim: SEC-22
+/// claim: SEC-8
 /// defect: D53
 #[tokio::test]
 async fn upstream_x_beyond_headers_never_reach_the_client() {
@@ -304,7 +304,7 @@ async fn upstream_x_beyond_headers_never_reach_the_client() {
 
 /// Pool keys over a plaintext upstream are sent in cleartext on every managed request. Legitimate
 /// only against a local mock (as here), so it boots, but loudly.
-/// claim: SEC-8
+/// claim: SEC-22
 /// defect: D53
 #[tokio::test]
 async fn pool_keys_over_cleartext_warn_at_boot() {

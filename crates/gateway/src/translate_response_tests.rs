@@ -425,6 +425,7 @@ data: {"type":"response.completed","sequence_number":20,"response":{"id":"resp_1
 
 // ---- 3. usage: cache tokens both ways ----------------------------------------------------------
 
+/// claim: TRN-23
 #[test]
 fn anthropic_cache_counts_join_prompt_tokens_for_an_openai_client() {
     let usage = json!({
@@ -452,6 +453,7 @@ fn anthropic_cache_counts_join_prompt_tokens_for_an_openai_client() {
     assert_eq!(u["prompt_tokens_details"]["cache_write_tokens"], 2000);
 }
 
+/// claim: TRN-23
 #[test]
 fn anthropic_message_delta_usage_is_cumulative() {
     let src = concat!(
@@ -474,6 +476,7 @@ fn anthropic_message_delta_usage_is_cumulative() {
     assert_eq!(u["completion_tokens"], 9);
 }
 
+/// claim: TRN-23
 #[test]
 fn openai_cached_tokens_are_not_anthropic_input_tokens() {
     let usage = json!({
@@ -500,6 +503,7 @@ fn openai_cached_tokens_are_not_anthropic_input_tokens() {
     assert_eq!(u["output_tokens"], 40);
 }
 
+/// claim: TRN-23
 #[test]
 fn responses_usage_carries_cache_and_reasoning_both_ways() {
     let usage = json!({
@@ -853,6 +857,7 @@ fn openrouter_nonstream_reasoning_details_become_signed_thinking() {
     );
 }
 
+/// claim: TRN-21
 #[test]
 fn unsigned_thinking_never_reaches_a_messages_client() {
     // DeepSeek / gpt-oss style: reasoning text, never a signature.
@@ -926,6 +931,7 @@ fn a_claude_signature_crosses_chat_into_anthropic_json_and_back() {
 
 // ---- 5. stop reasons ---------------------------------------------------------------------------
 
+/// claim: TRN-22
 #[test]
 fn every_anthropic_stop_reason_has_an_openai_finish_reason() {
     for (stop, finish) in [
@@ -956,6 +962,7 @@ fn every_anthropic_stop_reason_has_an_openai_finish_reason() {
     }
 }
 
+/// claim: TRN-22
 #[test]
 fn an_anthropic_refusal_explanation_reaches_openai_refusal() {
     let mut msg = anthropic_msg(json!([]), "refusal", json!({}));
@@ -968,6 +975,7 @@ fn an_anthropic_refusal_explanation_reaches_openai_refusal() {
     assert_eq!(oai["choices"][0]["finish_reason"], "content_filter");
 }
 
+/// claim: TRN-22
 #[test]
 fn an_openai_refusal_reaches_an_anthropic_client_as_a_refusal() {
     let oai = chat_completion(
@@ -1004,6 +1012,7 @@ fn an_openai_refusal_reaches_an_anthropic_client_as_a_refusal() {
     );
 }
 
+/// claim: TRN-22
 #[test]
 fn every_chat_finish_reason_has_an_anthropic_stop_reason() {
     for (finish, stop) in [
@@ -1036,6 +1045,7 @@ fn every_chat_finish_reason_has_an_anthropic_stop_reason() {
     assert_eq!(json_resp(Chat, Messages, &c)["stop_reason"], "tool_use");
 }
 
+/// claim: TRN-22
 #[test]
 fn an_openai_refusal_becomes_a_responses_refusal_part() {
     let r = json_resp(
@@ -1217,6 +1227,7 @@ fn stream_errors_keep_their_detail() {
 
 // ---- 19. required fields ---------------------------------------------------------------------
 
+/// claim: TRN-23
 #[test]
 fn chat_completions_and_every_chunk_carry_created_and_one_id() {
     let oai = json_resp(
@@ -1250,6 +1261,7 @@ fn chat_completions_and_every_chunk_carry_created_and_one_id() {
     );
 }
 
+/// claim: TRN-23
 #[test]
 fn responses_objects_carry_created_at_and_item_ids() {
     let r = json_resp(
@@ -1462,6 +1474,7 @@ fn a_responses_stream_reaches_messages_with_tool_use() {
     assert_eq!(evs.last().unwrap().0, "message_stop");
 }
 
+/// claim: TRN-22
 #[test]
 fn a_responses_stream_ending_incomplete_or_failed_says_so() {
     let incomplete = RESPONSES_TOOLS_SSE

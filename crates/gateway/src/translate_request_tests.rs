@@ -520,6 +520,7 @@ fn tool_strict_crosses_both_ways() {
 }
 
 /// A mid-conversation `role: "system"` became a user message: a user saying "answer in French".
+/// claim: TRN-2
 #[test]
 fn messages_mid_conversation_system_stays_a_system_message_on_chat() {
     let body = anth(json!({"system": "base", "messages": [
@@ -829,6 +830,7 @@ fn convo(tail: Value) -> Value {
 
 /// A mid-conversation system message was hoisted into top-level `system`, rewriting the prefix
 /// every earlier thinking block is bound to (and the prompt cache) each time one was appended.
+/// claim: TRN-2
 #[test]
 fn mid_conversation_system_stays_in_place_where_supported() {
     let body = convo(json!([
@@ -854,6 +856,7 @@ fn mid_conversation_system_stays_in_place_where_supported() {
 }
 
 /// Messages accepts a system message only after a user turn and before an assistant turn (or last).
+/// claim: TRN-2
 #[test]
 fn a_misplaced_system_message_moves_past_the_next_user_turn() {
     let v = c2m(
@@ -878,6 +881,7 @@ fn a_misplaced_system_message_moves_past_the_next_user_turn() {
     assert_eq!(v["system"][0]["text"], "Answer in French.");
 }
 
+/// claim: TRN-2
 #[test]
 fn mid_conversation_system_is_hoisted_where_unsupported() {
     let body = convo(
@@ -1099,6 +1103,7 @@ fn chat_onto_responses_does_not_store_by_default() {
 
 /// A Claude Code-shaped body (thinking in history, `cache_control` everywhere) onto a
 /// Responses-only GPT row: another vendor's thinking is not input, and markers are not fields.
+/// claim: TRN-21
 #[test]
 fn messages_onto_responses_drops_thinking_and_cache_control() {
     let body = anth(json!({
@@ -1165,6 +1170,7 @@ fn a_tiny_limit_is_raised_to_the_responses_floor() {
 /// `reasoning`: that text was never signed, and sent as a thinking block it is a 400 on every later
 /// turn ("messages.1.content.0.thinking.signature: Field required", measured). Anthropic takes the
 /// turn without its thinking, so the text goes; so does an unsigned thinking part.
+/// claim: TRN-21
 #[test]
 fn bare_reasoning_text_never_becomes_an_unsigned_thinking_block() {
     for assistant in [
@@ -1765,7 +1771,7 @@ fn explicit_nulls_are_not_forwarded_upstream() {
 /// A Responses `developer` message onto a non-OpenAI Chat Completions host (DeepSeek, Mistral,
 /// most OpenAI-compatible servers) becomes `system`: those hosts only know system / user /
 /// assistant / tool.
-/// claim: TRN-16
+/// claim: TRN-16, TRN-2
 /// defect: D49
 #[test]
 fn a_responses_developer_message_is_system_on_a_non_openai_chat_host() {

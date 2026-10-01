@@ -119,7 +119,7 @@ async fn two_identical_managed_v1_requests_hit_the_cache() {
     );
 }
 
-/// claim: K2
+/// claim: K2, SEC-14
 #[tokio::test]
 async fn different_tenant_is_a_cache_miss() {
     let nats = unused_nats_port();

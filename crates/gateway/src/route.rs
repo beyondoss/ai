@@ -681,7 +681,7 @@ mod tests {
         assert_eq!(dialect_default(Dialect::Anthropic), "anthropic");
     }
 
-    /// claim: SEC-8
+    /// claim: SEC-4
     /// defect: D53
     #[test]
     fn resolve_derives_host_and_pool_auth() {

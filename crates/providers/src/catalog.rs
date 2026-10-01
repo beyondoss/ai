@@ -2581,6 +2581,7 @@ mod tests {
         }
     }
 
+    /// claim: CAT-10
     #[test]
     fn for_model_finds_every_row() {
         for route in MODEL_ROUTES {
@@ -2593,6 +2594,7 @@ mod tests {
         }
     }
 
+    /// claim: CAT-10
     #[test]
     fn for_model_is_case_insensitive() {
         assert_eq!(
@@ -2601,6 +2603,7 @@ mod tests {
         );
     }
 
+    /// claim: CAT-10
     #[test]
     fn for_model_is_none_for_unknown_ids() {
         for unknown in ["", "gpt-4o-min", "gpt-4o-mini-x", "claude", "nonesuch"] {
@@ -2614,6 +2617,7 @@ mod tests {
 
     /// A candidate's upstream id is an alias for its row, not a second product. OpenRouter slugs
     /// and Bedrock inference-profile ids must resolve to the same row as the canonical name.
+    /// claim: CAT-10
     #[test]
     fn for_model_accepts_candidate_spellings_as_aliases() {
         assert_eq!(

@@ -581,7 +581,7 @@ group = "Security and isolation"
 text = "No credential in a query string reaches the upstream"
 layer = "hermetic"
 touches = ["crates/gateway/src/proxy.rs", "crates/gateway/src/key.rs", "crates/gateway/src/route.rs", "crates/gateway/src/cache.rs", "crates/gateway/src/control.rs", "crates/gateway/src/secret.rs"]
-defects = ["D03"]
+defects = ["D03", "D65"]
 
 [[claim]]
 id = "SEC-4"
@@ -617,7 +617,7 @@ group = "Security and isolation"
 text = "Pool keys never reach the client in any body, header or error"
 layer = "both"
 touches = ["crates/gateway/src/proxy.rs", "crates/gateway/src/key.rs", "crates/gateway/src/route.rs", "crates/gateway/src/cache.rs", "crates/gateway/src/control.rs", "crates/gateway/src/secret.rs"]
-defects = []
+defects = ["D66"]
 
 [[claim]]
 id = "SEC-8"
@@ -635,7 +635,7 @@ group = "Security and isolation"
 text = "Client x-beyond-* headers are stripped upstream on every route"
 layer = "hermetic"
 touches = ["crates/gateway/src/proxy.rs", "crates/gateway/src/key.rs", "crates/gateway/src/route.rs", "crates/gateway/src/cache.rs", "crates/gateway/src/control.rs", "crates/gateway/src/secret.rs"]
-defects = []
+defects = ["D67"]
 
 [[claim]]
 id = "SEC-10"
@@ -653,7 +653,7 @@ group = "Security and isolation"
 text = "Mixed or malformed credentials never leak a virtual key, and a BYO Anthropic key never goes to OpenAI"
 layer = "hermetic"
 touches = ["crates/gateway/src/proxy.rs", "crates/gateway/src/key.rs", "crates/gateway/src/route.rs", "crates/gateway/src/cache.rs", "crates/gateway/src/control.rs", "crates/gateway/src/secret.rs"]
-defects = ["D29", "D30"]
+defects = ["D29", "D30", "D65"]
 
 [[claim]]
 id = "SEC-12"
@@ -1498,7 +1498,7 @@ group = "Translation detail"
 text = "Every documented lossy mapping is asserted as a negative claim"
 layer = "hermetic"
 touches = ["crates/gateway/src/translate.rs", "crates/gateway/src/proxy.rs"]
-defects = []
+defects = ["D68"]
 
 [[claim]]
 id = "TRN-22"
