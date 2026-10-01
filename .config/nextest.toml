@@ -36,5 +36,11 @@ fail-fast = false
 retries = 0
 slow-timeout = { period = "60s", terminate-after = 3 }
 
+# Billing reconciliation waits up to 15 minutes for the providers' usage reports to catch up with
+# its batch (see verify/README.md), so it gets its own cap.
+[[profile.verify.overrides]]
+filter = "binary_id(beyond-ai-verify::reconcile_live)"
+slow-timeout = { period = "60s", terminate-after = 18 }
+
 [profile.verify.junit]
 path = "junit.xml"

@@ -271,7 +271,7 @@ fn filter_expr(tagged: &[Tagged]) -> String {
     // Live cells are listed only under VERIFY_LIVE=1 (they spend money), so they join the run only
     // then.
     if std::env::var("VERIFY_LIVE").as_deref() == Ok("1") {
-        parts.push(format!("binary_id({LIVE_BINARY})"));
+        parts.extend(LIVE_BINARIES.iter().map(|b| format!("binary_id({b})")));
     }
     if parts.is_empty() {
         return "none()".to_owned();
@@ -279,8 +279,10 @@ fn filter_expr(tagged: &[Tagged]) -> String {
     parts.join(" | ")
 }
 
-/// The nextest binary holding the live cells (`crates/verify/tests/live.rs`).
-const LIVE_BINARY: &str = "beyond-ai-verify::live";
+/// The nextest binaries holding live cells: real clients (`crates/verify/tests/live.rs`) and
+/// billing reconciliation against the providers' usage reports (`tests/reconcile_live.rs`). Every
+/// test in them is named `CLAIMS::client::...`.
+const LIVE_BINARIES: &[&str] = &["beyond-ai-verify::live", "beyond-ai-verify::reconcile_live"];
 
 /// One live cell's result, parsed from its name `CLAIMS::client::route::probe`.
 struct LiveCell<'a> {
@@ -293,7 +295,7 @@ struct LiveCell<'a> {
 fn live_cells(results: &Results) -> Vec<LiveCell<'_>> {
     results
         .iter()
-        .filter(|((class, _), _)| class == LIVE_BINARY)
+        .filter(|((class, _), _)| LIVE_BINARIES.contains(&class.as_str()))
         .filter_map(|((_, name), outcome)| {
             let mut parts = name.split("::");
             let claims = parts.next()?.split('+').collect();
@@ -712,7 +714,10 @@ fn gate(ctx: &Ctx, args: &[String], root: &Path) -> bool {
                 ));
             }
             if let Some(r) = results.as_ref() {
-                let outcome = r.get(&(LIVE_BINARY.to_owned(), cell.to_owned())).copied();
+                let outcome = LIVE_BINARIES
+                    .iter()
+                    .find_map(|b| r.get(&((*b).to_owned(), cell.to_owned())))
+                    .copied();
                 match outcome {
                     Some(Outcome::Passed) => {}
                     Some(Outcome::Failed) => errors.push(format!(

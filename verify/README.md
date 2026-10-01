@@ -58,5 +58,26 @@ mise run verify:status -- --json  # the same as JSON (feeds the status page)
 mise run verify:gate              # registry/tag/result consistency; non-zero on any problem
 ```
 
+## Billing reconciliation (BIL-5)
+
+`crates/verify/tests/reconcile_live.rs` checks the ledger against the providers' own books. Each
+trial (`BIL-5::raw::openai::reconcile`, `BIL-5::raw::anthropic::reconcile`) boots a gateway with
+that provider's pool key, sends a fixed batch through it (non-stream and stream, a translated
+pairing, a ~3k-token system prompt reused so cache writes and reads occur, and Responses on
+OpenAI), and sums the batch's `ai.usage` rows, normalized by `usage_wire`. It then reads the
+provider's organization usage report for the same minutes, filtered to the pool key's id and the
+batch's model (`gpt-4.1-nano`, `claude-sonnet-4-5`, which the other live suites don't use). It
+passes only when uncached input, cache reads, cache writes and output agree exactly (and the request
+count, where OpenAI reports one). So it proves that every token the provider charged our key for is
+in a billing row, and that no row bills a token the provider didn't charge.
+
+A trial is listed only with `VERIFY_LIVE=1` and both of that provider's keys set: `OPENAI_ADMIN_KEY`
+and `OPENAI_API_KEY`, or `ANTHROPIC_ADMIN_KEY` and `ANTHROPIC_API_KEY`. A missing key means the
+trial isn't listed, never that it fails. The admin keys are used only on read-only endpoints (key
+listings and usage reports).
+
+Usage reports lag traffic by minutes. A trial polls every 30 seconds until the provider's totals
+match and hold, so it can take up to ~15 minutes.
+
 Live cells, which run real SDKs and agent harnesses against real providers, will land as tagged
 tests in their own layer. `STALE` status will land with the run ledger.

@@ -24,5 +24,9 @@ serde_json.workspace = true
 name = "live"
 harness = false
 
+[[test]]
+name = "reconcile_live"
+harness = false
+
 [lints]
 workspace = true
