@@ -243,7 +243,6 @@ async fn a_finished_stream_with_unparseable_usage_bills_a_flagged_estimate() {
 /// claim: BIL-2
 /// defect: D88
 #[tokio::test]
-#[ignore = "D88 reproduced: a duplicate or escaped stream_options keeps include_usage false"]
 async fn duplicate_or_escaped_stream_options_cannot_turn_off_exact_metering() {
     /// Usage only when OpenAI would send it (last key wins), and only when the body carries one
     /// root `stream_options` however it is spelled.

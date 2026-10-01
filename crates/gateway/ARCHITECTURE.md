@@ -1566,6 +1566,11 @@ the requests that send one). Without the usage chunk the row would be an estimat
 hidden reasoning. The visible cost: such a client receives one chunk it did not ask for, OpenAI's
 usage chunk with `choices: []`, which every OpenAI SDK already accepts.
 
+Nor does a second key. OpenAI's parser keeps the **last** of duplicate keys and decodes escaped key
+names, while the scan reads the first raw `stream_options`. So when the root carries more than one
+`stream_options`, or any spelled with escapes (`"stream\u005foptions"`), every such member is cut
+out by span (`peek::remove_root_members`) and the usual injection adds the one that reaches OpenAI.
+
 ### Why the deny-set watch resumes from a saved revision
 
 A plain `watch_prefix` (NATS `DeliverPolicy::New`) would miss any entry written in the window

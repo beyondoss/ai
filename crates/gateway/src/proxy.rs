@@ -4945,6 +4945,14 @@ impl ProxyHttp for AiProxy {
                 // rewriting the value cannot move it. A client-sent `stream_options` can sit on
                 // either side of `model`, so that rewrite runs first and hands back the span it
                 // may have shifted.
+                // A duplicate or escaped `stream_options` (OpenAI takes the last, decoded): drop
+                // them all, so the injection below adds the one that counts (D88).
+                if rc.inject_eligible
+                    && scan.stream_options_ambiguous
+                    && peek::remove_root_members(&mut buf, "stream_options")
+                {
+                    scan = peek::scan_buffered(&buf);
+                }
                 let (buf, model_span) = match scan.stream_options_at {
                     Some(at) if rc.inject_eligible => force_include_usage(buf, at, scan.model_span),
                     _ => (buf, scan.model_span),

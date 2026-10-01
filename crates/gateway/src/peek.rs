@@ -399,6 +399,11 @@ pub struct BufferedScan {
     /// [`OUTPUT_LIMIT_KEYS`] (first occurrence of each, whatever its value): where a walk onto
     /// native OpenAI Chat Completions renames `max_tokens`.
     pub limit_keys: [Option<usize>; 3],
+    /// The root carries more than one `stream_options`, or one spelled with escapes. OpenAI takes
+    /// the last and decodes escapes, so neither [`Self::stream_options_at`] (the first raw one) nor
+    /// [`Self::inject_at`] (which a later escaped key would override) can be trusted to decide
+    /// whether usage is on. The caller removes every such member and injects a fresh one.
+    pub stream_options_ambiguous: bool,
 }
 
 /// The fields that cap a response's length, whichever wire the body speaks.
@@ -441,6 +446,7 @@ pub fn scan_buffered(body: &[u8]) -> BufferedScan {
             duplicate_model: false,
             limit_spans: [None; 3],
             limit_keys: [None; 3],
+            stream_options_ambiguous: false,
         };
     }
     let insert_at = i + 1;
@@ -455,6 +461,7 @@ pub fn scan_buffered(body: &[u8]) -> BufferedScan {
     let mut last_key_is_model = false;
     let mut stream_true = false;
     let mut saw_stream_options = false;
+    let mut stream_options_ambiguous = false;
     // The closing quote of the root `stream_options` key; its value follows the next `:`.
     let mut stream_options_key_end = 0usize;
     // Accumulated (unescaped) `model` value, and whether we're inside it. A `Vec` rather than a
@@ -498,9 +505,16 @@ pub fn scan_buffered(body: &[u8]) -> BufferedScan {
                         let key = &body[key_start..j];
                         // Unlike the planner we cannot return early on `stream_options`: the model
                         // may still be ahead of us. Record it and keep walking.
-                        if key == b"stream_options" && !saw_stream_options {
-                            saw_stream_options = true;
-                            stream_options_key_end = j;
+                        if key == b"stream_options" {
+                            stream_options_ambiguous |= saw_stream_options;
+                            if !saw_stream_options {
+                                saw_stream_options = true;
+                                stream_options_key_end = j;
+                            }
+                        } else if key.contains(&b'\\')
+                            && escaped_key_is(&body[key_start - 1..=j], "stream_options")
+                        {
+                            stream_options_ambiguous = true;
                         }
                         last_key_is_stream = key == b"stream";
                         last_key_is_model = key == b"model"
@@ -608,7 +622,19 @@ pub fn scan_buffered(body: &[u8]) -> BufferedScan {
         duplicate_model: model_keys > 1,
         limit_spans,
         limit_keys,
+        stream_options_ambiguous,
     }
+}
+
+/// Remove every root member whose key decodes to `key` (escaped spellings included), by span. `true`
+/// when the body changed.
+pub fn remove_root_members(body: &mut Vec<u8>, key: &str) -> bool {
+    let Some(members) = root_members(body) else {
+        return false;
+    };
+    let spans: Vec<(usize, usize)> = members.iter().map(Member::span).collect();
+    let hit: Vec<bool> = members.iter().map(|m| m.key_is(body, key)).collect();
+    remove_items(body, &spans, |k| hit[k])
 }
 
 /// Whether a quoted JSON key containing escapes decodes to `want`. Only reached for a root key with a
