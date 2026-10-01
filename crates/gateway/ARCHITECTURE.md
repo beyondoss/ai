@@ -608,8 +608,9 @@ model would call one and nothing would run it), Responses hosted tools (`web_sea
 `file_search`, …), a Chat Completions client's `custom` tools onto Messages, `mcp_servers`, a Responses `prompt`
 template, `stop` onto Responses, and Responses input items with no Chat Completions shape
 (`item_reference`, `computer_call_output`, `local_shell_call`, `compaction`, …, forwarded whole in
-their place in `messages`) have no equivalent on the other wire and change what the client gets
-back. Only records of a hosted tool the provider ran itself (`web_search_call`, `mcp_call`, …) are
+their place in `messages`), and a message whose role no dialect has (a typo, a framework's private
+role: forwarded whole, in place, role unchanged, never turned into a user turn) have no equivalent
+on the other wire and change what the client gets back. Only records of a hosted tool the provider ran itself (`web_search_call`, `mcp_call`, …) are
 dropped: the client wrote none of it, and the answer that used it follows as a message. An explicit
 `null` (how OpenAI SDKs send an unset option) is "not set" and is never forwarded; that includes
 `instructions: null`, which becomes no system message rather than one with null content. A

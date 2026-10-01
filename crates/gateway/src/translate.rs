@@ -756,13 +756,15 @@ fn openai_req_to_anthropic(v: &Value, claude: ClaudeModel) -> (Value, bool) {
                 // A Responses input item with no Chat Completions shape (see
                 // `responses_input_to_messages`): forwarded whole, never merged into a user turn
                 // it would vanish from, so the provider rejects it by name.
-                _ if m.get("role").is_none() => {
+                //
+                // So is a message whose role no dialect has (a typo, a framework's private role),
+                // role unchanged: the provider's 400 names it, as it does called directly (D103).
+                _ if !matches!(role, "user" | "") || m.get("role").is_none() => {
                     in_conversation = true;
                     flush_tool_results(&mut messages, &mut pending_tool_results);
                     messages.push(m.clone());
                 }
                 _ => {
-                    // user (and anything else treated as user)
                     in_conversation = true;
                     flush_tool_results(&mut messages, &mut pending_tool_results);
                     push_anth_message(&mut messages, "user", openai_user_content(m));
@@ -2431,7 +2433,10 @@ fn anthropic_req_to_openai(v: &Value, up: Upstream) -> Value {
                 // takes `system` anywhere. A directive-only one (`content: []` plus
                 // `output_config`) says nothing a Chat model can read, so it has no message.
                 "system" => messages.extend(m.get("content").and_then(anthropic_system_to_openai)),
-                _ => messages.extend(anthropic_user_to_openai(m)),
+                "user" => messages.extend(anthropic_user_to_openai(m)),
+                // A role no dialect has: forwarded whole, role unchanged, for the provider's 400
+                // to name (D103).
+                _ => messages.push(m.clone()),
             }
         }
     }
@@ -3758,13 +3763,19 @@ fn openai_req_to_responses(v: &Value, openai: OpenAiModel) -> Value {
                         input.extend(calls.iter().map(chat_tool_call_to_responses_item));
                     }
                 }
-                _ => {
+                "user" | "" => {
                     in_conversation = true;
                     input.push(json!({
                         "type": "message",
                         "role": "user",
                         "content": chat_content_to_responses(m.get("content"), false),
                     }));
+                }
+                // A role no dialect has: forwarded whole, role unchanged, for the provider's 400
+                // to name (D103).
+                _ => {
+                    in_conversation = true;
+                    input.push(m.clone());
                 }
             }
         }
