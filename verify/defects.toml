@@ -1459,10 +1459,10 @@ impact = "ModelCard.context_window is documented as the most input tokens one re
 confidence = "high"
 evidence = "live 2026-10-01 catalog sweep, CAT-3::raw::openai::{gpt-5,gpt-5-mini,gpt-5-nano,gpt-5.1,gpt-5.2,gpt-5.4-mini,gpt-5.4-nano}: over-limit prompt -> 400 context_length_exceeded \"Input tokens exceed the configured limit of 272000 tokens\" (card 400000); CAT-3::raw::openai::{gpt-5.4,gpt-5.5,gpt-5.6-luna,gpt-5.6-sol,gpt-5.6-terra,gpt-6-astra}: \"configured limit of 922000 tokens\" (card 1050000). Same in all three sweeps."
 claims = ["CAT-3"]
-state = "suspected"
-test = ""
-fix = ""
-note = "OpenAI's model pages publish 400K / 1.05M as the context window (input + output), which is what catalog_truth.toml records; the API's input cap is the window minus the 128K max output."
+state = "fixed"
+test = "gpt5_cards_state_openais_input_cap"
+fix = "e27c935"
+note = "OpenAI's model pages publish 400K / 1.05M as the context window (input + output), which is what catalog_truth.toml records; the API's input cap is the window minus the 128K max output. Fixed: The card states the limit every candidate enforces, not the window: GPT-5-family cards list OpenAI's input cap (272,000 of 400,000; 922,000 of 1,050,000; gpt-5-pro 128,000, the 400K window less its 272K max output, by the same rule since its TPM and Responses-only error hide the number). catalog_truth.toml keeps the vendor's window and records input_limit with the API's own error as evidence. One figure per row rather than per candidate: the gateway counts no prompt tokens, so it could not pick a candidate by window, and a client only sees the row. Live: CAT-3::raw::openai::{gpt-5,gpt-5.4,...} pass (re-run 2026-10-01)."
 
 [[defect]]
 id = "D105"
@@ -1473,10 +1473,10 @@ impact = "Every request on the row's primary fails: xAI answers 400 \"Multi Agen
 confidence = "high"
 evidence = "live 2026-10-01 catalog sweep: CAT-1+BIL-13::raw::xai::grok-4.20-multi-agent, CAT-4/CAT-5/CAT-6+BIL-9/CAT-7::raw::xai::grok-4.20-multi-agent -> 400 \"Multi Agent requests are not allowed on chat completions\"; CAT-6+BIL-9::raw::openrouter::grok-4.20-multi-agent -> 404 \"No endpoints found that support tool use\". Same in all three sweeps."
 claims = ["CAT-1", "CAT-6"]
-state = "suspected"
-test = ""
-fix = ""
-note = "xAI serves multi-agent on /v1/responses only; the candidate path would have to be a Responses arm."
+state = "fixed"
+test = "multi_agent_reaches_xai_over_responses"
+fix = "e27c935"
+note = "xAI serves multi-agent on /v1/responses only; the candidate path would have to be a Responses arm. Fixed: grok-4.20-multi-agent's xAI candidate is /v1/responses (xai_responses_first); Chat Completions and Messages clients are translated onto it. Its client-side tools need beta access at xAI (400 \"Client-side tools for multi-agent models require beta access\" on Responses, 2026-10-01), and OpenRouter has no tool endpoint, so the card drops tools; catalog_truth.toml records features_absent with that evidence. Live: CAT-1/BIL-13/CAT-2/CAT-4/CAT-5/CAT-6/CAT-6+BIL-9/CAT-7::raw::xai::grok-4.20-multi-agent re-run 2026-10-01."
 
 [[defect]]
 id = "D106"
@@ -1487,10 +1487,10 @@ impact = "grok-4.20, grok-4.3, grok-4.5, grok-4.6 and grok-build-0.1 list input_
 confidence = "high"
 evidence = "live 2026-10-01 catalog sweep: CAT-5::raw::xai::{grok-4.20,grok-4.3,grok-4.5,grok-4.6,grok-build-0.1} (pdf -> 400 as quoted); CAT-5::raw::openrouter::grok-build-0.1 (pdf -> 404 \"No endpoints found that support file input\"). Images work on all of them. Same in all three sweeps."
 claims = ["CAT-5"]
-state = "suspected"
-test = ""
-fix = ""
-note = ""
+state = "fixed"
+test = "no_row_advertises_files_over_xai_chat_completions"
+fix = "e27c935"
+note = "Fixed: Stopped advertising: grok-4.20, 4.3, 4.5, 4.6 and build-0.1 cards drop file input, because xAI's Chat Completions (the path these rows reach xAI on) refuses file content. Moving every grok row onto xAI's /v1/responses would restore PDFs (xAI Responses reads inline PDFs: OSPREY on grok-4.3 and grok-build-0.1, 2026-10-01), but it changes the wire for every grok request while D23, D100 and D102 are open on that path, so it is not done here. grok-4.20-multi-agent, now on Responses (D105), keeps file input. Live: CAT-5::raw::xai::grok-* re-run 2026-10-01."
 
 [[defect]]
 id = "D107"
@@ -1501,10 +1501,10 @@ impact = "claude-haiku-4-5 and claude-opus-4-8 advertise structured_outputs. The
 confidence = "high"
 evidence = "live 2026-10-01 catalog sweep: CAT-6+BIL-9::raw::bedrock::claude-opus-4-8 -> 400 \"output_config.format: Extra inputs are not permitted\"; CAT-6+BIL-9::raw::bedrock::claude-haiku-4-5 -> 404 \"The model doesn't exist or doesn't support this API\". The same request on the Anthropic and OpenRouter candidates passes. Same in all three sweeps."
 claims = ["CAT-6"]
-state = "suspected"
-test = ""
-fix = ""
-note = ""
+state = "fixed"
+test = "a_structured_output_request_skips_a_bedrock_candidate"
+fix = "e27c935"
+note = "Fixed: Capability-aware candidate filtering: Bedrock cannot be translated onto (it refuses output_config.format and the beta output_format, measured on both rows), so a body asking for a JSON-schema output leaves Bedrock out of the walk (providers::catalog::serves_structured_outputs, route::unserved), unless nothing else is usable. A header-won walk on a row with such a candidate now reads the body before choosing (route::walk_reads_body), as a headerless walk always did; a large body is checked in relay_full_body. Live: CAT-6::raw::bedrock::{claude-opus-4-8,claude-haiku-4-5} now assert json_schema with Bedrock ordered first is served elsewhere."
 
 [[defect]]
 id = "D108"
@@ -1515,10 +1515,10 @@ impact = "google/gemma-4-31b-it (google/gemma-4-31B-it) and qwen/qwen-2.5-7b-ins
 confidence = "high"
 evidence = "live 2026-10-01 catalog sweep: CAT-1+BIL-13::raw::together::google/gemma-4-31b-it and CAT-1+BIL-13::raw::together::qwen/qwen-2.5-7b-instruct (and their CAT-2/CAT-4/CAT-6 trials) -> 400 model_not_available. Qwen2.5-7B also fails the same way as a /together/ passthrough."
 claims = ["CAT-1"]
-state = "suspected"
-test = ""
-fix = ""
-note = "Belongs in catalog_truth.toml's not_serverless list once confirmed on Together's model page."
+state = "fixed"
+test = "no_candidate_is_retired_or_not_serverless"
+fix = "e27c935"
+note = "Belongs in catalog_truth.toml's not_serverless list once confirmed on Together's model page. Fixed: Together's serverless models table lists neither google/gemma-4-31B-it nor Qwen/Qwen2.5-7B-Instruct-Turbo; both are recorded as not_serverless and the rows are OpenRouter-only, priced at OpenRouter's listing (the only host; the makers sell no API). Live: CAT-1::raw::openrouter::{google/gemma-4-31b-it,qwen/qwen-2.5-7b-instruct} re-run 2026-10-01."
 
 [[defect]]
 id = "D109"
@@ -1529,10 +1529,10 @@ impact = "A 10601-word prompt to gpt-4 (8192 window) through the OpenRouter cand
 confidence = "high"
 evidence = "live 2026-10-01 catalog sweep: CAT-3::raw::openrouter::gpt-4 -> 200 (sweep 1: 1298 input tokens billed; sweep 2: 1941; sweep 3: 0) where CAT-3::raw::openai::gpt-4 -> 400 context_length_exceeded."
 claims = ["CAT-3"]
-state = "suspected"
-test = ""
-fix = ""
-note = "OpenRouter documents middle-out as on by default for endpoints with <= 8k context; sending transforms: [] turns it off."
+state = "fixed"
+test = "an_openrouter_candidate_is_asked_not_to_compress_the_prompt"
+fix = "e27c935"
+note = "OpenRouter documents middle-out as on by default for endpoints with <= 8k context; sending transforms: [] turns it off. Fixed: OpenRouter's docs: endpoints of 8K context or less default to context compression; plugins: [{\"id\": \"context-compression\", \"enabled\": false}] turns it off (transforms: [] is the older spelling). Every catalog attempt on an OpenRouter Chat Completions candidate gets that field spliced in unless the client sent its own plugins. Measured directly: the 10,601-word gpt-4 prompt then gets 400 \"This endpoint's maximum context length is 8191 tokens\"; PDF parsing still works with the field present. Live: CAT-3::raw::openrouter::gpt-4 re-run 2026-10-01."
 
 [[defect]]
 id = "D110"
@@ -1543,10 +1543,10 @@ impact = "ministral-3b-latest's OpenRouter candidate serves 131072 tokens agains
 confidence = "high"
 evidence = "live 2026-10-01 catalog sweep: CAT-3::raw::openrouter::ministral-3b-latest -> 400 \"This endpoint's maximum context length is 131072 tokens\"; CAT-3::raw::together::qwen/qwen3.8-2.4t-a95b -> 400 \"This model's maximum context length is 1010000 tokens\". Same in all three sweeps."
 claims = ["CAT-3"]
-state = "suspected"
-test = ""
-fix = ""
-note = ""
+state = "fixed"
+test = "cards_state_a_failover_hosts_smaller_window"
+fix = "e27c935"
+note = "Fixed: The row's card states the smallest window any candidate enforces (D104's rule): ministral-3b-latest 131,072 (its OpenRouter candidate), qwen/qwen3.8-2.4t-a95b 1,010,000 (Together, which publishes no window). Recorded as input_limit with the rejection as evidence. Live: CAT-3::raw::openrouter::ministral-3b-latest and CAT-3::raw::together::qwen/qwen3.8-2.4t-a95b re-run 2026-10-01."
 
 [[defect]]
 id = "D111"
@@ -1557,10 +1557,10 @@ impact = "The card lists max_output_tokens 8192 and context_window 8192. Any req
 confidence = "high"
 evidence = "live 2026-10-01 catalog sweep: CAT-4::raw::openai::gpt-4 -> 400 \"This model's maximum context length is 8192 tokens. However, you requested 8206 tokens (14 in the messages, 8192 in the completion)\". Same in all three sweeps."
 claims = ["CAT-4"]
-state = "suspected"
-test = ""
-fix = ""
-note = ""
+state = "fixed"
+test = "gpt4_max_output_leaves_room_for_a_prompt"
+fix = "e27c935"
+note = "Fixed: gpt-4's 8,192 window holds prompt and output together, so no max output equal to it is usable. The card takes OpenRouter's published figures for its candidate: max_completion_tokens 4,096 and context_length 8,191 (the smaller window, D104's rule); catalog_truth.toml records output_limit / input_limit beside OpenAI's 8,192 / 8,192. The gateway also clamps a request's output limit to the card, so a larger ask fits. Live: CAT-4::raw::{openai,openai-responses,openrouter}::gpt-4 re-run 2026-10-01."
 
 [[defect]]
 id = "D112"
@@ -1571,10 +1571,10 @@ impact = "Rows whose card omits image input accept one silently (200, the model 
 confidence = "high"
 evidence = "live 2026-10-01 catalog sweep: CAT-5::raw::openai::o3-mini and CAT-5::raw::together::openai/gpt-oss-120b -> 200 (\"I'm sorry, but I can't view images\"); CAT-5::raw::openai::gpt-4 -> 500 server_error. Same in all three sweeps."
 claims = ["CAT-5"]
-state = "suspected"
-test = ""
-fix = ""
-note = ""
+state = "fixed"
+test = "an_image_on_a_text_only_row_is_refused_before_any_upstream"
+fix = "e27c935"
+note = "Fixed: The gateway refuses an image part on a row whose card lists no image input with a 400 naming the row, before any upstream (route::refused_input, ai_rejections_total{reason=\"modality\"}); header-won walks on such rows read the body first. Only images: OpenRouter extracts PDF text for any model, so PDFs are not gated. Live: CAT-5::raw::{openai,openai-responses}::{o3-mini,gpt-4} and CAT-5::raw::together::openai/gpt-oss-120b re-run 2026-10-01."
 
 [[defect]]
 id = "D113"
@@ -1585,10 +1585,10 @@ impact = "The card's capabilities are empty, yet OpenAI (Chat and Responses) and
 confidence = "high"
 evidence = "live 2026-10-01 catalog sweep: CAT-6::raw::openai::gpt-4, CAT-6::raw::openai-responses::gpt-4, CAT-6::raw::openrouter::gpt-4 -> get_weather({\"city\":\"Paris\"})."
 claims = ["CAT-6"]
-state = "suspected"
-test = ""
-fix = ""
-note = "The card follows the sourcing rule (list only what the vendor's model page names); the page omits function calling for gpt-4."
+state = "fixed"
+test = "gpt4_card_lists_the_tools_it_serves"
+fix = "e27c935"
+note = "The card follows the sourcing rule (list only what the vendor's model page names); the page omits function calling for gpt-4. Fixed: The card lists tools: every candidate returns the forced call, and gpt-4-0613 is the snapshot that introduced function calling; the model page's feature list omits it. catalog_truth.toml drops tools from features_absent with that note. Live: CAT-6::raw::{openai,openai-responses,openrouter}::gpt-4 re-run 2026-10-01."
 
 [[defect]]
 id = "D114"
@@ -1599,10 +1599,10 @@ impact = "gpt-5.6-luna, gpt-5.6-sol, gpt-5.6-terra and gpt-6-astra advertise too
 confidence = "high"
 evidence = "live 2026-10-01 catalog sweep 3: CAT-6+BIL-9::raw::openai::{gpt-5.6-luna,gpt-5.6-sol,gpt-5.6-terra,gpt-6-astra} -> 400 as quoted, with no reasoning_effort in the body. Sweep 2, which sent reasoning_effort low with the tools, also failed gpt-5.4, gpt-5.4-mini, gpt-5.4-nano and gpt-5.5. Their Responses arms and OpenRouter candidates pass."
 claims = ["CAT-6"]
-state = "suspected"
-test = ""
-fix = ""
-note = "Also bites the translation path: a Messages client with thinking plus tools on these rows is translated to Chat with a reasoning_effort."
+state = "fixed"
+test = "gpt_5_4_and_later_reach_openai_over_responses"
+fix = "e27c935"
+note = "Also bites the translation path: a Messages client with thinking plus tools on these rows is translated to Chat with a reasoning_effort. Fixed: OpenAI's rule, measured 2026-10-01 on Chat Completions with a forced function tool: gpt-5.2 accepts reasoning_effort low; gpt-5.4, 5.4-nano and 5.5 answer 400 \"Function tools with reasoning_effort are not supported ... use /v1/responses or set reasoning_effort to 'none'\" when an effort is sent; gpt-5.6-luna/terra and gpt-6-astra answer it with no effort sent (they reason by default; astra cannot take none). Setting effort none would silently turn reasoning off, so gpt-5.4, 5.4-mini, 5.4-nano, 5.5, 5.6-luna/sol/terra and gpt-6-astra now reach OpenAI over /v1/responses (openai_responses_first), and Chat Completions and Messages clients are translated onto it. The catalog sweep's tool probe now sends a reasoning effort with the tools on OpenAI reasoning rows. Live: CAT-6 and CAT-6+BIL-9::raw::openai on those rows re-run 2026-10-01."
 
 [[defect]]
 id = "D115"
@@ -1613,10 +1613,10 @@ impact = "meta-llama/llama-4-scout advertises tools but OpenRouter has no tool-c
 confidence = "med"
 evidence = "live 2026-10-01 catalog sweep: CAT-6::raw::openrouter::meta-llama/llama-4-scout -> 404 \"Filter by Tool Compatibility removed deepinfra/fp8, novita/bf16\" (all sweeps); CAT-6+BIL-9::raw::openrouter::openai/gpt-oss-120b -> 200 with no tool call and empty text (all sweeps); CAT-6+BIL-9::raw::openrouter::z-ai/glm-5.3-flash -> arguments \"{\\\"city\\\":\\\"Paris (France)? I'll check that for you.<tool_call>get_weather...\" (sweep 3 only). Sweep 2 also saw json_schema ignored on qwen/qwen3.6-plus and z-ai/glm-5.1 over OpenRouter."
 claims = ["CAT-6"]
-state = "suspected"
-test = ""
-fix = ""
-note = "Host-dependent: OpenRouter picks the host per request, so these vary run to run except llama-4-scout and gpt-oss-120b."
+state = "fixed"
+test = "advertised_tools_have_a_tool_capable_candidate"
+fix = "e27c935"
+note = "Host-dependent: OpenRouter picks the host per request, so these vary run to run except llama-4-scout and gpt-oss-120b. Fixed: llama-4-scout's card drops tools (OpenRouter has no tool-capable host for it; json_schema still works there). gpt-oss-120b drops its OpenRouter candidate: OpenRouter's CoreWeave host answers a forced tool_choice (named or required) with a 200, finish_reason error and an empty message (2 of 3 forced calls, 2026-10-01); Groq, Together and Fireworks remain. glm-5.3-flash's leaked markup was one OpenRouter host once: three forced calls through OpenRouter on 2026-10-01 all returned clean get_weather calls (served by Together). Live: CAT-6::raw::openrouter::{meta-llama/llama-4-scout,z-ai/glm-5.3-flash} and CAT-6::raw::together::openai/gpt-oss-120b re-run 2026-10-01."
 
 [[defect]]
 id = "D116"
@@ -1627,10 +1627,10 @@ impact = "gpt-5.6-sol and gpt-5.6-sol-pro: OpenRouter, routed to OpenAI, charges
 confidence = "high"
 evidence = "live 2026-10-01 catalog sweep: CAT-7::raw::openrouter::gpt-5.6-sol (ledger x card $0.001056, OpenRouter charged $0.000528), CAT-7::raw::openrouter::gpt-5.6-sol-pro (+100%), CAT-7::raw::openrouter::z-ai/glm-5.1, CAT-7::raw::openrouter::moonshotai/kimi-k2.7-code, CAT-7::raw::together::qwen/qwen3.8-flash. Same in all three sweeps."
 claims = ["CAT-7"]
-state = "suspected"
-test = ""
-fix = ""
-note = "catalog_truth.toml already notes OpenAI's promotional gpt-5.6-sol pricing and lists the standard tier on purpose; whether the card should bill the promotional rate is an owner decision. Third-party OpenRouter hosts of open models charging their own rate are recorded as notes, not failures."
+state = "fixed"
+test = "prices_follow_the_maker_not_openrouter"
+fix = "e27c935"
+note = "catalog_truth.toml already notes OpenAI's promotional gpt-5.6-sol pricing and lists the standard tier on purpose; whether the card should bill the promotional rate is an owner decision. Third-party OpenRouter hosts of open models charging their own rate are recorded as notes, not failures. Fixed: Prices follow the model's maker, never OpenRouter's listing: z-ai/glm-5.1 stays at Z.ai's $1.4 / $4.4 / $0.26 (now recorded in catalog_truth.toml from Z.ai's table), kimi-k2.7-code and kimi-k2.6 move to Moonshot's $0.95 / $4.00 (cache $0.19 / $0.16), qwen3.8-flash output to Together's $0.282 (docs table and /v1/models). gpt-5.6-sol keeps OpenAI's standard $4 / $20: that is what OpenAI bills the pool key (organization costs report 2026-10-01: 4,289 input tokens $0.017156, 1,394 output $0.02788), and one row has one list price, so a failover that costs us less does not lower the customer's price. OpenRouter's half price is OpenAI's announced promotion (\"at least through November 21, 2026\"), recorded as [[promo]] for gpt-5.6-sol and gpt-5.6-sol-pro; the CAT-7 check accepts a charge at that rate until then. Live: CAT-7::raw::openrouter::{gpt-5.6-sol,gpt-5.6-sol-pro,z-ai/glm-5.1,moonshotai/kimi-k2.7-code} and CAT-7::raw::together::qwen/qwen3.8-flash re-run 2026-10-01."
 
 [[defect]]
 id = "D117"
@@ -1641,10 +1641,10 @@ impact = "OpenAI rows' created is OpenRouter's listing date, 2 to 35 days after 
 confidence = "high"
 evidence = "live 2026-10-01 catalog sweep: 27 CAT-8 cells, e.g. CAT-8::raw::openai::text-embedding-3-small (card 1761857455, OpenAI 1705948997), CAT-8::raw::openai::gpt-5.6-sol (+15.8 days), CAT-8::raw::xai::grok-build-0.1 (+34.7 days, owned_by x-ai vs xai), CAT-8::raw::openai::gpt-4 (-30.7 days). Anthropic and Together rows match."
 claims = ["CAT-8"]
-state = "suspected"
-test = ""
-fix = ""
-note = ""
+state = "fixed"
+test = "cards_carry_the_vendors_created_and_owner"
+fix = "e27c935"
+note = "Fixed: Every OpenAI row (and the OpenAI-listed codex rows served through OpenRouter) takes created from OpenAI's /v1/models; every xAI row takes created and owned_by xai from xAI's /v1/models. catalog_truth.toml records them, and the catalog sweep's CAT-8 reads an OpenRouter-primary row's metadata from its maker's listing when the maker lists it. Live: CAT-8::raw::* re-run 2026-10-01."
 
 [[defect]]
 id = "D118"
