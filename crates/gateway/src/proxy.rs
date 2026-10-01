@@ -553,6 +553,21 @@ fn body_delivered(session: &mut Session, rc: &RequestCtx, e: Option<&pingora_cor
         })
 }
 
+/// Whether the upstream refused this request's HTTP/2 stream before processing any of it, so it
+/// is safe to resend whatever was written (D72). Two shapes, both guaranteed by RFC 9113:
+///
+/// - `RST_STREAM(REFUSED_STREAM)` from the peer (§8.7: "closed prior to any processing").
+/// - A remote GOAWAY on the stream. The `h2` client hands a stream that error only when its id is
+///   above the GOAWAY's `last_stream_id` (`Streams::recv_go_away`), which is §6.8's "not
+///   processed": a stream at or below it that dies later fails with an I/O error instead. Any
+///   reason code — a GOAWAY(ENHANCE_YOUR_CALM) refuses as surely as a graceful NO_ERROR one.
+fn upstream_refused_stream(e: &pingora_core::Error) -> bool {
+    e.root_cause().downcast_ref::<h2::Error>().is_some_and(|h| {
+        h.is_remote()
+            && (h.is_go_away() || (h.is_reset() && h.reason() == Some(h2::Reason::REFUSED_STREAM)))
+    })
+}
+
 /// What became of a request, on its billing row: a consumer must be able to tell a zero-token row
 /// for an upstream error or a cancel from a real zero-token generation.
 fn outcome(rc: &RequestCtx, e: Option<&pingora_core::Error>, cache_hit: bool) -> &'static str {
@@ -5014,6 +5029,12 @@ impl ProxyHttp for AiProxy {
     /// request ends instead, with a JSON 504/502 (`fail_to_proxy`). That holds for pingora's own
     /// reused-connection retry and for the `FullBody` reset retry alike. A 5xx or 429 is an
     /// answer, not a failure, and keeps walking as before.
+    ///
+    /// The one exception is a stream the provider refused ([`upstream_refused_stream`], D72): an
+    /// HTTP/2 GOAWAY that left it above `last_stream_id`, or `RST_STREAM(REFUSED_STREAM)`. That is
+    /// the provider's guarantee it processed none of the request, so it is resent — on a fresh
+    /// connection to the same candidate — however much of the body went out. Routine H2
+    /// connection recycling at a provider would otherwise surface as client 502s.
     fn error_while_proxy(
         &self,
         peer: &HttpPeer,
@@ -5035,10 +5056,12 @@ impl ProxyHttp for AiProxy {
         // be generating, and billing, already; resending it — to the same candidate or the next,
         // pingora's reused-connection retry included — risks running the request twice, so that
         // failure ends the request (`fail_to_proxy` answers it).
-        let delivered = ctx
-            .rc
-            .as_ref()
-            .is_some_and(|rc| body_delivered(session, rc, Some(&*e)));
+        let refused = upstream_refused_stream(&e);
+        let delivered = !refused
+            && ctx
+                .rc
+                .as_ref()
+                .is_some_and(|rc| body_delivered(session, rc, Some(&*e)));
         if *e.esource() == pingora_core::ErrorSource::Downstream
             || session.as_downstream().response_written().is_some()
             || delivered
@@ -5050,6 +5073,14 @@ impl ProxyHttp for AiProxy {
             e.set_retry(false);
             return e;
         };
+        if refused {
+            warn!(
+                request_id = %rc.request_id,
+                provider = rc.provider.name.as_str(),
+                error = %e,
+                "upstream refused the stream unprocessed (GOAWAY / REFUSED_STREAM); resending",
+            );
+        }
         let walk = rc
             .auto
             .as_ref()
@@ -5061,7 +5092,7 @@ impl ProxyHttp for AiProxy {
         if let Some(fb) = full_body_ctx(session) {
             e.set_retry(false);
             if let Some((orig, at, usable)) = walk {
-                let retry = if client_reused && fb.reset & (1 << orig) == 0 {
+                let retry = if (client_reused || refused) && fb.reset & (1 << orig) == 0 {
                     Some(RelayRetry::Reset(orig))
                 } else if first_usable(usable, at.saturating_add(1)).is_some() {
                     Some(RelayRetry::Candidate(orig))
@@ -5080,9 +5111,9 @@ impl ProxyHttp for AiProxy {
             return e;
         }
         match walk {
-            // A reused connection: the same candidate again on a fresh one, keeping its breaker
-            // permit (it was the connection, not the provider).
-            Some(_) if client_reused => {
+            // A reused connection, or a stream the provider refused: the same candidate again on a
+            // fresh one, keeping its breaker permit (it was the connection, not the provider).
+            Some(_) if client_reused || refused => {
                 rc.same_provider_retry = true;
                 e.set_retry(true);
             }
@@ -5095,6 +5126,7 @@ impl ProxyHttp for AiProxy {
             Some(_) => e.set_retry(false),
             // Provider-routed: there is no next candidate; pingora's rule, a reused connection is
             // retried once.
+            None if refused => e.set_retry(true),
             None => e.retry.decide_reuse(client_reused),
         }
         e

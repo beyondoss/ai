@@ -1278,9 +1278,9 @@ async fn h2_frame<W: tokio::io::AsyncWrite + Unpin>(
     w.flush().await
 }
 
-/// A hand-rolled TLS H2 upstream that answers the first request on each connection and refuses
-/// every later one only once its whole body has arrived — the moment the gateway counts the body
-/// as delivered. Hand-rolled because no server library lets a test choose the GOAWAY's
+/// A hand-rolled TLS H2 upstream that refuses the second request on each connection, and only
+/// once its whole body has arrived — the moment the gateway counts the body as delivered. Every
+/// other request is answered (a GOAWAY ends the connection, so it has no third). Hand-rolled because no server library lets a test choose the GOAWAY's
 /// `last_stream_id`. Returns (port, requests served, streams refused, task).
 async fn refusing_h2_upstream(
     mode: Refuse,
@@ -1321,7 +1321,7 @@ async fn refusing_h2_upstream(
                 // literal without indexing.
                 let mut head = vec![0x88, 0x0f, 0x10, 16];
                 head.extend_from_slice(b"application/json");
-                let mut first: Option<u32> = None;
+                let (mut seen, mut last_served) = (0u32, 0u32);
                 loop {
                     let mut h = [0u8; 9];
                     if io.read_exact(&mut h).await.is_err() {
@@ -1339,8 +1339,9 @@ async fn refusing_h2_upstream(
                         (0x4, 0) => h2_frame(&mut io, 0x4, 0x1, 0, &[]).await,
                         (0x6, 0) => h2_frame(&mut io, 0x6, 0x1, 0, &payload).await,
                         // HEADERS or DATA ending the request body.
-                        (0x0 | 0x1, 0x1) if first.is_none() => {
-                            first = Some(stream);
+                        (0x0 | 0x1, 0x1) if seen != 1 => {
+                            seen += 1;
+                            last_served = stream;
                             served.fetch_add(1, Ordering::SeqCst);
                             let r = h2_frame(&mut io, 0x1, 0x4, stream, &head).await;
                             match r {
@@ -1351,10 +1352,11 @@ async fn refusing_h2_upstream(
                             }
                         }
                         (0x0 | 0x1, 0x1) => {
+                            seen += 1;
                             refused.fetch_add(1, Ordering::SeqCst);
                             match mode {
                                 Refuse::GoAway => {
-                                    let mut p = first.unwrap_or(0).to_be_bytes().to_vec();
+                                    let mut p = last_served.to_be_bytes().to_vec();
                                     p.extend_from_slice(&0u32.to_be_bytes());
                                     let _ = h2_frame(&mut io, 0x7, 0, 0, &p).await;
                                     // Hold the connection open a moment, as a draining server
@@ -1387,7 +1389,6 @@ async fn refusing_h2_upstream(
 /// claim: REL-22
 /// defect: D72
 #[tokio::test]
-#[ignore = "D72 reproduced: a stream refused by GOAWAY/REFUSED_STREAM after its body was sent is a 502, not a retry"]
 async fn a_stream_the_upstream_refused_is_retried() {
     let (pubkey, sk) = test_keypair(223);
     let key = billing_vkey(&sk, 2203);

@@ -373,6 +373,7 @@ dependencies = [
  "ed25519-dalek",
  "figment",
  "getrandom 0.3.4",
+ "h2",
  "http",
  "http-body-util",
  "hyper",
