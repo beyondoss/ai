@@ -114,7 +114,16 @@ set -e
 if [ "${VERIFY_LIVE:-}" = 1 ]; then cargo build -q -p beyond-ai; fi
 expr=$(cargo run -q -p beyond-ai-verify -- filter)
 cargo nextest run --workspace --profile verify --run-ignored all --no-tests=pass -E "$expr" || true
-cargo run -q -p beyond-ai-verify -- status --junit target/nextest/verify/junit.xml "$@"
+# Reconciled live cells (BIL-5) run last, alone: a provider's usage report holds every request
+# on the key and model, so no other suite may be sending. See verify/README.md.
+rm -f target/nextest/verify-isolated/junit.xml
+reports="--junit target/nextest/verify/junit.xml"
+if [ "${VERIFY_LIVE:-}" = 1 ]; then
+  expr=$(cargo run -q -p beyond-ai-verify -- filter --isolated)
+  cargo nextest run --workspace --profile verify-isolated --no-tests=pass -E "$expr" || true
+  if [ -f target/nextest/verify-isolated/junit.xml ]; then reports="$reports --junit target/nextest/verify-isolated/junit.xml"; fi
+fi
+cargo run -q -p beyond-ai-verify -- status $reports "$@"
 """
 
 [tasks."verify:live"]
@@ -134,4 +143,8 @@ VERIFY_CATALOG_SUMMARY=1 cargo test -q -p beyond-ai-verify --test catalog_live
 
 [tasks."verify:gate"]
 description = "Fail on any inconsistency between verify/claims.toml, verify/defects.toml, test tags and the last verify:status run."
-run = "cargo run -q -p beyond-ai-verify -- gate --junit target/nextest/verify/junit.xml"
+run = """
+reports="--junit target/nextest/verify/junit.xml"
+if [ -f target/nextest/verify-isolated/junit.xml ]; then reports="$reports --junit target/nextest/verify-isolated/junit.xml"; fi
+cargo run -q -p beyond-ai-verify -- gate $reports
+"""

@@ -21,13 +21,16 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+#[path = "common/live.rs"]
+mod common;
+
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read as _, Write as _};
-use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+use common::free_port;
 use libtest_mimic::{Arguments, Failed, Trial};
 use serde_json::Value;
 
@@ -456,6 +459,8 @@ fn main() {
             }
         }
     }
+    // Live traffic: no reconciliation window may be open while it runs (see common::live_traffic).
+    let _traffic = (!trials.is_empty() && !args.list).then(common::live_traffic);
     libtest_mimic::run(&args, trials).exit();
 }
 
@@ -467,36 +472,6 @@ struct Checks {
     /// E7: the harness's model list and displayed session cost (see [`e7_problems`]). An E7-only
     /// cell doesn't need the task to succeed: a session that failed still has a cost to compare.
     e7: bool,
-}
-
-/// A free port below the kernel's ephemeral range. Other suites on this host take theirs from
-/// `bind(0)` and release them before their gateway binds; Pingora binds with `SO_REUSEPORT`, so a
-/// port two gateways both picked is shared silently and some requests land on the other one.
-fn free_port() -> u16 {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-    let _ = NEXT.compare_exchange(
-        0,
-        u64::from(std::process::id())
-            ^ std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos() as u64,
-        Ordering::Relaxed,
-        Ordering::Relaxed,
-    );
-    loop {
-        // splitmix64: consecutive seeds scatter across the range.
-        let mut z = NEXT
-            .fetch_add(1, Ordering::Relaxed)
-            .wrapping_mul(0x9E37_79B9_7F4A_7C15);
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        let port = 20_000 + ((z ^ (z >> 31)) % 12_000) as u16;
-        if TcpListener::bind(("127.0.0.1", port)).is_ok() {
-            return port;
-        }
-    }
 }
 
 /// Kills its process on drop, so a failing cell never leaks a gateway or nats-server.
@@ -537,6 +512,13 @@ fn tail(path: &Path) -> String {
     s[start..].to_owned()
 }
 
+/// One cell under the stock SDKs' own retry policy. Every probe runs its SDK with retries off, so
+/// each HTTP call it records is one ledger row; the cell retries instead, whole, on a fresh
+/// gateway. When the client failed on an answer its SDK retries (a 503 overloaded, a 429), the
+/// cell waits as the SDK would (Retry-After, else its backoff) and runs again, up to the SDK's two
+/// retries. If the last answer is still a provider's own, relayed because the route has no other
+/// provider to fail over to, the cell is INCONCLUSIVE: it proves nothing about the gateway either
+/// way. A gateway-made answer stays a failure.
 fn run_cell(
     rt: Runtime,
     client: &str,
@@ -544,6 +526,82 @@ fn run_cell(
     route: Route,
     keys: &BTreeMap<String, String>,
     checks: Checks,
+) -> Result<(), Failed> {
+    let mut retry = 0;
+    loop {
+        let mut retryable = None;
+        let result = attempt_cell(rt, client, probe, route, keys, checks, &mut retryable);
+        let (Err(failure), Some((e, providers))) = (&result, retryable) else {
+            return result;
+        };
+        let status = e["status"].as_u64().unwrap_or(0) as u16;
+        let who = e["provider"].as_str().unwrap_or("the gateway");
+        let why = format!(
+            "{who} answered {status} on attempt {} of {} (request {}){}",
+            retry + 1,
+            common::SDK_MAX_RETRIES + 1,
+            e["request_id"].as_str().unwrap_or("?"),
+            if providers {
+                ", and the route has no other provider to fail over to"
+            } else {
+                ""
+            },
+        );
+        match common::sdk_retry(status, retry, |h| error_header(&e, h)) {
+            Some(wait) => {
+                eprintln!("{why}; retrying in {wait:?}, as the SDK would");
+                std::thread::sleep(wait);
+                retry += 1;
+            }
+            None if providers => {
+                return Err(common::inconclusive(&why, failure.message().unwrap_or("")));
+            }
+            None => return result,
+        }
+    }
+}
+
+/// A response header from a probe's `errors` entry.
+fn error_header(e: &Value, name: &str) -> Option<String> {
+    let key = match name {
+        "retry-after" => "retry_after",
+        "retry-after-ms" => "retry_after_ms",
+        "x-should-retry" => "should_retry",
+        _ => return None,
+    };
+    e[key].as_str().map(str::to_owned)
+}
+
+/// The error answer the client failed on, when its SDK would retry it, and whether it is the
+/// provider's own answer that the gateway had to relay: `x-beyond-provider` names who sent it,
+/// the gateway's row for it records the same upstream status, and the route holds one live
+/// provider, so there was nothing to fail over to.
+fn retryable_failure(verdict: &Value, rows: &[Value], route: Route) -> Option<(Value, bool)> {
+    let e = verdict["errors"].as_array()?.last()?;
+    let status = e["status"].as_u64()?;
+    if !common::sdk_retryable(status as u16, |h| error_header(e, h)) {
+        return None;
+    }
+    let providers = route.pools.len() - route.dead.len() == 1
+        && e["provider"].as_str().is_some_and(|provider| {
+            rows.iter().any(|r| {
+                r["request_id"] == e["request_id"]
+                    && r["provider"] == provider
+                    && r["outcome"] == "upstream_error"
+                    && r["upstream_status"] == status
+            })
+        });
+    Some((e.clone(), providers))
+}
+
+fn attempt_cell(
+    rt: Runtime,
+    client: &str,
+    probe: &str,
+    route: Route,
+    keys: &BTreeMap<String, String>,
+    checks: Checks,
+    retryable: &mut Option<(Value, bool)>,
 ) -> Result<(), Failed> {
     let dir = std::env::temp_dir().join(format!(
         "verify-live-{}-{}",
@@ -635,6 +693,7 @@ fn run_cell(
 
     // Witness 1: the client's own verdict.
     if checks.task && verdict["ok"] != true {
+        *retryable = retryable_failure(&verdict, &usage_rows(&log_path), route);
         return Err(format!(
             "client verdict failed: {}\n--- gateway log ---\n{}",
             verdict["detail"],

@@ -20,13 +20,16 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+#[path = "common/live.rs"]
+pub(crate) mod common;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, BufReader, Read as _, Write as _};
-use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use common::free_port;
 use libtest_mimic::{Arguments, Failed, Trial};
 use serde_json::{Value, json};
 
@@ -53,8 +56,8 @@ struct Recon {
     name: &'static str,
     pool_var: &'static str,
     admin_var: &'static str,
-    /// A catalog row the other live suites don't use, so no one else's traffic lands in the same
-    /// key + model + minutes. Its first candidate is this provider.
+    /// The catalog row reconciled; [`Window`] keeps everyone else's traffic out of its key, model
+    /// and minutes. Its first candidate is this provider.
     model: &'static str,
     /// The batch: `(endpoint, stream)` in order.
     batch: &'static [(Endpoint, bool)],
@@ -85,6 +88,11 @@ const OPENAI: Recon = Recon {
         (Endpoint::Messages, true),
     ],
 };
+
+/// The models BIL-5's batches reconcile on. `long_live.rs` checks its own reconciled sessions
+/// against these: reconciled trials run at once, so no two may share a key and model.
+#[allow(dead_code)] // read by long_live.rs, which includes this file
+pub(crate) const MODELS: [&str; 2] = [OPENAI.model, ANTHROPIC.model];
 
 const ANTHROPIC: Recon = Recon {
     provider: Provider::Anthropic,
@@ -146,7 +154,7 @@ fn main() {
             let (pool, admin) = (pool.clone(), admin.clone());
             trials.push(Trial::test(
                 format!("BIL-5::raw::{}::reconcile", recon.name),
-                move || reconcile(recon, &pool, &admin),
+                move || common::retrying(|| reconcile(recon, &pool, &admin)),
             ));
         }
     }
@@ -199,6 +207,43 @@ pub(crate) fn now_secs() -> u64 {
         .as_secs()
 }
 
+/// The minutes a reconciled batch or session is compared over, with no other live traffic on the
+/// host inside them (see [`common::isolated`]).
+///
+/// [`Window::open`] waits for every other live process to finish, then for the next whole minute,
+/// so no earlier request shares the report's first bucket. [`Window::close`] holds the isolation
+/// until the window's end (a minute past the one the last request landed in), so no later
+/// request shares its last.
+pub(crate) struct Window {
+    _isolation: common::Isolation,
+    pub(crate) start: u64,
+}
+
+impl Window {
+    pub(crate) fn open() -> Window {
+        let isolation = common::isolated();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64();
+        let start = (now / 60.0).floor() as u64 * 60 + 60;
+        std::thread::sleep(Duration::from_secs_f64(start as f64 - now));
+        Window {
+            _isolation: isolation,
+            start,
+        }
+    }
+
+    /// `(start, end)` in unix seconds, once the window is over.
+    pub(crate) fn close(self) -> (u64, u64) {
+        let end = now_secs().div_ceil(60) * 60 + 60;
+        while now_secs() < end {
+            std::thread::sleep(Duration::from_secs(end - now_secs()));
+        }
+        (self.start, end)
+    }
+}
+
 fn reconcile(recon: Recon, pool: &str, admin: &str) -> Result<(), Failed> {
     // Find the pool key's id first: no point spending on a batch we can't reconcile.
     let key_id = pool_key_id(recon.provider, pool, admin)?;
@@ -212,7 +257,7 @@ fn reconcile(recon: Recon, pool: &str, admin: &str) -> Result<(), Failed> {
     let gw = Gateway::boot(&dir, recon.name, pool)?;
 
     // The window is whole minutes (the report's bucket width) around the batch.
-    let start = now_secs() / 60 * 60;
+    let window = Window::open();
     let nonce = format!("{}-{}", std::process::id(), now_secs());
     let system = system_prompt(&nonce);
     let mut ids = Vec::new();
@@ -233,9 +278,9 @@ fn reconcile(recon: Recon, pool: &str, admin: &str) -> Result<(), Failed> {
         }
         std::thread::sleep(Duration::from_millis(200));
     };
-    let end = now_secs().div_ceil(60) * 60 + 60;
-    let ledger = ledger_totals(&rows, &ids, recon)?;
     drop(gw);
+    let (start, end) = window.close();
+    let ledger = ledger_totals(&rows, &ids, recon)?;
     eprintln!(
         "BIL-5 {}: ledger for {} requests on {} (key {key_id}, window {start}..{end}): {ledger}",
         recon.name,
@@ -383,36 +428,6 @@ impl Drop for Guard {
     }
 }
 
-/// A free port below the kernel's ephemeral range. Other suites on this host take theirs from
-/// `bind(0)` and release them before their gateway binds; Pingora binds with `SO_REUSEPORT`, so a
-/// port two gateways both picked is shared silently and some requests land on the other one.
-fn free_port() -> u16 {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-    let _ = NEXT.compare_exchange(
-        0,
-        u64::from(std::process::id())
-            ^ std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos() as u64,
-        Ordering::Relaxed,
-        Ordering::Relaxed,
-    );
-    loop {
-        // splitmix64: consecutive seeds scatter across the range.
-        let mut z = NEXT
-            .fetch_add(1, Ordering::Relaxed)
-            .wrapping_mul(0x9E37_79B9_7F4A_7C15);
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        let port = 20_000 + ((z ^ (z >> 31)) % 12_000) as u16;
-        if TcpListener::bind(("127.0.0.1", port)).is_ok() {
-            return port;
-        }
-    }
-}
-
 impl Gateway {
     fn boot(dir: &Path, provider: &str, pool: &str) -> Result<Gateway, Failed> {
         let nats_port = free_port();
@@ -534,6 +549,10 @@ impl Gateway {
         let (status, out) = run_curl(cmd, &body.to_string())?;
         let what = format!("{endpoint:?} stream={stream} turn {turn}");
         if status != 200 {
+            // The gateway holds one provider: its own retryable answer here makes the batch
+            // run again under the SDK policy (`common::retrying`).
+            std::thread::sleep(Duration::from_millis(200));
+            common::note_if_ended_unavailable(&usage_rows(&self.log));
             return Err(format!("{what}: HTTP {status}: {out}").into());
         }
         let hdrs = std::fs::read_to_string(&headers).map_err(|e| e.to_string())?;

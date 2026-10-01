@@ -39,15 +39,18 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+#[path = "common/live.rs"]
+mod common;
+
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read as _, Write as _};
-use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
 use base64::Engine as _;
+use common::free_port;
 use libtest_mimic::{Arguments, Failed, Trial};
 use providers::catalog::{
     Candidate, IN_FILE, IN_IMAGE, MODEL_ROUTES, ModelRoute, REASONING, STRUCTURED_OUTPUTS, TOOLS,
@@ -280,35 +283,6 @@ struct Gateway {
 }
 
 static CHILDREN: Mutex<Vec<Child>> = Mutex::new(Vec::new());
-
-/// A free port below the kernel's ephemeral range (as `live.rs` picks them): Pingora binds with
-/// `SO_REUSEPORT`, so a `bind(0)` port another session's gateway also picked is shared silently.
-fn free_port() -> u16 {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-    let _ = NEXT.compare_exchange(
-        0,
-        u64::from(std::process::id())
-            ^ SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos() as u64,
-        Ordering::Relaxed,
-        Ordering::Relaxed,
-    );
-    loop {
-        // splitmix64: consecutive seeds scatter across the range.
-        let mut z = NEXT
-            .fetch_add(1, Ordering::Relaxed)
-            .wrapping_mul(0x9E37_79B9_7F4A_7C15);
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        let port = 20_000 + ((z ^ (z >> 31)) % 12_000) as u16;
-        if TcpListener::bind(("127.0.0.1", port)).is_ok() {
-            return port;
-        }
-    }
-}
 
 fn gateway() -> Result<&'static Gateway, String> {
     static GW: OnceLock<Result<Gateway, String>> = OnceLock::new();
@@ -572,11 +546,19 @@ struct Reply {
     provider: Option<String>,
     upstream: Option<String>,
     request_id: Option<String>,
+    headers: reqwest::header::HeaderMap,
     json: Value,
     raw: String,
 }
 
 impl Reply {
+    fn header(&self, name: &str) -> Option<String> {
+        self.headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned)
+    }
+
     fn excerpt(&self) -> String {
         let s = self.raw.trim();
         let end = s.floor_char_boundary(s.len().min(400));
@@ -598,12 +580,14 @@ fn send(req: reqwest::blocking::RequestBuilder) -> Result<Reply, String> {
         h("x-beyond-upstream-model"),
         h("x-beyond-request-id"),
     );
+    let headers = r.headers().clone();
     let raw = r.text().map_err(|e| format!("body: {e}"))?;
     Ok(Reply {
         status,
         provider,
         upstream,
         request_id,
+        headers,
         json: serde_json::from_str(&raw).unwrap_or(Value::Null),
         raw,
     })
@@ -643,9 +627,10 @@ fn call(arm: &Arm, body: &Value, walk: Walk) -> Result<Reply, String> {
     // Multi-megabyte context probes share a few upload slots across every trial process: sixteen
     // at once saturate the uplink, and an upstream that answers early then stalls the relay.
     let _slot = (bytes.len() > 1 << 20).then(upload_slot);
-    // A 502/503/504/529 is retried twice, as every provider SDK does: a stale pooled upstream
-    // connection, or a provider's momentary overload, is not a catalog fact.
-    let mut attempt: u64 = 0;
+    // An answer the stock SDKs retry is retried as they do (common::sdk_retry): a stale pooled
+    // upstream connection, or a provider's momentary overload, is not a catalog fact. If the last
+    // answer is still the provider's own, on a candidate forced alone, the trial is INCONCLUSIVE.
+    let mut retry = 0;
     loop {
         let r = send(
             http()
@@ -657,12 +642,30 @@ fn call(arm: &Arm, body: &Value, walk: Walk) -> Result<Reply, String> {
                 .header("content-type", "application/json")
                 .body(bytes.clone()),
         )?;
-        let busy = r.status == 429 && r.raw.contains("rate-limited");
-        if attempt < 2 && (busy || matches!(r.status, 502 | 503 | 504 | 529)) {
-            attempt += 1;
-            println!("retry {attempt} after HTTP {}: {}", r.status, r.excerpt());
-            std::thread::sleep(Duration::from_secs(if busy { 8 } else { 2 } * attempt));
+        if !common::sdk_retryable(r.status, |h| r.header(h)) {
+            return Ok(r);
+        }
+        if let Some(wait) = common::sdk_retry(r.status, retry, |h| r.header(h)) {
+            retry += 1;
+            println!(
+                "retry {retry} in {wait:?} after HTTP {}: {}",
+                r.status,
+                r.excerpt()
+            );
+            std::thread::sleep(wait);
             continue;
+        }
+        // The provider's own answer (it named itself), on a request no other candidate could take.
+        if walk == Walk::Only
+            && let Some(p) = &r.provider
+        {
+            common::provider_unavailable(format!(
+                "{p} answered {} on all {} attempts at {}: {}",
+                r.status,
+                retry + 1,
+                arm.cand.upstream_model,
+                r.excerpt()
+            ));
         }
         return Ok(r);
     }
@@ -1170,7 +1173,13 @@ fn bil13(trial: &str, arm: Arm) -> Result<(), Failed> {
         &body(&arm, OK_PROMPT, max, Opts::default()),
         Walk::Only,
     )?;
-    let id = r.request_id.as_deref().ok_or("no x-beyond-request-id")?;
+    let id = r.request_id.as_deref().ok_or_else(|| {
+        format!(
+            "no x-beyond-request-id on HTTP {} (not our gateway's proxy listener?): {}",
+            r.status,
+            r.excerpt()
+        )
+    })?;
     let rows = ledger(id, 1);
     let [row] = rows.as_slice() else {
         return Err(format!(
@@ -2600,9 +2609,11 @@ fn main() {
         for p in plan().0 {
             let Planned { name, kind, .. } = p;
             let n = name.clone();
-            trials.push(Trial::test(name, move || run(&n, &kind)));
+            trials.push(Trial::test(name, move || common::judge(|| run(&n, &kind))));
         }
     }
+    // Live traffic: no reconciliation window may be open while it runs (see common::live_traffic).
+    let _traffic = (!trials.is_empty() && !args.list).then(common::live_traffic);
     let conclusion = libtest_mimic::run(&args, trials);
     cleanup();
     conclusion.exit();

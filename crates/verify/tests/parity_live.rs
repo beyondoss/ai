@@ -40,14 +40,17 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+#[path = "common/live.rs"]
+mod common;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, BufReader, Read as _, Write as _};
-use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+use common::free_port;
 use libtest_mimic::{Arguments, Failed, Trial};
 use serde_json::{Value, json};
 
@@ -1033,23 +1036,54 @@ struct Obs {
     /// SSE events `(event name, data, arrival in ms since the request)`.
     events: Vec<(String, Value, f64)>,
     raw: String,
+    /// The answer's response headers, names lowercased.
+    headers: Vec<(String, String)>,
 }
 
-/// [`post_once`], again after a transport failure (a TLS reset on connect) or a rate limit /
-/// overload (429, 529): neither says anything about parity.
+impl Obs {
+    fn header(&self, name: &str) -> Option<String> {
+        self.headers
+            .iter()
+            .rev()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.clone())
+    }
+}
+
+/// [`post_once`] under the stock SDKs' retry policy (`common::sdk_retry`): again after a transport
+/// failure (a TLS reset on connect) or an answer the SDK retries (a rate limit, an overload),
+/// none of which says anything about parity. If the last answer is still one the SDK would retry
+/// and it is the provider's own (a direct call, or a gateway relay naming the provider, which is
+/// the gateway's only one here), the trial is INCONCLUSIVE.
 fn post(dir: &Path, tag: &str, url: &str, headers: &[String], body: &Value) -> Result<Obs, Failed> {
-    let mut tries = 0;
+    let mut retry = 0;
     loop {
-        tries += 1;
         let r = post_once(dir, tag, url, headers, body);
-        let again = match &r {
-            Err(_) => true,
-            Ok(o) => matches!(o.status, 429 | 529),
+        let wait = match &r {
+            Err(_) => common::sdk_backoff(retry),
+            Ok(o) => common::sdk_retry(o.status, retry, |h| o.header(h)),
         };
-        if !again || tries == 4 {
-            return r;
+        if let Some(wait) = wait {
+            retry += 1;
+            std::thread::sleep(wait);
+            continue;
         }
-        std::thread::sleep(Duration::from_secs(2 * tries));
+        if let Ok(o) = &r
+            && common::sdk_retryable(o.status, |h| o.header(h))
+        {
+            let direct = !url.starts_with("http://127.0.0.1");
+            let provider = o.header("x-beyond-provider");
+            if direct || provider.is_some() {
+                common::provider_unavailable(format!(
+                    "{} answered {} on all {} attempts ({tag}): {}",
+                    provider.as_deref().unwrap_or(url),
+                    o.status,
+                    retry + 1,
+                    o.raw.chars().take(300).collect::<String>()
+                ));
+            }
+        }
+        return r;
     }
 }
 
@@ -1149,6 +1183,11 @@ fn post_once(
         body: None,
         events: Vec::new(),
         raw: raw.clone(),
+        headers: block
+            .lines()
+            .filter_map(|l| l.split_once(':'))
+            .map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_owned()))
+            .collect(),
     };
     if content_type.starts_with("text/event-stream") {
         let (mut name, mut data, mut t) = (String::new(), String::new(), 0.0);
@@ -2297,29 +2336,6 @@ fn gateway(provider: Provider, pool: &str) -> Result<Arc<Gateway>, Failed> {
     Ok(gw)
 }
 
-/// A free port below the kernel's ephemeral range. Other suites on this host take theirs from
-/// `bind(0)` (the ephemeral range) and release them before their gateway binds; Pingora binds
-/// with `SO_REUSEPORT`, so a port two gateways both picked is shared silently and some requests
-/// land on the other one (seen once: a 404 from a stranger's admin listener).
-fn free_port() -> u16 {
-    static NEXT: Mutex<u64> = Mutex::new(0);
-    let mut seed = NEXT.lock().unwrap();
-    if *seed == 0 {
-        *seed = u64::from(std::process::id())
-            ^ std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos() as u64;
-    }
-    loop {
-        let port = 20_000 + (Rng(*seed).next() % 12_000) as u16;
-        *seed = seed.wrapping_add(1);
-        if TcpListener::bind(("127.0.0.1", port)).is_ok() {
-            return port;
-        }
-    }
-}
-
 fn boot(provider: &str, pool: &str) -> Result<Gateway, Failed> {
     let dir = scratch().join(format!(
         "gw-{provider}-{}-{}",
@@ -2449,7 +2465,7 @@ fn main() {
                 estimate_usd += estimate(path, case);
                 let (path, keys, cases, n2) = (*path, keys.clone(), cases.clone(), name.clone());
                 trials.push(Trial::test(name, move || {
-                    run_trial(&n2, path, &cases[i], &keys)
+                    common::judge(|| run_trial(&n2, path, &cases[i], &keys))
                 }));
             }
         }
@@ -2467,6 +2483,8 @@ fn main() {
         args.test_threads = Some(6);
     }
     let list = args.list;
+    // Live traffic: no reconciliation window may be open while it runs (see common::live_traffic).
+    let _traffic = (!trials.is_empty() && !args.list).then(common::live_traffic);
     let conclusion = libtest_mimic::run(&args, trials);
     gateways().lock().unwrap().clear();
     if !list && estimate_usd > 0.0 {

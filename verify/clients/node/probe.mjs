@@ -19,11 +19,20 @@ const CLIENT = process.env.VERIFY_CLIENT ?? "";
 
 const calls = [];
 const ids = [];
+// Every error answer, with what the cell's retry policy reads (see live.rs `retryable_failure`).
+const errors = [];
 
 // A fetch that records each response's x-beyond-request-id, handed to every SDK.
 const recordingFetch = async (input, init) => {
   const resp = await fetch(input, init);
   ids.push(resp.headers.get("x-beyond-request-id"));
+  if (resp.status >= 400) {
+    const h = (n) => resp.headers.get(n);
+    errors.push({
+      request_id: h("x-beyond-request-id"), status: resp.status, provider: h("x-beyond-provider"),
+      retry_after: h("retry-after"), retry_after_ms: h("retry-after-ms"), should_retry: h("x-should-retry"),
+    });
+  }
   return resp;
 };
 const takeId = () => ids.shift() ?? null;
@@ -124,14 +133,14 @@ const aiUsage = (u) => {
 };
 
 async function aiSdk(model, wire) {
-  const g = await generateText({ model, maxOutputTokens: 1024, prompt: "Reply with the single word: pong" });
+  const g = await generateText({ model, maxRetries: 0, maxOutputTokens: 1024, prompt: "Reply with the single word: pong" });
   record(wire, aiUsage(g.usage));
   const weather = tool({
     description: "Weather for a city",
     inputSchema: jsonSchema({ type: "object", properties: { city: { type: "string" } }, required: ["city"] }),
     execute: async ({ city }) => `Sunny in ${city}, 31C`,
   });
-  const s = streamText({ model, maxOutputTokens: 1024, tools: { weather }, stopWhen: stepCountIs(3), prompt: "What's the weather in Paris? Use the weather tool, then answer." });
+  const s = streamText({ model, maxRetries: 0, maxOutputTokens: 1024, tools: { weather }, stopWhen: stepCountIs(3), prompt: "What's the weather in Paris? Use the weather tool, then answer." });
   const text = await s.text;
   const steps = await s.steps;
   for (const st of steps) record(wire, aiUsage(st.usage));
@@ -198,6 +207,7 @@ Object.assign(probes, {
     const [model, wire] = aiModel();
     const g = await generateText({
       model,
+      maxRetries: 0,
       maxOutputTokens: 2048,
       messages: [{
         role: "user",
@@ -235,7 +245,7 @@ Object.assign(probes, {
   // T4 via the AI SDK: Output.object over OpenAI Chat (response_format json_schema).
   async ai_sdk_structured() {
     const model = createOpenAI({ baseURL: `${BASE}/v1`, apiKey: KEY, fetch: recordingFetch }).chat(MODEL);
-    const g = await generateText({ model, maxOutputTokens: 2048, output: Output.object({ schema: jsonSchema(SCHEMA) }), prompt: "Give the city, country and population (millions) of Paris." });
+    const g = await generateText({ model, maxRetries: 0, maxOutputTokens: 2048, output: Output.object({ schema: jsonSchema(SCHEMA) }), prompt: "Give the city, country and population (millions) of Paris." });
     record("chat", aiUsage(g.usage));
     return [validates(g.output), { obj: g.output }];
   },
@@ -279,7 +289,7 @@ Object.assign(probes, {
   async ai_sdk_error() {
     const [model, wire] = aiModel();
     try {
-      await generateText({ model, maxOutputTokens: 64, maxRetries: 0, messages: [{ role: "user", content: [{ type: "image", image: Buffer.from(CORRUPT_PNG, "base64"), mediaType: "image/png" }, { type: "text", text: "What is this?" }] }] });
+      await generateText({ model, maxRetries: 0, maxOutputTokens: 64, messages: [{ role: "user", content: [{ type: "image", image: Buffer.from(CORRUPT_PNG, "base64"), mediaType: "image/png" }, { type: "text", text: "What is this?" }] }] });
     } catch (e) {
       record(wire, null, { error: true });
       return [APICallError.isInstance(e) && e.statusCode === 400 && /image/i.test(e.message), { name: e.name, status: e.statusCode, message: e.message?.slice(0, 200) }];
@@ -336,7 +346,7 @@ Object.assign(probes, {
     const reads = [];
     for (const q of ["Which city does fact 3 name?", "And fact 4?", "And fact 5?"]) {
       messages.push({ role: "user", content: q });
-      const g = await generateText({ model, maxOutputTokens: 1024, system: longPrefix(), messages });
+      const g = await generateText({ model, maxRetries: 0, maxOutputTokens: 1024, system: longPrefix(), messages });
       const u = aiUsage(g.usage);
       reads.push(u.cache_read);
       record("chat", u, reads.length > 1 ? { row_min: { cache_read_tokens: 1 } } : undefined);
@@ -352,4 +362,4 @@ try {
 } catch (e) {
   detail = { exception: `${e?.name}: ${e?.message}`, stack: String(e?.stack ?? "").slice(0, 1500) };
 }
-console.log("VERIFY " + JSON.stringify({ ok: Boolean(ok), calls, detail }));
+console.log("VERIFY " + JSON.stringify({ ok: Boolean(ok), calls, errors, detail }));

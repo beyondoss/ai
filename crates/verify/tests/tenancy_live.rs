@@ -24,15 +24,19 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+#[path = "common/live.rs"]
+mod common;
+
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read as _, Write as _};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use common::free_port;
 use ed25519_dalek::{Signer as _, SigningKey};
 use libtest_mimic::{Arguments, Failed, Trial};
 use serde_json::{Value, json};
@@ -216,10 +220,12 @@ fn main() {
             let name = format!("{claims}::{client}::{}::{scenario}", route.name);
             let keys = keys.clone();
             trials.push(Trial::test(name, move || {
-                run_cell(client, route, scenario, extra, &keys)
+                common::retrying(|| run_cell(client, route, scenario, extra, &keys))
             }));
         }
     }
+    // Live traffic: no reconciliation window may be open while it runs (see common::live_traffic).
+    let _traffic = (!trials.is_empty() && !args.list).then(common::live_traffic);
     libtest_mimic::run(&args, trials).exit();
 }
 
@@ -345,35 +351,6 @@ fn kv_write(port: u16, key: &str, value: Option<&str>) -> Result<(), String> {
 }
 
 // --- process plumbing ----------------------------------------------------------------------------
-
-/// A free port below the kernel's ephemeral range, as `live.rs` picks them: Pingora binds with
-/// `SO_REUSEPORT`, so a `bind(0)` port another session's gateway also picked is shared silently.
-fn free_port() -> u16 {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-    let _ = NEXT.compare_exchange(
-        0,
-        u64::from(std::process::id())
-            ^ std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos() as u64,
-        Ordering::Relaxed,
-        Ordering::Relaxed,
-    );
-    loop {
-        // splitmix64: consecutive seeds scatter across the range.
-        let mut z = NEXT
-            .fetch_add(1, Ordering::Relaxed)
-            .wrapping_mul(0x9E37_79B9_7F4A_7C15);
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        let port = 20_000 + ((z ^ (z >> 31)) % 12_000) as u16;
-        if TcpListener::bind(("127.0.0.1", port)).is_ok() {
-            return port;
-        }
-    }
-}
 
 /// Kills its process on drop, so a failing cell never leaks a gateway, nats-server or client.
 struct Guard(Child);
@@ -585,6 +562,11 @@ fn run_cell(
     eprintln!("{scenario} detail: {}", verdict["detail"]);
 
     if verdict["ok"] != true {
+        // The scenario's clients run with retries off: a session that ended on its only
+        // provider's retryable answer is run again under the SDK policy (`common::retrying`).
+        if route.pools.len() == 1 {
+            common::note_if_ended_unavailable(&usage_rows(&log_path));
+        }
         return Err(format!(
             "client verdict failed: {}\ncontrol: {transcript:?}\n--- gateway log ---\n{}",
             verdict["detail"],

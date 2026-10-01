@@ -33,13 +33,16 @@
 #[path = "common/fault_proxy.rs"]
 mod fault_proxy;
 
+#[path = "common/live.rs"]
+mod common;
+
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read as _, Write as _};
-use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+use common::free_port;
 use fault_proxy::{Delivery, Fault, FaultProxy, Record, Script, Shape};
 use libtest_mimic::{Arguments, Failed, Trial};
 use serde_json::Value;
@@ -354,42 +357,9 @@ fn main() {
             }
         }
     }
+    // Live traffic: no reconciliation window may be open while it runs (see common::live_traffic).
+    let _traffic = (!trials.is_empty() && !args.list).then(common::live_traffic);
     libtest_mimic::run(&args, trials).exit();
-}
-
-/// Three distinct free ports (nats, the gateway, its admin listener) below the kernel's ephemeral
-/// range, picked the way `live.rs` picks them. Pingora binds with `SO_REUSEPORT`, so a `bind(0)`
-/// port is unsafe: two back-to-back `bind(0)` calls once returned the same port, the gateway's two
-/// listeners shared it, and a client retry landed on the admin server's 404.
-fn ports() -> [u16; 3] {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-    let _ = NEXT.compare_exchange(
-        0,
-        u64::from(std::process::id())
-            ^ std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos() as u64,
-        Ordering::Relaxed,
-        Ordering::Relaxed,
-    );
-    let mut out = [0u16; 3];
-    let mut i = 0;
-    while i < 3 {
-        // splitmix64: consecutive seeds scatter across the range.
-        let mut z = NEXT
-            .fetch_add(1, Ordering::Relaxed)
-            .wrapping_mul(0x9E37_79B9_7F4A_7C15);
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        let port = 20_000 + ((z ^ (z >> 31)) % 12_000) as u16;
-        if !out[..i].contains(&port) && TcpListener::bind(("127.0.0.1", port)).is_ok() {
-            out[i] = port;
-            i += 1;
-        }
-    }
-    out
 }
 
 /// Removes a trial's scratch directory on drop.
@@ -460,7 +430,7 @@ fn run_trial(
     case: Case,
     keys: &BTreeMap<String, String>,
 ) -> Result<(), Failed> {
-    let [nats_port, port, metrics_port] = ports();
+    let [nats_port, port, metrics_port] = [free_port(), free_port(), free_port()];
     // Under the target dir rather than /tmp: nats' JetStream store needs real disk, and a tmpfs
     // shared with other suites can be full. Removed on every exit path, after the processes.
     let scratch =

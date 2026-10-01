@@ -62,3 +62,12 @@ slow-timeout = { period = "60s", terminate-after = 35 }
 
 [profile.verify.junit]
 path = "junit.xml"
+
+# `mise run verify:live`'s second phase: the reconciled live cells (those claiming BIL-5), after
+# every other cell has finished, so no other suite's traffic is in their providers' usage reports
+# (verify/README.md). Same settings as `verify`, its own report.
+[profile.verify-isolated]
+inherits = "verify"
+
+[profile.verify-isolated.junit]
+path = "junit.xml"

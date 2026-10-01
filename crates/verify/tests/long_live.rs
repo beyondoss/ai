@@ -26,8 +26,9 @@
 //!   (`count_tokens`) has none; a refused call bills nothing; no row belongs to no call;
 //! - where the session reconciles and the provider's admin key is set, the session's token totals
 //!   equal the provider's usage report for the pool key, model and minutes (the BIL-5 method,
-//!   reused from `reconcile_live.rs`). Two sessions reconcile, on rows no other live suite drives:
-//!   pi on `claude-sonnet-5` and Claude Code (translated) on `gpt-5`. A failure lists the minutes
+//!   reused from `reconcile_live.rs`). Two sessions reconcile, claiming BIL-5 as well, so they run
+//!   in verify:live's isolated phase with no other live traffic (`recon::Window`): pi on
+//!   `claude-sonnet-5` and Claude Code (translated) on `gpt-5`. A failure lists the minutes
 //!   that differ, to tell another suite's traffic (a catalog sweep) from ours.
 //!
 //! # LNG-2: caching over a long session
@@ -74,12 +75,13 @@ mod recon;
 
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read as _, Write as _};
-use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+use common::free_port;
 use libtest_mimic::{Arguments, Failed, Trial};
+use recon::common;
 use recon::{Provider, Totals};
 use serde_json::Value;
 
@@ -124,8 +126,8 @@ const CLAUDE: Route = Route {
     pools: ANTHROPIC,
     serves: "anthropic",
 };
-/// A Claude row no other suite drives, so its session can be reconciled against Anthropic's
-/// usage report without anyone else's traffic in the same key + model + minutes.
+/// The Claude row pi's session reconciles on against Anthropic's usage report; isolation in time
+/// (`recon::Window`) keeps anyone else's traffic out of its key + model + minutes.
 const SONNET5: Route = Route {
     name: "claude-sonnet-5",
     model: "claude-sonnet-5",
@@ -138,7 +140,7 @@ const GPT: Route = Route {
     pools: OPENAI,
     serves: "openai",
 };
-/// A GPT row no other live suite drives, for a reconciled translated session. Cheaper rows fail
+/// The GPT row of the reconciled translated session (`recon::Window`). Cheaper rows fail
 /// the task for their own reasons: gpt-4.1-mini stops after step 1, gpt-5-nano edits the tests,
 /// gpt-5-mini answers the turn after a compaction with another summary, and gpt-5.4-mini is D114.
 const GPT5: Route = Route {
@@ -286,6 +288,17 @@ fn installed() -> bool {
 
 fn main() {
     let args = Arguments::from_args();
+    // Reconciled trials run side by side in verify:live's isolated phase, so no two may share a
+    // model: one's usage report would hold the other's tokens.
+    let mut models: Vec<&str> = SESSIONS
+        .iter()
+        .filter(|s| s.4.is_some())
+        .map(|s| s.3.model)
+        .chain(recon::MODELS)
+        .collect();
+    models.sort_unstable();
+    let distinct = models.windows(2).all(|w| w[0] != w[1]);
+    assert!(distinct, "two reconciled trials share a model: {models:?}");
     let mut trials = Vec::new();
     if std::env::var("VERIFY_LIVE").as_deref() == Ok("1") && installed() {
         let keys = env_keys();
@@ -298,10 +311,16 @@ fn main() {
                 Some((_, mode)) => format!("long_task_{mode}"),
                 None => "long_task".to_owned(),
             };
-            let name = format!("{claims}::{client}::{}::{scenario}", route.name);
+            // A session reconciles only where the provider's admin key is set; it then claims
+            // BIL-5 too, which is what runs it in verify:live's isolated phase.
+            let recon = recon.filter(|p| keys.contains_key(admin_var(*p)));
+            let bil5 = if recon.is_some() { "+BIL-5" } else { "" };
+            let name = format!("{claims}{bil5}::{client}::{}::{scenario}", route.name);
             let keys = keys.clone();
             trials.push(Trial::test(name, move || {
-                long_session(claims, spec, route, recon, &keys)
+                // Unreconciled sessions are live traffic a reconciliation window must not see.
+                let _traffic = recon.is_none().then(common::live_traffic);
+                common::judge(|| long_session(claims, spec, route, recon, &keys))
             }));
         }
         for &(client, route, scenario, expect) in TOOL_CASES {
@@ -311,7 +330,8 @@ fn main() {
             let name = format!("TOOL-1::{client}::{}::{scenario}", route.name);
             let keys = keys.clone();
             trials.push(Trial::test(name, move || {
-                tool_case(route, scenario, expect, &keys)
+                let _traffic = common::live_traffic();
+                common::retrying(|| tool_case(route, scenario, expect, &keys))
             }));
         }
         for &(client, route, expect) in MCP_CASES {
@@ -321,7 +341,8 @@ fn main() {
             let name = format!("TOOL-1::{client}::{}::mcp_150", route.name);
             let keys = keys.clone();
             trials.push(Trial::test(name, move || {
-                mcp_case(client, route, expect, &keys)
+                let _traffic = common::live_traffic();
+                common::judge(|| mcp_case(client, route, expect, &keys))
             }));
         }
     }
@@ -340,36 +361,6 @@ impl Drop for Guard {
     }
 }
 
-/// A free port below the ephemeral range (as session_live.rs picks them): a port the OS handed
-/// out and took back can be handed to another process's outbound connection before the gateway
-/// binds it, which many parallel sessions made happen.
-fn free_port() -> u16 {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-    let _ = NEXT.compare_exchange(
-        0,
-        u64::from(std::process::id())
-            ^ std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos() as u64,
-        Ordering::Relaxed,
-        Ordering::Relaxed,
-    );
-    loop {
-        // splitmix64: consecutive seeds scatter across the range.
-        let mut z = NEXT
-            .fetch_add(1, Ordering::Relaxed)
-            .wrapping_mul(0x9E37_79B9_7F4A_7C15);
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        let port = 20_000 + ((z ^ (z >> 31)) % 12_000) as u16;
-        if TcpListener::bind(("127.0.0.1", port)).is_ok() {
-            return port;
-        }
-    }
-}
-
 struct Gateway {
     _nats: Guard,
     _gw: Guard,
@@ -377,6 +368,15 @@ struct Gateway {
     log: PathBuf,
     dir: PathBuf,
     tmp: PathBuf,
+}
+
+/// Every route here holds one provider, so a session that ended on that provider's retryable
+/// answer (after the client's own retries) proves nothing: the trial is INCONCLUSIVE
+/// (`common::judge`). Checked where the gateway goes away, whichever way the trial ended.
+impl Drop for Gateway {
+    fn drop(&mut self) {
+        common::note_if_ended_unavailable(&usage_rows(&self.log));
+    }
 }
 
 impl Gateway {
@@ -492,6 +492,7 @@ impl Gateway {
     }
 
     fn cleanup(&self) {
+        common::note_if_ended_unavailable(&usage_rows(&self.log));
         if std::env::var_os("VERIFY_LONG_KEEP").is_none() {
             let _ = std::fs::remove_dir_all(&self.dir);
             let _ = std::fs::remove_dir_all(&self.tmp);
@@ -685,6 +686,14 @@ fn cost(t: &Totals, pricing: &Value) -> f64 {
 
 // --- LNG-1 / LNG-2 -------------------------------------------------------------------------------
 
+/// The env var holding a provider's admin key, which reads its usage report.
+fn admin_var(p: Provider) -> &'static str {
+    match p {
+        Provider::OpenAi => "OPENAI_ADMIN_KEY",
+        Provider::Anthropic => "ANTHROPIC_ADMIN_KEY",
+    }
+}
+
 fn long_session(
     claims: &str,
     spec: &str,
@@ -697,24 +706,21 @@ fn long_session(
     // Reconciliation needs the pool key's id: find it before spending on a session.
     let recon = match recon {
         Some(p) => {
-            let (pool_var, admin_var) = match p {
-                Provider::OpenAi => ("OPENAI_API_KEY", "OPENAI_ADMIN_KEY"),
-                Provider::Anthropic => ("ANTHROPIC_API_KEY", "ANTHROPIC_ADMIN_KEY"),
+            let pool_var = match p {
+                Provider::OpenAi => "OPENAI_API_KEY",
+                Provider::Anthropic => "ANTHROPIC_API_KEY",
             };
-            match keys.get(admin_var) {
-                Some(admin) => {
-                    let id = recon::pool_key_id(p, &keys[pool_var], admin)?;
-                    Some((p, admin.clone(), id))
-                }
-                None => None,
-            }
+            let admin = &keys[admin_var(p)];
+            let id = recon::pool_key_id(p, &keys[pool_var], admin)?;
+            Some((p, admin.clone(), id))
         }
         None => None,
     };
     let gw = Gateway::boot(route, keys)?;
-    let start = recon::now_secs() / 60 * 60;
+    // A reconciled session runs with no other live traffic on the host (see recon::Window).
+    let window = recon.is_some().then(recon::Window::open);
     let verdict = gw.client("long", spec, route.model)?;
-    let end = recon::now_secs().div_ceil(60) * 60 + 60;
+    let (start, end) = window.map_or((0, 0), recon::Window::close);
     let detail = &verdict["detail"];
     let calls = verdict["calls"].as_array().cloned().unwrap_or_default();
     let ids: Vec<&str> = calls

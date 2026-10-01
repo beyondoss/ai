@@ -11,6 +11,9 @@ Prints one final line `VERIFY {json}`:
             {input_total, output, cache_read} where input_total includes cached tokens, plus
             optional reasoning / service_tier breakouts; and `expect`, when the call's row is
             not the ordinary one (no row, a refusal, an estimate; see `record`)
+  errors    every answer with status >= 400: request_id, status, the x-beyond-provider that sent
+            it (none when the gateway itself refused), and its retry headers, so the cell can
+            tell a provider that was unavailable from a gateway failure
   detail    free-form evidence for a failing cell
 The Rust cell checks each call against the gateway's ai.usage rows (the second witness).
 """
@@ -28,10 +31,17 @@ MODEL = os.environ["VERIFY_MODEL"]
 
 calls = []
 _ids = []
+# Every error answer, with what the cell's retry policy reads (see live.rs `retryable_failure`).
+errors = []
 
 
 def _hook(resp):
     _ids.append(resp.headers.get("x-beyond-request-id"))
+    if resp.status_code >= 400:
+        h = resp.headers.get
+        errors.append({"request_id": h("x-beyond-request-id"), "status": resp.status_code,
+                       "provider": h("x-beyond-provider"), "retry_after": h("retry-after"),
+                       "retry_after_ms": h("retry-after-ms"), "should_retry": h("x-should-retry")})
 
 
 def http(sdk="openai"):
@@ -287,7 +297,7 @@ def agents_sdk():
 
 
 async def _ahook(resp):
-    _ids.append(resp.headers.get("x-beyond-request-id"))
+    _hook(resp)
 
 
 # --- Endpoint, translation and billing detail -------------------------------------------------
@@ -1561,4 +1571,4 @@ if __name__ == "__main__":
         ok, detail = PROBES[name]()
     except Exception as e:  # noqa: BLE001 - every failure shape is evidence
         ok, detail = False, {"exception": f"{type(e).__name__}: {e}", "trace": traceback.format_exc()[-1500:]}
-    print("VERIFY " + json.dumps({"ok": bool(ok), "calls": calls, "detail": detail}, default=str))
+    print("VERIFY " + json.dumps({"ok": bool(ok), "calls": calls, "errors": errors, "detail": detail}, default=str))

@@ -43,12 +43,12 @@ reason a tagged test may be ignored.
 
 ## Claim status
 
-| Status     | Meaning                                                                       |
-| ---------- | ----------------------------------------------------------------------------- |
-| `PROVEN`   | Every tagged test passed and no linked defect is open.                        |
-| `PARTIAL`  | Hermetic tests pass, but live cells are pending, or some tests didn't run.    |
-| `RED`      | A tagged test fails, or a linked defect is still `suspected` or `reproduced`. |
-| `UNTESTED` | No test carries the id.                                                       |
+| Status     | Meaning                                                                                    |
+| ---------- | ------------------------------------------------------------------------------------------ |
+| `PROVEN`   | Every tagged test passed and no linked defect is open.                                     |
+| `PARTIAL`  | Hermetic tests pass, but live cells are pending or INCONCLUSIVE, or some tests didn't run. |
+| `RED`      | A tagged test fails, or a linked defect is still `suspected` or `reproduced`.              |
+| `UNTESTED` | No test carries the id.                                                                    |
 
 ## Commands
 
@@ -58,6 +58,61 @@ mise run verify:status -- --json  # the same as JSON (feeds the status page)
 mise run verify:gate              # registry/tag/result consistency; non-zero on any problem
 ```
 
+## One live run, one proof
+
+`mise run verify:live` runs in two phases, so that what it reports holds for this tree and
+nothing else:
+
+1. Every tagged test and every live cell except the reconciled ones, concurrently
+   (`verify filter`).
+2. The reconciled live cells, the ones whose claims include BIL-5, after phase 1 has finished
+   (`verify filter --isolated`, nextest profile `verify-isolated`, its own JUnit report). They run
+   side by side; each reconciles its own model, and `long_live.rs` refuses to list two on the same
+   one.
+
+A reconciled cell compares the ledger with a provider's usage report for its key, model and
+minutes, and that report holds every request anyone made there. No model is free of other suites:
+the catalog sweep drives every row. So isolation is in time, not in the choice of model.
+`tests/common/live.rs` enforces it between processes as well, so a cell run some other way (or a
+second worktree's run on the same host) still can't overlap: every live process holds a shared
+`flock` on `$TMPDIR/beyond-verify-live/traffic` while it sends, and a reconciled cell opens its
+window only once it holds `window` and has seen `traffic` free. It then waits for the next whole
+minute (the report's bucket), and holds the window until a minute past its last request, so no
+earlier or later request shares a bucket with it. Live traffic that starts while a window is open
+waits for it to close.
+
+Ports come from `tests/common/live.rs` too. A port is reserved with an exclusive `flock` on
+`$TMPDIR/beyond-verify-ports/<port>` for the life of the test process, then bind-checked, so no two
+live processes on the host are ever handed the same one. A bind check alone races: Pingora binds
+with `SO_REUSEPORT`, so two gateways that picked one port share it silently, and a nats-server
+holding it instead makes the gateway give up.
+
+### Provider unavailable: INCONCLUSIVE
+
+A cell proves the gateway, so a provider that is overloaded at that moment is neither a pass nor
+a gateway failure. The cells retry what the stock OpenAI and Anthropic SDKs retry (408, 409, 429,
+any 5xx, or what `x-should-retry` says), as they do: two retries, waiting out `Retry-After` up to
+two minutes, otherwise 0.5s doubling to at most 8s less up to 25% jitter (openai-python and
+anthropic-sdk-python `_constants.py`). If the last answer is still the provider's own (it names
+itself in `x-beyond-provider` and the ledger row records the same upstream status) on a request no
+other provider could take (a one-provider route, a candidate forced with `x-beyond-only`, a direct
+call), the cell fails with a message that starts `INCONCLUSIVE:`. `verify status` lists those cells
+apart and keeps their claims from `PROVEN` without turning them `RED`; the gate rejects a defect
+whose closing live cell was inconclusive. The cell's other problems stay in the message. An answer
+the gateway made itself stays a failure, as does a relayed one where failover was possible.
+
+| Suite                                          | How a cell retries                                                                                                          |
+| ---------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
+| `live.rs`                                      | The probe's SDK runs with retries off (one HTTP call, one row); the whole cell runs again on a new gateway.                 |
+| `catalog_live.rs`                              | Each request is retried in place.                                                                                           |
+| `parity_live.rs`                               | Each request (direct or through the gateway) is retried in place.                                                           |
+| `tenancy_live.rs`, `reconcile_live.rs`, TOOL-1 | The whole cell runs again (no `Retry-After` to read: the backoff).                                                          |
+| LNG sessions, MCP cases                        | The harness already retried with its own defaults; a session that ended on its provider's retryable answer is INCONCLUSIVE. |
+| `fault_live.rs`, `session_live.rs`             | Not applied: their providers fail on purpose (injected faults, killed upstreams), so a relayed failure is the subject.      |
+
+A cell that is INCONCLUSIVE on every run is worth a look: a provider 500 can be its deterministic
+answer to a request shape the gateway produced.
+
 ## Billing reconciliation (BIL-5)
 
 `crates/verify/tests/reconcile_live.rs` checks the ledger against the providers' own books. Each
@@ -66,7 +121,8 @@ that provider's pool key, sends a fixed batch through it (non-stream and stream,
 pairing, a ~3k-token system prompt reused so cache writes and reads occur, and Responses on
 OpenAI), and sums the batch's `ai.usage` rows, normalized by `usage_wire`. It then reads the
 provider's organization usage report for the same minutes, filtered to the pool key's id and the
-batch's model (`gpt-4.1-nano`, `claude-sonnet-4-5`, which the other live suites don't use). It
+batch's model (`gpt-4.1-nano`, `claude-sonnet-4-5`). It runs in verify:live's isolated phase (see
+[One live run, one proof](#one-live-run-one-proof)), so no other request is in those minutes. It
 passes only when uncached input, cache reads, cache writes and output agree exactly (and the request
 count, where OpenAI reports one). So it proves that every token the provider charged our key for is
 in a billing row, and that no row bills a token the provider didn't charge.
@@ -221,7 +277,10 @@ billed for a refusal, and no row without a call.
   down so auto-compaction happens mid-session. The trial checks that the repo's tests pass, that
   compaction shows in both the harness's events and on the wire, and that the ledger is complete.
   Two sessions reconcile against the provider's usage report (the BIL-5 method): pi on
-  `claude-sonnet-5` and Claude Code (translated) on `gpt-5`.
+  `claude-sonnet-5` and Claude Code (translated) on `gpt-5`. Where the provider's admin key is
+  set they claim BIL-5 too (`LNG-1+BIL-5::claude-code::gpt-5::long_task_uncompacted`,
+  `LNG-1+LNG-2+BIL-5::pi::claude-sonnet-5::long_task_messages`), which runs them in verify:live's
+  isolated phase.
 - LNG-2: the per-turn cache share (`cache_read / input_total`) over the same sessions, plus
   opencode, must clear a floor after warm-up. The floor and how it was chosen are in the file's
   doc comment.

@@ -8,10 +8,15 @@
 //!   defect with `/// defect: ID`. Results come from nextest's JUnit report.
 //!
 //! ```text
-//! verify filter                       nextest filter expression for every tagged test
-//! verify status [--junit P] [--json]  per-claim status and the summary
-//! verify gate   [--junit P]           fail on any registry/tag/result inconsistency
+//! verify filter [--isolated]          nextest filter expression for every tagged test; live
+//!                                     reconciled cells only with --isolated, all but them without
+//! verify status [--junit P]… [--json] per-claim status and the summary (reports merged)
+//! verify gate   [--junit P]…          fail on any registry/tag/result inconsistency
 //! ```
+//!
+//! A live cell whose failure message starts `INCONCLUSIVE: ` proved nothing either way (its
+//! provider stayed unavailable through the SDKs' retry budget): it keeps its claims from PROVEN
+//! without turning them RED.
 //!
 //! A test tagged with a `reproduced` defect asserts the *correct* behavior, is `#[ignore]`d so the
 //! normal suite stays green, and must fail when run. When it starts passing, the gate stops until
@@ -75,12 +80,19 @@ struct Tagged {
 /// `(nextest binary id, test name) → outcome`.
 type Results = BTreeMap<(String, String), Outcome>;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 enum Outcome {
     Passed,
     Failed,
     Skipped,
+    /// A live cell that could prove nothing either way, with why: its provider stayed
+    /// unavailable through the SDKs' retry budget, or its reconciliation couldn't be isolated.
+    /// Not proven, and not a failure of the gateway.
+    Inconclusive(String),
 }
+
+/// How a live cell's failure message starts when it is INCONCLUSIVE (`tests/common/live.rs`).
+const INCONCLUSIVE: &str = "INCONCLUSIVE: ";
 
 const STATES: [&str; 5] = ["suspected", "reproduced", "fixed", "refuted", "accepted"];
 
@@ -89,7 +101,8 @@ fn main() -> ExitCode {
     let root = repo_root();
     let result = match args.first().map(String::as_str) {
         Some("filter") => load(&root).map(|ctx| {
-            println!("{}", filter_expr(&ctx.tagged));
+            let isolated = args.iter().any(|a| a == "--isolated");
+            println!("{}", filter_expr(&ctx.tagged, isolated));
             true
         }),
         Some("status") => load(&root).map(|ctx| status(&ctx, &args, &root)),
@@ -262,22 +275,45 @@ fn fn_name(line: &str) -> Option<String> {
     (end > 0).then(|| rest[..end].to_owned())
 }
 
-/// A nextest filterset selecting exactly the tagged tests.
-fn filter_expr(tagged: &[Tagged]) -> String {
+/// A nextest filterset selecting exactly the tagged tests, in two phases: everything but the
+/// reconciled live cells (the default), then those alone (`isolated`).
+///
+/// A reconciled cell (one claiming BIL-5) compares the ledger with a provider's usage report for
+/// its key, model and minutes, which holds every request anyone made there. The catalog sweep
+/// drives every row, so no model is free of other suites' traffic; the cells run after everything
+/// else instead, side by side (each on its own model). `tests/common/live.rs` enforces the same
+/// separation between processes, so a cell run any other way still waits for a quiet host.
+fn filter_expr(tagged: &[Tagged], isolated: bool) -> String {
+    // Live cells are listed only under VERIFY_LIVE=1 (they spend money), so they join the run only
+    // then.
+    let live = std::env::var("VERIFY_LIVE").as_deref() == Ok("1");
+    let live_cells = LIVE_BINARIES
+        .iter()
+        .map(|b| format!("binary_id({b})"))
+        .collect::<Vec<_>>()
+        .join(" | ");
+    if isolated {
+        return if live {
+            format!("({live_cells}) & {RECONCILED}")
+        } else {
+            "none()".to_owned()
+        };
+    }
     let mut parts: Vec<String> = tagged
         .iter()
         .map(|t| format!("(binary_id({}) & test(/(^|::){}$/))", t.binary, t.name))
         .collect();
-    // Live cells are listed only under VERIFY_LIVE=1 (they spend money), so they join the run only
-    // then.
-    if std::env::var("VERIFY_LIVE").as_deref() == Ok("1") {
-        parts.extend(LIVE_BINARIES.iter().map(|b| format!("binary_id({b})")));
+    if live {
+        parts.push(format!("(({live_cells}) & not {RECONCILED})"));
     }
     if parts.is_empty() {
         return "none()".to_owned();
     }
     parts.join(" | ")
 }
+
+/// Live cells whose claims (the name's first `::` segment) include BIL-5.
+const RECONCILED: &str = r"test(/^([^:]*\+)?BIL-5(\+[^:]*)?::/)";
 
 /// The nextest binaries holding live cells: real clients (`crates/verify/tests/live.rs`), billing
 /// reconciliation against the providers' usage reports (`tests/reconcile_live.rs`), differential
@@ -303,7 +339,7 @@ struct LiveCell<'a> {
     claims: Vec<&'a str>,
     client: &'a str,
     name: &'a str,
-    outcome: Outcome,
+    outcome: &'a Outcome,
 }
 
 fn live_cells(results: &Results) -> Vec<LiveCell<'_>> {
@@ -318,7 +354,7 @@ fn live_cells(results: &Results) -> Vec<LiveCell<'_>> {
                 claims,
                 client,
                 name,
-                outcome: *outcome,
+                outcome,
             })
         })
         .collect()
@@ -341,7 +377,9 @@ fn parse_junit(xml: &str) -> Results {
         };
         let body = &rest[head_end..body_end];
         let outcome = if body.contains("<failure") || body.contains("<error") {
-            Outcome::Failed
+            attr(head, "name")
+                .and_then(|name| inconclusive_reason(&unescape(body), &unescape(&name)))
+                .map_or(Outcome::Failed, Outcome::Inconclusive)
         } else if body.contains("<skipped") {
             Outcome::Skipped
         } else {
@@ -353,6 +391,16 @@ fn parse_junit(xml: &str) -> Results {
         rest = &rest[body_end.max(1)..];
     }
     out
+}
+
+/// A failed test is INCONCLUSIVE when its failure message (the line after libtest's
+/// `---- NAME ----` header in its captured output) starts with [`INCONCLUSIVE`]; the rest of that
+/// line says why.
+fn inconclusive_reason(output: &str, name: &str) -> Option<String> {
+    let header = format!("---- {name} ----\n");
+    let after = &output[output.find(&header)? + header.len()..];
+    let why = after.strip_prefix(INCONCLUSIVE)?;
+    Some(why.lines().next().unwrap_or("").trim().to_owned())
 }
 
 fn attr(head: &str, key: &str) -> Option<String> {
@@ -377,23 +425,26 @@ fn outcome_of(t: &Tagged, results: &Results) -> Option<Outcome> {
         .find(|((class, name), _)| {
             class == &t.binary && (name == &t.name || name.ends_with(&suffix))
         })
-        .map(|(_, o)| *o)
+        .map(|(_, o)| o.clone())
 }
 
+/// Every `--junit PATH` merged: `verify:live` runs in two phases, each with its own report.
 fn junit_arg(args: &[String], root: &Path) -> Result<Option<Results>, String> {
-    let Some(i) = args.iter().position(|a| a == "--junit") else {
-        return Ok(None);
-    };
-    let path = args.get(i + 1).ok_or("--junit needs a path")?;
-    let p = if Path::new(path).is_absolute() {
-        PathBuf::from(path)
-    } else {
-        root.join(path)
-    };
-    match std::fs::read_to_string(&p) {
-        Ok(xml) => Ok(Some(parse_junit(&xml))),
-        Err(e) => Err(format!("reading {}: {e}", p.display())),
+    let mut merged: Option<Results> = None;
+    let mut rest = args;
+    while let Some(i) = rest.iter().position(|a| a == "--junit") {
+        let path = rest.get(i + 1).ok_or("--junit needs a path")?;
+        let p = if Path::new(path).is_absolute() {
+            PathBuf::from(path)
+        } else {
+            root.join(path)
+        };
+        let xml =
+            std::fs::read_to_string(&p).map_err(|e| format!("reading {}: {e}", p.display()))?;
+        merged.get_or_insert_default().extend(parse_junit(&xml));
+        rest = &rest[i + 2..];
     }
+    Ok(merged)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -451,7 +502,7 @@ fn claim_statuses<'a>(ctx: &'a Ctx, results: Option<&Results>) -> Vec<ClaimStatu
                 (Status::Red, format!("open defects: {}", open.join(", ")))
             } else if tests.is_empty() && live.is_empty() {
                 (Status::Untested, "no test carries this id".to_owned())
-            } else if let Some(bad) = live.iter().find(|cell| cell.outcome == Outcome::Failed) {
+            } else if let Some(bad) = live.iter().find(|cell| *cell.outcome == Outcome::Failed) {
                 (Status::Red, format!("live cell failing: {}", bad.name))
             } else if needs_hermetic && tests.is_empty() {
                 (
@@ -466,11 +517,22 @@ fn claim_statuses<'a>(ctx: &'a Ctx, results: Option<&Results>) -> Vec<ClaimStatu
                     match results.and_then(|r| outcome_of(t, r)) {
                         Some(Outcome::Passed) => {}
                         Some(Outcome::Failed) => failed.push(t.name.as_str()),
-                        Some(Outcome::Skipped) | None => unrun.push(t.name.as_str()),
+                        Some(Outcome::Skipped | Outcome::Inconclusive(_)) | None => {
+                            unrun.push(t.name.as_str());
+                        }
                     }
                 }
+                let inconclusive = live.iter().find_map(|cell| match cell.outcome {
+                    Outcome::Inconclusive(why) => Some((cell.name, why)),
+                    _ => None,
+                });
                 if !failed.is_empty() {
                     (Status::Red, format!("failing: {}", failed.join(", ")))
+                } else if let Some((cell, why)) = inconclusive {
+                    (
+                        Status::Partial,
+                        format!("live cell INCONCLUSIVE: {cell} ({why})"),
+                    )
                 } else if !unrun.is_empty() {
                     (Status::Partial, format!("not run: {}", unrun.join(", ")))
                 } else if needs_live {
@@ -478,7 +540,7 @@ fn claim_statuses<'a>(ctx: &'a Ctx, results: Option<&Results>) -> Vec<ClaimStatu
                     // clients needs at least one.
                     let passed: Vec<&str> = live
                         .iter()
-                        .filter(|cell| cell.outcome == Outcome::Passed)
+                        .filter(|cell| *cell.outcome == Outcome::Passed)
                         .map(|cell| cell.client)
                         .collect();
                     let missing: Vec<&str> = c
@@ -527,6 +589,17 @@ fn status(ctx: &Ctx, args: &[String], root: &Path) -> bool {
         }
     };
     let rows = claim_statuses(ctx, results.as_ref());
+    // Live cells that proved nothing either way: not passes, not gateway failures.
+    let inconclusive: Vec<(&str, &str)> = results
+        .as_ref()
+        .map(live_cells)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|cell| match cell.outcome {
+            Outcome::Inconclusive(why) => Some((cell.name, why.as_str())),
+            _ => None,
+        })
+        .collect();
     if args.iter().any(|a| a == "--json") {
         let claims: Vec<serde_json::Value> = rows
             .iter()
@@ -550,7 +623,12 @@ fn status(ctx: &Ctx, args: &[String], root: &Path) -> bool {
             .collect();
         println!(
             "{}",
-            serde_json::json!({"commit": head_commit(root), "claims": claims, "defects": defects})
+            serde_json::json!({
+                "commit": head_commit(root), "claims": claims, "defects": defects,
+                "inconclusive": inconclusive.iter()
+                    .map(|(cell, why)| serde_json::json!({"cell": cell, "why": why}))
+                    .collect::<Vec<_>>(),
+            })
         );
         return true;
     }
@@ -600,6 +678,16 @@ fn status(ctx: &Ctx, args: &[String], root: &Path) -> bool {
         state("accepted")
     );
     let _ = writeln!(out, "P0 not proven ({}): {}", p0.len(), p0.join(" "));
+    if !inconclusive.is_empty() {
+        let _ = writeln!(
+            out,
+            "live cells INCONCLUSIVE ({}), not proven; re-run them:",
+            inconclusive.len()
+        );
+        for (cell, why) in &inconclusive {
+            let _ = writeln!(out, "  {cell} — {why}");
+        }
+    }
     if results.is_none() {
         let _ = writeln!(
             out,
@@ -731,9 +819,13 @@ fn gate(ctx: &Ctx, args: &[String], root: &Path) -> bool {
                 let outcome = LIVE_BINARIES
                     .iter()
                     .find_map(|b| r.get(&((*b).to_owned(), cell.to_owned())))
-                    .copied();
+                    .cloned();
                 match outcome {
                     Some(Outcome::Passed) => {}
+                    Some(Outcome::Inconclusive(why)) => errors.push(format!(
+                        "{}: live cell `{cell}` was INCONCLUSIVE ({why}), so it proves nothing; re-run it",
+                        d.id
+                    )),
                     Some(Outcome::Failed) => errors.push(format!(
                         "{}: live cell `{cell}` fails but the defect is {}",
                         d.id, d.state
@@ -882,8 +974,24 @@ mod tests {
 <testcase name="a_test" classname="pkg::t" time="0.1"><failure message="x"/></testcase>
 <testcase name="m::tests::b" classname="pkg" time="0.1"/>
 <testcase name="c" classname="pkg::t" time="0"><skipped/></testcase>
+<testcase name="E1::py::x::p" classname="pkg::live" time="1"><failure type="exit 101"/><system-out>
+---- E1::py::x::p ----
+INCONCLUSIVE: provider x answered 503 &apos;Overloaded&apos; on all 3 attempts
+client verdict failed
+</system-out></testcase>
+<testcase name="E1::py::y::p" classname="pkg::live" time="1"><failure type="exit 101"/><system-out>
+---- E1::py::y::p ----
+client verdict failed: INCONCLUSIVE: quoted, not leading
+</system-out></testcase>
 </testsuite></testsuites>"#;
         let r = parse_junit(xml);
+        assert!(
+            r[&("pkg::live".into(), "E1::py::x::p".into())]
+                == Outcome::Inconclusive(
+                    "provider x answered 503 'Overloaded' on all 3 attempts".into()
+                )
+        );
+        assert!(r[&("pkg::live".into(), "E1::py::y::p".into())] == Outcome::Failed);
         assert!(r[&("pkg::t".into(), "a_test".into())] == Outcome::Failed);
         assert!(r[&("pkg".into(), "m::tests::b".into())] == Outcome::Passed);
         assert!(r[&("pkg::t".into(), "c".into())] == Outcome::Skipped);
