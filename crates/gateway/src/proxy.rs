@@ -358,6 +358,11 @@ struct ModelRouting {
     /// The ranker chose this walk with no `order` / `split` / `only` from the caller, so the
     /// candidate that serves may be pinned for the caller's next requests (see `smart`).
     pinnable: bool,
+    /// A provider endpoint under the parent one (`count_tokens`, `compact`): its suffix is appended
+    /// to the serving candidate's path. It never feeds the TTFT ranker (a token count answers in a
+    /// fraction of a generation's time and would skew the walk), and a free one writes no billing
+    /// row.
+    sub: Option<route::SubResource>,
     /// Walk slot of the candidate currently being attempted. Maps through [`Self::walk`] onto
     /// [`Self::arms`].
     candidate: u8,
@@ -1081,8 +1086,9 @@ fn record_walk_ttft(state: &GatewayState, rc: &RequestCtx, ok: bool) {
         return;
     };
     // Responses arms share a ModelRoute with Chat Completions candidates; writing TTFT into
-    // overlapping catalog indices would rerank the Chat Completions walk. Skip.
-    if !std::ptr::eq(auto.arms, auto.route.candidates) {
+    // overlapping catalog indices would rerank the Chat Completions walk. Skip. A sub-resource
+    // (a token count) answers far faster than a generation and would skew it too.
+    if !std::ptr::eq(auto.arms, auto.route.candidates) || auto.sub.is_some() {
         return;
     }
     let Some(orig) = auto.walk.catalog_index(auto.candidate) else {
@@ -2152,6 +2158,8 @@ impl ProxyHttp for AiProxy {
             }
             None => None,
         };
+        // `/v1/messages/count_tokens`, `/v1/responses/compact`, … (see `route::SubResource`).
+        let sub = model_route.and(route::SubResource::of_path(session.req_header().uri.path()));
         let (provider, usable) = match model_route {
             None => {
                 // Provider-routed, or BYO `/v1` dialect default. Headerless `/auto` always set
@@ -2199,12 +2207,21 @@ impl ProxyHttp for AiProxy {
                 // would name a field the caller may never have set: it walks its candidates and the
                 // wire check below rejects the endpoint, which is what is actually wrong.
                 let embeddings_row = route::Endpoint::of_row(row) == route::Endpoint::Embeddings;
-                let arms: &'static [route::Candidate] =
-                    if inbound_responses && session_field.is_some() && !embeddings_row {
+                // A sub-resource walks the arms that hold its provider's parent endpoint: OpenAI's
+                // `/v1/responses` sits in a GPT row's Responses arm, or first in a Responses-first
+                // row's candidates.
+                let arms: &'static [route::Candidate] = match sub {
+                    Some(route::SubResource::InputTokens | route::SubResource::Compact)
+                        if !row.responses.is_empty() =>
+                    {
                         row.responses
-                    } else {
-                        row.candidates
-                    };
+                    }
+                    Some(_) => row.candidates,
+                    None if inbound_responses && session_field.is_some() && !embeddings_row => {
+                        row.responses
+                    }
+                    None => row.candidates,
+                };
                 if inbound_responses
                     && let Some(field) = session_field
                     && arms.is_empty()
@@ -2235,6 +2252,7 @@ impl ProxyHttp for AiProxy {
                     |c| c.catalog_walk(arms, request_seq),
                 );
                 if self.state.config.smart_router
+                    && sub.is_none()
                     && std::ptr::eq(arms, row.candidates)
                     && !parsed_control
                         .as_ref()
@@ -2280,9 +2298,28 @@ impl ProxyHttp for AiProxy {
                     let failed = full_body
                         .as_ref()
                         .is_some_and(|fb| fb.skip & (1 << orig) != 0);
-                    if keyed && !failed {
+                    let serves = sub.is_none_or(|sub| sub.serves(c));
+                    if keyed && !failed && serves {
                         usable |= 1 << i;
                     }
+                }
+                if let Some(sub) = sub
+                    && !arms.iter().any(|c| sub.serves(c))
+                {
+                    self.state.metrics.rejection(Rejection::WireMismatch).inc();
+                    return Self::reject_message_boxed(
+                        session,
+                        &request_id,
+                        400,
+                        "invalid_request_error",
+                        format!(
+                            "{} has no {} upstream for {}",
+                            row.model,
+                            sub.provider_name(),
+                            session.req_header().uri.path()
+                        ),
+                    )
+                    .await;
                 }
                 let Some(first) = first_usable(usable, 0) else {
                     // Every remaining candidate is unkeyed. Distinct from `circuit_open`, which
@@ -2328,7 +2365,8 @@ impl ProxyHttp for AiProxy {
         // (or 400'd) — same-endpoint is a byte relay (`from == to`). `/{provider}/…` never
         // reaches this — it has no row.
         let mut translate_state = None;
-        if let Some(row) = model_route {
+        // A sub-resource is its provider's own API: no wire check, no translation.
+        if let Some(row) = model_route.filter(|_| sub.is_none()) {
             let path = session.req_header().uri.path();
             let row_endpoint = route::Endpoint::of_row(row);
             match route::catalog_wire_action(path, row_endpoint) {
@@ -2466,6 +2504,7 @@ impl ProxyHttp for AiProxy {
                         Box::new(ModelRouting {
                             route,
                             pinnable,
+                            sub,
                             candidate: first_usable(usable, 0).unwrap_or(0),
                             usable,
                             walk,
@@ -2618,6 +2657,7 @@ impl ProxyHttp for AiProxy {
                 Box::new(ModelRouting {
                     route,
                     pinnable,
+                    sub,
                     // `first_usable` picked this candidate above; `upstream_peer` re-derives it from
                     // here on.
                     candidate: first_usable(usable, 0).unwrap_or(0),
@@ -2779,6 +2819,11 @@ impl ProxyHttp for AiProxy {
                             a.attempt_start = Instant::now();
                         }
                         rc.set_forward_path(candidate.path);
+                        if let Some(sub) = rc.auto.as_ref().and_then(|a| a.sub)
+                            && let Some(path) = rc.forward_path.as_mut()
+                        {
+                            path.push_str(sub.suffix());
+                        }
                         return Ok(Box::new(self.build_peer(addr, &p)));
                     }
                     Err(e) => {
@@ -3758,6 +3803,13 @@ impl ProxyHttp for AiProxy {
         if usage_estimated {
             self.state.metrics.usage_estimated_total.inc();
         }
+        // A free sub-resource (a token count) is not a billable call: it carries no usage block,
+        // writes no billing row, and is not a usage-shape regression.
+        let free = rc
+            .auto
+            .as_ref()
+            .and_then(|a| a.sub)
+            .is_some_and(|sub| !sub.billed());
         // A managed 2xx response is *expected* to carry usage; `None` there means the provider's
         // usage block changed shape (a new API version, a wire change) and we're about to emit a
         // zero-token billing row that looks exactly like a (non-existent) legitimate zero-token
@@ -3769,6 +3821,7 @@ impl ProxyHttp for AiProxy {
         // it is now billed an estimate, so it still counts here; one cut short by an error does not.
         if (parsed.is_none() || (usage_estimated && e.is_none()))
             && rc.managed
+            && !free
             && cache_hit.is_none()
             && let Some(s) = rc.upstream_status
             && (200..300).contains(&s)
@@ -3821,7 +3874,7 @@ impl ProxyHttp for AiProxy {
         // the Prometheus metrics above, which is the right tool for non-billing observability.
         // An abandoned `FullBody` attempt is not the request the client got: the attempt that
         // serves writes the one row (and the one capture).
-        if rc.managed && !rc.relay_abandoned {
+        if rc.managed && !rc.relay_abandoned && !free {
             // Emit BOTH models. `model` is the one the *provider* resolved + billed (echoed in its
             // response) — the key for pricing AND for reconciling against the provider's invoice,
             // which itemizes by the pinned snapshot. `requested_model` is the alias the client sent —
