@@ -1522,6 +1522,25 @@ fn bare_default_provider_name(path: &str) -> Option<&'static str> {
 /// disabled injection for all managed Azure streams: no `stream_options.include_usage`, therefore no
 /// usage chunk from OpenAI, therefore a zero-token billing row. The caller computes this in
 /// `request_filter` *before* appending the query for exactly that reason.
+/// The `/{provider}/…` endpoints a managed key may reach: the metered generation calls and their
+/// token-count / compact sub-resources, matched by suffix so every provider's mount prefix
+/// (`/api/v1`, `/openai/v1`, `/inference/v1`, `/anthropic/v1`, `/backend-api/codex`) works.
+/// Everything else on a provider (files, batches, stored responses, fine-tuning, models) is refused
+/// for managed keys. `path` must not carry the query string.
+fn is_managed_provider_endpoint(path: &str) -> bool {
+    const ALLOWED: [&str; 7] = [
+        "/chat/completions",
+        "/messages",
+        "/responses",
+        "/embeddings",
+        "/messages/count_tokens",
+        "/responses/input_tokens",
+        "/responses/compact",
+    ];
+    let path = path.strip_suffix('/').unwrap_or(path);
+    ALLOWED.iter().any(|suffix| path.ends_with(suffix))
+}
+
 fn is_streamable_path(forward_path: &str) -> bool {
     forward_path.ends_with("/chat/completions")
 }
@@ -1754,6 +1773,8 @@ impl ProxyHttp for AiProxy {
         let resolve_from_body: bool;
         // BYO is 400 — the `/auto` path, with or without a routing header.
         let managed_only: bool;
+        // Checked against the managed endpoint allowlist once the key is known to be managed.
+        let provider_route = matches!(routed, Routed::Provider { .. });
         match routed {
             Routed::Provider {
                 provider: p,
@@ -2030,6 +2051,43 @@ impl ProxyHttp for AiProxy {
         // a missing-model 404, and so BYO keys can discover names before they hold a managed one.
         if is_v1_models_list(session) {
             return Self::reply_models_list_boxed(session, &request_id).await;
+        }
+
+        // A managed key spends Beyond's shared pool key, so it reaches only metered generation
+        // calls: POST, and on `/{provider}/…` only a generation endpoint. Anything else (listing or
+        // reading stored files and responses, batches, fine-tuning, a GET relayed to a generation
+        // path) would let one tenant reach another's data on the shared key and run unmetered.
+        // BYO keys are the caller's own and pass through untouched.
+        if managed && full_body.is_none() {
+            let req = session.req_header();
+            let method_ok = req.method == http::Method::POST;
+            let endpoint_ok = !provider_route
+                || forward_path
+                    .as_deref()
+                    .map(|p| p.split_once('?').map_or(p, |(path, _)| path))
+                    .is_some_and(is_managed_provider_endpoint);
+            if !(method_ok && endpoint_ok) {
+                let msg = format!(
+                    "{} {} is not available with a managed key; managed keys reach POST generation endpoints only (chat/completions, messages, responses, embeddings, count_tokens)",
+                    req.method,
+                    clip_catalog_name(req.uri.path()),
+                );
+                // An endpoint outside the allowlist is 404 whatever the method; a wrong method on an
+                // allowed endpoint (or any catalog path) is 405.
+                let status = if endpoint_ok { 405 } else { 404 };
+                self.state
+                    .metrics
+                    .rejection(Rejection::ManagedEndpoint)
+                    .inc();
+                return Self::reject_message_boxed(
+                    session,
+                    &request_id,
+                    status,
+                    "invalid_request_error",
+                    msg,
+                )
+                .await;
+            }
         }
 
         let mut body_complete: Option<Vec<u8>> = None;

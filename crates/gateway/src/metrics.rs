@@ -63,12 +63,17 @@ pub enum Rejection {
     /// A translated response outgrew `translate::MAX_TRANSLATE_BUFFER` (a non-streaming body, or one
     /// unterminated SSE event) and was aborted mid-relay.
     ResponseTooLarge,
+    /// A managed key asked for something other than a metered generation call: a method other
+    /// than POST on a catalog path, or a `/{provider}/…` endpoint outside the generation allowlist
+    /// (files, batches, stored responses, fine-tuning, …). Those would run on the shared pool key,
+    /// where one tenant could reach another's stored data and the spend is unmetered.
+    ManagedEndpoint,
 }
 
 impl Rejection {
     /// Every variant, in `as_index` order. The array in `Metrics` is built from this, so adding a
     /// variant without adding it here fails the exhaustive `match` in `as_index`.
-    pub(crate) const ALL: [Rejection; 16] = [
+    pub(crate) const ALL: [Rejection; 17] = [
         Rejection::Auth,
         Rejection::DenySpend,
         Rejection::DenyFraud,
@@ -85,6 +90,7 @@ impl Rejection {
         Rejection::AllowanceUnavailable,
         Rejection::TenantConcurrency,
         Rejection::ResponseTooLarge,
+        Rejection::ManagedEndpoint,
     ];
 
     /// The `reason=` label value. `RateLimit` keeps the original `"rate_limit"` string so existing
@@ -107,6 +113,7 @@ impl Rejection {
             Rejection::AllowanceUnavailable => "allowance_unavailable",
             Rejection::TenantConcurrency => "tenant_concurrency",
             Rejection::ResponseTooLarge => "response_too_large",
+            Rejection::ManagedEndpoint => "managed_endpoint",
         }
     }
 
@@ -128,6 +135,7 @@ impl Rejection {
             Rejection::AllowanceUnavailable => 13,
             Rejection::TenantConcurrency => 14,
             Rejection::ResponseTooLarge => 15,
+            Rejection::ManagedEndpoint => 16,
         }
     }
 }
