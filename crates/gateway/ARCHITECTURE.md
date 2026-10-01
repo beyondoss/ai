@@ -1989,6 +1989,15 @@ before the RST arrives), and the peer's TCP ACKs cannot tell the idle-close race
 request the application then closes on unread) from a request that was read. Each resend takes another
 connection, and is resent again only if that one fails the same way, within pingora's retry limit.
 
+**Upstream H2 is multiplexed.** A provider that negotiates `h2` carries up to 100 concurrent
+streams on one connection (`UPSTREAM_H2_MAX_STREAMS`, lowered by the provider's
+`SETTINGS_MAX_CONCURRENT_STREAMS`), and a full connection makes the next request open another.
+Pingora's default is one stream per connection, which opened a TLS connection per concurrent
+request (D160). Requests that arrive together, before the open connection is back in pingora's pool
+as one with room, can each still open their own (a burst of 32 opened 0-10, measured). A connection
+that dies takes every stream on it: a refused one is resent (below), the rest fail like any
+delivered request whose connection died.
+
 **A stream the provider refused is not delivered.** An upstream HTTP/2 stream refused with
 `RST_STREAM(REFUSED_STREAM)` (RFC 9113 §8.7), or left above a GOAWAY's `last_stream_id` (§6.8), is
 the provider's guarantee that it processed none of the request, so `error_while_proxy` resends it

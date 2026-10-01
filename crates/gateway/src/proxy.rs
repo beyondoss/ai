@@ -213,6 +213,11 @@ const USAGE_HEAD_CAP: usize = 8 * 1024;
 /// failover, and not a breaker failure.
 const MAX_CONNECT_RETRIES: u8 = 2;
 
+/// Concurrent streams the gateway opens on one upstream H2 connection before it opens another
+/// (D160). 100 is the least RFC 9113 §6.5.2 recommends a server allow; a provider whose
+/// `SETTINGS_MAX_CONCURRENT_STREAMS` is lower lowers it (pingora takes the smaller).
+const UPSTREAM_H2_MAX_STREAMS: usize = 100;
+
 pub struct AiProxy {
     /// The gateway state, which lives as long as the process: a `&'static` borrow, so a request
     /// context holds it without an `Arc` clone (a shared-cache-line RMW pair on every request,
@@ -1103,6 +1108,11 @@ impl AiProxy {
         } else {
             ALPN::H1
         };
+        // Pingora allows one stream per upstream H2 connection unless told otherwise, which made
+        // every concurrent request open its own TLS connection: H2 without the multiplexing (D160).
+        // The provider's own SETTINGS_MAX_CONCURRENT_STREAMS still caps this (pingora takes the
+        // lower), and a full connection makes the next request open another.
+        peer.options.max_h2_streams = UPSTREAM_H2_MAX_STREAMS;
         // Cert verification is on everywhere except the bench's self-signed TLS mock (see config).
         if !self.state.config.upstream_verify_cert {
             peer.options.verify_cert = false;

@@ -1249,6 +1249,111 @@ async fn upstream_h2_multiplexes_concurrent_requests() {
     );
 }
 
+/// A TLS H2-only upstream that answers every request after `delay`, and counts the connections it
+/// accepted.
+async fn counting_h2_upstream(
+    delay: Duration,
+) -> (u16, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+    use http_body_util::{BodyExt, Full};
+    use hyper::service::service_fn;
+    use hyper_util::rt::{TokioExecutor, TokioIo};
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let ck = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string()]).unwrap();
+    let key = rustls::pki_types::PrivateKeyDer::Pkcs8(ck.key_pair.serialize_der().into());
+    let mut tls = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(vec![ck.cert.der().clone()], key)
+        .unwrap();
+    tls.alpn_protocols = vec![b"h2".to_vec()];
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls));
+    let conns = Arc::new(AtomicUsize::new(0));
+    let counter = conns.clone();
+    let task = tokio::spawn(async move {
+        while let Ok((s, _)) = listener.accept().await {
+            counter.fetch_add(1, Ordering::SeqCst);
+            let acceptor = acceptor.clone();
+            tokio::spawn(async move {
+                let Ok(tls) = acceptor.accept(s).await else {
+                    return;
+                };
+                let svc = service_fn(
+                    move |req: hyper::Request<hyper::body::Incoming>| async move {
+                        let _ = req.into_body().collect().await;
+                        tokio::time::sleep(delay).await;
+                        Ok::<_, std::convert::Infallible>(
+                            hyper::Response::builder()
+                                .header("content-type", "application/json")
+                                .body(Full::new(Bytes::from_static(OK_JSON.as_bytes())))
+                                .unwrap(),
+                        )
+                    },
+                );
+                let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+                    .serve_connection(TokioIo::new(tls), svc)
+                    .await;
+            });
+        }
+    });
+    (port, conns, task)
+}
+
+/// Concurrent requests to an H2 provider share connections instead of opening one each. Pingora
+/// allows one stream per upstream H2 connection unless told otherwise, so 32 concurrent requests
+/// opened 32 TLS connections to the provider: no multiplexing at all (D160, found live against
+/// OpenAI and Anthropic by `REL-22::raw::*::h2_burst`).
+/// claim: REL-22
+/// defect: D160
+#[tokio::test]
+async fn concurrent_requests_share_an_upstream_h2_connection() {
+    let (port, conns, task) = counting_h2_upstream(Duration::from_millis(400)).await;
+    let (pubkey, sk) = test_keypair(224);
+    let gw = Gateway::builder(
+        unused_nats_port(),
+        &format!("127.0.0.1:{port}"),
+        &b64(&pubkey),
+    )
+    .providers(&["openai"])
+    .tls_upstream()
+    .upstream_http2(true)
+    .start()
+    .await;
+    let key = billing_vkey(&sk, 2204);
+    let path = "/openai/v1/chat/completions";
+    // One request first: the steady state, where a connection to the provider is already open.
+    assert_eq!(status_of(&gw, path, &key, CHAT).await, 200);
+    let before = conns.load(Ordering::SeqCst);
+    let mut tasks = Vec::new();
+    for _ in 0..32 {
+        let (url, key) = (gw.url(), key.clone());
+        tasks.push(tokio::spawn(async move {
+            test_client()
+                .post(format!("{url}{path}"))
+                .header("authorization", format!("Bearer {key}"))
+                .header("content-type", "application/json")
+                .body(CHAT)
+                .send()
+                .await
+                .map(|r| r.status().as_u16())
+                .unwrap_or(0)
+        }));
+    }
+    let mut statuses = Vec::new();
+    for t in tasks {
+        statuses.push(t.await.unwrap());
+    }
+    let opened = conns.load(Ordering::SeqCst) - before;
+    task.abort();
+    assert!(statuses.iter().all(|s| *s == 200), "{statuses:?}");
+    // Requests that arrive together, before the open connection is back in pingora's pool as one
+    // with room, each open their own (measured: 0-10 of 32), so this bounds sharing, not a count.
+    assert!(
+        opened <= 16,
+        "32 concurrent requests opened {opened} new upstream H2 connections (plus {before} before)"
+    );
+}
+
 /// A TLS H2 upstream that sends GOAWAY (graceful) on every connection right after its first
 /// request — what a provider's load balancer does when it drains a node.
 async fn goaway_upstream() -> (u16, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
@@ -1696,4 +1801,83 @@ async fn upstream_goaway_is_handled() {
         "concurrent requests across GOAWAYs: {statuses:?}"
     );
     assert!(served.load(Ordering::SeqCst) >= 26);
+}
+
+// --- memory under sustained load -----------------------------------------------------------------
+
+/// RSS plateaus under sustained load and large bodies. Ten rounds of the same mixed traffic, 16
+/// requests at a time: non-streaming Chat, Chat with a 512 KiB body, and Chat streamed from a Claude
+/// row (translated from Anthropic SSE). Memory may grow while allocator arenas, connection pools
+/// and caches warm up (the first three rounds), but after that more of the same work may not cost
+/// more: RSS after the last round is within 10% + 8 MiB of RSS after round three. Seven measured
+/// rounds are 1,400 requests (350 of them large), so a request that kept its body, or any
+/// per-request leak of about 16 KiB or more, fails (measured: flat at ~140 MiB, ±4 MiB).
+/// claim: REL-18
+#[tokio::test]
+async fn rss_plateaus_under_sustained_load_and_large_bodies() {
+    const ROUNDS: usize = 10;
+    const WARM: usize = 3;
+    const PER_ROUND: usize = 200;
+    const PARALLEL: usize = 16;
+    let (pubkey, sk) = test_keypair(181);
+    let openai = MockUpstream::start(Mode::Json).await;
+    let anthropic = MockUpstream::start(Mode::AnthropicSse).await;
+    let gw = Gateway::builder(unused_nats_port(), &openai.authority(), &b64(&pubkey))
+        .providers(&["openai", "anthropic"])
+        .provider_authority("anthropic", &anthropic.authority())
+        // Sustained load from one key: the per-credential rate limit is not what is measured.
+        .rate_limit_rps(1_000_000)
+        .start()
+        .await;
+    let key = billing_vkey(&sk, 1801);
+    let filler = "x".repeat(512 << 10);
+    let bodies: Arc<Vec<String>> = Arc::new(vec![
+        r#"{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}]}"#.to_owned(),
+        format!(r#"{{"model":"gpt-4o-mini","messages":[{{"role":"user","content":"{filler}"}}]}}"#),
+        r#"{"model":"claude-haiku-4-5","stream":true,"max_tokens":64,"messages":[{"role":"user","content":"hi"}]}"#
+            .to_owned(),
+        r#"{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hello again"}]}"#.to_owned(),
+    ]);
+    let mut rss = Vec::with_capacity(ROUNDS);
+    for round in 0..ROUNDS {
+        let mut tasks = Vec::with_capacity(PARALLEL);
+        for worker in 0..PARALLEL {
+            let (url, key, bodies) = (gw.url(), key.clone(), bodies.clone());
+            tasks.push(tokio::spawn(async move {
+                let client = test_client();
+                let mut bad = Vec::new();
+                for i in (worker..PER_ROUND).step_by(PARALLEL) {
+                    let resp = client
+                        .post(format!("{url}/v1/chat/completions"))
+                        .header("authorization", format!("Bearer {key}"))
+                        .header("content-type", "application/json")
+                        .body(bodies[i % bodies.len()].clone())
+                        .send()
+                        .await
+                        .unwrap();
+                    let status = resp.status().as_u16();
+                    let _ = resp.bytes().await;
+                    if status != 200 {
+                        bad.push((i, status));
+                    }
+                }
+                bad
+            }));
+        }
+        for t in tasks {
+            let bad = t.await.unwrap();
+            assert!(bad.is_empty(), "round {round}: non-200s {bad:?}");
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        rss.push(gw.rss_kib());
+    }
+    let warm = rss[WARM - 1];
+    let last = rss[ROUNDS - 1];
+    let limit = warm + warm / 10 + 8 * 1024;
+    eprintln!("REL-18 RSS per round (KiB): {rss:?}");
+    assert!(
+        last <= limit,
+        "RSS kept growing under the same load: {last} KiB after round {ROUNDS}, {warm} KiB after \
+         round {WARM} (limit {limit}); per round: {rss:?}"
+    );
 }
