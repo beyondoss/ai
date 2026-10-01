@@ -98,6 +98,82 @@ pub struct ModelRoute {
     pub responses: &'static [Candidate],
     /// Standard public list price for this model. See [`ListPrice`].
     pub price: ListPrice,
+    /// What `GET /v1/models` tells a client about the model. See [`ModelCard`].
+    pub card: ModelCard,
+}
+
+/// The model facts `GET /v1/models` publishes beside the price, so a client can size a prompt,
+/// cap its output and pick a model by what it accepts and supports.
+///
+/// Generated on 2026-09-30, like [`ListPrice`]. Claude rows come from Anthropic's `GET /v1/models`
+/// when it still lists them. Every other row, and the retired Claude snapshots, come from
+/// OpenRouter's public card for the row's OpenRouter candidate: `context_length`,
+/// `top_provider.max_completion_tokens`, `architecture.input_modalities`, and
+/// `supported_parameters`. A row whose primary is another vendor (Groq, Fireworks, …) may serve a
+/// smaller window than the model card; the card describes the model, not one deployment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModelCard {
+    /// Human-readable name, e.g. `Claude Sonnet 5.5`.
+    pub name: &'static str,
+    /// The vendor that made the model (`anthropic`, `openai`, `meta-llama`, …).
+    pub owned_by: &'static str,
+    /// Release time, Unix seconds.
+    pub created: u64,
+    /// Most input tokens one request may carry.
+    pub context_window: u32,
+    /// Most output tokens one request may ask for. Zero on an embeddings row, which generates none.
+    pub max_output_tokens: u32,
+    /// `IN_*` bits: what a request may contain.
+    pub input: u8,
+    /// Capability bits: [`TOOLS`], [`REASONING`], [`STRUCTURED_OUTPUTS`].
+    pub features: u8,
+}
+
+pub const IN_TEXT: u8 = 1;
+pub const IN_IMAGE: u8 = 1 << 1;
+/// Documents (PDF).
+pub const IN_FILE: u8 = 1 << 2;
+pub const IN_AUDIO: u8 = 1 << 3;
+pub const IN_VIDEO: u8 = 1 << 4;
+/// Function calling.
+pub const TOOLS: u8 = 1;
+/// Thinking / reasoning tokens.
+pub const REASONING: u8 = 1 << 1;
+/// Output constrained to a JSON schema.
+pub const STRUCTURED_OUTPUTS: u8 = 1 << 2;
+
+/// The `/v1/models` names of the `IN_*` bits and the capability bits, in output order.
+const INPUT_NAMES: [(u8, &str); 5] = [
+    (IN_TEXT, "text"),
+    (IN_IMAGE, "image"),
+    (IN_FILE, "file"),
+    (IN_AUDIO, "audio"),
+    (IN_VIDEO, "video"),
+];
+const FEATURE_NAMES: [(u8, &str); 3] = [
+    (TOOLS, "tools"),
+    (REASONING, "reasoning"),
+    (STRUCTURED_OUTPUTS, "structured_outputs"),
+];
+
+const fn card(
+    name: &'static str,
+    owned_by: &'static str,
+    created: u64,
+    context_window: u32,
+    max_output_tokens: u32,
+    input: u8,
+    features: u8,
+) -> ModelCard {
+    ModelCard {
+        name,
+        owned_by,
+        created,
+        context_window,
+        max_output_tokens,
+        input,
+        features,
+    }
 }
 
 /// Standard list price, USD per million tokens.
@@ -551,6 +627,15 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &claude("claude-fable-5", "anthropic/claude-fable-5"),
         responses: &[],
         price: price("10", "50", "1", "12.5"),
+        card: card(
+            "Claude Fable 5",
+            "anthropic",
+            1780790400,
+            1_000_000,
+            128_000,
+            IN_TEXT | IN_IMAGE | IN_FILE,
+            TOOLS | REASONING | STRUCTURED_OUTPUTS,
+        ),
     },
     ModelRoute {
         model: "claude-fable-5-1",
@@ -558,6 +643,15 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &claude("claude-fable-5-1", "anthropic/claude-fable-5.1"),
         responses: &[],
         price: price("10", "50", "0.25", "12.5"),
+        card: card(
+            "Claude Fable 5.1",
+            "anthropic",
+            1787875200,
+            1_000_000,
+            128_000,
+            IN_TEXT | IN_IMAGE | IN_FILE,
+            TOOLS | REASONING | STRUCTURED_OUTPUTS,
+        ),
     },
     ModelRoute {
         model: "claude-haiku-4-5",
@@ -569,6 +663,15 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         ),
         responses: &[],
         price: price("1", "5", "0.1", "1.25"),
+        card: card(
+            "Claude Haiku 4.5",
+            "anthropic",
+            1760486400,
+            200_000,
+            64_000,
+            IN_TEXT | IN_IMAGE | IN_FILE,
+            TOOLS | REASONING | STRUCTURED_OUTPUTS,
+        ),
     },
     ModelRoute {
         model: "claude-opus-4-1",
@@ -576,6 +679,15 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &openrouter_only("anthropic/claude-opus-4.1"), // retired at Anthropic
         responses: &[],
         price: price("15", "75", "1.5", "18.75"),
+        card: card(
+            "Claude Opus 4.1",
+            "anthropic",
+            1754411591,
+            200_000,
+            32_000,
+            IN_TEXT | IN_IMAGE | IN_FILE,
+            TOOLS | REASONING,
+        ),
     },
     ModelRoute {
         model: "claude-opus-4-5",
@@ -583,6 +695,15 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &claude("claude-opus-4-5", "anthropic/claude-opus-4.5"),
         responses: &[],
         price: price("5", "25", "0.5", "6.25"),
+        card: card(
+            "Claude Opus 4.5",
+            "anthropic",
+            1763942400,
+            200_000,
+            64_000,
+            IN_TEXT | IN_IMAGE | IN_FILE,
+            TOOLS | REASONING | STRUCTURED_OUTPUTS,
+        ),
     },
     ModelRoute {
         model: "claude-opus-4-6",
@@ -590,6 +711,15 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &claude("claude-opus-4-6", "anthropic/claude-opus-4.6"),
         responses: &[],
         price: price("5", "25", "0.5", "6.25"),
+        card: card(
+            "Claude Opus 4.6",
+            "anthropic",
+            1770163200,
+            1_000_000,
+            128_000,
+            IN_TEXT | IN_IMAGE | IN_FILE,
+            TOOLS | REASONING | STRUCTURED_OUTPUTS,
+        ),
     },
     ModelRoute {
         model: "claude-opus-4-7",
@@ -597,6 +727,15 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &claude("claude-opus-4-7", "anthropic/claude-opus-4.7"),
         responses: &[],
         price: price("5", "25", "0.5", "6.25"),
+        card: card(
+            "Claude Opus 4.7",
+            "anthropic",
+            1776124800,
+            1_000_000,
+            128_000,
+            IN_TEXT | IN_IMAGE | IN_FILE,
+            TOOLS | REASONING | STRUCTURED_OUTPUTS,
+        ),
     },
     ModelRoute {
         model: "claude-opus-4-8",
@@ -608,6 +747,15 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         ),
         responses: &[],
         price: price("5", "25", "0.5", "6.25"),
+        card: card(
+            "Claude Opus 4.8",
+            "anthropic",
+            1779926400,
+            1_000_000,
+            128_000,
+            IN_TEXT | IN_IMAGE | IN_FILE,
+            TOOLS | REASONING | STRUCTURED_OUTPUTS,
+        ),
     },
     ModelRoute {
         model: "claude-opus-5",
@@ -615,6 +763,15 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &claude("claude-opus-5", "anthropic/claude-opus-5"),
         responses: &[],
         price: price("5", "25", "0.5", "6.25"),
+        card: card(
+            "Claude Opus 5",
+            "anthropic",
+            1784851200,
+            1_000_000,
+            128_000,
+            IN_TEXT | IN_IMAGE | IN_FILE,
+            TOOLS | REASONING | STRUCTURED_OUTPUTS,
+        ),
     },
     ModelRoute {
         model: "claude-opus-5-5",
@@ -622,6 +779,15 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &claude("claude-opus-5-5", "anthropic/claude-opus-5.5"),
         responses: &[],
         price: price("4", "20", "0.2", "5"),
+        card: card(
+            "Claude Opus 5.5",
+            "anthropic",
+            1790007840,
+            1_000_000,
+            128_000,
+            IN_TEXT | IN_IMAGE | IN_FILE,
+            TOOLS | REASONING | STRUCTURED_OUTPUTS,
+        ),
     },
     ModelRoute {
         model: "claude-sonnet-4",
@@ -629,6 +795,15 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &openrouter_only("anthropic/claude-sonnet-4"), // retired at Anthropic
         responses: &[],
         price: price("3", "15", "0.3", "3.75"),
+        card: card(
+            "Claude Sonnet 4",
+            "anthropic",
+            1747930371,
+            200_000,
+            64_000,
+            IN_TEXT | IN_IMAGE | IN_FILE,
+            TOOLS | REASONING,
+        ),
     },
     ModelRoute {
         model: "claude-sonnet-4-5",
@@ -636,6 +811,15 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &claude("claude-sonnet-4-5", "anthropic/claude-sonnet-4.5"),
         responses: &[],
         price: price("3", "15", "0.3", "3.75"),
+        card: card(
+            "Claude Sonnet 4.5",
+            "anthropic",
+            1759104000,
+            1_000_000,
+            64_000,
+            IN_TEXT | IN_IMAGE | IN_FILE,
+            TOOLS | REASONING | STRUCTURED_OUTPUTS,
+        ),
     },
     ModelRoute {
         model: "claude-sonnet-4-6",
@@ -643,6 +827,15 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &claude("claude-sonnet-4-6", "anthropic/claude-sonnet-4.6"),
         responses: &[],
         price: price("3", "15", "0.3", "3.75"),
+        card: card(
+            "Claude Sonnet 4.6",
+            "anthropic",
+            1771286400,
+            1_000_000,
+            128_000,
+            IN_TEXT | IN_IMAGE | IN_FILE,
+            TOOLS | REASONING | STRUCTURED_OUTPUTS,
+        ),
     },
     ModelRoute {
         model: "claude-sonnet-5",
@@ -650,6 +843,15 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &claude("claude-sonnet-5", "anthropic/claude-sonnet-5"),
         responses: &[],
         price: price("2", "10", "0.2", "2.5"),
+        card: card(
+            "Claude Sonnet 5",
+            "anthropic",
+            1782691200,
+            1_000_000,
+            128_000,
+            IN_TEXT | IN_IMAGE | IN_FILE,
+            TOOLS | REASONING | STRUCTURED_OUTPUTS,
+        ),
     },
     ModelRoute {
         model: "claude-sonnet-5-5",
@@ -657,6 +859,15 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &claude("claude-sonnet-5-5", "anthropic/claude-sonnet-5.5"),
         responses: &[],
         price: price("2", "10", "0.2", "2.5"),
+        card: card(
+            "Claude Sonnet 5.5",
+            "anthropic",
+            1790553600,
+            1_000_000,
+            128_000,
+            IN_TEXT | IN_IMAGE | IN_FILE,
+            TOOLS | REASONING | STRUCTURED_OUTPUTS,
+        ),
     },
     // Mistral `-latest` aliases (GA only). Magistral and Devstral are retired as of 2026-09;
     // a guessed still-served alias 404s and looks like the client's fault.
@@ -666,6 +877,15 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &mistral("codestral-latest", "mistralai/codestral-2508"),
         responses: &[],
         price: price("0.3", "0.9", "0.03", "0.3"), // cache_write unpublished; equals input
+        card: card(
+            "Codestral 2508",
+            "mistralai",
+            1754079630,
+            256_000,
+            204_800,
+            IN_TEXT | IN_FILE,
+            TOOLS | STRUCTURED_OUTPUTS,
+        ),
     },
     // DeepSeek. Official current names are `deepseek-flash` / `deepseek-v4-pro`. `deepseek-chat`
     // and `deepseek-reasoner` are the ids stock SDKs still send; OpenRouter still lists the chat
@@ -677,6 +897,15 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &deepseek("deepseek-chat", "deepseek/deepseek-chat"),
         responses: &[],
         price: price("0.2574", "1.0287", "0.2574", "0.2574"), // no separate cache card; both rates equal input
+        card: card(
+            "DeepSeek V3",
+            "deepseek",
+            1735241320,
+            163_840,
+            16_000,
+            IN_TEXT,
+            TOOLS | STRUCTURED_OUTPUTS,
+        ),
     },
     ModelRoute {
         model: "deepseek-flash",
@@ -684,6 +913,15 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &deepseek("deepseek-flash", "deepseek/deepseek-v4.1-flash"),
         responses: &[],
         price: price("0.3", "1.2", "0.006", "0.3"), // cache_write unpublished; equals input
+        card: card(
+            "DeepSeek V4.1 Flash",
+            "deepseek",
+            1789021285,
+            1_048_576,
+            943_718,
+            IN_TEXT | IN_IMAGE,
+            TOOLS | REASONING | STRUCTURED_OUTPUTS,
+        ),
     },
     ModelRoute {
         model: "deepseek-reasoner",
@@ -691,6 +929,15 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &deepseek("deepseek-reasoner", "deepseek/deepseek-r1"),
         responses: &[],
         price: price("0.7", "2.5", "0.7", "0.7"), // no separate cache card; both rates equal input
+        card: card(
+            "R1",
+            "deepseek",
+            1737381095,
+            64_000,
+            16_000,
+            IN_TEXT,
+            TOOLS | REASONING,
+        ),
     },
     ModelRoute {
         model: "deepseek-v4-pro",
@@ -698,6 +945,15 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &deepseek("deepseek-v4-pro", "deepseek/deepseek-v4-pro"),
         responses: &[],
         price: price("0.95526", "1.91052", "0.079605", "0.95526"), // cache_write unpublished; equals input
+        card: card(
+            "DeepSeek V4 Pro 0423",
+            "deepseek",
+            1777000679,
+            1_048_576,
+            384_000,
+            IN_TEXT,
+            TOOLS | REASONING | STRUCTURED_OUTPUTS,
+        ),
     },
     // Gemma 4 on Together (vision table, `google/gemma-4-31B-it`) with OpenRouter failover.
     // Not a Gemini dialect — Chat Completions like every other third-party row.
@@ -707,6 +963,15 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &together("google/gemma-4-31B-it", "google/gemma-4-31b-it"),
         responses: &[],
         price: price("0.09", "0.34", "0.05", "0.09"), // cache_write unpublished; equals input
+        card: card(
+            "Gemma 4 31B",
+            "google",
+            1775148486,
+            262_144,
+            16_384,
+            IN_TEXT | IN_IMAGE | IN_VIDEO,
+            TOOLS | REASONING | STRUCTURED_OUTPUTS,
+        ),
     },
     // The same shape on the OpenAI wire, where the two mounts differ as well (`/v1` vs `/api/v1`).
     // Flagships first in the *id* sort: 4.x, then 5 / 5.4 / 5.5 / 5.6, then 6 Astra, then o-series.
@@ -718,6 +983,15 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &openai_chat("gpt-4", "openai/gpt-4"),
         responses: &openai_responses("gpt-4"),
         price: price("30", "60", "30", "30"), // no separate cache card; both rates equal input
+        card: card(
+            "GPT-4",
+            "openai",
+            1685232000,
+            8_191,
+            4_096,
+            IN_TEXT,
+            TOOLS | STRUCTURED_OUTPUTS,
+        ),
     },
     ModelRoute {
         model: "gpt-4-turbo",
@@ -725,6 +999,15 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &openai_chat("gpt-4-turbo", "openai/gpt-4-turbo"),
         responses: &openai_responses("gpt-4-turbo"),
         price: price("10", "30", "10", "10"), // no separate cache card; both rates equal input
+        card: card(
+            "GPT-4 Turbo",
+            "openai",
+            1712620800,
+            128_000,
+            4_096,
+            IN_TEXT | IN_IMAGE,
+            TOOLS | STRUCTURED_OUTPUTS,
+        ),
     },
     ModelRoute {
         model: "gpt-4.1",
@@ -732,6 +1015,15 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &openai_chat("gpt-4.1", "openai/gpt-4.1"),
         responses: &openai_responses("gpt-4.1"),
         price: price("2", "8", "0.5", "2"), // cache_write unpublished; equals input
+        card: card(
+            "GPT-4.1",
+            "openai",
+            1744651385,
+            1_047_576,
+            32_768,
+            IN_TEXT | IN_IMAGE | IN_FILE,
+            TOOLS | STRUCTURED_OUTPUTS,
+        ),
     },
     ModelRoute {
         model: "gpt-4.1-mini",
@@ -739,6 +1031,15 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &openai_chat("gpt-4.1-mini", "openai/gpt-4.1-mini"),
         responses: &openai_responses("gpt-4.1-mini"),
         price: price("0.4", "1.6", "0.1", "0.4"), // cache_write unpublished; equals input
+        card: card(
+            "GPT-4.1 Mini",
+            "openai",
+            1744651381,
+            1_047_576,
+            32_768,
+            IN_TEXT | IN_IMAGE | IN_FILE,
+            TOOLS | STRUCTURED_OUTPUTS,
+        ),
     },
     ModelRoute {
         model: "gpt-4.1-nano",
@@ -746,6 +1047,15 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &openai_chat("gpt-4.1-nano", "openai/gpt-4.1-nano"),
         responses: &openai_responses("gpt-4.1-nano"),
         price: price("0.1", "0.4", "0.025", "0.1"), // cache_write unpublished; equals input
+        card: card(
+            "GPT-4.1 Nano",
+            "openai",
+            1744651369,
+            1_047_576,
+            32_768,
+            IN_TEXT | IN_IMAGE | IN_FILE,
+            TOOLS | STRUCTURED_OUTPUTS,
+        ),
     },
     ModelRoute {
         model: "gpt-4o",
@@ -753,6 +1063,15 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &openai_chat("gpt-4o", "openai/gpt-4o"),
         responses: &openai_responses("gpt-4o"),
         price: price("2.5", "10", "1.25", "2.5"), // cache_write unpublished; equals input
+        card: card(
+            "GPT-4o",
+            "openai",
+            1715558400,
+            128_000,
+            16_384,
+            IN_TEXT | IN_IMAGE | IN_FILE,
+            TOOLS | STRUCTURED_OUTPUTS,
+        ),
     },
     ModelRoute {
         model: "gpt-4o-mini",
@@ -760,6 +1079,15 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &openai_chat("gpt-4o-mini", "openai/gpt-4o-mini"),
         responses: &openai_responses("gpt-4o-mini"),
         price: price("0.15", "0.6", "0.075", "0.15"), // cache_write unpublished; equals input
+        card: card(
+            "GPT-4o-mini",
+            "openai",
+            1721260800,
+            128_000,
+            16_384,
+            IN_TEXT | IN_IMAGE | IN_FILE,
+            TOOLS | STRUCTURED_OUTPUTS,
+        ),
     },
     ModelRoute {
         model: "gpt-5",
@@ -767,6 +1095,15 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &openai_chat("gpt-5", "openai/gpt-5"),
         responses: &openai_responses("gpt-5"),
         price: price("1.25", "10", "0.125", "1.25"), // cache_write unpublished; equals input
+        card: card(
+            "GPT-5",
+            "openai",
+            1754587413,
+            400_000,
+            128_000,
+            IN_TEXT | IN_IMAGE | IN_FILE,
+            TOOLS | REASONING | STRUCTURED_OUTPUTS,
+        ),
     },
     ModelRoute {
         model: "gpt-5-mini",
@@ -774,6 +1111,15 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &openai_chat("gpt-5-mini", "openai/gpt-5-mini"),
         responses: &openai_responses("gpt-5-mini"),
         price: price("0.25", "2", "0.025", "0.25"), // cache_write unpublished; equals input
+        card: card(
+            "GPT-5 Mini",
+            "openai",
+            1754587407,
+            400_000,
+            128_000,
+            IN_TEXT | IN_IMAGE | IN_FILE,
+            TOOLS | REASONING | STRUCTURED_OUTPUTS,
+        ),
     },
     ModelRoute {
         model: "gpt-5-nano",
@@ -781,6 +1127,15 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &openai_chat("gpt-5-nano", "openai/gpt-5-nano"),
         responses: &openai_responses("gpt-5-nano"),
         price: price("0.05", "0.4", "0.005", "0.05"), // cache_write unpublished; equals input
+        card: card(
+            "GPT-5 Nano",
+            "openai",
+            1754587402,
+            400_000,
+            128_000,
+            IN_TEXT | IN_IMAGE | IN_FILE,
+            TOOLS | REASONING | STRUCTURED_OUTPUTS,
+        ),
     },
     ModelRoute {
         model: "gpt-5-pro",
@@ -788,6 +1143,15 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &openai_responses_first("gpt-5-pro", "openai/gpt-5-pro"),
         responses: &openai_responses("gpt-5-pro"),
         price: price("15", "120", "15", "15"), // no separate cache card; both rates equal input
+        card: card(
+            "GPT-5 Pro",
+            "openai",
+            1759776663,
+            400_000,
+            128_000,
+            IN_TEXT | IN_IMAGE | IN_FILE,
+            TOOLS | REASONING | STRUCTURED_OUTPUTS,
+        ),
     },
     ModelRoute {
         model: "gpt-5.1",
@@ -795,6 +1159,15 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &openai_chat("gpt-5.1", "openai/gpt-5.1"),
         responses: &openai_responses("gpt-5.1"),
         price: price("1.25", "10", "0.125", "1.25"), // cache_write unpublished; equals input
+        card: card(
+            "GPT-5.1",
+            "openai",
+            1763060305,
+            400_000,
+            128_000,
+            IN_TEXT | IN_IMAGE | IN_FILE,
+            TOOLS | REASONING | STRUCTURED_OUTPUTS,
+        ),
     },
     ModelRoute {
         model: "gpt-5.1-codex",
@@ -802,6 +1175,15 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &openrouter_only("openai/gpt-5.1-codex"), // not served to our OpenAI key
         responses: &[],
         price: price("1.25", "10", "0.13", "1.25"), // cache_write unpublished; equals input
+        card: card(
+            "GPT-5.1-Codex",
+            "openai",
+            1763060298,
+            400_000,
+            128_000,
+            IN_TEXT | IN_IMAGE,
+            TOOLS | REASONING | STRUCTURED_OUTPUTS,
+        ),
     },
     ModelRoute {
         model: "gpt-5.1-codex-max",
@@ -809,6 +1191,15 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &openrouter_only("openai/gpt-5.1-codex-max"), // not served to our OpenAI key
         responses: &[],
         price: price("1.25", "10", "0.125", "1.25"), // cache_write unpublished; equals input
+        card: card(
+            "GPT-5.1-Codex-Max",
+            "openai",
+            1764878934,
+            400_000,
+            128_000,
+            IN_TEXT | IN_IMAGE,
+            TOOLS | REASONING | STRUCTURED_OUTPUTS,
+        ),
     },
     ModelRoute {
         model: "gpt-5.1-codex-mini",
@@ -816,6 +1207,15 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &openrouter_only("openai/gpt-5.1-codex-mini"), // not served to our OpenAI key
         responses: &[],
         price: price("0.25", "2", "0.03", "0.25"), // cache_write unpublished; equals input
+        card: card(
+            "GPT-5.1-Codex-Mini",
+            "openai",
+            1763057820,
+            400_000,
+            128_000,
+            IN_TEXT | IN_IMAGE,
+            TOOLS | REASONING | STRUCTURED_OUTPUTS,
+        ),
     },
     ModelRoute {
         model: "gpt-5.2",
@@ -823,6 +1223,15 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &openai_chat("gpt-5.2", "openai/gpt-5.2"),
         responses: &openai_responses("gpt-5.2"),
         price: price("1.75", "14", "0.175", "1.75"), // cache_write unpublished; equals input
+        card: card(
+            "GPT-5.2",
+            "openai",
+            1765389775,
+            400_000,
+            128_000,
+            IN_TEXT | IN_IMAGE | IN_FILE,
+            TOOLS | REASONING | STRUCTURED_OUTPUTS,
+        ),
     },
     ModelRoute {
         model: "gpt-5.2-codex",
@@ -830,6 +1239,15 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &openrouter_only("openai/gpt-5.2-codex"), // not served to our OpenAI key
         responses: &[],
         price: price("1.75", "14", "0.175", "1.75"), // cache_write unpublished; equals input
+        card: card(
+            "GPT-5.2-Codex",
+            "openai",
+            1768409315,
+            400_000,
+            128_000,
+            IN_TEXT | IN_IMAGE,
+            TOOLS | REASONING | STRUCTURED_OUTPUTS,
+        ),
     },
     ModelRoute {
         model: "gpt-5.2-pro",
@@ -837,6 +1255,15 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &openai_responses_first("gpt-5.2-pro", "openai/gpt-5.2-pro"),
         responses: &openai_responses("gpt-5.2-pro"),
         price: price("21", "168", "21", "21"), // no separate cache card; both rates equal input
+        card: card(
+            "GPT-5.2 Pro",
+            "openai",
+            1765389780,
+            400_000,
+            128_000,
+            IN_TEXT | IN_IMAGE | IN_FILE,
+            TOOLS | REASONING | STRUCTURED_OUTPUTS,
+        ),
     },
     ModelRoute {
         model: "gpt-5.3-codex",
@@ -844,6 +1271,15 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &openai_responses_first("gpt-5.3-codex", "openai/gpt-5.3-codex"),
         responses: &openai_responses("gpt-5.3-codex"),
         price: price("1.75", "14", "0.175", "1.75"), // cache_write unpublished; equals input
+        card: card(
+            "GPT-5.3-Codex",
+            "openai",
+            1771959164,
+            400_000,
+            128_000,
+            IN_TEXT | IN_IMAGE | IN_FILE,
+            TOOLS | REASONING | STRUCTURED_OUTPUTS,
+        ),
     },
     ModelRoute {
         model: "gpt-5.4",
@@ -851,6 +1287,15 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &openai_chat("gpt-5.4", "openai/gpt-5.4"),
         responses: &openai_responses("gpt-5.4"),
         price: price("2.5", "15", "0.25", "2.5"), // cache_write unpublished; equals input
+        card: card(
+            "GPT-5.4",
+            "openai",
+            1772734352,
+            1_050_000,
+            128_000,
+            IN_TEXT | IN_IMAGE | IN_FILE,
+            TOOLS | REASONING | STRUCTURED_OUTPUTS,
+        ),
     },
     ModelRoute {
         model: "gpt-5.4-mini",
@@ -858,6 +1303,15 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &openai_chat("gpt-5.4-mini", "openai/gpt-5.4-mini"),
         responses: &openai_responses("gpt-5.4-mini"),
         price: price("0.75", "4.5", "0.075", "0.75"), // cache_write unpublished; equals input
+        card: card(
+            "GPT-5.4 Mini",
+            "openai",
+            1773748178,
+            400_000,
+            128_000,
+            IN_TEXT | IN_IMAGE | IN_FILE,
+            TOOLS | REASONING | STRUCTURED_OUTPUTS,
+        ),
     },
     ModelRoute {
         model: "gpt-5.4-nano",
@@ -865,6 +1319,15 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &openai_chat("gpt-5.4-nano", "openai/gpt-5.4-nano"),
         responses: &openai_responses("gpt-5.4-nano"),
         price: price("0.2", "1.25", "0.02", "0.2"), // cache_write unpublished; equals input
+        card: card(
+            "GPT-5.4 Nano",
+            "openai",
+            1773748187,
+            400_000,
+            128_000,
+            IN_TEXT | IN_IMAGE | IN_FILE,
+            TOOLS | REASONING | STRUCTURED_OUTPUTS,
+        ),
     },
     ModelRoute {
         model: "gpt-5.4-pro",
@@ -872,6 +1335,15 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &openai_responses_first("gpt-5.4-pro", "openai/gpt-5.4-pro"),
         responses: &openai_responses("gpt-5.4-pro"),
         price: price("30", "180", "30", "30"), // no separate cache card; both rates equal input
+        card: card(
+            "GPT-5.4 Pro",
+            "openai",
+            1772734366,
+            1_050_000,
+            128_000,
+            IN_TEXT | IN_IMAGE | IN_FILE,
+            TOOLS | REASONING | STRUCTURED_OUTPUTS,
+        ),
     },
     ModelRoute {
         model: "gpt-5.5",
@@ -879,6 +1351,15 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &openai_chat("gpt-5.5", "openai/gpt-5.5"),
         responses: &openai_responses("gpt-5.5"),
         price: price("5", "30", "0.5", "5"), // cache_write unpublished; equals input
+        card: card(
+            "GPT-5.5",
+            "openai",
+            1777051893,
+            1_050_000,
+            128_000,
+            IN_TEXT | IN_IMAGE | IN_FILE,
+            TOOLS | REASONING | STRUCTURED_OUTPUTS,
+        ),
     },
     ModelRoute {
         model: "gpt-5.5-pro",
@@ -886,6 +1367,15 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &openai_responses_first("gpt-5.5-pro", "openai/gpt-5.5-pro"),
         responses: &openai_responses("gpt-5.5-pro"),
         price: price("30", "180", "30", "30"), // no separate cache card; both rates equal input
+        card: card(
+            "GPT-5.5 Pro",
+            "openai",
+            1777051896,
+            1_050_000,
+            128_000,
+            IN_TEXT | IN_IMAGE | IN_FILE,
+            TOOLS | REASONING | STRUCTURED_OUTPUTS,
+        ),
     },
     ModelRoute {
         model: "gpt-5.6-luna",
@@ -893,6 +1383,15 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &openai_chat("gpt-5.6-luna", "openai/gpt-5.6-luna"),
         responses: &openai_responses("gpt-5.6-luna"),
         price: price("0.2", "1.2", "0.02", "0.25"),
+        card: card(
+            "GPT-5.6 Luna",
+            "openai",
+            1783590864,
+            1_050_000,
+            128_000,
+            IN_TEXT | IN_IMAGE | IN_FILE,
+            TOOLS | REASONING | STRUCTURED_OUTPUTS,
+        ),
     },
     ModelRoute {
         model: "gpt-5.6-luna-pro",
@@ -900,6 +1399,15 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &openrouter_only("openai/gpt-5.6-luna-pro"), // not served to our OpenAI key
         responses: &[],
         price: price("0.2", "1.2", "0.02", "0.25"),
+        card: card(
+            "GPT-5.6 Luna Pro",
+            "openai",
+            1783590867,
+            1_050_000,
+            128_000,
+            IN_TEXT | IN_IMAGE | IN_FILE,
+            TOOLS | REASONING | STRUCTURED_OUTPUTS,
+        ),
     },
     ModelRoute {
         model: "gpt-5.6-sol",
@@ -907,6 +1415,15 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &openai_chat("gpt-5.6-sol", "openai/gpt-5.6-sol"),
         responses: &openai_responses("gpt-5.6-sol"),
         price: price("2", "10", "0.2", "2.5"),
+        card: card(
+            "GPT-5.6 Sol",
+            "openai",
+            1783590850,
+            1_050_000,
+            128_000,
+            IN_TEXT | IN_IMAGE | IN_FILE,
+            TOOLS | REASONING | STRUCTURED_OUTPUTS,
+        ),
     },
     ModelRoute {
         model: "gpt-5.6-sol-pro",
@@ -914,6 +1431,15 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &openrouter_only("openai/gpt-5.6-sol-pro"), // not served to our OpenAI key
         responses: &[],
         price: price("4", "20", "0.4", "5"),
+        card: card(
+            "GPT-5.6 Sol Pro",
+            "openai",
+            1783590854,
+            1_050_000,
+            128_000,
+            IN_TEXT | IN_IMAGE | IN_FILE,
+            TOOLS | REASONING | STRUCTURED_OUTPUTS,
+        ),
     },
     ModelRoute {
         model: "gpt-5.6-terra",
@@ -921,6 +1447,15 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &openai_chat("gpt-5.6-terra", "openai/gpt-5.6-terra"),
         responses: &openai_responses("gpt-5.6-terra"),
         price: price("2", "12", "0.2", "2.5"),
+        card: card(
+            "GPT-5.6 Terra",
+            "openai",
+            1783590857,
+            1_050_000,
+            128_000,
+            IN_TEXT | IN_IMAGE | IN_FILE,
+            TOOLS | REASONING | STRUCTURED_OUTPUTS,
+        ),
     },
     ModelRoute {
         model: "gpt-5.6-terra-pro",
@@ -928,6 +1463,15 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &openrouter_only("openai/gpt-5.6-terra-pro"), // not served to our OpenAI key
         responses: &[],
         price: price("2", "12", "0.2", "2.5"),
+        card: card(
+            "GPT-5.6 Terra Pro",
+            "openai",
+            1783590861,
+            1_050_000,
+            128_000,
+            IN_TEXT | IN_IMAGE | IN_FILE,
+            TOOLS | REASONING | STRUCTURED_OUTPUTS,
+        ),
     },
     ModelRoute {
         model: "gpt-6-astra",
@@ -935,6 +1479,15 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &openai_chat("gpt-6-astra", "openai/gpt-6-astra"),
         responses: &openai_responses("gpt-6-astra"),
         price: price("10", "50", "1", "12.5"),
+        card: card(
+            "GPT-6 Astra",
+            "openai",
+            1788552838,
+            1_050_000,
+            128_000,
+            IN_TEXT | IN_IMAGE | IN_FILE,
+            TOOLS | REASONING | STRUCTURED_OUTPUTS,
+        ),
     },
     ModelRoute {
         model: "gpt-6-astra-pro",
@@ -942,6 +1495,15 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &openrouter_only("openai/gpt-6-astra-pro"), // not served to our OpenAI key
         responses: &[],
         price: price("10", "50", "1", "12.5"),
+        card: card(
+            "GPT-6 Astra Pro",
+            "openai",
+            1788552835,
+            1_050_000,
+            128_000,
+            IN_TEXT | IN_IMAGE | IN_FILE,
+            TOOLS | REASONING | STRUCTURED_OUTPUTS,
+        ),
     },
     // xAI Grok. Native ids from the 2026-09-17 xAI models table plus `grok-4.20-multi-agent`
     // (OpenRouter `x-ai/grok-4.20-multi-agent`, 2026-09-19). No Responses arm — session state
@@ -952,6 +1514,15 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &xai("grok-4.20", "x-ai/grok-4.20"),
         responses: &[],
         price: price("1.25", "2.5", "0.2", "1.25"), // cache_write unpublished; equals input
+        card: card(
+            "Grok 4.20",
+            "x-ai",
+            1774979019,
+            2_000_000,
+            1_800_000,
+            IN_TEXT | IN_IMAGE | IN_FILE,
+            TOOLS | REASONING | STRUCTURED_OUTPUTS,
+        ),
     },
     ModelRoute {
         model: "grok-4.20-multi-agent",
@@ -959,6 +1530,15 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &xai("grok-4.20-multi-agent", "x-ai/grok-4.20-multi-agent"),
         responses: &[],
         price: price("1.25", "2.5", "0.2", "1.25"), // cache_write unpublished; equals input
+        card: card(
+            "Grok 4.20 Multi-Agent",
+            "x-ai",
+            1774979158,
+            2_000_000,
+            1_800_000,
+            IN_TEXT | IN_IMAGE | IN_FILE,
+            REASONING | STRUCTURED_OUTPUTS,
+        ),
     },
     ModelRoute {
         model: "grok-4.3",
@@ -966,6 +1546,15 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &xai("grok-4.3", "x-ai/grok-4.3"),
         responses: &[],
         price: price("1.25", "2.5", "0.2", "1.25"), // cache_write unpublished; equals input
+        card: card(
+            "Grok 4.3",
+            "x-ai",
+            1777591821,
+            1_000_000,
+            900_000,
+            IN_TEXT | IN_IMAGE | IN_FILE,
+            TOOLS | REASONING | STRUCTURED_OUTPUTS,
+        ),
     },
     ModelRoute {
         model: "grok-4.5",
@@ -973,6 +1562,15 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &xai("grok-4.5", "x-ai/grok-4.5"),
         responses: &[],
         price: price("2", "6", "0.3", "2"), // cache_write unpublished; equals input
+        card: card(
+            "Grok 4.5",
+            "x-ai",
+            1783523154,
+            500_000,
+            450_000,
+            IN_TEXT | IN_IMAGE | IN_FILE,
+            TOOLS | REASONING | STRUCTURED_OUTPUTS,
+        ),
     },
     ModelRoute {
         model: "grok-4.6",
@@ -980,6 +1578,15 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &xai("grok-4.6", "x-ai/grok-4.6"),
         responses: &[],
         price: price("2", "6", "0.5", "2"), // cache_write unpublished; equals input
+        card: card(
+            "Grok 4.6",
+            "x-ai",
+            1786548957,
+            500_000,
+            450_000,
+            IN_TEXT | IN_IMAGE | IN_FILE,
+            TOOLS | REASONING | STRUCTURED_OUTPUTS,
+        ),
     },
     ModelRoute {
         model: "grok-build-0.1",
@@ -987,6 +1594,15 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &xai("grok-build-0.1", "x-ai/grok-build-0.1"),
         responses: &[],
         price: price("1", "2", "0.2", "1"), // cache_write unpublished; equals input
+        card: card(
+            "Grok Build 0.1",
+            "x-ai",
+            1779298123,
+            256_000,
+            230_400,
+            IN_TEXT | IN_IMAGE | IN_FILE,
+            TOOLS | REASONING | STRUCTURED_OUTPUTS,
+        ),
     },
     // Groq / Together / Fireworks llama + qwen + open-weight ids people send. No Meta row, so
     // primary is the host whose id is the catalog name (Groq for the short llama-3.x ids,
@@ -999,6 +1615,15 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &groq("llama-3.1-8b-instant", "meta-llama/llama-3.1-8b-instruct"),
         responses: &[],
         price: price("0.05", "0.08", "0.025", "0.05"), // cache_write unpublished; equals input
+        card: card(
+            "Llama 3.1 8B Instruct",
+            "meta-llama",
+            1721692800,
+            131_072,
+            117_964,
+            IN_TEXT,
+            TOOLS | STRUCTURED_OUTPUTS,
+        ),
     },
     ModelRoute {
         model: "llama-3.3-70b-versatile",
@@ -1006,6 +1631,15 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &llama_3_3(),
         responses: &[],
         price: price("0.1", "0.32", "0.1", "0.1"), // no separate cache card; both rates equal input
+        card: card(
+            "Llama 3.3 70B Instruct",
+            "meta-llama",
+            1733506137,
+            131_072,
+            16_384,
+            IN_TEXT,
+            TOOLS | STRUCTURED_OUTPUTS,
+        ),
     },
     ModelRoute {
         model: "meta-llama/llama-4-maverick",
@@ -1016,6 +1650,15 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         ),
         responses: &[],
         price: price("0.1875", "0.6525", "0.1875", "0.1875"), // no separate cache card; both rates equal input
+        card: card(
+            "Llama 4 Maverick",
+            "meta-llama",
+            1743881822,
+            1_048_576,
+            16_384,
+            IN_TEXT | IN_IMAGE,
+            TOOLS | STRUCTURED_OUTPUTS,
+        ),
     },
     ModelRoute {
         model: "meta-llama/llama-4-scout",
@@ -1026,6 +1669,15 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         ),
         responses: &[],
         price: price("0.1", "0.3", "0.1", "0.1"), // no separate cache card; both rates equal input
+        card: card(
+            "Llama 4 Scout",
+            "meta-llama",
+            1743881519,
+            1_310_720,
+            16_384,
+            IN_TEXT | IN_IMAGE,
+            TOOLS | STRUCTURED_OUTPUTS,
+        ),
     },
     ModelRoute {
         model: "meta/muse-glimmer-30b",
@@ -1033,6 +1685,15 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &together("meta-models/Muse-Glimmer-30B", "meta/muse-glimmer-30b"),
         responses: &[],
         price: price("0.35", "1.5", "0.04", "0.35"), // cache_write unpublished; equals input
+        card: card(
+            "Muse Glimmer 30B",
+            "meta",
+            1786302394,
+            131_072,
+            117_964,
+            IN_TEXT | IN_IMAGE,
+            TOOLS | REASONING | STRUCTURED_OUTPUTS,
+        ),
     },
     ModelRoute {
         model: "minimax/minimax-m3",
@@ -1040,6 +1701,15 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &minimax_m3(),
         responses: &[],
         price: price("0.3", "1.2", "0.06", "0.3"), // cache_write unpublished; equals input
+        card: card(
+            "MiniMax M3",
+            "minimax",
+            1780245374,
+            1_048_576,
+            512_000,
+            IN_TEXT | IN_IMAGE | IN_VIDEO,
+            TOOLS | REASONING | STRUCTURED_OUTPUTS,
+        ),
     },
     ModelRoute {
         model: "minimaxai/minimax-m2.7",
@@ -1047,6 +1717,15 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &groq("minimaxai/minimax-m2.7", "minimax/minimax-m2.7"),
         responses: &[],
         price: price("0.21", "0.84", "0.042", "0.21"), // cache_write unpublished; equals input
+        card: card(
+            "MiniMax M2.7",
+            "minimax",
+            1773836697,
+            204_800,
+            176_947,
+            IN_TEXT,
+            TOOLS | REASONING | STRUCTURED_OUTPUTS,
+        ),
     },
     ModelRoute {
         model: "ministral-14b-latest",
@@ -1054,6 +1733,15 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &mistral("ministral-14b-latest", "mistralai/ministral-14b-2512"),
         responses: &[],
         price: price("0.2", "0.2", "0.02", "0.2"), // cache_write unpublished; equals input
+        card: card(
+            "Ministral 3 14B 2512",
+            "mistralai",
+            1764681735,
+            262_144,
+            209_715,
+            IN_TEXT | IN_IMAGE,
+            TOOLS | STRUCTURED_OUTPUTS,
+        ),
     },
     ModelRoute {
         model: "ministral-3b-latest",
@@ -1061,6 +1749,15 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &mistral("ministral-3b-latest", "mistralai/ministral-3b-2512"),
         responses: &[],
         price: price("0.1", "0.1", "0.01", "0.1"), // cache_write unpublished; equals input
+        card: card(
+            "Ministral 3 3B 2512",
+            "mistralai",
+            1764681560,
+            131_072,
+            104_857,
+            IN_TEXT | IN_IMAGE,
+            TOOLS | STRUCTURED_OUTPUTS,
+        ),
     },
     ModelRoute {
         model: "ministral-8b-latest",
@@ -1068,6 +1765,15 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &mistral("ministral-8b-latest", "mistralai/ministral-8b-2512"),
         responses: &[],
         price: price("0.15", "0.15", "0.015", "0.15"), // cache_write unpublished; equals input
+        card: card(
+            "Ministral 3 8B 2512",
+            "mistralai",
+            1764681654,
+            262_144,
+            209_715,
+            IN_TEXT | IN_IMAGE,
+            TOOLS | STRUCTURED_OUTPUTS,
+        ),
     },
     ModelRoute {
         model: "mistral-large-latest",
@@ -1075,6 +1781,15 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &mistral("mistral-large-latest", "mistralai/mistral-large-2512"),
         responses: &[],
         price: price("0.5", "1.5", "0.05", "0.5"), // cache_write unpublished; equals input
+        card: card(
+            "Mistral Large 3 2512",
+            "mistralai",
+            1764624472,
+            262_144,
+            209_715,
+            IN_TEXT | IN_IMAGE | IN_FILE,
+            TOOLS | STRUCTURED_OUTPUTS,
+        ),
     },
     ModelRoute {
         model: "mistral-medium-latest",
@@ -1082,6 +1797,15 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &mistral("mistral-medium-latest", "mistralai/mistral-medium-3-5"),
         responses: &[],
         price: price("1.5", "7.5", "1.5", "1.5"), // no separate cache card; both rates equal input
+        card: card(
+            "Mistral Medium 3.5",
+            "mistralai",
+            1777570439,
+            262_144,
+            209_715,
+            IN_TEXT | IN_IMAGE | IN_FILE,
+            TOOLS | REASONING | STRUCTURED_OUTPUTS,
+        ),
     },
     ModelRoute {
         model: "mistral-nemo",
@@ -1089,6 +1813,15 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &mistral("mistral-nemo", "mistralai/mistral-nemo"),
         responses: &[],
         price: price("0.019", "0.03", "0.019", "0.019"), // no separate cache card; both rates equal input
+        card: card(
+            "Mistral Nemo",
+            "mistralai",
+            1721347200,
+            131_072,
+            16_384,
+            IN_TEXT,
+            TOOLS | STRUCTURED_OUTPUTS,
+        ),
     },
     ModelRoute {
         model: "mistral-small-latest",
@@ -1096,6 +1829,15 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &mistral("mistral-small-latest", "mistralai/mistral-small-2603"),
         responses: &[],
         price: price("0.15", "0.6", "0.015", "0.15"), // cache_write unpublished; equals input
+        card: card(
+            "Mistral Small 4",
+            "mistralai",
+            1773695685,
+            262_144,
+            209_715,
+            IN_TEXT | IN_IMAGE,
+            TOOLS | REASONING | STRUCTURED_OUTPUTS,
+        ),
     },
     ModelRoute {
         model: "moonshotai/kimi-k2.6",
@@ -1106,6 +1848,15 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         ),
         responses: &[],
         price: price("0.65", "3.41", "0.15", "0.65"), // cache_write unpublished; equals input
+        card: card(
+            "Kimi K2.6",
+            "moonshotai",
+            1776699402,
+            262_144,
+            235_929,
+            IN_TEXT | IN_IMAGE,
+            TOOLS | REASONING | STRUCTURED_OUTPUTS,
+        ),
     },
     ModelRoute {
         model: "moonshotai/kimi-k2.7-code",
@@ -1113,6 +1864,15 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &together("moonshotai/Kimi-K2.7-Code", "moonshotai/kimi-k2.7-code"),
         responses: &[],
         price: price("0.6562", "3.3", "0.18", "0.6562"), // cache_write unpublished; equals input
+        card: card(
+            "Kimi K2.7 Code",
+            "moonshotai",
+            1781266361,
+            262_144,
+            235_929,
+            IN_TEXT | IN_IMAGE,
+            TOOLS | REASONING | STRUCTURED_OUTPUTS,
+        ),
     },
     ModelRoute {
         model: "moonshotai/kimi-k3",
@@ -1120,6 +1880,15 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &kimi_k3(),
         responses: &[],
         price: price("3", "15", "0.3", "3"), // cache_write unpublished; equals input
+        card: card(
+            "Kimi K3",
+            "moonshotai",
+            1784215858,
+            1_048_576,
+            943_718,
+            IN_TEXT | IN_IMAGE | IN_VIDEO,
+            TOOLS | REASONING | STRUCTURED_OUTPUTS,
+        ),
     },
     ModelRoute {
         model: "o1",
@@ -1127,6 +1896,15 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &openai_chat("o1", "openai/o1"),
         responses: &openai_responses("o1"),
         price: price("15", "60", "7.5", "15"), // cache_write unpublished; equals input
+        card: card(
+            "o1",
+            "openai",
+            1734459999,
+            200_000,
+            100_000,
+            IN_TEXT | IN_IMAGE | IN_FILE,
+            TOOLS | REASONING | STRUCTURED_OUTPUTS,
+        ),
     },
     ModelRoute {
         model: "o1-pro",
@@ -1134,6 +1912,15 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &openai_responses_first("o1-pro", "openai/o1-pro"),
         responses: &openai_responses("o1-pro"),
         price: price("150", "600", "150", "150"), // no separate cache card; both rates equal input
+        card: card(
+            "o1-pro",
+            "openai",
+            1742423211,
+            200_000,
+            100_000,
+            IN_TEXT | IN_IMAGE | IN_FILE,
+            REASONING | STRUCTURED_OUTPUTS,
+        ),
     },
     ModelRoute {
         model: "o3",
@@ -1141,6 +1928,15 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &openai_chat("o3", "openai/o3"),
         responses: &openai_responses("o3"),
         price: price("2", "8", "0.5", "2"), // cache_write unpublished; equals input
+        card: card(
+            "o3",
+            "openai",
+            1744823457,
+            200_000,
+            100_000,
+            IN_TEXT | IN_IMAGE | IN_FILE,
+            TOOLS | REASONING | STRUCTURED_OUTPUTS,
+        ),
     },
     ModelRoute {
         model: "o3-mini",
@@ -1148,6 +1944,15 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &openai_chat("o3-mini", "openai/o3-mini"),
         responses: &openai_responses("o3-mini"),
         price: price("1.1", "4.4", "0.55", "1.1"), // cache_write unpublished; equals input
+        card: card(
+            "o3 Mini",
+            "openai",
+            1738351721,
+            200_000,
+            100_000,
+            IN_TEXT | IN_FILE,
+            TOOLS | REASONING | STRUCTURED_OUTPUTS,
+        ),
     },
     ModelRoute {
         model: "o3-pro",
@@ -1155,6 +1960,15 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &openrouter_only("openai/o3-pro"), // not served to our OpenAI key
         responses: &[],
         price: price("20", "80", "20", "20"), // no separate cache card; both rates equal input
+        card: card(
+            "o3 Pro",
+            "openai",
+            1749598352,
+            200_000,
+            100_000,
+            IN_TEXT | IN_IMAGE | IN_FILE,
+            TOOLS | REASONING | STRUCTURED_OUTPUTS,
+        ),
     },
     ModelRoute {
         model: "o4-mini",
@@ -1162,6 +1976,15 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &openai_chat("o4-mini", "openai/o4-mini"),
         responses: &openai_responses("o4-mini"),
         price: price("1.1", "4.4", "0.275", "1.1"), // cache_write unpublished; equals input
+        card: card(
+            "o4 Mini",
+            "openai",
+            1744820942,
+            200_000,
+            100_000,
+            IN_TEXT | IN_IMAGE | IN_FILE,
+            TOOLS | REASONING | STRUCTURED_OUTPUTS,
+        ),
     },
     ModelRoute {
         model: "openai/gpt-oss-120b",
@@ -1169,6 +1992,15 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &gpt_oss_120b(),
         responses: &[],
         price: price("0.037", "0.17", "0.037", "0.037"), // no separate cache card; both rates equal input
+        card: card(
+            "gpt-oss-120b",
+            "openai",
+            1754414231,
+            131_072,
+            117_964,
+            IN_TEXT,
+            TOOLS | REASONING | STRUCTURED_OUTPUTS,
+        ),
     },
     ModelRoute {
         model: "openai/gpt-oss-20b",
@@ -1176,6 +2008,15 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &gpt_oss_20b(),
         responses: &[],
         price: price("0.018", "0.09", "0.009", "0.018"), // cache_write unpublished; equals input
+        card: card(
+            "gpt-oss-20b",
+            "openai",
+            1754414229,
+            131_072,
+            32_768,
+            IN_TEXT,
+            TOOLS | REASONING | STRUCTURED_OUTPUTS,
+        ),
     },
     ModelRoute {
         model: "openai/gpt-oss-safeguard-20b",
@@ -1186,6 +2027,15 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         ),
         responses: &[],
         price: price("0.075", "0.3", "0.0375", "0.075"), // cache_write unpublished; equals input
+        card: card(
+            "gpt-oss-safeguard-20b",
+            "openai",
+            1761752836,
+            131_072,
+            65_536,
+            IN_TEXT,
+            TOOLS | REASONING | STRUCTURED_OUTPUTS,
+        ),
     },
     ModelRoute {
         model: "qwen/qwen-2.5-7b-instruct",
@@ -1196,6 +2046,15 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         ),
         responses: &[],
         price: price("0.1", "0.2", "0.1", "0.1"), // no separate cache card; both rates equal input
+        card: card(
+            "Qwen2.5 7B Instruct",
+            "qwen",
+            1729036800,
+            32_768,
+            29_491,
+            IN_TEXT,
+            TOOLS | STRUCTURED_OUTPUTS,
+        ),
     },
     ModelRoute {
         model: "qwen/qwen3.5-9b",
@@ -1203,6 +2062,15 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &together("Qwen/Qwen3.5-9B", "qwen/qwen3.5-9b"),
         responses: &[],
         price: price("0.1", "0.15", "0.1", "0.1"), // no separate cache card; both rates equal input
+        card: card(
+            "Qwen3.5-9B",
+            "qwen",
+            1773152396,
+            262_144,
+            32_768,
+            IN_TEXT | IN_IMAGE | IN_VIDEO,
+            TOOLS | REASONING | STRUCTURED_OUTPUTS,
+        ),
     },
     ModelRoute {
         model: "qwen/qwen3.6-plus",
@@ -1210,6 +2078,15 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &together("Qwen/Qwen3.6-Plus", "qwen/qwen3.6-plus"),
         responses: &[],
         price: price("0.325", "1.95", "0.325", "0.40625"), // cache_read unpublished; equals input
+        card: card(
+            "Qwen3.6 Plus",
+            "qwen",
+            1775133557,
+            1_000_000,
+            65_536,
+            IN_TEXT | IN_IMAGE | IN_VIDEO,
+            TOOLS | REASONING | STRUCTURED_OUTPUTS,
+        ),
     },
     ModelRoute {
         model: "qwen/qwen3.7-max",
@@ -1217,6 +2094,15 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &together("Qwen/Qwen3.7-Max", "qwen/qwen3.7-max"),
         responses: &[],
         price: price("1.475", "4.425", "0.295", "1.84375"),
+        card: card(
+            "Qwen3.7 Max",
+            "qwen",
+            1779376861,
+            1_000_000,
+            131_072,
+            IN_TEXT,
+            TOOLS | REASONING | STRUCTURED_OUTPUTS,
+        ),
     },
     ModelRoute {
         model: "qwen/qwen3.7-plus",
@@ -1224,6 +2110,15 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &together("Qwen/Qwen3.7-Plus", "qwen/qwen3.7-plus"),
         responses: &[],
         price: price("0.32", "1.28", "0.064", "0.4"),
+        card: card(
+            "Qwen3.7 Plus",
+            "qwen",
+            1780491783,
+            1_000_000,
+            131_072,
+            IN_TEXT | IN_IMAGE,
+            TOOLS | REASONING | STRUCTURED_OUTPUTS,
+        ),
     },
     ModelRoute {
         model: "qwen/qwen3.8-2.4t-a95b",
@@ -1231,6 +2126,15 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &together("Qwen/Qwen3.8-2.4T-A95B", "qwen/qwen3.8-2.4t-a95b"),
         responses: &[],
         price: price("2", "6", "0.25", "2"), // cache_write unpublished; equals input
+        card: card(
+            "Qwen3.8 2.4T A95B",
+            "qwen",
+            1786551702,
+            1_048_576,
+            131_072,
+            IN_TEXT,
+            TOOLS | REASONING | STRUCTURED_OUTPUTS,
+        ),
     },
     ModelRoute {
         model: "qwen/qwen3.8-27b",
@@ -1238,6 +2142,15 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &groq("qwen/qwen3.8-27b", "qwen/qwen3.8-27b"),
         responses: &[],
         price: price("0.42", "3", "0.085", "0.42"), // cache_write unpublished; equals input
+        card: card(
+            "Qwen3.8 27B",
+            "qwen",
+            1786722910,
+            1_000_000,
+            131_072,
+            IN_TEXT | IN_IMAGE | IN_VIDEO,
+            TOOLS | REASONING | STRUCTURED_OUTPUTS,
+        ),
     },
     ModelRoute {
         model: "qwen/qwen3.8-flash",
@@ -1245,6 +2158,15 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &together("Qwen/Qwen3.8-Flash", "qwen/qwen3.8-flash"),
         responses: &[],
         price: price("0.15", "0.47", "0.016", "0.2"),
+        card: card(
+            "Qwen3.8 Flash",
+            "qwen",
+            1787773060,
+            1_000_000,
+            131_072,
+            IN_TEXT | IN_IMAGE | IN_VIDEO,
+            TOOLS | REASONING | STRUCTURED_OUTPUTS,
+        ),
     },
     // Embeddings: input only. Output is priced 0 and there is no cache, so both cache rates are
     // the input rate (the `ListPrice` rule for an unpublished rate). `text-embedding-ada-002` is
@@ -1255,6 +2177,15 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &openai_embeddings("text-embedding-3-large", "openai/text-embedding-3-large"),
         responses: &[],
         price: price("0.13", "0", "0.13", "0.13"),
+        card: card(
+            "Text Embedding 3 Large",
+            "openai",
+            1761862866,
+            8_192,
+            0,
+            IN_TEXT,
+            0,
+        ),
     },
     ModelRoute {
         model: "text-embedding-3-small",
@@ -1262,6 +2193,15 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &openai_embeddings("text-embedding-3-small", "openai/text-embedding-3-small"),
         responses: &[],
         price: price("0.02", "0", "0.02", "0.02"),
+        card: card(
+            "Text Embedding 3 Small",
+            "openai",
+            1761857455,
+            8_192,
+            0,
+            IN_TEXT,
+            0,
+        ),
     },
     ModelRoute {
         model: "thinkingmachines/inkling",
@@ -1269,6 +2209,15 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &together("thinkingmachines/Inkling", "thinkingmachines/inkling"),
         responses: &[],
         price: price("1", "4.05", "0.17", "1"), // cache_write unpublished; equals input
+        card: card(
+            "Inkling",
+            "thinkingmachines",
+            1784325956,
+            524_288,
+            471_859,
+            IN_TEXT | IN_IMAGE | IN_AUDIO,
+            TOOLS | REASONING,
+        ),
     },
     ModelRoute {
         model: "z-ai/glm-5.1",
@@ -1276,6 +2225,15 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &fireworks("accounts/fireworks/models/glm-5p1", "z-ai/glm-5.1"),
         responses: &[],
         price: price("1.4", "4.4", "0.26", "1.4"), // cache_write unpublished; equals input
+        card: card(
+            "GLM 5.1",
+            "z-ai",
+            1775578025,
+            204_800,
+            131_072,
+            IN_TEXT,
+            TOOLS | REASONING | STRUCTURED_OUTPUTS,
+        ),
     },
     ModelRoute {
         model: "z-ai/glm-5.2",
@@ -1283,6 +2241,15 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &glm_5_2(),
         responses: &[],
         price: price("0.1739", "3.99", "0.1391", "0.1739"), // cache_write unpublished; equals input
+        card: card(
+            "GLM 5.2",
+            "z-ai",
+            1781631930,
+            1_048_576,
+            943_718,
+            IN_TEXT,
+            TOOLS | REASONING | STRUCTURED_OUTPUTS,
+        ),
     },
     ModelRoute {
         model: "z-ai/glm-5.3",
@@ -1290,6 +2257,15 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &together("zai-org/GLM-5.3", "z-ai/glm-5.3"),
         responses: &[],
         price: price("1.4", "4.4", "0.26", "1.4"), // cache_write unpublished; equals input
+        card: card(
+            "GLM 5.3",
+            "z-ai",
+            1787086655,
+            1_048_576,
+            943_718,
+            IN_TEXT,
+            TOOLS | REASONING | STRUCTURED_OUTPUTS,
+        ),
     },
     ModelRoute {
         model: "z-ai/glm-5.3-flash",
@@ -1297,6 +2273,15 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &together("zai-org/GLM-5.3-Flash", "z-ai/glm-5.3-flash"),
         responses: &[],
         price: price("0.15", "0.5", "0.03", "0.15"), // cache_write unpublished; equals input
+        card: card(
+            "GLM 5.3 Flash",
+            "z-ai",
+            1787752741,
+            1_048_576,
+            943_717,
+            IN_TEXT | IN_IMAGE | IN_VIDEO,
+            TOOLS | REASONING | STRUCTURED_OUTPUTS,
+        ),
     },
 ];
 
@@ -1327,30 +2312,74 @@ pub fn for_model(name: &str) -> Option<&'static ModelRoute> {
     }
 }
 
-/// OpenAI-shaped `GET /v1/models` body for the catalog. Extra `wire` (`"openai"` / `"anthropic"`)
-/// so a caller can pick the matching SDK, and `pricing` (USD per million tokens — see [`ListPrice`]).
-/// Names are log-safe (`[a-z0-9._/-]`) and prices are decimal strings, so this needs no JSON escaping.
+/// OpenAI-shaped `GET /v1/models` body for the catalog, readable by the Anthropic SDK too
+/// (`display_name`, `has_more`). Beyond OpenAI's fields each model carries `wire` (`"openai"` /
+/// `"anthropic"`, so a caller can pick the matching SDK), its [`ModelCard`] (`context_window`,
+/// `max_output_tokens`, `input_modalities`, `output_modalities`, `capabilities`), the `endpoints` it
+/// answers on (any generation row serves all three through translation), and `pricing` (USD per
+/// million tokens — see [`ListPrice`]). Ids are log-safe (`[a-z0-9._/-]`), display names are
+/// tested free of quotes and backslashes, and prices are decimal strings, so this needs no JSON
+/// escaping.
 pub fn models_list_json() -> &'static str {
     static JSON: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     JSON.get_or_init(|| {
         use std::fmt::Write as _;
+        fn names(out: &mut String, bits: u8, table: &[(u8, &str)]) {
+            out.push('[');
+            let mut first = true;
+            for &(bit, name) in table {
+                if bits & bit != 0 {
+                    if !first {
+                        out.push(',');
+                    }
+                    first = false;
+                    let _ = write!(out, "\"{name}\"");
+                }
+            }
+            out.push(']');
+        }
         let mut out = String::from(
-            "{\"object\":\"list\",\"pricing_unit\":\"usd_per_million_tokens\",\"data\":[",
+            "{\"object\":\"list\",\"pricing_unit\":\"usd_per_million_tokens\",\"has_more\":false,\"data\":[",
         );
         for (i, r) in MODEL_ROUTES.iter().enumerate() {
             if i > 0 {
                 out.push(',');
             }
+            let c = r.card;
+            let embeddings = r.candidates[0].path.ends_with("/embeddings");
+            let _ = write!(
+                out,
+                "{{\"id\":\"{}\",\"object\":\"model\",\"type\":\"model\",\"created\":{},\"owned_by\":\"{}\",\"display_name\":\"{}\",\"wire\":\"{}\",\"context_window\":{},\"max_output_tokens\":",
+                r.model,
+                c.created,
+                c.owned_by,
+                c.name,
+                r.wire.as_str(),
+                c.context_window,
+            );
+            if embeddings {
+                out.push_str("null");
+            } else {
+                let _ = write!(out, "{}", c.max_output_tokens);
+            }
+            out.push_str(",\"input_modalities\":");
+            names(&mut out, c.input, &INPUT_NAMES);
+            out.push_str(if embeddings {
+                ",\"output_modalities\":[\"embeddings\"],\"capabilities\":"
+            } else {
+                ",\"output_modalities\":[\"text\"],\"capabilities\":"
+            });
+            names(&mut out, c.features, &FEATURE_NAMES);
+            out.push_str(if embeddings {
+                ",\"endpoints\":[\"/v1/embeddings\"]"
+            } else {
+                ",\"endpoints\":[\"/v1/chat/completions\",\"/v1/messages\",\"/v1/responses\"]"
+            });
             let p = r.price;
             let _ = write!(
                 out,
-                "{{\"id\":\"{}\",\"object\":\"model\",\"type\":\"model\",\"owned_by\":\"system\",\"wire\":\"{}\",\"pricing\":{{\"input\":\"{}\",\"output\":\"{}\",\"cache_read\":\"{}\",\"cache_write\":\"{}\"}}}}",
-                r.model,
-                r.wire.as_str(),
-                p.input,
-                p.output,
-                p.cache_read,
-                p.cache_write,
+                ",\"pricing\":{{\"input\":\"{}\",\"output\":\"{}\",\"cache_read\":\"{}\",\"cache_write\":\"{}\"}}}}",
+                p.input, p.output, p.cache_read, p.cache_write,
             );
         }
         out.push_str("]}");
@@ -1359,6 +2388,7 @@ pub fn models_list_json() -> &'static str {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use crate::{by_id, gateway_providers};
@@ -1694,30 +2724,87 @@ mod tests {
     }
 
     #[test]
-    fn models_list_json_names_every_row_its_wire_and_its_price() {
-        let json = models_list_json();
-        assert!(
-            json.starts_with(
-                "{\"object\":\"list\",\"pricing_unit\":\"usd_per_million_tokens\",\"data\":["
-            ),
-            "OpenAI list envelope: {json}"
-        );
-        assert!(json.ends_with("]}"), "{json}");
-        for route in MODEL_ROUTES {
-            let p = route.price;
+    fn models_list_json_describes_every_row() {
+        let v: serde_json::Value = serde_json::from_str(models_list_json()).expect("valid JSON");
+        assert_eq!(v["object"], "list");
+        assert_eq!(v["pricing_unit"], "usd_per_million_tokens");
+        assert_eq!(v["has_more"], false);
+        let data = v["data"].as_array().unwrap();
+        assert_eq!(data.len(), MODEL_ROUTES.len());
+        for (m, r) in data.iter().zip(MODEL_ROUTES) {
+            let (c, p) = (r.card, r.price);
+            assert_eq!(m["id"], r.model);
+            assert_eq!(m["object"], "model");
+            assert_eq!(m["type"], "model");
+            assert_eq!(m["created"], c.created);
+            assert_eq!(m["owned_by"], c.owned_by);
+            assert_eq!(m["display_name"], c.name);
+            assert_eq!(m["wire"], r.wire.as_str());
+            assert_eq!(m["context_window"], c.context_window);
+            assert_eq!(m["pricing"]["input"], p.input);
+            assert_eq!(m["pricing"]["output"], p.output);
+            assert_eq!(m["pricing"]["cache_read"], p.cache_read);
+            assert_eq!(m["pricing"]["cache_write"], p.cache_write);
+            let inputs = m["input_modalities"].as_array().unwrap();
+            assert_eq!(inputs.len(), c.input.count_ones() as usize, "{m}");
+            assert_eq!(inputs[0], "text", "every model reads text: {m}");
+            let caps = m["capabilities"].as_array().unwrap();
+            assert_eq!(caps.len(), c.features.count_ones() as usize, "{m}");
+            if r.candidates[0].path.ends_with("/embeddings") {
+                assert!(m["max_output_tokens"].is_null(), "{m}");
+                assert_eq!(m["output_modalities"], serde_json::json!(["embeddings"]));
+                assert_eq!(m["endpoints"], serde_json::json!(["/v1/embeddings"]));
+                assert!(caps.is_empty(), "{m}");
+            } else {
+                assert_eq!(m["max_output_tokens"], c.max_output_tokens);
+                assert_eq!(m["output_modalities"], serde_json::json!(["text"]));
+                assert_eq!(m["endpoints"].as_array().unwrap().len(), 3);
+            }
+        }
+    }
+
+    /// The card is what a client sizes requests by: a zero window or output cap would make every
+    /// request look oversized, and an output cap above the window is not a real card. Names go into
+    /// the list unescaped.
+    #[test]
+    fn every_route_has_a_plausible_card() {
+        for r in MODEL_ROUTES {
+            let c = r.card;
+            let embeddings = r.candidates[0].path.ends_with("/embeddings");
             assert!(
-                json.contains(&format!(
-                    "\"id\":\"{}\",\"object\":\"model\",\"type\":\"model\",\"owned_by\":\"system\",\"wire\":\"{}\",\"pricing\":{{\"input\":\"{}\",\"output\":\"{}\",\"cache_read\":\"{}\",\"cache_write\":\"{}\"}}",
-                    route.model,
-                    route.wire.as_str(),
-                    p.input,
-                    p.output,
-                    p.cache_read,
-                    p.cache_write,
-                )),
-                "{:?} wire/price missing from the models list",
-                route.model
+                c.context_window >= 512,
+                "{} window {}",
+                r.model,
+                c.context_window
             );
+            assert_eq!(
+                c.max_output_tokens == 0,
+                embeddings,
+                "{} max output",
+                r.model
+            );
+            assert!(
+                c.max_output_tokens <= c.context_window,
+                "{} output over window",
+                r.model
+            );
+            assert!(c.input & IN_TEXT != 0, "{} reads no text", r.model);
+            assert!(
+                c.created > 1_600_000_000,
+                "{} created {}",
+                r.model,
+                c.created
+            );
+            for s in [c.name, c.owned_by] {
+                assert!(
+                    !s.is_empty()
+                        && !s
+                            .chars()
+                            .any(|ch| ch == '"' || ch == '\\' || ch.is_control()),
+                    "{} card string {s:?} needs escaping",
+                    r.model
+                );
+            }
         }
     }
 
