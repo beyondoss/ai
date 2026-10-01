@@ -17,6 +17,7 @@ The Rust cell checks each call against the gateway's ai.usage rows (the second w
 import json
 import os
 import sys
+import time
 import traceback
 
 import httpx
@@ -1056,6 +1057,493 @@ def langchain_agent():
     return used and "31" in final, {"final": final[:120], "turns": len(out["messages"])}
 
 
+def langchain_embeddings():
+    """M1 via LangChain's OpenAIEmbeddings, stock settings (it tokenizes and sends token arrays):
+    three inputs, then a 200-input batch past 64 KiB. LangChain hands back vectors only, so the
+    usage the client was shown is read off the response it received."""
+    from langchain_openai import OpenAIEmbeddings
+    shown = []
+
+    def hook(resp):
+        resp.read()
+        shown.append(resp.json().get("usage", {}).get("prompt_tokens"))
+
+    client = httpx.Client(event_hooks={"response": [_hook, hook]}, timeout=120)
+    emb = OpenAIEmbeddings(model=MODEL, base_url=f"{BASE}/v1", api_key=KEY, http_client=client, max_retries=0)
+    small = emb.embed_documents(["alpha", "beta", "gamma"])
+    chunk = "lorem ipsum dolor sit amet " * 16
+    big = emb.embed_documents([f"{i} {chunk}" for i in range(200)])
+    for n in shown:
+        record("embeddings", {"input_total": n, "output": 0, "cache_read": 0})
+    ok = len(small) == 3 and len(big) == 200 and len(small[0]) > 100 and len(shown) == 2
+    return ok, {"dims": len(small[0]), "calls": len(shown), "prompt_tokens": shown}
+
+
+def agents_structured():
+    """T4 via the OpenAI Agents SDK: an agent with a typed output (`output_type`), which the SDK
+    sends as a strict json_schema text format over Responses and parses into the type."""
+    import asyncio
+    from agents import Agent, Runner
+    from pydantic import BaseModel, ConfigDict
+    _agents_client()
+
+    class CityFacts(BaseModel):
+        model_config = ConfigDict(extra="forbid")
+        city: str
+        country: str
+        population_millions: float
+
+    agent = Agent(name="facts", instructions="Answer with the requested facts.", model=MODEL, output_type=CityFacts)
+    res = asyncio.run(Runner.run(agent, "Give the city, country and population (millions) of Paris."))
+    _agents_record(res)
+    out = res.final_output
+    obj = out.model_dump() if isinstance(out, CityFacts) else out
+    return isinstance(out, CityFacts) and validates(obj), {"obj": obj, "type": type(out).__name__}
+
+
+def thinking_no_echo():
+    """TRN-7: a thinking + tool loop from a client that never sends thinking back. Turn 1 asks for
+    reasoning and gets a tool call; turn 2 echoes only the tool call (Chat: the assistant message
+    without our `thinking`; Messages: the tool_use block without its thinking block) and must
+    still be accepted and use the tool result."""
+    ask = "What's the weather in Paris? Use the get_weather tool, then answer in one sentence."
+    if CLIENT == "anthropic":
+        c = anthropic_client()
+        tool = {"name": "get_weather", "description": "Weather for a city", "input_schema": WEATHER["function"]["parameters"]}
+        think = {"type": "enabled", "budget_tokens": 1024}
+        msgs = [{"role": "user", "content": ask}]
+        r = c.messages.create(model=MODEL, max_tokens=4096, thinking=think, tools=[tool], messages=msgs)
+        record("messages", messages_usage(r.usage))
+        tu = next((b for b in r.content if b.type == "tool_use"), None)
+        if tu is None:
+            return False, {"why": "no tool_use on turn 1", "types": [b.type for b in r.content]}
+        msgs.append({"role": "assistant", "content": [tu.model_dump(exclude_none=True)]})
+        msgs.append({"role": "user", "content": [{"type": "tool_result", "tool_use_id": tu.id, "content": "Sunny, 31C"}]})
+        f = c.messages.create(model=MODEL, max_tokens=4096, thinking=think, tools=[tool], messages=msgs)
+        record("messages", messages_usage(f.usage))
+        dropped = [b.type for b in r.content if b.type != "tool_use"]
+        return "31" in text_of(f.content), {"dropped": dropped, "final": text_of(f.content)[:160]}
+    c = openai_client()
+    msgs = [{"role": "user", "content": ask}]
+    r = c.chat.completions.create(model=MODEL, max_completion_tokens=4096, reasoning_effort="high", tools=[WEATHER], messages=msgs)
+    record("chat", chat_usage(r.usage))
+    m = r.choices[0].message
+    tc = (m.tool_calls or [None])[0]
+    if tc is None:
+        return False, {"why": "no tool call on turn 1", "message": m.model_dump()}
+    extra = sorted(k for k in (m.model_extra or {}) if (m.model_extra or {}).get(k))
+    msgs.append({"role": "assistant", "content": m.content, "tool_calls": [tc.model_dump(exclude_none=True)]})
+    msgs.append({"role": "tool", "tool_call_id": tc.id, "content": "Sunny, 31C"})
+    f = c.chat.completions.create(model=MODEL, max_completion_tokens=4096, reasoning_effort="high", tools=[WEATHER], messages=msgs)
+    record("chat", chat_usage(f.usage))
+    text = f.choices[0].message.content or ""
+    return "31" in text, {"dropped": extra, "final": text[:160]}
+
+
+# --- raw HTTP (client "raw") ---------------------------------------------------------------------
+# No SDK: httpx on the wire, the way a customer's own HTTP code calls the gateway. Streams are read
+# as SSE by hand; usage is what the response carried.
+
+ANTHROPIC_VERSION = {"anthropic-version": "2023-06-01"}
+
+
+def bearer(key=KEY):
+    return {"authorization": f"Bearer {key}"}
+
+
+def sse(resp):
+    """The JSON payload of every `data:` line of a streamed response."""
+    for line in resp.iter_lines():
+        if line.startswith("data:"):
+            data = line[5:].strip()
+            if data and data != "[DONE]":
+                yield json.loads(data)
+
+
+def wire_chat_usage(u):
+    if not u:
+        return None
+    cd = u.get("completion_tokens_details") or {}
+    extra = outside_reasoning(u["prompt_tokens"], u["completion_tokens"], u.get("total_tokens"), cd.get("reasoning_tokens") or 0)
+    return {"input_total": u["prompt_tokens"], "output": u["completion_tokens"] + extra,
+            "cache_read": (u.get("prompt_tokens_details") or {}).get("cached_tokens") or 0}
+
+
+def wire_messages_usage(u):
+    cr, cw = u.get("cache_read_input_tokens") or 0, u.get("cache_creation_input_tokens") or 0
+    return {"input_total": u["input_tokens"] + cr + cw, "output": u["output_tokens"], "cache_read": cr}
+
+
+def raw_chat(c, messages, headers=None, stream=False, **kw):
+    """One Chat Completions call. Returns (status, provider header, text, usage shown)."""
+    body = {"model": MODEL, "messages": messages, "max_completion_tokens": kw.pop("max_tokens", 1024), **kw}
+    if not stream:
+        r = c.post(f"{BASE}/v1/chat/completions", json=body, headers={**bearer(), **(headers or {})})
+        j = r.json() if r.headers.get("content-type", "").startswith("application/json") else {}
+        text = ((j.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
+        return r.status_code, r.headers.get("x-beyond-provider"), text, wire_chat_usage(j.get("usage")), j
+    body.update(stream=True, stream_options={"include_usage": True})
+    with c.stream("POST", f"{BASE}/v1/chat/completions", json=body, headers={**bearer(), **(headers or {})}) as r:
+        text, usage = "", None
+        for ev in sse(r):
+            usage = ev.get("usage") or usage
+            for ch in ev.get("choices") or []:
+                text += (ch.get("delta") or {}).get("content") or ""
+        return r.status_code, r.headers.get("x-beyond-provider"), text, wire_chat_usage(usage), None
+
+
+def raw_messages(c, messages, headers=None, stream=False, **kw):
+    """One Messages call with Anthropic's own headers. Returns (status, provider, text, usage)."""
+    body = {"model": MODEL, "messages": messages, "max_tokens": kw.pop("max_tokens", 1024), **kw}
+    hdrs = {"x-api-key": KEY, **ANTHROPIC_VERSION, **(headers or {})}
+    if not stream:
+        r = c.post(f"{BASE}/v1/messages", json=body, headers=hdrs)
+        j = r.json()
+        text = "".join(b.get("text", "") for b in j.get("content") or [] if b.get("type") == "text")
+        return r.status_code, r.headers.get("x-beyond-provider"), text, wire_messages_usage(j["usage"]) if "usage" in j else None
+    body["stream"] = True
+    with c.stream("POST", f"{BASE}/v1/messages", json=body, headers=hdrs) as r:
+        text, usage = "", {}
+        for ev in sse(r):
+            if ev.get("type") == "message_start":
+                usage.update(ev["message"].get("usage") or {})
+            elif ev.get("type") == "message_delta":
+                usage.update({k: v for k, v in (ev.get("usage") or {}).items() if v is not None})
+            elif ev.get("type") == "content_block_delta":
+                text += (ev.get("delta") or {}).get("text") or ""
+        return r.status_code, r.headers.get("x-beyond-provider"), text, wire_messages_usage(usage) if usage else None
+
+
+PONG = [{"role": "user", "content": "Reply with the single word: pong"}]
+
+
+def raw_models():
+    """E4 on the wire: GET /v1/models lists every row with its card, under a Bearer key or
+    Anthropic's x-api-key; HEAD answers without a body; a forged key is refused. All free."""
+    c = http()
+    o = c.get(f"{BASE}/v1/models", headers=bearer())
+    record("models", None, rows=0)
+    a = c.get(f"{BASE}/v1/models", params={"limit": 1000}, headers={"x-api-key": KEY, **ANTHROPIC_VERSION})
+    record("models", None, rows=0)
+    h = c.head(f"{BASE}/v1/models", headers=bearer())
+    record("models", None, rows=0)
+    forged = KEY[:-6] + ("AAAAAA" if not KEY.endswith("AAAAAA") else "BBBBBB")
+    f = c.get(f"{BASE}/v1/models", headers=bearer(forged))
+    record("models", None, rows=0)
+    body = o.json()
+    rows = body.get("data") or []
+    ids = [m.get("id") for m in rows]
+    bad = []
+    for m in rows:
+        p = m.get("pricing") or {}
+        if not (m.get("object") == "model" and m.get("display_name") and m.get("wire") in ("openai", "anthropic")
+                and (m.get("context_window") or 0) > 0 and isinstance(m.get("capabilities"), list)
+                and m.get("endpoints") and all(isinstance(p.get(k), (int, float, str)) for k in
+                                                ("input", "output", "cache_read", "cache_write"))):
+            bad.append(m.get("id"))
+    ok = (o.status_code == 200 and body.get("object") == "list" and body.get("has_more") is False and len(rows) >= 90
+          and len(set(ids)) == len(ids) and MODEL in ids and not bad
+          and a.status_code == 200 and [m["id"] for m in a.json()["data"]] == ids
+          and h.status_code == 200 and not h.content and f.status_code == 401)
+    return ok, {"rows": len(rows), "bad_cards": bad[:5], "anthropic_auth": a.status_code, "head": h.status_code,
+                "forged": f.status_code}
+
+
+def raw_count_compact():
+    """E5 / B4 on the wire: Anthropic count_tokens (Claude row), OpenAI input_tokens and compact
+    (GPT row) forward to their provider; the counts are free, compact is billed."""
+    c = http()
+    if PROVIDER == "anthropic":
+        hdrs = {"x-api-key": KEY, **ANTHROPIC_VERSION}
+        counts = []
+        for body in ({"model": MODEL, "messages": [{"role": "user", "content": "Count the tokens in this sentence."}]},
+                     {"model": MODEL, "messages": [{"role": "user", "content": "Weather in Paris?"}],
+                      "tools": [{"name": "get_weather", "description": "Weather for a city",
+                                 "input_schema": WEATHER["function"]["parameters"]}]}):
+            r = c.post(f"{BASE}/v1/messages/count_tokens", json=body, headers=hdrs)
+            record("messages", None, rows=0)
+            counts.append((r.status_code, r.json().get("input_tokens", 0)))
+        ok = all(s == 200 and n > 0 for s, n in counts) and counts[1][1] > counts[0][1]
+        return ok, {"counts": counts}
+    r = c.post(f"{BASE}/v1/responses/input_tokens", headers=bearer(),
+               json={"model": MODEL, "input": "Count the tokens in this sentence, please."})
+    record("responses", None, rows=0)
+    n = r.json().get("input_tokens", 0) if r.status_code == 200 else 0
+    convo = [{"role": "user", "content": "My favourite colour is teal and my cat is called Miso."},
+             {"role": "assistant", "content": "Noted: teal, and a cat named Miso."},
+             {"role": "user", "content": "Remember both."}]
+    comp = c.post(f"{BASE}/v1/responses/compact", headers=bearer(), json={"model": MODEL, "input": convo})
+    j = comp.json()
+    u = j.get("usage") or {}
+    record("responses", {"input_total": u.get("input_tokens", 0), "output": u.get("output_tokens", 0),
+                         "cache_read": (u.get("input_tokens_details") or {}).get("cached_tokens") or 0},
+           row_min={"output_tokens": 1})
+    ok = r.status_code == 200 and n > 0 and comp.status_code == 200 and j.get("output") and u.get("output_tokens", 0) > 0
+    return ok, {"input_tokens": n, "compact_status": comp.status_code, "usage": u}
+
+
+def raw_failover():
+    """R1 on the wire: with the row's first provider unreachable, Chat (non-stream) and Messages
+    (streamed) are served by the next candidate, and the response says which."""
+    c = http()
+    s1, p1, t1, u1, _ = raw_chat(c, PONG)
+    record("chat", u1)
+    s2, p2, t2, u2 = raw_messages(c, [{"role": "user", "content": "Count from 1 to 5."}], stream=True)
+    record("messages", u2)
+    ok = s1 == 200 and s2 == 200 and bool(t1) and bool(t2) and p1 == p2 == "openrouter"
+    return ok, {"status": [s1, s2], "served": [p1, p2]}
+
+
+def raw_steer():
+    """R3 on the wire: x-beyond-only, x-beyond-order and x-beyond-split pick the serving provider;
+    the response header and the billing row agree. A 50/50 split over ten calls uses both."""
+    c = http()
+    plan = [({"x-beyond-only": "openrouter"}, "openrouter"), ({"x-beyond-only": "anthropic"}, "anthropic"),
+            ({"x-beyond-order": "openrouter,anthropic"}, "openrouter"), ({"x-beyond-order": "anthropic,openrouter"}, "anthropic"),
+            ({"x-beyond-split": "openrouter=100"}, "openrouter"), ({"x-beyond-split": "anthropic=100"}, "anthropic")]
+    got = []
+    for headers, want in plan:
+        s, served, _, u, _ = raw_chat(c, PONG, headers=headers, max_tokens=64)
+        record("chat", u, provider=want)
+        got.append(served)
+    split = []
+    for _ in range(10):
+        s, served, _, u, _ = raw_chat(c, PONG, headers={"x-beyond-split": "anthropic=50,openrouter=50"}, max_tokens=64)
+        record("chat", u, provider=served or "?")
+        split.append(served)
+    ok = got == [w for _, w in plan] and set(split) == {"anthropic", "openrouter"}
+    return ok, {"served": got, "split": split}
+
+
+def raw_session_pin():
+    """R4 on the wire: with two pools on the Claude row and no steering headers, a three-turn
+    Messages conversation stays on one provider and reads its prompt cache from turn 2."""
+    c = http()
+    system = [{"type": "text", "text": long_prefix(), "cache_control": {"type": "ephemeral"}}]
+    msgs, served, reads = [], [], []
+    for q in ("Which city does fact 3 name?", "And fact 4?", "And fact 5?"):
+        msgs.append({"role": "user", "content": q})
+        s, p, text, u = raw_messages(c, msgs, system=system, max_tokens=128)
+        served.append(p)
+        reads.append((u or {}).get("cache_read", 0))
+        record("messages", u, provider=served[0] or "?", **({"row_min": {"cache_read_tokens": 1}} if len(reads) > 1 else {}))
+        msgs.append({"role": "assistant", "content": text or "ok"})
+    ok = len(set(served)) == 1 and served[0] is not None and reads[1] > 0 and reads[2] >= reads[1]
+    return ok, {"served": served, "cache_read": reads}
+
+
+def raw_big_body():
+    """R5 on the wire: a ~210 KB conversation (past the 64 KiB replay buffer) is served over Chat
+    and Messages, one row each."""
+    turns = []
+    for k in range(6):
+        turns.append({"role": "user", "content": f"Part {k} of a log to keep:\n{_filler(35_000)}"})
+        turns.append({"role": "assistant", "content": f"Stored part {k}."})
+    turns.append({"role": "user", "content": "Reply with the single word: done"})
+    size = len(json.dumps(turns))
+    c = http()
+    s1, _, t1, u1, _ = raw_chat(c, turns, max_tokens=256)
+    record("chat", u1)
+    s2, _, t2, u2 = raw_messages(c, turns, max_tokens=64)
+    record("messages", u2)
+    return size > 200_000 and s1 == s2 == 200 and bool(t1) and bool(t2), {"bytes": size, "status": [s1, s2]}
+
+
+def raw_stream_abort():
+    """B2 on the wire: the same Chat stream completed, then dropped after 25 content chunks by
+    closing the connection. The dropped call's row is an estimate with output > 0, bounded by the
+    completed call's usage."""
+    c = http()
+    _, _, _, full, _ = raw_chat(c, COUNT_ASK, stream=True, max_tokens=6000)
+    record("chat", full)
+    body = {"model": MODEL, "messages": COUNT_ASK, "max_completion_tokens": 6000, "stream": True,
+            "stream_options": {"include_usage": True}}
+    got = 0
+    with c.stream("POST", f"{BASE}/v1/chat/completions", json=body, headers=bearer()) as r:
+        for ev in sse(r):
+            if any((ch.get("delta") or {}).get("content") for ch in ev.get("choices") or []):
+                got += 1
+                if got >= 25:
+                    break
+    c.close()
+    record("chat", None, estimated=True, output_min=1, output_max=full["output"], input_max=full["input_total"])
+    return full is not None and got >= 25, {"completed": full, "chunks_before_abort": got}
+
+
+def byo_raw():
+    """A1 on the wire: the managed key is served and billed; a forged bai key is a 401 that bills
+    nothing; the provider's own key through /{provider}/ is served and writes no row."""
+    byo = os.environ["VERIFY_BYO_KEY"]
+    forged = KEY[:-6] + ("AAAAAA" if not KEY.endswith("AAAAAA") else "BBBBBB")
+    c = http()
+    if PROVIDER == "anthropic":
+        s, _, t, u = raw_messages(c, PONG, max_tokens=64)
+        record("messages", u)
+        b = c.post(f"{BASE}/anthropic/v1/messages", headers={"x-api-key": byo, **ANTHROPIC_VERSION},
+                   json={"model": MODEL, "max_tokens": 64, "messages": PONG})
+        bj = b.json()
+        record("messages", wire_messages_usage(bj["usage"]) if "usage" in bj else None, rows=0)
+        f = c.post(f"{BASE}/v1/messages", headers={"x-api-key": forged, **ANTHROPIC_VERSION},
+                   json={"model": MODEL, "max_tokens": 64, "messages": PONG})
+        record("messages", None, rows=0)
+        byo_ok = b.status_code == 200 and any(x.get("type") == "text" for x in bj.get("content") or [])
+    else:
+        s, _, t, u, _ = raw_chat(c, PONG, max_tokens=256)
+        record("chat", u)
+        b = c.post(f"{BASE}/openai/v1/chat/completions", headers=bearer(byo),
+                   json={"model": MODEL, "max_completion_tokens": 256, "messages": PONG})
+        bj = b.json()
+        record("chat", wire_chat_usage(bj.get("usage")), rows=0)
+        f = c.post(f"{BASE}/v1/chat/completions", headers=bearer(forged),
+                   json={"model": MODEL, "max_completion_tokens": 64, "messages": PONG})
+        record("chat", None, rows=0)
+        byo_ok = b.status_code == 200 and bool((bj.get("choices") or [{}])[0].get("message", {}).get("content"))
+    ok = s == 200 and bool(t) and byo_ok and f.status_code == 401
+    return ok, {"managed": s, "byo": b.status_code, "forged": f.status_code}
+
+
+def raw_auto_cache():
+    """K1 on the wire: a three-turn Chat conversation with a long system prompt and no
+    cache_control reads the cache from turn 2 on; the row agrees."""
+    c = http()
+    msgs, reads = [{"role": "system", "content": long_prefix()}], []
+    for q in ("Which city does fact 3 name?", "And fact 4?", "And fact 5?"):
+        msgs.append({"role": "user", "content": q})
+        s, _, text, u, _ = raw_chat(c, msgs)
+        reads.append((u or {}).get("cache_read", 0))
+        record("chat", u, **({"row_min": {"cache_read_tokens": 1}} if len(reads) > 1 else {}))
+        msgs.append({"role": "assistant", "content": text or "ok"})
+    return all(x > 0 for x in reads[1:]), {"cache_read": reads}
+
+
+def raw_embeddings():
+    """M1 on the wire: three inputs, then a 200-input batch past 64 KiB, input tokens billed."""
+    c = http()
+    chunk = "lorem ipsum dolor sit amet " * 16
+    out = []
+    for inputs in (["alpha", "beta", "gamma"], [f"{i} {chunk}" for i in range(200)]):
+        body = json.dumps({"model": MODEL, "input": inputs})
+        r = c.post(f"{BASE}/v1/embeddings", content=body, headers={**bearer(), "content-type": "application/json"})
+        j = r.json()
+        record("embeddings", {"input_total": (j.get("usage") or {}).get("prompt_tokens", 0), "output": 0, "cache_read": 0})
+        out.append((r.status_code, len(j.get("data") or []), len(body)))
+    ok = out[0][:2] == (200, 3) and out[1][:2] == (200, 200) and out[1][2] > 65536
+    return ok, {"calls": out}
+
+
+def leak_scan():
+    """SEC-7 on the wire: the route's pool key (VERIFY_BYO_KEY here) appears in no header or body
+    of anything the gateway answers: a success, a stream, a provider's refusal, the model list, a
+    token count, a catalog miss and a forged key. Any 16-character run of the key counts."""
+    pool = os.environ["VERIFY_BYO_KEY"]
+    needles = {pool[i:i + 16] for i in range(0, max(len(pool) - 15, 1))}
+    c = http()
+    seen, leaks = [], []
+
+    def scan(label, status, headers, body):
+        blob = "\n".join(f"{k}: {v}" for k, v in headers.items()) + "\n" + body
+        seen.append((label, status))
+        if any(n in blob for n in needles):
+            leaks.append(label)
+
+    corrupt = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfAAAA"
+    bad_image = [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": f"data:image/png;base64,{corrupt}"}},
+                                              {"type": "text", "text": "What is this?"}]}]
+    for label, body, expect in (("chat", {"messages": PONG}, {}), ("refusal", {"messages": bad_image}, {"error": True})):
+        r = c.post(f"{BASE}/v1/chat/completions", headers=bearer(),
+                   json={"model": MODEL, "max_completion_tokens": 256, **body})
+        j = r.json() if r.status_code == 200 else {}
+        record("chat", wire_chat_usage(j.get("usage")), **expect)
+        scan(label, r.status_code, r.headers, r.text)
+    body = {"model": MODEL, "messages": PONG, "max_completion_tokens": 256, "stream": True,
+            "stream_options": {"include_usage": True}}
+    with c.stream("POST", f"{BASE}/v1/chat/completions", json=body, headers=bearer()) as r:
+        raw = "".join(r.iter_text())
+        usage = None
+        for line in raw.splitlines():
+            if line.startswith("data:") and line[5:].strip() not in ("", "[DONE]"):
+                usage = json.loads(line[5:]).get("usage") or usage
+        record("chat", wire_chat_usage(usage))
+        scan("stream", r.status_code, r.headers, raw)
+    r = c.get(f"{BASE}/v1/models", headers=bearer())
+    record("models", None, rows=0)
+    scan("models", r.status_code, r.headers, r.text)
+    if PROVIDER == "anthropic":
+        r = c.post(f"{BASE}/v1/messages/count_tokens", headers={"x-api-key": KEY, **ANTHROPIC_VERSION},
+                   json={"model": MODEL, "messages": PONG})
+    else:
+        r = c.post(f"{BASE}/v1/responses/input_tokens", headers=bearer(), json={"model": MODEL, "input": "pong"})
+    record("count", None, rows=0)
+    scan("count", r.status_code, r.headers, r.text)
+    r = c.post(f"{BASE}/v1/chat/completions", headers=bearer(), json={"model": "no-such-model", "messages": PONG})
+    record("chat", None, rows=0)
+    scan("catalog_miss", r.status_code, r.headers, r.text)
+    forged = KEY[:-6] + ("AAAAAA" if not KEY.endswith("AAAAAA") else "BBBBBB")
+    r = c.post(f"{BASE}/v1/chat/completions", headers=bearer(forged), json={"model": MODEL, "messages": PONG})
+    record("chat", None, rows=0)
+    scan("forged", r.status_code, r.headers, r.text)
+    statuses = dict(seen)
+    ok = (not leaks and statuses["chat"] == 200 and statuses["stream"] == 200 and statuses["refusal"] == 400
+          and statuses["models"] == 200 and statuses["count"] == 200 and statuses["forged"] == 401)
+    return ok, {"leaks": leaks, "statuses": statuses}
+
+
+def h2_burst():
+    """REL-22: 24 concurrent streams through the gateway to the provider, which negotiates h2. All
+    are served, one row each, and while they are in flight the gateway holds at most half as many
+    TLS connections to the provider as requests: they share connections (multiplexed, D160), not
+    one each."""
+    import subprocess
+    import threading
+    pid = os.environ["VERIFY_GATEWAY_PID"]
+    n, results, lock = 24, [], threading.Lock()
+    in_flight, peak_flight = [0], [0]
+
+    def one(i):
+        c = httpx.Client(event_hooks={"response": [_hook]}, timeout=120)
+        body = {"model": MODEL, "messages": [{"role": "user", "content": f"Count from 1 to 30, one number per line. ({i})"}],
+                "max_completion_tokens": 512, "stream": True, "stream_options": {"include_usage": True}}
+        with lock:
+            in_flight[0] += 1
+            peak_flight[0] = max(peak_flight[0], in_flight[0])
+        try:
+            with c.stream("POST", f"{BASE}/v1/chat/completions", json=body, headers=bearer()) as r:
+                usage, rid = None, r.headers.get("x-beyond-request-id")
+                for ev in sse(r):
+                    usage = ev.get("usage") or usage
+                with lock:
+                    results.append((r.status_code, rid, wire_chat_usage(usage)))
+        finally:
+            with lock:
+                in_flight[0] -= 1
+
+    def conns():
+        out = subprocess.run(["ss", "-tnpH", "state", "established", "( dport = :443 )"], capture_output=True, text=True).stdout
+        return sum(1 for line in out.splitlines() if f"pid={pid}," in line)
+
+    # One call first, the steady state: a connection to the provider is already open. Then the
+    # burst, 20 ms apart, as agent traffic arrives (not all in one instant, when each request
+    # would race to open its own connection before the first is back in the pool).
+    one(-1)
+    threads = [threading.Thread(target=one, args=(i,)) for i in range(n)]
+    for t in threads:
+        t.start()
+        time.sleep(0.02)
+    peak_conns = 0
+    while any(t.is_alive() for t in threads):
+        if in_flight[0] >= n // 2:
+            peak_conns = max(peak_conns, conns())
+        time.sleep(0.05)
+    for t in threads:
+        t.join()
+    _ids.clear()
+    for status, rid, usage in results:
+        calls.append({"request_id": rid, "wire": "chat", "usage": usage})
+    served = sum(1 for s, _, u in results if s == 200 and u)
+    ok = served == n + 1 and 0 < peak_conns <= peak_flight[0] // 2
+    return ok, {"served": served, "peak_in_flight": peak_flight[0], "peak_upstream_connections": peak_conns}
+
+
 PROBES = {f.__name__: f for f in [
     chat_basic, messages_basic, responses_basic, models_list, tools_chat, tools_messages, embeddings,
     langchain_chat, agents_sdk, responses_count_compact, count_tokens, thinking_replay, reasoning_replay,
@@ -1063,7 +1551,9 @@ PROBES = {f.__name__: f for f in [
     reasoning_effort, typed_error, steer_providers, session_pin, big_body, stream_abort, cancel_before_head,
     stream_no_usage, prompt_cache, cache_ttl_1h, auto_cache, langchain_cache, byo_key, provider_routed,
     reasoning_metered, web_search, mid_system, developer_role, cache_control_turns, cache_control_parts,
-    max_tokens_clamp, strict_tools, explicit_nulls, context_overflow, agents_handoff, langchain_agent]}
+    max_tokens_clamp, strict_tools, explicit_nulls, context_overflow, agents_handoff, langchain_agent,
+    langchain_embeddings, agents_structured, thinking_no_echo, raw_models, raw_count_compact, raw_failover, raw_steer,
+    raw_session_pin, raw_big_body, raw_stream_abort, byo_raw, raw_auto_cache, raw_embeddings, leak_scan, h2_burst]}
 
 if __name__ == "__main__":
     name = sys.argv[1]

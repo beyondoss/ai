@@ -5,6 +5,9 @@ Usage:
                                              (claude-code:uncompacted: Claude Code's own threshold)
   harness_long.py tools <scenario>           an SDK request with a large tool set (TOOL-1)
   harness_long.py mcp <harness>              a coding agent offered ~150 MCP tools (TOOL-1)
+  harness_long.py cell <harness>[:<mode>]+<scenario>
+                                             a short recorded session for a live.rs cell (see
+                                             "recorded live.rs cells" below)
 
 Env: VERIFY_BASE (gateway origin), VERIFY_KEY (bai_ key), VERIFY_MODEL.
 
@@ -80,6 +83,7 @@ class Recorder:
         u = urllib.parse.urlparse(upstream)
         self.host, self.port = u.hostname, u.port
         self.calls = []
+        self.progress = {}
         self.lock = threading.Lock()
         rec = self
 
@@ -138,12 +142,16 @@ class Recorder:
                 self.send_header("transfer-encoding", "chunked")
                 self.end_headers()
                 head, size, tail_buf = b"", 0, b""
+                # Bytes relayed so far on each response still in flight (a cell that cuts a
+                # client off mid-stream waits on this).
+                rec.progress[id(call)] = (call, 0)
                 try:
                     while True:
                         chunk = resp.read1(65536)
                         if not chunk:
                             break
                         size += len(chunk)
+                        rec.progress[id(call)] = (call, size)
                         if len(head) < 4096 and resp.status >= 400:
                             head += chunk[:4096]
                         tail_buf = (tail_buf + chunk)[-3000:]
@@ -155,6 +163,7 @@ class Recorder:
                     call["client_gone"] = True
                 finally:
                     conn.close()
+                    rec.progress.pop(id(call), None)
                     call.update(t1=time.time(), resp_bytes=size)
                     if head:
                         call["error_body"] = head.decode("utf-8", "replace")[:1500]
@@ -201,6 +210,22 @@ def summarize(path, body):
                                    if isinstance(t, dict) and t.get("type") == "namespace")
     msgs = v.get("messages") if isinstance(v.get("messages"), list) else v.get("input")
     out["items"] = len(msgs) if isinstance(msgs, list) else 1
+    # Prompt caching the client asked for itself, and thinking: whether the request enables it, and
+    # how many signed thinking blocks / encrypted reasoning items its history replays (T2, K1).
+    out["cache_control"] = body.count(b'"cache_control"')
+    th = v.get("thinking")
+    out["thinking"] = bool((isinstance(th, dict) and th.get("type") in ("enabled", "adaptive"))
+                           or v.get("reasoning") or v.get("reasoning_effort"))
+    replayed = 0
+    for m in msgs if isinstance(msgs, list) else []:
+        if not isinstance(m, dict):
+            continue
+        if m.get("type") == "reasoning" and m.get("encrypted_content"):
+            replayed += 1
+        if m.get("role") == "assistant" and isinstance(m.get("content"), list):
+            replayed += sum(1 for b in m["content"] if isinstance(b, dict) and (
+                (b.get("type") == "thinking" and b.get("signature")) or b.get("type") == "redacted_thinking"))
+    out["replayed_thinking"] = replayed
     # Only the last message asks for the summary: a summary kept in the history afterwards may
     # quote the prompt (gpt-5-mini's do), and that turn isn't a compaction.
     # (Claude Code can follow it with a role "system" note, so: the last user message.)
@@ -997,9 +1022,211 @@ def mcp_session(harness):
     return secret in out, calls, detail
 
 
+# --- recorded live.rs cells ----------------------------------------------------------------------
+#
+# `cell <harness>[:<mode>]+<scenario>`: one short session behind the recorder, for a `live.rs` cell
+# that holds every call the harness made to the ledger (`recorded_problems` there). A call may carry
+# `expect` (the same keys as a probe's: rows=0, estimated, output_min, row_min, provider), and the
+# verdict `same_provider` when every row must name one provider. The scenarios:
+#
+# | scenario | what the harness does                                                      | claims |
+# | -------- | -------------------------------------------------------------------------- | ------ |
+# | task     | harness.py's fixture task (fix calc.py)                                     | R1, E3 |
+# | big      | the task, and its requests are over 64 KiB (Claude Code's always are)       | R5     |
+# | pin      | the task on a two-provider row: one provider every turn, cache read from turn 2 | R4 |
+# | cache    | the task, no `cache_control` in any request, cache read from turn 2         | K1     |
+# | thinking | the task with thinking on; a later turn replays signed thinking / encrypted reasoning | T2 |
+# | context  | Claude Code's `/context`, which counts tokens (free: no row)                | E5     |
+# | abort    | Claude Code interrupted (SIGINT) mid-stream: that call is billed an estimate | B2    |
+# | byo      | Claude Code with the managed key, a forged one (401, nothing billed), and the provider's own key through /anthropic (served, no row) | A1 |
+
+BILLED_SUFFIXES = ("/v1/messages", "/v1/chat/completions", "/v1/responses", "/v1/responses/compact",
+                   "/v1/embeddings")
+
+
+def billed(call):
+    return call["method"] == "POST" and call["path"].endswith(BILLED_SUFFIXES)
+
+
+def served(calls):
+    """The billed calls that succeeded, in order."""
+    return [c for c in calls if billed(c) and 200 <= (c.get("status") or 0) < 300]
+
+
+def run_task(rec, target):
+    """harness.py's fixture task, its traffic through the recorder."""
+    H.BASE = rec.base
+    return H.main(target)
+
+
+def cell(spec):
+    target, _, scenario = spec.partition("+")
+    harness = target.partition(":")[0]
+    H.TIMEOUT = 420
+    rec = Recorder(BASE)
+    extra = {}
+    if scenario == "thinking":
+        if harness == "claude-code":
+            os.environ["MAX_THINKING_TOKENS"] = "2048"
+        elif harness == "pi":
+            H.EXTRA_ARGS = ["--thinking", "low"]
+        elif harness == "codex":
+            # At Codex's default effort gpt-5.3-codex often answers this task without reasoning.
+            H.EXTRA_ARGS = ["-c", 'model_reasoning_effort="high"']
+    if scenario in ("task", "big", "pin", "cache", "thinking"):
+        ok, detail = run_task(rec, target)
+        calls = rec.stop()
+        done = served(calls)
+        detail = {k: detail.get(k) for k in ("harness", "mode", "exit", "test_rc", "test_unchanged", "stdout_tail",
+                                              "stderr_tail", "exception")}
+        detail["served"] = len(done)
+        if not done:
+            ok, detail["why"] = False, "no billed call succeeded"
+        if scenario == "big":
+            biggest = max((c["req_bytes"] for c in done), default=0)
+            detail["largest_request"] = biggest
+            if biggest <= 65536:
+                ok, detail["why"] = False, f"no request over 64 KiB (largest {biggest} bytes)"
+        elif scenario == "pin":
+            extra["same_provider"] = True
+            for c in done[1:]:
+                c["expect"] = {"row_min": {"cache_read_tokens": 1}}
+        elif scenario == "cache":
+            marked = [c["request_id"] for c in calls if c.get("cache_control")]
+            detail["cache_control_sent"] = marked
+            if marked:
+                ok, detail["why"] = False, "the harness sent cache_control itself"
+            for c in done[1:]:
+                c["expect"] = {"row_min": {"cache_read_tokens": 1}}
+        elif scenario == "thinking":
+            detail["thinking"] = [(c.get("thinking"), c.get("replayed_thinking")) for c in done]
+            replayed = [c for c in done if c.get("thinking") and c.get("replayed_thinking")]
+            if not replayed:
+                ok, detail["why"] = False, "no successful turn replayed signed thinking or encrypted reasoning"
+            if any(billed(c) and (c.get("status") or 0) >= 400 for c in calls):
+                ok, detail["why"] = False, "a turn was refused"
+        return ok, calls, detail, extra
+    if harness != "claude-code":
+        return False, rec.stop(), {"why": f"scenario {scenario} is Claude Code only"}, extra
+    fn = {"context": cc_context, "abort": cc_abort, "byo": cc_byo}.get(scenario)
+    if fn is None:
+        return False, rec.stop(), {"why": f"unknown scenario {scenario}"}, extra
+    home = pathlib.Path(tempfile.mkdtemp(prefix=f"verify-cell-{scenario}-"))
+    work = home / "repo"
+    work.mkdir()
+    try:
+        ok, detail = fn(rec, home, work)
+    finally:
+        calls = rec.stop()
+        shutil.rmtree(home, ignore_errors=True)
+    return ok, calls, detail, extra
+
+
+def cc_cmd(prompt, *more):
+    return [str(BIN / "claude"), "-p", prompt, "--model", MODEL, "--dangerously-skip-permissions",
+            "--output-format", "json", *more]
+
+
+def cc_result(out):
+    return next((e for e in H.json_lines(out) if e.get("type") == "result"), {})
+
+
+def cc_context(rec, home, work):
+    """E5: `/context` counts the session's tokens through POST /v1/messages/count_tokens."""
+    env = clean_env(home)
+    claude_env(env, rec.base)
+    code, out, _ = H.run(cc_cmd("/context"), work, env)
+    counts = [c for c in rec.calls if c["path"] == "/v1/messages/count_tokens"]
+    shown = cc_result(out).get("result") or ""
+    ok = (code == 0 and counts and all(c.get("status") == 200 for c in counts)
+          and re.search(r"\d+(\.\d+)?k", shown) is not None)
+    return ok, {"exit": code, "count_tokens_calls": len(counts), "shown": shown[:400]}
+
+
+def cc_abort(rec, home, work):
+    """B2: Claude Code interrupted mid-answer, the way a user's Ctrl-C does it."""
+    env = clean_env(home)
+    claude_env(env, rec.base)
+    cmd = cc_cmd("Write a 1500-word story about a lighthouse keeper. Do not use any tools.")
+    p = subprocess.Popen(cmd, cwd=work, env={**env, "PWD": str(work)}, stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    deadline = time.time() + 120
+    cut = None
+    while time.time() < deadline and p.poll() is None:
+        inflight = [(c, n) for c, n in list(rec.progress.values()) if billed(c) and n >= 6000]
+        if inflight:
+            cut = inflight[0][0]
+            p.send_signal(2)
+            break
+        time.sleep(0.05)
+    try:
+        p.wait(timeout=20)
+    except subprocess.TimeoutExpired:
+        p.kill()
+        p.wait()
+    # The recorder notices the client gone on its next write; let every relay finish.
+    end = time.time() + 30
+    while rec.progress and time.time() < end:
+        time.sleep(0.1)
+    if cut is None:
+        return False, {"why": "the answer never streamed 6 KB before the session ended", "exit": p.returncode}
+    cut["expect"] = {"estimated": True, "output_min": 1}
+    return cut.get("client_gone") is True, {"exit": p.returncode, "cut_request": cut.get("request_id"),
+                                            "relayed_bytes": cut.get("resp_bytes")}
+
+
+def cc_byo(rec, home, work):
+    """A1: the managed key is served and billed; a forged bai key is a 401 that bills nothing; the
+    provider's own key through /anthropic is served and writes no row."""
+    detail = {}
+    ask = "Reply with the single word: pong"
+    env = clean_env(home)
+    claude_env(env, rec.base)
+    code, out, _ = H.run(cc_cmd(ask), work, env)
+    managed = cc_result(out)
+    detail["managed"] = {"exit": code, "result": (managed.get("result") or "")[:80]}
+    ok = code == 0 and "pong" in (managed.get("result") or "").lower()
+
+    n = len(rec.calls)
+    forged = KEY[:-6] + ("AAAAAA" if not KEY.endswith("AAAAAA") else "BBBBBB")
+    # Claude Code retries a 401 ten times with backoff (minutes); one retry still shows it.
+    env.update(ANTHROPIC_API_KEY=forged, CLAUDE_CODE_MAX_RETRIES="1")
+    code, out, err = H.run(cc_cmd(ask), work, env)
+    del env["CLAUDE_CODE_MAX_RETRIES"]
+    refused = [c for c in rec.calls[n:] if billed(c)]
+    detail["forged"] = {"exit": code, "statuses": [c.get("status") for c in refused],
+                        "shown": (cc_result(out).get("result") or err)[-200:]}
+    ok = ok and code != 0 and refused and all(c.get("status") == 401 for c in refused)
+
+    n = len(rec.calls)
+    env.update(ANTHROPIC_BASE_URL=f"{rec.base}/anthropic", ANTHROPIC_API_KEY=os.environ["VERIFY_BYO_KEY"])
+    code, out, _ = H.run(cc_cmd(ask), work, env)
+    byo = [c for c in rec.calls[n:] if billed(c)]
+    for c in rec.calls[n:]:
+        c["expect"] = {"rows": 0}
+    detail["byo"] = {"exit": code, "paths": sorted({c["path"] for c in byo}),
+                     "result": (cc_result(out).get("result") or "")[:80]}
+    ok = (ok and code == 0 and byo and all(c["path"].startswith("/anthropic/") and c.get("status") == 200 for c in byo)
+          and "pong" in (cc_result(out).get("result") or "").lower())
+    return bool(ok), detail
+
+
 if __name__ == "__main__":
     kind, arg = sys.argv[1], sys.argv[2]
     calls = []
+    if kind == "cell":
+        # A live.rs cell: the verdict says its calls were recorded, so they are held one by one.
+        extra = {}
+        try:
+            ok, calls, detail, extra = cell(arg)
+        except Exception as e:  # noqa: BLE001
+            import traceback
+            ok, detail = False, {"exception": f"{type(e).__name__}: {e}", "trace": traceback.format_exc()[-1500:]}
+        for c in calls:
+            c.pop("resp_tail", None)
+        print("VERIFY " + json.dumps({"ok": bool(ok), "recorded": True, "calls": calls, "detail": detail, **extra},
+                                     default=str))
+        sys.exit(0)
     try:
         fn = {"long": long_session, "tools": tools_probe, "mcp": mcp_session}[kind]
         ok, calls, detail = fn(arg)

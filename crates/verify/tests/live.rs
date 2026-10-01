@@ -127,6 +127,18 @@ const POOLED: Route = Route {
     dead: &[],
     serves: "",
 };
+/// [`POOLED`] on Claude Sonnet 4.5, whose minimum cacheable prompt (1024 tokens) is below pi's
+/// whole prompt (~2.5k); on Haiku 4.5 (4096) pi's session never caches, so a pin can't show it.
+const POOLED_SONNET: Route = Route {
+    name: "pooled-sonnet",
+    model: "claude-sonnet-4-5",
+    pools: &[
+        ("anthropic", "ANTHROPIC_API_KEY"),
+        ("openrouter", "OPENROUTER_API_KEY"),
+    ],
+    dead: &[],
+    serves: "",
+};
 /// A Claude 5.x row, for behavior that differs on newer Claude (forced tools, effort).
 const SONNET: Route = Route {
     name: "sonnet",
@@ -165,6 +177,9 @@ enum Runtime {
     Node,
     /// A coding agent (Claude Code, Codex, opencode, pi) driven by `verify/clients/harness.py`.
     Harness,
+    /// A coding agent behind `verify/clients/harness_long.py`'s recording proxy (`cell` mode), so
+    /// each of its HTTP calls is held to the ledger ([`recorded_problems`]), not just the total.
+    Recorded,
 }
 
 /// `(claims, client, runtime, probe, routes, extra claims on the failover route)`. One line per
@@ -284,6 +299,43 @@ const CELLS: &[Cell] = &[
     ("E7",                "pi",            Runtime::Harness, "pi:chat",         SESSION,  ""),
     ("E7",                "pi",            Runtime::Harness, "pi:messages",     SESSION,  ""),
     ("E7",                "pi",            Runtime::Harness, "pi:responses",    SESSION,  ""),
+    // Raw HTTP (`raw`): httpx on the wire, no SDK, the way a customer's own HTTP code calls us.
+    ("E4",                "raw",           Runtime::Python, "raw_models",       ONE,      ""),
+    ("E5+B4",             "raw",           Runtime::Python, "raw_count_compact", CLAUDE_GPT, ""),
+    ("R1",                "raw",           Runtime::Python, "raw_failover",     &[FAILOVER], ""),
+    ("R3",                "raw",           Runtime::Python, "raw_steer",        &[POOLED], ""),
+    ("R4+B3",             "raw",           Runtime::Python, "raw_session_pin",  &[POOLED], ""),
+    ("R5",                "raw",           Runtime::Python, "raw_big_body",     &[CLAUDE, FAILOVER], "R1"),
+    ("B2+BIL-20",         "raw",           Runtime::Python, "raw_stream_abort", CLAUDE_GPT, ""),
+    ("A1",                "raw",           Runtime::Python, "byo_raw",          CLAUDE_GPT, ""),
+    ("K1+B3",             "raw",           Runtime::Python, "raw_auto_cache",   &[CLAUDE], ""),
+    ("M1+B1",             "raw",           Runtime::Python, "raw_embeddings",   &[EMBED], ""),
+    ("SEC-7",             "raw",           Runtime::Python, "leak_scan",        CLAUDE_GPT, ""),
+    ("REL-22",            "raw",           Runtime::Python, "h2_burst",         CLAUDE_GPT, ""),
+    // The remaining SDK pairings.
+    ("M1+B1",             "langchain",     Runtime::Python, "langchain_embeddings", &[EMBED], ""),
+    ("M1+B1",             "openai-node",   Runtime::Node,   "embeddings",       &[EMBED], ""),
+    ("M1+B1",             "ai-sdk",        Runtime::Node,   "ai_sdk_embeddings", &[EMBED], ""),
+    ("T4",                "openai-agents", Runtime::Python, "agents_structured", CLAUDE_GPT, ""),
+    // TRN-7: thinking + tools from clients that never echo thinking (Claude direct, and Claude
+    // over OpenRouter, where D77 / D79 lived).
+    ("TRN-7+T1",          "openai-py",     Runtime::Python, "thinking_no_echo", &[CLAUDE, OPENROUTER], ""),
+    ("TRN-7+T1",          "anthropic-py",  Runtime::Python, "thinking_no_echo", &[OPENROUTER], ""),
+    // Coding agents behind the recording proxy (`harness_long.py cell`): every call they make is
+    // held to the ledger one by one. Codex's thinking cells run native (codex) and translated
+    // (claude), so they carry E3 too.
+    ("R1",                "codex",         Runtime::Recorded, "codex+task",     &[FAILOVER], ""),
+    ("R1",                "opencode",      Runtime::Recorded, "opencode+task",  &[FAILOVER], ""),
+    ("R1",                "pi",            Runtime::Recorded, "pi:messages+task", &[FAILOVER], ""),
+    ("R5",                "claude-code",   Runtime::Recorded, "claude-code+big", &[CLAUDE, FAILOVER], "R1"),
+    ("T2+E3",             "codex",         Runtime::Recorded, "codex+thinking", &[CODEX, CLAUDE], ""),
+    ("T2",                "claude-code",   Runtime::Recorded, "claude-code+thinking", &[CLAUDE], ""),
+    ("T2",                "pi",            Runtime::Recorded, "pi:messages+thinking", &[CLAUDE], ""),
+    ("R4",                "claude-code",   Runtime::Recorded, "claude-code+pin", &[POOLED], ""),
+    ("R4",                "pi",            Runtime::Recorded, "pi:messages+pin", &[POOLED_SONNET], ""),
+    ("E5+B4",             "claude-code",   Runtime::Recorded, "claude-code+context", &[CLAUDE], ""),
+    ("B2",                "claude-code",   Runtime::Recorded, "claude-code+abort", &[CLAUDE], ""),
+    ("A1",                "claude-code",   Runtime::Recorded, "claude-code+byo", &[CLAUDE], ""),
 ];
 
 /// `(client, probe, route, claims)`: claims a cell carries on one route only, where the behavior
@@ -331,7 +383,9 @@ fn interpreter(rt: Runtime) -> PathBuf {
     match rt {
         Runtime::Python => repo_root().join("verify/clients/py/.venv/bin/python"),
         Runtime::Node => PathBuf::from("node"),
-        Runtime::Harness => repo_root().join("verify/clients/py/.venv/bin/python"),
+        Runtime::Harness | Runtime::Recorded => {
+            repo_root().join("verify/clients/py/.venv/bin/python")
+        }
     }
 }
 
@@ -340,6 +394,7 @@ fn probe_script(rt: Runtime) -> PathBuf {
         Runtime::Python => repo_root().join("verify/clients/py/probe.py"),
         Runtime::Node => repo_root().join("verify/clients/node/probe.mjs"),
         Runtime::Harness => repo_root().join("verify/clients/harness.py"),
+        Runtime::Recorded => repo_root().join("verify/clients/harness_long.py"),
     }
 }
 
@@ -350,7 +405,7 @@ fn installed(rt: Runtime) -> bool {
         Runtime::Node => repo_root()
             .join("verify/clients/node/node_modules/openai")
             .exists(),
-        Runtime::Harness => {
+        Runtime::Harness | Runtime::Recorded => {
             interpreter(rt).exists()
                 && repo_root()
                     .join("verify/clients/node/node_modules/.bin/pi")
@@ -549,16 +604,21 @@ fn run_cell(
     wait_ready(metrics_port, &mut gw.0, &log_path)?;
 
     let mut cmd = Command::new(interpreter(rt));
-    cmd.arg(probe_script(rt))
-        .arg(probe)
+    cmd.arg(probe_script(rt));
+    if matches!(rt, Runtime::Recorded) {
+        cmd.arg("cell");
+    }
+    cmd.arg(probe)
         .env("VERIFY_BASE", format!("http://127.0.0.1:{port}"))
         .env("VERIFY_KEY", DEV_TOKEN)
         .env("VERIFY_MODEL", route.model)
         .env("VERIFY_PROVIDER", route.pools[0].0)
-        .env("VERIFY_CLIENT", client);
+        .env("VERIFY_CLIENT", client)
+        .env("VERIFY_GATEWAY_PID", gw.0.id().to_string());
     // A BYO probe sends the provider's own key through /{provider}/, the way a customer with
-    // their own key would. Only that probe sees a real key.
-    if probe.starts_with("byo") {
+    // their own key would; a leak probe looks for the pool key in everything it was sent. Only
+    // those probes see a real key.
+    if probe.starts_with("byo") || probe.ends_with("+byo") || probe.starts_with("leak") {
         cmd.env("VERIFY_BYO_KEY", &keys[route.pools[0].1]);
     }
     let out = cmd
@@ -584,6 +644,21 @@ fn run_cell(
     }
 
     // Witness 2: the ledger. Rows can land a beat after the response; give them a moment.
+    if verdict["recorded"] == true {
+        let problems = recorded_problems(&verdict, &log_path, route);
+        export_rows(&log_path);
+        let _ = std::fs::remove_dir_all(&dir);
+        return if problems.is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "ledger disagrees with the recorded calls:\n  {}\n--- detail --- {}",
+                problems.join("\n  "),
+                verdict["detail"]
+            )
+            .into())
+        };
+    }
     // A harness's individual HTTP calls aren't visible to us (`calls` is null): check the ledger
     // in aggregate instead.
     if verdict["calls"].is_null() {
@@ -688,6 +763,158 @@ fn run_cell(
         )
         .into())
     }
+}
+
+/// The paths the gateway bills (one `ai.usage` row per served call); any other path is free.
+const BILLED_SUFFIXES: &[&str] = &[
+    "/v1/messages",
+    "/v1/chat/completions",
+    "/v1/responses",
+    "/v1/responses/compact",
+    "/v1/embeddings",
+];
+
+/// A recorded harness session against the ledger, call by call. Every HTTP call the harness made
+/// went through the recording proxy, so each one is held to its rows by `x-beyond-request-id`:
+///
+/// - a served billed call (POST to a [`BILLED_SUFFIXES`] path, 2xx): exactly one row, on the
+///   route's provider, not an estimate, with output (unless the client hung up first);
+/// - a refused billed call: at most one row, billing nothing;
+/// - a free call (`/v1/models`, `count_tokens`): no row;
+/// - `expect` on a call overrides that, with the keys a probe uses (`rows: 0`, `estimated` with
+///   `output_min`, `provider`, `row_min`);
+/// - and no row belongs to no call. With `same_provider` in the verdict, every row names one
+///   provider (a session pin).
+fn recorded_problems(verdict: &Value, log: &Path, route: Route) -> Vec<String> {
+    let n = |v: &Value| v.as_u64().unwrap_or(0);
+    let calls = verdict["calls"].as_array().cloned().unwrap_or_default();
+    let is_billed = |c: &Value| {
+        c["method"] == "POST"
+            && c["path"]
+                .as_str()
+                .is_some_and(|p| BILLED_SUFFIXES.iter().any(|s| p.ends_with(s)))
+    };
+    let ok_status = |c: &Value| (200..300).contains(&n(&c["status"]));
+    let wants_row = |c: &Value| {
+        c["expect"]["estimated"] == true
+            || (c["expect"]["rows"] != 0 && is_billed(c) && ok_status(c))
+    };
+    let rowed = calls.iter().filter(|c| wants_row(c)).count();
+    let slow = calls.iter().any(|c| c["expect"]["estimated"] == true);
+    let deadline = Instant::now() + Duration::from_secs(if slow { 30 } else { 5 });
+    let mut rows = usage_rows(log);
+    while rows.len() < rowed && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+        rows = usage_rows(log);
+    }
+    // A free or refused call's row would land as fast as any other; give a stray one a beat.
+    std::thread::sleep(Duration::from_millis(500));
+    let rows = usage_rows(log);
+    let mut problems = Vec::new();
+    let mut used = 0;
+    for call in &calls {
+        let label = format!(
+            "{} {} -> {} ({})",
+            call["method"].as_str().unwrap_or("?"),
+            call["path"].as_str().unwrap_or("?"),
+            call["status"],
+            call["request_id"].as_str().unwrap_or("no request id")
+        );
+        let mine: Vec<&Value> = match call["request_id"].as_str() {
+            Some(id) => rows.iter().filter(|r| r["request_id"] == id).collect(),
+            None => Vec::new(),
+        };
+        used += mine.len();
+        let expect = &call["expect"];
+        if !wants_row(call) {
+            // Free, BYO, or refused: no row, or (refused) one that bills nothing.
+            let billed: u64 = mine
+                .iter()
+                .map(|r| {
+                    n(&r["input_tokens"])
+                        + n(&r["output_tokens"])
+                        + n(&r["cache_read_tokens"])
+                        + n(&r["cache_write_tokens"])
+                })
+                .sum();
+            let refused = is_billed(call) && !ok_status(call) && expect["rows"] != 0;
+            if (refused && (mine.len() > 1 || billed != 0)) || (!refused && !mine.is_empty()) {
+                problems.push(format!("{label}: want no billed row, got {mine:?}"));
+            }
+            continue;
+        }
+        let [row] = mine.as_slice() else {
+            problems.push(format!("{label}: {} ai.usage rows, want 1", mine.len()));
+            continue;
+        };
+        let serves = expect["provider"].as_str().unwrap_or(route.serves);
+        if !serves.is_empty() && row["provider"] != serves {
+            problems.push(format!(
+                "{label}: served by {}, want {serves}",
+                row["provider"]
+            ));
+        }
+        if row["price_model"].as_str().is_none_or(str::is_empty) {
+            problems.push(format!("{label}: price_model doesn't resolve ({row})"));
+        }
+        if expect["estimated"] == true {
+            if row["usage_estimated"] != true {
+                problems.push(format!(
+                    "{label}: a cut-short call's row is not flagged usage_estimated ({row})"
+                ));
+            }
+            if n(&row["input_tokens"])
+                + n(&row["cache_read_tokens"])
+                + n(&row["cache_write_tokens"])
+                == 0
+            {
+                problems.push(format!(
+                    "{label}: a cut-short call's estimate bills no input ({row})"
+                ));
+            }
+            if n(&row["output_tokens"]) < n(&expect["output_min"]) {
+                problems.push(format!(
+                    "{label}: estimate bills {} output tokens, want >= {} ({row})",
+                    row["output_tokens"], expect["output_min"]
+                ));
+            }
+            continue;
+        }
+        if row["usage_estimated"] == true {
+            problems.push(format!("{label}: a completed call billed as an estimate"));
+        }
+        if call["client_gone"] != true && n(&row["output_tokens"]) == 0 {
+            problems.push(format!(
+                "{label}: a completed call billed no output ({row})"
+            ));
+        }
+        if let Some(mins) = expect["row_min"].as_object() {
+            for (field, min) in mins {
+                if n(&row[field.as_str()]) < n(min) {
+                    problems.push(format!(
+                        "{label}: row {field} = {}, want >= {min} ({row})",
+                        row[field.as_str()]
+                    ));
+                }
+            }
+        }
+    }
+    if used != rows.len() {
+        problems.push(format!(
+            "{} ai.usage rows belong to no call the harness made",
+            rows.len() - used
+        ));
+    }
+    if verdict["same_provider"] == true {
+        let providers: std::collections::BTreeSet<&str> =
+            rows.iter().filter_map(|r| r["provider"].as_str()).collect();
+        if providers.len() != 1 {
+            problems.push(format!(
+                "the session's rows name providers {providers:?}, want one (a session pin)"
+            ));
+        }
+    }
+    problems
 }
 
 /// One client call against the ledger. A probe can shape what the call must find with `expect`:

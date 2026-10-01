@@ -73,15 +73,8 @@ group = "Endpoints and SDK compatibility"
 text = "/v1/models lists every row and stock SDKs read it"
 oracle = "models.list() returns 101 with card fields"
 layer = "both"
-clients = [
-  "openai-py",
-  "openai-node",
-  "anthropic-py",
-  "anthropic-ts",
-  "ai-sdk",
-  "opencode",
-  "raw",
-]
+clients = ["openai-py", "openai-node", "anthropic-py", "anthropic-ts", "raw"]
+client_note = "Not ai-sdk: the pinned AI SDK (ai 7.0.126, @ai-sdk/openai 4.0.83, @ai-sdk/anthropic 4.0.71, @ai-sdk/openai-compatible 3.0.62) has no model-listing call for an OpenAI, Anthropic or OpenAI-compatible provider; its only listing, getAvailableModels(), belongs to Vercel's own gateway provider and reads GET {baseURL}/config, not /v1/models. Not opencode: opencode 1.18.34 never reads a custom provider's /v1/models. It takes models from models.dev and the provider's config; with a provider configured and no models, `opencode models beyond` says \"Provider not found\" and `opencode run` fails, and the recording proxy saw no request at all (2026-10-01). Its listing of a config generated from /v1/models is claim E7."
 failover_clients = []
 touches = ["crates/providers/src/catalog.rs", "crates/gateway/src/proxy.rs"]
 defects = []
@@ -108,7 +101,8 @@ group = "Endpoints and SDK compatibility"
 text = "count_tokens, input_tokens and compact forward to their provider"
 oracle = "counts free (no row), compact billed"
 layer = "both"
-clients = ["anthropic-py", "openai-py", "claude-code", "codex", "raw"]
+clients = ["anthropic-py", "openai-py", "claude-code", "raw"]
+client_note = "Not codex: Codex 0.159.3 never calls a count or compact endpoint through a gateway. On a custom model_provider it compacts locally, with an ordinary /v1/responses call carrying its checkpoint prompt (seen by the recording proxy at model_auto_compact_token_limit = 9000, and in LNG-1's Codex session); on the built-in openai provider with openai_base_url it did not compact at all at a limit of 3000. In neither did it send /v1/responses/input_tokens or /v1/responses/compact (2026-10-01). Claude Code counts tokens (count_tokens) for /context; neither harness calls a compact endpoint."
 failover_clients = []
 touches = [
   "crates/gateway/src/route.rs",
@@ -479,7 +473,8 @@ group = "Caching"
 text = "Automatic cache breakpoints give OpenAI-SDK callers cache hits on Claude"
 oracle = "turn 2+ cached_tokens > 0 with no cache_control sent"
 layer = "both"
-clients = ["openai-py", "openai-node", "ai-sdk", "opencode", "langchain", "raw"]
+clients = ["openai-py", "openai-node", "ai-sdk", "langchain", "raw"]
+client_note = "Not opencode: opencode 1.18.34 marks its own cache breakpoints on a Claude model id (2-3 cache_control markers in every request, seen by the recording proxy on 2026-10-01), so it never relies on the automatic breakpoints this claim is about. Its cache hits over long sessions are LNG-2."
 failover_clients = []
 touches = ["crates/gateway/src/translate.rs"]
 defects = []

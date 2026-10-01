@@ -45,6 +45,9 @@ BASE = os.environ["VERIFY_BASE"]
 KEY = os.environ["VERIFY_KEY"]
 MODEL = os.environ["VERIFY_MODEL"]
 TIMEOUT = 420
+# Extra arguments for the harness command line (`harness_long.py cell` sets them, e.g. pi's
+# `--thinking low`).
+EXTRA_ARGS = []
 
 CALC = '''def add(a, b):
     """Return the sum of a and b."""
@@ -261,7 +264,7 @@ def main(spec):
     else:
         return False, {"why": f"unknown harness {harness}"}
 
-    code, out, err = run(cmd, work, env)
+    code, out, err = run(cmd + EXTRA_ARGS, work, env)
 
     if harness == "claude-code":
         result = next((e for e in json_lines(out) if e.get("type") == "result"), {})

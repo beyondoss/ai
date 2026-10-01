@@ -7,7 +7,7 @@ import { readFileSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import OpenAI from "openai";
 import Anthropic from "@anthropic-ai/sdk";
-import { generateText, streamText, tool, jsonSchema, stepCountIs, Output, APICallError } from "ai";
+import { generateText, streamText, tool, jsonSchema, stepCountIs, Output, APICallError, embed, embedMany } from "ai";
 import { createOpenAI } from "@ai-sdk/openai";
 import { createAnthropic } from "@ai-sdk/anthropic";
 
@@ -302,6 +302,31 @@ Object.assign(probes, {
       msgs.push({ role: "assistant", content: r.choices[0].message.content || "ok" });
     }
     return [reads.slice(1).every((x) => x > 0), { cache_read: reads }];
+  },
+
+  // M1 via openai-node: three inputs, then a 200-input batch past 64 KiB; input tokens billed.
+  async embeddings() {
+    const c = openai();
+    const r = await c.embeddings.create({ model: MODEL, input: ["alpha", "beta", "gamma"] });
+    record("embeddings", { input_total: r.usage.prompt_tokens, output: 0, cache_read: 0 });
+    const chunk = "lorem ipsum dolor sit amet ".repeat(16);
+    const big = await c.embeddings.create({ model: MODEL, input: Array.from({ length: 200 }, (_, i) => `${i} ${chunk}`) });
+    record("embeddings", { input_total: big.usage.prompt_tokens, output: 0, cache_read: 0 });
+    return [r.data.length === 3 && big.data.length === 200 && r.data[0].embedding.length > 100, { dims: r.data[0].embedding.length }];
+  },
+
+  // M1 via the AI SDK: embed() one value, then embedMany() a 200-value batch past 64 KiB (one call:
+  // under the OpenAI provider's 2048-per-call limit). The SDK reports the tokens it was shown.
+  async ai_sdk_embeddings() {
+    const model = createOpenAI({ baseURL: `${BASE}/v1`, apiKey: KEY, fetch: recordingFetch }).embedding(MODEL);
+    const one = await embed({ model, value: "alpha", maxRetries: 0 });
+    record("embeddings", { input_total: one.usage.tokens, output: 0, cache_read: 0 });
+    const chunk = "lorem ipsum dolor sit amet ".repeat(16);
+    const many = await embedMany({ model, values: Array.from({ length: 200 }, (_, i) => `${i} ${chunk}`), maxRetries: 0 });
+    const sent = ids.length;
+    record("embeddings", { input_total: many.usage.tokens, output: 0, cache_read: 0 });
+    const ok = one.embedding.length > 100 && many.embeddings.length === 200 && sent === 1;
+    return [ok, { dims: one.embedding.length, batch: many.embeddings.length, batch_calls: sent }];
   },
 
   // K1 via the AI SDK's OpenAI Chat provider: the same, as opencode-style callers send it.

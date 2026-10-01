@@ -90,6 +90,15 @@ free token count, a BYO key), a refusal billed nothing, a cut-short estimate bou
 request completed, the provider it must land on, or a row field's minimum (cache reads, 1-hour
 writes, server tool calls). Image and PDF fixtures live in `verify/clients/fixtures/`.
 
+A `raw` cell is the same with no SDK: httpx on the wire (`raw_*` probes in `probe.py`), streams
+read as SSE by hand. A coding agent's calls are invisible to a probe, so its `W*` and `E7` cells
+check the ledger in aggregate. Its other cells run behind `harness_long.py`'s recording proxy
+(`harness_long.py cell <harness>+<scenario>`), and every call it made is held to the ledger by
+request id: a served call has exactly one row on the route's provider, a free or refused one bills
+nothing, and no row is left over. A scenario can ask more of a call (an estimate for a stream the
+agent was interrupted in, a cache read from turn 2, one provider for the whole session). A claim's
+`client_note` says why a client it would name can't exercise it.
+
 ```sh
 VERIFY_LIVE=1 cargo nextest run -p beyond-ai-verify --test live -E 'test(/::stream_abort$/)'
 VERIFY_ROWS_OUT=$PWD/target/rows.jsonl VERIFY_LIVE=1 cargo nextest run ...  # also keep every row

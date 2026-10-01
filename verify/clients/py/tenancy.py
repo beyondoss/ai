@@ -561,8 +561,58 @@ def rate_limit():
     return ok, detail
 
 
+def leaked(headers, body):
+    """Any 16-character run of a pool key in a response's headers or body."""
+    blob = "\n".join(f"{k}: {v}" for k, v in (headers or {}).items()) + "\n" + json.dumps(body, default=str)
+    for key in json.loads(os.environ.get("VERIFY_POOL_KEYS") or "[]"):
+        if any(key[i:i + 16] in blob for i in range(0, max(len(key) - 15, 1))):
+            return True
+    return False
+
+
+def key_rotation():
+    """REL-14 / SEC-7. The gateway holds two signing kids, and the provider's pool is mid-rotation:
+    its first key is revoked (the provider 401s it), the second is live; the last provider on the
+    row has only a revoked key.
+
+    - Tokens from kid 1 (a1, tenant A) and kid 2 (k2, tenant B) are both served, non-streaming and
+      streamed, each billed to its own tenant and key: the revoked key costs no request.
+    - A kid-2 token signed with kid 1's key, and a kid-3 token, are refused 401 and bill nothing.
+    - A call steered (x-beyond-only) to the provider holding only a revoked key gets that provider's
+      refusal relayed, and no response anywhere carries a pool key."""
+    detail, leaks, ok = {"served": [], "refused": {}}, [], True
+    for key in ("a1", "k2", "a1", "k2"):
+        status, rid, usage, err, headers = once(key)
+        record(key, rid, usage)
+        detail["served"].append((key, status))
+        ok = ok and status == 200
+        if leaked(headers, err):
+            leaks.append(key)
+    for key in ("a1", "k2"):
+        s = Stream(key, SHORT_ASK, max_tokens=16)
+        s.done.wait(120)
+        record(key, s.request_id, s.usage)
+        detail["served"].append((f"{key}:stream", s.status))
+        ok = ok and s.status == 200 and s.usage is not None
+    for key in ("k2forged", "k3"):
+        status, rid, usage, err, headers = once(key)
+        record(key, rid, None, refused=True)
+        detail["refused"][key] = status
+        ok = ok and clear_refusal(status, err, 401)
+        if leaked(headers, err):
+            leaks.append(key)
+    status, rid, usage, err, headers = once("a1", headers={"x-beyond-only": "openrouter"})
+    record("a1", rid, usage, **({} if status == 200 else {"refused": True}))
+    detail["revoked_only"] = {"status": status, "error": err}
+    ok = ok and status in (401, 403) and bool(err)
+    if leaked(headers, err):
+        leaks.append("revoked_only")
+    detail["leaks"] = leaks
+    return ok and not leaks, detail
+
+
 SCENARIOS = {f.__name__: f for f in (revoke_tenant, revoke_key, exhaust_allowance, claude_code_revoked,
-                                     cache_isolation, pin_isolation, tenant_limit, rate_limit)}
+                                     cache_isolation, pin_isolation, tenant_limit, rate_limit, key_rotation)}
 
 if __name__ == "__main__":
     try:

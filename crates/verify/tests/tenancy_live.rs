@@ -73,6 +73,33 @@ const POOLED: Route = Route {
     ],
 };
 
+/// Mid-rotation pool keys: the provider has already revoked the first key (a key it never issued,
+/// `REVOKED_*`, minted per run in `main`; the provider answers it with the 401 a revoked key gets)
+/// and the second is the real one. The provider listed last has only a revoked key, so a call
+/// steered there sees that provider's own 401 relayed (SEC-7: no pool key in it).
+const ROTATE_GPT: Route = Route {
+    name: "gpt4o-mini-rotating",
+    model: "gpt-4o-mini",
+    pools: &[
+        ("openai", "REVOKED_OPENAI_KEY"),
+        ("openai", "OPENAI_API_KEY"),
+        ("openrouter", "REVOKED_OPENROUTER_KEY"),
+    ],
+};
+const ROTATE_CLAUDE: Route = Route {
+    name: "claude-rotating",
+    model: "claude-haiku-4-5",
+    pools: &[
+        ("anthropic", "REVOKED_ANTHROPIC_KEY"),
+        ("anthropic", "ANTHROPIC_API_KEY"),
+        ("openrouter", "REVOKED_OPENROUTER_KEY"),
+    ],
+};
+
+/// A second signing key (seed `[8; 32]`), configured as kid 2 beside the dev key: REL-14's two
+/// kids side by side.
+const KID2_SEED: [u8; 32] = [8; 32];
+
 /// `(claims, client, route, scenario, extra gateway config)`.
 type Cell = (
     &'static str,
@@ -104,6 +131,9 @@ const CELLS: &[Cell] = &[
     ("TEN-2+SEC-15",    "openai-py",    GPT4O_MINI, "tenant_limit",        SLOTS),
     ("TEN-2+SEC-15",    "anthropic-py", CLAUDE,     "tenant_limit",        SLOTS),
     ("TEN-2+SEC-15",    "openai-py",    GPT4O_MINI, "rate_limit",          RATE),
+    // REL-14: tokens from two signing kids, and a pool mid-rotation (the first key revoked).
+    ("REL-14+SEC-7",    "openai-py",    ROTATE_GPT,    "key_rotation",     ""),
+    ("REL-14+SEC-7",    "anthropic-py", ROTATE_CLAUDE, "key_rotation",     ""),
 ];
 
 fn repo_root() -> PathBuf {
@@ -158,7 +188,23 @@ fn main() {
     let args = Arguments::from_args();
     let mut trials = Vec::new();
     if std::env::var("VERIFY_LIVE").as_deref() == Ok("1") {
-        let keys = env_keys();
+        let mut keys = env_keys();
+        // Revoked pool keys: well-formed, never issued, fresh per run.
+        let nonce = format!(
+            "{:032x}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+                ^ u128::from(std::process::id())
+        );
+        for (var, prefix) in [
+            ("REVOKED_OPENAI_KEY", "sk-proj-"),
+            ("REVOKED_ANTHROPIC_KEY", "sk-ant-api03-"),
+            ("REVOKED_OPENROUTER_KEY", "sk-or-v1-"),
+        ] {
+            keys.insert(var.to_owned(), format!("{prefix}verifyrevoked{nonce}"));
+        }
         for &(claims, client, route, scenario, extra) in CELLS {
             let have = route
                 .pools
@@ -182,12 +228,17 @@ fn main() {
 /// A `bai_v2` token: `bai_v2.{kid}.b64url(tenant || vpc || key_id, LE u64s).b64url(sig)`, the
 /// layout `crates/gateway/src/key.rs` documents for the control plane.
 fn mint_v2(tenant: u64, vpc: u64, key_id: u64) -> String {
-    let sk = SigningKey::from_bytes(&[7; 32]);
+    mint_kid(1, &[7; 32], tenant, vpc, key_id)
+}
+
+/// A `bai_v2` token naming signing kid `kid`, signed with the key from `seed`.
+fn mint_kid(kid: u8, seed: &[u8; 32], tenant: u64, vpc: u64, key_id: u64) -> String {
+    let sk = SigningKey::from_bytes(seed);
     let mut payload = Vec::with_capacity(24);
     for v in [tenant, vpc, key_id] {
         payload.extend_from_slice(&v.to_le_bytes());
     }
-    let signed = format!("bai_v2.1.{}", URL_SAFE_NO_PAD.encode(&payload));
+    let signed = format!("bai_v2.{kid}.{}", URL_SAFE_NO_PAD.encode(&payload));
     let sig = sk.sign(signed.as_bytes());
     format!("{signed}.{}", URL_SAFE_NO_PAD.encode(sig.to_bytes()))
 }
@@ -210,6 +261,17 @@ fn session_keys() -> Value {
         add(format!("pa{i:02}"), TENANT_A, 300 + i);
         add(format!("pb{i:02}"), TENANT_B, 300 + i);
     }
+    // REL-14: tenant B's key under signing kid 2; the same claims under kid 2 but signed with kid
+    // 1's key (refused); and kid 3, which no gateway knows (refused).
+    let mut kid = |name: &str, kid: u8, seed: &[u8; 32]| {
+        m.insert(
+            name.to_owned(),
+            json!({"token": mint_kid(kid, seed, TENANT_B, 1, 202), "tenant": TENANT_B, "key_id": 202}),
+        );
+    };
+    kid("k2", 2, &KID2_SEED);
+    kid("k2forged", 2, &[7; 32]);
+    kid("k3", 3, &KID2_SEED);
     Value::Object(m)
 }
 
@@ -417,10 +479,25 @@ fn run_cell(
         "listen = \"127.0.0.1:{port}\"\nmetrics_listen = \"127.0.0.1:{metrics_port}\"\n\
          nats_url = \"nats://127.0.0.1:{nats_port}\"\nconfig_bucket = \"ai-gateway\"\nupstream_tls = true\n{extra}\n[pool_keys]\n"
     );
+    // A provider listed twice holds both keys, in order (a pool mid-rotation).
+    let mut pools: Vec<(&str, Vec<&str>)> = Vec::new();
     for (provider, var) in route.pools {
-        cfg.push_str(&format!("{provider} = [{:?}]\n", keys[*var]));
+        match pools.iter_mut().find(|(p, _)| p == provider) {
+            Some((_, ks)) => ks.push(&keys[*var]),
+            None => pools.push((provider, vec![&keys[*var]])),
+        }
     }
-    cfg.push_str(&format!("\n[signing_keys]\n1 = \"{DEV_PUBKEY_B64}\"\n"));
+    for (provider, ks) in &pools {
+        cfg.push_str(&format!("{provider} = {ks:?}\n"));
+    }
+    let kid2 = base64::engine::general_purpose::STANDARD.encode(
+        SigningKey::from_bytes(&KID2_SEED)
+            .verifying_key()
+            .to_bytes(),
+    );
+    cfg.push_str(&format!(
+        "\n[signing_keys]\n1 = \"{DEV_PUBKEY_B64}\"\n2 = \"{kid2}\"\n"
+    ));
     let cfg_path = dir.join("gateway.toml");
     std::fs::write(&cfg_path, cfg).map_err(|e| e.to_string())?;
 
@@ -439,10 +516,20 @@ fn run_cell(
     wait_ready(metrics_port, &mut gw.0, &log_path)?;
 
     let ids = session_keys();
+    // The pool keys, for a scenario that looks for them in what the client was sent (SEC-7).
+    let pool_keys: Vec<&str> = route.pools.iter().map(|(_, var)| &*keys[*var]).collect();
     let mut child = Guard(
         Command::new(python())
             .arg(repo_root().join("verify/clients/py/tenancy.py"))
             .arg(scenario)
+            .env(
+                "VERIFY_POOL_KEYS",
+                if scenario == "key_rotation" {
+                    serde_json::to_string(&pool_keys).unwrap()
+                } else {
+                    "[]".to_owned()
+                },
+            )
             .env("VERIFY_BASE", format!("http://127.0.0.1:{port}"))
             .env("VERIFY_MODEL", route.model)
             .env("VERIFY_CLIENT", client)
@@ -509,11 +596,21 @@ fn run_cell(
     // Rows can land a beat after the response.
     std::thread::sleep(Duration::from_millis(500));
     let rows = usage_rows(&log_path);
-    let problems = if client == "claude-code" {
+    let mut problems = if client == "claude-code" {
         session_problems(&rows, &ids["a1"])
     } else {
         ledger_problems(&verdict["calls"], &rows, &ids)
     };
+    // The revoked keys were really presented: the provider's 401 drew the key walk (the primary's
+    // revoked key) and the relayed refusal (the steered call's), each counted once.
+    if scenario == "key_rotation" {
+        let failures = metric(metrics_port, "ai_key_auth_failures_total");
+        if failures < 2.0 {
+            problems.push(format!(
+                "ai_key_auth_failures_total = {failures}: the revoked pool keys were never tried"
+            ));
+        }
+    }
     export_rows(&rows);
     if problems.is_empty() {
         let _ = std::fs::remove_dir_all(&dir);
@@ -526,6 +623,21 @@ fn run_cell(
         )
         .into())
     }
+}
+
+/// One unlabeled counter from the gateway's `/metrics` (0 when absent).
+fn metric(metrics_port: u16, name: &str) -> f64 {
+    let Ok(mut s) = TcpStream::connect(("127.0.0.1", metrics_port)) else {
+        return 0.0;
+    };
+    let _ = s.set_read_timeout(Some(Duration::from_secs(2)));
+    let _ = s.write_all(b"GET /metrics HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+    let mut body = String::new();
+    let _ = s.read_to_string(&mut body);
+    body.lines()
+        .filter_map(|l| l.strip_prefix(name))
+        .filter_map(|rest| rest.split_whitespace().last()?.parse::<f64>().ok())
+        .sum()
 }
 
 fn n(v: &Value) -> u64 {
