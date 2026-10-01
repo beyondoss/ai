@@ -1556,7 +1556,6 @@ async fn bare_byo(gw: &Gateway, path: &str, headers: &[(&'static str, &str)]) ->
 /// claim: SEC-11
 /// defect: D82
 #[tokio::test]
-#[ignore = "D82 reproduced: any non-managed x-api-key routes bare /v1 to Anthropic, carrying the Bearer OpenAI key; only the first x-api-key is read"]
 async fn bare_v1_byo_routes_by_the_forwarded_credential() {
     let openai = MockUpstream::start(Mode::Json).await;
     let anthropic = MockUpstream::start(Mode::Json).await;

@@ -2416,26 +2416,60 @@ fn clip_catalog_name(name: &str) -> &str {
 /// ([`dialect_for_path`]); `None` for anything else, which the caller turns into a 404 rather than
 /// silently guessing a provider (Task #7, pi-parity).
 ///
-/// `anthropic_key`: the request carries a non-managed `x-api-key`, which is Anthropic's credential
-/// header. That picks Anthropic whatever the path, so an Anthropic SDK call to `/v1/files` or
-/// `/v1/models/{id}` never reaches OpenAI carrying `sk-ant-…`. The path alone picked OpenAI for
-/// everything but `/v1/messages`.
-fn bare_default_provider_name(path: &str, anthropic_key: bool) -> Option<&'static str> {
-    let dialect = if anthropic_key {
-        Dialect::Anthropic
-    } else {
-        dialect_for_path(path)
-    };
+/// `credential`: the provider the request's BYO credentials belong to
+/// ([`byo_credential_dialect`]). It wins over the path, so an Anthropic SDK call to `/v1/files`
+/// never reaches OpenAI carrying `sk-ant-…`, and an OpenAI key on `/v1/messages` never reaches
+/// Anthropic. With no credential that says, the path picks.
+fn bare_default_provider_name(path: &str, credential: Option<Dialect>) -> Option<&'static str> {
+    let dialect = credential.unwrap_or_else(|| dialect_for_path(path));
     route::is_default_prefix(path).then(|| route::dialect_default(dialect))
 }
 
-/// Whether the request presents a BYO Anthropic credential: a non-empty `x-api-key` that is not a
-/// managed key.
-fn has_byo_anthropic_key(req: &pingora::http::RequestHeader) -> bool {
-    req.headers
-        .get("x-api-key")
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| !v.is_empty() && !key::is_managed_prefix(v))
+/// The provider a BYO key belongs to, from its shape: `sk-ant-…` is Anthropic's, any other `sk-…`
+/// OpenAI's. `None` when the shape says nothing.
+fn byo_key_dialect(key: &str) -> Option<Dialect> {
+    if key.starts_with("sk-ant-") {
+        Some(Dialect::Anthropic)
+    } else if key.starts_with("sk-") {
+        Some(Dialect::OpenAi)
+    } else {
+        None
+    }
+}
+
+/// The provider the BYO credentials on a bare `/v1` request belong to, read from every value the
+/// gateway would forward (D82): each `x-api-key` line (Anthropic's header, so Anthropic unless the
+/// key's shape says otherwise) and each `Authorization: Bearer` token (by its shape only; an
+/// opaque token says nothing). Managed and empty values do not count. `Ok(None)`: nothing says.
+/// `Err(())`: they name different providers; every one would be forwarded, so whichever provider
+/// the request went to would receive the other's key.
+fn byo_credential_dialect(req: &pingora::http::RequestHeader) -> Result<Option<Dialect>, ()> {
+    let byo = |v: &&str| !v.is_empty() && !key::is_managed_prefix(v);
+    let api_keys = req
+        .headers
+        .get_all("x-api-key")
+        .into_iter()
+        .filter_map(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(byo)
+        .map(|v| Some(byo_key_dialect(v).unwrap_or(Dialect::Anthropic)));
+    let bearers = req
+        .headers
+        .get_all("authorization")
+        .into_iter()
+        .filter_map(|v| v.to_str().ok())
+        .filter_map(bearer_token)
+        .filter(byo)
+        .map(byo_key_dialect);
+    let mut vote = None;
+    for d in api_keys.chain(bearers).flatten() {
+        match vote {
+            None => vote = Some(d),
+            Some(v) if v == d => {}
+            Some(_) => return Err(()),
+        }
+    }
+    Ok(vote)
 }
 
 /// Whether the **forwarded** (provider-native) path targets the OpenAI Chat Completions endpoint.
@@ -2737,6 +2771,8 @@ enum Routed {
     UnknownModel,
     /// The first segment matches no provider, is not the bare default, and is not `/auto`.
     UnknownProvider,
+    /// Bare `/v1` with BYO keys for two different providers (D82): a 400, never a guess.
+    AmbiguousCredential,
 }
 
 #[async_trait]
@@ -2838,16 +2874,25 @@ impl ProxyHttp for AiProxy {
                     forward_path: Some(with_query(rest)),
                     streamable: is_streamable_path(rest),
                 }
-            } else if let Some(name) = bare_default_provider_name(path, has_byo_anthropic_key(req))
-            {
-                // Bare default: dialect picks the BYO provider; managed traffic becomes a catalog
-                // walk after identity. Path is forwarded unchanged for BYO (`None`).
-                match self.state.provider(name) {
-                    Some(p) => Routed::BareDefault {
-                        provider: p.clone(),
-                        streamable: is_streamable_path(path),
+            } else if route::is_default_prefix(path) {
+                // Bare default: the BYO credential, else the path's dialect, picks the provider;
+                // managed traffic becomes a catalog walk after identity. Path is forwarded
+                // unchanged for BYO (`None`).
+                match byo_credential_dialect(req) {
+                    // BYO keys for two providers. A managed key anywhere makes the request managed
+                    // (every credential location is stripped), so only BYO is ambiguous.
+                    Err(()) if !extract_virtual_key(req).is_some_and(|p| p.managed) => {
+                        Routed::AmbiguousCredential
+                    }
+                    credential => match bare_default_provider_name(path, credential.ok().flatten())
+                        .and_then(|name| self.state.provider(name))
+                    {
+                        Some(p) => Routed::BareDefault {
+                            provider: p.clone(),
+                            streamable: is_streamable_path(path),
+                        },
+                        None => Routed::UnknownProvider,
                     },
-                    None => Routed::UnknownProvider,
                 }
             } else if first == route::AUTO_SEGMENT {
                 // Model-routed. Reached only after a provider-table miss, so the established routes
@@ -2970,6 +3015,20 @@ impl ProxyHttp for AiProxy {
                     404,
                     "invalid_request_error",
                     "unknown provider",
+                )
+                .await;
+            }
+            Routed::AmbiguousCredential => {
+                // Rare and never a flood path, so not in `REJECT_BODIES`.
+                return Self::reject_message_boxed(
+                    session,
+                    &request_id,
+                    400,
+                    "invalid_request_error",
+                    "the request carries API keys for different providers (x-api-key and \
+                     Authorization); send only the key for the provider you mean, or name it \
+                     with /{provider}/..."
+                        .to_owned(),
                 )
                 .await;
             }
@@ -6811,26 +6870,26 @@ mod tests {
         // then routed it to OpenAI — a silent misroute that 404s against `api.openai.com` instead of
         // failing with a clear "unknown provider" error. Boundary-checking must reject it.
         assert_eq!(
-            bare_default_provider_name("/v1beta/models/gemini-2.5-pro:generateContent", false),
+            bare_default_provider_name("/v1beta/models/gemini-2.5-pro:generateContent", None),
             None,
             "/v1beta must NOT be routed to OpenAI (or any provider) via the bare-default path"
         );
-        assert_eq!(bare_default_provider_name("/v1beta", false), None);
+        assert_eq!(bare_default_provider_name("/v1beta", None), None);
 
         // The real bare-default shape still resolves correctly, dialect-picked.
         assert_eq!(
-            bare_default_provider_name("/v1/messages", false),
+            bare_default_provider_name("/v1/messages", None),
             Some("anthropic")
         );
         assert_eq!(
-            bare_default_provider_name("/v1/chat/completions", false),
+            bare_default_provider_name("/v1/chat/completions", None),
             Some("openai")
         );
-        assert_eq!(bare_default_provider_name("/v1", false), Some("openai"));
+        assert_eq!(bare_default_provider_name("/v1", None), Some("openai"));
 
         // Other near-miss prefixes must also be rejected, not just /v1beta.
-        assert_eq!(bare_default_provider_name("/v10/messages", false), None);
-        assert_eq!(bare_default_provider_name("/v2/messages", false), None);
+        assert_eq!(bare_default_provider_name("/v10/messages", None), None);
+        assert_eq!(bare_default_provider_name("/v2/messages", None), None);
     }
 
     /// claim: SEC-11
@@ -6844,22 +6903,90 @@ mod tests {
             "/v1",
         ] {
             assert_eq!(
-                bare_default_provider_name(path, true),
+                bare_default_provider_name(path, Some(Dialect::Anthropic)),
                 Some("anthropic"),
                 "{path}"
             );
         }
-        assert_eq!(bare_default_provider_name("/v1beta/x", true), None);
+        assert_eq!(
+            bare_default_provider_name("/v1beta/x", Some(Dialect::Anthropic)),
+            None
+        );
         let req = req_with_headers("/v1/files", &[("x-api-key", "sk-ant-byo")]);
-        assert!(has_byo_anthropic_key(&req));
+        assert_eq!(byo_credential_dialect(&req), Ok(Some(Dialect::Anthropic)));
         for headers in [
             &[("x-api-key", "bai_v1.1.p.s")][..],
             &[("x-api-key", "")][..],
-            &[("authorization", "Bearer sk-ant-byo")][..],
+            &[("authorization", "Bearer opaque-token")][..],
         ] {
             let req = req_with_headers("/v1/files", headers);
-            assert!(!has_byo_anthropic_key(&req), "{headers:?}");
+            assert_eq!(byo_credential_dialect(&req), Ok(None), "{headers:?}");
         }
+    }
+
+    /// The BYO credential that will be forwarded picks the provider (D82): by shape where it has
+    /// one, `x-api-key` meaning Anthropic otherwise, every value read; keys for two providers on one
+    /// request are ambiguous.
+    #[test]
+    fn byo_credentials_pick_the_provider_they_belong_to() {
+        // Appends, so a repeated header keeps every line.
+        let dialect = |headers: &[(&'static str, &'static str)]| {
+            let mut req = pingora::http::RequestHeader::build(
+                http::Method::POST,
+                b"/v1/chat/completions",
+                None,
+            )
+            .unwrap();
+            for (k, v) in headers {
+                req.append_header(*k, *v).unwrap();
+            }
+            byo_credential_dialect(&req)
+        };
+        assert_eq!(
+            dialect(&[("authorization", "Bearer sk-proj-abc")]),
+            Ok(Some(Dialect::OpenAi))
+        );
+        assert_eq!(
+            dialect(&[("authorization", "Bearer sk-ant-oat01-abc")]),
+            Ok(Some(Dialect::Anthropic))
+        );
+        assert_eq!(
+            dialect(&[("x-api-key", ""), ("x-api-key", "sk-ant-api03-x")]),
+            Ok(Some(Dialect::Anthropic)),
+            "every x-api-key line counts"
+        );
+        assert_eq!(
+            dialect(&[
+                ("x-api-key", "sk-ant-a"),
+                ("authorization", "Bearer sk-ant-a")
+            ]),
+            Ok(Some(Dialect::Anthropic)),
+            "the same provider twice is not ambiguous"
+        );
+        assert_eq!(
+            dialect(&[
+                ("x-api-key", "stray"),
+                ("authorization", "Bearer sk-proj-abc")
+            ]),
+            Err(())
+        );
+        assert_eq!(
+            dialect(&[("x-api-key", "sk-ant-a"), ("x-api-key", "sk-proj-b")]),
+            Err(())
+        );
+        assert_eq!(
+            dialect(&[
+                ("x-api-key", "bai_v1.1.p.s"),
+                ("authorization", "Bearer sk-proj-abc")
+            ]),
+            Ok(Some(Dialect::OpenAi)),
+            "a managed value casts no vote"
+        );
+        assert_eq!(
+            bare_default_provider_name("/v1/messages", Some(Dialect::OpenAi)),
+            Some("openai"),
+            "an OpenAI key never goes to Anthropic, whatever the path"
+        );
     }
 
     #[test]
