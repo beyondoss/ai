@@ -622,7 +622,7 @@ const HEALTH_PREFIX_CAP: usize = 1024;
 /// A managed catalog walk's status that means this candidate's pool key failed: revoked (401),
 /// not entitled (403), or unfunded (402).
 fn is_pool_key_failure(status: u16) -> bool {
-    matches!(status, 401 | 402 | 403)
+    (401..=403).contains(&status)
 }
 
 /// Whether a 2xx body's first bytes are an error: `Some(true)` an error object, `Some(false)` an
