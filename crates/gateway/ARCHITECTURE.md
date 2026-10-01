@@ -1121,8 +1121,13 @@ disconnects too, and "the stream died at token 400" is frequently the answer.
 
 `ai.usage` keeps the blocking stdout writer and is **lossless** — a dropped billing row is money we
 can't account for. `ai.payload` gets a **bounded, lossy** queue drained by its own OS thread, and
-overflow drops the line rather than waiting. `init_tracing` installs the two as separate layers
-whose target filters are exact complements.
+overflow drops the line rather than waiting. `init_tracing` installs three layers whose target
+filters are exact complements: `ai.usage`, `ai.payload`, and every other target.
+
+`AI_LOG` filters the diagnostic and payload layers only. The `ai.usage` layer has no level filter:
+billing rows are not diagnostics, and when one global filter covered every layer, `AI_LOG=warn`
+silently dropped every row. A row whose stdout write fails (a closed or broken pipe) is counted on
+`ai_usage_write_errors_total` and reported on stderr, the only record left of it.
 
 The hazard this removes is real: a synchronous multi-KB write means that if the log shipper stops
 draining the stdout pipe, `write(2)` blocks and a _log sink_ is applying backpressure to the proxy.
@@ -1738,6 +1743,7 @@ Prometheus on the default registry, exposed at `/metrics` on `metrics_listen`.
 | `ai_model_header_body_mismatch_total` | Counter   | —                    | Catalog-walk requests whose `x-beyond-model` and body `model` disagreed (header wins; client bug)                                                             |
 | `ai_failover_unreplayable_total`      | Counter   | —                    | 5xx/429 retries declined on `/{provider}` or a still-uploading body: not provably replayable (catalog walks re-run instead)                                   |
 | `ai_usage_estimated_total`            | Counter   | —                    | Managed streams cut short before their usage block, billed with estimated tokens                                                                              |
+| `ai_usage_write_errors_total`         | Counter   | —                    | `ai.usage` billing rows whose stdout write failed (the row is lost; also reported on stderr)                                                                  |
 
 ---
 

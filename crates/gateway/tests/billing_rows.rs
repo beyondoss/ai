@@ -28,7 +28,6 @@ async fn post(url: String, auth: (&str, String), body: &str, extra: &[(&str, &st
 /// claim: BIL-4
 /// defect: D08
 #[tokio::test]
-#[ignore = "D08 reproduced: with AI_LOG=warn the global EnvFilter drops every ai.usage row"]
 async fn ai_log_warn_still_emits_usage_rows() {
     let (pubkey, sk) = test_keypair(81);
     let mock = MockUpstream::start(Mode::Json).await;

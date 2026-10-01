@@ -270,6 +270,9 @@ pub struct Metrics {
     /// Managed streams cut short before their usage block (client cancel, upstream death) whose
     /// `ai.usage` row carries estimated tokens (`usage_estimated=true`) instead of reported ones.
     pub usage_estimated_total: IntCounter,
+    /// `ai.usage` billing rows whose stdout write failed (a closed or broken pipe). The row is lost
+    /// to the log pipeline, so this counter, and the line on stderr, are the only record of it.
+    pub usage_write_errors_total: IntCounter,
     /// Current allowance-set cardinality (exhausted tenants + keys). Sparse; a climb that never
     /// falls means the control plane is writing exhaust bits without deleting them on restore.
     pub allowance_set_size: IntGauge,
@@ -435,6 +438,10 @@ impl Metrics {
             "ai_usage_estimated_total",
             "Managed streams cut short before their usage block, billed with estimated tokens",
         ))?;
+        let usage_write_errors_total = IntCounter::with_opts(Opts::new(
+            "ai_usage_write_errors_total",
+            "ai.usage billing rows whose stdout write failed (the row is lost)",
+        ))?;
         let cache_hits_total = IntCounter::with_opts(Opts::new(
             "ai_cache_hits_total",
             "Exact-match cache hits that replayed a stored 2xx and skipped the provider",
@@ -486,6 +493,7 @@ impl Metrics {
         r.register(Box::new(control_header_errors_total.clone()))?;
         r.register(Box::new(usage_parse_errors_total.clone()))?;
         r.register(Box::new(usage_estimated_total.clone()))?;
+        r.register(Box::new(usage_write_errors_total.clone()))?;
         r.register(Box::new(cache_hits_total.clone()))?;
         r.register(Box::new(cache_scope.clone()))?;
         r.register(Box::new(smart_rank_scope.clone()))?;
@@ -524,6 +532,7 @@ impl Metrics {
             control_header_errors_total,
             usage_parse_errors_total,
             usage_estimated_total,
+            usage_write_errors_total,
             cache_hits_total,
             cache_scope: cache_scope_process,
             smart_rank_scope: smart_rank_scope_process,

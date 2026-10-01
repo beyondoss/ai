@@ -28,7 +28,7 @@ use pingora_proxy::ProxyServiceBuilder;
 use std::path::Path;
 use std::process::exit;
 use tracing_subscriber::EnvFilter;
-use tracing_subscriber::filter::filter_fn;
+use tracing_subscriber::filter::{FilterExt, filter_fn};
 use tracing_subscriber::layer::{Layer, SubscriberExt};
 use tracing_subscriber::util::SubscriberInitExt;
 
@@ -67,22 +67,66 @@ fn load_config(path: Option<&Path>) -> AiConfig {
 /// The target carrying captured request/response payloads. Split onto its own writer — see below.
 const PAYLOAD_TARGET: &str = "ai.payload";
 
+/// The target carrying billing rows. Split onto its own layer — see below.
+const USAGE_TARGET: &str = "ai.usage";
+
+/// Stdout for `ai.usage` rows that notices when a row fails to land.
+///
+/// The fmt layer discards a writer's error, so a closed or broken stdout pipe silently lost every
+/// billing row. This counts each failed row on `ai_usage_write_errors_total` and says so on
+/// stderr — the only record left of it. One row is one `write_all`, which stops at the first error,
+/// so a failed row counts once.
+struct UsageStdout(prometheus::IntCounter);
+
+struct UsageLine<'a>(&'a prometheus::IntCounter, std::io::Stdout);
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for UsageStdout {
+    type Writer = UsageLine<'a>;
+    fn make_writer(&'a self) -> Self::Writer {
+        UsageLine(&self.0, std::io::stdout())
+    }
+}
+
+impl std::io::Write for UsageLine<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.1.write(buf).inspect_err(|e| {
+            // `write_all` retries an interrupted write itself; that is not a lost row.
+            if e.kind() != std::io::ErrorKind::Interrupted {
+                self.0.inc();
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "ai.usage billing row lost: stdout write failed: {e}"
+                );
+            }
+        })
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.1.flush()
+    }
+}
+
 fn init_tracing(metrics: &Metrics, queue_depth: usize) {
     // JSON to stdout; the `ai.usage` target carries billing facts that logfwd/OTLP ships to
-    // ClickHouse. `AI_LOG` overrides the level filter.
-    let filter = EnvFilter::try_from_env("AI_LOG").unwrap_or_else(|_| EnvFilter::new("info"));
+    // ClickHouse. `AI_LOG` sets the level filter for everything **except** those rows.
+    let env_filter =
+        || EnvFilter::try_from_env("AI_LOG").unwrap_or_else(|_| EnvFilter::new("info"));
 
-    // Two layers, split by target, because the two kinds of line want opposite guarantees.
+    // Three layers, split by target, because the three kinds of line want different guarantees.
     //
-    //  * Everything else — including `ai.usage` — keeps the **blocking** stdout writer. Billing rows
-    //    must never be dropped, and at a few hundred bytes each the synchronous write is free.
-    //  * `ai.payload` gets a **bounded, lossy** queue drained by its own thread. A captured payload
-    //    is orders of magnitude larger and exists only to explain incidents, so if the log pipeline
-    //    stalls we drop payloads (counted on `ai_capture_dropped_total`) rather than let a stalled
-    //    stdout pipe backpressure the proxy. See `capture_sink`.
+    //  * `ai.usage` — billing rows, not diagnostics. Its own layer with **no** level filter: an
+    //    operator turning `AI_LOG` down to `warn` must not silently stop billing, which is what one
+    //    global filter over every layer did. The **blocking** stdout writer: at a few hundred bytes
+    //    each the synchronous write is free, and a row must never be dropped — a failed write is
+    //    counted (`UsageStdout`).
+    //  * Everything else — diagnostics, filtered by `AI_LOG`, on the same blocking stdout.
+    //  * `ai.payload` gets a **bounded, lossy** queue drained by its own thread, under `AI_LOG` as
+    //    before. A captured payload is orders of magnitude larger and exists only to explain
+    //    incidents, so if the log pipeline stalls we drop payloads (counted on
+    //    `ai_capture_dropped_total`) rather than let a stalled stdout pipe backpressure the proxy.
+    //    See `capture_sink`.
     //
-    // The two filters are exact complements: every event lands in exactly one layer, so nothing is
-    // duplicated and nothing is silently swallowed.
+    // The target filters are exact complements: every event lands in at most one layer, so nothing
+    // is duplicated.
     // A gateway that can't spawn a thread at boot won't serve traffic either — fail visibly rather
     // than run with payload capture silently disabled. Same eprintln+exit shape as the config and
     // metrics failures above, which is why this isn't a `tracing` error: nothing is initialized yet.
@@ -94,18 +138,23 @@ fn init_tracing(metrics: &Metrics, queue_depth: usize) {
             exit(1);
         }
     };
+    let usage_layer = tracing_subscriber::fmt::layer()
+        .json()
+        .with_writer(UsageStdout(metrics.usage_write_errors_total.clone()))
+        .with_filter(filter_fn(|meta| meta.target() == USAGE_TARGET));
     let payload_layer = tracing_subscriber::fmt::layer()
         .json()
         .with_writer(payload_sink)
-        .with_filter(filter_fn(|meta| meta.target() == PAYLOAD_TARGET));
-    let main_layer = tracing_subscriber::fmt::layer()
-        .json()
-        .with_filter(filter_fn(|meta| meta.target() != PAYLOAD_TARGET));
+        .with_filter(filter_fn(|meta| meta.target() == PAYLOAD_TARGET).and(env_filter()));
+    let main_layer = tracing_subscriber::fmt::layer().json().with_filter(
+        filter_fn(|meta| meta.target() != PAYLOAD_TARGET && meta.target() != USAGE_TARGET)
+            .and(env_filter()),
+    );
 
     tracing_subscriber::registry()
+        .with(usage_layer)
         .with(main_layer)
         .with(payload_layer)
-        .with(filter)
         .init();
 }
 
