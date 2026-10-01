@@ -1604,7 +1604,7 @@ oracle = "Claude Code / Codex / pi multi-step repo task: task completes, compact
 layer = "live"
 clients = ["claude-code", "codex", "pi"]
 touches = ["crates/gateway/src/translate.rs", "crates/gateway/src/proxy.rs", "crates/gateway/src/usage.rs"]
-defects = []
+defects = ["D114"]
 
 [[claim]]
 id = "LNG-2"
@@ -1626,7 +1626,7 @@ oracle = "SDK and harness requests with N tools around each provider's limit: su
 layer = "live"
 clients = ["openai-py", "anthropic-py", "claude-code", "codex"]
 touches = ["crates/gateway/src/translate.rs"]
-defects = []
+defects = ["D131"]
 
 [[claim]]
 id = "TEN-1"

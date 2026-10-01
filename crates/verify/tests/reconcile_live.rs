@@ -15,6 +15,8 @@
 //!
 //! Trials are listed only with `VERIFY_LIVE=1` *and* both of the provider's keys set (admin and
 //! pool): a missing key means the trial is not listed, never that it fails.
+//!
+//! `long_live.rs` includes this file as a module to reconcile its long sessions the same way.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -38,7 +40,7 @@ const SETTLE_BUDGET: Duration = Duration::from_secs(15 * 60);
 const POLL_EVERY: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Copy, PartialEq)]
-enum Provider {
+pub(crate) enum Provider {
     OpenAi,
     Anthropic,
 }
@@ -153,18 +155,18 @@ fn main() {
 
 /// Token totals in one normalized shape: `fresh` is uncached input on both wires.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct Totals {
-    fresh: u64,
-    cache_read: u64,
-    cache_write: u64,
-    output: u64,
+pub(crate) struct Totals {
+    pub(crate) fresh: u64,
+    pub(crate) cache_read: u64,
+    pub(crate) cache_write: u64,
+    pub(crate) output: u64,
     /// Request count, where the side reports one (Anthropic's usage report doesn't).
-    requests: Option<u64>,
+    pub(crate) requests: Option<u64>,
 }
 
 impl Totals {
     /// Equal on every token class, and on requests where both sides count them.
-    fn agrees(&self, other: &Totals) -> bool {
+    pub(crate) fn agrees(&self, other: &Totals) -> bool {
         self.fresh == other.fresh
             && self.cache_read == other.cache_read
             && self.cache_write == other.cache_write
@@ -190,7 +192,7 @@ impl std::fmt::Display for Totals {
     }
 }
 
-fn now_secs() -> u64 {
+pub(crate) fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
@@ -651,7 +653,7 @@ fn hint_matches(hint: &str, key: &str) -> bool {
 
 /// The pool key's id in the provider's usage report, found by listing the org's keys (read-only)
 /// and matching the redacted hint.
-fn pool_key_id(provider: Provider, pool: &str, admin: &str) -> Result<String, Failed> {
+pub(crate) fn pool_key_id(provider: Provider, pool: &str, admin: &str) -> Result<String, Failed> {
     let mut found = BTreeSet::new();
     match provider {
         Provider::Anthropic => {
@@ -728,7 +730,7 @@ fn model_matches(reported: &str, model: &str) -> bool {
 
 /// OpenAI's completions usage (Chat Completions and Responses both report here). `input_tokens`
 /// includes cached and cache-written tokens; `input_uncached_tokens` is what's left.
-fn openai_usage(
+pub(crate) fn openai_usage(
     admin: &str,
     key_id: &str,
     model: &str,
@@ -781,7 +783,7 @@ fn openai_usage(
 /// Anthropic's messages usage report: `uncached_input_tokens`, `cache_read_input_tokens`, and
 /// cache writes split by TTL under `cache_creation` (summed: the ledger's `cache_write_tokens`
 /// counts both, with the 1-hour ones a subset in `cache_write_1h_tokens`). No request count.
-fn anthropic_usage(
+pub(crate) fn anthropic_usage(
     admin: &str,
     key_id: &str,
     model: &str,

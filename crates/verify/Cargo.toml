@@ -62,5 +62,9 @@ harness = false
 name = "fault_live"
 harness = false
 
+[[test]]
+name = "long_live"
+harness = false
+
 [lints]
 workspace = true

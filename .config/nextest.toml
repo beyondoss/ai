@@ -42,5 +42,11 @@ slow-timeout = { period = "60s", terminate-after = 3 }
 filter = "binary_id(beyond-ai-verify::reconcile_live)"
 slow-timeout = { period = "60s", terminate-after = 18 }
 
+# A long coding session runs 3-10 minutes, then (where reconciled) waits up to 15 more for the
+# provider's usage report (crates/verify/tests/long_live.rs).
+[[profile.verify.overrides]]
+filter = "binary_id(beyond-ai-verify::long_live)"
+slow-timeout = { period = "60s", terminate-after = 35 }
+
 [profile.verify.junit]
 path = "junit.xml"

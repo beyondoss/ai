@@ -197,6 +197,36 @@ VERIFY_LIVE=1 cargo nextest run -p beyond-ai-verify --test fault_live -j 12
 VERIFY_FAULT_VERBOSE=1 VERIFY_LIVE=1 cargo nextest run ... --no-capture  # print every witness
 ```
 
+## Long sessions and large tool sets (LNG-1, LNG-2, TOOL-1)
+
+`crates/verify/tests/long_live.rs` drives clients through `verify/clients/harness_long.py`, which
+puts a recording proxy between the client and the gateway. So every HTTP call a coding agent makes
+is held to the ledger: one `ai.usage` row per successful billed call, none for a free one, nothing
+billed for a refusal, and no row without a call.
+
+- LNG-1: Claude Code, Codex and pi work through `ledgerlib`, a fixture repo with eight ordered
+  steps, each with its own tests (30-80 model calls). Each harness's compaction knob is turned
+  down so auto-compaction happens mid-session. The trial checks that the repo's tests pass, that
+  compaction shows in both the harness's events and on the wire, and that the ledger is complete.
+  Two sessions reconcile against the provider's usage report (the BIL-5 method): pi on
+  `claude-sonnet-5` and Claude Code (translated) on `gpt-5`.
+- LNG-2: the per-turn cache share (`cache_read / input_total`) over the same sessions, plus
+  opencode, must clear a floor after warm-up. The floor and how it was chosen are in the file's
+  doc comment.
+- TOOL-1: SDK requests with N tools on every wire (Chat, Responses, Messages, Codex's `namespace`
+  tool), below and above OpenAI Chat Completions' 128-tool limit, plus large schemas. Two
+  harnesses are also offered 150 MCP tools.
+
+A long session takes 3-10 minutes, and a reconciled one waits up to 15 more for the usage report.
+A full run costs about $3. Harness homes live in `/var/tmp/verify-long-*`, outside the user's home:
+Claude Code reads every `CLAUDE.md` on the way up from its working directory. `VERIFY_LONG_KEEP=1`
+keeps them (with every call and its response tail) and each gateway log under
+`target/verify-long/`.
+
+```sh
+VERIFY_LIVE=1 cargo nextest run -p beyond-ai-verify --test long_live --profile verify
+```
+
 `STALE` status will land with the run ledger.
 
 ## Session trials (SES-1..3)
