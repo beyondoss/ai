@@ -191,12 +191,11 @@ const SESSIONS: &[Session] = &[
     // into the new context, and the session stalls (5 of 6 tries on gpt-5 and gpt-5-mini; the
     // gateway relays both turns intact). Compaction is covered on the Claude rows.
     ("LNG-1",       "claude-code", "claude-code:uncompacted", GPT51, Some(Provider::OpenAi)),
-    // Translated and compacted (D114 refused its first turn until fixed). Claude Code's knob is
-    // CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=30 on its 80k effective window: 24k, between the ~21k a
-    // compaction leaves and the 25.8-27k the session ends on uncompacted (derivation in
-    // harness_long.py; at 35%, 28k, two of three sessions finished without compacting). The band
-    // is narrow: at 30% one of two sessions compacted 8 times and stalled on the last step.
-    ("LNG-1",       "claude-code", "claude-code", GPT54MINI, None),
+    // Translated onto the Responses arm (D114 refused its first turn until fixed), uncompacted for
+    // the same reason as the gpt-5.1 session: forced to compact, a GPT model answers with another
+    // summary and the session loops (measured here too: at a 24k threshold one of two sessions
+    // compacted 8 times and stalled on the last step; the gateway relays every turn intact).
+    ("LNG-1",       "claude-code", "claude-code:uncompacted", GPT54MINI, None),
     // Not reconciled: gpt-5.3-codex is the one row Codex runs on (D74), and live.rs,
     // session_live.rs and catalog_live.rs drive it too. Two tries both met a few small requests
     // from other suites in the same minutes (+3 and +4 requests over ~30), which no report
