@@ -95,6 +95,80 @@ async fn a_429_key_walk_ends_the_same_for_small_and_large_bodies() {
     assert_eq!(small, large, "small vs large body diverged");
 }
 
+/// The primary throttles its first pool key and fails (5xx) on its second. The key walk stays on
+/// the primary, and the 5xx that ends it is a candidate failure like any other: both body sizes
+/// fail over to the fallback vendor.
+/// claim: R1, R5, REL-21
+/// defect: D81
+#[tokio::test]
+#[ignore = "D81 reproduced: a large body's key walk pins every later attempt to its candidate, so the next key's 5xx is relayed"]
+async fn a_5xx_after_a_key_walk_fails_over_for_small_and_large_bodies() {
+    let (pubkey, sk) = test_keypair(1);
+    for pad in [SMALL, LARGE] {
+        let primary = ReplyUpstream::start(|_, req| match req.authorization.as_deref() {
+            Some("Bearer sk-a") => Reply::json(429, r#"{"error":{"message":"slow down"}}"#),
+            _ => Reply::json(500, r#"{"error":{"message":"boom"}}"#),
+        })
+        .await;
+        let fallback = MockUpstream::start(Mode::Json).await;
+        let gw = Gateway::builder(unused_nats_port(), &primary.authority(), &b64(&pubkey))
+            .providers(&["openai", "openrouter"])
+            .provider_authority("openrouter", &fallback.authority())
+            .pool_keys("openai", &["sk-a", "sk-b"])
+            .start()
+            .await;
+        let out = send(&gw, &vkey(&sk), pad).await;
+        assert_eq!(
+            (
+                out.status,
+                out.provider.as_deref(),
+                primary.hits(),
+                fallback.hits()
+            ),
+            (200, Some("openrouter"), 2, 1),
+            "pad {pad}: {out:?}"
+        );
+    }
+}
+
+/// A revoked first pool key cools off (D71), so later requests start on the next key. A large body
+/// re-run as a `FullBody` subrequest must honor that too, rather than paying a 401 and a second
+/// upload of the whole body on every request.
+/// claim: REL-14, R5
+/// defect: D83
+#[tokio::test]
+#[ignore = "D83 reproduced: a FullBody re-run starts on key 0 whatever its cooldown"]
+async fn a_large_body_starts_past_a_cooling_pool_key() {
+    let (pubkey, sk) = test_keypair(1);
+    let revoked = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let count = revoked.clone();
+    let primary = ReplyUpstream::start(move |_, req| {
+        if req.authorization.as_deref() == Some("Bearer sk-a") {
+            count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Reply::json(401, r#"{"error":{"message":"invalid api key"}}"#)
+        } else {
+            Reply::ok()
+        }
+    })
+    .await;
+    let gw = Gateway::builder(unused_nats_port(), &primary.authority(), &b64(&pubkey))
+        .providers(&["openai"])
+        .pool_keys("openai", &["sk-a", "sk-b"])
+        .start()
+        .await;
+    let key = vkey(&sk);
+    assert_eq!(send(&gw, &key, SMALL).await.status, 200);
+    for i in 0..3 {
+        let out = send(&gw, &key, LARGE).await;
+        assert_eq!(out.status, 200, "#{i}: {out:?}");
+    }
+    assert_eq!(
+        revoked.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "only the first request pays the revoked key"
+    );
+}
+
 /// Every candidate resets the connection. Whatever the gateway answers, a large body must get the
 /// same status as a small one, and must not blame a missing provider key.
 /// claim: REL-21

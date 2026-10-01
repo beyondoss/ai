@@ -8,6 +8,16 @@
 use crate::route::Dialect;
 use arrayvec::ArrayString;
 use serde::Deserialize;
+use tracing_subscriber::filter::{FilterFn, filter_fn};
+
+/// The `tracing` target billing rows are written on.
+pub const USAGE_TARGET: &str = "ai.usage";
+
+/// The filter for the billing-row log layer: the [`USAGE_TARGET`] only, and under no `AI_LOG`
+/// level, so an operator turning diagnostics down never stops billing.
+pub fn usage_log_filter() -> FilterFn<impl Fn(&tracing::Metadata<'_>) -> bool> {
+    filter_fn(|meta| meta.target() == USAGE_TARGET)
+}
 
 /// A provider-echoed service tier (`default`, `flex`, `priority`, `standard`, …). Inline and `Copy`
 /// so [`Usage`] stays `Copy`; a value longer than this, or outside `[a-z0-9_-]`, is dropped rather
@@ -995,6 +1005,27 @@ fn delta_text_len(v: &serde_json::Value) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The billing layer takes no `AI_LOG` filter, but it must still tell `tracing` the most verbose
+    /// level it wants. Without a hint the whole subscriber's max level is TRACE, and `LogTracer`
+    /// dispatches every pingora `debug!`/`trace!` record only for every layer to drop it.
+    /// claim: BIL-4
+    /// defect: D93
+    #[test]
+    #[ignore = "D93 reproduced: the billing layer gives no max level hint, so the subscriber's max level is TRACE"]
+    fn the_billing_log_layer_caps_the_max_level_at_info() {
+        use tracing::Subscriber as _;
+        use tracing_subscriber::layer::{Layer as _, SubscriberExt as _};
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(std::io::sink)
+                .with_filter(usage_log_filter()),
+        );
+        assert_eq!(
+            subscriber.max_level_hint(),
+            Some(tracing::level_filters::LevelFilter::INFO)
+        );
+    }
 
     // --- cut-short estimates ---
 

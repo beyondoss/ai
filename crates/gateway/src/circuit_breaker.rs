@@ -1251,6 +1251,35 @@ mod tests {
         }
     }
 
+    /// The windowed rate rule is "failures ≥ threshold and failures ≥ successes". A busy window can
+    /// record more successes than the failure count can hold; failures must still be able to catch
+    /// up, so the two counts saturate at the same value and a majority of failures always opens.
+    /// claim: REL-6
+    /// defect: D97
+    #[test]
+    #[ignore = "D97 reproduced: successes count to 65535 but failures stop at 16383, so a busy window can never trip"]
+    fn a_failure_majority_opens_a_window_with_more_successes_than_the_failure_count_holds() {
+        let cb = CircuitBreaker::with_clock(
+            CircuitBreakerConfig::windowed(3, Duration::from_secs(60))
+                .reset_timeout(Duration::from_secs(3600)),
+            fixed_clock,
+        );
+        cb.record_failure();
+        for _ in 0..20_000 {
+            cb.record_success();
+        }
+        for _ in 0..20_001 {
+            cb.record_failure();
+            if cb.state() == CircuitState::Open {
+                return;
+            }
+        }
+        panic!(
+            "20001 failures against 20000 successes in one window never opened: {:?}",
+            cb.state()
+        );
+    }
+
     // =========================================================================
     // Pack/unpack tests
     // =========================================================================

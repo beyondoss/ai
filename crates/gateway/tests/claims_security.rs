@@ -1524,3 +1524,85 @@ async fn capture_off_is_per_request_and_forced_capture_is_bounded() {
         body.len()
     );
 }
+
+/// Send a BYO request to bare `/v1{path}` with these credential headers (repeats kept) and return
+/// the status.
+async fn bare_byo(gw: &Gateway, path: &str, headers: &[(&'static str, &str)]) -> u16 {
+    let mut map = reqwest::header::HeaderMap::new();
+    for (k, v) in headers {
+        map.append(
+            reqwest::header::HeaderName::from_static(k),
+            reqwest::header::HeaderValue::from_str(v).unwrap(),
+        );
+    }
+    let resp = test_client()
+        .post(format!("{}{path}", gw.url()))
+        .headers(map)
+        .header("content-type", "application/json")
+        .body(CHAT)
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status().as_u16();
+    let _ = resp.bytes().await;
+    status
+}
+
+/// Bare `/v1` routes a BYO request by the credential it will forward, never by a stray header
+/// beside it. An OpenAI-shaped `Bearer sk-…` never reaches Anthropic, whatever the path; every
+/// `x-api-key` value counts, not just the first; and credentials for two different providers on one
+/// request are a 400, since the gateway forwards them all and cannot know which one the caller
+/// meant.
+/// claim: SEC-11
+/// defect: D82
+#[tokio::test]
+#[ignore = "D82 reproduced: any non-managed x-api-key routes bare /v1 to Anthropic, carrying the Bearer OpenAI key; only the first x-api-key is read"]
+async fn bare_v1_byo_routes_by_the_forwarded_credential() {
+    let openai = MockUpstream::start(Mode::Json).await;
+    let anthropic = MockUpstream::start(Mode::Json).await;
+    let (pubkey, _sk) = test_keypair(82);
+    let gw = Gateway::builder(unused_nats_port(), &openai.authority(), &b64(&pubkey))
+        .providers(&["openai", "anthropic"])
+        .provider_authority("anthropic", &anthropic.authority())
+        .start()
+        .await;
+    // A stray x-api-key beside an OpenAI key: ambiguous, and nothing leaves the gateway.
+    let status = bare_byo(
+        &gw,
+        "/v1/chat/completions",
+        &[
+            ("x-api-key", "stray"),
+            ("authorization", "Bearer sk-proj-openai-byo"),
+        ],
+    )
+    .await;
+    assert_eq!(
+        (status, openai.hits(), anthropic.hits()),
+        (400, 0, 0),
+        "mixed BYO credentials"
+    );
+    // An OpenAI key on the Messages path goes to OpenAI (which will refuse it), not to Anthropic.
+    let status = bare_byo(
+        &gw,
+        "/v1/messages",
+        &[("authorization", "Bearer sk-proj-openai-byo")],
+    )
+    .await;
+    assert_eq!(
+        (status, openai.hits(), anthropic.hits()),
+        (200, 1, 0),
+        "an OpenAI key reached Anthropic"
+    );
+    // The Anthropic key is the second x-api-key line: it still routes to Anthropic.
+    let status = bare_byo(
+        &gw,
+        "/v1/chat/completions",
+        &[("x-api-key", ""), ("x-api-key", "sk-ant-api03-byo")],
+    )
+    .await;
+    assert_eq!(
+        (status, openai.hits(), anthropic.hits()),
+        (200, 1, 1),
+        "an Anthropic key reached OpenAI"
+    );
+}

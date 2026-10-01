@@ -17,6 +17,7 @@ use beyond_ai::metrics::Metrics;
 use beyond_ai::proxy::{AiProxy, LIVE_REQUESTS};
 use beyond_ai::state::GatewayState;
 use beyond_ai::store_watch::{Allowance, Capture, Deny, WatcherService};
+use beyond_ai::usage::{USAGE_TARGET, usage_log_filter};
 use clap::{Parser, Subcommand};
 use pingora_core::apps::HttpServerOptions;
 use pingora_core::apps::http_app::HttpServer;
@@ -123,9 +124,6 @@ fn drain_then_exit(grace: Duration) {
 /// The target carrying captured request/response payloads. Split onto its own writer — see below.
 const PAYLOAD_TARGET: &str = "ai.payload";
 
-/// The target carrying billing rows. Split onto its own layer — see below.
-const USAGE_TARGET: &str = "ai.usage";
-
 /// Stdout for `ai.usage` rows that notices when a row fails to land.
 ///
 /// The fmt layer discards a writer's error, so a closed or broken stdout pipe silently lost every
@@ -197,7 +195,7 @@ fn init_tracing(metrics: &Metrics, queue_depth: usize) {
     let usage_layer = tracing_subscriber::fmt::layer()
         .json()
         .with_writer(UsageStdout(metrics.usage_write_errors_total.clone()))
-        .with_filter(filter_fn(|meta| meta.target() == USAGE_TARGET));
+        .with_filter(usage_log_filter());
     let payload_layer = tracing_subscriber::fmt::layer()
         .json()
         .with_writer(payload_sink)

@@ -6064,6 +6064,31 @@ mod tests {
         assert_eq!(sse("data: {\"err"), None);
     }
 
+    /// Building a request's context touches no shared reference count: every worker would otherwise
+    /// bounce the gateway state's `Arc` cache line on every request, including every fast reject.
+    /// claim: S1
+    /// defect: D92
+    #[test]
+    #[ignore = "D92 reproduced: new_ctx clones the gateway state's Arc for every request"]
+    fn new_ctx_pays_no_arc_clone() {
+        let state = GatewayState::new(
+            crate::config::AiConfig::default(),
+            crate::state::test_metrics(),
+        )
+        .unwrap();
+        let proxy = AiProxy {
+            state: state.clone(),
+        };
+        let before = Arc::strong_count(&state);
+        let ctx = proxy.new_ctx();
+        assert_eq!(
+            Arc::strong_count(&state),
+            before,
+            "new_ctx cloned the state Arc"
+        );
+        drop(ctx);
+    }
+
     #[test]
     fn request_ctx_stays_small_enough_to_be_cheap_per_chunk() {
         let size = std::mem::size_of::<RequestCtx>();

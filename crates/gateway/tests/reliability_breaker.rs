@@ -342,6 +342,60 @@ async fn client_upload_failures_do_not_open_the_breaker() {
     assert_eq!(status, 200, "the breaker opened on client faults");
 }
 
+/// The half-open probe is a request whose client stalls mid-upload, so the attempt ends with no
+/// provider outcome at all. That says nothing about the provider: the probe permit goes back, and
+/// the breaker stays half-open. It must not close (which would let every caller flood a provider
+/// that is still broken), so the next callers get exactly one new probe between them.
+/// claim: REL-6, SEC-16
+/// defect: D86
+#[tokio::test]
+#[ignore = "D86 reproduced: a probe that ends with no provider outcome records a success and closes the breaker"]
+async fn a_probe_with_no_provider_outcome_leaves_the_breaker_half_open() {
+    let nats_port = unused_nats_port();
+    let (pubkey, _sk) = test_keypair(1);
+    // 0: a 500 opens the breaker. 1: the stalled probe (never answered: its body never ends).
+    // Everything after: still broken, and slow enough that concurrent callers overlap.
+    let mock = ReplyUpstream::start(|n, _| match n {
+        0 => Reply::json(500, r#"{"error":{"message":"mock"}}"#),
+        _ => Reply::Delayed(
+            Duration::from_millis(800),
+            Box::new(Reply::json(500, r#"{"error":{"message":"mock"}}"#)),
+        ),
+    })
+    .await;
+    let gw = Gateway::builder(nats_port, &mock.authority(), &b64(&pubkey))
+        .config_line("circuit_breaker_threshold = 1")
+        .config_line("circuit_breaker_window_secs = 60")
+        .config_line("circuit_breaker_reset_secs = 1")
+        .config_line("read_timeout_secs = 1")
+        .start()
+        .await;
+    let client = test_client();
+    assert_eq!(post_byo(&client, &gw.url()).await, 500);
+    tokio::time::sleep(Duration::from_millis(2100)).await;
+    let head = "POST /v1/chat/completions HTTP/1.1\r\nhost: 127.0.0.1\r\n\
+                authorization: Bearer sk-byo-test\r\ncontent-type: application/json\r\n\
+                transfer-encoding: chunked\r\n\r\n";
+    chunked_upload(gw.port, head, 1, false).await;
+    assert_eq!(mock.hits(), 2, "the stalled upload was the probe");
+    let callers: Vec<_> = (0..3)
+        .map(|_| {
+            let (client, url) = (client.clone(), gw.url());
+            tokio::spawn(async move { post_byo(&client, &url).await })
+        })
+        .collect();
+    let mut statuses = Vec::new();
+    for c in callers {
+        statuses.push(c.await.unwrap());
+    }
+    statuses.sort_unstable();
+    assert_eq!(
+        (statuses.as_slice(), mock.hits()),
+        (&[500, 503, 503][..], 3),
+        "a closed breaker let every caller through to the broken provider"
+    );
+}
+
 /// A pool key failing on every candidate relays the last candidate's own 401, and never opens a
 /// breaker: the providers answered, so the next request still reaches them.
 /// claim: REL-4

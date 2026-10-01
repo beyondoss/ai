@@ -906,6 +906,62 @@ async fn a_revoked_pool_key_cools_off_and_the_last_401_is_relayed() {
     assert!(resp.text().await.unwrap().contains("invalid api key"));
 }
 
+/// A 403 is usually about the request, not the credential: a moderation block, a model the key's
+/// project may not use, Anthropic's `permission_error`. Such a 403 is relayed, and it neither walks
+/// the pool keys nor cools one off, so one tenant cannot move every other tenant's traffic off a
+/// healthy key. Only a 403 whose body names the key itself (OpenAI `invalid_api_key`, Anthropic
+/// `authentication_error`) cools that key for later requests.
+/// claim: REL-4, REL-14, SEC-15
+/// defect: D84
+#[tokio::test]
+#[ignore = "D84 reproduced: every managed 403 walks the pool keys and cools the key"]
+async fn a_request_specific_403_neither_walks_nor_cools_the_pool_key() {
+    const PERMISSION: &str = r#"{"error":{"message":"Your project does not have access to model gpt-4o","type":"invalid_request_error","code":"model_not_found"}}"#;
+    const BAD_KEY: &str = r#"{"error":{"message":"Incorrect API key provided","type":"invalid_request_error","code":"invalid_api_key"}}"#;
+    let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+    let bad_key = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (log, mode) = (seen.clone(), bad_key.clone());
+    let up = ReplyUpstream::start(move |_, req| {
+        log.lock()
+            .unwrap()
+            .push(req.authorization.clone().unwrap_or_default());
+        if mode.load(Ordering::SeqCst) {
+            Reply::json(403, BAD_KEY)
+        } else {
+            Reply::json(403, PERMISSION)
+        }
+    })
+    .await;
+    let (pubkey, sk) = test_keypair(146);
+    let gw = Gateway::builder(unused_nats_port(), &up.authority(), &b64(&pubkey))
+        .providers(&["openai"])
+        .pool_keys("openai", &["sk-a", "sk-b"])
+        .start()
+        .await;
+    let key = billing_vkey(&sk, 1406);
+    let path = "/openai/v1/chat/completions";
+    for _ in 0..2 {
+        assert_eq!(status_of(&gw, path, &key, CHAT).await, 403);
+    }
+    assert_eq!(
+        *seen.lock().unwrap(),
+        ["Bearer sk-a", "Bearer sk-a"],
+        "a request-specific 403 walked or cooled the pool key"
+    );
+    assert_eq!(gw.metric("ai_key_auth_failures_total", "").await, 0.0);
+
+    bad_key.store(true, Ordering::SeqCst);
+    seen.lock().unwrap().clear();
+    assert_eq!(status_of(&gw, path, &key, CHAT).await, 403);
+    assert_eq!(status_of(&gw, path, &key, CHAT).await, 403);
+    assert_eq!(
+        *seen.lock().unwrap(),
+        ["Bearer sk-a", "Bearer sk-b"],
+        "a 403 naming the key is relayed, and cools that key for the next request"
+    );
+    assert_eq!(gw.metric("ai_key_auth_failures_total", "").await, 2.0);
+}
+
 // --- drain ---------------------------------------------------------------------------------------
 
 /// SIGTERM with a request in flight: the request finishes, the client gets the whole answer, and
@@ -1260,6 +1316,9 @@ enum Refuse {
     GoAway,
     /// `RST_STREAM(REFUSED_STREAM)`: §8.7, closed before any processing.
     RefusedStream,
+    /// `RST_STREAM(REFUSED_STREAM)` on every stream, the first included: a provider at its
+    /// concurrent-stream limit that stays there.
+    Always,
 }
 
 /// Write one H2 frame.
@@ -1339,7 +1398,7 @@ async fn refusing_h2_upstream(
                         (0x4, 0) => h2_frame(&mut io, 0x4, 0x1, 0, &[]).await,
                         (0x6, 0) => h2_frame(&mut io, 0x6, 0x1, 0, &payload).await,
                         // HEADERS or DATA ending the request body.
-                        (0x0 | 0x1, 0x1) if seen != 1 => {
+                        (0x0 | 0x1, 0x1) if seen != 1 && !matches!(mode, Refuse::Always) => {
                             seen += 1;
                             last_served = stream;
                             served.fetch_add(1, Ordering::SeqCst);
@@ -1365,7 +1424,7 @@ async fn refusing_h2_upstream(
                                     let _ = io.shutdown().await;
                                     return;
                                 }
-                                Refuse::RefusedStream => {
+                                Refuse::RefusedStream | Refuse::Always => {
                                     h2_frame(&mut io, 0x3, 0, stream, &7u32.to_be_bytes()).await
                                 }
                             }
@@ -1418,6 +1477,54 @@ async fn a_stream_the_upstream_refused_is_retried() {
         );
         assert_eq!(served.load(Ordering::SeqCst), 4, "{mode:?}");
     }
+}
+
+/// A provider that keeps refusing streams (it sits at its concurrent-stream limit) gets one resend,
+/// not a tight loop of them. The repeated refusal is a provider failure: the breaker sees it, so
+/// the next request is turned away while the provider recovers. And the client is told what
+/// happened: the stream was refused, not processed, so a retry of its own is safe.
+/// claim: REL-22, REL-6
+/// defect: D91
+#[tokio::test]
+#[ignore = "D91 reproduced: refused streams are resent up to pingora's retry limit, never feed the breaker, and are reported as failing after delivery"]
+async fn a_provider_that_keeps_refusing_streams_is_resent_once_and_trips_the_breaker() {
+    let (pubkey, sk) = test_keypair(224);
+    let key = billing_vkey(&sk, 2204);
+    let path = "/openai/v1/chat/completions";
+    let (port, served, refused, task) = refusing_h2_upstream(Refuse::Always).await;
+    let gw = Gateway::builder(
+        unused_nats_port(),
+        &format!("127.0.0.1:{port}"),
+        &b64(&pubkey),
+    )
+    .providers(&["openai"])
+    .tls_upstream()
+    .upstream_http2(true)
+    .config_line("circuit_breaker_threshold = 1")
+    .config_line("circuit_breaker_window_secs = 60")
+    .config_line("circuit_breaker_reset_secs = 60")
+    .start()
+    .await;
+    let resp = post(&gw, path, &key, CHAT).await;
+    let status = resp.status().as_u16();
+    let text = resp.text().await.unwrap_or_default();
+    assert_eq!(
+        (status, refused.load(Ordering::SeqCst)),
+        (502, 2),
+        "one send and one resend: {text}"
+    );
+    assert!(
+        text.contains("refused the stream") && text.contains("not processed"),
+        "{text}"
+    );
+    let resp = post(&gw, path, &key, CHAT).await;
+    assert_eq!(
+        (resp.status().as_u16(), refused.load(Ordering::SeqCst)),
+        (503, 2),
+        "the repeated refusal opened the breaker"
+    );
+    task.abort();
+    assert_eq!(served.load(Ordering::SeqCst), 0);
 }
 
 /// Every upstream H2 connection is drained with GOAWAY after one request. Sequential and

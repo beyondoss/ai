@@ -580,19 +580,20 @@ impl GatewayState {
     }
 }
 
+/// One process-wide `Metrics` (it registers on the default Prometheus registry, which rejects a
+/// second registration), shared by every unit test that needs a `GatewayState`.
+#[cfg(test)]
+pub(crate) fn test_metrics() -> Arc<Metrics> {
+    use std::sync::OnceLock;
+    static M: OnceLock<Arc<Metrics>> = OnceLock::new();
+    M.get_or_init(|| Metrics::new().expect("register metrics once"))
+        .clone()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::route::AuthScheme;
-
-    /// One process-wide `Metrics` (it registers on the default Prometheus registry, which rejects a
-    /// second registration), shared by every test that needs a `GatewayState`.
-    fn test_metrics() -> Arc<Metrics> {
-        use std::sync::OnceLock;
-        static M: OnceLock<Arc<Metrics>> = OnceLock::new();
-        M.get_or_init(|| Metrics::new().expect("register metrics once"))
-            .clone()
-    }
 
     /// Provider lookup runs before the model-routed segment is even considered, so registering a
     /// provider named `auto` from config would silently disable model routing. Boot must refuse.
@@ -903,5 +904,80 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    /// Run `n` concurrent resolves of `authority` whose lookup counts itself and then hangs.
+    /// Returns each caller's answer and how long it waited, and the number of lookups started.
+    async fn hung_resolves(
+        state: &Arc<GatewayState>,
+        authority: &'static str,
+        n: usize,
+    ) -> (Vec<(Option<Vec<SocketAddr>>, Duration)>, usize) {
+        use std::sync::atomic::AtomicUsize;
+        let lookups = Arc::new(AtomicUsize::new(0));
+        let mut tasks = Vec::new();
+        for _ in 0..n {
+            let (state, lookups) = (state.clone(), lookups.clone());
+            tasks.push(tokio::spawn(async move {
+                let start = tokio::time::Instant::now();
+                let got = state
+                    .resolve_all(authority, move |_| {
+                        lookups.fetch_add(1, Ordering::SeqCst);
+                        std::future::pending()
+                    })
+                    .await;
+                (got.ok().map(|a| a.to_vec()), start.elapsed())
+            }));
+        }
+        let mut out = Vec::new();
+        for t in tasks {
+            out.push(t.await.unwrap());
+        }
+        (out, lookups.load(Ordering::SeqCst))
+    }
+
+    /// A due refresh is one lookup, run in the background while every caller is served the cached
+    /// answer at once. A hung resolver then costs nobody its timeout, and the number of `getaddrinfo`
+    /// calls stuck on the blocking pool stays bounded.
+    /// claim: REL-20
+    /// defect: D89
+    #[tokio::test(start_paused = true)]
+    #[ignore = "D89 reproduced: every caller past refresh_at runs its own lookup and waits on it"]
+    async fn a_due_refresh_is_one_background_lookup() {
+        let state = GatewayState::new(AiConfig::default(), test_metrics()).unwrap();
+        let good = addrs(&["10.0.0.1:443"]);
+        let primed = good.clone();
+        state
+            .resolve_all("refresh.test:443", move |_| async move { Ok(primed) })
+            .await
+            .unwrap();
+        state.dns_cache.rcu(|cur| {
+            let mut next = HashMap::clone(cur);
+            if let Some(e) = next.get_mut("refresh.test:443") {
+                e.refresh_at = Instant::now();
+            }
+            next
+        });
+        let (answers, lookups) = hung_resolves(&state, "refresh.test:443", 16).await;
+        for (got, waited) in answers {
+            assert_eq!(got.as_deref(), Some(&good[..]));
+            assert_eq!(waited, Duration::ZERO, "a caller waited on the refresh");
+        }
+        assert_eq!(lookups, 1, "one refresh, not one per caller");
+    }
+
+    /// With nothing cached, concurrent callers share one lookup and its answer (here, its timeout).
+    /// claim: REL-20
+    /// defect: D89
+    #[tokio::test(start_paused = true)]
+    #[ignore = "D89 reproduced: every concurrent cold caller runs its own lookup"]
+    async fn concurrent_cold_resolves_share_one_lookup() {
+        let state = GatewayState::new(AiConfig::default(), test_metrics()).unwrap();
+        let (answers, lookups) = hung_resolves(&state, "cold.test:443", 16).await;
+        for (got, waited) in answers {
+            assert_eq!(got, None);
+            assert_eq!(waited, DNS_TIMEOUT);
+        }
+        assert_eq!(lookups, 1, "one lookup, not one per caller");
     }
 }
