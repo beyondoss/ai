@@ -44,7 +44,7 @@ layer = "both"
 clients = ["openai-py", "openai-node", "codex", "openai-agents", "raw"]
 failover_clients = ["openai-py", "codex"]
 touches = ["crates/gateway/src/route.rs", "crates/gateway/src/proxy.rs", "crates/gateway/src/translate.rs"]
-defects = []
+defects = ["D74"]
 
 [[claim]]
 id = "E4"
@@ -65,10 +65,13 @@ group = "Endpoints and SDK compatibility"
 text = "Agent harnesses list every catalog model with its context window, output limit and pricing, and the session cost they display matches the billing rows"
 oracle = "harness model list = /v1/models ids; limits and prices match the card; displayed session cost = sum of ai.usage rows priced at the card, within rounding. A harness that can't discover models gets config generated from /v1/models, never hand-written"
 layer = "live"
-clients = ["opencode", "pi", "codex", "claude-code", "ai-sdk"]
+# Harnesses that show a model list and a session cost. Not codex: it lists only its bundled catalog
+# (a model_catalog_json needs Codex's own system prompt per model, which no /v1/models carries) and
+# displays no cost. Not ai-sdk: a library, with no model list or cost display of its own.
+clients = ["opencode", "pi", "claude-code"]
 failover_clients = []
 touches = ["crates/providers/src/catalog.rs", "crates/gateway/src/proxy.rs"]
-defects = []
+defects = ["D21", "D63", "D76"]
 
 [[claim]]
 id = "E5"
@@ -504,7 +507,7 @@ layer = "live"
 clients = ["codex"]
 failover_clients = ["codex"]
 touches = ["crates/gateway/src/", "crates/providers/src/"]
-defects = []
+defects = ["D74", "D75"]
 
 [[claim]]
 id = "W3"
@@ -516,7 +519,7 @@ layer = "live"
 clients = ["opencode"]
 failover_clients = ["opencode"]
 touches = ["crates/gateway/src/", "crates/providers/src/"]
-defects = []
+defects = ["D63"]
 
 [[claim]]
 id = "W4"
@@ -528,7 +531,7 @@ layer = "live"
 clients = ["pi"]
 failover_clients = ["pi"]
 touches = ["crates/gateway/src/", "crates/providers/src/"]
-defects = []
+defects = ["D36", "D77"]
 
 [[claim]]
 id = "W5"
@@ -1253,7 +1256,7 @@ group = "Catalog truth"
 text = "Advertised endpoints are honest: the stock default call succeeds on every row × endpoint"
 layer = "live"
 touches = ["crates/providers/src/", "crates/gateway/src/route.rs", "crates/gateway/src/proxy.rs"]
-defects = ["D12"]
+defects = ["D12", "D74"]
 
 [[claim]]
 id = "CAT-10"
@@ -1372,7 +1375,7 @@ group = "Translation detail"
 text = "Thinking replay works for clients that don't echo thinking"
 layer = "both"
 touches = ["crates/gateway/src/translate.rs", "crates/gateway/src/proxy.rs"]
-defects = ["D14"]
+defects = ["D14", "D77"]
 
 [[claim]]
 id = "TRN-8"
