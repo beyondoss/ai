@@ -196,9 +196,16 @@ impl From<OpenAiUsage> for Usage {
                 output_tokens_details: u.output_tokens_details,
             });
         }
+        // OpenAI counts reasoning inside `completion_tokens`; xAI reports it beside it
+        // (`total_tokens = prompt + completion + reasoning`) and bills it at the output rate. The
+        // arithmetic says which convention a body follows, so the output count is right on both
+        // without a per-provider switch.
+        let reasoning = u.completion_tokens_details.reasoning_tokens.unwrap_or(0);
+        let reasoning_outside = reasoning > 0
+            && u.total_tokens == Some(u.prompt_tokens + u.completion_tokens + reasoning);
         Usage {
             input_tokens: u.prompt_tokens,
-            output_tokens: u.completion_tokens,
+            output_tokens: u.completion_tokens + if reasoning_outside { reasoning } else { 0 },
             // `prompt_tokens_details.cached_tokens` (real OpenAI, and OpenAI-compatible providers that
             // populate it) wins when present; DeepSeek's flat `prompt_cache_hit_tokens` is the fallback
             // for when it's entirely absent. Mirrors pi's
@@ -1614,6 +1621,28 @@ mod tests {
             .is_none(),
             "an anthropic stream with no usage-bearing event meters nothing"
         );
+    }
+
+    /// xAI reports reasoning beside `completion_tokens` (total = prompt + completion + reasoning)
+    /// and bills it as output; OpenAI counts it inside. Body shape taken from a live grok-4.3 call.
+    ///
+    /// claim: BIL-9
+    /// defect: D23
+    #[test]
+    fn reasoning_reported_beside_completion_tokens_is_billed_as_output() {
+        let xai = br#"{"usage":{"prompt_tokens":202,"completion_tokens":7,"total_tokens":376,
+            "prompt_tokens_details":{"cached_tokens":192},
+            "completion_tokens_details":{"reasoning_tokens":167}}}"#;
+        let u = openai_body(xai).unwrap();
+        assert_eq!(u.output_tokens, 174, "7 visible + 167 reasoning");
+        assert_eq!(u.reasoning_tokens, Some(167));
+        // OpenAI: reasoning is already inside completion_tokens (total = prompt + completion).
+        let openai = br#"{"usage":{"prompt_tokens":20,"completion_tokens":300,"total_tokens":320,
+            "completion_tokens_details":{"reasoning_tokens":250}}}"#;
+        assert_eq!(openai_body(openai).unwrap().output_tokens, 300);
+        // Streaming terminal chunk, same rule.
+        let sse = b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":202,\"completion_tokens\":7,\"total_tokens\":376,\"completion_tokens_details\":{\"reasoning_tokens\":167}}}\n\ndata: [DONE]\n\n";
+        assert_eq!(openai_stream(sse).unwrap().output_tokens, 174);
     }
 
     #[test]

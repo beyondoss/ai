@@ -907,6 +907,12 @@ the caller's own header. Two dialects:
 | Anthropic | JSON body  | `usage.input_tokens`, `usage.output_tokens`, `usage.cache_read_input_tokens`, `usage.cache_creation_input_tokens`, `usage.output_tokens_details.thinking_tokens`                                                                                                                                                                                                                                                                                 |
 | Anthropic | SSE stream | `message_start` input and cache counts; `message_delta` event with `usage` block (thinking tokens on the same block). Its cumulative input and cache counts, when present (server tools), supersede `message_start`'s                                                                                                                                                                                                                            |
 
+**Reasoning tokens outside `completion_tokens`.** OpenAI counts reasoning inside
+`completion_tokens`. xAI reports it beside it (`total_tokens = prompt_tokens + completion_tokens +
+reasoning_tokens`) and bills it at the output rate. When a body's arithmetic shows the second
+convention, `output_tokens` on the row is `completion_tokens + reasoning_tokens`. Before this, grok
+reasoning rows billed only the visible answer (a live grok-4.3 call: 7 of 174 output tokens).
+
 Missing or zero usage fields deserialize to zero (safe default) — **except** `reasoning_tokens`
 (`Usage::reasoning_tokens: Option<u64>`), which stays `None` when the provider didn't report it at
 all, distinct from `Some(0)` when it reported a real zero; that distinction is unrecoverable once the
