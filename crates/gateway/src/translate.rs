@@ -8732,3 +8732,46 @@ mod request_tests;
 #[cfg(test)]
 #[path = "translate_response_tests.rs"]
 mod response_tests;
+
+/// Behaviors a mutation-testing pass found no test constraining.
+#[cfg(test)]
+mod mutation_gaps {
+    use super::*;
+
+    /// OpenRouter's `native_finish_reason` on a Claude model is an Anthropic stop reason, and it
+    /// reaches a Messages client exactly, whatever the mapped `finish_reason` beside it says —
+    /// including the two (`pause_turn`, `model_context_window_exceeded`) the mapping table would
+    /// otherwise flatten to `end_turn` and `max_tokens`.
+    /// claim: TRN-22
+    #[test]
+    fn a_native_anthropic_stop_reason_wins_over_the_mapped_finish_reason() {
+        for (native, finish) in [
+            ("end_turn", "length"),
+            ("max_tokens", "stop"),
+            ("stop_sequence", "stop"),
+            ("tool_use", "stop"),
+            ("pause_turn", "stop"),
+            ("refusal", "stop"),
+            ("model_context_window_exceeded", "length"),
+        ] {
+            let body = json!({
+                "id": "gen-1",
+                "model": "anthropic/claude-sonnet-4.5",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "hi"},
+                    "finish_reason": finish,
+                    "native_finish_reason": native,
+                }],
+                "usage": {"prompt_tokens": 3, "completion_tokens": 1, "total_tokens": 4},
+            });
+            let out = response_json(
+                Endpoint::ChatCompletions,
+                Endpoint::Messages,
+                &serde_json::to_vec(&body).unwrap(),
+            );
+            let out: Value = serde_json::from_slice(&out).unwrap();
+            assert_eq!(out["stop_reason"], native, "{finish}");
+        }
+    }
+}

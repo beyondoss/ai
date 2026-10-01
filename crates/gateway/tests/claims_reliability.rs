@@ -1318,6 +1318,12 @@ enum Refuse {
     /// `RST_STREAM(REFUSED_STREAM)` on every stream, the first included: a provider at its
     /// concurrent-stream limit that stays there.
     Always,
+    /// `RST_STREAM(INTERNAL_ERROR)` once the whole body is in: the provider may have processed it,
+    /// so this one is *not* a refusal.
+    InternalError,
+    /// `RST_STREAM(REFUSED_STREAM)` on the very first stream of the first connection — a refusal
+    /// on a fresh connection — and nothing after it.
+    FirstStream,
 }
 
 /// Write one H2 frame.
@@ -1362,8 +1368,11 @@ async fn refusing_h2_upstream(
     let (served, refused) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
     let (s2, r2) = (served.clone(), refused.clone());
     let task = tokio::spawn(async move {
+        let mut conns = 0usize;
         while let Ok((s, _)) = listener.accept().await {
             let (acceptor, served, refused) = (acceptor.clone(), s2.clone(), r2.clone());
+            let conn = conns;
+            conns += 1;
             tokio::spawn(async move {
                 let Ok(mut io) = acceptor.accept(s).await else {
                     return;
@@ -1380,6 +1389,11 @@ async fn refusing_h2_upstream(
                 let mut head = vec![0x88, 0x0f, 0x10, 16];
                 head.extend_from_slice(b"application/json");
                 let (mut seen, mut last_served) = (0u32, 0u32);
+                let refuse = |seen: u32| match mode {
+                    Refuse::Always => true,
+                    Refuse::FirstStream => conn == 0 && seen == 0,
+                    _ => seen == 1,
+                };
                 loop {
                     let mut h = [0u8; 9];
                     if io.read_exact(&mut h).await.is_err() {
@@ -1392,12 +1406,22 @@ async fn refusing_h2_upstream(
                     if io.read_exact(&mut payload).await.is_err() {
                         return;
                     }
+                    // Give back the flow-control window a DATA frame used, on the connection and
+                    // the stream, so a body past the initial 64 KiB window can arrive.
+                    if kind == 0x0 && len > 0 {
+                        let inc = u32::try_from(len).unwrap().to_be_bytes();
+                        if h2_frame(&mut io, 0x8, 0, 0, &inc).await.is_err()
+                            || h2_frame(&mut io, 0x8, 0, stream, &inc).await.is_err()
+                        {
+                            return;
+                        }
+                    }
                     let ok = match (kind, flags & 0x1) {
                         // SETTINGS → ACK; PING → PONG.
                         (0x4, 0) => h2_frame(&mut io, 0x4, 0x1, 0, &[]).await,
                         (0x6, 0) => h2_frame(&mut io, 0x6, 0x1, 0, &payload).await,
                         // HEADERS or DATA ending the request body.
-                        (0x0 | 0x1, 0x1) if seen != 1 && !matches!(mode, Refuse::Always) => {
+                        (0x0 | 0x1, 0x1) if !refuse(seen) => {
                             seen += 1;
                             last_served = stream;
                             served.fetch_add(1, Ordering::SeqCst);
@@ -1423,8 +1447,11 @@ async fn refusing_h2_upstream(
                                     let _ = io.shutdown().await;
                                     return;
                                 }
-                                Refuse::RefusedStream | Refuse::Always => {
+                                Refuse::RefusedStream | Refuse::Always | Refuse::FirstStream => {
                                     h2_frame(&mut io, 0x3, 0, stream, &7u32.to_be_bytes()).await
+                                }
+                                Refuse::InternalError => {
+                                    h2_frame(&mut io, 0x3, 0, stream, &2u32.to_be_bytes()).await
                                 }
                             }
                         }
@@ -1523,6 +1550,98 @@ async fn a_provider_that_keeps_refusing_streams_is_resent_once_and_trips_the_bre
     );
     task.abort();
     assert_eq!(served.load(Ordering::SeqCst), 0);
+}
+
+/// A refusal on a fresh connection is as safe to resend as one on a reused connection: the
+/// provider guarantees it processed nothing. On a catalog walk the same candidate is tried again
+/// (it was the connection, not the provider), even with no other candidate to walk to.
+/// claim: REL-22
+#[tokio::test]
+async fn a_stream_refused_on_a_fresh_connection_is_retried() {
+    let (pubkey, sk) = test_keypair(225);
+    let key = billing_vkey(&sk, 2205);
+    let large = format!(
+        r#"{{"model":"gpt-4o","messages":[{{"role":"user","content":"{}"}}]}}"#,
+        "x".repeat(200 * 1024)
+    );
+    // The provider route, then a catalog walk with one usable candidate, then the same walk with a
+    // body past the 64 KiB replay buffer (the parent re-runs it on the same candidate).
+    for (path, body) in [
+        ("/openai/v1/chat/completions", CHAT),
+        ("/v1/chat/completions", CHAT),
+        ("/v1/chat/completions", large.as_str()),
+    ] {
+        let (port, served, refused, task) = refusing_h2_upstream(Refuse::FirstStream).await;
+        let gw = Gateway::builder(
+            unused_nats_port(),
+            &format!("127.0.0.1:{port}"),
+            &b64(&pubkey),
+        )
+        .providers(&["openai"])
+        .tls_upstream()
+        .upstream_http2(true)
+        .start()
+        .await;
+        let resp = post(&gw, path, &key, body).await;
+        let status = resp.status().as_u16();
+        let text = resp.text().await.unwrap_or_default();
+        task.abort();
+        let size = body.len();
+        assert_eq!(status, 200, "{path} ({size} B): {text}");
+        assert_eq!(
+            (
+                refused.load(Ordering::SeqCst),
+                served.load(Ordering::SeqCst)
+            ),
+            (1, 1),
+            "{path} ({size} B)"
+        );
+    }
+}
+
+/// The other side of D72: a stream the upstream resets with any code but REFUSED_STREAM, after
+/// its whole body went out, may have been processed — it is not resent (that could run, and bill,
+/// the request twice). The client gets the 502 that says the provider had the request.
+/// claim: REL-22, BIL-14
+#[tokio::test]
+async fn a_stream_the_upstream_reset_after_its_body_is_not_resent() {
+    let (pubkey, sk) = test_keypair(224);
+    let key = billing_vkey(&sk, 2204);
+    let path = "/openai/v1/chat/completions";
+    let (port, served, reset, task) = refusing_h2_upstream(Refuse::InternalError).await;
+    let gw = Gateway::builder(
+        unused_nats_port(),
+        &format!("127.0.0.1:{port}"),
+        &b64(&pubkey),
+    )
+    .providers(&["openai"])
+    .tls_upstream()
+    .upstream_http2(true)
+    .start()
+    .await;
+    let mut failed = 0;
+    for i in 0..4 {
+        let resp = post(&gw, path, &key, CHAT).await;
+        let status = resp.status().as_u16();
+        let text = resp.text().await.unwrap_or_default();
+        if status != 200 {
+            assert_eq!(status, 502, "#{i}: {text}");
+            assert!(text.contains("after receiving the request"), "#{i}: {text}");
+            failed += 1;
+        }
+    }
+    task.abort();
+    let reset = reset.load(Ordering::SeqCst);
+    assert!(
+        reset >= 1,
+        "no stream was reset, so the test proved nothing"
+    );
+    assert_eq!(failed, reset, "a reset stream was resent and answered");
+    assert_eq!(
+        served.load(Ordering::SeqCst) + reset,
+        4,
+        "some request reached the upstream twice"
+    );
 }
 
 /// Every upstream H2 connection is drained with GOAWAY after one request. Sequential and

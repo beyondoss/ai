@@ -1469,3 +1469,125 @@ mod tests {
         assert!(root_members(esc).unwrap()[0].key_is(esc, "key"));
     }
 }
+
+/// Behaviors a mutation-testing pass found no test constraining.
+#[cfg(test)]
+mod mutation_gaps {
+    use super::*;
+
+    fn scan(body: &[u8]) -> Option<String> {
+        let mut s = ModelScanner::new();
+        s.feed(body);
+        s.take_model()
+    }
+
+    /// A root `model` whose value is not a string names no model: a string nested inside it is not
+    /// the value, so it can't pick a catalog row or a billing model.
+    /// claim: SEC-21
+    #[test]
+    fn a_non_string_root_model_names_no_model() {
+        assert_eq!(scan(br#"{"model":["gpt-4o"],"messages":[]}"#), None);
+        assert_eq!(scan(br#"{"model":{"id":"gpt-4o"},"messages":[]}"#), None);
+        let mut s = ModelScanner::for_response();
+        s.feed(br#"{"type":"message_start","message":{"model":["claude-x"],"id":"m"}}"#);
+        assert_eq!(s.take_model(), None);
+    }
+
+    /// Escapes inside a skipped string (a prompt) are stepped over one byte at a time, so an
+    /// escape other than `\"` never swallows the closing quote, and the root `model` after it is
+    /// still found.
+    /// claim: SEC-21
+    #[test]
+    fn escapes_in_skipped_strings_do_not_derail_the_scan() {
+        let body = br#"{"messages":[{"role":"user","content":"line\nnext \"model\":\"evil\" \\ end"}],"model":"gpt-4o"}"#;
+        assert_eq!(scan(body).as_deref(), Some("gpt-4o"));
+        // The same bytes split at every point agree.
+        for cut in 1..body.len() {
+            let mut s = ModelScanner::new();
+            s.feed(&body[..cut]);
+            s.feed(&body[cut..]);
+            assert_eq!(s.take_model().as_deref(), Some("gpt-4o"), "cut at {cut}");
+        }
+        // A root string whose escape is followed by its own closing quote: swallowing that quote
+        // would shift every quote after it.
+        assert_eq!(
+            scan(br#"{"system":"a\nb","model":"gpt-4o"}"#).as_deref(),
+            Some("gpt-4o")
+        );
+        // The buffered walks step over the same escapes.
+        for streamed in [
+            &br#"{"messages":[{"content":"line\nnext \"stream\":false"}],"model":"gpt-4o","stream":true}"#[..],
+            &br#"{"system":"a\nb","model":"gpt-4o","stream":true}"#[..],
+        ] {
+            let scan = scan_buffered(streamed);
+            assert_eq!(scan.model.as_deref(), Some("gpt-4o"));
+            assert_eq!(scan.inject_at, Some(1));
+            assert_eq!(plan_stream_usage_injection(streamed), Some(1));
+        }
+    }
+
+    /// A response's `model` after a nested object inside `message` is still the message's model:
+    /// leaving that nested object does not end the message.
+    /// claim: BIL-13
+    #[test]
+    fn a_response_model_after_a_nested_object_in_message_is_found() {
+        let mut s = ModelScanner::for_response();
+        s.feed(br#"{"type":"message_start","message":{"usage":{"input_tokens":1},"content":[],"model":"claude-x"}}"#);
+        assert_eq!(s.take_model().as_deref(), Some("claude-x"));
+    }
+
+    /// Only a root `"stream": true` streams, and a string *value* spelled like a key is not one:
+    /// another key's `true`, or a value reading `stream_options`, never changes the answer.
+    /// claim: BIL-2
+    #[test]
+    fn only_the_root_stream_literal_decides_streaming() {
+        let not_streaming = br#"{"stream":false,"store":true,"model":"m"}"#;
+        assert_eq!(plan_stream_usage_injection(not_streaming), None);
+        assert_eq!(scan_buffered(not_streaming).inject_at, None);
+
+        let value_spelled_like_a_key = br#"{"model":"stream_options","stream":true}"#;
+        assert_eq!(
+            plan_stream_usage_injection(value_spelled_like_a_key),
+            Some(1)
+        );
+        assert_eq!(scan_buffered(value_spelled_like_a_key).inject_at, Some(1));
+    }
+
+    /// Where a client's own `stream_options` value starts, with and without whitespace around the
+    /// colon — the span `force_include_usage` rewrites.
+    /// claim: BIL-2
+    #[test]
+    fn stream_options_value_offset_is_exact() {
+        for body in [
+            &br#"{"stream":true,"stream_options":{"include_usage":false}}"#[..],
+            &br#"{"stream":true,"stream_options" :  {"include_usage":false}}"#[..],
+        ] {
+            let at = scan_buffered(body)
+                .stream_options_at
+                .expect("streams with options");
+            assert!(
+                body[at..].starts_with(br#"{"include_usage":false}"#),
+                "{at}"
+            );
+        }
+    }
+
+    /// An output limit nested in an array is no limit to clamp.
+    /// claim: TRN-5
+    #[test]
+    fn a_nested_output_limit_is_not_spanned() {
+        let scan = scan_buffered(br#"{"max_tokens":[64000],"model":"m"}"#);
+        assert_eq!(scan.limit_spans[0], None);
+    }
+
+    /// A key with an escape counts as `model` only when it decodes to `model`.
+    /// claim: SEC-21
+    #[test]
+    fn an_escaped_key_is_model_only_when_it_decodes_to_model() {
+        let other = scan_buffered(br#"{"a\u0062":"x","model":"m"}"#);
+        assert_eq!(other.model.as_deref(), Some("m"));
+        assert!(!other.duplicate_model);
+        let model = scan_buffered(br#"{"mod\u0065l":"x","model":"m"}"#);
+        assert!(model.duplicate_model);
+    }
+}

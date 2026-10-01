@@ -433,3 +433,226 @@ async fn a_401_on_every_candidate_is_relayed_and_opens_no_breaker() {
     );
     assert_eq!(primary.hits() + fallback.hits(), 4);
 }
+
+/// A complete OpenAI chat answer.
+const OK_JSON: &str = r#"{"id":"chatcmpl-ok","object":"chat.completion","model":"gpt-4o-2024-08-06","choices":[{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}],"usage":{"prompt_tokens":11,"completion_tokens":7,"total_tokens":18}}"#;
+
+/// An error-in-200 whose first bytes cannot tell yet (`{"err`, then the rest a moment later) is
+/// still judged on the bytes that decide it: it must not pin the caller on the strength of a prefix
+/// that had not said anything.
+/// claim: REL-8, R4
+#[tokio::test]
+async fn a_200_error_body_split_before_its_first_key_is_not_pinned() {
+    let nats_port = unused_nats_port();
+    let (pubkey, sk) = test_keypair(1);
+    let primary = ScriptedUpstream::start(|_, _| {
+        vec![
+            Step::Write(http_head(200, "application/json", None)),
+            Step::Write(b"{\"err".to_vec()),
+            Step::Sleep(Duration::from_millis(150)),
+            Step::Write(br#"or":{"message":"upstream overloaded","code":502}}"#.to_vec()),
+        ]
+    })
+    .await;
+    let fallback = MockUpstream::start(Mode::Slow(30)).await;
+    let gw = Gateway::builder(nats_port, &primary.authority(), &b64(&pubkey))
+        .providers(&["openai", "openrouter"])
+        .provider_authority("openrouter", &fallback.authority())
+        .start()
+        .await;
+    let client = test_client();
+    let key = vkey(&sk, 8);
+    let mut served = Vec::new();
+    for _ in 0..10 {
+        let resp = post_auto(&client, &gw.url(), &key).await;
+        served.push(provider_of(&resp));
+        let _ = resp.bytes().await;
+    }
+    let on_fallback = served.iter().filter(|p| *p == "openrouter").count();
+    assert!(
+        on_fallback >= 7,
+        "only {on_fallback}/10 reached the working fallback: {served:?}"
+    );
+}
+
+/// A 2xx whose first KiB says nothing either way (OpenRouter pads a slow non-stream answer with
+/// whitespace) is settled as an answer once that KiB is in — while the body is still arriving — so
+/// the caller's next request is already pinned to it.
+/// claim: R4
+#[tokio::test]
+async fn an_undecidable_first_kib_settles_as_an_answer_before_the_body_ends() {
+    let nats_port = unused_nats_port();
+    let (pubkey, sk) = test_keypair(1);
+    let primary = ScriptedUpstream::start(|_, _| {
+        vec![
+            Step::Write(http_head(200, "application/json", None)),
+            Step::Write(vec![b' '; 1100]),
+            Step::Sleep(Duration::from_secs(4)),
+            Step::Write(OK_JSON.as_bytes().to_vec()),
+        ]
+    })
+    .await;
+    let fallback = MockUpstream::start(Mode::Json).await;
+    let gw = Gateway::builder(nats_port, &primary.authority(), &b64(&pubkey))
+        .providers(&["openai", "openrouter"])
+        .provider_authority("openrouter", &fallback.authority())
+        .start()
+        .await;
+    let client = test_client();
+    let key = vkey(&sk, 9);
+    let (c, url, k) = (client.clone(), gw.url(), key.clone());
+    let first = tokio::spawn(async move { post_auto(&c, &url, &k).await.bytes().await });
+    // The padding is in; the answer is not.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let (c, url, k) = (client.clone(), gw.url(), key.clone());
+    let second = tokio::spawn(async move { post_auto(&c, &url, &k).await.bytes().await });
+    first.await.unwrap().unwrap();
+    second.await.unwrap().unwrap();
+    assert!(
+        gw.metric("ai_session_pinned_total", "").await >= 1.0,
+        "the second request was not routed by a pin taken on the first's padded prefix"
+    );
+}
+
+/// A candidate that was answering and then starts failing is demoted after its first failure:
+/// the next caller goes to the fallback first instead of paying for the failing attempt again.
+/// claim: R7, R1
+#[tokio::test]
+async fn a_candidate_that_starts_failing_is_demoted_after_one_failure() {
+    let nats_port = unused_nats_port();
+    let (pubkey, sk) = test_keypair(1);
+    let primary = ReplyUpstream::start(|n, _| {
+        if n < 2 {
+            Reply::json(200, OK_JSON)
+        } else {
+            Reply::json(500, r#"{"error":{"message":"mock"}}"#)
+        }
+    })
+    .await;
+    // Slower than the primary's answers, so only the failure — not raw speed — can put it first.
+    let fallback = MockUpstream::start(Mode::Slow(150)).await;
+    let gw = Gateway::builder(nats_port, &primary.authority(), &b64(&pubkey))
+        .providers(&["openai", "openrouter"])
+        .provider_authority("openrouter", &fallback.authority())
+        .config_line("circuit_breaker_threshold = 100")
+        .start()
+        .await;
+    let client = test_client();
+    // Distinct tenants: no session pin, so only the ranker orders the walk.
+    for tenant in 100..105 {
+        let resp = post_auto(&client, &gw.url(), &vkey(&sk, tenant)).await;
+        assert_eq!(resp.status().as_u16(), 200, "tenant {tenant}");
+        let _ = resp.bytes().await;
+    }
+    assert_eq!(
+        primary.hits(),
+        3,
+        "after its first 5xx the primary kept being tried first"
+    );
+}
+
+/// A connect failure on a provider route counts against that provider's breaker: no body byte
+/// moved, so the failure is the provider's, not a stalled client upload.
+/// claim: R6, REL-6
+#[tokio::test]
+async fn connect_failures_on_a_provider_route_open_the_breaker() {
+    let nats_port = unused_nats_port();
+    let (pubkey, _sk) = test_keypair(1);
+    let gw = Gateway::builder(nats_port, &GatewayBuilder::dead_authority(), &b64(&pubkey))
+        .config_line("circuit_breaker_threshold = 2")
+        .config_line("circuit_breaker_window_secs = 60")
+        .config_line("circuit_breaker_reset_secs = 60")
+        .start()
+        .await;
+    let client = test_client();
+    let mut statuses = Vec::new();
+    for _ in 0..4 {
+        statuses.push(post_byo(&client, &gw.url()).await);
+    }
+    assert!(statuses.contains(&503), "{statuses:?}");
+    // The same with a body still streaming in when the connect fails: no byte of it reached the
+    // provider, so it is still the provider's failure, not a stalled upload.
+    let gw = Gateway::builder(nats_port, &GatewayBuilder::dead_authority(), &b64(&pubkey))
+        .config_line("circuit_breaker_threshold = 2")
+        .config_line("circuit_breaker_window_secs = 60")
+        .config_line("circuit_breaker_reset_secs = 60")
+        .start()
+        .await;
+    let head = "POST /openai/v1/chat/completions HTTP/1.1\r\nhost: 127.0.0.1\r\n\
+                authorization: Bearer sk-byo-test\r\ncontent-type: application/json\r\n\
+                transfer-encoding: chunked\r\n\r\n";
+    for _ in 0..2 {
+        chunked_upload(gw.port, head, 1, true).await;
+    }
+    assert_eq!(
+        post_byo(&client, &gw.url()).await,
+        503,
+        "two connect failures during uploads did not open the breaker"
+    );
+}
+
+/// A provider route's connect failure is retried exactly `MAX_CONNECT_RETRIES` (2) times, then
+/// answered as a 502 that names the connect failure — never "after receiving the request", since
+/// no byte reached the provider — with no `Retry-After`. The breaker's 503 carries one.
+/// claim: REL-1, REL-19
+#[tokio::test]
+async fn a_provider_route_connect_failure_is_retried_twice_then_named() {
+    let nats_port = unused_nats_port();
+    let (pubkey, _sk) = test_keypair(1);
+    let gw = Gateway::builder(nats_port, &GatewayBuilder::dead_authority(), &b64(&pubkey))
+        .config_line("circuit_breaker_threshold = 2")
+        .config_line("circuit_breaker_window_secs = 60")
+        .config_line("circuit_breaker_reset_secs = 60")
+        .start()
+        .await;
+    let client = test_client();
+    let send = || async {
+        client
+            .post(format!("{}/v1/chat/completions", gw.url()))
+            .header("authorization", "Bearer sk-byo-test")
+            .header("content-type", "application/json")
+            .body(body())
+            .send()
+            .await
+            .unwrap()
+    };
+    let first = send().await;
+    assert_eq!(first.status().as_u16(), 502);
+    assert!(first.headers().get("retry-after").is_none());
+    let text = first.text().await.unwrap();
+    assert!(text.contains("could not connect to the provider"), "{text}");
+    assert_eq!(
+        gw.metric("ai_connect_retries_total", "openai").await,
+        2.0,
+        "one request, two same-provider retries"
+    );
+    let mut open = None;
+    for _ in 0..3 {
+        let resp = send().await;
+        if resp.status().as_u16() == 503 {
+            open = Some(resp);
+            break;
+        }
+    }
+    let open = open.expect("the breaker never opened");
+    assert!(open.headers().get("retry-after").is_some());
+}
+
+/// A dead single-address candidate is left after one connect failure: there is no other address
+/// of it to try, so the walk moves straight to the next candidate.
+/// claim: R1
+#[tokio::test]
+async fn a_dead_single_address_candidate_is_tried_once() {
+    let nats_port = unused_nats_port();
+    let (pubkey, sk) = test_keypair(1);
+    let fallback = MockUpstream::start(Mode::Json).await;
+    let gw = Gateway::builder(nats_port, &GatewayBuilder::dead_authority(), &b64(&pubkey))
+        .providers(&["openai", "openrouter"])
+        .provider_authority("openrouter", &fallback.authority())
+        .start()
+        .await;
+    let resp = post_auto(&test_client(), &gw.url(), &vkey(&sk, 120)).await;
+    assert_eq!(resp.status().as_u16(), 200);
+    assert_eq!(fallback.hits(), 1);
+    assert_eq!(gw.metric("ai_connect_retries_total", "openai").await, 1.0);
+}

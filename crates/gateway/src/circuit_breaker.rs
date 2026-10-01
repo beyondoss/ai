@@ -1376,3 +1376,102 @@ mod tests {
         assert_eq!(config.half_open_permits, 5);
     }
 }
+
+/// Behaviors a mutation-testing pass found no test constraining.
+#[cfg(test)]
+mod mutation_gaps {
+    use super::*;
+
+    /// `allow()` on a closed breaker is a read: it must not wipe the failures counted so far, or a
+    /// provider failing every request between admissions would never trip.
+    /// claim: R6
+    #[test]
+    fn allow_on_a_closed_breaker_keeps_its_failure_count() {
+        let cb = CircuitBreaker::new(CircuitBreakerConfig::consecutive(3));
+        cb.record_failure();
+        cb.record_failure();
+        assert!(cb.allow().is_ok());
+        assert_eq!(cb.state(), CircuitState::Closed { failure_count: 2 });
+        cb.record_failure();
+        assert_eq!(cb.state(), CircuitState::Open);
+    }
+
+    /// A windowed breaker's success after its window has expired wipes the slate, at the boundary
+    /// itself too; inside the window it only counts toward the rate.
+    /// claim: R6
+    #[test]
+    fn windowed_success_resets_once_the_window_has_expired() {
+        static NOW: AtomicU64 = AtomicU64::new(1_000);
+        fn clock() -> u64 {
+            NOW.load(Ordering::SeqCst)
+        }
+        let cb = CircuitBreaker::with_clock(
+            CircuitBreakerConfig::windowed(5, Duration::from_secs(10)),
+            clock,
+        );
+        cb.record_failure();
+        cb.record_failure();
+        NOW.store(1_009, Ordering::SeqCst);
+        cb.record_success();
+        assert_eq!(cb.state(), CircuitState::Closed { failure_count: 2 });
+        // Exactly one window after the first failure: expired.
+        NOW.store(1_010, Ordering::SeqCst);
+        cb.record_success();
+        assert_eq!(cb.state(), CircuitState::Closed { failure_count: 0 });
+    }
+
+    /// A failed probe reopens a windowed breaker, as it does a consecutive one.
+    /// claim: R6, REL-6
+    #[test]
+    fn windowed_half_open_failure_reopens() {
+        let cb = CircuitBreaker::new(CircuitBreakerConfig::windowed(3, Duration::from_secs(10)));
+        cb.force_state(CircuitState::HalfOpen {
+            permits_remaining: 1,
+        });
+        cb.record_failure();
+        assert_eq!(cb.state(), CircuitState::Open);
+    }
+
+    /// `Retry-After` while half-open: 1 when a probe permit is free (the next request is admitted),
+    /// and the rest of the reset timeout when every permit is out.
+    /// claim: R6, REL-19
+    #[test]
+    fn half_open_retry_after_depends_on_free_permits() {
+        static NOW: AtomicU64 = AtomicU64::new(500);
+        fn clock() -> u64 {
+            NOW.load(Ordering::SeqCst)
+        }
+        let cb = CircuitBreaker::with_clock(
+            CircuitBreakerConfig::consecutive(1)
+                .reset_timeout(Duration::from_secs(30))
+                .half_open_permits(1),
+            clock,
+        );
+        cb.force_state(CircuitState::HalfOpen {
+            permits_remaining: 1,
+        });
+        NOW.store(510, Ordering::SeqCst);
+        assert_eq!(cb.retry_after_secs(), 1, "a free permit admits now");
+        cb.force_state(CircuitState::HalfOpen {
+            permits_remaining: 0,
+        });
+        NOW.store(510, Ordering::SeqCst);
+        assert_eq!(
+            cb.retry_after_secs(),
+            30,
+            "no permit: wait out the reset timeout"
+        );
+    }
+
+    /// `reset()` closes an open breaker and clears its count.
+    /// claim: R6
+    #[test]
+    fn reset_closes_an_open_breaker() {
+        let cb = CircuitBreaker::new(CircuitBreakerConfig::consecutive(1));
+        cb.record_failure();
+        assert_eq!(cb.state(), CircuitState::Open);
+        cb.reset();
+        assert_eq!(cb.state(), CircuitState::Closed { failure_count: 0 });
+        assert!(cb.allow().is_ok());
+    }
+}

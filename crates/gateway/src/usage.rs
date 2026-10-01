@@ -2433,3 +2433,183 @@ data: {\"type\":\"message_delta\",\"usage\":{\"input_tokens\":2500,\"cache_read_
         );
     }
 }
+
+/// Behaviors a mutation-testing pass found no test constraining.
+#[cfg(test)]
+mod mutation_gaps {
+    use super::*;
+    use serde_json::json;
+
+    /// A tier is kept when it is spelled from `[a-z0-9_-]`: digits, `_` and `-` included.
+    /// claim: BIL-11
+    #[test]
+    fn a_service_tier_may_use_digits_underscores_and_hyphens() {
+        let body =
+            br#"{"service_tier":"batch_v2-x","usage":{"prompt_tokens":3,"completion_tokens":1}}"#;
+        assert_eq!(
+            openai_body(body).unwrap().service_tier.as_deref(),
+            Some("batch_v2-x")
+        );
+    }
+
+    /// An object or array `service_tier` on a stream line costs only the tier, never the line's
+    /// usage — on either wire, and on a line the first-line recovery can't reach.
+    /// claim: BIL-11, BIL-1
+    #[test]
+    fn a_malformed_service_tier_on_a_stream_line_keeps_its_usage() {
+        for tier in [r#"{"a":1}"#, r#"["x",1]"#] {
+            let sse = format!(
+                "data: {{\"choices\":[{{\"delta\":{{\"content\":\"hi\"}}}}]}}\n\n\
+                 data: {{\"service_tier\":{tier},\"choices\":[],\"usage\":{{\"prompt_tokens\":7,\"completion_tokens\":2,\"total_tokens\":9}}}}\n\n\
+                 data: [DONE]\n\n"
+            );
+            let u = openai_stream(sse.as_bytes()).expect(tier);
+            assert_eq!(
+                (u.input_tokens, u.output_tokens, u.service_tier),
+                (7, 2, None),
+                "{tier}"
+            );
+
+            let sse = format!(
+                "data: {{\"type\":\"ping\"}}\n\n\
+                 data: {{\"type\":\"message_start\",\"message\":{{\"usage\":{{\"input_tokens\":11,\"service_tier\":{tier}}}}}}}\n\n\
+                 data: {{\"type\":\"message_delta\",\"usage\":{{\"output_tokens\":4}}}}\n\n"
+            );
+            let u = anthropic_stream(sse.as_bytes()).expect(tier);
+            assert_eq!((u.input_tokens, u.output_tokens), (11, 4), "{tier}");
+        }
+    }
+
+    /// The tier echoed on a Chat Completions usage chunk reaches the row.
+    /// claim: BIL-11
+    #[test]
+    fn a_chat_stream_usage_chunk_carries_its_service_tier() {
+        let sse = b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}],\"service_tier\":\"priority\"}\n\n\
+data: {\"choices\":[],\"service_tier\":\"priority\",\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":1,\"total_tokens\":4}}\n\n\
+data: [DONE]\n\n";
+        assert_eq!(
+            openai_stream(sse).unwrap().service_tier.as_deref(),
+            Some("priority")
+        );
+    }
+
+    /// OpenRouter's cache writes on its Responses mount are metered from a non-stream body, as
+    /// they are on its Chat mount (D21).
+    /// claim: BIL-8
+    #[test]
+    fn a_responses_body_reads_cache_write_tokens() {
+        let body = br#"{"usage":{"input_tokens":100,"output_tokens":5,"total_tokens":105,"input_tokens_details":{"cached_tokens":10,"cache_write_tokens":40}}}"#;
+        let u = openai_body(body).unwrap();
+        assert_eq!((u.cache_read_tokens, u.cache_write_tokens), (10, 40));
+    }
+
+    /// One stray name from the other wire does not reclassify a usage block: a Chat block with an
+    /// extra `input_tokens` is still Chat (its output is `completion_tokens`), and a Messages block
+    /// with an extra `prompt_tokens` is still billed.
+    /// claim: BIL-1
+    #[test]
+    fn a_single_foreign_usage_key_does_not_change_the_shape() {
+        let chat = br#"{"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15,"input_tokens":10}}"#;
+        let u = openai_body(chat).unwrap();
+        assert_eq!((u.input_tokens, u.output_tokens), (10, 5));
+        let messages = br#"{"usage":{"input_tokens":10,"output_tokens":5,"prompt_tokens":10}}"#;
+        let u = anthropic_body(messages).expect("still Anthropic-shaped");
+        assert_eq!((u.input_tokens, u.output_tokens), (10, 5));
+    }
+
+    /// `message_delta` counts supersede `message_start`'s when present, and a later delta that
+    /// omits one keeps the earlier value rather than zeroing it.
+    /// claim: BIL-8, BIL-10, BIL-11
+    #[test]
+    fn anthropic_stream_deltas_supersede_present_counts_and_keep_absent_ones() {
+        let sse = b"data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10,\"cache_creation_input_tokens\":100,\"cache_creation\":{\"ephemeral_1h_input_tokens\":50},\"output_tokens\":1}}}\n\n\
+data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":300,\"cache_creation_input_tokens\":500,\"cache_creation\":{\"ephemeral_1h_input_tokens\":200},\"server_tool_use\":{\"web_search_requests\":2}}}\n\n\
+data: {\"type\":\"message_delta\",\"usage\":{\"input_tokens\":40}}\n\n";
+        let u = anthropic_stream(sse).unwrap();
+        assert_eq!(
+            (
+                u.input_tokens,
+                u.output_tokens,
+                u.cache_write_tokens,
+                u.cache_write_1h_tokens,
+                u.server_tool_calls
+            ),
+            (40, 300, 500, 200, 2)
+        );
+    }
+
+    /// A finished Anthropic stream is recognized on each of its structural markers alone: the
+    /// `event:` line, or a compact or spaced `"type"` member on a data-only stream.
+    /// claim: BIL-22, B2
+    #[test]
+    fn each_message_delta_marker_alone_finishes_a_stream() {
+        let compact = b"data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":4}}\n\n";
+        let spaced = b"data: {\"type\": \"message_delta\", \"usage\": {\"output_tokens\": 4}}\n\n";
+        let event = b"data: {}\n\nevent: message_delta\ndata: {}\n\n";
+        assert!(anthropic_stream_finished(compact));
+        assert!(anthropic_stream_finished(spaced));
+        assert!(anthropic_stream_finished(event));
+        let forged =
+            b"data: {\"type\":\"content_block_delta\",\"delta\":{\"text\":\"message_delta\"}}\n\n";
+        assert!(!anthropic_stream_finished(forged));
+    }
+
+    /// An error object on a stream is an error event; a `null` error member is not.
+    /// claim: BIL-12, BIL-20
+    #[test]
+    fn a_stream_carries_an_error_only_as_an_object() {
+        assert!(stream_carried_error(
+            b"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\"}}\n\n"
+        ));
+        assert!(!stream_carried_error(
+            b"data: {\"type\":\"response.created\",\"response\":{\"error\":null}}\n\n"
+        ));
+    }
+
+    /// Only events that carry generated text count as output tokens: a cut-short stream's pings
+    /// and lifecycle events are not tokens.
+    /// claim: BIL-20, B2
+    #[test]
+    fn non_delta_events_are_not_counted_as_output_tokens() {
+        let mut tail = String::from("data: {\"type\":\"message_start\",\"message\":{}}\n\n");
+        for _ in 0..10 {
+            tail.push_str("data: {\"type\":\"ping\"}\n\n");
+        }
+        for _ in 0..2 {
+            tail.push_str(
+                "data: {\"type\":\"content_block_delta\",\"delta\":{\"text\":\"abc\"}}\n\n",
+            );
+        }
+        assert_eq!(
+            estimate_stream_output(tail.as_bytes(), tail.len() as u64),
+            2
+        );
+    }
+
+    /// Every text-bearing field of a delta adds to its length, on each wire.
+    /// claim: BIL-20, BIL-9
+    #[test]
+    fn delta_text_counts_every_generated_field() {
+        let chat = json!({"choices":[{"delta":{"content":"ab","reasoning":"cde","reasoning_content":"fghi"}}]});
+        assert_eq!(delta_text_len(&chat), 9);
+        let messages = json!({"delta":{"text":"a","thinking":"bc","partial_json":"def"}});
+        assert_eq!(delta_text_len(&messages), 6);
+    }
+
+    /// A cut non-stream body's estimate counts the bytes inside string values exactly — escapes
+    /// stepped over, keys excluded — and scales with what was relayed.
+    /// claim: BIL-20
+    #[test]
+    fn body_estimate_counts_value_bytes_exactly() {
+        // The escape sits one byte into its value, so mis-stepping it lands on the escaped quote.
+        let tail = format!(
+            r#"{{"content":"{}","quote":"x\"{}"}}"#,
+            "a".repeat(91),
+            "y".repeat(40)
+        );
+        let n = tail.len() as u64;
+        // 91 + (1 + 2 + 40) value bytes = 134, at 4.5 bytes a token: 29.8, one byte short of 30.
+        assert_eq!(estimate_body_output(tail.as_bytes(), n), 29);
+        assert_eq!(estimate_body_output(tail.as_bytes(), 2 * n), 59);
+    }
+}

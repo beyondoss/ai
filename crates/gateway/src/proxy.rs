@@ -6256,7 +6256,7 @@ mod tests {
     }
 
     /// A minimal `RequestCtx` for exercising the body-phase logic without a running proxy.
-    fn test_ctx(inject_eligible: bool) -> RequestCtx {
+    pub(super) fn test_ctx(inject_eligible: bool) -> RequestCtx {
         let provider = Provider::resolve(
             "openai",
             "api.openai.com:443".to_string(),
@@ -7612,5 +7612,258 @@ mod tests {
             byo_req.headers.get("X-OpenRouter-Categories").is_none(),
             "BYO OpenRouter traffic must not get X-OpenRouter-Categories"
         );
+    }
+}
+
+/// Behaviors a mutation-testing pass found no test constraining.
+#[cfg(test)]
+mod mutation_gaps {
+    use super::*;
+    use pingora_core::{Error, ErrorType as T};
+
+    /// Each way a request ends maps to its own `outcome` on the billing row, so a zero-token row
+    /// for an error or a cancel can be told from a real zero-token generation.
+    /// claim: BIL-12
+    #[test]
+    fn every_ending_has_its_own_outcome() {
+        let mut rc = tests::test_ctx(false);
+        assert_eq!(outcome(&rc, None, false), "no_candidate");
+        assert_eq!(outcome(&rc, None, true), "ok", "a cache hit made no call");
+        rc.upstream_phase = UpstreamPhase::Attempted;
+        let up = Error::new_up(T::ConnectRefused);
+        assert_eq!(outcome(&rc, Some(&up), false), "upstream_error");
+        let down = Error::new_down(T::ReadError);
+        assert_eq!(outcome(&rc, Some(&down), false), "client_cancelled");
+        rc.upstream_phase = UpstreamPhase::Connected;
+        rc.upstream_status = Some(200);
+        assert_eq!(outcome(&rc, None, false), "ok");
+        assert_eq!(outcome(&rc, Some(&up), false), "cut_short");
+        assert_eq!(outcome(&rc, Some(&down), false), "client_cancelled");
+        rc.upstream_status = Some(400);
+        assert_eq!(outcome(&rc, None, false), "upstream_error");
+        assert_eq!(outcome(&rc, Some(&down), false), "upstream_error");
+    }
+
+    /// Only a 401 is a pool key failing (D84): a 402 or 403 is about the request or the account,
+    /// a candidate refusal that walks the catalog but never cools or walks keys.
+    /// claim: REL-4
+    #[test]
+    fn pool_key_failures_are_401_only() {
+        for (status, key, candidate) in [
+            (400, false, false),
+            (401, true, true),
+            (402, false, true),
+            (403, false, true),
+            (404, false, false),
+            (429, false, false),
+            (500, false, false),
+        ] {
+            assert_eq!(is_pool_key_failure(status), key, "{status}");
+            assert_eq!(is_candidate_refusal(status), candidate, "{status}");
+        }
+    }
+
+    /// A complete first `data:` line the error check cannot read is an answer, not "undecided".
+    /// claim: REL-8
+    #[test]
+    fn an_unreadable_complete_first_event_is_an_answer() {
+        assert_eq!(body_reports_error(b"data: {\"err\n\n", true), Some(false));
+        assert_eq!(
+            body_reports_error(b"data: {\"err\ndata: {\"error\":{}}\n\n", true),
+            Some(false),
+            "the first event decides"
+        );
+    }
+
+    /// Only the `Bearer` scheme carries a token; another six-letter scheme does not, and neither
+    /// does `Bearer` run into its token.
+    /// claim: SEC-11
+    #[test]
+    fn only_a_spaced_bearer_scheme_carries_a_token() {
+        assert_eq!(bearer_token("Bearer bai_v1x"), Some("bai_v1x"));
+        assert_eq!(bearer_token("bEaReR \t bai_v1x"), Some("bai_v1x"));
+        assert_eq!(bearer_token("Digest bai_v1x"), None);
+        assert_eq!(bearer_token("Bearerbai_v1x"), None);
+    }
+
+    /// A space is not a control byte: a model id with one is kept on the billing row.
+    /// claim: BIL-13
+    #[test]
+    fn a_model_id_with_a_space_is_kept() {
+        assert_eq!(sanitize_model("my model".to_owned()), "my model");
+        assert_eq!(sanitize_model("bad\u{1f}model".to_owned()), "unknown");
+    }
+
+    /// Only an eight-digit or `YYYY-MM-DD` suffix is a snapshot date; an all-digit suffix of
+    /// another length (`gpt-4-0613`) and an eight-letter one are not.
+    /// claim: BIL-13
+    #[test]
+    fn only_real_snapshot_dates_are_stripped() {
+        assert_eq!(
+            strip_snapshot_date("claude-sonnet-4-5-20250929"),
+            Some("claude-sonnet-4-5")
+        );
+        assert_eq!(strip_snapshot_date("gpt-5-2025-08-07"), Some("gpt-5"));
+        assert_eq!(strip_snapshot_date("gpt-4-0613"), None);
+        assert_eq!(strip_snapshot_date("model-abcdefgh"), None);
+        assert_eq!(strip_snapshot_date("model-v2-05-12"), None, "no year");
+        assert_eq!(
+            strip_snapshot_date("model-2025-5-12"),
+            None,
+            "one-digit month"
+        );
+    }
+
+    /// `Retry-After` defaults: 5s for an unavailable allowance, 1s for any other 429/503, none
+    /// otherwise.
+    /// claim: REL-19
+    #[test]
+    fn default_retry_after_by_status_and_message() {
+        assert_eq!(default_retry_after(503, "allowance unavailable"), Some(5));
+        assert_eq!(
+            default_retry_after(503, "provider temporarily unavailable"),
+            Some(1)
+        );
+        assert_eq!(default_retry_after(429, "allowance unavailable"), Some(1));
+        assert_eq!(default_retry_after(429, "rate limit exceeded"), Some(1));
+        assert_eq!(default_retry_after(400, "bad request"), None);
+        assert_eq!(default_retry_after(502, "upstream unavailable"), None);
+    }
+
+    /// The client-facing status, type and message for every class of error that ends a request.
+    /// claim: REL-1, REL-2
+    #[test]
+    fn failure_response_maps_every_error_class() {
+        type Want = Option<(u16, &'static str, &'static str)>;
+        let cases: [(Box<Error>, Want); 18] = [
+            (
+                Error::new(T::CustomCode("allowance unavailable", 503)),
+                Some((503, "api_error", "allowance unavailable")),
+            ),
+            (
+                Error::new(T::CustomCode("too many", 429)),
+                Some((429, "rate_limit_error", "too many")),
+            ),
+            (
+                Error::new(T::CustomCode("nope", 404)),
+                Some((404, "invalid_request_error", "nope")),
+            ),
+            (
+                Error::new(T::HTTPStatus(400)),
+                Some((400, "invalid_request_error", "bad request")),
+            ),
+            (
+                Error::new(T::HTTPStatus(413)),
+                Some((413, "invalid_request_error", "request body too large")),
+            ),
+            (
+                Error::new(T::HTTPStatus(429)),
+                Some((429, "rate_limit_error", "rate limit exceeded")),
+            ),
+            (
+                Error::new(T::HTTPStatus(502)),
+                Some((502, "api_error", "upstream unavailable")),
+            ),
+            (
+                Error::new(T::HTTPStatus(503)),
+                Some((503, "api_error", "provider temporarily unavailable")),
+            ),
+            (
+                Error::new(T::HTTPStatus(504)),
+                Some((504, "api_error", "upstream timed out")),
+            ),
+            (
+                Error::new(T::HTTPStatus(401)),
+                Some((401, "invalid_request_error", "request rejected")),
+            ),
+            (
+                Error::new(T::HTTPStatus(500)),
+                Some((500, "api_error", "upstream error")),
+            ),
+            (Error::new_down(T::ConnectionClosed), None),
+            (
+                Error::new_down(T::ReadTimedout),
+                Some((408, "invalid_request_error", "request body timed out")),
+            ),
+            (
+                Error::new_down(T::InvalidHTTPHeader),
+                Some((400, "invalid_request_error", "bad request")),
+            ),
+            (
+                Error::new_up(T::ReadTimedout),
+                Some((504, "api_error", "upstream timed out")),
+            ),
+            (
+                Error::new_up(T::ConnectRefused),
+                Some((502, "api_error", "could not connect to the provider")),
+            ),
+            (
+                Error::new_up(T::ConnectionClosed),
+                Some((502, "api_error", "upstream connection failed")),
+            ),
+            (
+                Error::new(T::InternalError),
+                Some((500, "api_error", "internal error")),
+            ),
+        ];
+        for (e, want) in cases {
+            assert_eq!(failure_response(&e), want, "{e}");
+        }
+    }
+
+    /// Only OpenAI's own Chat Completions takes `max_completion_tokens` in place of `max_tokens`:
+    /// not another vendor's Chat endpoint, and not OpenAI's Responses.
+    /// claim: TRN-5
+    #[test]
+    fn only_native_openai_chat_is_respelled() {
+        let c = |provider, path| route::Candidate {
+            provider,
+            upstream_model: "m",
+            path,
+        };
+        use providers::ProviderId::{OpenAi, OpenRouter};
+        assert!(native_openai_chat(&c(OpenAi, "/v1/chat/completions")));
+        assert!(!native_openai_chat(&c(
+            OpenRouter,
+            "/api/v1/chat/completions"
+        )));
+        assert!(!native_openai_chat(&c(OpenAi, "/v1/responses")));
+    }
+
+    /// A limit already at the serving row's maximum is not rewritten.
+    /// claim: TRN-5
+    #[test]
+    fn a_limit_equal_to_the_cap_is_left_alone() {
+        let mut body = br#"{"max_tokens":16384}"#.to_vec();
+        let scan = peek::scan_buffered(&body);
+        assert!(!clamp_output_limits(&mut body, &scan.limit_spans, 16384));
+        assert_eq!(body, br#"{"max_tokens":16384}"#);
+    }
+
+    /// An empty `model` value is still replaced with the serving candidate's id.
+    /// claim: R1, BIL-13
+    #[test]
+    fn an_empty_model_value_is_rewritten() {
+        let body = br#"{"model":"","messages":[]}"#.to_vec();
+        let scan = peek::scan_buffered(&body);
+        let span = scan.model_span.expect("an empty value still has a span");
+        let out = apply_model_rewrite(body, span, b"gpt-4o");
+        assert_eq!(out, br#"{"model":"gpt-4o","messages":[]}"#);
+    }
+
+    /// Forcing `include_usage` keeps the client's other `stream_options` members.
+    /// claim: BIL-2
+    #[test]
+    fn forcing_include_usage_keeps_other_stream_options() {
+        let body =
+            br#"{"stream":true,"stream_options":{"include_usage":false,"include_obfuscation":false}}"#
+                .to_vec();
+        let at = peek::scan_buffered(&body)
+            .stream_options_at
+            .expect("streams with options");
+        let (out, _) = force_include_usage(body, at, None);
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["stream_options"]["include_usage"], true);
+        assert_eq!(v["stream_options"]["include_obfuscation"], false);
     }
 }

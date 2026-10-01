@@ -1,0 +1,15 @@
+# cargo-mutants (https://mutants.rs) defaults: the gateway's money and correctness paths.
+#
+#   cargo mutants -p beyond-ai --jobs 3 --cargo-arg=--lib   # fast pass: unit tests only
+#   cargo mutants -p beyond-ai --jobs 3 --iterate           # then the survivors, every test
+#
+# The integration suites need `nats-server` on PATH. Narrow proxy.rs with `--re` to the functions
+# under study; the whole file is ~860 mutants.
+test_tool = "nextest"
+examine_globs = [
+    "crates/gateway/src/usage.rs",
+    "crates/gateway/src/proxy.rs",
+    "crates/gateway/src/translate.rs",
+    "crates/gateway/src/circuit_breaker.rs",
+    "crates/gateway/src/peek.rs",
+]

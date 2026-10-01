@@ -186,3 +186,46 @@ async fn zero_cost_endings_carry_their_outcome() {
     assert_eq!(r2["outcome"], "no_candidate", "{evidence}");
     assert!(r2.get("upstream_status").is_none(), "{evidence}");
 }
+
+/// A request no provider received costs nothing: a connect failure on every candidate, or every
+/// breaker open, writes a row of zeros that is not an estimate. An estimate is for a provider that
+/// had the request (BIL-3), never for one that did not.
+/// claim: BIL-20, BIL-12
+#[tokio::test]
+async fn a_request_no_provider_received_bills_nothing() {
+    let (pubkey, sk) = test_keypair(84);
+    let gw = Gateway::builder(
+        unused_nats_port(),
+        &GatewayBuilder::dead_authority(),
+        &b64(&pubkey),
+    )
+    .providers(&["openai", "openrouter"])
+    .provider_authority("openrouter", &GatewayBuilder::dead_authority())
+    .circuit_breaker_threshold(1)
+    .start()
+    .await;
+    let key = billing_vkey(&sk, 84);
+    let body = format!(
+        r#"{{"model":"gpt-4o-mini","messages":[{{"role":"user","content":"{}"}}]}}"#,
+        "hello ".repeat(200)
+    );
+    let url = format!("{}/v1/chat/completions", gw.url());
+    // 1: both candidates refuse the connection (and their breakers open); 2: every breaker open.
+    for _ in 0..2 {
+        let status = post(
+            url.clone(),
+            ("authorization", format!("Bearer {key}")),
+            &body,
+            &[],
+        )
+        .await;
+        assert!(status >= 500, "{status}");
+    }
+    let rows = wait_usage_rows(&gw, 2, 5).await;
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    for row in &rows {
+        assert_eq!(row["input_tokens"].as_u64(), Some(0), "{row}");
+        assert_eq!(row["output_tokens"].as_u64(), Some(0), "{row}");
+        assert_eq!(row["usage_estimated"], false, "{row}");
+    }
+}
