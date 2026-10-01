@@ -262,7 +262,6 @@ async fn a_client_that_stops_reading_is_released() {
 /// claim: SEC-19
 /// defect: D35
 #[tokio::test]
-#[ignore = "D35 reproduced: 8 concurrent 90 MiB uploads grow gateway RSS by ~1.4 GiB"]
 async fn concurrent_large_uploads_have_bounded_memory() {
     const N: u64 = 8;
     const BODY_MIB: usize = 90;
@@ -487,4 +486,47 @@ async fn a_catalog_candidate_is_tried_on_its_next_address() {
         "upstream hits {}",
         mock.hits()
     );
+}
+
+/// A body the process budget cannot hold is refused before it is read: a 503 with `Retry-After`
+/// and a JSON error, counted on `ai_rejections_total{reason="body_memory"}`. A body within the
+/// budget is still served.
+/// claim: SEC-19
+/// defect: D35
+#[tokio::test]
+async fn a_body_past_the_memory_budget_is_a_retryable_503() {
+    let (pubkey, sk) = test_keypair(1);
+    let mock = MockUpstream::start(Mode::Json).await;
+    let gw = Gateway::builder(unused_nats_port(), &mock.authority(), &b64(&pubkey))
+        .config_line("max_buffered_body_bytes = 1048576")
+        .start()
+        .await;
+    let chat = |pad: usize| {
+        format!(
+            r#"{{"model":"gpt-4o-mini","messages":[{{"role":"user","content":"{}"}}]}}"#,
+            "x".repeat(pad)
+        )
+    };
+    let send = |body: String| {
+        test_client()
+            .post(format!("{}/v1/chat/completions", gw.url()))
+            .header("authorization", format!("Bearer {}", vkey(&sk, 35)))
+            .header("content-type", "application/json")
+            .body(body)
+            .send()
+    };
+    // 1 MiB declared, held twice: past the 1 MiB budget.
+    let resp = send(chat(1 << 20)).await.unwrap();
+    let status = resp.status().as_u16();
+    let retry_after = resp.headers().get("retry-after").is_some();
+    let text = resp.text().await.unwrap_or_default();
+    assert!(
+        status == 503 && retry_after && text.contains("too many large request bodies"),
+        "status {status} retry-after {retry_after}: {text}"
+    );
+    assert_eq!(mock.hits(), 0, "refused before any upstream attempt");
+    wait_for_metric(&gw, "ai_rejections_total", "body_memory", 1.0).await;
+    // 200 KiB, held twice: within it.
+    let ok = send(chat(200 * 1024)).await.unwrap();
+    assert_eq!(ok.status().as_u16(), 200);
 }

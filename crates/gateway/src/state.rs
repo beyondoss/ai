@@ -9,7 +9,7 @@
 use crate::allowance::AllowanceSet;
 use crate::cache::{self, ResponseCache};
 use crate::capture::{CaptureRule, CaptureSet};
-use crate::concurrency::TenantSlots;
+use crate::concurrency::{BodyBudget, TenantSlots};
 use crate::config::AiConfig;
 use crate::deny::DenySet;
 use crate::error::{GatewayError, Result};
@@ -254,6 +254,10 @@ pub struct GatewayState {
     /// Per-tenant in-flight cap (see `concurrency`). `None` when `tenant_max_in_flight == 0`.
     pub tenant_slots: Option<TenantSlots>,
 
+    /// Process-wide budget for buffered request bodies (see `concurrency::BodyBudget`). `None` when
+    /// `max_buffered_body_bytes == 0`.
+    pub body_budget: Option<BodyBudget>,
+
     /// Per-key request-rate guardrail (see `ratelimit`). `None` when `rate_limit_rps == 0`. Fixed
     /// memory regardless of tenant count, so it lives in the static state with no GC.
     pub rate_limit: Option<RateLimit>,
@@ -411,6 +415,7 @@ impl GatewayState {
             cache,
             smart: smart::Router::new(),
             tenant_slots: TenantSlots::new(config.tenant_max_in_flight),
+            body_budget: BodyBudget::new(config.max_buffered_body_bytes),
             rate_limit,
             dns_cache: ArcSwap::from_pointee(HashMap::new()),
             instance_prefix: {

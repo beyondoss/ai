@@ -252,6 +252,10 @@ struct Held {
     /// The request asks for a stream (root `"stream": true`, read before connecting). Set in
     /// `request_filter`; `upstream_peer` gives such an attempt the stream-idle read bound.
     streams: bool,
+    /// Bytes this request holds in the process body budget (`max_buffered_body_bytes`).
+    body_bytes: usize,
+    /// A `FullBody` re-run: its parent reserved the budget for both copies of the body.
+    body_exempt: bool,
 }
 
 impl Held {
@@ -278,6 +282,36 @@ impl Held {
     fn release_stream(&mut self) {
         if std::mem::take(&mut self.active_stream) {
             self.state.metrics.active_streams.dec();
+        }
+    }
+
+    /// Make sure at least `total` bytes of buffered body are reserved for this request. `false`
+    /// when the process budget cannot cover them (nothing further is reserved). Grows in whole
+    /// MiB, so a chunked body costs one shared atomic per MiB rather than per chunk.
+    fn reserve_body(&mut self, total: usize) -> bool {
+        if self.body_exempt || total <= self.body_bytes {
+            return true;
+        }
+        let Some(budget) = self.state.body_budget.as_ref() else {
+            return true;
+        };
+        const STEP: usize = 1 << 20;
+        let rounded = total.div_ceil(STEP).saturating_mul(STEP);
+        for target in [rounded, total] {
+            if budget.try_reserve(target - self.body_bytes) {
+                self.body_bytes = target;
+                return true;
+            }
+        }
+        false
+    }
+
+    fn release_body(&mut self) {
+        let n = std::mem::take(&mut self.body_bytes);
+        if n > 0
+            && let Some(budget) = self.state.body_budget.as_ref()
+        {
+            budget.release(n);
         }
     }
 
@@ -308,6 +342,7 @@ impl Drop for Ctx {
         self.held.release_in_flight();
         self.held.release_stream();
         self.held.release_tenant();
+        self.held.release_body();
         if let Some(rc) = self.rc.as_mut()
             && std::mem::take(&mut rc.breaker_pending)
             && let Some(b) = rc.provider.breaker.as_ref()
@@ -768,7 +803,7 @@ impl RequestCtx {
 /// Kept as a table so `reject_bodies_are_valid_json` can walk it and assert each entry parses,
 /// carries the `type` and `message` it claims, and is reachable — a hand-written JSON literal is
 /// exactly the thing that rots silently otherwise.
-pub const REJECT_BODIES: [(&str, &str, &str); 15] = [
+pub const REJECT_BODIES: [(&str, &str, &str); 16] = [
     (
         "invalid_request_error",
         "unknown provider",
@@ -833,6 +868,11 @@ pub const REJECT_BODIES: [(&str, &str, &str); 15] = [
         "rate_limit_error",
         "too many concurrent requests",
         r#"{"error":{"message":"too many concurrent requests","type":"rate_limit_error"}}"#,
+    ),
+    (
+        "api_error",
+        "too many large request bodies in flight",
+        r#"{"error":{"message":"too many large request bodies in flight","type":"api_error"}}"#,
     ),
     (
         "api_error",
@@ -1033,6 +1073,20 @@ impl AiProxy {
             429,
             "rate_limit_error",
             "too many concurrent requests",
+        )
+        .await
+    }
+
+    /// Holding this request's body would cross `max_buffered_body_bytes`: a retryable 503, since
+    /// the memory frees as the bodies in flight finish.
+    async fn reject_body_memory(&self, session: &mut Session, request_id: &str) -> Result<bool> {
+        self.state.metrics.rejection(Rejection::BodyMemory).inc();
+        Self::reject_boxed(
+            session,
+            request_id,
+            503,
+            "api_error",
+            "too many large request bodies in flight",
         )
         .await
     }
@@ -1681,6 +1735,8 @@ struct BodyPeek {
     relay: bool,
     /// [`MAX_REQUEST_BODY`] was reached before the body ended. 413.
     over_cap: bool,
+    /// Holding more of the body would cross `max_buffered_body_bytes`. 503.
+    over_budget: bool,
 }
 
 /// Read the whole body before connecting, scanning it for the root `model`.
@@ -1696,7 +1752,15 @@ struct BodyPeek {
 /// `previous_response_id` can sit after `input`, the cache hashes everything, `stream` decides the
 /// read bound (`stream_idle_timeout_secs`), and stock Python SDKs put `model` *after* `messages`
 /// anyway, so a long agent turn reads to the end regardless.
-async fn peek_body_model(session: &mut Session, reserve: usize) -> pingora_core::Result<BodyPeek> {
+///
+/// A body growing past the replay buffer reserves twice its size in the body budget as it grows
+/// (this buffer, and the `FullBody` re-run's own copy): a chunked upload has no length to reserve
+/// up front.
+async fn peek_body_model(
+    session: &mut Session,
+    reserve: usize,
+    held: &mut Held,
+) -> pingora_core::Result<BodyPeek> {
     if expects_continue(session) {
         session.write_continue_response().await?;
     }
@@ -1704,6 +1768,7 @@ async fn peek_body_model(session: &mut Session, reserve: usize) -> pingora_core:
     let mut buf = Vec::with_capacity(reserve.min(MAX_REQUEST_BODY));
     let mut scanner = peek::ModelScanner::new();
     let mut over_cap = false;
+    let mut over_budget = false;
     loop {
         if buf.len() >= MAX_REQUEST_BODY {
             over_cap = true;
@@ -1713,6 +1778,10 @@ async fn peek_body_model(session: &mut Session, reserve: usize) -> pingora_core:
             Some(chunk) if !chunk.is_empty() => {
                 scanner.feed(&chunk);
                 buf.extend_from_slice(&chunk);
+                if buf.len() > BODY_PEEK_LIMIT && !held.reserve_body(buf.len().saturating_mul(2)) {
+                    over_budget = true;
+                    break;
+                }
             }
             Some(_) => {}
             None => break,
@@ -1722,9 +1791,10 @@ async fn peek_body_model(session: &mut Session, reserve: usize) -> pingora_core:
     let done = session.as_mut().is_body_done();
     Ok(BodyPeek {
         model: scanner.take_model(),
-        complete: done.then_some(buf),
+        complete: (done && !over_budget).then_some(buf),
         relay: truncated && done,
         over_cap: over_cap && !done,
+        over_budget,
     })
 }
 
@@ -2388,6 +2458,8 @@ impl ProxyHttp for AiProxy {
                 active_stream: false,
                 tenant: None,
                 streams: false,
+                body_bytes: 0,
+                body_exempt: false,
             },
         }
     }
@@ -2892,11 +2964,21 @@ impl ProxyHttp for AiProxy {
                             Err(()) => return self.reject_tenant_busy(session, &request_id).await,
                         }
                     }
+                    // A large body is held twice (here and in its `FullBody` re-run): reserve
+                    // both before reading a byte of it.
+                    if let Some(n) = declared_len.filter(|n| *n > BODY_PEEK_LIMIT)
+                        && !ctx.held.reserve_body(n.saturating_mul(2))
+                    {
+                        return self.reject_body_memory(session, &request_id).await;
+                    }
                     let reserve = declared_len.unwrap_or(0).min(MAX_REQUEST_BODY);
-                    let peek = Box::pin(peek_body_model(session, reserve)).await?;
+                    let peek = Box::pin(peek_body_model(session, reserve, &mut ctx.held)).await?;
                     peeked = true;
                     if peek.over_cap {
                         return self.reject_too_large(session, &request_id).await;
+                    }
+                    if peek.over_budget {
+                        return self.reject_body_memory(session, &request_id).await;
                     }
                     let Some(name) = peek.model.filter(|n| !n.is_empty()) else {
                         self.state.metrics.rejection(Rejection::UnknownModel).inc();
@@ -2940,10 +3022,18 @@ impl ProxyHttp for AiProxy {
                 Ok(guard) => early_slot = guard,
                 Err(()) => return self.reject_tenant_busy(session, &request_id).await,
             }
+            if let Some(n) = declared_len.filter(|n| *n > BODY_PEEK_LIMIT)
+                && !ctx.held.reserve_body(n.saturating_mul(2))
+            {
+                return self.reject_body_memory(session, &request_id).await;
+            }
             let reserve = declared_len.unwrap_or(0).min(MAX_REQUEST_BODY);
-            let peek = Box::pin(peek_body_model(session, reserve)).await?;
+            let peek = Box::pin(peek_body_model(session, reserve, &mut ctx.held)).await?;
             if peek.over_cap {
                 return self.reject_too_large(session, &request_id).await;
+            }
+            if peek.over_budget {
+                return self.reject_body_memory(session, &request_id).await;
             }
             if peek.relay {
                 let body = peek.complete.unwrap_or_default();
@@ -2964,6 +3054,8 @@ impl ProxyHttp for AiProxy {
         // here — any other small body (≤ the replay buffer, declared length, so pingora replays it
         // byte for byte). A large body on `/{provider}` or BYO is not read ahead; it keeps the
         // plain `read_timeout_secs`.
+        // A `FullBody` re-run's body is its parent's, already reserved for both copies.
+        ctx.held.body_exempt = full_body.is_some();
         let streams = match (&full_body, body_complete.as_deref()) {
             (Some(fb), _) => fb.streams,
             (None, Some(body)) => peek::requests_stream(body),
@@ -2974,7 +3066,7 @@ impl ProxyHttp for AiProxy {
                         && n <= BODY_PEEK_LIMIT
                         && session.req_header().method == http::Method::POST =>
                 {
-                    let small = Box::pin(peek_body_model(session, n)).await?;
+                    let small = Box::pin(peek_body_model(session, n, &mut ctx.held)).await?;
                     small.complete.as_deref().is_some_and(peek::requests_stream)
                 }
                 _ => false,
@@ -3283,6 +3375,16 @@ impl ProxyHttp for AiProxy {
         // passthrough), OpenAI dialect only, streaming-capable paths only — so everything else still
         // streams through untouched. Checked on the forwarded path (suffix), so it's prefix-agnostic.
         let inject_eligible = managed && dialect == Dialect::OpenAi && forward_streamable;
+        // That buffer counts against the body budget. A declared large body reserves up front,
+        // before the tenant slot and the breaker permit, so a refusal holds neither; a chunked one
+        // reserves as it grows (`request_body_filter`).
+        if inject_eligible
+            && model_route.is_none()
+            && let Some(n) = declared_len.filter(|n| *n > BODY_PEEK_LIMIT)
+            && !ctx.held.reserve_body(n)
+        {
+            return self.reject_body_memory(session, &request_id).await;
+        }
 
         // Capture decision from the control surface parsed above. The header wins in **both**
         // directions over the tenant's control-plane rule (Cloudflare's `cf-aig-collect-log`
@@ -4156,7 +4258,8 @@ impl ProxyHttp for AiProxy {
         end_of_stream: bool,
         ctx: &mut Self::CTX,
     ) -> Result<()> {
-        let Some(rc) = ctx.as_mut() else {
+        let Ctx { rc, held } = ctx;
+        let Some(rc) = rc.as_mut() else {
             return Ok(());
         };
         // Feed the body through the structural scanner as it passes (never withheld, never
@@ -4210,6 +4313,15 @@ impl ProxyHttp for AiProxy {
 
             if rc.rewrites_body() {
                 rc.req_buf.extend_from_slice(chunk);
+                // A large body buffered for a rewrite (the `/{provider}` usage splice; a catalog
+                // walk's large body is a `FullBody` re-run, already reserved) holds budget as it
+                // grows. Tagged downstream: the client's size, not the provider's health.
+                if rc.req_buf.len() > BODY_PEEK_LIMIT && !held.reserve_body(rc.req_buf.len()) {
+                    self.state.metrics.rejection(Rejection::BodyMemory).inc();
+                    return Err(
+                        gateway_error(503, "too many large request bodies in flight").into_down(),
+                    );
+                }
             } else if rc.managed {
                 rc.model_scanner.feed(chunk);
             }

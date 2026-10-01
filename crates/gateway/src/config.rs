@@ -228,6 +228,15 @@ pub struct AiConfig {
     /// `/{provider}` or BYO), keep `read_timeout_secs`. Capped by it; `0` disables.
     pub stream_idle_timeout_secs: u64,
 
+    /// Most request-body bytes this process holds in memory at once, across every request. A body
+    /// past pingora's 64 KiB replay buffer is read in full for a catalog walk (twice over while its
+    /// `FullBody` re-run buffers its own copy), and a managed OpenAI chat body is buffered for the
+    /// usage splice; each is capped at 100 MiB but nothing bounded how many. A request that would
+    /// cross this gets a 503 with `Retry-After` (`ai_rejections_total{reason="body_memory"}`)
+    /// before its body is read, or as soon as a chunked one grows past it. Bodies within the replay
+    /// buffer are not counted. `0` disables.
+    pub max_buffered_body_bytes: usize,
+
     /// Graceful-shutdown drain window (seconds): after SIGTERM, how long Pingora lets **in-flight
     /// requests finish** before tearing the runtimes down. Maps to Pingora's `grace_period_seconds`
     /// (left unset, Pingora silently defaults to 300s — this knob makes the window explicit).
@@ -393,6 +402,7 @@ impl Default for AiConfig {
             idle_timeout_secs: 90,
             client_write_timeout_secs: 60,
             stream_idle_timeout_secs: 120,
+            max_buffered_body_bytes: 512 * 1024 * 1024,
             // Drain for the full request lifetime (= read_timeout_secs) so a deploy never truncates
             // an in-flight stream — we're a transparent proxy and must not mangle a paid-for
             // generation. Pingora stops accepting new connections at SIGTERM, so this only waits out

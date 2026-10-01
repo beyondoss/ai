@@ -35,6 +35,9 @@ client_write_timeout_secs = 60
 # A request that asks for a stream is cut after this long without a byte from the provider (head or
 # body). Non-streaming requests keep read_timeout_secs. 0 disables.
 stream_idle_timeout_secs = 120
+# Most request-body bytes held in memory at once (large catalog bodies, usage-splice buffers).
+# Over it a request gets a 503 with Retry-After. 0 disables.
+max_buffered_body_bytes = 536870912
 
 # Graceful shutdown. On SIGTERM, in-flight requests drain for up to grace_period_secs before the
 # runtimes are torn down (then runtime_timeout_secs is the final teardown backstop).

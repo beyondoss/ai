@@ -72,12 +72,15 @@ pub enum Rejection {
     /// A catalog-walk body with more than one root `model` key. The walk routed and rewrote one;
     /// the provider might serve the other.
     DuplicateModel,
+    /// Buffering this request's body would take the process past `max_buffered_body_bytes`. 503
+    /// with `Retry-After`: the memory frees as the bodies in flight finish.
+    BodyMemory,
 }
 
 impl Rejection {
     /// Every variant, in `as_index` order. The array in `Metrics` is built from this, so adding a
     /// variant without adding it here fails the exhaustive `match` in `as_index`.
-    pub(crate) const ALL: [Rejection; 18] = [
+    pub(crate) const ALL: [Rejection; 19] = [
         Rejection::Auth,
         Rejection::DenySpend,
         Rejection::DenyFraud,
@@ -96,6 +99,7 @@ impl Rejection {
         Rejection::ResponseTooLarge,
         Rejection::ManagedEndpoint,
         Rejection::DuplicateModel,
+        Rejection::BodyMemory,
     ];
 
     /// The `reason=` label value. `RateLimit` keeps the original `"rate_limit"` string so existing
@@ -120,6 +124,7 @@ impl Rejection {
             Rejection::ResponseTooLarge => "response_too_large",
             Rejection::ManagedEndpoint => "managed_endpoint",
             Rejection::DuplicateModel => "duplicate_model",
+            Rejection::BodyMemory => "body_memory",
         }
     }
 
@@ -143,6 +148,7 @@ impl Rejection {
             Rejection::ResponseTooLarge => 15,
             Rejection::ManagedEndpoint => 16,
             Rejection::DuplicateModel => 17,
+            Rejection::BodyMemory => 18,
         }
     }
 }
