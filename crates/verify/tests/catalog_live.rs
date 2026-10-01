@@ -8,16 +8,17 @@
 //!
 //! | Trial              | Per         | Asserts                                                       |
 //! | ------------------ | ----------- | ------------------------------------------------------------- |
-//! | `CAT-1+BIL-13`     | candidate   | 200; echoed model is the candidate's id (snapshot/prefix      |
-//! |                    |             | aside); `x-beyond-upstream-model` is the id; one ledger row,  |
-//! |                    |             | `price_model` = the row, billed `model` = the echo            |
+//! | `CAT-1`            | candidate   | 200; echoed model is the candidate's id (snapshot/prefix      |
+//! |                    |             | aside); `x-beyond-upstream-model` is the id; one ledger row   |
+//! | `BIL-13`           | candidate   | its ledger row (served or not) prices at the row; on a 200    |
+//! |                    |             | the billed `model` is the echo                                |
 //! | `CAT-2`            | row         | every candidate echoes the same model family and snapshot     |
 //! | `CAT-3`            | candidate   | one request over `context_window` is a clean 4xx from that    |
 //! |                    |             | candidate (no failover); rows <= 200k also take 0.9x once     |
 //! | `CAT-4`            | candidate   | `max_tokens` = card `max_output_tokens` is accepted           |
 //! | `CAT-5`            | candidate   | advertised image / PDF input is read; unadvertised image 4xx  |
-//! | `CAT-6(+BIL-9)`    | candidate   | forced tool call, json_schema output, reasoning reported      |
-//! |                    |             | (ledger output counts reasoning exactly once); no tools: 4xx  |
+//! | `CAT-6`            | candidate   | forced tool call, json_schema output; no tools: clean 4xx     |
+//! | `CAT-6+BIL-9`      | candidate   | reasoning reported; ledger output counts it exactly once      |
 //! | `CAT-7`            | candidate   | ledger tokens x card = provider-reported cost (OpenRouter,    |
 //! |                    |             | xAI) within 2%; listed price (Together, xAI, OpenRouter);     |
 //! |                    |             | else card = `verify/catalog_truth.toml` (vendor-doc verified) |
@@ -277,12 +278,33 @@ struct Gateway {
 
 static CHILDREN: Mutex<Vec<Child>> = Mutex::new(Vec::new());
 
+/// A free port below the kernel's ephemeral range (as `live.rs` picks them): Pingora binds with
+/// `SO_REUSEPORT`, so a `bind(0)` port another session's gateway also picked is shared silently.
 fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let _ = NEXT.compare_exchange(
+        0,
+        u64::from(std::process::id())
+            ^ SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos() as u64,
+        Ordering::Relaxed,
+        Ordering::Relaxed,
+    );
+    loop {
+        // splitmix64: consecutive seeds scatter across the range.
+        let mut z = NEXT
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        let port = 20_000 + ((z ^ (z >> 31)) % 12_000) as u16;
+        if TcpListener::bind(("127.0.0.1", port)).is_ok() {
+            return port;
+        }
+    }
 }
 
 fn gateway() -> Result<&'static Gateway, String> {
@@ -722,7 +744,7 @@ fn body(arm: &Arm, prompt: &str, max: Option<u32>, o: Opts) -> Value {
     let mut m = Map::new();
     m.insert("model".into(), json!(arm.row.model));
     // Not with tools: gpt-5.4 and later 400 function tools with any reasoning_effort on Chat
-    // Completions (D-tools-effort); their default is no reasoning.
+    // Completions, and gpt-5.6 / gpt-6 even with none sent (D114).
     let low_effort = arm.provider() == "openai" && arm.can(REASONING) && !arm.pro() && !o.tools;
     match arm.wire {
         Wire::Embeddings => {
@@ -1101,7 +1123,7 @@ const REASON_PROMPT: &str = "What is 1234 times 5678? Reply with only the number
 const CLAUDE_REASON_PROMPT: &str =
     "How many prime numbers are there between 1000 and 1100? Reply with only the number.";
 
-/// CAT-1 + BIL-13: the candidate serves, echoes its own id, and the ledger bills the echo.
+/// CAT-1: the candidate serves and echoes its own id.
 fn cat1(trial: &str, arm: Arm) -> Result<(), Failed> {
     let max = (arm.wire != Wire::Embeddings).then_some(arm.basic_max());
     let r = call(
@@ -1109,7 +1131,7 @@ fn cat1(trial: &str, arm: Arm) -> Result<(), Failed> {
         &body(&arm, OK_PROMPT, max, Opts::default()),
         Walk::Only,
     )?;
-    let (out, row) = served(trial, &arm, "basic", &r)?;
+    let (out, _) = served(trial, &arm, "basic", &r)?;
     let mut problems = Vec::new();
     if r.upstream.as_deref() != Some(arm.cand.upstream_model) {
         problems.push(format!(
@@ -1125,13 +1147,60 @@ fn cat1(trial: &str, arm: Arm) -> Result<(), Failed> {
             out.model, arm.cand.upstream_model
         ));
     }
-    if row["model"] != out.model.as_str() {
+    println!("echo {} → {}", arm.cand.upstream_model, out.model);
+    if problems.is_empty() {
+        Ok(())
+    } else {
+        Err(problems.join("; ").into())
+    }
+}
+
+/// BIL-13: whatever the candidate answers, its one ledger row prices at the row; on a 200 the
+/// billed model is the echoed snapshot. A candidate that doesn't serve still writes a row, so
+/// this holds on every candidate without depending on CAT-1.
+fn bil13(trial: &str, arm: Arm) -> Result<(), Failed> {
+    let max = (arm.wire != Wire::Embeddings).then_some(arm.basic_max());
+    let r = call(
+        &arm,
+        &body(&arm, OK_PROMPT, max, Opts::default()),
+        Walk::Only,
+    )?;
+    let id = r.request_id.as_deref().ok_or("no x-beyond-request-id")?;
+    let rows = ledger(id, 1);
+    let [row] = rows.as_slice() else {
+        return Err(format!(
+            "{} ai.usage rows for {id}, want 1 (HTTP {})",
+            rows.len(),
+            r.status
+        )
+        .into());
+    };
+    let out = parse(arm.wire, &r.json);
+    if r.status == 200 {
+        record(trial, &arm, "basic", row, &out);
+    }
+    let mut problems = Vec::new();
+    if row["price_model"] != arm.row.model {
         problems.push(format!(
-            "BIL-13: ledger bills model {}, the provider echoed {}",
+            "price_model {} does not resolve to the row {} (HTTP {}; {row})",
+            row["price_model"], arm.row.model, r.status
+        ));
+    }
+    if r.status == 200 && row["model"] != out.model.as_str() {
+        problems.push(format!(
+            "ledger bills model {}, the provider echoed {}",
             row["model"], out.model
         ));
     }
-    println!("echo {} → {}", arm.cand.upstream_model, out.model);
+    if r.status != 200 {
+        note(
+            trial,
+            &format!(
+                "candidate answered HTTP {}; its row still prices at the row",
+                r.status
+            ),
+        );
+    }
     if problems.is_empty() {
         Ok(())
     } else {
@@ -1429,7 +1498,7 @@ fn cat5(trial: &str, arm: Arm) -> Result<(), Failed> {
     }
 }
 
-/// CAT-6 (+ BIL-9 on reasoning rows): tools, structured outputs and reasoning as advertised.
+/// CAT-6: tools and structured outputs as advertised; tools on a row without them fail cleanly.
 fn cat6(trial: &str, arm: Arm) -> Result<(), Failed> {
     let mut problems = Vec::new();
     let max = Some(arm.short_max());
@@ -1533,8 +1602,18 @@ fn cat6(trial: &str, arm: Arm) -> Result<(), Failed> {
             Err(e) => problems.push(format!("json_schema: {e}")),
         }
     }
-    // Reasoning, and BIL-9: the ledger counts it exactly once.
-    if arm.can(REASONING) {
+    if problems.is_empty() {
+        Ok(())
+    } else {
+        Err(problems.join("; ").into())
+    }
+}
+
+/// CAT-6 + BIL-9 on a reasoning row: reasoning is reported, and the ledger counts it exactly once.
+fn cat6_reasoning(trial: &str, arm: Arm) -> Result<(), Failed> {
+    let mut problems = Vec::new();
+    let max = Some(arm.short_max());
+    {
         let opts = Opts {
             reason: true,
             ..Opts::default()
@@ -2059,7 +2138,9 @@ enum Kind {
     Cat4(Arm),
     Cat5(Arm),
     Cat6(Arm),
+    Cat6Reasoning(Arm),
     Cat7(Arm),
+    Bil13(Arm),
     Cat8(&'static ModelRoute),
     Cat13(Mount, bool),
 }
@@ -2106,7 +2187,8 @@ fn plan() -> (Vec<Planned>, Vec<String>) {
                     });
                 }
             };
-            push("CAT-1+BIL-13", arm.est(30, 16), Kind::Cat1(*arm), 1);
+            push("CAT-1", arm.est(30, 16), Kind::Cat1(*arm), 1);
+            push("BIL-13", arm.est(30, 16), Kind::Bil13(*arm), 1);
             if !embeddings {
                 push("CAT-4", arm.est(30, out_tok), Kind::Cat4(*arm), 1);
                 let calls = 1 + u32::from(arm.has(IN_FILE));
@@ -2116,14 +2198,16 @@ fn plan() -> (Vec<Planned>, Vec<String>) {
                     Kind::Cat5(*arm),
                     calls,
                 );
-                let calls =
-                    1 + u32::from(arm.can(STRUCTURED_OUTPUTS)) + u32::from(arm.can(REASONING));
-                let claims = if arm.can(REASONING) {
-                    "CAT-6+BIL-9"
-                } else {
-                    "CAT-6"
-                };
-                push(claims, arm.est(120, out_tok), Kind::Cat6(*arm), calls);
+                let calls = 1 + u32::from(arm.can(STRUCTURED_OUTPUTS));
+                push("CAT-6", arm.est(120, out_tok), Kind::Cat6(*arm), calls);
+                if arm.can(REASONING) {
+                    push(
+                        "CAT-6+BIL-9",
+                        arm.est(40, out_tok),
+                        Kind::Cat6Reasoning(*arm),
+                        1,
+                    );
+                }
             }
             if arm.wire != Wire::Responses {
                 let billed = matches!(arm.provider(), "openrouter" | "xai");
@@ -2235,6 +2319,8 @@ fn run(name: &str, kind: &Kind) -> Result<(), Failed> {
         Kind::Cat4(a) => cat4(name, a),
         Kind::Cat5(a) => cat5(name, a),
         Kind::Cat6(a) => cat6(name, a),
+        Kind::Cat6Reasoning(a) => cat6_reasoning(name, a),
+        Kind::Bil13(a) => bil13(name, a),
         Kind::Cat7(a) => cat7(name, a),
         Kind::Cat8(r) => cat8(name, r),
         Kind::Cat13(m, byo) => cat13(name, m, byo),

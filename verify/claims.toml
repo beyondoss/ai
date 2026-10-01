@@ -999,7 +999,7 @@ group = "Reliability"
 text = "Every upstream failure class has a bounded, documented client outcome"
 layer = "both"
 touches = ["crates/gateway/src/proxy.rs", "crates/gateway/src/circuit_breaker.rs", "crates/gateway/src/smart.rs", "crates/gateway/src/state.rs", "crates/gateway/src/admin.rs", "crates/gateway/src/store_watch.rs", "crates/gateway/src/main.rs", "crates/gateway/src/config.rs"]
-defects = ["D57", "D72", "D80"]
+defects = ["D57", "D72", "D80", "D118"]
 
 [[claim]]
 id = "REL-2"
@@ -1202,7 +1202,7 @@ group = "Catalog truth"
 text = "Every candidate on an in-scope provider (OpenAI, Anthropic, OpenRouter, xAI, Bedrock), including Responses arms, serves its model live, and the echoed model matches. Together, Mistral, Groq, DeepSeek and Fireworks primaries are out of scope by decision (2026-10-01); their rows are reachable through OpenRouter."
 layer = "live"
 touches = ["crates/providers/src/", "crates/gateway/src/route.rs", "crates/gateway/src/proxy.rs"]
-defects = ["D61"]
+defects = ["D61", "D105", "D108"]
 
 [[claim]]
 id = "CAT-2"
@@ -1220,7 +1220,7 @@ group = "Catalog truth"
 text = "context_window is accepted near the limit on every candidate"
 layer = "live"
 touches = ["crates/providers/src/", "crates/gateway/src/route.rs", "crates/gateway/src/proxy.rs"]
-defects = ["D62"]
+defects = ["D62", "D104", "D109", "D110", "D118"]
 
 [[claim]]
 id = "CAT-4"
@@ -1229,7 +1229,7 @@ group = "Catalog truth"
 text = "max_output_tokens is accepted on every candidate"
 layer = "live"
 touches = ["crates/providers/src/", "crates/gateway/src/route.rs", "crates/gateway/src/proxy.rs"]
-defects = ["D54", "D62", "D85"]
+defects = ["D54", "D62", "D85", "D111"]
 
 [[claim]]
 id = "CAT-5"
@@ -1238,7 +1238,7 @@ group = "Catalog truth"
 text = "Every advertised modality works per endpoint × candidate; the rest fail cleanly"
 layer = "live"
 touches = ["crates/providers/src/", "crates/gateway/src/route.rs", "crates/gateway/src/proxy.rs"]
-defects = []
+defects = ["D106", "D112"]
 
 [[claim]]
 id = "CAT-6"
@@ -1247,7 +1247,7 @@ group = "Catalog truth"
 text = "Every advertised capability works per candidate; the rest fail cleanly"
 layer = "live"
 touches = ["crates/providers/src/", "crates/gateway/src/route.rs", "crates/gateway/src/proxy.rs"]
-defects = ["D54", "D62"]
+defects = ["D54", "D62", "D105", "D107", "D113", "D114", "D115"]
 
 [[claim]]
 id = "CAT-7"
@@ -1256,7 +1256,7 @@ group = "Catalog truth"
 text = "List prices equal the declared source of truth"
 layer = "live"
 touches = ["crates/providers/src/", "crates/gateway/src/route.rs", "crates/gateway/src/proxy.rs"]
-defects = ["D19", "D60"]
+defects = ["D19", "D60", "D116"]
 
 [[claim]]
 id = "CAT-8"
@@ -1265,7 +1265,7 @@ group = "Catalog truth"
 text = "Card metadata (created, owner, names) is accurate"
 layer = "live"
 touches = ["crates/providers/src/", "crates/gateway/src/route.rs", "crates/gateway/src/proxy.rs"]
-defects = []
+defects = ["D117"]
 
 [[claim]]
 id = "CAT-9"

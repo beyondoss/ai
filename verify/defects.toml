@@ -1449,3 +1449,213 @@ state = "suspected"
 test = ""
 fix = ""
 note = "Found by crates/verify/tests/parity_live.rs. Proposed: forward a message with an unrecognized role whole, in place, with its role unchanged (as an unknown Responses input item already is), so the provider's 400 names it."
+
+[[defect]]
+id = "D104"
+severity = "med"
+area = "Catalog"
+title = "GPT-5-family cards list the total context as context_window; OpenAI's input limit is lower"
+impact = "ModelCard.context_window is documented as the most input tokens one request may carry. On gpt-5, gpt-5-mini, gpt-5-nano, gpt-5.1, gpt-5.2, gpt-5.4-mini and gpt-5.4-nano the card says 400000 but OpenAI rejects input over 272000; on gpt-5.4, gpt-5.5, gpt-5.6-luna/sol/terra and gpt-6-astra the card says 1050000 but the limit is 922000. A client sizing its prompt from /v1/models gets a 400 between those numbers."
+confidence = "high"
+evidence = "live 2026-10-01 catalog sweep, CAT-3::raw::openai::{gpt-5,gpt-5-mini,gpt-5-nano,gpt-5.1,gpt-5.2,gpt-5.4-mini,gpt-5.4-nano}: over-limit prompt -> 400 context_length_exceeded \"Input tokens exceed the configured limit of 272000 tokens\" (card 400000); CAT-3::raw::openai::{gpt-5.4,gpt-5.5,gpt-5.6-luna,gpt-5.6-sol,gpt-5.6-terra,gpt-6-astra}: \"configured limit of 922000 tokens\" (card 1050000). Same in all three sweeps."
+claims = ["CAT-3"]
+state = "suspected"
+test = ""
+fix = ""
+note = "OpenAI's model pages publish 400K / 1.05M as the context window (input + output), which is what catalog_truth.toml records; the API's input cap is the window minus the 128K max output."
+
+[[defect]]
+id = "D105"
+severity = "high"
+area = "Catalog"
+title = "grok-4.20-multi-agent's xAI candidate is on Chat Completions, which xAI refuses for multi-agent"
+impact = "Every request on the row's primary fails: xAI answers 400 \"Multi Agent requests are not allowed on chat completions\". The OpenRouter failover has no endpoint that takes tools, so the row's advertised tools fail there too."
+confidence = "high"
+evidence = "live 2026-10-01 catalog sweep: CAT-1+BIL-13::raw::xai::grok-4.20-multi-agent, CAT-4/CAT-5/CAT-6+BIL-9/CAT-7::raw::xai::grok-4.20-multi-agent -> 400 \"Multi Agent requests are not allowed on chat completions\"; CAT-6+BIL-9::raw::openrouter::grok-4.20-multi-agent -> 404 \"No endpoints found that support tool use\". Same in all three sweeps."
+claims = ["CAT-1", "CAT-6"]
+state = "suspected"
+test = ""
+fix = ""
+note = "xAI serves multi-agent on /v1/responses only; the candidate path would have to be a Responses arm."
+
+[[defect]]
+id = "D106"
+severity = "med"
+area = "Catalog"
+title = "Grok rows advertise file (PDF) input that their candidates refuse"
+impact = "grok-4.20, grok-4.3, grok-4.5, grok-4.6 and grok-build-0.1 list input_modalities file, but xAI Chat Completions (every grok candidate's path) answers 400 \"File content is not supported on /v1/chat/completions. Please use /v1/responses instead.\", and OpenRouter has no file-capable endpoint for grok-build-0.1 (404)."
+confidence = "high"
+evidence = "live 2026-10-01 catalog sweep: CAT-5::raw::xai::{grok-4.20,grok-4.3,grok-4.5,grok-4.6,grok-build-0.1} (pdf -> 400 as quoted); CAT-5::raw::openrouter::grok-build-0.1 (pdf -> 404 \"No endpoints found that support file input\"). Images work on all of them. Same in all three sweeps."
+claims = ["CAT-5"]
+state = "suspected"
+test = ""
+fix = ""
+note = ""
+
+[[defect]]
+id = "D107"
+severity = "med"
+area = "Catalog"
+title = "Bedrock candidates reject structured outputs on Claude rows that advertise them"
+impact = "claude-haiku-4-5 and claude-opus-4-8 advertise structured_outputs. The gateway translates response_format json_schema to output_config.format, which Bedrock's Anthropic surface rejects: a 400 on opus-4-8 and a misleading 404 on haiku-4-5. A request that fails over onto Bedrock (or is pinned there) loses the capability."
+confidence = "high"
+evidence = "live 2026-10-01 catalog sweep: CAT-6+BIL-9::raw::bedrock::claude-opus-4-8 -> 400 \"output_config.format: Extra inputs are not permitted\"; CAT-6+BIL-9::raw::bedrock::claude-haiku-4-5 -> 404 \"The model doesn't exist or doesn't support this API\". The same request on the Anthropic and OpenRouter candidates passes. Same in all three sweeps."
+claims = ["CAT-6"]
+state = "suspected"
+test = ""
+fix = ""
+note = ""
+
+[[defect]]
+id = "D108"
+severity = "high"
+area = "Catalog"
+title = "Two Together primaries are not serverless"
+impact = "google/gemma-4-31b-it (google/gemma-4-31B-it) and qwen/qwen-2.5-7b-instruct (Qwen/Qwen2.5-7B-Instruct-Turbo) are Together-primary rows; Together answers 400 model_not_available \"Unable to access non-serverless model ... create and start a new dedicated endpoint\". Every request pays a failed primary before OpenRouter serves it."
+confidence = "high"
+evidence = "live 2026-10-01 catalog sweep: CAT-1+BIL-13::raw::together::google/gemma-4-31b-it and CAT-1+BIL-13::raw::together::qwen/qwen-2.5-7b-instruct (and their CAT-2/CAT-4/CAT-6 trials) -> 400 model_not_available. Qwen2.5-7B also fails the same way as a /together/ passthrough."
+claims = ["CAT-1"]
+state = "suspected"
+test = ""
+fix = ""
+note = "Belongs in catalog_truth.toml's not_serverless list once confirmed on Together's model page."
+
+[[defect]]
+id = "D109"
+severity = "med"
+area = "Catalog"
+title = "OpenRouter silently compresses an over-window prompt on gpt-4 instead of rejecting it"
+impact = "A 10601-word prompt to gpt-4 (8192 window) through the OpenRouter candidate returns 200: OpenRouter's default middle-out transform drops the middle of the prompt for models with small windows, so the model answers a prompt the client didn't send. Every other candidate rejects it with a context error."
+confidence = "high"
+evidence = "live 2026-10-01 catalog sweep: CAT-3::raw::openrouter::gpt-4 -> 200 (sweep 1: 1298 input tokens billed; sweep 2: 1941; sweep 3: 0) where CAT-3::raw::openai::gpt-4 -> 400 context_length_exceeded."
+claims = ["CAT-3"]
+state = "suspected"
+test = ""
+fix = ""
+note = "OpenRouter documents middle-out as on by default for endpoints with <= 8k context; sending transforms: [] turns it off."
+
+[[defect]]
+id = "D110"
+severity = "low"
+area = "Catalog"
+title = "Candidates serve smaller windows than their cards"
+impact = "ministral-3b-latest's OpenRouter candidate serves 131072 tokens against a card of 262144; qwen/qwen3.8-2.4t-a95b on Together serves 1010000 against 1048576. A prompt sized to the card fails on that candidate."
+confidence = "high"
+evidence = "live 2026-10-01 catalog sweep: CAT-3::raw::openrouter::ministral-3b-latest -> 400 \"This endpoint's maximum context length is 131072 tokens\"; CAT-3::raw::together::qwen/qwen3.8-2.4t-a95b -> 400 \"This model's maximum context length is 1010000 tokens\". Same in all three sweeps."
+claims = ["CAT-3"]
+state = "suspected"
+test = ""
+fix = ""
+note = ""
+
+[[defect]]
+id = "D111"
+severity = "low"
+area = "Catalog"
+title = "gpt-4's max_output_tokens equals its whole window, so the card's max is always rejected"
+impact = "The card lists max_output_tokens 8192 and context_window 8192. Any request asking for the card's max output with a non-empty prompt is a 400."
+confidence = "high"
+evidence = "live 2026-10-01 catalog sweep: CAT-4::raw::openai::gpt-4 -> 400 \"This model's maximum context length is 8192 tokens. However, you requested 8206 tokens (14 in the messages, 8192 in the completion)\". Same in all three sweeps."
+claims = ["CAT-4"]
+state = "suspected"
+test = ""
+fix = ""
+note = ""
+
+[[defect]]
+id = "D112"
+severity = "low"
+area = "Catalog"
+title = "Unadvertised image input doesn't fail cleanly on some candidates"
+impact = "Rows whose card omits image input accept one silently (200, the model says it sees no image) on o3-mini (OpenAI) and openai/gpt-oss-120b (Together), and gpt-4 (OpenAI) answers 500. The client pays for a call that ignored its input, or sees a server error for a client mistake. The gateway has the card and could reject the request before it leaves."
+confidence = "high"
+evidence = "live 2026-10-01 catalog sweep: CAT-5::raw::openai::o3-mini and CAT-5::raw::together::openai/gpt-oss-120b -> 200 (\"I'm sorry, but I can't view images\"); CAT-5::raw::openai::gpt-4 -> 500 server_error. Same in all three sweeps."
+claims = ["CAT-5"]
+state = "suspected"
+test = ""
+fix = ""
+note = ""
+
+[[defect]]
+id = "D113"
+severity = "low"
+area = "Catalog"
+title = "gpt-4's card omits tools, but every candidate calls them"
+impact = "The card's capabilities are empty, yet OpenAI (Chat and Responses) and OpenRouter return the forced tool call. A client that picks models by /v1/models capabilities skips a model that works."
+confidence = "high"
+evidence = "live 2026-10-01 catalog sweep: CAT-6::raw::openai::gpt-4, CAT-6::raw::openai-responses::gpt-4, CAT-6::raw::openrouter::gpt-4 -> get_weather({\"city\":\"Paris\"})."
+claims = ["CAT-6"]
+state = "suspected"
+test = ""
+fix = ""
+note = "The card follows the sourcing rule (list only what the vendor's model page names); the page omits function calling for gpt-4."
+
+[[defect]]
+id = "D114"
+severity = "high"
+area = "Catalog"
+title = "gpt-5.6 and gpt-6-astra can't call tools on their Chat Completions primary"
+impact = "gpt-5.6-luna, gpt-5.6-sol, gpt-5.6-terra and gpt-6-astra advertise tools, and their primary candidate is OpenAI /v1/chat/completions. OpenAI rejects function tools there with 400 \"Function tools with reasoning_effort are not supported ... use /v1/responses or set reasoning_effort to 'none'\" even when the request sends no reasoning_effort (these models reason by default). A Chat or Messages client with tools gets a 400 on the primary. gpt-5.4 and gpt-5.5 default to no reasoning and work unless the client asks for reasoning."
+confidence = "high"
+evidence = "live 2026-10-01 catalog sweep 3: CAT-6+BIL-9::raw::openai::{gpt-5.6-luna,gpt-5.6-sol,gpt-5.6-terra,gpt-6-astra} -> 400 as quoted, with no reasoning_effort in the body. Sweep 2, which sent reasoning_effort low with the tools, also failed gpt-5.4, gpt-5.4-mini, gpt-5.4-nano and gpt-5.5. Their Responses arms and OpenRouter candidates pass."
+claims = ["CAT-6"]
+state = "suspected"
+test = ""
+fix = ""
+note = "Also bites the translation path: a Messages client with thinking plus tools on these rows is translated to Chat with a reasoning_effort."
+
+[[defect]]
+id = "D115"
+severity = "med"
+area = "Catalog"
+title = "Advertised tools fail on some OpenRouter candidates"
+impact = "meta-llama/llama-4-scout advertises tools but OpenRouter has no tool-capable endpoint for it (404). openai/gpt-oss-120b over OpenRouter returns neither the forced tool call nor text. z-ai/glm-5.3-flash over OpenRouter leaked its native tool-call markup into the arguments string (sweep 3)."
+confidence = "med"
+evidence = "live 2026-10-01 catalog sweep: CAT-6::raw::openrouter::meta-llama/llama-4-scout -> 404 \"Filter by Tool Compatibility removed deepinfra/fp8, novita/bf16\" (all sweeps); CAT-6+BIL-9::raw::openrouter::openai/gpt-oss-120b -> 200 with no tool call and empty text (all sweeps); CAT-6+BIL-9::raw::openrouter::z-ai/glm-5.3-flash -> arguments \"{\\\"city\\\":\\\"Paris (France)? I'll check that for you.<tool_call>get_weather...\" (sweep 3 only). Sweep 2 also saw json_schema ignored on qwen/qwen3.6-plus and z-ai/glm-5.1 over OpenRouter."
+claims = ["CAT-6"]
+state = "suspected"
+test = ""
+fix = ""
+note = "Host-dependent: OpenRouter picks the host per request, so these vary run to run except llama-4-scout and gpt-oss-120b."
+
+[[defect]]
+id = "D116"
+severity = "med"
+area = "Billing"
+title = "List prices disagree with what the provider charges or lists"
+impact = "gpt-5.6-sol and gpt-5.6-sol-pro: OpenRouter, routed to OpenAI, charges exactly half the card ($2/$10 against $4/$20), matching OpenAI's promotional rate. OpenRouter-primary rows drift from OpenRouter's own listing: z-ai/glm-5.1 card 1.4/4.4 vs listed 0.9646/3.0316, moonshotai/kimi-k2.7-code 0.6562/3.3 vs 0.6712/3.35. Together lists qwen/qwen3.8-flash output at 0.282 against the card's 0.28."
+confidence = "high"
+evidence = "live 2026-10-01 catalog sweep: CAT-7::raw::openrouter::gpt-5.6-sol (ledger x card $0.001056, OpenRouter charged $0.000528), CAT-7::raw::openrouter::gpt-5.6-sol-pro (+100%), CAT-7::raw::openrouter::z-ai/glm-5.1, CAT-7::raw::openrouter::moonshotai/kimi-k2.7-code, CAT-7::raw::together::qwen/qwen3.8-flash. Same in all three sweeps."
+claims = ["CAT-7"]
+state = "suspected"
+test = ""
+fix = ""
+note = "catalog_truth.toml already notes OpenAI's promotional gpt-5.6-sol pricing and lists the standard tier on purpose; whether the card should bill the promotional rate is an owner decision. Third-party OpenRouter hosts of open models charging their own rate are recorded as notes, not failures."
+
+[[defect]]
+id = "D117"
+severity = "low"
+area = "Catalog"
+title = "Card created and owned_by come from OpenRouter, not the vendor"
+impact = "OpenAI rows' created is OpenRouter's listing date, 2 to 35 days after OpenAI's own (text-embedding-3-large/small: 647 days); xAI rows are 6 to 35 days off and list owned_by x-ai where xAI says xai."
+confidence = "high"
+evidence = "live 2026-10-01 catalog sweep: 27 CAT-8 cells, e.g. CAT-8::raw::openai::text-embedding-3-small (card 1761857455, OpenAI 1705948997), CAT-8::raw::openai::gpt-5.6-sol (+15.8 days), CAT-8::raw::xai::grok-build-0.1 (+34.7 days, owned_by x-ai vs xai), CAT-8::raw::openai::gpt-4 (-30.7 days). Anthropic and Together rows match."
+claims = ["CAT-8"]
+state = "suspected"
+test = ""
+fix = ""
+note = ""
+
+[[defect]]
+id = "D118"
+severity = "med"
+area = "Reliability"
+title = "A large request body to an h2 upstream that answers early stalls, then ends in a 502"
+impact = "When OpenRouter rejects a multi-megabyte prompt before reading all of it (an over-window request), the gateway keeps writing the body until Pingora's 60s write timeout, never relays the 400 OpenRouter already sent, and answers 502 minutes later. The client waits or times out and never sees the context error. Seen only under concurrent uploads (16 trial processes); one at a time it relays the 400."
+confidence = "med"
+evidence = "live 2026-10-01 catalog sweep 1: 12 CAT-3/CAT-5 cells on openrouter timed out at 180s (e.g. CAT-3::raw::openrouter::gpt-5, CAT-3::raw::openrouter::claude-opus-4-5). Their gateway logs: \"Upstream h2 body send error: Upstream WriteTimedout context: while writing h2 request body, timeout: 60s\", then \"Fail to proxy: Upstream H2Error ... connection error received: not a result of an error, status: 502\" about 6 minutes after the request. The same 2.5 MB body sent to OpenRouter directly returns 400 in 0.6s. Sweep 3 caps concurrent multi-megabyte uploads at three and saw no timeouts."
+claims = ["CAT-3", "REL-1"]
+state = "suspected"
+test = ""
+fix = ""
+note = "Related to D81 / D83 (large-body handling) but a different path: here the upstream answered and the answer was dropped."
