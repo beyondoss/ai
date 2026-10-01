@@ -1548,3 +1548,103 @@ text = "Responses stream lifecycle conformance holds live through Codex and the 
 layer = "live"
 touches = ["crates/gateway/src/translate.rs", "crates/gateway/src/proxy.rs"]
 defects = []
+
+# --- Real-world sessions (end to end, live) ------------------------------------------------------
+[[claim]]
+id = "SES-1"
+priority = "P0"
+group = "Real-world sessions"
+text = "A conversation that fails over to another provider mid-session (dialect change included) continues correctly: history with thinking signatures, tool calls and results, and cache markers replays and the next turns succeed"
+oracle = "harness/SDK session with the primary killed between turns: every later turn succeeds on the fallback, tool loop intact, no 400 on replayed history, ledger rows per turn on the provider that served"
+layer = "live"
+clients = ["claude-code", "pi", "openai-py", "anthropic-py"]
+touches = ["crates/gateway/src/translate.rs", "crates/gateway/src/proxy.rs"]
+defects = []
+
+[[claim]]
+id = "SES-2"
+priority = "P0"
+group = "Real-world sessions"
+text = "A user switching models mid-session (Claude to GPT and back, across dialects) continues correctly"
+oracle = "opencode/pi/SDK session switching model every few turns: every turn succeeds, history replays across dialects, ledger rows match"
+layer = "live"
+clients = ["opencode", "pi", "openai-py", "anthropic-py"]
+touches = ["crates/gateway/src/translate.rs", "crates/gateway/src/proxy.rs"]
+defects = []
+
+[[claim]]
+id = "SES-3"
+priority = "P1"
+group = "Real-world sessions"
+text = "Stateful Responses chains (previous_response_id, store:true, conversation state) work on GPT rows, including failover within the Responses arm"
+oracle = "Agents SDK / openai-py chain of 5+ turns via previous_response_id: each turn sees prior context; a forced Responses-arm failover keeps the chain valid or fails with a clear error"
+layer = "live"
+clients = ["openai-agents", "openai-py", "codex"]
+touches = ["crates/gateway/src/proxy.rs", "crates/gateway/src/translate.rs"]
+defects = []
+
+[[claim]]
+id = "FLT-1"
+priority = "P0"
+group = "Real-world sessions"
+text = "Under injected faults in front of a real provider (5xx, 429, connection resets before and mid-stream, slow drip), stock SDKs with their default retries succeed or fail cleanly, with no duplicate billing and no request amplification beyond the documented bound"
+oracle = "fault proxy between gateway and the real provider; per scenario: client outcome, upstream request count vs documented bound, exactly one ai.usage row per provider-billed generation, reconciliation-style token agreement"
+layer = "live"
+clients = ["openai-py", "anthropic-py", "openai-node", "anthropic-ts"]
+touches = ["crates/gateway/src/proxy.rs", "crates/gateway/src/circuit_breaker.rs"]
+defects = []
+
+[[claim]]
+id = "LNG-1"
+priority = "P0"
+group = "Real-world sessions"
+text = "Long coding-agent sessions (30-50 turns) complete through the gateway, including auto-compaction and context-overflow handling, and the session's billed cost equals the provider's"
+oracle = "Claude Code / Codex / pi multi-step repo task: task completes, compaction/overflow handled (no stuck loop), every turn has a ledger row, session token totals reconcile against provider usage (BIL-5 method) where admin keys exist"
+layer = "live"
+clients = ["claude-code", "codex", "pi"]
+touches = ["crates/gateway/src/translate.rs", "crates/gateway/src/proxy.rs", "crates/gateway/src/usage.rs"]
+defects = []
+
+[[claim]]
+id = "LNG-2"
+priority = "P1"
+group = "Real-world sessions"
+text = "Prompt caching holds across long sessions: cache read share rises after the first turns and stays high, on direct and translated paths"
+oracle = "per-turn ledger cache_read / input ratio over a long harness session exceeds a stated floor after warm-up, per route"
+layer = "live"
+clients = ["claude-code", "pi", "opencode"]
+touches = ["crates/gateway/src/translate.rs", "crates/gateway/src/smart.rs"]
+defects = []
+
+[[claim]]
+id = "TOOL-1"
+priority = "P1"
+group = "Real-world sessions"
+text = "Large tool sets (more than 128 tools, large schemas, Codex namespace tools) work through every client and route, or fail with a clear documented error naming the limit"
+oracle = "SDK and harness requests with N tools around each provider's limit: success below it; a clear 4xx naming the limit above it (never a 5xx or silent drop)"
+layer = "live"
+clients = ["openai-py", "anthropic-py", "claude-code", "codex"]
+touches = ["crates/gateway/src/translate.rs"]
+defects = []
+
+[[claim]]
+id = "TEN-1"
+priority = "P0"
+group = "Real-world sessions"
+text = "Revoking a key or exhausting a tenant's allowance mid-session behaves as documented: the in-flight stream finishes (or is cut cleanly as documented), is billed correctly, and the next turn is refused with a clear error"
+oracle = "harness/SDK session; deny-set or allowance written to NATS mid-stream: in-flight outcome per docs, its ai.usage row correct, next request 402/403 JSON within the documented bound"
+layer = "live"
+clients = ["openai-py", "anthropic-py", "claude-code"]
+touches = ["crates/gateway/src/deny.rs", "crates/gateway/src/allowance.rs", "crates/gateway/src/store_watch.rs", "crates/gateway/src/proxy.rs"]
+defects = []
+
+[[claim]]
+id = "TEN-2"
+priority = "P1"
+group = "Real-world sessions"
+text = "Two tenants' concurrent live sessions stay isolated: no cross-tenant cache hit, pin, limit or billing attribution"
+oracle = "two tenants run identical concurrent sessions: each tenant's rows carry its own tenant_id, no x-beyond-cache-status: hit across tenants, pins and limits per tenant"
+layer = "live"
+clients = ["openai-py", "anthropic-py"]
+touches = ["crates/gateway/src/cache.rs", "crates/gateway/src/smart.rs", "crates/gateway/src/concurrency.rs"]
+defects = []
