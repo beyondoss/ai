@@ -2121,3 +2121,17 @@ state = "fixed"
 test = "an_echoed_out_of_credit_phrase_never_cools_the_pool_key"
 fix = ""
 note = "Fixed in remedy.rs by keeping the two decisions apart. Out of credit (Neutralized::unfunded, which cools the shared key) is read only from what the provider sets and the request cannot: a 402 (OpenRouter, DeepSeek, Anthropic billing_error), except OpenRouter's \"This request requires more credits\" (one request bigger than the balance, anchored at the start); OpenAI's insufficient_quota code or type and Anthropic's billing_error type; and Anthropic's credit-balance 400 and xAI's spent-credits 403 compared to the provider's whole sentence (xAI's team id is the one variable part). The phrase list (now REMEDIES only) drives the cosmetic D174 rewrite, and only on a status about the account (401, 402, 403, 429): a 400 or 404 is about the request and may quote it, so it is relayed as written. Unit: remedy::tests::an_echoed_phrase_is_never_unfunded (every phrase in a model name, an unknown parameter and an extra field, on 400/404/422 untouched, on 401/403/429 never unfunded; the anchored sentences with tenant text around them) and unfunded_is_read_from_structured_fields. D180's two answers (Anthropic's credit-balance 400, OpenAI's insufficient_quota 429) still cool (an_unfunded_pool_key_sends_later_requests_to_the_next_candidate). Trade-off: an OpenRouter 404 naming its privacy-settings page is relayed verbatim; a different wording of Anthropic's or xAI's sentence would no longer cool (the safe direction: that request is relayed, as before D180)."
+
+[[defect]]
+id = "D201"
+severity = "high"
+area = "Reliability"
+title = "An x-beyond-split weight near u32::MAX panicked request_filter"
+impact = "control::permute summed the split weights saturating (total) but accumulated the pick with acc += w, and the release profile keeps overflow checks on. x-beyond-split: anthropic=1,openrouter=4294967295 (or two weights of 2^31) overflowed acc on most seeds and panicked the request in request_filter: any managed caller could make the gateway drop its request with a panic, as often as it liked."
+confidence = "high"
+evidence = "Hermetic: control::tests::split_weights_near_u32_max_never_overflow. parse_split accepted any u32 weight, and permute with [1, u32::MAX] or [2^31, 2^31] reached acc += w past u32::MAX (control.rs, the split arm of permute)."
+claims = ["R3", "CAT-12"]
+state = "fixed"
+test = "split_weights_near_u32_max_never_overflow"
+fix = ""
+note = "Fixed in control.rs: a weight above MAX_SPLIT_WEIGHT = u32::MAX / MAX_CANDIDATES makes the header malformed (counted on ai_control_header_errors_total, the default walk serves), derived so the sum of the at most MAX_CANDIDATES weights a walk adds always fits a u32; the pick accumulates with saturating_add as well, so weights handed to permute directly cannot panic either. The test runs 512 seeds each of [1, u32::MAX], [2^31, 2^31] and [u32::MAX, u32::MAX] through permute, and checks the parse bound on both sides."

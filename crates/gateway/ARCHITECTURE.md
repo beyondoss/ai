@@ -336,11 +336,11 @@ provider the row does not already name (`ProviderSpec::name` on that row). Parse
 stripped before the upstream, never a 4xx. `order` and `split` **pin** (the ranker does not run);
 `only` filters, then ranking still applies:
 
-| Header           | Value                     | Walk                                                                                                                                   |
-| ---------------- | ------------------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
-| `x-beyond-order` | `bedrock,anthropic`       | those providers first (stable as written), then any remaining row candidates                                                           |
-| `x-beyond-only`  | `bedrock,openrouter`      | drop anyone not named                                                                                                                  |
-| `x-beyond-split` | `anthropic=70,bedrock=30` | pick the primary with those weights (hash of the request counter, not `rand` per replica); leftover stay failover in the current order |
+| Header           | Value                     | Walk                                                                                                                                                                                                                                                                               |
+| ---------------- | ------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `x-beyond-order` | `bedrock,anthropic`       | those providers first (stable as written), then any remaining row candidates                                                                                                                                                                                                       |
+| `x-beyond-only`  | `bedrock,openrouter`      | drop anyone not named                                                                                                                                                                                                                                                              |
+| `x-beyond-split` | `anthropic=70,bedrock=30` | pick the primary with those weights (hash of the request counter, not `rand` per replica); leftover stay failover in the current order. A weight above `control::MAX_SPLIT_WEIGHT` (`u32::MAX / MAX_CANDIDATES`, so the sum always fits a `u32`) makes the header malformed (D201) |
 
 Unknown names are dropped. Unparseable values are dropped, counted on
 `ai_control_header_errors_total`, and the request uses the unpinned walk (TTFT rank, or catalog
@@ -1630,14 +1630,14 @@ every route, BYO included.
 **Managed only** — a BYO request carries no verified `tenant_id`, so a tag on it would be an
 unattributable row, the same reason `ai.usage` is managed-only.
 
-| Header              | Value                                       | Effect                                          |
-| ------------------- | ------------------------------------------- | ----------------------------------------------- |
-| `x-beyond-metadata` | flat JSON object of scalars, ≤1KB, ≤16 keys | tags `ai.usage` + `ai.payload`                  |
-| `x-beyond-capture`  | `on` / `off`                                | enables or suppresses capture for this request  |
-| `x-beyond-cache`    | `on` / `off`                                | `off` skips exact-match cache lookup and store  |
-| `x-beyond-order`    | comma-separated `ProviderSpec::name`s       | those providers first, then the rest of the row |
-| `x-beyond-only`     | comma-separated `ProviderSpec::name`s       | drop anyone on the row not named                |
-| `x-beyond-split`    | `name=weight` pairs                         | weighted primary; leftover stay failover        |
+| Header              | Value                                                           | Effect                                          |
+| ------------------- | --------------------------------------------------------------- | ----------------------------------------------- |
+| `x-beyond-metadata` | flat JSON object of scalars, ≤1KB, ≤16 keys                     | tags `ai.usage` + `ai.payload`                  |
+| `x-beyond-capture`  | `on` / `off`                                                    | enables or suppresses capture for this request  |
+| `x-beyond-cache`    | `on` / `off`                                                    | `off` skips exact-match cache lookup and store  |
+| `x-beyond-order`    | comma-separated `ProviderSpec::name`s                           | those providers first, then the rest of the row |
+| `x-beyond-only`     | comma-separated `ProviderSpec::name`s                           | drop anyone on the row not named                |
+| `x-beyond-split`    | `name=weight` pairs, each weight <= `u32::MAX / MAX_CANDIDATES` | weighted primary; leftover stay failover        |
 
 **Nothing here can fail a request with a 4xx.** Malformed, oversize, or unrecognized values are
 dropped and counted on `ai_control_header_errors_total`; the request proceeds as if the header were

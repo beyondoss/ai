@@ -11,7 +11,7 @@
 //! | `x-beyond-cache` | `on` / `off` | enable or skip the exact-match response cache for this request |
 //! | `x-beyond-order` | `bedrock,anthropic` | those providers first (stable), then the rest of the row |
 //! | `x-beyond-only` | `bedrock,openrouter` | drop anyone on the row not named |
-//! | `x-beyond-split` | `anthropic=70,bedrock=30` | pick the primary by those weights; leftover stay failover |
+//! | `x-beyond-split` | `anthropic=70,bedrock=30` | pick the primary by those weights (each <= [`MAX_SPLIT_WEIGHT`]); leftover stay failover |
 //!
 //! Walk headers permute a catalog row's candidate list. They never add a provider the row does not
 //! already list, they do not change the wire, and they run **before** `first_usable` / breaker skip
@@ -258,8 +258,15 @@ fn parse_name_list(raw: &str) -> Option<Vec<String>> {
     (!names.is_empty()).then_some(names)
 }
 
-/// Comma-separated `name=weight` pairs. Weights are unsigned integers; a zero-weight arm is kept
-/// so apply can skip it. No valid pair → unusable (counted, default order).
+/// The largest `x-beyond-split` weight: the walk sums at most [`MAX_CANDIDATES`] weights (one per
+/// row slot) into a `u32`, so any header that parses has a sum that fits. A larger weight makes
+/// the header malformed (counted, default order) rather than overflowing the pick (D201). The
+/// bound is ~536 million, far past any ratio a caller means.
+pub const MAX_SPLIT_WEIGHT: u32 = u32::MAX / MAX_CANDIDATES as u32;
+
+/// Comma-separated `name=weight` pairs. Weights are unsigned integers up to [`MAX_SPLIT_WEIGHT`];
+/// a zero-weight arm is kept so apply can skip it. No valid pair, or a weight past the bound →
+/// unusable (counted, default order).
 fn parse_split(raw: &str) -> Option<Vec<(String, u32)>> {
     let mut out = Vec::new();
     for part in raw.split(',') {
@@ -273,7 +280,7 @@ fn parse_split(raw: &str) -> Option<Vec<(String, u32)>> {
         if name.is_empty() || weight.is_empty() || !weight.bytes().all(|b| b.is_ascii_digit()) {
             return None;
         }
-        let w: u32 = weight.parse().ok()?;
+        let w: u32 = weight.parse().ok().filter(|w| *w <= MAX_SPLIT_WEIGHT)?;
         if out.len() == MAX_CANDIDATES {
             break;
         }
@@ -375,7 +382,9 @@ fn permute(
             let mut acc = 0u32;
             let mut pick_slot = arms[0].0;
             for &(slot, w) in &arms[..nw as usize] {
-                acc += w;
+                // Saturating, like `total`: weights handed in past `MAX_SPLIT_WEIGHT` must not
+                // panic the request (D201).
+                acc = acc.saturating_add(w);
                 if r < acc {
                     pick_slot = slot;
                     break;
@@ -786,6 +795,39 @@ mod tests {
             saw_anthropic && saw_bedrock,
             "a 70/30 split over many seeds must hit both primaries"
         );
+    }
+
+    /// Weights whose sum does not fit a `u32` used to overflow the cumulative pick (`acc += w`),
+    /// which panics in request_filter with overflow checks on (they are, in release). The header
+    /// refuses a weight past [`MAX_SPLIT_WEIGHT`] (counted as malformed, the default walk serves),
+    /// and the pick itself saturates, so neither the header nor any weights handed to the walk
+    /// directly can panic.
+    /// claim: R3, CAT-12
+    /// defect: D201
+    #[test]
+    fn split_weights_near_u32_max_never_overflow() {
+        for raw in [
+            "anthropic=1,bedrock=4294967295",
+            "anthropic=2147483648,bedrock=2147483648",
+        ] {
+            let c = Control::parse(&req(&[(SPLIT_HEADER, raw)]));
+            assert!(c.split.is_none() && c.malformed, "{raw}");
+        }
+        let at_bound = format!("anthropic={MAX_SPLIT_WEIGHT},bedrock={MAX_SPLIT_WEIGHT}");
+        let c = Control::parse(&req(&[(SPLIT_HEADER, at_bound.as_str())]));
+        assert!(c.split.is_some() && !c.malformed, "{at_bound}");
+
+        let row = claude_row();
+        for weights in [[1, u32::MAX], [1 << 31, 1 << 31], [u32::MAX, u32::MAX]] {
+            let split = [
+                ("anthropic".to_string(), weights[0]),
+                ("bedrock".to_string(), weights[1]),
+            ];
+            for seed in 0..512 {
+                let walk = permute(row.candidates, None, None, Some(&split), seed);
+                assert_eq!(walk.len, 3, "{weights:?} seed {seed}");
+            }
+        }
     }
 
     #[test]
