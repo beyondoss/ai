@@ -1993,5 +1993,5 @@ evidence = "live 2026-10-01 crates/verify/tests/live.rs REL-22::raw::{gpt,claude
 claims = ["REL-22"]
 state = "fixed"
 test = "concurrent_requests_share_an_upstream_h2_connection"
-fix = "5d7a719"
+fix = "678f398"
 note = "Found by the REL-22 live cell written to close its coverage gap. Fixed: build_peer sets max_h2_streams = UPSTREAM_H2_MAX_STREAMS (100, RFC 9113's recommended floor; the provider's SETTINGS_MAX_CONCURRENT_STREAMS still caps it). Live after: the same 24-stream burst holds 1 connection to OpenAI and 2 to Anthropic. Requests that arrive in the same instant can still each open one before the first is back in pingora's pool with room (hermetic: 0-10 of 32), so the test bounds sharing at half. GOAWAY and refused streams on a shared connection were already handled (D72)."
