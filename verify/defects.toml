@@ -2191,3 +2191,31 @@ state = "fixed"
 test = "an_error_in_200_is_not_billed_whatever_its_key_order"
 fix = ""
 note = "Fixed in proxy.rs logging: json_is_error_only reads the root's members in any order: a non-null error member and none of choices, output or content (so a Responses answer's \"error\": null beside output, and OpenRouter's partial choices with finish_reason error, stay answers). It is parsed only on the path that needs it (a managed non-stream 2xx with no parsed usage), so no other response pays a parse. Still read only when the whole body fits the 64 KiB usage tail; a larger body has no root to read and is estimated (an error-in-200 is under 2 KiB in practice). Unit: json_is_error_only_reads_members_in_any_order."
+
+[[defect]]
+id = "D206"
+severity = "med"
+area = "Reliability"
+title = "A full-body relay could retry an attempt after its client had disconnected"
+impact = "relay_full_body matched (Ok(_) | Err(_), Some(decision)) before looking at the error: when an attempt had recorded a retry (a 5xx, a 429 key walk, a reset before delivery) and the pipe ended because the client hung up (a downstream error), the parent ran the next attempt anyway. That attempt sends the whole body (up to 100 MiB) to the next candidate or key for nobody: a generation the provider bills and no client reads, and a wasted breaker permit."
+confidence = "med"
+evidence = "Code: proxy.rs relay_full_body, the (Ok(_) | Err(_), Some(decision)) arm. The window is the time between an attempt recording its RelayRetry and the parent reading it, while pipe_full_body has already returned the client's disconnect; not reproducible deterministically end to end, so the decision is extracted (attempt_end) and tested directly. Hermetic: a_full_body_attempt_that_lost_its_client_is_never_retried (the old match returned Retry(Candidate(0)) for a downstream ConnectionClosed with a recorded retry)."
+claims = ["REL-9", "REL-21"]
+state = "fixed"
+test = "a_full_body_attempt_that_lost_its_client_is_never_retried"
+fix = ""
+note = "Fixed in proxy.rs: relay_full_body decides through attempt_end, where a pipe that ended with an ErrorSource::Downstream error is AttemptEnd::Fail whatever the attempt recorded; an upstream error or an abandoned header with a recorded retry still retries, and a written response is done. Not covered: an upstream error that lands in the same instant as the client's close (the pipe reports the upstream one first, biased); the next attempt's pipe then sees the client gone at once and ends, but that attempt may already have connected."
+
+[[defect]]
+id = "D207"
+severity = "low"
+area = "Observability"
+title = "A panicked full-body attempt became an anonymous 502"
+impact = "relay_full_body spawned each attempt (tokio::spawn(subrequest.run())) and either discarded its JoinHandle result (let _ = timeout(grace, attempt)) or dropped it. A panic inside an attempt (translation, usage parsing, any filter running in the subrequest) surfaced only as \"full-body attempt ended without a response\", a 502 with no log line naming the panic or tying it to the request id: an oncall could not tell a panic from a provider that answered nothing."
+confidence = "high"
+evidence = "Code: proxy.rs relay_full_body, the (Ok(_), None) arm and the retry arm. Hermetic: a_panicked_full_body_attempt_is_reported (the old handling reported a panicked task as finished)."
+claims = ["REL-17", "REL-21"]
+state = "fixed"
+test = "a_panicked_full_body_attempt_is_reported"
+fix = ""
+note = "Fixed in proxy.rs: reap_attempt awaits every attempt's JoinHandle (bounded by ABANDONED_ATTEMPT_GRACE, 2s, as before) and, when JoinError::is_panic, logs at error \"full-body attempt panicked\" with request_id and the panic message; the failing request's 502 then reads \"full-body attempt panicked\". It runs on every attempt that ends without a written response (retried or failed), so an abandoned attempt's panic is logged too."

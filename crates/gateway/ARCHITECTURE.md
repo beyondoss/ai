@@ -1078,7 +1078,13 @@ What the parent does for every attempt, so a relayed request behaves like any ot
   parent renders as `HTTP/2`, which that parser rejects. The header is rendered as HTTP/1.1 with the
   body's real `Content-Length` and a `Host` from `:authority`, then restored.
 - **No silent hang.** An attempt that ends with neither a response nor an error (a panic) is a 502,
-  never a connection left open with nothing written.
+  never a connection left open with nothing written. The parent awaits the attempt's task (bounded
+  at 2s) and logs a panic at error with the request id and the panic message ("full-body attempt
+  panicked"), so the 502 has a log line that explains it (D207).
+- **A client that left ends the walk.** An attempt whose pipe ended with a downstream error (the
+  client hung up, a write to it failed) ends the request, whatever retry the attempt recorded: a
+  re-run would send the whole body to another candidate or key for a client that is no longer
+  there, a generation billed upstream that nobody reads (D206).
 - **`Expect: 100-continue`** is answered before the body is read (curl waits a second for it).
 
 Before this, a body whose `model` was past 64 KiB was a 404, and one where the read that found it

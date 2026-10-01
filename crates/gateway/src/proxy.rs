@@ -1550,14 +1550,14 @@ impl AiProxy {
             let attempt = tokio::spawn(subrequest.run());
             let piped = Box::pin(pipe_full_body(session, handle, body.clone(), &retry)).await;
             let decision = retry.lock().ok().and_then(|mut r| r.take());
-            match (piped, decision) {
-                (Ok(Piped::Written), _) => return Ok(true),
-                (Ok(_) | Err(_), Some(decision)) => {
+            match attempt_end(&piped, decision) {
+                AttemptEnd::Done => return Ok(true),
+                AttemptEnd::Retry(decision) => {
                     // Let the abandoned attempt finish (its channels are closed, so it aborts its
                     // upstream at once) before the next one starts: it still holds that
                     // candidate's breaker permit, which a half-open breaker has only one of.
                     // Bounded, so an attempt that somehow never notices cannot stall the client.
-                    let _ = tokio::time::timeout(ABANDONED_ATTEMPT_GRACE, attempt).await;
+                    reap_attempt(attempt, &request_id).await;
                     match decision {
                         // The key walk (if any) ended on this candidate: the rest of the walk is
                         // vendor failover, as on a small body (D81).
@@ -1577,15 +1577,23 @@ impl AiProxy {
                         RelayRetry::Reset(i) => reset |= 1 << i,
                     }
                 }
-                (Ok(_), None) => {
-                    // The attempt ended without a response or an error (it panicked, say). Never
-                    // leave the client waiting on a connection pingora would keep alive.
-                    return Err(pingora_core::Error::explain(
-                        pingora_core::ErrorType::HTTPStatus(502),
-                        "full-body attempt ended without a response",
-                    ));
+                AttemptEnd::Fail => {
+                    // A panicked attempt is logged with the request id before its 502 (D207).
+                    let reaped = reap_attempt(attempt, &request_id).await;
+                    return Err(match piped {
+                        Err(e) => e,
+                        // The attempt ended without a response or an error (it panicked, say).
+                        // Never leave the client waiting on a connection pingora would keep alive.
+                        Ok(_) => pingora_core::Error::explain(
+                            pingora_core::ErrorType::HTTPStatus(502),
+                            if reaped == Reaped::Panicked {
+                                "full-body attempt panicked"
+                            } else {
+                                "full-body attempt ended without a response"
+                            },
+                        ),
+                    });
                 }
-                (Err(e), None) => return Err(e),
             }
         }
         Self::reject_message_boxed(
@@ -2368,7 +2376,61 @@ fn full_body_ctx(session: &Session) -> Option<FullBody> {
 /// starts the next one anyway.
 const ABANDONED_ATTEMPT_GRACE: Duration = Duration::from_secs(2);
 
+/// What [`AiProxy::relay_full_body`] does once an attempt's pipe has ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AttemptEnd {
+    /// The response reached the client.
+    Done,
+    /// Run the walk again as the attempt asked.
+    Retry(RelayRetry),
+    /// End the request with this attempt's error (or a 502 when it had none).
+    Fail,
+}
+
+/// Decide from how an attempt's pipe ended and the retry (if any) the attempt recorded. The
+/// client gone (a downstream error) is the end whatever the attempt recorded: a re-run would send
+/// the whole body to another candidate or key for nobody, a generation billed upstream that no
+/// client reads (D206).
+fn attempt_end(piped: &Result<Piped>, decision: Option<RelayRetry>) -> AttemptEnd {
+    match (piped, decision) {
+        (Ok(Piped::Written), _) => AttemptEnd::Done,
+        (Err(e), _) if e.esource() == &pingora_core::ErrorSource::Downstream => AttemptEnd::Fail,
+        (_, Some(d)) => AttemptEnd::Retry(d),
+        (_, None) => AttemptEnd::Fail,
+    }
+}
+
+/// How a finished attempt's task ended, as [`reap_attempt`] saw it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Reaped {
+    Finished,
+    Panicked,
+    StillRunning,
+}
+
+/// Wait, at most [`ABANDONED_ATTEMPT_GRACE`], for an attempt's task to end, and say how it did. A
+/// panic is logged at error with the request id (D207): the subrequest dies with it, and the
+/// client would otherwise get a 502 no log line explains.
+async fn reap_attempt<T>(attempt: tokio::task::JoinHandle<T>, request_id: &str) -> Reaped {
+    match tokio::time::timeout(ABANDONED_ATTEMPT_GRACE, attempt).await {
+        Ok(Ok(_)) => Reaped::Finished,
+        Ok(Err(e)) if e.is_panic() => {
+            let payload = e.into_panic();
+            let msg = payload
+                .downcast_ref::<&str>()
+                .copied()
+                .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+                .unwrap_or("non-string panic payload");
+            tracing::error!(request_id, panic = msg, "full-body attempt panicked");
+            Reaped::Panicked
+        }
+        Ok(Err(_)) => Reaped::Finished,
+        Err(_) => Reaped::StillRunning,
+    }
+}
+
 /// How one [`FullBody`] attempt's pipe ended.
+#[derive(Debug)]
 enum Piped {
     /// The response was written to the client.
     Written,
@@ -7246,6 +7308,58 @@ mod tests {
         );
         assert!(all("a=1&b=2&keys=3&monkey=4").is_empty());
         assert!(all("").is_empty());
+    }
+
+    /// A full-body attempt that ended with the client gone is the end of the request, whatever
+    /// retry the attempt recorded: re-running it would send the whole body to another candidate (or
+    /// key) for a client that is no longer there, a generation billed upstream that nobody reads.
+    /// An upstream failure with a recorded retry still retries, and nothing written ends the walk.
+    /// claim: REL-9, REL-21
+    /// defect: D206
+    #[test]
+    fn a_full_body_attempt_that_lost_its_client_is_never_retried() {
+        use pingora_core::{Error, ErrorType};
+        let down = || Err(Error::new(ErrorType::ConnectionClosed).into_down());
+        let up = || Err(Error::new(ErrorType::ConnectRefused).into_up());
+        let retry = Some(RelayRetry::Candidate(0));
+        assert_eq!(attempt_end(&down(), retry), AttemptEnd::Fail);
+        assert_eq!(
+            attempt_end(
+                &down(),
+                Some(RelayRetry::Key {
+                    candidate: 0,
+                    key: 1
+                })
+            ),
+            AttemptEnd::Fail
+        );
+        assert_eq!(attempt_end(&down(), None), AttemptEnd::Fail);
+        assert_eq!(
+            attempt_end(&up(), retry),
+            AttemptEnd::Retry(RelayRetry::Candidate(0))
+        );
+        assert_eq!(attempt_end(&up(), None), AttemptEnd::Fail);
+        assert_eq!(
+            attempt_end(&Ok(Piped::Abandoned), retry),
+            AttemptEnd::Retry(RelayRetry::Candidate(0))
+        );
+        assert_eq!(attempt_end(&Ok(Piped::Written), retry), AttemptEnd::Done);
+        assert_eq!(attempt_end(&Ok(Piped::Empty), None), AttemptEnd::Fail);
+    }
+
+    /// A full-body attempt's task that panicked is reported (the parent logs it with the request
+    /// id, then answers 502), not dropped unseen; one that finished or is still running is not.
+    /// claim: REL-17, REL-21
+    /// defect: D207
+    #[tokio::test]
+    async fn a_panicked_full_body_attempt_is_reported() {
+        let panicked = tokio::spawn(async { panic!("attempt blew up") });
+        assert_eq!(reap_attempt(panicked, "rid-1").await, Reaped::Panicked);
+        let finished = tokio::spawn(async {});
+        assert_eq!(reap_attempt(finished, "rid-2").await, Reaped::Finished);
+        let stuck = tokio::spawn(std::future::pending::<()>());
+        tokio::time::pause();
+        assert_eq!(reap_attempt(stuck, "rid-3").await, Reaped::StillRunning);
     }
 
     /// An error-in-200 is read from the root's members in any order; an answer beside `"error":
