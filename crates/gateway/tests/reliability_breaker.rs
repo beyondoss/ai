@@ -101,7 +101,6 @@ async fn a_401_candidate_does_not_black_hole_the_row() {
 /// claim: REL-6
 /// defect: D37
 #[tokio::test]
-#[ignore = "D37 reproduced: alternating 500/200 x40 never opens the breaker (no gateway 503)"]
 async fn a_half_failing_provider_opens_the_breaker() {
     let nats_port = unused_nats_port();
     let (pubkey, _sk) = test_keypair(1);
@@ -157,7 +156,6 @@ async fn a_solid_5xx_run_opens_the_breaker() {
 /// claim: REL-6
 /// defect: D17
 #[tokio::test]
-#[ignore = "D17 reproduced: stalled half-open probe holds the only permit; every request 503s"]
 async fn a_stalled_half_open_probe_does_not_wedge_the_provider() {
     let nats_port = unused_nats_port();
     let (pubkey, _sk) = test_keypair(1);

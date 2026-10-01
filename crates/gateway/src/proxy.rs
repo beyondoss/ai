@@ -260,10 +260,10 @@ pub struct RequestCtx {
     /// Running total of request-body bytes seen, to enforce `MAX_REQUEST_BODY` even when the client
     /// uses chunked transfer encoding (no `Content-Length` to check up front).
     body_bytes_fed: usize,
-    /// Upstream HTTP status, set in `response_filter` once the response head arrives. Drives the
-    /// circuit-breaker outcome recorded once in `logging`: `5xx` → failure, any other response →
-    /// success (the provider answered — a `429` is a healthy throttle, not a breaker trip), and a
-    /// `None` here with an upstream error → failure (connect/read failed before any response).
+    /// Upstream HTTP status, set in `response_filter` once the response head arrives, which is
+    /// also where the breaker permit is resolved (`5xx` → failure, any other response → success:
+    /// the provider answered, and a `429` is a healthy throttle). A `None` here at `logging` with an
+    /// upstream error → failure (connect/read failed before any response).
     upstream_status: Option<u16>,
     /// Managed OpenAI chat/completions request: buffer the body and inject
     /// `stream_options.include_usage` if it streams without it, so the usage chunk (hence the
@@ -3899,10 +3899,21 @@ impl ProxyHttp for AiProxy {
                 pin_walk(&self.state, rc);
             }
             rc.provider.metrics.record_response(status);
-            // Remember the status for the circuit-breaker outcome resolved in `logging` (a response
-            // arrived, so the provider is reachable — even a 429/5xx is a real answer, not a connect
-            // failure). `logging` decides failure-vs-success from this.
             rc.upstream_status = Some(status);
+            // Resolve the breaker permit here, at the head, not at the end of the body: the head
+            // is the provider's answer (a 5xx is broken, anything else is reachable), and a
+            // half-open probe resolved only at end of stream let one long or stalled stream 503
+            // the provider for everyone until it ended. `logging` resolves only the attempts that
+            // never got a head.
+            if std::mem::take(&mut rc.breaker_pending)
+                && let Some(b) = rc.provider.breaker.as_ref()
+            {
+                if status >= 500 {
+                    b.record_failure();
+                } else {
+                    b.record_success();
+                }
+            }
 
             // Derive streaming from the response, not the request: SSE ⇒ use the streaming usage
             // parser; otherwise the body is a single JSON object.
