@@ -1011,10 +1011,10 @@ impact = "A stream refused by GOAWAY (above the server's last processed stream i
 confidence = "high"
 evidence = "claims_reliability.rs::upstream_goaway_is_handled fails under full-suite load (sequential #3: 502), passes 10/10 alone"
 claims = ["REL-22", "REL-1"]
-state = "suspected"
-test = ""
+state = "reproduced"
+test = "a_stream_the_upstream_refused_is_retried"
 fix = ""
-note = "Needs a deterministic reproduction (refuse the stream with GOAWAY last_stream_id below it) and a retry rule for refused streams."
+note = "Reproduced deterministically (claims_reliability.rs) with a hand-rolled TLS H2 upstream that answers each connection's first stream and refuses the next once its whole body has arrived: GOAWAY(last_stream_id = the served stream, NO_ERROR) and RST_STREAM(REFUSED_STREAM) both come back as a JSON 502 'upstream failed after receiving the request'. The full-suite flake of upstream_goaway_is_handled is the same race: hyper's graceful shutdown sends GOAWAY(last processed) while the gateway's next stream is in flight."
 
 [[defect]]
 id = "D73"

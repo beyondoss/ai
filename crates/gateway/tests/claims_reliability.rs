@@ -1252,6 +1252,173 @@ async fn goaway_upstream() -> (u16, Arc<AtomicUsize>, tokio::task::JoinHandle<()
     (port, served, task)
 }
 
+/// How [`refusing_h2_upstream`] refuses every stream after a connection's first.
+#[derive(Clone, Copy, Debug)]
+enum Refuse {
+    /// `GOAWAY(last_stream_id = the stream it served, NO_ERROR)`: the new stream is above it, so
+    /// RFC 9113 §6.8 guarantees it was not processed.
+    GoAway,
+    /// `RST_STREAM(REFUSED_STREAM)`: §8.7, closed before any processing.
+    RefusedStream,
+}
+
+/// Write one H2 frame.
+async fn h2_frame<W: tokio::io::AsyncWrite + Unpin>(
+    w: &mut W,
+    kind: u8,
+    flags: u8,
+    stream: u32,
+    payload: &[u8],
+) -> std::io::Result<()> {
+    let len = u32::try_from(payload.len()).unwrap().to_be_bytes();
+    let mut buf = vec![len[1], len[2], len[3], kind, flags];
+    buf.extend_from_slice(&stream.to_be_bytes());
+    buf.extend_from_slice(payload);
+    w.write_all(&buf).await?;
+    w.flush().await
+}
+
+/// A hand-rolled TLS H2 upstream that answers the first request on each connection and refuses
+/// every later one only once its whole body has arrived — the moment the gateway counts the body
+/// as delivered. Hand-rolled because no server library lets a test choose the GOAWAY's
+/// `last_stream_id`. Returns (port, requests served, streams refused, task).
+async fn refusing_h2_upstream(
+    mode: Refuse,
+) -> (
+    u16,
+    Arc<AtomicUsize>,
+    Arc<AtomicUsize>,
+    tokio::task::JoinHandle<()>,
+) {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let ck = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string()]).unwrap();
+    let key = rustls::pki_types::PrivateKeyDer::Pkcs8(ck.key_pair.serialize_der().into());
+    let mut tls = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(vec![ck.cert.der().clone()], key)
+        .unwrap();
+    tls.alpn_protocols = vec![b"h2".to_vec()];
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls));
+    let (served, refused) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+    let (s2, r2) = (served.clone(), refused.clone());
+    let task = tokio::spawn(async move {
+        while let Ok((s, _)) = listener.accept().await {
+            let (acceptor, served, refused) = (acceptor.clone(), s2.clone(), r2.clone());
+            tokio::spawn(async move {
+                let Ok(mut io) = acceptor.accept(s).await else {
+                    return;
+                };
+                let mut preface = [0u8; 24];
+                if io.read_exact(&mut preface).await.is_err() {
+                    return;
+                }
+                if h2_frame(&mut io, 0x4, 0, 0, &[]).await.is_err() {
+                    return;
+                }
+                // `:status: 200` (static index 8), then `content-type` (static name 31) as a
+                // literal without indexing.
+                let mut head = vec![0x88, 0x0f, 0x10, 16];
+                head.extend_from_slice(b"application/json");
+                let mut first: Option<u32> = None;
+                loop {
+                    let mut h = [0u8; 9];
+                    if io.read_exact(&mut h).await.is_err() {
+                        return;
+                    }
+                    let len = usize::from(h[0]) << 16 | usize::from(h[1]) << 8 | usize::from(h[2]);
+                    let (kind, flags) = (h[3], h[4]);
+                    let stream = u32::from_be_bytes([h[5], h[6], h[7], h[8]]) & 0x7fff_ffff;
+                    let mut payload = vec![0u8; len];
+                    if io.read_exact(&mut payload).await.is_err() {
+                        return;
+                    }
+                    let ok = match (kind, flags & 0x1) {
+                        // SETTINGS → ACK; PING → PONG.
+                        (0x4, 0) => h2_frame(&mut io, 0x4, 0x1, 0, &[]).await,
+                        (0x6, 0) => h2_frame(&mut io, 0x6, 0x1, 0, &payload).await,
+                        // HEADERS or DATA ending the request body.
+                        (0x0 | 0x1, 0x1) if first.is_none() => {
+                            first = Some(stream);
+                            served.fetch_add(1, Ordering::SeqCst);
+                            let r = h2_frame(&mut io, 0x1, 0x4, stream, &head).await;
+                            match r {
+                                Ok(()) => {
+                                    h2_frame(&mut io, 0x0, 0x1, stream, OK_JSON.as_bytes()).await
+                                }
+                                e => e,
+                            }
+                        }
+                        (0x0 | 0x1, 0x1) => {
+                            refused.fetch_add(1, Ordering::SeqCst);
+                            match mode {
+                                Refuse::GoAway => {
+                                    let mut p = first.unwrap_or(0).to_be_bytes().to_vec();
+                                    p.extend_from_slice(&0u32.to_be_bytes());
+                                    let _ = h2_frame(&mut io, 0x7, 0, 0, &p).await;
+                                    // Hold the connection open a moment, as a draining server
+                                    // does, then close it.
+                                    tokio::time::sleep(Duration::from_millis(200)).await;
+                                    let _ = io.shutdown().await;
+                                    return;
+                                }
+                                Refuse::RefusedStream => {
+                                    h2_frame(&mut io, 0x3, 0, stream, &7u32.to_be_bytes()).await
+                                }
+                            }
+                        }
+                        _ => Ok(()),
+                    };
+                    if ok.is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    (port, served, refused, task)
+}
+
+/// A request whose stream the upstream refused — GOAWAY with a `last_stream_id` below it, or
+/// RST_STREAM(REFUSED_STREAM) — was not processed, so it is retried on a new connection even
+/// though its whole body went out. The "never resend a delivered body" rule (D09) is about a
+/// provider that may be generating; a refused stream is the provider's guarantee it is not.
+/// claim: REL-22
+/// defect: D72
+#[tokio::test]
+#[ignore = "D72 reproduced: a stream refused by GOAWAY/REFUSED_STREAM after its body was sent is a 502, not a retry"]
+async fn a_stream_the_upstream_refused_is_retried() {
+    let (pubkey, sk) = test_keypair(223);
+    let key = billing_vkey(&sk, 2203);
+    let path = "/openai/v1/chat/completions";
+    for mode in [Refuse::GoAway, Refuse::RefusedStream] {
+        let (port, served, refused, task) = refusing_h2_upstream(mode).await;
+        let gw = Gateway::builder(
+            unused_nats_port(),
+            &format!("127.0.0.1:{port}"),
+            &b64(&pubkey),
+        )
+        .providers(&["openai"])
+        .tls_upstream()
+        .upstream_http2(true)
+        .start()
+        .await;
+        for i in 0..4 {
+            let resp = post(&gw, path, &key, CHAT).await;
+            let status = resp.status().as_u16();
+            let text = resp.text().await.unwrap_or_default();
+            assert_eq!(status, 200, "{mode:?} #{i}: {text}");
+        }
+        task.abort();
+        assert!(
+            refused.load(Ordering::SeqCst) >= 1,
+            "{mode:?}: no stream was refused, so the test proved nothing"
+        );
+        assert_eq!(served.load(Ordering::SeqCst), 4, "{mode:?}");
+    }
+}
+
 /// Every upstream H2 connection is drained with GOAWAY after one request. Sequential and
 /// concurrent requests all still succeed: the gateway opens a new connection rather than failing
 /// the request that met the GOAWAY.
