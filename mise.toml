@@ -110,10 +110,17 @@ run = "cargo run -q -p beyond-ai-fleet-sim --bin fleet-sim -- list"
 description = "Run every claim/defect-tagged test (ignored reproductions included) and print each claim's computed status. See verify/README.md."
 run = """
 set -e
+# Live cells (VERIFY_LIVE=1) drive the gateway binary from this tree; build it first.
+if [ "${VERIFY_LIVE:-}" = 1 ]; then cargo build -q -p beyond-ai; fi
 expr=$(cargo run -q -p beyond-ai-verify -- filter)
 cargo nextest run --workspace --profile verify --run-ignored all --no-tests=pass -E "$expr" || true
 cargo run -q -p beyond-ai-verify -- status --junit target/nextest/verify/junit.xml "$@"
 """
+
+[tasks."verify:live"]
+description = "verify:status including the live cells: real SDKs and agent harnesses, through this tree's gateway, to real providers. Spends real (small) money; reads keys from .env."
+env = { VERIFY_LIVE = "1" }
+run = "mise run verify:status"
 
 [tasks."verify:gate"]
 description = "Fail on any inconsistency between verify/claims.toml, verify/defects.toml, test tags and the last verify:status run."

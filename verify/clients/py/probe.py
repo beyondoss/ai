@@ -29,8 +29,16 @@ def _hook(resp):
     _ids.append(resp.headers.get("x-beyond-request-id"))
 
 
-def http():
-    return httpx.Client(event_hooks={"response": [_hook]}, timeout=120)
+def http(sdk="openai"):
+    """An HTTP client that records every response's x-beyond-request-id. Each SDK insists on its
+    own transport package (anthropic>=1.11 uses httpx2), so build the one it expects."""
+    mod = httpx
+    if sdk == "anthropic":
+        try:
+            import httpx2 as mod  # noqa: F811
+        except ImportError:
+            mod = httpx
+    return mod.Client(event_hooks={"response": [_hook]}, timeout=120)
 
 
 def take_id():
@@ -68,7 +76,7 @@ def openai_client():
 
 def anthropic_client():
     import anthropic
-    return anthropic.Anthropic(base_url=BASE, api_key=KEY, http_client=http(), max_retries=0)
+    return anthropic.Anthropic(base_url=BASE, api_key=KEY, http_client=http("anthropic"), max_retries=0)
 
 
 WEATHER = {"type": "function", "function": {"name": "get_weather", "description": "Weather for a city",
@@ -78,11 +86,11 @@ WEATHER = {"type": "function", "function": {"name": "get_weather", "description"
 def chat_basic():
     """E1: Chat Completions, non-stream then stream with the SDK's own accumulator."""
     c = openai_client()
-    r = c.chat.completions.create(model=MODEL, max_tokens=64,
+    r = c.chat.completions.create(model=MODEL, max_tokens=1024,
                                   messages=[{"role": "user", "content": "Reply with the single word: pong"}])
     record("chat", chat_usage(r.usage))
     ok = bool(r.choices[0].message.content) and r.choices[0].message.role == "assistant"
-    with c.chat.completions.stream(model=MODEL, max_tokens=64,
+    with c.chat.completions.stream(model=MODEL, max_tokens=1024,
                                    messages=[{"role": "user", "content": "Count from 1 to 5."}]) as s:
         final = s.get_final_completion()
     record("chat", chat_usage(final.usage))
@@ -94,11 +102,11 @@ def chat_basic():
 def messages_basic():
     """E2: Anthropic Messages, non-stream then stream via the SDK's final-message helper."""
     c = anthropic_client()
-    r = c.messages.create(model=MODEL, max_tokens=64,
+    r = c.messages.create(model=MODEL, max_tokens=1024,
                           messages=[{"role": "user", "content": "Reply with the single word: pong"}])
     record("messages", messages_usage(r.usage))
     ok = r.content and r.content[0].type == "text" and r.stop_reason in ("end_turn", "max_tokens")
-    with c.messages.stream(model=MODEL, max_tokens=64,
+    with c.messages.stream(model=MODEL, max_tokens=1024,
                            messages=[{"role": "user", "content": "Count from 1 to 5."}]) as s:
         final = s.get_final_message()
     record("messages", messages_usage(final.usage))
@@ -109,10 +117,10 @@ def messages_basic():
 def responses_basic():
     """E3 / TRN-1: the stock responses.create() (no `store`), non-stream then stream."""
     c = openai_client()
-    r = c.responses.create(model=MODEL, input="Reply with the single word: pong", max_output_tokens=64)
+    r = c.responses.create(model=MODEL, input="Reply with the single word: pong", max_output_tokens=1024)
     record("responses", responses_usage(r.usage))
     ok = r.status in ("completed", "incomplete") and bool(r.output_text or r.status == "incomplete")
-    with c.responses.stream(model=MODEL, input="Count from 1 to 5.", max_output_tokens=64) as s:
+    with c.responses.stream(model=MODEL, input="Count from 1 to 5.", max_output_tokens=1024) as s:
         final = s.get_final_response()
     record("responses", responses_usage(final.usage))
     ok = ok and final.status in ("completed", "incomplete")
@@ -124,7 +132,7 @@ def models_list():
     import anthropic
     o = list(openai_client().models.list())
     _ids.clear()
-    a = list(anthropic.Anthropic(base_url=BASE, api_key=KEY, http_client=http(), max_retries=0).models.list(limit=1000))
+    a = list(anthropic.Anthropic(base_url=BASE, api_key=KEY, http_client=http("anthropic"), max_retries=0).models.list(limit=1000))
     _ids.clear()
     m = next((x for x in o if x.id == MODEL), None)
     extra = (m.model_extra or {}) if m else {}
@@ -137,7 +145,7 @@ def tools_chat():
     """T1: forced tool call over Chat, result fed back, final answer uses it."""
     c = openai_client()
     msgs = [{"role": "user", "content": "What's the weather in Paris? Use the tool."}]
-    r = c.chat.completions.create(model=MODEL, max_tokens=512, messages=msgs, tools=[WEATHER],
+    r = c.chat.completions.create(model=MODEL, max_tokens=1024, messages=msgs, tools=[WEATHER],
                                   tool_choice={"type": "function", "function": {"name": "get_weather"}})
     record("chat", chat_usage(r.usage))
     tc = (r.choices[0].message.tool_calls or [None])[0]
@@ -146,7 +154,7 @@ def tools_chat():
     args = json.loads(tc.function.arguments or "{}")
     msgs.append(r.choices[0].message.model_dump(exclude_none=True))
     msgs.append({"role": "tool", "tool_call_id": tc.id, "content": "Sunny, 31C, code ZEBRA-7"})
-    with c.chat.completions.stream(model=MODEL, max_tokens=256, messages=msgs, tools=[WEATHER]) as s:
+    with c.chat.completions.stream(model=MODEL, max_tokens=1024, messages=msgs, tools=[WEATHER]) as s:
         final = s.get_final_completion()
     record("chat", chat_usage(final.usage))
     text = final.choices[0].message.content or ""
@@ -159,7 +167,7 @@ def tools_messages():
     tool = {"name": "get_weather", "description": "Weather for a city",
             "input_schema": WEATHER["function"]["parameters"]}
     msgs = [{"role": "user", "content": "What's the weather in Paris? Use the tool."}]
-    with c.messages.stream(model=MODEL, max_tokens=512, messages=msgs, tools=[tool],
+    with c.messages.stream(model=MODEL, max_tokens=1024, messages=msgs, tools=[tool],
                            tool_choice={"type": "tool", "name": "get_weather"}) as s:
         r = s.get_final_message()
     record("messages", messages_usage(r.usage))
@@ -169,7 +177,7 @@ def tools_messages():
     msgs.append({"role": "assistant", "content": [b.model_dump(exclude_none=True) for b in r.content]})
     msgs.append({"role": "user", "content": [{"type": "tool_result", "tool_use_id": tu.id,
                                               "content": "Sunny, 31C, code ZEBRA-7"}]})
-    f = c.messages.create(model=MODEL, max_tokens=256, messages=msgs, tools=[tool])
+    f = c.messages.create(model=MODEL, max_tokens=1024, messages=msgs, tools=[tool])
     record("messages", messages_usage(f.usage))
     text = "".join(b.text for b in f.content if b.type == "text")
     return ("paris" in json.dumps(tu.input).lower() and "31" in text), {"input": tu.input, "final": text[:200]}

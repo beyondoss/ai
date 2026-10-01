@@ -264,14 +264,48 @@ fn fn_name(line: &str) -> Option<String> {
 
 /// A nextest filterset selecting exactly the tagged tests.
 fn filter_expr(tagged: &[Tagged]) -> String {
-    if tagged.is_empty() {
-        return "none()".to_owned();
-    }
-    let parts: Vec<String> = tagged
+    let mut parts: Vec<String> = tagged
         .iter()
         .map(|t| format!("(binary_id({}) & test(/(^|::){}$/))", t.binary, t.name))
         .collect();
+    // Live cells are listed only under VERIFY_LIVE=1 (they spend money), so they join the run only
+    // then.
+    if std::env::var("VERIFY_LIVE").as_deref() == Ok("1") {
+        parts.push(format!("binary_id({LIVE_BINARY})"));
+    }
+    if parts.is_empty() {
+        return "none()".to_owned();
+    }
     parts.join(" | ")
+}
+
+/// The nextest binary holding the live cells (`crates/verify/tests/live.rs`).
+const LIVE_BINARY: &str = "beyond-ai-verify::live";
+
+/// One live cell's result, parsed from its name `CLAIMS::client::route::probe`.
+struct LiveCell<'a> {
+    claims: Vec<&'a str>,
+    client: &'a str,
+    name: &'a str,
+    outcome: Outcome,
+}
+
+fn live_cells(results: &Results) -> Vec<LiveCell<'_>> {
+    results
+        .iter()
+        .filter(|((class, _), _)| class == LIVE_BINARY)
+        .filter_map(|((_, name), outcome)| {
+            let mut parts = name.split("::");
+            let claims = parts.next()?.split('+').collect();
+            let client = parts.next()?;
+            Some(LiveCell {
+                claims,
+                client,
+                name,
+                outcome: *outcome,
+            })
+        })
+        .collect()
 }
 
 /// `(classname, test name) → outcome` from a nextest JUnit report. Retries (`flakyFailure`) count
@@ -389,10 +423,25 @@ fn claim_statuses<'a>(ctx: &'a Ctx, results: Option<&Results>) -> Vec<ClaimStatu
                 .filter(|d| matches!(d.state.as_str(), "suspected" | "reproduced"))
                 .map(|d| d.id.as_str())
                 .collect();
+            let live: Vec<LiveCell<'_>> = results
+                .map(live_cells)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|cell| cell.claims.contains(&c.id.as_str()))
+                .collect();
+            let needs_live = c.layer != "hermetic";
+            let needs_hermetic = c.layer != "live";
             let (status, why) = if !open.is_empty() {
                 (Status::Red, format!("open defects: {}", open.join(", ")))
-            } else if tests.is_empty() {
+            } else if tests.is_empty() && live.is_empty() {
                 (Status::Untested, "no test carries this id".to_owned())
+            } else if let Some(bad) = live.iter().find(|cell| cell.outcome == Outcome::Failed) {
+                (Status::Red, format!("live cell failing: {}", bad.name))
+            } else if needs_hermetic && tests.is_empty() {
+                (
+                    Status::Partial,
+                    format!("{} live cell(s); no hermetic test", live.len()),
+                )
             } else {
                 // Tests that reproduce an already-handled defect don't stand for the claim itself.
                 let mut failed = Vec::new();
@@ -408,12 +457,37 @@ fn claim_statuses<'a>(ctx: &'a Ctx, results: Option<&Results>) -> Vec<ClaimStatu
                     (Status::Red, format!("failing: {}", failed.join(", ")))
                 } else if !unrun.is_empty() {
                     (Status::Partial, format!("not run: {}", unrun.join(", ")))
-                } else if c.layer != "hermetic" {
-                    // Live cells land with the live layers; until then a hermetic pass is partial.
-                    (
-                        Status::Partial,
-                        format!("hermetic proven; live cells pending ({})", c.layer),
-                    )
+                } else if needs_live {
+                    // Every required client must have a passing cell; a claim that names no
+                    // clients needs at least one.
+                    let passed: Vec<&str> = live
+                        .iter()
+                        .filter(|cell| cell.outcome == Outcome::Passed)
+                        .map(|cell| cell.client)
+                        .collect();
+                    let missing: Vec<&str> = c
+                        .clients
+                        .iter()
+                        .map(String::as_str)
+                        .filter(|client| !passed.contains(client))
+                        .collect();
+                    if passed.is_empty() {
+                        (Status::Partial, "no passing live cell".to_owned())
+                    } else if !missing.is_empty() {
+                        (
+                            Status::Partial,
+                            format!("live cells missing for: {}", missing.join(", ")),
+                        )
+                    } else {
+                        (
+                            Status::Proven,
+                            format!(
+                                "{} test(s), {} live cell(s) pass",
+                                tests.len(),
+                                passed.len()
+                            ),
+                        )
+                    }
                 } else {
                     (Status::Proven, format!("{} test(s) pass", tests.len()))
                 }
@@ -595,6 +669,15 @@ fn gate(ctx: &Ctx, args: &[String], root: &Path) -> bool {
                 "{at}: `{}` is #[ignore]d but reproduces no open defect; only reproductions may be ignored",
                 t.name
             ));
+        }
+    }
+    if let Some(r) = results.as_ref() {
+        for cell in live_cells(r) {
+            for c in &cell.claims {
+                if !claim_ids.contains(c) {
+                    errors.push(format!("live cell `{}` claims unknown id {c}", cell.name));
+                }
+            }
         }
     }
     for d in &ctx.defects {

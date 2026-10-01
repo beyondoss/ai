@@ -875,3 +875,17 @@ state = "suspected"
 test = ""
 fix = ""
 note = "Supersedes the narrower D54 guesses; deepseek-flash image input is CORRECT per DeepSeek (D54's suspicion refuted)."
+
+[[defect]]
+id = "D63"
+severity = "high"
+area = "Translation"
+title = "A stock Chat request with max_tokens fails on GPT-5 and o-series rows"
+impact = "OpenAI rejects max_tokens for reasoning models ('Use max_completion_tokens instead'). The gateway relays it unchanged on a same-wire walk, so the same application code that works on every Claude row 400s on gpt-5*, o1/o3/o4 rows. Translated walks already send max_completion_tokens."
+confidence = "high"
+evidence = "live cell E1::openai-py::gpt::chat_basic 2026-10-01: 400 unsupported_parameter 'max_tokens' on gpt-5-mini via managed /v1/chat/completions"
+claims = ["E1", "T1", "TRN-5"]
+state = "suspected"
+test = ""
+fix = ""
+note = "Found by the first live run."

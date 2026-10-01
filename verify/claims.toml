@@ -20,7 +20,7 @@ layer = "both"
 clients = ["openai-py", "openai-node", "ai-sdk", "langchain", "openai-agents", "opencode", "pi", "raw"]
 failover_clients = ["openai-py", "openai-node", "opencode", "pi"]
 touches = ["crates/gateway/src/route.rs", "crates/gateway/src/proxy.rs", "crates/gateway/src/translate.rs"]
-defects = []
+defects = ["D63"]
 
 [[claim]]
 id = "E2"
@@ -106,7 +106,7 @@ layer = "both"
 clients = ["openai-py", "openai-node", "anthropic-py", "anthropic-ts", "ai-sdk", "langchain", "openai-agents", "claude-code", "codex", "opencode", "pi", "raw"]
 failover_clients = ["openai-py", "anthropic-py", "claude-code", "pi"]
 touches = ["crates/gateway/src/translate.rs", "crates/gateway/src/proxy.rs"]
-defects = []
+defects = ["D63"]
 
 [[claim]]
 id = "T2"
@@ -1354,7 +1354,7 @@ group = "Translation detail"
 text = "max_tokens defaults and clamps never truncate or 400"
 layer = "both"
 touches = ["crates/gateway/src/translate.rs", "crates/gateway/src/proxy.rs"]
-defects = ["D59"]
+defects = ["D59", "D63"]
 
 [[claim]]
 id = "TRN-6"
