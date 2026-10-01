@@ -617,13 +617,33 @@ models today; one that does would 400 a turn after a forced one on an enforced a
 **Unmappable input is forwarded, not dropped.** `input_audio`, a `file_id` or URL document, a
 Files API image, a non-base64 data URI, `n` > 1, `logprobs`, audio output, Anthropic server and
 Anthropic-defined tools (`web_search_…`, `bash_…`, `text_editor_…`: as an empty-schema function the
-model would call one and nothing would run it), Responses hosted tools (`web_search`,
-`file_search`, …), a Chat Completions client's `custom` tools onto Messages, `mcp_servers`, a Responses `prompt`
+model would call one and nothing would run it), Responses hosted tools (`file_search`, `mcp`, …;
+`web_search` is mapped, below), a Chat Completions client's `custom` tools onto Messages, `mcp_servers`, a Responses `prompt`
 template, `stop` onto Responses, and Responses input items with no Chat Completions shape
 (`computer_call_output`, `local_shell_call`, …, forwarded whole in their place in `messages`), and a message whose role no dialect has (a typo, a framework's private
 role: forwarded whole, in place, role unchanged, never turned into a user turn) have no equivalent
 on the other wire and change what the client gets back. Only records of a hosted tool the provider ran itself (`web_search_call`, `mcp_call`, …) are
-dropped: the client wrote none of it, and the answer that used it follows as a message. So are
+dropped: the client wrote none of it, and the answer that used it follows as a message.
+
+**Hosted web search.** Codex offers Responses' hosted `web_search` on every request, so forwarding
+it whole failed Codex outright on every Claude row (D78). Onto Anthropic's own API (the bare
+`claude-…` spelling) it becomes Anthropic's web search server tool, `web_search_20250305` (the basic
+version every searching Claude model and Vertex accept), with `filters.allowed_domains` →
+`allowed_domains` and an approximate `user_location` carried over (`search_context_size` has no
+equivalent). Bedrock has no web search and no Chat Completions host runs it, so there it is dropped
+and Codex works without search (a body left with no tools loses `tool_choice` and
+`parallel_tool_calls`). Back to a Responses client, a `server_tool_use` web search and its
+`web_search_tool_result` become one `web_search_call` output item (`action: {type: "search",
+query}`, status `completed`, or `failed` when the result is Anthropic's error object), ahead of
+the message that used it: whole in a non-stream body, and on a stream as `output_item.added`, the
+`web_search_call.in_progress` / `.searching` / `.completed` events and `output_item.done`, once the
+result block arrives. The Chat Completions leg in between carries them as a `web_search_calls`
+list on the message or delta, which only a Responses client's bridge reads or emits. The search
+is billed from Anthropic's `usage.server_tool_use.web_search_requests` (`server_tool_calls`), as
+on any Messages walk. Codex's replayed `web_search_call` items are dropped like other hosted-tool
+records.
+
+So are
 `compaction` and `item_reference` items, which are OpenAI-held state (a summary only OpenAI can
 decrypt, a pointer into its store) that no translated upstream can resolve: a compacted Codex
 session that fails over onto a translated candidate runs on the history the client holds, a

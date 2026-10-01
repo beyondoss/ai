@@ -324,6 +324,8 @@ fn responses_parallel_function_calls_become_one_assistant_message() {
 }
 
 /// Hosted and custom tools used to vanish: the model answered without a tool the client offered.
+/// (Hosted web search is the exception: no Chat Completions host runs it, and Codex always offers
+/// it, so it is dropped; see D78.)
 #[test]
 fn responses_hosted_tools_are_forwarded_and_custom_tools_mapped() {
     let body = json!({"model": "m", "store": false, "input": "x", "tools": [
@@ -334,13 +336,13 @@ fn responses_hosted_tools_are_forwarded_and_custom_tools_mapped() {
     ]});
     let v = r2c(&body, "gpt-5-nano");
     let tools = v["tools"].as_array().unwrap();
-    assert_eq!(tools[0], json!({"type": "web_search"}));
-    assert_eq!(tools[1]["type"], "file_search");
+    assert_eq!(tools.len(), 3, "{v}");
+    assert_eq!(tools[0]["type"], "file_search");
     assert_eq!(
-        tools[2],
+        tools[1],
         json!({"type": "custom", "custom": {"name": "apply_patch", "description": "patch", "format": {"type": "text"}}})
     );
-    assert_eq!(tools[3]["function"]["strict"], true);
+    assert_eq!(tools[2]["function"]["strict"], true);
 }
 
 #[test]
@@ -2192,7 +2194,6 @@ fn replayed_thinking_leaves_the_final_assistant_turn_when_thinking_is_off() {
 /// claim: W2, TRN-21
 /// defect: D78
 #[test]
-#[ignore = "D78 reproduced: Codex's hosted web_search is forwarded as-is to Claude and Chat hosts"]
 fn codex_web_search_maps_onto_anthropic_or_is_dropped() {
     let body = json!({"model": "m", "store": false, "input": "news?", "tool_choice": "auto",
     "tools": [
@@ -2208,8 +2209,9 @@ fn codex_web_search_maps_onto_anthropic_or_is_dropped() {
         &body,
         "claude-haiku-4-5",
     );
-    let t = tools(&v);
+    let mut t = tools(&v);
     assert_eq!(t.len(), 2, "{v}");
+    t[1].as_object_mut().unwrap().remove("cache_control");
     assert_eq!(
         t[1],
         json!({"type": "web_search_20250305", "name": "web_search",

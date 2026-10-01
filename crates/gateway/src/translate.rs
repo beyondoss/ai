@@ -297,9 +297,10 @@ fn map_request(from: Endpoint, to: Endpoint, v: &Value, up: Upstream) -> (Value,
         (Endpoint::Messages, Endpoint::ChatCompletions) => {
             claude_chat_reasoning_guard(anthropic_req_to_openai(v, up), up)
         }
-        (Endpoint::Responses, Endpoint::ChatCompletions) => {
-            claude_chat_reasoning_guard(responses_req_to_openai(v, up, false), up)
-        }
+        (Endpoint::Responses, Endpoint::ChatCompletions) => claude_chat_reasoning_guard(
+            drop_hosted_web_search(responses_req_to_openai(v, up, false)),
+            up,
+        ),
         (Endpoint::ChatCompletions, Endpoint::Responses) => {
             openai_req_to_responses(chat, up.openai)
         }
@@ -382,13 +383,13 @@ fn map_response(
 ) -> Value {
     match (upstream, client) {
         (Endpoint::Messages, Endpoint::ChatCompletions) => {
-            anthropic_resp_to_openai(v, gateway_cache)
+            anthropic_resp_to_openai(v, gateway_cache, false)
         }
         (Endpoint::ChatCompletions, Endpoint::Messages) => openai_resp_to_anthropic(v),
         (Endpoint::ChatCompletions, Endpoint::Responses) => openai_resp_to_responses(v, tools),
         (Endpoint::Responses, Endpoint::ChatCompletions) => responses_resp_to_openai(v),
         (Endpoint::Messages, Endpoint::Responses) => {
-            openai_resp_to_responses(&anthropic_resp_to_openai(v, gateway_cache), tools)
+            openai_resp_to_responses(&anthropic_resp_to_openai(v, gateway_cache, true), tools)
         }
         (Endpoint::Responses, Endpoint::Messages) => {
             openai_resp_to_anthropic(&responses_resp_to_openai(v))
@@ -720,8 +721,15 @@ fn openai_req_to_anthropic(v: &Value, claude: ClaudeModel) -> (Value, bool) {
             _ => {}
         }
     }
+    // Every tool dropped (a lone hosted web search where none exists): no `tool_choice` either,
+    // which Anthropic refuses without tools.
+    let mut all_dropped = false;
     if let Some(tools) = v.get("tools").and_then(Value::as_array) {
-        let mapped: Vec<Value> = tools.iter().filter_map(openai_tool_to_anthropic).collect();
+        let mapped: Vec<Value> = tools
+            .iter()
+            .filter_map(|t| openai_tool_to_anthropic(t, claude))
+            .collect();
+        all_dropped = !tools.is_empty() && mapped.is_empty();
         if !mapped.is_empty() {
             out.insert("tools".into(), Value::Array(mapped));
         }
@@ -729,7 +737,7 @@ fn openai_req_to_anthropic(v: &Value, claude: ClaudeModel) -> (Value, bool) {
     // Models that reject forced tool use get `auto` plus a closing system instruction naming what
     // must be called (appended after the messages below).
     let mut must_call: Option<String> = None;
-    if let Some(choice) = v.get("tool_choice") {
+    if let Some(choice) = v.get("tool_choice").filter(|_| !all_dropped) {
         let mut mapped = openai_tool_choice_to_anthropic(choice);
         let forced = matches!(
             mapped.get("type").and_then(Value::as_str),
@@ -1506,14 +1514,17 @@ fn merge_content(msg: &mut Value, add: Value) {
     }
 }
 
-fn openai_tool_to_anthropic(t: &Value) -> Option<Value> {
-    // `custom` (free-form input) and hosted tools have no Messages equivalent. Forwarded for the
-    // provider to reject by name: dropping one would let the model answer without a tool the
-    // client offered.
-    if t.get("type")
-        .and_then(Value::as_str)
-        .is_some_and(|ty| ty != "function")
-    {
+fn openai_tool_to_anthropic(t: &Value, claude: ClaudeModel) -> Option<Value> {
+    let typ = t.get("type").and_then(Value::as_str);
+    // Responses' hosted web search (Codex always offers it) is Anthropic's web search server tool
+    // on Anthropic's own API, and is dropped where no search tool exists (D78).
+    if typ.is_some_and(is_openai_web_search) {
+        return claude.server_tools.then(|| web_search_to_anthropic(t));
+    }
+    // `custom` (free-form input) and other hosted tools have no Messages equivalent. Forwarded
+    // for the provider to reject by name: dropping one would let the model answer without a tool
+    // the client offered.
+    if typ.is_some_and(|ty| ty != "function") {
         return Some(t.clone());
     }
     let func = t.get("function").unwrap_or(t);
@@ -1536,6 +1547,69 @@ fn openai_tool_to_anthropic(t: &Value) -> Option<Value> {
         copy_cache_control(&mut m, func);
     }
     Some(Value::Object(m))
+}
+
+/// Whether a tool type is OpenAI's hosted web search (`web_search`, `web_search_preview…`,
+/// `web_search_2025_08_26`), not Anthropic's server tool (`web_search_20250305`: no `_` in the
+/// date).
+fn is_openai_web_search(typ: &str) -> bool {
+    typ == "web_search"
+        || typ.starts_with("web_search_preview")
+        || typ
+            .strip_prefix("web_search_")
+            .is_some_and(|date| date.contains('_'))
+}
+
+/// A Responses hosted `web_search` tool as Anthropic's web search server tool. The basic version,
+/// which every Claude model that searches accepts. `filters.allowed_domains` and an approximate
+/// `user_location` carry over; `search_context_size` has no Anthropic equivalent.
+fn web_search_to_anthropic(t: &Value) -> Value {
+    let mut m = Map::new();
+    m.insert("type".into(), json!("web_search_20250305"));
+    m.insert("name".into(), json!("web_search"));
+    if let Some(domains) = t
+        .pointer("/filters/allowed_domains")
+        .filter(|d| d.as_array().is_some_and(|a| !a.is_empty()))
+    {
+        m.insert("allowed_domains".into(), domains.clone());
+    }
+    if let Some(loc) = t.get("user_location").and_then(Value::as_object) {
+        let mut l = Map::new();
+        l.insert("type".into(), json!("approximate"));
+        for key in ["city", "region", "country", "timezone"] {
+            if let Some(v) = loc.get(key).filter(|v| v.is_string()) {
+                l.insert(key.into(), v.clone());
+            }
+        }
+        if l.len() > 1 {
+            m.insert("user_location".into(), Value::Object(l));
+        }
+    }
+    Value::Object(m)
+}
+
+/// Remove Responses' hosted web search from a translated Chat Completions body: no Chat
+/// Completions host runs it (D78). A body left with no tools loses `tool_choice` and
+/// `parallel_tool_calls`, which hosts refuse without tools.
+fn drop_hosted_web_search(mut body: Value) -> Value {
+    let Some(out) = body.as_object_mut() else {
+        return body;
+    };
+    let Some(tools) = out.get_mut("tools").and_then(Value::as_array_mut) else {
+        return body;
+    };
+    let before = tools.len();
+    tools.retain(|t| {
+        !t.get("type")
+            .and_then(Value::as_str)
+            .is_some_and(is_openai_web_search)
+    });
+    if tools.is_empty() && before > 0 {
+        out.remove("tools");
+        out.remove("tool_choice");
+        out.remove("parallel_tool_calls");
+    }
+    body
 }
 
 /// Which reasoning and sampling controls a Claude model accepts. Decided from the id the candidate
@@ -1582,6 +1656,9 @@ pub(crate) struct ClaudeModel {
     pub(crate) binding_controls: bool,
     /// Whether `thinking: {type: between_tools}` exists: Sonnet 5.5 and later Sonnets only.
     pub(crate) between_tools: bool,
+    /// Whether Anthropic's server tools (web search) exist: Anthropic's own API (the bare
+    /// `claude-…` spelling). Bedrock has no web search, and OpenRouter is a Chat host.
+    pub(crate) server_tools: bool,
     /// Whether a request that omits `thinking` runs without it: Claude 4.x and older (4.6, 4.7
     /// and 4.8 need `adaptive` set explicitly). Claude 5 and later, Fable and Mythos think when it
     /// is omitted.
@@ -1596,6 +1673,7 @@ impl ClaudeModel {
             mid_system: false,
             binding_controls: false,
             between_tools: false,
+            server_tools: false,
             omitted_thinking_off: true,
         };
         let Some(at) = model.find("claude-") else {
@@ -1608,6 +1686,7 @@ impl ClaudeModel {
             mid_system: true,
             binding_controls: first_party,
             between_tools: false,
+            server_tools: first_party,
             omitted_thinking_off: false,
         };
         let mut parts = model[at + "claude-".len()..].split(['-', '.']);
@@ -1639,6 +1718,7 @@ impl ClaudeModel {
                 },
                 binding_controls: first_party && version >= (5, 5),
                 between_tools: family == "sonnet" && version >= (5, 5),
+                server_tools: first_party,
                 omitted_thinking_off: version < (5, 0),
             },
             "fable" | "mythos" => ClaudeModel {
@@ -1647,6 +1727,7 @@ impl ClaudeModel {
                 mid_system: true,
                 binding_controls: first_party && family == "fable" && version >= (5, 1),
                 between_tools: false,
+                server_tools: first_party,
                 omitted_thinking_off: false,
             },
             _ => newest,
@@ -3464,17 +3545,19 @@ fn is_thinking_block(block: &Value) -> bool {
 }
 
 /// `gateway_cache`: the request's breakpoints were the gateway's, so its writes show as input.
-fn anthropic_resp_to_openai(v: &Value, gateway_cache: bool) -> Value {
+/// `web_search`: the client is Responses, and the turn's web searches ride the Chat message as
+/// `web_search_calls` (see [`web_search_calls`]) for `openai_resp_to_responses` to emit.
+fn anthropic_resp_to_openai(v: &Value, gateway_cache: bool, web_search: bool) -> Value {
     let mut text = String::new();
     let mut reasoning = String::new();
     let mut thinking: Vec<Value> = Vec::new();
     let mut tool_calls: Vec<Value> = Vec::new();
-    for b in v
+    let blocks = v
         .get("content")
         .and_then(Value::as_array)
         .map(Vec::as_slice)
-        .unwrap_or_default()
-    {
+        .unwrap_or_default();
+    for b in blocks {
         match b.get("type").and_then(Value::as_str) {
             Some("text") => text.push_str(b.get("text").and_then(Value::as_str).unwrap_or("")),
             Some("thinking") => {
@@ -3519,6 +3602,12 @@ fn anthropic_resp_to_openai(v: &Value, gateway_cache: bool) -> Value {
     if !thinking.is_empty() {
         msg.insert("thinking".into(), Value::Array(thinking));
     }
+    if web_search {
+        let calls = web_search_calls(blocks);
+        if !calls.is_empty() {
+            msg.insert("web_search_calls".into(), Value::Array(calls));
+        }
+    }
     json!({
         "id": id_or_fresh(v.get("id"), "chatcmpl"),
         "object": "chat.completion",
@@ -3533,6 +3622,51 @@ fn anthropic_resp_to_openai(v: &Value, gateway_cache: bool) -> Value {
         "usage": Usage::from_anthropic(v.get("usage").unwrap_or(&Value::Null))
             .writes_as_input(gateway_cache)
             .to_chat(),
+    })
+}
+
+/// A Messages turn's web searches, in order, as the intermediate Chat form a Responses client's
+/// `web_search_call` items are built from: `{"id", "query", "status"}`, completed once its
+/// `web_search_tool_result` arrived (failed when that holds an error), else in progress.
+fn web_search_calls(content: &[Value]) -> Vec<Value> {
+    content
+        .iter()
+        .filter(|b| {
+            b.get("type").and_then(Value::as_str) == Some("server_tool_use")
+                && b.get("name").and_then(Value::as_str) == Some("web_search")
+        })
+        .map(|b| {
+            let id = b.get("id").and_then(Value::as_str).unwrap_or("");
+            let result = content.iter().find(|r| {
+                r.get("type").and_then(Value::as_str) == Some("web_search_tool_result")
+                    && r.get("tool_use_id").and_then(Value::as_str) == Some(id)
+            });
+            json!({
+                "id": id,
+                "query": b.pointer("/input/query").cloned().unwrap_or(json!("")),
+                "status": result.map_or("in_progress", web_search_status),
+            })
+        })
+        .collect()
+}
+
+/// `completed`, or `failed` when the result is Anthropic's error object rather than a list.
+fn web_search_status(result: &Value) -> &'static str {
+    if result.get("content").is_some_and(Value::is_array) {
+        "completed"
+    } else {
+        "failed"
+    }
+}
+
+/// A Responses `web_search_call` output item from its intermediate Chat form (see
+/// [`web_search_calls`]).
+fn web_search_call_item(ws: &Value) -> Value {
+    json!({
+        "type": "web_search_call",
+        "id": fresh_id("ws"),
+        "status": ws.get("status").cloned().unwrap_or(json!("completed")),
+        "action": {"type": "search", "query": ws.get("query").cloned().unwrap_or(json!(""))},
     })
 }
 
@@ -4630,6 +4764,14 @@ fn openai_resp_to_responses(v: &Value, tools: &ToolNames) -> Value {
         .iter()
         .filter_map(|b| reasoning_item(b, fresh_id("rs")))
         .collect();
+    output.extend(
+        message
+            .get("web_search_calls")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .map(web_search_call_item),
+    );
     let mut parts = Vec::new();
     match message.get("content") {
         Some(Value::String(s)) if !s.is_empty() => parts.push(output_text_part(s)),
@@ -5098,7 +5240,10 @@ impl SseBridge {
             identity: ChatIdentity::default(),
             buf: Vec::new(),
             scanned: 0,
-            ant_to_oai: AntToOai::default(),
+            ant_to_oai: AntToOai {
+                web_search: client == Endpoint::Responses,
+                ..AntToOai::default()
+            },
             resp_to_oai: RespToOai::default(),
             oai_to_ant: OaiToAnt::default(),
             oai_to_resp: OaiToResp::default(),
@@ -5336,6 +5481,13 @@ struct AntToOai {
     usage: Usage,
     /// The request's cache breakpoints were the gateway's: its writes show as input.
     gateway_cache: bool,
+    /// The client is Responses: web searches go out as `web_search_calls` deltas (see
+    /// [`web_search_calls`]).
+    web_search: bool,
+    /// The open `server_tool_use` web search block: its id and input JSON so far.
+    open_search: Option<(String, String)>,
+    /// Web searches whose input closed, awaiting their result: id and query.
+    searches: Vec<(String, Value)>,
 }
 
 /// A client `tool_use` block streaming to a Chat client.
@@ -5415,7 +5567,37 @@ impl AntToOai {
                 let block = v.get("content_block").unwrap_or(&Value::Null);
                 self.open_tool = None;
                 self.open_thinking = None;
+                self.open_search = None;
                 let delta = match block.get("type").and_then(Value::as_str) {
+                    Some("server_tool_use")
+                        if self.web_search
+                            && block.get("name").and_then(Value::as_str) == Some("web_search") =>
+                    {
+                        let id = block.get("id").and_then(Value::as_str).unwrap_or("");
+                        let input = block
+                            .get("input")
+                            .filter(|i| i.as_object().is_some_and(|o| !o.is_empty()))
+                            .map(value_string)
+                            .unwrap_or_default();
+                        self.open_search = Some((id.to_owned(), input));
+                        return;
+                    }
+                    Some("web_search_tool_result") if self.web_search => {
+                        let id = block.get("tool_use_id").and_then(Value::as_str);
+                        let Some(at) = self
+                            .searches
+                            .iter()
+                            .position(|(s, _)| Some(s.as_str()) == id)
+                        else {
+                            return;
+                        };
+                        let (id, query) = self.searches.remove(at);
+                        json!({ "web_search_calls": [{
+                            "id": id,
+                            "query": query,
+                            "status": web_search_status(block),
+                        }] })
+                    }
                     Some("tool_use") => {
                         let index = self.tools;
                         self.tools = self.tools.saturating_add(1);
@@ -5469,6 +5651,14 @@ impl AntToOai {
                         Some(t) => json!({ "content": t }),
                         None => return,
                     },
+                    Some("input_json_delta") if self.open_search.is_some() => {
+                        if let (Some((_, input)), Some(p)) =
+                            (self.open_search.as_mut(), non_empty_str(d, "partial_json"))
+                        {
+                            input.push_str(p);
+                        }
+                        return;
+                    }
                     Some("input_json_delta") => {
                         match (self.open_tool.as_mut(), non_empty_str(d, "partial_json")) {
                             (Some(tool), Some(p)) => {
@@ -5527,6 +5717,13 @@ impl AntToOai {
                 );
             }
             "content_block_stop" => {
+                if let Some((id, input)) = self.open_search.take() {
+                    let query = serde_json::from_str::<Value>(&input)
+                        .ok()
+                        .and_then(|i| i.get("query").cloned())
+                        .unwrap_or(json!(""));
+                    self.searches.push((id, query));
+                }
                 if let Some(tool) = self.open_tool.take()
                     && !tool.sent
                 {
@@ -6459,6 +6656,15 @@ impl OaiToResp {
                     self.reasoning_block(text, sig, out);
                 }
             }
+            // A web search the provider ran (see `AntToOai`): one whole `web_search_call` item.
+            for ws in delta
+                .get("web_search_calls")
+                .and_then(Value::as_array)
+                .map(Vec::as_slice)
+                .unwrap_or_default()
+            {
+                self.web_search_call(ws, out);
+            }
             if let Some(t) = non_empty_str(delta, "content") {
                 self.message_delta(false, t, out);
             }
@@ -6521,6 +6727,30 @@ impl OaiToResp {
         let resp = self.response("in_progress", Value::Null, Value::Null);
         self.emit(out, "response.created", json!({ "response": resp }));
         self.emit(out, "response.in_progress", json!({ "response": resp }));
+    }
+
+    /// Emit a finished web search as Responses streams one: the item added in progress, its
+    /// `in_progress` / `searching` / `completed` events, then the item done.
+    fn web_search_call(&mut self, ws: &Value, out: &mut Vec<u8>) {
+        self.close_reasoning(out);
+        self.close_message(out);
+        self.close_calls(out);
+        let item = web_search_call_item(ws);
+        let id = item.get("id").cloned().unwrap_or(Value::Null);
+        let mut started = item.clone();
+        if let Some(m) = started.as_object_mut() {
+            m.insert("status".into(), json!("in_progress"));
+            m.remove("action");
+        }
+        let output_index = self.add_item(out, started);
+        for phase in ["in_progress", "searching", "completed"] {
+            self.emit(
+                out,
+                &format!("response.web_search_call.{phase}"),
+                json!({ "item_id": id, "output_index": output_index }),
+            );
+        }
+        self.done_item(out, output_index, item);
     }
 
     fn add_item(&mut self, out: &mut Vec<u8>, item: Value) -> usize {

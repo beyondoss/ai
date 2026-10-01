@@ -2541,7 +2541,6 @@ fn claude_web_search_content() -> Value {
 /// claim: W2, TRN-21
 /// defect: D78
 #[test]
-#[ignore = "D78 reproduced: Anthropic's web search blocks are dropped on the way to a Responses client"]
 fn claude_web_search_comes_back_as_a_web_search_call() {
     let usage = json!({"input_tokens": 900, "output_tokens": 40,
         "server_tool_use": {"web_search_requests": 1}});
