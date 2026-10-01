@@ -1097,8 +1097,8 @@ evidence = "live cell W2::codex::claude::codex after the D75 fix: Anthropic 400 
 claims = ["W2", "TRN-21"]
 state = "fixed"
 test = "hosted_web_search_is_dropped_leaving_responses_unless_chosen"
-fix = "32fa772"
-note = "Proposed: map Responses' hosted web_search onto Anthropic's server tool (web_search_20250305) and its result blocks back onto web_search_call items; billed via server_tool_calls (D24). Fixed in 32fa772 by a documented drop, not a translation. Codex 0.1x sends {\"type\":\"web_search\",\"external_web_access\":false} on every request (captured 2026-10-01): its default cached mode, OpenAI's own index, which no other provider has. The hosted search is the model's to use or not and the client runs nothing for it, so leaving Responses it is now dropped unless tool_choice names it (then forwarded for the provider to reject). Anthropic's server web_search was rejected as a stand-in: it always fetches the live web (what Codex's default opts out of), bills per search, and a Claude row's OpenRouter and Bedrock candidates would each need their own spelling, so failover would change what the tool does. E2E: codex_runs_on_a_claude_row_without_its_hosted_web_search. Live re-run 2026-10-01: W2+TRN-24::codex::claude::codex and ::openrouter::codex pass. Superseded (integration): a parallel fix mapped the tool onto web_search_20250305 and back; it was dropped for the semantic and billing change above."
+fix = "49d64fd"
+note = "Proposed: map Responses' hosted web_search onto Anthropic's server tool (web_search_20250305) and its result blocks back onto web_search_call items; billed via server_tool_calls (D24). Fixed in 49d64fd by a documented drop, not a translation. Codex 0.1x sends {\"type\":\"web_search\",\"external_web_access\":false} on every request (captured 2026-10-01): its default cached mode, OpenAI's own index, which no other provider has. The hosted search is the model's to use or not and the client runs nothing for it, so leaving Responses it is now dropped unless tool_choice names it (then forwarded for the provider to reject). Anthropic's server web_search was rejected as a stand-in: it always fetches the live web (what Codex's default opts out of), bills per search, and a Claude row's OpenRouter and Bedrock candidates would each need their own spelling, so failover would change what the tool does. E2E: codex_runs_on_a_claude_row_without_its_hosted_web_search. Live re-run 2026-10-01: W2+TRN-24::codex::claude::codex and ::openrouter::codex pass. Superseded (integration): a parallel fix mapped the tool onto web_search_20250305 and back; it was dropped for the semantic and billing change above."
 
 [[defect]]
 id = "D79"
@@ -1111,8 +1111,8 @@ evidence = "live cell W4::pi::openrouter::pi:responses (pi Responses mode, think
 claims = ["TRN-7", "W4"]
 state = "fixed"
 test = "replayed_thinking_is_dropped_when_thinking_is_off"
-fix = "32fa772"
-note = "Proposed: when the outgoing request has thinking/reasoning off, strip thinking/reasoning blocks from the final assistant turn (Anthropic's rule), on every path to a Claude model. Fixed in 32fa772. Measured direct on OpenRouter claude-sonnet-4 (Bedrock): the 400 fires for the last tool-call assistant turn and for the first call of a two-round tool loop (pi's live failure was messages.1 a round later); a turn answered by a new user message is accepted; Anthropic's own API accepts all of these. A request that does not think (no reasoning key onto Chat for a Claude model, translated and same-wire; thinking disabled or omitted before 4.7, onto Messages) now drops the thinking its assistant messages carry, rather than guessing the turn boundary. Adaptive-generation models keep theirs. E2E: a_replayed_thinking_turn_without_thinking_on_reaches_openrouter_without_it. Live re-run 2026-10-01: all nine W4::pi cells pass, W4::pi::openrouter::pi:responses included. Superseded (integration): a parallel final-assistant-message-only fix still 400ed on Bedrock and was dropped."
+fix = "49d64fd"
+note = "Proposed: when the outgoing request has thinking/reasoning off, strip thinking/reasoning blocks from the final assistant turn (Anthropic's rule), on every path to a Claude model. Fixed in 49d64fd. Measured direct on OpenRouter claude-sonnet-4 (Bedrock): the 400 fires for the last tool-call assistant turn and for the first call of a two-round tool loop (pi's live failure was messages.1 a round later); a turn answered by a new user message is accepted; Anthropic's own API accepts all of these. A request that does not think (no reasoning key onto Chat for a Claude model, translated and same-wire; thinking disabled or omitted before 4.7, onto Messages) now drops the thinking its assistant messages carry, rather than guessing the turn boundary. Adaptive-generation models keep theirs. E2E: a_replayed_thinking_turn_without_thinking_on_reaches_openrouter_without_it. Live re-run 2026-10-01: all nine W4::pi cells pass, W4::pi::openrouter::pi:responses included. Superseded (integration): a parallel final-assistant-message-only fix still 400ed on Bedrock and was dropped."
 
 [[defect]]
 id = "D80"
@@ -1139,7 +1139,7 @@ evidence = "proxy.rs relay_full_body (RelayRetry::Key sets only=Some(candidate))
 claims = ["R1", "R5", "REL-21"]
 state = "fixed"
 test = "a_5xx_after_a_key_walk_fails_over_for_small_and_large_bodies"
-fix = "9cf3307"
+fix = "fc3164e"
 note = "Found by the independent branch review (2026-10-01) of a54c22c. Fixed: a FullBody re-run after a key walk puts that candidate first in its walk (FullBody::resume) instead of making it the only usable one, so the next key's 5xx fails over like a small body; a Candidate retry clears it."
 
 [[defect]]
@@ -1153,7 +1153,7 @@ evidence = "proxy.rs bare_default_provider_name / has_byo_anthropic_key; reprodu
 claims = ["SEC-11"]
 state = "fixed"
 test = "bare_v1_byo_routes_by_the_forwarded_credential"
-fix = "d51f517"
+fix = "963ac84"
 note = "Found by the independent branch review (2026-10-01) of a54c22c. Fixed: byo_credential_dialect reads every x-api-key line (Anthropic unless the key's shape says otherwise) and every Bearer token (sk-ant- Anthropic, other sk- OpenAI; opaque says nothing); with no vote the path picks; BYO keys for two providers on bare /v1 are a 400."
 
 [[defect]]
@@ -1167,7 +1167,7 @@ evidence = "proxy.rs relay_full_body (keys start at 0), upstream_peer fb.keys lo
 claims = ["REL-14", "R5"]
 state = "fixed"
 test = "a_large_body_starts_past_a_cooling_pool_key"
-fix = "9cf3307"
+fix = "fc3164e"
 note = "Found by the independent branch review (2026-10-01) of a54c22c. Fixed: FullBody keys start at NO_KEY_WALK, and upstream_peer falls back to Provider::first_key() for a candidate with no key walk, so a re-run skips cooling keys."
 
 [[defect]]
@@ -1181,7 +1181,7 @@ evidence = "proxy.rs upstream_response_filter key_auth = 401|403, is_pool_key_fa
 claims = ["REL-4", "REL-14", "SEC-15"]
 state = "fixed"
 test = "a_request_specific_403_neither_walks_nor_cools_the_pool_key"
-fix = "e2fe688"
+fix = "c2e7ec9"
 note = "Found by the independent branch review (2026-10-01) of a54c22c. Fixed: is_pool_key_failure is a 401 only, used by both the walk and the cooldown; 401/402/403 stay catalog candidate refusals (is_candidate_refusal, breaker-neutral). A relayed managed 403 whose body names the key (invalid_api_key / authentication_error) cools it from logging; that request does not walk."
 
 [[defect]]
@@ -1195,7 +1195,7 @@ evidence = "catalog.rs ~142-148; proxy.rs ~4618. Reproduced hermetically (transl
 claims = ["TRN-5", "CAT-4"]
 state = "fixed"
 test = "an_unpublished_max_output_is_not_a_cap"
-fix = "c1f7566"
+fix = "b7ca8ec"
 note = "Found by the independent branch review (2026-10-01) of a54c22c. Fixed: ModelCard gains max_output_published; the 24 rows whose vendor publishes no max output use card_unpublished_output, keep the 32768 placeholder in /v1/models with max_output_published false, and are never clamped (ModelCard::output_cap is None). The catalog models one card per row, not per candidate, so the row card is the limit on every candidate."
 
 [[defect]]
@@ -1209,7 +1209,7 @@ evidence = "proxy.rs logging: the no-head, no-provider-outcome arm calls record_
 claims = ["REL-6", "SEC-16"]
 state = "fixed"
 test = "a_probe_with_no_provider_outcome_leaves_the_breaker_half_open"
-fix = "fa2d578"
+fix = "9d45e5a"
 note = "Found by the independent branch review (2026-10-01) of a54c22c. Fixed: logging releases the permit (CircuitBreaker::release) when no head arrived and the error is not a provider outcome. A claimed half-open permit is now stamped at its handout, so a released permit claimed again is not immediately reclaimable (which admitted a second probe)."
 
 [[defect]]
@@ -1223,7 +1223,7 @@ evidence = "usage.rs ~204; translate.rs ~2728; Cargo.toml overflow-checks. Repro
 claims = ["BIL-4", "REL-17"]
 state = "fixed"
 test = "overflowing_provider_token_counts_saturate_instead_of_panicking"
-fix = "178a4df"
+fix = "0ada0dd"
 note = "Found by the independent branch review (2026-10-01) of a54c22c. Fixed: every sum of provider-supplied counts saturates (usage.rs OpenAI arithmetic, translate.rs Usage::from_chat, and the cut-short estimators' scaling); a nonsense count bills a saturated value, never a panic. Also held by props_regressions::usage_with_boundary_counts_never_panics (the property suites' minimized counterexample) and props_usage's boundary-count properties, whose D87 exclusions were removed at integration."
 
 [[defect]]
@@ -1237,8 +1237,8 @@ evidence = "peek.rs ~535. Reproduced hermetically (billing_streams.rs): a second
 claims = ["BIL-2"]
 state = "fixed"
 test = "duplicate_or_escaped_stream_keys_cannot_turn_off_exact_metering"
-fix = "790d911"
-note = "Found by the independent branch review (2026-10-01) of a54c22c. Fixed: scan_buffered flags a root with more than one stream_options or an escaped spelling (stream_options_ambiguous); the buffered path removes every such member by span and the usual injection adds the one stream_options that reaches OpenAI. That fix (48a5c00) covered stream_options; the property suites also found an escaped `stream` key (\"str\\u0065am\":true) hiding the stream from the scan, so no usage was injected. Completed at integration (790d911 on this branch): scan_buffered and plan_stream_usage_injection decode an escaped key and let the last `stream` decide. Held by billing_streams::duplicate_or_escaped_stream_keys_cannot_turn_off_exact_metering (all three cases), duplicate_or_escaped_stream_options_cannot_turn_off_exact_metering, and props_peek::prop_stream_and_stream_options_match_serde with its D88 exclusion removed."
+fix = "dece8c9"
+note = "Found by the independent branch review (2026-10-01) of a54c22c. Fixed: scan_buffered flags a root with more than one stream_options or an escaped spelling (stream_options_ambiguous); the buffered path removes every such member by span and the usual injection adds the one stream_options that reaches OpenAI. That fix (3efec0b) covered stream_options; the property suites also found an escaped `stream` key (\"str\\u0065am\":true) hiding the stream from the scan, so no usage was injected. Completed at integration (dece8c9 on this branch): scan_buffered and plan_stream_usage_injection decode an escaped key and let the last `stream` decide. Held by billing_streams::duplicate_or_escaped_stream_keys_cannot_turn_off_exact_metering (all three cases), duplicate_or_escaped_stream_options_cannot_turn_off_exact_metering, and props_peek::prop_stream_and_stream_options_match_serde with its D88 exclusion removed."
 
 [[defect]]
 id = "D89"
@@ -1251,7 +1251,7 @@ evidence = "state.rs resolve_all; reproduced: 16 callers past refresh_at against
 claims = ["REL-20"]
 state = "fixed"
 test = "a_due_refresh_is_one_background_lookup"
-fix = "8f387bd"
+fix = "d671145"
 note = "Found by the independent branch review (2026-10-01) of a54c22c. Fixed: one lookup per authority runs in a background task (DnsCache::lookup_once); callers with a servable entry are served at once, cold callers share the lookup's answer, and a lookup hung past DNS_TIMEOUT stays in flight until it returns (at most one blocking getaddrinfo per authority). Also pinned by concurrent_cold_resolves_share_one_lookup and a_hung_lookup_is_never_joined_by_a_second."
 
 [[defect]]
@@ -1265,7 +1265,7 @@ evidence = "translate.rs ~3810-3826. Reproduced hermetically: translate::request
 claims = ["TRN-20", "TRN-4"]
 state = "fixed"
 test = "stripping_gateway_reasoning_changes_only_the_stripped_items"
-fix = "69be108"
+fix = "7a8a283"
 note = "Found by the independent branch review (2026-10-01) of a54c22c. Fixed: strip_gateway_reasoning cuts the minted reasoning items out of input by span (new peek::root_members / array_elements / remove_items); every other byte is the client's, and a body with nothing to strip is returned byte for byte. A property test checks every subset removal against a Value removal."
 
 [[defect]]
@@ -1279,7 +1279,7 @@ evidence = "proxy.rs error_while_proxy (refused ⇒ same-provider retry, unbound
 claims = ["REL-22", "REL-6"]
 state = "fixed"
 test = "a_provider_that_keeps_refusing_streams_is_resent_once_and_trips_the_breaker"
-fix = "4c578ac"
+fix = "efc853d"
 note = "Found by the independent branch review (2026-10-01) of a54c22c. Fixed: one resend per candidate (RequestCtx::refused_resent); a second refusal fails over (breaker failure recorded as the walk moves on) or ends the request (logging records it); fail_to_proxy answers 'the provider refused the stream; it was not processed'. A FullBody Reset retry releases its permit."
 
 [[defect]]
@@ -1293,7 +1293,7 @@ evidence = "proxy.rs new_ctx (Arc::clone of the state), retain_managed_client_he
 claims = ["S1"]
 state = "fixed"
 test = "new_ctx_pays_no_arc_clone"
-fix = "b6f2b78"
+fix = "3d44c35"
 note = "Found by the independent branch review (2026-10-01) of a54c22c. Fixed: AiProxy and the request context hold a &'static GatewayState (no per-request Arc clone; LIVE_REQUESTS stays for D38); remove_headers_where sweeps headers via stack batches (no Vec); each PoolAuth carries a boot-built memmem Finder used by response_filter and Redact. Structure pinned by remove_headers_where_removes_every_match_in_stack_batches and a_pool_key_carries_its_boot_built_searcher."
 
 [[defect]]
@@ -1307,7 +1307,7 @@ evidence = "main.rs init_tracing: the ai.usage layer's filter_fn has no max leve
 claims = ["BIL-4"]
 state = "fixed"
 test = "the_billing_log_layer_caps_the_max_level_at_info"
-fix = "892bb96"
+fix = "da45ad0"
 note = "Found by the independent branch review (2026-10-01) of a54c22c. Fixed: usage::usage_log_filter carries a max level hint of INFO, so the subscriber's max level (and LogTracer's) is INFO under the default AI_LOG."
 
 [[defect]]
@@ -1321,7 +1321,7 @@ evidence = "proxy.rs request_body_filter. Reproduced hermetically (catalog_body.
 claims = ["SEC-21", "CAT-11"]
 state = "fixed"
 test = "a_duplicate_model_is_refused_before_the_upstream_with_a_json_400"
-fix = "74837fb"
+fix = "52ae63b"
 note = "Found by the independent branch review (2026-10-01) of a54c22c. Fixed: where the body is in hand before connecting (a headerless walk, a header-won Responses or large-body walk), two root model keys get the gateway's JSON 400 (invalid_request_error, x-beyond-request-id) and the upstream gets nothing. A body streamed through (a header-won small Chat or Messages body) is still refused in request_body_filter with pingora's bare 400 after the headers went out; ARCHITECTURE.md says so."
 
 [[defect]]
@@ -1335,7 +1335,7 @@ evidence = "translate.rs ~3772. Reproduced hermetically: translate::request_test
 claims = ["TRN-17"]
 state = "fixed"
 test = "openai_held_responses_items_are_dropped_only_when_translating"
-fix = "d95b250"
+fix = "876aab9"
 note = "Found by the independent branch review (2026-10-01) of a54c22c. Fixed: translation drops compaction and item_reference items (OpenAI-held state no translated upstream can resolve), so a compacted session degrades instead of 400ing; the same-wire Responses relay keeps them. D49's rule stands for every item the gateway does not know (still forwarded; its test now uses local_shell_call, computer_call_output and an unknown future item type)."
 
 [[defect]]
@@ -1349,7 +1349,7 @@ evidence = "translate.rs ~5448. Reproduced hermetically: translate::response_tes
 claims = ["TRN-12"]
 state = "fixed"
 test = "an_empty_args_call_does_not_hold_parallel_calls_until_the_end"
-fix = "17108eb"
+fix = "44b02eb"
 note = "Found by the independent branch review (2026-10-01) of a54c22c. Fixed: OaiToAnt finds the live call's argument end incrementally (ArgsEnd scans only new bytes; one parse confirms when the outer value closes), and a live call with no argument bytes is done once a queued call's arguments start arriving."
 
 [[defect]]
@@ -1363,7 +1363,7 @@ evidence = "circuit_breaker.rs record_success (successes cap 65535) vs record_fa
 claims = ["REL-6"]
 state = "fixed"
 test = "a_failure_majority_opens_a_window_with_more_successes_than_the_failure_count_holds"
-fix = "cee19fb"
+fix = "b941e4b"
 note = "Found by the independent branch review (2026-10-01) of a54c22c. Fixed: windowed successes saturate at the failure count's 14-bit cap. Docs now describe the window as fixed (anchored at its first failure), which it is; it was not made rolling."
 
 [[defect]]
@@ -1377,7 +1377,7 @@ evidence = "proxy.rs ~780-827, ~2370-2480; ARCHITECTURE.md ~1400, ~1754, ~2114; 
 claims = ["CAT-15"]
 state = "fixed"
 test = "doc_comments_sit_on_their_items_and_the_docs_agree"
-fix = "b59a8a3"
+fix = "2d52a24"
 note = "Found by the independent branch review (2026-10-01) of a54c22c. Fixed: the reset_request_body_phase, is_streamable_path, apply_stream_usage_injection and apply_model_rewrite docs sit on their functions again; rewrites_body lists its reasons without a count; ARCHITECTURE.md says BYO forwards headers less x-beyond-* (D67) and hop-by-hop ones, and that BYO/non-stream bodies are relayed as sent; config.rs no longer names an AI_POOL_KEY_OPENAI_CODEX (providers is right: openai-codex takes only a client's own ChatGPT bearer)."
 
 [[defect]]
@@ -1391,7 +1391,7 @@ evidence = "live 2026-10-01 B2+BIL-3+BIL-20::openai-py::gpt::stream_abort, three
 claims = ["BIL-20", "FLT-1"]
 state = "fixed"
 test = "a_short_prompt_estimate_stays_under_the_provider_count"
-fix = "12981ee"
+fix = "498cb8f"
 note = "Found by live cell B2+BIL-3+BIL-20::openai-py::gpt::stream_abort. Fixed: InputTally no longer divides body bytes by a measured constant. It counts the pre-tokens of the prompt text: only the string values of prompt keys (content, text, role, system, instructions, input, output, arguments, name, description), split the way the GPT tokenizers' stated pre-tokenizer regex splits and every measured tokenizer honors (words at whitespace, one per letter run, one per three digits, one per punctuation run unless it is a single byte before letters; non-ASCII left out, a word of only non-ASCII counting one). A BPE tokenizer never merges across a pre-token split, so this is a lower bound by construction, on every wire, with no divisor. The fault prompt now estimates 16 (Chat and Messages bodies alike) for 24 real tokens. Measured on o200k_base, cl100k_base, grok-4.3's tokenize endpoint and Claude's count_tokens over prose, code, JSON, numbers, hex, base64-like text, French, Russian, CJK, emoji and punctuation: never above, ~0.8x on English and code for GPT/grok, ~0.65x for Claude (usage.rs input_estimate_never_exceeds_a_real_tokenizer pins those fixtures). Binary payloads drop out as values of non-text keys, so the base64 markers and aho-corasick are gone; text runs through a 9-state table four bytes per lookup in two lanes (1.3 GB/s on source, 3 GB/s on prose, 100 GB/s on an image body; benches/unit.rs input_tally). Also held by usage.rs input_estimate_counts_string_values_only (the bare and dressed stream-abort bodies estimate the same, under 29, at any split). Superseded (integration): a parallel fix counted all JSON string-value bytes / 5; the pre-token bound was kept."
 
 [[defect]]
@@ -1405,7 +1405,7 @@ evidence = "live 2026-10-01 (corrupt base64 PNG, grok-4.3): T6::openai-py::xai::
 claims = ["T6"]
 state = "fixed"
 test = "an_xai_error_arrives_in_the_clients_envelope"
-fix = "1c4cc2b"
+fix = "513f58f"
 note = "Found by live cells T6::openai-py::xai::typed_error and T6::anthropic-py::xai::typed_error. Fixed both halves. A catalog walk now buffers a non-stream error from a same-endpoint candidate (catalog_error_relay, capped by MAX_TRANSLATE_BUFFER) and translate::response_json_tools re-encodes it unless it is already the client API's envelope, so OpenAI's and OpenRouter's own errors still relay byte for byte (an_error_already_in_the_clients_envelope_is_relayed_untouched). And map_error types an error whose body names none from its HTTP status (status_error_type: Anthropic's closed set on Messages, 400 -> invalid_request_error; the gateway's own words on the OpenAI endpoints) instead of api_error. translate_response_tests' 404 {detail} case moved from api_error to not_found_error. Also held by translate_response.rs xai_errors_arrive_in_the_clients_envelope (from a parallel, similar fix folded into this one)."
 
 [[defect]]
@@ -1419,7 +1419,7 @@ evidence = "live 2026-10-01 TRN-15::openai-py::openrouter::explicit_nulls and TR
 claims = ["TRN-15"]
 state = "fixed"
 test = "explicit_nulls_are_omitted_on_a_same_wire_chat_relay_to_openrouter"
-fix = "572d763"
+fix = "ff09e82"
 note = "Found by live cells TRN-15::openai-py::openrouter::explicit_nulls and TRN-15::openai-py::failover::explicit_nulls. Fixed: a same-wire Chat Completions relay to a non-OpenAI host drops every root member whose value is null, by span (peek::remove_root_nulls, one memmem gate); nested values and every other byte are the client's. Also held by a_null_user_is_not_relayed_to_openrouter and peek::tests::remove_root_nulls_removes_only_root_nulls. Live re-run 2026-10-01 (on the user-only variant): TRN-15::openai-py::{openrouter,failover,claude,gpt,bedrock}::explicit_nulls pass. Superseded (integration): a parallel fix removed only a root user: null via a scan_buffered field; the general rule was kept."
 
 [[defect]]
@@ -1433,7 +1433,7 @@ evidence = "live 2026-10-01 TRN-15::openai-py::xai::explicit_nulls -> 422 'messa
 claims = ["TRN-15"]
 state = "fixed"
 test = "null_instructions_are_absent_on_chat"
-fix = "d71b6bc"
+fix = "54cb102"
 note = "Found by live cells TRN-15::openai-py::xai::explicit_nulls and TRN-15::openai-py::together::explicit_nulls. Fixed: responses_req_to_openai treats instructions: null as absent (no system message), as copy_if treats other nulls. Also held by null_instructions_add_no_system_message. Live re-run 2026-10-01: TRN-15::openai-py::xai::explicit_nulls and ::together::explicit_nulls pass."
 
 [[defect]]
@@ -1447,7 +1447,7 @@ evidence = "Differential parity, reproduced in two full runs (2026-10-01, seed 1
 claims = ["T6", "TRN-21"]
 state = "fixed"
 test = "an_unknown_role_is_forwarded_onto_messages"
-fix = "154ccbc"
+fix = "c0b439e"
 note = "Found by crates/verify/tests/parity_live.rs. Fixed: chat->messages, messages->chat and chat->responses forward a message whose role no dialect has whole, in place, role unchanged (an_unknown_role_is_forwarded_onto_messages / _onto_chat / _onto_responses; Responses->Messages walks the same mapping)."
 
 [[defect]]
@@ -1461,7 +1461,7 @@ evidence = "live 2026-10-01 catalog sweep, CAT-3::raw::openai::{gpt-5,gpt-5-mini
 claims = ["CAT-3"]
 state = "fixed"
 test = "gpt5_cards_state_openais_input_cap"
-fix = "e27c935"
+fix = "f00e48a"
 note = "OpenAI's model pages publish 400K / 1.05M as the context window (input + output), which is what catalog_truth.toml records; the API's input cap is the window minus the 128K max output. Fixed: The card states the limit every candidate enforces, not the window: GPT-5-family cards list OpenAI's input cap (272,000 of 400,000; 922,000 of 1,050,000; gpt-5-pro 128,000, the 400K window less its 272K max output, by the same rule since its TPM and Responses-only error hide the number). catalog_truth.toml keeps the vendor's window and records input_limit with the API's own error as evidence. One figure per row rather than per candidate: the gateway counts no prompt tokens, so it could not pick a candidate by window, and a client only sees the row. Live: CAT-3::raw::openai::{gpt-5,gpt-5.4,...} pass (re-run 2026-10-01)."
 
 [[defect]]
@@ -1475,7 +1475,7 @@ evidence = "live 2026-10-01 catalog sweep: CAT-1+BIL-13::raw::xai::grok-4.20-mul
 claims = ["CAT-1", "CAT-6"]
 state = "fixed"
 test = "multi_agent_reaches_xai_over_responses"
-fix = "e27c935"
+fix = "f00e48a"
 note = "xAI serves multi-agent on /v1/responses only; the candidate path would have to be a Responses arm. Fixed: grok-4.20-multi-agent's xAI candidate is /v1/responses (xai_responses_first); Chat Completions and Messages clients are translated onto it. Its client-side tools need beta access at xAI (400 \"Client-side tools for multi-agent models require beta access\" on Responses, 2026-10-01), and OpenRouter has no tool endpoint, so the card drops tools; catalog_truth.toml records features_absent with that evidence. Live: CAT-1/BIL-13/CAT-2/CAT-4/CAT-5/CAT-6/CAT-6+BIL-9/CAT-7::raw::xai::grok-4.20-multi-agent re-run 2026-10-01."
 
 [[defect]]
@@ -1489,7 +1489,7 @@ evidence = "live 2026-10-01 catalog sweep: CAT-5::raw::xai::{grok-4.20,grok-4.3,
 claims = ["CAT-5"]
 state = "fixed"
 test = "no_row_advertises_files_over_xai_chat_completions"
-fix = "e27c935"
+fix = "f00e48a"
 note = "Fixed: Stopped advertising: grok-4.20, 4.3, 4.5, 4.6 and build-0.1 cards drop file input, because xAI's Chat Completions (the path these rows reach xAI on) refuses file content. Moving every grok row onto xAI's /v1/responses would restore PDFs (xAI Responses reads inline PDFs: OSPREY on grok-4.3 and grok-build-0.1, 2026-10-01), but it changes the wire for every grok request while D23, D100 and D102 are open on that path, so it is not done here. grok-4.20-multi-agent, now on Responses (D105), keeps file input. Live: CAT-5::raw::xai::grok-* re-run 2026-10-01."
 
 [[defect]]
@@ -1503,7 +1503,7 @@ evidence = "live 2026-10-01 catalog sweep: CAT-6+BIL-9::raw::bedrock::claude-opu
 claims = ["CAT-6"]
 state = "fixed"
 test = "a_structured_output_request_skips_a_bedrock_candidate"
-fix = "e27c935"
+fix = "f00e48a"
 note = "Fixed: Capability-aware candidate filtering: Bedrock cannot be translated onto (it refuses output_config.format and the beta output_format, measured on both rows), so a body asking for a JSON-schema output leaves Bedrock out of the walk (providers::catalog::serves_structured_outputs, route::unserved), unless nothing else is usable. A header-won walk on a row with such a candidate now reads the body before choosing (route::walk_reads_body), as a headerless walk always did; a large body is checked in relay_full_body. Live: CAT-6::raw::bedrock::{claude-opus-4-8,claude-haiku-4-5} now assert json_schema with Bedrock ordered first is served elsewhere."
 
 [[defect]]
@@ -1517,7 +1517,7 @@ evidence = "live 2026-10-01 catalog sweep: CAT-1+BIL-13::raw::together::google/g
 claims = ["CAT-1"]
 state = "fixed"
 test = "no_candidate_is_retired_or_not_serverless"
-fix = "e27c935"
+fix = "f00e48a"
 note = "Belongs in catalog_truth.toml's not_serverless list once confirmed on Together's model page. Fixed: Together's serverless models table lists neither google/gemma-4-31B-it nor Qwen/Qwen2.5-7B-Instruct-Turbo; both are recorded as not_serverless and the rows are OpenRouter-only, priced at OpenRouter's listing (the only host; the makers sell no API). Live: CAT-1::raw::openrouter::{google/gemma-4-31b-it,qwen/qwen-2.5-7b-instruct} re-run 2026-10-01."
 
 [[defect]]
@@ -1531,7 +1531,7 @@ evidence = "live 2026-10-01 catalog sweep: CAT-3::raw::openrouter::gpt-4 -> 200 
 claims = ["CAT-3"]
 state = "fixed"
 test = "an_openrouter_candidate_is_asked_not_to_compress_the_prompt"
-fix = "e27c935"
+fix = "f00e48a"
 note = "OpenRouter documents middle-out as on by default for endpoints with <= 8k context; sending transforms: [] turns it off. Fixed: OpenRouter's docs: endpoints of 8K context or less default to context compression; plugins: [{\"id\": \"context-compression\", \"enabled\": false}] turns it off (transforms: [] is the older spelling). Every catalog attempt on an OpenRouter Chat Completions candidate gets that field spliced in unless the client sent its own plugins. Measured directly: the 10,601-word gpt-4 prompt then gets 400 \"This endpoint's maximum context length is 8191 tokens\"; PDF parsing still works with the field present. Live: CAT-3::raw::openrouter::gpt-4 re-run 2026-10-01."
 
 [[defect]]
@@ -1545,7 +1545,7 @@ evidence = "live 2026-10-01 catalog sweep: CAT-3::raw::openrouter::ministral-3b-
 claims = ["CAT-3"]
 state = "fixed"
 test = "cards_state_a_failover_hosts_smaller_window"
-fix = "e27c935"
+fix = "f00e48a"
 note = "Fixed: The row's card states the smallest window any candidate enforces (D104's rule): ministral-3b-latest 131,072 (its OpenRouter candidate), qwen/qwen3.8-2.4t-a95b 1,010,000 (Together, which publishes no window). Recorded as input_limit with the rejection as evidence. Live: CAT-3::raw::openrouter::ministral-3b-latest and CAT-3::raw::together::qwen/qwen3.8-2.4t-a95b re-run 2026-10-01."
 
 [[defect]]
@@ -1559,7 +1559,7 @@ evidence = "live 2026-10-01 catalog sweep: CAT-4::raw::openai::gpt-4 -> 400 \"Th
 claims = ["CAT-4"]
 state = "fixed"
 test = "gpt4_max_output_leaves_room_for_a_prompt"
-fix = "e27c935"
+fix = "f00e48a"
 note = "Fixed: gpt-4's 8,192 window holds prompt and output together, so no max output equal to it is usable. The card takes OpenRouter's published figures for its candidate: max_completion_tokens 4,096 and context_length 8,191 (the smaller window, D104's rule); catalog_truth.toml records output_limit / input_limit beside OpenAI's 8,192 / 8,192. The gateway also clamps a request's output limit to the card, so a larger ask fits. Live: CAT-4::raw::{openai,openai-responses,openrouter}::gpt-4 re-run 2026-10-01."
 
 [[defect]]
@@ -1573,7 +1573,7 @@ evidence = "live 2026-10-01 catalog sweep: CAT-5::raw::openai::o3-mini and CAT-5
 claims = ["CAT-5"]
 state = "fixed"
 test = "an_image_on_a_text_only_row_is_refused_before_any_upstream"
-fix = "e27c935"
+fix = "f00e48a"
 note = "Fixed: The gateway refuses an image part on a row whose card lists no image input with a 400 naming the row, before any upstream (route::refused_input, ai_rejections_total{reason=\"modality\"}); header-won walks on such rows read the body first. Only images: OpenRouter extracts PDF text for any model, so PDFs are not gated. Live: CAT-5::raw::{openai,openai-responses}::{o3-mini,gpt-4} and CAT-5::raw::together::openai/gpt-oss-120b re-run 2026-10-01."
 
 [[defect]]
@@ -1587,7 +1587,7 @@ evidence = "live 2026-10-01 catalog sweep: CAT-6::raw::openai::gpt-4, CAT-6::raw
 claims = ["CAT-6"]
 state = "fixed"
 test = "gpt4_card_lists_the_tools_it_serves"
-fix = "e27c935"
+fix = "f00e48a"
 note = "The card follows the sourcing rule (list only what the vendor's model page names); the page omits function calling for gpt-4. Fixed: The card lists tools: every candidate returns the forced call, and gpt-4-0613 is the snapshot that introduced function calling; the model page's feature list omits it. catalog_truth.toml drops tools from features_absent with that note. Live: CAT-6::raw::{openai,openai-responses,openrouter}::gpt-4 re-run 2026-10-01."
 
 [[defect]]
@@ -1601,7 +1601,7 @@ evidence = "live 2026-10-01 catalog sweep 3: CAT-6+BIL-9::raw::openai::{gpt-5.6-
 claims = ["CAT-6", "LNG-1"]
 state = "fixed"
 test = "gpt_5_4_and_later_reach_openai_over_responses"
-fix = "e27c935"
+fix = "f00e48a"
 note = "Also bites the translation path: a Messages client with thinking plus tools on these rows is translated to Chat with a reasoning_effort. Fixed: OpenAI's rule, measured 2026-10-01 on Chat Completions with a forced function tool: gpt-5.2 accepts reasoning_effort low; gpt-5.4, 5.4-nano and 5.5 answer 400 \"Function tools with reasoning_effort are not supported ... use /v1/responses or set reasoning_effort to 'none'\" when an effort is sent; gpt-5.6-luna/terra and gpt-6-astra answer it with no effort sent (they reason by default; astra cannot take none). Setting effort none would silently turn reasoning off, so gpt-5.4, 5.4-mini, 5.4-nano, 5.5, 5.6-luna/sol/terra and gpt-6-astra now reach OpenAI over /v1/responses (openai_responses_first), and Chat Completions and Messages clients are translated onto it. The catalog sweep's tool probe now sends a reasoning effort with the tools on OpenAI reasoning rows. Live: CAT-6 and CAT-6+BIL-9::raw::openai on those rows re-run 2026-10-01."
 
 [[defect]]
@@ -1615,7 +1615,7 @@ evidence = "live 2026-10-01 catalog sweep: CAT-6::raw::openrouter::meta-llama/ll
 claims = ["CAT-6"]
 state = "fixed"
 test = "advertised_tools_have_a_tool_capable_candidate"
-fix = "e27c935"
+fix = "f00e48a"
 note = "Host-dependent: OpenRouter picks the host per request, so these vary run to run except llama-4-scout and gpt-oss-120b. Fixed: llama-4-scout's card drops tools (OpenRouter has no tool-capable host for it; json_schema still works there). gpt-oss-120b drops its OpenRouter candidate: OpenRouter's CoreWeave host answers a forced tool_choice (named or required) with a 200, finish_reason error and an empty message (2 of 3 forced calls, 2026-10-01); Groq, Together and Fireworks remain. glm-5.3-flash's leaked markup was one OpenRouter host once: three forced calls through OpenRouter on 2026-10-01 all returned clean get_weather calls (served by Together). Live: CAT-6::raw::openrouter::{meta-llama/llama-4-scout,z-ai/glm-5.3-flash} and CAT-6::raw::together::openai/gpt-oss-120b re-run 2026-10-01."
 
 [[defect]]
@@ -1629,7 +1629,7 @@ evidence = "live 2026-10-01 catalog sweep: CAT-7::raw::openrouter::gpt-5.6-sol (
 claims = ["CAT-7"]
 state = "fixed"
 test = "prices_follow_the_maker_not_openrouter"
-fix = "e27c935"
+fix = "f00e48a"
 note = "catalog_truth.toml already notes OpenAI's promotional gpt-5.6-sol pricing and lists the standard tier on purpose; whether the card should bill the promotional rate is an owner decision. Third-party OpenRouter hosts of open models charging their own rate are recorded as notes, not failures. Fixed: Prices follow the model's maker, never OpenRouter's listing: z-ai/glm-5.1 stays at Z.ai's $1.4 / $4.4 / $0.26 (now recorded in catalog_truth.toml from Z.ai's table), kimi-k2.7-code and kimi-k2.6 move to Moonshot's $0.95 / $4.00 (cache $0.19 / $0.16), qwen3.8-flash output to Together's $0.282 (docs table and /v1/models). gpt-5.6-sol keeps OpenAI's standard $4 / $20: that is what OpenAI bills the pool key (organization costs report 2026-10-01: 4,289 input tokens $0.017156, 1,394 output $0.02788), and one row has one list price, so a failover that costs us less does not lower the customer's price. OpenRouter's half price is OpenAI's announced promotion (\"at least through November 21, 2026\"), recorded as [[promo]] for gpt-5.6-sol and gpt-5.6-sol-pro; the CAT-7 check accepts a charge at that rate until then. Live: CAT-7::raw::openrouter::{gpt-5.6-sol,gpt-5.6-sol-pro,z-ai/glm-5.1,moonshotai/kimi-k2.7-code} and CAT-7::raw::together::qwen/qwen3.8-flash re-run 2026-10-01."
 
 [[defect]]
@@ -1643,7 +1643,7 @@ evidence = "live 2026-10-01 catalog sweep: 27 CAT-8 cells, e.g. CAT-8::raw::open
 claims = ["CAT-8"]
 state = "fixed"
 test = "cards_carry_the_vendors_created_and_owner"
-fix = "e27c935"
+fix = "f00e48a"
 note = "Fixed: Every OpenAI row (and the OpenAI-listed codex rows served through OpenRouter) takes created from OpenAI's /v1/models; every xAI row takes created and owned_by xai from xAI's /v1/models. catalog_truth.toml records them, and the catalog sweep's CAT-8 reads an OpenRouter-primary row's metadata from its maker's listing when the maker lists it. Live: CAT-8::raw::* re-run 2026-10-01."
 
 [[defect]]
@@ -1727,22 +1727,8 @@ evidence = "live 2026-10-01 FLT-1+REL-7+BIL-3+BIL-14+BIL-20::<client>::<route>::
 claims = ["FLT-1", "B2", "BIL-3", "BIL-20"]
 state = "fixed"
 test = "a_stream_accepted_then_silent_before_its_first_byte_is_billed_an_estimate"
-fix = "12981ee"
+fix = "498cb8f"
 note = "Found by live cells FLT-1+REL-7+BIL-3+BIL-14+BIL-20::*::*::stall_after_head (crates/verify/tests/fault_live.rs). Fixed: the 2xx head is the proof the provider took the request, so proxy.rs logging's `started` gate no longer needs message_start, a relayed delta or a clean finish; a cut-short 2xx stream is estimated unless it carried only an error event (an_error_only_stream_is_not_billed_an_estimate still passes). Both wires: the Anthropic one gets no message_start, so its input comes from the tally. The related open question (the gateway's own 504 before the head) is D130."
-
-[[defect]]
-id = "D130"
-severity = "med"
-area = "Billing"
-title = "The gateway's own read timeout before the head bills zero for a prompt the provider has"
-impact = "BIL-3 bills a client that gives up before the response head once the provider has the whole request (D07), because the provider bills that prompt either way. When the gateway gives up instead (read_timeout_secs on a live connection, its 504), the provider is in the same state and bills the same prompt, but the row was 0/0. The SDKs retry a 504, so the ledger held one generation where the provider billed two (BIL-14)."
-confidence = "high"
-evidence = "Open question raised with D123 by the fault-suite author (proxy.rs no_head comment: the provider bills that prompt either way). Hermetic: an upstream that reads the whole body and stays silent past read_timeout_secs = 2 -> client 504, row {outcome: upstream_error, input_tokens: 0, usage_estimated: false}, while a client giving up at the same moment is billed the estimate (billing_cancel::a_cancel_before_the_response_head_is_billed_an_estimate). no_head required ErrorSource::Downstream."
-claims = ["BIL-3", "BIL-14", "BIL-20"]
-state = "fixed"
-test = "a_read_timeout_before_the_head_bills_the_delivered_prompt"
-fix = "12981ee"
-note = "Fixed: no_head now covers any wait given up on (gave_up_waiting): the client going away, or the gateway's ReadTimedout from upstream. Both leave a provider holding the whole request on a live connection, and it cannot tell who hung up. A reset or close from the upstream before any head (the gateway's 502) stays 0 (a_close_before_the_head_bills_nothing): the peer declined to answer, the managed providers' edge (Cloudflare) answers a forwarded-then-lost request with a 52x status rather than a bare reset, and an estimate the customer cannot check errs low (BIL-20). A dead peer (keepalive or TCP_USER_TIMEOUT) stays 0 for the same reason. The fault suite now models stall_before_head as forwarded with the provider's answer held back (the realistic shape: a provider still working when the timeout fires) and owes an estimated row for it; reset_after_forward stays unbilled by design."
 
 [[defect]]
 id = "D124"
@@ -1769,8 +1755,8 @@ evidence = "props_usage::prop_input_tally_ignores_chunking (fed byte by byte), m
 claims = ["BIL-20"]
 state = "fixed"
 test = "input_estimate_ignores_how_the_body_is_chunked"
-fix = "12981ee"
-note = "Found by the property suites (crates/gateway/tests/props_usage.rs). Proposed: keep the last MARKER_CARRY bytes of carry+chunk, not of the chunk alone. Fixed by the D99 rewrite of InputTally (12981ee): payloads drop out as values of non-text keys, with no markers to split, so any chunking agrees with the whole body. The property's at-least-7-byte chunk exclusion was removed at integration."
+fix = "498cb8f"
+note = "Found by the property suites (crates/gateway/tests/props_usage.rs). Proposed: keep the last MARKER_CARRY bytes of carry+chunk, not of the chunk alone. Fixed by the D99 rewrite of InputTally (498cb8f): payloads drop out as values of non-text keys, with no markers to split, so any chunking agrees with the whole body. The property's at-least-7-byte chunk exclusion was removed at integration."
 
 [[defect]]
 id = "D126"
@@ -1827,6 +1813,20 @@ state = "reproduced"
 test = "responses_answer_options_are_never_dropped"
 fix = ""
 note = "Found by the property suites. openai_req_to_anthropic rebuilds the body from known Chat fields, so a Responses field the intermediate Chat body carried for forwarding is lost on the second hop."
+
+[[defect]]
+id = "D130"
+severity = "med"
+area = "Billing"
+title = "The gateway's own read timeout before the head bills zero for a prompt the provider has"
+impact = "BIL-3 bills a client that gives up before the response head once the provider has the whole request (D07), because the provider bills that prompt either way. When the gateway gives up instead (read_timeout_secs on a live connection, its 504), the provider is in the same state and bills the same prompt, but the row was 0/0. The SDKs retry a 504, so the ledger held one generation where the provider billed two (BIL-14)."
+confidence = "high"
+evidence = "Open question raised with D123 by the fault-suite author (proxy.rs no_head comment: the provider bills that prompt either way). Hermetic: an upstream that reads the whole body and stays silent past read_timeout_secs = 2 -> client 504, row {outcome: upstream_error, input_tokens: 0, usage_estimated: false}, while a client giving up at the same moment is billed the estimate (billing_cancel::a_cancel_before_the_response_head_is_billed_an_estimate). no_head required ErrorSource::Downstream."
+claims = ["BIL-3", "BIL-14", "BIL-20"]
+state = "fixed"
+test = "a_read_timeout_before_the_head_bills_the_delivered_prompt"
+fix = "498cb8f"
+note = "Fixed: no_head now covers any wait given up on (gave_up_waiting): the client going away, or the gateway's ReadTimedout from upstream. Both leave a provider holding the whole request on a live connection, and it cannot tell who hung up. A reset or close from the upstream before any head (the gateway's 502) stays 0 (a_close_before_the_head_bills_nothing): the peer declined to answer, the managed providers' edge (Cloudflare) answers a forwarded-then-lost request with a 52x status rather than a bare reset, and an estimate the customer cannot check errs low (BIL-20). A dead peer (keepalive or TCP_USER_TIMEOUT) stays 0 for the same reason. The fault suite now models stall_before_head as forwarded with the provider's answer held back (the realistic shape: a provider still working when the timeout fires) and owes an estimated row for it; reset_after_forward stays unbilled by design."
 
 [[defect]]
 id = "D131"

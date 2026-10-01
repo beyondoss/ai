@@ -80,12 +80,12 @@ http-body-util = "0.1"
 # throwaway self-signed cert for that listener; `tokio-rustls` terminates TLS in front of hyper.
 hyper = { version = "1", features = ["server", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["tokio", "server-auto"] }
-rcgen = "0.13"
-reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "http2"] }
-tokio-rustls = "0.26"
 # Property tests (`tests/props_*.rs`): generated requests, responses and streams. Only `std` — no
 # fork/timeout runner, so no rusty-fork or tempfile in the build graph.
 proptest = { version = "1.10", default-features = false, features = ["std"] }
+rcgen = "0.13"
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "http2"] }
+tokio-rustls = "0.26"
 
 [[bench]]
 name = "unit"

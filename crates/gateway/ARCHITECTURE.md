@@ -2368,7 +2368,7 @@ Prometheus on the default registry, exposed at `/metrics` on `metrics_listen`.
   two candidate orders (default vs `x-beyond-order`) do not cross-hit. `ai_cache_scope{kind="process"}`
   and `ai_smart_rank_scope{kind="process"}` are `1` — rank and cache are per-pod, not fleet-wide.
 - **Cut short (`tests/cut_short.rs`):** a real stream cancelled mid-flight through the binary —
-  OpenAI bills estimated input (body ÷ 5) and one token per relayed delta; Anthropic keeps
+  OpenAI bills estimated input (the prompt text's pre-tokens) and one token per relayed delta; Anthropic keeps
   `message_start`'s exact input and estimates output; a base64 image does not inflate the input
   estimate; a stream that finishes is billed exactly, `usage_estimated=false`.
 - **Tenant concurrency (`tests/tenant_concurrency.rs`):** at the ceiling a tenant gets a 429 without

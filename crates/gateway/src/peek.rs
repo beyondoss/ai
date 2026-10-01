@@ -266,7 +266,8 @@ pub fn plan_stream_usage_injection(body: &[u8]) -> Option<usize> {
     // An escaped key (`"str\u0065am"`) decodes to `stream` at the provider without spelling it,
     // and such a key always carries `\u`; real clients never send one, so the second search runs
     // only on a body with no `"stream"` at all.
-    if memchr::memmem::find(body, b"\"stream\"").is_none() && memchr::memmem::find(body, b"\\u").is_none()
+    if memchr::memmem::find(body, b"\"stream\"").is_none()
+        && memchr::memmem::find(body, b"\\u").is_none()
     {
         return None;
     }

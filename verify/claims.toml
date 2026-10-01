@@ -8,7 +8,6 @@
 #   touches   source paths whose change makes a proof stale
 #   defects   suspected or confirmed defects that violate this claim (see defects.toml)
 
-
 # --- Endpoints and SDK compatibility -----------------------------------------------------------
 [[claim]]
 id = "E1"
@@ -17,9 +16,22 @@ group = "Endpoints and SDK compatibility"
 text = "Chat Completions works for any catalog model, streaming and not"
 oracle = "SDK parses; one ai.usage row per call; client usage = ledger"
 layer = "both"
-clients = ["openai-py", "openai-node", "ai-sdk", "langchain", "openai-agents", "opencode", "pi", "raw"]
+clients = [
+  "openai-py",
+  "openai-node",
+  "ai-sdk",
+  "langchain",
+  "openai-agents",
+  "opencode",
+  "pi",
+  "raw",
+]
 failover_clients = ["openai-py", "openai-node", "opencode", "pi"]
-touches = ["crates/gateway/src/route.rs", "crates/gateway/src/proxy.rs", "crates/gateway/src/translate.rs"]
+touches = [
+  "crates/gateway/src/route.rs",
+  "crates/gateway/src/proxy.rs",
+  "crates/gateway/src/translate.rs",
+]
 defects = ["D63"]
 
 [[claim]]
@@ -31,7 +43,11 @@ oracle = "SDK parses; signed thinking kept; ledger agrees"
 layer = "both"
 clients = ["anthropic-py", "anthropic-ts", "claude-code", "ai-sdk", "raw"]
 failover_clients = ["anthropic-py", "anthropic-ts", "claude-code"]
-touches = ["crates/gateway/src/route.rs", "crates/gateway/src/proxy.rs", "crates/gateway/src/translate.rs"]
+touches = [
+  "crates/gateway/src/route.rs",
+  "crates/gateway/src/proxy.rs",
+  "crates/gateway/src/translate.rs",
+]
 defects = []
 
 [[claim]]
@@ -43,7 +59,11 @@ oracle = "item lifecycle intact; store / previous_response_id round-trip"
 layer = "both"
 clients = ["openai-py", "openai-node", "codex", "openai-agents", "raw"]
 failover_clients = ["openai-py", "codex"]
-touches = ["crates/gateway/src/route.rs", "crates/gateway/src/proxy.rs", "crates/gateway/src/translate.rs"]
+touches = [
+  "crates/gateway/src/route.rs",
+  "crates/gateway/src/proxy.rs",
+  "crates/gateway/src/translate.rs",
+]
 defects = ["D74", "D128"]
 
 [[claim]]
@@ -53,7 +73,15 @@ group = "Endpoints and SDK compatibility"
 text = "/v1/models lists every row and stock SDKs read it"
 oracle = "models.list() returns 101 with card fields"
 layer = "both"
-clients = ["openai-py", "openai-node", "anthropic-py", "anthropic-ts", "ai-sdk", "opencode", "raw"]
+clients = [
+  "openai-py",
+  "openai-node",
+  "anthropic-py",
+  "anthropic-ts",
+  "ai-sdk",
+  "opencode",
+  "raw",
+]
 failover_clients = []
 touches = ["crates/providers/src/catalog.rs", "crates/gateway/src/proxy.rs"]
 defects = []
@@ -82,7 +110,11 @@ oracle = "counts free (no row), compact billed"
 layer = "both"
 clients = ["anthropic-py", "openai-py", "claude-code", "codex", "raw"]
 failover_clients = []
-touches = ["crates/gateway/src/route.rs", "crates/gateway/src/proxy.rs", "crates/gateway/src/usage.rs"]
+touches = [
+  "crates/gateway/src/route.rs",
+  "crates/gateway/src/proxy.rs",
+  "crates/gateway/src/usage.rs",
+]
 defects = []
 
 [[claim]]
@@ -95,9 +127,12 @@ layer = "hermetic"
 layer_note = "Reclassified from live/both on 2026-10-01: Protocol framing on the gateway's own listener; no provider is involved."
 clients = ["raw"]
 failover_clients = []
-touches = ["crates/gateway/src/route.rs", "crates/gateway/src/proxy.rs", "crates/gateway/src/translate.rs"]
+touches = [
+  "crates/gateway/src/route.rs",
+  "crates/gateway/src/proxy.rs",
+  "crates/gateway/src/translate.rs",
+]
 defects = []
-
 
 # --- Translation -------------------------------------------------------------------------------
 [[claim]]
@@ -107,7 +142,20 @@ group = "Translation"
 text = "Tool calls round-trip across dialects, multi-turn and parallel"
 oracle = "forced tool, fixed args, result fed back, final answer uses it"
 layer = "both"
-clients = ["openai-py", "openai-node", "anthropic-py", "anthropic-ts", "ai-sdk", "langchain", "openai-agents", "claude-code", "codex", "opencode", "pi", "raw"]
+clients = [
+  "openai-py",
+  "openai-node",
+  "anthropic-py",
+  "anthropic-ts",
+  "ai-sdk",
+  "langchain",
+  "openai-agents",
+  "claude-code",
+  "codex",
+  "opencode",
+  "pi",
+  "raw",
+]
 failover_clients = ["openai-py", "anthropic-py", "claude-code", "pi"]
 touches = ["crates/gateway/src/translate.rs", "crates/gateway/src/proxy.rs"]
 defects = ["D63", "D127"]
@@ -119,7 +167,14 @@ group = "Translation"
 text = "Thinking and reasoning survive across turns (signatures, encrypted reasoning)"
 oracle = "turn 2 accepted with replayed blocks; reasoning tokens metered"
 layer = "both"
-clients = ["anthropic-py", "anthropic-ts", "claude-code", "codex", "pi", "openai-py"]
+clients = [
+  "anthropic-py",
+  "anthropic-ts",
+  "claude-code",
+  "codex",
+  "pi",
+  "openai-py",
+]
 failover_clients = ["anthropic-py", "claude-code"]
 touches = ["crates/gateway/src/translate.rs", "crates/gateway/src/proxy.rs"]
 defects = ["D74"]
@@ -143,7 +198,15 @@ group = "Translation"
 text = "Structured output (json_schema) across dialects"
 oracle = "response validates against the schema"
 layer = "both"
-clients = ["openai-py", "openai-node", "anthropic-py", "ai-sdk", "langchain", "openai-agents", "raw"]
+clients = [
+  "openai-py",
+  "openai-node",
+  "anthropic-py",
+  "ai-sdk",
+  "langchain",
+  "openai-agents",
+  "raw",
+]
 failover_clients = []
 touches = ["crates/gateway/src/translate.rs", "crates/gateway/src/proxy.rs"]
 defects = []
@@ -167,7 +230,14 @@ group = "Translation"
 text = "Errors arrive in the client's own envelope"
 oracle = "SDK raises its typed error with the provider's message"
 layer = "both"
-clients = ["openai-py", "openai-node", "anthropic-py", "anthropic-ts", "ai-sdk", "raw"]
+clients = [
+  "openai-py",
+  "openai-node",
+  "anthropic-py",
+  "anthropic-ts",
+  "ai-sdk",
+  "raw",
+]
 failover_clients = []
 touches = ["crates/gateway/src/translate.rs", "crates/gateway/src/proxy.rs"]
 defects = ["D100", "D103"]
@@ -185,7 +255,6 @@ failover_clients = []
 touches = ["crates/gateway/src/translate.rs", "crates/gateway/src/proxy.rs"]
 defects = []
 
-
 # --- Routing and failover ----------------------------------------------------------------------
 [[claim]]
 id = "R1"
@@ -194,9 +263,29 @@ group = "Routing and failover"
 text = "Connect failure or 5xx fails over before the client notices"
 oracle = "client succeeds; x-beyond-provider = next candidate; failover metric Δ"
 layer = "both"
-clients = ["openai-py", "anthropic-py", "claude-code", "codex", "opencode", "pi", "raw"]
-failover_clients = ["openai-py", "anthropic-py", "claude-code", "codex", "opencode", "pi"]
-touches = ["crates/gateway/src/proxy.rs", "crates/gateway/src/smart.rs", "crates/gateway/src/circuit_breaker.rs", "crates/gateway/src/control.rs"]
+clients = [
+  "openai-py",
+  "anthropic-py",
+  "claude-code",
+  "codex",
+  "opencode",
+  "pi",
+  "raw",
+]
+failover_clients = [
+  "openai-py",
+  "anthropic-py",
+  "claude-code",
+  "codex",
+  "opencode",
+  "pi",
+]
+touches = [
+  "crates/gateway/src/proxy.rs",
+  "crates/gateway/src/smart.rs",
+  "crates/gateway/src/circuit_breaker.rs",
+  "crates/gateway/src/control.rs",
+]
 defects = ["D81"]
 
 [[claim]]
@@ -209,7 +298,12 @@ layer = "hermetic"
 layer_note = "Reclassified from live/both on 2026-10-01: A real provider can't be made to 429 on demand without a fault proxy; the key walk is the gateway's decision and is proven against a mock that throttles one key."
 clients = ["openai-py", "anthropic-py", "raw"]
 failover_clients = []
-touches = ["crates/gateway/src/proxy.rs", "crates/gateway/src/smart.rs", "crates/gateway/src/circuit_breaker.rs", "crates/gateway/src/control.rs"]
+touches = [
+  "crates/gateway/src/proxy.rs",
+  "crates/gateway/src/smart.rs",
+  "crates/gateway/src/circuit_breaker.rs",
+  "crates/gateway/src/control.rs",
+]
 defects = []
 
 [[claim]]
@@ -221,7 +315,12 @@ oracle = "provider header over N calls matches the request"
 layer = "both"
 clients = ["raw", "openai-py"]
 failover_clients = []
-touches = ["crates/gateway/src/proxy.rs", "crates/gateway/src/smart.rs", "crates/gateway/src/circuit_breaker.rs", "crates/gateway/src/control.rs"]
+touches = [
+  "crates/gateway/src/proxy.rs",
+  "crates/gateway/src/smart.rs",
+  "crates/gateway/src/circuit_breaker.rs",
+  "crates/gateway/src/control.rs",
+]
 defects = []
 
 [[claim]]
@@ -233,7 +332,12 @@ oracle = "same provider every turn; cache_read rises"
 layer = "both"
 clients = ["anthropic-py", "claude-code", "pi", "raw"]
 failover_clients = []
-touches = ["crates/gateway/src/proxy.rs", "crates/gateway/src/smart.rs", "crates/gateway/src/circuit_breaker.rs", "crates/gateway/src/control.rs"]
+touches = [
+  "crates/gateway/src/proxy.rs",
+  "crates/gateway/src/smart.rs",
+  "crates/gateway/src/circuit_breaker.rs",
+  "crates/gateway/src/control.rs",
+]
 defects = []
 
 [[claim]]
@@ -245,7 +349,12 @@ oracle = "256 KiB conversation served; one row per request"
 layer = "both"
 clients = ["openai-py", "anthropic-py", "claude-code", "raw"]
 failover_clients = ["openai-py", "anthropic-py"]
-touches = ["crates/gateway/src/proxy.rs", "crates/gateway/src/smart.rs", "crates/gateway/src/circuit_breaker.rs", "crates/gateway/src/control.rs"]
+touches = [
+  "crates/gateway/src/proxy.rs",
+  "crates/gateway/src/smart.rs",
+  "crates/gateway/src/circuit_breaker.rs",
+  "crates/gateway/src/control.rs",
+]
 defects = ["D81", "D83"]
 
 [[claim]]
@@ -258,7 +367,12 @@ layer = "hermetic"
 layer_note = "Reclassified from live/both on 2026-10-01: Breaker state is internal and opened by forced failures; a live provider can't be broken on demand."
 clients = ["raw"]
 failover_clients = []
-touches = ["crates/gateway/src/proxy.rs", "crates/gateway/src/smart.rs", "crates/gateway/src/circuit_breaker.rs", "crates/gateway/src/control.rs"]
+touches = [
+  "crates/gateway/src/proxy.rs",
+  "crates/gateway/src/smart.rs",
+  "crates/gateway/src/circuit_breaker.rs",
+  "crates/gateway/src/control.rs",
+]
 defects = []
 
 [[claim]]
@@ -271,9 +385,13 @@ layer = "hermetic"
 layer_note = "Reclassified from live/both on 2026-10-01: The ranker reacts to measured latency, which a live provider can't make deterministic; proven with controlled mock delays."
 clients = ["raw"]
 failover_clients = []
-touches = ["crates/gateway/src/proxy.rs", "crates/gateway/src/smart.rs", "crates/gateway/src/circuit_breaker.rs", "crates/gateway/src/control.rs"]
+touches = [
+  "crates/gateway/src/proxy.rs",
+  "crates/gateway/src/smart.rs",
+  "crates/gateway/src/circuit_breaker.rs",
+  "crates/gateway/src/control.rs",
+]
 defects = ["D119"]
-
 
 # --- Billing -----------------------------------------------------------------------------------
 [[claim]]
@@ -283,9 +401,26 @@ group = "Billing"
 text = "Every managed call writes exactly one ai.usage row whose tokens match the client's"
 oracle = "the second witness on every cell, so this row lists all clients"
 layer = "both"
-clients = ["openai-py", "openai-node", "anthropic-py", "anthropic-ts", "ai-sdk", "langchain", "openai-agents", "claude-code", "codex", "opencode", "pi", "raw"]
+clients = [
+  "openai-py",
+  "openai-node",
+  "anthropic-py",
+  "anthropic-ts",
+  "ai-sdk",
+  "langchain",
+  "openai-agents",
+  "claude-code",
+  "codex",
+  "opencode",
+  "pi",
+  "raw",
+]
 failover_clients = []
-touches = ["crates/gateway/src/usage.rs", "crates/gateway/src/proxy.rs", "crates/gateway/src/peek.rs"]
+touches = [
+  "crates/gateway/src/usage.rs",
+  "crates/gateway/src/proxy.rs",
+  "crates/gateway/src/peek.rs",
+]
 defects = ["D126"]
 
 [[claim]]
@@ -297,7 +432,11 @@ oracle = "client aborts mid-stream; usage_estimated=true, output > 0"
 layer = "both"
 clients = ["raw", "openai-py", "claude-code"]
 failover_clients = []
-touches = ["crates/gateway/src/usage.rs", "crates/gateway/src/proxy.rs", "crates/gateway/src/peek.rs"]
+touches = [
+  "crates/gateway/src/usage.rs",
+  "crates/gateway/src/proxy.rs",
+  "crates/gateway/src/peek.rs",
+]
 defects = ["D123"]
 
 [[claim]]
@@ -309,7 +448,11 @@ oracle = "cached_tokens / cache_read equal on both sides"
 layer = "both"
 clients = ["anthropic-py", "openai-py", "claude-code", "pi"]
 failover_clients = []
-touches = ["crates/gateway/src/usage.rs", "crates/gateway/src/proxy.rs", "crates/gateway/src/peek.rs"]
+touches = [
+  "crates/gateway/src/usage.rs",
+  "crates/gateway/src/proxy.rs",
+  "crates/gateway/src/peek.rs",
+]
 defects = []
 
 [[claim]]
@@ -321,9 +464,12 @@ oracle = "no row for counts; compact row has tokens"
 layer = "both"
 clients = ["raw", "anthropic-py", "openai-py"]
 failover_clients = []
-touches = ["crates/gateway/src/usage.rs", "crates/gateway/src/proxy.rs", "crates/gateway/src/peek.rs"]
+touches = [
+  "crates/gateway/src/usage.rs",
+  "crates/gateway/src/proxy.rs",
+  "crates/gateway/src/peek.rs",
+]
 defects = []
-
 
 # --- Caching -----------------------------------------------------------------------------------
 [[claim]]
@@ -351,7 +497,6 @@ failover_clients = []
 touches = ["crates/gateway/src/cache.rs", "crates/gateway/src/proxy.rs"]
 defects = ["D120"]
 
-
 # --- Auth and limits ---------------------------------------------------------------------------
 [[claim]]
 id = "A1"
@@ -362,7 +507,14 @@ oracle = "bai key works; forged key 401; BYO bills nothing"
 layer = "both"
 clients = ["raw", "openai-py", "anthropic-py", "claude-code"]
 failover_clients = []
-touches = ["crates/gateway/src/key.rs", "crates/gateway/src/proxy.rs", "crates/gateway/src/ratelimit.rs", "crates/gateway/src/concurrency.rs", "crates/gateway/src/deny.rs", "crates/gateway/src/allowance.rs"]
+touches = [
+  "crates/gateway/src/key.rs",
+  "crates/gateway/src/proxy.rs",
+  "crates/gateway/src/ratelimit.rs",
+  "crates/gateway/src/concurrency.rs",
+  "crates/gateway/src/deny.rs",
+  "crates/gateway/src/allowance.rs",
+]
 defects = []
 
 [[claim]]
@@ -375,7 +527,14 @@ layer = "hermetic"
 layer_note = "Reclassified from live/both on 2026-10-01: Deny and allowance refuse before any upstream call."
 clients = ["raw", "openai-py", "anthropic-py"]
 failover_clients = []
-touches = ["crates/gateway/src/key.rs", "crates/gateway/src/proxy.rs", "crates/gateway/src/ratelimit.rs", "crates/gateway/src/concurrency.rs", "crates/gateway/src/deny.rs", "crates/gateway/src/allowance.rs"]
+touches = [
+  "crates/gateway/src/key.rs",
+  "crates/gateway/src/proxy.rs",
+  "crates/gateway/src/ratelimit.rs",
+  "crates/gateway/src/concurrency.rs",
+  "crates/gateway/src/deny.rs",
+  "crates/gateway/src/allowance.rs",
+]
 defects = []
 
 [[claim]]
@@ -388,7 +547,14 @@ layer = "hermetic"
 layer_note = "Reclassified from live/both on 2026-10-01: Rate limits and the tenant cap refuse before any upstream call."
 clients = ["raw"]
 failover_clients = []
-touches = ["crates/gateway/src/key.rs", "crates/gateway/src/proxy.rs", "crates/gateway/src/ratelimit.rs", "crates/gateway/src/concurrency.rs", "crates/gateway/src/deny.rs", "crates/gateway/src/allowance.rs"]
+touches = [
+  "crates/gateway/src/key.rs",
+  "crates/gateway/src/proxy.rs",
+  "crates/gateway/src/ratelimit.rs",
+  "crates/gateway/src/concurrency.rs",
+  "crates/gateway/src/deny.rs",
+  "crates/gateway/src/allowance.rs",
+]
 defects = []
 
 [[claim]]
@@ -401,9 +567,15 @@ layer = "hermetic"
 layer_note = "Reclassified from live/both on 2026-10-01: The size cap refuses before any upstream call."
 clients = ["raw"]
 failover_clients = []
-touches = ["crates/gateway/src/key.rs", "crates/gateway/src/proxy.rs", "crates/gateway/src/ratelimit.rs", "crates/gateway/src/concurrency.rs", "crates/gateway/src/deny.rs", "crates/gateway/src/allowance.rs"]
+touches = [
+  "crates/gateway/src/key.rs",
+  "crates/gateway/src/proxy.rs",
+  "crates/gateway/src/ratelimit.rs",
+  "crates/gateway/src/concurrency.rs",
+  "crates/gateway/src/deny.rs",
+  "crates/gateway/src/allowance.rs",
+]
 defects = []
-
 
 # --- Embeddings and streaming ------------------------------------------------------------------
 [[claim]]
@@ -427,7 +599,11 @@ oracle = "TTFT via gateway within budget of direct"
 layer = "both"
 clients = ["openai-py", "anthropic-py", "claude-code", "raw"]
 failover_clients = []
-touches = ["crates/gateway/src/proxy.rs", "crates/gateway/src/translate.rs", "crates/gateway/src/main.rs"]
+touches = [
+  "crates/gateway/src/proxy.rs",
+  "crates/gateway/src/translate.rs",
+  "crates/gateway/src/main.rs",
+]
 defects = ["D92"]
 
 [[claim]]
@@ -439,7 +615,11 @@ oracle = "final message role = assistant; next turn accepted"
 layer = "both"
 clients = ["openai-py", "openai-node", "ai-sdk", "opencode"]
 failover_clients = []
-touches = ["crates/gateway/src/proxy.rs", "crates/gateway/src/translate.rs", "crates/gateway/src/main.rs"]
+touches = [
+  "crates/gateway/src/proxy.rs",
+  "crates/gateway/src/translate.rs",
+  "crates/gateway/src/main.rs",
+]
 defects = ["D124"]
 
 [[claim]]
@@ -452,9 +632,12 @@ layer = "hermetic"
 layer_note = "Reclassified from live/both on 2026-10-01: SIGTERM drain is a gateway process property."
 clients = ["raw"]
 failover_clients = []
-touches = ["crates/gateway/src/proxy.rs", "crates/gateway/src/translate.rs", "crates/gateway/src/main.rs"]
+touches = [
+  "crates/gateway/src/proxy.rs",
+  "crates/gateway/src/translate.rs",
+  "crates/gateway/src/main.rs",
+]
 defects = []
-
 
 # --- Observability -----------------------------------------------------------------------------
 [[claim]]
@@ -467,7 +650,12 @@ layer = "hermetic"
 layer_note = "Reclassified from live/both on 2026-10-01: The request id is minted by the gateway on every response, including rejects with no upstream."
 clients = ["raw"]
 failover_clients = []
-touches = ["crates/gateway/src/proxy.rs", "crates/gateway/src/capture.rs", "crates/gateway/src/admin.rs", "crates/gateway/src/doctor.rs"]
+touches = [
+  "crates/gateway/src/proxy.rs",
+  "crates/gateway/src/capture.rs",
+  "crates/gateway/src/admin.rs",
+  "crates/gateway/src/doctor.rs",
+]
 defects = []
 
 [[claim]]
@@ -480,7 +668,12 @@ layer = "hermetic"
 layer_note = "Reclassified from live/both on 2026-10-01: Metadata and capture are written by the gateway; the relay-byte invariant is proven against a mock."
 clients = ["raw"]
 failover_clients = []
-touches = ["crates/gateway/src/proxy.rs", "crates/gateway/src/capture.rs", "crates/gateway/src/admin.rs", "crates/gateway/src/doctor.rs"]
+touches = [
+  "crates/gateway/src/proxy.rs",
+  "crates/gateway/src/capture.rs",
+  "crates/gateway/src/admin.rs",
+  "crates/gateway/src/doctor.rs",
+]
 defects = []
 
 [[claim]]
@@ -493,9 +686,13 @@ layer = "hermetic"
 layer_note = "Reclassified from live/both on 2026-10-01: doctor, /livez, /readyz and /metrics are gateway endpoints."
 clients = ["raw"]
 failover_clients = []
-touches = ["crates/gateway/src/proxy.rs", "crates/gateway/src/capture.rs", "crates/gateway/src/admin.rs", "crates/gateway/src/doctor.rs"]
+touches = [
+  "crates/gateway/src/proxy.rs",
+  "crates/gateway/src/capture.rs",
+  "crates/gateway/src/admin.rs",
+  "crates/gateway/src/doctor.rs",
+]
 defects = []
-
 
 # --- Real agents doing real work ---------------------------------------------------------------
 [[claim]]
@@ -570,7 +767,6 @@ failover_clients = []
 touches = ["crates/gateway/src/", "crates/providers/src/"]
 defects = []
 
-
 # --- Security and isolation --------------------------------------------------------------------
 [[claim]]
 id = "SEC-1"
@@ -579,7 +775,14 @@ group = "Security and isolation"
 text = "Managed /{provider} reaches only allowlisted generation endpoints, with POST only"
 layer = "hermetic"
 layer_note = "Reclassified from live/both on 2026-10-01: Refused managed endpoints never reach a provider by design; zero upstream hits is the proof."
-touches = ["crates/gateway/src/proxy.rs", "crates/gateway/src/key.rs", "crates/gateway/src/route.rs", "crates/gateway/src/cache.rs", "crates/gateway/src/control.rs", "crates/gateway/src/secret.rs"]
+touches = [
+  "crates/gateway/src/proxy.rs",
+  "crates/gateway/src/key.rs",
+  "crates/gateway/src/route.rs",
+  "crates/gateway/src/cache.rs",
+  "crates/gateway/src/control.rs",
+  "crates/gateway/src/secret.rs",
+]
 defects = ["D01"]
 
 [[claim]]
@@ -589,7 +792,14 @@ group = "Security and isolation"
 text = "Catalog paths are POST-only (GET/HEAD /v1/models excepted)"
 layer = "hermetic"
 layer_note = "Reclassified from live/both on 2026-10-01: Refused methods never reach a provider by design; zero upstream hits is the proof."
-touches = ["crates/gateway/src/proxy.rs", "crates/gateway/src/key.rs", "crates/gateway/src/route.rs", "crates/gateway/src/cache.rs", "crates/gateway/src/control.rs", "crates/gateway/src/secret.rs"]
+touches = [
+  "crates/gateway/src/proxy.rs",
+  "crates/gateway/src/key.rs",
+  "crates/gateway/src/route.rs",
+  "crates/gateway/src/cache.rs",
+  "crates/gateway/src/control.rs",
+  "crates/gateway/src/secret.rs",
+]
 defects = ["D02"]
 
 [[claim]]
@@ -598,7 +808,14 @@ priority = "P0"
 group = "Security and isolation"
 text = "No credential in a query string reaches the upstream"
 layer = "hermetic"
-touches = ["crates/gateway/src/proxy.rs", "crates/gateway/src/key.rs", "crates/gateway/src/route.rs", "crates/gateway/src/cache.rs", "crates/gateway/src/control.rs", "crates/gateway/src/secret.rs"]
+touches = [
+  "crates/gateway/src/proxy.rs",
+  "crates/gateway/src/key.rs",
+  "crates/gateway/src/route.rs",
+  "crates/gateway/src/cache.rs",
+  "crates/gateway/src/control.rs",
+  "crates/gateway/src/secret.rs",
+]
 defects = ["D03", "D65"]
 
 [[claim]]
@@ -607,7 +824,14 @@ priority = "P0"
 group = "Security and isolation"
 text = "No virtual, pool or BYO key ever appears in any log line, including proxy failures and panics"
 layer = "hermetic"
-touches = ["crates/gateway/src/proxy.rs", "crates/gateway/src/key.rs", "crates/gateway/src/route.rs", "crates/gateway/src/cache.rs", "crates/gateway/src/control.rs", "crates/gateway/src/secret.rs"]
+touches = [
+  "crates/gateway/src/proxy.rs",
+  "crates/gateway/src/key.rs",
+  "crates/gateway/src/route.rs",
+  "crates/gateway/src/cache.rs",
+  "crates/gateway/src/control.rs",
+  "crates/gateway/src/secret.rs",
+]
 defects = ["D03"]
 
 [[claim]]
@@ -616,7 +840,14 @@ priority = "P0"
 group = "Security and isolation"
 text = "Every credential location is stripped on managed requests; exactly one pool key goes out, in the provider's own scheme"
 layer = "hermetic"
-touches = ["crates/gateway/src/proxy.rs", "crates/gateway/src/key.rs", "crates/gateway/src/route.rs", "crates/gateway/src/cache.rs", "crates/gateway/src/control.rs", "crates/gateway/src/secret.rs"]
+touches = [
+  "crates/gateway/src/proxy.rs",
+  "crates/gateway/src/key.rs",
+  "crates/gateway/src/route.rs",
+  "crates/gateway/src/cache.rs",
+  "crates/gateway/src/control.rs",
+  "crates/gateway/src/secret.rs",
+]
 defects = []
 
 [[claim]]
@@ -625,7 +856,14 @@ priority = "P0"
 group = "Security and isolation"
 text = "Only allowlisted client headers reach the upstream on the pool key"
 layer = "hermetic"
-touches = ["crates/gateway/src/proxy.rs", "crates/gateway/src/key.rs", "crates/gateway/src/route.rs", "crates/gateway/src/cache.rs", "crates/gateway/src/control.rs", "crates/gateway/src/secret.rs"]
+touches = [
+  "crates/gateway/src/proxy.rs",
+  "crates/gateway/src/key.rs",
+  "crates/gateway/src/route.rs",
+  "crates/gateway/src/cache.rs",
+  "crates/gateway/src/control.rs",
+  "crates/gateway/src/secret.rs",
+]
 defects = ["D04"]
 
 [[claim]]
@@ -634,7 +872,14 @@ priority = "P0"
 group = "Security and isolation"
 text = "Pool keys never reach the client in any body, header or error"
 layer = "both"
-touches = ["crates/gateway/src/proxy.rs", "crates/gateway/src/key.rs", "crates/gateway/src/route.rs", "crates/gateway/src/cache.rs", "crates/gateway/src/control.rs", "crates/gateway/src/secret.rs"]
+touches = [
+  "crates/gateway/src/proxy.rs",
+  "crates/gateway/src/key.rs",
+  "crates/gateway/src/route.rs",
+  "crates/gateway/src/cache.rs",
+  "crates/gateway/src/control.rs",
+  "crates/gateway/src/secret.rs",
+]
 defects = ["D66"]
 
 [[claim]]
@@ -643,7 +888,14 @@ priority = "P1"
 group = "Security and isolation"
 text = "Upstream response headers are filtered, and x-beyond-* can't be spoofed"
 layer = "hermetic"
-touches = ["crates/gateway/src/proxy.rs", "crates/gateway/src/key.rs", "crates/gateway/src/route.rs", "crates/gateway/src/cache.rs", "crates/gateway/src/control.rs", "crates/gateway/src/secret.rs"]
+touches = [
+  "crates/gateway/src/proxy.rs",
+  "crates/gateway/src/key.rs",
+  "crates/gateway/src/route.rs",
+  "crates/gateway/src/cache.rs",
+  "crates/gateway/src/control.rs",
+  "crates/gateway/src/secret.rs",
+]
 defects = ["D53"]
 
 [[claim]]
@@ -652,7 +904,14 @@ priority = "P1"
 group = "Security and isolation"
 text = "Client x-beyond-* headers are stripped upstream on every route"
 layer = "hermetic"
-touches = ["crates/gateway/src/proxy.rs", "crates/gateway/src/key.rs", "crates/gateway/src/route.rs", "crates/gateway/src/cache.rs", "crates/gateway/src/control.rs", "crates/gateway/src/secret.rs"]
+touches = [
+  "crates/gateway/src/proxy.rs",
+  "crates/gateway/src/key.rs",
+  "crates/gateway/src/route.rs",
+  "crates/gateway/src/cache.rs",
+  "crates/gateway/src/control.rs",
+  "crates/gateway/src/secret.rs",
+]
 defects = ["D67"]
 
 [[claim]]
@@ -661,7 +920,14 @@ priority = "P0"
 group = "Security and isolation"
 text = "BYO can't use pool keys, walks, cache, capture or control headers"
 layer = "hermetic"
-touches = ["crates/gateway/src/proxy.rs", "crates/gateway/src/key.rs", "crates/gateway/src/route.rs", "crates/gateway/src/cache.rs", "crates/gateway/src/control.rs", "crates/gateway/src/secret.rs"]
+touches = [
+  "crates/gateway/src/proxy.rs",
+  "crates/gateway/src/key.rs",
+  "crates/gateway/src/route.rs",
+  "crates/gateway/src/cache.rs",
+  "crates/gateway/src/control.rs",
+  "crates/gateway/src/secret.rs",
+]
 defects = []
 
 [[claim]]
@@ -670,7 +936,14 @@ priority = "P0"
 group = "Security and isolation"
 text = "Mixed or malformed credentials never leak a virtual key, and a BYO Anthropic key never goes to OpenAI"
 layer = "hermetic"
-touches = ["crates/gateway/src/proxy.rs", "crates/gateway/src/key.rs", "crates/gateway/src/route.rs", "crates/gateway/src/cache.rs", "crates/gateway/src/control.rs", "crates/gateway/src/secret.rs"]
+touches = [
+  "crates/gateway/src/proxy.rs",
+  "crates/gateway/src/key.rs",
+  "crates/gateway/src/route.rs",
+  "crates/gateway/src/cache.rs",
+  "crates/gateway/src/control.rs",
+  "crates/gateway/src/secret.rs",
+]
 defects = ["D29", "D30", "D65", "D82"]
 
 [[claim]]
@@ -679,7 +952,14 @@ priority = "P1"
 group = "Security and isolation"
 text = "Only canonical key encodings verify, and the rate limit is keyed on identity"
 layer = "hermetic"
-touches = ["crates/gateway/src/proxy.rs", "crates/gateway/src/key.rs", "crates/gateway/src/route.rs", "crates/gateway/src/cache.rs", "crates/gateway/src/control.rs", "crates/gateway/src/secret.rs"]
+touches = [
+  "crates/gateway/src/proxy.rs",
+  "crates/gateway/src/key.rs",
+  "crates/gateway/src/route.rs",
+  "crates/gateway/src/cache.rs",
+  "crates/gateway/src/control.rs",
+  "crates/gateway/src/secret.rs",
+]
 defects = ["D28"]
 
 [[claim]]
@@ -688,7 +968,14 @@ priority = "P1"
 group = "Security and isolation"
 text = "Every forged key gets the same byte-identical 401 with no upstream call"
 layer = "hermetic"
-touches = ["crates/gateway/src/proxy.rs", "crates/gateway/src/key.rs", "crates/gateway/src/route.rs", "crates/gateway/src/cache.rs", "crates/gateway/src/control.rs", "crates/gateway/src/secret.rs"]
+touches = [
+  "crates/gateway/src/proxy.rs",
+  "crates/gateway/src/key.rs",
+  "crates/gateway/src/route.rs",
+  "crates/gateway/src/cache.rs",
+  "crates/gateway/src/control.rs",
+  "crates/gateway/src/secret.rs",
+]
 defects = []
 
 [[claim]]
@@ -697,7 +984,14 @@ priority = "P0"
 group = "Security and isolation"
 text = "The response cache is isolated by tenant, row, method and beta headers"
 layer = "hermetic"
-touches = ["crates/gateway/src/proxy.rs", "crates/gateway/src/key.rs", "crates/gateway/src/route.rs", "crates/gateway/src/cache.rs", "crates/gateway/src/control.rs", "crates/gateway/src/secret.rs"]
+touches = [
+  "crates/gateway/src/proxy.rs",
+  "crates/gateway/src/key.rs",
+  "crates/gateway/src/route.rs",
+  "crates/gateway/src/cache.rs",
+  "crates/gateway/src/control.rs",
+  "crates/gateway/src/secret.rs",
+]
 defects = ["D31"]
 
 [[claim]]
@@ -706,7 +1000,14 @@ priority = "P1"
 group = "Security and isolation"
 text = "Pins, ranker and limiter state can't be steered across tenants"
 layer = "hermetic"
-touches = ["crates/gateway/src/proxy.rs", "crates/gateway/src/key.rs", "crates/gateway/src/route.rs", "crates/gateway/src/cache.rs", "crates/gateway/src/control.rs", "crates/gateway/src/secret.rs"]
+touches = [
+  "crates/gateway/src/proxy.rs",
+  "crates/gateway/src/key.rs",
+  "crates/gateway/src/route.rs",
+  "crates/gateway/src/cache.rs",
+  "crates/gateway/src/control.rs",
+  "crates/gateway/src/secret.rs",
+]
 defects = ["D58", "D84"]
 
 [[claim]]
@@ -715,7 +1016,14 @@ priority = "P1"
 group = "Security and isolation"
 text = "Client-caused failures don't trip the shared breaker"
 layer = "hermetic"
-touches = ["crates/gateway/src/proxy.rs", "crates/gateway/src/key.rs", "crates/gateway/src/route.rs", "crates/gateway/src/cache.rs", "crates/gateway/src/control.rs", "crates/gateway/src/secret.rs"]
+touches = [
+  "crates/gateway/src/proxy.rs",
+  "crates/gateway/src/key.rs",
+  "crates/gateway/src/route.rs",
+  "crates/gateway/src/cache.rs",
+  "crates/gateway/src/control.rs",
+  "crates/gateway/src/secret.rs",
+]
 defects = ["D32", "D86"]
 
 [[claim]]
@@ -724,7 +1032,14 @@ priority = "P1"
 group = "Security and isolation"
 text = "A deny-set revocation applies within a stated bound, with a pinned policy for in-flight streams"
 layer = "hermetic"
-touches = ["crates/gateway/src/proxy.rs", "crates/gateway/src/key.rs", "crates/gateway/src/route.rs", "crates/gateway/src/cache.rs", "crates/gateway/src/control.rs", "crates/gateway/src/secret.rs"]
+touches = [
+  "crates/gateway/src/proxy.rs",
+  "crates/gateway/src/key.rs",
+  "crates/gateway/src/route.rs",
+  "crates/gateway/src/cache.rs",
+  "crates/gateway/src/control.rs",
+  "crates/gateway/src/secret.rs",
+]
 defects = ["D121"]
 
 [[claim]]
@@ -733,7 +1048,14 @@ priority = "P1"
 group = "Security and isolation"
 text = "Request smuggling and bad framing are rejected"
 layer = "hermetic"
-touches = ["crates/gateway/src/proxy.rs", "crates/gateway/src/key.rs", "crates/gateway/src/route.rs", "crates/gateway/src/cache.rs", "crates/gateway/src/control.rs", "crates/gateway/src/secret.rs"]
+touches = [
+  "crates/gateway/src/proxy.rs",
+  "crates/gateway/src/key.rs",
+  "crates/gateway/src/route.rs",
+  "crates/gateway/src/cache.rs",
+  "crates/gateway/src/control.rs",
+  "crates/gateway/src/secret.rs",
+]
 defects = []
 
 [[claim]]
@@ -742,7 +1064,14 @@ priority = "P1"
 group = "Security and isolation"
 text = "Header, path, JSON-depth and body-memory bounds hold"
 layer = "hermetic"
-touches = ["crates/gateway/src/proxy.rs", "crates/gateway/src/key.rs", "crates/gateway/src/route.rs", "crates/gateway/src/cache.rs", "crates/gateway/src/control.rs", "crates/gateway/src/secret.rs"]
+touches = [
+  "crates/gateway/src/proxy.rs",
+  "crates/gateway/src/key.rs",
+  "crates/gateway/src/route.rs",
+  "crates/gateway/src/cache.rs",
+  "crates/gateway/src/control.rs",
+  "crates/gateway/src/secret.rs",
+]
 defects = ["D35"]
 
 [[claim]]
@@ -751,7 +1080,14 @@ priority = "P0"
 group = "Security and isolation"
 text = "WebSocket upgrades are rejected or metered"
 layer = "hermetic"
-touches = ["crates/gateway/src/proxy.rs", "crates/gateway/src/key.rs", "crates/gateway/src/route.rs", "crates/gateway/src/cache.rs", "crates/gateway/src/control.rs", "crates/gateway/src/secret.rs"]
+touches = [
+  "crates/gateway/src/proxy.rs",
+  "crates/gateway/src/key.rs",
+  "crates/gateway/src/route.rs",
+  "crates/gateway/src/cache.rs",
+  "crates/gateway/src/control.rs",
+  "crates/gateway/src/secret.rs",
+]
 defects = ["D33"]
 
 [[claim]]
@@ -760,7 +1096,14 @@ priority = "P1"
 group = "Security and isolation"
 text = "Duplicate model keys can't escape the row"
 layer = "hermetic"
-touches = ["crates/gateway/src/proxy.rs", "crates/gateway/src/key.rs", "crates/gateway/src/route.rs", "crates/gateway/src/cache.rs", "crates/gateway/src/control.rs", "crates/gateway/src/secret.rs"]
+touches = [
+  "crates/gateway/src/proxy.rs",
+  "crates/gateway/src/key.rs",
+  "crates/gateway/src/route.rs",
+  "crates/gateway/src/cache.rs",
+  "crates/gateway/src/control.rs",
+  "crates/gateway/src/secret.rs",
+]
 defects = ["D34", "D94"]
 
 [[claim]]
@@ -769,7 +1112,14 @@ priority = "P1"
 group = "Security and isolation"
 text = "Upstream TLS is verified and fails closed; cleartext pool keys are refused at boot"
 layer = "hermetic"
-touches = ["crates/gateway/src/proxy.rs", "crates/gateway/src/key.rs", "crates/gateway/src/route.rs", "crates/gateway/src/cache.rs", "crates/gateway/src/control.rs", "crates/gateway/src/secret.rs"]
+touches = [
+  "crates/gateway/src/proxy.rs",
+  "crates/gateway/src/key.rs",
+  "crates/gateway/src/route.rs",
+  "crates/gateway/src/cache.rs",
+  "crates/gateway/src/control.rs",
+  "crates/gateway/src/secret.rs",
+]
 defects = ["D53"]
 
 [[claim]]
@@ -778,7 +1128,14 @@ priority = "P2"
 group = "Security and isolation"
 text = "Admin endpoints are absent from the client listener, and metrics carry no tenant data"
 layer = "hermetic"
-touches = ["crates/gateway/src/proxy.rs", "crates/gateway/src/key.rs", "crates/gateway/src/route.rs", "crates/gateway/src/cache.rs", "crates/gateway/src/control.rs", "crates/gateway/src/secret.rs"]
+touches = [
+  "crates/gateway/src/proxy.rs",
+  "crates/gateway/src/key.rs",
+  "crates/gateway/src/route.rs",
+  "crates/gateway/src/cache.rs",
+  "crates/gateway/src/control.rs",
+  "crates/gateway/src/secret.rs",
+]
 defects = []
 
 [[claim]]
@@ -787,9 +1144,15 @@ priority = "P2"
 group = "Security and isolation"
 text = "Capture can't be forced to crowd out or switch off operator capture"
 layer = "hermetic"
-touches = ["crates/gateway/src/proxy.rs", "crates/gateway/src/key.rs", "crates/gateway/src/route.rs", "crates/gateway/src/cache.rs", "crates/gateway/src/control.rs", "crates/gateway/src/secret.rs"]
+touches = [
+  "crates/gateway/src/proxy.rs",
+  "crates/gateway/src/key.rs",
+  "crates/gateway/src/route.rs",
+  "crates/gateway/src/cache.rs",
+  "crates/gateway/src/control.rs",
+  "crates/gateway/src/secret.rs",
+]
 defects = []
-
 
 # --- Billing integrity -------------------------------------------------------------------------
 [[claim]]
@@ -798,7 +1161,12 @@ priority = "P0"
 group = "Billing integrity"
 text = "Usage is parsed by the serving path's wire on every route, including /{provider}"
 layer = "both"
-touches = ["crates/gateway/src/usage.rs", "crates/gateway/src/proxy.rs", "crates/gateway/src/peek.rs", "crates/gateway/src/main.rs"]
+touches = [
+  "crates/gateway/src/usage.rs",
+  "crates/gateway/src/proxy.rs",
+  "crates/gateway/src/peek.rs",
+  "crates/gateway/src/main.rs",
+]
 defects = ["D05"]
 
 [[claim]]
@@ -807,7 +1175,12 @@ priority = "P0"
 group = "Billing integrity"
 text = "Clients can't opt out of exact metering"
 layer = "both"
-touches = ["crates/gateway/src/usage.rs", "crates/gateway/src/proxy.rs", "crates/gateway/src/peek.rs", "crates/gateway/src/main.rs"]
+touches = [
+  "crates/gateway/src/usage.rs",
+  "crates/gateway/src/proxy.rs",
+  "crates/gateway/src/peek.rs",
+  "crates/gateway/src/main.rs",
+]
 defects = ["D06", "D88"]
 
 [[claim]]
@@ -816,7 +1189,12 @@ priority = "P0"
 group = "Billing integrity"
 text = "A cancel at any phase after the upstream accepts is billed (exact or estimate), stream or not"
 layer = "both"
-touches = ["crates/gateway/src/usage.rs", "crates/gateway/src/proxy.rs", "crates/gateway/src/peek.rs", "crates/gateway/src/main.rs"]
+touches = [
+  "crates/gateway/src/usage.rs",
+  "crates/gateway/src/proxy.rs",
+  "crates/gateway/src/peek.rs",
+  "crates/gateway/src/main.rs",
+]
 defects = ["D07", "D123", "D130"]
 
 [[claim]]
@@ -825,7 +1203,12 @@ priority = "P0"
 group = "Billing integrity"
 text = "Billing rows are never lost to log level or write errors"
 layer = "hermetic"
-touches = ["crates/gateway/src/usage.rs", "crates/gateway/src/proxy.rs", "crates/gateway/src/peek.rs", "crates/gateway/src/main.rs"]
+touches = [
+  "crates/gateway/src/usage.rs",
+  "crates/gateway/src/proxy.rs",
+  "crates/gateway/src/peek.rs",
+  "crates/gateway/src/main.rs",
+]
 defects = ["D08", "D87", "D93"]
 
 [[claim]]
@@ -834,7 +1217,12 @@ priority = "P0"
 group = "Billing integrity"
 text = "Rows reconcile with each provider's usage API, per key per hour, within tolerance"
 layer = "live"
-touches = ["crates/gateway/src/usage.rs", "crates/gateway/src/proxy.rs", "crates/gateway/src/peek.rs", "crates/gateway/src/main.rs"]
+touches = [
+  "crates/gateway/src/usage.rs",
+  "crates/gateway/src/proxy.rs",
+  "crates/gateway/src/peek.rs",
+  "crates/gateway/src/main.rs",
+]
 defects = []
 
 [[claim]]
@@ -843,7 +1231,12 @@ priority = "P0"
 group = "Billing integrity"
 text = "Row tokens equal the tokens the client was shown, after normalization, for every translation pair"
 layer = "both"
-touches = ["crates/gateway/src/usage.rs", "crates/gateway/src/proxy.rs", "crates/gateway/src/peek.rs", "crates/gateway/src/main.rs"]
+touches = [
+  "crates/gateway/src/usage.rs",
+  "crates/gateway/src/proxy.rs",
+  "crates/gateway/src/peek.rs",
+  "crates/gateway/src/main.rs",
+]
 defects = ["D56", "D64"]
 
 [[claim]]
@@ -852,7 +1245,12 @@ priority = "P0"
 group = "Billing integrity"
 text = "input_tokens has one meaning on every row, or the row carries its wire"
 layer = "both"
-touches = ["crates/gateway/src/usage.rs", "crates/gateway/src/proxy.rs", "crates/gateway/src/peek.rs", "crates/gateway/src/main.rs"]
+touches = [
+  "crates/gateway/src/usage.rs",
+  "crates/gateway/src/proxy.rs",
+  "crates/gateway/src/peek.rs",
+  "crates/gateway/src/main.rs",
+]
 defects = ["D25"]
 
 [[claim]]
@@ -861,7 +1259,12 @@ priority = "P0"
 group = "Billing integrity"
 text = "Cache reads and writes are metered on every provider's usage shape"
 layer = "both"
-touches = ["crates/gateway/src/usage.rs", "crates/gateway/src/proxy.rs", "crates/gateway/src/peek.rs", "crates/gateway/src/main.rs"]
+touches = [
+  "crates/gateway/src/usage.rs",
+  "crates/gateway/src/proxy.rs",
+  "crates/gateway/src/peek.rs",
+  "crates/gateway/src/main.rs",
+]
 defects = ["D21", "D22"]
 
 [[claim]]
@@ -870,7 +1273,12 @@ priority = "P0"
 group = "Billing integrity"
 text = "Reasoning tokens are counted exactly once on every provider"
 layer = "live"
-touches = ["crates/gateway/src/usage.rs", "crates/gateway/src/proxy.rs", "crates/gateway/src/peek.rs", "crates/gateway/src/main.rs"]
+touches = [
+  "crates/gateway/src/usage.rs",
+  "crates/gateway/src/proxy.rs",
+  "crates/gateway/src/peek.rs",
+  "crates/gateway/src/main.rs",
+]
 defects = ["D23", "D64"]
 
 [[claim]]
@@ -879,7 +1287,12 @@ priority = "P1"
 group = "Billing integrity"
 text = "Server-side tool charges are metered or blocked"
 layer = "live"
-touches = ["crates/gateway/src/usage.rs", "crates/gateway/src/proxy.rs", "crates/gateway/src/peek.rs", "crates/gateway/src/main.rs"]
+touches = [
+  "crates/gateway/src/usage.rs",
+  "crates/gateway/src/proxy.rs",
+  "crates/gateway/src/peek.rs",
+  "crates/gateway/src/main.rs",
+]
 defects = ["D24"]
 
 [[claim]]
@@ -888,7 +1301,12 @@ priority = "P1"
 group = "Billing integrity"
 text = "Priced variants are recorded: 1h cache writes, service_tier, long context"
 layer = "both"
-touches = ["crates/gateway/src/usage.rs", "crates/gateway/src/proxy.rs", "crates/gateway/src/peek.rs", "crates/gateway/src/main.rs"]
+touches = [
+  "crates/gateway/src/usage.rs",
+  "crates/gateway/src/proxy.rs",
+  "crates/gateway/src/peek.rs",
+  "crates/gateway/src/main.rs",
+]
 defects = ["D24"]
 
 [[claim]]
@@ -897,7 +1315,12 @@ priority = "P1"
 group = "Billing integrity"
 text = "Zero-cost endings are distinguishable, with no fabricated provider"
 layer = "hermetic"
-touches = ["crates/gateway/src/usage.rs", "crates/gateway/src/proxy.rs", "crates/gateway/src/peek.rs", "crates/gateway/src/main.rs"]
+touches = [
+  "crates/gateway/src/usage.rs",
+  "crates/gateway/src/proxy.rs",
+  "crates/gateway/src/peek.rs",
+  "crates/gateway/src/main.rs",
+]
 defects = ["D26", "D56", "D122"]
 
 [[claim]]
@@ -906,7 +1329,12 @@ priority = "P1"
 group = "Billing integrity"
 text = "Every row's price key resolves, and the billed model is the echoed snapshot on every wire"
 layer = "both"
-touches = ["crates/gateway/src/usage.rs", "crates/gateway/src/proxy.rs", "crates/gateway/src/peek.rs", "crates/gateway/src/main.rs"]
+touches = [
+  "crates/gateway/src/usage.rs",
+  "crates/gateway/src/proxy.rs",
+  "crates/gateway/src/peek.rs",
+  "crates/gateway/src/main.rs",
+]
 defects = ["D27"]
 
 [[claim]]
@@ -915,7 +1343,12 @@ priority = "P0"
 group = "Billing integrity"
 text = "Retries never hide spend"
 layer = "hermetic"
-touches = ["crates/gateway/src/usage.rs", "crates/gateway/src/proxy.rs", "crates/gateway/src/peek.rs", "crates/gateway/src/main.rs"]
+touches = [
+  "crates/gateway/src/usage.rs",
+  "crates/gateway/src/proxy.rs",
+  "crates/gateway/src/peek.rs",
+  "crates/gateway/src/main.rs",
+]
 defects = ["D09", "D130"]
 
 [[claim]]
@@ -924,7 +1357,12 @@ priority = "P0"
 group = "Billing integrity"
 text = "The size of the final usage event never degrades billing"
 layer = "hermetic"
-touches = ["crates/gateway/src/usage.rs", "crates/gateway/src/proxy.rs", "crates/gateway/src/peek.rs", "crates/gateway/src/main.rs"]
+touches = [
+  "crates/gateway/src/usage.rs",
+  "crates/gateway/src/proxy.rs",
+  "crates/gateway/src/peek.rs",
+  "crates/gateway/src/main.rs",
+]
 defects = ["D20", "D56"]
 
 [[claim]]
@@ -933,7 +1371,12 @@ priority = "P1"
 group = "Billing integrity"
 text = "Compressed responses never bill zero"
 layer = "hermetic"
-touches = ["crates/gateway/src/usage.rs", "crates/gateway/src/proxy.rs", "crates/gateway/src/peek.rs", "crates/gateway/src/main.rs"]
+touches = [
+  "crates/gateway/src/usage.rs",
+  "crates/gateway/src/proxy.rs",
+  "crates/gateway/src/peek.rs",
+  "crates/gateway/src/main.rs",
+]
 defects = []
 
 [[claim]]
@@ -942,7 +1385,12 @@ priority = "P1"
 group = "Billing integrity"
 text = "Cache-hit rows have defined, tested semantics"
 layer = "hermetic"
-touches = ["crates/gateway/src/usage.rs", "crates/gateway/src/proxy.rs", "crates/gateway/src/peek.rs", "crates/gateway/src/main.rs"]
+touches = [
+  "crates/gateway/src/usage.rs",
+  "crates/gateway/src/proxy.rs",
+  "crates/gateway/src/peek.rs",
+  "crates/gateway/src/main.rs",
+]
 defects = []
 
 [[claim]]
@@ -951,7 +1399,12 @@ priority = "P1"
 group = "Billing integrity"
 text = "Free sub-resources write no row on any route"
 layer = "hermetic"
-touches = ["crates/gateway/src/usage.rs", "crates/gateway/src/proxy.rs", "crates/gateway/src/peek.rs", "crates/gateway/src/main.rs"]
+touches = [
+  "crates/gateway/src/usage.rs",
+  "crates/gateway/src/proxy.rs",
+  "crates/gateway/src/peek.rs",
+  "crates/gateway/src/main.rs",
+]
 defects = ["D69"]
 
 [[claim]]
@@ -960,7 +1413,12 @@ priority = "P0"
 group = "Billing integrity"
 text = "request_id is a safe dedupe key, with one row per billed call"
 layer = "hermetic"
-touches = ["crates/gateway/src/usage.rs", "crates/gateway/src/proxy.rs", "crates/gateway/src/peek.rs", "crates/gateway/src/main.rs"]
+touches = [
+  "crates/gateway/src/usage.rs",
+  "crates/gateway/src/proxy.rs",
+  "crates/gateway/src/peek.rs",
+  "crates/gateway/src/main.rs",
+]
 defects = []
 
 [[claim]]
@@ -969,7 +1427,12 @@ priority = "P1"
 group = "Billing integrity"
 text = "Estimates never exceed provider truth and are non-zero once the upstream accepts"
 layer = "live"
-touches = ["crates/gateway/src/usage.rs", "crates/gateway/src/proxy.rs", "crates/gateway/src/peek.rs", "crates/gateway/src/main.rs"]
+touches = [
+  "crates/gateway/src/usage.rs",
+  "crates/gateway/src/proxy.rs",
+  "crates/gateway/src/peek.rs",
+  "crates/gateway/src/main.rs",
+]
 defects = ["D99", "D123", "D125", "D130"]
 
 [[claim]]
@@ -978,7 +1441,12 @@ priority = "P1"
 group = "Billing integrity"
 text = "Rows survive a shutdown kill, or the loss is bounded and counted"
 layer = "hermetic"
-touches = ["crates/gateway/src/usage.rs", "crates/gateway/src/proxy.rs", "crates/gateway/src/peek.rs", "crates/gateway/src/main.rs"]
+touches = [
+  "crates/gateway/src/usage.rs",
+  "crates/gateway/src/proxy.rs",
+  "crates/gateway/src/peek.rs",
+  "crates/gateway/src/main.rs",
+]
 defects = ["D38"]
 
 [[claim]]
@@ -987,9 +1455,13 @@ priority = "P1"
 group = "Billing integrity"
 text = "Cut-short detection can't be fooled by generated text"
 layer = "hermetic"
-touches = ["crates/gateway/src/usage.rs", "crates/gateway/src/proxy.rs", "crates/gateway/src/peek.rs", "crates/gateway/src/main.rs"]
+touches = [
+  "crates/gateway/src/usage.rs",
+  "crates/gateway/src/proxy.rs",
+  "crates/gateway/src/peek.rs",
+  "crates/gateway/src/main.rs",
+]
 defects = ["D70"]
-
 
 # --- Reliability -------------------------------------------------------------------------------
 [[claim]]
@@ -998,7 +1470,16 @@ priority = "P0"
 group = "Reliability"
 text = "Every upstream failure class has a bounded, documented client outcome"
 layer = "both"
-touches = ["crates/gateway/src/proxy.rs", "crates/gateway/src/circuit_breaker.rs", "crates/gateway/src/smart.rs", "crates/gateway/src/state.rs", "crates/gateway/src/admin.rs", "crates/gateway/src/store_watch.rs", "crates/gateway/src/main.rs", "crates/gateway/src/config.rs"]
+touches = [
+  "crates/gateway/src/proxy.rs",
+  "crates/gateway/src/circuit_breaker.rs",
+  "crates/gateway/src/smart.rs",
+  "crates/gateway/src/state.rs",
+  "crates/gateway/src/admin.rs",
+  "crates/gateway/src/store_watch.rs",
+  "crates/gateway/src/main.rs",
+  "crates/gateway/src/config.rs",
+]
 defects = ["D57", "D72", "D80", "D118"]
 
 [[claim]]
@@ -1007,7 +1488,16 @@ priority = "P0"
 group = "Reliability"
 text = "When all candidates fail, the client gets a JSON error with a request id and the right status"
 layer = "hermetic"
-touches = ["crates/gateway/src/proxy.rs", "crates/gateway/src/circuit_breaker.rs", "crates/gateway/src/smart.rs", "crates/gateway/src/state.rs", "crates/gateway/src/admin.rs", "crates/gateway/src/store_watch.rs", "crates/gateway/src/main.rs", "crates/gateway/src/config.rs"]
+touches = [
+  "crates/gateway/src/proxy.rs",
+  "crates/gateway/src/circuit_breaker.rs",
+  "crates/gateway/src/smart.rs",
+  "crates/gateway/src/state.rs",
+  "crates/gateway/src/admin.rs",
+  "crates/gateway/src/store_watch.rs",
+  "crates/gateway/src/main.rs",
+  "crates/gateway/src/config.rs",
+]
 defects = ["D16"]
 
 [[claim]]
@@ -1017,7 +1507,16 @@ group = "Reliability"
 text = "Nothing fails over after the first byte, and a stream that dies mid-way is an error, never a clean end"
 layer = "hermetic"
 layer_note = "Reclassified from live/both on 2026-10-01: A response dying mid-way needs a forced cut, which only a mock (or a fault proxy) can produce."
-touches = ["crates/gateway/src/proxy.rs", "crates/gateway/src/circuit_breaker.rs", "crates/gateway/src/smart.rs", "crates/gateway/src/state.rs", "crates/gateway/src/admin.rs", "crates/gateway/src/store_watch.rs", "crates/gateway/src/main.rs", "crates/gateway/src/config.rs"]
+touches = [
+  "crates/gateway/src/proxy.rs",
+  "crates/gateway/src/circuit_breaker.rs",
+  "crates/gateway/src/smart.rs",
+  "crates/gateway/src/state.rs",
+  "crates/gateway/src/admin.rs",
+  "crates/gateway/src/store_watch.rs",
+  "crates/gateway/src/main.rs",
+  "crates/gateway/src/config.rs",
+]
 defects = []
 
 [[claim]]
@@ -1026,7 +1525,16 @@ priority = "P0"
 group = "Reliability"
 text = "A bad pool key on one candidate never black-holes the row"
 layer = "hermetic"
-touches = ["crates/gateway/src/proxy.rs", "crates/gateway/src/circuit_breaker.rs", "crates/gateway/src/smart.rs", "crates/gateway/src/state.rs", "crates/gateway/src/admin.rs", "crates/gateway/src/store_watch.rs", "crates/gateway/src/main.rs", "crates/gateway/src/config.rs"]
+touches = [
+  "crates/gateway/src/proxy.rs",
+  "crates/gateway/src/circuit_breaker.rs",
+  "crates/gateway/src/smart.rs",
+  "crates/gateway/src/state.rs",
+  "crates/gateway/src/admin.rs",
+  "crates/gateway/src/store_watch.rs",
+  "crates/gateway/src/main.rs",
+  "crates/gateway/src/config.rs",
+]
 defects = ["D10", "D84"]
 
 [[claim]]
@@ -1035,7 +1543,16 @@ priority = "P0"
 group = "Reliability"
 text = "/readyz is false while managed traffic would be refused"
 layer = "hermetic"
-touches = ["crates/gateway/src/proxy.rs", "crates/gateway/src/circuit_breaker.rs", "crates/gateway/src/smart.rs", "crates/gateway/src/state.rs", "crates/gateway/src/admin.rs", "crates/gateway/src/store_watch.rs", "crates/gateway/src/main.rs", "crates/gateway/src/config.rs"]
+touches = [
+  "crates/gateway/src/proxy.rs",
+  "crates/gateway/src/circuit_breaker.rs",
+  "crates/gateway/src/smart.rs",
+  "crates/gateway/src/state.rs",
+  "crates/gateway/src/admin.rs",
+  "crates/gateway/src/store_watch.rs",
+  "crates/gateway/src/main.rs",
+  "crates/gateway/src/config.rs",
+]
 defects = ["D11"]
 
 [[claim]]
@@ -1044,7 +1561,16 @@ priority = "P0"
 group = "Reliability"
 text = "The breaker probe can't wedge, brownouts open the breaker, and each request is recorded exactly once"
 layer = "hermetic"
-touches = ["crates/gateway/src/proxy.rs", "crates/gateway/src/circuit_breaker.rs", "crates/gateway/src/smart.rs", "crates/gateway/src/state.rs", "crates/gateway/src/admin.rs", "crates/gateway/src/store_watch.rs", "crates/gateway/src/main.rs", "crates/gateway/src/config.rs"]
+touches = [
+  "crates/gateway/src/proxy.rs",
+  "crates/gateway/src/circuit_breaker.rs",
+  "crates/gateway/src/smart.rs",
+  "crates/gateway/src/state.rs",
+  "crates/gateway/src/admin.rs",
+  "crates/gateway/src/store_watch.rs",
+  "crates/gateway/src/main.rs",
+  "crates/gateway/src/config.rs",
+]
 defects = ["D17", "D37", "D86", "D91", "D97"]
 
 [[claim]]
@@ -1054,7 +1580,16 @@ group = "Reliability"
 text = "A dead upstream connection is detected by transport liveness (H2 PING/TCP keepalive) and failed promptly; a slow-but-alive upstream is never cut before the 600s client-default timeout; slow-drip streams survive"
 oracle = "a peer that stops acknowledging H2 PINGs fails within h2_ping_interval_secs + 5s (and TCP keepalive is armed on upstream and client sockets: idle + interval x count); an upstream silent for longer than the liveness bound but alive is not cut; read_timeout_secs is 600, the OpenAI and Anthropic SDKs' default request timeout; a stream that drips under the read bound arrives whole"
 layer = "hermetic"
-touches = ["crates/gateway/src/proxy.rs", "crates/gateway/src/circuit_breaker.rs", "crates/gateway/src/smart.rs", "crates/gateway/src/state.rs", "crates/gateway/src/admin.rs", "crates/gateway/src/store_watch.rs", "crates/gateway/src/main.rs", "crates/gateway/src/config.rs"]
+touches = [
+  "crates/gateway/src/proxy.rs",
+  "crates/gateway/src/circuit_breaker.rs",
+  "crates/gateway/src/smart.rs",
+  "crates/gateway/src/state.rs",
+  "crates/gateway/src/admin.rs",
+  "crates/gateway/src/store_watch.rs",
+  "crates/gateway/src/main.rs",
+  "crates/gateway/src/config.rs",
+]
 defects = ["D36"]
 
 [[claim]]
@@ -1063,7 +1598,16 @@ priority = "P1"
 group = "Reliability"
 text = "A 200 with an error body never counts as healthy or pins"
 layer = "hermetic"
-touches = ["crates/gateway/src/proxy.rs", "crates/gateway/src/circuit_breaker.rs", "crates/gateway/src/smart.rs", "crates/gateway/src/state.rs", "crates/gateway/src/admin.rs", "crates/gateway/src/store_watch.rs", "crates/gateway/src/main.rs", "crates/gateway/src/config.rs"]
+touches = [
+  "crates/gateway/src/proxy.rs",
+  "crates/gateway/src/circuit_breaker.rs",
+  "crates/gateway/src/smart.rs",
+  "crates/gateway/src/state.rs",
+  "crates/gateway/src/admin.rs",
+  "crates/gateway/src/store_watch.rs",
+  "crates/gateway/src/main.rs",
+  "crates/gateway/src/config.rs",
+]
 defects = ["D41"]
 
 [[claim]]
@@ -1072,7 +1616,16 @@ priority = "P0"
 group = "Reliability"
 text = "A client abort at every phase releases the slot, the upstream and the gauges, and leaves the breaker untouched"
 layer = "hermetic"
-touches = ["crates/gateway/src/proxy.rs", "crates/gateway/src/circuit_breaker.rs", "crates/gateway/src/smart.rs", "crates/gateway/src/state.rs", "crates/gateway/src/admin.rs", "crates/gateway/src/store_watch.rs", "crates/gateway/src/main.rs", "crates/gateway/src/config.rs"]
+touches = [
+  "crates/gateway/src/proxy.rs",
+  "crates/gateway/src/circuit_breaker.rs",
+  "crates/gateway/src/smart.rs",
+  "crates/gateway/src/state.rs",
+  "crates/gateway/src/admin.rs",
+  "crates/gateway/src/store_watch.rs",
+  "crates/gateway/src/main.rs",
+  "crates/gateway/src/config.rs",
+]
 defects = []
 
 [[claim]]
@@ -1081,7 +1634,16 @@ priority = "P1"
 group = "Reliability"
 text = "Slow and stalled readers are bounded and released"
 layer = "hermetic"
-touches = ["crates/gateway/src/proxy.rs", "crates/gateway/src/circuit_breaker.rs", "crates/gateway/src/smart.rs", "crates/gateway/src/state.rs", "crates/gateway/src/admin.rs", "crates/gateway/src/store_watch.rs", "crates/gateway/src/main.rs", "crates/gateway/src/config.rs"]
+touches = [
+  "crates/gateway/src/proxy.rs",
+  "crates/gateway/src/circuit_breaker.rs",
+  "crates/gateway/src/smart.rs",
+  "crates/gateway/src/state.rs",
+  "crates/gateway/src/admin.rs",
+  "crates/gateway/src/store_watch.rs",
+  "crates/gateway/src/main.rs",
+  "crates/gateway/src/config.rs",
+]
 defects = ["D42"]
 
 [[claim]]
@@ -1090,7 +1652,16 @@ priority = "P1"
 group = "Reliability"
 text = "H1 keep-alive and h2c multiplexing stay correct after rejects and cancels"
 layer = "hermetic"
-touches = ["crates/gateway/src/proxy.rs", "crates/gateway/src/circuit_breaker.rs", "crates/gateway/src/smart.rs", "crates/gateway/src/state.rs", "crates/gateway/src/admin.rs", "crates/gateway/src/store_watch.rs", "crates/gateway/src/main.rs", "crates/gateway/src/config.rs"]
+touches = [
+  "crates/gateway/src/proxy.rs",
+  "crates/gateway/src/circuit_breaker.rs",
+  "crates/gateway/src/smart.rs",
+  "crates/gateway/src/state.rs",
+  "crates/gateway/src/admin.rs",
+  "crates/gateway/src/store_watch.rs",
+  "crates/gateway/src/main.rs",
+  "crates/gateway/src/config.rs",
+]
 defects = []
 
 [[claim]]
@@ -1099,7 +1670,16 @@ priority = "P2"
 group = "Reliability"
 text = "Expect: 100-continue never stalls or hangs"
 layer = "hermetic"
-touches = ["crates/gateway/src/proxy.rs", "crates/gateway/src/circuit_breaker.rs", "crates/gateway/src/smart.rs", "crates/gateway/src/state.rs", "crates/gateway/src/admin.rs", "crates/gateway/src/store_watch.rs", "crates/gateway/src/main.rs", "crates/gateway/src/config.rs"]
+touches = [
+  "crates/gateway/src/proxy.rs",
+  "crates/gateway/src/circuit_breaker.rs",
+  "crates/gateway/src/smart.rs",
+  "crates/gateway/src/state.rs",
+  "crates/gateway/src/admin.rs",
+  "crates/gateway/src/store_watch.rs",
+  "crates/gateway/src/main.rs",
+  "crates/gateway/src/config.rs",
+]
 defects = ["D73"]
 
 [[claim]]
@@ -1108,7 +1688,16 @@ priority = "P0"
 group = "Reliability"
 text = "A NATS outage at boot or mid-run recovers, missed updates are applied, and a stale snapshot is replaced"
 layer = "hermetic"
-touches = ["crates/gateway/src/proxy.rs", "crates/gateway/src/circuit_breaker.rs", "crates/gateway/src/smart.rs", "crates/gateway/src/state.rs", "crates/gateway/src/admin.rs", "crates/gateway/src/store_watch.rs", "crates/gateway/src/main.rs", "crates/gateway/src/config.rs"]
+touches = [
+  "crates/gateway/src/proxy.rs",
+  "crates/gateway/src/circuit_breaker.rs",
+  "crates/gateway/src/smart.rs",
+  "crates/gateway/src/state.rs",
+  "crates/gateway/src/admin.rs",
+  "crates/gateway/src/store_watch.rs",
+  "crates/gateway/src/main.rs",
+  "crates/gateway/src/config.rs",
+]
 defects = []
 
 [[claim]]
@@ -1117,7 +1706,16 @@ priority = "P1"
 group = "Reliability"
 text = "Two signing kids rotate cleanly, and a rolling pool-key rotation drops nothing"
 layer = "both"
-touches = ["crates/gateway/src/proxy.rs", "crates/gateway/src/circuit_breaker.rs", "crates/gateway/src/smart.rs", "crates/gateway/src/state.rs", "crates/gateway/src/admin.rs", "crates/gateway/src/store_watch.rs", "crates/gateway/src/main.rs", "crates/gateway/src/config.rs"]
+touches = [
+  "crates/gateway/src/proxy.rs",
+  "crates/gateway/src/circuit_breaker.rs",
+  "crates/gateway/src/smart.rs",
+  "crates/gateway/src/state.rs",
+  "crates/gateway/src/admin.rs",
+  "crates/gateway/src/store_watch.rs",
+  "crates/gateway/src/main.rs",
+  "crates/gateway/src/config.rs",
+]
 defects = ["D71", "D83", "D84"]
 
 [[claim]]
@@ -1126,7 +1724,16 @@ priority = "P1"
 group = "Reliability"
 text = "Config validation rejects values that silently disable features, and env reaches every provider name"
 layer = "hermetic"
-touches = ["crates/gateway/src/proxy.rs", "crates/gateway/src/circuit_breaker.rs", "crates/gateway/src/smart.rs", "crates/gateway/src/state.rs", "crates/gateway/src/admin.rs", "crates/gateway/src/store_watch.rs", "crates/gateway/src/main.rs", "crates/gateway/src/config.rs"]
+touches = [
+  "crates/gateway/src/proxy.rs",
+  "crates/gateway/src/circuit_breaker.rs",
+  "crates/gateway/src/smart.rs",
+  "crates/gateway/src/state.rs",
+  "crates/gateway/src/admin.rs",
+  "crates/gateway/src/store_watch.rs",
+  "crates/gateway/src/main.rs",
+  "crates/gateway/src/config.rs",
+]
 defects = ["D52"]
 
 [[claim]]
@@ -1135,7 +1742,16 @@ priority = "P0"
 group = "Reliability"
 text = "SIGTERM drains, and the process exits when idle within orchestrator limits"
 layer = "hermetic"
-touches = ["crates/gateway/src/proxy.rs", "crates/gateway/src/circuit_breaker.rs", "crates/gateway/src/smart.rs", "crates/gateway/src/state.rs", "crates/gateway/src/admin.rs", "crates/gateway/src/store_watch.rs", "crates/gateway/src/main.rs", "crates/gateway/src/config.rs"]
+touches = [
+  "crates/gateway/src/proxy.rs",
+  "crates/gateway/src/circuit_breaker.rs",
+  "crates/gateway/src/smart.rs",
+  "crates/gateway/src/state.rs",
+  "crates/gateway/src/admin.rs",
+  "crates/gateway/src/store_watch.rs",
+  "crates/gateway/src/main.rs",
+  "crates/gateway/src/config.rs",
+]
 defects = ["D38"]
 
 [[claim]]
@@ -1144,7 +1760,16 @@ priority = "P1"
 group = "Reliability"
 text = "A panic drops only its own request and releases everything"
 layer = "hermetic"
-touches = ["crates/gateway/src/proxy.rs", "crates/gateway/src/circuit_breaker.rs", "crates/gateway/src/smart.rs", "crates/gateway/src/state.rs", "crates/gateway/src/admin.rs", "crates/gateway/src/store_watch.rs", "crates/gateway/src/main.rs", "crates/gateway/src/config.rs"]
+touches = [
+  "crates/gateway/src/proxy.rs",
+  "crates/gateway/src/circuit_breaker.rs",
+  "crates/gateway/src/smart.rs",
+  "crates/gateway/src/state.rs",
+  "crates/gateway/src/admin.rs",
+  "crates/gateway/src/store_watch.rs",
+  "crates/gateway/src/main.rs",
+  "crates/gateway/src/config.rs",
+]
 defects = ["D39", "D87"]
 
 [[claim]]
@@ -1154,7 +1779,16 @@ group = "Reliability"
 text = "RSS plateaus under sustained load and large bodies"
 layer = "hermetic"
 layer_note = "Reclassified from live/both on 2026-10-01: Memory under load is a gateway property; a soak against a mock upstream measures it without paying providers."
-touches = ["crates/gateway/src/proxy.rs", "crates/gateway/src/circuit_breaker.rs", "crates/gateway/src/smart.rs", "crates/gateway/src/state.rs", "crates/gateway/src/admin.rs", "crates/gateway/src/store_watch.rs", "crates/gateway/src/main.rs", "crates/gateway/src/config.rs"]
+touches = [
+  "crates/gateway/src/proxy.rs",
+  "crates/gateway/src/circuit_breaker.rs",
+  "crates/gateway/src/smart.rs",
+  "crates/gateway/src/state.rs",
+  "crates/gateway/src/admin.rs",
+  "crates/gateway/src/store_watch.rs",
+  "crates/gateway/src/main.rs",
+  "crates/gateway/src/config.rs",
+]
 defects = []
 
 [[claim]]
@@ -1163,7 +1797,16 @@ priority = "P1"
 group = "Reliability"
 text = "Gateway 429/503 carry Retry-After, and transient faults use retryable statuses"
 layer = "hermetic"
-touches = ["crates/gateway/src/proxy.rs", "crates/gateway/src/circuit_breaker.rs", "crates/gateway/src/smart.rs", "crates/gateway/src/state.rs", "crates/gateway/src/admin.rs", "crates/gateway/src/store_watch.rs", "crates/gateway/src/main.rs", "crates/gateway/src/config.rs"]
+touches = [
+  "crates/gateway/src/proxy.rs",
+  "crates/gateway/src/circuit_breaker.rs",
+  "crates/gateway/src/smart.rs",
+  "crates/gateway/src/state.rs",
+  "crates/gateway/src/admin.rs",
+  "crates/gateway/src/store_watch.rs",
+  "crates/gateway/src/main.rs",
+  "crates/gateway/src/config.rs",
+]
 defects = ["D43"]
 
 [[claim]]
@@ -1172,7 +1815,16 @@ priority = "P1"
 group = "Reliability"
 text = "DNS lookups have a timeout, try multiple IPs, and serve stale"
 layer = "hermetic"
-touches = ["crates/gateway/src/proxy.rs", "crates/gateway/src/circuit_breaker.rs", "crates/gateway/src/smart.rs", "crates/gateway/src/state.rs", "crates/gateway/src/admin.rs", "crates/gateway/src/store_watch.rs", "crates/gateway/src/main.rs", "crates/gateway/src/config.rs"]
+touches = [
+  "crates/gateway/src/proxy.rs",
+  "crates/gateway/src/circuit_breaker.rs",
+  "crates/gateway/src/smart.rs",
+  "crates/gateway/src/state.rs",
+  "crates/gateway/src/admin.rs",
+  "crates/gateway/src/store_watch.rs",
+  "crates/gateway/src/main.rs",
+  "crates/gateway/src/config.rs",
+]
 defects = ["D40", "D89"]
 
 [[claim]]
@@ -1181,7 +1833,16 @@ priority = "P1"
 group = "Reliability"
 text = "The large-body path matches small-body semantics"
 layer = "hermetic"
-touches = ["crates/gateway/src/proxy.rs", "crates/gateway/src/circuit_breaker.rs", "crates/gateway/src/smart.rs", "crates/gateway/src/state.rs", "crates/gateway/src/admin.rs", "crates/gateway/src/store_watch.rs", "crates/gateway/src/main.rs", "crates/gateway/src/config.rs"]
+touches = [
+  "crates/gateway/src/proxy.rs",
+  "crates/gateway/src/circuit_breaker.rs",
+  "crates/gateway/src/smart.rs",
+  "crates/gateway/src/state.rs",
+  "crates/gateway/src/admin.rs",
+  "crates/gateway/src/store_watch.rs",
+  "crates/gateway/src/main.rs",
+  "crates/gateway/src/config.rs",
+]
 defects = ["D09", "D51", "D57", "D80", "D81"]
 
 [[claim]]
@@ -1190,9 +1851,17 @@ priority = "P2"
 group = "Reliability"
 text = "Upstream H2 multiplexing and GOAWAY are handled"
 layer = "both"
-touches = ["crates/gateway/src/proxy.rs", "crates/gateway/src/circuit_breaker.rs", "crates/gateway/src/smart.rs", "crates/gateway/src/state.rs", "crates/gateway/src/admin.rs", "crates/gateway/src/store_watch.rs", "crates/gateway/src/main.rs", "crates/gateway/src/config.rs"]
+touches = [
+  "crates/gateway/src/proxy.rs",
+  "crates/gateway/src/circuit_breaker.rs",
+  "crates/gateway/src/smart.rs",
+  "crates/gateway/src/state.rs",
+  "crates/gateway/src/admin.rs",
+  "crates/gateway/src/store_watch.rs",
+  "crates/gateway/src/main.rs",
+  "crates/gateway/src/config.rs",
+]
 defects = ["D72", "D91"]
-
 
 # --- Catalog truth -----------------------------------------------------------------------------
 [[claim]]
@@ -1201,7 +1870,11 @@ priority = "P0"
 group = "Catalog truth"
 text = "Every candidate on an in-scope provider (OpenAI, Anthropic, OpenRouter, xAI, Bedrock), including Responses arms, serves its model live, and the echoed model matches. Together, Mistral, Groq, DeepSeek and Fireworks primaries are out of scope by decision (2026-10-01); their rows are reachable through OpenRouter."
 layer = "live"
-touches = ["crates/providers/src/", "crates/gateway/src/route.rs", "crates/gateway/src/proxy.rs"]
+touches = [
+  "crates/providers/src/",
+  "crates/gateway/src/route.rs",
+  "crates/gateway/src/proxy.rs",
+]
 defects = ["D61", "D105", "D108"]
 
 [[claim]]
@@ -1210,7 +1883,11 @@ priority = "P0"
 group = "Catalog truth"
 text = "Fallback candidates serve the same model as the primary"
 layer = "live"
-touches = ["crates/providers/src/", "crates/gateway/src/route.rs", "crates/gateway/src/proxy.rs"]
+touches = [
+  "crates/providers/src/",
+  "crates/gateway/src/route.rs",
+  "crates/gateway/src/proxy.rs",
+]
 defects = ["D18", "D61"]
 
 [[claim]]
@@ -1219,7 +1896,11 @@ priority = "P1"
 group = "Catalog truth"
 text = "context_window is accepted near the limit on every candidate"
 layer = "live"
-touches = ["crates/providers/src/", "crates/gateway/src/route.rs", "crates/gateway/src/proxy.rs"]
+touches = [
+  "crates/providers/src/",
+  "crates/gateway/src/route.rs",
+  "crates/gateway/src/proxy.rs",
+]
 defects = ["D62", "D104", "D109", "D110", "D118"]
 
 [[claim]]
@@ -1228,7 +1909,11 @@ priority = "P1"
 group = "Catalog truth"
 text = "max_output_tokens is accepted on every candidate"
 layer = "live"
-touches = ["crates/providers/src/", "crates/gateway/src/route.rs", "crates/gateway/src/proxy.rs"]
+touches = [
+  "crates/providers/src/",
+  "crates/gateway/src/route.rs",
+  "crates/gateway/src/proxy.rs",
+]
 defects = ["D54", "D62", "D85", "D111"]
 
 [[claim]]
@@ -1237,7 +1922,11 @@ priority = "P1"
 group = "Catalog truth"
 text = "Every advertised modality works per endpoint × candidate; the rest fail cleanly"
 layer = "live"
-touches = ["crates/providers/src/", "crates/gateway/src/route.rs", "crates/gateway/src/proxy.rs"]
+touches = [
+  "crates/providers/src/",
+  "crates/gateway/src/route.rs",
+  "crates/gateway/src/proxy.rs",
+]
 defects = ["D106", "D112"]
 
 [[claim]]
@@ -1246,7 +1935,11 @@ priority = "P1"
 group = "Catalog truth"
 text = "Every advertised capability works per candidate; the rest fail cleanly"
 layer = "live"
-touches = ["crates/providers/src/", "crates/gateway/src/route.rs", "crates/gateway/src/proxy.rs"]
+touches = [
+  "crates/providers/src/",
+  "crates/gateway/src/route.rs",
+  "crates/gateway/src/proxy.rs",
+]
 defects = ["D54", "D62", "D105", "D107", "D113", "D114", "D115"]
 
 [[claim]]
@@ -1255,7 +1948,11 @@ priority = "P0"
 group = "Catalog truth"
 text = "List prices equal the declared source of truth"
 layer = "live"
-touches = ["crates/providers/src/", "crates/gateway/src/route.rs", "crates/gateway/src/proxy.rs"]
+touches = [
+  "crates/providers/src/",
+  "crates/gateway/src/route.rs",
+  "crates/gateway/src/proxy.rs",
+]
 defects = ["D19", "D60", "D116"]
 
 [[claim]]
@@ -1264,7 +1961,11 @@ priority = "P2"
 group = "Catalog truth"
 text = "Card metadata (created, owner, names) is accurate"
 layer = "live"
-touches = ["crates/providers/src/", "crates/gateway/src/route.rs", "crates/gateway/src/proxy.rs"]
+touches = [
+  "crates/providers/src/",
+  "crates/gateway/src/route.rs",
+  "crates/gateway/src/proxy.rs",
+]
 defects = ["D117"]
 
 [[claim]]
@@ -1273,7 +1974,11 @@ priority = "P0"
 group = "Catalog truth"
 text = "Advertised endpoints are honest: the stock default call succeeds on every row × endpoint"
 layer = "live"
-touches = ["crates/providers/src/", "crates/gateway/src/route.rs", "crates/gateway/src/proxy.rs"]
+touches = [
+  "crates/providers/src/",
+  "crates/gateway/src/route.rs",
+  "crates/gateway/src/proxy.rs",
+]
 defects = ["D12", "D74"]
 
 [[claim]]
@@ -1283,7 +1988,11 @@ group = "Catalog truth"
 text = "Aliases, case, whitespace and snapshot ids resolve as documented"
 layer = "hermetic"
 layer_note = "Reclassified from live/both on 2026-10-01: Alias, case and snapshot resolution happen in the catalog before any upstream call."
-touches = ["crates/providers/src/", "crates/gateway/src/route.rs", "crates/gateway/src/proxy.rs"]
+touches = [
+  "crates/providers/src/",
+  "crates/gateway/src/route.rs",
+  "crates/gateway/src/proxy.rs",
+]
 defects = []
 
 [[claim]]
@@ -1293,7 +2002,11 @@ group = "Catalog truth"
 text = "Every rejection's status, body, precedence and SDK exception match the contract"
 layer = "hermetic"
 layer_note = "Reclassified from live/both on 2026-10-01: Every listed rejection is produced by the gateway before any upstream call."
-touches = ["crates/providers/src/", "crates/gateway/src/route.rs", "crates/gateway/src/proxy.rs"]
+touches = [
+  "crates/providers/src/",
+  "crates/gateway/src/route.rs",
+  "crates/gateway/src/proxy.rs",
+]
 defects = ["D16", "D94"]
 
 [[claim]]
@@ -1302,7 +2015,11 @@ priority = "P1"
 group = "Catalog truth"
 text = "Every documented header behaves as documented, including malformed values"
 layer = "hermetic"
-touches = ["crates/providers/src/", "crates/gateway/src/route.rs", "crates/gateway/src/proxy.rs"]
+touches = [
+  "crates/providers/src/",
+  "crates/gateway/src/route.rs",
+  "crates/gateway/src/proxy.rs",
+]
 defects = []
 
 [[claim]]
@@ -1311,7 +2028,11 @@ priority = "P1"
 group = "Catalog truth"
 text = "/{provider}/ works for every gateway provider, managed and BYO, including config-added ones"
 layer = "live"
-touches = ["crates/providers/src/", "crates/gateway/src/route.rs", "crates/gateway/src/proxy.rs"]
+touches = [
+  "crates/providers/src/",
+  "crates/gateway/src/route.rs",
+  "crates/gateway/src/proxy.rs",
+]
 defects = []
 
 [[claim]]
@@ -1320,7 +2041,11 @@ priority = "P2"
 group = "Catalog truth"
 text = "The path and method table is pinned (/auto variants, case, CORS as a non-goal)"
 layer = "hermetic"
-touches = ["crates/providers/src/", "crates/gateway/src/route.rs", "crates/gateway/src/proxy.rs"]
+touches = [
+  "crates/providers/src/",
+  "crates/gateway/src/route.rs",
+  "crates/gateway/src/proxy.rs",
+]
 defects = []
 
 [[claim]]
@@ -1329,9 +2054,12 @@ priority = "P0"
 group = "Catalog truth"
 text = "Every statement in the README, ARCHITECTURE.md and config.example is true (doc lint)"
 layer = "hermetic"
-touches = ["README.md", "crates/gateway/ARCHITECTURE.md", "crates/gateway/config.example.toml"]
+touches = [
+  "README.md",
+  "crates/gateway/ARCHITECTURE.md",
+  "crates/gateway/config.example.toml",
+]
 defects = ["D55", "D98"]
-
 
 # --- Translation detail ------------------------------------------------------------------------
 [[claim]]
@@ -1592,7 +2320,10 @@ text = "Under injected faults in front of a real provider (5xx, 429, connection 
 oracle = "fault proxy between gateway and the real provider; per scenario: client outcome, upstream request count vs documented bound, exactly one ai.usage row per provider-billed generation, reconciliation-style token agreement"
 layer = "live"
 clients = ["openai-py", "anthropic-py", "openai-node", "anthropic-ts"]
-touches = ["crates/gateway/src/proxy.rs", "crates/gateway/src/circuit_breaker.rs"]
+touches = [
+  "crates/gateway/src/proxy.rs",
+  "crates/gateway/src/circuit_breaker.rs",
+]
 defects = ["D99", "D123"]
 
 [[claim]]
@@ -1603,7 +2334,11 @@ text = "Long coding-agent sessions (30-50 turns) complete through the gateway, i
 oracle = "Claude Code / Codex / pi multi-step repo task: task completes, compaction/overflow handled (no stuck loop), every turn has a ledger row, session token totals reconcile against provider usage (BIL-5 method) where admin keys exist"
 layer = "live"
 clients = ["claude-code", "codex", "pi"]
-touches = ["crates/gateway/src/translate.rs", "crates/gateway/src/proxy.rs", "crates/gateway/src/usage.rs"]
+touches = [
+  "crates/gateway/src/translate.rs",
+  "crates/gateway/src/proxy.rs",
+  "crates/gateway/src/usage.rs",
+]
 defects = ["D114"]
 
 [[claim]]
@@ -1636,7 +2371,12 @@ text = "Revoking a key or exhausting a tenant's allowance mid-session behaves as
 oracle = "harness/SDK session; deny-set or allowance written to NATS mid-stream: in-flight outcome per docs, its ai.usage row correct, next request 402/403 JSON within the documented bound"
 layer = "live"
 clients = ["openai-py", "anthropic-py", "claude-code"]
-touches = ["crates/gateway/src/deny.rs", "crates/gateway/src/allowance.rs", "crates/gateway/src/store_watch.rs", "crates/gateway/src/proxy.rs"]
+touches = [
+  "crates/gateway/src/deny.rs",
+  "crates/gateway/src/allowance.rs",
+  "crates/gateway/src/store_watch.rs",
+  "crates/gateway/src/proxy.rs",
+]
 defects = ["D121"]
 
 [[claim]]
@@ -1647,5 +2387,9 @@ text = "Two tenants' concurrent live sessions stay isolated: no cross-tenant cac
 oracle = "two tenants run identical concurrent sessions: each tenant's rows carry its own tenant_id, no x-beyond-cache-status: hit across tenants, pins and limits per tenant"
 layer = "live"
 clients = ["openai-py", "anthropic-py"]
-touches = ["crates/gateway/src/cache.rs", "crates/gateway/src/smart.rs", "crates/gateway/src/concurrency.rs"]
+touches = [
+  "crates/gateway/src/cache.rs",
+  "crates/gateway/src/smart.rs",
+  "crates/gateway/src/concurrency.rs",
+]
 defects = []
