@@ -347,6 +347,7 @@ too: each row has `display_name`, and the list has `has_more: false`. Each row a
 | ---------------------------------------------------------- | ------------------------------------------------------------------------- |
 | `wire` (`openai` / `anthropic`)                            | the row; it tells a caller which SDK matches                              |
 | `context_window`, `max_output_tokens`                      | `ModelCard`; `max_output_tokens` is `null` on embeddings                  |
+| `max_output_published`                                     | `ModelCard`; `false` when `max_output_tokens` is the 32,768 placeholder   |
 | `input_modalities` (`text` `image` `file` `audio` `video`) | `ModelCard`                                                               |
 | `output_modalities` (`text` / `embeddings`)                | the row's endpoint                                                        |
 | `capabilities` (`tools` `reasoning` `structured_outputs`)  | `ModelCard`                                                               |
@@ -366,7 +367,8 @@ file input (xAI reads PDFs on Responses only), `grok-4.20-multi-agent` no tools 
 client-side tools behind beta access), `gpt-4` lists the tools every candidate calls though its
 model page omits them. Where the vendor publishes no max output, OpenRouter's 0.9x /
 0.8x-of-window filler is replaced by `UNPUBLISHED_MAX_OUTPUT` (32,768), a conservative figure and
-not a vendor limit. Prices, `created` and `owned_by` follow the model's maker (OpenAI's and xAI's
+not a vendor limit: the row lists it with `max_output_published: false`, and the gateway never
+enforces it. Prices, `created` and `owned_by` follow the model's maker (OpenAI's and xAI's
 own `/v1/models` listings; Moonshot's and Z.ai's price tables for their OpenRouter-only rows),
 never OpenRouter's listing; facts no vendor publishes, and open-weight rows whose maker sells no
 API, still come from OpenRouter's public card. Each checked value is recorded with its source URL
@@ -662,9 +664,13 @@ it as `metadata.user_id`) becomes its FNV-1a hash, stable per user. Chat Complet
 sends `store: false` unless the client asked to store. Tools, text, and usage still
 round-trip. Anthropic requires `max_tokens`; a missing OpenAI value becomes 4096. On every catalog
 walk, translated or not, a root `max_tokens` / `max_completion_tokens` / `max_output_tokens` above
-the row's card `max_output_tokens` is capped to it (never raised; spans found by the same
-`peek::scan_buffered` walk that finds `model`, spliced in place). Claude Code sends 32000 or 64000,
-which gpt-4o-class rows (16384) answered with a 400. The cap runs before translation, so a
+the row's **published** max output (`ModelCard::output_cap`) is capped to it (never raised; spans
+found by the same `peek::scan_buffered` walk that finds `model`, spliced in place). Claude Code sends
+32000 or 64000, which gpt-4o-class rows (16384) answered with a 400. A row whose vendor publishes no
+max output (Grok, Mistral, Kimi, …) lists the `UNPUBLISHED_MAX_OUTPUT` placeholder and is not
+capped: cutting 64000 to a figure that is not the vendor's would end answers early with
+`finish_reason: length`. The catalog models one card per row, not a limit per candidate, so the
+row's card is the limit on every candidate. The cap runs before translation, so a
 thinking budget derived from the limit fits under it too. When the serving candidate is native
 OpenAI Chat Completions (provider `openai`, `/v1/chat/completions`), a same-wire relay also respells
 a root `max_tokens` as `max_completion_tokens`, which every OpenAI chat model accepts and which

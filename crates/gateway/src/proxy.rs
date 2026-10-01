@@ -2691,8 +2691,9 @@ const STREAM_OPTIONS_FRAG: &[u8] = br#""stream_options":{"include_usage":true},"
 /// Returns the body untouched when the id already matches, which is the common case: candidate 0
 /// usually spells the model the way the catalog names it, so the primary path does no memmove at all
 /// and only a failover pays for one.
-/// Cap each root-level output limit (`peek::OUTPUT_LIMIT_KEYS`) at `max`, the serving row's card
-/// `max_output_tokens`, in place. Never raises one; `max == 0` (an embeddings row) caps nothing.
+/// Cap each root-level output limit (`peek::OUTPUT_LIMIT_KEYS`) at `max`, the serving row's
+/// published maximum (`ModelCard::output_cap`), in place. Never raises one; `max == 0` (no
+/// published maximum, or an embeddings row) caps nothing.
 /// `true` when a value changed, so the caller re-scans the moved bytes.
 fn clamp_output_limits(body: &mut Vec<u8>, spans: &[Option<(usize, usize)>; 3], max: u32) -> bool {
     if max == 0 {
@@ -4881,10 +4882,11 @@ impl ProxyHttp for AiProxy {
                 if let Some(a) = rc.auto.as_mut() {
                     // An output limit past the row's maximum is a 400 by name; capped before the
                     // translation, so what it derives (a thinking budget) fits under the cap too.
+                    // Only a vendor-published maximum: an unpublished one is a placeholder (D85).
                     let mut changed = clamp_output_limits(
                         &mut buf,
                         &scan.limit_spans,
-                        a.route.card.max_output_tokens,
+                        a.route.card.output_cap().unwrap_or(0),
                     );
                     let serving = catalog_serving_endpoint(a.as_ref());
                     let upstream_model =

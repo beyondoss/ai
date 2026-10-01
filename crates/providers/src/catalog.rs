@@ -153,16 +153,34 @@ pub struct ModelCard {
     /// Most input tokens one request may carry, on every candidate of the row.
     pub context_window: u32,
     /// Most output tokens one request may ask for, on every candidate of the row. Zero on an
-    /// embeddings row, which generates none. The gateway caps a request's output limit at it.
+    /// embeddings row, which generates none. Where the vendor publishes no max output this is
+    /// [`UNPUBLISHED_MAX_OUTPUT`] and [`Self::max_output_published`] is false: a figure to size
+    /// requests by, never a limit to enforce. The gateway caps a request's output limit at
+    /// [`Self::output_cap`].
     pub max_output_tokens: u32,
+    /// Whether [`Self::max_output_tokens`] is the vendor's published limit.
+    pub max_output_published: bool,
     /// `IN_*` bits: what a request may contain.
     pub input: u8,
     /// Capability bits: [`TOOLS`], [`REASONING`], [`STRUCTURED_OUTPUTS`].
     pub features: u8,
 }
 
+impl ModelCard {
+    /// The output limit the gateway may enforce: the vendor's published maximum, `None` where it
+    /// publishes none (the card's [`UNPUBLISHED_MAX_OUTPUT`] is a placeholder, and a request past
+    /// it may well be served) and on an embeddings row.
+    pub const fn output_cap(&self) -> Option<u32> {
+        if self.max_output_published && self.max_output_tokens > 0 {
+            Some(self.max_output_tokens)
+        } else {
+            None
+        }
+    }
+}
+
 /// The max output a card lists when the primary vendor publishes none: a conservative figure, not
-/// a vendor limit. A client that sizes `max_tokens` from the card stays under every host's real
+/// a vendor limit, so it is never enforced ([`ModelCard::output_cap`]). A client that sizes `max_tokens` from the card stays under every host's real
 /// cap; one that asks for more may still be accepted. It replaced OpenRouter's derived
 /// 0.9x / 0.8x-of-window values, which advertised outputs as large as the whole prompt budget.
 pub const UNPUBLISHED_MAX_OUTPUT: u32 = 32_768;
@@ -209,8 +227,32 @@ const fn card(
         created,
         context_window,
         max_output_tokens,
+        max_output_published: true,
         input,
         features,
+    }
+}
+
+/// A card whose vendor publishes no max output: it lists [`UNPUBLISHED_MAX_OUTPUT`], unenforced.
+const fn card_unpublished_output(
+    name: &'static str,
+    owned_by: &'static str,
+    created: u64,
+    context_window: u32,
+    input: u8,
+    features: u8,
+) -> ModelCard {
+    ModelCard {
+        max_output_published: false,
+        ..card(
+            name,
+            owned_by,
+            created,
+            context_window,
+            UNPUBLISHED_MAX_OUTPUT,
+            input,
+            features,
+        )
     }
 }
 
@@ -930,12 +972,11 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &mistral("codestral-latest", "mistralai/codestral-2508"),
         responses: &[],
         price: price("0.3", "0.9", "0.3", "0.3"), // no published cache rates; both equal input
-        card: card(
+        card: card_unpublished_output(
             "Codestral 2508",
             "mistralai",
             1754079630,
             131_072,
-            UNPUBLISHED_MAX_OUTPUT,
             IN_TEXT | IN_FILE,
             TOOLS | STRUCTURED_OUTPUTS,
         ),
@@ -1546,12 +1587,11 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &xai("grok-4.20", "x-ai/grok-4.20"),
         responses: &[],
         price: price("1.25", "2.5", "0.2", "1.25"), // cache_write unpublished; equals input
-        card: card(
+        card: card_unpublished_output(
             "Grok 4.20",
             "xai",
             1773014400,
             1_000_000,
-            UNPUBLISHED_MAX_OUTPUT,
             IN_TEXT | IN_IMAGE,
             TOOLS | REASONING | STRUCTURED_OUTPUTS,
         ),
@@ -1562,12 +1602,11 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &xai_responses_first("grok-4.20-multi-agent", "x-ai/grok-4.20-multi-agent"),
         responses: &[],
         price: price("1.25", "2.5", "0.2", "1.25"), // cache_write unpublished; equals input
-        card: card(
+        card: card_unpublished_output(
             "Grok 4.20 Multi-Agent",
             "xai",
             1773014400,
             1_000_000,
-            UNPUBLISHED_MAX_OUTPUT,
             IN_TEXT | IN_IMAGE | IN_FILE,
             REASONING | STRUCTURED_OUTPUTS,
         ),
@@ -1578,12 +1617,11 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &xai("grok-4.3", "x-ai/grok-4.3"),
         responses: &[],
         price: price("1.25", "2.5", "0.2", "1.25"), // cache_write unpublished; equals input
-        card: card(
+        card: card_unpublished_output(
             "Grok 4.3",
             "xai",
             1776384000,
             1_000_000,
-            UNPUBLISHED_MAX_OUTPUT,
             IN_TEXT | IN_IMAGE,
             TOOLS | REASONING | STRUCTURED_OUTPUTS,
         ),
@@ -1594,12 +1632,11 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &xai("grok-4.5", "x-ai/grok-4.5"),
         responses: &[],
         price: price("2", "6", "0.3", "2"), // cache_write unpublished; equals input
-        card: card(
+        card: card_unpublished_output(
             "Grok 4.5",
             "xai",
             1782691200,
             500_000,
-            UNPUBLISHED_MAX_OUTPUT,
             IN_TEXT | IN_IMAGE,
             TOOLS | REASONING | STRUCTURED_OUTPUTS,
         ),
@@ -1610,12 +1647,11 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &xai("grok-4.6", "x-ai/grok-4.6"),
         responses: &[],
         price: price("2", "6", "0.5", "2"), // cache_write unpublished; equals input
-        card: card(
+        card: card_unpublished_output(
             "Grok 4.6",
             "xai",
             1785974400,
             500_000,
-            UNPUBLISHED_MAX_OUTPUT,
             IN_TEXT | IN_IMAGE,
             TOOLS | REASONING | STRUCTURED_OUTPUTS,
         ),
@@ -1626,12 +1662,11 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &xai("grok-build-0.1", "x-ai/grok-build-0.1"),
         responses: &[],
         price: price("1", "2", "0.2", "1"), // cache_write unpublished; equals input
-        card: card(
+        card: card_unpublished_output(
             "Grok Build 0.1",
             "xai",
             1776297600,
             256_000,
-            UNPUBLISHED_MAX_OUTPUT,
             IN_TEXT | IN_IMAGE,
             TOOLS | REASONING | STRUCTURED_OUTPUTS,
         ),
@@ -1651,12 +1686,11 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &openrouter_only("meta-llama/llama-3.1-8b-instruct"), // Groq: Enterprise-only
         responses: &[],
         price: price("0.05", "0.08", "0.025", "0.05"), // cache_write unpublished; equals input
-        card: card(
+        card: card_unpublished_output(
             "Llama 3.1 8B Instruct",
             "meta-llama",
             1721692800,
             131_072,
-            UNPUBLISHED_MAX_OUTPUT,
             IN_TEXT,
             TOOLS | STRUCTURED_OUTPUTS,
         ),
@@ -1718,12 +1752,11 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &together("meta-models/Muse-Glimmer-30B", "meta/muse-glimmer-30b"),
         responses: &[],
         price: price("0.35", "1.5", "0.04", "0.35"), // cache_write unpublished; equals input
-        card: card(
+        card: card_unpublished_output(
             "Muse Glimmer 30B",
             "meta",
             1786302394,
             131_072,
-            UNPUBLISHED_MAX_OUTPUT,
             IN_TEXT | IN_IMAGE,
             TOOLS | REASONING | STRUCTURED_OUTPUTS,
         ),
@@ -1734,12 +1767,11 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &minimax_m3(),
         responses: &[],
         price: price("0.3", "1.2", "0.06", "0.3"), // cache_write unpublished; equals input
-        card: card(
+        card: card_unpublished_output(
             "MiniMax M3",
             "minimax",
             1780245374,
             524_288,
-            UNPUBLISHED_MAX_OUTPUT,
             IN_TEXT | IN_IMAGE | IN_VIDEO,
             TOOLS | REASONING | STRUCTURED_OUTPUTS,
         ),
@@ -1750,12 +1782,11 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &openrouter_only("minimax/minimax-m2.7"), // Groq: Enterprise-only
         responses: &[],
         price: price("0.3", "1.2", "0.06", "0.375"), // MiniMax's own pay-as-you-go rate
-        card: card(
+        card: card_unpublished_output(
             "MiniMax M2.7",
             "minimax",
             1773836697,
             204_800,
-            UNPUBLISHED_MAX_OUTPUT,
             IN_TEXT,
             TOOLS | REASONING | STRUCTURED_OUTPUTS,
         ),
@@ -1766,12 +1797,11 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &mistral("ministral-14b-latest", "mistralai/ministral-14b-2512"),
         responses: &[],
         price: price("0.2", "0.2", "0.2", "0.2"), // no published cache rates; both equal input
-        card: card(
+        card: card_unpublished_output(
             "Ministral 3 14B 2512",
             "mistralai",
             1764681735,
             262_144,
-            UNPUBLISHED_MAX_OUTPUT,
             IN_TEXT | IN_IMAGE,
             TOOLS | STRUCTURED_OUTPUTS,
         ),
@@ -1782,12 +1812,11 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &mistral("ministral-3b-latest", "mistralai/ministral-3b-2512"),
         responses: &[],
         price: price("0.1", "0.1", "0.1", "0.1"), // no published cache rates; both equal input
-        card: card(
+        card: card_unpublished_output(
             "Ministral 3 3B 2512",
             "mistralai",
             1764681560,
             131_072,
-            UNPUBLISHED_MAX_OUTPUT,
             IN_TEXT | IN_IMAGE,
             TOOLS | STRUCTURED_OUTPUTS,
         ),
@@ -1798,12 +1827,11 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &mistral("ministral-8b-latest", "mistralai/ministral-8b-2512"),
         responses: &[],
         price: price("0.15", "0.15", "0.15", "0.15"), // no published cache rates; both equal input
-        card: card(
+        card: card_unpublished_output(
             "Ministral 3 8B 2512",
             "mistralai",
             1764681654,
             262_144,
-            UNPUBLISHED_MAX_OUTPUT,
             IN_TEXT | IN_IMAGE,
             TOOLS | STRUCTURED_OUTPUTS,
         ),
@@ -1814,12 +1842,11 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &mistral("mistral-large-latest", "mistralai/mistral-large-2512"),
         responses: &[],
         price: price("0.5", "1.5", "0.5", "0.5"), // no published cache rates; both equal input
-        card: card(
+        card: card_unpublished_output(
             "Mistral Large 3 2512",
             "mistralai",
             1764624472,
             262_144,
-            UNPUBLISHED_MAX_OUTPUT,
             IN_TEXT | IN_IMAGE | IN_FILE,
             TOOLS | STRUCTURED_OUTPUTS,
         ),
@@ -1830,12 +1857,11 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &mistral("mistral-medium-latest", "mistralai/mistral-medium-3-5"),
         responses: &[],
         price: price("1.5", "7.5", "1.5", "1.5"), // no published cache rates; both equal input
-        card: card(
+        card: card_unpublished_output(
             "Mistral Medium 3.5",
             "mistralai",
             1777570439,
             262_144,
-            UNPUBLISHED_MAX_OUTPUT,
             IN_TEXT | IN_IMAGE | IN_FILE,
             TOOLS | REASONING | STRUCTURED_OUTPUTS,
         ),
@@ -1846,12 +1872,11 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &mistral("mistral-small-latest", "mistralai/mistral-small-2603"),
         responses: &[],
         price: price("0.15", "0.6", "0.15", "0.15"), // no published cache rates; both equal input
-        card: card(
+        card: card_unpublished_output(
             "Mistral Small 4",
             "mistralai",
             1773695685,
             262_144,
-            UNPUBLISHED_MAX_OUTPUT,
             IN_TEXT | IN_IMAGE,
             TOOLS | REASONING | STRUCTURED_OUTPUTS,
         ),
@@ -1862,12 +1887,11 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &openrouter_only("moonshotai/kimi-k2.6"), // Fireworks: serverless deprecated
         responses: &[],
         price: price("0.95", "4", "0.16", "0.95"), // Moonshot's own rate; cache_write unpublished, equals input
-        card: card(
+        card: card_unpublished_output(
             "Kimi K2.6",
             "moonshotai",
             1776699402,
             262_144,
-            UNPUBLISHED_MAX_OUTPUT,
             IN_TEXT | IN_IMAGE,
             TOOLS | REASONING | STRUCTURED_OUTPUTS,
         ),
@@ -1878,12 +1902,11 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &openrouter_only("moonshotai/kimi-k2.7-code"), // Together: dedicated only
         responses: &[],
         price: price("0.95", "4", "0.19", "0.95"), // Moonshot's own rate; cache_write unpublished, equals input
-        card: card(
+        card: card_unpublished_output(
             "Kimi K2.7 Code",
             "moonshotai",
             1781266361,
             262_144,
-            UNPUBLISHED_MAX_OUTPUT,
             IN_TEXT | IN_IMAGE,
             TOOLS | REASONING | STRUCTURED_OUTPUTS,
         ),
@@ -1894,12 +1917,11 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &kimi_k3(),
         responses: &[],
         price: price("3", "15", "0.3", "3"), // cache_write unpublished; equals input
-        card: card(
+        card: card_unpublished_output(
             "Kimi K3",
             "moonshotai",
             1784215858,
             1_048_576,
-            UNPUBLISHED_MAX_OUTPUT,
             IN_TEXT | IN_IMAGE | IN_VIDEO,
             TOOLS | REASONING | STRUCTURED_OUTPUTS,
         ),
@@ -2220,12 +2242,11 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &together("thinkingmachines/Inkling", "thinkingmachines/inkling"),
         responses: &[],
         price: price("1", "4.05", "0.17", "1"), // cache_write unpublished; equals input
-        card: card(
+        card: card_unpublished_output(
             "Inkling",
             "thinkingmachines",
             1784325956,
             524_288,
-            UNPUBLISHED_MAX_OUTPUT,
             IN_TEXT | IN_IMAGE | IN_AUDIO,
             TOOLS | REASONING,
         ),
@@ -2252,12 +2273,11 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &glm_5_2(),
         responses: &[],
         price: price("1.4", "4.4", "0.26", "1.4"), // cache_write unpublished; equals input
-        card: card(
+        card: card_unpublished_output(
             "GLM 5.2",
             "z-ai",
             1781631930,
             1_048_575,
-            UNPUBLISHED_MAX_OUTPUT,
             IN_TEXT,
             TOOLS | REASONING | STRUCTURED_OUTPUTS,
         ),
@@ -2268,12 +2288,11 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &together("zai-org/GLM-5.3", "z-ai/glm-5.3"),
         responses: &[],
         price: price("1.4", "4.4", "0.26", "1.4"), // cache_write unpublished; equals input
-        card: card(
+        card: card_unpublished_output(
             "GLM 5.3",
             "z-ai",
             1787086655,
             1_048_575,
-            UNPUBLISHED_MAX_OUTPUT,
             IN_TEXT,
             TOOLS | REASONING | STRUCTURED_OUTPUTS,
         ),
@@ -2284,12 +2303,11 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
         candidates: &together("zai-org/GLM-5.3-Flash", "z-ai/glm-5.3-flash"),
         responses: &[],
         price: price("0.15", "0.5", "0.03", "0.15"), // cache_write unpublished; equals input
-        card: card(
+        card: card_unpublished_output(
             "GLM 5.3 Flash",
             "z-ai",
             1787752741,
             1_048_575,
-            UNPUBLISHED_MAX_OUTPUT,
             IN_TEXT | IN_IMAGE | IN_VIDEO,
             TOOLS | REASONING | STRUCTURED_OUTPUTS,
         ),
@@ -2371,7 +2389,11 @@ pub fn models_list_json() -> &'static str {
             if embeddings {
                 out.push_str("null");
             } else {
-                let _ = write!(out, "{}", c.max_output_tokens);
+                let _ = write!(
+                    out,
+                    "{},\"max_output_published\":{}",
+                    c.max_output_tokens, c.max_output_published
+                );
             }
             out.push_str(",\"input_modalities\":");
             names(&mut out, c.input, &INPUT_NAMES);
@@ -2777,6 +2799,7 @@ mod tests {
                 assert!(caps.is_empty(), "{m}");
             } else {
                 assert_eq!(m["max_output_tokens"], c.max_output_tokens);
+                assert_eq!(m["max_output_published"], c.max_output_published, "{m}");
                 assert_eq!(m["output_modalities"], serde_json::json!(["text"]));
                 assert_eq!(m["endpoints"].as_array().unwrap().len(), 3);
             }
