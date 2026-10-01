@@ -492,7 +492,7 @@ layer = "live"
 clients = ["claude-code"]
 failover_clients = ["claude-code"]
 touches = ["crates/gateway/src/", "crates/providers/src/"]
-defects = []
+defects = ["D59"]
 
 [[claim]]
 id = "W2"
@@ -1354,7 +1354,7 @@ group = "Translation detail"
 text = "max_tokens defaults and clamps never truncate or 400"
 layer = "both"
 touches = ["crates/gateway/src/translate.rs", "crates/gateway/src/proxy.rs"]
-defects = []
+defects = ["D59"]
 
 [[claim]]
 id = "TRN-6"

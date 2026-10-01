@@ -216,7 +216,7 @@ claims = ["TRN-10"]
 state = "suspected"
 test = ""
 fix = ""
-note = ""
+note = "Live 2026-10-01 (gateway 4e36708, real OpenAI): Claude Code-shaped Messages requests with cache_control on system/tools/messages and a long JSON metadata.user_id were accepted by gpt-5-mini and gpt-4o-mini, with and without adaptive thinking. Likely refuted; becomes refuted once the live layer carries this as a cell (the gate requires a test)."
 
 [[defect]]
 id = "D16"
@@ -258,7 +258,7 @@ claims = ["CAT-2"]
 state = "suspected"
 test = ""
 fix = ""
-note = ""
+note = "DeepSeek's pricing page (2026-10-01) lists only deepseek-flash (V4.1-Flash) and deepseek-v4-pro (V4-Pro-0813): the native deepseek-chat and deepseek-reasoner names our rows use appear retired, so those rows likely always fail over to OpenRouter's older V3/R1. deepseek-v4-pro falls back to OpenRouter's V4 Pro 0423, a different snapshot from native 0813. Needs a DeepSeek key to confirm the native 404."
 
 [[defect]]
 id = "D19"
@@ -272,7 +272,7 @@ claims = ["CAT-7"]
 state = "suspected"
 test = ""
 fix = ""
-note = ""
+note = "deepseek-v4-pro lists 0.95526/1.91052 against DeepSeek's peak 1.32/3.96 (off-peak 0.66/1.98): output under-listed by half at peak. DeepSeek prices peak hours at 2x, which a single list price cannot express."
 
 [[defect]]
 id = "D20"
@@ -819,3 +819,17 @@ state = "suspected"
 test = ""
 fix = ""
 note = ""
+
+[[defect]]
+id = "D59"
+severity = "high"
+area = "Translation"
+title = "max_tokens is passed through unclamped onto models with a smaller output limit"
+impact = "Claude Code sends max_tokens 32000/64000; translated onto gpt-4o-mini (16384 max) OpenAI returns 400, so every Claude Code request on a gpt-4o-class row fails. Any client default above a row's max_output_tokens hits the same wall."
+confidence = "high"
+evidence = "live 2026-10-01: Messages max_tokens=64000 to gpt-4o-mini -> 400 'max_tokens is too large: 64000. This model supports at most 16384'; translate.rs ~2001-2003"
+claims = ["TRN-5", "W1"]
+state = "suspected"
+test = ""
+fix = ""
+note = "Found during the D15 live check."
