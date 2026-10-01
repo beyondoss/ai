@@ -1179,6 +1179,13 @@ fn is_upstream_failure(e: Option<&pingora_core::Error>) -> bool {
     e.is_some_and(|e| !matches!(e.esource(), pingora_core::ErrorSource::Downstream))
 }
 
+/// Whether this attempt had started sending the client's body upstream and the client had not
+/// finished it. An upstream error then reflects the client (a stalled or abandoned upload), not the
+/// provider. Zero bytes fed means the attempt never got past connecting.
+fn client_still_uploading(session: &mut Session, rc: &RequestCtx) -> bool {
+    rc.body_bytes_fed > 0 && !session.as_mut().is_body_done()
+}
+
 /// The lowest set bit in `usable` at or after index `from`, or `None` if there is none.
 ///
 /// The candidate walk's only cursor primitive. `from` strictly increases across a request, so the
@@ -3495,10 +3502,18 @@ impl ProxyHttp for AiProxy {
             // — we just count — and abort the proxied request once the running total crosses the cap.
             // Aborting (vs. a clean 413) is acceptable here: headers are already away to the upstream,
             // and this is an abuse guard, not a normal client path.
+            //
+            // Tagged `Downstream` because it is the client's fault: an untagged error counted
+            // against the provider's breaker, so one caller sending oversized bodies could open it
+            // and 503 every tenant. The status is what pingora answers with.
             rc.body_bytes_fed = rc.body_bytes_fed.saturating_add(chunk.len());
             if rc.body_bytes_fed > MAX_REQUEST_BODY {
                 self.state.metrics.rejection(Rejection::BodyTooLarge).inc();
-                return Err(pingora_core::Error::new_str("request body exceeds limit"));
+                return Err(pingora_core::Error::explain(
+                    pingora_core::ErrorType::HTTPStatus(413),
+                    "request body exceeds limit",
+                )
+                .into_down());
             }
             // Eligible requests are buffered so we can splice the root object before any byte reaches
             // the upstream (injection inserts near the front, so we can't have forwarded it already).
@@ -3937,7 +3952,7 @@ impl ProxyHttp for AiProxy {
 
     async fn logging(
         &self,
-        _session: &mut Session,
+        session: &mut Session,
         e: Option<&pingora_core::Error>,
         ctx: &mut Self::CTX,
     ) {
@@ -3993,7 +4008,13 @@ impl ProxyHttp for AiProxy {
                 // would open the breaker and 503 *everyone*. Worse, `half_open_permits` is 1, so a
                 // cancel-prone request drawn as the probe reopened it every time — the breaker could
                 // not recover while users were cancelling.
-                None if is_upstream_failure(e) => breaker.record_failure(),
+                //
+                // Nor is a client still uploading when the request died: the upstream was waiting
+                // on *our* bytes, so its read timeout or reset says the client stalled, not that
+                // the provider is sick. A connect failure moved no body byte, so it still counts.
+                None if is_upstream_failure(e) && !client_still_uploading(session, rc) => {
+                    breaker.record_failure();
+                }
                 // Client went away, or the request ended with no error at all. The provider is not
                 // implicated either way; record a success so a claimed half-open probe permit still
                 // resolves rather than being stranded.

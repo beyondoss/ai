@@ -1147,6 +1147,13 @@ the rate guardrails (which protect against abusive _inbound_ load):
   on a slow turn); counting those opened breakers on perfectly healthy providers, and because
   `half_open_permits` is 1, a cancel-prone request drawn as the recovery probe reopened the breaker
   every time — so it could not recover while users were cancelling.
+- **A client's bad upload is NOT a failure.** A chunked body that crosses the 100 MiB cap is aborted
+  with an error tagged `Downstream` (pingora answers 413). An upstream error that ends a request whose
+  body was still arriving (the attempt had fed body bytes and the client had not finished) means the
+  provider was waiting on the client: a stalled or abandoned upload. Neither counts. Before this, any
+  caller, BYO included, could open a provider's breaker for every tenant with a few oversized or
+  stalled uploads. A connect failure feeds no body byte, so it still counts. The cost: a provider
+  that resets the connection mid-upload is not blamed for it either; one that answers 5xx is.
 - **Applies to all traffic** (managed + BYO) — a down provider is down regardless of whose key is
   used. One breaker per provider, built at boot, shared lock-free across callers.
 - `circuit_breaker_threshold = 0` disables it.

@@ -164,7 +164,7 @@ async fn chunked_upload(port: u16, path: &str, total: usize) -> RawResponse {
 /// claim: REL-2, CAT-11
 /// defect: D16
 #[tokio::test]
-#[ignore = "D16 reproduced: chunked body over 100 MiB on /{provider} gives a bare 500"]
+#[ignore = "D16 reproduced: chunked body over 100 MiB on /{provider} gives a bare 413 (no JSON, no request id)"]
 async fn a_chunked_body_over_the_cap_is_a_json_413() {
     let nats_port = unused_nats_port();
     let (pubkey, _sk) = test_keypair(1);

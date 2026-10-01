@@ -277,3 +277,72 @@ async fn a_200_stream_with_an_error_first_event_is_not_pinned() {
         "only {on_fallback}/10 reached the working fallback: {served:?}"
     );
 }
+
+/// Write `head`, then `chunks` 1 MiB chunks of a chunked body, then (if `finish`) the terminator.
+/// Returns once the gateway answers or closes. A client that sends neither the terminator nor more
+/// bytes is a stalled upload.
+async fn chunked_upload(port: u16, head: &str, chunks: usize, finish: bool) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut s = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .unwrap();
+    s.write_all(head.as_bytes()).await.unwrap();
+    let frame = {
+        let mut f = format!("{:x}\r\n", 1 << 20).into_bytes();
+        f.extend_from_slice(&vec![b' '; 1 << 20]);
+        f.extend_from_slice(b"\r\n");
+        f
+    };
+    for _ in 0..chunks {
+        if s.write_all(&frame).await.is_err() {
+            break;
+        }
+    }
+    if finish {
+        let _ = s.write_all(b"0\r\n\r\n").await;
+    }
+    let mut buf = [0u8; 1024];
+    let _ = tokio::time::timeout(Duration::from_secs(10), s.read(&mut buf)).await;
+}
+
+/// Oversized and stalled uploads are the client's fault. Before the fix each one counted as a
+/// provider failure, so any caller (no key needed: BYO counts too) could open the shared breaker
+/// and 503 every tenant.
+/// claim: SEC-16
+/// defect: D32
+#[tokio::test]
+async fn client_upload_failures_do_not_open_the_breaker() {
+    let nats_port = unused_nats_port();
+    let (pubkey, _sk) = test_keypair(1);
+    let mock = MockUpstream::start(Mode::Json).await;
+    let gw = Gateway::builder(nats_port, &mock.authority(), &b64(&pubkey))
+        .config_line("circuit_breaker_threshold = 2")
+        .config_line("circuit_breaker_window_secs = 60")
+        .config_line("circuit_breaker_reset_secs = 60")
+        .config_line("read_timeout_secs = 1")
+        .start()
+        .await;
+    let head = "POST /openai/v1/chat/completions HTTP/1.1\r\nhost: 127.0.0.1\r\n\
+                authorization: Bearer sk-byo-test\r\ncontent-type: application/json\r\n\
+                transfer-encoding: chunked\r\n\r\n";
+    // Past the 100 MiB cap, with no Content-Length for the up-front check to see.
+    for _ in 0..3 {
+        chunked_upload(gw.port, head, 101, true).await;
+    }
+    wait_for_metric(&gw, "ai_rejections_total", "body_too_large", 3.0).await;
+    // A body that starts and then stops: the upstream gives up waiting for it.
+    let stalls: Vec<_> = (0..3)
+        .map(|_| tokio::spawn(chunked_upload(gw.port, head, 1, false)))
+        .collect();
+    for s in stalls {
+        s.await.unwrap();
+    }
+    let metrics = gw.metrics().await;
+    assert!(
+        !metrics.contains(r#"ai_rejections_total{reason="circuit_open"} "#)
+            || metrics.contains(r#"ai_rejections_total{reason="circuit_open"} 0"#),
+        "{metrics}"
+    );
+    let status = post_byo(&test_client(), &gw.url()).await;
+    assert_eq!(status, 200, "the breaker opened on client faults");
+}
