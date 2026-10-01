@@ -1345,10 +1345,10 @@ area = "Translation"
 title = "Queued parallel tool calls re-parse the live call's args on every step"
 impact = "OaiToAnt::advance_calls re-parses the full args each step while calls are queued (O(steps x len)); a call with empty args holds the queue until end of stream."
 confidence = "high"
-evidence = "translate.rs ~5448"
+evidence = "translate.rs ~5448. Reproduced hermetically: translate::response_tests::an_empty_args_call_does_not_hold_parallel_calls_until_the_end: a no-argument call followed by a second call whose arguments stream fully shows only the first block before the end of the stream (the second waits on serde parsing \"\" as JSON, which never succeeds). advance_calls re-parses the live call's full args on every step."
 claims = ["TRN-12"]
-state = "suspected"
-test = ""
+state = "reproduced"
+test = "an_empty_args_call_does_not_hold_parallel_calls_until_the_end"
 fix = ""
 note = "Found by the independent branch review (2026-10-01) of a54c22c."
 

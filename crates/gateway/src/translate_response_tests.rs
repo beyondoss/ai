@@ -2479,3 +2479,42 @@ fn overflowing_chat_usage_saturates_when_translated() {
         assert_eq!(out, Some(max), "{resp}");
     }
 }
+
+/// Parallel calls onto Messages stream one `tool_use` block at a time. A call that takes no
+/// arguments sends none; once the upstream streams the next call's arguments, the empty call is
+/// done and the next block shows, rather than every later call waiting for the end of the stream.
+/// claim: TRN-12
+/// defect: D96
+#[test]
+#[ignore = "D96 reproduced: an empty-args call holds the queue until the end of the stream"]
+fn an_empty_args_call_does_not_hold_parallel_calls_until_the_end() {
+    let chunk = |calls: Value| {
+        format!(
+            "data: {}\n\n",
+            json!({"id": "c", "model": "gpt-4o", "choices": [{"index": 0, "delta": {"tool_calls": calls}}]})
+        )
+    };
+    let chunks = [
+        chunk(json!([{"index": 0, "id": "call_a", "type": "function", "function": {"name": "now", "arguments": ""}}])),
+        chunk(json!([{"index": 1, "id": "call_b", "type": "function", "function": {"name": "weather", "arguments": ""}}])),
+        chunk(json!([{"index": 1, "function": {"arguments": "{\"city\":"}}])),
+        chunk(json!([{"index": 1, "function": {"arguments": "\"Paris\"}"}}])),
+    ];
+    let mut b = SseBridge::new(Messages, Chat);
+    let mut out = Vec::new();
+    for c in &chunks {
+        out.extend(b.feed(c.as_bytes(), false));
+    }
+    let evs = events(&String::from_utf8(out).unwrap());
+    let started: Vec<&str> = evs
+        .iter()
+        .filter(|(n, _)| n == "content_block_start")
+        .filter_map(|(_, v)| v.pointer("/content_block/name").and_then(Value::as_str))
+        .collect();
+    assert_eq!(started, ["now", "weather"], "{evs:?}");
+    let args: String = evs
+        .iter()
+        .filter_map(|(_, v)| v.pointer("/delta/partial_json").and_then(Value::as_str))
+        .collect();
+    assert_eq!(args, r#"{"city":"Paris"}"#);
+}
