@@ -36,6 +36,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.request
 from decimal import ROUND_HALF_UP, Decimal
 
@@ -45,6 +46,13 @@ BASE = os.environ["VERIFY_BASE"]
 KEY = os.environ["VERIFY_KEY"]
 MODEL = os.environ["VERIFY_MODEL"]
 TIMEOUT = 420
+# The live cell's time budget (`VERIFY_DEADLINE_SECS`, seconds from start; set by live.rs and
+# long_live.rs from nextest's slow-timeout): no harness command runs past it, so a session that
+# hangs is stopped here and reported with what it printed, instead of nextest killing the cell.
+DEADLINE = (time.monotonic() + float(os.environ["VERIFY_DEADLINE_SECS"])
+            if os.environ.get("VERIFY_DEADLINE_SECS") else None)
+# Set by `run` when a command was stopped at its timeout or the deadline: how long it had run.
+TIMED_OUT = None
 # Extra arguments for the harness command line (`harness_long.py cell` sets them, e.g. pi's
 # `--thinking low`).
 EXTRA_ARGS = []
@@ -164,13 +172,23 @@ def run(cmd, cwd, env):
     # cwd, so an inherited PWD silently drops the repo's opencode.json (ProviderModelNotFoundError).
     # Output to files, not pipes: bun (opencode) exits without draining a full pipe, so under load
     # a large stdout (`opencode models --verbose` is ~100 KB) came back cut off mid-JSON.
+    # A command still running at TIMEOUT or the cell's DEADLINE is killed and returns -9 with
+    # whatever it printed, and TIMED_OUT says how long it ran.
+    global TIMED_OUT
     env = {**env, "PWD": str(cwd)}
+    timeout = TIMEOUT if DEADLINE is None else max(min(TIMEOUT, DEADLINE - time.monotonic()), 1)
+    t0 = time.monotonic()
     with tempfile.TemporaryFile("w+") as out, tempfile.TemporaryFile("w+") as err:
-        p = subprocess.run(cmd, cwd=cwd, env=env, stdout=out, stderr=err, timeout=TIMEOUT,
-                           stdin=subprocess.DEVNULL)
+        try:
+            p = subprocess.run(cmd, cwd=cwd, env=env, stdout=out, stderr=err, timeout=timeout,
+                               stdin=subprocess.DEVNULL)
+            code = p.returncode
+        except subprocess.TimeoutExpired:
+            TIMED_OUT = round(time.monotonic() - t0)
+            code = -9
         out.seek(0)
         err.seek(0)
-        return p.returncode, out.read(), err.read()
+        return code, out.read(), err.read()
 
 
 def main(spec):
@@ -265,6 +283,8 @@ def main(spec):
         return False, {"why": f"unknown harness {harness}"}
 
     code, out, err = run(cmd + EXTRA_ARGS, work, env)
+    if TIMED_OUT is not None:
+        detail["timed_out"] = TIMED_OUT
 
     if harness == "claude-code":
         result = next((e for e in json_lines(out) if e.get("type") == "result"), {})

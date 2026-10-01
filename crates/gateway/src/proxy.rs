@@ -1282,8 +1282,8 @@ impl AiProxy {
         .await
     }
 
-    /// The body carries input the row's card says it does not accept (`route::refused_input`): a
-    /// 400 naming the row and the kind, before any upstream sees it.
+    /// The body asks for what the row's card says it does not accept (`route::refused_input`: image
+    /// input, tools): a 400 naming the row and the kind, before any upstream sees it.
     async fn reject_refused_input(
         &self,
         session: &mut Session,
@@ -1297,7 +1297,7 @@ impl AiProxy {
             request_id,
             400,
             "invalid_request_error",
-            format!("{} does not accept {kind} input", row.model),
+            format!("{} does not accept {kind}", row.model),
         )
         .await
     }

@@ -849,16 +849,29 @@ def opencode_setup(work, base, models):
     (work / "opencode.json").write_text(json.dumps(cfg))
 
 
-# Compaction thresholds, in tokens: each a little above the harness's own fixed prompt (system
-# prompt + tool definitions, measured on the pinned versions), so the session's growth crosses
-# it within the first few steps and compacts at least once without compacting every turn.
+# Compaction thresholds, in tokens, each derived from the prompt sizes the recorder sees (fresh +
+# cache tokens per call, printed by long_live.rs as `prompts`): above the context a compaction
+# leaves (the harness's fixed prompt, its system prompt and tool definitions, plus the summary),
+# so it doesn't compact every turn, and below the prompt a session typically ends on, so it
+# compacts at least once before the task is done. Measured on the pinned versions.
 # Claude Code's window can't go below 100k (it clamps); its threshold is min(window - 13k,
-# window * CLAUDE_AUTOCOMPACT_PCT_OVERRIDE%) of an 80k effective window (output reserved), so
-# the percentage is the knob that bites: 50% = 40k on a Claude row (its fixed prompt is ~29k,
-# the session peaks ~50k); 35% = 28k on a translated GPT row, where the same prompt is ~15k and
-# the session peaks ~35k.
+# window * CLAUDE_AUTOCOMPACT_PCT_OVERRIDE%) of an 80k effective window (its debug log:
+# `effectiveWindow=80000`), so the percentage is the knob that bites. Its count is the last
+# prompt plus that answer's output (compacting at 28.3k and 29.7k after prompts of 26.8k + 0.5k
+# out and 21.7k + 6.6k out). On a Claude row, 50% = 40k: the fixed prompt is ~29k, the session
+# peaks ~50k. On a translated GPT row (gpt-5.4-mini, 2026-10-01): the fixed prompt is 12.8k and
+# the summary 7.7-9.1k (so ~21k after a compaction), and uncompacted sessions end at 25.8k
+# (28 calls) and ~27k (29 calls), growing ~0.5k a call. 35% = 28k sat above that end: two of
+# three sessions never compacted. 30% = 24k is crossed ~5 calls before the end. The band between
+# ~21k and ~26k is narrow, so this route is marginal both ways: at 30% one session compacted 3
+# times in 39 calls and passed, another 8 times in ~100 calls and was still on the last step after
+# 16 minutes (stopped by hand; each summary loses some of the task).
+# Codex compacts above model_auto_compact_token_limit: its fixed prompt is 10.0k, it resumes at
+# ~11k after a compaction, and it passes 20k around call 21 of ~38 (2026-10-01: once, at 20.6k).
+# pi compacts above window - reserveTokens = 16k: its fixed prompt is 2.0k, it resumes at 1.6-9k,
+# and a session grows past 16k twice in ~70 calls (2026-10-01, on claude-haiku-4-5 over Chat).
 CLAUDE_COMPACT_WINDOW = 100000
-CLAUDE_COMPACT_PCT = int(os.environ.get("VERIFY_LONG_CC_PCT", "50" if MODEL.startswith("claude") else "35"))
+CLAUDE_COMPACT_PCT = int(os.environ.get("VERIFY_LONG_CC_PCT", "50" if MODEL.startswith("claude") else "30"))
 CODEX_COMPACT_LIMIT = int(os.environ.get("VERIFY_LONG_CODEX_LIMIT", "20000"))
 PI_COMPACT_AT = int(os.environ.get("VERIFY_LONG_PI_AT", "16000"))
 
@@ -888,6 +901,10 @@ def long_session(spec):
                               f"CLAUDE_AUTOCOMPACT_PCT_OVERRIDE={CLAUDE_COMPACT_PCT}")
         cmds = [[str(BIN / "claude"), "-p", WHOLE, "--model", MODEL, "--dangerously-skip-permissions",
                  "--output-format", "stream-json", "--verbose", "--max-turns", "120"]]
+        if KEEP:
+            # Its debug log has a line per turn with the count the threshold is held to
+            # ("autocompact: tokens=N level=... effectiveWindow=W").
+            cmds[0] += ["--debug-file", str(home / "claude-debug.txt")]
     elif harness == "codex":
         ch = codex_home(home, rec.base, f"model_auto_compact_token_limit = {CODEX_COMPACT_LIMIT}\n")
         env.update(CODEX_HOME=str(ch), BEYOND_API_KEY=KEY)
@@ -921,10 +938,7 @@ def long_session(spec):
     code, out, err = 0, "", ""
     outs, errs = [], []
     for cmd in cmds:
-        try:
-            code, o, e = H.run(cmd, work, env)
-        except subprocess.TimeoutExpired:
-            code, o, e = -9, "", f"timed out after {H.TIMEOUT}s"
+        code, o, e = H.run(cmd, work, env)  # -9 at H.TIMEOUT or the cell's deadline
         outs.append(o)
         errs.append(e)
         if code != 0:
@@ -1142,10 +1156,7 @@ def mcp_session(harness):
     else:
         return False, rec.stop(), {"why": f"unknown harness {harness}"}
     H.TIMEOUT = 600
-    try:
-        code, out, err = H.run(cmd, work, env)
-    except subprocess.TimeoutExpired:
-        code, out, err = -9, "", "timed out"
+    code, out, err = H.run(cmd, work, env)  # -9 at H.TIMEOUT or the cell's deadline
     calls = rec.stop()
     detail.update(exit=code, found_secret=secret in out, stdout_tail=out[-1500:], stderr_tail=err[-800:])
     shutil.rmtree(home, ignore_errors=True)
@@ -1255,7 +1266,7 @@ def cell_session(spec):
         calls = rec.stop()
         done = served(calls)
         detail = {k: detail.get(k) for k in ("harness", "mode", "exit", "test_rc", "test_unchanged", "stdout_tail",
-                                              "stderr_tail", "exception")}
+                                              "stderr_tail", "exception", "timed_out")}
         detail["served"] = len(done)
         if not done:
             ok, detail["why"] = False, "no billed call succeeded"
@@ -1522,6 +1533,8 @@ if __name__ == "__main__":
         except Exception as e:  # noqa: BLE001
             import traceback
             ok, detail = False, {"exception": f"{type(e).__name__}: {e}", "trace": traceback.format_exc()[-1500:]}
+        if H.TIMED_OUT is not None:
+            detail["timed_out"] = H.TIMED_OUT
         for c in calls:
             c.pop("resp_tail", None)
         if os.environ.get("VERIFY_CELL_TRACE"):
@@ -1536,4 +1549,6 @@ if __name__ == "__main__":
     except Exception as e:  # noqa: BLE001
         import traceback
         ok, detail = False, {"exception": f"{type(e).__name__}: {e}", "trace": traceback.format_exc()[-1500:]}
+    if H.TIMED_OUT is not None:
+        detail["timed_out"] = H.TIMED_OUT
     print("VERIFY " + json.dumps({"ok": bool(ok), "calls": calls, "detail": detail}, default=str))

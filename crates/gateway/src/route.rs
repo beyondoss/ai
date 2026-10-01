@@ -318,11 +318,12 @@ pub fn catalog_wire_action(path: &str, row: Endpoint) -> WireAction {
 /// Whether a managed catalog walk on `row` reads the whole body before it chooses candidates, even
 /// when a header named the row. A headerless walk reads it anyway (to find `model`); this makes a
 /// header-won one do the same where the body decides something: the row's card refuses image input
-/// ([`refused_input`]), or a candidate cannot serve a capability the card advertises
+/// or tools ([`refused_input`]), or a candidate cannot serve a capability the card advertises
 /// ([`unserved`]). Embeddings rows never: their bodies carry neither.
 pub fn walk_reads_body(row: &ModelRoute) -> bool {
     Endpoint::of_row(row) != Endpoint::Embeddings
         && (row.card.input & providers::catalog::IN_IMAGE == 0
+            || row.card.features & providers::catalog::TOOLS == 0
             || row
                 .candidates
                 .iter()
@@ -381,18 +382,25 @@ fn tool_count(body: &[u8]) -> usize {
     crate::peek::array_elements(body, tools.value.0).map_or(0, |items| items.len())
 }
 
-/// The input kind `body` carries that `row`'s card says it does not accept: `Some("image")` for an
-/// image part on a row without image input. The walk answers 400 before any upstream sees it: a
-/// candidate would otherwise ignore the image and bill an answer about nothing (o3-mini, Together's
-/// gpt-oss-120b) or fail with a 500 (gpt-4). Only image input is gated. A PDF on a row without file
-/// input is left to the candidate, because OpenRouter extracts a PDF's text for any model.
+/// What `body` asks of `row` that its card says the row does not accept: `Some("image input")` for
+/// an image part on a row without image input, `Some("tools")` for a non-empty `tools` array on a
+/// row whose card lists no tools. The walk answers 400 before any upstream sees it. An image would
+/// otherwise be ignored and an answer about nothing billed (o3-mini, Together's gpt-oss-120b), or
+/// fail with a 500 (gpt-4). Tools would be called with junk arguments by a model the card dropped
+/// them from for that (GLM 5.3 Flash, D197), or refused upstream in each provider's own words. A
+/// PDF on a row without file input is left to the candidate, because OpenRouter extracts a PDF's
+/// text for any model.
 pub fn refused_input(row: &ModelRoute, body: &[u8]) -> Option<&'static str> {
-    if Endpoint::of_row(row) == Endpoint::Embeddings
-        || row.card.input & providers::catalog::IN_IMAGE != 0
-    {
+    if Endpoint::of_row(row) == Endpoint::Embeddings {
         return None;
     }
-    carries_image(body).then_some("image")
+    if row.card.input & providers::catalog::IN_IMAGE == 0 && carries_image(body) {
+        return Some("image input");
+    }
+    if row.card.features & providers::catalog::TOOLS == 0 && tool_count(body) > 0 {
+        return Some("tools");
+    }
+    None
 }
 
 /// An image content part anywhere in the conversation: Chat Completions `image_url`, Messages

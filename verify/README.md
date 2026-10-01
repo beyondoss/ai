@@ -132,7 +132,14 @@ their own). The retry loop (`common::sdk_retry`, `sdk_backoff`) reads that budge
 wait plus one more attempt as long as the last would not finish inside it, keeping five seconds to
 read the billing row and report. The catalog sweep also caps each request's timeout at the time
 left. So a cell reports its last answer (INCONCLUSIVE, where it is the provider's) instead of being
-killed as a TIMEOUT. Outside nextest there is no budget. A failed catalog run keeps its gateway's
+killed as a TIMEOUT. A client process (a `live.rs` probe, a harness in `live.rs` or `long_live.rs`)
+gets the same budget less ten seconds (`common::run_client`), as `VERIFY_DEADLINE_SECS`:
+`harness.py` stops the agent there and reports with `detail.timed_out` and what it printed, and a
+client still running five seconds later is killed with its process group. A stopped session fails
+saying so, or is INCONCLUSIVE when its provider had the last request whole and sent no response
+head for a minute (`common::note_if_stalled_on_provider`): `E7::pi::gpt::pi:responses` was killed
+as a TIMEOUT on 2026-10-01 while OpenAI held pi's fifth request for 172s, after answering its
+first four in 1-2s (15 re-runs answered in 8-14s). Outside nextest there is no budget. A failed catalog run keeps its gateway's
 directory (`target/catalog-live/gw-<pid>/gateway.log`), so a failure can be read after the fact.
 
 | Suite                                                         | How a cell retries                                                                                                                                      |
@@ -254,11 +261,15 @@ limiter can never admit on the pool key's project).
 
 CAT-3 on OpenAI is held to the project's own tokens-per-minute limits, read with `OPENAI_ADMIN_KEY`
 from `GET /v1/organization/projects/{id}/rate_limits` (the project whose key hint matches
-`OPENAI_API_KEY`; a model's `-long-context` limit where it has one). The limiter answers before
-the context check: a prompt over the TPM is a 429 "Request too large" at once, and one over half of
-it a 429 "Rate limit reached ... Used N, Requested N" after up to a minute (the limiter counts the
-request against the minute before comparing; measured 2026-10-01 on gpt-4.1 and gpt-5-pro). So an
-over-limit or near-limit prompt is planned only when twice its size fits the limit. A 429 is never
+`OPENAI_API_KEY`). The limiter answers before the context check: a prompt over the TPM is a 429
+at once ("Request too large" on Chat Completions; "You've exceeded the rate limit, please slow
+down" on Responses), and one over half of it a 429 "Rate limit reached ... Used N, Requested N"
+after up to a minute (the limiter counts the request against the minute before comparing; measured
+2026-10-01 on gpt-4.1, gpt-5-pro, gpt-5.4-pro and gpt-5.5-pro). So an over-limit or near-limit
+prompt is planned only when twice its size fits the model's own TPM. A larger `-long-context`
+limit listed beside it doesn't raise that: gpt-5.5-pro (500K, long-context 2M) refuses a 970K
+prompt at once, as gpt-5.4-pro (200K) does, while gpt-5.5 (2M) answers the context error. A listed
+long-context limit can still refuse a prompt over it, so the prompt must fit that too. A 429 is never
 read as a context error: "exceeded the rate limit" used to match the context words, and
 `CAT-3::raw::openai::{gpt-4.1,gpt-5.2-pro,gpt-5.4-pro,gpt-5.5-pro,o1-pro}` passed on rate limits
 until 2026-10-01. Those over-limit trials are now left out with that reason.

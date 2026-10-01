@@ -382,7 +382,8 @@ around stays on the card, and a request using it skips that candidate (below): s
 on Bedrock and on OpenRouter's `z-ai/glm-5.2`, file input on OpenRouter's `x-ai/grok-build-0.1`. A
 bit no candidate honors is dropped: Kimi K2.6, Kimi K2.7 Code and Qwen3.6 Plus list no structured
 outputs, because their hosts accept a JSON schema and answer outside it (OpenRouter's per-endpoint
-`supported_parameters` claims otherwise, so it is not taken as ground truth). Grok rows list file input because
+`supported_parameters` claims otherwise, so it is not taken as ground truth), and GLM 5.3 Flash
+lists no tools, because both its candidates call them with junk arguments (D197). Grok rows list file input because
 every grok row reaches xAI over `/v1/responses`, where xAI reads PDFs (its Chat Completions answers
 400 "File content is not supported on /v1/chat/completions"). Where the vendor publishes no max output, OpenRouter's 0.9x /
 0.8x-of-window filler is replaced by `UNPUBLISHED_MAX_OUTPUT` (32,768), a conservative figure and
@@ -398,14 +399,20 @@ served after identity and before the body peek, so an empty GET is not a missing
 
 **The card holds the request.** A header-won catalog walk normally relays a small body without
 reading it first; on a row where the body decides something (`route::walk_reads_body`: a card
-without image input, or a candidate that cannot honor an advertised capability) it reads the whole
-body before choosing, as a headerless walk always does. Then:
+without image input or tools, or a candidate that cannot honor an advertised capability) it reads
+the whole body before choosing, as a headerless walk always does. Then:
 
 - An image part (Chat `image_url`, Messages `image`, Responses `input_image`) on a row whose card
   lists no image input is a 400 naming the row (`ai_rejections_total{reason="modality"}`), before
   any upstream: o3-mini would ignore the image and bill an answer about nothing, gpt-4 would
   answer 500. PDFs on a row without file input are not refused: OpenRouter extracts a PDF's text
   for most models.
+- A non-empty root `tools` array (any dialect) on a row whose card lists no tools is a 400 naming
+  the row ("... does not accept tools", the same `modality` reason), before any upstream. A card
+  drops tools when no candidate calls them reliably (GLM 5.3 Flash: junk in a forced call's
+  arguments about one time in ten on both candidates, D197) or none takes them (Llama 4 Scout,
+  `grok-4.20-multi-agent`), so a provider would call them badly or refuse in its own words. An
+  empty `tools: []` offers nothing and is served.
 - A body asking for a JSON-schema output (`response_format` / `output_config.format` /
   `text.format`) leaves Amazon Bedrock out of the walk (`providers::catalog::serves_structured_outputs`):
   Bedrock's Messages surface answers `output_config.format` with a 400 (Opus 4.8) or a 404 (Haiku

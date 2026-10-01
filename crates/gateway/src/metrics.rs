@@ -75,8 +75,9 @@ pub enum Rejection {
     /// Buffering this request's body would take the process past `max_buffered_body_bytes`. 503
     /// with `Retry-After`: the memory frees as the bodies in flight finish.
     BodyMemory,
-    /// A catalog-walk body carries input the row's card does not accept (an image on a text-only
-    /// row). 400 before any upstream, which would ignore the image or answer 500.
+    /// A catalog-walk body asks for what the row's card does not accept (an image on a text-only
+    /// row, tools on a tool-less one). 400 before any upstream, which would ignore the image or
+    /// answer 500, or call the tools badly.
     Modality,
 }
 

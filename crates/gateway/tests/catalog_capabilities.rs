@@ -3,7 +3,8 @@
 //!
 //! - A JSON-schema output request skips a candidate that cannot honor one (Amazon Bedrock).
 //! - A request carrying a PDF skips a candidate that reads none (OpenRouter's grok-build-0.1).
-//! - An image on a row whose card lists no image input is a 400 before any upstream sees it.
+//! - An image on a row whose card lists no image input is a 400 before any upstream sees it, as is
+//!   a request offering tools on a row whose card lists none.
 //! - An OpenRouter candidate is asked not to compress a prompt that overflows its window.
 //!
 //! Run via `mise run test:integration:rs` (needs `nats-server` on PATH).
@@ -278,6 +279,77 @@ async fn an_image_on_a_text_only_row_is_refused_before_any_upstream() {
         {"type": "image_url", "image_url": {"url": png}}]}]});
     let resp = post(&gw, &key, "/v1/chat/completions", &[], &seeing).await;
     assert_eq!(resp.status().as_u16(), 200);
+    assert_eq!(mock.hits(), 2);
+}
+
+/// GLM 5.3 Flash's card lists no tools: both its candidates (Together, and OpenRouter, which
+/// serves it from Together) put junk in a forced call's arguments about one time in ten. A request
+/// offering tools, from any client dialect, header-won or not, is a 400 naming the row before any
+/// upstream sees it; an empty `tools` array offers nothing and is served, as is a plain request.
+/// claim: CAT-6
+/// defect: D197
+#[tokio::test]
+async fn a_tool_request_on_a_tool_less_row_is_refused_before_any_upstream() {
+    let (pubkey, sk) = test_keypair(76);
+    let mock = MockUpstream::start(Mode::Json).await;
+    let gw = Gateway::builder(unused_nats_port(), &mock.authority(), &b64(&pubkey))
+        .providers(&["together", "openrouter"])
+        .provider_authority("openrouter", &mock.authority())
+        .start()
+        .await;
+    let key = billing_vkey(&sk, 76);
+    let params = json!({"type": "object", "properties": {"city": {"type": "string"}},
+                        "required": ["city"]});
+    let model = "z-ai/glm-5.3-flash";
+    let cases: [Case<'_>; 4] = [
+        (
+            "/v1/chat/completions",
+            &[],
+            json!({"model": model, "messages": [{"role": "user", "content": "Weather in Paris?"}],
+                   "tools": [{"type": "function", "function": {"name": "get_weather",
+                              "parameters": params}}],
+                   "tool_choice": {"type": "function", "function": {"name": "get_weather"}}}),
+        ),
+        (
+            "/v1/chat/completions",
+            &[("x-beyond-model", model)],
+            json!({"model": model, "messages": [{"role": "user", "content": "Weather in Paris?"}],
+                   "tools": [{"type": "function", "function": {"name": "get_weather",
+                              "parameters": params}}]}),
+        ),
+        (
+            "/v1/messages",
+            &[("x-beyond-model", model)],
+            json!({"model": model, "max_tokens": 64, "messages": [{"role": "user",
+                   "content": "Weather in Paris?"}],
+                   "tools": [{"name": "get_weather", "input_schema": params}]}),
+        ),
+        (
+            "/v1/responses",
+            &[],
+            json!({"model": model, "input": "Weather in Paris?",
+                   "tools": [{"type": "function", "name": "get_weather", "parameters": params}]}),
+        ),
+    ];
+    for (path, headers, body) in &cases {
+        let resp = post(&gw, &key, path, headers, body).await;
+        assert_eq!(resp.status().as_u16(), 400, "{path}: {body}");
+        let msg = resp.json::<Value>().await.unwrap().to_string();
+        assert!(
+            msg.contains("z-ai/glm-5.3-flash does not accept tools"),
+            "{path}: {msg}"
+        );
+    }
+    assert_eq!(mock.hits(), 0, "a refused tool request reached a provider");
+    wait_for_metric(&gw, "ai_rejections_total", "modality", 4.0).await;
+
+    for body in [
+        json!({"model": model, "messages": [{"role": "user", "content": "Hi"}]}),
+        json!({"model": model, "messages": [{"role": "user", "content": "Hi"}], "tools": []}),
+    ] {
+        let resp = post(&gw, &key, "/v1/chat/completions", &[], &body).await;
+        assert_eq!(resp.status().as_u16(), 200, "{body}");
+    }
     assert_eq!(mock.hits(), 2);
 }
 

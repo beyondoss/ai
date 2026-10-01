@@ -285,6 +285,126 @@ pub fn fits(wait: Duration, attempt: Duration) -> bool {
     time_left().is_none_or(|left| wait + attempt <= left)
 }
 
+/// What a cell keeps for itself after its client process (a probe, a harness session) ends: read
+/// the ledger and judge. A client gets [`time_left`] less this.
+pub const CLIENT_RESERVE: Duration = Duration::from_secs(10);
+
+/// How long past its own deadline a client process may run before [`run_client`] kills it.
+const CLIENT_GRACE: Duration = Duration::from_secs(5);
+
+/// Runs a cell's client process inside the test's time budget, and returns its exit status and
+/// stdout (stderr is the caller's to direct).
+///
+/// The client is told its deadline in `VERIFY_DEADLINE_SECS` ([`time_left`] less
+/// [`CLIENT_RESERVE`]): a harness (`harness.py`, `harness_long.py`) stops the agent it drives
+/// there and reports what it saw, with `detail.timed_out`, so the cell can still say what the
+/// session was waiting on ([`note_if_stalled_on_provider`]). One that doesn't stop (an SDK probe
+/// blocked on a read) is killed with its whole process group [`CLIENT_GRACE`] later, and the cell
+/// fails saying so. Either way the cell reports before nextest's kill, never as a bare TIMEOUT.
+/// Without a budget (outside nextest) the client runs as long as it likes.
+pub fn run_client(
+    cmd: &mut std::process::Command,
+) -> Result<(std::process::ExitStatus, Vec<u8>), String> {
+    run_client_until(
+        cmd,
+        time_left().map(|left| left.saturating_sub(CLIENT_RESERVE)),
+    )
+}
+
+/// [`run_client`] with the client's deadline given (`None`: none).
+pub fn run_client_until(
+    cmd: &mut std::process::Command,
+    deadline: Option<Duration>,
+) -> Result<(std::process::ExitStatus, Vec<u8>), String> {
+    use std::io::Read as _;
+    use std::os::unix::process::CommandExt as _;
+    if let Some(d) = deadline {
+        cmd.env("VERIFY_DEADLINE_SECS", d.as_secs().max(1).to_string());
+    }
+    let start = std::time::Instant::now();
+    let mut child = cmd
+        .process_group(0)
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| e.to_string())?;
+    let pgid = child.id();
+    let mut stdout = child.stdout.take().expect("piped stdout");
+    let reader = std::thread::spawn(move || {
+        let mut out = Vec::new();
+        let _ = stdout.read_to_end(&mut out);
+        out
+    });
+    let status = loop {
+        if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
+            break status;
+        }
+        if deadline.is_some_and(|d| start.elapsed() >= d + CLIENT_GRACE) {
+            kill_group(pgid);
+            let _ = child.wait();
+            return Err(format!(
+                "the client was still running {}s after its {}s deadline, at the test's time \
+                 budget, and was killed",
+                CLIENT_GRACE.as_secs(),
+                deadline.unwrap_or_default().as_secs()
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    // Whatever it left behind (an agent's tool subprocess) would hold stdout open.
+    kill_group(pgid);
+    let out = reader.join().unwrap_or_default();
+    Ok((status, out))
+}
+
+fn kill_group(pgid: u32) {
+    let _ = std::process::Command::new("kill")
+        .args(["-KILL", "--", &format!("-{pgid}")])
+        .stderr(std::process::Stdio::null())
+        .status();
+}
+
+/// Calls [`provider_unavailable`] when a client that was stopped at the time budget had been
+/// waiting on its provider: the session's last `ai.usage` row is a request the client gave up
+/// on (`client_cancelled`) after the provider had all of it (the gateway billed it an estimate,
+/// which it does only once the whole body went upstream: `body_delivered` in proxy.rs), and no
+/// response head ever reached the client (the gateway logged the upstream request as ending
+/// "before response header is sent"), after at least [`STALL`]. A provider that answers this
+/// session's other calls in seconds and sends nothing for minutes is unavailable; the gateway
+/// relays a head the moment it has one. Only for a route with one live provider.
+pub fn note_if_stalled_on_provider(rows: &[serde_json::Value], log: &str) {
+    if let Some(why) = stalled_on_provider(rows, log) {
+        provider_unavailable(why);
+    }
+}
+
+/// What [`note_if_stalled_on_provider`] reads: why the session's provider counts as unavailable,
+/// or `None` when it doesn't.
+pub fn stalled_on_provider(rows: &[serde_json::Value], log: &str) -> Option<String> {
+    let row = rows.last()?;
+    let id = row["request_id"].as_str()?;
+    let provider = row["provider"].as_str()?;
+    let ms = row["latency_ms"].as_u64()?;
+    let headless = log
+        .lines()
+        .any(|l| l.contains(id) && l.contains("before response header is sent"));
+    (row["outcome"] == "client_cancelled"
+        && row["usage_estimated"] == true
+        && headless
+        && Duration::from_millis(ms) >= STALL)
+        .then(|| {
+            format!(
+                "{provider} had the session's last request ({id}) whole and sent no response \
+                 head in {}s; the client was stopped at the test's time budget, and the route \
+                 has no other provider to fail over to",
+                ms / 1000
+            )
+        })
+}
+
+/// How long a provider must have sent nothing for [`note_if_stalled_on_provider`] to call it
+/// unavailable: a minute, against the 1-15s a harness cell's calls take.
+pub const STALL: Duration = Duration::from_secs(60);
+
 /// Whether the SDK retries an answer with `status` at all: `x-should-retry` when the server sends
 /// it, else 408, 409, 429 and every 5xx.
 pub fn sdk_retryable(status: u16, header: impl Fn(&str) -> Option<String>) -> bool {

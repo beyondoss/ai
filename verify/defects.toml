@@ -2093,3 +2093,17 @@ state = "fixed"
 test = "a_request_over_the_tpm_limit_is_told_to_shrink_not_to_retry"
 fix = "90ac266"
 note = "Fixed in remedy.rs: a 429 whose message carries a remedy and says the request alone is over the limit (\"request too large\", \"must be reduced in order to run successfully\") reads remedy::TOO_LARGE, \"The request is larger than the provider's per-minute token limit admits; reduce the input or output tokens. Retrying it unchanged will not succeed.\"; the org id and link still go, and status, type and code are kept. A plain rate limit (\"Rate limit reached ... Please try again in 2s\") still reads RATE_LIMITED. Not changed: the status stays 429, so a stock SDK still retries it twice (the gateway relays the provider's status verbatim and has no x-should-retry of its own to send at end of body)."
+
+[[defect]]
+id = "D197"
+severity = "med"
+area = "Catalog"
+title = "GLM 5.3 Flash advertised tools that neither candidate calls reliably"
+impact = "A client offered tools on z-ai/glm-5.3-flash got a call to the right function about one time in ten with junk in its arguments: invented coordinates, weather readings or postal codes inside the city string, an empty object, or a repetition loop that ran to the token cap and left the arguments unparseable. Both candidates do it, because OpenRouter serves the model from Together, the row's primary, nearly every time, so no steering of the walk avoids it."
+confidence = "high"
+evidence = "live 2026-10-01 final run (target/final-live5.log): CAT-6::raw::openrouter::z-ai/glm-5.3-flash, forced get_weather, arguments {\"city\": \"Paris, France (FR-75, FR-IDF, Île-de-France, 75001/75002/.../76035/7 cut off (a repetition loop to the 4096-token cap), so the JSON lacked city; D115 had seen tool-call markup leak into the same cell's arguments. Measured direct 2026-10-01 with the cell's own body (named tool_choice, max_tokens 4096): Together zai-org/GLM-5.3-Flash 9 of 100 calls bad (junk in city or {}; 1 of 20 with reasoning enabled, 1 of 20 disabled), OpenRouter z-ai/glm-5.3-flash 9 of 60 bad, all served by its Together host (56 of 60 went there; InferenceNet and Wafer served 4, clean). Control: Together zai-org/GLM-5.3, 20 of 20 clean. Recorded in verify/catalog_truth.toml (the row's features_absent and note)."
+claims = ["CAT-6"]
+state = "fixed"
+test = "a_tool_request_on_a_tool_less_row_is_refused_before_any_upstream"
+fix = "PENDING"
+note = "Fixed by dropping tools from the card (glm_5_3_flash_advertises_no_tools), and by the gateway refusing a request that offers tools on a row whose card lists none: a 400 \"z-ai/glm-5.3-flash does not accept tools\" before any upstream (route::refused_input, as for an image on a text-only row), since dropping the bit alone left both candidates serving tool calls (CAT-6 re-run: \"card omits tools, but the candidate called one\"). A refusal table that skips one candidate for tool requests (as REFUSES_STRUCTURED_OUTPUTS does for schemas, D155) would have left the other, equally unreliable one. Plain, reasoning and structured-output requests still use both candidates; an empty tools array is served. GLM 5.3, on the same two hosts, keeps tools. The other tool-less rows (Llama 4 Scout, grok-4.20-multi-agent) now get the gateway's 400 instead of their provider's own 4xx."

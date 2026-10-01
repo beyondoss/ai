@@ -281,12 +281,13 @@ fn provider_window(provider: &str, id: &str) -> Option<u64> {
     }
 }
 
-/// The tokens-per-minute limit OpenAI sets on the pool key's project for `model`, read with the
+/// The tokens-per-minute limits OpenAI sets on the pool key's project for `model`, read with the
 /// admin key from the organization's own rate-limit listing (read-only:
 /// `GET /v1/organization/projects/{id}/rate_limits`, the project being the one whose key hint
-/// matches `OPENAI_API_KEY`). Cached for six hours like the model listings. `None` without
-/// `OPENAI_ADMIN_KEY`, or when the model has no listed limit.
-fn openai_tpm(model: &str) -> Option<u64> {
+/// matches `OPENAI_API_KEY`). Cached for six hours like the model listings. Returns the model's
+/// own limit and its `-long-context` one, each `None` when not listed; `None` without
+/// `OPENAI_ADMIN_KEY`.
+fn openai_tpm(model: &str) -> Option<Tpm> {
     static LIMITS: OnceLock<Option<Value>> = OnceLock::new();
     let limits = LIMITS.get_or_init(|| {
         let path = sweep_dir().join("listing-openai-rate-limits.json");
@@ -349,12 +350,26 @@ fn openai_tpm(model: &str) -> Option<u64> {
         let _ = std::fs::write(&path, v.to_string());
         Some(v)
     });
-    // A long prompt is held to the model's `-long-context` limit where it has one ("Request too
-    // large for gpt-4.1 (for limit gpt-4.1-long-context) ... Limit 1000000"), which is the larger.
     let l = limits.as_ref()?;
-    let base = l[model].as_u64();
-    let long = l[format!("{model}-long-context")].as_u64();
-    base.max(long)
+    Some(Tpm {
+        base: l[model].as_u64(),
+        long: l[format!("{model}-long-context")].as_u64(),
+    })
+}
+
+/// A model's tokens-per-minute limits on the pool key's project: its own, and the
+/// `-long-context` one OpenAI lists beside it for some models.
+#[derive(Clone, Copy, Debug)]
+struct Tpm {
+    base: Option<u64>,
+    long: Option<u64>,
+}
+
+impl std::fmt::Display for Tpm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let n = |v: Option<u64>| v.map_or("none".to_owned(), |v| v.to_string());
+        write!(f, "TPM {}, long-context {}", n(self.base), n(self.long))
+    }
 }
 
 /// Whether `key` is the key a redacted hint (`sk-proj-****wxyz`, `sk-...wxyz`) describes: the
@@ -377,10 +392,29 @@ fn hint_matches(hint: &str, key: &str) -> bool {
 /// comes); and the limiter counts a request against the minute before comparing, so a lone
 /// 136,404-token gpt-5-pro request with nothing else in the minute answered, after 38-56s, 429
 /// "Rate limit reached ... Limit 200000, Used 136626, Requested 136626" (Retry-After 22s), every
-/// time. So a request is admitted only if twice its size fits the TPM. `true` when the limit is
-/// unknown: the trial runs, and the 429 is judged as the rate limit it is.
-fn openai_admits(model: &str, tokens: u64) -> bool {
-    openai_tpm(model).is_none_or(|tpm| 2 * tokens <= tpm)
+/// time. So a request is admitted only if twice its size fits the TPM.
+///
+/// Which TPM: the model's own, even for a long prompt where a larger `-long-context` limit is
+/// listed. Measured 2026-10-01 on the Responses API: a 970,100-token prompt on gpt-5.5-pro (TPM
+/// 500,000, long-context 2,000,000) answered 429 "You've exceeded the rate limit, please slow
+/// down and try again after 1.5e-05 seconds" in 3s, every time, which is what gpt-5.4-pro
+/// (200,000 both) answers the same prompt, while gpt-5.5 (2,000,000 both) answered the context
+/// error. And gpt-4.1-mini (TPM 4,000,000, long-context 2,000,000) admits a 1,101,954-token
+/// prompt, over half its long-context limit. A listed `-long-context` limit can still refuse a
+/// prompt over it outright ("Request too large for gpt-4.1 (for limit gpt-4.1-long-context) ...
+/// Limit 1000000"), so the prompt must fit that one too. `Err` names the limit that refuses;
+/// `Ok` when no limit is known: the trial runs, and a 429 is judged as the rate limit it is.
+fn openai_admits(tpm: Option<Tpm>, tokens: u64) -> Result<(), String> {
+    let Some(tpm) = tpm else { return Ok(()) };
+    match (tpm.base.or(tpm.long), tpm.long) {
+        (Some(base), _) if 2 * tokens > base => Err(format!(
+            "twice the prompt must fit the model's own {base} TPM ({tpm})"
+        )),
+        (_, Some(long)) if tokens > long => Err(format!(
+            "the prompt is over the {long}-token long-context TPM ({tpm})"
+        )),
+        _ => Ok(()),
+    }
 }
 
 /// `us.anthropic.claude-haiku-4-5-20251001-v1:0` → `claude-haiku-4-5-20251001`.
@@ -3297,19 +3331,21 @@ fn plan() -> (Vec<Planned>, Vec<String>) {
             // A prompt OpenAI's rate limiter can never admit on our project gets a 429 every time,
             // not the context answer the trial is about.
             let tpm_skip = |words: u64, what: &str, skipped: &mut Vec<String>| {
-                let blocked =
-                    arm.provider() == "openai" && !openai_admits(arm.cand.upstream_model, words);
-                if blocked {
-                    skipped.push(format!(
-                        "{} {what}: a {words}-token prompt is over what OpenAI's rate limiter \
-                         admits on the pool key's project (2x the prompt must fit its {} TPM \
-                         for {})",
-                        name("CAT-3", route, m),
-                        openai_tpm(arm.cand.upstream_model).unwrap_or_default(),
-                        arm.cand.upstream_model
-                    ));
+                if arm.provider() != "openai" {
+                    return false;
                 }
-                blocked
+                let model = arm.cand.upstream_model;
+                match openai_admits(openai_tpm(model), words) {
+                    Ok(()) => false,
+                    Err(why) => {
+                        skipped.push(format!(
+                            "{} {what}: a {words}-token prompt is over what OpenAI's rate \
+                             limiter admits for {model} on the pool key's project: {why}",
+                            name("CAT-3", route, m),
+                        ));
+                        true
+                    }
+                }
             };
             let over = match theirs {
                 _ if tpm_skip(window + window / 20 + 2000, "over-limit", &mut skipped) => None,
@@ -3466,6 +3502,67 @@ fn retries_end_inside_the_nextest_budget() -> Result<(), Failed> {
         .filter_map(|&(profile, binary, want)| {
             let got = common::budget_in(&config, profile, binary);
             (got != want).then(|| format!("{profile} {binary:?}: {got:?}, want {want:?}"))
+        })
+        .collect();
+    if wrong.is_empty() {
+        Ok(())
+    } else {
+        Err(wrong.join("; ").into())
+    }
+}
+
+/// The CAT-3 planner holds an OpenAI prompt to the limits measured on 2026-10-01 (see
+/// `openai_admits`): twice the prompt within the model's own TPM even where a larger
+/// `-long-context` limit is listed (gpt-5.5-pro's 970,100-token over-limit prompt, rate-limited
+/// three times in the clean run), the prompt itself within a listed long-context limit, and no
+/// limit known means the trial runs.
+/// claim: CAT-3
+fn cat3_plans_openai_prompts_to_the_measured_limit() -> Result<(), Failed> {
+    let tpm = |base, long| Some(Tpm { base, long });
+    let cases: &[(&str, Option<Tpm>, u64, bool)] = &[
+        (
+            "gpt-5.5-pro over-limit",
+            tpm(Some(500_000), Some(2_000_000)),
+            970_100,
+            false,
+        ),
+        (
+            "gpt-5.5 over-limit",
+            tpm(Some(2_000_000), Some(2_000_000)),
+            970_100,
+            true,
+        ),
+        (
+            "gpt-4.1-mini over-limit",
+            tpm(Some(4_000_000), Some(2_000_000)),
+            1_101_954,
+            true,
+        ),
+        (
+            "gpt-4.1 over-limit",
+            tpm(Some(800_000), Some(1_000_000)),
+            1_101_954,
+            false,
+        ),
+        (
+            "gpt-5-pro near-limit",
+            tpm(Some(200_000), None),
+            136_404,
+            false,
+        ),
+        (
+            "long-context only",
+            tpm(None, Some(2_000_000)),
+            970_100,
+            true,
+        ),
+        ("no limit known", None, 970_100, true),
+    ];
+    let wrong: Vec<String> = cases
+        .iter()
+        .filter_map(|&(what, tpm, tokens, want)| {
+            let got = openai_admits(tpm, tokens);
+            (got.is_ok() != want).then(|| format!("{what}: {got:?}, want admitted={want}"))
         })
         .collect();
     if wrong.is_empty() {
@@ -3718,6 +3815,10 @@ fn main() {
     trials.push(Trial::test(
         "retries_end_inside_the_nextest_budget",
         retries_end_inside_the_nextest_budget,
+    ));
+    trials.push(Trial::test(
+        "cat3_plans_openai_prompts_to_the_measured_limit",
+        cat3_plans_openai_prompts_to_the_measured_limit,
     ));
     trials.push(Trial::test(
         "provider_failures_are_attributed",

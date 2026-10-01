@@ -13,7 +13,11 @@
 //! implement five modules against their tests, refactor, add a CLI), each with its own test file.
 //! It takes an agent 30-100 model calls (Codex, the most economical, 28-41). Each harness's own
 //! compaction knob is turned down (`harness_long.py` says which) so that auto-compaction happens
-//! inside the session. A trial passes when:
+//! inside the session. Each threshold is derived from the prompts the session measures (each
+//! billed call's fresh + cache tokens, printed as `prompts` with every trial): above what a
+//! compaction leaves (the harness's fixed prompt plus the summary), so it doesn't compact every
+//! turn, and below the prompt the session typically ends on uncompacted, so it compacts before the
+//! task is done. A trial passes when:
 //!
 //! - the task completed: the repo's full test run passes and no test file changed;
 //! - the session made at least [`MIN_TURNS`] billed model calls;
@@ -187,7 +191,11 @@ const SESSIONS: &[Session] = &[
     // into the new context, and the session stalls (5 of 6 tries on gpt-5 and gpt-5-mini; the
     // gateway relays both turns intact). Compaction is covered on the Claude rows.
     ("LNG-1",       "claude-code", "claude-code:uncompacted", GPT51, Some(Provider::OpenAi)),
-    // D114: refused at the first turn (Messages thinking + tools -> Chat reasoning_effort + tools).
+    // Translated and compacted (D114 refused its first turn until fixed). Claude Code's knob is
+    // CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=30 on its 80k effective window: 24k, between the ~21k a
+    // compaction leaves and the 25.8-27k the session ends on uncompacted (derivation in
+    // harness_long.py; at 35%, 28k, two of three sessions finished without compacting). The band
+    // is narrow: at 30% one of two sessions compacted 8 times and stalled on the last step.
     ("LNG-1",       "claude-code", "claude-code", GPT54MINI, None),
     // Not reconciled: gpt-5.3-codex is the one row Codex runs on (D74), and live.rs,
     // session_live.rs and catalog_live.rs drive it too. Two tries both met a few small requests
@@ -454,18 +462,27 @@ impl Gateway {
     }
 
     /// Run `harness_long.py <kind> <arg>` against this gateway; its `VERIFY` verdict.
+    /// Inside nextest's time budget (`common::run_client`): a session still running at its
+    /// deadline is stopped and fails saying so, INCONCLUSIVE when its provider had the last
+    /// request and sent nothing back.
     fn client(&self, kind: &str, arg: &str, model: &str) -> Result<Value, Failed> {
-        let out = Command::new(python())
-            .arg(repo_root().join("verify/clients/harness_long.py"))
-            .args([kind, arg])
-            .env("VERIFY_BASE", format!("http://127.0.0.1:{}", self.port))
-            .env("VERIFY_KEY", DEV_TOKEN)
-            .env("VERIFY_MODEL", model)
-            .env("TMPDIR", &self.tmp)
-            .stderr(Stdio::inherit())
-            .output()
-            .map_err(|e| format!("harness_long.py: {e}"))?;
-        let stdout = String::from_utf8_lossy(&out.stdout);
+        let (_, out) = common::run_client(
+            Command::new(python())
+                .arg(repo_root().join("verify/clients/harness_long.py"))
+                .args([kind, arg])
+                .env("VERIFY_BASE", format!("http://127.0.0.1:{}", self.port))
+                .env("VERIFY_KEY", DEV_TOKEN)
+                .env("VERIFY_MODEL", model)
+                .env("TMPDIR", &self.tmp)
+                .stderr(Stdio::inherit()),
+        )
+        .map_err(|e| {
+            format!(
+                "harness_long.py: {e}\n--- gateway log ---\n{}",
+                tail(&self.log)
+            )
+        })?;
+        let stdout = String::from_utf8_lossy(&out);
         let verdict: Value = stdout
             .lines()
             .rev()
@@ -476,6 +493,19 @@ impl Gateway {
             return Err(
                 format!("harness_long.py raised {e}\n{}", verdict["detail"]["trace"]).into(),
             );
+        }
+        if let Some(secs) = verdict["detail"]["timed_out"].as_u64() {
+            std::thread::sleep(Duration::from_millis(500));
+            let log = std::fs::read_to_string(&self.log).unwrap_or_default();
+            common::note_if_stalled_on_provider(&usage_rows(&self.log), &log);
+            return Err(format!(
+                "the session was stopped at the test's time budget after {secs}s, still \
+                 running: stdout tail {}, stderr tail {}\n--- gateway log ---\n{}",
+                verdict["detail"]["stdout_tail"],
+                verdict["detail"]["stderr_tail"],
+                tail(&self.log)
+            )
+            .into());
         }
         Ok(verdict)
     }
@@ -748,15 +778,30 @@ fn long_session(
     let session_rows: Vec<&Value> = matched.iter().flatten().copied().collect();
     let t = totals(&session_rows);
     let shares = cache_shares(&calls, &matched);
+    // Each billed call's prompt (fresh + cache tokens) in thousands, `c` marking a compaction
+    // request: what a harness's compaction threshold is measured against (`harness_long.py`).
+    let prompts: Vec<String> = calls
+        .iter()
+        .zip(&matched)
+        .filter_map(|(c, r)| {
+            let k = input_total((*r)?) as f64 / 1000.0;
+            Some(if c["compaction"] == true {
+                format!("{k:.1}c")
+            } else {
+                format!("{k:.1}")
+            })
+        })
+        .collect();
     eprintln!(
         "LNG {spec} on {}: task ok={} calls={} billed={} compaction requests={compactions} \
-         harness compactions={harness_compactions} {t} cost=${:.4} cache shares (eligible \
-         turns)={:?}",
+         harness compactions={harness_compactions} {t} cost=${:.4} prompts (k tokens)=[{}] \
+         cache shares (eligible turns)={:?}",
         route.model,
         verdict["ok"],
         calls.len(),
         billed.len(),
         cost(&t, &detail["pricing"]),
+        prompts.join(" "),
         shares
             .iter()
             .map(|s| (s * 100.0).round() / 100.0)

@@ -497,7 +497,95 @@ fn main() {
     }
     // Live traffic: no reconciliation window may be open while it runs (see common::live_traffic).
     let _traffic = (!trials.is_empty() && !args.list).then(common::live_traffic);
+    trials.push(Trial::test(
+        "harness_cells_report_inside_the_nextest_budget",
+        harness_cells_report_inside_the_nextest_budget,
+    ));
     libtest_mimic::run(&args, trials).exit();
+}
+
+/// A harness cell reports before nextest's kill, never as a bare TIMEOUT
+/// (`E7::pi::gpt::pi:responses`, 2026-10-01: OpenAI sent no head for pi's fifth request in 172s
+/// and nextest killed the cell at 180s). The client is told its deadline; one that runs past it
+/// is killed with its process group and the cell gets the reason; a client that exits leaves no
+/// subprocess holding its stdout open. And the session it was stopped in is read: a provider
+/// that had the last request whole (an estimated, cancelled row) and sent no head for a minute
+/// is unavailable, while a short wait, a request it never had, or a head that came are not.
+/// claim: E7
+fn harness_cells_report_inside_the_nextest_budget() -> Result<(), Failed> {
+    let mut problems = Vec::new();
+    let sh = |script: &str| {
+        let mut c = Command::new("sh");
+        c.args(["-c", script]);
+        c
+    };
+    match common::run_client_until(
+        &mut sh("echo VERIFY $VERIFY_DEADLINE_SECS"),
+        Some(Duration::from_secs(40)),
+    ) {
+        Ok((_, out)) if String::from_utf8_lossy(&out).trim() == "VERIFY 40" => {}
+        other => problems.push(format!("deadline not handed to the client: {other:?}")),
+    }
+    let at = Instant::now();
+    match common::run_client_until(&mut sh("sleep 60"), Some(Duration::from_secs(1))) {
+        Err(e) if e.contains("killed") && at.elapsed() < Duration::from_secs(15) => {}
+        other => problems.push(format!(
+            "a client past its deadline was not killed in time ({:?}): {other:?}",
+            at.elapsed()
+        )),
+    }
+    let at = Instant::now();
+    match common::run_client_until(&mut sh("sleep 60 & echo done"), None) {
+        Ok((_, out))
+            if String::from_utf8_lossy(&out).trim() == "done"
+                && at.elapsed() < Duration::from_secs(15) => {}
+        other => problems.push(format!(
+            "a subprocess left behind held the client's stdout ({:?}): {other:?}",
+            at.elapsed()
+        )),
+    }
+    let row = |outcome: &str, estimated: bool, ms: u64| {
+        serde_json::json!({"request_id": "r-5", "provider": "openai", "outcome": outcome,
+            "usage_estimated": estimated, "latency_ms": ms})
+    };
+    let headless = r#"{"fields":{"message":"upstream request errored","request_id":"r-5","error":"Downstream ConnectionClosed context: Prematurely before response header is sent"}}"#;
+    for (what, rows, log, want) in [
+        (
+            "stalled",
+            vec![row("client_cancelled", true, 172_208)],
+            headless,
+            true,
+        ),
+        (
+            "a short wait",
+            vec![row("client_cancelled", true, 20_000)],
+            headless,
+            false,
+        ),
+        (
+            "never delivered",
+            vec![row("client_cancelled", false, 172_208)],
+            headless,
+            false,
+        ),
+        (
+            "a head came",
+            vec![row("client_cancelled", true, 172_208)],
+            "",
+            false,
+        ),
+        ("answered", vec![row("ok", false, 172_208)], headless, false),
+        ("no rows", vec![], headless, false),
+    ] {
+        if common::stalled_on_provider(&rows, log).is_some() != want {
+            problems.push(format!("{what}: stalled_on_provider should be {want}"));
+        }
+    }
+    if problems.is_empty() {
+        Ok(())
+    } else {
+        Err(problems.join("; ").into())
+    }
 }
 
 /// What a cell asserts beyond the ledger, from the claims in its name.
@@ -724,17 +812,34 @@ fn attempt_cell(
     {
         cmd.env("VERIFY_BYO_KEY", &keys[route.pools[0].1]);
     }
-    let out = cmd
-        .stderr(Stdio::inherit())
-        .output()
-        .map_err(|e| format!("probe: {e}"))?;
-    let stdout = String::from_utf8_lossy(&out.stdout);
+    // Inside nextest's time budget: the probe is told its deadline, and killed just past it.
+    let (_, out) = common::run_client(cmd.stderr(Stdio::inherit()))
+        .map_err(|e| format!("probe: {e}\n--- gateway log ---\n{}", tail(&log_path)))?;
+    let stdout = String::from_utf8_lossy(&out);
     let verdict: Value = stdout
         .lines()
         .rev()
         .find_map(|l| l.strip_prefix("VERIFY "))
         .and_then(|j| serde_json::from_str(j).ok())
         .ok_or_else(|| format!("probe printed no VERIFY line:\n{stdout}"))?;
+
+    // A harness stopped at its deadline: what it was waiting on decides the verdict, not the cost
+    // or the task it didn't get to finish. A session whose provider had its last request and sent
+    // nothing back is INCONCLUSIVE; anything else fails, with what the harness printed.
+    if let Some(secs) = verdict["detail"]["timed_out"].as_u64() {
+        std::thread::sleep(Duration::from_millis(500));
+        if route.pools.len() - route.dead.len() == 1 {
+            let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+            common::note_if_stalled_on_provider(&usage_rows(&log_path), &log);
+        }
+        return Err(format!(
+            "the harness was stopped at the test's time budget after {secs}s, still running: {}\n\
+             --- gateway log ---\n{}",
+            verdict["detail"],
+            tail(&log_path)
+        )
+        .into());
+    }
 
     // A probe whose oracle rests on something the provider documents as best effort (OpenAI's
     // prompt cache hits) says so in `detail.best_effort` when it missed: the client saw nothing

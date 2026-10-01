@@ -1230,6 +1230,8 @@ input = "0.15"
 output = "0.50"
 cache_read = "0.03"
 context_window = 1_048_575
+features_absent = ["tools"]
+note = "Together lists function calling, but neither candidate calls a tool reliably (D197). Forced get_weather (\"What is the weather in Paris right now? Use the tool.\", tool_choice named, max_tokens 4096), 2026-10-01: direct to Together zai-org/GLM-5.3-Flash, 9 of 100 calls put junk in city (\"Paris (FR, FR-75, 48.8566, 2.3522, 35m a.s.l., UTC+2 Europe/Paris)\", \"Paris temperature:18°C condition:Partly Cloudy ...\") or sent {} (1 of 20 with reasoning enabled, 1 of 20 disabled, 7 of 60 by default); through OpenRouter z-ai/glm-5.3-flash, 9 of 60 (56 served by its Together host, all 9 bad ones among them; 4 by InferenceNet and Wafer, clean). CAT-6::raw::openrouter::z-ai/glm-5.3-flash's own failure was a repetition loop (\"75001/75002/...\") cut off at the token cap, and D115 saw tool-call markup leak into the arguments. Control: Together zai-org/GLM-5.3, 20 of 20 clean. features_absent records what a client can rely on."
 
 [[row]]
 model = "moonshotai/kimi-k2.6"

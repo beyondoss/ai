@@ -2335,7 +2335,8 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
             1787752741,
             1_048_575,
             IN_TEXT | IN_IMAGE | IN_VIDEO,
-            TOOLS | REASONING | STRUCTURED_OUTPUTS,
+            // No tools: neither candidate calls one reliably (D197).
+            REASONING | STRUCTURED_OUTPUTS,
         ),
     },
 ];
@@ -3183,6 +3184,32 @@ mod tests {
         let scout = for_model("meta-llama/llama-4-scout");
         assert!(scout.is_some_and(|r| r.card.features & TOOLS == 0));
         assert!(scout.is_some_and(|r| r.card.features & STRUCTURED_OUTPUTS != 0));
+    }
+
+    /// GLM 5.3 Flash advertises no tools: forced `get_weather` calls came back with junk in the
+    /// `city` argument (invented coordinates and weather readings, or no `city` at all) 9 of 100
+    /// times direct to Together, the row's primary, and 9 of 60 through OpenRouter (every bad one
+    /// served by its Together host), thinking on or off (2026-10-01, `verify/catalog_truth.toml`).
+    /// The sweep's own failure was a repetition loop cut off at the token cap. With no reliable candidate, steering a tool request away
+    /// from one would not help, so a tool request is refused instead of answered with bad
+    /// arguments. GLM 5.3, on the same two hosts, answered 20 of 20 cleanly and keeps them.
+    /// claim: CAT-6
+    /// defect: D197
+    #[test]
+    fn glm_5_3_flash_advertises_no_tools() {
+        let flash = for_model("z-ai/glm-5.3-flash").map(|r| r.card.features);
+        assert!(
+            flash.is_some_and(|f| f & TOOLS == 0),
+            "glm-5.3-flash: tools"
+        );
+        assert!(
+            flash.is_some_and(
+                |f| f & (REASONING | STRUCTURED_OUTPUTS) == REASONING | STRUCTURED_OUTPUTS
+            ),
+            "glm-5.3-flash keeps reasoning and structured outputs"
+        );
+        let glm = for_model("z-ai/glm-5.3").map(|r| r.card.features);
+        assert!(glm.is_some_and(|f| f & TOOLS != 0), "glm-5.3 keeps tools");
     }
 
     #[test]
