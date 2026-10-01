@@ -1732,9 +1732,14 @@ parent. A reused connection that fails that early is tried once more on the same
 disagreed: a small body made one attempt and got an empty 502, a large one re-sent its body to
 each candidate twice and ended on a misleading 503 "no provider key available". A `FullBody` retry
 is recorded only when another candidate remains, so the walk ends on an accurate error; a 429 key
-walk on a large body is pinned to its candidate (`FullBody::only`), so a re-ranked row cannot turn
-it into a vendor switch; and the last attempt the parent allows records no retry, so its answer is
-relayed rather than lost.
+walk on a large body resumes on its candidate first (`FullBody::resume` moves it to the front of
+the re-run's walk), so a re-ranked row cannot turn it into a vendor switch, while the other
+candidates stay behind it, so the 5xx (or last key's auth failure) that ends the key walk still
+fails over exactly as a small body does (D81: pinning the walk to that one candidate relayed the
+5xx); a re-run with no key walk on a candidate starts past its cooling keys
+(`Provider::first_key`), as any request does (D83: re-runs always started on key 0, so every large
+body paid a revoked key's 401 and a second upload); and the last attempt the parent allows records
+no retry, so its answer is relayed rather than lost.
 
 ### Why the catalog has a list price and the request does not
 

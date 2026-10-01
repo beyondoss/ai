@@ -1302,9 +1302,9 @@ impl AiProxy {
         let body = Bytes::from(body);
         self.state.metrics.full_body_relays_total.inc();
         let mut skip = 0u8;
-        let mut keys = [0u8; route::MAX_CANDIDATES];
+        let mut keys = [NO_KEY_WALK; route::MAX_CANDIDATES];
         let mut reset = 0u8;
-        let mut only = None;
+        let mut resume = None;
         // Every attempt removes a candidate, advances a key, or spends a candidate's one reset
         // retry, so the walk ends on its own; this bound only guards against a bug looping it. The
         // last attempt it allows records no retry, so even then the client gets that attempt's own
@@ -1320,7 +1320,7 @@ impl AiProxy {
                     skip,
                     keys,
                     reset,
-                    only,
+                    resume,
                     final_attempt: n + 1 == MAX_ATTEMPTS,
                     retry: Arc::clone(&retry),
                     request_id,
@@ -1352,14 +1352,20 @@ impl AiProxy {
                     // Bounded, so an attempt that somehow never notices cannot stall the client.
                     let _ = tokio::time::timeout(ABANDONED_ATTEMPT_GRACE, attempt).await;
                     match decision {
-                        RelayRetry::Candidate(i) => skip |= 1 << i,
-                        // A key walk stays on this candidate: the re-run may re-rank the row, and
-                        // a 429 must never become a vendor switch.
+                        // The key walk (if any) ended on this candidate: the rest of the walk is
+                        // vendor failover, as on a small body (D81).
+                        RelayRetry::Candidate(i) => {
+                            skip |= 1 << i;
+                            resume = None;
+                        }
+                        // A key walk resumes on this candidate first: the re-run may re-rank the
+                        // row, and a 429 must never become a vendor switch. The other candidates
+                        // stay in the walk, so the next key's 5xx still fails over.
                         RelayRetry::Key { candidate, key } => {
                             if let Some(k) = keys.get_mut(usize::from(candidate)) {
                                 *k = key;
                             }
-                            only = Some(candidate);
+                            resume = Some(candidate);
                         }
                         RelayRetry::Reset(i) => reset |= 1 << i,
                     }
@@ -2050,14 +2056,16 @@ struct FullBody {
     session_field: Option<&'static str>,
     /// Catalog indices (bit per index) an earlier attempt failed over from.
     skip: u8,
-    /// Per catalog index, the pool key an earlier attempt's 429 walked to.
+    /// Per catalog index, the pool key an earlier attempt's key walk moved to, or [`NO_KEY_WALK`]:
+    /// start on the provider's first key not cooling off (`Provider::first_key`, D71/D83).
     keys: [u8; route::MAX_CANDIDATES],
     /// Catalog indices (bit per index) that already had their one same-candidate retry after a
     /// stale reused connection failed before the upstream had the body.
     reset: u8,
-    /// A key walk in progress: only this catalog index is usable, so a re-ranked row cannot move a
-    /// 429's key walk onto another vendor.
-    only: Option<u8>,
+    /// A key walk in progress on this catalog index: it goes first in the walk, so a re-ranked row
+    /// cannot move a 429's key walk onto another vendor. The other candidates stay usable, so a
+    /// 5xx (or a last key's auth failure) that ends the key walk still fails over (D81).
+    resume: Option<u8>,
     /// The parent's attempt bound is reached: record no retry, relay this attempt's answer.
     final_attempt: bool,
     /// Set by this attempt when it would have retried but could not replay the body.
@@ -2070,6 +2078,18 @@ struct FullBody {
     /// The parent holds this tenant's concurrency slot for the whole request, taken before it read
     /// the body. Attempts neither take nor release one.
     slot_held: bool,
+}
+
+/// [`FullBody::keys`] for a candidate no earlier attempt walked keys on.
+const NO_KEY_WALK: u8 = u8::MAX;
+
+/// Move the walk slot holding catalog index `orig` to the front, keeping the others in order.
+/// A no-op when `orig` is not in the walk.
+fn walk_front(walk: &mut control::Walk, orig: u8) {
+    let len = usize::from(walk.len).min(route::MAX_CANDIDATES);
+    if let Some(at) = walk.indices[..len].iter().position(|&i| i == orig) {
+        walk.indices[..=at].rotate_right(1);
+    }
 }
 
 /// A retry a [`FullBody`] subrequest hands back to its parent.
@@ -3448,11 +3468,12 @@ impl ProxyHttp for AiProxy {
                         .state
                         .provider_by_id(c.provider)
                         .is_some_and(|p| p.has_pool_key());
-                    // A re-run of a large body skips the candidates earlier attempts failed on,
-                    // and a key walk stays on its candidate.
-                    let failed = full_body.as_ref().is_some_and(|fb| {
-                        fb.skip & (1 << orig) != 0 || fb.only.is_some_and(|only| only != orig)
-                    });
+                    // A re-run of a large body skips the candidates earlier attempts failed on. A
+                    // key walk in progress is not a filter: its candidate goes first below
+                    // (`FullBody::resume`), and the rest stay for failover (D81).
+                    let failed = full_body
+                        .as_ref()
+                        .is_some_and(|fb| fb.skip & (1 << orig) != 0);
                     let serves = sub.is_none_or(|sub| sub.serves(c));
                     if keyed && !failed && serves {
                         dispatchable |= 1 << orig;
@@ -3475,6 +3496,11 @@ impl ProxyHttp for AiProxy {
                     if pinned {
                         self.state.metrics.session_pinned_total.inc();
                     }
+                }
+                // A large body's re-run resumes its key walk on that candidate first; the rest of
+                // the walk stays behind it for failover (see `FullBody::resume`).
+                if let Some(orig) = full_body.as_ref().and_then(|fb| fb.resume) {
+                    walk_front(&mut walk, orig);
                 }
                 if walk.len == 0 {
                     self.state.metrics.rejection(Rejection::NoCandidate).inc();
@@ -4061,10 +4087,12 @@ impl ProxyHttp for AiProxy {
                 rc.breaker_pending = p.breaker.is_some();
                 // New vendor ⇒ that vendor's first key not cooling off (D71). Never carry provider
                 // A's index (or secret) onto provider B. A re-run of a large body resumes the key
-                // walk an earlier attempt started on this candidate (see `FullBody`).
+                // walk an earlier attempt started on this candidate (see `FullBody`); one with no
+                // walk starts past the cooling keys like any other request (D83).
                 rc.pool_key = full_body_ctx(session)
                     .zip(rc.auto.as_ref().and_then(|a| a.walk.catalog_index(i)))
                     .and_then(|(fb, orig)| fb.keys.get(usize::from(orig)).copied())
+                    .filter(|&k| k != NO_KEY_WALK)
                     .unwrap_or_else(|| p.first_key());
                 rc.provider = p.clone();
                 apply_serving_candidate(rc);
@@ -6134,6 +6162,22 @@ mod tests {
         // The old derivation (row.wire, or provider.wire) is wrong for this fallback:
         assert_eq!(row.wire, Dialect::Anthropic);
         assert_eq!(openrouter.wire, Dialect::OpenAi);
+    }
+
+    /// A resumed key walk's candidate goes first; everyone else keeps their order behind it.
+    #[test]
+    fn walk_front_moves_one_candidate_and_keeps_the_rest_in_order() {
+        let mut walk = control::Walk::identity(4);
+        walk_front(&mut walk, 2);
+        assert_eq!(&walk.indices[..4], &[2, 0, 1, 3]);
+        walk_front(&mut walk, 2);
+        assert_eq!(&walk.indices[..4], &[2, 0, 1, 3]);
+        walk_front(&mut walk, 7);
+        assert_eq!(
+            &walk.indices[..4],
+            &[2, 0, 1, 3],
+            "not in the walk: unchanged"
+        );
     }
 
     /// The candidate cursor. `from` strictly increases across a request, which is what guarantees

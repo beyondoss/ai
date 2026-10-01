@@ -101,7 +101,6 @@ async fn a_429_key_walk_ends_the_same_for_small_and_large_bodies() {
 /// claim: R1, R5, REL-21
 /// defect: D81
 #[tokio::test]
-#[ignore = "D81 reproduced: a large body's key walk pins every later attempt to its candidate, so the next key's 5xx is relayed"]
 async fn a_5xx_after_a_key_walk_fails_over_for_small_and_large_bodies() {
     let (pubkey, sk) = test_keypair(1);
     for pad in [SMALL, LARGE] {
@@ -137,7 +136,6 @@ async fn a_5xx_after_a_key_walk_fails_over_for_small_and_large_bodies() {
 /// claim: REL-14, R5
 /// defect: D83
 #[tokio::test]
-#[ignore = "D83 reproduced: a FullBody re-run starts on key 0 whatever its cooldown"]
 async fn a_large_body_starts_past_a_cooling_pool_key() {
     let (pubkey, sk) = test_keypair(1);
     let revoked = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
