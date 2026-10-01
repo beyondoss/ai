@@ -1708,7 +1708,6 @@ fn a_custom_tool_result_reaches_responses_as_custom_tool_call_output() {
 /// claim: TRN-15
 /// defect: D49
 #[test]
-#[ignore = "D49 reproduced: explicit null audio/stop/web_search_options/top_logprobs are forwarded"]
 fn explicit_nulls_are_not_forwarded_upstream() {
     let nulls = json!({"stop": null, "audio": null, "top_logprobs": null,
         "web_search_options": null});
@@ -1735,7 +1734,6 @@ fn explicit_nulls_are_not_forwarded_upstream() {
 /// claim: TRN-16
 /// defect: D49
 #[test]
-#[ignore = "D49 reproduced: a Responses developer message reaches a non-OpenAI Chat host as role developer"]
 fn a_responses_developer_message_is_system_on_a_non_openai_chat_host() {
     let v = r2c(
         &json!({"model": "m", "store": false, "input": [
@@ -1755,7 +1753,6 @@ fn a_responses_developer_message_is_system_on_a_non_openai_chat_host() {
 /// claim: TRN-17
 /// defect: D49
 #[test]
-#[ignore = "D49 reproduced: unknown Responses input items are silently dropped on Chat"]
 fn unknown_responses_input_items_are_forwarded_not_dropped() {
     let mut dropped = Vec::new();
     for item in [

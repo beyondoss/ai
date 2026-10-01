@@ -23,7 +23,9 @@
 //!   back and have no equivalent on the target (`input_audio`, a `file_id` or URL document or
 //!   image, a non-base64 data URI, `n` > 1, `logprobs`, audio output, `stop` onto Responses or a
 //!   model that rejects it, hosted / server / `custom` tools, `mcp_servers`, a Responses `prompt`
-//!   template). Translation runs after the request headers went upstream, so the gateway cannot 400
+//!   template, a Responses input item with no Chat Completions shape such as `item_reference` or
+//!   `computer_call_output`; records of a hosted tool the provider ran are dropped). An explicit
+//!   `null` is "not set" and is never forwarded. Translation runs after the request headers went upstream, so the gateway cannot 400
 //!   here; passing the field through gets the provider's 400 naming it, instead of an answer about
 //!   input the model never saw or without a tool the client offered.
 //! - **Images, both ways:** base64 data-URI images convert to Anthropic `base64` sources and back;
@@ -575,6 +577,14 @@ fn openai_req_to_anthropic(v: &Value, claude: ClaudeModel) -> Value {
                     place_system(&mut messages, &mut pending_system, &mut system_parts);
                     let m = assistant_refusal_as_text(m);
                     push_anth_message(&mut messages, "assistant", openai_assistant_content(&m));
+                }
+                // A Responses input item with no Chat Completions shape (see
+                // `responses_input_to_messages`): forwarded whole, never merged into a user turn
+                // it would vanish from, so the provider rejects it by name.
+                _ if m.get("role").is_none() => {
+                    in_conversation = true;
+                    flush_tool_results(&mut messages, &mut pending_tool_results);
+                    messages.push(m.clone());
                 }
                 _ => {
                     // user (and anything else treated as user)
@@ -1973,8 +1983,10 @@ fn message_text(m: &Value) -> Option<String> {
     }
 }
 
+/// Copy `key` when set. An explicit `null` is "not set" (OpenAI SDKs send unset options that way),
+/// and forwarded it would be a 400 by name on an upstream without the field.
 fn copy_if(out: &mut Map<String, Value>, v: &Value, key: &str) {
-    if let Some(x) = v.get(key) {
+    if let Some(x) = v.get(key).filter(|x| !x.is_null()) {
         out.insert(key.to_owned(), x.clone());
     }
 }
@@ -3185,10 +3197,7 @@ fn responses_req_to_openai(v: &Value, up: Upstream) -> Value {
     if let Some(instr) = v.get("instructions") {
         messages.push(responses_instructions_to_system(instr));
     }
-    messages.extend(responses_input_to_messages(
-        v.get("input"),
-        up.claude_thinking,
-    ));
+    messages.extend(responses_input_to_messages(v.get("input"), up));
     out.insert("messages".into(), Value::Array(messages));
     Value::Object(out)
 }
@@ -3612,10 +3621,11 @@ fn responses_instructions_to_system(instr: &Value) -> Value {
     }
 }
 
-/// Responses `input` → Chat Completions messages. `claude_thinking`: the upstream is a Claude model,
-/// which is sent the thinking the gateway minted as `reasoning` items (see
-/// [`gateway_reasoning_block`]).
-fn responses_input_to_messages(input: Option<&Value>, claude_thinking: bool) -> Vec<Value> {
+/// Responses `input` → Chat Completions messages. A Claude upstream is sent the thinking the
+/// gateway minted as `reasoning` items (see [`gateway_reasoning_block`]). A `developer` message
+/// stays one only on OpenAI's own API; other Chat Completions hosts know `system`, not `developer`.
+fn responses_input_to_messages(input: Option<&Value>, up: Upstream) -> Vec<Value> {
+    let claude_thinking = up.claude_thinking;
     let items = match input {
         Some(Value::String(s)) => return vec![json!({ "role": "user", "content": s })],
         Some(Value::Array(items)) => items,
@@ -3669,7 +3679,10 @@ fn responses_input_to_messages(input: Option<&Value>, claude_thinking: bool) -> 
             }
             _ if typ == "message" || item.get("role").is_some() => {
                 flush_carried(&mut out, &mut carried);
-                let role = item.get("role").and_then(Value::as_str).unwrap_or("user");
+                let role = match item.get("role").and_then(Value::as_str).unwrap_or("user") {
+                    "developer" if !up.openai.native => "system",
+                    role => role,
+                };
                 let mut msg = Map::new();
                 msg.insert("role".into(), json!(role));
                 msg.insert(
@@ -3683,9 +3696,22 @@ fn responses_input_to_messages(input: Option<&Value>, claude_thinking: bool) -> 
                 }
                 out.push(Value::Object(msg));
             }
-            // Hosted-tool call records: no Chat Completions equivalent, and nothing the client
-            // wrote.
-            _ => {}
+            // Records of a tool the provider ran itself: no Chat Completions equivalent, and
+            // nothing the client wrote (the answer that used them follows as a message).
+            "web_search_call"
+            | "file_search_call"
+            | "code_interpreter_call"
+            | "image_generation_call"
+            | "mcp_call"
+            | "mcp_list_tools" => {}
+            // Anything else (`item_reference`, `computer_call_output`, `local_shell_call`,
+            // `compaction`, …) is history the model would answer without. Forwarded as-is in
+            // place, so the provider rejects it by name rather than answering a different
+            // conversation.
+            _ => {
+                flush_carried(&mut out, &mut carried);
+                out.push(item.clone());
+            }
         }
     }
     flush_carried(&mut out, &mut carried);

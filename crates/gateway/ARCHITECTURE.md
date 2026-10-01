@@ -517,8 +517,12 @@ Files API image, a non-base64 data URI, `n` > 1, `logprobs`, audio output, Anthr
 Anthropic-defined tools (`web_search_…`, `bash_…`, `text_editor_…`: as an empty-schema function the
 model would call one and nothing would run it), Responses hosted tools (`web_search`,
 `file_search`, …), OpenAI `custom` tools onto Messages, `mcp_servers`, a Responses `prompt`
-template, and `stop` onto Responses have no equivalent on the other wire and change what the
-client gets back. Translation runs in `request_body_filter`, after the request headers went
+template, `stop` onto Responses, and Responses input items with no Chat Completions shape
+(`item_reference`, `computer_call_output`, `local_shell_call`, `compaction`, …, forwarded whole in
+their place in `messages`) have no equivalent on the other wire and change what the client gets
+back. Only records of a hosted tool the provider ran itself (`web_search_call`, `mcp_call`, …) are
+dropped: the client wrote none of it, and the answer that used it follows as a message. An explicit
+`null` (how OpenAI SDKs send an unset option) is "not set" and is never forwarded. Translation runs in `request_body_filter`, after the request headers went
 upstream, so the gateway cannot answer 400 itself; the field is passed through and the provider's
 400 names it (each verified live, 2026-09-30). A non-http(s) image URL (`file://`) is never
 forwarded in any shape. Hints that change nothing about the response's shape (`seed`, penalties,
@@ -538,7 +542,9 @@ alongside `tools` (OpenAI 400s either without them; Messages and Responses accep
 Responses `function_call` items become one assistant message (OpenAI rejects the split form),
 joined to that turn's text; consecutive same-role messages share one Messages turn, each keeping its
 own text block (two strings are never fused into one); an assistant refusal is text on Messages; a mid-conversation Anthropic
-`system` message stays a Chat Completions `system` message in place; tool `strict` crosses both
+`system` message stays a Chat Completions `system` message in place; a Responses `developer`
+message stays `developer` on OpenAI's own API and becomes `system` on every other Chat Completions
+host (DeepSeek, Mistral, OpenRouter, … know no `developer` role); tool `strict` crosses both
 ways; structured output is `strict: true` onto OpenAI only when the schema qualifies (every object
 closed with `additionalProperties: false`, every property required; Anthropic allows optional
 ones); an Anthropic `tool_result` that is an error says so in the tool text (`Error: …`); a
