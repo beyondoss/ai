@@ -155,15 +155,18 @@ async fn a_reset_after_the_whole_body_is_not_resent_for_any_body_size() {
     }
 }
 
-/// An upstream that resets while the body is still arriving cannot hold the whole request, so the
-/// walk fails over to the next candidate and the client never sees the reset.
+/// An upstream that resets before it has read the whole body cannot hold the request, so the walk
+/// fails over to the next candidate and the client never sees the reset. The gateway holds the body
+/// before connecting (a catalog walk reads it ahead), so the reset surfaces as the write of a body
+/// too large for the socket buffers failing.
 /// claim: REL-1, REL-21
 /// defect: D51
 #[tokio::test]
 async fn a_reset_during_the_upload_fails_over() {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::AsyncReadExt;
     let (pubkey, sk) = test_keypair(1);
-    // Read the request head, then reset the connection (no FIN: SO_LINGER 0).
+    // Read the request head and the first 256 KiB of the body, so the gateway is mid-write, then
+    // reset the connection (no FIN: SO_LINGER 0).
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let primary = listener.local_addr().unwrap();
     let resets = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -172,7 +175,7 @@ async fn a_reset_during_the_upload_fails_over() {
         while let Ok((mut s, _)) = listener.accept().await {
             let mut seen = Vec::new();
             let mut buf = [0u8; 4096];
-            while !seen.windows(4).any(|w| w == b"\r\n\r\n") {
+            while seen.len() < 256 * 1024 {
                 match s.read(&mut buf).await {
                     Ok(0) | Err(_) => break,
                     Ok(n) => seen.extend_from_slice(&buf[..n]),
@@ -189,51 +192,26 @@ async fn a_reset_during_the_upload_fails_over() {
         .provider_authority("openrouter", &fallback.authority())
         .start()
         .await;
-    // The routing header picks the row, so the gateway streams the body rather than reading it
-    // first: the client controls when the upload ends.
-    let full = body(30 * 1024);
-    let (first, rest) = full.as_bytes().split_at(1024);
-    let mut s = tokio::net::TcpStream::connect(("127.0.0.1", gw.port))
+    let resp = test_client()
+        .post(format!("{}/auto/chat/completions", gw.url()))
+        .header("authorization", format!("Bearer {}", vkey(&sk)))
+        .header("content-type", "application/json")
+        .header("x-beyond-model", MODEL)
+        .header("x-beyond-order", "openai,openrouter")
+        .body(body(8 << 20))
+        .send()
         .await
         .unwrap();
-    let head = format!(
-        "POST /auto/chat/completions HTTP/1.1\r\nhost: 127.0.0.1\r\nauthorization: Bearer {}\r\n\
-         content-type: application/json\r\nx-beyond-model: {MODEL}\r\nx-beyond-order: openai,openrouter\r\n\
-         content-length: {}\r\n\r\n",
-        vkey(&sk),
-        full.len()
-    );
-    s.write_all(head.as_bytes()).await.unwrap();
-    s.write_all(first).await.unwrap();
-    // Give the primary time to reset while the rest of the body is still to come.
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    s.write_all(rest).await.unwrap();
-    let mut buf = Vec::new();
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(10), async {
-        let mut chunk = [0u8; 4096];
-        loop {
-            match s.read(&mut chunk).await {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    buf.extend_from_slice(&chunk[..n]);
-                    if buf.windows(4).any(|w| w == b"\r\n\r\n") && buf.ends_with(b"}") {
-                        break;
-                    }
-                }
-            }
-        }
-    })
-    .await;
+    let status = resp.status().as_u16();
     task.abort();
-    let resp = parse_raw_response(&buf);
     assert_eq!(
         (
-            resp.status,
+            status,
             resets.load(std::sync::atomic::Ordering::SeqCst),
             fallback.hits()
         ),
         (200, 1, 1),
-        "{resp:?}; log:\n{}",
+        "log:\n{}",
         gw.log()
     );
 }
