@@ -88,6 +88,8 @@ const EMBED: Route = Route {
 enum Runtime {
     Python,
     Node,
+    /// A coding agent (Claude Code, Codex, opencode, pi) driven by `verify/clients/harness.py`.
+    Harness,
 }
 
 /// `(claims, client, runtime, probe, routes, extra claims on the failover route)`. One line per
@@ -126,6 +128,14 @@ const CELLS: &[Cell] = &[
     ("E4",                "anthropic-ts",  Runtime::Node,   "models_list",      ONE,      ""),
     ("E1+T1+B1+S2",       "ai-sdk",        Runtime::Node,   "ai_sdk_openai",    GEN,      "R1"),
     ("E2+T1+B1",          "ai-sdk",        Runtime::Node,   "ai_sdk_anthropic", GEN,      "R1"),
+    // Coding agents fixing a failing test in a fixture repo. pi runs once per API mode; pi and
+    // opencode take models only from config, generated from /v1/models (E7).
+    ("W1",                "claude-code",   Runtime::Harness, "claude-code",     SESSION,  ""),
+    ("W2",                "codex",         Runtime::Harness, "codex",           SESSION,  ""),
+    ("W3+E7",             "opencode",      Runtime::Harness, "opencode",        SESSION,  ""),
+    ("W4+E7",             "pi",            Runtime::Harness, "pi:chat",         SESSION,  ""),
+    ("W4+E7",             "pi",            Runtime::Harness, "pi:messages",     SESSION,  ""),
+    ("W4+E7",             "pi",            Runtime::Harness, "pi:responses",    SESSION,  ""),
 ];
 
 fn repo_root() -> PathBuf {
@@ -156,6 +166,7 @@ fn interpreter(rt: Runtime) -> PathBuf {
     match rt {
         Runtime::Python => repo_root().join("verify/clients/py/.venv/bin/python"),
         Runtime::Node => PathBuf::from("node"),
+        Runtime::Harness => repo_root().join("verify/clients/py/.venv/bin/python"),
     }
 }
 
@@ -163,6 +174,7 @@ fn probe_script(rt: Runtime) -> PathBuf {
     match rt {
         Runtime::Python => repo_root().join("verify/clients/py/probe.py"),
         Runtime::Node => repo_root().join("verify/clients/node/probe.mjs"),
+        Runtime::Harness => repo_root().join("verify/clients/harness.py"),
     }
 }
 
@@ -173,6 +185,12 @@ fn installed(rt: Runtime) -> bool {
         Runtime::Node => repo_root()
             .join("verify/clients/node/node_modules/openai")
             .exists(),
+        Runtime::Harness => {
+            interpreter(rt).exists()
+                && repo_root()
+                    .join("verify/clients/node/node_modules/.bin/pi")
+                    .exists()
+        }
     }
 }
 
@@ -348,6 +366,46 @@ fn run_cell(
     }
 
     // Witness 2: the ledger. Rows can land a beat after the response; give them a moment.
+    // A harness's individual HTTP calls aren't visible to us (`calls` is null): check the ledger
+    // in aggregate instead.
+    if verdict["calls"].is_null() {
+        std::thread::sleep(Duration::from_millis(500));
+        let rows = usage_rows(&log_path);
+        let mut problems = Vec::new();
+        if rows.is_empty() {
+            problems.push("the harness finished but the gateway billed nothing".to_owned());
+        }
+        for row in &rows {
+            if row["provider"] != route.serves {
+                problems.push(format!(
+                    "row served by {}, route expects {} ({row})",
+                    row["provider"], route.serves
+                ));
+            }
+            if row["usage_estimated"] == true {
+                problems.push(format!("row is an estimate ({row})"));
+            }
+        }
+        if rows
+            .iter()
+            .map(|r| r["output_tokens"].as_u64().unwrap_or(0))
+            .sum::<u64>()
+            == 0
+        {
+            problems.push("no output tokens billed across the session".to_owned());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        return if problems.is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "ledger: {}\n--- detail --- {}",
+                problems.join("; "),
+                verdict["detail"]
+            )
+            .into())
+        };
+    }
     let calls = verdict["calls"].as_array().cloned().unwrap_or_default();
     let deadline = Instant::now() + Duration::from_secs(5);
     let rows = loop {
