@@ -47,7 +47,7 @@ evidence = "proxy.rs:1001, 1704-1712; pingora request_summary"
 claims = ["SEC-3", "SEC-4"]
 state = "fixed"
 test = "a_managed_query_key_is_not_forwarded_upstream"
-fix = "0553b88"
+fix = "793d6f6"
 note = "Managed ?key= is stripped from the forwarded path (other params kept); request_summary logs the path without its query."
 
 [[defect]]
@@ -61,7 +61,7 @@ evidence = "upstream_request_filter strips only auth and control headers"
 claims = ["SEC-6"]
 state = "fixed"
 test = "managed_requests_forward_only_allowlisted_client_headers"
-fix = "494cead"
+fix = "d7ee34e"
 note = "Managed requests forward only an allowlist of client headers; anthropic-beta is filtered to known-safe tokens (ARCHITECTURE.md lists them). BYO untouched."
 
 [[defect]]
@@ -397,7 +397,7 @@ evidence = "key.rs:164; ratelimit.rs"
 claims = ["SEC-12"]
 state = "fixed"
 test = "only_the_canonical_kid_spelling_verifies"
-fix = "8306a79"
+fix = "30842da"
 note = "verify rejects any kid that is not digits-only with no leading zero."
 
 [[defect]]
@@ -411,7 +411,7 @@ evidence = "proxy.rs:997-1001"
 claims = ["SEC-11"]
 state = "fixed"
 test = "mixed_credentials_never_forward_a_virtual_key"
-fix = "0553b88"
+fix = "793d6f6"
 note = "A managed key in any credential location makes the request managed, so every location is stripped; empty values count as absent."
 
 [[defect]]
@@ -425,7 +425,7 @@ evidence = "proxy.rs:1468-1475"
 claims = ["SEC-11"]
 state = "fixed"
 test = "a_byo_anthropic_key_on_bare_v1_never_reaches_openai"
-fix = "0553b88"
+fix = "793d6f6"
 note = "Bare /v1 BYO with a non-managed x-api-key routes to Anthropic on every path (404 if no Anthropic provider is configured)."
 
 [[defect]]
@@ -439,7 +439,7 @@ evidence = "cache.rs key()"
 claims = ["SEC-14"]
 state = "fixed"
 test = "the_same_body_on_another_row_is_a_cache_miss"
-fix = "acb3f00"
+fix = "e9be872"
 note = "Cache key adds the method, the resolved catalog row, and every anthropic-version / anthropic-beta value."
 
 [[defect]]
@@ -453,7 +453,7 @@ evidence = "proxy.rs:1060, 3256"
 claims = ["SEC-16"]
 state = "fixed"
 test = "client_upload_failures_do_not_open_the_breaker"
-fix = "cc6c51f"
+fix = "8775b58"
 note = "Body-cap abort is tagged Downstream (413); an upstream error while the client body is still arriving is not a breaker failure."
 
 [[defect]]
@@ -467,7 +467,7 @@ evidence = "no upgrade rejection"
 claims = ["SEC-20"]
 state = "fixed"
 test = "a_managed_upgrade_is_refused_before_the_upstream"
-fix = "7c54740"
+fix = "58396a1"
 note = "A managed request carrying Upgrade is a 400 on any path before any upstream contact."
 
 [[defect]]
@@ -481,7 +481,7 @@ evidence = "peek.rs first-span rewrite"
 claims = ["SEC-21"]
 state = "fixed"
 test = "a_body_with_two_root_model_keys_is_refused_on_a_catalog_walk"
-fix = "23dbef3"
+fix = "7dd93df"
 note = "scan_buffered counts root model keys (escape-aware); a catalog walk with two aborts with 400 before any body byte goes upstream."
 
 [[defect]]
@@ -747,7 +747,7 @@ evidence = "route.rs:377; state.rs:284"
 claims = ["SEC-8", "SEC-22"]
 state = "fixed"
 test = "upstream_x_beyond_headers_never_reach_the_client"
-fix = "da0a968"
+fix = "d5f8a34"
 note = "Pool key header marked sensitive, upstream x-beyond-* response headers stripped, cleartext-upstream boot warning. Not changed: x-beyond-capture is the documented caller opt-in; metrics bind is operator config."
 
 [[defect]]
