@@ -79,5 +79,20 @@ listings and usage reports).
 Usage reports lag traffic by minutes. A trial polls every 30 seconds until the provider's totals
 match and hold, so it can take up to ~15 minutes.
 
-Live cells, which run real SDKs and agent harnesses against real providers, will land as tagged
-tests in their own layer. `STALE` status will land with the run ledger.
+## Live cells
+
+`crates/verify/tests/live.rs` runs real SDKs and agent harnesses through a gateway built from this
+tree to real providers, one cell per `(claims, client, route, probe)`. Each probe
+(`verify/clients/py/probe.py`, `verify/clients/node/probe.mjs`) asserts its claim's oracle and
+reports every HTTP call it made. The cell then holds each call to exactly one `ai.usage` row with
+the tokens the client saw. A call whose row is not the ordinary one says so with `expect`: no row (a
+free token count, a BYO key), a refusal billed nothing, a cut-short estimate bounded by the same
+request completed, the provider it must land on, or a row field's minimum (cache reads, 1-hour
+writes, server tool calls). Image and PDF fixtures live in `verify/clients/fixtures/`.
+
+```sh
+VERIFY_LIVE=1 cargo nextest run -p beyond-ai-verify --test live -E 'test(/::stream_abort$/)'
+VERIFY_ROWS_OUT=$PWD/target/rows.jsonl VERIFY_LIVE=1 cargo nextest run ...  # also keep every row
+```
+
+`STALE` status will land with the run ledger.

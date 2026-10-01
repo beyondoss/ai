@@ -122,7 +122,7 @@ layer = "both"
 clients = ["anthropic-py", "anthropic-ts", "claude-code", "codex", "pi", "openai-py"]
 failover_clients = ["anthropic-py", "claude-code"]
 touches = ["crates/gateway/src/translate.rs", "crates/gateway/src/proxy.rs"]
-defects = []
+defects = ["D74"]
 
 [[claim]]
 id = "T3"
@@ -170,7 +170,7 @@ layer = "both"
 clients = ["openai-py", "openai-node", "anthropic-py", "anthropic-ts", "ai-sdk", "raw"]
 failover_clients = []
 touches = ["crates/gateway/src/translate.rs", "crates/gateway/src/proxy.rs"]
-defects = []
+defects = ["D100"]
 
 [[claim]]
 id = "T7"
@@ -970,7 +970,7 @@ group = "Billing integrity"
 text = "Estimates never exceed provider truth and are non-zero once the upstream accepts"
 layer = "live"
 touches = ["crates/gateway/src/usage.rs", "crates/gateway/src/proxy.rs", "crates/gateway/src/peek.rs", "crates/gateway/src/main.rs"]
-defects = []
+defects = ["D99"]
 
 [[claim]]
 id = "BIL-21"
@@ -1403,7 +1403,7 @@ group = "Translation detail"
 text = "Codex and Agents SDK reasoning replays without item ids"
 layer = "both"
 touches = ["crates/gateway/src/translate.rs", "crates/gateway/src/proxy.rs"]
-defects = ["D14"]
+defects = ["D14", "D74"]
 
 [[claim]]
 id = "TRN-9"
@@ -1466,7 +1466,7 @@ group = "Translation detail"
 text = "Explicit nulls never cause spurious 400s"
 layer = "both"
 touches = ["crates/gateway/src/translate.rs", "crates/gateway/src/proxy.rs"]
-defects = ["D49"]
+defects = ["D49", "D101", "D102"]
 
 [[claim]]
 id = "TRN-16"

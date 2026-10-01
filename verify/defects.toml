@@ -214,7 +214,7 @@ confidence = "med-low"
 evidence = "translate.rs:2092, 2152, 2324, 2391"
 claims = ["TRN-10"]
 state = "refuted"
-test = "live:W1::claude-code::gpt::claude-code"
+test = "live:W1+TRN-10::claude-code::gpt::claude-code"
 fix = ""
 note = "Refuted live: Claude Code (pinned 2.1.286) fixes the fixture repo on gpt-5-mini through the gateway (Messages translated onto native OpenAI Chat), with cache_control and metadata.user_id in its requests; OpenAI accepted every turn. Also checked by hand 2026-10-01 on gpt-5-mini and gpt-4o-mini with and without adaptive thinking."
 
@@ -1379,3 +1379,59 @@ state = "suspected"
 test = ""
 fix = ""
 note = "Found by the independent branch review (2026-10-01) of a54c22c."
+
+[[defect]]
+id = "D99"
+severity = "low"
+area = "Billing"
+title = "A cut-short estimate's input counts JSON structure, so it exceeds the provider's count on short prompts"
+impact = "BIL-20 says an estimate never exceeds provider truth. InputTally counts every non-base64 body byte (keys, model id, stream_options, max tokens) and divides by 5, so on a short prompt the JSON overhead alone outweighs the real prompt: an aborted stream bills more input than the same request completed. Small in absolute terms, but it is the one direction the estimate promises never to err."
+confidence = "high"
+evidence = "live 2026-10-01 B2+BIL-3+BIL-20::openai-py::gpt::stream_abort, three runs: the completed stream reports prompt_tokens 29; the identical request aborted after 25 content chunks bills an estimate of input_tokens 44 (outcome client_cancelled, usage_estimated true). usage.rs InputTally::feed counts all bytes outside base64 payloads; estimate_tokens divides by INPUT_BYTES_PER_TOKEN (5). On Claude the estimate keeps message_start's exact count, and on grok the prompt (with xAI's system preamble) outweighs the overhead, so those cells pass."
+claims = ["BIL-20"]
+state = "suspected"
+test = ""
+fix = ""
+note = "Found by live cell B2+BIL-3+BIL-20::openai-py::gpt::stream_abort. Counting only string values (as estimate_body_output already does for output) would keep the estimate under truth."
+
+[[defect]]
+id = "D100"
+severity = "low"
+area = "Translation"
+title = "xAI errors don't arrive in the client's envelope"
+impact = "On a grok row, an OpenAI SDK gets xAI's own error shape relayed as-is ({\"code\": ..., \"error\": \"<string>\"}), so the SDK's error body is a bare string with no message, type or code to branch on. Translated onto Messages, the same 400 is typed api_error rather than invalid_request_error. The SDK still raises its typed 400; code that reads the envelope does not find it."
+confidence = "high"
+evidence = "live 2026-10-01 (corrupt base64 PNG, grok-4.3): T6::openai-py::xai::typed_error -> BadRequestError, e.body = \"code: 'Client specified an invalid argument', message: \\\"Invalid PNG image.\" (a string; the same probe on claude-haiku-4-5 and gpt-5-mini gets {message, type, code}). T6::anthropic-py::xai::typed_error -> {\"type\":\"error\",\"error\":{\"code\":\"invalid_image\",\"message\":...,\"type\":\"api_error\"}} on a 400. Raw through the gateway: POST /v1/chat/completions -> 400 {\"code\":\"invalid_image\",\"error\":\"code: 'Client specified an invalid argument', ...\"}."
+claims = ["T6"]
+state = "suspected"
+test = ""
+fix = ""
+note = "Found by live cells T6::openai-py::xai::typed_error and T6::anthropic-py::xai::typed_error. The Chat case is a same-wire byte relay of xAI's body; the Messages case is map_error choosing api_error for a 4xx whose body names no type."
+
+[[defect]]
+id = "D101"
+severity = "med"
+area = "Translation"
+title = "An explicit user: null relays to OpenRouter and 400s, so a Claude row's failover changes the outcome"
+impact = "openai-python sends user: null when a caller passes user=None. OpenAI and the translated Claude path accept it, but a same-wire Chat relay forwards the body untouched and OpenRouter rejects the null. On claude-sonnet-4 (OpenRouter only) the request always fails; on every Claude row the same request succeeds on Anthropic and 400s once it fails over to OpenRouter."
+confidence = "high"
+evidence = "live 2026-10-01 TRN-15::openai-py::openrouter::explicit_nulls and TRN-15::openai-py::failover::explicit_nulls: 400 {\"error\":{\"message\":\"user: Invalid input: expected string, received null\",\"code\":400}}. One null at a time through the gateway on claude-sonnet-4: stop, temperature, top_p, seed, presence_penalty, frequency_penalty, tools, tool_choice null -> 200; user null -> 400. The same probe passes on the claude, bedrock and gpt routes."
+claims = ["TRN-15"]
+state = "suspected"
+test = ""
+fix = ""
+note = "Found by live cells TRN-15::openai-py::openrouter::explicit_nulls and TRN-15::openai-py::failover::explicit_nulls. D49's fix (copy_if drops nulls) covers translated walks only."
+
+[[defect]]
+id = "D102"
+severity = "med"
+area = "Translation"
+title = "Responses onto Chat turns instructions: null into a system message with null content"
+impact = "A stock responses.create(instructions=None) on a row translated onto Chat Completions (grok, Together rows) sends messages[0] = a system message whose content is null; xAI answers 422 and Together 400, so the call fails where it succeeds on GPT and Claude rows."
+confidence = "high"
+evidence = "live 2026-10-01 TRN-15::openai-py::xai::explicit_nulls -> 422 \"Failed to deserialize the JSON body into the target type: messages[0]: data did not match any variant of untagged enum Content\"; TRN-15::openai-py::together::explicit_nulls -> 400 \"Input validation error\". One null at a time through the gateway (POST /v1/responses, store false) on grok-4.3 and llama-3.3-70b-versatile: instructions null fails; temperature, top_p, tools, tool_choice, previous_response_id null -> 200."
+claims = ["TRN-15"]
+state = "suspected"
+test = ""
+fix = ""
+note = "Found by live cells TRN-15::openai-py::xai::explicit_nulls and TRN-15::openai-py::together::explicit_nulls. responses_to_chat should treat a null instructions as absent, the way copy_if treats other nulls."

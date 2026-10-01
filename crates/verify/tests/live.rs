@@ -107,6 +107,50 @@ const XAI: Route = Route {
     dead: &[],
     serves: "xai",
 };
+/// Together's own API (OpenAI-compatible Chat): an open-weights row whose primary is Together.
+const TOGETHER: Route = Route {
+    name: "together",
+    model: "llama-3.3-70b-versatile",
+    pools: &[("together", "TOGETHER_API_KEY")],
+    dead: &[],
+    serves: "together",
+};
+/// The Claude row with two live pools, so routing has a real choice. The probe names the provider
+/// each call must land on (steering headers, session pins), so `serves` is empty: any.
+const POOLED: Route = Route {
+    name: "pooled",
+    model: "claude-haiku-4-5",
+    pools: &[
+        ("anthropic", "ANTHROPIC_API_KEY"),
+        ("openrouter", "OPENROUTER_API_KEY"),
+    ],
+    dead: &[],
+    serves: "",
+};
+/// A Claude 5.x row, for behavior that differs on newer Claude (forced tools, effort).
+const SONNET: Route = Route {
+    name: "sonnet",
+    model: "claude-sonnet-5-5",
+    pools: &[("anthropic", "ANTHROPIC_API_KEY")],
+    dead: &[],
+    serves: "anthropic",
+};
+/// An 8k-window row: a context overflow costs ~40 KB of prompt and is rejected before billing.
+const GPT4: Route = Route {
+    name: "gpt4",
+    model: "gpt-4",
+    pools: &[("openai", "OPENAI_API_KEY")],
+    dead: &[],
+    serves: "openai",
+};
+/// A 16k-output row, for max_tokens clamping.
+const GPT4O_MINI: Route = Route {
+    name: "gpt4o-mini",
+    model: "gpt-4o-mini",
+    pools: &[("openai", "OPENAI_API_KEY")],
+    dead: &[],
+    serves: "openai",
+};
 const EMBED: Route = Route {
     name: "embed",
     model: "text-embedding-3-small",
@@ -134,24 +178,76 @@ type Cell = (
     &'static str,
 );
 
-const GEN: &[Route] = &[CLAUDE, GPT, OPENROUTER, FAILOVER, BEDROCK, XAI];
+const GEN: &[Route] = &[CLAUDE, GPT, OPENROUTER, FAILOVER, BEDROCK, XAI, TOGETHER];
 const SESSION: &[Route] = &[CLAUDE, GPT, OPENROUTER];
 const ONE: &[Route] = &[GPT];
 const CODEX_ROWS: &[Route] = &[CODEX, CLAUDE, OPENROUTER];
+/// The three model families whose request mapping differs most: Claude, GPT and grok.
+const FAMILIES: &[Route] = &[CLAUDE, GPT, XAI];
+const CLAUDE_GPT: &[Route] = &[CLAUDE, GPT];
 
 #[rustfmt::skip]
 const CELLS: &[Cell] = &[
-    // Python SDKs and frameworks.
-    ("E1+B1+S1",          "openai-py",     Runtime::Python, "chat_basic",       GEN,      "R1"),
-    ("E2+B1+S1",          "anthropic-py",  Runtime::Python, "messages_basic",   GEN,      "R1"),
+    // Python SDKs and frameworks. The basic cells carry the generic ledger claims (BIL-6/7/13):
+    // every cell checks them, these name them across every translation pair.
+    ("E1+B1+S1+BIL-6+BIL-7+BIL-13", "openai-py", Runtime::Python, "chat_basic",   GEN,      "R1"),
+    ("E2+B1+S1+BIL-6+BIL-7+BIL-13", "anthropic-py", Runtime::Python, "messages_basic", GEN, "R1"),
     ("E3+TRN-1+CAT-9+B1", "openai-py",     Runtime::Python, "responses_basic",  SESSION,  ""),
+    ("TRN-1+B1+BIL-6",    "openai-py",     Runtime::Python, "responses_basic",  &[FAILOVER, BEDROCK, XAI, TOGETHER], ""),
     ("E4",                "openai-py",     Runtime::Python, "models_list",      ONE,      ""),
     ("E4",                "anthropic-py",  Runtime::Python, "models_list",      ONE,      ""),
     ("T1+B1",             "openai-py",     Runtime::Python, "tools_chat",       GEN,      "R1"),
     ("T1+B1",             "anthropic-py",  Runtime::Python, "tools_messages",   GEN,      "R1"),
     ("M1+B1",             "openai-py",     Runtime::Python, "embeddings",       &[EMBED], ""),
     ("E1+T1+B1",          "langchain",     Runtime::Python, "langchain_chat",   GEN,      "R1"),
-    ("E3+T1+B1",          "openai-agents", Runtime::Python, "agents_sdk",       SESSION,  ""),
+    ("E3+T1+B1+TRN-24",   "openai-agents", Runtime::Python, "agents_sdk",       SESSION,  ""),
+    // Endpoint and billing detail (Python).
+    ("E5+B4+BIL-1",       "openai-py",     Runtime::Python, "responses_count_compact", ONE, ""),
+    ("E5+B4",             "anthropic-py",  Runtime::Python, "count_tokens",     &[CLAUDE], ""),
+    ("T2+E2",             "anthropic-py",  Runtime::Python, "thinking_replay",  &[CLAUDE, BEDROCK, FAILOVER], ""),
+    ("T2+BIL-9",          "openai-py",     Runtime::Python, "reasoning_replay", ONE,      ""),
+    ("TRN-8+T2",          "openai-agents", Runtime::Python, "agents_reasoning", CLAUDE_GPT, ""),
+    ("T3",                "openai-py",     Runtime::Python, "vision_chat",      CLAUDE_GPT, ""),
+    ("T3",                "anthropic-py",  Runtime::Python, "vision_messages",  CLAUDE_GPT, ""),
+    ("T4",                "openai-py",     Runtime::Python, "structured_chat",  &[CLAUDE, GPT, XAI, TOGETHER], ""),
+    ("T4",                "anthropic-py",  Runtime::Python, "structured_messages", CLAUDE_GPT, ""),
+    ("T4",                "langchain",     Runtime::Python, "langchain_structured", FAMILIES, ""),
+    ("T5",                "openai-py",     Runtime::Python, "reasoning_effort", &[CLAUDE, SONNET, GPT, XAI], ""),
+    ("T6",                "openai-py",     Runtime::Python, "typed_error",      FAMILIES, ""),
+    ("T6",                "anthropic-py",  Runtime::Python, "typed_error",      FAMILIES, ""),
+    ("R3",                "openai-py",     Runtime::Python, "steer_providers",  &[POOLED], ""),
+    ("R4+B3",             "anthropic-py",  Runtime::Python, "session_pin",      &[POOLED], ""),
+    ("R5",                "openai-py",     Runtime::Python, "big_body",         &[CLAUDE, GPT, FAILOVER], ""),
+    ("R5",                "anthropic-py",  Runtime::Python, "big_body",         &[CLAUDE, FAILOVER], ""),
+    ("B2+BIL-3+BIL-20",   "openai-py",     Runtime::Python, "stream_abort",     FAMILIES, ""),
+    ("BIL-3",             "openai-py",     Runtime::Python, "cancel_before_head", CLAUDE_GPT, ""),
+    ("BIL-2",             "openai-py",     Runtime::Python, "stream_no_usage",  &[CLAUDE, GPT, XAI, TOGETHER], ""),
+    ("B3+BIL-8+BIL-11",   "anthropic-py",  Runtime::Python, "prompt_cache",     &[CLAUDE, BEDROCK], ""),
+    ("K1+B3+BIL-8",       "openai-py",     Runtime::Python, "auto_cache",       &[CLAUDE, BEDROCK, GPT], ""),
+    ("K1",                "langchain",     Runtime::Python, "langchain_cache",  &[CLAUDE], ""),
+    ("A1",                "openai-py",     Runtime::Python, "byo_key",          ONE,      ""),
+    ("A1",                "anthropic-py",  Runtime::Python, "byo_key",          &[CLAUDE], ""),
+    ("BIL-1+BIL-7",       "openai-py",     Runtime::Python, "provider_routed",  &[GPT, XAI], ""),
+    ("BIL-1+BIL-7",       "anthropic-py",  Runtime::Python, "provider_routed",  &[CLAUDE], ""),
+    ("BIL-9",             "openai-py",     Runtime::Python, "reasoning_metered", &[XAI, GPT], ""),
+    ("BIL-10",            "anthropic-py",  Runtime::Python, "web_search",       &[CLAUDE], ""),
+    ("BIL-11+B3",         "anthropic-py",  Runtime::Python, "cache_ttl_1h",     &[CLAUDE], ""),
+    ("TRN-2",             "openai-py",     Runtime::Python, "mid_system",       FAMILIES, ""),
+    ("TRN-4+B3",          "anthropic-py",  Runtime::Python, "cache_control_turns", &[CLAUDE], ""),
+    ("TRN-4+B3",          "openai-py",     Runtime::Python, "cache_control_parts", &[CLAUDE], ""),
+    ("TRN-5",             "openai-py",     Runtime::Python, "max_tokens_clamp", &[GPT4O_MINI], ""),
+    ("TRN-5",             "anthropic-py",  Runtime::Python, "max_tokens_clamp", &[GPT4O_MINI], ""),
+    // TRN-6 is the translated path: Sonnet 5.5 itself 400s on a forced Messages tool_choice (relayed
+    // as-is to a Messages client); a Chat named tool must still come back as a tool call.
+    ("TRN-6+T1",          "openai-py",     Runtime::Python, "tools_chat",       &[SONNET], ""),
+    ("TRN-11",            "anthropic-py",  Runtime::Python, "strict_tools",     &[CLAUDE], ""),
+    ("TRN-11",            "openai-py",     Runtime::Python, "strict_tools",     &[CLAUDE], ""),
+    ("TRN-15",            "openai-py",     Runtime::Python, "explicit_nulls",   GEN,      ""),
+    ("TRN-16+TRN-2",      "openai-py",     Runtime::Python, "developer_role",   &[XAI, TOGETHER], ""),
+    ("TRN-18",            "openai-py",     Runtime::Python, "context_overflow", &[GPT4], ""),
+    ("TRN-18",            "anthropic-py",  Runtime::Python, "context_overflow", &[GPT4], ""),
+    ("W5+TRN-24",         "openai-agents", Runtime::Python, "agents_handoff",   CLAUDE_GPT, ""),
+    ("W6",                "langchain",     Runtime::Python, "langchain_agent",  CLAUDE_GPT, ""),
     // Node SDKs.
     ("E1+B1+S1+S2",       "openai-node",   Runtime::Node,   "chat_basic",       GEN,      "R1"),
     ("E2+B1+S1",          "anthropic-ts",  Runtime::Node,   "messages_basic",   GEN,      "R1"),
@@ -160,11 +256,21 @@ const CELLS: &[Cell] = &[
     ("E4",                "anthropic-ts",  Runtime::Node,   "models_list",      ONE,      ""),
     ("E1+T1+B1+S2",       "ai-sdk",        Runtime::Node,   "ai_sdk_openai",    GEN,      "R1"),
     ("E2+T1+B1",          "ai-sdk",        Runtime::Node,   "ai_sdk_anthropic", GEN,      "R1"),
+    ("T2",                "anthropic-ts",  Runtime::Node,   "thinking_replay",  &[CLAUDE], ""),
+    ("T3",                "ai-sdk",        Runtime::Node,   "ai_sdk_vision",    CLAUDE_GPT, ""),
+    ("T4",                "openai-node",   Runtime::Node,   "structured_chat",  FAMILIES, ""),
+    ("T4",                "ai-sdk",        Runtime::Node,   "ai_sdk_structured", FAMILIES, ""),
+    ("T5",                "openai-node",   Runtime::Node,   "reasoning_effort", &[CLAUDE, SONNET, GPT, XAI], ""),
+    ("T6",                "openai-node",   Runtime::Node,   "typed_error",      CLAUDE_GPT, ""),
+    ("T6",                "anthropic-ts",  Runtime::Node,   "typed_error",      CLAUDE_GPT, ""),
+    ("T6",                "ai-sdk",        Runtime::Node,   "ai_sdk_error",     CLAUDE_GPT, ""),
+    ("K1",                "openai-node",   Runtime::Node,   "auto_cache",       &[CLAUDE], ""),
+    ("K1",                "ai-sdk",        Runtime::Node,   "ai_sdk_cache",     &[CLAUDE], ""),
     // Coding agents fixing a failing test in a fixture repo (W*). pi runs once per API mode; pi
     // and opencode take models only from config, generated from /v1/models. Codex's GPT row is a
     // Codex-native one (D74 keeps it off gpt-5-mini).
     ("W1",                "claude-code",   Runtime::Harness, "claude-code",     SESSION,  ""),
-    ("W2",                "codex",         Runtime::Harness, "codex",           CODEX_ROWS, ""),
+    ("W2+TRN-24",         "codex",         Runtime::Harness, "codex",           CODEX_ROWS, ""),
     ("W3",                "opencode",      Runtime::Harness, "opencode",        SESSION,  ""),
     ("W4",                "pi",            Runtime::Harness, "pi:chat",         SESSION,  ""),
     ("W4",                "pi",            Runtime::Harness, "pi:messages",     SESSION,  ""),
@@ -179,6 +285,11 @@ const CELLS: &[Cell] = &[
     ("E7",                "pi",            Runtime::Harness, "pi:messages",     SESSION,  ""),
     ("E7",                "pi",            Runtime::Harness, "pi:responses",    SESSION,  ""),
 ];
+
+/// `(client, probe, route, claims)`: claims a cell carries on one route only, where the behavior
+/// is specific to that route (Claude Code's request shape reaching native OpenAI).
+const ROUTE_CLAIMS: &[(&str, &str, &str, &str)] =
+    &[("claude-code", "claude-code", "gpt", "TRN-10")];
 
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
@@ -268,11 +379,16 @@ fn main() {
                 if !have_keys || !installed(rt) || !gateway_bin().exists() {
                     continue;
                 }
-                let claims = if route.name == "failover" && !failover_claims.is_empty() {
-                    format!("{claims}+{failover_claims}")
-                } else {
-                    claims.to_owned()
-                };
+                let mut claims = claims.to_owned();
+                if route.name == "failover" && !failover_claims.is_empty() {
+                    claims = format!("{claims}+{failover_claims}");
+                }
+                // E7 cells re-run a W* session for its cost; route claims stay on the W* cell.
+                for (c, p, r, extra) in ROUTE_CLAIMS {
+                    if (*c, *p, *r) == (client, probe, route.name) && claims != "E7" {
+                        claims = format!("{claims}+{extra}");
+                    }
+                }
                 let name = format!("{claims}::{client}::{}::{probe}", route.name);
                 let checks = Checks {
                     task: claims.split('+').any(|c| c != "E7"),
@@ -280,7 +396,7 @@ fn main() {
                 };
                 let (route, keys) = (*route, keys.clone());
                 trials.push(Trial::test(name, move || {
-                    run_cell(rt, probe, route, &keys, checks)
+                    run_cell(rt, client, probe, route, &keys, checks)
                 }));
             }
         }
@@ -346,6 +462,7 @@ fn tail(path: &Path) -> String {
 
 fn run_cell(
     rt: Runtime,
+    client: &str,
     probe: &str,
     route: Route,
     keys: &BTreeMap<String, String>,
@@ -409,12 +526,20 @@ fn run_cell(
     // nats needs a moment before the gateway's first connect; readiness waits for the scan.
     wait_ready(metrics_port, &mut gw.0, &log_path)?;
 
-    let out = Command::new(interpreter(rt))
-        .arg(probe_script(rt))
+    let mut cmd = Command::new(interpreter(rt));
+    cmd.arg(probe_script(rt))
         .arg(probe)
         .env("VERIFY_BASE", format!("http://127.0.0.1:{port}"))
         .env("VERIFY_KEY", DEV_TOKEN)
         .env("VERIFY_MODEL", route.model)
+        .env("VERIFY_PROVIDER", route.pools[0].0)
+        .env("VERIFY_CLIENT", client);
+    // A BYO probe sends the provider's own key through /{provider}/, the way a customer with
+    // their own key would. Only that probe sees a real key.
+    if probe.starts_with("byo") {
+        cmd.env("VERIFY_BYO_KEY", &keys[route.pools[0].1]);
+    }
+    let out = cmd
         .stderr(Stdio::inherit())
         .output()
         .map_err(|e| format!("probe: {e}"))?;
@@ -456,6 +581,9 @@ fn run_cell(
             if row["usage_estimated"] == true {
                 problems.push(format!("row is an estimate ({row})"));
             }
+            if row["price_model"].as_str().is_none_or(str::is_empty) {
+                problems.push(format!("row's price_model doesn't resolve ({row})"));
+            }
         }
         if rows
             .iter()
@@ -468,6 +596,7 @@ fn run_cell(
         if checks.e7 {
             problems.extend(e7_problems(&verdict["detail"], &rows, route.model));
         }
+        export_rows(&log_path);
         let _ = std::fs::remove_dir_all(&dir);
         return if problems.is_empty() {
             Ok(())
@@ -481,75 +610,51 @@ fn run_cell(
         };
     }
     let calls = verdict["calls"].as_array().cloned().unwrap_or_default();
-    let deadline = Instant::now() + Duration::from_secs(5);
+    // A call the probe expects no row for (a free token count, a BYO key) must not get one; every
+    // other call gets exactly one. A cancelled call's row lands when the gateway notices the
+    // client gone, so cells with one wait longer for it.
+    let rowed = calls.iter().filter(|c| c["expect"]["rows"] != 0).count();
+    let slow = calls.iter().any(|c| c["expect"]["estimated"] == true);
+    let deadline = Instant::now() + Duration::from_secs(if slow { 30 } else { 5 });
     let rows = loop {
         let rows = usage_rows(&log_path);
-        if rows.len() >= calls.len() || Instant::now() >= deadline {
+        if rows.len() >= rowed || Instant::now() >= deadline {
             break rows;
         }
         std::thread::sleep(Duration::from_millis(100));
     };
+    // A free call's row would land as fast as any other; give a stray one the same beat.
+    if rowed < calls.len() {
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    let rows = if rowed < calls.len() {
+        usage_rows(&log_path)
+    } else {
+        rows
+    };
     let mut problems = Vec::new();
-    if rows.len() != calls.len() {
+    if rows.len() != rowed {
         problems.push(format!(
-            "{} client calls but {} ai.usage rows",
-            calls.len(),
+            "{} client calls want a row, but there are {} ai.usage rows",
+            rowed,
             rows.len()
         ));
     }
     for call in &calls {
-        let Some(id) = call["request_id"].as_str() else {
-            problems.push(format!("a call carried no x-beyond-request-id: {call}"));
-            continue;
-        };
-        let matching: Vec<&Value> = rows.iter().filter(|r| r["request_id"] == id).collect();
-        let [row] = matching.as_slice() else {
-            problems.push(format!(
-                "{id}: {} ai.usage rows, want exactly 1",
-                matching.len()
-            ));
-            continue;
-        };
-        if row["provider"] != route.serves {
-            problems.push(format!(
-                "{id}: served by {}, route expects {}",
-                row["provider"], route.serves
-            ));
+        problems.extend(call_problems(call, &rows, route));
+    }
+    // BIL-7 / BIL-13 on every row, matched or not: the row names its wire and its price key.
+    for row in &rows {
+        if row["outcome"] == "ok"
+            && !matches!(row["usage_wire"].as_str(), Some("openai" | "anthropic"))
+        {
+            problems.push(format!("row carries no usage_wire ({row})"));
         }
-        if let Some(u) = call["usage"].as_object() {
-            let n = |v: &Value| v.as_u64().unwrap_or(0);
-            let anthropic_wire = matches!(row["provider"].as_str(), Some("anthropic" | "bedrock"));
-            let row_input = n(&row["input_tokens"])
-                + if anthropic_wire {
-                    n(&row["cache_read_tokens"]) + n(&row["cache_write_tokens"])
-                } else {
-                    0
-                };
-            if row_input != n(&u["input_total"]) {
-                problems.push(format!(
-                    "{id}: client saw {} input tokens, row bills {row_input} ({row})",
-                    u["input_total"]
-                ));
-            }
-            // `output_with_reasoning`: a client that reports reasoning apart from output without
-            // saying which convention the provider used (the AI SDK) — either exact count is right.
-            let alt = u.get("output_with_reasoning").map(n);
-            if n(&row["output_tokens"]) != n(&u["output"]) && alt != Some(n(&row["output_tokens"]))
-            {
-                problems.push(format!(
-                    "{id}: client saw {} output tokens, row bills {} ({row})",
-                    u["output"], row["output_tokens"]
-                ));
-            }
-            if row["usage_estimated"] == true {
-                problems.push(format!(
-                    "{id}: row is an estimate on a completed call ({row})"
-                ));
-            }
-        } else {
-            problems.push(format!("{id}: the client was shown no usage"));
+        if row["provider"].is_string() && row["price_model"].as_str().is_none_or(str::is_empty) {
+            problems.push(format!("row's price_model doesn't resolve ({row})"));
         }
     }
+    export_rows(&log_path);
     let _ = std::fs::remove_dir_all(&dir);
     if problems.is_empty() {
         Ok(())
@@ -560,6 +665,214 @@ fn run_cell(
             verdict["detail"]
         )
         .into())
+    }
+}
+
+/// One client call against the ledger. A probe can shape what the call must find with `expect`:
+///
+/// - `rows: 0` — no row may carry its request id (a free token count, a BYO key).
+/// - `error: true` — the provider refused it: one row, zero tokens billed.
+/// - `estimated: true` — the client cut it short: one row flagged `usage_estimated`, with input
+///   (and `output_min`, default 0) tokens; `input_max` / `output_max` bound it by the same request
+///   completed (BIL-20: an estimate never exceeds the truth).
+/// - `provider` — the provider that must serve it, overriding the route's.
+/// - `row_min` — `{field: n}`: the row's field is at least n (cache reads, server tool calls).
+///
+/// A call with no request id (cancelled before the response head) is matched by `tag`, the value
+/// it sent as `x-beyond-metadata: {"verify": tag}`.
+fn call_problems(call: &Value, rows: &[Value], route: Route) -> Vec<String> {
+    let n = |v: &Value| v.as_u64().unwrap_or(0);
+    let expect = &call["expect"];
+    let mut problems = Vec::new();
+    // A rowless call that carried no request id (a BYO call: the gateway only relays) has nothing
+    // to match; the row count over the whole cell still proves it wrote none.
+    if expect["rows"] == 0 && call["request_id"].is_null() {
+        return problems;
+    }
+    let (label, matching): (String, Vec<&Value>) = if let Some(id) = call["request_id"].as_str() {
+        (
+            id.to_owned(),
+            rows.iter().filter(|r| r["request_id"] == id).collect(),
+        )
+    } else if let Some(tag) = call["tag"].as_str() {
+        let tagged = |r: &&Value| {
+            r["metadata"]
+                .as_str()
+                .and_then(|m| serde_json::from_str::<Value>(m).ok())
+                .is_some_and(|m| m["verify"] == tag)
+        };
+        (format!("tag {tag}"), rows.iter().filter(tagged).collect())
+    } else {
+        return vec![format!("a call carried no x-beyond-request-id: {call}")];
+    };
+    if expect["rows"] == 0 {
+        if !matching.is_empty() {
+            problems.push(format!(
+                "{label}: billed {} row(s), want none ({:?})",
+                matching.len(),
+                matching
+            ));
+        }
+        return problems;
+    }
+    let [row] = matching.as_slice() else {
+        return vec![format!(
+            "{label}: {} ai.usage rows, want exactly 1",
+            matching.len()
+        )];
+    };
+    let serves = expect["provider"].as_str().unwrap_or(route.serves);
+    if !serves.is_empty() && row["provider"] != serves {
+        problems.push(format!(
+            "{label}: served by {}, want {serves}",
+            row["provider"]
+        ));
+    }
+    if let Some(mins) = expect["row_min"].as_object() {
+        for (field, min) in mins {
+            if n(&row[field.as_str()]) < n(min) {
+                problems.push(format!(
+                    "{label}: row {field} = {}, want >= {min} ({row})",
+                    row[field.as_str()]
+                ));
+            }
+        }
+    }
+    if expect["error"] == true {
+        let billed: u64 = [
+            "input_tokens",
+            "output_tokens",
+            "cache_read_tokens",
+            "cache_write_tokens",
+        ]
+        .iter()
+        .map(|k| n(&row[*k]))
+        .sum();
+        if billed != 0 || row["outcome"] == "ok" {
+            problems.push(format!(
+                "{label}: a refused call billed {billed} tokens, outcome {} ({row})",
+                row["outcome"]
+            ));
+        }
+        return problems;
+    }
+    if expect["estimated"] == true {
+        if row["usage_estimated"] != true {
+            problems.push(format!(
+                "{label}: a cut-short call's row is not flagged usage_estimated ({row})"
+            ));
+        }
+        let anthropic_wire = row["usage_wire"] == "anthropic";
+        let input = n(&row["input_tokens"])
+            + if anthropic_wire {
+                n(&row["cache_read_tokens"]) + n(&row["cache_write_tokens"])
+            } else {
+                0
+            };
+        let output = n(&row["output_tokens"]);
+        if input == 0 {
+            problems.push(format!(
+                "{label}: a cut-short call's estimate bills no input ({row})"
+            ));
+        }
+        if output < n(&expect["output_min"]) {
+            problems.push(format!(
+                "{label}: estimate bills {output} output tokens, want >= {} ({row})",
+                expect["output_min"]
+            ));
+        }
+        for (k, got) in [("input_max", input), ("output_max", output)] {
+            if let Some(max) = expect[k].as_u64()
+                && got > max
+            {
+                problems.push(format!(
+                    "{label}: estimate {got} exceeds the completed request's {max} ({k}; {row})"
+                ));
+            }
+        }
+        return problems;
+    }
+    let Some(u) = call["usage"].as_object() else {
+        // A client that opted out of usage (stream_options.include_usage false) is still billed
+        // exactly: the row can't be an estimate, and output was generated.
+        if expect["exact"] == true {
+            if row["usage_estimated"] == true || n(&row["output_tokens"]) == 0 {
+                problems.push(format!(
+                    "{label}: a call the client asked no usage for isn't billed exactly ({row})"
+                ));
+            }
+        } else {
+            problems.push(format!("{label}: the client was shown no usage"));
+        }
+        return problems;
+    };
+    let anthropic_wire = match row["usage_wire"].as_str() {
+        Some(w) => w == "anthropic",
+        None => matches!(row["provider"].as_str(), Some("anthropic" | "bedrock")),
+    };
+    let row_input = n(&row["input_tokens"])
+        + if anthropic_wire {
+            n(&row["cache_read_tokens"]) + n(&row["cache_write_tokens"])
+        } else {
+            0
+        };
+    if row_input != n(&u["input_total"]) {
+        problems.push(format!(
+            "{label}: client saw {} input tokens, row bills {row_input} ({row})",
+            u["input_total"]
+        ));
+    }
+    // `output_with_reasoning`: a client that reports reasoning apart from output without saying
+    // which convention the provider used (the AI SDK) — either exact count is right.
+    let alt = u.get("output_with_reasoning").map(n);
+    if n(&row["output_tokens"]) != n(&u["output"]) && alt != Some(n(&row["output_tokens"])) {
+        problems.push(format!(
+            "{label}: client saw {} output tokens, row bills {} ({row})",
+            u["output"], row["output_tokens"]
+        ));
+    }
+    // B3 / BIL-8: cache reads are the same number on both sides.
+    if let Some(cr) = u.get("cache_read")
+        && n(cr) != n(&row["cache_read_tokens"])
+    {
+        problems.push(format!(
+            "{label}: client saw {cr} cache-read tokens, row bills {} ({row})",
+            row["cache_read_tokens"]
+        ));
+    }
+    // BIL-9: reasoning is counted once — the row's breakout equals what the client was shown.
+    if let Some(r) = u.get("reasoning").filter(|r| n(r) > 0)
+        && reasoning_of(row) != Some(n(r))
+    {
+        problems.push(format!(
+            "{label}: client saw {r} reasoning tokens, row reports {} ({row})",
+            row["reasoning_tokens"]
+        ));
+    }
+    // BIL-11: the service tier the provider echoed is the one recorded.
+    if let Some(tier) = u.get("service_tier").filter(|t| t.is_string())
+        && &row["service_tier"] != tier
+    {
+        problems.push(format!(
+            "{label}: client was shown service_tier {tier}, row records {} ({row})",
+            row["service_tier"]
+        ));
+    }
+    if row["usage_estimated"] == true {
+        problems.push(format!(
+            "{label}: row is an estimate on a completed call ({row})"
+        ));
+    }
+    problems
+}
+
+/// The row's `reasoning_tokens`, logged as `Debug` of an `Option` (`Some(12)` / `None`) so a real
+/// zero stays distinct from "not reported".
+fn reasoning_of(row: &Value) -> Option<u64> {
+    match &row["reasoning_tokens"] {
+        Value::Number(n) => n.as_u64(),
+        Value::String(s) => s.strip_prefix("Some(")?.strip_suffix(')')?.parse().ok(),
+        _ => None,
     }
 }
 
@@ -631,6 +944,22 @@ fn e7_problems(detail: &Value, rows: &[Value], model: &str) -> Vec<String> {
         ));
     }
     problems
+}
+
+/// With `VERIFY_ROWS_OUT=<file>`, append the cell's billing rows there as JSON lines, so a run's
+/// spend can be totalled afterwards.
+fn export_rows(log: &Path) {
+    let Some(out) = std::env::var_os("VERIFY_ROWS_OUT") else {
+        return;
+    };
+    let lines: String = usage_rows(log).iter().map(|r| format!("{r}\n")).collect();
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(out)
+    {
+        let _ = f.write_all(lines.as_bytes());
+    }
 }
 
 fn usage_rows(log: &Path) -> Vec<Value> {
