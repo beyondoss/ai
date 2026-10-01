@@ -576,11 +576,10 @@ async fn a_panic_in_a_proxy_phase_releases_what_the_request_held() {
         Ok(r) => r.text().await.map(|_| ()).map_err(|e| e.to_string()),
         Err(e) => Err(e.to_string()),
     };
-    assert!(
-        gw.log().contains("AI_FAULT_PANIC"),
-        "the fault did not fire (first request: {first:?}); log:\n{}",
-        gw.log()
-    );
+    // The panic message reaches the captured log through a reader thread, which can trail the
+    // dropped connection under load: wait for it rather than read the log once.
+    eprintln!("first request: {first:?}");
+    gw.wait_for_log_line(&["AI_FAULT_PANIC"]).await;
     let start = Instant::now();
     while start.elapsed() < Duration::from_secs(5)
         && (gw.metric("ai_requests_in_flight", "").await != 0.0
