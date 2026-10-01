@@ -1490,7 +1490,7 @@ claims = ["CAT-5"]
 state = "fixed"
 test = "grok_rows_read_files_over_xai_responses"
 fix = "f00e48a"
-note = "Fixed: Stopped advertising: grok-4.20, 4.3, 4.5, 4.6 and build-0.1 cards drop file input, because xAI's Chat Completions (the path these rows reach xAI on) refuses file content. Moving every grok row onto xAI's /v1/responses would restore PDFs (xAI Responses reads inline PDFs: OSPREY on grok-4.3 and grok-build-0.1, 2026-10-01), but it changes the wire for every grok request while D23, D100 and D102 are open on that path, so it is not done here. grok-4.20-multi-agent, now on Responses (D105), keeps file input. Live: CAT-5::raw::xai::grok-* re-run 2026-10-01. PDFs restored via Responses (FIXHASH): every grok row now reaches xAI over /v1/responses (xai_responses_first), so the cards list file input again; xAI Responses reads the PDF on grok-4.20, 4.3, 4.5, 4.6 and build-0.1. OpenRouter x-ai/grok-build-0.1 still answers a PDF with 404 \"No endpoints found that support file input\" (its 4.20/4.3/4.5/4.6 ids read it), so a request carrying a file part skips it (providers::catalog::serves_file_input, the D107 route::unserved mask). Also held by a_pdf_request_skips_a_candidate_that_reads_none. Live 2026-10-01: CAT-5::raw::xai::{grok-4.20,grok-4.3,grok-4.5,grok-4.6,grok-build-0.1} read the PDF; CAT-5::raw::openrouter::grok-build-0.1 asserts the PDF with OpenRouter ordered first is served by xAI."
+note = "Fixed: Stopped advertising: grok-4.20, 4.3, 4.5, 4.6 and build-0.1 cards drop file input, because xAI's Chat Completions (the path these rows reach xAI on) refuses file content. Moving every grok row onto xAI's /v1/responses would restore PDFs (xAI Responses reads inline PDFs: OSPREY on grok-4.3 and grok-build-0.1, 2026-10-01), but it changes the wire for every grok request while D23, D100 and D102 are open on that path, so it is not done here. grok-4.20-multi-agent, now on Responses (D105), keeps file input. Live: CAT-5::raw::xai::grok-* re-run 2026-10-01. PDFs restored via Responses (54349d1): every grok row now reaches xAI over /v1/responses (xai_responses_first), so the cards list file input again; xAI Responses reads the PDF on grok-4.20, 4.3, 4.5, 4.6 and build-0.1. OpenRouter x-ai/grok-build-0.1 still answers a PDF with 404 \"No endpoints found that support file input\" (its 4.20/4.3/4.5/4.6 ids read it), so a request carrying a file part skips it (providers::catalog::serves_file_input, the D107 route::unserved mask). Also held by a_pdf_request_skips_a_candidate_that_reads_none. Live 2026-10-01: CAT-5::raw::xai::{grok-4.20,grok-4.3,grok-4.5,grok-4.6,grok-build-0.1} read the PDF; CAT-5::raw::openrouter::grok-build-0.1 asserts the PDF with OpenRouter ordered first is served by xAI."
 
 [[defect]]
 id = "D107"
@@ -1839,7 +1839,7 @@ evidence = "live 2026-10-01 crates/verify/tests/long_live.rs, two runs each: TOO
 claims = ["TOOL-1"]
 state = "fixed"
 test = "more_tools_than_chat_takes_walk_the_responses_arm"
-fix = "FIXHASH"
+fix = "54349d1"
 note = "Found by long_live.rs TOOL-1 trials, which assert the claim's fallback (a 4xx naming 128) and pass. Either document the limit per wire (Chat Completions upstreams cap tools at 128), or send a translated request with more than 128 tools to the row's Responses arm. Fixed the second way: a Messages client offering more than 128 tools on a row whose primary is Chat Completions and that has a Responses arm walks that arm, translated onto /v1/responses (route::tools_need_responses_arm; a header-won walk reads the body first, a large body is counted in relay_full_body). A Chat Completions client keeps its endpoint and OpenAI's own 400 naming 128; ARCHITECTURE.md documents the limit per wire. Doing so surfaced D146 (Claude Code's user id is too long for OpenAI Responses). Live 2026-10-01 (long_live.rs TOOL-1, all 21 trials): TOOL-1::anthropic-py::gpt::{messages_129,messages_300} and TOOL-1::claude-code::gpt::mcp_150 now assert success and pass; chat_129 still asserts the 4xx naming 128."
 
 [[defect]]
@@ -1853,7 +1853,7 @@ evidence = "live 2026-10-01: POST api.x.ai/v1/responses (grok-4.3, grok-build-0.
 claims = ["E3", "CAT-5"]
 state = "fixed"
 test = "a_one_shot_on_a_grok_row_is_not_stored_at_xai"
-fix = "FIXHASH"
+fix = "54349d1"
 note = "Found while moving the grok rows onto xAI Responses (D106). Fixed: a same-endpoint Responses walk on a row with no Responses arm sends store: false (translate::store_false: every root store member cut out by span, \"store\":false spliced first, nothing else moved). Translated Chat and Messages clients already sent store: false unless they asked to store. Also held by store_false_is_added_once_and_nothing_else_moves."
 
 [[defect]]
@@ -1867,5 +1867,5 @@ evidence = "live 2026-10-01: TOOL-1::claude-code::gpt::mcp_150 (after D131's fix
 claims = ["TOOL-1", "TRN-10"]
 state = "fixed"
 test = "a_long_user_id_fits_openai_responses"
-fix = "FIXHASH"
+fix = "54349d1"
 note = "Found by the D131 fix's live re-run. Fixed: onto OpenAI's own Responses a user over 64 characters becomes its FNV-1a hash (16 hex characters, stable per user, as anthropic_user_id does for an email address); xAI and a short id keep the client's value. Live 2026-10-01: TOOL-1::claude-code::gpt::mcp_150 passes."
