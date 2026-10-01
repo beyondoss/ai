@@ -1756,7 +1756,13 @@ Observability that can stall the data plane is a worse bug than the missing obse
 
 Drops are counted on `ai_capture_dropped_total`. That counter is what makes a missing payload
 diagnosable ("capture was on and we lost it") rather than ambiguous ("was capture even on?") —
-which is exactly the question asked during the incident capture exists to serve.
+which is exactly the question asked during the incident capture exists to serve. It counts every
+lost line: one dropped on a full queue, one the destination refused (a closed stdout pipe), and one
+enqueued after shutdown began (D208). On SIGTERM, the drain that exits once nothing is in flight
+first writes out what is queued (`CaptureDrain::finish`: an empty line, which no event produces,
+tells the sink's thread to flush and stop, since the `tracing` subscriber holds a sender for the
+life of the process), waiting at most 5 s or the rest of the grace period; lines still queued after
+that are lost with a warn line. Before, `exit(0)` dropped them silently.
 
 **Downstream schema.** Payload rows ship on the same logfwd/OTLP path as `ai.usage` and correlate by
 `request_id`, which is also returned to the client in `x-beyond-request-id` — so a user quoting that

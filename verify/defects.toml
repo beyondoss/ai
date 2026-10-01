@@ -2219,3 +2219,17 @@ state = "fixed"
 test = "a_panicked_full_body_attempt_is_reported"
 fix = ""
 note = "Fixed in proxy.rs: reap_attempt awaits every attempt's JoinHandle (bounded by ABANDONED_ATTEMPT_GRACE, 2s, as before) and, when JoinError::is_panic, logs at error \"full-body attempt panicked\" with request_id and the panic message; the failing request's 502 then reads \"full-body attempt panicked\". It runs on every attempt that ends without a written response (retried or failed), so an abandoned attempt's panic is logged too."
+
+[[defect]]
+id = "D208"
+severity = "low"
+area = "Observability"
+title = "Captured payload lines were lost silently on a write error and at shutdown"
+impact = "ai_capture_dropped_total is the counter that tells \"capture was on and we lost it\" from \"capture was off\", but the capture sink's thread discarded write errors (let _ = out.write_all), so a closed or broken stdout lost every payload line uncounted. On SIGTERM the drain called exit(0) the moment no request was in flight, without waiting for the sink's thread, so the captures of the last requests before a deploy (still queued) were lost, also uncounted."
+confidence = "high"
+evidence = "Code: capture_sink.rs drain thread (let _ = out.write_all(&line)); main.rs drain_then_exit exit(0) with the sink's queue never drained (the tracing subscriber holds a sender for the life of the process, so the queue never closes). Hermetic: every_lost_capture_line_is_counted_and_shutdown_drains_the_queue."
+claims = ["O2"]
+state = "fixed"
+test = "every_lost_capture_line_is_counted_and_shutdown_drains_the_queue"
+fix = ""
+note = "Fixed: a line the destination refuses increments ai_capture_dropped_total, like a full-queue drop. CaptureSink::spawn also returns a CaptureDrain; finish(timeout) enqueues an empty line (no event produces one), on which the thread writes out everything queued before it, flushes and stops, and waits for it; a line enqueued after that is counted as dropped (the queue is disconnected). main.rs hands the drain to DrainOnTerm, and drain_then_exit finishes it before exit(0), bounded by 5 s or the rest of the grace period (a wedged pipeline cannot hold teardown up; the remainder is lost with a warn line). ai.usage is unchanged: it already uses the blocking writer. Not covered: pingora's own exit at the end of the grace period, with requests still in flight."

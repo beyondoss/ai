@@ -10,7 +10,7 @@
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 use beyond_ai::admin::AdminApp;
-use beyond_ai::capture_sink::CaptureSink;
+use beyond_ai::capture_sink::{CaptureDrain, CaptureSink};
 use beyond_ai::config::AiConfig;
 use beyond_ai::doctor;
 use beyond_ai::metrics::Metrics;
@@ -78,8 +78,13 @@ fn load_config(path: Option<&Path>) -> AiConfig {
 /// ended in SIGKILL. The drain watches [`LIVE_REQUESTS`] (every request context, dropped only after
 /// its `logging`, billing row included) and exits the moment it reaches zero. Pingora's sleep stays
 /// the upper bound: a request still running when the grace ends is cut as before.
+///
+/// Before it exits, the drain writes out the `ai.payload` lines still queued (`capture`, D208):
+/// `exit` does not wait for the capture sink's thread, so a capture of the last requests was lost
+/// silently. `ai.usage` rows need no such step: they are written synchronously.
 struct DrainOnTerm {
     grace: Duration,
+    capture: std::sync::Mutex<Option<CaptureDrain>>,
 }
 
 #[async_trait::async_trait]
@@ -88,11 +93,12 @@ impl ShutdownSignalWatch for DrainOnTerm {
         let signal = UnixShutdownSignalWatch.recv().await;
         if matches!(signal, ShutdownSignal::GracefulTerminate) {
             let grace = self.grace;
+            let capture = self.capture.lock().ok().and_then(|mut c| c.take());
             // A plain thread: pingora's main thread is about to block in its grace sleep, and the
             // service runtimes are what is being drained.
             let spawned = std::thread::Builder::new()
                 .name("ai-drain".into())
-                .spawn(move || drain_then_exit(grace));
+                .spawn(move || drain_then_exit(grace, capture));
             if let Err(e) = spawned {
                 tracing::warn!(error = %e, "could not start the shutdown drain; waiting out the grace period");
             }
@@ -105,7 +111,12 @@ impl ShutdownSignalWatch for DrainOnTerm {
 /// keep-alive connections drop) before it trusts a zero [`LIVE_REQUESTS`].
 const DRAIN_SETTLE: Duration = Duration::from_millis(200);
 
-fn drain_then_exit(grace: Duration) {
+/// The longest the drain waits for queued `ai.payload` lines to be written before it exits. A
+/// wedged log pipeline must not hold the process past its stop timeout; what is still queued then
+/// is lost, and the warn line says so.
+const CAPTURE_FLUSH: Duration = Duration::from_secs(5);
+
+fn drain_then_exit(grace: Duration, capture: Option<CaptureDrain>) {
     let start = Instant::now();
     std::thread::sleep(DRAIN_SETTLE);
     while start.elapsed() < grace {
@@ -115,6 +126,14 @@ fn drain_then_exit(grace: Duration) {
                 after_ms = start.elapsed().as_millis() as u64,
                 "drained: no request in flight; exiting"
             );
+            let budget = grace.saturating_sub(start.elapsed()).min(CAPTURE_FLUSH);
+            if let Some(c) = capture
+                && !c.finish(budget)
+            {
+                tracing::warn!(
+                    "capture sink did not drain before exit; queued ai.payload lines are lost"
+                );
+            }
             exit(0);
         }
         std::thread::sleep(Duration::from_millis(50));
@@ -159,7 +178,7 @@ impl std::io::Write for UsageLine<'_> {
     }
 }
 
-fn init_tracing(metrics: &Metrics, queue_depth: usize) {
+fn init_tracing(metrics: &Metrics, queue_depth: usize) -> CaptureDrain {
     // JSON to stdout; the `ai.usage` target carries billing facts that logfwd/OTLP ships to
     // ClickHouse. `AI_LOG` sets the level filter for everything **except** those rows.
     let env_filter =
@@ -185,14 +204,14 @@ fn init_tracing(metrics: &Metrics, queue_depth: usize) {
     // A gateway that can't spawn a thread at boot won't serve traffic either — fail visibly rather
     // than run with payload capture silently disabled. Same eprintln+exit shape as the config and
     // metrics failures above, which is why this isn't a `tracing` error: nothing is initialized yet.
-    let payload_sink = match CaptureSink::spawn(queue_depth, metrics.capture_dropped_total.clone())
-    {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("failed to start the capture-payload log sink: {e}");
-            exit(1);
-        }
-    };
+    let (payload_sink, payload_drain) =
+        match CaptureSink::spawn(queue_depth, metrics.capture_dropped_total.clone()) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("failed to start the capture-payload log sink: {e}");
+                exit(1);
+            }
+        };
     let usage_layer = tracing_subscriber::fmt::layer()
         .json()
         .with_writer(UsageStdout(metrics.usage_write_errors_total.clone()))
@@ -211,6 +230,7 @@ fn init_tracing(metrics: &Metrics, queue_depth: usize) {
         .with(main_layer)
         .with(payload_layer)
         .init();
+    payload_drain
 }
 
 // Boot path: every `.expect()` here is a fatal start-up invariant (no runtime to build, no Pingora
@@ -265,7 +285,7 @@ fn main() {
     // the first thing on this path that logs through `tracing` rather than `eprintln!`. Everything
     // above reports its own failures directly to stderr and exits, so nothing is lost by initializing
     // here rather than at the top of `main`.
-    init_tracing(&metrics, capture_queue_depth);
+    let capture_drain = init_tracing(&metrics, capture_queue_depth);
     let state = match GatewayState::new(config, metrics) {
         Ok(s) => s,
         Err(e) => {
@@ -354,6 +374,7 @@ fn main() {
     server.run(RunArgs {
         shutdown_signal: Box::new(DrainOnTerm {
             grace: Duration::from_secs(grace_period_secs),
+            capture: std::sync::Mutex::new(Some(capture_drain)),
         }),
     });
     exit(0);
