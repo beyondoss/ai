@@ -345,3 +345,52 @@ async fn cache_and_rank_export_process_scope() {
     wait_for_metric(&gw, "ai_cache_scope", "process", 1.0).await;
     wait_for_metric(&gw, "ai_smart_rank_scope", "process", 1.0).await;
 }
+
+/// With `x-beyond-model` the header names the row, not the body, and the body's `model` is
+/// overwritten per candidate. Two rows that share a provider set, sent the same body, are two
+/// different requests: the second must reach the upstream asking for its own model, not replay the
+/// first row's answer.
+/// claim: SEC-14
+/// defect: D31
+#[tokio::test]
+async fn the_same_body_on_another_row_is_a_cache_miss() {
+    let nats = unused_nats_port();
+    let (pubkey, sk) = test_keypair(23);
+    let mock = MockUpstream::start(Mode::Json).await;
+    let gw = Gateway::builder(nats, &mock.authority(), &b64(&pubkey))
+        .providers(&["openai"])
+        .cache_ttl_secs(60)
+        .start()
+        .await;
+    let key = vkey(&sk, 23);
+    let client = test_client();
+    // Responses: the header-won path reads the whole body, so the cache is consulted.
+    let body = r#"{"model":"gpt-4o","input":"hi"}"#;
+    let send = |row: &'static str| {
+        client
+            .post(format!("{}/v1/responses", gw.url()))
+            .header("authorization", format!("Bearer {key}"))
+            .header("content-type", "application/json")
+            .header("x-beyond-model", row)
+            .body(body)
+            .send()
+    };
+    let first = send("gpt-4o").await.unwrap();
+    assert_eq!(first.status(), 200, "{}", first.text().await.unwrap());
+    let _ = gw.wait_for_log_line(&["ai.usage"]).await;
+    let hits = mock.hits();
+    // The fill is in: the same row again is a hit, which proves this path caches at all.
+    let again = send("gpt-4o").await.unwrap();
+    assert_eq!(again.headers().get("x-beyond-cache-status").unwrap(), "hit");
+    assert_eq!(mock.hits(), hits);
+
+    let other = send("gpt-4o-mini").await.unwrap();
+    assert_eq!(other.status(), 200);
+    assert!(
+        other.headers().get("x-beyond-cache-status").is_none(),
+        "another row must not replay gpt-4o's answer"
+    );
+    assert_eq!(mock.hits(), hits + 1, "the other row reaches the upstream");
+    let sent: serde_json::Value = serde_json::from_slice(&mock.captured().unwrap().body).unwrap();
+    assert_eq!(sent["model"], "gpt-4o-mini");
+}

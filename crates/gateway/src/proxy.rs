@@ -2703,9 +2703,17 @@ impl ProxyHttp for AiProxy {
         let cache_look = if !cache_bypass && model_route.is_some() {
             body_complete.as_deref().and_then(|body| {
                 let store = self.state.cache.as_ref()?;
-                let path = session.req_header().uri.path();
+                let req = session.req_header();
                 let (ids, n) = walk.provider_ids(walk_arms);
-                let ck = cache::key(tenant_id, path, body, &ids[..usize::from(n)]);
+                let ck = cache::key(&cache::KeyParts {
+                    tenant_id,
+                    method: req.method.as_str(),
+                    inbound_path: req.uri.path(),
+                    model: model_route.map_or("", |r| r.model),
+                    headers: &req.headers,
+                    body,
+                    providers: &ids[..usize::from(n)],
+                });
                 match store.get(&ck) {
                     Some(hit) => Some(Err(hit)),
                     None => Some(Ok((ck, store.max_bytes()))),

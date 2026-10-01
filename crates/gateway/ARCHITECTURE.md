@@ -83,7 +83,8 @@ Client (stock OpenAI/Anthropic SDK)
   │  │    order / only / split, then TTFT rank unless order/split pinned, *before* first_usable / breaker skip
   │  │    capture decision = header (wins both ways) else capture-set rule ∧ 1-in-N sample
   │  ├─ Exact-match cache (managed catalog walk, body already in hand, cache_ttl_secs > 0):
-  │  │    key = pre-rewrite body + inbound path + tenant_id + effective candidate order
+  │  │    key = pre-rewrite body + method + inbound path + tenant_id + catalog row
+  │  │      + anthropic-version / anthropic-beta values + effective candidate order
   │  │    per-pod table (ai_cache_scope{kind="process"}); miss does not consult Redis
   │  │    x-beyond-cache: off / Cache-Control: no-store ────────── skip lookup and store
   │  │    hit: write stored 2xx (no upstream, no breaker, no key-walk)
@@ -1049,7 +1050,13 @@ the miss path: a miss is always the unbuffered upstream relay. `ai_cache_scope{k
 is the honesty metric; do not alert as if a shared cache were in front of the providers.
 
 **The key is the client request plus the walk, not the upstream attempt.** Hash of the pre-rewrite
-body + inbound path + `tenant_id` + the effective candidate order (`ProviderId` indices). Two ahash
+body + method + inbound path + `tenant_id` + the resolved catalog row + the `anthropic-version` and
+`anthropic-beta` values (`cache::VARY_HEADERS`) + the effective candidate order (`ProviderId`
+indices). The row matters because `x-beyond-model` names it, not the body: the body's `model` is
+overwritten per candidate, so without the row a `gpt-4o-mini` request whose body matched an earlier
+`gpt-4o` one replayed the `gpt-4o` answer whenever the two rows shared a provider set. The two
+Anthropic headers change what the provider generates for the same body; the other forwarded headers
+do not. Two ahash
 passes with a process-secret key — not `DefaultHasher`, which is SipHash-1-3 with zero keys, run
 over the whole body on the lookup in front of `upstream_peer`. Not the pool key, not the serving
 candidate, not the raw virtual key: a 429 that walks to a second key and then 200s is still one
@@ -1392,8 +1399,9 @@ embeddings, and semantic match are a different product: this is "the same bytes 
 out" for a managed catalog walk whose body we already had to peek.
 
 The key cannot be the pool key or the candidate. Those change across a 429 walk and a vendor
-failover, but the client sent one body. Hashing the pre-rewrite body (and the inbound path, and
-the tenant) keeps "identical request" meaning what the caller sent, not which credential happened
+failover, but the client sent one body. Hashing the pre-rewrite body (and the method, inbound path,
+catalog row, Anthropic version and beta headers, and the tenant) keeps "identical request" meaning
+what the caller sent, not which credential happened
 to serve.
 
 ---

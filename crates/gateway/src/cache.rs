@@ -5,7 +5,8 @@
 //! the same contract as payload capture. BYO and `/{provider}` passthrough are not cached — those
 //! paths do not have the client body in hand before `upstream_peer`.
 //!
-//! The key is a hash of the **pre-rewrite** body + inbound path + `tenant_id` + the effective
+//! The key is a hash of the **pre-rewrite** body + method + inbound path + `tenant_id` + the
+//! resolved catalog row + the `anthropic-version` / `anthropic-beta` values + the effective
 //! catalog-walk candidate order (provider ids). Not the pool key, not the serving candidate, not
 //! the raw virtual key: a 429 that walks to a second key and then 200s is still one client request.
 //! Split/order permute the walk, so each arm is its own cache entry rather than pinning A/B traffic
@@ -33,7 +34,7 @@ use std::time::{Duration, Instant};
 /// `CacheKey` with `HashMap`'s own `RandomState`.
 static KEY_HASHER: LazyLock<ahash::RandomState> = LazyLock::new(ahash::RandomState::new);
 
-/// 128-bit fingerprint of `(tenant_id, inbound path, pre-rewrite body, candidate provider ids)`.
+/// 128-bit fingerprint of a [`KeyParts`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct CacheKey([u8; 16]);
 
@@ -101,27 +102,56 @@ impl ResponseTap {
     }
 }
 
-/// Fingerprint used as the map key. Length prefixes stop `path||body` concatenation collisions.
-/// `providers` is the effective catalog-walk order (`ProviderId::index` bytes) so split/order
-/// cache per arm instead of pinning both to the first fill.
-pub fn key(tenant_id: u64, inbound_path: &str, body: &[u8], providers: &[u8]) -> CacheKey {
-    fn mix(seed: u64, tenant_id: u64, path: &str, body: &[u8], providers: &[u8]) -> u64 {
+/// Request headers whose value changes the upstream's answer for the same body, so they are part
+/// of the key. Any other header the gateway forwards (`content-type`, `accept`, `user-agent`) does
+/// not change what a provider generates.
+pub const VARY_HEADERS: [&str; 2] = ["anthropic-version", "anthropic-beta"];
+
+/// Everything a cached answer depends on.
+pub struct KeyParts<'a> {
+    pub tenant_id: u64,
+    pub method: &'a str,
+    pub inbound_path: &'a str,
+    /// The catalog row the request resolved to. With `x-beyond-model` the header names it, not the
+    /// body, and the body's `model` is overwritten per candidate: two rows that share a provider
+    /// set must not share an entry for the same body.
+    pub model: &'a str,
+    /// The request headers; only [`VARY_HEADERS`] are read.
+    pub headers: &'a http::HeaderMap,
+    pub body: &'a [u8],
+    /// The effective catalog-walk order (`ProviderId::index` bytes), so split/order cache per arm
+    /// instead of pinning both to the first fill.
+    pub providers: &'a [u8],
+}
+
+/// Fingerprint used as the map key. Every variable-length field is length-prefixed, which stops
+/// `path||body`-style concatenation collisions.
+pub fn key(p: &KeyParts<'_>) -> CacheKey {
+    fn field(h: &mut impl Hasher, bytes: &[u8]) {
+        h.write_u64(bytes.len() as u64);
+        h.write(bytes);
+    }
+    let mix = |seed: u64| {
         let mut h = KEY_HASHER.build_hasher();
         h.write_u64(seed);
-        h.write_u64(tenant_id);
-        h.write_u64(path.len() as u64);
-        h.write(path.as_bytes());
-        h.write_u64(body.len() as u64);
-        h.write(body);
-        h.write_u64(providers.len() as u64);
-        h.write(providers);
+        h.write_u64(p.tenant_id);
+        field(&mut h, p.method.as_bytes());
+        field(&mut h, p.inbound_path.as_bytes());
+        field(&mut h, p.model.as_bytes());
+        for name in VARY_HEADERS {
+            let values = p.headers.get_all(name);
+            h.write_u64(values.iter().count() as u64);
+            for v in values {
+                field(&mut h, v.as_bytes());
+            }
+        }
+        field(&mut h, p.body);
+        field(&mut h, p.providers);
         h.finish()
-    }
-    let a = mix(0, tenant_id, inbound_path, body, providers).to_le_bytes();
-    let b = mix(1, tenant_id, inbound_path, body, providers).to_le_bytes();
+    };
     let mut out = [0u8; 16];
-    out[..8].copy_from_slice(&a);
-    out[8..].copy_from_slice(&b);
+    out[..8].copy_from_slice(&mix(0).to_le_bytes());
+    out[8..].copy_from_slice(&mix(1).to_le_bytes());
     CacheKey(out)
 }
 
@@ -287,6 +317,19 @@ mod tests {
         }
     }
 
+    /// A key for a POST on the `gpt-4o` row with no vary headers.
+    fn key_of(tenant_id: u64, inbound_path: &str, body: &[u8], providers: &[u8]) -> CacheKey {
+        key(&KeyParts {
+            tenant_id,
+            method: "POST",
+            inbound_path,
+            model: "gpt-4o",
+            headers: &http::HeaderMap::new(),
+            body,
+            providers,
+        })
+    }
+
     fn req(headers: &[(&str, &str)]) -> RequestHeader {
         let mut r = RequestHeader::build("POST", b"/v1/chat/completions", None).unwrap();
         for (k, v) in headers {
@@ -298,21 +341,21 @@ mod tests {
     #[test]
     fn key_is_tenant_path_body_and_candidate_order() {
         let body = br#"{"model":"gpt-4o","messages":[]}"#;
-        let a = key(1, "/v1/chat/completions", body, &[0, 2]);
-        assert_eq!(a, key(1, "/v1/chat/completions", body, &[0, 2]));
+        let a = key_of(1, "/v1/chat/completions", body, &[0, 2]);
+        assert_eq!(a, key_of(1, "/v1/chat/completions", body, &[0, 2]));
         assert_ne!(
             a,
-            key(2, "/v1/chat/completions", body, &[0, 2]),
+            key_of(2, "/v1/chat/completions", body, &[0, 2]),
             "tenant isolation"
         );
         assert_ne!(
             a,
-            key(1, "/auto/chat/completions", body, &[0, 2]),
+            key_of(1, "/auto/chat/completions", body, &[0, 2]),
             "inbound path is part of the key"
         );
         assert_ne!(
             a,
-            key(
+            key_of(
                 1,
                 "/v1/chat/completions",
                 br#"{"model":"gpt-4o-mini"}"#,
@@ -322,38 +365,86 @@ mod tests {
         );
         assert_ne!(
             a,
-            key(1, "/v1/chat/completions", body, &[2, 0]),
+            key_of(1, "/v1/chat/completions", body, &[2, 0]),
             "candidate order is part of the key — split/order cache per arm"
         );
         assert_ne!(
             a,
-            key(1, "/v1/chat/completions", body, &[0]),
+            key_of(1, "/v1/chat/completions", body, &[0]),
             "a shorter walk is a different arm"
         );
         // Concatenation must not collide: path "ab" + body "c" vs path "a" + body "bc".
         assert_ne!(
-            key(1, "ab", b"c", &[]),
-            key(1, "a", b"bc", &[]),
+            key_of(1, "ab", b"c", &[]),
+            key_of(1, "a", b"bc", &[]),
             "length prefixes stop concatenation collisions"
+        );
+    }
+
+    /// claim: SEC-14
+    /// defect: D31
+    #[test]
+    fn key_includes_the_row_the_method_and_the_vary_headers() {
+        let body = br#"{"model":"gpt-4o","messages":[]}"#;
+        let none = http::HeaderMap::new();
+        let parts = |method, model, headers| KeyParts {
+            tenant_id: 1,
+            method,
+            inbound_path: "/v1/chat/completions",
+            model,
+            headers,
+            body,
+            providers: &[0],
+        };
+        let a = key(&parts("POST", "gpt-4o", &none));
+        assert_eq!(a, key_of(1, "/v1/chat/completions", body, &[0]));
+        assert_ne!(a, key(&parts("POST", "gpt-4o-mini", &none)), "row");
+        assert_ne!(a, key(&parts("GET", "gpt-4o", &none)), "method");
+        let mut beta = http::HeaderMap::new();
+        beta.insert(
+            "anthropic-beta",
+            "prompt-caching-2024-07-31".parse().unwrap(),
+        );
+        let b = key(&parts("POST", "gpt-4o", &beta));
+        assert_ne!(a, b, "anthropic-beta");
+        let mut version = http::HeaderMap::new();
+        version.insert(
+            "anthropic-version",
+            "prompt-caching-2024-07-31".parse().unwrap(),
+        );
+        assert_ne!(
+            b,
+            key(&parts("POST", "gpt-4o", &version)),
+            "the same value under the other header"
+        );
+        let mut unrelated = http::HeaderMap::new();
+        unrelated.insert("user-agent", "sdk/2".parse().unwrap());
+        assert_eq!(
+            a,
+            key(&parts("POST", "gpt-4o", &unrelated)),
+            "not a vary header"
         );
     }
 
     #[test]
     fn insert_then_get_replays_the_stored_bytes() {
         let c = ResponseCache::new(Duration::from_secs(60), 8, 1024);
-        let k = key(1, "/v1/chat/completions", b"{}", &[]);
+        let k = key_of(1, "/v1/chat/completions", b"{}", &[]);
         c.insert(k, entry(b"{\"ok\":true}"));
         let hit = c.get(&k).expect("hit");
         assert_eq!(hit.status, 200);
         assert_eq!(hit.body.as_ref(), br#"{"ok":true}"#);
         assert_eq!(hit.usage, usage(11, 7));
-        assert!(c.get(&key(2, "/v1/chat/completions", b"{}", &[])).is_none());
+        assert!(
+            c.get(&key_of(2, "/v1/chat/completions", b"{}", &[]))
+                .is_none()
+        );
     }
 
     #[test]
     fn expired_entry_is_a_miss() {
         let c = ResponseCache::new(Duration::from_millis(1), 8, 1024);
-        let k = key(1, "/v1", b"x", &[]);
+        let k = key_of(1, "/v1", b"x", &[]);
         c.insert(k, entry(b"old"));
         std::thread::sleep(Duration::from_millis(5));
         assert!(c.get(&k).is_none(), "TTL expiry must miss, not serve stale");
@@ -362,9 +453,9 @@ mod tests {
     #[test]
     fn max_entries_evicts_the_oldest() {
         let c = ResponseCache::new(Duration::from_secs(60), 2, 1024);
-        let k1 = key(1, "/v1", b"a", &[]);
-        let k2 = key(1, "/v1", b"b", &[]);
-        let k3 = key(1, "/v1", b"c", &[]);
+        let k1 = key_of(1, "/v1", b"a", &[]);
+        let k2 = key_of(1, "/v1", b"b", &[]);
+        let k3 = key_of(1, "/v1", b"c", &[]);
         c.insert(k1, entry(b"1"));
         c.insert(k2, entry(b"2"));
         c.insert(k3, entry(b"3"));
@@ -378,9 +469,9 @@ mod tests {
         // A re-fill must not stay at the front of the order, or the next insert evicts the
         // entry that was just written and keeps the one that is about to go stale.
         let c = ResponseCache::new(Duration::from_secs(60), 2, 1024);
-        let k1 = key(1, "/v1", b"a", &[]);
-        let k2 = key(1, "/v1", b"b", &[]);
-        let k3 = key(1, "/v1", b"c", &[]);
+        let k1 = key_of(1, "/v1", b"a", &[]);
+        let k2 = key_of(1, "/v1", b"b", &[]);
+        let k3 = key_of(1, "/v1", b"c", &[]);
         c.insert(k1, entry(b"1"));
         c.insert(k2, entry(b"2"));
         c.insert(k1, entry(b"1b"));
@@ -393,12 +484,12 @@ mod tests {
     #[test]
     fn insert_drops_an_expired_prefix_without_evicting_a_newer_live_entry() {
         let c = ResponseCache::new(Duration::from_millis(40), 2, 1024);
-        let k1 = key(1, "/v1", b"a", &[]);
-        let k2 = key(1, "/v1", b"b", &[]);
+        let k1 = key_of(1, "/v1", b"a", &[]);
+        let k2 = key_of(1, "/v1", b"b", &[]);
         c.insert(k1, entry(b"old"));
         std::thread::sleep(Duration::from_millis(50));
         c.insert(k2, entry(b"new"));
-        let k3 = key(1, "/v1", b"c", &[]);
+        let k3 = key_of(1, "/v1", b"c", &[]);
         c.insert(k3, entry(b"newer"));
         assert!(c.get(&k1).is_none());
         assert_eq!(c.get(&k2).unwrap().body.as_ref(), b"new");
@@ -408,7 +499,7 @@ mod tests {
     #[test]
     fn oversized_body_is_not_stored() {
         let c = ResponseCache::new(Duration::from_secs(60), 8, 4);
-        let k = key(1, "/v1", b"x", &[]);
+        let k = key_of(1, "/v1", b"x", &[]);
         c.insert(k, entry(b"12345"));
         assert!(c.get(&k).is_none());
         c.insert(k, entry(b"1234"));

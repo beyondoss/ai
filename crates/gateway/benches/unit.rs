@@ -1237,21 +1237,30 @@ mod response_cache {
     #[divan::bench(args = [0, 4 * 1024, 64 * 1024, 256 * 1024])]
     fn fingerprint(bencher: Bencher, padding: usize) {
         let body = body_of(padding);
-        bencher.counter(BytesCount::of_slice(&body)).bench(|| {
-            cache::key(
-                black_box(42),
-                black_box("/auto"),
-                black_box(&body),
-                black_box(&[1, 2, 3]),
-            )
-        });
+        bencher
+            .counter(BytesCount::of_slice(&body))
+            .bench(|| cache::key(black_box(&parts(42, &body, &[1, 2, 3]))));
+    }
+
+    static NO_HEADERS: LazyLock<http::HeaderMap> = LazyLock::new(http::HeaderMap::new);
+
+    fn parts<'a>(tenant_id: u64, body: &'a [u8], providers: &'a [u8]) -> cache::KeyParts<'a> {
+        cache::KeyParts {
+            tenant_id,
+            method: "POST",
+            inbound_path: "/auto",
+            model: "gpt-4o",
+            headers: &NO_HEADERS,
+            body,
+            providers,
+        }
     }
 
     fn fill(entries: usize) -> ResponseCache {
         let cache = ResponseCache::new(Duration::from_secs(3600), entries.max(1) + 8, 64);
         for i in 0..entries {
             let body = (i as u64).to_le_bytes();
-            let key = cache::key(i as u64, "/auto", &body, &[1]);
+            let key = cache::key(&parts(i as u64, &body, &[1]));
             cache.insert(key, entry(&body));
         }
         cache
@@ -1262,7 +1271,7 @@ mod response_cache {
     #[divan::bench(args = [0, 1024])]
     fn get_miss(bencher: Bencher, entries: usize) {
         let cache = fill(entries);
-        let missing = cache::key(u64::MAX, "/auto", b"nope", &[9]);
+        let missing = cache::key(&parts(u64::MAX, b"nope", &[9]));
         bencher.bench(|| cache.get(black_box(&missing)));
     }
 
@@ -1272,7 +1281,7 @@ mod response_cache {
     fn get_hit(bencher: Bencher, body_len: usize) {
         let body = vec![b'y'; body_len];
         let cache = ResponseCache::new(Duration::from_secs(3600), 8, body_len.max(1));
-        let key = cache::key(7, "/auto", &body, &[1, 2]);
+        let key = cache::key(&parts(7, &body, &[1, 2]));
         cache.insert(key, entry(&body));
         bencher.bench(|| cache.get(black_box(&key)));
     }
@@ -1286,7 +1295,7 @@ mod response_cache {
         static HIT: LazyLock<SharedHit> = LazyLock::new(|| {
             let body: &[u8] = b"{\"ok\":true}";
             let cache = ResponseCache::new(Duration::from_secs(3600), 8, 1024);
-            let key = cache::key(7, "/auto", body, &[1, 2]);
+            let key = cache::key(&parts(7, body, &[1, 2]));
             cache.insert(key, entry(body));
             SharedHit { cache, key }
         });
