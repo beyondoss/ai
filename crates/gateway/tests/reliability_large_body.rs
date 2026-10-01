@@ -125,3 +125,115 @@ async fn resets_on_every_candidate_end_the_same_for_small_and_large_bodies() {
         "small {small:?} vs large {large:?} (outcome, primary hits, fallback hits)"
     );
 }
+
+/// The primary reads the whole request, then drops the connection without answering. It may be
+/// generating, and billing, already, so the body is not resent anywhere, whatever its size: one
+/// attempt, the fallback untouched, and an accurate JSON 502.
+/// claim: REL-1, REL-21
+/// defect: D57
+#[tokio::test]
+async fn a_reset_after_the_whole_body_is_not_resent_for_any_body_size() {
+    let (pubkey, sk) = test_keypair(1);
+    for pad in [SMALL, LARGE] {
+        let primary = ReplyUpstream::start(|_, _| Reply::Reset).await;
+        let fallback = MockUpstream::start(Mode::Json).await;
+        let gw = Gateway::builder(unused_nats_port(), &primary.authority(), &b64(&pubkey))
+            .providers(&["openai", "openrouter"])
+            .provider_authority("openrouter", &fallback.authority())
+            .start()
+            .await;
+        let out = send(&gw, &vkey(&sk), pad).await;
+        assert_eq!(
+            (out.status, primary.hits(), fallback.hits()),
+            (502, 1, 0),
+            "pad {pad}: {out:?}"
+        );
+        assert!(
+            out.message.is_some(),
+            "pad {pad}: the 502 must carry a JSON error: {out:?}"
+        );
+    }
+}
+
+/// An upstream that resets while the body is still arriving cannot hold the whole request, so the
+/// walk fails over to the next candidate and the client never sees the reset.
+/// claim: REL-1, REL-21
+/// defect: D51
+#[tokio::test]
+async fn a_reset_during_the_upload_fails_over() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let (pubkey, sk) = test_keypair(1);
+    // Read the request head, then reset the connection (no FIN: SO_LINGER 0).
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let primary = listener.local_addr().unwrap();
+    let resets = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = resets.clone();
+    let task = tokio::spawn(async move {
+        while let Ok((mut s, _)) = listener.accept().await {
+            let mut seen = Vec::new();
+            let mut buf = [0u8; 4096];
+            while !seen.windows(4).any(|w| w == b"\r\n\r\n") {
+                match s.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => seen.extend_from_slice(&buf[..n]),
+                }
+            }
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let _ = s.set_zero_linger();
+            drop(s);
+        }
+    });
+    let fallback = MockUpstream::start(Mode::Json).await;
+    let gw = Gateway::builder(unused_nats_port(), &primary.to_string(), &b64(&pubkey))
+        .providers(&["openai", "openrouter"])
+        .provider_authority("openrouter", &fallback.authority())
+        .start()
+        .await;
+    // The routing header picks the row, so the gateway streams the body rather than reading it
+    // first: the client controls when the upload ends.
+    let full = body(30 * 1024);
+    let (first, rest) = full.as_bytes().split_at(1024);
+    let mut s = tokio::net::TcpStream::connect(("127.0.0.1", gw.port))
+        .await
+        .unwrap();
+    let head = format!(
+        "POST /auto/chat/completions HTTP/1.1\r\nhost: 127.0.0.1\r\nauthorization: Bearer {}\r\n\
+         content-type: application/json\r\nx-beyond-model: {MODEL}\r\nx-beyond-order: openai,openrouter\r\n\
+         content-length: {}\r\n\r\n",
+        vkey(&sk),
+        full.len()
+    );
+    s.write_all(head.as_bytes()).await.unwrap();
+    s.write_all(first).await.unwrap();
+    // Give the primary time to reset while the rest of the body is still to come.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    s.write_all(rest).await.unwrap();
+    let mut buf = Vec::new();
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let mut chunk = [0u8; 4096];
+        loop {
+            match s.read(&mut chunk).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    buf.extend_from_slice(&chunk[..n]);
+                    if buf.windows(4).any(|w| w == b"\r\n\r\n") && buf.ends_with(b"}") {
+                        break;
+                    }
+                }
+            }
+        }
+    })
+    .await;
+    task.abort();
+    let resp = parse_raw_response(&buf);
+    assert_eq!(
+        (
+            resp.status,
+            resets.load(std::sync::atomic::Ordering::SeqCst),
+            fallback.hits()
+        ),
+        (200, 1, 1),
+        "{resp:?}; log:\n{}",
+        gw.log()
+    );
+}

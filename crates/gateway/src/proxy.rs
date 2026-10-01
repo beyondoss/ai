@@ -1124,9 +1124,13 @@ impl AiProxy {
         let mut skip = 0u8;
         let mut keys = [0u8; route::MAX_CANDIDATES];
         let mut reset = 0u8;
+        let mut only = None;
         // Every attempt removes a candidate, advances a key, or spends a candidate's one reset
-        // retry, so the walk ends on its own; this bound only guards against a bug looping it.
-        for _ in 0..route::MAX_CANDIDATES * 18 {
+        // retry, so the walk ends on its own; this bound only guards against a bug looping it. The
+        // last attempt it allows records no retry, so even then the client gets that attempt's own
+        // answer rather than a synthetic one.
+        const MAX_ATTEMPTS: usize = route::MAX_CANDIDATES * 18;
+        for n in 0..MAX_ATTEMPTS {
             let retry = Arc::new(std::sync::Mutex::new(None));
             let ctx = SubrequestCtx::builder()
                 .body_mode(BodyMode::ExpectBody)
@@ -1135,6 +1139,9 @@ impl AiProxy {
                     session_field,
                     skip,
                     keys,
+                    reset,
+                    only,
+                    final_attempt: n + 1 == MAX_ATTEMPTS,
                     retry: Arc::clone(&retry),
                     request_id,
                     request_seq,
@@ -1166,18 +1173,15 @@ impl AiProxy {
                     let _ = tokio::time::timeout(ABANDONED_ATTEMPT_GRACE, attempt).await;
                     match decision {
                         RelayRetry::Candidate(i) => skip |= 1 << i,
+                        // A key walk stays on this candidate: the re-run may re-rank the row, and
+                        // a 429 must never become a vendor switch.
                         RelayRetry::Key { candidate, key } => {
                             if let Some(k) = keys.get_mut(usize::from(candidate)) {
                                 *k = key;
                             }
+                            only = Some(candidate);
                         }
-                        RelayRetry::Reset(i) => {
-                            if reset & (1 << i) != 0 {
-                                skip |= 1 << i;
-                            } else {
-                                reset |= 1 << i;
-                            }
-                        }
+                        RelayRetry::Reset(i) => reset |= 1 << i,
                     }
                 }
                 (Ok(_), None) => {
@@ -1767,10 +1771,18 @@ fn expects_continue(session: &Session) -> bool {
 struct FullBody {
     route: &'static route::ModelRoute,
     session_field: Option<&'static str>,
-    /// Catalog indices (bit per index) an earlier attempt failed over from on a 5xx.
+    /// Catalog indices (bit per index) an earlier attempt failed over from.
     skip: u8,
     /// Per catalog index, the pool key an earlier attempt's 429 walked to.
     keys: [u8; route::MAX_CANDIDATES],
+    /// Catalog indices (bit per index) that already had their one same-candidate retry after a
+    /// stale reused connection failed before the upstream had the body.
+    reset: u8,
+    /// A key walk in progress: only this catalog index is usable, so a re-ranked row cannot move a
+    /// 429's key walk onto another vendor.
+    only: Option<u8>,
+    /// The parent's attempt bound is reached: record no retry, relay this attempt's answer.
+    final_attempt: bool,
     /// Set by this attempt when it would have retried but could not replay the body.
     retry: Arc<std::sync::Mutex<Option<RelayRetry>>>,
     /// The parent's request id and sequence: every attempt is the same request to the client and
@@ -1786,20 +1798,28 @@ struct FullBody {
 /// A retry a [`FullBody`] subrequest hands back to its parent.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RelayRetry {
-    /// A 5xx from this catalog index with another candidate left: skip it.
+    /// A candidate failure (a 5xx, a pool-key 401/403/402, or a connection that failed before the
+    /// upstream had the whole body) from this catalog index with another candidate left: skip it.
     Candidate(u8),
     /// A 429 from this catalog index with another pool key left: resume there.
     Key { candidate: u8, key: u8 },
-    /// The upstream connection failed before any response header (a reset, an early close): try
-    /// this candidate once more, then move on.
+    /// A reused connection failed before the upstream had the whole body (a pooled connection
+    /// the provider had already closed): try this candidate once more on a fresh connection.
     Reset(u8),
 }
 
 impl FullBody {
-    fn record(&self, retry: RelayRetry) {
+    /// Hand a retry back to the parent. Returns whether it was recorded: never on the final
+    /// attempt, whose answer is relayed whatever it is.
+    fn record(&self, retry: RelayRetry) -> bool {
+        if self.final_attempt {
+            return false;
+        }
         if let Ok(mut slot) = self.retry.lock() {
             *slot = Some(retry);
+            return true;
         }
+        false
     }
 }
 
@@ -3089,10 +3109,11 @@ impl ProxyHttp for AiProxy {
                         .state
                         .provider_by_id(c.provider)
                         .is_some_and(|p| p.has_pool_key());
-                    // A re-run of a large body skips the candidates earlier attempts failed on.
-                    let failed = full_body
-                        .as_ref()
-                        .is_some_and(|fb| fb.skip & (1 << orig) != 0);
+                    // A re-run of a large body skips the candidates earlier attempts failed on,
+                    // and a key walk stays on its candidate.
+                    let failed = full_body.as_ref().is_some_and(|fb| {
+                        fb.skip & (1 << orig) != 0 || fb.only.is_some_and(|only| only != orig)
+                    });
                     let serves = sub.is_none_or(|sub| sub.serves(c));
                     if keyed && !failed && serves {
                         usable |= 1 << i;
@@ -3794,11 +3815,10 @@ impl ProxyHttp for AiProxy {
                         key = rc.pool_key,
                         "upstream returned 429; re-running the full body on the next pool key",
                     );
-                    fb.record(RelayRetry::Key {
+                    rc.relay_abandoned = fb.record(RelayRetry::Key {
                         candidate: orig,
                         key: next,
                     });
-                    rc.relay_abandoned = true;
                     return Ok(());
                 }
                 warn!(
@@ -3860,8 +3880,7 @@ impl ProxyHttp for AiProxy {
                 status,
                 "upstream returned {status}; re-running the full body on the next candidate",
             );
-            fb.record(RelayRetry::Candidate(orig));
-            rc.relay_abandoned = true;
+            rc.relay_abandoned = fb.record(RelayRetry::Candidate(orig));
             return Ok(());
         }
         if !body_replayable(session) {
@@ -4552,30 +4571,81 @@ impl ProxyHttp for AiProxy {
         ctx: &mut Self::CTX,
         client_reused: bool,
     ) -> Box<pingora_core::Error> {
+        use pingora_core::ErrorType as T;
+        let mut e = e.more_context(format!("Peer: {peer}"));
+        // Our own decisions (a 5xx / 401 vendor walk, a 429 key walk, a body cap) are made.
+        if matches!(e.etype(), T::HTTPStatus(_) | T::CustomCode(..)) {
+            return e;
+        }
+        // One rule for every body size (D09, D51): a connection failure is retried only when the
+        // upstream cannot have the whole request (`body_delivered` is false: the connection never
+        // came up, the body was not read to its end, or writing it failed), and never once the
+        // response has started or the client is gone. A provider that received the whole body may
+        // be generating, and billing, already; resending it — to the same candidate or the next,
+        // pingora's reused-connection retry included — risks running the request twice, so that
+        // failure ends the request (`fail_to_proxy` answers it).
         let delivered = ctx
+            .rc
             .as_ref()
             .is_some_and(|rc| body_delivered(session, rc, Some(&*e)));
-        // A `FullBody` attempt whose upstream connection failed before any response header and
-        // before the upstream had the whole body (a reset mid-upload): pingora cannot resend a
-        // body past its buffer, but the parent holds it, so hand the retry back. Not for a
-        // downstream error: that is the parent having gone.
-        if !delivered
-            && e.esource() != &pingora_core::ErrorSource::Downstream
-            && session.as_downstream().response_written().is_none()
-            && let Some(fb) = full_body_ctx(session)
-            && let Some(rc) = ctx.as_mut()
-            && let Some(orig) = rc
-                .auto
-                .as_ref()
-                .and_then(|a| a.walk.catalog_index(a.candidate))
+        if *e.esource() == pingora_core::ErrorSource::Downstream
+            || session.as_downstream().response_written().is_some()
+            || delivered
         {
-            fb.record(RelayRetry::Reset(orig));
-            rc.relay_abandoned = true;
+            e.set_retry(false);
+            return e;
         }
-        let mut e = e.more_context(format!("Peer: {peer}"));
-        e.retry.decide_reuse(
-            client_reused && !delivered && !session.as_ref().retry_buffer_truncated(),
-        );
+        let Some(rc) = ctx.rc.as_mut() else {
+            e.set_retry(false);
+            return e;
+        };
+        let walk = rc
+            .auto
+            .as_ref()
+            .and_then(|a| Some((a.walk.catalog_index(a.candidate)?, a.candidate, a.usable)));
+        // A large body: pingora cannot resend it, but the parent holds it, so hand the retry back:
+        // a reused connection (a pooled one the provider had closed) gets one more try on the same
+        // candidate, otherwise the walk moves to the next candidate, if there is one. With nowhere
+        // to go the error stands.
+        if let Some(fb) = full_body_ctx(session) {
+            e.set_retry(false);
+            if let Some((orig, at, usable)) = walk {
+                let retry = if client_reused && fb.reset & (1 << orig) == 0 {
+                    Some(RelayRetry::Reset(orig))
+                } else if first_usable(usable, at.saturating_add(1)).is_some() {
+                    Some(RelayRetry::Candidate(orig))
+                } else {
+                    None
+                };
+                if let Some(retry) = retry {
+                    rc.relay_abandoned = fb.record(retry);
+                }
+            }
+            return e;
+        }
+        // A small body pingora can replay from its buffer.
+        if session.as_ref().retry_buffer_truncated() {
+            e.set_retry(false);
+            return e;
+        }
+        match walk {
+            // A reused connection: the same candidate again on a fresh one, keeping its breaker
+            // permit (it was the connection, not the provider).
+            Some(_) if client_reused => {
+                rc.same_provider_retry = true;
+                e.set_retry(true);
+            }
+            Some((_, at, usable)) if first_usable(usable, at.saturating_add(1)).is_some() => {
+                self.state.metrics.candidate_failovers_total.inc();
+                record_walk_ttft(&self.state, rc, false);
+                rc.advance_candidate(at);
+                e.set_retry(true);
+            }
+            Some(_) => e.set_retry(false),
+            // Provider-routed: there is no next candidate; pingora's rule, a reused connection is
+            // retried once.
+            None => e.retry.decide_reuse(client_reused),
+        }
         e
     }
 
