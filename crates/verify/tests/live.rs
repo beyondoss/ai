@@ -76,6 +76,23 @@ const FAILOVER: Route = Route {
     dead: &["anthropic"],
     serves: "openrouter",
 };
+/// The Claude row with Anthropic unkeyed: Amazon Bedrock serves (its key is minted per run from
+/// the local AWS credential, see `verify/clients/py/bedrock_token.py`).
+const BEDROCK: Route = Route {
+    name: "bedrock",
+    model: "claude-haiku-4-5",
+    pools: &[("bedrock", "AWS_BEARER_TOKEN_BEDROCK")],
+    dead: &[],
+    serves: "bedrock",
+};
+/// xAI's own API: grok reports reasoning beside completion_tokens (D23).
+const XAI: Route = Route {
+    name: "xai",
+    model: "grok-4.3",
+    pools: &[("xai", "XAI_API_KEY")],
+    dead: &[],
+    serves: "xai",
+};
 const EMBED: Route = Route {
     name: "embed",
     model: "text-embedding-3-small",
@@ -103,7 +120,7 @@ type Cell = (
     &'static str,
 );
 
-const GEN: &[Route] = &[CLAUDE, GPT, OPENROUTER, FAILOVER];
+const GEN: &[Route] = &[CLAUDE, GPT, OPENROUTER, FAILOVER, BEDROCK, XAI];
 const SESSION: &[Route] = &[CLAUDE, GPT, OPENROUTER];
 const ONE: &[Route] = &[GPT];
 
@@ -158,6 +175,18 @@ fn env_keys() -> BTreeMap<String, String> {
     }
     for (k, v) in std::env::vars() {
         out.insert(k, v);
+    }
+    // No Bedrock key in the environment: mint a short-term one from the AWS credential chain.
+    if !out.contains_key("AWS_BEARER_TOKEN_BEDROCK")
+        && let Ok(o) = Command::new(interpreter(Runtime::Python))
+            .arg(repo_root().join("verify/clients/py/bedrock_token.py"))
+            .output()
+        && o.status.success()
+    {
+        let token = String::from_utf8_lossy(&o.stdout).trim().to_owned();
+        if !token.is_empty() {
+            out.insert("AWS_BEARER_TOKEN_BEDROCK".to_owned(), token);
+        }
     }
     out
 }
@@ -457,7 +486,11 @@ fn run_cell(
                     u["input_total"]
                 ));
             }
-            if n(&row["output_tokens"]) != n(&u["output"]) {
+            // `output_with_reasoning`: a client that reports reasoning apart from output without
+            // saying which convention the provider used (the AI SDK) — either exact count is right.
+            let alt = u.get("output_with_reasoning").map(n);
+            if n(&row["output_tokens"]) != n(&u["output"]) && alt != Some(n(&row["output_tokens"]))
+            {
                 problems.push(format!(
                     "{id}: client saw {} output tokens, row bills {} ({row})",
                     u["output"], row["output_tokens"]

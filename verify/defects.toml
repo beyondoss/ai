@@ -889,3 +889,17 @@ state = "reproduced"
 test = "a_stock_max_tokens_reaches_native_openai_as_max_completion_tokens"
 fix = ""
 note = "Found by the first live run; reproduced hermetically (tests/openai_params.rs): a managed Chat request with max_tokens reaches native OpenAI unchanged on gpt-5-mini."
+
+[[defect]]
+id = "D64"
+severity = "high"
+area = "Translation"
+title = "Translated usage hid reasoning that xAI reports beside completion_tokens"
+impact = "A Messages or Responses client on a grok row was shown output_tokens = the visible answer only (e.g. 1 or 14) while the provider billed visible + reasoning (89, 200). Client-visible usage must equal what is billed."
+confidence = "high"
+evidence = "live xAI cells 2026-10-01 (E2::anthropic-py::xai::messages_basic): client saw 1 / 14 output tokens, row billed 89 / 200"
+claims = ["BIL-6", "BIL-9"]
+state = "fixed"
+test = "translated_usage_counts_reasoning_reported_beside_completion_tokens"
+fix = "c166c7b"
+note = "translate::Usage::from_chat adds reasoning to output when total = prompt + completion + reasoning, matching usage::openai_body (D23)."

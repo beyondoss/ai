@@ -49,11 +49,20 @@ def record(wire, usage):
     calls.append({"request_id": take_id(), "wire": wire, "usage": usage})
 
 
+def outside_reasoning(prompt, completion, total, reasoning):
+    """Reasoning a provider reports beside the completion count (xAI: total = prompt + completion +
+    reasoning) is output the client is billed for; OpenAI counts it inside completion_tokens."""
+    return reasoning if reasoning and total == prompt + completion + reasoning else 0
+
+
 def chat_usage(u):
     if u is None:
         return None
     d = getattr(u, "prompt_tokens_details", None)
-    return {"input_total": u.prompt_tokens, "output": u.completion_tokens,
+    cd = getattr(u, "completion_tokens_details", None)
+    reasoning = (getattr(cd, "reasoning_tokens", None) or 0) if cd else 0
+    extra = outside_reasoning(u.prompt_tokens, u.completion_tokens, u.total_tokens, reasoning)
+    return {"input_total": u.prompt_tokens, "output": u.completion_tokens + extra,
             "cache_read": (getattr(d, "cached_tokens", None) or 0) if d else 0}
 
 
@@ -217,7 +226,9 @@ def langchain_chat():
 
 def _lc_usage(m):
     u = m.usage_metadata or {}
-    return {"input_total": u.get("input_tokens", 0), "output": u.get("output_tokens", 0),
+    i, o = u.get("input_tokens", 0), u.get("output_tokens", 0)
+    r = (u.get("output_token_details") or {}).get("reasoning", 0)
+    return {"input_total": i, "output": o + outside_reasoning(i, o, u.get("total_tokens"), r),
             "cache_read": (u.get("input_token_details") or {}).get("cache_read", 0)}
 
 

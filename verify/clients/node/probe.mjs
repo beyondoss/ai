@@ -24,8 +24,15 @@ const recordingFetch = async (input, init) => {
 const takeId = () => ids.shift() ?? null;
 const record = (wire, usage) => calls.push({ request_id: takeId(), wire, usage });
 
+// Reasoning a provider reports beside the completion count (xAI: total = prompt + completion +
+// reasoning) is billed output; OpenAI counts it inside completion_tokens.
+const outside = (prompt, completion, total, reasoning) => (reasoning && total === prompt + completion + reasoning ? reasoning : 0);
 const chatUsage = (u) =>
-  u && { input_total: u.prompt_tokens, output: u.completion_tokens, cache_read: u.prompt_tokens_details?.cached_tokens ?? 0 };
+  u && {
+    input_total: u.prompt_tokens,
+    output: u.completion_tokens + outside(u.prompt_tokens, u.completion_tokens, u.total_tokens, u.completion_tokens_details?.reasoning_tokens ?? 0),
+    cache_read: u.prompt_tokens_details?.cached_tokens ?? 0,
+  };
 const messagesUsage = (u) => {
   const cr = u.cache_read_input_tokens ?? 0;
   const cw = u.cache_creation_input_tokens ?? 0;
@@ -98,7 +105,17 @@ const probes = {
 };
 
 async function aiSdk(model, wire) {
-  const usage = (u) => ({ input_total: u.inputTokens, output: u.outputTokens, cache_read: u.inputTokenDetails?.cacheReadTokens ?? u.cachedInputTokens ?? 0 });
+  const usage = (u) => {
+    const r = u.outputTokenDetails?.reasoningTokens ?? u.reasoningTokens ?? 0;
+    // The AI SDK derives totalTokens itself, so it can't say which convention the provider used;
+    // it does report reasoning separately, so the billed output is one of exactly two counts.
+    return {
+      input_total: u.inputTokens,
+      output: u.outputTokens + outside(u.inputTokens, u.outputTokens, u.totalTokens, r),
+      ...(r ? { output_with_reasoning: u.outputTokens + r } : {}),
+      cache_read: u.inputTokenDetails?.cacheReadTokens ?? u.cachedInputTokens ?? 0,
+    };
+  };
   const g = await generateText({ model, maxOutputTokens: 1024, prompt: "Reply with the single word: pong" });
   record(wire, usage(g.usage));
   const weather = tool({

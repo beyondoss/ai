@@ -826,7 +826,7 @@ group = "Billing integrity"
 text = "Row tokens equal the tokens the client was shown, after normalization, for every translation pair"
 layer = "both"
 touches = ["crates/gateway/src/usage.rs", "crates/gateway/src/proxy.rs", "crates/gateway/src/peek.rs", "crates/gateway/src/main.rs"]
-defects = ["D56"]
+defects = ["D56", "D64"]
 
 [[claim]]
 id = "BIL-7"
@@ -853,7 +853,7 @@ group = "Billing integrity"
 text = "Reasoning tokens are counted exactly once on every provider"
 layer = "live"
 touches = ["crates/gateway/src/usage.rs", "crates/gateway/src/proxy.rs", "crates/gateway/src/peek.rs", "crates/gateway/src/main.rs"]
-defects = ["D23"]
+defects = ["D23", "D64"]
 
 [[claim]]
 id = "BIL-10"
