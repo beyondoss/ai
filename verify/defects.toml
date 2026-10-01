@@ -1191,10 +1191,10 @@ area = "Translation"
 title = "The max-output clamp treats the catalog's placeholder limit as a hard cap"
 impact = "UNPUBLISHED_MAX_OUTPUT (32768) is documented as not a vendor limit, but clamp_output_limits cuts larger requests to it on ~28 rows (Grok, Codestral, Kimi...), truncating Claude Code's 64000 with finish=length. The clamp also uses the row card, not the serving candidate's limit."
 confidence = "high"
-evidence = "catalog.rs ~142-148; proxy.rs ~4618"
+evidence = "catalog.rs ~142-148; proxy.rs ~4618. Reproduced hermetically (translate_request.rs): max_tokens 64000 on grok-4.20 (Messages translated, and Chat same-wire) reaches xAI as 32768, the UNPUBLISHED_MAX_OUTPUT placeholder."
 claims = ["TRN-5", "CAT-4"]
-state = "suspected"
-test = ""
+state = "reproduced"
+test = "an_unpublished_max_output_is_not_a_cap"
 fix = ""
 note = "Found by the independent branch review (2026-10-01) of a54c22c."
 

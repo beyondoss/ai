@@ -602,3 +602,36 @@ async fn an_output_limit_above_the_model_maximum_is_clamped_to_it() {
     let (_, got) = captured(&mock);
     assert_eq!(got["max_completion_tokens"], 1000, "{got}");
 }
+
+/// The clamp enforces only a limit the vendor publishes. Where it publishes none (Grok, Codestral,
+/// Kimi, …) the card lists a conservative placeholder for `/v1/models`, which is not a cap: Claude
+/// Code's 64000 on a Grok row reaches xAI as sent, rather than being cut to the placeholder and
+/// ending with `finish_reason: length`.
+/// claim: TRN-5, CAT-4
+/// defect: D85
+#[tokio::test]
+#[ignore = "D85 reproduced: an unpublished max output is clamped to the catalog placeholder"]
+async fn an_unpublished_max_output_is_not_a_cap() {
+    let nats_port = unused_nats_port();
+    let (pubkey, sk) = test_keypair(1);
+    let mock = MockUpstream::start(Mode::Json).await;
+    let gw = Gateway::builder(nats_port, &mock.authority(), &b64(&pubkey))
+        .providers(&["xai", "openrouter"])
+        .start()
+        .await;
+    let user = json!([{"role": "user", "content": "hi"}]);
+    for (path, body) in [
+        (
+            "/v1/messages",
+            json!({"model": "grok-4.20", "max_tokens": 64000, "messages": user}),
+        ),
+        (
+            "/v1/chat/completions",
+            json!({"model": "grok-4.20", "max_tokens": 64000, "messages": user}),
+        ),
+    ] {
+        post(&gw, &sk, path, &body).await;
+        let (_, got) = captured(&mock);
+        assert_eq!(got["max_tokens"], 64000, "{path}: {got}");
+    }
+}
