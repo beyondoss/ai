@@ -31,6 +31,7 @@ pub mod metrics;
 pub mod peek;
 pub mod proxy;
 pub mod ratelimit;
+pub mod remedy;
 pub mod route;
 pub mod secret;
 pub mod smart;

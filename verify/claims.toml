@@ -233,7 +233,11 @@ clients = [
   "raw",
 ]
 failover_clients = []
-touches = ["crates/gateway/src/translate.rs", "crates/gateway/src/proxy.rs"]
+touches = [
+  "crates/gateway/src/translate.rs",
+  "crates/gateway/src/proxy.rs",
+  "crates/gateway/src/remedy.rs",
+]
 defects = ["D100", "D103", "D174"]
 
 [[claim]]

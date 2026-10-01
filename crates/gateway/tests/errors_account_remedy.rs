@@ -42,7 +42,6 @@ fn remedy_leaks(text: &str) -> Vec<&'static str> {
 /// claim: T6
 /// defect: D174
 #[tokio::test]
-#[ignore = "D174 reproduced: OpenRouter's add-your-own-key remedy reaches the client"]
 async fn a_provider_account_remedy_never_reaches_the_client() {
     let (pubkey, sk) = test_keypair(174);
     let mock = MockUpstream::start(Mode::Raw(

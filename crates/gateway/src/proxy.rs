@@ -70,7 +70,7 @@ use crate::metrics::Rejection;
 use crate::route::{self, Dialect, Provider};
 use crate::state::{GatewayState, RequestId};
 use crate::terminal::TerminalTracker;
-use crate::{control, peek, smart, translate, usage};
+use crate::{control, peek, remedy, smart, translate, usage};
 use arrayvec::{ArrayString, ArrayVec};
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -495,17 +495,24 @@ pub struct RequestCtx {
     terminal: TerminalTracker,
 }
 
-/// Scrubs one secret (the pool key an attempt sent) from a response body as it streams past (D66).
-/// A provider, or a proxy in between, that echoes the credential it received in an error message
-/// would otherwise hand Beyond's key to the client.
+/// Scrubs a managed error body (status >= 400) as it streams past: the pool key the attempt sent
+/// (D66), and a provider-account remedy (D174). The one rewrite of a provider's error body, made
+/// before translation, capture and the cache see it.
 ///
-/// Each occurrence is overwritten in place with [`REDACTED`] padded to the key's length, so the
-/// body keeps its length and its `Content-Length`. The last `key.len() - 1` bytes of each chunk
-/// are held back until the next one, so a key split across chunks is caught too; memory is bounded
-/// by the key, not the body.
+/// **Pool key.** A provider, or a proxy in between, that echoes the credential it received in an
+/// error message would otherwise hand Beyond's key to the client. Each occurrence is overwritten in
+/// place with [`REDACTED`] padded to the key's length, so the body keeps its length. The last
+/// `key.len() - 1` bytes of each chunk are held back until the next one, so a key split across
+/// chunks is caught too; memory is bounded by the key, not the body.
+///
+/// **Account remedy.** A JSON error (`whole`) is held until its end, at most
+/// [`remedy::MAX_BODY`], and handed to [`remedy::neutralize`] after the key is masked: "add your
+/// own key", a billing page and the like become a neutral message (`response_filter` dropped the
+/// `Content-Length`, since that changes the length). Past the cap it streams as above.
 #[derive(Default)]
 struct Redact {
     carry: Vec<u8>,
+    whole: bool,
 }
 
 /// What a scrubbed pool key reads as. Same length as the key (padded with `*`), truncated when the
@@ -514,23 +521,38 @@ const REDACTED: &[u8] = b"[redacted]";
 
 impl Redact {
     /// Scrub `chunk` (with the bytes held back from the last one) and return what may be relayed
-    /// now: everything at `end_of_stream`, otherwise all but a key-sized tail. `key` is the pool
-    /// key's boot-built searcher ([`route::PoolAuth::finder`]).
+    /// now: everything at `end_of_stream`, nothing while a `whole` body is held, otherwise all but
+    /// a key-sized tail. `key` is the pool key's boot-built searcher
+    /// ([`route::PoolAuth::finder`]), if the attempt sent one.
     fn feed(
         &mut self,
-        key: &memchr::memmem::Finder<'_>,
+        key: Option<&memchr::memmem::Finder<'_>>,
         chunk: Option<Bytes>,
         end_of_stream: bool,
     ) -> Option<Bytes> {
-        let len = key.needle().len();
-        if len == 0 {
+        let key = key.filter(|k| !k.needle().is_empty());
+        if key.is_none() && !self.whole && self.carry.is_empty() {
             return chunk;
         }
         let mut buf = std::mem::take(&mut self.carry);
         buf.extend_from_slice(chunk.as_deref().unwrap_or(&[]));
-        mask_all(&mut buf, key);
-        if !end_of_stream {
-            let keep = (len - 1).min(buf.len());
+        if self.whole && !end_of_stream {
+            if buf.len() <= remedy::MAX_BODY {
+                self.carry = buf;
+                // Empty, not `None`: `None` would end the body.
+                return Some(Bytes::new());
+            }
+            self.whole = false;
+        }
+        if let Some(key) = key {
+            mask_all(&mut buf, key);
+        }
+        if self.whole {
+            if let Some(b) = remedy::neutralize(&buf) {
+                buf = b;
+            }
+        } else if !end_of_stream {
+            let keep = key.map_or(0, |k| k.needle().len() - 1).min(buf.len());
             self.carry = buf.split_off(buf.len() - keep);
         }
         Some(Bytes::from(buf))
@@ -5259,8 +5281,33 @@ impl ProxyHttp for AiProxy {
                 for name in &echoed {
                     upstream_response.remove_header(name);
                 }
-                if status >= 400 {
-                    rc.redact = Some(Box::default());
+            }
+            // A managed JSON error is held whole and checked for a provider-account remedy (D174):
+            // the rewrite changes its length, so it loses its `Content-Length` here, on the error
+            // path only. A BYO error is the caller's own account talking and is relayed as sent.
+            if rc.managed && status >= 400 {
+                let whole = !rc.streaming
+                    && upstream_response
+                        .headers
+                        .get("content-type")
+                        .and_then(|v| v.to_str().ok())
+                        .is_some_and(|ct| ct.contains("json"));
+                if whole {
+                    upstream_response.remove_header("content-length");
+                    if upstream_response.version != http::Version::HTTP_2 {
+                        upstream_response.insert_header("transfer-encoding", "chunked")?;
+                    }
+                }
+                let keyed = rc
+                    .provider
+                    .pool_auth
+                    .get(usize::from(rc.pool_key))
+                    .is_some_and(|a| !a.finder().needle().is_empty());
+                if whole || keyed {
+                    rc.redact = Some(Box::new(Redact {
+                        carry: Vec::new(),
+                        whole,
+                    }));
                 }
             }
 
@@ -5347,10 +5394,13 @@ impl ProxyHttp for AiProxy {
         self.state.fault_point("response_body_filter");
         // First, so nothing downstream — translation, capture, the cache, the usage tail — ever
         // holds the pool key (D66).
-        if let Some(r) = rc.redact.as_mut()
-            && let Some(auth) = rc.provider.pool_auth.get(usize::from(rc.pool_key))
-        {
-            *body = r.feed(auth.finder(), body.take(), end_of_stream);
+        if let Some(r) = rc.redact.as_mut() {
+            let key = rc
+                .provider
+                .pool_auth
+                .get(usize::from(rc.pool_key))
+                .map(route::PoolAuth::finder);
+            *body = r.feed(key, body.take(), end_of_stream);
         }
         let chunk = body.as_deref().unwrap_or(&[]);
         // A catalog walk's 2xx waits here for its health verdict (see `response_filter`): the
@@ -7050,16 +7100,60 @@ mod tests {
                 let mut chunks: Vec<&[u8]> = head.chunks(step).collect();
                 chunks.push(tail);
                 for c in chunks {
-                    let got = r.feed(key, Some(Bytes::copy_from_slice(c)), false);
+                    let got = r.feed(Some(key), Some(Bytes::copy_from_slice(c)), false);
                     out.extend_from_slice(got.as_deref().unwrap_or(&[]));
                 }
-                out.extend_from_slice(&r.feed(key, None, true).unwrap());
+                out.extend_from_slice(&r.feed(Some(key), None, true).unwrap());
                 let text = String::from_utf8(out).unwrap();
                 assert_eq!(text.len(), body.len(), "{split}/{step}");
                 assert!(!text.contains("sk-pool-secret"), "{split}/{step}: {text}");
                 assert_eq!(text.matches("[redacted]").count(), 3, "{text}");
             }
         }
+        // A JSON error is held whole: nothing until its end, then the key masked and an account
+        // remedy neutralized; one past the cap streams with the key masked.
+        let remedy = format!(
+            r#"{{"error":{{"message":"bad key {k}; add your own key","code":429}}}}"#,
+            k = std::str::from_utf8(raw).unwrap()
+        );
+        let mut r = Redact {
+            carry: Vec::new(),
+            whole: true,
+        };
+        for c in remedy.as_bytes().chunks(5) {
+            let got = r.feed(Some(key), Some(Bytes::copy_from_slice(c)), false);
+            assert!(got.unwrap().is_empty());
+        }
+        let out = r.feed(Some(key), None, true).unwrap();
+        assert_eq!(
+            &out[..],
+            format!(
+                r#"{{"error":{{"code":429,"message":"{}"}}}}"#,
+                remedy::NEUTRAL
+            )
+            .as_bytes()
+        );
+        let big = format!(
+            r#"{{"error":{{"message":"{k} add your own key","pad":"{}"}}}}"#,
+            "x".repeat(remedy::MAX_BODY),
+            k = std::str::from_utf8(raw).unwrap()
+        );
+        let mut r = Redact {
+            carry: Vec::new(),
+            whole: true,
+        };
+        let mut out = r
+            .feed(
+                Some(key),
+                Some(Bytes::copy_from_slice(big.as_bytes())),
+                false,
+            )
+            .unwrap()
+            .to_vec();
+        out.extend_from_slice(&r.feed(Some(key), None, true).unwrap());
+        assert_eq!(out.len(), big.len());
+        assert!(!out.windows(raw.len()).any(|w| w == raw));
+
         // A key shorter than the marker is masked with a truncated marker.
         let mut buf = *b"x=abc;";
         assert!(mask_all(&mut buf, &memchr::memmem::Finder::new(b"abc")));

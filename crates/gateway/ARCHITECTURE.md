@@ -158,15 +158,18 @@ Client (stock OpenAI/Anthropic SDK)
   │  Drop any upstream x-beyond-* header, then set x-beyond-request-id, x-beyond-provider,
   │    x-beyond-upstream-model (catalog walk)
   │  Managed: drop any header whose value carries the pool key this attempt sent; a
-  │    status >= 400 arms the body scrub below
+  │    status >= 400 arms the body scrub below (a JSON one also drops Content-Length: it is
+  │    held whole for the account-remedy rewrite)
   │  Translate walk, or a same-endpoint catalog error (re-encoded into the client's
   │    envelope when it is another vendor's shape): drop Content-Length (body length will change)
   │
   ▼  response_body_filter (proxy.rs)  — response relayed chunk-by-chunk; SSE is never fully buffered
-  │  Managed >= 400, first: overwrite the pool key with `[redacted]***` (same length, so
-  │    Content-Length holds), holding back a key-sized tail per chunk to catch a split key.
-  │    Everything below (translation, capture, cache, usage tail) sees the scrubbed bytes.
-  │    The key searcher is built once per pool key at boot (`PoolAuth::finder`), not per response
+  │  Managed >= 400, first (`Redact`): overwrite the pool key with `[redacted]***` (same
+  │    length), holding back a key-sized tail per chunk to catch a split key. A JSON error
+  │    (<= 64 KiB) is held whole instead and, once masked, has any provider-account remedy
+  │    rewritten (`remedy::neutralize`, D174). Everything below (translation, capture, cache,
+  │    usage tail) sees the scrubbed bytes. The key searcher is built once per pool key at boot
+  │    (`PoolAuth::finder`), not per response
   │  Translate path: convert SSE event-by-event into the inbound dialect (do not wait for `[DONE]`
   │    before forwarding deltas). Non-stream: map the JSON object, including error envelopes.
   │    Assembled walk (stream-only candidate, non-stream client): the stream is read by a quiet
@@ -924,7 +927,8 @@ Responses-only models the catalog routes to `/v1/responses`, and is held to the 
   vendor gets this too: a catalog walk buffers a non-stream error from a same-endpoint candidate and
   re-encodes it unless it is already the client API's envelope, so xAI's `{"code", "error":
   "<string>"}` reaches an OpenAI SDK as `{"error": {"message", "type", "code"}}` (D100), while
-  OpenAI's own errors and OpenRouter's are relayed byte for byte. A context overflow carries what
+  OpenAI's own errors and OpenRouter's are relayed verbatim except provider-account remedies (see
+  "Provider-account remedies" below). A context overflow carries what
   each client's harness compacts on: OpenAI's `context_length_exceeded` reaches a Messages client
   with its message prefixed "prompt is too long: " (Claude Code's trigger), and Anthropic's "prompt
   is too long" reaches a Chat Completions or Responses client with code `context_length_exceeded`
@@ -934,6 +938,43 @@ Responses-only models the catalog routes to `/v1/responses`, and is held to the 
   upstream did not give is minted (`…_gw…`), never a shared constant.
 - **Not mapped:** server-tool blocks and hosted-tool items (only reachable through tools a
   translated client cannot declare), `choices` past the first, logprobs.
+
+**Provider-account remedies (D174).** A provider error reaches the client verbatim — its status,
+`type`, `code`, `param`, `Retry-After` and message — except advice about Beyond's own account with
+that provider. OpenRouter's shared-pool 429 says "add your own key to accumulate your rate limits:
+https://openrouter.ai/settings/integrations" beside `is_byok`, `limit_source:
+upstream_provider_shared_pool` and `remedy_hint`; a gateway client has no OpenRouter account to add
+a key to, and the text names the upstream behind the row and describes Beyond's account with it.
+Billing and quota remedies do the same with Beyond's account state. So on a managed JSON error the
+pool-key scrub (`Redact`, which already rewrites error bodies, before translation, capture and the
+cache) also runs `remedy::neutralize` at end of body:
+
+- **What counts.** A `message`, a string `error` (xAI) or OpenRouter's `metadata.raw` containing,
+  case-insensitively, one of: "add your own key", `openrouter.ai/settings` (OpenRouter's shared pool,
+  402 credits, BYOK pages); "check your plan and billing details", `platform.openai.com/account`
+  (OpenAI's `insufficient_quota`, and its organization rate limit, which names Beyond's org id;
+  Gemini uses the same words); "credit balance is too low", `anthropic.com/contact-sales`,
+  `console.anthropic.com/settings` (Anthropic's billing 400, and its organization rate limit, which
+  names Beyond's org id); "purchase more credits", "raise your spending limit", `console.x.ai`
+  (xAI's spent credits or spending limit, which name Beyond's team id); `console.groq.com/settings`
+  (Groq's "Upgrade to Dev Tier"); "insufficient balance" (DeepSeek's 402). And always OpenRouter's
+  `metadata.is_byok`, `limit_source` and `remedy_hint`.
+- **What it becomes.** That `message` (or string `error`) is "The provider is rate-limited upstream;
+  retry later.", a `raw` carrying a remedy is removed (a translation quotes `raw` after the message,
+  so it would repeat), and the three metadata keys are removed. `type`, `code`, `param`,
+  `metadata.provider_name` and the status and headers are kept, so an SDK raises the same typed
+  error and retries on the same `Retry-After`. From a client's side an exhausted provider account
+  is an upstream rate limit: nothing it can change, and it clears without it.
+- **What does not count.** Anything the client can act on carries none of those phrases and is
+  relayed as sent: a context overflow, an unknown or invalid parameter, a content-policy refusal, a
+  plain rate limit, OpenRouter quoting an upstream's own error. An OpenAI organization rate limit
+  does lose its "try again in 2s" with the rest of the message; `Retry-After` still says when.
+- **Scope and cost.** Managed only: a BYO error is the caller's own account talking, and its remedy
+  is one they can follow. Error paths only: a status >= 400 with a JSON body (<= 64 KiB) is held to
+  its end and parsed once; a 2xx is never held or parsed, and the response head drops its
+  `Content-Length` only on that error path (the rewrite changes the length). A body that is not a
+  JSON object, an SSE error, or an error inside a 2xx stream is not rewritten. OpenRouter's root
+  `user_id` on its errors is not a remedy and is relayed.
 
 **Managed responses are never compressed upstream** (`accept-encoding: identity`; see "Usage
 Extraction"). For translation it matters as much as for billing: a gzipped body reached a translated
@@ -2139,7 +2180,8 @@ to serve.
   and there is no per-tenant entitlement check on rows — any managed tenant can route to any row. Not
   price-gameable (billing uses the id the provider echoes back), but worth knowing before rows are
   added whose pool keys differ in cost or contract.
-- Provider response content — relayed byte-for-byte on a same-endpoint walk; Chat Completions ↔
+- Provider response content — relayed byte-for-byte on a same-endpoint walk (a managed error:
+  verbatim except provider-account remedies, below); Chat Completions ↔
   Messages ↔ Responses is translated so the client sees the inbound dialect. Usage taps stay on
   the upstream body.
 - BYO token validity — forwarded as-is; the provider rejects it if invalid
