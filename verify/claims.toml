@@ -298,7 +298,7 @@ layer = "both"
 clients = ["raw", "openai-py", "claude-code"]
 failover_clients = []
 touches = ["crates/gateway/src/usage.rs", "crates/gateway/src/proxy.rs", "crates/gateway/src/peek.rs"]
-defects = []
+defects = ["D123"]
 
 [[claim]]
 id = "B3"
@@ -817,7 +817,7 @@ group = "Billing integrity"
 text = "A cancel at any phase after the upstream accepts is billed (exact or estimate), stream or not"
 layer = "both"
 touches = ["crates/gateway/src/usage.rs", "crates/gateway/src/proxy.rs", "crates/gateway/src/peek.rs", "crates/gateway/src/main.rs"]
-defects = ["D07"]
+defects = ["D07", "D123"]
 
 [[claim]]
 id = "BIL-4"
@@ -970,7 +970,7 @@ group = "Billing integrity"
 text = "Estimates never exceed provider truth and are non-zero once the upstream accepts"
 layer = "live"
 touches = ["crates/gateway/src/usage.rs", "crates/gateway/src/proxy.rs", "crates/gateway/src/peek.rs", "crates/gateway/src/main.rs"]
-defects = ["D99"]
+defects = ["D99", "D123"]
 
 [[claim]]
 id = "BIL-21"
@@ -1593,7 +1593,7 @@ oracle = "fault proxy between gateway and the real provider; per scenario: clien
 layer = "live"
 clients = ["openai-py", "anthropic-py", "openai-node", "anthropic-ts"]
 touches = ["crates/gateway/src/proxy.rs", "crates/gateway/src/circuit_breaker.rs"]
-defects = []
+defects = ["D99", "D123"]
 
 [[claim]]
 id = "LNG-1"

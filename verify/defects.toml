@@ -1387,8 +1387,8 @@ area = "Billing"
 title = "A cut-short estimate's input counts JSON structure, so it exceeds the provider's count on short prompts"
 impact = "BIL-20 says an estimate never exceeds provider truth. InputTally counts every non-base64 body byte (keys, model id, stream_options, max tokens) and divides by 5, so on a short prompt the JSON overhead alone outweighs the real prompt: an aborted stream bills more input than the same request completed. Small in absolute terms, but it is the one direction the estimate promises never to err."
 confidence = "high"
-evidence = "live 2026-10-01 B2+BIL-3+BIL-20::openai-py::gpt::stream_abort, three runs: the completed stream reports prompt_tokens 29; the identical request aborted after 25 content chunks bills an estimate of input_tokens 44 (outcome client_cancelled, usage_estimated true). usage.rs InputTally::feed counts all bytes outside base64 payloads; estimate_tokens divides by INPUT_BYTES_PER_TOKEN (5). On Claude the estimate keeps message_start's exact count, and on grok the prompt (with xAI's system preamble) outweighs the overhead, so those cells pass."
-claims = ["BIL-20"]
+evidence = "live 2026-10-01 B2+BIL-3+BIL-20::openai-py::gpt::stream_abort, three runs: the completed stream reports prompt_tokens 29; the identical request aborted after 25 content chunks bills an estimate of input_tokens 44 (outcome client_cancelled, usage_estimated true). usage.rs InputTally::feed counts all bytes outside base64 payloads; estimate_tokens divides by INPUT_BYTES_PER_TOKEN (5). On Claude the estimate keeps message_start's exact count, and on grok the prompt (with xAI's system preamble) outweighs the overhead, so those cells pass. Also live 2026-10-01 FLT-1 cells reset_mid_stream and stall_mid_stream on gpt-pooled and gpt-single, all four clients, four runs (16 cells each): the provider reported prompt_tokens 24 for the request (read from the drained upstream stream); the cut-short row estimates input_tokens 40 (Chat clients) or 32 (Messages clients translated onto Chat)."
+claims = ["BIL-20", "FLT-1"]
 state = "suspected"
 test = ""
 fix = ""
@@ -1715,3 +1715,17 @@ state = "suspected"
 test = ""
 fix = ""
 note = "Found by crates/verify/tests/session_live.rs (SES-3::codex::codex::codex-resume). Same root cause as D120 (openai-py closing at [DONE]), seen here on the ledger rather than the cache. Proposed: a stream whose terminal event (response.completed / message_stop / [DONE]) was already relayed is ok when the client then closes."
+
+[[defect]]
+id = "D123"
+severity = "med"
+area = "Billing"
+title = "A stream the provider accepted (200 head) but that dies before its first body byte bills zero"
+impact = "B2 and BIL-20 say a stream cut short is billed an estimate, non-zero once the upstream accepts. A provider that answers 200 and then stalls or drops before the first event has the prompt and bills it (here the whole generation), but the row is outcome cut_short with 0 input, 0 output and usage_estimated false. When the gateway has not yet committed the head downstream (the translated path waits for the first bytes), the same stall ends in the gateway's 504, the SDK retries it, and the provider bills two generations while the ledger holds one (BIL-14)."
+confidence = "high"
+evidence = "live 2026-10-01 FLT-1+REL-7+BIL-3+BIL-14+BIL-20::<client>::<route>::stall_after_head, all 16 cells (openai-py, anthropic-py, openai-node, anthropic-ts x claude-pooled, claude-single, gpt-pooled, gpt-single), four runs (two on 635acff, two on 4df371d): the fault proxy relays the provider's 200 head, then holds the body; the gateway cuts the stream at read_timeout_secs (20 in the trials; client sees a broken 200 stream, which is correct), and its row is {outcome: cut_short, input_tokens: 0, output_tokens: 0, usage_estimated: false} while the provider, drained by the proxy, reported in=25 out=43 (claude-haiku-4-5) / in=24 out=39 (gpt-4o-mini). Also seen once (before c7819c7, with a 5s stream idle bound) in a slow_drip cell when Anthropic took >5s to its first event: the client got a 504, the SDK retried, the provider processed two generations and the ledger billed one (the first row upstream_error 0/0). proxy.rs logging: `started` (parsed usage, output > 0, or a clean finish) gates the cut_short estimate, so a 2xx with no body bytes estimates nothing; `no_head` covers only a downstream abort before the head, not an upstream stall or reset after it."
+claims = ["FLT-1", "B2", "BIL-3", "BIL-20"]
+state = "suspected"
+test = ""
+fix = ""
+note = "Found by live cells FLT-1+REL-7+BIL-3+BIL-14+BIL-20::*::*::stall_after_head (crates/verify/tests/fault_live.rs). A 2xx head is the provider's proof it took the request; estimating input from InputTally there (as no_head already does for a client abort) would bill the prompt. Related open question, not filed: the gateway's own 502/504 after the body was delivered (reset or read timeout before the head) also bills 0, though proxy.rs's no_head comment says the provider bills that prompt either way."

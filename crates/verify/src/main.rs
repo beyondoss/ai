@@ -283,8 +283,9 @@ fn filter_expr(tagged: &[Tagged]) -> String {
 /// reconciliation against the providers' usage reports (`tests/reconcile_live.rs`), differential
 /// parity against direct provider calls (`tests/parity_live.rs`), the catalog sweep
 /// (`tests/catalog_live.rs`), tenancy sessions under control-plane changes
-/// (`tests/tenancy_live.rs`), and whole sessions where the provider or model changes between turns
-/// (`tests/session_live.rs`). Every test in them is named `CLAIMS::client::...`.
+/// (`tests/tenancy_live.rs`), whole sessions where the provider or model changes between turns
+/// (`tests/session_live.rs`), and stock SDKs under faults injected in front of real providers
+/// (`tests/fault_live.rs`). Every test in them is named `CLAIMS::client::...`.
 const LIVE_BINARIES: &[&str] = &[
     "beyond-ai-verify::live",
     "beyond-ai-verify::reconcile_live",
@@ -292,6 +293,7 @@ const LIVE_BINARIES: &[&str] = &[
     "beyond-ai-verify::catalog_live",
     "beyond-ai-verify::tenancy_live",
     "beyond-ai-verify::session_live",
+    "beyond-ai-verify::fault_live",
 ];
 
 /// One live cell's result, parsed from its name `CLAIMS::client::route::probe`.

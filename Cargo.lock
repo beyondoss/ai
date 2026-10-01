@@ -525,11 +525,18 @@ dependencies = [
  "base64 0.22.1",
  "beyond-ai-providers",
  "ed25519-dalek",
+ "httparse",
  "libtest-mimic",
+ "rcgen",
  "reqwest",
+ "rustls",
  "serde",
  "serde_json",
+ "socket2",
+ "tokio",
+ "tokio-rustls",
  "toml",
+ "webpki-roots 1.0.7",
 ]
 
 [[package]]

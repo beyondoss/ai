@@ -164,6 +164,36 @@ A run costs about $0.10.
 VERIFY_LIVE=1 cargo test -p beyond-ai-verify --test tenancy_live -- --nocapture --test-threads=4
 ```
 
+## Faults in front of real providers (FLT-1)
+
+`crates/verify/tests/fault_live.rs` puts a fault proxy (`tests/common/fault_proxy.rs`) between the
+gateway and each real provider a route uses. The gateway is pointed at it with
+`provider_authorities` and `upstream_verify_cert = false`, so it still dials TLS with its own pool,
+ALPN and error handling; the proxy's throwaway cert offers only `http/1.1` (H2 is out of scope).
+The proxy re-originates TLS to the real host, reads each request in full and, per a script, answers
+with a provider-shaped `5xx` or `429` (with `Retry-After`), resets the connection before the TLS
+handshake, after reading the request, or after the provider answered, cuts or stalls a stream after
+N events, or slows every event down. It records each request: whether the provider processed it,
+the provider's status, how much of the response reached the gateway, and the usage the provider
+reported. A response it cuts off is still drained from the provider, so that usage is what the
+provider billed.
+
+A trial is `FLT-1+<claims>::<client>::<route>::<fault>`: the four stock SDKs at their default
+`max_retries` (two retries), on a Claude row (Anthropic, then OpenRouter), a GPT row (`gpt-4o-mini`:
+OpenAI, then OpenRouter), and single-provider versions of both holding their key twice (so a `429`
+can key-walk). The fault goes on the primary. Each trial checks the client's final outcome and
+attempt count against `crates/gateway/ARCHITECTURE.md` (failover, relayed status, a JSON error with
+`x-beyond-request-id`, `Retry-After` waited out, a cut stream raised as an error), that providers
+processed at most one generation per client attempt, and that every generation whose response
+reached the gateway has exactly one billed row with the provider's tokens (an estimate, never above
+them, when cut short) and nothing else is billed. The gateway's `read_timeout_secs` is 20 in
+these trials (default 600) so a stall costs seconds.
+
+```sh
+VERIFY_LIVE=1 cargo nextest run -p beyond-ai-verify --test fault_live -j 12
+VERIFY_FAULT_VERBOSE=1 VERIFY_LIVE=1 cargo nextest run ... --no-capture  # print every witness
+```
+
 `STALE` status will land with the run ledger.
 
 ## Session trials (SES-1..3)
