@@ -1953,4 +1953,36 @@ data: {\"type\":\"message_delta\",\"usage\":{\"input_tokens\":2500,\"cache_read_
             }
         );
     }
+
+    /// Provider token counts are untrusted numbers. A garbage or hostile usage block whose sums
+    /// overflow a `u64` must still bill (saturated), never panic: release builds keep
+    /// overflow-checks on, and a panic in logging loses the billing row.
+    ///
+    /// claim: BIL-4, REL-17
+    /// defect: D87
+    #[test]
+    #[ignore = "D87 reproduced: prompt + completion + reasoning overflows and panics"]
+    fn overflowing_provider_token_counts_saturate_instead_of_panicking() {
+        let max = u64::MAX;
+        let body = format!(
+            r#"{{"usage":{{"prompt_tokens":{max},"completion_tokens":{max},"total_tokens":3,
+            "completion_tokens_details":{{"reasoning_tokens":{max}}}}}}}"#
+        );
+        let u = std::panic::catch_unwind(|| openai_body(body.as_bytes()))
+            .expect("must not panic")
+            .unwrap();
+        assert_eq!(u.input_tokens, max);
+        assert_eq!(u.output_tokens, max, "saturated, not wrapped");
+        let sse = format!("data: {{\"choices\":[],\"usage\":{{\"prompt_tokens\":1,\"completion_tokens\":{max},\"total_tokens\":{max},\"completion_tokens_details\":{{\"reasoning_tokens\":5}}}}}}\n\ndata: [DONE]\n\n");
+        let u = std::panic::catch_unwind(|| openai_stream(sse.as_bytes()))
+            .expect("must not panic")
+            .unwrap();
+        assert_eq!(u.output_tokens, max);
+        // The estimators scale byte counts by multiplication; a huge relayed total saturates.
+        let tail = br#"data: {"choices":[{"index":0,"delta":{"content":"hello"}}]}
+
+"#;
+        assert!(std::panic::catch_unwind(|| estimate_stream_output(tail, max)).is_ok());
+        assert!(std::panic::catch_unwind(|| estimate_body_output(br#"{"a":"hello"}"#, max)).is_ok());
+    }
 }

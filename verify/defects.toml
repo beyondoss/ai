@@ -1219,10 +1219,10 @@ area = "Billing"
 title = "Unchecked token arithmetic can panic under overflow-checks"
 impact = "usage.rs prompt+completion+reasoning and translate.rs prompt+completion+r add provider-supplied u64s; release builds set overflow-checks=true, so huge or garbage counts panic in logging (losing the billing row) or mid-translation."
 confidence = "high"
-evidence = "usage.rs ~204; translate.rs ~2728; Cargo.toml overflow-checks"
+evidence = "usage.rs ~204; translate.rs ~2728; Cargo.toml overflow-checks. Reproduced hermetically: usage::overflowing_provider_token_counts_saturate_instead_of_panicking panics at usage.rs:205 (prompt + completion + reasoning), and translate::response_tests::overflowing_chat_usage_saturates_when_translated at translate.rs:2975."
 claims = ["BIL-4", "REL-17"]
-state = "suspected"
-test = ""
+state = "reproduced"
+test = "overflowing_provider_token_counts_saturate_instead_of_panicking"
 fix = ""
 note = "Found by the independent branch review (2026-10-01) of a54c22c."
 

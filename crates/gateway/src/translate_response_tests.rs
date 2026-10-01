@@ -2457,3 +2457,25 @@ fn translated_usage_counts_reasoning_reported_beside_completion_tokens() {
         "{resp}"
     );
 }
+
+/// A translated response carries the provider's usage onto the client's wire; a garbage count
+/// whose sum overflows a `u64` saturates rather than panicking mid-translation (release builds
+/// keep overflow-checks on).
+/// claim: BIL-4, REL-17
+/// defect: D87
+#[test]
+#[ignore = "D87 reproduced: prompt + completion + reasoning overflows and panics"]
+fn overflowing_chat_usage_saturates_when_translated() {
+    let max = u64::MAX;
+    let chat = json!({
+        "id": "x", "object": "chat.completion", "model": "grok-4",
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": "hi"}, "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": max, "completion_tokens": max, "total_tokens": 1,
+                  "completion_tokens_details": {"reasoning_tokens": max}},
+    });
+    for client in [Messages, Responses] {
+        let resp = std::panic::catch_unwind(|| json_resp(Chat, client, &chat)).expect("must not panic");
+        let out = resp["usage"]["output_tokens"].as_u64();
+        assert_eq!(out, Some(max), "{resp}");
+    }
+}
