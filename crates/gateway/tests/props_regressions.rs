@@ -160,7 +160,6 @@ fn n_of(text: &str) -> String {
 /// claim: T1
 /// defect: D127
 #[test]
-#[ignore = "D127 reproduced: tool-argument numbers change value when translation re-parses them"]
 fn tool_argument_numbers_keep_their_value() {
     // A Chat history call onto Messages.
     let body = r#"{"model":"m","messages":[{"role":"user","content":"hi"},{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"f","arguments":"{\"n\":-1.32417719719006e-11}"}}]},{"role":"tool","tool_call_id":"call_1","content":"ok"}]}"#;

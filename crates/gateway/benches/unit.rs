@@ -1382,6 +1382,57 @@ mod translate {
         });
     }
 
+    /// Tool arguments with only integers, or with a decimal (the D127 path: their text is kept).
+    const TOOL_ARGS: [&str; 2] = [
+        r#"{"path":"src/main.rs","line":42,"limit":200}"#,
+        r#"{"lat":48.858370,"lon":2.294481,"zoom":12}"#,
+    ];
+
+    /// A Chat client's tool loop onto Claude: 20 replayed calls whose arguments are re-parsed.
+    #[divan::bench(args = [0, 1])]
+    fn request_chat_tool_history_to_messages(bencher: Bencher, which: usize) {
+        let args = serde_json::to_string(TOOL_ARGS[which]).unwrap();
+        let mut messages = vec![r#"{"role":"user","content":"go"}"#.to_owned()];
+        for i in 0..20 {
+            messages.push(format!(
+                r#"{{"role":"assistant","content":null,"tool_calls":[{{"id":"call_{i}","type":"function","function":{{"name":"f","arguments":{args}}}}}]}}"#
+            ));
+            messages.push(format!(
+                r#"{{"role":"tool","tool_call_id":"call_{i}","content":"ok"}}"#
+            ));
+        }
+        let body = format!(
+            r#"{{"model":"claude-opus-4-8","messages":[{}]}}"#,
+            messages.join(",")
+        )
+        .into_bytes();
+        bencher.counter(BytesCount::of_slice(&body)).bench(|| {
+            translate::request(
+                black_box(Endpoint::ChatCompletions),
+                black_box(Endpoint::Messages),
+                black_box(&body),
+                black_box("claude-opus-4-8"),
+            )
+        });
+    }
+
+    /// A Claude tool call onto a Chat client: `tool_use.input` becomes an `arguments` string.
+    #[divan::bench(args = [0, 1])]
+    fn response_messages_tool_use_to_chat(bencher: Bencher, which: usize) {
+        let body = format!(
+            r#"{{"id":"msg_1","type":"message","role":"assistant","model":"claude-opus-4-8","content":[{{"type":"text","text":"Looking."}},{{"type":"tool_use","id":"toolu_1","name":"f","input":{}}}],"stop_reason":"tool_use","usage":{{"input_tokens":12,"output_tokens":34}}}}"#,
+            TOOL_ARGS[which]
+        )
+        .into_bytes();
+        bencher.bench(|| {
+            translate::response_json(
+                black_box(Endpoint::Messages),
+                black_box(Endpoint::ChatCompletions),
+                black_box(&body),
+            )
+        });
+    }
+
     /// One Anthropic `text_delta` rewritten into an OpenAI chat chunk. This is the per-token cost
     /// of a translated stream; a completion pays it once per event, not once per request.
     #[divan::bench]

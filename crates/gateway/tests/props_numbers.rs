@@ -53,14 +53,13 @@ fn number_after_n(text: &str) -> Option<String> {
     Some(rest[..end].to_owned())
 }
 
-/// Numbers translation keeps today: integers in `i64`/`u64`, short exponent forms, and decimals of
-/// up to 7 significant digits.
-///
-/// D127: a longer decimal can change value (`-1.32417719719006e-11` comes out as
-/// `-1.3241771971900598e-11`: serde_json's default float parsing is not correctly rounded), and an
-/// integer past `u64` becomes an `f64`. Both are excluded here while D127 is open;
-/// `props_regressions` reproduces them.
-fn representable() -> impl Strategy<Value = String> {
+/// Any JSON number literal: integers in and past `i64`/`u64`, decimals of any length (money,
+/// coordinates, scores, and the 15-20 digit floats a model writes), exponent forms, and the
+/// subnormal and huge magnitudes at `f64`'s edges. A `Value` keeps every integer within `u64` as
+/// written; anything else was the D127 shape (`-1.32417719719006e-11` came out as
+/// `-1.3241771971900598e-11`, a 30-digit integer as `1.2345678901234568e29`).
+fn number() -> impl Strategy<Value = String> {
+    let digits = |n: std::ops::Range<usize>| prop::collection::vec(0u8..10, n);
     prop_oneof![
         any::<i64>().prop_map(|n| n.to_string()),
         any::<u64>().prop_map(|n| n.to_string()),
@@ -78,6 +77,22 @@ fn representable() -> impl Strategy<Value = String> {
             }
         }),
         (1u32..1000, -20i32..20).prop_map(|(m, e)| format!("{m}e{e}")),
+        // Integers past `u64` (ids, account numbers).
+        (1u8..10, digits(19..40), any::<bool>()).prop_map(|(lead, rest, neg)| {
+            let rest: String = rest.iter().map(|d| char::from(b'0' + d)).collect();
+            format!("{}{lead}{rest}", if neg { "-" } else { "" })
+        }),
+        // Long decimals in plain and exponent form, out to `f64`'s subnormal and huge edges.
+        (1u8..10, digits(8..25), -330i32..308, any::<bool>()).prop_map(|(lead, rest, e, neg)| {
+            let rest: String = rest.iter().map(|d| char::from(b'0' + d)).collect();
+            format!("{}{lead}.{rest}e{e}", if neg { "-" } else { "" })
+        }),
+        (digits(1..10), digits(8..25)).prop_map(|(int, frac)| {
+            let int: String = int.iter().map(|d| char::from(b'0' + d)).collect();
+            let frac: String = frac.iter().map(|d| char::from(b'0' + d)).collect();
+            let int = int.trim_start_matches('0');
+            format!("{}.{frac}", if int.is_empty() { "0" } else { int })
+        }),
     ]
 }
 
@@ -140,7 +155,7 @@ fn through(path: u8, lit: &str) -> Result<String, String> {
 fn prop_tool_argument_numbers_keep_their_value() {
     check(
         "prop_tool_argument_numbers_keep_their_value",
-        (any::<u8>(), representable()),
+        (any::<u8>(), number()),
         |(path, lit)| {
             let got = through(path, &lit).map_err(TestCaseError::fail)?;
             prop_assert_eq!(

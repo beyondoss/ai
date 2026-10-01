@@ -152,7 +152,7 @@ pub fn request_with_tools(
     if from == to {
         return (body.to_vec(), ToolNames::default(), false);
     }
-    let Ok(v) = serde_json::from_slice::<Value>(body) else {
+    let Some(v) = parse_body(from, body) else {
         return (body.to_vec(), ToolNames::default(), false);
     };
     if !v.is_object() {
@@ -354,7 +354,7 @@ pub fn response_json_tools(
     if upstream == client && ok {
         return body.to_vec();
     }
-    let Ok(v) = serde_json::from_slice::<Value>(body) else {
+    let Some(v) = parse_body(upstream, body) else {
         return body.to_vec();
     };
     // The same endpoint on another vendor's error shape (xAI's `{"code", "error": "<string>"}`,
@@ -398,9 +398,201 @@ fn map_response(
 }
 
 fn encode(v: &Value) -> Vec<u8> {
-    serde_json::to_vec(v).unwrap_or_else(|_| {
+    serde_json::to_vec(&Exact(v)).unwrap_or_else(|_| {
         br#"{"error":{"message":"translate failed","type":"api_error"}}"#.to_vec()
     })
+}
+
+// --- tool arguments keep their exact text -----------------------------------
+//
+// A tool call's arguments are JSON the model wrote, and the client replays them in its history or
+// hands them to its tool. Translation moves them between a JSON string (Chat Completions and
+// Responses `arguments`) and a JSON value (Messages `tool_use.input`), which parsing into a `Value`
+// would do lossily: an integer past `u64` becomes an `f64`, and a decimal is rounded to the nearest
+// `f64` (D127). serde_json's `arbitrary_precision` would keep every number's text, but it is a
+// crate-wide feature that breaks `untagged` enums holding numbers, which async-nats' JetStream
+// responses are. So only arguments holding a number a `Value` keeps as an `f64` (a decimal, an
+// exponent, a huge integer) keep their text, as a one-entry object (`RAW_JSON_KEY`) that [`Exact`]
+// writes back verbatim; every other argument, and every other number, is an ordinary `Value`.
+
+/// The key of a one-entry object standing for JSON text kept verbatim. A client object carrying it
+/// is written as its value's JSON text only if that is one valid JSON value, which the client could
+/// have sent as is.
+const RAW_JSON_KEY: &str = "\u{0}beyond:raw-json";
+
+/// Whether a `Value` holds a number parsed as an `f64`, whose text it may not reproduce.
+fn has_float(v: &Value) -> bool {
+    match v {
+        Value::Number(n) => n.is_f64(),
+        Value::Array(a) => a.iter().any(has_float),
+        Value::Object(m) => m.values().any(has_float),
+        _ => false,
+    }
+}
+
+/// `v`, parsed from `text`, or `text` kept verbatim when `v` would not reproduce its numbers.
+fn exact_value(text: &str, v: Value) -> Value {
+    if has_float(&v) {
+        let mut m = Map::new();
+        m.insert(RAW_JSON_KEY.to_owned(), Value::String(text.to_owned()));
+        Value::Object(m)
+    } else {
+        v
+    }
+}
+
+/// The text a verbatim-kept value stands for.
+fn raw_json(v: &Value) -> Option<&str> {
+    match v {
+        Value::Object(m) if m.len() == 1 => m.get(RAW_JSON_KEY)?.as_str(),
+        _ => None,
+    }
+}
+
+/// Tool arguments as the JSON text a Chat Completions or Responses `arguments` string holds.
+fn arguments_text(v: &Value) -> String {
+    raw_json(v).map_or_else(|| value_string(v), |raw| raw.trim().to_owned())
+}
+
+/// Serializes a `Value` as serde_json does, except that a verbatim-kept value is written as its
+/// text.
+struct Exact<'a>(&'a Value);
+
+impl serde::Serialize for Exact<'_> {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::{SerializeMap, SerializeSeq};
+        match self.0 {
+            Value::Object(m) => {
+                if let Some(raw) = raw_json(self.0)
+                    && let Ok(raw) = serde_json::from_str::<&serde_json::value::RawValue>(raw)
+                {
+                    return raw.serialize(s);
+                }
+                let mut map = s.serialize_map(Some(m.len()))?;
+                for (k, v) in m {
+                    map.serialize_entry(k, &Exact(v))?;
+                }
+                map.end()
+            }
+            Value::Array(a) => {
+                let mut seq = s.serialize_seq(Some(a.len()))?;
+                for v in a {
+                    seq.serialize_element(&Exact(v))?;
+                }
+                seq.end()
+            }
+            v => v.serialize(s),
+        }
+    }
+}
+
+/// A request or response body as a `Value`. A Messages body whose `tool_use` inputs hold a number
+/// a `Value` keeps as an `f64` is parsed a second time, keeping each `input`'s text (see
+/// [`KeepInputs`]); any other body is parsed once, as it always was.
+fn parse_body(wire: Endpoint, body: &[u8]) -> Option<Value> {
+    let v = serde_json::from_slice::<Value>(body).ok()?;
+    if wire != Endpoint::Messages || !tool_inputs_have_float(&v) {
+        return Some(v);
+    }
+    let mut de = serde_json::Deserializer::from_slice(body);
+    let kept = serde::de::DeserializeSeed::deserialize(KeepInputs, &mut de).ok();
+    match kept {
+        Some(kept) if de.end().is_ok() => Some(kept),
+        _ => Some(v),
+    }
+}
+
+/// Whether any content block's `input` (a response's, or a request message's) holds an `f64`.
+fn tool_inputs_have_float(v: &Value) -> bool {
+    let blocks_have = |content: Option<&Value>| {
+        content
+            .and_then(Value::as_array)
+            .is_some_and(|blocks| blocks.iter().any(|b| b.get("input").is_some_and(has_float)))
+    };
+    blocks_have(v.get("content"))
+        || v.get("messages")
+            .and_then(Value::as_array)
+            .is_some_and(|ms| ms.iter().any(|m| blocks_have(m.get("content"))))
+}
+
+/// Builds a `Value` as serde_json does, except that every `input` member keeps its text when it
+/// holds a number a `Value` would not reproduce (see [`exact_value`]).
+struct KeepInputs;
+
+impl<'de> serde::de::DeserializeSeed<'de> for KeepInputs {
+    type Value = Value;
+
+    fn deserialize<D: serde::Deserializer<'de>>(self, d: D) -> Result<Value, D::Error> {
+        d.deserialize_any(self)
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for KeepInputs {
+    type Value = Value;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("any JSON value")
+    }
+
+    fn visit_bool<E>(self, b: bool) -> Result<Value, E> {
+        Ok(Value::Bool(b))
+    }
+
+    fn visit_i64<E>(self, n: i64) -> Result<Value, E> {
+        Ok(Value::from(n))
+    }
+
+    fn visit_u64<E>(self, n: u64) -> Result<Value, E> {
+        Ok(Value::from(n))
+    }
+
+    fn visit_f64<E>(self, n: f64) -> Result<Value, E> {
+        Ok(serde_json::Number::from_f64(n).map_or(Value::Null, Value::Number))
+    }
+
+    fn visit_str<E>(self, s: &str) -> Result<Value, E> {
+        Ok(Value::String(s.to_owned()))
+    }
+
+    fn visit_string<E>(self, s: String) -> Result<Value, E> {
+        Ok(Value::String(s))
+    }
+
+    fn visit_unit<E>(self) -> Result<Value, E> {
+        Ok(Value::Null)
+    }
+
+    fn visit_none<E>(self) -> Result<Value, E> {
+        Ok(Value::Null)
+    }
+
+    fn visit_some<D: serde::Deserializer<'de>>(self, d: D) -> Result<Value, D::Error> {
+        d.deserialize_any(self)
+    }
+
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Value, A::Error> {
+        let mut out = Vec::with_capacity(seq.size_hint().unwrap_or(0));
+        while let Some(v) = seq.next_element_seed(KeepInputs)? {
+            out.push(v);
+        }
+        Ok(Value::Array(out))
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Value, A::Error> {
+        let mut out = Map::new();
+        while let Some(key) = map.next_key::<String>()? {
+            let v = if key == "input" {
+                let raw: &'de serde_json::value::RawValue = map.next_value()?;
+                let v =
+                    serde_json::from_str::<Value>(raw.get()).map_err(serde::de::Error::custom)?;
+                exact_value(raw.get(), v)
+            } else {
+                map.next_value_seed(KeepInputs)?
+            };
+            out.insert(key, v);
+        }
+        Ok(Value::Object(out))
+    }
 }
 
 fn looks_like_error(v: &Value) -> bool {
@@ -2403,7 +2595,10 @@ fn parse_data_uri(url: &str) -> Option<(&str, &str)> {
 
 fn parse_arguments(v: Option<&Value>) -> Value {
     match v {
-        Some(Value::String(s)) => serde_json::from_str(s).unwrap_or_else(|_| json!({})),
+        Some(Value::String(s)) => match serde_json::from_str(s) {
+            Ok(v) => exact_value(s, v),
+            Err(_) => json!({}),
+        },
         Some(o) if o.is_object() => o.clone(),
         _ => json!({}),
     }
@@ -2752,7 +2947,7 @@ fn anthropic_assistant_to_openai(m: &Value, claude_thinking: bool) -> Value {
                         let name = b.get("name").and_then(Value::as_str).unwrap_or("");
                         let args = b
                             .get("input")
-                            .map(|i| serde_json::to_string(i).unwrap_or_else(|_| "{}".into()))
+                            .map(arguments_text)
                             .unwrap_or_else(|| "{}".into());
                         tool_calls.push(json!({
                             "id": id,
@@ -3487,7 +3682,7 @@ fn anthropic_resp_to_openai(v: &Value, gateway_cache: bool) -> Value {
                 "type": "function",
                 "function": {
                     "name": b.get("name").and_then(Value::as_str).unwrap_or(""),
-                    "arguments": b.get("input").map_or_else(|| "{}".to_owned(), value_string),
+                    "arguments": b.get("input").map_or_else(|| "{}".to_owned(), arguments_text),
                 },
             })),
             // Server-tool blocks (`server_tool_use`, `web_search_tool_result`, …) have no Chat
@@ -4526,7 +4721,7 @@ fn responses_output_to_tool_message(item: &Value, carried: &mut Vec<Value>) -> V
             }
             text
         }
-        Some(other) => value_string(other),
+        Some(other) => arguments_text(other),
         None => String::new(),
     };
     m.insert("content".into(), json!(content));
@@ -4858,7 +5053,7 @@ fn arguments_string(v: Option<&Value>) -> String {
     match v {
         Some(Value::String(s)) => s.clone(),
         Some(Value::Null) | None => "{}".to_owned(),
-        Some(other) => value_string(other),
+        Some(other) => arguments_text(other),
     }
 }
 
@@ -7203,7 +7398,7 @@ fn sse_named(event: &str, data: &str) -> Vec<u8> {
 }
 
 fn value_string(v: &Value) -> String {
-    serde_json::to_string(v).unwrap_or_else(|_| "{}".into())
+    serde_json::to_string(&Exact(v)).unwrap_or_else(|_| "{}".into())
 }
 
 #[cfg(test)]
@@ -7820,6 +8015,38 @@ mod tests {
         assert_eq!(back["stop_reason"], "tool_use");
         assert_eq!(back["content"][0]["type"], "tool_use");
         assert_eq!(back["content"][0]["input"]["city"], "SF");
+    }
+
+    /// A Messages history call's `input` reaches a Chat upstream with its numbers as written
+    /// (D127), next to an integer-only call that takes the ordinary path.
+    #[test]
+    fn messages_history_tool_input_keeps_its_number_text() {
+        let body = br#"{"model":"m","max_tokens":10,"messages":[{"role":"user","content":"hi"},{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"f","input":{"n":0.30000000000000001,"big":123456789012345678901234567890}},{"type":"tool_use","id":"toolu_2","name":"g","input":{"k":7}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"ok"},{"type":"tool_result","tool_use_id":"toolu_2","content":"ok"}]}]}"#;
+        let out = request(
+            Endpoint::Messages,
+            Endpoint::ChatCompletions,
+            body,
+            "gpt-4o",
+        );
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        let calls = v["messages"][1]["tool_calls"].as_array().unwrap();
+        assert_eq!(
+            calls[0]["function"]["arguments"],
+            r#"{"n":0.30000000000000001,"big":123456789012345678901234567890}"#
+        );
+        assert_eq!(calls[1]["function"]["arguments"], r#"{"k":7}"#);
+    }
+
+    /// The verbatim stand-in is written as its text only when that text is one JSON value: a client
+    /// object that happens to carry the key cannot splice arbitrary bytes into a body.
+    #[test]
+    fn a_verbatim_stand_in_is_written_only_as_valid_json() {
+        let valid = json!({ "a": { RAW_JSON_KEY: " {\"n\":1.50} " } });
+        assert_eq!(encode(&valid), br#"{"a":{"n":1.50}}"#);
+        let spliced = json!({ "a": { RAW_JSON_KEY: "1, \"model\": \"other\"" } });
+        let out: Value = serde_json::from_slice(&encode(&spliced)).unwrap();
+        assert_eq!(out["a"][RAW_JSON_KEY], "1, \"model\": \"other\"");
+        assert!(out.get("model").is_none());
     }
 
     #[test]

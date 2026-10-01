@@ -58,7 +58,9 @@ prometheus = "0.13"
 rustc-hash = "2"
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 serde.workspace = true
-serde_json.workspace = true
+# `raw_value`: tool arguments keep their exact number text through translation (D127; see
+# `translate::Exact`). Adds a type, changes no existing behavior.
+serde_json = { workspace = true, features = ["raw_value"] }
 thiserror.workspace = true
 # Global allocator. jemalloc under a memory cgroup uncharges freed pages promptly (MADV_DONTNEED);
 # matches `compute/instd`. See the rationale at the `#[global_allocator]` in `main.rs`.

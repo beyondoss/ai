@@ -816,6 +816,20 @@ Responses-only models the catalog routes to `/v1/responses`, and is held to the 
   closes. An open call with no argument bytes is done once a waiting call's arguments start
   arriving (a zero-argument call; the upstream has moved on). A sequential upstream streams each
   call as it comes; one that interleaves argument deltas has the later calls held back.
+- **Tool arguments keep their numbers as written.** Translation moves arguments between a JSON
+  string (Chat Completions and Responses `arguments`) and a JSON value (Messages `tool_use.input`).
+  Parsed into a `serde_json::Value`, an integer past `u64` became an `f64` and a long decimal was
+  rounded (`-1.32417719719006e-11` came out `-1.3241771971900598e-11`, D127), so the model's own
+  arguments were altered before reaching the client's tool or its replayed history. Arguments
+  holding a number a `Value` keeps as an `f64` (a decimal, an exponent, a huge integer) now keep
+  their text: a Chat `arguments` string becomes a verbatim stand-in that `translate::Exact` writes
+  back as the original text, and a Messages body whose `tool_use` inputs hold one is parsed a
+  second time keeping each `input`'s text (`KeepInputs`). Integer-only arguments, the common case,
+  take the path they always did. serde_json's `arbitrary_precision` would have kept every number,
+  but it is crate-wide and breaks `untagged` enums holding numbers, which async-nats' JetStream
+  responses are. Measured (`benches/unit.rs`, `translate`): a Messages tool call with a decimal
+  onto a Chat client 4.0 → 5.4 µs, the same with integers and 20 replayed Chat calls onto Messages
+  unchanged. Streams already passed argument text through untouched.
 - **Errors.** Any non-2xx JSON body is an error, whatever its shape (Bedrock's `{"message"}` has no
   `error` key); `message`, `type`, `code` and `param` survive, a string `error` is the message,
   OpenRouter's `metadata.raw` is quoted after its message with the provider's name, and a numeric
