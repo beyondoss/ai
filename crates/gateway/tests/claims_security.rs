@@ -270,7 +270,6 @@ async fn every_credential_location_is_stripped_and_one_pool_key_goes_out() {
 /// claim: SEC-3, SEC-11
 /// defect: D65
 #[tokio::test]
-#[ignore = "D65 reproduced: repeated, encoded or oddly spaced credentials forward the virtual key upstream"]
 async fn repeated_or_respelled_credentials_never_forward_a_virtual_key() {
     let (pubkey, sk) = test_keypair(1);
     let mock = MockUpstream::start(Mode::Json).await;
@@ -433,7 +432,6 @@ async fn gateway_made_responses_never_carry_a_pool_key() {
 /// claim: SEC-7
 /// defect: D66
 #[tokio::test]
-#[ignore = "D66 reproduced: an upstream echo of the pool key is relayed to the client"]
 async fn an_upstream_echo_of_the_pool_key_never_reaches_the_client() {
     let (pubkey, sk) = test_keypair(1);
     let vk = vkey(&sk, 8);
@@ -498,7 +496,6 @@ async fn an_upstream_echo_of_the_pool_key_never_reaches_the_client() {
 /// claim: SEC-9
 /// defect: D67
 #[tokio::test]
-#[ignore = "D67 reproduced: BYO requests forward x-beyond-model and unknown x-beyond-* headers"]
 async fn client_x_beyond_headers_never_reach_the_upstream_on_any_route() {
     let (pubkey, sk) = test_keypair(1);
     let mock = MockUpstream::start(Mode::Json).await;

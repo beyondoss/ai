@@ -62,7 +62,8 @@ Client (stock OpenAI/Anthropic SDK)
   │  │        Anthropic on every `/v1` path, not just `/v1/messages`
   │  │      no remaining candidate holds a pool key ──────────► 503
   │  ├─ Extract key: x-api-key / api-key / x-goog-api-key / Authorization Bearer / ?key= query param
-  │  │    a managed (bai_v1/v2) value in ANY of them wins; empty values count as absent
+  │  │    a managed (bai_v1/v2) value in ANY of them wins: every line of a repeated header,
+  │  │    every `key` param (`k%65y` too), `Bearer` with any whitespace; empty = absent
   │  ├─ Rate guardrails (BEFORE verify — keeps forged-key floods at ns cost)
   │  │    per-credential count-min  ──────────────────────────────► 429
   │  │    global BYO aggregate (managed exempt)  ─────────────────► 429
@@ -109,18 +110,18 @@ Client (stock OpenAI/Anthropic SDK)
   │
   ▼  upstream_request_filter (proxy.rs)
   │  Managed: remove every static-key header (authorization, x-api-key, api-key,
-  │    x-goog-api-key) UNCONDITIONALLY → inject the next unused pool key in the
-  │    provider's own scheme (never provider A's key on provider B); a `key=` query
-  │    param is dropped from the forwarded path (other params kept)
+  │    x-goog-api-key; every repeat) UNCONDITIONALLY → inject the pool key in the
+  │    provider's own scheme (never provider A's key on provider B); every `key` query
+  │    param, under any spelling a provider decodes to `key`, is dropped from the
+  │    forwarded path (other params kept)
   │  Managed: forward only allowlisted client headers (content-type, content-length,
   │    transfer-encoding, expect, accept, user-agent, anthropic-version, anthropic-beta
   │    filtered to known-safe tokens); everything else the client sent is dropped
   │  BYO: leave auth header unchanged (and every other client header)
   │  Managed: accept-encoding: identity (the gateway parses the body; gzip billed 0 tokens)
-  │  Strip x-beyond-* control headers (ours; meaningless upstream)
+  │  Strip every x-beyond-* header, any name, every route, managed or BYO (ours)
   │  Set Host; path: verbatim for /{provider} (prefix stripped), or the candidate's
-  │    own catalog path for a catalog walk (`/auto`, managed `/v1`). Model-routed: strip
-  │    x-beyond-model
+  │    own catalog path for a catalog walk (`/auto`, managed `/v1`)
   │  OpenRouter + managed only: dashboard-attribution headers (HTTP-Referer, X-OpenRouter-*)
   │
   ▼  request_body_filter (proxy.rs)  — streamed through, except where a rewrite needs the whole body
@@ -150,9 +151,14 @@ Client (stock OpenAI/Anthropic SDK)
   │  Count upstream response by provider + status class
   │  Drop any upstream x-beyond-* header, then set x-beyond-request-id, x-beyond-provider,
   │    x-beyond-upstream-model (catalog walk)
+  │  Managed: drop any header whose value carries the pool key this attempt sent; a
+  │    status >= 400 arms the body scrub below
   │  Translate walk: drop Content-Length (body length will change)
   │
   ▼  response_body_filter (proxy.rs)  — response relayed chunk-by-chunk; SSE is never fully buffered
+  │  Managed >= 400, first: overwrite the pool key with `[redacted]***` (same length, so
+  │    Content-Length holds), holding back a key-sized tail per chunk to catch a split key.
+  │    Everything below (translation, capture, cache, usage tail) sees the scrubbed bytes
   │  Translate path: convert SSE event-by-event into the inbound dialect (do not wait for `[DONE]`
   │    before forwarding deltas). Non-stream: map the JSON object, including error envelopes.
   │    Both held buffers (the non-stream body; one not-yet-terminated SSE event) are capped at
@@ -1094,7 +1100,9 @@ cached 2xx.
 ### Control surface (`control.rs`) and payload capture (`capture.rs`)
 
 The `x-beyond-*` headers are the per-request control surface, parsed once in `request_filter` after
-identity is verified and stripped in `upstream_request_filter` before the request leaves.
+identity is verified. Every `x-beyond-*` request header — these, `x-beyond-model`, and any name the
+gateway does not define — is stripped in `upstream_request_filter` before the request leaves, on
+every route, BYO included.
 **Managed only** — a BYO request carries no verified `tenant_id`, so a tag on it would be an
 unattributable row, the same reason `ai.usage` is managed-only.
 
@@ -1520,12 +1528,22 @@ Two deliberate non-cases, plus one same-provider retry:
   a retryable error and the next attempt stays on the same provider with the next key. Works for
   `/{provider}` and `/auto`. BYO does not walk. The last 429 is relayed, with `Retry-After` if the
   upstream sent one. Counted on `ai_key_walks_total`, never on `ai_candidate_failovers_total`.
+- **A managed `401` / `403` walks keys first, like a `429`.** It is that pool key revoked or not
+  entitled, never the caller's fault, and the provider refused it before processing anything, so
+  resending the body under the next key is safe. It walks the next key on the same provider (never
+  a vendor switch at this step) on `/{provider}` and `/auto` alike, counted on
+  `ai_key_walks_total`. The key is also cooled off for `KEY_COOLDOWN` (60s,
+  `Provider::mark_key_bad`, counted on `ai_key_auth_failures_total`): a new request, or a walk
+  entering the provider, starts on its first key not cooling off (`Provider::first_key`), or key 0
+  when all are. So rotating by appending the new key and revoking the old one costs one extra round
+  trip per pod per minute, not one per request. On the last key, a provider route relays the 401/403,
+  and a catalog walk goes on to the rule below.
 - **A `5xx` does not walk keys.** Vendor walk already owns that on `/auto`. Keys stay with their
   provider.
-- **A managed walk's `401` / `403` / `402` is a candidate failure.** It is that candidate's pool key
-  failing (revoked, not entitled, unfunded), not the caller's request, and the next candidate holds
-  a different key, so the walk fails over exactly as on a `5xx` (replayable body, or the `FullBody`
-  re-run). The candidate takes the ranker's failure penalty and is never pinned, so one revoked key
+- **A managed walk's `401` / `403` / `402` on its last key is a candidate failure.** It is that
+  candidate's pool key failing (revoked, not entitled, unfunded), not the caller's request, and the
+  next candidate holds a different key, so the walk fails over exactly as on a `5xx` (replayable
+  body, or the `FullBody` re-run). The candidate takes the ranker's failure penalty and is never pinned, so one revoked key
   cannot black-hole a row by answering fastest. It is **not** a breaker failure: the provider
   answered, so its permit resolves as a success. When every candidate fails this way, the last
   candidate's own status is relayed. An OpenAI `429` with `insufficient_quota` in its body is not
@@ -1724,10 +1742,23 @@ crosses the proxy for anyone. BYO requests forward every client header untouched
 **Where a credential may travel:**
 
 - A managed key reaches no provider in any location. Every static-key header and `Authorization`
-  are stripped, and a `?key=` query param is removed from the forwarded path. When the credential
-  locations disagree (`x-api-key: junk` beside `Bearer bai_v1…`, or an empty `x-api-key`), a
-  managed value in **any** location makes the request managed. First-location-wins classified that
-  as BYO, and BYO headers are forwarded untouched, so the virtual key reached the provider.
+  are stripped (every repeat), and every `key` query param is removed from the forwarded path. When
+  the credential locations disagree (`x-api-key: junk` beside `Bearer bai_v1…`, or an empty
+  `x-api-key`), a managed value in **any** location makes the request managed. First-location-wins
+  classified that as BYO, and BYO headers are forwarded untouched, so the virtual key reached the
+  provider. "Any location" means every spelling a provider would read: each line of a repeated
+  header, each repeated `?key=`, a percent-encoded name (`k%65y`, which Google decodes as `key`) or
+  value, and `Bearer` followed by any run of whitespace. A value managed only once decoded is
+  verified as written, so it 401s rather than being forwarded.
+- A pool key reaches no client. A provider, or a proxy in between, that echoes the credential it
+  was sent would otherwise hand Beyond's key to a tenant. On a managed response, any header whose
+  value carries the key this attempt sent is dropped, and an error body (status >= 400) has every
+  occurrence overwritten with a same-length `[redacted]***` marker as it streams, before
+  translation (so a translated error envelope, or OpenRouter quoting an upstream error in
+  `metadata.raw`, is scrubbed too) and before capture and the cache. A 2xx body is an answer and is
+  **not** scanned: a streamed answer would pay the scan on every chunk, and an echo of a credential
+  belongs in an error. Real providers already mask all but the last 4 characters; this does not
+  depend on it.
 - Pingora's own error line prints `ProxyHttp::request_summary`, overridden to log the path without
   its query, so a `?key=` credential (managed, or a BYO Google key) never reaches the log.
 - A BYO key reaches only the provider it belongs to: on bare `/v1`, `x-api-key` routes to Anthropic.
@@ -1833,6 +1864,7 @@ already gone gets nothing, and a response that has started cannot be replaced.
 | Provider stalls a stream (no head, or a silent gap)                | A request that asked for a stream is cut after `stream_idle_timeout_secs` (120s) of silence with a JSON 504 (`upstream timed out after receiving the request`); not resent, since the provider has the request. A non-streaming request waits up to `read_timeout_secs` (600s) for its head, the whole generation. No total deadline: a stream that keeps sending (pings included) lives until it ends. | Client retry. Tune the bound per workload; hidden-reasoning streams that are silent for longer need a larger value.                                                                                                                                                                                                      |
 | Provider brownout (sustained 5xx)                                  | After `circuit_breaker_threshold` 5xx/connect failures in the window that are also at least half its outcomes (so a 50% brownout counts), the breaker opens; requests fast-fail 503 (`circuit_open`) instead of stalling against the read timeout.                                                                                                                                                      | Auto: after `circuit_breaker_reset_secs` a half-open probe is admitted — success closes the breaker, failure reopens it. Per-provider, so other providers are unaffected.                                                                                                                                                |
 | Provider throttles (429 storm)                                     | Walk the next unused pool key on the same provider when the body is replayable; the last 429 is relayed with `Retry-After` if the upstream sent one. Does **not** trip the breaker (provider is healthy). Does **not** fail over to another vendor.                                                                                                                                                     | Client `Retry-After` backoff after keys are exhausted; no gateway-side circuit action.                                                                                                                                                                                                                                   |
+| Pool key revoked or not entitled (401/403)                         | Walk the next pool key on the same provider when the body is replayable, and cool the refused key off for 60s so later requests start on a good one (`ai_key_auth_failures_total`). The last key's 401/403 is relayed on a provider route, a candidate failure on a catalog walk. Not a breaker failure.                                                                                                | Replace the key in config; the metric says which provider (log line names the key index).                                                                                                                                                                                                                                |
 | Response body > 128KB before usage chunk                           | Tail compaction fires: `drain(..half)` discards first half, keeps tail. Usage extracted from retained tail.                                                                                                                                                                                                                                                                                             | No action — SSE usage is always in the final `data:` line, which always lands in the tail.                                                                                                                                                                                                                               |
 | Client cancels mid-request (ESC on a slow turn)                    | Relayed as a downstream abort. **Not** counted against the provider's breaker — pingora tags it `ErrorSource::Downstream`. A streaming 2xx cut short this way is billed an estimate (`usage_estimated=true`), not zero. The tenant slot is released.                                                                                                                                                    | None. `tests/cancellation.rs` pins the breaker halves; `tests/cut_short.rs` the billing.                                                                                                                                                                                                                                 |
 | Retry replays a partially-read request body                        | `upstream_peer` resets the body-phase state each attempt, so the replayed prefix replaces rather than appends. Previously it was appended, producing a duplicated JSON fragment the provider rejected with a `400` that `logging` recorded as a breaker _success_.                                                                                                                                      | None — the reset is unconditional and O(1) on the first attempt.                                                                                                                                                                                                                                                         |
@@ -1875,7 +1907,8 @@ Prometheus on the default registry, exposed at `/metrics` on `metrics_listen`.
 | `ai_cache_scope`                      | Gauge     | `kind`               | Constant `1` with `kind="process"`: this pod's cache table, not a fleet store                                                                                              |
 | `ai_smart_rank_scope`                 | Gauge     | `kind`               | Constant `1` with `kind="process"`: this pod's TTFT EWMA, not a fleet-wide ranking                                                                                         |
 | `ai_candidate_failovers_total`        | Counter   | —                    | Model-routed requests that abandoned a candidate for the next one                                                                                                          |
-| `ai_key_walks_total`                  | Counter   | —                    | Managed 429s that retried the same provider with the next unused pool key                                                                                                  |
+| `ai_key_walks_total`                  | Counter   | —                    | Managed 429s, 401s and 403s that retried the same provider with the next unused pool key                                                                                   |
+| `ai_key_auth_failures_total`          | Counter   | —                    | Managed responses where a pool key drew a 401/403; that key is cooled off for 60s. Any rate means a pool key needs replacing                                               |
 | `ai_session_pinned_total`             | Counter   | —                    | Catalog walks whose primary came from a session pin instead of the TTFT rank                                                                                               |
 | `ai_full_body_relays_total`           | Counter   | —                    | Managed requests re-run as a subrequest because routing needed the whole body past 64 KiB                                                                                  |
 | `ai_model_header_body_mismatch_total` | Counter   | —                    | Catalog-walk requests whose `x-beyond-model` and body `model` disagreed (header wins; client bug)                                                                          |

@@ -25,6 +25,9 @@
 use crate::circuit_breaker::CircuitBreaker;
 use crate::metrics::ProviderMetrics;
 use crate::secret::Secret;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 /// The shared provider table. `KNOWN_PROVIDERS` is the gateway-routable subset — the BYO-only rows
 /// (HuggingFace, NVIDIA, Kimi-Coding, OpenCode) have no `/{name}/…` mount and no pool key, so minting
@@ -332,6 +335,37 @@ pub fn catalog_wire_action(path: &str, row: Endpoint) -> WireAction {
 pub struct PoolAuth {
     pub value: Secret,
     pub header: Option<http::HeaderValue>,
+    /// Where the bare key starts in `value` (after the scheme's `Bearer `), for [`Self::key`].
+    key_at: usize,
+    /// When this key's last auth failure (401/403) cools off, in ms since [`clock_ms`]'s epoch; 0
+    /// when it has none. A cooling key is skipped as a request's *first* key, so traffic stops
+    /// paying a round trip to a revoked key on every request. Shared across requests; relaxed
+    /// ordering, since a stale read costs only one more walk.
+    bad_until_ms: AtomicU64,
+}
+
+impl PoolAuth {
+    /// The bare key, without its scheme: what a provider that echoes its credential would echo,
+    /// and so what the gateway scrubs from responses (`proxy::Redact`).
+    pub fn key(&self) -> &str {
+        self.value.expose().get(self.key_at..).unwrap_or("")
+    }
+
+    fn cooling(&self, now_ms: u64) -> bool {
+        self.bad_until_ms.load(Ordering::Relaxed) > now_ms
+    }
+}
+
+/// How long a pool key that drew a 401/403 is skipped as a request's first key.
+pub const KEY_COOLDOWN: Duration = Duration::from_secs(60);
+
+/// Monotonic milliseconds since the first call, plus one (so 0 stays "never failed"). Coarse
+/// enough for a cooldown, and an `AtomicU64` holds it where an `Instant` would need a lock.
+fn clock_ms() -> u64 {
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    u64::try_from(EPOCH.get_or_init(Instant::now).elapsed().as_millis())
+        .unwrap_or(u64::MAX)
+        .saturating_add(1)
 }
 
 /// A *resolved* provider: static wire facts + the boot-resolved upstream authority/host + (for
@@ -349,7 +383,8 @@ pub struct Provider {
     pub auth: AuthScheme,
     /// Precomputed managed auth values, one per configured pool key, in config order. Empty ⇒ no
     /// pool key is configured for this provider ⇒ managed requests to it are rejected (503). A
-    /// managed 429 walks the next unused entry; the key is never sent to a different provider.
+    /// managed 429, 401 or 403 walks the next unused entry; the key is never sent to a different
+    /// provider. A 401/403 also cools the key off for later requests (see [`Self::first_key`]).
     pub pool_auth: Box<[PoolAuth]>,
     /// `host` as a ready-to-insert `HeaderValue` — see [`PoolAuth`].
     pub host_header: Option<http::HeaderValue>,
@@ -368,6 +403,29 @@ impl Provider {
     /// Whether at least one pool key is configured — the 503 gate for managed traffic.
     pub fn has_pool_key(&self) -> bool {
         !self.pool_auth.is_empty()
+    }
+
+    /// The pool key a new request on this provider starts on: the first one not cooling off from
+    /// an auth failure, or key 0 when every key is (a revoked set still has to answer something).
+    pub fn first_key(&self) -> u8 {
+        if self.pool_auth.len() < 2 {
+            return 0;
+        }
+        let now = clock_ms();
+        self.pool_auth
+            .iter()
+            .position(|k| !k.cooling(now))
+            .and_then(|i| u8::try_from(i).ok())
+            .unwrap_or(0)
+    }
+
+    /// Record that pool key `i` drew a 401/403: later requests start past it for [`KEY_COOLDOWN`].
+    pub fn mark_key_bad(&self, i: u8) {
+        if let Some(k) = self.pool_auth.get(usize::from(i)) {
+            let cooldown = u64::try_from(KEY_COOLDOWN.as_millis()).unwrap_or(u64::MAX);
+            k.bad_until_ms
+                .store(clock_ms().saturating_add(cooldown), Ordering::Relaxed);
+        }
     }
 
     /// Resolve a provider from its name, upstream authority, dialect, auth scheme, pool keys, and
@@ -400,7 +458,12 @@ impl Provider {
                         h.set_sensitive(true);
                         h
                     });
-                PoolAuth { value, header }
+                PoolAuth {
+                    value,
+                    header,
+                    key_at: auth.value_prefix().map_or(0, str::len),
+                    bad_until_ms: AtomicU64::new(0),
+                }
             })
             .collect();
         let host_header = http::HeaderValue::from_str(&host).ok();

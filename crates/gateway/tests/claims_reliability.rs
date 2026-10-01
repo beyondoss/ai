@@ -852,7 +852,6 @@ async fn a_rolling_pool_key_rotation_drops_nothing() {
 /// claim: REL-14
 /// defect: D71
 #[tokio::test]
-#[ignore = "D71 reproduced: pool_keys [old, new] with old revoked relays the provider's 401 on every request; only 429 walks keys"]
 async fn a_revoked_first_pool_key_walks_to_the_next() {
     let valid = Arc::new(Mutex::new(HashSet::from(["sk-new"])));
     let up = keyed_upstream(valid).await;
@@ -870,6 +869,41 @@ async fn a_revoked_first_pool_key_walks_to_the_next() {
             "a revoked first pool key black-holed the request"
         );
     }
+}
+
+/// A revoked pool key is paid for once, not on every request: its 401 cools it off, so later
+/// requests start on the next key. With every key revoked, the last key's 401 is relayed after
+/// each key was tried once — never a vendor switch on a provider route.
+/// claim: REL-14
+#[tokio::test]
+async fn a_revoked_pool_key_cools_off_and_the_last_401_is_relayed() {
+    let valid = Arc::new(Mutex::new(HashSet::from(["sk-new"])));
+    let up = keyed_upstream(valid.clone()).await;
+    let (pubkey, sk) = test_keypair(145);
+    let gw = Gateway::builder(unused_nats_port(), &up.authority(), &b64(&pubkey))
+        .providers(&["openai"])
+        .pool_keys("openai", &["sk-old", "sk-new"])
+        .start()
+        .await;
+    let key = billing_vkey(&sk, 1405);
+    let path = "/openai/v1/chat/completions";
+    for _ in 0..4 {
+        assert_eq!(status_of(&gw, path, &key, CHAT).await, 200);
+    }
+    assert_eq!(up.hits(), 5, "sk-old is tried by the first request only");
+    assert_eq!(gw.metric("ai_key_auth_failures_total", "").await, 1.0);
+
+    valid.lock().unwrap().clear();
+    let before = up.hits();
+    assert_eq!(status_of(&gw, path, &key, CHAT).await, 401);
+    assert_eq!(
+        up.hits() - before,
+        1,
+        "started on sk-new, the last key: nothing to walk to"
+    );
+    let resp = post(&gw, path, &key, CHAT).await;
+    assert_eq!(resp.status(), 401);
+    assert!(resp.text().await.unwrap().contains("invalid api key"));
 }
 
 // --- drain ---------------------------------------------------------------------------------------

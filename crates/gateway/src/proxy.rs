@@ -417,9 +417,10 @@ pub struct RequestCtx {
     start: Instant,
     /// Connect-retry counter (see `fail_to_connect`).
     attempt: u8,
-    /// Index into `provider.pool_auth` of the key used on this attempt. Advanced on a managed 429
-    /// when another unused key remains. Reset to 0 when `provider` changes — never send provider
-    /// A's key to provider B.
+    /// Index into `provider.pool_auth` of the key used on this attempt. Starts on
+    /// `Provider::first_key` (past keys cooling off from a 401/403). Advanced on a managed 429,
+    /// 401 or 403 when another unused key remains. Reset to the new provider's first key when
+    /// `provider` changes — never send provider A's key to provider B.
     pool_key: u8,
     /// The previous attempt was a same-provider key walk. `upstream_peer` must not treat that as a
     /// candidate/breaker failure (a 429 is a healthy throttle) and must not pick a new vendor.
@@ -464,6 +465,61 @@ pub struct RequestCtx {
     /// How far the current attempt got toward a provider. Lets a billing row tell a request no
     /// provider was ever called for (every breaker open) from one that failed upstream.
     upstream_phase: UpstreamPhase,
+    /// Set on a managed response with status >= 400: its body is scrubbed of the pool key this
+    /// attempt sent (see [`Redact`]). Boxed: `None` on every other response.
+    redact: Option<Box<Redact>>,
+}
+
+/// Scrubs one secret (the pool key an attempt sent) from a response body as it streams past (D66).
+/// A provider, or a proxy in between, that echoes the credential it received in an error message
+/// would otherwise hand Beyond's key to the client.
+///
+/// Each occurrence is overwritten in place with [`REDACTED`] padded to the key's length, so the
+/// body keeps its length and its `Content-Length`. The last `key.len() - 1` bytes of each chunk
+/// are held back until the next one, so a key split across chunks is caught too; memory is bounded
+/// by the key, not the body.
+#[derive(Default)]
+struct Redact {
+    carry: Vec<u8>,
+}
+
+/// What a scrubbed pool key reads as. Same length as the key (padded with `*`), truncated when the
+/// key is shorter.
+const REDACTED: &[u8] = b"[redacted]";
+
+impl Redact {
+    /// Scrub `chunk` (with the bytes held back from the last one) and return what may be relayed
+    /// now: everything at `end_of_stream`, otherwise all but a key-sized tail.
+    fn feed(&mut self, key: &[u8], chunk: Option<Bytes>, end_of_stream: bool) -> Option<Bytes> {
+        if key.is_empty() {
+            return chunk;
+        }
+        let mut buf = std::mem::take(&mut self.carry);
+        buf.extend_from_slice(chunk.as_deref().unwrap_or(&[]));
+        mask_all(&mut buf, key);
+        if !end_of_stream {
+            let keep = (key.len() - 1).min(buf.len());
+            self.carry = buf.split_off(buf.len() - keep);
+        }
+        Some(Bytes::from(buf))
+    }
+}
+
+/// Overwrite every occurrence of `key` in `buf` with [`REDACTED`], padded to `key`'s length.
+/// Returns whether there was one.
+fn mask_all(buf: &mut [u8], key: &[u8]) -> bool {
+    let finder = memchr::memmem::Finder::new(key);
+    let mut at = 0;
+    let mut found = false;
+    while let Some(i) = finder.find(&buf[at..]) {
+        let hit = &mut buf[at + i..at + i + key.len()];
+        for (j, b) in hit.iter_mut().enumerate() {
+            *b = REDACTED.get(j).copied().unwrap_or(b'*');
+        }
+        at += i + key.len();
+        found = true;
+    }
+    found
 }
 
 /// How far a request got toward a provider: what its billing row may claim about who was called.
@@ -1453,15 +1509,83 @@ fn retain_managed_client_headers(req: &mut pingora::http::RequestHeader) -> Resu
     Ok(())
 }
 
-/// Extract query-param `name`'s value from a raw query string (`k=v&k2=v2`). Used only for Google
-/// Gemini's `?key=` convention — the sole query-param credential shape among recognized providers.
-/// No percent-decoding: a real API key is alphanumeric, so a plain split is exact, and decoding would
-/// let a crafted query smuggle characters past the literal `name=` match.
-fn query_param<'a>(query: &'a str, name: &str) -> Option<&'a str> {
-    query.split('&').find_map(|pair| {
-        let (k, v) = pair.split_once('=')?;
-        (k == name).then_some(v)
-    })
+/// Drop every `x-beyond-*` header from a request about to go upstream (D67). Allocates only when
+/// there is one to drop.
+fn strip_beyond_headers(req: &mut pingora::http::RequestHeader) {
+    let ours: Vec<http::HeaderName> = req
+        .headers
+        .keys()
+        .filter(|k| k.as_str().starts_with("x-beyond-"))
+        .cloned()
+        .collect();
+    for name in &ours {
+        req.remove_header(name);
+    }
+}
+
+/// `s` with its `%XX` escapes decoded, borrowed when it has none. A malformed escape is kept as
+/// written. Used only to *recognize* a credential the way a provider would read it (Google decodes
+/// `k%65y` as `key`), never to rebuild what is forwarded.
+fn percent_decoded(s: &str) -> Cow<'_, str> {
+    if !s.contains('%') {
+        return Cow::Borrowed(s);
+    }
+    let hex = |b: u8| char::from(b).to_digit(16);
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && let (Some(h), Some(l)) = (
+                bytes.get(i + 1).copied().and_then(hex),
+                bytes.get(i + 2).copied().and_then(hex),
+            )
+        {
+            out.push(u8::try_from(h * 16 + l).unwrap_or(b'%'));
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    Cow::Owned(String::from_utf8_lossy(&out).into_owned())
+}
+
+/// Whether a raw query pair (`k=v`) names the `key` credential param, under any spelling a provider
+/// decodes to `key` (`k%65y`).
+fn is_key_param(pair: &str) -> bool {
+    let name = pair.split_once('=').map_or(pair, |(k, _)| k);
+    name == "key" || percent_decoded(name) == "key"
+}
+
+/// Every `key` query param's raw value, in order (Gemini's `?key=` convention — the sole
+/// query-param credential shape among recognized providers).
+fn key_params(query: &str) -> impl Iterator<Item = &str> {
+    query
+        .split('&')
+        .filter(|p| is_key_param(p))
+        .map(|p| p.split_once('=').map_or("", |(_, v)| v))
+}
+
+/// The token of one `Authorization` value: `Bearer <token>`, scheme matched case-insensitively and
+/// any run of whitespace around the token tolerated (a lenient provider trims it). `None` for any
+/// other scheme.
+fn bearer_token(v: &str) -> Option<&str> {
+    let v = v.trim();
+    let scheme = v.get(..6)?;
+    let rest = &v[6..];
+    (scheme.eq_ignore_ascii_case("bearer") && rest.starts_with(|c: char| c.is_ascii_whitespace()))
+        .then(|| rest.trim_start())
+}
+
+/// The key a request presents, and whether it is managed.
+#[derive(Debug, PartialEq, Eq)]
+struct Presented<'a> {
+    /// The value to verify (managed) or to rate-guard as a BYO token. Borrowed from the request.
+    key: &'a str,
+    /// Some credential location carries a virtual key (`bai_v1…`/`bai_v2…`). The request is then
+    /// managed whatever the others hold: verified (fail-closed, 401) and every location stripped.
+    managed: bool,
 }
 
 /// Extract the presented key (virtual or BYO) from wherever the client's SDK puts it. Every
@@ -1471,52 +1595,72 @@ fn query_param<'a>(query: &'a str, name: &str) -> Option<&'a str> {
 /// OpenAI's `Authorization: Bearer` (scheme matched case-insensitively). Borrowed from the request —
 /// no per-request copy. Empty values count as absent.
 ///
-/// **A managed key anywhere wins.** When the locations disagree — junk in `x-api-key` beside
-/// `Bearer bai_v1…`, say — the request is managed, and `upstream_request_filter` then strips every
-/// credential location. Taking the first location instead classified that request as BYO, which
-/// forwards headers untouched and so sent the virtual key to the provider. Otherwise the first
-/// location in the order above wins; the query param is last since keys in a URL end up in
-/// proxy/access logs.
-fn extract_virtual_key(req: &pingora::http::RequestHeader) -> Option<&str> {
+/// **A managed key anywhere wins** (D29, D65). Every value of every location is read: each line of a
+/// repeated header, each `key` param (including a percent-encoded name such as `k%65y`, and a
+/// percent-encoded value), and a `Bearer` with extra whitespace. When any of them carries a virtual
+/// key the request is managed, and `upstream_request_filter` / `strip_key_param` strip every
+/// location. Reading only the first value of each let a junk first line, a second `?key=`, an
+/// encoded name or a double space classify the request as BYO, which forwards it untouched — the
+/// virtual key included. Otherwise the first location in the order above wins; the query param is
+/// last since keys in a URL end up in proxy/access logs.
+///
+/// A value that is managed only once percent-decoded is returned as written: it fails verification
+/// (401), which is the right answer for a key no SDK would encode.
+fn extract_virtual_key(req: &pingora::http::RequestHeader) -> Option<Presented<'_>> {
     let headers = STATIC_KEY_HEADERS
         .iter()
-        .filter_map(|h| req.headers.get(*h).and_then(|v| v.to_str().ok()));
-    let bearer = req
+        .flat_map(|h| req.headers.get_all(*h))
+        .filter_map(|v| v.to_str().ok())
+        .map(|v| (v.trim(), false));
+    // A scheme-less `Authorization: bai_v1…` is no credential a provider reads, but it is one the
+    // gateway must not forward on a BYO request: it counts as managed, never as the BYO key.
+    let auth = req
         .headers
-        .get("authorization")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| {
-            v.get(..7)
-                .filter(|s| s.eq_ignore_ascii_case("bearer "))
-                .map(|_| &v[7..])
+        .get_all("authorization")
+        .into_iter()
+        .filter_map(|v| v.to_str().ok())
+        .filter_map(|v| match bearer_token(v) {
+            Some(t) => Some((t, false)),
+            None => key::is_managed_prefix(v.trim()).then(|| (v.trim(), true)),
         });
-    let query = req.uri.query().and_then(|q| query_param(q, "key"));
+    let query = req
+        .uri
+        .query()
+        .into_iter()
+        .flat_map(key_params)
+        .map(|v| (v, key::is_managed_prefix(&percent_decoded(v))));
     let mut first = None;
-    for v in headers.chain(bearer).chain(query) {
+    for (v, decoded_managed) in headers.chain(auth).chain(query) {
         if v.is_empty() {
             continue;
         }
-        if key::is_managed_prefix(v) {
-            return Some(v);
+        if decoded_managed || key::is_managed_prefix(v) {
+            return Some(Presented {
+                key: v,
+                managed: true,
+            });
         }
         first = first.or(Some(v));
     }
-    first
+    first.map(|key| Presented {
+        key,
+        managed: false,
+    })
 }
 
 /// `path_and_query` without its `key` query params, or `None` when it carries none. Other params
 /// (Azure's `api-version`) keep their order. Managed requests only: a `?key=` there is the virtual
-/// key, which must not reach the provider, while a BYO `?key=` is the caller's own Gemini key.
+/// key, which must not reach the provider, while a BYO `?key=` is the caller's own Gemini key. Every
+/// spelling a provider decodes to `key` is dropped (`k%65y`), and every repeat of it.
 fn strip_key_param(path_and_query: &str) -> Option<String> {
     let (path, query) = path_and_query.split_once('?')?;
-    let is_key = |pair: &&str| pair.split_once('=').map_or(*pair, |(k, _)| k) == "key";
-    if !query.split('&').any(|p| is_key(&p)) {
+    if !query.split('&').any(is_key_param) {
         return None;
     }
     let mut out = String::with_capacity(path_and_query.len());
     out.push_str(path);
     let mut sep = '?';
-    for pair in query.split('&').filter(|p| !is_key(p)) {
+    for pair in query.split('&').filter(|p| !is_key_param(p)) {
         out.push(sep);
         out.push_str(pair);
         sep = '&';
@@ -2746,7 +2890,11 @@ impl ProxyHttp for AiProxy {
         }
 
         // 2. Extract the presented key — a managed virtual key (`bai_v1…`) or a raw BYO provider token.
-        let Some(raw_key) = extract_virtual_key(session.req_header()) else {
+        let Some(Presented {
+            key: raw_key,
+            managed: managed_key,
+        }) = extract_virtual_key(session.req_header())
+        else {
             return Self::reject_boxed(
                 session,
                 &request_id,
@@ -2767,7 +2915,7 @@ impl ProxyHttp for AiProxy {
         // over-limit path (where `raw_key` is unused afterward).
         if full_body.is_none()
             && let Some(rl) = &self.state.rate_limit
-            && let Some(reason) = rl.check_at(raw_key, key::is_managed_prefix(raw_key), start)
+            && let Some(reason) = rl.check_at(raw_key, managed_key, start)
         {
             self.state.metrics.rejection(reason.into()).inc();
             return Self::reject_boxed(
@@ -2806,7 +2954,7 @@ impl ProxyHttp for AiProxy {
         // allowance, and no per-tenant attribution). A public listener without this split would
         // forward a forged virtual key as BYO — junk-auth egress, and the rate guard already
         // exempted it from the BYO aggregate.
-        let (tenant_id, vpc_id, key_id, managed) = if key::is_managed_prefix(raw_key) {
+        let (tenant_id, vpc_id, key_id, managed) = if managed_key {
             let Ok(identity) = self.state.keyring.verify(raw_key) else {
                 self.state.metrics.rejection(Rejection::Auth).inc();
                 return Self::reject_boxed(
@@ -3566,6 +3714,7 @@ impl ProxyHttp for AiProxy {
                     input_tally: usage::InputTally::default(),
                     resp_bytes: 0,
                     upstream_phase: UpstreamPhase::None,
+                    redact: None,
                 });
                 ctx.held.admit();
                 return Ok(true);
@@ -3650,6 +3799,8 @@ impl ProxyHttp for AiProxy {
         // ledger existed, so recording is unchanged for the provider-routed path. The model-routed
         // path starts owing nothing and takes on its first permit in `upstream_peer`.
         let breaker_pending = model_route.is_none() && provider.breaker.is_some();
+        // Past any key cooling off from a 401/403 (D71); a catalog walk picks per candidate.
+        let pool_key = provider.first_key();
         if tenant_slot {
             ctx.held.tenant = Some(tenant_id);
         }
@@ -3701,7 +3852,7 @@ impl ProxyHttp for AiProxy {
             upstream_status: None,
             start,
             attempt: 0,
-            pool_key: 0,
+            pool_key,
             same_provider_retry: false,
             relay_abandoned: false,
             breaker_pending,
@@ -3732,6 +3883,7 @@ impl ProxyHttp for AiProxy {
             input_tally: usage::InputTally::default(),
             resp_bytes: 0,
             upstream_phase: UpstreamPhase::None,
+            redact: None,
         });
         // Admitted: count it in-flight. Released in `logging`, or by `Ctx`'s drop if a panic
         // skipped `logging`, so the gauge cannot leak. `active_streams` only covers SSE; this
@@ -3873,13 +4025,13 @@ impl ProxyHttp for AiProxy {
                 }
                 // A permit (if this breaker has one to give) is now outstanding against `p`.
                 rc.breaker_pending = p.breaker.is_some();
-                // New vendor ⇒ that vendor's first key. Never carry provider A's index (or secret)
-                // onto provider B. A re-run of a large body resumes the key walk an earlier attempt
-                // started on this candidate (see `FullBody`).
+                // New vendor ⇒ that vendor's first key not cooling off (D71). Never carry provider
+                // A's index (or secret) onto provider B. A re-run of a large body resumes the key
+                // walk an earlier attempt started on this candidate (see `FullBody`).
                 rc.pool_key = full_body_ctx(session)
                     .zip(rc.auto.as_ref().and_then(|a| a.walk.catalog_index(i)))
                     .and_then(|(fb, orig)| fb.keys.get(usize::from(orig)).copied())
-                    .unwrap_or(0);
+                    .unwrap_or_else(|| p.first_key());
                 rc.provider = p.clone();
                 apply_serving_candidate(rc);
                 // A new candidate starts at its first address.
@@ -3975,9 +4127,13 @@ impl ProxyHttp for AiProxy {
     ///
     /// Two distinct retries, never mixed:
     ///
-    /// - **Managed 429 → next unused key, same provider.** A 429 is a healthy provider throttling
-    ///   *that credential*, not a vendor outage. Walks `/{provider}` and `/auto`. BYO does not
-    ///   walk. The last 429 is relayed, `Retry-After` included. Counted on `ai_key_walks_total`.
+    /// - **Managed 429, 401 or 403 → next unused key, same provider.** A 429 is a healthy provider
+    ///   throttling *that credential*, not a vendor outage; a 401/403 is that credential revoked or
+    ///   not entitled (D71), which also cools the key off for later requests
+    ///   (`Provider::mark_key_bad`, counted on `ai_key_auth_failures_total`). Walks `/{provider}`
+    ///   and `/auto`. BYO does not walk. The last 429 is relayed, `Retry-After` included; the last
+    ///   key's 401/403 is relayed on a provider route and is a candidate failure on a catalog walk.
+    ///   Counted on `ai_key_walks_total`.
     /// - **Model-routed 5xx → next candidate.** A provider-routed request named its provider; there
     ///   is nowhere else to go. A 429 is *not* a vendor failover — re-asking a different vendor
     ///   would convert a self-healing throttle into spend somewhere else. Counted on
@@ -3997,9 +4153,20 @@ impl ProxyHttp for AiProxy {
         };
         let status = upstream_response.status.as_u16();
 
-        // Managed 429: walk the next unused key on *this* provider. Not a vendor failover (those
-        // rules stay — `/auto` 5xx owns that) and not a breaker failure (429 is still success).
-        if rc.managed && status == 429 {
+        // Managed 401/403: this pool key is revoked or not entitled (D71). Never the caller's
+        // fault. Cool it off so later requests start on a good key, then walk like a 429.
+        let key_auth = rc.managed && matches!(status, 401 | 403);
+        if key_auth {
+            self.state.metrics.key_auth_failures_total.inc();
+            rc.provider.mark_key_bad(rc.pool_key);
+        }
+
+        // Managed 429, 401 or 403: walk the next unused key on *this* provider. Not a vendor
+        // failover (those rules stay — `/auto` 5xx owns that, and a 401/403 on the last key falls
+        // through to it below) and not a breaker failure (the provider answered). A 401/403 is the
+        // provider refusing the credential before it processed anything, so resending the body
+        // under the next key is as safe as after a 429.
+        if rc.managed && (status == 429 || key_auth) {
             let next = usize::from(rc.pool_key).saturating_add(1);
             if next < rc.provider.pool_auth.len()
                 && let Ok(next) = u8::try_from(next)
@@ -4010,7 +4177,8 @@ impl ProxyHttp for AiProxy {
                         request_id = %rc.request_id,
                         provider = rc.provider.name.as_str(),
                         key = rc.pool_key,
-                        "upstream returned 429; trying the next pool key",
+                        status,
+                        "upstream returned {status}; trying the next pool key",
                     );
                     rc.pool_key = next;
                     rc.same_provider_retry = true;
@@ -4025,13 +4193,14 @@ impl ProxyHttp for AiProxy {
                         .as_ref()
                         .and_then(|a| a.walk.catalog_index(a.candidate))
                 {
-                    // The parent holds the body: it drops this 429 and re-runs on the next key.
+                    // The parent holds the body: it drops this response and re-runs on the next key.
                     self.state.metrics.key_walks_total.inc();
                     warn!(
                         request_id = %rc.request_id,
                         provider = rc.provider.name.as_str(),
                         key = rc.pool_key,
-                        "upstream returned 429; re-running the full body on the next pool key",
+                        status,
+                        "upstream returned {status}; re-running the full body on the next pool key",
                     );
                     rc.relay_abandoned = fb.record(RelayRetry::Key {
                         candidate: orig,
@@ -4044,11 +4213,14 @@ impl ProxyHttp for AiProxy {
                     provider = rc.provider.name.as_str(),
                     status,
                     body_done = session.as_mut().is_body_done(),
-                    "upstream returned 429 but the request body is not provably replayable; relaying",
+                    "upstream returned {status} but the request body is not provably replayable; not walking keys",
                 );
             }
-            // Last key, or unreplayable: relay this 429, Retry-After included.
-            return Ok(());
+            // Last key, or unreplayable: relay this 429, Retry-After included. A 401/403 goes on to
+            // the catalog walk's key-failure rule (next candidate), or is relayed.
+            if status == 429 {
+                return Ok(());
+            }
         }
 
         let Some((usable, at)) = rc.auto.as_ref().map(|a| (a.usable, a.candidate)) else {
@@ -4200,20 +4372,14 @@ impl ProxyHttp for AiProxy {
             }
         }
 
-        // The routing header is ours, not the provider's. Stripped on every attempt (pingora rebuilds
-        // this header from the downstream request each time, so it reappears each time).
-        if rc.auto.is_some() {
-            upstream_request.remove_header(route::MODEL_HEADER);
-        }
-
-        // Strip our own control headers. They're Beyond's namespace, meaningless to a provider, and
-        // a provider that rejects unknown headers would turn an observability opt-in into their 400.
-        // Unconditional rather than gated on `rc.control`: the parse is managed-only, so a BYO
-        // request that sent one was never read — but it must not be forwarded either, and a request
-        // whose header was *malformed* has `rc.control == None` while the header is still on the wire.
-        for header in control::CONTROL_HEADERS {
-            upstream_request.remove_header(header);
-        }
+        // `x-beyond-*` is Beyond's namespace: the routing header, the control headers, and any name
+        // the gateway does not (yet) define. None of it reaches a provider, on any route, managed or
+        // BYO (D67) — a provider that rejects unknown headers would turn an opt-in into their 400,
+        // and a header the gateway adds later must not have leaked from old clients first. A sweep
+        // by prefix rather than a list of names, so a new header cannot be forgotten here. Runs on
+        // every attempt (pingora rebuilds the head from the downstream request each time), and
+        // before anything below adds a header of its own. Allocates only when one is present.
+        strip_beyond_headers(upstream_request);
 
         // Point Host at the upstream. Same precomputed-value trick as the pool key above.
         match &rc.provider.host_header {
@@ -4286,6 +4452,17 @@ impl ProxyHttp for AiProxy {
         if let Some(forward_path) = &rc.forward_path
             && let Ok(uri) = forward_path.parse()
         {
+            upstream_request.set_uri(uri);
+        } else if rc.managed
+            && let Some(stripped) = upstream_request
+                .uri
+                .path_and_query()
+                .and_then(|pq| strip_key_param(pq.as_str()))
+            && let Ok(uri) = stripped.parse()
+        {
+            // The inbound path goes out as-is, and on a managed request its `key` params are the
+            // virtual key: `request_filter` strips them from a built `forward_path`, this from the
+            // path nobody rebuilt.
             upstream_request.set_uri(uri);
         }
 
@@ -4602,6 +4779,35 @@ impl ProxyHttp for AiProxy {
                 upstream_response.remove_header(name);
             }
 
+            // The pool key never reaches the client (D66). A provider, or anything between us and
+            // it, that echoes the credential it was sent would otherwise hand Beyond's key to a
+            // tenant: any header carrying it is dropped, and an error body (>= 400, where an echo
+            // lives: "Incorrect API key provided: …") is scrubbed as it streams (`Redact`). A 2xx
+            // body is an answer and is not scanned; a streamed answer would pay for it per chunk.
+            rc.redact = None;
+            if rc.managed
+                && let Some(key) = rc
+                    .provider
+                    .pool_auth
+                    .get(usize::from(rc.pool_key))
+                    .map(|a| a.key().as_bytes())
+                    .filter(|k| !k.is_empty())
+            {
+                let finder = memchr::memmem::Finder::new(key);
+                let echoed: Vec<http::HeaderName> = upstream_response
+                    .headers
+                    .iter()
+                    .filter(|(_, v)| finder.find(v.as_bytes()).is_some())
+                    .map(|(k, _)| k.clone())
+                    .collect();
+                for name in &echoed {
+                    upstream_response.remove_header(name);
+                }
+                if status >= 400 {
+                    rc.redact = Some(Box::default());
+                }
+            }
+
             // Echo the request id so a client (or an oncall reading a captured response) can quote it
             // and land on this request's log line. `insert_header` only fails on an invalid value;
             // our id is `[0-9a-f-]`, always valid — but surface a failure rather than silently drop.
@@ -4670,6 +4876,16 @@ impl ProxyHttp for AiProxy {
             return Ok(None);
         };
         self.state.fault_point("response_body_filter");
+        // First, so nothing downstream — translation, capture, the cache, the usage tail — ever
+        // holds the pool key (D66).
+        if let Some(r) = rc.redact.as_mut() {
+            let key = rc
+                .provider
+                .pool_auth
+                .get(usize::from(rc.pool_key))
+                .map_or(&[][..], |a| a.key().as_bytes());
+            *body = r.feed(key, body.take(), end_of_stream);
+        }
         let chunk = body.as_deref().unwrap_or(&[]);
         // A catalog walk's 2xx waits here for its health verdict (see `response_filter`): the
         // first event or JSON key says whether the 200 carries an answer or an error. Bounded, and
@@ -5605,6 +5821,7 @@ mod tests {
             input_tally: usage::InputTally::default(),
             resp_bytes: 0,
             upstream_phase: UpstreamPhase::None,
+            redact: None,
         }
     }
 
@@ -5743,8 +5960,8 @@ mod tests {
     fn request_ctx_stays_small_enough_to_be_cheap_per_chunk() {
         let size = std::mem::size_of::<RequestCtx>();
         assert!(
-            size <= 416,
-            "RequestCtx grew to {size} bytes (ceiling 416). It is touched once per response chunk \
+            size <= 424,
+            "RequestCtx grew to {size} bytes (ceiling 424). It is touched once per response chunk \
              on a stream — if the new state is only needed on one route, box it the way \
              `ModelRouting` is rather than paying for it on every request.",
         );
@@ -5939,7 +6156,7 @@ mod tests {
     #[test]
     fn extract_virtual_key_recognizes_anthropic_x_api_key() {
         let req = req_with_headers("/v1/messages", &[("x-api-key", "sk-ant-key")]);
-        assert_eq!(extract_virtual_key(&req), Some("sk-ant-key"));
+        assert_eq!(extract_virtual_key(&req).map(|p| p.key), Some("sk-ant-key"));
     }
 
     #[test]
@@ -5948,7 +6165,10 @@ mod tests {
             "/v1/chat/completions",
             &[("authorization", "Bearer sk-openai-key")],
         );
-        assert_eq!(extract_virtual_key(&req), Some("sk-openai-key"));
+        assert_eq!(
+            extract_virtual_key(&req).map(|p| p.key),
+            Some("sk-openai-key")
+        );
     }
 
     #[test]
@@ -5956,7 +6176,10 @@ mod tests {
         // Task #31: Azure OpenAI authenticates via the bare `api-key` header (no `Bearer` prefix, no
         // OAuth). Before this fix, a client presenting only this header got a 401.
         let req = req_with_headers("/v1/responses", &[("api-key", "azure-secret")]);
-        assert_eq!(extract_virtual_key(&req), Some("azure-secret"));
+        assert_eq!(
+            extract_virtual_key(&req).map(|p| p.key),
+            Some("azure-secret")
+        );
     }
 
     #[test]
@@ -5966,7 +6189,10 @@ mod tests {
             "/v1beta/models/gemini-2.5-pro:generateContent",
             &[("x-goog-api-key", "goog-secret")],
         );
-        assert_eq!(extract_virtual_key(&req), Some("goog-secret"));
+        assert_eq!(
+            extract_virtual_key(&req).map(|p| p.key),
+            Some("goog-secret")
+        );
     }
 
     #[test]
@@ -5976,7 +6202,10 @@ mod tests {
             "/v1beta/models/gemini-2.5-pro:generateContent?key=goog-query-secret",
             &[],
         );
-        assert_eq!(extract_virtual_key(&req), Some("goog-query-secret"));
+        assert_eq!(
+            extract_virtual_key(&req).map(|p| p.key),
+            Some("goog-query-secret")
+        );
     }
 
     #[test]
@@ -5986,7 +6215,10 @@ mod tests {
             "/v1beta/models/gemini-2.5-pro:generateContent?key=query-secret",
             &[("x-goog-api-key", "header-secret")],
         );
-        assert_eq!(extract_virtual_key(&req), Some("header-secret"));
+        assert_eq!(
+            extract_virtual_key(&req).map(|p| p.key),
+            Some("header-secret")
+        );
     }
 
     /// claim: SEC-11
@@ -6010,25 +6242,29 @@ mod tests {
             ][..],
         ] {
             let req = req_with_headers("/openai/v1/chat/completions", headers);
-            assert_eq!(extract_virtual_key(&req), Some(VK), "{headers:?}");
+            assert_eq!(
+                extract_virtual_key(&req).map(|p| p.key),
+                Some(VK),
+                "{headers:?}"
+            );
         }
         let req = req_with_headers(
             "/openai/v1/chat/completions?key=bai_v1.1.payload.sig",
             &[("authorization", "Bearer sk-byo")],
         );
-        assert_eq!(extract_virtual_key(&req), Some(VK));
+        assert_eq!(extract_virtual_key(&req).map(|p| p.key), Some(VK));
         // No managed key anywhere: the first non-empty location, as before.
         let req = req_with_headers(
             "/v1/chat/completions",
             &[("x-api-key", ""), ("authorization", "Bearer sk-byo")],
         );
-        assert_eq!(extract_virtual_key(&req), Some("sk-byo"));
+        assert_eq!(extract_virtual_key(&req).map(|p| p.key), Some("sk-byo"));
     }
 
     #[test]
     fn extract_virtual_key_returns_none_when_absent() {
         let req = req_with_headers("/v1/chat/completions", &[]);
-        assert_eq!(extract_virtual_key(&req), None);
+        assert_eq!(extract_virtual_key(&req).map(|p| p.key), None);
     }
 
     #[test]
@@ -6104,11 +6340,106 @@ mod tests {
     }
 
     #[test]
-    fn query_param_finds_key_among_multiple_params() {
-        assert_eq!(query_param("a=1&key=abc123&b=2", "key"), Some("abc123"));
-        assert_eq!(query_param("key=solo", "key"), Some("solo"));
-        assert_eq!(query_param("a=1&b=2", "key"), None);
-        assert_eq!(query_param("", "key"), None);
+    fn key_params_finds_every_key_among_multiple_params() {
+        let all = |q| key_params(q).collect::<Vec<_>>();
+        assert_eq!(all("a=1&key=abc123&b=2"), ["abc123"]);
+        assert_eq!(all("key=solo"), ["solo"]);
+        assert_eq!(
+            all("key=junk&k%65y=two&%6B%65%79=three"),
+            ["junk", "two", "three"]
+        );
+        assert!(all("a=1&b=2&keys=3&monkey=4").is_empty());
+        assert!(all("").is_empty());
+    }
+
+    /// The pool key is scrubbed wherever it falls in a streamed body — inside one chunk, split
+    /// across two, repeated — and the body keeps its length (so its `Content-Length`).
+    /// claim: SEC-7
+    #[test]
+    fn redact_scrubs_a_key_split_across_chunks_and_keeps_the_length() {
+        let key = b"sk-pool-secret-0123456789";
+        let body = format!(
+            r#"{{"error":{{"message":"bad key {k} (again: {k})","note":"{k}"}}}}"#,
+            k = std::str::from_utf8(key).unwrap()
+        );
+        for split in [1, 7, 20, 30, 47, body.len() - 1] {
+            for step in [1, 3, 64] {
+                let mut r = Redact::default();
+                let mut out = Vec::new();
+                let (head, tail) = body.as_bytes().split_at(split);
+                let mut chunks: Vec<&[u8]> = head.chunks(step).collect();
+                chunks.push(tail);
+                for c in chunks {
+                    let got = r.feed(key, Some(Bytes::copy_from_slice(c)), false);
+                    out.extend_from_slice(got.as_deref().unwrap_or(&[]));
+                }
+                out.extend_from_slice(&r.feed(key, None, true).unwrap());
+                let text = String::from_utf8(out).unwrap();
+                assert_eq!(text.len(), body.len(), "{split}/{step}");
+                assert!(!text.contains("sk-pool-secret"), "{split}/{step}: {text}");
+                assert_eq!(text.matches("[redacted]").count(), 3, "{text}");
+            }
+        }
+        // A key shorter than the marker is masked with a truncated marker.
+        let mut buf = *b"x=abc;";
+        assert!(mask_all(&mut buf, b"abc"));
+        assert_eq!(&buf, b"x=[re;");
+    }
+
+    /// Every spelling of a credential location is read, and a virtual key in any of them makes the
+    /// request managed: a repeated header whose first line is junk, a second `?key=`, an encoded
+    /// `key` name or value, extra whitespace after `Bearer`, a scheme-less virtual key.
+    /// claim: SEC-3, SEC-11
+    #[test]
+    fn a_managed_key_in_any_spelling_makes_the_request_managed() {
+        const VK: &str = "bai_v1.1.payload.sig";
+        let build = |path: &str, headers: &[(&'static str, &str)]| {
+            let mut req =
+                pingora::http::RequestHeader::build(http::Method::POST, path.as_bytes(), None)
+                    .unwrap();
+            for (k, v) in headers {
+                req.append_header(*k, *v).unwrap();
+            }
+            req
+        };
+        let cases: [(&str, &[(&'static str, &str)]); 7] = [
+            ("/x?key=junk&key=bai_v1.1.payload.sig", &[]),
+            (
+                "/x?k%65y=bai_v1.1.payload.sig",
+                &[("authorization", "Bearer sk-byo")],
+            ),
+            ("/x", &[("x-api-key", "junk"), ("x-api-key", VK)]),
+            ("/x", &[("authorization", "Bearer  bai_v1.1.payload.sig")]),
+            ("/x", &[("authorization", "Bearer	bai_v1.1.payload.sig ")]),
+            (
+                "/x",
+                &[("authorization", "Bearer sk-byo"), ("authorization", VK)],
+            ),
+            ("/x", &[("api-key", "sk-real"), ("api-key", VK)]),
+        ];
+        for (path, headers) in cases {
+            let req = build(path, headers);
+            let p = extract_virtual_key(&req).unwrap();
+            assert!(p.managed, "{path} {headers:?}");
+            assert_eq!(p.key, VK, "{path} {headers:?}");
+        }
+        // Managed only once decoded: managed (so stripped, never forwarded), and the encoded
+        // value fails verification.
+        let req = build("/x?key=%62ai_v1.1.payload.sig", &[]);
+        assert!(extract_virtual_key(&req).unwrap().managed);
+        // A BYO key in a lenient spelling is still the BYO key.
+        let req = build("/x", &[("authorization", "bearer   sk-byo")]);
+        assert_eq!(
+            extract_virtual_key(&req),
+            Some(Presented {
+                key: "sk-byo",
+                managed: false
+            })
+        );
+        assert_eq!(
+            strip_key_param("/x?k%65y=a&b=1&%6b%65%79=c&key=d").as_deref(),
+            Some("/x?b=1")
+        );
     }
 
     #[test]

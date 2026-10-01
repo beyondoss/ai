@@ -196,12 +196,16 @@ pub struct Metrics {
     /// that answers "is failover actually firing, and how often". The per-provider
     /// `connect_retries_total` still fires alongside it, labelled with the candidate we left.
     pub candidate_failovers_total: IntCounter,
-    /// Managed requests that retried the same provider with the next unused pool key after a 429.
+    /// Managed requests that retried the same provider with the next unused pool key after a 429, 401 or 403.
     ///
     /// Deliberately *not* folded into `candidate_failovers_total`: that counter means "we abandoned
     /// a vendor". This one means "the credential was throttled and another key on the same provider
     /// served" — a 429 is not a vendor outage.
     pub key_walks_total: IntCounter,
+    /// Managed responses where a pool key drew a 401/403 (revoked, invalid, not entitled). Each one
+    /// cools that key off for later requests; the request itself walks to the next key when there
+    /// is one (also counted on `key_walks_total`). Any rate here means a pool key needs replacing.
+    pub key_auth_failures_total: IntCounter,
     /// Catalog walks whose primary came from a live session pin rather than the TTFT rank (see
     /// `smart`'s "Session pins"). Against `ai_requests_total` it is the share of traffic being kept
     /// on its provider's prompt cache; a sudden drop means pins are yielding (failures) or evicting.
@@ -327,7 +331,11 @@ impl Metrics {
         ))?;
         let key_walks_total = IntCounter::with_opts(Opts::new(
             "ai_key_walks_total",
-            "Managed requests that retried the same provider with the next unused pool key after a 429",
+            "Managed requests that retried the same provider with the next unused pool key after a 429, 401 or 403",
+        ))?;
+        let key_auth_failures_total = IntCounter::with_opts(Opts::new(
+            "ai_key_auth_failures_total",
+            "Managed responses where a pool key drew a 401 or 403; the key is cooled off for later requests",
         ))?;
         let full_body_relays_total = IntCounter::with_opts(Opts::new(
             "ai_full_body_relays_total",
@@ -475,6 +483,7 @@ impl Metrics {
         r.register(Box::new(requests_total.clone()))?;
         r.register(Box::new(candidate_failovers_total.clone()))?;
         r.register(Box::new(key_walks_total.clone()))?;
+        r.register(Box::new(key_auth_failures_total.clone()))?;
         r.register(Box::new(session_pinned_total.clone()))?;
         r.register(Box::new(full_body_relays_total.clone()))?;
         r.register(Box::new(model_header_body_mismatch_total.clone()))?;
@@ -509,6 +518,7 @@ impl Metrics {
             requests_total,
             candidate_failovers_total,
             key_walks_total,
+            key_auth_failures_total,
             session_pinned_total,
             full_body_relays_total,
             model_header_body_mismatch_total,

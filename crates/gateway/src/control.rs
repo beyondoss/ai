@@ -79,18 +79,6 @@ static ORDER_NAME: LazyLock<HeaderName> = LazyLock::new(|| HeaderName::from_stat
 static ONLY_NAME: LazyLock<HeaderName> = LazyLock::new(|| HeaderName::from_static(ONLY_HEADER));
 static SPLIT_NAME: LazyLock<HeaderName> = LazyLock::new(|| HeaderName::from_static(SPLIT_HEADER));
 
-/// Every header this module consumes. Stripped in `upstream_request_filter` so a provider never
-/// sees a Beyond control header — they're ours, they'd be meaningless upstream, and a provider that
-/// rejects unknown headers would turn our observability feature into their 400.
-pub const CONTROL_HEADERS: [&str; 6] = [
-    METADATA_HEADER,
-    CAPTURE_HEADER,
-    CACHE_HEADER,
-    ORDER_HEADER,
-    ONLY_HEADER,
-    SPLIT_HEADER,
-];
-
 /// Longest metadata header we'll even attempt to parse. Checked **before** parsing so a caller
 /// can't make us walk a multi-megabyte JSON document on the request path.
 const MAX_METADATA_LEN: usize = 1024;
