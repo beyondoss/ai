@@ -262,8 +262,11 @@ id) is an alias for the row — those are the ids we already rewrite _to_.
 
 The default walk is TTFT-ranked (`smart.rs`): **this process's** EWMA per catalog candidate, measured
 from `attempt_start` the same way `ai_ttft_seconds` is. Cold start (no samples) is the row's static
-order. A connect failure or 5xx takes a penalty floor so a fast error does not outrank a slower 2xx;
-a 429 is a real answer. A candidate whose **latest** attempt failed ranks behind every other
+order. A connect failure, a 5xx, or a managed walk's pool-key failure (401/402/403) takes a penalty
+floor so a fast error does not outrank a slower 2xx; a 429 is a real answer. A 2xx's sample waits
+for the body's first bytes: a `200` whose body is an error object (OpenRouter's error-in-200: a root
+`error` key, or Anthropic's `"type":"error"`) or an SSE stream whose first event is an error counts
+as a failure, not a fast healthy sample (`settle_health`, at most 1 KiB read). A candidate whose **latest** attempt failed ranks behind every other
 candidate — unmeasured ones included — until it answers again or its sample goes stale (30s). That
 is what turns a client's own retry into a failover; see "Status-based failover, and where it stops". Unmeasured arms stay failover until a deterministic probe (every 8th
 request, skipping seq `0`) promotes one. A sample older than 30s is treated as unmeasured so a
@@ -277,8 +280,9 @@ routing. `x-beyond-split` is the only cross-replica pin (hash of the request cou
 Provider prompt caches are per provider, so re-ranking every request moved agent loops between
 Anthropic and Bedrock and re-bought the whole prefix on each move (a Claude cache write is 1.25×
 input against 0.1× for a read), and the every-8th probe landed on whoever drew the seed, usually
-someone mid-session. After a 2xx on a candidate walk, `(tenant_id, vpc_id, key_id)` plus the
-catalog row is pinned to the candidate that served. While the pin is live the walk puts that
+someone mid-session. After a 2xx that carried an answer (not an error-in-200, see above) on a
+candidate walk, `(tenant_id, vpc_id, key_id)` plus the catalog row is pinned to the candidate that
+served. While the pin is live the walk puts that
 candidate first, keeps the rest in EWMA order as failover, and never probes. One virtual key is one
 app, and an app's sessions share their system prompt and tools, so one pin per key per model is
 the grain the provider cache wants. A pin yields when its candidate's latest attempt failed (the
@@ -1501,6 +1505,14 @@ Two deliberate non-cases, plus one same-provider retry:
   upstream sent one. Counted on `ai_key_walks_total`, never on `ai_candidate_failovers_total`.
 - **A `5xx` does not walk keys.** Vendor walk already owns that on `/auto`. Keys stay with their
   provider.
+- **A managed walk's `401` / `403` / `402` is a candidate failure.** It is that candidate's pool key
+  failing (revoked, not entitled, unfunded), not the caller's request, and the next candidate holds
+  a different key, so the walk fails over exactly as on a `5xx` (replayable body, or the `FullBody`
+  re-run). The candidate takes the ranker's failure penalty and is never pinned, so one revoked key
+  cannot black-hole a row by answering fastest. It is **not** a breaker failure: the provider
+  answered, so its permit resolves as a success. When every candidate fails this way, the last
+  candidate's own status is relayed. An OpenAI `429` with `insufficient_quota` in its body is not
+  detected (the walk decides on the response head) and stays a key walk.
 - **When every candidate 5xxes, the client gets the last provider's own status**, not a synthetic
   error. Better diagnostics than an exhausted retry loop produces.
 

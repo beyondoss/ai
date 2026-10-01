@@ -70,7 +70,6 @@ fn provider_of(resp: &reqwest::Response) -> String {
 /// claim: REL-4
 /// defect: D10
 #[tokio::test]
-#[ignore = "D10 reproduced: fast 401 primary ranks healthy and fastest; 1/30 callers succeed"]
 async fn a_401_candidate_does_not_black_hole_the_row() {
     let nats_port = unused_nats_port();
     let (pubkey, sk) = test_keypair(1);
@@ -218,7 +217,6 @@ async fn a_stalled_half_open_probe_does_not_wedge_the_provider() {
 /// claim: REL-8
 /// defect: D41
 #[tokio::test]
-#[ignore = "D41 reproduced: 200+error body pins the caller to the failing primary; 0/10 reach fallback"]
 async fn a_200_with_an_error_body_is_not_pinned() {
     let nats_port = unused_nats_port();
     let (pubkey, sk) = test_keypair(1);
@@ -252,7 +250,6 @@ async fn a_200_with_an_error_body_is_not_pinned() {
 /// claim: REL-8
 /// defect: D41
 #[tokio::test]
-#[ignore = "D41 reproduced: SSE error-first 200 pins the caller to the failing primary"]
 async fn a_200_stream_with_an_error_first_event_is_not_pinned() {
     let nats_port = unused_nats_port();
     let (pubkey, sk) = test_keypair(1);
@@ -343,4 +340,43 @@ async fn client_upload_failures_do_not_open_the_breaker() {
     );
     let status = post_byo(&test_client(), &gw.url()).await;
     assert_eq!(status, 200, "the breaker opened on client faults");
+}
+
+/// A pool key failing on every candidate relays the last candidate's own 401, and never opens a
+/// breaker: the providers answered, so the next request still reaches them.
+/// claim: REL-4
+/// defect: D10
+#[tokio::test]
+async fn a_401_on_every_candidate_is_relayed_and_opens_no_breaker() {
+    let nats_port = unused_nats_port();
+    let (pubkey, sk) = test_keypair(1);
+    let primary = MockUpstream::start(Mode::Status(401)).await;
+    let fallback = MockUpstream::start(Mode::Status(403)).await;
+    let gw = Gateway::builder(nats_port, &primary.authority(), &b64(&pubkey))
+        .providers(&["openai", "openrouter"])
+        .provider_authority("openrouter", &fallback.authority())
+        .config_line("circuit_breaker_threshold = 1")
+        .config_line("circuit_breaker_window_secs = 60")
+        .config_line("circuit_breaker_reset_secs = 60")
+        .start()
+        .await;
+    let client = test_client();
+    let first = post_auto(&client, &gw.url(), &vkey(&sk, 77)).await;
+    let status = first.status().as_u16();
+    assert!(
+        status == 401 || status == 403,
+        "the last candidate's own status is relayed, got {status}"
+    );
+    assert_eq!(
+        (primary.hits(), fallback.hits()),
+        (1, 1),
+        "the walk tried both candidates"
+    );
+    let second = post_auto(&client, &gw.url(), &vkey(&sk, 78)).await;
+    assert_ne!(
+        second.status().as_u16(),
+        503,
+        "a key failure opened a breaker"
+    );
+    assert_eq!(primary.hits() + fallback.hits(), 4);
 }

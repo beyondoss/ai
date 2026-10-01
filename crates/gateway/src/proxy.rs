@@ -548,6 +548,9 @@ struct ModelRouting {
     /// Inbound endpoint. Always set on a catalog walk so a mixed-row failover can translate
     /// onto the next candidate's path. Same-endpoint attempts skip the mapper (`from == to`).
     translate: Option<translate::TranslateState>,
+    /// A 2xx whose TTFT sample and session pin wait on the body's first bytes (see
+    /// `settle_health`). `None` once settled, and for every non-2xx.
+    health: Option<PendingHealth>,
     /// The walk made at least one upstream attempt (it connected, or tried to). Distinguishes
     /// "every candidate failed" (502) from "every candidate's breaker was open" (503) when the walk
     /// runs out.
@@ -555,6 +558,101 @@ struct ModelRouting {
     /// Seconds until the soonest skipped open breaker admits a request, for the `Retry-After` on
     /// the 503 when every candidate was skipped. `None` while no breaker skipped one.
     open_retry_after: Option<u16>,
+}
+
+/// A 2xx's held-back ranker sample, waiting on the body to say whether it is an answer.
+struct PendingHealth {
+    /// Time to the response head, the sample the ranker gets.
+    elapsed_us: u64,
+    /// The body's first bytes, up to [`HEALTH_PREFIX_CAP`].
+    prefix: Vec<u8>,
+}
+
+impl PendingHealth {
+    fn extend_prefix(&mut self, bytes: &[u8]) {
+        self.prefix.extend_from_slice(bytes);
+    }
+}
+
+/// How much of a 2xx body `settle_health` reads before calling it an answer. An error-in-200 says
+/// so in its first key (`{"error":` / `{"type":"error"`) or its first SSE event.
+const HEALTH_PREFIX_CAP: usize = 1024;
+
+/// A managed catalog walk's status that means this candidate's pool key failed: revoked (401),
+/// not entitled (403), or unfunded (402).
+fn is_pool_key_failure(status: u16) -> bool {
+    matches!(status, 401 | 402 | 403)
+}
+
+/// Whether a 2xx body's first bytes are an error: `Some(true)` an error object, `Some(false)` an
+/// answer, `None` not decidable yet. Non-streaming: the root object's first key is `error`, or a
+/// first key `type` whose value is `"error"` (Anthropic's shape). Streaming: an `event: error`
+/// line, or a first `data:` event whose payload is such an object.
+fn body_reports_error(prefix: &[u8], streaming: bool) -> Option<bool> {
+    if !streaming {
+        return json_is_error_object(prefix);
+    }
+    let mut rest = prefix;
+    loop {
+        let (line, tail, complete) = match memchr::memchr(b'\n', rest) {
+            Some(i) => (&rest[..i], &rest[i + 1..], true),
+            None => (rest, &rest[rest.len()..], false),
+        };
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        if let Some(event) = line.strip_prefix(b"event:") {
+            if !complete {
+                return None;
+            }
+            if event.trim_ascii() == b"error" {
+                return Some(true);
+            }
+        } else if let Some(data) = line.strip_prefix(b"data:") {
+            let data = data.trim_ascii_start();
+            if data.starts_with(b"[DONE]") {
+                return Some(false);
+            }
+            return match json_is_error_object(data) {
+                None if complete => Some(false),
+                v => v,
+            };
+        } else if !complete {
+            return None;
+        }
+        // A blank line, a comment (`: keepalive`), or an `id:`/`retry:` field: keep looking.
+        rest = tail;
+    }
+}
+
+/// [`body_reports_error`] for one JSON value's leading bytes.
+fn json_is_error_object(bytes: &[u8]) -> Option<bool> {
+    let bytes = bytes.trim_ascii_start();
+    let Some(rest) = bytes.strip_prefix(b"{") else {
+        return if bytes.is_empty() { None } else { Some(false) };
+    };
+    let (key, rest) = json_leading_string(rest.trim_ascii_start())?;
+    match key {
+        b"error" => Some(true),
+        b"type" => {
+            let rest = rest.trim_ascii_start().strip_prefix(b":")?;
+            let (value, _) = json_leading_string(rest.trim_ascii_start())?;
+            Some(value == b"error")
+        }
+        _ => Some(false),
+    }
+}
+
+/// A leading JSON string's raw bytes and what follows it. `None` when it has not ended yet; an
+/// escaped string reads as itself, which matches neither `error` nor `type` (the right answer for
+/// a key spelled oddly enough to need one).
+fn json_leading_string(bytes: &[u8]) -> Option<(&[u8], &[u8])> {
+    let body = bytes.strip_prefix(b"\"")?;
+    let end = memchr::memchr(b'"', body)?;
+    Some((&body[..end], &body[end + 1..]))
+}
+
+/// Microseconds since `start`, saturating.
+fn elapsed_us(start: Instant) -> u64 {
+    start.elapsed().as_micros().min(u128::from(u64::MAX)) as u64
 }
 
 impl ModelRouting {
@@ -1103,6 +1201,30 @@ impl AiProxy {
         .await
     }
 
+    /// Resolve a 2xx's pending health verdict from the first response bytes: feed the TTFT ranker
+    /// the sample it held back, and pin the caller only to an answer, never to an error-in-200.
+    fn settle_health(&self, rc: &mut RequestCtx, chunk: &[u8], end_of_stream: bool) {
+        let streaming = rc.streaming;
+        let Some(a) = rc.auto.as_mut() else { return };
+        let Some(pending) = a.health.as_mut() else {
+            return;
+        };
+        let room = HEALTH_PREFIX_CAP.saturating_sub(pending.prefix.len());
+        pending.extend_prefix(&chunk[..room.min(chunk.len())]);
+        let verdict = match body_reports_error(&pending.prefix, streaming) {
+            Some(error) => error,
+            // Undecidable within the cap, or the body ended first: an answer we cannot fault.
+            None if end_of_stream || pending.prefix.len() >= HEALTH_PREFIX_CAP => false,
+            None => return,
+        };
+        let us = pending.elapsed_us;
+        a.health = None;
+        record_walk_ttft_us(&self.state, rc, us, !verdict);
+        if !verdict {
+            pin_walk(&self.state, rc);
+        }
+    }
+
     /// Replay a cached 2xx. Boxed so its write future is not inlined into `request_filter`.
     async fn reply_cache_hit(
         session: &mut Session,
@@ -1436,6 +1558,11 @@ fn first_usable(usable: u8, from: u8) -> Option<u8> {
 /// walk, or the current walk slot is gone. `ok` is "the provider answered" (including 429); connect
 /// failure and 5xx pass `false`.
 fn record_walk_ttft(state: &GatewayState, rc: &RequestCtx, ok: bool) {
+    record_walk_ttft_us(state, rc, elapsed_us(rc.attempt_start()), ok);
+}
+
+/// [`record_walk_ttft`] with the sample measured earlier (a 2xx's head, settled on its body).
+fn record_walk_ttft_us(state: &GatewayState, rc: &RequestCtx, us: u64, ok: bool) {
     if !state.config.smart_router {
         return;
     }
@@ -1451,11 +1578,6 @@ fn record_walk_ttft(state: &GatewayState, rc: &RequestCtx, ok: bool) {
     let Some(orig) = auto.walk.catalog_index(auto.candidate) else {
         return;
     };
-    let us = rc
-        .attempt_start()
-        .elapsed()
-        .as_micros()
-        .min(u128::from(u64::MAX)) as u64;
     state.smart.observe(auto.route, orig, us, ok);
 }
 
@@ -3205,6 +3327,7 @@ impl ProxyHttp for AiProxy {
                             attempt_start: start,
                             cache: Some(cache::Pending::Hit(hit)),
                             translate: None,
+                            health: None,
                             attempted: false,
                             open_retry_after: None,
                         })
@@ -3369,6 +3492,7 @@ impl ProxyHttp for AiProxy {
                     attempt_start: start,
                     cache: pending_cache,
                     translate: translate_state,
+                    health: None,
                     attempted: false,
                     open_retry_after: None,
                 })
@@ -3692,7 +3816,13 @@ impl ProxyHttp for AiProxy {
         let Some((usable, at)) = rc.auto.as_ref().map(|a| (a.usable, a.candidate)) else {
             return Ok(());
         };
-        if status < 500 {
+        // A managed walk's 401/403/402 is this candidate's pool key failing (revoked, unfunded,
+        // not entitled to the model), not the caller's request: the next candidate holds a
+        // different key, so it is a candidate failure for this request like a 5xx. Unlike a 5xx
+        // it says nothing about the provider's health, so it never opens the breaker (resolved
+        // as a success below).
+        let key_failure = rc.managed && is_pool_key_failure(status);
+        if status < 500 && !key_failure {
             return Ok(());
         }
         if first_usable(usable, at.saturating_add(1)).is_none() {
@@ -3755,12 +3885,19 @@ impl ProxyHttp for AiProxy {
             "upstream returned {status}; trying the next candidate",
         );
         // `response_filter` does not run for an abandoned attempt, so the ranker would never see
-        // this 5xx unless we record it here. Penalty, not the raw elapsed — a 3ms 500 must not beat
-        // a slower 2xx.
+        // this failure unless we record it here. Penalty, not the raw elapsed — a 3ms 500 (or a
+        // 1ms 401) must not beat a slower 2xx.
         record_walk_ttft(&self.state, rc, false);
         // The outgoing candidate's breaker failure is recorded by `upstream_peer`'s prologue, which
         // still sees `breaker_pending` set. A 5xx is a failure by the breaker's own definition, so
-        // that is the right outcome — and recording it here as well would double-count.
+        // that is the right outcome — and recording it here as well would double-count. A key
+        // failure is not one: resolve its permit as the success it is (the provider answered).
+        if key_failure
+            && std::mem::take(&mut rc.breaker_pending)
+            && let Some(b) = rc.provider.breaker.as_ref()
+        {
+            b.record_success();
+        }
         rc.advance_candidate(at);
         let mut e = pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(status));
         e.set_retry(true);
@@ -4152,11 +4289,19 @@ impl ProxyHttp for AiProxy {
                 .ttft_seconds
                 .observe(rc.attempt_start().elapsed().as_secs_f64());
             // An abandoned 429 is a key walk: the ordinary path records no sample for it either.
-            if !(rc.relay_abandoned && status == 429) {
-                record_walk_ttft(&self.state, rc, status < 500);
-            }
+            // A 2xx is not yet known to be healthy: a provider can answer 200 with an error body
+            // (OpenRouter's error-in-200, an SSE stream whose first event is an error), so its
+            // sample and its pin wait for the body's first bytes (`response_body_filter`).
             if (200..300).contains(&status) {
-                pin_walk(&self.state, rc);
+                if let Some(a) = rc.auto.as_mut() {
+                    a.health = Some(PendingHealth {
+                        elapsed_us: elapsed_us(a.attempt_start),
+                        prefix: Vec::new(),
+                    });
+                }
+            } else if !(rc.relay_abandoned && status == 429) {
+                let healthy = status < 500 && !(rc.managed && is_pool_key_failure(status));
+                record_walk_ttft(&self.state, rc, healthy);
             }
             rc.provider.metrics.record_response(status);
             rc.upstream_status = Some(status);
@@ -4272,6 +4417,12 @@ impl ProxyHttp for AiProxy {
         };
         self.state.fault_point("response_body_filter");
         let chunk = body.as_deref().unwrap_or(&[]);
+        // A catalog walk's 2xx waits here for its health verdict (see `response_filter`): the
+        // first event or JSON key says whether the 200 carries an answer or an error. Bounded, and
+        // done after a few hundred bytes.
+        if rc.auto.as_ref().is_some_and(|a| a.health.is_some()) {
+            self.settle_health(rc, chunk, end_of_stream);
+        }
         if !chunk.is_empty() {
             // Tap the provider-reported (resolved/billed) model from the response *head* — the
             // scanner stops at the first root `model`, so this is O(1) and cheap (it finds the model
@@ -5175,6 +5326,44 @@ mod tests {
     /// an `Instant` here without noticing that the cost is paid per chunk on every stream.
     /// `key_id` (identity, every managed request) is why 384 became 416 — do not spend that slack
     /// on route-specific state.
+    #[test]
+    fn a_2xx_body_that_is_an_error_object_is_told_apart_from_an_answer() {
+        // Non-streaming.
+        let json = |b: &str| body_reports_error(b.as_bytes(), false);
+        assert_eq!(
+            json(r#"{"error":{"message":"overloaded","code":502}}"#),
+            Some(true)
+        );
+        assert_eq!(json(r#" { "type" : "error", "error": {}}"#), Some(true));
+        assert_eq!(
+            json(r#"{"id":"chatcmpl-1","object":"chat.completion"}"#),
+            Some(false)
+        );
+        assert_eq!(json(r#"{"type":"message","id":"msg_1"}"#), Some(false));
+        assert_eq!(json(r#"{"err"#), None, "the first key has not ended");
+        assert_eq!(json(""), None);
+        assert_eq!(json("not json"), Some(false));
+        // Streaming: the first data event decides; comments, ids and blank lines are skipped.
+        let sse = |b: &str| body_reports_error(b.as_bytes(), true);
+        assert_eq!(sse("data: {\"error\":{\"message\":\"x\"}}\n\n"), Some(true));
+        assert_eq!(
+            sse("event: error\ndata: {\"type\":\"error\",\"error\":{}}\n\n"),
+            Some(true)
+        );
+        assert_eq!(
+            sse(": OPENROUTER PROCESSING\n\ndata: {\"error\":1}\n\n"),
+            Some(true)
+        );
+        assert_eq!(sse("data: {\"id\":\"c\",\"choices\":[]}\n\n"), Some(false));
+        assert_eq!(
+            sse("event: message_start\ndata: {\"type\":\"message_start\"}\n\n"),
+            Some(false)
+        );
+        assert_eq!(sse("data: [DONE]\n\n"), Some(false));
+        assert_eq!(sse(": keepalive\n"), None, "only a comment so far");
+        assert_eq!(sse("data: {\"err"), None);
+    }
+
     #[test]
     fn request_ctx_stays_small_enough_to_be_cheap_per_chunk() {
         let size = std::mem::size_of::<RequestCtx>();
