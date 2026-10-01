@@ -511,11 +511,11 @@ async fn stock_responses_create_without_store_works_on_a_claude_row() {
 /// while translating: the model answers turn 2 without its own turn 1 (live: Claude, Together,
 /// OpenRouter, Bedrock). The referenced answer must reach the upstream, or the client must be
 /// told (a 4xx naming `item_reference`), never a confident answer to a conversation the model
-/// never saw.
+/// never saw. The gateway stores no customer content, so it refuses: a 400 naming the item and
+/// how to send it in full (`store: false`). The translated response says `store: false` too.
 /// claim: E3
 /// defect: D175
 #[tokio::test]
-#[ignore = "D175 reproduced: an item_reference to a translated answer is dropped on a Claude row"]
 async fn an_item_reference_to_a_translated_answer_is_resolved_or_refused() {
     let nats_port = unused_nats_port();
     let (pubkey, sk) = test_keypair(1);
@@ -535,6 +535,10 @@ async fn an_item_reference_to_a_translated_answer_is_resolved_or_refused() {
     )
     .await;
     let turn1: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(
+        turn1["store"], false,
+        "nothing keeps a translated answer: {turn1}"
+    );
     let message = turn1["output"]
         .as_array()
         .unwrap()
@@ -562,9 +566,10 @@ async fn an_item_reference_to_a_translated_answer_is_resolved_or_refused() {
     let text = resp.text().await.unwrap();
     if (400..500).contains(&status) {
         assert!(
-            text.contains("item_reference"),
-            "a refusal names the item: {text}"
+            text.contains("item_reference") && text.contains("store: false"),
+            "a refusal names the item and the remedy: {text}"
         );
+        assert_eq!(mock.hits(), 1, "turn 2 never reached the upstream");
         return;
     }
     assert_eq!(status, 200, "{text}");

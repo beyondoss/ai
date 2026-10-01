@@ -28,7 +28,7 @@
 //!   back and have no equivalent on the target (`input_audio`, a `file_id` or URL document or
 //!   image, a non-base64 data URI, `n` > 1, `logprobs`, audio output, `stop` onto Responses or a
 //!   model that rejects it, hosted / server / `custom` tools, `mcp_servers`, a Responses `prompt`
-//!   template and `top_logprobs`, a Responses input item with no Chat Completions shape such as `item_reference` or
+//!   template and `top_logprobs`, a Responses input item with no Chat Completions shape such as
 //!   `computer_call_output`; records of a hosted tool the provider ran are dropped). An explicit
 //!   `null` is "not set" and is never forwarded. Translation runs after the request headers went upstream, so the gateway cannot 400
 //!   here; passing the field through gets the provider's 400 naming it, instead of an answer about
@@ -2646,8 +2646,12 @@ fn copy_if(out: &mut Map<String, Value>, v: &Value, key: &str) {
 /// way, never translated with the history dropped). An omitted
 /// (or `null`) `store` is OpenAI's default `true`, so it is session state only where the row has a
 /// Responses arm to keep it (`responses_arm`); elsewhere it is the stock `responses.create()` call,
-/// which translates rather than 400s. Unparseable JSON is `Some("store")` so a catalog walk
-/// fail-closes onto a real Responses arm rather than silently stripping session state.
+/// which translates rather than 400s. An `item_reference` input item is a pointer into the
+/// upstream's store, so it is session state wherever it appears (D175): the Vercel AI SDK sends
+/// one for every earlier assistant answer unless the caller sets `store: false`, and a row with no
+/// Responses arm has nowhere to resolve it (the gateway stores no customer content). Unparseable
+/// JSON is `Some("store")` so a catalog walk fail-closes onto a real Responses arm rather than
+/// silently stripping session state.
 pub fn responses_session_field(body: &[u8], responses_arm: bool) -> Option<&'static str> {
     let Ok(v) = serde_json::from_slice::<Value>(body) else {
         return Some("store");
@@ -2658,10 +2662,38 @@ pub fn responses_session_field(body: &[u8], responses_arm: bool) -> Option<&'sta
     if conversation_set(&v) {
         return Some("conversation");
     }
+    if item_reference_in_input(&v) {
+        return Some("item_reference");
+    }
     match v.get("store") {
         Some(Value::Bool(false)) => None,
         Some(Value::Null) | None => responses_arm.then_some("store"),
         _ => Some("store"),
+    }
+}
+
+/// Whether `input` carries an `item_reference` item (`{"type":"item_reference","id":…}`).
+fn item_reference_in_input(v: &Value) -> bool {
+    v.get("input")
+        .and_then(Value::as_array)
+        .is_some_and(|items| {
+            items
+                .iter()
+                .any(|i| i.get("type").and_then(Value::as_str) == Some("item_reference"))
+        })
+}
+
+/// The 400 for a Responses session field a row cannot honor. An `item_reference` also says how to
+/// send the item instead: the gateway keeps no copy to resolve it from.
+pub fn session_field_refusal(field: &str, model: &str) -> String {
+    if field == "item_reference" {
+        format!(
+            "item_reference cannot be honored for {model}: no upstream on this route keeps \
+             responses, and the gateway stores none. Send earlier items in full by setting \
+             store: false (Vercel AI SDK: providerOptions.openai.store = false)"
+        )
+    } else {
+        format!("{field} cannot be honored for {model} (no Responses upstream)")
     }
 }
 
@@ -4572,9 +4604,11 @@ fn responses_input_to_messages(input: Option<&Value>, up: Upstream) -> Vec<Value
             | "mcp_call"
             | "mcp_list_tools" => {}
             // OpenAI-held state no other upstream can resolve: a `compaction` is a summary only
-            // OpenAI can decrypt, an `item_reference` a pointer into its store. Dropped, so a
-            // compacted session that fails over onto a translated candidate runs on the history
-            // the client holds instead of failing (D95). The same-wire relay keeps both.
+            // OpenAI can decrypt, an `item_reference` a pointer into its store. A catalog walk
+            // never brings an `item_reference` here: `responses_session_field` names it, and the
+            // row walks its Responses arm or 400s (D175). A `compaction` is dropped, so a
+            // compacted session on a translated candidate runs on the history the client holds
+            // (D95). The same-wire relay keeps both.
             "compaction" | "item_reference" => {}
             // Anything else (`computer_call_output`, `local_shell_call`, …) is history the client
             // holds and the model would answer without. Forwarded as-is in place, so the provider
@@ -5191,6 +5225,8 @@ fn responses_object(
         "model": model,
         "output": output,
         "parallel_tool_calls": true,
+        // Truthful: a translated response is kept nowhere, so nothing can point back into it.
+        "store": false,
         "tool_choice": "auto",
         "tools": [],
         "usage": usage,
@@ -8489,6 +8525,17 @@ mod tests {
         let empty_prev = br#"{"model":"gpt-4o","previous_response_id":"","store":false}"#;
         assert_eq!(responses_session_field(empty_prev, true), None);
         assert_eq!(responses_session_field(b"not-json", false), Some("store"));
+        // A pointer into a store is session state on every row (D175).
+        let reference =
+            br#"{"model":"m","store":false,"input":[{"type":"item_reference","id":"msg_1"}]}"#;
+        assert_eq!(
+            responses_session_field(reference, false),
+            Some("item_reference")
+        );
+        assert_eq!(
+            responses_session_field(reference, true),
+            Some("item_reference")
+        );
     }
 
     #[test]

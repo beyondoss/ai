@@ -114,6 +114,28 @@ async fn a_one_shot_on_a_grok_row_is_not_stored_at_xai() {
     .await;
     assert_eq!(resp.status().as_u16(), 400);
     assert_eq!(xai.hits(), hits);
+
+    // So is an `item_reference` (the AI SDK's default for an earlier answer): sent as
+    // `store: false`, nothing at xAI holds the item, and xAI would 422 it (D175).
+    let resp = post(
+        &gw,
+        &key,
+        "/v1/responses",
+        &[],
+        &json!({"model": "grok-4.3", "input": [
+            {"role": "user", "content": "hi"},
+            {"type": "item_reference", "id": "msg_1"},
+            {"role": "user", "content": "again"},
+        ]}),
+    )
+    .await;
+    assert_eq!(resp.status().as_u16(), 400);
+    let text = resp.text().await.unwrap();
+    assert!(
+        text.contains("item_reference") && text.contains("store: false"),
+        "{text}"
+    );
+    assert_eq!(xai.hits(), hits);
 }
 
 /// `n` small function tools in Anthropic's shape, each `pad` bytes of description long.

@@ -3762,10 +3762,7 @@ impl ProxyHttp for AiProxy {
                         &request_id,
                         400,
                         "invalid_request_error",
-                        format!(
-                            "{field} cannot be honored for {} (no Responses upstream)",
-                            row.model
-                        ),
+                        translate::session_field_refusal(field, row.model),
                     )
                     .await;
                 }

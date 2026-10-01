@@ -432,14 +432,17 @@ Responses-only tools (Codex's `namespace` groups and `custom` grammars) pass thr
 5xx may walk another Responses candidate; it never walks onto Chat Completions/Messages. Rows with
 no Responses arm (Claude, DeepSeek, …) translate a one-shot and have no OpenAI store: an
 **omitted** `store` there is the stock `responses.create()` call and translates as a one-shot, while
-an explicit `store: true`, a `previous_response_id` or a `conversation` is a **400** naming the
-field, not a hollow Messages call. A `conversation` (the Conversations API) is the same OpenAI-held
+an explicit `store: true`, a `previous_response_id`, a `conversation` or an `item_reference` input
+item is a **400** naming the field, not a hollow Messages call (`translate::responses_session_field`;
+the `item_reference` refusal also says to send items in full with `store: false`). A `conversation` (the Conversations API) is the same OpenAI-held
 history `previous_response_id` points into, so it is session state too: relayed on a row's
 Responses arm, refused elsewhere, never translated with the history dropped (D128). Grok rows have no Responses arm either (xAI's store is not
 OpenAI's, and no failover shares it), but their xAI candidate is `/v1/responses`: a Responses
 one-shot is relayed there as sent, except that it goes as `store: false`
 (`translate::store_false`), because xAI stores every response for 30 days unless told not to (its
-`store` defaults to true). Usage/billing still parse the upstream body/SSE;
+`store` defaults to true). So an `item_reference` points at nothing xAI kept (xAI answered it 422
+"unknown item type"): it is refused before xAI like the other session state (D175). Usage/billing
+still parse the upstream body/SSE;
 `ai.usage.model` is what the provider echoed. Same-wire Responses (`/{provider}/v1/responses`)
 stays a byte relay. `/{provider}/…` never translates.
 
@@ -713,13 +716,21 @@ a message whose role no dialect has (a typo, a framework's private role: forward
 role unchanged, never turned into a user turn) have no equivalent on the other wire and change what
 the client gets back. Only records of a hosted tool the provider ran itself (`web_search_call`,
 `mcp_call`, …) are dropped: the client wrote none of it, and the answer that used it follows as a
-message. So are `compaction` and `item_reference` items, which are OpenAI-held state (a summary
-only OpenAI can decrypt, a pointer into its store) that no translated upstream can resolve: a
-compacted Codex session that fails over onto a translated candidate runs on the history the client
-holds, a degraded answer rather than a 400. That rule is wrong for the Vercel AI SDK's default
-Responses model, which sends no `store` and passes every earlier assistant answer back as an
-`item_reference`: on a row with no Responses arm its conversation loses the assistant's turns
-(D175, open; `providerOptions.openai.store = false` avoids it). The distinction from forwarding:
+message. So is a `compaction` item, OpenAI-held state (a summary only OpenAI can decrypt) that no
+translated upstream can resolve: a compacted Codex session that fails over onto a translated
+candidate runs on the history the client holds, a degraded answer rather than a 400. An
+`item_reference` (a pointer into a store) never reaches translation: it is session state (above),
+so a row with no Responses arm answers it with a 400 that names it and the remedy (D175). The
+Vercel AI SDK's default Responses model sends no `store`, takes the upstream to be keeping every
+response, and passes each earlier assistant text or reasoning item back as an `item_reference`
+(`convertToOpenAIResponsesInput` in `@ai-sdk/openai`, gated only on the request's
+`providerOptions.openai.store ?? true` and the part's `itemId`). Dropped, the model answered a
+conversation without its own turns. The gateway stores no customer content, so it cannot resolve
+the reference, and no response field steers the SDK: it reads `itemId` from every output item's
+`id` (required by its schema, and fixed at `response.output_item.added`, before the content
+exists) and never reads `response.store`. A translated response still says `store: false`,
+because nothing keeps it. AI SDK callers on such rows set `providerOptions.openai.store = false`,
+and the SDK then sends every item in full. The distinction from forwarding:
 an item the gateway does not know is forwarded (the provider names it), and a known item that only OpenAI can read is
 dropped when translating. A same-wire Responses relay keeps both. OpenAI's hosted search
 (`web_search`, `web_search_preview` and dated spellings) is the one tool dropped leaving Responses,
