@@ -68,7 +68,6 @@ async fn error_shape_problems(resp: reqwest::Response, want: u16) -> Vec<String>
 /// claim: REL-2, CAT-11
 /// defect: D16
 #[tokio::test]
-#[ignore = "D16 reproduced: all candidates connect-failing gives an empty 502 with no request id"]
 async fn all_candidates_failing_to_connect_is_a_json_502() {
     let nats_port = unused_nats_port();
     let (pubkey, sk) = test_keypair(1);
@@ -92,7 +91,6 @@ async fn all_candidates_failing_to_connect_is_a_json_502() {
 /// claim: REL-2, CAT-11
 /// defect: D16
 #[tokio::test]
-#[ignore = "D16 reproduced: all breakers open on a catalog walk gives a bare 500"]
 async fn all_breakers_open_on_a_catalog_walk_is_a_json_503() {
     let nats_port = unused_nats_port();
     let (pubkey, sk) = test_keypair(1);
@@ -164,7 +162,6 @@ async fn chunked_upload(port: u16, path: &str, total: usize) -> RawResponse {
 /// claim: REL-2, CAT-11
 /// defect: D16
 #[tokio::test]
-#[ignore = "D16 reproduced: chunked body over 100 MiB on /{provider} gives a bare 413 (no JSON, no request id)"]
 async fn a_chunked_body_over_the_cap_is_a_json_413() {
     let nats_port = unused_nats_port();
     let (pubkey, _sk) = test_keypair(1);
@@ -346,4 +343,29 @@ async fn gateway_429_and_503_carry_retry_after() {
     }
 
     assert!(problems.is_empty(), "{problems:#?}");
+}
+
+/// An upstream that never answers within the read timeout is a 504 with a JSON error, not a bare
+/// gateway status.
+/// claim: REL-2, CAT-11
+/// defect: D16
+#[tokio::test]
+async fn an_upstream_timeout_is_a_json_504() {
+    let nats_port = unused_nats_port();
+    let (pubkey, _sk) = test_keypair(1);
+    let mock = ReplyUpstream::start(|_, _| Reply::HeaderStall).await;
+    let gw = Gateway::builder(nats_port, &mock.authority(), &b64(&pubkey))
+        .config_line("read_timeout_secs = 1")
+        .start()
+        .await;
+    let resp = test_client()
+        .post(format!("{}/openai/v1/chat/completions", gw.url()))
+        .header("authorization", "Bearer sk-byo-test")
+        .header("content-type", "application/json")
+        .body(body())
+        .send()
+        .await
+        .unwrap();
+    let problems = error_shape_problems(resp, 504).await;
+    assert!(problems.is_empty(), "{problems:?}");
 }

@@ -81,7 +81,7 @@ use pingora_core::protocols::http::HttpTask;
 use pingora_core::protocols::http::subrequest::server::SubrequestHandle;
 use pingora_core::upstreams::peer::HttpPeer;
 use pingora_proxy::subrequest::{BodyMode, Ctx as SubrequestCtx};
-use pingora_proxy::{ProxyHttp, Session};
+use pingora_proxy::{FailToProxy, ProxyHttp, Session};
 use std::borrow::Cow;
 use std::fmt::Write as _;
 use std::sync::Arc;
@@ -548,6 +548,13 @@ struct ModelRouting {
     /// Inbound endpoint. Always set on a catalog walk so a mixed-row failover can translate
     /// onto the next candidate's path. Same-endpoint attempts skip the mapper (`from == to`).
     translate: Option<translate::TranslateState>,
+    /// The walk made at least one upstream attempt (it connected, or tried to). Distinguishes
+    /// "every candidate failed" (502) from "every candidate's breaker was open" (503) when the walk
+    /// runs out.
+    attempted: bool,
+    /// Seconds until the soonest skipped open breaker admits a request, for the `Retry-After` on
+    /// the 503 when every candidate was skipped. `None` while no breaker skipped one.
+    open_retry_after: Option<u16>,
 }
 
 impl ModelRouting {
@@ -1786,6 +1793,88 @@ async fn pipe_full_body(
             }
         }
     }
+}
+
+/// An error the gateway raises with the status and message the client should see. Carried in
+/// `ErrorType::CustomCode` so [`failure_response`] can answer with exactly this rather than a
+/// generic line for the status.
+fn gateway_error(status: u16, msg: &'static str) -> Box<pingora_core::Error> {
+    pingora_core::Error::new(pingora_core::ErrorType::CustomCode(msg, status))
+}
+
+/// The client-facing `(status, error type, message)` for an error that ended a request, or `None`
+/// when the client is already gone (nothing can be written). See `fail_to_proxy`.
+fn failure_response(e: &pingora_core::Error) -> Option<(u16, &'static str, &'static str)> {
+    use pingora_core::{ErrorSource as Source, ErrorType as T};
+    let typ = |status: u16| match status {
+        429 => "rate_limit_error",
+        400..=499 => "invalid_request_error",
+        _ => "api_error",
+    };
+    let downstream = matches!(e.esource(), Source::Downstream);
+    Some(match e.etype() {
+        T::CustomCode(msg, status) => (*status, typ(*status), *msg),
+        T::HTTPStatus(status) => {
+            let msg = match status {
+                400 => "bad request",
+                413 => "request body too large",
+                429 => "rate limit exceeded",
+                502 => "upstream unavailable",
+                503 => "provider temporarily unavailable",
+                504 => "upstream timed out",
+                400..=499 => "request rejected",
+                _ => "upstream error",
+            };
+            (*status, typ(*status), msg)
+        }
+        // The client's connection is dead: nothing to write to.
+        T::ReadError | T::WriteError | T::ConnectionClosed if downstream => return None,
+        T::ReadTimedout if downstream => (408, "invalid_request_error", "request body timed out"),
+        _ if downstream => (400, "invalid_request_error", "bad request"),
+        T::ConnectTimedout | T::TLSHandshakeTimedout | T::ReadTimedout | T::WriteTimedout => {
+            (504, "api_error", "upstream timed out")
+        }
+        T::ConnectRefused
+        | T::ConnectNoRoute
+        | T::ConnectError
+        | T::ConnectProxyFailure
+        | T::TLSHandshakeFailure
+        | T::TLSWantX509Lookup
+        | T::InvalidCert
+        | T::HandshakeError
+        | T::SocketError
+        | T::BindError => (502, "api_error", "could not connect to the provider"),
+        _ => match e.esource() {
+            Source::Upstream => (502, "api_error", "upstream connection failed"),
+            _ => (500, "api_error", "internal error"),
+        },
+    })
+}
+
+/// Write a JSON error (see `fail_to_proxy`). `Retry-After` when given.
+async fn write_json_error(
+    session: &mut Session,
+    request_id: &str,
+    status: u16,
+    typ: &str,
+    msg: &str,
+    retry_after: Option<u64>,
+) -> Result<()> {
+    let body = error_body(typ, msg);
+    let mut len_buf = ArrayString::<20>::new();
+    let _ = write!(len_buf, "{}", body.len());
+    let mut resp = ResponseHeader::build(status, Some(4))?;
+    resp.insert_header("content-type", "application/json")?;
+    resp.insert_header("content-length", len_buf.as_str())?;
+    resp.insert_header(REQUEST_ID_HEADER, request_id)?;
+    if let Some(secs) = retry_after {
+        let mut ra = ArrayString::<20>::new();
+        let _ = write!(ra, "{secs}");
+        resp.insert_header(http::header::RETRY_AFTER, ra.as_str())?;
+    }
+    session.write_response_header(Box::new(resp), false).await?;
+    session.write_response_body(Some(body), true).await?;
+    Ok(())
 }
 
 fn dialect_for_path(path: &str) -> Dialect {
@@ -3076,6 +3165,8 @@ impl ProxyHttp for AiProxy {
                             attempt_start: start,
                             cache: Some(cache::Pending::Hit(hit)),
                             translate: None,
+                            attempted: false,
+                            open_retry_after: None,
                         })
                     }),
                     request_id,
@@ -3236,6 +3327,8 @@ impl ProxyHttp for AiProxy {
                     attempt_start: start,
                     cache: pending_cache,
                     translate: translate_state,
+                    attempted: false,
+                    open_retry_after: None,
                 })
             }),
             request_id,
@@ -3328,9 +3421,15 @@ impl ProxyHttp for AiProxy {
                 let Some(i) = first_usable(usable, at) else {
                     // Out of candidates. `Error::new` defaults `retry` to false, so the proxy loop
                     // stops here rather than spinning; `logging` finds nothing pending to record.
-                    return Err(pingora_core::Error::new_str(
-                        "no candidate provider available",
-                    ));
+                    // What the client is told depends on why: every candidate was tried and failed
+                    // (502), or every one was skipped because its breaker is open (503, retry once
+                    // the soonest one half-opens).
+                    let attempted = rc.auto.as_ref().is_some_and(|a| a.attempted);
+                    return Err(if attempted {
+                        gateway_error(502, "no provider could be reached")
+                    } else {
+                        gateway_error(503, "provider temporarily unavailable")
+                    });
                 };
                 if let Some(a) = rc.auto.as_mut() {
                     a.candidate = i;
@@ -3365,6 +3464,10 @@ impl ProxyHttp for AiProxy {
                     && b.allow().is_err()
                 {
                     self.state.metrics.rejection(Rejection::CircuitOpen).inc();
+                    if let Some(a) = rc.auto.as_mut() {
+                        let secs = u16::try_from(b.retry_after_secs()).unwrap_or(u16::MAX);
+                        a.open_retry_after = Some(a.open_retry_after.map_or(secs, |s| s.min(secs)));
+                    }
                     rc.advance_candidate(i);
                     continue;
                 }
@@ -3379,6 +3482,9 @@ impl ProxyHttp for AiProxy {
                     .unwrap_or(0);
                 rc.provider = p.clone();
                 apply_serving_candidate(rc);
+                if let Some(a) = rc.auto.as_mut() {
+                    a.attempted = true;
+                }
 
                 match self.state.resolve(&p.authority).await {
                     Ok(addr) => {
@@ -4229,83 +4335,6 @@ impl ProxyHttp for AiProxy {
         Ok(None)
     }
 
-    /// Answer a request pingora could not proxy.
-    ///
-    /// Pingora's own answer is a bare status with an empty body. For an upstream that failed after
-    /// it had the whole request — the walk ends there rather than resending (see
-    /// `error_while_proxy`) — the client gets the gateway's JSON error and request id instead: 504
-    /// for a read timeout, 502 otherwise. Every other failure keeps pingora's answer.
-    async fn fail_to_proxy(
-        &self,
-        session: &mut Session,
-        e: &pingora_core::Error,
-        ctx: &mut Self::CTX,
-    ) -> pingora_proxy::FailToProxy {
-        use pingora_core::ErrorSource;
-        use pingora_core::ErrorType::{
-            ConnectionClosed, HTTPStatus, ReadError, ReadTimedout, WriteError,
-        };
-        let unanswered = session.as_downstream().response_written().is_none();
-        let code = match e.etype() {
-            HTTPStatus(code) => *code,
-            _ => match e.esource() {
-                ErrorSource::Upstream => 502,
-                // The client is gone; nothing to answer.
-                ErrorSource::Downstream
-                    if matches!(e.etype(), WriteError | ReadError | ConnectionClosed) =>
-                {
-                    0
-                }
-                ErrorSource::Downstream => 400,
-                ErrorSource::Internal | ErrorSource::Unset => 500,
-            },
-        };
-        let after_delivery = unanswered
-            && e.esource() == &ErrorSource::Upstream
-            && !matches!(e.etype(), HTTPStatus(_))
-            && ctx
-                .as_ref()
-                .is_some_and(|rc| body_delivered(session, rc, Some(e)));
-        let request_id = ctx.as_ref().map_or("", |rc| rc.request_id.as_str());
-        if after_delivery {
-            // Pingora closes the client connection after a proxy error; say so (`connection:
-            // close`), as its own error responses do, so a pooled client does not send its next
-            // request into a socket about to close.
-            session.as_downstream_mut().set_keepalive(None);
-        }
-        let code = if after_delivery && matches!(e.etype(), ReadTimedout) {
-            let _ = Self::reject_boxed(
-                session,
-                request_id,
-                504,
-                "api_error",
-                "upstream timed out after receiving the request",
-            )
-            .await;
-            504
-        } else if after_delivery {
-            let _ = Self::reject_boxed(
-                session,
-                request_id,
-                502,
-                "api_error",
-                "upstream failed after receiving the request",
-            )
-            .await;
-            502
-        } else {
-            if code > 0 && unanswered {
-                let _ = session.respond_error(code).await;
-            }
-            code
-        };
-        pingora_proxy::FailToProxy {
-            error_code: code,
-            // Pingora closes the client connection after any proxy error whatever this says.
-            can_reuse_downstream: false,
-        }
-    }
-
     /// Keep pingora 0.8's retry policy for an error after the connection is up — except that a
     /// body the provider already has is never sent again.
     ///
@@ -4355,6 +4384,101 @@ impl ProxyHttp for AiProxy {
             client_reused && !delivered && !session.as_ref().retry_buffer_truncated(),
         );
         e
+    }
+
+    /// Answer every request the gateway itself ends, after admission or during the proxy loop,
+    /// with the same JSON error envelope the `reject` paths use: `content-type: application/json`,
+    /// `{"error":{"message","type"}}`, and `x-beyond-request-id`. Pingora's default wrote a bare
+    /// status with an empty body (a 500 for "every breaker open", which is a 503), which an SDK
+    /// cannot parse and an oncall cannot correlate.
+    ///
+    /// The status follows the cause (see [`failure_response`]): a connect failure on every
+    /// candidate is a 502, every candidate's breaker open a 503 with `Retry-After`, an upstream
+    /// timeout a 504, a chunked body over the cap a 413. An upstream that failed after it had the
+    /// whole request (the walk ends there rather than resending, see `error_while_proxy`) says so:
+    /// `upstream timed out after receiving the request` (504) or `upstream failed after receiving
+    /// the request` (502). A client that is already gone gets nothing, and a response that already
+    /// started cannot be replaced.
+    async fn fail_to_proxy(
+        &self,
+        session: &mut Session,
+        e: &pingora_core::Error,
+        ctx: &mut Self::CTX,
+    ) -> FailToProxy
+    where
+        Self::CTX: Send + Sync,
+    {
+        let Some((status, typ, mut msg)) = failure_response(e) else {
+            return FailToProxy {
+                error_code: 0,
+                can_reuse_downstream: false,
+            };
+        };
+        if session.response_written().is_some() {
+            return FailToProxy {
+                error_code: status,
+                can_reuse_downstream: false,
+            };
+        }
+        // The provider had the whole request: name that, so a client does not read a resend-safe
+        // failure into it (the gateway did not resend; a client retry may run it twice).
+        let after_delivery = *e.esource() == pingora_core::ErrorSource::Upstream
+            && !matches!(
+                e.etype(),
+                pingora_core::ErrorType::HTTPStatus(_) | pingora_core::ErrorType::CustomCode(..)
+            )
+            && ctx
+                .rc
+                .as_ref()
+                .is_some_and(|rc| body_delivered(session, rc, Some(e)));
+        let status = match (after_delivery, status) {
+            (true, 504) => {
+                msg = "upstream timed out after receiving the request";
+                504
+            }
+            (true, _) => {
+                msg = "upstream failed after receiving the request";
+                502
+            }
+            (false, status) => status,
+        };
+        // Pingora closes the client connection after a proxy error; say so (`connection: close`),
+        // as its own error responses do, so a pooled client does not send its next request into a
+        // socket about to close.
+        session.as_downstream_mut().set_keepalive(None);
+        let retry_after = (status == 503).then(|| {
+            ctx.rc
+                .as_ref()
+                .and_then(|rc| rc.auto.as_ref())
+                .and_then(|a| a.open_retry_after)
+                .map_or(1, u64::from)
+        });
+        let request_id = ctx
+            .held
+            .request_id
+            .or_else(|| ctx.rc.as_ref().map(|rc| rc.request_id))
+            .unwrap_or_default();
+        if let Err(write_err) = Box::pin(write_json_error(
+            session,
+            &request_id,
+            status,
+            typ,
+            msg,
+            retry_after,
+        ))
+        .await
+        {
+            warn!(
+                request_id = %request_id,
+                status,
+                error = %write_err,
+                "failed to send the error response downstream",
+            );
+        }
+        FailToProxy {
+            error_code: status,
+            can_reuse_downstream: false,
+        }
     }
 
     fn fail_to_connect(
