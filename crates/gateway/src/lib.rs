@@ -36,5 +36,6 @@ pub mod secret;
 pub mod smart;
 pub mod state;
 pub mod store_watch;
+pub mod terminal;
 pub mod translate;
 pub mod usage;

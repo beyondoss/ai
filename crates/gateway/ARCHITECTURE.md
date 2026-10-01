@@ -1005,9 +1005,23 @@ an estimate with nothing parsed takes the request's wire.
 | ------------------ | ------------------------------------------------------------------------------------ |
 | `ok`               | A complete response, or a cache hit                                                  |
 | `upstream_error`   | The provider answered 4xx/5xx, or failed before any response head (connect, timeout) |
-| `client_cancelled` | The client went away first                                                           |
+| `client_cancelled` | The client went away before the stream's terminal event reached it                   |
 | `no_candidate`     | No provider was called — every candidate's breaker was open                          |
 | `cut_short`        | A response started and then died upstream                                            |
+
+**A stream is complete when its protocol says so.** Chat Completions ends at `data: [DONE]`,
+Messages at `message_stop`, Responses at `response.completed` (or `response.incomplete`). Stock
+clients close as soon as they have it: openai-python breaks out at `[DONE]`, Codex closes at
+`response.completed`. When that close reaches the gateway before the provider's own end of stream,
+pingora ends the request with a downstream error, though the client has the whole answer. So on a
+managed stream `response_body_filter` feeds the bytes the client is sent (after translation) to a
+`terminal::TerminalTracker`, which reports whether they end with a whole terminal event (its first
+line, and the blank line that dispatches it; reading only each chunk's last event, three bytes of
+state). In `logging`, a downstream error after that is the request completing: `outcome` is `ok`,
+the cache fill runs, the capture is `complete` (D120, D122). No timer is involved. Pingora awaits
+each chunk's write to the client before it polls the client again, so a terminal event the tracker
+saw was written, unless that write failed, and then the error is the write's
+(`WriteError`/`WriteTimedout`), which stays `client_cancelled`.
 
 On `no_candidate` the row has no `provider`: the request's provider is only the walk's seed then,
 and naming it would bill a call that never happened. `RequestCtx::upstream_phase` (none → attempted
@@ -1292,7 +1306,9 @@ to the client; there is no upstream, no breaker permit, no key-walk. `logging` s
 carries `cache_hit` and the tokens stored on the fill, and `ai_cache_hits_total` counts it.
 
 **A miss is still an unbuffered relay.** The fill is a tap — copy, never withhold, the same contract
-as payload capture. Insert only on a complete 2xx. Client abort, 4xx/5xx, and truncation (the tap
+as payload capture. Insert only on a complete 2xx (a stream whose terminal event reached the
+client is complete even if the client then closed first; see "A stream is complete when its
+protocol says so"). Client abort, 4xx/5xx, and truncation (the tap
 hit `cache_max_bytes`) are all skips: serving a cut or error body as a cached 2xx would be a silent
 wrong answer. Cache errors never fail the request: a poisoned lock is recovered, a full store
 evicts the oldest insertion, an oversized body is dropped. One TTL means insertion order is expiry
@@ -2021,6 +2037,7 @@ Prometheus on the default registry, exposed at `/metrics` on `metrics_listen`.
 | `route`           | Data-driven provider table (name / authority / auth) + dialect default + model-route re-exports                                 | unit ✓         |
 | `peek`            | `ModelScanner` — streaming structural scan for the root-level `model`; O(1) memory                                              | unit ✓         |
 | `usage`           | Token extraction (OpenAI / Anthropic, body + SSE)                                                                               | unit ✓         |
+| `terminal`        | Whether the bytes sent to a client end with the stream's terminal event (`[DONE]`, `message_stop`, `response.completed`)        | unit ✓ + e2e ✓ |
 | `deny`            | Sparse deny-set, default-allow, reason → HTTP status                                                                            | unit ✓         |
 | `allowance`       | Sparse remaining-ok / exhausted set; fail-closed until seeded (503); 402 when exhausted                                         | unit ✓ + e2e ✓ |
 | `capture`         | Sparse capture-set (default-off) + head-bounded `CaptureBufs` and 1-in-N sampling                                               | unit ✓ + e2e ✓ |

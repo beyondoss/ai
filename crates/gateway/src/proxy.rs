@@ -69,6 +69,7 @@ use crate::key;
 use crate::metrics::Rejection;
 use crate::route::{self, Dialect, Provider};
 use crate::state::{GatewayState, RequestId};
+use crate::terminal::TerminalTracker;
 use crate::{control, peek, smart, translate, usage};
 use arrayvec::ArrayString;
 use async_trait::async_trait;
@@ -133,17 +134,22 @@ const USAGE_TAIL_CAP: usize = 64 * 1024;
 /// long response was memmoved roughly twice over, on top of the geometric realloc chain from
 /// starting at zero capacity. Measured 1.88× the response size in memmove at steady state.
 #[derive(Default)]
+///
+/// `buf` is a ring once it holds exactly `USAGE_TAIL_CAP` bytes; below that it is in order and
+/// `head` is 0. No separate flag: a full in-order buffer is a ring whose oldest byte is at 0.
 struct UsageTail {
     buf: Vec<u8>,
-    /// Next write index. Meaningful only once `ring` is set.
+    /// Next write index (the oldest byte). 0 until the buffer is a ring.
     head: usize,
-    /// Whether `buf` is a wraparound ring of exactly `USAGE_TAIL_CAP` bytes.
-    ring: bool,
 }
 
 impl UsageTail {
+    fn ring(&self) -> bool {
+        self.buf.len() == USAGE_TAIL_CAP
+    }
+
     fn push(&mut self, data: &[u8]) {
-        if !self.ring {
+        if !self.ring() {
             self.buf.extend_from_slice(data);
             if self.buf.len() > USAGE_TAIL_CAP {
                 // Outgrown: keep the last cap bytes in order and switch to ring mode. This is the
@@ -151,8 +157,6 @@ impl UsageTail {
                 let start = self.buf.len() - USAGE_TAIL_CAP;
                 self.buf.copy_within(start.., 0);
                 self.buf.truncate(USAGE_TAIL_CAP);
-                self.head = 0;
-                self.ring = true;
             }
             return;
         }
@@ -179,7 +183,7 @@ impl UsageTail {
     /// oldest bytes, which is exactly right. In practice `logging` calls this once, after the body
     /// is complete.
     fn contiguous(&mut self) -> &[u8] {
-        if self.ring && self.head != 0 {
+        if self.head != 0 {
             self.buf.rotate_left(self.head);
             self.head = 0;
         }
@@ -463,6 +467,10 @@ pub struct RequestCtx {
     /// Set on a managed response with status >= 400: its body is scrubbed of the pool key this
     /// attempt sent (see [`Redact`]). Boxed: `None` on every other response.
     redact: Option<Box<Redact>>,
+    /// Whether the bytes sent to the client so far end with the stream's terminal event (`[DONE]`,
+    /// `message_stop`, `response.completed`). Fed on managed streams only; read in `logging` so a
+    /// client that closes once it has the whole answer is not a cancel (D120, D122).
+    terminal: TerminalTracker,
 }
 
 /// Scrubs one secret (the pool key an attempt sent) from a response body as it streams past (D66).
@@ -584,6 +592,23 @@ fn reset_before_reading(e: &pingora_core::Error, client_reused: bool) -> bool {
                     std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
                 )
             })
+}
+
+/// Whether `e` is the client closing after the stream's terminal event was written to it (D120,
+/// D122). openai-python closes at `[DONE]`, Codex at `response.completed`; when that close lands
+/// before the provider's end of stream, pingora ends the request with a downstream error although
+/// the client read the whole answer.
+///
+/// "Written" is exact, not a guess at timing: pingora runs `response_body_filter` on a chunk and
+/// then awaits its write to the client before it polls the client again, so the terminal bytes
+/// [`TerminalTracker`] saw either went out, or their write failed and the error is that write's
+/// (`WriteError` / `WriteTimedout`). Any other downstream error (the client's FIN or reset, read
+/// after the write returned) came after the client had the terminal event.
+fn closed_after_terminal(rc: &RequestCtx, e: &pingora_core::Error) -> bool {
+    use pingora_core::ErrorType as T;
+    rc.terminal.ended()
+        && e.esource() == &pingora_core::ErrorSource::Downstream
+        && !matches!(e.etype(), T::WriteError | T::WriteTimedout)
 }
 
 /// What became of a request, on its billing row: a consumer must be able to tell a zero-token row
@@ -3723,6 +3748,7 @@ impl ProxyHttp for AiProxy {
                     resp_bytes: 0,
                     upstream_phase: UpstreamPhase::None,
                     redact: None,
+                    terminal: TerminalTracker::default(),
                 });
                 ctx.held.admit();
                 return Ok(true);
@@ -3892,6 +3918,7 @@ impl ProxyHttp for AiProxy {
             resp_bytes: 0,
             upstream_phase: UpstreamPhase::None,
             redact: None,
+            terminal: TerminalTracker::default(),
         });
         // Admitted: count it in-flight. Released in `logging`, or by `Ctx`'s drop if a panic
         // skipped `logging`, so the gauge cannot leak. `active_streams` only covers SSE; this
@@ -5013,8 +5040,14 @@ impl ProxyHttp for AiProxy {
                     tap.push(&out);
                 }
             }
+            if rc.managed && rc.streaming {
+                rc.terminal.feed(&out);
+            }
             *body = Some(Bytes::from(out));
         } else if !chunk.is_empty() {
+            if rc.managed && rc.streaming {
+                rc.terminal.feed(chunk);
+            }
             // Capture tap — same passive-tap contract as the usage tail above (copy, never withhold),
             // differing only in which end it keeps. `resp_tail` keeps the *last* 64 KB because usage
             // rides the final event; capture keeps the *first* `max_bytes` because that's where the
@@ -5346,6 +5379,9 @@ impl ProxyHttp for AiProxy {
         held.release_in_flight();
         held.release_tenant();
         let Some(rc) = rc.as_mut() else { return };
+        // A client that closed after its stream's terminal event reached it has the whole answer:
+        // the request completed, whatever the provider's end of stream was still doing.
+        let e = e.filter(|e| !closed_after_terminal(rc, e));
 
         // An upstream error (DNS/connect timeout, read timeout, abort) lands here with `Some(e)` but
         // no `ai.usage` row (no parseable body) — and the earlier `warn!` in `upstream_peer` only
@@ -5893,6 +5929,7 @@ mod tests {
             resp_bytes: 0,
             upstream_phase: UpstreamPhase::None,
             redact: None,
+            terminal: TerminalTracker::default(),
         }
     }
 
