@@ -94,9 +94,17 @@ def opencode_models(models):
     return out
 
 
+def parse_k(v):
+    """pi's compact counts: 200K, 16.4K, 1M, 8192."""
+    mult = {"K": 1_000, "M": 1_000_000}.get(v[-1:].upper(), 1)
+    return float(v[:-1] if mult > 1 else v) * mult
+
+
 def run(cmd, cwd, env):
-    p = subprocess.run(cmd, cwd=cwd, env=env, capture_output=True, text=True, timeout=TIMEOUT)
-    return p.returncode, p.stdout[-3000:], p.stderr[-3000:]
+    # stdin closed: Codex (and others) read a non-TTY stdin as the prompt and would wait forever.
+    p = subprocess.run(cmd, cwd=cwd, env=env, capture_output=True, text=True, timeout=TIMEOUT,
+                       stdin=subprocess.DEVNULL)
+    return p.returncode, p.stdout[-3000:], p.stderr[-12000:]
 
 
 def main(spec):
@@ -141,7 +149,7 @@ def main(spec):
         want = set(opencode_models(models))
         listed_ok = listed == want
         detail["models_listed"] = {"harness": len(listed), "catalog": len(want), "missing": sorted(want - listed)[:5]}
-        cmd = [str(BIN / "opencode"), "run", "-m", f"beyond/{MODEL}", TASK]
+        cmd = [str(BIN / "opencode"), "run", "--print-logs", "-m", f"beyond/{MODEL}", TASK]
     elif harness == "pi":
         api = {"chat": "openai-completions", "messages": "anthropic-messages", "responses": "openai-responses"}[mode]
         base = BASE if mode == "messages" else f"{BASE}/v1"
@@ -152,10 +160,22 @@ def main(spec):
             {"providers": {"beyond": {"baseUrl": base, "api": api, "apiKey": KEY, "models": pi_models(models)}}}))
         env.update(PI_CODING_AGENT_DIR=str(agent_dir))
         code, out, err = run([str(BIN / "pi"), "--list-models", "beyond"], work, env)
-        listed = {tok for line in out.splitlines() for tok in line.split() if tok in {m["id"] for m in models}}
-        want = {m["id"] for m in pi_models(models)}
-        listed_ok = listed == want
-        detail["models_listed"] = {"harness": len(listed), "catalog": len(want), "missing": sorted(want - listed)[:5]}
+        # pi prints a table (to stderr): provider, model, context, max-out, thinking, images.
+        out = out + "\n" + err
+        listed, card_mismatch = set(), []
+        cards = {m["id"]: m for m in pi_models(models)}
+        for line in out.splitlines():
+            cols = line.split()
+            if len(cols) >= 4 and cols[0] == "beyond" and cols[1] in cards:
+                listed.add(cols[1])
+                c = cards[cols[1]]
+                for shown, real in ((cols[2], c["contextWindow"]), (cols[3], c["maxTokens"])):
+                    if abs(parse_k(shown) - real) > max(real * 0.01, 1):
+                        card_mismatch.append(f"{cols[1]}: shows {shown}, card {real}")
+        want = set(cards)
+        listed_ok = listed == want and not card_mismatch
+        detail["models_listed"] = {"harness": len(listed), "catalog": len(want), "missing": sorted(want - listed)[:5],
+                                   "card_mismatch": card_mismatch[:5]}
         cmd = [str(BIN / "pi"), "-p", "--provider", "beyond", "--model", MODEL, "--no-session", TASK]
     else:
         return False, {"why": f"unknown harness {harness}"}

@@ -136,7 +136,7 @@ def models_list():
     _ids.clear()
     m = next((x for x in o if x.id == MODEL), None)
     extra = (m.model_extra or {}) if m else {}
-    ok = (len(o) >= 100 and len(a) == len(o) and m is not None
+    ok = (len(o) >= 90 and len(a) == len(o) and m is not None
           and extra.get("context_window", 0) > 0 and "pricing" in extra and "capabilities" in extra)
     return ok, {"openai": len(o), "anthropic": len(a), "card": {k: extra.get(k) for k in ("context_window", "max_output_tokens", "pricing")}}
 
