@@ -866,6 +866,55 @@ pub fn estimate_stream_output(tail: &[u8], total_bytes: u64) -> u64 {
     by_events.max(by_text)
 }
 
+/// Estimate the output tokens of a non-stream body cut off before its `usage` block.
+///
+/// Counts the bytes inside JSON string **values** in the tail — the generated text, plus a few
+/// short ids — and not keys or structure, which are envelope; scales them up to `total_bytes`
+/// relayed, as [`estimate_stream_output`] does, and divides by the text divisor. A tail that starts
+/// mid-string reads its first segment inverted, which moves the estimate by one string's length.
+/// Runs once, on a failure path.
+pub fn estimate_body_output(tail: &[u8], total_bytes: u64) -> u64 {
+    let n = tail.len();
+    let (mut text, mut i) = (0u64, 0usize);
+    while let Some(open) = tail.get(i..).and_then(|t| memchr::memchr(b'"', t)) {
+        let start = i + open + 1;
+        // The closing quote, stepping over escapes.
+        let mut end = start;
+        loop {
+            match tail
+                .get(end..)
+                .and_then(|t| memchr::memchr2(b'"', b'\\', t))
+            {
+                Some(k) if tail[end + k] == b'\\' => end += k + 2,
+                Some(k) => {
+                    end += k;
+                    break;
+                }
+                None => {
+                    end = n;
+                    break;
+                }
+            }
+        }
+        let end = end.min(n);
+        // A key is followed by `:`; a value is not.
+        let is_key = tail
+            .get(end + 1..)
+            .and_then(|t| t.iter().find(|b| !b.is_ascii_whitespace()))
+            == Some(&b':');
+        if !is_key {
+            text += (end - start) as u64;
+        }
+        i = end + 1;
+    }
+    if n == 0 {
+        return 0;
+    }
+    let sampled = n as u64;
+    let text = text + text * total_bytes.saturating_sub(sampled) / sampled;
+    text * 10 / OUTPUT_TEXT_BYTES_PER_TOKEN_X10
+}
+
 /// Generated text carried by one stream event, across the three wires: Chat Completions
 /// (`choices[0].delta` content, reasoning, tool-call arguments), Messages (`delta` text, thinking,
 /// tool-input JSON), and Responses (a string `delta`).
@@ -931,6 +980,24 @@ mod tests {
                 "split at {cut}"
             );
         }
+    }
+
+    #[test]
+    fn body_output_estimate_counts_string_values_only() {
+        let content = "word ".repeat(2000);
+        let full = format!(
+            r#"{{"id":"chatcmpl-1","object":"chat.completion","choices":[{{"index":0,"message":{{"role":"assistant","content":"{content}"}}}}],"usage":{{"prompt_tokens":40,"completion_tokens":2000}}}}"#
+        );
+        let half = &full.as_bytes()[..full.len() / 2];
+        let est = estimate_body_output(half, half.len() as u64);
+        // ~4.9 KB of "word word …" relayed: about 1100 tokens at 4.5 bytes each. The half that
+        // arrived, not the whole 2000 the provider reports, and none of the envelope's keys.
+        assert!((900..1200).contains(&est), "{est}");
+        // A tail of a larger body scales up.
+        let scaled = estimate_body_output(half, 2 * half.len() as u64);
+        assert!(scaled >= 2 * est - 1, "{scaled} vs {est}");
+        assert_eq!(estimate_body_output(b"", 0), 0);
+        assert_eq!(estimate_body_output(br#"{"a":"b\"#, 10), 0);
     }
 
     #[test]

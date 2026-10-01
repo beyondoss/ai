@@ -317,9 +317,10 @@ pub struct RequestCtx {
     /// managed only. The input-token estimate for a stream cut short before its usage block, on a
     /// wire (OpenAI) that reports input only at the end. See `usage::InputTally`.
     input_tally: usage::InputTally,
-    /// Response bytes relayed — managed streams only. Scales the retained tail up to the whole
-    /// stream in `usage::estimate_stream_output`. One add per chunk; nothing is scanned.
-    stream_bytes: u32,
+    /// Response bytes relayed — managed only. Scales the retained tail up to the whole response in
+    /// `usage::estimate_stream_output` / `estimate_body_output`. One add per chunk; nothing is
+    /// scanned.
+    resp_bytes: u32,
     /// Whether this request holds one of its tenant's `tenant_max_in_flight` slots, released in
     /// `logging` (which runs exactly once per admitted request — the same guarantee
     /// `requests_in_flight` rests on).
@@ -340,6 +341,24 @@ enum UpstreamPhase {
     Attempted,
     /// The connection is up and the request is going out (`upstream_request_filter` ran).
     Connected,
+}
+
+/// Whether the provider has this attempt's whole request: the connection was up, the client's body
+/// was read to its end (and so forwarded), and nothing failed writing it upstream. A request in
+/// that state is one the provider can bill for even when nothing comes back; one that is not (a
+/// connect failure, a reset mid-upload) never reached it.
+///
+/// The client side stands in for the upstream side: pingora forwards each body chunk as it reads
+/// it, and a failure on the way out surfaces as a write error. So this can only over-report by a
+/// chunk still in flight when a read-side error lands, never miss a request the provider has.
+fn body_delivered(session: &mut Session, rc: &RequestCtx, e: Option<&pingora_core::Error>) -> bool {
+    use pingora_core::ErrorType::{WriteError, WriteTimedout};
+    rc.upstream_phase == UpstreamPhase::Connected
+        && session.as_mut().is_body_done()
+        && !e.is_some_and(|e| {
+            e.esource() == &pingora_core::ErrorSource::Upstream
+                && matches!(e.etype(), WriteError | WriteTimedout)
+        })
 }
 
 /// What became of a request, on its billing row: a consumer must be able to tell a zero-token row
@@ -2943,7 +2962,7 @@ impl ProxyHttp for AiProxy {
                     }),
                     request_id,
                     input_tally: usage::InputTally::default(),
-                    stream_bytes: 0,
+                    resp_bytes: 0,
                     tenant_slot: false,
                     upstream_phase: UpstreamPhase::None,
                 });
@@ -3101,7 +3120,7 @@ impl ProxyHttp for AiProxy {
             }),
             request_id,
             input_tally: usage::InputTally::default(),
-            stream_bytes: 0,
+            resp_bytes: 0,
             tenant_slot,
             upstream_phase: UpstreamPhase::None,
         });
@@ -4000,10 +4019,10 @@ impl ProxyHttp for AiProxy {
             }
 
             rc.resp_tail.push(chunk);
-            // Managed streams only. Counts *upstream* bytes (pre-translate), like the tail.
-            if rc.managed && rc.streaming {
-                rc.stream_bytes = rc
-                    .stream_bytes
+            // Managed only. Counts *upstream* bytes (pre-translate), like the tail.
+            if rc.managed {
+                rc.resp_bytes = rc
+                    .resp_bytes
                     .saturating_add(u32::try_from(chunk.len()).unwrap_or(u32::MAX));
             }
         }
@@ -4265,6 +4284,14 @@ impl ProxyHttp for AiProxy {
         // responses are the whole body; long ones are rotated into order here, once. Skipped on a
         // cache hit — there is no tail; tokens come from the stored entry.
         let mut usage_estimated = false;
+        // The client gave up before the response head, after the provider had the whole request (a
+        // long reasoning turn, a huge prompt). The provider bills that prompt either way; a request
+        // that never reached it (every breaker open, a connect failure) costs nothing and stays 0.
+        let no_head = rc.managed
+            && cache_hit.is_none()
+            && rc.upstream_status.is_none()
+            && e.is_some_and(|e| e.esource() == &pingora_core::ErrorSource::Downstream)
+            && body_delivered(session, rc, e);
         let parsed = if cache_hit.is_some() {
             cache_hit.as_ref().map(|h| h.usage)
         } else {
@@ -4286,9 +4313,10 @@ impl ProxyHttp for AiProxy {
             // `message_start` already carries exact input and cache counts, so only the missing
             // side is estimated. See `usage`'s estimate section for the measured divisors; both err
             // low.
+            let ok_2xx = rc.upstream_status.is_some_and(|s| (200..300).contains(&s));
             let cut_short = rc.managed
                 && rc.streaming
-                && rc.upstream_status.is_some_and(|s| (200..300).contains(&s))
+                && ok_2xx
                 && match rc.dialect {
                     Dialect::OpenAi => parsed.is_none(),
                     Dialect::Anthropic => !usage::anthropic_stream_finished(tail),
@@ -4296,12 +4324,18 @@ impl ProxyHttp for AiProxy {
             // Only once the provider demonstrably started: Anthropic's `message_start` arrived, or
             // at least one generated delta was relayed. A 200 stream carrying nothing but an error
             // event (`overloaded_error` before any output) is not work we were billed for.
+            // A non-stream 2xx that died before its `usage` (the body is last): the provider
+            // generated, and bills, the whole answer; we relayed part of it. Always estimated —
+            // the 2xx is the proof the provider took the request.
+            let body_cut = rc.managed && !rc.streaming && ok_2xx && parsed.is_none() && e.is_some();
             let output = if cut_short {
-                usage::estimate_stream_output(tail, u64::from(rc.stream_bytes))
+                usage::estimate_stream_output(tail, u64::from(rc.resp_bytes))
+            } else if body_cut {
+                usage::estimate_body_output(tail, u64::from(rc.resp_bytes))
             } else {
                 0
             };
-            if cut_short && (parsed.is_some() || output > 0) {
+            if (cut_short && (parsed.is_some() || output > 0)) || body_cut || no_head {
                 usage_estimated = true;
                 let mut u = parsed.unwrap_or_default();
                 if u.input_tokens == 0 {
@@ -4651,7 +4685,7 @@ mod tests {
             control: None,
             request_id: RequestId::new(),
             input_tally: usage::InputTally::default(),
-            stream_bytes: 0,
+            resp_bytes: 0,
             tenant_slot: false,
             upstream_phase: UpstreamPhase::None,
         }

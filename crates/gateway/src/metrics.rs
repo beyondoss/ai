@@ -267,8 +267,9 @@ pub struct Metrics {
     /// legitimate zero-token generation — so a provider changing its usage wire shape would silently
     /// zero out billing. This counter (paired with a `warn!`) is the alerting surface for that.
     pub usage_parse_errors_total: IntCounter,
-    /// Managed streams cut short before their usage block (client cancel, upstream death) whose
-    /// `ai.usage` row carries estimated tokens (`usage_estimated=true`) instead of reported ones.
+    /// Managed requests whose usage never arrived — a stream or non-stream body cut short, a cancel
+    /// before the response head — and whose `ai.usage` row carries estimated tokens
+    /// (`usage_estimated=true`) instead of reported ones.
     pub usage_estimated_total: IntCounter,
     /// `ai.usage` billing rows whose stdout write failed (a closed or broken pipe). The row is lost
     /// to the log pipeline, so this counter, and the line on stderr, are the only record of it.
@@ -436,7 +437,7 @@ impl Metrics {
         ))?;
         let usage_estimated_total = IntCounter::with_opts(Opts::new(
             "ai_usage_estimated_total",
-            "Managed streams cut short before their usage block, billed with estimated tokens",
+            "Managed requests billed estimated tokens: a stream or body cut short, or a cancel before the response head",
         ))?;
         let usage_write_errors_total = IntCounter::with_opts(Opts::new(
             "ai_usage_write_errors_total",

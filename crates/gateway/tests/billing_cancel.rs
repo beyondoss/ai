@@ -18,7 +18,6 @@ const CHAT_BODY: &str = r#"{"model":"gpt-4o","messages":[{"role":"system","conte
 /// claim: BIL-3
 /// defect: D07
 #[tokio::test]
-#[ignore = "D07 reproduced: a cancel before the response head writes input_tokens=0, usage_estimated=false"]
 async fn a_cancel_before_the_response_head_is_billed_an_estimate() {
     let (pubkey, sk) = test_keypair(71);
     // Drains the body (the provider has it), then never answers within the client's patience and
@@ -58,7 +57,6 @@ async fn a_cancel_before_the_response_head_is_billed_an_estimate() {
 /// claim: BIL-3
 /// defect: D07
 #[tokio::test]
-#[ignore = "D07 reproduced: a non-stream 2xx cut off mid-body writes a zero-token, non-estimated row"]
 async fn a_non_stream_body_cut_off_midway_is_billed_an_estimate() {
     let (pubkey, sk) = test_keypair(72);
     let content = "word ".repeat(2000);
