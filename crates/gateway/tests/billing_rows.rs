@@ -119,7 +119,6 @@ fn outcome(row: &serde_json::Value) -> Option<&serde_json::Value> {
 /// claim: BIL-12
 /// defect: D26
 #[tokio::test]
-#[ignore = "D26 reproduced: rows for a 5xx and for breaker exhaustion carry no status/outcome field"]
 async fn zero_cost_endings_carry_their_outcome() {
     let (pubkey, sk) = test_keypair(83);
     let primary = MockUpstream::start(Mode::Status(500)).await;
@@ -177,4 +176,13 @@ async fn zero_cost_endings_carry_their_outcome() {
             );
         }
     }
+    // The decided schema, exactly: `upstream_status` and `outcome` on both rows.
+    assert_eq!(r1["upstream_status"].as_u64(), Some(500), "{evidence}");
+    assert_eq!(r1["outcome"], "upstream_error", "{evidence}");
+    let r2 = rows2
+        .get(1)
+        .unwrap_or_else(|| panic!("no second row: {evidence}"));
+    assert_eq!(hits_after_second, hits_after_first, "{evidence}");
+    assert_eq!(r2["outcome"], "no_candidate", "{evidence}");
+    assert!(r2.get("upstream_status").is_none(), "{evidence}");
 }

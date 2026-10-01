@@ -170,7 +170,8 @@ Client (stock OpenAI/Anthropic SDK)
        estimate the missing side from the request tally + relayed events → usage_estimated
      Emit ai.usage fact: tenant, vpc, key_id, model, requested_model, routed_model, price_model,
        token counts + usage_wire + reasoning / 1h-cache-write / server-tool / service-tier
-       breakouts, + x-beyond-metadata tags (managed only) → blocking stdout, lossless
+       breakouts, upstream_status + outcome, + x-beyond-metadata tags (managed only) → blocking
+       stdout, lossless. `provider` is absent when no provider was called
      Cache hit: same row with `cache_hit` and the stored tokens; no parse, no upstream latency
      Capturing: emit ai.payload (both bodies, truncation + completeness flags), correlated by
        request_id → bounded queue, DROPPED on overflow so a stalled sink can't backpressure
@@ -923,6 +924,21 @@ for 900 cached. The rows keep each wire's own meaning (downstream consumers rely
 `openai`, and `input_tokens + cache_read_tokens + cache_write_tokens` on `anthropic`. It is set by
 the extractor that read the usage, so a cache hit replays the convention its fill was parsed under;
 an estimate with nothing parsed takes the request's wire.
+
+**A zero-token row says why.** Every row carries `outcome` and, when a response head arrived,
+`upstream_status` (the provider's HTTP status; absent on a cache hit, which made no call):
+
+| `outcome`          | When                                                                                 |
+| ------------------ | ------------------------------------------------------------------------------------ |
+| `ok`               | A complete response, or a cache hit                                                  |
+| `upstream_error`   | The provider answered 4xx/5xx, or failed before any response head (connect, timeout) |
+| `client_cancelled` | The client went away first                                                           |
+| `no_candidate`     | No provider was called — every candidate's breaker was open                          |
+| `cut_short`        | A response started and then died upstream                                            |
+
+On `no_candidate` the row has no `provider`: the request's provider is only the walk's seed then,
+and naming it would bill a call that never happened. `RequestCtx::upstream_phase` (none → attempted
+in `upstream_peer` → connected in `upstream_request_filter`) is what tells the cases apart.
 
 **Priced variants and per-call fees** ride on the row next to the token counts:
 

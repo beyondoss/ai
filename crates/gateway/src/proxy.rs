@@ -324,6 +324,46 @@ pub struct RequestCtx {
     /// `logging` (which runs exactly once per admitted request — the same guarantee
     /// `requests_in_flight` rests on).
     tenant_slot: bool,
+    /// How far the current attempt got toward a provider. Lets a billing row tell a request no
+    /// provider was ever called for (every breaker open) from one that failed upstream.
+    upstream_phase: UpstreamPhase,
+}
+
+/// How far a request got toward a provider: what its billing row may claim about who was called.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum UpstreamPhase {
+    /// No provider was called: no attempt has been handed a peer.
+    #[default]
+    None,
+    /// `upstream_peer` handed pingora this attempt's peer. A provider was called, even if the
+    /// connect then failed.
+    Attempted,
+    /// The connection is up and the request is going out (`upstream_request_filter` ran).
+    Connected,
+}
+
+/// What became of a request, on its billing row: a consumer must be able to tell a zero-token row
+/// for an upstream error or a cancel from a real zero-token generation.
+fn outcome(rc: &RequestCtx, e: Option<&pingora_core::Error>, cache_hit: bool) -> &'static str {
+    if cache_hit {
+        return "ok";
+    }
+    if rc.upstream_status.is_some_and(|s| s >= 400) {
+        return "upstream_error";
+    }
+    if e.is_some_and(|e| e.esource() == &pingora_core::ErrorSource::Downstream) {
+        return "client_cancelled";
+    }
+    if rc.upstream_phase == UpstreamPhase::None {
+        return "no_candidate";
+    }
+    match (e, rc.upstream_status) {
+        // Failed before any response head: a connect, read-timeout or reset failure upstream.
+        (Some(_), None) => "upstream_error",
+        // A response that started and then died.
+        (Some(_), Some(_)) => "cut_short",
+        (None, _) => "ok",
+    }
 }
 
 /// State that exists only when a request uses the `x-beyond-*` control surface — it carried
@@ -2905,6 +2945,7 @@ impl ProxyHttp for AiProxy {
                     input_tally: usage::InputTally::default(),
                     stream_bytes: 0,
                     tenant_slot: false,
+                    upstream_phase: UpstreamPhase::None,
                 });
                 self.state.metrics.requests_in_flight.inc();
                 return Ok(true);
@@ -3062,6 +3103,7 @@ impl ProxyHttp for AiProxy {
             input_tally: usage::InputTally::default(),
             stream_bytes: 0,
             tenant_slot,
+            upstream_phase: UpstreamPhase::None,
         });
         // Admitted: count it in-flight. Balanced by the decrement in `logging`, which runs exactly
         // once per admitted request (rejected requests leave `ctx` None and never reach that path,
@@ -3113,6 +3155,7 @@ impl ProxyHttp for AiProxy {
                     ));
                 }
             };
+            rc.upstream_phase = UpstreamPhase::Attempted;
             return Ok(Box::new(self.build_peer(addr, &rc.provider)));
         }
 
@@ -3210,6 +3253,7 @@ impl ProxyHttp for AiProxy {
                         {
                             path.push_str(sub.suffix());
                         }
+                        rc.upstream_phase = UpstreamPhase::Attempted;
                         return Ok(Box::new(self.build_peer(addr, &p)));
                     }
                     Err(e) => {
@@ -3261,6 +3305,7 @@ impl ProxyHttp for AiProxy {
                 ));
             }
         };
+        rc.upstream_phase = UpstreamPhase::Attempted;
         Ok(Box::new(self.build_peer(addr, &rc.provider)))
     }
 
@@ -3440,9 +3485,12 @@ impl ProxyHttp for AiProxy {
         upstream_request: &mut pingora::http::RequestHeader,
         ctx: &mut Self::CTX,
     ) -> Result<()> {
-        let Some(rc) = ctx.as_ref() else {
+        let Some(rc) = ctx.as_mut() else {
             return Ok(());
         };
+        // Pingora runs this once the connection is up, just before the request head goes out.
+        rc.upstream_phase = UpstreamPhase::Connected;
+        let rc = &*rc;
 
         // Managed: swap the virtual key for the real pool key (precomputed at boot) in the scheme
         // the upstream wants — removing every inbound static-key header first (see
@@ -4395,10 +4443,15 @@ impl ProxyHttp for AiProxy {
             // The catalog row to price this row at. A model-routed row already names it; a
             // provider-routed one resolves it from what the provider echoed or the client asked for.
             let price_model = routed_model.or_else(|| price_model(billed_model, requested_model));
-            let usage_provider = cache_hit
-                .as_ref()
-                .map(|h| h.provider.as_ref())
-                .unwrap_or(rc.provider.name.as_str());
+            // Absent when no provider was called (every candidate's breaker open): `rc.provider`
+            // is then just the walk's seed, and naming it would bill a call that never happened.
+            let usage_provider = match cache_hit.as_ref() {
+                Some(h) => Some(h.provider.as_ref()),
+                None => {
+                    (rc.upstream_phase != UpstreamPhase::None).then_some(rc.provider.name.as_str())
+                }
+            };
+            let outcome = outcome(rc, e, cache_hit.is_some());
             let usage_stream = cache_hit
                 .as_ref()
                 .map(|h| h.streaming)
@@ -4421,6 +4474,10 @@ impl ProxyHttp for AiProxy {
                 price_model,
                 stream = usage_stream,
                 cache_hit = cache_hit.is_some(),
+                // The provider's HTTP status, absent when no response head arrived (and on a cache
+                // hit, which made no call); and what became of the request (see `outcome`).
+                upstream_status = cache_hit.is_none().then_some(rc.upstream_status).flatten(),
+                outcome,
                 // True when the stream was cut short before its usage block and the token counts
                 // below are the gateway's estimate, not the provider's report. Estimates err low.
                 usage_estimated,
@@ -4596,6 +4653,7 @@ mod tests {
             input_tally: usage::InputTally::default(),
             stream_bytes: 0,
             tenant_slot: false,
+            upstream_phase: UpstreamPhase::None,
         }
     }
 
