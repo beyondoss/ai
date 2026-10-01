@@ -272,7 +272,7 @@ layer_note = "Reclassified from live/both on 2026-10-01: The ranker reacts to me
 clients = ["raw"]
 failover_clients = []
 touches = ["crates/gateway/src/proxy.rs", "crates/gateway/src/smart.rs", "crates/gateway/src/circuit_breaker.rs", "crates/gateway/src/control.rs"]
-defects = []
+defects = ["D119"]
 
 
 # --- Billing -----------------------------------------------------------------------------------
@@ -349,7 +349,7 @@ layer_note = "Reclassified from live/both on 2026-10-01: The response cache is g
 clients = ["raw", "openai-py"]
 failover_clients = []
 touches = ["crates/gateway/src/cache.rs", "crates/gateway/src/proxy.rs"]
-defects = []
+defects = ["D120"]
 
 
 # --- Auth and limits ---------------------------------------------------------------------------
@@ -725,7 +725,7 @@ group = "Security and isolation"
 text = "A deny-set revocation applies within a stated bound, with a pinned policy for in-flight streams"
 layer = "hermetic"
 touches = ["crates/gateway/src/proxy.rs", "crates/gateway/src/key.rs", "crates/gateway/src/route.rs", "crates/gateway/src/cache.rs", "crates/gateway/src/control.rs", "crates/gateway/src/secret.rs"]
-defects = []
+defects = ["D121"]
 
 [[claim]]
 id = "SEC-18"
@@ -1637,7 +1637,7 @@ oracle = "harness/SDK session; deny-set or allowance written to NATS mid-stream:
 layer = "live"
 clients = ["openai-py", "anthropic-py", "claude-code"]
 touches = ["crates/gateway/src/deny.rs", "crates/gateway/src/allowance.rs", "crates/gateway/src/store_watch.rs", "crates/gateway/src/proxy.rs"]
-defects = []
+defects = ["D121"]
 
 [[claim]]
 id = "TEN-2"

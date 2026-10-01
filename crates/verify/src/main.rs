@@ -280,14 +280,16 @@ fn filter_expr(tagged: &[Tagged]) -> String {
 }
 
 /// The nextest binaries holding live cells: real clients (`crates/verify/tests/live.rs`), billing
-/// reconciliation against the providers' usage reports (`tests/reconcile_live.rs`),
-/// differential parity against direct provider calls (`tests/parity_live.rs`), and the catalog
-/// sweep (`tests/catalog_live.rs`). Every test in them is named `CLAIMS::client::...`.
+/// reconciliation against the providers' usage reports (`tests/reconcile_live.rs`), differential
+/// parity against direct provider calls (`tests/parity_live.rs`), the catalog sweep
+/// (`tests/catalog_live.rs`), and tenancy sessions under control-plane changes
+/// (`tests/tenancy_live.rs`). Every test in them is named `CLAIMS::client::...`.
 const LIVE_BINARIES: &[&str] = &[
     "beyond-ai-verify::live",
     "beyond-ai-verify::reconcile_live",
     "beyond-ai-verify::parity_live",
     "beyond-ai-verify::catalog_live",
+    "beyond-ai-verify::tenancy_live",
 ];
 
 /// One live cell's result, parsed from its name `CLAIMS::client::route::probe`.

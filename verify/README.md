@@ -136,4 +136,32 @@ and prints its cost (each billed call is priced from the ledger into
 estimated cost, and every trial left out with its reason (no key, over the per-call cost cap, or a
 provider window an over-limit prompt would be billed against).
 
+## Tenancy sessions (TEN-1, TEN-2)
+
+`crates/verify/tests/tenancy_live.rs` runs real SDK sessions while the control plane changes under
+them, and two tenants side by side. Each trial (`CLAIMS::client::route::scenario`) boots its own
+nats-server and gateway, mints `bai_v2` keys for two tenants from the dev signing key, and runs one
+scenario of `verify/clients/py/tenancy.py`. The scenario drives the clients and the timing; the cell
+writes the `ai-gateway` KV bucket (`blackhole.*`, `allowance.*`) when the scenario asks, over a bare
+NATS connection, and checks the ledger afterwards: each call has one row with the tenant and key it
+used, the tokens it was shown and the cache hit and provider it saw; a refused call bills nothing;
+no row is unaccounted for.
+
+| Scenario              | What it proves                                                                                                                                                                                         |
+| --------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `revoke_tenant`       | `blackhole.{tenant}` written mid-stream: the stream finishes and is billed exactly; the next call 402s within 2s, the tenant's other key too, the other tenant doesn't; deleting it restores within 2s |
+| `revoke_key`          | the same for `blackhole.key.{id}`: the tenant's sibling key keeps working                                                                                                                              |
+| `exhaust_allowance`   | the same for `allowance.{tenant}`: 402 `insufficient_quota`                                                                                                                                            |
+| `claude_code_revoked` | Claude Code's key is denied after its first billed call: it exits promptly with the 402 named, no retry loop                                                                                           |
+| `cache_isolation`     | with `cache_ttl_secs`, identical sessions: a tenant replays its own fills, never the other tenant's                                                                                                    |
+| `pin_isolation`       | a tenant-A key pinned to the provider a new caller isn't ranked to; tenant B's key with the same vpc and key id is ranked, not steered                                                                 |
+| `tenant_limit`        | `tenant_max_in_flight = 2`: A's third concurrent call 429s; B's two are served                                                                                                                         |
+| `rate_limit`          | `rate_limit_rps = 3`: a burst on one credential 429s; the tenant's other key and the other tenant don't                                                                                                |
+
+A run costs about $0.10.
+
+```sh
+VERIFY_LIVE=1 cargo test -p beyond-ai-verify --test tenancy_live -- --nocapture --test-threads=4
+```
+
 `STALE` status will land with the run ledger.

@@ -1659,3 +1659,45 @@ state = "suspected"
 test = ""
 fix = ""
 note = "Related to D81 / D83 (large-body handling) but a different path: here the upstream answered and the answer was dropped."
+
+[[defect]]
+id = "D119"
+severity = "low"
+area = "Routing"
+title = "The ranker's probe promotes an unkeyed candidate, so a keyed arm behind it is never measured"
+impact = "Every 8th request is meant to promote the first unmeasured candidate so a fallback gets measured and can be ranked. The probe looks at the whole catalog row, keyed or not, and an unkeyed candidate never gets a sample, so it stays 'unmeasured' forever and wins every probe. upstream_peer then skips it and the request goes to the usual primary. On a Claude row deployed without Bedrock (anthropic, bedrock, openrouter), OpenRouter is never probed, measured, ranked or pinned: it is only ever used as failover, whatever its latency."
+confidence = "high"
+evidence = "live 2026-10-01, TEN-2 pin cells on claude-haiku-4-5 with Anthropic and OpenRouter keyed and Bedrock unkeyed: 20 sequential calls from 20 fresh bai_v2 keys (each its own pin) were all served by anthropic, including seq 8 and 16, the probe slots (TEN-2+SEC-15::{anthropic-py,openai-py}::pooled::pin_isolation, first run). With Bedrock keyed too (route pooled3), seq 8 lands on bedrock (key pa09) in every run. Code: smart.rs probe() picks the first walk index whose effective() is Tier::Unmeasured; the walk passed to rank() is the row's identity walk, ranked before the usable (keyed) mask is computed in proxy.rs (~3432-3470)."
+claims = ["R7"]
+state = "suspected"
+test = ""
+fix = ""
+note = "Found by crates/verify/tests/tenancy_live.rs, whose pin cells now key Bedrock so the probe can reach a second provider. Proposed: skip unkeyed (and breaker-open) candidates when choosing the probe target."
+
+[[defect]]
+id = "D120"
+severity = "low"
+area = "Reliability"
+title = "openai-py closes at [DONE], so a complete stream can be logged client_cancelled and is then not cached"
+impact = "openai-python's Stream breaks out at `data: [DONE]` and closes the response at once. The gateway has relayed the whole answer and the usage chunk, but when the provider's end-of-stream reaches it a moment after [DONE], the client's close lands first: the row says outcome client_cancelled (with exact usage, not an estimate), and the cache fill is skipped because the request ended in a downstream error. Billing is right, but cancel-rate dashboards count completed streams from the most common SDK as cancellations, and with cache_ttl_secs > 0 an identical streamed request from openai-py misses when it should hit. It is a race: it happened on 3 of 8 openai-py streamed fills observed (none of 8 anthropic-py ones)."
+confidence = "high"
+evidence = "live 2026-10-01 TEN-2+SEC-14+K2::openai-py::gpt4o-mini::cache_isolation, twice in a row before the cell was made tolerant: the first streamed turn's row was {stream:true, outcome:client_cancelled, usage_estimated:false, input 18, output 13, upstream_status 200}; the client had read every chunk through [DONE] with usage; the gateway logged 'Fail to proxy: Downstream ConnectionClosed ... Prematurely before response body is complete'; the identical turn replayed by the same tenant then missed (no x-beyond-cache-status). Tenant B's identical stream seconds later was logged ok and cached. openai/_streaming.py (openai==3.22.1): `if sse.data.startswith(\"[DONE]\"): break`, then `finally: response.close()`. proxy.rs logging fills the cache only when `e.is_none()` (~5729)."
+claims = ["K2"]
+state = "suspected"
+test = ""
+fix = ""
+note = "Found by crates/verify/tests/tenancy_live.rs. The cell now tolerates a miss on a streamed turn (never a cross-tenant hit). Proposed: treat a downstream close after the terminal [DONE] / message_stop was relayed as a completed response (outcome ok, fill allowed)."
+
+[[defect]]
+id = "D121"
+severity = "low"
+area = "Docs"
+title = "ARCHITECTURE.md states no propagation bound and no in-flight policy for a deny or an exhausted allowance"
+impact = "SEC-17 and TEN-1 promise a revocation that applies within a stated bound, with a pinned policy for streams already in flight. ARCHITECTURE.md describes where deny and allowance are checked (request_filter, before upstream_peer) but never says how quickly a written blackhole.* / allowance.* entry takes effect, nor that a stream admitted before it runs to completion and is billed in full. The only statement of either is a doc comment on a hermetic test (claims_security.rs SEC-17: 'within two seconds', 'runs to completion'). An operator or the control-plane team cannot learn the contract from the docs."
+confidence = "high"
+evidence = "crates/gateway/ARCHITECTURE.md Deny-Set and Allowance-Set sections (~1086-1116), the request-flow diagram (~70-80) and the failure-modes table: no bound, no in-flight behavior. crates/gateway/tests/claims_security.rs ~1020-1023 states both. Live 2026-10-01 (tenancy_live.rs): a written deny or allowance refused the next request in 17-50 ms; deleting it restored service at the first poll; every in-flight stream ran to completion and its row was exact."
+claims = ["SEC-17", "TEN-1"]
+state = "suspected"
+test = ""
+fix = ""
+note = "Found while building crates/verify/tests/tenancy_live.rs, whose TEN-1 cells assert the policy the hermetic test pins (2s bound; in-flight streams finish, billed exactly). Fix: state both in the Deny-Set / Allowance-Set sections."
