@@ -212,6 +212,13 @@ pub struct AiConfig {
     pub write_timeout_secs: u64,
     pub idle_timeout_secs: u64,
 
+    /// Downstream write timeout (seconds): a write to the client that cannot make progress for this
+    /// long ends the request. A client that stops reading (a hung SDK, a paused process, a
+    /// half-dead connection) otherwise held its in-flight slot, its tenant slot, its upstream
+    /// connection and possibly a half-open probe permit forever, since nothing else times out a
+    /// blocked write. Per write: a slow but steady reader never trips it. `0` disables it.
+    pub client_write_timeout_secs: u64,
+
     /// Graceful-shutdown drain window (seconds): after SIGTERM, how long Pingora lets **in-flight
     /// requests finish** before tearing the runtimes down. Maps to Pingora's `grace_period_seconds`
     /// (left unset, Pingora silently defaults to 300s — this knob makes the window explicit).
@@ -375,6 +382,7 @@ impl Default for AiConfig {
             read_timeout_secs: 600,
             write_timeout_secs: 60,
             idle_timeout_secs: 90,
+            client_write_timeout_secs: 60,
             // Drain for the full request lifetime (= read_timeout_secs) so a deploy never truncates
             // an in-flight stream — we're a transparent proxy and must not mangle a paid-for
             // generation. Pingora stops accepting new connections at SIGTERM, so this only waits out

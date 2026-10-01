@@ -30,6 +30,8 @@ connect_timeout_secs = 10
 read_timeout_secs = 600
 write_timeout_secs = 60
 idle_timeout_secs = 90
+# A client that stops reading for this long is disconnected and its slots released (0 disables).
+client_write_timeout_secs = 60
 
 # Graceful shutdown. On SIGTERM, in-flight requests drain for up to grace_period_secs before the
 # runtimes are torn down (then runtime_timeout_secs is the final teardown backstop).

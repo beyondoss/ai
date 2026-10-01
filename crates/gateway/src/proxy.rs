@@ -2404,6 +2404,14 @@ impl ProxyHttp for AiProxy {
         let full_body = full_body_ctx(session);
         if full_body.is_none() {
             self.state.metrics.requests_total.inc();
+            // A client that stops reading is cut off after this long rather than holding its slot,
+            // its upstream connection and any breaker permit forever (see the config field).
+            let secs = self.state.config.client_write_timeout_secs;
+            if secs > 0 {
+                session
+                    .downstream_session
+                    .set_write_timeout(Some(Duration::from_secs(secs)));
+            }
         }
         let start = Instant::now();
         // One id per request, generated before any reject path so even a 400/401 carries it (in the

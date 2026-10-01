@@ -158,13 +158,18 @@ async fn a_streaming_header_stall_fails_well_under_read_timeout_by_default() {
 }
 
 /// A client that sends a request for a large stream and then never reads must be released (its
-/// in-flight slot, upstream connection, gauge) within a bound. 20s is generous for "stopped reading
-/// entirely".
+/// in-flight slot, upstream connection, gauge) within a bound. The bound is the downstream write
+/// timeout: 60s by default (asserted below), configured to 3s here so the release is observed
+/// inside the test's 20s window rather than after a minute.
 /// claim: REL-10
 /// defect: D42
 #[tokio::test]
-#[ignore = "D42 reproduced: a client that never reads holds its in-flight slot past 20s"]
 async fn a_client_that_stops_reading_is_released() {
+    assert_eq!(
+        beyond_ai::config::AiConfig::default().client_write_timeout_secs,
+        60,
+        "a default downstream write timeout exists"
+    );
     let (pubkey, _sk) = test_keypair(1);
     let big = {
         let event = "data: {\"choices\":[{\"delta\":{\"content\":\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\"}}]}\n\n";
@@ -176,7 +181,10 @@ async fn a_client_that_stops_reading_is_released() {
         body: big.clone(),
     })
     .await;
-    let gw = Gateway::start(unused_nats_port(), &mock.authority(), &b64(&pubkey)).await;
+    let gw = Gateway::builder(unused_nats_port(), &mock.authority(), &b64(&pubkey))
+        .config_line("client_write_timeout_secs = 3")
+        .start()
+        .await;
     let mut s = tokio::net::TcpStream::connect(("127.0.0.1", gw.port))
         .await
         .unwrap();
