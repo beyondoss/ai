@@ -1870,6 +1870,69 @@ fn a_chat_custom_tool_call_reaches_responses_as_a_custom_tool_call() {
     assert!(named(&evs, "response.function_call_arguments.delta").is_empty());
 }
 
+/// Codex on a Claude row, streaming: Claude calls a namespace member under its flat name and the
+/// wrapped `apply_patch` with an `{"input": …}` object split across deltas. Codex sees
+/// `{name, namespace}` and a `custom_tool_call` whose input deltas are the raw patch, not JSON.
+/// claim: W2
+/// defect: D75
+#[test]
+fn codex_tool_calls_stream_back_under_the_names_codex_offered() {
+    const CLAUDE_SSE: &str = concat!(
+        "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-opus-4-8\",\"content\":[],\"usage\":{\"input_tokens\":9,\"output_tokens\":1}}}\n\n",
+        "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"multi_agent_v1__spawn_agent\",\"input\":{}}}\n\n",
+        "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"task\\\":\\\"fix\\\"}\"}}\n\n",
+        "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+        "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_2\",\"name\":\"apply_patch\",\"input\":{}}}\n\n",
+        "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"input\\\":\\\"*** Begin\"}}\n\n",
+        "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\" Patch\\\\n\\\"}\"}}\n\n",
+        "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
+        "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":20}}\n\n",
+        "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+    );
+    let request = json!({"tools": [
+        {"type": "custom", "name": "apply_patch", "format": {"type": "grammar", "syntax": "lark", "definition": "start: x"}},
+        {"type": "namespace", "name": "multi_agent_v1", "description": "agents", "tools": [
+            {"type": "function", "name": "spawn_agent", "parameters": {"type": "object"}}]},
+    ]});
+    let tools = ToolNames::of_responses(&request, true);
+    let run = |chunks: &[&[u8]]| {
+        let mut b = SseBridge::new(Responses, Messages).with_tools(tools.clone());
+        let mut out = Vec::new();
+        for c in chunks {
+            out.extend(b.feed(c, false));
+        }
+        out.extend(b.feed(b"", true));
+        events(&String::from_utf8(out).unwrap())
+    };
+    let evs = run(&[CLAUDE_SSE.as_bytes()]);
+    let bytes: Vec<&[u8]> = CLAUDE_SSE.as_bytes().chunks(1).collect();
+    assert_eq!(normalize(&run(&bytes)), normalize(&evs));
+
+    let resp = assert_responses_lifecycle(&evs, "response.completed");
+    let out = resp["output"].as_array().unwrap();
+    assert_eq!(out[0]["type"], "function_call", "{resp:#}");
+    assert_eq!(out[0]["name"], "spawn_agent");
+    assert_eq!(out[0]["namespace"], "multi_agent_v1");
+    assert_eq!(out[0]["arguments"], "{\"task\":\"fix\"}");
+    assert_eq!(out[1]["type"], "custom_tool_call", "{resp:#}");
+    assert_eq!(out[1]["name"], "apply_patch");
+    assert_eq!(out[1]["input"], "*** Begin Patch\n");
+    assert_eq!(
+        named(&evs, "response.output_item.added")[0]["item"]["namespace"],
+        "multi_agent_v1"
+    );
+    let deltas: Vec<&str> = named(&evs, "response.custom_tool_call_input.delta")
+        .iter()
+        .map(|v| v["delta"].as_str().unwrap())
+        .collect();
+    assert_eq!(deltas, ["*** Begin Patch\n"]);
+    assert_eq!(
+        named(&evs, "response.function_call_arguments.delta").len(),
+        1,
+        "only the namespaced call streams arguments: {evs:#?}"
+    );
+}
+
 /// A Chat client on a Responses-only row (the `-codex` models) with a custom tool: the call was
 /// dropped, and the turn ended `stop` with nothing to run.
 #[test]

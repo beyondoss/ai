@@ -554,7 +554,7 @@ models today; one that does would 400 a turn after a forced one on an enforced a
 Files API image, a non-base64 data URI, `n` > 1, `logprobs`, audio output, Anthropic server and
 Anthropic-defined tools (`web_search_…`, `bash_…`, `text_editor_…`: as an empty-schema function the
 model would call one and nothing would run it), Responses hosted tools (`web_search`,
-`file_search`, …), OpenAI `custom` tools onto Messages, `mcp_servers`, a Responses `prompt`
+`file_search`, …), a Chat Completions client's `custom` tools onto Messages, `mcp_servers`, a Responses `prompt`
 template, `stop` onto Responses, and Responses input items with no Chat Completions shape
 (`item_reference`, `computer_call_output`, `local_shell_call`, `compaction`, …, forwarded whole in
 their place in `messages`) have no equivalent on the other wire and change what the client gets
@@ -572,7 +572,17 @@ legacy call gets an id from its message position, reused by its `function` resul
 Responses `custom` tool and its calls map to Chat Completions' `custom`, in requests and in
 responses both ways (a Responses `custom_tool_call` item with its raw `input` ↔ a Chat
 `tool_calls` entry of `type: "custom"`, streamed as `response.custom_tool_call_input.*` ↔
-`custom.input` deltas), and the tool message answering a `custom` call becomes a
+`custom.input` deltas; a grammar format's flat `{type, syntax, definition}` ↔ Chat's nested
+`{type, grammar: {syntax, definition}}`, which OpenAI requires). Onto Messages, which has no
+free-form tool, a Responses client's `custom` tool becomes a tool taking one `input` string, its
+description carrying the grammar, and a call to it comes back as a `custom_tool_call` whose raw
+input is that string (streamed whole once the arguments object is). A Responses `namespace` tool
+(Codex groups its multi-agent and MCP tools in one) is flattened onto Chat Completions and Messages:
+each member tool is sent as `{namespace}__{name}` (`{namespace}{name}` when the namespace already
+ends in `_`), with the namespace's description ahead of its own, and a replayed call carrying
+`namespace` is sent under the same flat name. The flat names are per-request state
+(`translate::ToolNames`, built from the client's tools as the body is translated): each call that
+comes back is named `{name, namespace}` again, in JSON and in streams. The tool message answering a `custom` call becomes a
 `custom_tool_call_output` onto Responses (OpenAI rejects a `function_call_output` for it); a custom
 call in history onto Messages keeps its name, its raw text as `tool_use.input: {"input": …}` (the
 input must be an object); `tool_choice` and `parallel_tool_calls` go onto Chat Completions only

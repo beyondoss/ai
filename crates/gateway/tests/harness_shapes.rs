@@ -164,7 +164,6 @@ fn assert_codex_calls(resp: &Value) {
 /// claim: W2
 /// defect: D75
 #[tokio::test]
-#[ignore = "D75 reproduced: namespace tools pass through translation and custom grammars lose their wrapper"]
 async fn codex_tools_survive_translation_and_calls_map_back() {
     let history = json!([
         {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "fix the test"}]},

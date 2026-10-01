@@ -90,6 +90,9 @@ pub struct TranslateState {
     pub sse: Option<SseBridge>,
     /// Non-stream JSON, withheld until end-of-stream so we can map the object.
     pub json_buf: Vec<u8>,
+    /// How this attempt's request reshaped a Responses client's tools; set per attempt by
+    /// [`request_with_tools`] and read by the response translation.
+    pub tools: ToolNames,
 }
 
 impl TranslateState {
@@ -98,6 +101,7 @@ impl TranslateState {
             client,
             sse: None,
             json_buf: Vec::new(),
+            tools: ToolNames::default(),
         }
     }
 
@@ -122,16 +126,131 @@ impl TranslateState {
 /// headers have already gone upstream. The candidate `model` id is spliced by the caller
 /// **after** this returns.
 pub fn request(from: Endpoint, to: Endpoint, body: &[u8], upstream_model: &str) -> Vec<u8> {
+    request_with_tools(from, to, body, upstream_model).0
+}
+
+/// [`request`], plus the [`ToolNames`] the response must map the upstream's tool calls back
+/// through (empty unless a Responses body's tools were reshaped).
+pub fn request_with_tools(
+    from: Endpoint,
+    to: Endpoint,
+    body: &[u8],
+    upstream_model: &str,
+) -> (Vec<u8>, ToolNames) {
     if from == to {
-        return body.to_vec();
+        return (body.to_vec(), ToolNames::default());
     }
     let Ok(v) = serde_json::from_slice::<Value>(body) else {
-        return body.to_vec();
+        return (body.to_vec(), ToolNames::default());
     };
     if !v.is_object() {
-        return body.to_vec();
+        return (body.to_vec(), ToolNames::default());
     }
-    encode(&map_request(from, to, &v, Upstream::of(upstream_model)))
+    let names = if from == Endpoint::Responses {
+        ToolNames::of_responses(&v, to == Endpoint::Messages)
+    } else {
+        ToolNames::default()
+    };
+    (
+        encode(&map_request(from, to, &v, Upstream::of(upstream_model))),
+        names,
+    )
+}
+
+/// How a Responses client's tools were reshaped on the way to a Chat Completions or Messages
+/// upstream, so the calls that come back can be named the way the client offered them.
+///
+/// - A `namespace` tool (Codex groups its multi-agent and MCP tools in one) has no shape off
+///   Responses: its member tools are sent flat, as [`namespaced_name`] (`multi_agent__spawn`),
+///   and a call to one comes back as `{name, namespace}`.
+/// - A `custom` (free-form input) tool has no Messages shape: it is sent as a tool taking one
+///   `input` string, and a call to it comes back as a `custom_tool_call` with that string as its
+///   raw input.
+///
+/// Empty (no allocation) for every other request.
+#[derive(Debug, Default, Clone)]
+pub struct ToolNames {
+    /// `(flat name, namespace, member name)` for each namespaced member tool.
+    namespaced: Vec<(String, String, String)>,
+    /// Flat names of the `custom` tools sent to Messages as a one-string-field tool.
+    wrapped: Vec<String>,
+}
+
+impl ToolNames {
+    fn of_responses(v: &Value, wrap_custom: bool) -> Self {
+        let mut names = Self::default();
+        for t in v
+            .get("tools")
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+        {
+            match t.get("type").and_then(Value::as_str) {
+                Some("namespace") => {
+                    let ns = t.get("name").and_then(Value::as_str).unwrap_or("");
+                    for m in namespace_members(t) {
+                        let Some(name) = m.get("name").and_then(Value::as_str) else {
+                            continue;
+                        };
+                        let flat = namespaced_name(ns, name);
+                        if wrap_custom && m.get("type").and_then(Value::as_str) == Some("custom") {
+                            names.wrapped.push(flat.clone());
+                        }
+                        names
+                            .namespaced
+                            .push((flat, ns.to_owned(), name.to_owned()));
+                    }
+                }
+                Some("custom") if wrap_custom => {
+                    if let Some(name) = t.get("name").and_then(Value::as_str) {
+                        names.wrapped.push(name.to_owned());
+                    }
+                }
+                _ => {}
+            }
+        }
+        names
+    }
+
+    /// The name a call to `flat` had in the client's request, and its namespace if it had one.
+    fn restore<'a>(&'a self, flat: &'a str) -> (&'a str, Option<&'a str>) {
+        self.namespaced
+            .iter()
+            .find(|(f, _, _)| f == flat)
+            .map_or((flat, None), |(_, ns, name)| {
+                (name.as_str(), Some(ns.as_str()))
+            })
+    }
+
+    fn is_empty(&self) -> bool {
+        self.namespaced.is_empty() && self.wrapped.is_empty()
+    }
+
+    /// Whether `flat` is a `custom` tool sent to Messages wrapped in an `input` object.
+    fn wrapped(&self, flat: &str) -> bool {
+        self.wrapped.iter().any(|w| w == flat)
+    }
+}
+
+/// A namespace member's flat name: `{namespace}__{name}`, or `{namespace}{name}` when the
+/// namespace already ends in `_` (Codex's MCP namespaces, `mcp__server__`, then read as the
+/// `mcp__server__tool` names Codex itself gives MCP tools elsewhere). Both fit every provider's
+/// tool-name alphabet.
+fn namespaced_name(namespace: &str, name: &str) -> String {
+    if namespace.is_empty() {
+        name.to_owned()
+    } else if namespace.ends_with('_') {
+        format!("{namespace}{name}")
+    } else {
+        format!("{namespace}__{name}")
+    }
+}
+
+fn namespace_members(t: &Value) -> &[Value] {
+    t.get("tools")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default()
 }
 
 /// What this attempt's upstream model accepts, parsed once from the id it will receive.
@@ -162,12 +281,12 @@ fn map_request(from: Endpoint, to: Endpoint, v: &Value, up: Upstream) -> Value {
     match (from, to) {
         (Endpoint::ChatCompletions, Endpoint::Messages) => openai_req_to_anthropic(chat, up.claude),
         (Endpoint::Messages, Endpoint::ChatCompletions) => anthropic_req_to_openai(v, up),
-        (Endpoint::Responses, Endpoint::ChatCompletions) => responses_req_to_openai(v, up),
+        (Endpoint::Responses, Endpoint::ChatCompletions) => responses_req_to_openai(v, up, false),
         (Endpoint::ChatCompletions, Endpoint::Responses) => {
             openai_req_to_responses(chat, up.openai)
         }
         (Endpoint::Responses, Endpoint::Messages) => {
-            let mut chat = responses_req_to_openai(v, up);
+            let mut chat = responses_req_to_openai(v, up, true);
             // Intermediate only (never sent): `reasoning.summary` has no Chat Completions field, but
             // it decides `thinking.display` on Messages.
             if let (Some(r), Some(obj)) = (v.get("reasoning"), chat.as_object_mut()) {
@@ -198,6 +317,18 @@ pub fn response_json_status(
     status: u16,
     body: &[u8],
 ) -> Vec<u8> {
+    response_json_tools(upstream, client, status, body, &ToolNames::default())
+}
+
+/// [`response_json_status`] for a request whose tools were reshaped (see [`ToolNames`]): each tool
+/// call comes back under the name, namespace and kind the client offered.
+pub fn response_json_tools(
+    upstream: Endpoint,
+    client: Endpoint,
+    status: u16,
+    body: &[u8],
+    tools: &ToolNames,
+) -> Vec<u8> {
     if upstream == client {
         return body.to_vec();
     }
@@ -207,17 +338,17 @@ pub fn response_json_status(
     if !(200..300).contains(&status) || looks_like_error(&v) {
         return encode(&map_error(&v, client));
     }
-    encode(&map_response(upstream, client, &v))
+    encode(&map_response(upstream, client, &v, tools))
 }
 
-fn map_response(upstream: Endpoint, client: Endpoint, v: &Value) -> Value {
+fn map_response(upstream: Endpoint, client: Endpoint, v: &Value, tools: &ToolNames) -> Value {
     match (upstream, client) {
         (Endpoint::Messages, Endpoint::ChatCompletions) => anthropic_resp_to_openai(v),
         (Endpoint::ChatCompletions, Endpoint::Messages) => openai_resp_to_anthropic(v),
-        (Endpoint::ChatCompletions, Endpoint::Responses) => openai_resp_to_responses(v),
+        (Endpoint::ChatCompletions, Endpoint::Responses) => openai_resp_to_responses(v, tools),
         (Endpoint::Responses, Endpoint::ChatCompletions) => responses_resp_to_openai(v),
         (Endpoint::Messages, Endpoint::Responses) => {
-            openai_resp_to_responses(&anthropic_resp_to_openai(v))
+            openai_resp_to_responses(&anthropic_resp_to_openai(v), tools)
         }
         (Endpoint::Responses, Endpoint::Messages) => {
             openai_resp_to_anthropic(&responses_resp_to_openai(v))
@@ -3179,7 +3310,10 @@ fn openai_resp_to_anthropic(v: &Value) -> Value {
 
 // --- request: Responses ↔ Chat Completions ----------------------------------
 
-fn responses_req_to_openai(v: &Value, up: Upstream) -> Value {
+/// `wrap_custom`: the Chat Completions body is an intermediate bound for Messages, which has no
+/// free-form tool, so each `custom` tool becomes a function taking one `input` string (see
+/// [`ToolNames`]).
+fn responses_req_to_openai(v: &Value, up: Upstream, wrap_custom: bool) -> Value {
     let openai = up.openai;
     let mut out = Map::new();
     copy_if(&mut out, v, "model");
@@ -3204,7 +3338,38 @@ fn responses_req_to_openai(v: &Value, up: Upstream) -> Value {
         out.insert("reasoning_effort".into(), json!(effort));
     }
     if let Some(tools) = v.get("tools").and_then(Value::as_array) {
-        let mapped: Vec<Value> = tools.iter().map(responses_tool_to_openai).collect();
+        let mut mapped: Vec<Value> = Vec::with_capacity(tools.len());
+        for t in tools {
+            if t.get("type").and_then(Value::as_str) == Some("namespace") {
+                let ns = t.get("name").and_then(Value::as_str).unwrap_or("");
+                let about = non_empty_str(t, "description");
+                for m in namespace_members(t) {
+                    let Some(name) = m.get("name").and_then(Value::as_str) else {
+                        continue;
+                    };
+                    let mut m = m.clone();
+                    if let Some(obj) = m.as_object_mut() {
+                        obj.insert("name".into(), json!(namespaced_name(ns, name)));
+                        if let Some(about) = about {
+                            // The namespace's description is shown to the model once on
+                            // Responses; flat, each member carries it.
+                            let desc = match obj
+                                .get("description")
+                                .and_then(Value::as_str)
+                                .filter(|d| !d.is_empty())
+                            {
+                                Some(d) => format!("{about}\n\n{d}"),
+                                None => about.to_owned(),
+                            };
+                            obj.insert("description".into(), json!(desc));
+                        }
+                    }
+                    mapped.push(responses_tool_to_openai(&m, wrap_custom));
+                }
+            } else {
+                mapped.push(responses_tool_to_openai(t, wrap_custom));
+            }
+        }
         if !mapped.is_empty() {
             out.insert("tools".into(), Value::Array(mapped));
         }
@@ -3552,7 +3717,7 @@ fn chat_tool_call_to_responses_item(c: &Value) -> Value {
 /// hosted tools (`web_search`, `file_search`, `mcp`, …) do not, and are forwarded as-is for the
 /// provider to reject by name. Dropping one would let the model answer without a tool the client
 /// offered.
-fn responses_tool_to_openai(t: &Value) -> Value {
+fn responses_tool_to_openai(t: &Value, wrap_custom: bool) -> Value {
     if t.get("function").is_some() || t.get("custom").is_some() {
         return t.clone();
     }
@@ -3560,15 +3725,23 @@ fn responses_tool_to_openai(t: &Value) -> Value {
     let Some(name) = t.get("name").and_then(Value::as_str) else {
         return t.clone();
     };
+    if typ == "custom" && wrap_custom {
+        return wrapped_custom_tool(t, name);
+    }
     let keys: &[&str] = match typ {
         "function" => &["description", "parameters", "strict"],
-        "custom" => &["description", "format"],
+        "custom" => &["description"],
         _ => return t.clone(),
     };
     let mut inner = Map::new();
     inner.insert("name".into(), json!(name));
     for key in keys {
         copy_if(&mut inner, t, key);
+    }
+    if typ == "custom"
+        && let Some(format) = t.get("format").filter(|f| !f.is_null())
+    {
+        inner.insert("format".into(), custom_format_to_chat(format));
     }
     let mut out = Map::new();
     out.insert("type".into(), json!(typ));
@@ -3585,7 +3758,7 @@ fn openai_tool_to_responses(t: &Value) -> Option<Value> {
             t.get("function").unwrap_or(t),
             &["description", "parameters", "strict"],
         ),
-        "custom" => (t.get("custom").unwrap_or(t), &["description", "format"]),
+        "custom" => (t.get("custom").unwrap_or(t), &["description"]),
         // Hosted and Anthropic server tools: forwarded for the provider to reject by name.
         _ => return Some(t.clone()),
     };
@@ -3596,7 +3769,85 @@ fn openai_tool_to_responses(t: &Value) -> Option<Value> {
     for key in keys {
         copy_if(&mut m, inner, key);
     }
+    if typ == "custom"
+        && let Some(format) = inner.get("format").filter(|f| !f.is_null())
+    {
+        m.insert("format".into(), custom_format_to_responses(format));
+    }
     Some(Value::Object(m))
+}
+
+/// A `custom` tool's grammar format, Responses (`{type, syntax, definition}`) → Chat Completions
+/// (`{type, grammar: {syntax, definition}}`). Copied flat, OpenAI 400s it ("Missing required
+/// parameter: 'tools[3].custom.format.grammar'"). `text`, and a format already nested, pass.
+fn custom_format_to_chat(format: &Value) -> Value {
+    if format.get("type").and_then(Value::as_str) != Some("grammar")
+        || format.get("grammar").is_some()
+    {
+        return format.clone();
+    }
+    let mut grammar = Map::new();
+    copy_if(&mut grammar, format, "syntax");
+    copy_if(&mut grammar, format, "definition");
+    json!({ "type": "grammar", "grammar": grammar })
+}
+
+/// The inverse of [`custom_format_to_chat`].
+fn custom_format_to_responses(format: &Value) -> Value {
+    let Some(grammar) = format
+        .get("grammar")
+        .filter(|_| format.get("type").and_then(Value::as_str) == Some("grammar"))
+    else {
+        return format.clone();
+    };
+    let mut out = Map::new();
+    out.insert("type".into(), json!("grammar"));
+    copy_if(&mut out, grammar, "syntax");
+    copy_if(&mut out, grammar, "definition");
+    Value::Object(out)
+}
+
+/// A Responses `custom` tool bound for Messages, which has no free-form tool: a Chat Completions
+/// function taking one `input` string, its description saying what the string must be (the
+/// grammar, when the tool has one). A call to it comes back as a `custom_tool_call` (see
+/// [`ToolNames`]); a replayed one already crosses as `tool_use.input: {input}`.
+fn wrapped_custom_tool(t: &Value, name: &str) -> Value {
+    let mut desc = non_empty_str(t, "description").unwrap_or("").to_owned();
+    if !desc.is_empty() {
+        desc.push_str("\n\n");
+    }
+    let grammar = t
+        .get("format")
+        .filter(|f| f.get("type").and_then(Value::as_str) == Some("grammar"))
+        .map(|f| f.get("grammar").unwrap_or(f));
+    match grammar.and_then(|g| non_empty_str(g, "definition")) {
+        Some(definition) => {
+            let syntax = grammar
+                .and_then(|g| non_empty_str(g, "syntax"))
+                .unwrap_or("lark");
+            desc.push_str(&format!(
+                "`input` is this tool's raw input text, not JSON. It must match this {syntax} \
+                 grammar:\n```{syntax}\n{definition}\n```"
+            ));
+        }
+        None => desc.push_str("`input` is this tool's raw, free-form input text."),
+    }
+    let mut out = json!({
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": desc,
+            "parameters": {
+                "type": "object",
+                "properties": { "input": { "type": "string" } },
+                "required": ["input"],
+            },
+        },
+    });
+    if let Some(m) = out.as_object_mut() {
+        copy_cache_control(m, t);
+    }
+    out
 }
 
 /// A tool reference inside `tool_choice` / `allowed_tools`, Responses (flat) → Chat (nested).
@@ -3864,7 +4115,14 @@ fn responses_call_to_openai(item: &Value) -> Value {
         .or_else(|| item.get("id"))
         .cloned()
         .unwrap_or(json!("call_0"));
-    let name = item.get("name").cloned().unwrap_or(json!(""));
+    // A call into a `namespace` tool replays under the flat name the tool was offered as.
+    let name = match (
+        item.get("name").and_then(Value::as_str),
+        non_empty_str(item, "namespace"),
+    ) {
+        (Some(name), Some(ns)) => json!(namespaced_name(ns, name)),
+        _ => item.get("name").cloned().unwrap_or(json!("")),
+    };
     if item.get("type").and_then(Value::as_str) == Some("custom_tool_call") {
         return json!({
             "id": id,
@@ -4027,7 +4285,7 @@ fn openai_system_to_responses_blocks(m: &Value) -> Vec<Value> {
 
 /// A Chat Completions response for a Responses client. Items come in the order OpenAI emits
 /// them: reasoning, the message, then function calls.
-fn openai_resp_to_responses(v: &Value) -> Value {
+fn openai_resp_to_responses(v: &Value, tools: &ToolNames) -> Value {
     let choice = v
         .get("choices")
         .and_then(Value::as_array)
@@ -4090,24 +4348,44 @@ fn openai_resp_to_responses(v: &Value) -> Value {
             .get("custom")
             .filter(|_| c.get("type").and_then(Value::as_str) != Some("function"))
         {
-            output.push(json!({
-                "type": "custom_tool_call",
-                "id": fresh_id("ctc"),
-                "call_id": id_or_fresh(c.get("id"), "call"),
-                "name": custom.get("name").and_then(Value::as_str).unwrap_or(""),
-                "input": custom.get("input").and_then(Value::as_str).unwrap_or(""),
-            }));
+            let flat = custom.get("name").and_then(Value::as_str).unwrap_or("");
+            let (name, namespace) = tools.restore(flat);
+            let input = custom.get("input").and_then(Value::as_str).unwrap_or("");
+            output.push(custom_call_item(
+                fresh_id("ctc"),
+                id_or_fresh(c.get("id"), "call"),
+                name,
+                namespace,
+                input,
+            ));
             continue;
         }
         let func = c.get("function").unwrap_or(c);
-        output.push(json!({
+        let flat = func.get("name").and_then(Value::as_str).unwrap_or("");
+        let (name, namespace) = tools.restore(flat);
+        let arguments = arguments_string(func.get("arguments"));
+        if tools.wrapped(flat) {
+            output.push(custom_call_item(
+                fresh_id("ctc"),
+                id_or_fresh(c.get("id"), "call"),
+                name,
+                namespace,
+                &unwrap_custom_input(&arguments),
+            ));
+            continue;
+        }
+        let mut item = json!({
             "type": "function_call",
             "id": fresh_id("fc"),
             "call_id": id_or_fresh(c.get("id"), "call"),
-            "name": func.get("name").and_then(Value::as_str).unwrap_or(""),
-            "arguments": arguments_string(func.get("arguments")),
+            "name": name,
+            "arguments": arguments,
             "status": item_status,
-        }));
+        });
+        if let (Some(ns), Some(m)) = (namespace, item.as_object_mut()) {
+            m.insert("namespace".into(), json!(ns));
+        }
+        output.push(item);
     }
     responses_object(
         id_or_fresh(v.get("id"), "resp"),
@@ -4120,6 +4398,40 @@ fn openai_resp_to_responses(v: &Value) -> Value {
         output,
         Usage::from_chat(v.get("usage").unwrap_or(&Value::Null)).to_responses(),
     )
+}
+
+/// A Responses `custom_tool_call` item.
+fn custom_call_item(
+    id: String,
+    call_id: String,
+    name: &str,
+    namespace: Option<&str>,
+    input: &str,
+) -> Value {
+    let mut item = json!({
+        "type": "custom_tool_call",
+        "id": id,
+        "call_id": call_id,
+        "name": name,
+        "input": input,
+    });
+    if let (Some(ns), Some(m)) = (namespace, item.as_object_mut()) {
+        m.insert("namespace".into(), json!(ns));
+    }
+    item
+}
+
+/// A wrapped `custom` tool's raw input, from the `{"input": "…"}` arguments the model called it with
+/// (see [`wrapped_custom_tool`]). Arguments of any other shape are passed as they came: the client
+/// then sees what the model actually sent.
+fn unwrap_custom_input(arguments: &str) -> String {
+    match serde_json::from_str::<Value>(arguments) {
+        Ok(Value::Object(mut m)) => match m.remove("input") {
+            Some(Value::String(s)) => s,
+            _ => arguments.to_owned(),
+        },
+        _ => arguments.to_owned(),
+    }
 }
 
 /// A Responses object with every field the schema requires. The request's `tools` and
@@ -4470,6 +4782,14 @@ impl SseBridge {
             done: false,
             ended: false,
         }
+    }
+
+    /// Name each tool call the way the request offered it to a Responses client (see
+    /// [`ToolNames`]).
+    #[must_use]
+    pub fn with_tools(mut self, tools: ToolNames) -> Self {
+        self.oai_to_resp.tools = tools;
+        self
     }
 
     /// Bytes held for an event whose terminating blank line has not arrived yet.
@@ -5144,6 +5464,11 @@ struct ChatCall {
     args: String,
     /// A `custom` tool call (`{"type": "custom", "custom": {name, input}}`), not a function call.
     custom: bool,
+    /// A Responses client's call to a `custom` tool sent to Messages wrapped (see [`ToolNames`]):
+    /// `args` is the `{"input": …}` object, shown only once whole, as the raw input.
+    wrapped: bool,
+    /// The `namespace` a Responses client offered this tool in (see [`ToolNames`]).
+    namespace: Option<String>,
     opened: bool,
     closed: bool,
     /// Where the client sees it: an Anthropic block index or a Responses `output_index`.
@@ -5239,6 +5564,8 @@ impl ToolCalls {
                 name: String::new(),
                 args: String::new(),
                 custom: false,
+                wrapped: false,
+                namespace: None,
                 opened: false,
                 closed: false,
                 slot: 0,
@@ -5647,6 +5974,8 @@ struct OaiToResp {
     finish: Option<&'static str>,
     usage: Option<Usage>,
     completed: bool,
+    /// How the request's tools were reshaped, to name each call the way the client offered it.
+    tools: ToolNames,
 }
 
 impl OaiToResp {
@@ -6089,27 +6418,34 @@ impl OaiToResp {
         for step in steps {
             match step {
                 CallStep::Open(at) => {
-                    let Some((call_id, name, args, custom)) = self
-                        .calls
-                        .calls
-                        .get(at)
-                        .map(|c| (c.id.clone(), c.name.clone(), c.args.clone(), c.custom))
-                    else {
+                    let Some(call) = self.calls.calls.get_mut(at) else {
                         continue;
                     };
+                    // The name the client offered the tool under (see `ToolNames`).
+                    if !self.tools.is_empty() {
+                        call.wrapped = self.tools.wrapped(&call.name);
+                        call.custom |= call.wrapped;
+                        let (name, namespace) = self.tools.restore(&call.name);
+                        let (name, namespace) = (name.to_owned(), namespace.map(str::to_owned));
+                        call.name = name;
+                        call.namespace = namespace;
+                    }
+                    let (call_id, name, args, custom, wrapped) = (
+                        call.id.clone(),
+                        call.name.clone(),
+                        call.args.clone(),
+                        call.custom,
+                        call.wrapped,
+                    );
+                    let namespace = call.namespace.clone();
                     let (item_id, item) = if custom {
                         let id = fresh_id("ctc");
-                        let item = json!({
-                            "type": "custom_tool_call",
-                            "id": id,
-                            "call_id": call_id,
-                            "name": name,
-                            "input": "",
-                        });
+                        let item =
+                            custom_call_item(id.clone(), call_id, &name, namespace.as_deref(), "");
                         (id, item)
                     } else {
                         let id = fresh_id("fc");
-                        let item = json!({
+                        let mut item = json!({
                             "type": "function_call",
                             "id": id,
                             "call_id": call_id,
@@ -6117,6 +6453,9 @@ impl OaiToResp {
                             "arguments": "",
                             "status": "in_progress",
                         });
+                        if let (Some(ns), Some(m)) = (namespace, item.as_object_mut()) {
+                            m.insert("namespace".into(), json!(ns));
+                        }
                         (id, item)
                     };
                     let output_index = self.add_item(out, item);
@@ -6124,7 +6463,7 @@ impl OaiToResp {
                         call.slot = output_index;
                         call.item.clone_from(&item_id);
                     }
-                    if !args.is_empty() {
+                    if !args.is_empty() && !wrapped {
                         self.args_delta(out, custom, &item_id, output_index, &args);
                     }
                 }
@@ -6133,6 +6472,7 @@ impl OaiToResp {
                         .calls
                         .calls
                         .get(at)
+                        .filter(|c| !c.wrapped)
                         .map(|c| (c.item.clone(), c.slot, c.custom))
                     else {
                         continue;
@@ -6181,23 +6521,29 @@ impl OaiToResp {
                     call.name.clone(),
                     call.args.clone(),
                     call.custom,
+                    call.wrapped,
+                    call.namespace.clone(),
                 ));
             }
         }
-        for (output_index, item_id, call_id, name, args, custom) in done {
+        for (output_index, item_id, call_id, name, args, custom, wrapped, namespace) in done {
             if custom {
+                // A wrapped call's input was held back until its arguments object was whole.
+                let args = if wrapped {
+                    let input = unwrap_custom_input(&args);
+                    if !input.is_empty() {
+                        self.args_delta(out, true, &item_id, output_index, &input);
+                    }
+                    input
+                } else {
+                    args
+                };
                 self.emit(
                     out,
                     "response.custom_tool_call_input.done",
                     json!({ "item_id": item_id, "output_index": output_index, "input": args }),
                 );
-                let item = json!({
-                    "type": "custom_tool_call",
-                    "id": item_id,
-                    "call_id": call_id,
-                    "name": name,
-                    "input": args,
-                });
+                let item = custom_call_item(item_id, call_id, &name, namespace.as_deref(), &args);
                 self.done_item(out, output_index, item);
                 continue;
             }
@@ -6211,7 +6557,7 @@ impl OaiToResp {
                     "arguments": args,
                 }),
             );
-            let item = json!({
+            let mut item = json!({
                 "type": "function_call",
                 "id": item_id,
                 "call_id": call_id,
@@ -6219,6 +6565,9 @@ impl OaiToResp {
                 "arguments": args,
                 "status": status,
             });
+            if let (Some(ns), Some(m)) = (namespace, item.as_object_mut()) {
+                m.insert("namespace".into(), json!(ns));
+            }
             self.done_item(out, output_index, item);
         }
     }

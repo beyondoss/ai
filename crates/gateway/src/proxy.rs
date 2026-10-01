@@ -4618,7 +4618,7 @@ impl ProxyHttp for AiProxy {
                 // below, on the translated Chat Completions body. Same-endpoint Responses
                 // (session arm) is `from == to` and is a byte relay, less the reasoning items the
                 // gateway minted from Claude's thinking (see `translate::strip_gateway_reasoning`).
-                if let Some(a) = rc.auto.as_ref() {
+                if let Some(a) = rc.auto.as_mut() {
                     // An output limit past the row's maximum is a 400 by name; capped before the
                     // translation, so what it derives (a thinking budget) fits under the cap too.
                     let mut changed = clamp_output_limits(
@@ -4626,13 +4626,17 @@ impl ProxyHttp for AiProxy {
                         &scan.limit_spans,
                         a.route.card.max_output_tokens,
                     );
-                    if let Some(t) = a.translate.as_ref()
-                        && let Some(to) = catalog_serving_endpoint(a.as_ref())
+                    let serving = catalog_serving_endpoint(a.as_ref());
+                    let upstream_model =
+                        a.candidate_at(a.candidate).map_or("", |c| c.upstream_model);
+                    if let Some(t) = a.translate.as_mut()
+                        && let Some(to) = serving
                     {
+                        t.tools = translate::ToolNames::default();
                         if t.client != to {
-                            let upstream_model =
-                                a.candidate_at(a.candidate).map_or("", |c| c.upstream_model);
-                            buf = translate::request(t.client, to, &buf, upstream_model);
+                            // The tool names this attempt's response maps calls back through.
+                            (buf, t.tools) =
+                                translate::request_with_tools(t.client, to, &buf, upstream_model);
                             changed = true;
                         } else if to == route::Endpoint::Responses {
                             let len = buf.len();
@@ -4869,7 +4873,9 @@ impl ProxyHttp for AiProxy {
                 if let Some(t) = rc.auto.as_mut().and_then(|a| a.translate.as_mut())
                     && streaming
                 {
-                    t.sse = Some(translate::SseBridge::new(t.client, upstream));
+                    t.sse = Some(
+                        translate::SseBridge::new(t.client, upstream).with_tools(t.tools.clone()),
+                    );
                 }
                 upstream_response.remove_header("content-length");
                 if upstream_response.version != http::Version::HTTP_2 {
@@ -4967,10 +4973,10 @@ impl ProxyHttp for AiProxy {
                 .unwrap_or_else(|| route::Endpoint::of_wire(dialect));
             let out = if let Some(t) = rc.auto.as_mut().and_then(|a| a.translate.as_mut()) {
                 if streaming {
-                    let client = t.client;
-                    let sse = t
-                        .sse
-                        .get_or_insert_with(|| translate::SseBridge::new(client, upstream));
+                    let (client, tools) = (t.client, &t.tools);
+                    let sse = t.sse.get_or_insert_with(|| {
+                        translate::SseBridge::new(client, upstream).with_tools(tools.clone())
+                    });
                     let out = sse.feed(chunk, end_of_stream);
                     if sse.pending_len() > translate::MAX_TRANSLATE_BUFFER {
                         return Err(self.translate_overflow(&rc.request_id, "sse_event"));
@@ -4981,7 +4987,13 @@ impl ProxyHttp for AiProxy {
                         return Err(self.translate_overflow(&rc.request_id, "json_body"));
                     }
                     if end_of_stream {
-                        translate::response_json_status(upstream, t.client, status, &t.json_buf)
+                        translate::response_json_tools(
+                            upstream,
+                            t.client,
+                            status,
+                            &t.json_buf,
+                            &t.tools,
+                        )
                     } else {
                         Vec::new()
                     }
