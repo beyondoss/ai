@@ -2670,6 +2670,7 @@ mod tests {
         }
     }
 
+    /// claim: E4
     #[test]
     fn models_list_json_describes_every_row() {
         let v: serde_json::Value = serde_json::from_str(models_list_json()).expect("valid JSON");

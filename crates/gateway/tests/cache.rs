@@ -46,6 +46,7 @@ async fn post(
     req.body(body).send().await.unwrap()
 }
 
+/// claim: K2
 #[tokio::test]
 async fn two_identical_managed_v1_requests_hit_the_cache() {
     let nats = unused_nats_port();
@@ -118,6 +119,7 @@ async fn two_identical_managed_v1_requests_hit_the_cache() {
     );
 }
 
+/// claim: K2
 #[tokio::test]
 async fn different_tenant_is_a_cache_miss() {
     let nats = unused_nats_port();
@@ -151,6 +153,7 @@ async fn different_tenant_is_a_cache_miss() {
     );
 }
 
+/// claim: K2
 #[tokio::test]
 async fn x_beyond_cache_off_always_goes_upstream() {
     let nats = unused_nats_port();

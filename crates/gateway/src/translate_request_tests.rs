@@ -170,6 +170,7 @@ fn anthropic_sdk_onto_gpt5_sends_max_completion_tokens_and_no_sampling() {
 
 /// `thinking: disabled` → `reasoning_effort: "none"` was "Unrecognized request argument" on
 /// gpt-4.1 and "does not support 'none'" on gpt-5.
+/// claim: T5
 #[test]
 fn thinking_disabled_fits_each_family() {
     let off = anth(json!({"thinking": {"type": "disabled"}}));
@@ -187,6 +188,7 @@ fn thinking_disabled_fits_each_family() {
 }
 
 /// `effort: max` → `xhigh` is outside gpt-5's and the o-series' accepted sets.
+/// claim: T5
 #[test]
 fn effort_is_clamped_to_what_each_family_accepts() {
     let max = anth(json!({"output_config": {"effort": "max"}}));
@@ -208,6 +210,7 @@ fn effort_is_clamped_to_what_each_family_accepts() {
 
 /// Sampling stays wherever the model accepts it: reasoning off, a non-reasoning model, or a host
 /// that normalizes it itself.
+/// claim: T5
 #[test]
 fn sampling_survives_where_the_upstream_accepts_it() {
     let body = anth(json!({"temperature": 0.2, "thinking": {"type": "disabled"}}));
@@ -417,6 +420,7 @@ fn anthropic_server_tools_are_forwarded_not_emptied() {
 
 /// Images in a `tool_result` (a screenshot tool) were dropped: the model answered about output it
 /// never saw. A tool message holds text, so they follow as a user message.
+/// claim: T3
 #[test]
 fn tool_result_images_follow_the_tool_messages() {
     let img = json!({"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo="}});
@@ -463,6 +467,7 @@ fn tool_result_is_error_is_said_in_text() {
 }
 
 /// `strict: true` with an optional property is a 400 on OpenAI.
+/// claim: T4
 #[test]
 fn structured_output_is_strict_only_when_openai_can_be() {
     let optional = json!({"type": "object", "properties": {"a": {"type": "string"}, "b": {"type": "string"}}, "required": ["a"], "additionalProperties": false});
@@ -1189,6 +1194,7 @@ fn bare_reasoning_text_never_becomes_an_unsigned_thinking_block() {
 /// Signed blocks cross whichever way the client carried them: our `thinking` array (what the
 /// gateway's Chat responses return), thinking parts, or OpenRouter's `reasoning_details` — a turn a
 /// Chat client got relayed from OpenRouter (failover) and echoes onto the Anthropic primary.
+/// claim: T2
 #[test]
 fn signed_thinking_crosses_from_every_chat_shape() {
     let want = json!([

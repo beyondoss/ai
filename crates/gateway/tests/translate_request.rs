@@ -50,6 +50,7 @@ fn captured(mock: &MockUpstream) -> (Captured, Value) {
 /// in a tool result) on a GPT-5 row. OpenAI 400s `max_tokens` and non-default sampling on every
 /// reasoning model and `reasoning_effort: "none"` on GPT-5, and a tool message cannot hold the
 /// image, so each used to be a 400 or an answer about a picture the model never saw.
+/// claim: T5, T3
 #[tokio::test]
 async fn anthropic_sdk_on_a_gpt5_row_sends_what_openai_accepts() {
     let nats_port = unused_nats_port();
@@ -107,6 +108,7 @@ async fn anthropic_sdk_on_a_gpt5_row_sends_what_openai_accepts() {
 /// A Responses client (store: false) with parallel tool calls on a GPT row. Consecutive
 /// `function_call` items became one assistant message each, which OpenAI rejects; a Responses
 /// named `tool_choice` went through flat, which Chat Completions rejects.
+/// claim: T1
 #[tokio::test]
 async fn responses_client_parallel_tool_calls_reach_chat_as_one_turn() {
     let nats_port = unused_nats_port();
@@ -165,6 +167,7 @@ fn weather_tool() -> Value {
 /// enforced account answers with 400 "bound to a different conversation" unless the request sets
 /// `thinking.block_binding.prefix_mismatch_behavior: drop_block`, and that field is itself a 400
 /// without the `thinking-binding-controls-2026-08-01` beta header, which only `proxy` can send.
+/// claim: T2
 #[tokio::test]
 async fn preserved_thinking_survives_a_forced_tool_turn() {
     let nats_port = unused_nats_port();
@@ -296,6 +299,7 @@ data: {"type":"message_stop"}
 /// ("thinking.signature: Field required"): the signature rode a string the request side never read
 /// back, and the echoed `reasoning_content` became an unsigned block. The stream now carries each
 /// finished block on the `thinking` list, and the echo reaches Anthropic signed.
+/// claim: T2
 #[tokio::test]
 async fn a_streamed_claude_turn_reaches_anthropic_signed_on_the_next_turn() {
     let nats_port = unused_nats_port();
@@ -365,6 +369,7 @@ async fn a_streamed_claude_turn_reaches_anthropic_signed_on_the_next_turn() {
 /// An Anthropic SDK thinking + tool loop on a Claude row only OpenRouter serves. OpenRouter replays
 /// Claude's thinking from `reasoning_details` alone; without it turn 2 was a 400 ("a final
 /// `assistant` message must start with a thinking block").
+/// claim: T2
 #[tokio::test]
 async fn anthropic_sdk_thinking_reaches_openrouter_as_reasoning_details() {
     let nats_port = unused_nats_port();

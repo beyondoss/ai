@@ -116,6 +116,7 @@ async fn routes_by_model_header_to_the_primary_candidate() {
 
 /// The headline behaviour: primary refuses the connection, and the request still succeeds — served
 /// by the fallback, under the fallback's mount, key, and id.
+/// claim: R1
 #[tokio::test]
 async fn fails_over_to_the_next_candidate_when_the_primary_wont_connect() {
     let nats_port = unused_nats_port();
@@ -676,6 +677,7 @@ async fn provider_routed_requested_model_still_comes_from_the_body() {
 ///
 /// This is the outage that actually happens — a provider that is up and failing, not one that
 /// refuses connections — so it is the case the whole feature exists for.
+/// claim: R1
 #[tokio::test]
 async fn fails_over_when_the_primary_answers_5xx() {
     let nats_port = unused_nats_port();
@@ -821,6 +823,7 @@ async fn every_candidate_5xx_relays_the_last_error() {
 /// A body past pingora's 64 KiB replay buffer fails over like any other: the gateway holds the
 /// whole body and re-runs the request on the next candidate (see `FullBody`). Before, the 5xx was
 /// relayed and counted on `ai_failover_unreplayable_total`.
+/// claim: R5
 #[tokio::test]
 async fn a_large_body_fails_over_on_a_5xx() {
     let nats_port = unused_nats_port();
@@ -1293,6 +1296,7 @@ async fn explicit_provider_path_ignores_the_catalog() {
 
 /// A Claude catalog id on Chat Completions is translated to Messages, not 400'd.
 /// The client (stock OpenAI SDK) sees `chat.completion.chunk`; billing parses the Anthropic stream.
+/// claim: E1
 #[tokio::test]
 async fn openai_sdk_can_call_claude_via_v1_chat_completions() {
     let nats_port = unused_nats_port();
@@ -1372,6 +1376,7 @@ async fn openai_sdk_can_call_claude_via_v1_chat_completions() {
 }
 
 /// Reverse: a GPT catalog id on Messages is translated to Chat Completions.
+/// claim: E2
 #[tokio::test]
 async fn anthropic_sdk_can_call_gpt_via_v1_messages() {
     let nats_port = unused_nats_port();
@@ -1531,6 +1536,7 @@ async fn embeddings_path_with_a_claude_row_is_still_a_wire_mismatch() {
 
 /// A stock OpenAI SDK's `client.embeddings.create` on the managed drop-in: the catalog row routes
 /// it to the embeddings path, and the input tokens are billed.
+/// claim: M1
 #[tokio::test]
 async fn v1_embeddings_route_through_the_catalog_and_bill_input() {
     let nats_port = unused_nats_port();
@@ -1732,6 +1738,7 @@ async fn auto_short_paths_get_the_same_endpoint_check() {
 /// Claude Code's `count_tokens` reaches Anthropic's own endpoint, with the model re-spelled for the
 /// candidate. Free on the provider side, so no billing row. Before, it was forwarded to
 /// `/v1/messages` and ran as a billed generation.
+/// claim: E5, B4
 #[tokio::test]
 async fn count_tokens_reaches_anthropic_and_is_not_billed() {
     let nats_port = unused_nats_port();
@@ -1772,6 +1779,7 @@ async fn count_tokens_reaches_anthropic_and_is_not_billed() {
 
 /// Codex's remote compaction and OpenAI's input-token count reach `/v1/responses/*` on the GPT
 /// row's Responses arm. Compaction runs a model, so it bills from its usage block.
+/// claim: E5, B4
 #[tokio::test]
 async fn responses_compact_and_input_tokens_reach_openai() {
     let nats_port = unused_nats_port();
@@ -1910,6 +1918,7 @@ async fn v1_accepts_a_candidate_spelling_as_an_alias() {
 
 /// Stock OpenAI/Anthropic SDKs list models at GET /v1/models — the catalog, with each row's wire,
 /// card and price.
+/// claim: E4
 #[tokio::test]
 async fn v1_models_lists_the_catalog() {
     let nats_port = unused_nats_port();
@@ -1930,9 +1939,10 @@ async fn v1_models_lists_the_catalog() {
     let v: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(v["object"], "list");
     let data = v["data"].as_array().expect("data array");
-    assert!(
-        data.len() >= 2,
-        "catalog list must include more than a token model: {v}"
+    assert_eq!(
+        data.len(),
+        providers::catalog::MODEL_ROUTES.len(),
+        "every catalog row is listed: {v}"
     );
     let gpt = data
         .iter()
@@ -2023,6 +2033,7 @@ async fn post_claude(
 }
 
 /// Catalog is Anthropic-first; `x-beyond-order: bedrock` must hit Bedrock's mount, key, and id.
+/// claim: R3
 #[tokio::test]
 async fn order_header_front_loads_bedrock_on_an_anthropic_first_row() {
     let nats_port = unused_nats_port();
@@ -2123,6 +2134,7 @@ async fn junk_walk_header_keeps_catalog_order_and_is_counted() {
 
 /// Weighted split over many requests hits both named primaries. Leftover is failover, so a live
 /// primary is enough — we never need the leftover to fire.
+/// claim: R3
 #[tokio::test]
 async fn split_over_n_requests_hits_both_primaries() {
     let nats_port = unused_nats_port();
@@ -2159,6 +2171,7 @@ async fn split_over_n_requests_hits_both_primaries() {
 /// Cold start is catalog order. After a probe samples a faster fallback, **new** callers prefer
 /// it, while a caller already served stays on its provider (session pin, so its prompt cache is not
 /// thrown away). `x-beyond-order` still pins the slow primary.
+/// claim: R7, R4
 #[tokio::test]
 async fn ttft_ranker_prefers_the_faster_candidate_after_a_probe() {
     let nats_port = unused_nats_port();
@@ -2240,6 +2253,7 @@ async fn ttft_ranker_prefers_the_faster_candidate_after_a_probe() {
 
 /// A walk the caller shaped says nothing about where the key's other requests go: an
 /// `x-beyond-order` request must not re-pin the key to the (slower) provider it named.
+/// claim: R4
 #[tokio::test]
 async fn an_order_header_does_not_pin_the_key() {
     let nats_port = unused_nats_port();

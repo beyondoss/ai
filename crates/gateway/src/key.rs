@@ -306,6 +306,7 @@ mod tests {
         r
     }
 
+    /// claim: A1
     #[test]
     fn mint_then_verify_roundtrips_identity() {
         let (sk, vk) = test_keypair(1);
@@ -382,6 +383,7 @@ mod tests {
         assert_eq!(ring.verify(&tampered), Err(KeyError::BadSignature));
     }
 
+    /// claim: A1
     #[test]
     fn tampered_signature_is_rejected() {
         let (sk, vk) = test_keypair(4);

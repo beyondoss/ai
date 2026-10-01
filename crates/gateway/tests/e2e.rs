@@ -87,6 +87,7 @@ async fn raw_status(port: u16, request: &str) -> u16 {
         .unwrap_or(0)
 }
 
+/// claim: A1
 #[tokio::test]
 async fn managed_swaps_key_relays_body_and_meters_usage() {
     let nats = Nats::start().await;
@@ -190,6 +191,7 @@ async fn managed_openai_stream_relays_a_large_multichunk_body() {
     );
 }
 
+/// claim: A1
 #[tokio::test]
 async fn byo_passes_user_token_through_unchanged() {
     let nats = Nats::start().await;
@@ -450,6 +452,7 @@ async fn streaming_injects_usage_option_when_the_path_carries_a_query_string() {
     );
 }
 
+/// claim: A2
 #[tokio::test]
 async fn blackhole_denies_then_restores() {
     let nats = Nats::start().await;
@@ -486,6 +489,7 @@ async fn blackhole_denies_then_restores() {
     probe(200).await; // restored
 }
 
+/// claim: A2
 #[tokio::test]
 async fn blackhole_fraud_returns_403() {
     // The spend path (402) is covered above; fraud takes the separate `DenyReason::Fraud` branch
@@ -598,6 +602,7 @@ async fn allowance_key_exhausts_one_credential_not_its_sibling() {
     probe(key_b, 402).await; // tenant exhaust kills every key, including v1-grain
 }
 
+/// claim: A2
 #[tokio::test]
 async fn allowance_exhaust_does_not_connect_upstream() {
     let nats = Nats::start().await;
@@ -672,6 +677,7 @@ async fn allowance_unready_402s_without_connecting() {
     wait_for_metric(&gw, "ai_rejections_total", "allowance_unavailable", 1.0).await;
 }
 
+/// claim: A4
 #[tokio::test]
 async fn oversized_content_length_is_rejected_413() {
     let nats = Nats::start().await;
@@ -709,9 +715,12 @@ async fn oversized_content_length_is_rejected_413() {
          Content-Length: 209715201\r\n\
          Connection: close\r\n\r\n"
     );
+    let hits = mock.hits();
     assert_eq!(raw_status(gw.port, &req).await, 413);
+    assert_eq!(mock.hits(), hits, "the 413 is decided before any upstream");
 }
 
+/// claim: A3
 #[tokio::test]
 async fn per_credential_rate_limit_returns_429() {
     // Every other rejection code is covered e2e (401/402/403/413/503) — 429 was the gap. A
@@ -1221,6 +1230,7 @@ async fn on_disk_snapshot_enforces_across_restart_without_nats() {
     let _ = std::fs::remove_file(&snap);
 }
 
+/// claim: O3
 #[tokio::test]
 async fn health_endpoints_report_ready_on_the_metrics_listener() {
     // /livez and /readyz live on the metrics listener (alongside /metrics) and must both 200 with a
@@ -1262,6 +1272,7 @@ async fn health_endpoints_report_ready_on_the_metrics_listener() {
     assert_eq!(nf_status, 404);
 }
 
+/// claim: R6
 #[tokio::test]
 async fn circuit_breaker_opens_on_5xx_and_sheds() {
     // A provider returning 5xx is *broken*: after `threshold` failures the per-provider breaker
@@ -1346,6 +1357,7 @@ async fn circuit_breaker_does_not_trip_on_429() {
 const WALK_KEY_A: &str = "sk-walk-a";
 const WALK_KEY_B: &str = "sk-walk-b";
 
+/// claim: R2
 #[tokio::test]
 async fn managed_429_walks_the_next_pool_key() {
     // Two keys on one provider: the first is throttled, the second serves. A public 429 must not
@@ -1405,6 +1417,7 @@ async fn managed_429_walks_the_next_pool_key() {
     );
 }
 
+/// claim: R2
 #[tokio::test]
 async fn one_pool_key_relays_429_with_retry_after() {
     // A single key has nowhere to walk. The last (only) 429 is relayed, Retry-After included.
@@ -1457,6 +1470,7 @@ async fn one_pool_key_relays_429_with_retry_after() {
     );
 }
 
+/// claim: R5
 #[tokio::test]
 async fn a_large_catalog_body_walks_keys_on_429() {
     // A body past pingora's 64 KiB replay buffer walks keys like any other on a catalog walk: the

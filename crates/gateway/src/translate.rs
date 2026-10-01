@@ -6499,6 +6499,7 @@ mod tests {
 
     /// A stock OpenAI SDK sends no `cache_control`. Without a marker Anthropic caches nothing, so
     /// the static prefix gets one.
+    /// claim: K1
     #[test]
     fn an_unmarked_request_caches_its_system_prompt() {
         let v = to_messages(&oai_req());
@@ -6513,6 +6514,7 @@ mod tests {
         assert_eq!(count_markers(&v), 1, "{v}");
     }
 
+    /// claim: K1
     #[test]
     fn without_a_system_prompt_the_last_tool_is_marked() {
         let mut req = oai_req();
@@ -6529,6 +6531,7 @@ mod tests {
     }
 
     /// Once the request is a conversation, the whole prefix is marked so the next turn reads it.
+    /// claim: K1
     #[test]
     fn a_conversation_marks_the_end_of_its_last_message() {
         let mut req = oai_req();
@@ -6595,6 +6598,7 @@ mod tests {
     }
 
     /// A client that manages its own caching keeps full control.
+    /// claim: K1
     #[test]
     fn a_client_marker_anywhere_disables_the_defaults() {
         let mut req = oai_req();
@@ -6611,6 +6615,7 @@ mod tests {
         assert_eq!(v["messages"][0]["content"][0]["cache_control"]["ttl"], "1h");
     }
 
+    /// claim: K1
     #[test]
     fn responses_onto_messages_gets_the_same_defaults() {
         let body = json!({
@@ -6681,6 +6686,7 @@ mod tests {
         assert_eq!(v["max_tokens"], DEFAULT_MAX_TOKENS);
     }
 
+    /// claim: T1
     #[test]
     fn tool_loop_round_trips_openai_through_anthropic() {
         let oai = json!({
@@ -6776,6 +6782,7 @@ mod tests {
         assert_eq!(back["usage"]["input_tokens"], 13);
     }
 
+    /// claim: T6
     #[test]
     fn error_bodies_map_into_the_client_envelope() {
         let oai_err = br#"{"error":{"message":"nope","type":"invalid_request_error"}}"#;
@@ -6797,6 +6804,7 @@ mod tests {
         assert_eq!(back["error"]["type"], "invalid_request_error");
     }
 
+    /// claim: S1
     #[test]
     fn anthropic_sse_becomes_chat_completion_chunk_without_waiting_for_stop() {
         let mut b = SseBridge::new(Endpoint::ChatCompletions, Endpoint::Messages);
@@ -6830,6 +6838,7 @@ mod tests {
         assert!(out.contains("\"z\""), "{out}");
     }
 
+    /// claim: S1
     #[test]
     fn openai_sse_becomes_anthropic_events_and_does_not_wait_for_done() {
         let mut b = SseBridge::new(Endpoint::Messages, Endpoint::ChatCompletions);
@@ -6872,6 +6881,7 @@ mod tests {
         assert!(out.contains("event: message_stop"), "{out}");
     }
 
+    /// claim: T1
     #[test]
     fn anthropic_tool_sse_becomes_openai_tool_calls() {
         let mut b = SseBridge::new(Endpoint::ChatCompletions, Endpoint::Messages);
@@ -6904,6 +6914,7 @@ mod tests {
         assert!(text.contains("[DONE]"), "{text}");
     }
 
+    /// claim: T1
     #[test]
     fn openai_tool_sse_becomes_anthropic_tool_use() {
         let mut b = SseBridge::new(Endpoint::Messages, Endpoint::ChatCompletions);
@@ -6925,6 +6936,7 @@ mod tests {
         assert!(!out.contains("chat.completion.chunk"), "{out}");
     }
 
+    /// claim: T6
     #[test]
     fn sse_error_events_map_into_the_client_envelope() {
         let mut oai = SseBridge::new(Endpoint::ChatCompletions, Endpoint::Messages);
@@ -6949,6 +6961,7 @@ mod tests {
         );
     }
 
+    /// claim: T1
     #[test]
     fn nonstream_tool_json_round_trips() {
         let anth = json!({
@@ -7102,6 +7115,7 @@ mod tests {
         assert!(v.get("thinking").is_none(), "{v}");
     }
 
+    /// claim: T2
     #[test]
     fn thinking_and_redacted_thinking_round_trip_in_history() {
         let anth = json!({
@@ -7147,6 +7161,7 @@ mod tests {
         assert_eq!(content[2]["text"], "hi");
     }
 
+    /// claim: T3
     #[test]
     fn http_image_urls_become_anthropic_url_sources() {
         let oai = json!({
@@ -7173,6 +7188,7 @@ mod tests {
         assert_eq!(content[1]["source"]["url"], "https://example.com/x.png");
     }
 
+    /// claim: T3
     #[test]
     fn anthropic_url_sources_become_openai_image_urls() {
         let msg = json!({
@@ -7523,6 +7539,7 @@ mod tests {
     }
 
     /// Current Claude models 400 on `budget_tokens` and on `temperature` / `top_p`.
+    /// claim: T5
     #[test]
     fn current_claude_gets_adaptive_thinking_and_no_sampling() {
         let v = to_claude(
@@ -7556,6 +7573,7 @@ mod tests {
         assert_eq!(v["output_config"]["effort"], "max");
     }
 
+    /// claim: T5
     #[test]
     fn older_claude_gets_a_budget_below_max_tokens() {
         let v = to_claude(
@@ -7582,6 +7600,7 @@ mod tests {
     }
 
     /// Sampling is fine on older models, except alongside thinking.
+    /// claim: T5
     #[test]
     fn older_claude_keeps_sampling_unless_thinking() {
         let v = to_claude(&chat(json!({"temperature": 0.2})), "claude-haiku-4-5");
@@ -7604,6 +7623,7 @@ mod tests {
         })
     }
 
+    /// claim: T4
     #[test]
     fn json_schema_response_format_becomes_output_config_format() {
         let v = to_claude(
@@ -7633,6 +7653,7 @@ mod tests {
         assert_eq!(v["output_config"]["format"]["type"], "json_schema");
     }
 
+    /// claim: T4
     #[test]
     fn output_config_format_becomes_response_format() {
         let anth = json!({
@@ -7690,6 +7711,7 @@ mod tests {
         assert_eq!(back["user"], "u-123");
     }
 
+    /// claim: T3
     #[test]
     fn an_inline_pdf_becomes_a_document_and_back() {
         let v = to_claude(
@@ -7770,6 +7792,7 @@ mod tests {
         assert_eq!(v["messages"][0]["content"][0]["type"], "document");
     }
 
+    /// claim: T4
     #[test]
     fn chat_response_format_becomes_responses_text_format() {
         let v: Value = serde_json::from_slice(&request(

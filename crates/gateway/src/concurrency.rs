@@ -87,6 +87,7 @@ mod tests {
         assert!(TenantSlots::new(0).is_none());
     }
 
+    /// claim: A3
     #[test]
     fn a_tenant_is_capped_and_recovers_on_release() {
         let slots = TenantSlots::new(2).expect("on");

@@ -192,6 +192,7 @@ fn assert_lifecycle(evs: &[(String, Value)]) -> Value {
 /// A Responses client on a Claude row: thinking, text and both tool calls arrive as items, and
 /// `response.completed` carries them. Before this the stream had no items at all and the OpenAI
 /// SDK's `responses.stream()` raised on the first delta.
+/// claim: E3
 #[tokio::test]
 async fn responses_client_on_claude_gets_items_for_reasoning_text_and_calls() {
     let nats_port = unused_nats_port();
@@ -274,6 +275,7 @@ async fn responses_client_on_gpt_gets_function_call_items() {
 /// Anthropic is down; OpenRouter serves the Claude row over Chat Completions. The signature it
 /// streams in `reasoning_details` must reach the Messages client, or the next turn on Anthropic
 /// 400s (`thinking.signature: Field required`) for the rest of the conversation.
+/// claim: E2, T2
 #[tokio::test]
 async fn messages_client_keeps_the_thinking_signature_across_openrouter_failover() {
     let nats_port = unused_nats_port();
@@ -315,6 +317,7 @@ async fn messages_client_keeps_the_thinking_signature_across_openrouter_failover
 /// A Chat client served by OpenRouter gets `role` and each reasoning entry's `format` once.
 /// OpenRouter repeats both on every chunk, and openai-python's `.stream()` concatenated them into a
 /// role of "assistantassistant…" for the next turn to send back.
+/// claim: S2
 #[tokio::test]
 async fn chat_client_on_openrouter_gets_each_identity_field_once() {
     let nats_port = unused_nats_port();
@@ -360,6 +363,7 @@ async fn chat_client_on_openrouter_gets_each_identity_field_once() {
 
 /// A Chat client on a Claude row: `prompt_tokens` is the whole prompt, cache included, and every
 /// chunk carries `created` (strictly typed clients reject a chunk without it).
+/// claim: S2
 #[tokio::test]
 async fn chat_client_on_claude_gets_whole_prompt_usage_and_created() {
     let nats_port = unused_nats_port();
@@ -578,6 +582,7 @@ data: [DONE]
 /// An upstream stream that ends cleanly without its terminal event (no `message_delta`, no
 /// `message_stop`) was cut short. The Chat client used to get a bare `[DONE]`, and a Responses
 /// client `response.completed`, for a half-written answer.
+/// claim: T7
 #[tokio::test]
 async fn a_claude_stream_cut_before_its_end_is_an_error_for_the_client() {
     const CUT_SSE: &str = r#"event: message_start
@@ -625,6 +630,7 @@ data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text
 }
 
 /// OpenRouter wraps the provider's error; the Messages client gets the provider's message too.
+/// claim: T6
 #[tokio::test]
 async fn openrouter_provider_errors_keep_the_provider_message() {
     let nats_port = unused_nats_port();

@@ -729,6 +729,7 @@ mod tests {
         }
     }
 
+    /// claim: R3
     #[test]
     fn order_front_loads_named_providers_then_the_rest() {
         let row = claude_row();
@@ -740,6 +741,7 @@ mod tests {
         );
     }
 
+    /// claim: R3
     #[test]
     fn only_drops_anyone_not_named() {
         let row = claude_row();
@@ -769,6 +771,7 @@ mod tests {
         assert_eq!(walk.len, 0);
     }
 
+    /// claim: R3
     #[test]
     fn split_picks_a_weighted_primary_and_keeps_leftover_in_catalog_order() {
         let row = claude_row();

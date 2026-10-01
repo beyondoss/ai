@@ -39,6 +39,7 @@ fn gpt_messages(stream: bool) -> String {
 
 /// Non-stream JSON is withheld until EOS and remapped. This is the path a stock SDK takes when
 /// `stream` is off — and the one Pingora empty-chunk withholding used to drop.
+/// claim: E1
 #[tokio::test]
 async fn openai_sdk_nonstream_claude_round_trips_json() {
     let nats_port = unused_nats_port();
@@ -98,6 +99,7 @@ async fn openai_sdk_nonstream_claude_round_trips_json() {
     );
 }
 
+/// claim: E2
 #[tokio::test]
 async fn anthropic_sdk_nonstream_gpt_round_trips_json() {
     let nats_port = unused_nats_port();
@@ -151,6 +153,7 @@ async fn anthropic_sdk_nonstream_gpt_round_trips_json() {
     );
 }
 
+/// claim: T1
 #[tokio::test]
 async fn openai_sdk_sees_claude_tool_calls_on_the_stream() {
     let nats_port = unused_nats_port();
@@ -188,6 +191,7 @@ async fn openai_sdk_sees_claude_tool_calls_on_the_stream() {
     );
 }
 
+/// claim: T1
 #[tokio::test]
 async fn anthropic_sdk_sees_gpt_tool_use_on_the_stream() {
     let nats_port = unused_nats_port();
@@ -219,6 +223,7 @@ async fn anthropic_sdk_sees_gpt_tool_use_on_the_stream() {
     assert!(!text.contains("chat.completion.chunk"), "{text}");
 }
 
+/// claim: T1
 #[tokio::test]
 async fn openai_sdk_nonstream_claude_tool_calls() {
     let nats_port = unused_nats_port();
@@ -251,6 +256,7 @@ async fn openai_sdk_nonstream_claude_tool_calls() {
     assert!(args.contains("SF"), "{args}");
 }
 
+/// claim: T1
 #[tokio::test]
 async fn anthropic_sdk_nonstream_gpt_tool_use() {
     let nats_port = unused_nats_port();
@@ -279,6 +285,7 @@ async fn anthropic_sdk_nonstream_gpt_tool_use() {
 
 /// The second turn of a stock OpenAI tool loop: assistant `tool_calls` + `role: tool` must become
 /// Anthropic `tool_use` + `tool_result` on the wire.
+/// claim: T1
 #[tokio::test]
 async fn openai_tool_loop_second_turn_reaches_anthropic() {
     let nats_port = unused_nats_port();
@@ -310,6 +317,7 @@ async fn openai_tool_loop_second_turn_reaches_anthropic() {
     assert_eq!(got["messages"][2]["content"][0]["content"], "64F");
 }
 
+/// claim: T6
 #[tokio::test]
 async fn openai_sdk_sees_mapped_anthropic_error() {
     let nats_port = unused_nats_port();
@@ -335,6 +343,7 @@ async fn openai_sdk_sees_mapped_anthropic_error() {
     assert!(v.get("type").is_none() || v["type"] != "error");
 }
 
+/// claim: T6
 #[tokio::test]
 async fn anthropic_sdk_sees_mapped_openai_error() {
     let nats_port = unused_nats_port();
@@ -359,6 +368,7 @@ async fn anthropic_sdk_sees_mapped_openai_error() {
     assert_eq!(v["error"]["message"], "mock");
 }
 
+/// claim: T6
 #[tokio::test]
 async fn openai_sdk_sees_mapped_anthropic_sse_error() {
     let nats_port = unused_nats_port();
@@ -384,6 +394,7 @@ async fn openai_sdk_sees_mapped_anthropic_sse_error() {
     assert!(!text.contains("event: error"), "{text}");
 }
 
+/// claim: T6
 #[tokio::test]
 async fn anthropic_sdk_sees_mapped_openai_sse_error() {
     let nats_port = unused_nats_port();
@@ -621,6 +632,7 @@ async fn failover_while_translating_still_returns_the_client_dialect() {
 
 /// A Chat Completions body with `cache_control` / `reasoning_effort` reaches Anthropic's fields;
 /// thinking blocks reappear on the client stream; `ai.usage` still meters the *upstream* parser.
+/// claim: T2
 #[tokio::test]
 async fn openai_sdk_passes_cache_control_and_sees_thinking_on_the_stream() {
     let nats_port = unused_nats_port();
@@ -685,6 +697,7 @@ fn stock_responses(model: &str, stream: bool) -> String {
 
 /// Stock Responses body + a GPT catalog id translates onto Chat Completions. Billing still
 /// reads the upstream Chat Completions usage, not the Responses JSON the client sees.
+/// claim: E3
 #[tokio::test]
 async fn stock_responses_gpt_translates_to_chat_completions() {
     let nats_port = unused_nats_port();
@@ -741,6 +754,7 @@ async fn stock_responses_gpt_translates_to_chat_completions() {
 
 /// Stock Responses body + a Claude catalog id translates onto Messages. Billing still
 /// reads the upstream Anthropic usage.
+/// claim: E3
 #[tokio::test]
 async fn stock_responses_claude_translates_to_messages() {
     let nats_port = unused_nats_port();
@@ -806,6 +820,7 @@ fn gpt_responses_one_shot() -> &'static str {
 
 /// Managed `/v1/responses` + a GPT row + `previous_response_id` must hit OpenAI `/v1/responses`
 /// with the field intact — not Chat Completions with the id stripped.
+/// claim: E3
 #[tokio::test]
 async fn managed_responses_with_previous_response_id_relays_to_openai_responses() {
     let nats_port = unused_nats_port();
@@ -905,6 +920,7 @@ async fn store_false_one_shot_responses_may_translate_onto_chat_completions() {
 }
 
 /// Claude rows have no OpenAI store. Responses + `previous_response_id` is 400, not Messages.
+/// claim: E3
 #[tokio::test]
 async fn claude_responses_with_previous_response_id_is_400() {
     let nats_port = unused_nats_port();
@@ -990,6 +1006,7 @@ async fn provider_prefixed_responses_is_still_a_relay() {
 /// A stock OpenAI SDK sends images as `http(s)` URLs. Translated onto Claude they must arrive as
 /// Anthropic `url` image sources — they used to be silently dropped, so the model answered about a
 /// picture it never saw.
+/// claim: T3
 #[tokio::test]
 async fn openai_sdk_image_url_reaches_claude_as_a_url_source() {
     let nats_port = unused_nats_port();

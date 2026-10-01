@@ -704,6 +704,7 @@ mod tests {
         assert!(cb.allow().is_err());
     }
 
+    /// claim: R6
     #[test]
     fn test_half_open_success_closes() {
         let cb = CircuitBreaker::new(
@@ -795,6 +796,7 @@ mod tests {
         assert_eq!(cb.state(), CircuitState::Open);
     }
 
+    /// claim: R6
     #[test]
     fn test_windowed_half_open_recovery() {
         let cb = CircuitBreaker::new(

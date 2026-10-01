@@ -1290,6 +1290,7 @@ fn responses_objects_carry_created_at_and_item_ids() {
 
 // ---- tool-call deltas keyed by index ----------------------------------------------------------
 
+/// claim: T1
 #[test]
 fn interleaved_parallel_tool_deltas_follow_their_index() {
     let src = concat!(
@@ -1685,6 +1686,7 @@ fn next_turn(assistant: Value) -> Value {
 /// and the echoed `reasoning_content` became an unsigned block. Now each finished block arrives
 /// whole on the `thinking` list — what the non-stream body returns — and `messages.append(final
 /// .choices[0].message)` sends back exactly the signed blocks.
+/// claim: T2
 #[test]
 fn a_streamed_claude_turn_goes_back_signed() {
     let blocks = [
@@ -1954,6 +1956,7 @@ fn an_openrouter_mid_stream_error_is_an_error() {
 /// An upstream stream that ends cleanly without saying how the response ended (no stop reason, no
 /// end marker) was cut short. The bridge used to close it as a success — `end_turn`,
 /// `response.completed`, a bare `[DONE]` — on a half-written answer.
+/// claim: T7
 #[test]
 fn a_stream_that_ends_without_saying_how_is_an_error_for_every_client() {
     let cut_claude = concat!(
@@ -2056,6 +2059,7 @@ fn sdk_message(evs: &[Event]) -> Value {
     Value::Object(msg)
 }
 
+/// claim: S2
 #[test]
 fn a_chat_relay_sends_each_identity_field_once() {
     // As OpenRouter sent it, the SDK's message is unusable on the next turn.

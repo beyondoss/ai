@@ -53,6 +53,7 @@ async fn gateway(mode: Mode) -> (MockUpstream, Gateway, ed25519_dalek::SigningKe
     (mock, gw, sk)
 }
 
+/// claim: R5
 #[tokio::test]
 async fn a_large_chat_body_with_model_last_is_served_and_billed() {
     let (mock, gw, sk) = gateway(Mode::Json).await;
@@ -125,6 +126,7 @@ async fn bodies_just_past_the_replay_buffer_do_not_hang() {
 }
 
 /// The dominant embeddings shape: a LangChain-style batch, `input` first, well past 64 KiB.
+/// claim: M1
 #[tokio::test]
 async fn a_large_embeddings_batch_with_input_first_is_served() {
     let (mock, gw, sk) = gateway(Mode::Embeddings).await;
@@ -252,6 +254,7 @@ fn big_chat(model: &str) -> String {
 
 /// An HTTP/2 client (the default for the agent's `h2c` serve mode) used to get a bare 400: the
 /// subrequest was built by rendering the H2 request line as `HTTP/2`, which its parser rejects.
+/// claim: E6
 #[tokio::test]
 async fn an_h2c_client_can_send_a_large_body() {
     let (mock, gw, sk) = gateway(Mode::Json).await;
@@ -380,6 +383,7 @@ async fn a_large_body_failover_fits_a_tenant_cap_of_one() {
 
 /// One request, one billing row: the abandoned attempt writes none, and every attempt shares the
 /// id the client was given.
+/// claim: R5, O1, B1
 #[tokio::test]
 async fn a_relayed_failover_writes_one_usage_row_under_the_clients_id() {
     let (pubkey, sk) = test_keypair(1);

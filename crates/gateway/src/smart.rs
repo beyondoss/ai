@@ -420,6 +420,7 @@ mod tests {
         assert_eq!(names(walk, row), ["anthropic", "bedrock", "openrouter"]);
     }
 
+    /// claim: R7
     #[test]
     fn faster_measured_candidate_is_tried_first() {
         let r = Router::new();
@@ -534,6 +535,7 @@ mod tests {
         affinity(42, 7, Some(APP))
     }
 
+    /// claim: R4
     #[test]
     fn a_pin_keeps_the_caller_on_a_slower_candidate() {
         let r = Router::new();

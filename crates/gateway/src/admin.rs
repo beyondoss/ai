@@ -140,6 +140,7 @@ impl ServeHttp for AdminApp {
 mod tests {
     use super::*;
 
+    /// claim: O3
     #[test]
     fn health_bodies_keep_the_documented_json_shape() {
         // The bodies are hand-rolled `concat!` now rather than serde output, so a typo would ship a

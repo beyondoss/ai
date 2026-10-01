@@ -338,6 +338,7 @@ mod tests {
         r
     }
 
+    /// claim: K2
     #[test]
     fn key_is_tenant_path_body_and_candidate_order() {
         let body = br#"{"model":"gpt-4o","messages":[]}"#;
@@ -548,6 +549,7 @@ mod tests {
         )])));
     }
 
+    /// claim: K2
     #[test]
     fn request_bypasses_on_off_header_or_no_store() {
         assert!(!request_bypasses(&req(&[])));

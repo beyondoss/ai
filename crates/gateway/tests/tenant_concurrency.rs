@@ -55,6 +55,7 @@ async fn wait_for_hits(mock: &MockUpstream, n: usize) {
     .expect("request reached the upstream");
 }
 
+/// claim: A3
 #[tokio::test]
 async fn a_tenant_at_its_ceiling_is_refused_and_recovers() {
     let (pubkey, sk) = test_keypair(51);

@@ -318,6 +318,7 @@ mod tests {
     /// The catalog seed carries at least one Anthropic-only row, so a deployment with only an
     /// OpenAI pool key has a model it cannot serve. That must fail loudly at boot, naming the env
     /// var to set — the request-time symptom is a 503 indistinguishable from an unconfigured model.
+    /// claim: O3
     #[test]
     fn catalog_coverage_fails_when_a_model_has_no_reachable_provider() {
         let config = AiConfig {
@@ -404,6 +405,7 @@ mod tests {
         assert!(r.passed, "pure-BYO must not fail this check: {}", r.message);
     }
 
+    /// claim: O3
     #[test]
     fn signing_keys_empty_fails() {
         // No keys ⇒ every managed token 401s; doctor must flag it, not pass silently.

@@ -61,6 +61,7 @@ async fn usage_row(gw: &Gateway) -> serde_json::Value {
     v.get("fields").cloned().unwrap_or(v)
 }
 
+/// claim: B2
 #[tokio::test]
 async fn a_cancelled_openai_stream_is_billed_an_estimate() {
     let (pubkey, sk) = test_keypair(41);
@@ -95,6 +96,7 @@ async fn a_cancelled_openai_stream_is_billed_an_estimate() {
 
 /// Anthropic reports input and cache tokens on `message_start`, the first event — so those stay
 /// exact, and only the output count (which rides the missing `message_delta`) is estimated.
+/// claim: B2
 #[tokio::test]
 async fn a_cancelled_anthropic_stream_keeps_exact_input_and_estimates_output() {
     let (pubkey, sk) = test_keypair(42);
