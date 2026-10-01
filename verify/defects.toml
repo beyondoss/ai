@@ -1139,7 +1139,7 @@ evidence = "proxy.rs relay_full_body (RelayRetry::Key sets only=Some(candidate))
 claims = ["R1", "R5", "REL-21"]
 state = "fixed"
 test = "a_5xx_after_a_key_walk_fails_over_for_small_and_large_bodies"
-fix = "6457aa9"
+fix = "9cf3307"
 note = "Found by the independent branch review (2026-10-01) of a54c22c. Fixed: a FullBody re-run after a key walk puts that candidate first in its walk (FullBody::resume) instead of making it the only usable one, so the next key's 5xx fails over like a small body; a Candidate retry clears it."
 
 [[defect]]
@@ -1153,7 +1153,7 @@ evidence = "proxy.rs bare_default_provider_name / has_byo_anthropic_key; reprodu
 claims = ["SEC-11"]
 state = "fixed"
 test = "bare_v1_byo_routes_by_the_forwarded_credential"
-fix = "4d188dd"
+fix = "d51f517"
 note = "Found by the independent branch review (2026-10-01) of a54c22c. Fixed: byo_credential_dialect reads every x-api-key line (Anthropic unless the key's shape says otherwise) and every Bearer token (sk-ant- Anthropic, other sk- OpenAI; opaque says nothing); with no vote the path picks; BYO keys for two providers on bare /v1 are a 400."
 
 [[defect]]
@@ -1167,7 +1167,7 @@ evidence = "proxy.rs relay_full_body (keys start at 0), upstream_peer fb.keys lo
 claims = ["REL-14", "R5"]
 state = "fixed"
 test = "a_large_body_starts_past_a_cooling_pool_key"
-fix = "6457aa9"
+fix = "9cf3307"
 note = "Found by the independent branch review (2026-10-01) of a54c22c. Fixed: FullBody keys start at NO_KEY_WALK, and upstream_peer falls back to Provider::first_key() for a candidate with no key walk, so a re-run skips cooling keys."
 
 [[defect]]
@@ -1181,7 +1181,7 @@ evidence = "proxy.rs upstream_response_filter key_auth = 401|403, is_pool_key_fa
 claims = ["REL-4", "REL-14", "SEC-15"]
 state = "fixed"
 test = "a_request_specific_403_neither_walks_nor_cools_the_pool_key"
-fix = "b7e4d75"
+fix = "e2fe688"
 note = "Found by the independent branch review (2026-10-01) of a54c22c. Fixed: is_pool_key_failure is a 401 only, used by both the walk and the cooldown; 401/402/403 stay catalog candidate refusals (is_candidate_refusal, breaker-neutral). A relayed managed 403 whose body names the key (invalid_api_key / authentication_error) cools it from logging; that request does not walk."
 
 [[defect]]
@@ -1209,7 +1209,7 @@ evidence = "proxy.rs logging: the no-head, no-provider-outcome arm calls record_
 claims = ["REL-6", "SEC-16"]
 state = "fixed"
 test = "a_probe_with_no_provider_outcome_leaves_the_breaker_half_open"
-fix = "89bb6d5"
+fix = "fa2d578"
 note = "Found by the independent branch review (2026-10-01) of a54c22c. Fixed: logging releases the permit (CircuitBreaker::release) when no head arrived and the error is not a provider outcome. A claimed half-open permit is now stamped at its handout, so a released permit claimed again is not immediately reclaimable (which admitted a second probe)."
 
 [[defect]]
@@ -1251,7 +1251,7 @@ evidence = "state.rs resolve_all; reproduced: 16 callers past refresh_at against
 claims = ["REL-20"]
 state = "fixed"
 test = "a_due_refresh_is_one_background_lookup"
-fix = "6fc0677"
+fix = "8f387bd"
 note = "Found by the independent branch review (2026-10-01) of a54c22c. Fixed: one lookup per authority runs in a background task (DnsCache::lookup_once); callers with a servable entry are served at once, cold callers share the lookup's answer, and a lookup hung past DNS_TIMEOUT stays in flight until it returns (at most one blocking getaddrinfo per authority). Also pinned by concurrent_cold_resolves_share_one_lookup and a_hung_lookup_is_never_joined_by_a_second."
 
 [[defect]]
@@ -1279,7 +1279,7 @@ evidence = "proxy.rs error_while_proxy (refused ⇒ same-provider retry, unbound
 claims = ["REL-22", "REL-6"]
 state = "fixed"
 test = "a_provider_that_keeps_refusing_streams_is_resent_once_and_trips_the_breaker"
-fix = "b8a61fc"
+fix = "4c578ac"
 note = "Found by the independent branch review (2026-10-01) of a54c22c. Fixed: one resend per candidate (RequestCtx::refused_resent); a second refusal fails over (breaker failure recorded as the walk moves on) or ends the request (logging records it); fail_to_proxy answers 'the provider refused the stream; it was not processed'. A FullBody Reset retry releases its permit."
 
 [[defect]]
@@ -1293,7 +1293,7 @@ evidence = "proxy.rs new_ctx (Arc::clone of the state), retain_managed_client_he
 claims = ["S1"]
 state = "fixed"
 test = "new_ctx_pays_no_arc_clone"
-fix = "f098424"
+fix = "b6f2b78"
 note = "Found by the independent branch review (2026-10-01) of a54c22c. Fixed: AiProxy and the request context hold a &'static GatewayState (no per-request Arc clone; LIVE_REQUESTS stays for D38); remove_headers_where sweeps headers via stack batches (no Vec); each PoolAuth carries a boot-built memmem Finder used by response_filter and Redact. Structure pinned by remove_headers_where_removes_every_match_in_stack_batches and a_pool_key_carries_its_boot_built_searcher."
 
 [[defect]]
@@ -1307,7 +1307,7 @@ evidence = "main.rs init_tracing: the ai.usage layer's filter_fn has no max leve
 claims = ["BIL-4"]
 state = "fixed"
 test = "the_billing_log_layer_caps_the_max_level_at_info"
-fix = "ac17cff"
+fix = "892bb96"
 note = "Found by the independent branch review (2026-10-01) of a54c22c. Fixed: usage::usage_log_filter carries a max level hint of INFO, so the subscriber's max level (and LogTracer's) is INFO under the default AI_LOG."
 
 [[defect]]
@@ -1363,7 +1363,7 @@ evidence = "circuit_breaker.rs record_success (successes cap 65535) vs record_fa
 claims = ["REL-6"]
 state = "fixed"
 test = "a_failure_majority_opens_a_window_with_more_successes_than_the_failure_count_holds"
-fix = "6022576"
+fix = "cee19fb"
 note = "Found by the independent branch review (2026-10-01) of a54c22c. Fixed: windowed successes saturate at the failure count's 14-bit cap. Docs now describe the window as fixed (anchored at its first failure), which it is; it was not made rolling."
 
 [[defect]]
