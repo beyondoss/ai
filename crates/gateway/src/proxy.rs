@@ -3516,6 +3516,29 @@ impl ProxyHttp for AiProxy {
             body_complete = peek.complete;
         }
 
+        // Two root `model` keys (D34), refused before connecting wherever the body is already in
+        // hand, with a JSON 400 and the request id (D94). A body streamed through is still refused
+        // in `request_body_filter`, after the request headers went upstream.
+        if model_route.is_some()
+            && body_complete
+                .as_deref()
+                .is_some_and(|b| peek::scan_buffered(b).duplicate_model)
+        {
+            self.state
+                .metrics
+                .rejection(Rejection::DuplicateModel)
+                .inc();
+            return Self::reject_message_boxed(
+                session,
+                &request_id,
+                400,
+                "invalid_request_error",
+                "the request body has more than one root \"model\" key; send exactly one"
+                    .to_owned(),
+            )
+            .await;
+        }
+
         // A `FullBody` re-run's body is its parent's, already reserved for both copies.
         ctx.held.body_exempt = full_body.is_some();
 

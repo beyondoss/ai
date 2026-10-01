@@ -1933,9 +1933,13 @@ to serve.
   parsers take the _last_, so `{"model":"cheap",…,"model":"o1-pro"}` would route as the cheap row
   and be served as o1-pro. `peek::scan_buffered` counts root `model` keys on the client body, before
   any translation, and decodes a key spelled with escapes (`"mod\u0065l"`), since the provider
-  would. A second one aborts the request with a 400 before a body byte goes upstream
-  (`ai_rejections_total{reason="duplicate_model"}`). The 400 is pingora's bare status: request
-  headers have already left by the time the whole body is in.
+  would. A second one is refused (`ai_rejections_total{reason="duplicate_model"}`). Where the
+  whole body is in hand before connecting (a headerless walk, which reads it to choose the row,
+  and a header-won Responses or large-body walk), the refusal is the gateway's JSON 400
+  (`invalid_request_error`, with `x-beyond-request-id`) and the upstream gets nothing. A body that
+  streams through (a header-won small body on Chat Completions or Messages) is checked in
+  `request_body_filter` once it is all in: the request aborts before a body byte goes upstream,
+  but its headers have already left, so the 400 is pingora's bare status.
 - Per-credential request rate within ceiling; aggregate BYO rate within ceiling
 
 **What passes through unchecked:**

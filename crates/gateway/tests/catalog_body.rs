@@ -99,7 +99,6 @@ async fn a_body_with_two_root_model_keys_is_refused_on_a_catalog_walk() {
 /// claim: SEC-21, CAT-11
 /// defect: D94
 #[tokio::test]
-#[ignore = "D94 reproduced: the duplicate-model refusal is a bodyless 400 after the upstream connection"]
 async fn a_duplicate_model_is_refused_before_the_upstream_with_a_json_400() {
     let (pubkey, sk) = test_keypair(1);
     let mock = MockUpstream::start(Mode::Json).await;
