@@ -2383,8 +2383,8 @@ fn rename_max_tokens(body: &mut Vec<u8>, keys: &[Option<usize>; 3]) -> bool {
         return false;
     }
     let value = skip_ws(colon + 1);
-    let mut values = serde_json::Deserializer::from_slice(&body[value..])
-        .into_iter::<serde::de::IgnoredAny>();
+    let mut values =
+        serde_json::Deserializer::from_slice(&body[value..]).into_iter::<serde::de::IgnoredAny>();
     if !matches!(values.next(), Some(Ok(_))) {
         return false;
     }

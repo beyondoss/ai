@@ -662,7 +662,10 @@ mod tests {
         }
         for (path, want) in [
             ("/v1/messages/count_tokens", Some(SubResource::CountTokens)),
-            ("/v1/messages/count_tokens/?beta=true", Some(SubResource::CountTokens)),
+            (
+                "/v1/messages/count_tokens/?beta=true",
+                Some(SubResource::CountTokens),
+            ),
             ("/v1/responses/input_tokens", Some(SubResource::InputTokens)),
             ("/v1/responses/compact", Some(SubResource::Compact)),
             ("/v1/messages", None),
