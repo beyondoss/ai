@@ -1435,3 +1435,17 @@ state = "suspected"
 test = ""
 fix = ""
 note = "Found by live cells TRN-15::openai-py::xai::explicit_nulls and TRN-15::openai-py::together::explicit_nulls. responses_to_chat should treat a null instructions as absent, the way copy_if treats other nulls."
+
+[[defect]]
+id = "D103"
+severity = "low"
+area = "Translation"
+title = "Translation turns an unknown message role into a user turn, so a request the provider rejects succeeds"
+impact = "A message whose role no dialect has (a typo, a framework's private role) reaches the model as user speech on every translated walk: Chat Completions and Responses onto Messages, and Messages onto Chat Completions. Called directly, OpenAI and Anthropic both 400 the same request and name the role. The client gets an answer to a conversation it never sent, where the provider would have told it what was wrong. This breaks 'unmappable input is forwarded, not dropped' (the provider should be the one to reject it)."
+confidence = "high"
+evidence = "Differential parity, reproduced in two full runs (2026-10-01, seed 1): T6+TRN-21::raw::chat-to-claude::parity_error_role, ::responses-to-claude::parity_error_role and ::messages-to-gpt::parity_error_role (stream and not) — direct 400, gateway 200. Minimized: POST /v1/chat/completions {\"model\":\"claude-haiku-4-5\",\"max_tokens\":20,\"messages\":[{\"role\":\"robot\",\"content\":\"Say OK.\"}]} through the gateway -> 200 {\"choices\":[{\"finish_reason\":\"stop\",\"message\":{\"content\":\"OK.\",\"role\":\"assistant\"}}],...}; the same messages sent to Anthropic directly -> 400 {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"messages: Unexpected role \\\"robot\\\". Allowed roles are \\\"user\\\", \\\"assistant\\\" or \\\"system\\\"\"}}, and to OpenAI Chat directly -> 400 invalid_request_error / invalid_value, param messages[0].role. /v1/responses with input [{\"role\":\"robot\",\"content\":\"Say OK.\"}] on claude-haiku-4-5 -> 200 'OK.'; /v1/messages with role robot on gpt-5-mini -> 200 'OK' (OpenAI direct: 400 invalid_value). Code: translate.rs chat->messages `_ => // user (and anything else treated as user)` (~738), messages->chat `_ => messages.extend(anthropic_user_to_openai(m))` (~2405), chat->responses `_ => role: user` (~3711)."
+claims = ["T6", "TRN-21"]
+state = "suspected"
+test = ""
+fix = ""
+note = "Found by crates/verify/tests/parity_live.rs. Proposed: forward a message with an unrecognized role whole, in place, with its role unchanged (as an unknown Responses input item already is), so the provider's 400 names it."

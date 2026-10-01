@@ -170,7 +170,7 @@ layer = "both"
 clients = ["openai-py", "openai-node", "anthropic-py", "anthropic-ts", "ai-sdk", "raw"]
 failover_clients = []
 touches = ["crates/gateway/src/translate.rs", "crates/gateway/src/proxy.rs"]
-defects = ["D100"]
+defects = ["D100", "D103"]
 
 [[claim]]
 id = "T7"
@@ -1520,7 +1520,7 @@ group = "Translation detail"
 text = "Every documented lossy mapping is asserted as a negative claim"
 layer = "hermetic"
 touches = ["crates/gateway/src/translate.rs", "crates/gateway/src/proxy.rs"]
-defects = ["D68", "D78"]
+defects = ["D68", "D78", "D103"]
 
 [[claim]]
 id = "TRN-22"

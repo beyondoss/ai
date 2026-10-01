@@ -28,5 +28,9 @@ harness = false
 name = "reconcile_live"
 harness = false
 
+[[test]]
+name = "parity_live"
+harness = false
+
 [lints]
 workspace = true

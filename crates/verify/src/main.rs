@@ -279,10 +279,15 @@ fn filter_expr(tagged: &[Tagged]) -> String {
     parts.join(" | ")
 }
 
-/// The nextest binaries holding live cells: real clients (`crates/verify/tests/live.rs`) and
-/// billing reconciliation against the providers' usage reports (`tests/reconcile_live.rs`). Every
-/// test in them is named `CLAIMS::client::...`.
-const LIVE_BINARIES: &[&str] = &["beyond-ai-verify::live", "beyond-ai-verify::reconcile_live"];
+/// The nextest binaries holding live cells: real clients (`crates/verify/tests/live.rs`), billing
+/// reconciliation against the providers' usage reports (`tests/reconcile_live.rs`), and
+/// differential parity against direct provider calls (`tests/parity_live.rs`). Every test in them
+/// is named `CLAIMS::client::...`.
+const LIVE_BINARIES: &[&str] = &[
+    "beyond-ai-verify::live",
+    "beyond-ai-verify::reconcile_live",
+    "beyond-ai-verify::parity_live",
+];
 
 /// One live cell's result, parsed from its name `CLAIMS::client::route::probe`.
 struct LiveCell<'a> {
