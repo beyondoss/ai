@@ -2077,7 +2077,7 @@ evidence = "live 2026-10-01 final run (target/final-live4.log): CAT-7::raw::open
 claims = ["BIL-20", "BIL-12"]
 state = "fixed"
 test = "a_non_stream_answer_without_usage_is_billed_an_estimate"
-fix = ""
+fix = "90ac266"
 note = "Fixed in proxy.rs logging: a managed, non-free, non-stream 2xx that ended cleanly with no parseable usage is estimated as a cut-off body is (input from the request tally, a lower bound; output from the string values in the body tail), flagged usage_estimated, and still counted on ai_usage_parse_errors_total. A body that is only an error object (OpenRouter's non-stream error-in-200, root key error, read whole when the body fits the 64 KiB tail) stays 0/0 and is not an estimate, as an error-only stream is (a_non_stream_error_in_200_is_not_billed). The provider's own charge for such a turn cannot be read back (OpenRouter's generation endpoint needs the id from a response that never named one), so the estimate errs low, as every estimate does (BIL-20). The catalog sweep now reads an error-in-200 as the status its error.code names and retries it, so a cell no longer passes or fails on one silently."
 
 [[defect]]
@@ -2091,5 +2091,5 @@ evidence = "direct to OpenAI 2026-10-01, Chat Completions gpt-4.1 with the CAT-3
 claims = ["T6"]
 state = "fixed"
 test = "a_request_over_the_tpm_limit_is_told_to_shrink_not_to_retry"
-fix = ""
+fix = "90ac266"
 note = "Fixed in remedy.rs: a 429 whose message carries a remedy and says the request alone is over the limit (\"request too large\", \"must be reduced in order to run successfully\") reads remedy::TOO_LARGE, \"The request is larger than the provider's per-minute token limit admits; reduce the input or output tokens. Retrying it unchanged will not succeed.\"; the org id and link still go, and status, type and code are kept. A plain rate limit (\"Rate limit reached ... Please try again in 2s\") still reads RATE_LIMITED. Not changed: the status stays 429, so a stock SDK still retries it twice (the gateway relays the provider's status verbatim and has no x-should-retry of its own to send at end of body)."
