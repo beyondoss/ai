@@ -1893,10 +1893,10 @@ impact = "qwen/qwen3.6-plus advertises structured outputs, and its primary is To
 confidence = "high"
 evidence = "live 2026-10-01, after D147's fix made the cell runnable: CAT-6::raw::together::qwen/qwen3.6-plus failed 4 of 10 runs with json_schema: \"{\\\"result\\\": 391}\" does not validate as {\"answer\": <integer>}. The upstream stream Together sent (dumped from the gateway on a scratch build) carries that text, so it is Together's output, not translation."
 claims = ["CAT-6", "T4"]
-state = "suspected"
-test = ""
-fix = ""
-note = "Found by D147's live re-run. Options: drop structured outputs from the card, or leave Together out of a json_schema walk (as serves_structured_outputs does for Bedrock) so OpenRouter serves it."
+state = "fixed"
+test = "structured_outputs_are_advertised_only_where_enforced"
+fix = "eb415e9"
+note = "Found by D147's live re-run. Ground truth 2026-10-01: Together Qwen/Qwen3.6-Plus streamed with a strict json_schema answered {\"result\": 391} 3 of 8 times; OpenRouter qwen/qwen3.6-plus (Alibaba, its only host, which lists structured_outputs) 2 of 24. Leaving Together out of a json_schema walk would hand the request to a candidate that does not enforce it either, so the card stops advertising structured outputs (the D155 rule: a bit no candidate honors is dropped). Recorded in verify/catalog_truth.toml [[schema_unenforced]] (both candidates) and features_absent; held by structured_outputs_are_advertised_only_where_enforced and schema_unenforced_candidates_match_truth. Live 2026-10-01: CAT-6::raw::{together,openrouter}::qwen/qwen3.6-plus pass (the schema check is no longer claimed)."
 
 [[defect]]
 id = "D171"
@@ -1907,10 +1907,10 @@ impact = "qwen/qwen3.7-plus advertises tools, and its primary is Together. Some 
 confidence = "med"
 evidence = "live 2026-10-01: CAT-6::raw::together::qwen/qwen3.7-plus failed 3 of 12 runs. Twice with tools: forced get_weather, got None / text \"call\\n{\\\"name\\\": \\\"get_weather\\\", \\\"arguments\\\": {\\\"city\\\": \\\"Paris\\\"}}\". The upstream stream Together sent (dumped from the gateway on a scratch build) carries it as delta.content, so this is Together's tool parser. Once with arguments \"{\\\"city\\\": \\\"Paris\\\"\" lacking their closing brace. That one was not captured, and 24 direct streams plus 16 dumped gateway runs never showed it."
 claims = ["CAT-6", "T1"]
-state = "suspected"
-test = ""
-fix = ""
-note = "Found by D147's live re-run. The assembly was checked against the captured streams (each assembled into Chat, Messages and Responses bodies with every argument intact)."
+state = "fixed"
+test = "tools_on_qwen3_7_plus_go_with_thinking_off_unless_reasoning_was_asked"
+fix = "9df189c"
+note = "Found by D147's live re-run. Ground truth 2026-10-01 (direct, streamed, tool_choice auto, thinking on by default): Together Qwen/Qwen3.7-Plus wrote the call as text (\"call\\n{\\\"name\\\": \\\"get_weather\\\", ...}\", once a tool_calls slot with no name plus leaked reasoning) 6 of 48; OpenRouter qwen/qwen3.7-plus (Alibaba) 4 of 48, so skipping Together for tool requests would not help. With reasoning {\"enabled\": false}: 0 of 48 (32 auto, 16 forced). Qwen3.8 Flash, 3.7 Max and 3.6 Plus: 0 of 16 each with thinking on. Fixed by adapting the body rather than steering: providers::catalog::tool_thinking marks both Qwen3.7 Plus candidates OffWithTools, and translate::thinking_off_for_tools sends a request offering tools with every root reasoning / reasoning_effort cut and \"reasoning\":{\"enabled\":false} first, unless the client asked for reasoning itself (then it gets it as asked, with the risk). Together documents reasoning.enabled for hybrid models; OpenRouter's unified reasoning switch does the same. Also held by thinking_off_for_tools_follows_the_rule and qwen_candidates_whose_thinking_breaks_tools. Live 2026-10-01: CAT-6::raw::{together,openrouter}::qwen/qwen3.7-plus 16 of 16 runs pass; with the live.rs together route pointed at qwen/qwen3.7-plus on a scratch edit, all 14 together cells pass (tools_chat, tools_messages, langchain_chat, both ai-sdk tool cells)."
 
 [[defect]]
 id = "D172"
@@ -1921,10 +1921,10 @@ impact = "Together's Qwen3.6 Plus, 3.7 Plus, 3.7 Max and 3.8 Flash think by defa
 confidence = "high"
 evidence = "live 2026-10-01, the live.rs together route pointed at qwen/qwen3.8-flash on a scratch edit: T1+B1::openai-py::together::tools_chat, T1+B1::anthropic-py::together::tools_messages and E1+T1+B1::langchain::together::langchain_chat all got that 400 from Together. Direct to api.together.xyz with Qwen/Qwen3.7-Plus and a named tool_choice: the same 400."
 claims = ["T1", "E1", "E2"]
-state = "suspected"
-test = ""
-fix = ""
-note = "Found by D147's live re-run. Options: turn thinking off when a tool is forced (as thinking_off_between_tools does for Claude), or send tool_choice auto. The catalog sweep's CAT-6 already retries with auto, so it does not see this."
+state = "fixed"
+test = "a_forced_tool_on_a_thinking_qwen_row_goes_with_thinking_off"
+fix = "9df189c"
+note = "Found by D147's live re-run. Ground truth 2026-10-01 (direct, streamed, named and required tool_choice): the 400 on Together Qwen3.7-Plus and Qwen3.8-Flash and on OpenRouter qwen3.7-plus (Alibaba; qwen3.8-flash there was 429 at the time, same backend); Qwen3.6-Plus and Qwen3.7-Max call the forced tool while thinking. reasoning {\"enabled\": false} or chat_template_kwargs enable_thinking false: all four call the tool; reasoning_effort none works too, and reasoning_effort with thinking off is a 400 (\"'reasoning_effort' must be 'none' when 'enable_thinking' is false\"). Every candidate of both rows refuses, so steering cannot help: providers::catalog::tool_thinking marks them (OffWhenForced, OffWithTools), and translate::thinking_off_for_tools sends a forced tool request with root reasoning / reasoning_effort cut and \"reasoning\":{\"enabled\":false} first, whatever the client asked (thinking on is a certain 400). Applied after translation, so a Messages tool_choice any or tool is covered. Also held by thinking_off_for_tools_follows_the_rule and qwen_candidates_whose_thinking_breaks_tools. Live 2026-10-01: with the live.rs together route pointed at qwen/qwen3.8-flash and then qwen/qwen3.7-plus on a scratch edit, T1+B1::openai-py::together::tools_chat, T1+B1::anthropic-py::together::tools_messages, E1+T1+B1::langchain::together::langchain_chat and the ai-sdk tool cells pass (14 of 14 together cells each); CAT-6 on the four Qwen rows passes on both candidates."
 
 [[defect]]
 id = "D173"
@@ -1935,10 +1935,10 @@ impact = "OpenAI's Chat clients send the system prompt as role developer (openai
 confidence = "high"
 evidence = "live 2026-10-01, the live.rs together route pointed at qwen/qwen3.8-flash on a scratch edit: TRN-16+TRN-2::openai-py::together::developer_role got that 400 from Together."
 claims = ["TRN-16"]
-state = "suspected"
-test = ""
-fix = ""
-note = "Found by D147's live re-run. Likely fix: on a Chat relay to a host other than OpenAI, send developer as system. Not checked yet on Together's other model families."
+state = "fixed"
+test = "a_developer_message_reaches_together_as_system"
+fix = "9df189c"
+note = "Found by D147's live re-run. Ground truth 2026-10-01, a developer instruction (\"Answer with exactly the word PINEAPPLE\") direct to Together: Qwen3.6-Plus, 3.7-Plus, 3.7-Max and 3.8-Flash answer the 400; Kimi-K3, DeepSeek-V4-Pro-0813 and GLM-5.2 accept it but do not follow it; Llama-3.3-70B and gpt-oss-120b follow it. As system, all of them follow it. OpenRouter follows developer on Qwen3.8 Flash, Kimi K2.6 and GLM 5.2 (it maps the role per upstream). Fixed: on a same-wire Chat relay to any host but OpenAI and OpenRouter (providers::catalog::reads_developer_role), translate::developer_as_system rewrites each messages[].role \"developer\" to \"system\" by span, every other byte as sent; the Responses translation already did this off OpenAI (D49). For a model that is not OpenAI's, developer is the system role by another name, so this is faithful. Also held by developer_as_system_changes_only_the_roles and only_openai_and_openrouter_read_the_developer_role. Live 2026-10-01: TRN-16+TRN-2::openai-py::together::developer_role passes with the together route on qwen/qwen3.8-flash and qwen/qwen3.7-plus (scratch edits), and on its own llama-3.3-70b-versatile 5 of 6 runs (once Llama did not end its Chat reply with the instructed token: an instruction-following miss, not a refusal)."
 
 [[defect]]
 id = "D155"
@@ -1951,22 +1951,22 @@ evidence = "live 2026-10-01 catalog sweep: CAT-6::raw::openrouter::z-ai/glm-5.2 
 claims = ["CAT-6"]
 state = "fixed"
 test = "a_structured_output_request_skips_a_candidate_that_does_not_enforce_it"
-fix = "5f26a42"
-note = "Fixed as D107 was: capability-aware dispatch. providers::catalog::REFUSES_STRUCTURED_OUTPUTS lists OpenRouter's z-ai/glm-5.2, so serves_structured_outputs refuses it and route::unserved leaves it out of a json_schema request's walk (Together's GLM 5.2, which held the schema, serves; pinned to OpenRouter alone it is still sent). Where no candidate enforces the schema the card stops advertising it: kimi-k2.6, kimi-k2.7-code and qwen3.6-plus drop STRUCTURED_OUTPUTS. verify/catalog_truth.toml [[schema_unenforced]] records each candidate, OpenRouter's endpoint listing and the measurement, and features_absent on the three rows; schema_unenforced_candidates_match_truth and structured_outputs_are_advertised_only_where_enforced hold the catalog to it. OpenRouter's supported_parameters is not ground truth for enforcement. Live 2026-10-01: CAT-6::raw::openrouter::z-ai/glm-5.2 asserts json_schema with OpenRouter ordered first is served by Together; CAT-6 and CAT-6+BIL-9::raw::openrouter::{moonshotai/kimi-k2.6,moonshotai/kimi-k2.7-code,qwen/qwen3.6-plus,qwen/qwen3.8-flash,minimaxai/minimax-m2.7} and ::together::z-ai/glm-5.2 pass. The Together Qwen cells still fail on D147 (streaming only); CAT-6::raw::openrouter::mistral-large-latest on D156."
+fix = "eb415e9"
+note = "Fixed as D107 was: capability-aware dispatch. providers::catalog::REFUSES_STRUCTURED_OUTPUTS lists OpenRouter's z-ai/glm-5.2, so serves_structured_outputs refuses it and route::unserved leaves it out of a json_schema request's walk (Together's GLM 5.2, which held the schema, serves; pinned to OpenRouter alone it is still sent). Where no candidate enforces the schema the card stops advertising it: kimi-k2.6, kimi-k2.7-code and qwen3.6-plus drop STRUCTURED_OUTPUTS (qwen3.6-plus is also D170). verify/catalog_truth.toml [[schema_unenforced]] records each candidate, OpenRouter's endpoint listing and the measurement, and features_absent on the three rows; schema_unenforced_candidates_match_truth and structured_outputs_are_advertised_only_where_enforced hold the catalog to it. OpenRouter's supported_parameters is not ground truth for enforcement. Live 2026-10-01: CAT-6::raw::openrouter::z-ai/glm-5.2 asserts json_schema with OpenRouter ordered first is served by Together; CAT-6 and CAT-6+BIL-9::raw::openrouter::{moonshotai/kimi-k2.6,moonshotai/kimi-k2.7-code,qwen/qwen3.6-plus,qwen/qwen3.8-flash,minimaxai/minimax-m2.7} and ::together::z-ai/glm-5.2 pass; after D147, CAT-6 and CAT-6+BIL-9 on both candidates of qwen3.6-plus, 3.7-plus, 3.7-max and 3.8-flash pass (16/16). CAT-6::raw::openrouter::mistral-large-latest still fails on D156."
 
 [[defect]]
 id = "D156"
 severity = "med"
 area = "Catalog"
 title = "Rows served only through OpenRouter's shared upstream pool are rate-limited by other OpenRouter customers' traffic"
-impact = "OpenRouter answers 429 \"temporarily rate-limited upstream ... add your own key\" (metadata.limit_source upstream_provider_shared_pool, is_byok false) when the upstream host's limit on OpenRouter's own key is spent. That limit is shared with every OpenRouter customer, so our traffic has no control over it, and a pool-key walk cannot help (every OpenRouter key draws on the same upstream pool). With the keys this deployment holds, every Mistral row (mistral-large/medium/small, ministral-3b/8b/14b, codestral: Mistral is the only host OpenRouter has for each), minimaxai/minimax-m2.7's structured-output requests (Mara is its only host listing structured_outputs) and, while Together's Qwen candidates are unusable non-streamed (D147), qwen/qwen3.6-plus, 3.7-max, 3.7-plus and 3.8-flash (Alibaba only) can fail on any request."
+impact = "OpenRouter answers 429 \"temporarily rate-limited upstream ... add your own key\" (metadata.limit_source upstream_provider_shared_pool, is_byok false) when the upstream host's limit on OpenRouter's own key is spent. That limit is shared with every OpenRouter customer, so our traffic has no control over it, and a pool-key walk cannot help (every OpenRouter key draws on the same upstream pool). With the keys this deployment holds, every Mistral row (mistral-large/medium/small, ministral-3b/8b/14b, codestral: Mistral is the only host OpenRouter has for each), minimaxai/minimax-m2.7's structured-output requests (Mara is its only host listing structured_outputs) can fail on any request. The Qwen3.6/3.7/3.8 rows (Alibaba is OpenRouter's only host) are exposed only on failover or when pinned to OpenRouter, now that D147 lets Together, their primary, serve every call."
 confidence = "high"
 evidence = "live 2026-10-01 final run: 31 shared-pool 429s: mistralai/mistral-large-2512 (Mistral) 18, qwen/qwen3.8-flash (Alibaba) 7, minimax/minimax-m2.7 (Mara) 4, thinkingmachines/inkling (DeepInfra) 2; CAT-1/4/5/6/7::raw::openrouter::mistral-large-latest, CAT-6::raw::openrouter::{qwen/qwen3.8-flash,minimaxai/minimax-m2.7} and CAT-2::raw::all::qwen/qwen3.8-flash failed after the cell's two retries. Direct to OpenRouter, 2026-10-01 ~10:03 PT, 10 one-token calls 2 s apart: mistral-large-2512 8/10 429 shared pool; mistral-small-2603 6/10; mistral-medium-3-5 0/10; qwen3.8-flash 3/10; minimax-m2.7 0/10 (served by Minimax, Novita, AtlasCloud: plain requests avoid Mara). OpenRouter /api/v1/models/{id}/endpoints: every Mistral id has only Mistral endpoints; Qwen3.6/3.7/3.8 have only Alibaba."
 claims = ["CAT-1", "CAT-2", "CAT-4", "CAT-5", "CAT-6", "CAT-7"]
 state = "suspected"
 test = ""
 fix = ""
-note = "An account/procurement decision, not a code fix. Options: (A) a Mistral pool key (AI_POOL_KEY_MISTRAL): every Mistral row already lists Mistral's own API as its primary candidate (providers::catalog::mistral), so the key alone moves all seven rows off OpenRouter, with OpenRouter as failover; Mistral's own rate limits then apply to our account only. (B) OpenRouter BYOK: add a Mistral (or Alibaba, MiniMax) key under openrouter.ai/settings/integrations; OpenRouter tries BYOK endpoints first and by default falls back to shared capacity on failure, for a 5% fee on OpenRouter's price after a monthly free allowance (openrouter.ai/docs/use-cases/byok, 2026-10-01). Same upstream key as (A) but with OpenRouter still in the path, and nothing in the gateway changes. (C) Keep the rows and say they are best-effort: without (A) or (B) mistral-large-latest is not reliable (8 of 10 calls refused in a quiet minute). (D) Remove the affected rows. The Qwen rows recover when D147 makes Together usable (Together is their primary). No pure-code fix is clearly right: a shared-pool 429 is not our credential's limit, so treating it as a vendor failover (today a 429 never fails over) would be defensible, but no affected row has a second keyed vendor to fail over to, and it changes a documented rule. Also seen: the relayed 429 body carries OpenRouter's \"add your own key ... openrouter.ai/settings/integrations\" remedy, which a gateway client cannot act on."
+note = "An account/procurement decision, not a code fix. Options: (A) a Mistral pool key (AI_POOL_KEY_MISTRAL): every Mistral row already lists Mistral's own API as its primary candidate (providers::catalog::mistral), so the key alone moves all seven rows off OpenRouter, with OpenRouter as failover; Mistral's own rate limits then apply to our account only. (B) OpenRouter BYOK: add a Mistral (or Alibaba, MiniMax) key under openrouter.ai/settings/integrations; OpenRouter tries BYOK endpoints first and by default falls back to shared capacity on failure, for a 5% fee on OpenRouter's price after a monthly free allowance (openrouter.ai/docs/use-cases/byok, 2026-10-01). Same upstream key as (A) but with OpenRouter still in the path, and nothing in the gateway changes. (C) Keep the rows and say they are best-effort: without (A) or (B) mistral-large-latest is not reliable (8 of 10 calls refused in a quiet minute). (D) Remove the affected rows. The Qwen rows already recovered with D147 (Together, their primary, serves them). No pure-code fix is clearly right: a shared-pool 429 is not our credential's limit, so treating it as a vendor failover (today a 429 never fails over) would be defensible, but no affected row has a second keyed vendor to fail over to, and it changes a documented rule. Also seen: the relayed 429 body carries OpenRouter's \"add your own key ... openrouter.ai/settings/integrations\" remedy, which a gateway client cannot act on."
 
 [[defect]]
 id = "D157"
