@@ -4642,6 +4642,14 @@ impl ProxyHttp for AiProxy {
                             let len = buf.len();
                             buf = translate::strip_gateway_reasoning(buf);
                             changed |= buf.len() != len;
+                        } else if to == route::Endpoint::ChatCompletions
+                            && upstream_model.contains("claude")
+                        {
+                            // A Claude model behind Chat Completions (OpenRouter): a tool turn
+                            // with no thinking to replay goes without reasoning (D14's rule).
+                            let len = buf.len();
+                            buf = translate::claude_chat_relay_reasoning(buf);
+                            changed |= buf.len() != len;
                         }
                     }
                     if changed {

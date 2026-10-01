@@ -461,7 +461,15 @@ to an OpenAI Responses upstream (a Responses-first row, a GPT row's Responses ar
 failover) first strips the gateway's own reasoning items, whose id and Anthropic signature OpenAI
 rejects; one `memmem` for `rs_gw` keeps every other body a byte relay. Budget-thinking Claude (before 4.6) 400s a tool loop whose final assistant turn does not
 open with its thinking block; when a client sent none back (Vercel, LangChain, a Responses client
-that drops reasoning items), that request goes without `thinking`, which Anthropic accepts. Structured output maps
+that drops reasoning items), that request goes without `thinking`, which Anthropic accepts. The
+same rule covers a Claude model behind Chat Completions (OpenRouter's `anthropic/…`: an
+OpenRouter-only row like claude-sonnet-4, or any Claude row's OpenRouter failover), on a same-wire
+relay and a translated walk alike: when the request asks for reasoning (`reasoning_effort`,
+`reasoning`, `include_reasoning`, `thinking`) and its last assistant tool-call turn carries no
+`reasoning_details` OpenRouter can replay (a signed `reasoning.text` or an encrypted entry), those
+keys are dropped for that request — pi, the stock OpenAI SDK and LangChain echo at most a plain
+`reasoning` string. A relayed body that never says `reasoning` or `thinking` is not parsed (one
+`memmem` each). Structured output maps
 `response_format` `json_schema` ↔ `output_config.format` ↔ Responses `text.format`; OpenAI JSON mode
 (`json_object`) has no schema to give Anthropic and is dropped (OpenAI already requires the prompt to
 ask for JSON). Inline PDFs map Chat `file` ↔ Anthropic base64 `document` ↔ Responses `input_file`.

@@ -280,8 +280,12 @@ fn map_request(from: Endpoint, to: Endpoint, v: &Value, up: Upstream) -> Value {
     let chat = chat.as_ref().and_then(Option::as_ref).unwrap_or(v);
     match (from, to) {
         (Endpoint::ChatCompletions, Endpoint::Messages) => openai_req_to_anthropic(chat, up.claude),
-        (Endpoint::Messages, Endpoint::ChatCompletions) => anthropic_req_to_openai(v, up),
-        (Endpoint::Responses, Endpoint::ChatCompletions) => responses_req_to_openai(v, up, false),
+        (Endpoint::Messages, Endpoint::ChatCompletions) => {
+            claude_chat_reasoning_guard(anthropic_req_to_openai(v, up), up)
+        }
+        (Endpoint::Responses, Endpoint::ChatCompletions) => {
+            claude_chat_reasoning_guard(responses_req_to_openai(v, up, false), up)
+        }
         (Endpoint::ChatCompletions, Endpoint::Responses) => {
             openai_req_to_responses(chat, up.openai)
         }
@@ -816,6 +820,118 @@ fn thinking_off_between_tools(out: &mut Map<String, Value>, claude: ClaudeModel)
         return;
     }
     out.insert("thinking".into(), json!({ "type": "between_tools" }));
+}
+
+/// Root Chat Completions keys that turn reasoning on for a Claude model a Chat host (OpenRouter)
+/// serves: OpenAI's `reasoning_effort`, OpenRouter's `reasoning` and legacy `include_reasoning`,
+/// and an Anthropic-style `thinking` some clients pass through.
+const CHAT_REASONING_KEYS: [&str; 4] = [
+    "reasoning_effort",
+    "reasoning",
+    "include_reasoning",
+    "thinking",
+];
+
+/// [`drop_unreplayable_chat_reasoning`] on a translated Chat Completions body bound for a Claude
+/// model.
+fn claude_chat_reasoning_guard(mut body: Value, up: Upstream) -> Value {
+    if up.claude_thinking
+        && let Some(out) = body.as_object_mut()
+    {
+        drop_unreplayable_chat_reasoning(out);
+    }
+    body
+}
+
+/// D14's rule for a Claude model behind Chat Completions (OpenRouter's `anthropic/…`, same wire or
+/// translated): OpenRouter sends the request's reasoning to Anthropic as enabled thinking, and
+/// Anthropic 400s a tool turn whose last assistant message does not open on a signed thinking
+/// block ("a final `assistant` message must start with a thinking block"). OpenRouter replays a
+/// block only from `reasoning_details`; a client that sends none back for that turn (pi, the stock
+/// OpenAI SDK, LangChain: a plain `reasoning` string at most) gets the request without reasoning,
+/// which Anthropic accepts. `true` when a key was removed.
+fn drop_unreplayable_chat_reasoning(out: &mut Map<String, Value>) -> bool {
+    if !CHAT_REASONING_KEYS
+        .iter()
+        .any(|k| out.get(*k).is_some_and(reasoning_value_on))
+    {
+        return false;
+    }
+    let lacks = out
+        .get("messages")
+        .and_then(Value::as_array)
+        .is_some_and(|ms| chat_tool_turn_lacks_reasoning(ms));
+    if !lacks {
+        return false;
+    }
+    for k in CHAT_REASONING_KEYS {
+        out.remove(k);
+    }
+    true
+}
+
+/// Whether a reasoning control's value asks for reasoning: not `null`, `false`, `"none"`,
+/// `{"effort": "none"}`, `{"enabled": false}` or `{"type": "disabled"}`.
+fn reasoning_value_on(v: &Value) -> bool {
+    match v {
+        Value::Null | Value::Bool(false) => false,
+        Value::String(s) => s != "none",
+        Value::Object(o) => {
+            o.get("effort").and_then(Value::as_str) != Some("none")
+                && o.get("enabled").and_then(Value::as_bool) != Some(false)
+                && o.get("type").and_then(Value::as_str) != Some("disabled")
+        }
+        _ => true,
+    }
+}
+
+/// Whether the last assistant message of a Chat Completions body calls a tool without any thinking
+/// OpenRouter can replay (a signed `reasoning.text` or an encrypted entry in `reasoning_details`).
+fn chat_tool_turn_lacks_reasoning(messages: &[Value]) -> bool {
+    let Some(m) = messages
+        .iter()
+        .rev()
+        .find(|m| m.get("role").and_then(Value::as_str) == Some("assistant"))
+    else {
+        return false;
+    };
+    if m.get("tool_calls")
+        .and_then(Value::as_array)
+        .is_none_or(Vec::is_empty)
+    {
+        return false;
+    }
+    let mut blocks = Vec::new();
+    if let Some(details) = m.get("reasoning_details").and_then(Value::as_array) {
+        let mut gather = Gather::default();
+        for d in details {
+            gather.detail(d, &mut blocks);
+        }
+        gather.close(&mut blocks);
+    }
+    !blocks.iter().any(is_replayable_thinking)
+}
+
+/// A same-wire Chat Completions body relayed to a Claude model on a Chat host, less its reasoning
+/// controls when its tool turn has no thinking to replay (see
+/// [`drop_unreplayable_chat_reasoning`]). One `memmem` decides: a body that never mentions
+/// reasoning or thinking is returned untouched, unparsed.
+pub fn claude_chat_relay_reasoning(body: Vec<u8>) -> Vec<u8> {
+    if memchr::memmem::find(&body, b"reasoning").is_none()
+        && memchr::memmem::find(&body, b"thinking").is_none()
+    {
+        return body;
+    }
+    let Ok(mut v) = serde_json::from_slice::<Value>(&body) else {
+        return body;
+    };
+    if v.as_object_mut()
+        .is_some_and(drop_unreplayable_chat_reasoning)
+    {
+        encode(&v)
+    } else {
+        body
+    }
 }
 
 /// Whether the last assistant turn calls a tool without opening on a thinking block (signed or

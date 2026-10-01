@@ -282,7 +282,6 @@ fn weather_tool() -> Value {
 /// claim: TRN-7, W4
 /// defect: D77
 #[tokio::test]
-#[ignore = "D77 reproduced: reasoning_effort reaches OpenRouter on a Claude tool turn without replayable reasoning"]
 async fn a_claude_tool_turn_without_reasoning_details_goes_without_reasoning_on_openrouter() {
     let nats_port = unused_nats_port();
     let (pubkey, sk) = test_keypair(1);

@@ -1495,6 +1495,43 @@ fn tool_loop_thinking_violation(v: &Value) -> Option<String> {
     })
 }
 
+/// An Anthropic SDK turn 2 onto a Claude model OpenRouter serves: the client dropped turn 1's
+/// thinking, so OpenRouter has nothing to replay and Anthropic would 400 the enabled thinking. The
+/// request goes without reasoning; with the signed block echoed, it keeps it.
+/// claim: TRN-7
+/// defect: D77
+#[test]
+fn a_messages_tool_turn_without_thinking_goes_without_reasoning_onto_openrouter_claude() {
+    const MODEL: &str = "anthropic/claude-sonnet-4";
+    let turn2 = |assistant: Value| {
+        anth(json!({
+            "max_tokens": 2000,
+            "thinking": {"type": "enabled", "budget_tokens": 1024},
+            "tools": [{"name": "get_weather", "input_schema": weather_schema()}],
+            "messages": [
+                {"role": "user", "content": "weather?"},
+                {"role": "assistant", "content": assistant},
+                {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_1", "content": "sunny"}]},
+            ],
+        }))
+    };
+    let call = json!({"type": "tool_use", "id": "toolu_1", "name": "get_weather", "input": {"city": "Paris"}});
+    let has_reasoning = |v: &Value| CHAT_REASONING_KEYS.iter().any(|k| v.get(*k).is_some());
+
+    let signed = m2c(
+        &turn2(json!([{"type": "thinking", "thinking": "t", "signature": "SIG"}, call])),
+        MODEL,
+    );
+    assert!(has_reasoning(&signed), "control: {signed}");
+    let dropped = m2c(&turn2(json!([call])), MODEL);
+    assert!(!has_reasoning(&dropped), "{dropped}");
+    // Not a Claude model: nothing to replay, nothing dropped.
+    assert!(has_reasoning(&m2c(
+        &turn2(json!([call])),
+        "deepseek/deepseek-r1"
+    )));
+}
+
 /// Turn 2 of a thinking + tool loop on budget-thinking Claude, from clients that do not send our
 /// thinking back: Vercel / LangChain on Chat Completions (the assistant echo carries the tool call,
 /// maybe `reasoning_content`, never our `thinking` list), a Responses client that drops reasoning
