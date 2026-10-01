@@ -773,10 +773,10 @@ impact = "README: 'fail-open NATS' (managed gets 402), 'never buffers', '11 prov
 confidence = "high"
 evidence = "README.md; ARCHITECTURE.md; config.example.toml"
 claims = ["CAT-15"]
-state = "reproduced"
+state = "fixed"
 test = "architecture_tables_name_real_modules_metrics_and_fields"
-fix = ""
-note = "README fixed in the commit that adds this note (provider count, buffering, circuit breaker, NATS fail-closed allowance, slipstream sets, env overrides, broken links, managed endpoint scope). ARCHITECTURE.md and config.example.toml items remain. Reproduced 2026-09-30 by the mechanical doc lint (tests/claims_contract.rs): ARCHITECTURE.md's configuration table names `listen_addr` (the field is `listen`), and config.example.toml's 'Known providers (zero-config defaults)' list omits openai-codex. The README checks (provider count and list, config keys and defaults, links) and the example config's keys and defaults pass in readme_and_example_config_statements_hold. The prose items (Claude lineup, 413 happy path, fireworks-anthropic path, AWS_BEARER_TOKEN_BEDROCK) are not mechanically checked."
+fix = "5a4caf1"
+note = "ARCHITECTURE.md (config field names and missing keys, env override scope, Claude lineup, /v1/models and the catalog-walk 413 after identity, ai_requests_total, metrics_listen reachability, live smoke) and config.example.toml (env scope, openai-codex, fireworks-anthropic /inference path, AWS_BEARER_TOKEN_BEDROCK) corrected; README was fixed earlier."
 
 [[defect]]
 id = "D56"
@@ -885,10 +885,10 @@ impact = "OpenAI rejects max_tokens for reasoning models ('Use max_completion_to
 confidence = "high"
 evidence = "live cell E1::openai-py::gpt::chat_basic 2026-10-01: 400 unsupported_parameter 'max_tokens' on gpt-5-mini via managed /v1/chat/completions"
 claims = ["E1", "T1", "TRN-5"]
-state = "reproduced"
+state = "fixed"
 test = "a_stock_max_tokens_reaches_native_openai_as_max_completion_tokens"
-fix = ""
-note = "Found by the first live run; reproduced hermetically (tests/openai_params.rs): a managed Chat request with max_tokens reaches native OpenAI unchanged on gpt-5-mini."
+fix = "cbb2c92"
+note = "A catalog walk served by native OpenAI Chat Completions renames a root max_tokens to max_completion_tokens in place (peek limit_keys); with both present max_tokens is dropped. Other OpenAI-wire hosts keep max_tokens."
 
 [[defect]]
 id = "D64"
@@ -955,10 +955,10 @@ impact = "ARCHITECTURE.md: 'A non-http(s) image URL (file://) is never forwarded
 confidence = "high"
 evidence = "translate.rs Chat Completions <-> Responses image part mapping passes the URL through without the scheme check the Messages mapping applies"
 claims = ["TRN-21"]
-state = "reproduced"
+state = "fixed"
 test = "a_file_image_url_never_reaches_a_responses_upstream"
-fix = ""
-note = "Reproduced with translate::request (tests/claims_translation.rs): Chat -> Responses on gpt-5-pro keeps input_image.image_url = file:///etc/passwd."
+fix = "5225bc3"
+note = "Chat Completions <-> Responses drops a non-http(s), non-data image URL and a file:// input_file file_url, as the Messages mapping already did."
 
 [[defect]]
 id = "D69"
@@ -969,10 +969,10 @@ impact = "POST /anthropic/v1/messages/count_tokens and /openai/v1/responses/inpu
 confidence = "high"
 evidence = "proxy.rs logging(): `free` is derived from rc.auto.sub, which is None on /{provider} routes"
 claims = ["BIL-18"]
-state = "reproduced"
+state = "fixed"
 test = "token_counts_write_no_row_on_a_provider_route"
-fix = ""
-note = "Found by the claim-coverage pass (claims_billing.rs)."
+fix = "ebd61fe"
+note = "logging derives the free sub-resource from the forwarded path too (route::SubResource::of_forward_path), so /{provider} token counts write no row and no parse error."
 
 [[defect]]
 id = "D70"
@@ -983,10 +983,10 @@ impact = "anthropic_stream_finished is a substring search for message_delta anyw
 confidence = "high"
 evidence = "usage.rs anthropic_stream_finished: memmem::find(tail, b\"message_delta\")"
 claims = ["BIL-22"]
-state = "reproduced"
+state = "fixed"
 test = "generated_message_delta_text_does_not_hide_a_cut_short_anthropic_stream"
-fix = ""
-note = "Found by the claim-coverage pass (claims_billing.rs). The OpenAI side is not affected: generated text is JSON-escaped inside the delta."
+fix = "dc2a7d0"
+note = "anthropic_stream_finished matches an `\\nevent: message_delta` line or a `\"type\":\"message_delta\"` member, which JSON-escaped generated text cannot forge."
 
 [[defect]]
 id = "D71"
