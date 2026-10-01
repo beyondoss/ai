@@ -1065,6 +1065,9 @@ pub struct GatewayBuilder {
     /// `Some(1)` reproduces Pingora's single-threaded default, which is what the scaling bench
     /// compares against.
     worker_threads: Option<usize>,
+    /// verify phase 0: billing — raw `key = value` scalars and child env (see the marked block).
+    extra_config: Vec<String>,
+    env_overrides: Vec<(String, String)>,
 }
 
 impl GatewayBuilder {
@@ -1253,6 +1256,10 @@ impl GatewayBuilder {
         if let Some(n) = self.tenant_max_in_flight {
             cfg.push_str(&format!("tenant_max_in_flight = {n}\n"));
         }
+        for line in &self.extra_config {
+            cfg.push_str(line);
+            cfg.push('\n');
+        }
         if let Some(threshold) = self.circuit_breaker_threshold {
             // Tight window + reset so the test trips and recovers quickly.
             cfg.push_str(&format!(
@@ -1332,6 +1339,11 @@ impl GatewayBuilder {
                 // gates them all. Without this the payload layer is installed and silently starved.
                 std::env::var("AI_LOG")
                     .unwrap_or_else(|_| "warn,ai.usage=info,ai.payload=info".into()),
+            )
+            .envs(
+                self.env_overrides
+                    .iter()
+                    .map(|(k, v)| (k.as_str(), v.as_str())),
             )
             // Capture the child's output instead of letting it inherit ours. Two reasons: the
             // `ai.usage` rows are only observable this way (they are a log target, not a metric),
@@ -1432,6 +1444,8 @@ impl Gateway {
             cache_ttl_secs: None,
             tenant_max_in_flight: None,
             wait_allowance_ready: true,
+            extra_config: Vec::new(),
+            env_overrides: Vec::new(),
         }
     }
 
@@ -1543,4 +1557,230 @@ where
     })
     .await;
     assert!(r.is_ok(), "status never became {want}");
+}
+
+// --- verify phase 0: billing ---
+//
+// What the billing reproductions need that `MockUpstream` cannot express: an upstream that sees the
+// request body before deciding what to send (a provider honoring `stream_options.include_usage`),
+// that stalls before the response head, that sends half a body and closes, or that drains the body
+// and never answers. `ScriptedUpstream` is a raw HTTP/1.1 server driven by a per-request script, so
+// every byte and every pause is the test's to choose. Plus two `GatewayBuilder` knobs: raw config
+// scalars and child env overrides (`AI_LOG`).
+
+impl GatewayBuilder {
+    /// Append a raw top-level `key = value` line to the gateway config (e.g. `read_timeout_secs = 2`).
+    pub fn config_line(mut self, line: &str) -> Self {
+        self.extra_config.push(line.to_string());
+        self
+    }
+
+    /// Set an env var on the gateway child, overriding the harness's own (including `AI_LOG`).
+    pub fn env(mut self, key: &str, value: &str) -> Self {
+        self.env_overrides
+            .push((key.to_string(), value.to_string()));
+        self
+    }
+}
+
+/// One step of a [`ScriptedUpstream`] reply. After the last step the connection is closed.
+pub enum Step {
+    Write(Vec<u8>),
+    Sleep(Duration),
+}
+
+/// A complete HTTP/1.1 response with `content-length` and `connection: close`.
+pub fn http_response(status: u16, content_type: &str, body: &[u8]) -> Vec<u8> {
+    let mut out = http_head(status, content_type, Some(body.len()));
+    out.extend_from_slice(body);
+    out
+}
+
+/// A response head. `content_length: None` ⇒ the body runs to connection close.
+pub fn http_head(status: u16, content_type: &str, content_length: Option<usize>) -> Vec<u8> {
+    let mut head =
+        format!("HTTP/1.1 {status} X\r\ncontent-type: {content_type}\r\nconnection: close\r\n");
+    if let Some(n) = content_length {
+        head.push_str(&format!("content-length: {n}\r\n"));
+    }
+    head.push_str("\r\n");
+    head.into_bytes()
+}
+
+type Script = Arc<dyn Fn(&[u8], usize) -> Vec<Step> + Send + Sync>;
+
+pub struct ScriptedUpstream {
+    pub port: u16,
+    /// Requests whose body arrived in full, in arrival order.
+    bodies: Arc<Mutex<Vec<Vec<u8>>>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl ScriptedUpstream {
+    /// `script(body, n)` decides the reply to the `n`th (0-based) fully received request.
+    pub async fn start(script: impl Fn(&[u8], usize) -> Vec<Step> + Send + Sync + 'static) -> Self {
+        let script: Script = Arc::new(script);
+        let listener = bind_unreserved().await;
+        let port = listener.local_addr().unwrap().port();
+        let bodies: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&bodies);
+        let task = tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let script = Arc::clone(&script);
+                let seen = Arc::clone(&seen);
+                tokio::spawn(scripted_conn(stream, script, seen));
+            }
+        });
+        ScriptedUpstream { port, bodies, task }
+    }
+
+    /// Always answer with this complete response.
+    pub async fn reply(status: u16, content_type: &'static str, body: String) -> Self {
+        let bytes = http_response(status, content_type, body.as_bytes());
+        Self::start(move |_, _| vec![Step::Write(bytes.clone())]).await
+    }
+
+    pub fn authority(&self) -> String {
+        format!("127.0.0.1:{}", self.port)
+    }
+
+    /// How many requests arrived with their whole body.
+    pub fn hits(&self) -> usize {
+        self.bodies.lock().unwrap().len()
+    }
+
+    pub fn bodies(&self) -> Vec<Vec<u8>> {
+        self.bodies.lock().unwrap().clone()
+    }
+}
+
+impl Drop for ScriptedUpstream {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// Read one request (head, then a `content-length` or chunked body), record it, run the script.
+async fn scripted_conn(
+    mut stream: tokio::net::TcpStream,
+    script: Script,
+    seen: Arc<Mutex<Vec<Vec<u8>>>>,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 16 * 1024];
+    let head_end = loop {
+        if let Some(i) = find_bytes(&buf, b"\r\n\r\n") {
+            break i + 4;
+        }
+        match stream.read(&mut chunk).await {
+            Ok(0) | Err(_) => return,
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+        }
+    };
+    let head = String::from_utf8_lossy(&buf[..head_end]).to_ascii_lowercase();
+    let header = |name: &str| {
+        head.lines()
+            .find_map(|l| l.strip_prefix(name).map(|v| v.trim().to_string()))
+    };
+    let mut rest = buf.split_off(head_end);
+    let body = if let Some(n) = header("content-length:").and_then(|v| v.parse::<usize>().ok()) {
+        while rest.len() < n {
+            match stream.read(&mut chunk).await {
+                Ok(0) | Err(_) => return,
+                Ok(k) => rest.extend_from_slice(&chunk[..k]),
+            }
+        }
+        rest.truncate(n);
+        rest
+    } else if header("transfer-encoding:").is_some_and(|v| v.contains("chunked")) {
+        while find_bytes(&rest, b"\r\n0\r\n\r\n").is_none() && !rest.starts_with(b"0\r\n\r\n") {
+            match stream.read(&mut chunk).await {
+                Ok(0) | Err(_) => return,
+                Ok(k) => rest.extend_from_slice(&chunk[..k]),
+            }
+        }
+        let mut out = Vec::new();
+        let mut at = 0;
+        while let Some(eol) = find_bytes(&rest[at..], b"\r\n") {
+            let size = std::str::from_utf8(&rest[at..at + eol])
+                .ok()
+                .and_then(|s| {
+                    usize::from_str_radix(s.split(';').next().unwrap_or("").trim(), 16).ok()
+                })
+                .unwrap_or(0);
+            at += eol + 2;
+            if size == 0 {
+                break;
+            }
+            out.extend_from_slice(&rest[at..at + size]);
+            at += size + 2;
+        }
+        out
+    } else {
+        Vec::new()
+    };
+    let n = {
+        let mut seen = seen.lock().unwrap();
+        seen.push(body.clone());
+        seen.len() - 1
+    };
+    for step in script(&body, n) {
+        match step {
+            Step::Write(bytes) => {
+                if stream.write_all(&bytes).await.is_err() {
+                    return;
+                }
+                let _ = stream.flush().await;
+            }
+            Step::Sleep(d) => sleep(d).await,
+        }
+    }
+    let _ = stream.shutdown().await;
+}
+
+fn find_bytes(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    hay.windows(needle.len()).position(|w| w == needle)
+}
+
+/// The first `ai.usage` row's fields. `tracing`'s JSON layer nests event fields under `fields`.
+pub async fn usage_row_of(gw: &Gateway) -> serde_json::Value {
+    let line = gw.wait_for_log_line(&[r#""target":"ai.usage""#]).await;
+    let v: serde_json::Value = serde_json::from_str(&line).expect("usage line is JSON");
+    v.get("fields").cloned().unwrap_or(v)
+}
+
+/// Every `ai.usage` row logged so far, fields only.
+pub fn usage_rows_of(gw: &Gateway) -> Vec<serde_json::Value> {
+    gw.log()
+        .lines()
+        .filter(|l| l.contains(r#""target":"ai.usage""#))
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .map(|v| v.get("fields").cloned().unwrap_or(v))
+        .collect()
+}
+
+/// Wait up to `secs` for at least `n` usage rows; returns whatever exists at the deadline.
+pub async fn wait_usage_rows(gw: &Gateway, n: usize, secs: u64) -> Vec<serde_json::Value> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(secs);
+    loop {
+        let rows = usage_rows_of(gw);
+        if rows.len() >= n || std::time::Instant::now() >= deadline {
+            return rows;
+        }
+        sleep(Duration::from_millis(25)).await;
+    }
+}
+
+/// A `bai_` virtual key for `tenant_id` signed with `sk`.
+pub fn billing_vkey(sk: &ed25519_dalek::SigningKey, tenant_id: u64) -> String {
+    beyond_ai::key::mint(
+        &beyond_ai::key::VirtualKey {
+            tenant_id,
+            vpc_id: 1,
+            key_id: None,
+        },
+        1,
+        sk,
+    )
 }

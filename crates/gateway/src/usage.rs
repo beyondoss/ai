@@ -1458,3 +1458,57 @@ mod tests {
         assert_eq!(anthropic_body(no_reasoning).unwrap().reasoning_tokens, None);
     }
 }
+
+/// Verify phase 0, billing: parser-level reproductions. Each asserts the CORRECT behavior.
+#[cfg(test)]
+mod verify_billing {
+    use super::*;
+
+    /// The last 64 KiB of a Responses stream whose `response.completed` is bigger than that — what
+    /// `proxy::logging` hands `openai_stream` (see `USAGE_TAIL_CAP`).
+    /// claim: BIL-15
+    /// defect: D20
+    #[test]
+    #[ignore = "D20 reproduced: openai_stream returns None on a tail that starts mid-way through response.completed"]
+    fn openai_stream_reads_usage_from_a_final_event_larger_than_the_tail() {
+        let instructions = "You are a coding agent. ".repeat(4 * 1024);
+        let sse = format!(
+            "event: response.output_text.delta\n\
+             data: {{\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}}\n\n\
+             event: response.completed\n\
+             data: {{\"type\":\"response.completed\",\"response\":{{\"id\":\"resp_1\",\"instructions\":\"{instructions}\",\"usage\":{{\"input_tokens\":24000,\"output_tokens\":5,\"total_tokens\":24005}}}}}}\n\n"
+        );
+        let tail = &sse.as_bytes()[sse.len() - 64 * 1024..];
+        let u = openai_stream(tail).expect("usage is in the tail, just not on a whole line");
+        assert_eq!((u.input_tokens, u.output_tokens), (24000, 5));
+    }
+
+    /// OpenRouter's Chat Completions usage carries Claude cache writes as
+    /// `prompt_tokens_details.cache_write_tokens`.
+    /// claim: BIL-8
+    /// defect: D21
+    #[test]
+    #[ignore = "D21 reproduced: OpenAiUsage hard-codes cache_write_tokens = 0"]
+    fn openai_body_reads_openrouter_cache_write_tokens() {
+        let body = br#"{"usage":{"prompt_tokens":120,"completion_tokens":7,"total_tokens":127,"prompt_tokens_details":{"cached_tokens":10,"cache_write_tokens":50}}}"#;
+        let u = openai_body(body).unwrap();
+        assert_eq!(u.cache_read_tokens, 10);
+        assert_eq!(u.cache_write_tokens, 50);
+    }
+
+    /// Anthropic's `message_delta.usage` is cumulative and, after server tool use, carries larger
+    /// input and cache counts than `message_start`. The final counts win.
+    /// claim: BIL-8
+    /// defect: D22
+    #[test]
+    #[ignore = "D22 reproduced: anthropic_stream_parts reads input/cache only from message_start"]
+    fn anthropic_stream_takes_cumulative_input_from_message_delta() {
+        let sse = b"data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10,\"cache_read_input_tokens\":0,\"output_tokens\":1}}}\n\n\
+data: {\"type\":\"message_delta\",\"usage\":{\"input_tokens\":2500,\"cache_read_input_tokens\":800,\"cache_creation_input_tokens\":0,\"output_tokens\":300}}\n\n";
+        let u = anthropic_stream(sse).unwrap();
+        assert_eq!(
+            (u.input_tokens, u.cache_read_tokens, u.output_tokens),
+            (2500, 800, 300)
+        );
+    }
+}

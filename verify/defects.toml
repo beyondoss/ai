@@ -73,10 +73,10 @@ impact = "/openrouter/api/v1/messages bills zero (non-stream) or all-zero tokens
 confidence = "high"
 evidence = "proxy.rs:2416"
 claims = ["BIL-1"]
-state = "suspected"
-test = ""
+state = "reproduced"
+test = "openrouter_messages_path_is_metered_with_the_anthropic_extractor"
 fix = ""
-note = ""
+note = "Managed /openrouter/api/v1/messages with an Anthropic body (13 in/7 out) wrote input_tokens=0, output_tokens=0, usage_estimated=false. The SSE twin (openrouter_messages_stream_is_metered_with_the_anthropic_extractor) also wrote 0/0 with no estimate flag."
 
 [[defect]]
 id = "D06"
@@ -87,10 +87,10 @@ impact = "Sending stream_options:{include_usage:false} skips usage injection, so
 confidence = "high"
 evidence = "peek.rs:309-312, 526"
 claims = ["BIL-2"]
-state = "suspected"
-test = ""
+state = "reproduced"
+test = "a_client_cannot_turn_off_exact_stream_metering"
 fix = ""
-note = ""
+note = "Control (no stream_options) billed exact 5/9. With stream_options {include_usage:false} and {} the provider sent no usage chunk, and the rows were estimates (input 23, output 1, usage_estimated=true)."
 
 [[defect]]
 id = "D07"
@@ -101,10 +101,10 @@ impact = "A long o-series or long-prompt call the client cancels before headers 
 confidence = "high"
 evidence = "proxy.rs:3797-3812"
 claims = ["BIL-3"]
-state = "suspected"
-test = ""
+state = "reproduced"
+test = "a_cancel_before_the_response_head_is_billed_an_estimate"
 fix = ""
-note = ""
+note = "The client timed out after the upstream drained the body, before headers: row input_tokens=0, usage_estimated=false. A non-stream 2xx cut at half its body (a_non_stream_body_cut_off_midway_is_billed_an_estimate) also wrote 0/0, not estimated."
 
 [[defect]]
 id = "D08"
@@ -115,10 +115,10 @@ impact = "The log filter covers the ai.usage layer too, and stdout write errors 
 confidence = "high"
 evidence = "main.rs:73, 104-109"
 claims = ["BIL-4"]
-state = "suspected"
-test = ""
+state = "reproduced"
+test = "ai_log_warn_still_emits_usage_rows"
 fix = ""
-note = ""
+note = "Gateway child with AI_LOG=warn served the request (mock hit once, 200), but no ai.usage row appeared within 5s. The global EnvFilter gates the usage target."
 
 [[defect]]
 id = "D09"
@@ -129,10 +129,10 @@ impact = "A read timeout after the body was sent triggers a re-run on the same c
 confidence = "high"
 evidence = "proxy.rs:3610-3626, 870-889"
 claims = ["BIL-14", "REL-21"]
-state = "suspected"
-test = ""
+state = "reproduced"
+test = "a_large_body_is_not_resent_to_a_candidate_that_received_it"
 fix = ""
-note = ""
+note = "200 KiB body, read_timeout_secs=2, both candidates drain the body and stay silent: each mock received the full body twice (hits (2,2)) before the 503. The log shows two ReadTimedout per provider on one request_id."
 
 [[defect]]
 id = "D10"
@@ -283,10 +283,10 @@ impact = "response.completed echoes instructions, tools and output. When it's pa
 confidence = "high"
 evidence = "usage.rs:426; proxy.rs:120"
 claims = ["BIL-15"]
-state = "suspected"
-test = ""
+state = "reproduced"
+test = "openai_stream_reads_usage_from_a_final_event_larger_than_the_tail"
 fix = ""
-note = ""
+note = "openai_stream returns None on the last 64 KiB of a stream whose response.completed is ~96 KiB. The e2e (a_responses_stream_with_a_huge_final_event_bills_exact_usage) is worse than predicted: 0/0 with usage_estimated=false, because the estimator sees no whole data: line either."
 
 [[defect]]
 id = "D21"
@@ -297,10 +297,10 @@ impact = "Claude via OpenRouter bills writes at input rate. The row and the clie
 confidence = "high"
 evidence = "usage.rs:127 vs translate.rs:2629"
 claims = ["BIL-8"]
-state = "suspected"
-test = ""
+state = "reproduced"
+test = "openrouter_cache_write_tokens_reach_the_row"
 fix = ""
-note = ""
+note = "An OpenRouter chat body with prompt_tokens_details.cache_write_tokens=50 wrote cache_write_tokens=0 (input 120 and output 7 correct). Parser twin: openai_body_reads_openrouter_cache_write_tokens."
 
 [[defect]]
 id = "D22"
@@ -311,10 +311,10 @@ impact = "With server tools (web search), input grows mid-stream and the row und
 confidence = "med-high"
 evidence = "usage.rs:479-485"
 claims = ["BIL-8"]
-state = "suspected"
-test = ""
+state = "reproduced"
+test = "anthropic_cumulative_message_delta_usage_supersedes_message_start"
 fix = ""
-note = ""
+note = "message_start 10 in/0 cache, then message_delta cumulative 2500 in/800 cache_read/300 out: the row wrote input 10, cache_read 0, output 300. Parser twin: anthropic_stream_takes_cumulative_input_from_message_delta."
 
 [[defect]]
 id = "D23"
@@ -328,7 +328,7 @@ claims = ["BIL-9"]
 state = "suspected"
 test = ""
 fix = ""
-note = ""
+note = "needs live: call an xAI grok reasoning model and compare usage.completion_tokens with completion_tokens_details.reasoning_tokens and xAI's billed usage, to see whether reasoning is left out of completion_tokens."
 
 [[defect]]
 id = "D24"
@@ -339,10 +339,10 @@ impact = "Web search per-call fees, 1h cache writes (2×), service_tier and long
 confidence = "high"
 evidence = "usage.rs:221-229"
 claims = ["BIL-10", "BIL-11"]
-state = "suspected"
-test = ""
+state = "reproduced"
+test = "priced_variants_and_server_tool_calls_reach_the_row"
 fix = ""
-note = ""
+note = "The row carries cache_write_tokens=2000 but has no field for cache_creation.ephemeral_1h_input_tokens (2000) or server_tool_use.web_search_requests (3). The row schema cannot express either."
 
 [[defect]]
 id = "D25"
@@ -353,10 +353,10 @@ impact = "OpenAI wire includes cached tokens, Anthropic excludes them. A Claude 
 confidence = "high"
 evidence = "usage.rs vs translate.rs:2583-2590"
 claims = ["BIL-7"]
-state = "suspected"
-test = ""
+state = "reproduced"
+test = "a_claude_row_normalizes_input_tokens_the_same_on_both_wires"
 fix = ""
-note = ""
+note = "Same claude-opus-4-8 prompt (1000 tokens, 900 cached): the Anthropic-served row has input_tokens=100, the OpenRouter-chat-served row input_tokens=1000, both cache_read_tokens=900."
 
 [[defect]]
 id = "D26"
@@ -367,10 +367,10 @@ impact = "No status field. On breaker exhaustion the row names a provider that w
 confidence = "high"
 evidence = "proxy.rs:3959-3993"
 claims = ["BIL-12"]
-state = "suspected"
-test = ""
+state = "reproduced"
+test = "zero_cost_endings_carry_their_outcome"
 fix = ""
-note = ""
+note = "Both candidates 500: the row is 0/0 with no status or outcome field (provider=openrouter). The next request, with both breakers open, called no upstream (hits stayed (1,1)), yet its row names provider=openai, again with no outcome field."
 
 [[defect]]
 id = "D27"
@@ -381,10 +381,10 @@ impact = "Echoed snapshot ids don't resolve in for_model. The Responses stream m
 confidence = "high"
 evidence = "catalog.rs:2299; peek.rs:85-91"
 claims = ["BIL-13"]
-state = "suspected"
-test = ""
+state = "reproduced"
+test = "a_responses_stream_bills_the_echoed_snapshot"
 fix = ""
-note = ""
+note = "A Responses stream echoing response.model=gpt-5-2025-08-07: usage parsed (12/5), but the row has model=gpt-5 (the alias). The response scanner reads only a root or message.model."
 
 [[defect]]
 id = "D28"
