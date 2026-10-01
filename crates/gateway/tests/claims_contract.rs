@@ -1130,7 +1130,6 @@ fn doc_above(src: &str, item: &str) -> String {
 /// claim: CAT-15
 /// defect: D98
 #[test]
-#[ignore = "D98 reproduced: misplaced doc comments and contradicting docs"]
 fn doc_comments_sit_on_their_items_and_the_docs_agree() {
     let proxy = repo_file("crates/gateway/src/proxy.rs");
     let arch = repo_file("crates/gateway/ARCHITECTURE.md");

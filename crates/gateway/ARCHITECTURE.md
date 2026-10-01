@@ -1616,8 +1616,8 @@ OpenAI streams no usage chunk unless `stream_options.include_usage: true` is set
 streaming managed request is unmeterable: no usage block in the response means no billing fact. The
 gateway injects this field server-side so callers using stock SDKs get metered without any
 cooperation. The request is buffered (`MAX_REQUEST_BODY` cap), the field injected, and the body
-re-framed as chunked upstream. Scoped to managed + OpenAI-dialect + streaming only — BYO and
-non-streaming requests remain pure passthrough.
+re-framed as chunked upstream. Scoped to managed + OpenAI-dialect + streaming only: a BYO or
+non-streaming body is relayed as sent, without the field.
 
 A client that sends `stream_options` itself does not get to turn metering off: `include_usage:
 false` is rewritten to `true`, an object without it gains it, and a non-object value is replaced
@@ -2010,7 +2010,9 @@ dropped. Adding a token is a one-line change to `MANAGED_ANTHROPIC_BETAS` in `pr
 Dropped, among others: `openai-organization` and `openai-project` (they switch the org or project the
 pool key bills to, and an SDK user with `OPENAI_ORG_ID` set got a 401), `cookie`,
 `x-goog-user-project`, SDK telemetry (`x-stainless-*`). `proxy-authorization` is hop-by-hop and never
-crosses the proxy for anyone. BYO requests forward every client header untouched.
+crosses the proxy for anyone. BYO requests forward the client's headers, credentials included,
+less every `x-beyond-*` header (the gateway's own control headers, swept by prefix on every route,
+managed or BYO) and the hop-by-hop ones.
 
 **Where a credential may travel:**
 
@@ -2018,7 +2020,7 @@ crosses the proxy for anyone. BYO requests forward every client header untouched
   are stripped (every repeat), and every `key` query param is removed from the forwarded path. When
   the credential locations disagree (`x-api-key: junk` beside `Bearer bai_v1…`, or an empty
   `x-api-key`), a managed value in **any** location makes the request managed. First-location-wins
-  classified that as BYO, and BYO headers are forwarded untouched, so the virtual key reached the
+  classified that as BYO, and BYO credential headers are forwarded, so the virtual key reached the
   provider. "Any location" means every spelling a provider would read: each line of a repeated
   header, each repeated `?key=`, a percent-encoded name (`k%65y`, which Google decodes as `key`) or
   value, and `Bearer` followed by any run of whitespace. A value managed only once decoded is
@@ -2404,7 +2406,7 @@ gateway's added cost is negligible and bounded** — i.e. it never becomes the c
 - **End-to-end (`benches/e2e.rs`, `mise run bench:e2e`) — `criterion`.** Real `beyond-ai` binary
   - real nats-server + mock upstream (reuses `tests/common`). Latency group:
     `reject_missing_key_latency` (401, short-circuit before any upstream connection — transport floor),
-    `byo_json_latency` (pure passthrough), `managed_json_latency` (verify + deny + key swap),
+    `byo_json_latency` (BYO relay: no verify, no key swap), `managed_json_latency` (verify + deny + key swap),
     `managed_sse_latency` (a 3-line stream), `managed_large_sse_latency` and
     `managed_large_anthropic_sse_latency` (streams big enough to wrap the response tail, the
     Anthropic one splitting usage across head and tail), `managed_large_body_latency` /

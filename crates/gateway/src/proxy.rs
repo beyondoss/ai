@@ -863,6 +863,50 @@ impl ModelRouting {
 }
 
 impl RequestCtx {
+    /// When the current upstream attempt began: the per-attempt stamp for a model-routed request,
+    /// and simply the request start for everything else — where the two are always equal anyway,
+    /// so the common path stores no second `Instant`.
+    fn attempt_start(&self) -> Instant {
+        self.auto.as_ref().map_or(self.start, |a| a.attempt_start)
+    }
+
+    /// Move the candidate cursor past index `i`. No-op for a provider-routed request.
+    fn advance_candidate(&mut self, i: u8) {
+        if let Some(a) = self.auto.as_mut() {
+            a.candidate = i.saturating_add(1);
+        }
+    }
+
+    /// Whether this request's body is buffered and may leave with a different length than it
+    /// arrived — which is one question, not two, because the answer drives *both* the buffering in
+    /// `request_body_filter` and the `Content-Length`/`transfer-encoding` re-framing in
+    /// `upstream_request_filter`. Splitting them is how you get a body whose framing disagrees with
+    /// its bytes.
+    ///
+    /// Why a body gets rewritten:
+    /// - `inject_eligible`: splicing `stream_options` into a managed OpenAI stream.
+    /// - a catalog walk (`auto`): re-spelling `model` for the candidate serving this attempt,
+    ///   translating between Chat Completions, Messages and Responses when the wires differ, and
+    ///   the same-wire edits a walk makes (the output-limit cap, `max_tokens` respelled for native
+    ///   OpenAI, dropped nulls and unreplayable reasoning).
+    ///
+    /// Both can apply to the same request, in which case every edit is made to the one buffer.
+    fn rewrites_body(&self) -> bool {
+        self.inject_eligible || self.auto.is_some()
+    }
+
+    /// Point the forwarded path at the candidate about to be attempted.
+    ///
+    /// Taken wholesale from the catalog rather than composed from a mount and the client's suffix:
+    /// providers disagree on where an endpoint lives and the disagreement is not a prefix, so there
+    /// is no client suffix that is correct for every candidate in a row. Rewritten in place, so a
+    /// failover costs no allocation after the first attempt.
+    fn set_forward_path(&mut self, path: &str) {
+        let buf = self.forward_path.get_or_insert_with(String::new);
+        buf.clear();
+        buf.push_str(path);
+    }
+
     /// Clear the state the request-body phase accumulates, so a **retried** attempt starts from the
     /// same slate as the first one.
     ///
@@ -884,49 +928,6 @@ impl RequestCtx {
     /// `model` is deliberately **not** cleared: once a complete body has yielded it the value is
     /// correct, and pingora's replay buffer is capped at 64 KiB, so a larger body could not
     /// re-derive it on the next attempt.
-    /// When the current upstream attempt began: the per-attempt stamp for a model-routed request,
-    /// and simply the request start for everything else — where the two are always equal anyway,
-    /// so the common path stores no second `Instant`.
-    fn attempt_start(&self) -> Instant {
-        self.auto.as_ref().map_or(self.start, |a| a.attempt_start)
-    }
-
-    /// Move the candidate cursor past index `i`. No-op for a provider-routed request.
-    fn advance_candidate(&mut self, i: u8) {
-        if let Some(a) = self.auto.as_mut() {
-            a.candidate = i.saturating_add(1);
-        }
-    }
-
-    /// Whether this request's body is buffered and may leave with a different length than it
-    /// arrived — which is one question, not two, because the answer drives *both* the buffering in
-    /// `request_body_filter` and the `Content-Length`/`transfer-encoding` re-framing in
-    /// `upstream_request_filter`. Splitting them is how you get a body whose framing disagrees with
-    /// its bytes.
-    ///
-    /// Two reasons a body gets rewritten:
-    /// - `inject_eligible`: splicing `stream_options` into a managed OpenAI stream.
-    /// - `route`: re-spelling `model` for the candidate serving this attempt.
-    /// - translate: Chat Completions ↔ Messages on a wire-mismatched catalog walk (already on
-    ///   the buffered catalog-walk path).
-    ///
-    /// Both can apply to the same request, in which case both edits are made to the one buffer.
-    fn rewrites_body(&self) -> bool {
-        self.inject_eligible || self.auto.is_some()
-    }
-
-    /// Point the forwarded path at the candidate about to be attempted.
-    ///
-    /// Taken wholesale from the catalog rather than composed from a mount and the client's suffix:
-    /// providers disagree on where an endpoint lives and the disagreement is not a prefix, so there
-    /// is no client suffix that is correct for every candidate in a row. Rewritten in place, so a
-    /// failover costs no allocation after the first attempt.
-    fn set_forward_path(&mut self, path: &str) {
-        let buf = self.forward_path.get_or_insert_with(String::new);
-        buf.clear();
-        buf.push_str(path);
-    }
-
     fn reset_request_body_phase(&mut self) {
         // Translate response state belongs to *this* attempt. 5xx vendor-walk aborts in
         // `upstream_response_filter` before `response_filter` runs, so these are empty in
@@ -2544,21 +2545,6 @@ fn byo_credential_dialect(req: &pingora::http::RequestHeader) -> Result<Option<D
     Ok(vote)
 }
 
-/// Whether the **forwarded** (provider-native) path targets the OpenAI Chat Completions endpoint.
-/// Checked by *suffix*, so it holds regardless of the provider's mount prefix
-/// (`/v1/chat/completions`, `/openai/v1/chat/completions`, `/inference/v1/chat/completions`, …). Only
-/// this gets buffered for `stream_options.include_usage` injection — **not** `/v1/responses`: the
-/// Responses API has no `stream_options` field at all (it always reports usage on the terminal
-/// `response.completed` event, streaming or not), so splicing this chat-completions-only fragment into
-/// a Responses body would inject a field the API doesn't recognize. Embeddings and everything else
-/// never stream, so there's nothing to meter there either.
-///
-/// **Pass the path only — never a path with a query string.** The match is by suffix, so a trailing
-/// `?api-version=2024-10-21` makes it return `false` for a path that plainly *is* chat/completions.
-/// Azure OpenAI requires that parameter on every call, so testing this against a path+query silently
-/// disabled injection for all managed Azure streams: no `stream_options.include_usage`, therefore no
-/// usage chunk from OpenAI, therefore a zero-token billing row. The caller computes this in
-/// `request_filter` *before* appending the query for exactly that reason.
 /// The `/{provider}/…` endpoints a managed key may reach: the metered generation calls and their
 /// token-count / compact sub-resources, matched by suffix so every provider's mount prefix
 /// (`/api/v1`, `/openai/v1`, `/inference/v1`, `/anthropic/v1`, `/backend-api/codex`) works.
@@ -2591,6 +2577,21 @@ fn wire_of_forward_path(path_and_query: &str) -> Dialect {
     route::Endpoint::of_upstream_path(path).wire()
 }
 
+/// Whether the **forwarded** (provider-native) path targets the OpenAI Chat Completions endpoint.
+/// Checked by *suffix*, so it holds regardless of the provider's mount prefix
+/// (`/v1/chat/completions`, `/openai/v1/chat/completions`, `/inference/v1/chat/completions`, …). Only
+/// this gets buffered for `stream_options.include_usage` injection — **not** `/v1/responses`: the
+/// Responses API has no `stream_options` field at all (it always reports usage on the terminal
+/// `response.completed` event, streaming or not), so splicing this chat-completions-only fragment into
+/// a Responses body would inject a field the API doesn't recognize. Embeddings and everything else
+/// never stream, so there's nothing to meter there either.
+///
+/// **Pass the path only — never a path with a query string.** The match is by suffix, so a trailing
+/// `?api-version=2024-10-21` makes it return `false` for a path that plainly *is* chat/completions.
+/// Azure OpenAI requires that parameter on every call, so testing this against a path+query silently
+/// disabled injection for all managed Azure streams: no `stream_options.include_usage`, therefore no
+/// usage chunk from OpenAI, therefore a zero-token billing row. The caller computes this in
+/// `request_filter` *before* appending the query for exactly that reason.
 fn is_streamable_path(forward_path: &str) -> bool {
     forward_path.ends_with("/chat/completions")
 }
@@ -2674,23 +2675,6 @@ fn disable_openrouter_compression(mut body: Vec<u8>) -> Vec<u8> {
 /// key is what made it eligible).
 const STREAM_OPTIONS_FRAG: &[u8] = br#""stream_options":{"include_usage":true},"#;
 
-/// Splice `stream_options.include_usage` into a buffered OpenAI chat body at `at`, or return it
-/// unchanged when there is nothing to inject. This is what guarantees a usage chunk — hence a
-/// billable token count — from a stock client that never set the option.
-///
-/// Takes the offset rather than computing it: the caller already walked the body once for both the
-/// model and this plan (see `peek::scan_buffered`), and re-deriving it here would restore the second
-/// traversal that walk exists to remove.
-/// Overwrite the `model` value's bytes with the id the chosen candidate uses.
-///
-/// `span` comes from [`peek::BufferedScan::model_span`] and covers the raw value, quotes excluded.
-/// The replacement is a catalog string, so it needs no JSON escaping — the catalog charset test
-/// (`model_names_are_lowercase_and_log_safe`, plus the same shape for `upstream_model`) is what
-/// makes a raw byte copy safe here.
-///
-/// Returns the body untouched when the id already matches, which is the common case: candidate 0
-/// usually spells the model the way the catalog names it, so the primary path does no memmove at all
-/// and only a failover pays for one.
 /// Cap each root-level output limit (`peek::OUTPUT_LIMIT_KEYS`) at `max`, the serving row's
 /// published maximum (`ModelCard::output_cap`), in place. Never raises one; `max == 0` (no
 /// published maximum, or an embeddings row) caps nothing.
@@ -2779,6 +2763,16 @@ fn rename_max_tokens(body: &mut Vec<u8>, keys: &[Option<usize>; 3]) -> bool {
     true
 }
 
+/// Overwrite the `model` value's bytes with the id the chosen candidate uses.
+///
+/// `span` comes from [`peek::BufferedScan::model_span`] and covers the raw value, quotes excluded.
+/// The replacement is a catalog string, so it needs no JSON escaping — the catalog charset test
+/// (`model_names_are_lowercase_and_log_safe`, plus the same shape for `upstream_model`) is what
+/// makes a raw byte copy safe here.
+///
+/// Returns the body untouched when the id already matches, which is the common case: candidate 0
+/// usually spells the model the way the catalog names it, so the primary path does no memmove at all
+/// and only a failover pays for one.
 fn apply_model_rewrite(mut body: Vec<u8>, span: (usize, usize), replacement: &[u8]) -> Vec<u8> {
     let (start, end) = span;
     // Defensive: a span outside the buffer would panic on the splice. Unreachable — the span is
@@ -2834,6 +2828,13 @@ fn force_include_usage(
     (body, model_span)
 }
 
+/// Splice `stream_options.include_usage` into a buffered OpenAI chat body at `at`, or return it
+/// unchanged when there is nothing to inject. This is what guarantees a usage chunk — hence a
+/// billable token count — from a stock client that never set the option.
+///
+/// Takes the offset rather than computing it: the caller already walked the body once for both the
+/// model and this plan (see `peek::scan_buffered`), and re-deriving it here would restore the second
+/// traversal that walk exists to remove.
 fn apply_stream_usage_injection(mut body: Vec<u8>, at: Option<usize>) -> Vec<u8> {
     let Some(at) = at else { return body };
     // Shift the tail right in place rather than copying the whole body into a second buffer.

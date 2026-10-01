@@ -635,9 +635,10 @@ impl AiConfig {
     ///
     /// An environment variable name cannot hold `-`, so `<NAME>` is lowercased, and when that names
     /// no provider but its `_` → `-` spelling does, the hyphenated provider wins:
-    /// `AI_POOL_KEY_OPENAI_CODEX` reaches `openai-codex`, and `AI_POOL_KEY_FIREWORKS_ANTHROPIC` a
-    /// config-added `fireworks-anthropic`. A name that matches exactly always wins, so a provider
-    /// really called `my_vendor` keeps its key.
+    /// `AI_POOL_KEY_FIREWORKS_ANTHROPIC` reaches a config-added `fireworks-anthropic`. A name that
+    /// matches exactly always wins, so a provider really called `my_vendor` keeps its key. (The
+    /// mapping is mechanical; it does not make a provider poolable. `openai-codex` is reached only
+    /// with a client's own ChatGPT bearer and has no pool key: see `providers::ProviderId`.)
     fn pool_key_env_provider(&self, env_name: &str) -> String {
         let name = env_name.to_ascii_lowercase();
         let known = |n: &str| {
