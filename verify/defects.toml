@@ -915,7 +915,7 @@ evidence = "proxy.rs extract_virtual_key (headers.get = first value, query_param
 claims = ["SEC-3", "SEC-11"]
 state = "fixed"
 test = "repeated_or_respelled_credentials_never_forward_a_virtual_key"
-fix = "d58a45e"
+fix = "72936d6"
 note = "Fixed: extract_virtual_key reads every value of every credential location (each line of a repeated x-api-key / api-key / x-goog-api-key / authorization, every `key` query param including percent-encoded names like k%65y and encoded values, `Bearer` followed by any whitespace, a scheme-less virtual key); a virtual key anywhere makes the request managed (a value managed only once decoded is verified as written and 401s). strip_key_param drops every spelling and repeat of `key`, and a managed request whose inbound path goes out unrebuilt has its key params stripped in upstream_request_filter. Unit coverage: a_managed_key_in_any_spelling_makes_the_request_managed."
 
 [[defect]]
@@ -929,7 +929,7 @@ evidence = "proxy.rs response_filter / response_body_filter: no pool-key redacti
 claims = ["SEC-7"]
 state = "fixed"
 test = "an_upstream_echo_of_the_pool_key_never_reaches_the_client"
-fix = "d58a45e"
+fix = "72936d6"
 note = "Fixed: on a managed response, response_filter drops any header whose value carries the pool key the attempt sent, and a status >= 400 arms Redact, which overwrites every occurrence in the body with a same-length `[redacted]***` marker as it streams (a key-sized carry catches a key split across chunks; Content-Length holds). It runs first in response_body_filter, so translated error envelopes, OpenRouter metadata.raw quoting, capture, the cache and the usage tail all see scrubbed bytes. 2xx bodies are not scanned (documented). Unit coverage: redact_scrubs_a_key_split_across_chunks_and_keeps_the_length."
 
 [[defect]]
@@ -943,7 +943,7 @@ evidence = "proxy.rs upstream_request_filter: MODEL_HEADER removed only when rc.
 claims = ["SEC-9"]
 state = "fixed"
 test = "client_x_beyond_headers_never_reach_the_upstream_on_any_route"
-fix = "d58a45e"
+fix = "72936d6"
 note = "Fixed: upstream_request_filter sweeps every `x-beyond-*` request header by prefix on every route, managed or BYO, before the gateway adds its own headers; the fixed CONTROL_HEADERS list and the catalog-only x-beyond-model removal are gone."
 
 [[defect]]
@@ -999,7 +999,7 @@ evidence = "proxy.rs upstream_response_filter: key walk only on status == 429; R
 claims = ["REL-14"]
 state = "fixed"
 test = "a_revoked_first_pool_key_walks_to_the_next"
-fix = "d58a45e"
+fix = "72936d6"
 note = "Fixed: a managed 401/403 walks to the next pool key on the same provider like a 429 (never a vendor switch at that step) and cools the key off for 60s (Provider::mark_key_bad); requests and walks start on Provider::first_key, the first key not cooling off. ai_key_auth_failures_total counts them. On the last key a provider route relays the 401/403 and a catalog walk keeps its candidate-failure rule. a_revoked_pool_key_cools_off_and_the_last_401_is_relayed pins the cooldown (one round trip to the revoked key, not one per request) and the relayed last 401."
 
 [[defect]]
@@ -1013,7 +1013,7 @@ evidence = "claims_reliability.rs::upstream_goaway_is_handled fails under full-s
 claims = ["REL-22", "REL-1"]
 state = "fixed"
 test = "a_stream_the_upstream_refused_is_retried"
-fix = "35d8321"
+fix = "25d95ea"
 note = "Fixed: error_while_proxy treats a stream the provider refused (upstream_refused_stream: remote RST_STREAM(REFUSED_STREAM), or a remote GOAWAY error, which h2 gives only to streams above last_stream_id) as not delivered and resends it on a fresh connection to the same candidate (FullBody: its reset retry). Reproduction: a hand-rolled TLS H2 upstream refuses each connection's second stream after its body arrives, by GOAWAY(last_stream_id = the served stream) or RST_STREAM(REFUSED_STREAM); both 502'd before the fix. The mock's REFUSED_STREAM refuses only the second stream (it first refused every later stream on the connection, which a retry on the same connection could never pass). upstream_goaway_is_handled: 3 full-suite runs plus a 40x stress beside a concurrent suite, no failures. Residual (documented): a stream opened after the GOAWAY already arrived is ignored by the server and fails as a broken pipe, indistinguishable from a processed one, so it stays a 502."
 
 [[defect]]
