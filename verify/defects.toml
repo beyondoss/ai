@@ -1331,10 +1331,10 @@ area = "Translation"
 title = "Forwarded unknown Responses items hard-fail a failover onto a translated candidate"
 impact = "After D49, compaction/item_reference items are forwarded verbatim; a compacted Codex session that fails over to a translated candidate gets a 400 instead of a degraded answer."
 confidence = "high"
-evidence = "translate.rs ~3772"
+evidence = "translate.rs ~3772. Reproduced hermetically: translate::request_tests::openai_held_responses_items_are_dropped_only_when_translating: compaction and item_reference items reach a translated Chat (grok) and Messages (claude) body verbatim, which those upstreams 400."
 claims = ["TRN-17"]
-state = "suspected"
-test = ""
+state = "reproduced"
+test = "openai_held_responses_items_are_dropped_only_when_translating"
 fix = ""
 note = "Found by the independent branch review (2026-10-01) of a54c22c."
 

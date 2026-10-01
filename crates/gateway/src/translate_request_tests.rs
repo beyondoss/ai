@@ -2037,3 +2037,35 @@ fn an_unknown_role_is_forwarded_onto_responses() {
     assert_eq!(m["content"], "Say OK.", "{out}");
     assert_eq!(out["input"][1]["role"], "robot", "in place: {out}");
 }
+
+/// A compacted Codex session that fails over (or is routed) onto a translated candidate degrades
+/// instead of failing: `compaction` (an encrypted summary only OpenAI can read) and
+/// `item_reference` (a pointer into OpenAI's store) are OpenAI-held state no translated upstream
+/// can resolve, so translation drops them and the request runs on the history the client holds.
+/// The same-wire Responses relay keeps them; D49's rule (forward anything the gateway has no
+/// mapping for) still holds for every other item.
+/// claim: TRN-17
+/// defect: D95
+#[test]
+#[ignore = "D95 reproduced: compaction and item_reference are forwarded onto a translated candidate"]
+fn openai_held_responses_items_are_dropped_only_when_translating() {
+    let body = json!({"model": "m", "store": false, "input": [
+        {"type": "compaction", "id": "cmp_1", "encrypted_content": "opaque"},
+        {"type": "item_reference", "id": "msg_abc123"},
+        {"role": "user", "content": "continue"},
+    ]});
+    for (what, v) in [
+        ("Responses→Chat", r2c(&body, "grok-4.3")),
+        (
+            "Responses→Messages",
+            req(Endpoint::Responses, Endpoint::Messages, &body, "claude-haiku-4-5"),
+        ),
+    ] {
+        let s = v.to_string();
+        assert!(!s.contains("compaction") && !s.contains("item_reference"), "{what}: {v}");
+        assert!(s.contains("continue"), "{what}: {v}");
+    }
+    // Same wire: relayed as sent.
+    let raw = serde_json::to_vec(&body).unwrap();
+    assert_eq!(strip_gateway_reasoning(raw.clone()), raw);
+}
