@@ -898,7 +898,7 @@ group = "Billing integrity"
 text = "Zero-cost endings are distinguishable, with no fabricated provider"
 layer = "hermetic"
 touches = ["crates/gateway/src/usage.rs", "crates/gateway/src/proxy.rs", "crates/gateway/src/peek.rs", "crates/gateway/src/main.rs"]
-defects = ["D26", "D56"]
+defects = ["D26", "D56", "D122"]
 
 [[claim]]
 id = "BIL-13"

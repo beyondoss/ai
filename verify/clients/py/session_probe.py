@@ -54,86 +54,108 @@ def ask(city, first=False):
 FINAL = "Then, on a new line, write our project codename from the start of this conversation."
 
 
+class Miss(Exception):
+    """The model didn't do what the turn asked (no tool call, no answer): a failed verdict."""
+
+
+# A user turn's tool loop: answer every tool call and ask again, until the model answers in text.
+# Models sometimes call the tool twice in one turn; that is a valid agent loop, not a failure.
+MAX_STEPS = 4
+
+
+def messages_turn(c, log, msgs, model, provider_for, kw, tool=False, final=None, mark=False):
+    """One user turn over Messages. `final` rides along with the first tool results; `mark` puts a
+    cache_control breakpoint on the first tool_result (so a cache marker sits in replayed history)."""
+    for step in range(MAX_STEPS):
+        i = len(log)
+        raw = c.messages.with_raw_response.create(model=model, messages=msgs, **kw)
+        r = raw.parse()
+        p.record("messages", p.messages_usage(r.usage), provider=provider_for(i))
+        tus = [b for b in r.content if b.type == "tool_use"]
+        log.append({"req": i + 1, "model": model, "served": raw.headers.get("x-beyond-provider"),
+                    "types": [b.type for b in r.content],
+                    "signed": any(b.type == "thinking" and b.signature for b in r.content),
+                    "text": p.text_of(r.content)[:160]})
+        msgs.append({"role": "assistant", "content": [b.model_dump(exclude_none=True) for b in r.content]})
+        if not tus:
+            if tool and step == 0:
+                raise Miss(f"request {i + 1} ({model}): no tool_use")
+            return p.text_of(r.content)
+        content = [{"type": "tool_result", "tool_use_id": tu.id, "content": weather(tu.input.get("city", ""))}
+                   for tu in tus]
+        if mark and step == 0:
+            content[0]["cache_control"] = {"type": "ephemeral"}
+        if final and step == 0:
+            content.append({"type": "text", "text": final})
+        msgs.append({"role": "user", "content": content})
+    raise Miss(f"no answer after {MAX_STEPS} requests")
+
+
+def chat_turn(c, log, msgs, model, provider_for, kw, tool=False, final=None):
+    """One user turn over Chat Completions; `final` is a user message after the first tool results."""
+    for step in range(MAX_STEPS):
+        i = len(log)
+        raw = c.chat.completions.with_raw_response.create(model=model, messages=msgs, **kw)
+        r = raw.parse()
+        p.record("chat", p.chat_usage(r.usage), provider=provider_for(i))
+        m = r.choices[0].message
+        log.append({"req": i + 1, "model": model, "served": raw.headers.get("x-beyond-provider"),
+                    "finish": r.choices[0].finish_reason, "tool_calls": len(m.tool_calls or []),
+                    "text": (m.content or "")[:160]})
+        msgs.append(m.model_dump(exclude_none=True))
+        if not m.tool_calls:
+            if tool and step == 0:
+                raise Miss(f"request {i + 1} ({model}): no tool call")
+            return m.content or ""
+        for tc in m.tool_calls:
+            arg = json.loads(tc.function.arguments or "{}").get("city", "")
+            msgs.append({"role": "tool", "tool_call_id": tc.id, "content": weather(arg)})
+        if final and step == 0:
+            msgs.append({"role": "user", "content": final})
+    raise Miss(f"no answer after {MAX_STEPS} requests")
+
+
 # --- SES-1: the primary dies between turns ---------------------------------------------------------
 
-def failover_messages():
-    """SES-1 over Messages: thinking + tools + cache_control. The primary serves requests 1..k and
-    dies; requests k+1.. replay the whole history (signed thinking, tool_use / tool_result ids,
-    cache markers) onto the fallback, and every one must succeed there."""
-    c = p.anthropic_client()
-    system = [{"type": "text", "text": p.long_prefix() + "\n\n" + SYSTEM, "cache_control": {"type": "ephemeral"}}]
-    think = {"type": "enabled", "budget_tokens": 1024}
-    msgs, log = [], []
-    for turn, city in enumerate(["Paris", "Tokyo", "Berlin"]):
-        msgs.append({"role": "user", "content": ask(city, first=turn == 0)})
-        for step in ("tool", "answer"):
-            i = len(log)
-            raw = c.messages.with_raw_response.create(model=MODEL, max_tokens=3000, thinking=think, tools=[TOOL_ANT],
-                                                      system=system, messages=msgs)
-            r = raw.parse()
-            p.record("messages", p.messages_usage(r.usage), provider=serving(i))
-            types = [b.type for b in r.content]
-            log.append({"req": i + 1, "served": raw.headers.get("x-beyond-provider"), "types": types,
-                        "signed": any(b.type == "thinking" and b.signature for b in r.content)})
-            msgs.append({"role": "assistant", "content": [b.model_dump(exclude_none=True) for b in r.content]})
-            if step == "tool":
-                tu = next((b for b in r.content if b.type == "tool_use"), None)
-                if tu is None:
-                    return False, {"why": f"request {i + 1}: no tool_use for {city}", "log": log}
-                content = [{"type": "tool_result", "tool_use_id": tu.id, "content": weather(tu.input.get("city", city)),
-                            "cache_control": {"type": "ephemeral"}}]
-                if turn == 2:
-                    content.append({"type": "text", "text": FINAL})
-                msgs.append({"role": "user", "content": content})
-            else:
-                text = p.text_of(r.content)
-                log[-1]["text"] = text[:160]
-                if TEMPS[city] not in text:
-                    return False, {"why": f"request {i + 1}: the answer lacks {city}'s tool value", "log": log}
-                if turn == 2 and CODE not in text:
-                    return False, {"why": "the last turn doesn't recall the codename", "log": log}
+def _failover(turn_fn, msgs, kw, **extra):
+    """Paris, Tokyo, Berlin, one tool-using user turn each, on one model. The primary serves
+    requests 1..k and dies (k = 3: Paris's loop and Tokyo's tool call), so the rest replay the
+    whole history onto the fallback; the last answer must also recall the codename from turn 1."""
+    log = []
+    try:
+        for turn, city in enumerate(["Paris", "Tokyo", "Berlin"]):
+            msgs.append({"role": "user", "content": ask(city, first=turn == 0)})
+            text = turn_fn(log, msgs, MODEL, serving, kw, tool=True, final=FINAL if turn == 2 else None,
+                           **({"mark": turn == 1} if extra.get("mark") else {}))
+            if TEMPS[city] not in text:
+                raise Miss(f"turn {turn + 1}: the answer lacks {city}'s tool value")
+            if turn == 2 and CODE not in text:
+                raise Miss("the last turn doesn't recall the codename")
+    except Miss as e:
+        return False, {"why": str(e), "log": log}
     served = [e["served"] for e in log]
     want = [serving(i) for i in range(len(log))]
     return served == want, {"log": log, "want": want}
+
+
+def failover_messages():
+    """SES-1 over Messages: thinking + tools + cache_control (the system prompt, and a tool_result
+    that later turns replay); after the primary dies the fallback gets signed thinking blocks and
+    tool_use / tool_result ids it never issued."""
+    c = p.anthropic_client()
+    system = [{"type": "text", "text": p.long_prefix() + "\n\n" + SYSTEM, "cache_control": {"type": "ephemeral"}}]
+    kw = dict(max_tokens=3000, thinking={"type": "enabled", "budget_tokens": 1024}, tools=[TOOL_ANT], system=system)
+    return _failover(lambda *a, **k: messages_turn(c, *a, **k), [], kw, mark=True)
 
 
 def failover_chat():
     """SES-1 over Chat Completions on a Claude row: tools, reasoning_effort, part-level
-    cache_control; the primary dies after k requests and the rest fail over."""
+    cache_control on the system prompt."""
     c = p.openai_client()
     system = {"role": "system", "content": [{"type": "text", "text": p.long_prefix() + "\n\n" + SYSTEM,
                                              "cache_control": {"type": "ephemeral"}}]}
-    msgs, log = [system], []
-    for turn, city in enumerate(["Paris", "Tokyo", "Berlin"]):
-        msgs.append({"role": "user", "content": ask(city, first=turn == 0)})
-        for step in ("tool", "answer"):
-            i = len(log)
-            raw = c.chat.completions.with_raw_response.create(model=MODEL, max_completion_tokens=3000, messages=msgs,
-                                                              tools=[TOOL_MSG], reasoning_effort="low")
-            r = raw.parse()
-            p.record("chat", p.chat_usage(r.usage), provider=serving(i))
-            m = r.choices[0].message
-            log.append({"req": i + 1, "served": raw.headers.get("x-beyond-provider"),
-                        "finish": r.choices[0].finish_reason, "tool_calls": len(m.tool_calls or [])})
-            msgs.append(m.model_dump(exclude_none=True))
-            if step == "tool":
-                if not m.tool_calls:
-                    return False, {"why": f"request {i + 1}: no tool call for {city}", "log": log}
-                for tc in m.tool_calls:
-                    arg = json.loads(tc.function.arguments or "{}").get("city", city)
-                    msgs.append({"role": "tool", "tool_call_id": tc.id, "content": weather(arg)})
-                if turn == 2:
-                    msgs.append({"role": "user", "content": FINAL})
-            else:
-                text = m.content or ""
-                log[-1]["text"] = text[:160]
-                if TEMPS[city] not in text:
-                    return False, {"why": f"request {i + 1}: the answer lacks {city}'s tool value", "log": log}
-                if turn == 2 and CODE not in text:
-                    return False, {"why": "the last turn doesn't recall the codename", "log": log}
-    served = [e["served"] for e in log]
-    want = [serving(i) for i in range(len(log))]
-    return served == want, {"log": log, "want": want}
+    kw = dict(max_completion_tokens=3000, tools=[TOOL_MSG], reasoning_effort="low")
+    return _failover(lambda *a, **k: chat_turn(c, *a, **k), [system], kw)
 
 
 # --- SES-2: the user switches models between turns -------------------------------------------------
@@ -143,89 +165,50 @@ def plan():
     return [tuple(x.split("=")) for x in os.environ["VERIFY_MODELS"].split(",")]
 
 
-def switch_chat():
-    """SES-2 over Chat: the model alternates every user turn (Claude <-> GPT, so the history crosses
-    dialects each time), with a tool loop on each of the first two turns and reasoning on the last
-    two; the last two turns must recall the cities and the codename from turns 1-2."""
-    c = p.openai_client()
-    models = plan()
-    msgs, log = [{"role": "system", "content": SYSTEM}], []
-    turns = [("tool", "Paris"), ("tool", "Tokyo"), ("recall-cities", None), ("recall-code", None)]
-    for t, (kind, city) in enumerate(turns):
-        model, provider = models[t % len(models)]
-        effort = {} if kind == "tool" else {"reasoning_effort": "low"}
-        if kind == "tool":
-            msgs.append({"role": "user", "content": ask(city, first=t == 0)})
-        elif kind == "recall-cities":
-            msgs.append({"role": "user", "content": "Which cities have I asked about so far, and what temperature did "
-                                                    "the tool report for each? One line."})
-        else:
-            msgs.append({"role": "user", "content": "What is our project codename from the start of this conversation? "
-                                                    "Reply with only the codename."})
-        for step in (("tool", "answer") if kind == "tool" else ("answer",)):
-            raw = c.chat.completions.with_raw_response.create(model=model, max_completion_tokens=3000, messages=msgs,
-                                                              tools=[TOOL_MSG], **effort)
-            r = raw.parse()
-            p.record("chat", p.chat_usage(r.usage), provider=provider)
-            m = r.choices[0].message
-            log.append({"turn": t + 1, "model": model, "served": raw.headers.get("x-beyond-provider"),
-                        "tool_calls": len(m.tool_calls or []), "text": (m.content or "")[:160]})
-            msgs.append(m.model_dump(exclude_none=True))
-            if step == "tool":
-                if not m.tool_calls:
-                    return False, {"why": f"turn {t + 1} ({model}): no tool call", "log": log}
-                for tc in m.tool_calls:
-                    arg = json.loads(tc.function.arguments or "{}").get("city", city)
-                    msgs.append({"role": "tool", "tool_call_id": tc.id, "content": weather(arg)})
-        text = msgs[-1].get("content") or ""
-        ok = {"tool": lambda: TEMPS[city] in text,
-              "recall-cities": lambda: all(x in text for x in ("Paris", "Tokyo", "21", "27")),
-              "recall-code": lambda: CODE in text}[kind]()
-        if not ok:
-            return False, {"why": f"turn {t + 1} ({model}, {kind}) missed what it should know", "log": log}
+SWITCH_TURNS = [
+    ("tool", "Paris", None),
+    ("tool", "Tokyo", None),
+    ("recall-cities", None, "Which cities have I asked about so far, and what temperature did the tool report for "
+                            "each? Answer from our conversation, in one line."),
+    ("recall-code", None, "What is our project codename from the start of this conversation? Reply with only the "
+                          "codename."),
+]
+
+
+def _switch(turn_fn, msgs, kw_for):
+    """Four user turns, the model alternating each turn (so the history crosses dialects every time):
+    a tool loop on each of the first two, then two turns answerable only from the history."""
+    models, log = plan(), []
+    try:
+        for t, (kind, city, q) in enumerate(SWITCH_TURNS):
+            model, provider = models[t % len(models)]
+            msgs.append({"role": "user", "content": ask(city, first=t == 0) if city else q})
+            text = turn_fn(log, msgs, model, lambda _i, pr=provider: pr, kw_for(kind), tool=kind == "tool")
+            ok = {"tool": lambda: TEMPS.get(city, "?") in text,
+                  "recall-cities": lambda: all(x in text for x in ("Paris", "Tokyo", "21", "27")),
+                  "recall-code": lambda: CODE in text}[kind]()
+            if not ok:
+                raise Miss(f"turn {t + 1} ({model}, {kind}) missed what it should know")
+    except Miss as e:
+        return False, {"why": str(e), "log": log}
     return True, {"log": log}
+
+
+def switch_chat():
+    """SES-2 over Chat: tools on the first two turns, reasoning_effort on the last two."""
+    c = p.openai_client()
+    kw = lambda kind: dict(max_completion_tokens=3000, tools=[TOOL_MSG],
+                           **({} if kind == "tool" else {"reasoning_effort": "low"}))
+    return _switch(lambda *a, **k: chat_turn(c, *a, **k), [{"role": "system", "content": SYSTEM}], kw)
 
 
 def switch_messages():
-    """SES-2 over Messages: the same alternation with extended thinking on every turn, so each
-    Claude turn replays its own signed thinking alongside GPT turns that have none (and GPT turns
-    get Claude's thinking blocks in their history)."""
+    """SES-2 over Messages with extended thinking on every turn: each Claude turn replays its own
+    signed thinking beside GPT turns that have none, and GPT turns get Claude's thinking blocks."""
     c = p.anthropic_client()
-    models = plan()
-    msgs, log = [], []
-    think = {"type": "enabled", "budget_tokens": 1024}
-    turns = [("tool", "Paris"), ("tool", "Tokyo"), ("recall-cities", None), ("recall-code", None)]
-    for t, (kind, city) in enumerate(turns):
-        model, provider = models[t % len(models)]
-        if kind == "tool":
-            msgs.append({"role": "user", "content": ask(city, first=t == 0)})
-        elif kind == "recall-cities":
-            msgs.append({"role": "user", "content": "Which cities have I asked about so far, and what temperature did "
-                                                    "the tool report for each? One line."})
-        else:
-            msgs.append({"role": "user", "content": "What is our project codename from the start of this conversation? "
-                                                    "Reply with only the codename."})
-        for step in (("tool", "answer") if kind == "tool" else ("answer",)):
-            raw = c.messages.with_raw_response.create(model=model, max_tokens=3000, thinking=think, tools=[TOOL_ANT],
-                                                      system=SYSTEM, messages=msgs)
-            r = raw.parse()
-            p.record("messages", p.messages_usage(r.usage), provider=provider)
-            log.append({"turn": t + 1, "model": model, "served": raw.headers.get("x-beyond-provider"),
-                        "types": [b.type for b in r.content], "text": p.text_of(r.content)[:160]})
-            msgs.append({"role": "assistant", "content": [b.model_dump(exclude_none=True) for b in r.content]})
-            if step == "tool":
-                tu = next((b for b in r.content if b.type == "tool_use"), None)
-                if tu is None:
-                    return False, {"why": f"turn {t + 1} ({model}): no tool_use", "log": log}
-                msgs.append({"role": "user", "content": [{"type": "tool_result", "tool_use_id": tu.id,
-                                                          "content": weather(tu.input.get("city", city))}]})
-        text = log[-1]["text"]
-        ok = {"tool": lambda: TEMPS[city] in text,
-              "recall-cities": lambda: all(x in text for x in ("Paris", "Tokyo", "21", "27")),
-              "recall-code": lambda: CODE in text}[kind]()
-        if not ok:
-            return False, {"why": f"turn {t + 1} ({model}, {kind}) missed what it should know", "log": log}
-    return True, {"log": log}
+    kw = lambda _kind: dict(max_tokens=3000, thinking={"type": "enabled", "budget_tokens": 1024}, tools=[TOOL_ANT],
+                            system=SYSTEM)
+    return _switch(lambda *a, **k: messages_turn(c, *a, **k), [], kw)
 
 
 # --- SES-3: stateful Responses -----------------------------------------------------------------

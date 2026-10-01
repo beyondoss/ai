@@ -1701,3 +1701,17 @@ state = "suspected"
 test = ""
 fix = ""
 note = "Found while building crates/verify/tests/tenancy_live.rs, whose TEN-1 cells assert the policy the hermetic test pins (2s bound; in-flight streams finish, billed exactly). Fix: state both in the Deny-Set / Allowance-Set sections."
+
+[[defect]]
+id = "D122"
+severity = "low"
+area = "Billing"
+title = "Completed Codex turns are billed with outcome client_cancelled"
+impact = "Codex closes its stream as soon as it has read response.completed. The gateway sees the downstream go away before the upstream body ends and usually labels the row client_cancelled (a race with the upstream end of stream), though the generation finished, its usage is exact (usage_estimated false, upstream_status 200) and the turn succeeded. A consumer counting cancellations or success rates from the ledger sees every Codex turn as an abandoned request, the confusion BIL-12's outcome field exists to prevent."
+confidence = "high"
+evidence = "live 2026-10-01 SES-3::codex::codex::codex-resume, four runs: 6, 6, 6 and 4 of the session's 6 gpt-5.3-codex rows (stream true) have outcome client_cancelled, upstream_status 200, usage_estimated false and exact tokens (e.g. input 9972, cache_read 8576, output 88), while Codex fixed the fixture and resumed the session successfully. Every other harness in the same runs (Claude Code, pi, opencode) bills outcome ok. proxy.rs outcome(): any Downstream error source is client_cancelled, checked before whether the terminal event was already relayed."
+claims = ["BIL-12"]
+state = "suspected"
+test = ""
+fix = ""
+note = "Found by crates/verify/tests/session_live.rs (SES-3::codex::codex::codex-resume). Same root cause as D120 (openai-py closing at [DONE]), seen here on the ledger rather than the cache. Proposed: a stream whose terminal event (response.completed / message_stop / [DONE]) was already relayed is ok when the client then closes."
