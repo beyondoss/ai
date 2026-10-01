@@ -253,7 +253,8 @@ async fn smoke_groq() {
     smoke_openai_wire(
         "groq",
         "GROQ_API_KEY",
-        "llama-3.1-8b-instant",
+        // `llama-3.1-8b-instant` is Enterprise-only on Groq now (verify/catalog_truth.toml).
+        "openai/gpt-oss-20b",
         "/groq/openai/v1/chat/completions",
     )
     .await;
@@ -291,7 +292,8 @@ async fn smoke_deepseek() {
     smoke_openai_wire(
         "deepseek",
         "DEEPSEEK_API_KEY",
-        "deepseek-chat",
+        // `deepseek-chat` was retired 2026-07-24.
+        "deepseek-flash",
         "/deepseek/v1/chat/completions",
     )
     .await;

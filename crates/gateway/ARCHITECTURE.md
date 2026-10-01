@@ -318,11 +318,15 @@ too: each row has `display_name`, and the list has `has_more: false`. Each row a
 | `endpoints`                                                | all three generation paths (translation serves each), or `/v1/embeddings` |
 | `pricing` (`input` `output` `cache_read` `cache_write`)    | `ListPrice`, USD per million tokens (`pricing_unit` says so once)         |
 
-`providers::catalog::ModelCard` is generated like the price table: from Anthropic's `GET
-/v1/models` for the Claude rows it still lists, and otherwise from OpenRouter's public card for
-the row's OpenRouter candidate. It describes the model, not one deployment, so a Groq- or
-Fireworks-primary row may serve a smaller window. The body is built once and cached. It is served
-after identity and before the body peek, so an empty GET is not a missing-model 404.
+`providers::catalog::ModelCard` takes `context_window` and `max_output_tokens` from the
+**primary** vendor's model docs where it publishes them, and lists only the input kinds and
+capabilities that vendor lists. Where the vendor publishes no max output, OpenRouter's 0.9x /
+0.8x-of-window filler is replaced by `UNPUBLISHED_MAX_OUTPUT` (32,768), a conservative figure and
+not a vendor limit. OpenRouter-primary rows, and facts no vendor publishes, still come from
+OpenRouter's public card. Each checked value is recorded with its source URL in
+`verify/catalog_truth.toml`, and `catalog_matches_vendor_truth` / `capability_bits_match_vendor_truth`
+hold the table to it. The body is built once and cached. It is served after identity and before
+the body peek, so an empty GET is not a missing-model 404.
 
 A stock OpenAI or Anthropic SDK pointed at `/v1` with `model` in the JSON body is `/auto` without
 the header. Same-wire failover is a byte relay — the gateway rewrites ids, not API shapes, across
@@ -783,17 +787,26 @@ Messages API as an independent second source (`us.anthropic.claude-haiku-4-5-202
 Completions wire (`gpt-6-astra` → `openai/gpt-6-astra`) plus an OpenAI-only `/v1/responses` arm —
 the table covers the current 4 / 4.1 / 4o / 5 / 5.x / 6 and o-series ids OpenRouter listed on
 2026-09-19. The same Chat Completions helper covers every other pool-keyed host: xAI `grok-*`
-(`grok-4.6` → `x-ai/grok-4.6`, plus `grok-4.20-multi-agent`), DeepSeek (`deepseek-chat` →
-`deepseek/deepseek-chat`), Mistral `-latest` aliases (including Ministral and `mistral-nemo`),
-and the Groq/Together/Fireworks llama / qwen / open-weight ids people send (Groq
-`llama-3.3-70b-versatile` and `openai/gpt-oss-120b` also name Together and Fireworks as aliases;
-Kimi K3 / GLM-5.2 / MiniMax M3 do the same Together + Fireworks + OpenRouter shape). Those rows
-have no Responses arm — `previous_response_id` is OpenAI's store. OpenAI serves some GPT ids only
+(`grok-4.6` → `x-ai/grok-4.6`, plus `grok-4.20-multi-agent`), DeepSeek (`deepseek-flash` →
+`deepseek/deepseek-v4.1-flash`; `deepseek-v4-pro` fails over to Together's
+`deepseek-ai/DeepSeek-V4-Pro-0813`, because OpenRouter's `deepseek/deepseek-v4-pro` is the older
+0423 snapshot), Mistral `-latest` aliases (including Ministral), and the Groq/Together llama /
+qwen / open-weight ids people send (`openai/gpt-oss-120b` names Groq, Together, Fireworks and
+OpenRouter; Kimi K3 / GLM-5.2 / MiniMax M3 do the Together + Fireworks + OpenRouter shape). A
+fallback must serve the model the row names, so a retired vendor id is removed with its row
+(`deepseek-chat`, `deepseek-reasoner` and `mistral-nemo`, whose OpenRouter fallbacks were other
+models), and a candidate the host reserves for Enterprise or dedicated deployments is not listed
+(Groq `llama-3.1-8b-instant` / `llama-3.3-70b-versatile` / `minimaxai/minimax-m2.7`, the
+Fireworks Llama 4 / Kimi K2.6 / GLM 5.1 / Llama 3.3 ids, Together Kimi K2.7 Code and GPT-OSS 20B).
+Rows left with only OpenRouter keep their names as OpenRouter-only rows. These ids are recorded in
+`verify/catalog_truth.toml`, and `no_candidate_is_retired_or_not_serverless` keeps them out. Those
+rows have no Responses arm — `previous_response_id` is OpenAI's store. OpenAI serves some GPT ids only
 on the Responses API (`gpt-5-pro`, `gpt-5.x-pro`, `gpt-5.3-codex`, `o1-pro`): their OpenAI candidate
 is `/v1/responses` (a Chat Completions or Messages client is translated onto it), with OpenRouter
 Chat Completions as the failover. Rows whose first-party API no longer serves our keys (Claude
 Opus 4.1 and Sonnet 4, retired at Anthropic; older `-codex` and some `-pro` ids OpenAI does not
-serve this account) are OpenRouter-only. Every row and candidate is
+serve this account; the Groq/Fireworks/Together ids above that a serverless key cannot reach)
+are OpenRouter-only. Every row and candidate is
 verified against the live providers by `catalog_rows_are_servable` in `tests/smoke.rs`, and the
 failover itself by `model_route_fails_over_to_a_real_provider`.
 
@@ -1423,6 +1436,15 @@ USD per million tokens for input, output, cache read, and cache write. That is t
 estimates with, and the card a downstream consumer uses when it has nothing better. A public card
 that omits a cache rate is stored as the input rate — no discount, no write premium. Omission is
 not zero; a missing rate is how cache tokens used to bill free.
+
+The rate is the **primary candidate's** vendor standard published rate: not batch or flex, and not
+OpenRouter's cheapest host (OpenRouter's card is used only when OpenRouter is the primary). A
+vendor that tiers its rate is listed at the standard tier, which one card cannot fully express:
+DeepSeek's peak rate (off-peak is half, so off-peak traffic is over-listed 2x), xAI's < 200k-prompt
+tier (≥ 200k is 2x on every token), and OpenAI's ≤ 272K-input tier (above it, 2x input and 1.5x
+output). Each direct-vendor row's rates are recorded with their source URL in
+`verify/catalog_truth.toml`, and `catalog_matches_vendor_truth` fails when a row drifts from it or a
+direct-vendor row has no entry.
 
 The gateway still does not multiply those rates into `ai.usage`. It emits token facts: counts and
 model identifiers. Provider pricing changes frequently, varies by contract tier, and is sometimes

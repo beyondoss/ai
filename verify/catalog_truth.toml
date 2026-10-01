@@ -1,0 +1,1143 @@
+# Vendor-published facts behind `crates/providers/src/catalog.rs`, as data a test checks.
+#
+# One [[row]] per catalog row whose primary candidate is a direct vendor. Every field is the value
+# the PRIMARY vendor publishes, read from `source` on `date`. A field the vendor does not publish is
+# omitted, never guessed. Prices are USD per million tokens, as the vendor wrote them; the standard
+# tier only (not batch/flex; DeepSeek peak; xAI < 200k prompt; OpenAI <= 272K input).
+#
+# `catalog_matches_vendor_truth` (crates/providers/src/catalog.rs) asserts:
+# - every recorded field equals the catalog row's value;
+# - a row that records `input` but omits `cache_read` / `cache_write` lists the input rate there
+#   (the ListPrice rule for an unpublished rate);
+# - every direct-vendor catalog row has a [[row]] here or an `unverified` entry with a reason.
+#
+# `[[retired]]` and `[[not_serverless]]` are (provider, id) pairs the vendor no longer serves to a
+# standard key. No catalog candidate may name one (`no_candidate_is_retired_or_not_serverless`).
+#
+# Source audit: verify/catalog_truth_2026-10-01.md (raw pages fetched with curl and parsed locally).
+
+# Direct-vendor rows with no checked vendor facts, as { model = "...", reason = "..." }. Empty:
+# every direct-vendor row has a [[row]] below.
+unverified = []
+
+[[row]]
+model = "claude-fable-5"
+source = [
+  "https://platform.claude.com/docs/en/about-claude/pricing.md",
+  "https://platform.claude.com/docs/en/about-claude/models/overview.md",
+  "https://platform.claude.com/docs/en/about-claude/models/claude-fable-5/overview.md",
+]
+date = "2026-10-01"
+input = "10"
+output = "50"
+cache_read = "1"
+cache_write = "12.50"
+context_window = 1_000_000
+max_output_tokens = 128_000
+
+[[row]]
+model = "claude-fable-5-1"
+source = [
+  "https://platform.claude.com/docs/en/about-claude/pricing.md",
+  "https://platform.claude.com/docs/en/about-claude/models/overview.md",
+  "https://platform.claude.com/docs/en/about-claude/models/claude-fable-5-1/overview.md",
+]
+date = "2026-10-01"
+input = "10"
+output = "50"
+cache_read = "0.25"
+cache_write = "12.50"
+context_window = 1_000_000
+max_output_tokens = 128_000
+
+[[row]]
+model = "claude-haiku-4-5"
+source = [
+  "https://platform.claude.com/docs/en/about-claude/pricing.md",
+  "https://platform.claude.com/docs/en/about-claude/models/overview.md",
+  "https://platform.claude.com/docs/en/about-claude/models/claude-haiku-4-5/overview.md",
+]
+date = "2026-10-01"
+input = "1"
+output = "5"
+cache_read = "0.10"
+cache_write = "1.25"
+context_window = 200_000
+max_output_tokens = 64_000
+
+[[row]]
+model = "claude-opus-4-5"
+source = [
+  "https://platform.claude.com/docs/en/about-claude/pricing.md",
+  "https://platform.claude.com/docs/en/about-claude/models/overview.md",
+  "https://platform.claude.com/docs/en/about-claude/models/claude-opus-4-5/overview.md",
+]
+date = "2026-10-01"
+input = "5"
+output = "25"
+cache_read = "0.50"
+cache_write = "6.25"
+context_window = 200_000
+max_output_tokens = 64_000
+
+[[row]]
+model = "claude-opus-4-6"
+source = [
+  "https://platform.claude.com/docs/en/about-claude/pricing.md",
+  "https://platform.claude.com/docs/en/about-claude/models/overview.md",
+  "https://platform.claude.com/docs/en/about-claude/models/claude-opus-4-6/overview.md",
+]
+date = "2026-10-01"
+input = "5"
+output = "25"
+cache_read = "0.50"
+cache_write = "6.25"
+context_window = 1_000_000
+max_output_tokens = 128_000
+
+[[row]]
+model = "claude-opus-4-7"
+source = [
+  "https://platform.claude.com/docs/en/about-claude/pricing.md",
+  "https://platform.claude.com/docs/en/about-claude/models/overview.md",
+  "https://platform.claude.com/docs/en/about-claude/models/claude-opus-4-7/overview.md",
+]
+date = "2026-10-01"
+input = "5"
+output = "25"
+cache_read = "0.50"
+cache_write = "6.25"
+context_window = 1_000_000
+max_output_tokens = 128_000
+
+[[row]]
+model = "claude-opus-4-8"
+source = [
+  "https://platform.claude.com/docs/en/about-claude/pricing.md",
+  "https://platform.claude.com/docs/en/about-claude/models/overview.md",
+  "https://platform.claude.com/docs/en/about-claude/models/claude-opus-4-8/overview.md",
+]
+date = "2026-10-01"
+input = "5"
+output = "25"
+cache_read = "0.50"
+cache_write = "6.25"
+context_window = 1_000_000
+max_output_tokens = 128_000
+
+[[row]]
+model = "claude-opus-5"
+source = [
+  "https://platform.claude.com/docs/en/about-claude/pricing.md",
+  "https://platform.claude.com/docs/en/about-claude/models/overview.md",
+  "https://platform.claude.com/docs/en/about-claude/models/claude-opus-5/overview.md",
+]
+date = "2026-10-01"
+input = "5"
+output = "25"
+cache_read = "0.50"
+cache_write = "6.25"
+context_window = 1_000_000
+max_output_tokens = 128_000
+
+[[row]]
+model = "claude-opus-5-5"
+source = [
+  "https://platform.claude.com/docs/en/about-claude/pricing.md",
+  "https://platform.claude.com/docs/en/about-claude/models/overview.md",
+  "https://platform.claude.com/docs/en/about-claude/models/claude-opus-5-5/overview.md",
+]
+date = "2026-10-01"
+input = "4"
+output = "20"
+cache_read = "0.20"
+cache_write = "5"
+context_window = 1_000_000
+max_output_tokens = 128_000
+
+[[row]]
+model = "claude-sonnet-4-5"
+source = [
+  "https://platform.claude.com/docs/en/about-claude/pricing.md",
+  "https://platform.claude.com/docs/en/about-claude/models/overview.md",
+  "https://platform.claude.com/docs/en/about-claude/models/claude-sonnet-4-5/overview.md",
+]
+date = "2026-10-01"
+input = "3"
+output = "15"
+cache_read = "0.30"
+cache_write = "3.75"
+context_window = 200_000
+max_output_tokens = 64_000
+note = "Deprecated 2026-09-30, retires 2026-11-30. \"Context window: 200K tokens · Max output: 64K\"."
+
+[[row]]
+model = "claude-sonnet-4-6"
+source = [
+  "https://platform.claude.com/docs/en/about-claude/pricing.md",
+  "https://platform.claude.com/docs/en/about-claude/models/overview.md",
+  "https://platform.claude.com/docs/en/about-claude/models/claude-sonnet-4-6/overview.md",
+]
+date = "2026-10-01"
+input = "3"
+output = "15"
+cache_read = "0.30"
+cache_write = "3.75"
+context_window = 1_000_000
+max_output_tokens = 128_000
+
+[[row]]
+model = "claude-sonnet-5"
+source = [
+  "https://platform.claude.com/docs/en/about-claude/pricing.md",
+  "https://platform.claude.com/docs/en/about-claude/models/overview.md",
+  "https://platform.claude.com/docs/en/about-claude/models/claude-sonnet-5/overview.md",
+]
+date = "2026-10-01"
+input = "2"
+output = "10"
+cache_read = "0.20"
+cache_write = "2.50"
+context_window = 1_000_000
+max_output_tokens = 128_000
+
+[[row]]
+model = "claude-sonnet-5-5"
+source = [
+  "https://platform.claude.com/docs/en/about-claude/pricing.md",
+  "https://platform.claude.com/docs/en/about-claude/models/overview.md",
+  "https://platform.claude.com/docs/en/about-claude/models/claude-sonnet-5-5/overview.md",
+]
+date = "2026-10-01"
+input = "2"
+output = "10"
+cache_read = "0.20"
+cache_write = "2.50"
+context_window = 1_000_000
+max_output_tokens = 128_000
+
+[[row]]
+model = "codestral-latest"
+source = [
+  "https://docs.mistral.ai/models/codestral-25-08",
+  "https://docs.mistral.ai/models",
+]
+date = "2026-10-01"
+input = "0.3"
+output = "0.9"
+context_window = 131_072
+
+[[row]]
+model = "deepseek-flash"
+source = ["https://api-docs.deepseek.com/quick_start/pricing"]
+date = "2026-10-01"
+input = "0.30"
+output = "1.20"
+cache_read = "0.006"
+context_window = 1_048_576
+max_output_tokens = 384_000
+input_present = ["image"]
+note = "DeepSeek-V4.1-Flash. Vision supported. Off-peak $0.15 / $0.003 / $0.60."
+
+[[row]]
+model = "deepseek-v4-pro"
+source = [
+  "https://api-docs.deepseek.com/quick_start/pricing",
+  "https://docs.together.ai/docs/serverless/models",
+]
+date = "2026-10-01"
+input = "1.32"
+output = "3.96"
+cache_read = "0.044"
+context_window = 1_048_576
+max_output_tokens = 384_000
+input_absent = ["image"]
+note = "DeepSeek-V4-Pro-0813. \"Vision: Not supported\". Off-peak $0.66 / $0.022 / $1.98. Together serves the same snapshot as deepseek-ai/DeepSeek-V4-Pro-0813."
+
+[[row]]
+model = "google/gemma-4-31b-it"
+source = ["https://www.together.ai/pricing"]
+date = "2026-10-01"
+input = "0.39"
+output = "0.97"
+note = "google/gemma-4-31B-it is absent from the docs serverless table but listed serverless on the pricing page. Context not published."
+
+[[row]]
+model = "gpt-4"
+source = [
+  "https://developers.openai.com/api/docs/pricing.md",
+  "https://developers.openai.com/api/docs/models/gpt-4.md",
+]
+date = "2026-10-01"
+input = "30"
+output = "60"
+context_window = 8192
+max_output_tokens = 8192
+features_absent = ["tools", "structured_outputs"]
+note = "Shutdown 2026-10-23. Feature list is \"fine_tuning, streaming\" only."
+
+[[row]]
+model = "gpt-4-turbo"
+source = [
+  "https://developers.openai.com/api/docs/pricing.md",
+  "https://developers.openai.com/api/docs/models/gpt-4-turbo.md",
+]
+date = "2026-10-01"
+input = "10"
+output = "30"
+context_window = 128_000
+max_output_tokens = 4096
+input_present = ["image"]
+features_present = ["tools"]
+features_absent = ["structured_outputs"]
+note = "Shutdown 2026-10-23."
+
+[[row]]
+model = "gpt-4.1"
+source = [
+  "https://developers.openai.com/api/docs/pricing.md",
+  "https://developers.openai.com/api/docs/models/gpt-4.1.md",
+]
+date = "2026-10-01"
+input = "2"
+output = "8"
+cache_read = "0.5"
+context_window = 1_047_576
+max_output_tokens = 32_768
+
+[[row]]
+model = "gpt-4.1-mini"
+source = [
+  "https://developers.openai.com/api/docs/pricing.md",
+  "https://developers.openai.com/api/docs/models/gpt-4.1-mini.md",
+]
+date = "2026-10-01"
+input = "0.4"
+output = "1.6"
+cache_read = "0.1"
+context_window = 1_047_576
+max_output_tokens = 32_768
+
+[[row]]
+model = "gpt-4.1-nano"
+source = [
+  "https://developers.openai.com/api/docs/pricing.md",
+  "https://developers.openai.com/api/docs/models/gpt-4.1-nano.md",
+]
+date = "2026-10-01"
+input = "0.1"
+output = "0.4"
+cache_read = "0.025"
+context_window = 1_047_576
+max_output_tokens = 32_768
+note = "Shutdown 2026-10-23."
+
+[[row]]
+model = "gpt-4o"
+source = [
+  "https://developers.openai.com/api/docs/pricing.md",
+  "https://developers.openai.com/api/docs/models/gpt-4o.md",
+]
+date = "2026-10-01"
+input = "2.5"
+output = "10"
+cache_read = "1.25"
+context_window = 128_000
+max_output_tokens = 16_384
+
+[[row]]
+model = "gpt-4o-mini"
+source = [
+  "https://developers.openai.com/api/docs/pricing.md",
+  "https://developers.openai.com/api/docs/models/gpt-4o-mini.md",
+]
+date = "2026-10-01"
+input = "0.15"
+output = "0.6"
+cache_read = "0.075"
+context_window = 128_000
+max_output_tokens = 16_384
+
+[[row]]
+model = "gpt-5"
+source = [
+  "https://developers.openai.com/api/docs/pricing.md",
+  "https://developers.openai.com/api/docs/models/gpt-5.md",
+]
+date = "2026-10-01"
+input = "1.25"
+output = "10"
+cache_read = "0.125"
+context_window = 400_000
+max_output_tokens = 128_000
+note = "Default snapshot shuts down 2026-12-11."
+
+[[row]]
+model = "gpt-5-mini"
+source = [
+  "https://developers.openai.com/api/docs/pricing.md",
+  "https://developers.openai.com/api/docs/models/gpt-5-mini.md",
+]
+date = "2026-10-01"
+input = "0.25"
+output = "2"
+cache_read = "0.025"
+context_window = 400_000
+max_output_tokens = 128_000
+note = "Default snapshot shuts down 2026-12-11."
+
+[[row]]
+model = "gpt-5-nano"
+source = [
+  "https://developers.openai.com/api/docs/pricing.md",
+  "https://developers.openai.com/api/docs/models/gpt-5-nano.md",
+]
+date = "2026-10-01"
+input = "0.05"
+output = "0.4"
+cache_read = "0.005"
+context_window = 400_000
+max_output_tokens = 128_000
+note = "Default snapshot shuts down 2026-12-11."
+
+[[row]]
+model = "gpt-5-pro"
+source = [
+  "https://developers.openai.com/api/docs/pricing.md",
+  "https://developers.openai.com/api/docs/models/gpt-5-pro.md",
+]
+date = "2026-10-01"
+input = "15"
+output = "120"
+max_output_tokens = 272_000
+note = "Responses only. Default snapshot shuts down 2026-12-11."
+
+[[row]]
+model = "gpt-5.1"
+source = [
+  "https://developers.openai.com/api/docs/pricing.md",
+  "https://developers.openai.com/api/docs/models/gpt-5.1.md",
+]
+date = "2026-10-01"
+input = "1.25"
+output = "10"
+cache_read = "0.125"
+context_window = 400_000
+max_output_tokens = 128_000
+
+[[row]]
+model = "gpt-5.2"
+source = [
+  "https://developers.openai.com/api/docs/pricing.md",
+  "https://developers.openai.com/api/docs/models/gpt-5.2.md",
+]
+date = "2026-10-01"
+input = "1.75"
+output = "14"
+cache_read = "0.175"
+context_window = 400_000
+max_output_tokens = 128_000
+
+[[row]]
+model = "gpt-5.2-pro"
+source = [
+  "https://developers.openai.com/api/docs/pricing.md",
+  "https://developers.openai.com/api/docs/models/gpt-5.2-pro.md",
+]
+date = "2026-10-01"
+input = "21"
+output = "168"
+features_absent = ["structured_outputs"]
+note = "Responses only."
+
+[[row]]
+model = "gpt-5.3-codex"
+source = [
+  "https://developers.openai.com/api/docs/pricing.md",
+  "https://developers.openai.com/api/docs/models/gpt-5.3-codex.md",
+]
+date = "2026-10-01"
+input = "1.75"
+output = "14"
+cache_read = "0.175"
+context_window = 400_000
+max_output_tokens = 128_000
+
+[[row]]
+model = "gpt-5.4"
+source = [
+  "https://developers.openai.com/api/docs/pricing.md",
+  "https://developers.openai.com/api/docs/models/gpt-5.4.md",
+]
+date = "2026-10-01"
+input = "2.5"
+output = "15"
+cache_read = "0.25"
+context_window = 1_050_000
+max_output_tokens = 128_000
+note = ">272K input: 2x input, 1.5x output (not listed)."
+
+[[row]]
+model = "gpt-5.4-mini"
+source = [
+  "https://developers.openai.com/api/docs/pricing.md",
+  "https://developers.openai.com/api/docs/models/gpt-5.4-mini.md",
+]
+date = "2026-10-01"
+input = "0.75"
+output = "4.5"
+cache_read = "0.075"
+context_window = 400_000
+max_output_tokens = 128_000
+
+[[row]]
+model = "gpt-5.4-nano"
+source = [
+  "https://developers.openai.com/api/docs/pricing.md",
+  "https://developers.openai.com/api/docs/models/gpt-5.4-nano.md",
+]
+date = "2026-10-01"
+input = "0.2"
+output = "1.25"
+cache_read = "0.02"
+context_window = 400_000
+max_output_tokens = 128_000
+
+[[row]]
+model = "gpt-5.4-pro"
+source = [
+  "https://developers.openai.com/api/docs/pricing.md",
+  "https://developers.openai.com/api/docs/models/gpt-5.4-pro.md",
+]
+date = "2026-10-01"
+input = "30"
+output = "180"
+features_absent = ["structured_outputs"]
+note = ">272K input tier not listed."
+
+[[row]]
+model = "gpt-5.5"
+source = [
+  "https://developers.openai.com/api/docs/pricing.md",
+  "https://developers.openai.com/api/docs/models/gpt-5.5.md",
+]
+date = "2026-10-01"
+input = "5"
+output = "30"
+cache_read = "0.5"
+context_window = 1_050_000
+max_output_tokens = 128_000
+note = ">272K input tier not listed."
+
+[[row]]
+model = "gpt-5.5-pro"
+source = [
+  "https://developers.openai.com/api/docs/pricing.md",
+  "https://developers.openai.com/api/docs/models/gpt-5.5-pro.md",
+]
+date = "2026-10-01"
+input = "30"
+output = "180"
+context_window = 1_050_000
+max_output_tokens = 128_000
+note = ">272K input tier not listed."
+
+[[row]]
+model = "gpt-5.6-luna"
+source = [
+  "https://developers.openai.com/api/docs/pricing.md",
+  "https://developers.openai.com/api/docs/models/gpt-5.6-luna.md",
+]
+date = "2026-10-01"
+input = "0.2"
+output = "1.2"
+cache_read = "0.02"
+cache_write = "0.25"
+context_window = 1_050_000
+max_output_tokens = 128_000
+
+[[row]]
+model = "gpt-5.6-sol"
+source = [
+  "https://developers.openai.com/api/docs/pricing.md",
+  "https://developers.openai.com/api/docs/models/gpt-5.6-sol.md",
+]
+date = "2026-10-01"
+input = "4.00"
+output = "20.00"
+cache_read = "0.40"
+cache_write = "5.00"
+context_window = 1_050_000
+max_output_tokens = 128_000
+note = "Standard tier. The $2 / $10 row is Batch/Flex. \"Promotional pricing is available at least through November 21, 2026\" (not listed)."
+
+[[row]]
+model = "gpt-5.6-terra"
+source = [
+  "https://developers.openai.com/api/docs/pricing.md",
+  "https://developers.openai.com/api/docs/models/gpt-5.6-terra.md",
+]
+date = "2026-10-01"
+input = "2"
+output = "12"
+cache_read = "0.2"
+cache_write = "2.5"
+context_window = 1_050_000
+max_output_tokens = 128_000
+
+[[row]]
+model = "gpt-6-astra"
+source = [
+  "https://developers.openai.com/api/docs/pricing.md",
+  "https://developers.openai.com/api/docs/models/gpt-6-astra.md",
+]
+date = "2026-10-01"
+input = "10"
+output = "50"
+cache_read = "1"
+cache_write = "12.5"
+context_window = 1_050_000
+max_output_tokens = 128_000
+
+[[row]]
+model = "grok-4.20"
+source = [
+  "https://docs.x.ai/developers/pricing.md",
+  "https://docs.x.ai/developers/models/grok-4.20.md",
+]
+date = "2026-10-01"
+input = "1.25"
+output = "2.50"
+cache_read = "0.20"
+context_window = 1_000_000
+
+[[row]]
+model = "grok-4.20-multi-agent"
+source = [
+  "https://docs.x.ai/developers/pricing.md",
+  "https://docs.x.ai/developers/models/grok-4.20-multi-agent.md",
+]
+date = "2026-10-01"
+input = "1.25"
+output = "2.50"
+cache_read = "0.20"
+context_window = 1_000_000
+features_present = ["tools"]
+
+[[row]]
+model = "grok-4.3"
+source = [
+  "https://docs.x.ai/developers/pricing.md",
+  "https://docs.x.ai/developers/models/grok-4.3.md",
+]
+date = "2026-10-01"
+input = "1.25"
+output = "2.50"
+cache_read = "0.20"
+context_window = 1_000_000
+
+[[row]]
+model = "grok-4.5"
+source = [
+  "https://docs.x.ai/developers/pricing.md",
+  "https://docs.x.ai/developers/models/grok-4.5.md",
+]
+date = "2026-10-01"
+input = "2.00"
+output = "6.00"
+cache_read = "0.30"
+context_window = 500_000
+
+[[row]]
+model = "grok-4.6"
+source = [
+  "https://docs.x.ai/developers/pricing.md",
+  "https://docs.x.ai/developers/models/grok-4.6.md",
+]
+date = "2026-10-01"
+input = "2.00"
+output = "6.00"
+cache_read = "0.50"
+context_window = 500_000
+
+[[row]]
+model = "grok-build-0.1"
+source = [
+  "https://docs.x.ai/developers/pricing.md",
+  "https://docs.x.ai/developers/models/grok-build-0.1.md",
+]
+date = "2026-10-01"
+input = "1.00"
+output = "2.00"
+cache_read = "0.20"
+context_window = 256_000
+
+[[row]]
+model = "llama-3.3-70b-versatile"
+source = [
+  "https://www.together.ai/pricing",
+  "https://docs.together.ai/docs/serverless/models",
+]
+date = "2026-10-01"
+input = "1.04"
+output = "1.04"
+context_window = 131_072
+note = "Primary is Together meta-llama/Llama-3.3-70B-Instruct-Turbo (serverless: Yes)."
+
+[[row]]
+model = "meta/muse-glimmer-30b"
+source = [
+  "https://www.together.ai/pricing",
+  "https://docs.together.ai/docs/serverless/models",
+]
+date = "2026-10-01"
+input = "0.35"
+output = "1.50"
+cache_read = "0.04"
+context_window = 131_072
+
+[[row]]
+model = "minimax/minimax-m3"
+source = [
+  "https://www.together.ai/pricing",
+  "https://docs.together.ai/docs/serverless/models",
+]
+date = "2026-10-01"
+input = "0.30"
+output = "1.20"
+cache_read = "0.06"
+context_window = 524_288
+
+[[row]]
+model = "ministral-14b-latest"
+source = [
+  "https://docs.mistral.ai/models/ministral-3-14b-25-12",
+  "https://docs.mistral.ai/models",
+]
+date = "2026-10-01"
+input = "0.2"
+output = "0.2"
+context_window = 262_144
+
+[[row]]
+model = "ministral-3b-latest"
+source = [
+  "https://docs.mistral.ai/models/ministral-3-3b-25-12",
+  "https://docs.mistral.ai/models",
+]
+date = "2026-10-01"
+input = "0.1"
+output = "0.1"
+context_window = 262_144
+
+[[row]]
+model = "ministral-8b-latest"
+source = [
+  "https://docs.mistral.ai/models/ministral-3-8b-25-12",
+  "https://docs.mistral.ai/models",
+]
+date = "2026-10-01"
+input = "0.15"
+output = "0.15"
+context_window = 262_144
+
+[[row]]
+model = "mistral-large-latest"
+source = [
+  "https://docs.mistral.ai/models/mistral-large-3-25-12",
+  "https://docs.mistral.ai/models",
+]
+date = "2026-10-01"
+input = "0.5"
+output = "1.5"
+context_window = 262_144
+
+[[row]]
+model = "mistral-medium-latest"
+source = [
+  "https://docs.mistral.ai/models/mistral-medium-3-5-26-04",
+  "https://docs.mistral.ai/models",
+]
+date = "2026-10-01"
+input = "1.5"
+output = "7.5"
+context_window = 262_144
+
+[[row]]
+model = "mistral-small-latest"
+source = [
+  "https://docs.mistral.ai/models/mistral-small-4-0-26-03",
+  "https://docs.mistral.ai/models",
+]
+date = "2026-10-01"
+input = "0.15"
+output = "0.6"
+context_window = 262_144
+
+[[row]]
+model = "moonshotai/kimi-k3"
+source = [
+  "https://www.together.ai/pricing",
+  "https://docs.together.ai/docs/serverless/models",
+]
+date = "2026-10-01"
+input = "3.00"
+output = "15.00"
+cache_read = "0.30"
+context_window = 1_048_576
+
+[[row]]
+model = "o1"
+source = [
+  "https://developers.openai.com/api/docs/pricing.md",
+  "https://developers.openai.com/api/docs/models/o1.md",
+]
+date = "2026-10-01"
+input = "15"
+output = "60"
+cache_read = "7.5"
+context_window = 200_000
+max_output_tokens = 100_000
+note = "Shutdown 2026-10-23."
+
+[[row]]
+model = "o1-pro"
+source = [
+  "https://developers.openai.com/api/docs/pricing.md",
+  "https://developers.openai.com/api/docs/models/o1-pro.md",
+]
+date = "2026-10-01"
+input = "150"
+output = "600"
+features_present = ["tools"]
+note = "Shutdown 2026-10-23."
+
+[[row]]
+model = "o3"
+source = [
+  "https://developers.openai.com/api/docs/pricing.md",
+  "https://developers.openai.com/api/docs/models/o3.md",
+]
+date = "2026-10-01"
+input = "2"
+output = "8"
+cache_read = "0.5"
+context_window = 200_000
+max_output_tokens = 100_000
+
+[[row]]
+model = "o3-mini"
+source = [
+  "https://developers.openai.com/api/docs/pricing.md",
+  "https://developers.openai.com/api/docs/models/o3-mini.md",
+]
+date = "2026-10-01"
+input = "1.1"
+output = "4.4"
+cache_read = "0.55"
+context_window = 200_000
+max_output_tokens = 100_000
+input_absent = ["image"]
+note = "Shutdown 2026-10-23. Text only."
+
+[[row]]
+model = "o4-mini"
+source = [
+  "https://developers.openai.com/api/docs/pricing.md",
+  "https://developers.openai.com/api/docs/models/o4-mini.md",
+]
+date = "2026-10-01"
+input = "1.1"
+output = "4.4"
+cache_read = "0.275"
+context_window = 200_000
+max_output_tokens = 100_000
+note = "Shutdown 2026-10-23."
+
+[[row]]
+model = "openai/gpt-oss-120b"
+source = [
+  "https://console.groq.com/docs/models",
+  "https://console.groq.com/docs/prompt-caching",
+]
+date = "2026-10-01"
+input = "0.15"
+output = "0.60"
+cache_read = "0.075"
+context_window = 131_072
+max_output_tokens = 65_536
+
+[[row]]
+model = "openai/gpt-oss-20b"
+source = [
+  "https://console.groq.com/docs/models",
+  "https://console.groq.com/docs/prompt-caching",
+]
+date = "2026-10-01"
+input = "0.075"
+output = "0.30"
+cache_read = "0.0375"
+context_window = 131_072
+max_output_tokens = 65_536
+
+[[row]]
+model = "openai/gpt-oss-safeguard-20b"
+source = [
+  "https://console.groq.com/docs/models",
+  "https://console.groq.com/docs/prompt-caching",
+]
+date = "2026-10-01"
+input = "0.075"
+output = "0.30"
+cache_read = "0.0375"
+context_window = 131_072
+max_output_tokens = 65_536
+note = "Preview."
+
+[[row]]
+model = "qwen/qwen-2.5-7b-instruct"
+source = ["https://www.together.ai/pricing"]
+date = "2026-10-01"
+input = "0.30"
+output = "0.30"
+note = "Qwen/Qwen2.5-7B-Instruct-Turbo is absent from the docs serverless table; the pricing page still lists it."
+
+[[row]]
+model = "qwen/qwen3.5-9b"
+source = [
+  "https://www.together.ai/pricing",
+  "https://docs.together.ai/docs/serverless/models",
+]
+date = "2026-10-01"
+input = "0.17"
+output = "0.25"
+context_window = 262_144
+
+[[row]]
+model = "qwen/qwen3.6-plus"
+source = [
+  "https://www.together.ai/pricing",
+  "https://docs.together.ai/docs/serverless/models",
+]
+date = "2026-10-01"
+input = "0.50"
+output = "3.00"
+context_window = 1_000_000
+
+[[row]]
+model = "qwen/qwen3.7-max"
+source = [
+  "https://www.together.ai/pricing",
+  "https://docs.together.ai/docs/serverless/models",
+]
+date = "2026-10-01"
+input = "1.50"
+output = "4.50"
+cache_read = "0.30"
+note = "Cached: pricing page $0.30, docs table $0.50. Context not published."
+
+[[row]]
+model = "qwen/qwen3.7-plus"
+source = [
+  "https://www.together.ai/pricing",
+  "https://docs.together.ai/docs/serverless/models",
+]
+date = "2026-10-01"
+input = "0.32"
+output = "1.28"
+context_window = 1_000_000
+
+[[row]]
+model = "qwen/qwen3.8-2.4t-a95b"
+source = [
+  "https://www.together.ai/pricing",
+  "https://docs.together.ai/docs/serverless/models",
+]
+date = "2026-10-01"
+input = "2.00"
+output = "6.00"
+cache_read = "0.25"
+note = "Cached: pricing page $0.25, docs table $0.50. Context not published."
+
+[[row]]
+model = "qwen/qwen3.8-27b"
+source = [
+  "https://console.groq.com/docs/models",
+  "https://console.groq.com/docs/prompt-caching",
+]
+date = "2026-10-01"
+input = "0.80"
+output = "4.00"
+context_window = 131_072
+max_output_tokens = 16_384
+note = "Preview. No prompt caching."
+
+[[row]]
+model = "qwen/qwen3.8-flash"
+source = [
+  "https://www.together.ai/pricing",
+  "https://docs.together.ai/docs/serverless/models",
+]
+date = "2026-10-01"
+input = "0.09"
+output = "0.28"
+context_window = 1_000_000
+note = "Output: pricing page $0.28, docs table $0.282."
+
+[[row]]
+model = "text-embedding-3-large"
+source = ["https://developers.openai.com/api/docs/pricing.md"]
+date = "2026-10-01"
+input = "0.13"
+
+[[row]]
+model = "text-embedding-3-small"
+source = ["https://developers.openai.com/api/docs/pricing.md"]
+date = "2026-10-01"
+input = "0.02"
+
+[[row]]
+model = "thinkingmachines/inkling"
+source = [
+  "https://www.together.ai/pricing",
+  "https://docs.together.ai/docs/serverless/models",
+]
+date = "2026-10-01"
+input = "1.00"
+output = "4.05"
+cache_read = "0.17"
+context_window = 524_288
+
+[[row]]
+model = "z-ai/glm-5.2"
+source = [
+  "https://www.together.ai/pricing",
+  "https://docs.together.ai/docs/serverless/models",
+]
+date = "2026-10-01"
+input = "1.40"
+output = "4.40"
+cache_read = "0.26"
+context_window = 1_048_575
+
+[[row]]
+model = "z-ai/glm-5.3"
+source = [
+  "https://www.together.ai/pricing",
+  "https://docs.together.ai/docs/serverless/models",
+]
+date = "2026-10-01"
+input = "1.40"
+output = "4.40"
+cache_read = "0.26"
+context_window = 1_048_575
+
+[[row]]
+model = "z-ai/glm-5.3-flash"
+source = [
+  "https://www.together.ai/pricing",
+  "https://docs.together.ai/docs/serverless/models",
+]
+date = "2026-10-01"
+input = "0.15"
+output = "0.50"
+cache_read = "0.03"
+context_window = 1_048_575
+
+[[retired]]
+provider = "deepseek"
+id = "deepseek-chat"
+source = "https://api-docs.deepseek.com/updates"
+retired = "2026-07-24"
+note = "The two legacy API model names, deepseek-chat and deepseek-reasoner, will be discontinued in three months (2026-07-24)."
+
+[[retired]]
+provider = "deepseek"
+id = "deepseek-reasoner"
+source = "https://api-docs.deepseek.com/updates"
+retired = "2026-07-24"
+note = "Retired with deepseek-chat."
+
+[[retired]]
+provider = "mistral"
+id = "mistral-nemo"
+source = "https://docs.mistral.ai/models/mistral-nemo-12b-24-07"
+retired = "2026-07-31"
+note = "open-mistral-nemo-2407: deprecated 2026-05-22, retired 2026-07-31. \"Use Ministral 3 8B\"."
+
+[[retired]]
+provider = "mistral"
+id = "open-mistral-nemo-2407"
+source = "https://docs.mistral.ai/models/mistral-nemo-12b-24-07"
+retired = "2026-07-31"
+note = "Dated id of mistral-nemo."
+
+[[not_serverless]]
+provider = "fireworks"
+id = "accounts/fireworks/models/llama4-maverick-instruct-basic"
+source = "https://fireworks.ai/models/fireworks/llama4-maverick-instruct-basic"
+date = "2026-10-01"
+note = "Model page: \"serverless\":false."
+
+[[not_serverless]]
+provider = "fireworks"
+id = "accounts/fireworks/models/llama4-scout-instruct-basic"
+source = "https://fireworks.ai/models/fireworks/llama4-scout-instruct-basic"
+date = "2026-10-01"
+note = "Model page: \"serverless\":false."
+
+[[not_serverless]]
+provider = "fireworks"
+id = "accounts/fireworks/models/kimi-k2p6"
+source = "https://fireworks.ai/models/fireworks/kimi-k2p6"
+date = "2026-10-01"
+note = "Serverless deprecated 2026-09-25; on-demand deployment only."
+
+[[not_serverless]]
+provider = "fireworks"
+id = "accounts/fireworks/models/glm-5p1"
+source = "https://fireworks.ai/models/fireworks/glm-5p1"
+date = "2026-10-01"
+note = "Model page: \"serverless\":false."
+
+[[not_serverless]]
+provider = "fireworks"
+id = "accounts/fireworks/models/llama-v3p3-70b-instruct"
+source = "https://fireworks.ai/models/fireworks/llama-v3p3-70b-instruct"
+date = "2026-10-01"
+note = "Model page: \"serverless\":false."
+
+[[not_serverless]]
+provider = "together"
+id = "moonshotai/Kimi-K2.7-Code"
+source = "https://www.together.ai/pricing"
+date = "2026-10-01"
+note = "Only in the dedicated (PTU) table; absent from the serverless docs table."
+
+[[not_serverless]]
+provider = "together"
+id = "openai/gpt-oss-20b"
+source = "https://docs.together.ai/docs/serverless/models"
+date = "2026-10-01"
+note = "Absent from the serverless docs table; the pricing page lists gpt-oss-20B only outside the serverless table."
+
+[[not_serverless]]
+provider = "groq"
+id = "llama-3.1-8b-instant"
+source = "https://console.groq.com/docs/models"
+date = "2026-10-01"
+note = "Tagged \"Enterprise\", price \"ContactSales\"."
+
+[[not_serverless]]
+provider = "groq"
+id = "llama-3.3-70b-versatile"
+source = "https://console.groq.com/docs/models"
+date = "2026-10-01"
+note = "Tagged \"Enterprise\", price \"ContactSales\"."
+
+[[not_serverless]]
+provider = "groq"
+id = "minimaxai/minimax-m2.7"
+source = "https://console.groq.com/docs/models"
+date = "2026-10-01"
+note = "Tagged \"Enterprise\", price \"ContactSales\"."

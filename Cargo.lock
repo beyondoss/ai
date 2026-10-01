@@ -499,6 +499,7 @@ name = "beyond-ai-providers"
 version = "0.1.0"
 dependencies = [
  "serde_json",
+ "toml",
 ]
 
 [[package]]

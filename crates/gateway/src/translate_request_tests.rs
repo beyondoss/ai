@@ -136,7 +136,7 @@ fn openai_model_parses_families_and_hosts() {
         ),
         // Not OpenAI's own model, or not OpenAI at all: nothing is reshaped.
         ("grok-4.6", false, Unknown),
-        ("deepseek-chat", false, Unknown),
+        ("deepseek-flash", false, Unknown),
         ("x-ai/grok-4.6", false, Unknown),
         ("claude-opus-4-8", false, Unknown),
     ] {
@@ -1427,13 +1427,13 @@ fn unknown_hosts_get_the_classic_efforts() {
     for model in [
         "x-ai/grok-4.6",
         "grok-4.6",
-        "deepseek-chat",
+        "deepseek-flash",
         "moonshotai/kimi-k3",
     ] {
         assert_eq!(m2c(&big, model)["reasoning_effort"], "high", "{model}");
     }
     let max = anth(json!({"output_config": {"effort": "max"}}));
-    assert_eq!(m2c(&max, "deepseek-chat")["reasoning_effort"], "high");
+    assert_eq!(m2c(&max, "deepseek-flash")["reasoning_effort"], "high");
     let off = anth(json!({"thinking": {"type": "disabled"}}));
     for model in [
         "openai/gpt-oss-120b",
@@ -1769,7 +1769,7 @@ fn a_responses_developer_message_is_system_on_a_non_openai_chat_host() {
             {"role": "developer", "content": "Answer in French."},
             {"role": "user", "content": "how are you?"},
         ]}),
-        "deepseek-chat",
+        "deepseek-flash",
     );
     let r = roles(&v);
     assert!(!r.contains(&"developer"), "{r:?}: {v}");
