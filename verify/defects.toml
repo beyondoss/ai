@@ -1317,10 +1317,10 @@ area = "Contract"
 title = "The duplicate-model refusal is a generic 400 after the upstream already got headers"
 impact = "D34's check runs in request_body_filter after the upstream connection and headers are out, and returns a bodyless 400; for small headerless walks the body is in hand earlier."
 confidence = "high"
-evidence = "proxy.rs request_body_filter"
+evidence = "proxy.rs request_body_filter. Reproduced hermetically (catalog_body.rs): a headerless /v1/chat/completions with two root model keys, whose body the gateway read before choosing the row, is refused by request_body_filter with a bare pingora 400 carrying no x-beyond-request-id and no JSON body."
 claims = ["SEC-21", "CAT-11"]
-state = "suspected"
-test = ""
+state = "reproduced"
+test = "a_duplicate_model_is_refused_before_the_upstream_with_a_json_400"
 fix = ""
 note = "Found by the independent branch review (2026-10-01) of a54c22c."
 

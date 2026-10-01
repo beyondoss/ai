@@ -91,3 +91,46 @@ async fn a_body_with_two_root_model_keys_is_refused_on_a_catalog_walk() {
     let sent: serde_json::Value = serde_json::from_slice(&mock.captured().unwrap().body).unwrap();
     assert_eq!(sent["model"], "gpt-4o-mini");
 }
+
+/// Where the body is already in hand before connecting (a headerless walk reads it to choose the
+/// row; a header-won large or Responses walk reads it too), two root `model` keys are refused
+/// before the upstream gets anything, with the gateway's JSON 400 and its request id, not a bare
+/// 400 after the request headers went out.
+/// claim: SEC-21, CAT-11
+/// defect: D94
+#[tokio::test]
+#[ignore = "D94 reproduced: the duplicate-model refusal is a bodyless 400 after the upstream connection"]
+async fn a_duplicate_model_is_refused_before_the_upstream_with_a_json_400() {
+    let (pubkey, sk) = test_keypair(1);
+    let mock = MockUpstream::start(Mode::Json).await;
+    let gw = Gateway::builder(unused_nats_port(), &mock.authority(), &b64(&pubkey))
+        .providers(&["openai"])
+        .start()
+        .await;
+    let auth = format!("Bearer {}", managed_key(&sk));
+    let resp = test_client()
+        .post(format!("{}/v1/chat/completions", gw.url()))
+        .header("authorization", &auth)
+        .header("content-type", "application/json")
+        .body(r#"{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}],"model":"gpt-4o"}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 400);
+    assert!(
+        resp.headers().contains_key("x-beyond-request-id"),
+        "{:?}",
+        resp.headers()
+    );
+    let text = resp.text().await.unwrap();
+    let v: serde_json::Value =
+        serde_json::from_str(&text).unwrap_or_else(|e| panic!("{e}: {text:?}"));
+    assert_eq!(v["error"]["type"], "invalid_request_error", "{v}");
+    assert!(
+        v["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("model")),
+        "{v}"
+    );
+    assert_eq!(mock.hits(), 0, "the upstream got the request");
+}
