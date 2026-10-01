@@ -1533,6 +1533,8 @@ touches = [
   "crates/gateway/src/store_watch.rs",
   "crates/gateway/src/main.rs",
   "crates/gateway/src/config.rs",
+  "crates/gateway/src/remedy.rs",
+  "crates/gateway/src/route.rs",
 ]
 defects = ["D10", "D84", "D180"]
 

@@ -504,9 +504,11 @@ pub struct PoolAuth {
     /// for an echo of the key (`proxy::Redact`), and building a searcher per response repeated the
     /// key's preprocessing on each one (D92). Holds a copy of the key, like `header`.
     finder: memchr::memmem::Finder<'static>,
-    /// When this key's last auth failure (a 401, or a 403 naming the key) cools off, in ms since [`clock_ms`]'s epoch; 0
-    /// when it has none. A cooling key is skipped as a request's *first* key, so traffic stops
-    /// paying a round trip to a revoked key on every request. Shared across requests; relaxed
+    /// When this key's last refusal (a 401, a 403 naming the key, or an out-of-credit answer:
+    /// D180) cools off, in ms since [`clock_ms`]'s epoch; 0 when it has none. A cooling key is
+    /// skipped as a request's *first* key, and a provider whose keys all cool is skipped by a
+    /// catalog walk that has another candidate ([`Provider::cooling`]), so traffic stops paying a
+    /// round trip to a revoked or unfunded key on every request. Shared across requests; relaxed
     /// ordering, since a stale read costs only one more walk.
     bad_until_ms: AtomicU64,
 }
@@ -528,7 +530,8 @@ impl PoolAuth {
     }
 }
 
-/// How long a pool key that drew a 401 (or a 403 naming the key) is skipped as a request's first key.
+/// How long a pool key that drew a 401 (or a 403 naming the key, or an out-of-credit answer) is
+/// skipped as a request's first key.
 pub const KEY_COOLDOWN: Duration = Duration::from_secs(60);
 
 /// Monotonic milliseconds since the first call, plus one (so 0 stays "never failed"). Coarse
@@ -591,7 +594,15 @@ impl Provider {
             .unwrap_or(0)
     }
 
-    /// Record that pool key `i` drew a 401 (or a 403 naming the key): later requests start past it for [`KEY_COOLDOWN`].
+    /// Whether every pool key is cooling off from a refusal (see [`Self::mark_key_bad`]). A catalog
+    /// walk leaves such a provider out while another candidate can take the request (D180).
+    pub fn cooling(&self) -> bool {
+        let now = clock_ms();
+        !self.pool_auth.is_empty() && self.pool_auth.iter().all(|k| k.cooling(now))
+    }
+
+    /// Record that pool key `i` was refused (a 401, a 403 naming the key, or an out-of-credit
+    /// answer): later requests start past it for [`KEY_COOLDOWN`].
     pub fn mark_key_bad(&self, i: u8) {
         if let Some(k) = self.pool_auth.get(usize::from(i)) {
             let cooldown = u64::try_from(KEY_COOLDOWN.as_millis()).unwrap_or(u64::MAX);

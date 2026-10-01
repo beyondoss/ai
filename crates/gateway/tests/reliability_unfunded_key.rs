@@ -22,7 +22,6 @@ const OPENAI_NO_QUOTA: &str = r#"{"error":{"message":"You exceeded your current 
 /// claim: REL-4
 /// defect: D180
 #[tokio::test]
-#[ignore = "D180 reproduced: an out-of-credit pool key is retried on every request, never failed over"]
 async fn an_unfunded_pool_key_sends_later_requests_to_the_next_candidate() {
     let (pubkey, sk) = test_keypair(180);
     let key = billing_vkey(&sk, 180);

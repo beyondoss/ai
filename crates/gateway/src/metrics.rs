@@ -208,9 +208,10 @@ pub struct Metrics {
     /// a vendor". This one means "the credential was throttled and another key on the same provider
     /// served" — a 429 is not a vendor outage.
     pub key_walks_total: IntCounter,
-    /// Managed responses where a pool key drew a 401, or a 403 whose body names the key (revoked, invalid). Each one
-    /// cools that key off for later requests; the request itself walks to the next key when there
-    /// is one (also counted on `key_walks_total`). Any rate here means a pool key needs replacing.
+    /// Managed responses where a pool key drew a 401, a 403 whose body names the key (revoked,
+    /// invalid), or an out-of-credit answer (D180). Each one cools that key off for later requests;
+    /// a 401 also walks to the next key when there is one (also counted on `key_walks_total`). Any
+    /// rate here means a pool key needs replacing or its account funding.
     pub key_auth_failures_total: IntCounter,
     /// Catalog walks whose primary came from a live session pin rather than the TTFT rank (see
     /// `smart`'s "Session pins"). Against `ai_requests_total` it is the share of traffic being kept
@@ -341,7 +342,7 @@ impl Metrics {
         ))?;
         let key_auth_failures_total = IntCounter::with_opts(Opts::new(
             "ai_key_auth_failures_total",
-            "Managed responses where a pool key drew a 401, or a 403 naming the key; the key is cooled off for later requests",
+            "Managed responses where a pool key drew a 401, a 403 naming the key, or an out-of-credit answer (D180); the key is cooled off for later requests",
         ))?;
         let full_body_relays_total = IntCounter::with_opts(Opts::new(
             "ai_full_body_relays_total",

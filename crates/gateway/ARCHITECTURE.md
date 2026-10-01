@@ -950,21 +950,29 @@ pool-key scrub (`Redact`, which already rewrites error bodies, before translatio
 cache) also runs `remedy::neutralize` at end of body:
 
 - **What counts.** A `message`, a string `error` (xAI) or OpenRouter's `metadata.raw` containing,
-  case-insensitively, one of: "add your own key", `openrouter.ai/settings` (OpenRouter's shared pool,
-  402 credits, BYOK pages); "check your plan and billing details", `platform.openai.com/account`
-  (OpenAI's `insufficient_quota`, and its organization rate limit, which names Beyond's org id;
-  Gemini uses the same words); "credit balance is too low", `anthropic.com/contact-sales`,
-  `console.anthropic.com/settings` (Anthropic's billing 400, and its organization rate limit, which
-  names Beyond's org id); "purchase more credits", "raise your spending limit", `console.x.ai`
-  (xAI's spent credits or spending limit, which name Beyond's team id); `console.groq.com/settings`
-  (Groq's "Upgrade to Dev Tier"); "insufficient balance" (DeepSeek's 402). And always OpenRouter's
-  `metadata.is_byok`, `limit_source` and `remedy_hint`.
-- **What it becomes.** That `message` (or string `error`) is "The provider is rate-limited upstream;
-  retry later.", a `raw` carrying a remedy is removed (a translation quotes `raw` after the message,
-  so it would repeat), and the three metadata keys are removed. `type`, `code`, `param`,
-  `metadata.provider_name` and the status and headers are kept, so an SDK raises the same typed
-  error and retries on the same `Retry-After`. From a client's side an exhausted provider account
-  is an upstream rate limit: nothing it can change, and it clears without it.
+  case-insensitively, a phrase from one of two lists, and always OpenRouter's `metadata.is_byok`,
+  `limit_source` and `remedy_hint`.
+  - _Out of credit or quota_ (`remedy::UNFUNDED`): "check your plan and billing details",
+    `platform.openai.com/account/billing` (OpenAI's `insufficient_quota`, also matched by that code
+    or type; Gemini uses the same words); "credit balance is too low",
+    `console.anthropic.com/settings` (Anthropic's billing 400); "purchase more credits", "raise your
+    spending limit", `console.x.ai` (xAI's spent credits or spending limit, which name Beyond's team
+    id); "insufficient credits", `openrouter.ai/settings/credits` (OpenRouter's 402); "insufficient
+    balance" (DeepSeek's 402).
+  - _Other account advice_ (`remedy::REMEDIES`): "add your own key", `openrouter.ai/settings`
+    (OpenRouter's shared pool, its key and BYOK pages); `platform.openai.com/account` (OpenAI's
+    organization rate limit, which names Beyond's org id); `anthropic.com/contact-sales` (Anthropic's
+    organization rate limit, which names Beyond's org id); `console.groq.com/settings` (Groq's
+    "Upgrade to Dev Tier").
+- **What it becomes.** The message says what the error is, without the account behind it. A rate
+  limit (a 429 that is not out of credit) reads "The provider is rate-limited upstream; retry
+  later.": waiting clears it. Out of credit or quota, whatever its status (Anthropic's is a 400,
+  OpenAI's a 429), or account advice on any other status, reads "The provider cannot serve this
+  request right now; retry later or use another model.": true without saying why, and a retry is
+  served, since the walk now leaves that provider out (D180, below). A `raw` carrying a phrase is
+  removed (a translation quotes `raw` after the message, so it would repeat), and the three metadata
+  keys are removed. `type`, `code`, `param`, `metadata.provider_name` and the status and headers are
+  kept, so an SDK raises the same typed error and retries on the same `Retry-After`.
 - **What does not count.** Anything the client can act on carries none of those phrases and is
   relayed as sent: a context overflow, an unknown or invalid parameter, a content-policy refusal, a
   plain rate limit, OpenRouter quoting an upstream's own error. An OpenAI organization rate limit
@@ -1961,8 +1969,20 @@ Two deliberate non-cases, plus one same-provider retry:
   body, or the `FullBody` re-run). The candidate takes the ranker's failure penalty and is never pinned, so one revoked key
   cannot black-hole a row by answering fastest. It is **not** a breaker failure: the provider
   answered, so its permit resolves as a success. When every candidate fails this way, the last
-  candidate's own status is relayed. An OpenAI `429` with `insufficient_quota` in its body is not
-  detected (the walk decides on the response head) and stays a key walk.
+  candidate's own status is relayed.
+- **A key that is out of credit is cooled, and the walk leaves its provider out (D180).** A
+  provider can say "unfunded" under a status the head cannot tell from the request's fault or a
+  rate limit: Anthropic's credit-balance `400`, OpenAI's `insufficient_quota` `429`. The walk decides
+  on the response head, which reaches the client before the first body byte is read, so that
+  request is relayed (its message rewritten, above). `Redact` reads the body
+  (`remedy::Neutralized::unfunded`), and `logging` cools that key as a `401` is cooled
+  (`ai_key_auth_failures_total`). A catalog walk then leaves out every candidate whose provider has
+  all its keys cooling (`Provider::cooling`) while another candidate can take the request, so the
+  next request goes to the row's next candidate for `KEY_COOLDOWN` instead of failing on the same
+  account; when nothing else can, the cooled provider is tried and its answer relayed. The same
+  holds for a provider whose keys all drew a `401`. A provider with several keys that are all out
+  of credit is cooled one key per relayed answer (a key walk abandons the earlier keys' bodies
+  unread).
 - **When every candidate 5xxes, the client gets the last provider's own status**, not a synthetic
   error. Better diagnostics than an exhausted retry loop produces.
 
@@ -2377,6 +2397,7 @@ already gone gets nothing, and a response that has started cannot be replaced.
 | Provider alive but silent (no head yet, or a quiet gap: a model thinking without emitting) | Never cut before `read_timeout_secs` (600s), the clients' own default timeout: the gateway cannot tell thinking from stuck, so it does not guess. Then a JSON 504 (`upstream timed out after receiving the request`), not resent. No total deadline: a stream that keeps sending lives until it ends.                                                                                                                                                                                                                                                                                                                                                      | Client timeout or retry.                                                                                                                                                                                                                                                                                                 |
 | Provider brownout (sustained 5xx)                                                          | After `circuit_breaker_threshold` 5xx/connect failures in the window that are also at least half its outcomes (so a 50% brownout counts), the breaker opens; requests fast-fail 503 (`circuit_open`) instead of stalling against the read timeout.                                                                                                                                                                                                                                                                                                                                                                                                         | Auto: after `circuit_breaker_reset_secs` a half-open probe is admitted — success closes the breaker, failure reopens it. Per-provider, so other providers are unaffected.                                                                                                                                                |
 | Provider throttles (429 storm)                                                             | Walk the next unused pool key on the same provider when the body is replayable; the last 429 is relayed with `Retry-After` if the upstream sent one. Does **not** trip the breaker (provider is healthy). Does **not** fail over to another vendor.                                                                                                                                                                                                                                                                                                                                                                                                        | Client `Retry-After` backoff after keys are exhausted; no gateway-side circuit action.                                                                                                                                                                                                                                   |
+| Pool key out of credit (a credit-balance 400, `insufficient_quota`)                        | Relayed with a neutral message (the head is relayed before the body says why), the key cooled off for 60s (`ai_key_auth_failures_total`); a catalog walk leaves the provider out while all its keys cool, so later requests go to the row's next candidate (D180). Not a breaker failure.                                                                                                                                                                                                                                                                                                                                                                  | Fund the account or replace the key; the warn line `pool key is out of credit` names provider and key index.                                                                                                                                                                                                             |
 | Pool key revoked (401)                                                                     | Walk the next pool key on the same provider when the body is replayable, and cool the refused key off for 60s so later requests start on a good one (`ai_key_auth_failures_total`). The last key's 401 is relayed on a provider route, a candidate failure on a catalog walk. A 403 never walks or cools (a catalog walk fails over on it), except that one whose body names the key cools it. Not a breaker failure.                                                                                                                                                                                                                                      | Replace the key in config; the metric says which provider (log line names the key index).                                                                                                                                                                                                                                |
 | Response body > 128KB before usage chunk                                                   | Tail compaction fires: `drain(..half)` discards first half, keeps tail. Usage extracted from retained tail.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                | No action — SSE usage is always in the final `data:` line, which always lands in the tail.                                                                                                                                                                                                                               |
 | Client cancels mid-request (ESC on a slow turn)                                            | Relayed as a downstream abort. **Not** counted against the provider's breaker — pingora tags it `ErrorSource::Downstream`. A streaming 2xx cut short this way is billed an estimate (`usage_estimated=true`), not zero. The tenant slot is released.                                                                                                                                                                                                                                                                                                                                                                                                       | None. `tests/cancellation.rs` pins the breaker halves; `tests/cut_short.rs` the billing.                                                                                                                                                                                                                                 |
@@ -2421,7 +2442,7 @@ Prometheus on the default registry, exposed at `/metrics` on `metrics_listen`.
 | `ai_smart_rank_scope`                 | Gauge     | `kind`               | Constant `1` with `kind="process"`: this pod's TTFT EWMA, not a fleet-wide ranking                                                                                         |
 | `ai_candidate_failovers_total`        | Counter   | —                    | Model-routed requests that abandoned a candidate for the next one                                                                                                          |
 | `ai_key_walks_total`                  | Counter   | —                    | Managed 429s and 401s that retried the same provider with the next unused pool key                                                                                         |
-| `ai_key_auth_failures_total`          | Counter   | —                    | Managed responses where a pool key drew a 401, or a 403 whose body names the key; that key is cooled off for 60s. Any rate means a pool key needs replacing                |
+| `ai_key_auth_failures_total`          | Counter   | —                    | A pool key drew a 401, a 403 naming the key, or an out-of-credit answer (D180); that key is cooled off for 60s. Any rate means a key needs replacing or funding            |
 | `ai_session_pinned_total`             | Counter   | —                    | Catalog walks whose primary came from a session pin instead of the TTFT rank                                                                                               |
 | `ai_full_body_relays_total`           | Counter   | —                    | Managed requests re-run as a subrequest because routing needed the whole body past 64 KiB                                                                                  |
 | `ai_model_header_body_mismatch_total` | Counter   | —                    | Catalog-walk requests whose `x-beyond-model` and body `model` disagreed (header wins; client bug)                                                                          |

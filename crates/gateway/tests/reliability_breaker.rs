@@ -396,7 +396,8 @@ async fn a_probe_with_no_provider_outcome_leaves_the_breaker_half_open() {
 }
 
 /// A pool key failing on every candidate relays the last candidate's own 401, and never opens a
-/// breaker: the providers answered, so the next request still reaches them.
+/// breaker: the providers answered, so the next request still reaches them. The one whose every
+/// key drew a 401 is cooled, so that request skips it while another candidate remains (D180).
 /// claim: REL-4
 /// defect: D10
 #[tokio::test]
@@ -431,7 +432,11 @@ async fn a_401_on_every_candidate_is_relayed_and_opens_no_breaker() {
         503,
         "a key failure opened a breaker"
     );
-    assert_eq!(primary.hits() + fallback.hits(), 4);
+    assert_eq!(
+        (primary.hits(), fallback.hits()),
+        (1, 2),
+        "the cooled 401 provider is skipped, the other still reached"
+    );
 }
 
 /// A complete OpenAI chat answer.

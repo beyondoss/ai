@@ -508,11 +508,15 @@ pub struct RequestCtx {
 /// **Account remedy.** A JSON error (`whole`) is held until its end, at most
 /// [`remedy::MAX_BODY`], and handed to [`remedy::neutralize`] after the key is masked: "add your
 /// own key", a billing page and the like become a neutral message (`response_filter` dropped the
-/// `Content-Length`, since that changes the length). Past the cap it streams as above.
+/// `Content-Length`, since that changes the length). Past the cap it streams as above. An
+/// out-of-credit answer sets `unfunded`, which `logging` reads to cool the key (D180).
 #[derive(Default)]
 struct Redact {
     carry: Vec<u8>,
     whole: bool,
+    /// The response's status: whether a remedy reads as a rate limit (see [`remedy::neutralize`]).
+    status: u16,
+    unfunded: bool,
 }
 
 /// What a scrubbed pool key reads as. Same length as the key (padded with `*`), truncated when the
@@ -548,8 +552,9 @@ impl Redact {
             mask_all(&mut buf, key);
         }
         if self.whole {
-            if let Some(b) = remedy::neutralize(&buf) {
-                buf = b;
+            if let Some(n) = remedy::neutralize(&buf, self.status) {
+                buf = n.body;
+                self.unfunded = n.unfunded;
             }
         } else if !end_of_stream {
             let keep = key.map_or(0, |k| k.needle().len() - 1).min(buf.len());
@@ -3781,12 +3786,16 @@ impl ProxyHttp for AiProxy {
                 // sub-resource. Computed before ranking so the probe only promotes an arm that can
                 // actually take the request (D119); the usable mask below is this, by walk slot.
                 let mut dispatchable = 0u8;
+                // Bit `orig` ⇒ every pool key of that arm's provider is cooling off from a refusal
+                // (a 401, an out-of-credit answer): left out below while another arm can serve.
+                let mut cooling = 0u8;
                 for (orig, c) in arms.iter().enumerate().take(route::MAX_CANDIDATES) {
                     let orig = orig as u8;
-                    let keyed = self
-                        .state
-                        .provider_by_id(c.provider)
-                        .is_some_and(|p| p.has_pool_key());
+                    let provider = self.state.provider_by_id(c.provider);
+                    let keyed = provider.is_some_and(|p| p.has_pool_key());
+                    if provider.is_some_and(|p| p.cooling()) {
+                        cooling |= 1 << orig;
+                    }
                     // A re-run of a large body skips the candidates earlier attempts failed on. A
                     // key walk in progress is not a filter: its candidate goes first below
                     // (`FullBody::resume`), and the rest stay for failover (D81).
@@ -3813,6 +3822,12 @@ impl ProxyHttp for AiProxy {
                     .fold(0u8, |m, orig| m | (1 << orig));
                 if dispatchable & walked & !unserved != 0 {
                     dispatchable &= !unserved;
+                }
+                // A provider whose every key was refused within `KEY_COOLDOWN` (revoked, or out of
+                // credit: D180) is not sent to while another candidate can take the request; when
+                // none can, it is tried anyway, and its own answer is the client's.
+                if dispatchable & walked & !cooling != 0 {
+                    dispatchable &= !cooling;
                 }
                 if self.state.config.smart_router
                     && sub.is_none()
@@ -5305,8 +5320,9 @@ impl ProxyHttp for AiProxy {
                     .is_some_and(|a| !a.finder().needle().is_empty());
                 if whole || keyed {
                     rc.redact = Some(Box::new(Redact {
-                        carry: Vec::new(),
                         whole,
+                        status,
+                        ..Redact::default()
                     }));
                 }
             }
@@ -5985,6 +6001,22 @@ impl ProxyHttp for AiProxy {
             // This request already answered; it does not walk.
             if rc.managed && rc.upstream_status == Some(403) && body_names_the_key(tail) {
                 self.state.metrics.key_auth_failures_total.inc();
+                rc.provider.mark_key_bad(rc.pool_key);
+            }
+            // A relayed managed error that says the account is out of credit or quota (Anthropic's
+            // credit-balance 400, OpenAI's insufficient_quota 429: read from the body by `Redact`)
+            // is that key refused until someone pays, which waiting does not fix. Cool it as a 401
+            // is cooled: later requests start past it, and a catalog walk leaves the provider out
+            // once all its keys cool (D180). This request already answered.
+            if rc.managed && rc.redact.as_ref().is_some_and(|r| r.unfunded) {
+                self.state.metrics.key_auth_failures_total.inc();
+                warn!(
+                    request_id = %rc.request_id,
+                    provider = rc.provider.name.as_str(),
+                    key = rc.pool_key,
+                    status = rc.upstream_status.unwrap_or(0),
+                    "pool key is out of credit; cooling it",
+                );
                 rc.provider.mark_key_bad(rc.pool_key);
             }
             // Extract usage facts (shape depends on dialect + streaming). Every case reads the tail;
@@ -7117,8 +7149,9 @@ mod tests {
             k = std::str::from_utf8(raw).unwrap()
         );
         let mut r = Redact {
-            carry: Vec::new(),
             whole: true,
+            status: 429,
+            ..Redact::default()
         };
         for c in remedy.as_bytes().chunks(5) {
             let got = r.feed(Some(key), Some(Bytes::copy_from_slice(c)), false);
@@ -7129,7 +7162,7 @@ mod tests {
             &out[..],
             format!(
                 r#"{{"error":{{"code":429,"message":"{}"}}}}"#,
-                remedy::NEUTRAL
+                remedy::RATE_LIMITED
             )
             .as_bytes()
         );
@@ -7139,8 +7172,9 @@ mod tests {
             k = std::str::from_utf8(raw).unwrap()
         );
         let mut r = Redact {
-            carry: Vec::new(),
             whole: true,
+            status: 429,
+            ..Redact::default()
         };
         let mut out = r
             .feed(
