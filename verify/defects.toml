@@ -45,10 +45,10 @@ impact = "On /{provider}/… the bai_ key goes to the provider in the URL. Pingo
 confidence = "high"
 evidence = "proxy.rs:1001, 1704-1712; pingora request_summary"
 claims = ["SEC-3", "SEC-4"]
-state = "suspected"
-test = ""
-fix = ""
-note = ""
+state = "fixed"
+test = "a_managed_query_key_is_not_forwarded_upstream"
+fix = "0553b88"
+note = "Managed ?key= is stripped from the forwarded path (other params kept); request_summary logs the path without its query."
 
 [[defect]]
 id = "D04"
@@ -59,10 +59,10 @@ impact = "openai-project and openai-organization can switch the project or org o
 confidence = "med-high"
 evidence = "upstream_request_filter strips only auth and control headers"
 claims = ["SEC-6"]
-state = "suspected"
-test = ""
-fix = ""
-note = ""
+state = "fixed"
+test = "managed_requests_forward_only_allowlisted_client_headers"
+fix = "494cead"
+note = "Managed requests forward only an allowlist of client headers; anthropic-beta is filtered to known-safe tokens (ARCHITECTURE.md lists them). BYO untouched."
 
 [[defect]]
 id = "D05"
@@ -395,10 +395,10 @@ impact = "bai_v1.01… and bai_v1.+1… are the same identity, but each gets its
 confidence = "high"
 evidence = "key.rs:164; ratelimit.rs"
 claims = ["SEC-12"]
-state = "suspected"
-test = ""
-fix = ""
-note = ""
+state = "fixed"
+test = "only_the_canonical_kid_spelling_verifies"
+fix = "8306a79"
+note = "verify rejects any kid that is not digits-only with no leading zero."
 
 [[defect]]
 id = "D29"
@@ -409,10 +409,10 @@ impact = "x-api-key: junk plus Bearer bai_… is treated as BYO and the bai_ key
 confidence = "med"
 evidence = "proxy.rs:997-1001"
 claims = ["SEC-11"]
-state = "suspected"
-test = ""
-fix = ""
-note = ""
+state = "fixed"
+test = "mixed_credentials_never_forward_a_virtual_key"
+fix = "0553b88"
+note = "A managed key in any credential location makes the request managed, so every location is stripped; empty values count as absent."
 
 [[defect]]
 id = "D30"
@@ -423,10 +423,10 @@ impact = "Anthropic SDK calls to /v1/files or models.retrieve go to api.openai.c
 confidence = "med-high"
 evidence = "proxy.rs:1468-1475"
 claims = ["SEC-11"]
-state = "suspected"
-test = ""
-fix = ""
-note = ""
+state = "fixed"
+test = "a_byo_anthropic_key_on_bare_v1_never_reaches_openai"
+fix = "0553b88"
+note = "Bare /v1 BYO with a non-managed x-api-key routes to Anthropic on every path (404 if no Anthropic provider is configured)."
 
 [[defect]]
 id = "D31"
@@ -437,10 +437,10 @@ impact = "Within a tenant, a gpt-5 request can get the cached gpt-5-mini answer.
 confidence = "high"
 evidence = "cache.rs key()"
 claims = ["SEC-14"]
-state = "suspected"
-test = ""
-fix = ""
-note = ""
+state = "fixed"
+test = "the_same_body_on_another_row_is_a_cache_miss"
+fix = "acb3f00"
+note = "Cache key adds the method, the resolved catalog row, and every anthropic-version / anthropic-beta value."
 
 [[defect]]
 id = "D32"
@@ -451,10 +451,10 @@ impact = "Oversized or stalled uploads count as upstream failures, so every tena
 confidence = "med"
 evidence = "proxy.rs:1060, 3256"
 claims = ["SEC-16"]
-state = "suspected"
-test = ""
-fix = ""
-note = ""
+state = "fixed"
+test = "client_upload_failures_do_not_open_the_breaker"
+fix = "cc6c51f"
+note = "Body-cap abort is tagged Downstream (413); an upstream error while the client body is still arriving is not a breaker failure."
 
 [[defect]]
 id = "D33"
@@ -465,10 +465,10 @@ impact = "Over H1 upstream, /openai/v1/realtime is relayed and nothing is billed
 confidence = "low-med"
 evidence = "no upgrade rejection"
 claims = ["SEC-20"]
-state = "suspected"
-test = ""
-fix = ""
-note = ""
+state = "fixed"
+test = "a_managed_upgrade_is_refused_before_the_upstream"
+fix = "7c54740"
+note = "A managed request carrying Upgrade is a 400 on any path before any upstream contact."
 
 [[defect]]
 id = "D34"
@@ -479,10 +479,10 @@ impact = "{\"model\":\"cheap\",\"model\":\"o1-pro\"} routes as the cheap row and
 confidence = "med"
 evidence = "peek.rs first-span rewrite"
 claims = ["SEC-21"]
-state = "suspected"
-test = ""
-fix = ""
-note = ""
+state = "fixed"
+test = "a_body_with_two_root_model_keys_is_refused_on_a_catalog_walk"
+fix = "23dbef3"
+note = "scan_buffered counts root model keys (escape-aware); a catalog walk with two aborts with 400 before any body byte goes upstream."
 
 [[defect]]
 id = "D35"
@@ -745,10 +745,10 @@ impact = "Pool key header not marked sensitive. Cleartext upstream gets no warni
 confidence = "high"
 evidence = "route.rs:377; state.rs:284"
 claims = ["SEC-8", "SEC-22"]
-state = "suspected"
-test = ""
-fix = ""
-note = ""
+state = "fixed"
+test = "upstream_x_beyond_headers_never_reach_the_client"
+fix = "da0a968"
+note = "Pool key header marked sensitive, upstream x-beyond-* response headers stripped, cleartext-upstream boot warning. Not changed: x-beyond-capture is the documented caller opt-in; metrics bind is operator config."
 
 [[defect]]
 id = "D54"
