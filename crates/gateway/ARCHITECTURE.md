@@ -407,8 +407,10 @@ Responses-only tools (Codex's `namespace` groups and `custom` grammars) pass thr
 5xx may walk another Responses candidate; it never walks onto Chat Completions/Messages. Rows with
 no Responses arm (Claude, DeepSeek, …) translate a one-shot and have no OpenAI store: an
 **omitted** `store` there is the stock `responses.create()` call and translates as a one-shot, while
-an explicit `store: true` or a `previous_response_id` is a **400** naming the field, not a hollow
-Messages call. Usage/billing still parse the upstream body/SSE;
+an explicit `store: true`, a `previous_response_id` or a `conversation` is a **400** naming the
+field, not a hollow Messages call. A `conversation` (the Conversations API) is the same OpenAI-held
+history `previous_response_id` points into, so it is session state too: relayed on a row's
+Responses arm, refused elsewhere, never translated with the history dropped (D128). Usage/billing still parse the upstream body/SSE;
 `ai.usage.model` is what the provider echoed. Same-wire Responses (`/{provider}/v1/responses`)
 stays a byte relay. `/{provider}/…` never translates.
 
@@ -619,7 +621,8 @@ Files API image, a non-base64 data URI, `n` > 1, `logprobs`, audio output, Anthr
 Anthropic-defined tools (`web_search_…`, `bash_…`, `text_editor_…`: as an empty-schema function the
 model would call one and nothing would run it), Responses hosted tools (`file_search`, `mcp`,
 …), a Chat Completions client's `custom` tools onto Messages, `mcp_servers`, a Responses `prompt`
-template, `stop` onto Responses, and Responses input items with no Chat Completions shape
+template and `top_logprobs` (onto Chat Completions and, through the intermediate Chat body, onto
+Messages: D129), `stop` onto Responses, and Responses input items with no Chat Completions shape
 (`computer_call_output`, `local_shell_call`, …, forwarded whole in their place in `messages`), and
 a message whose role no dialect has (a typo, a framework's private role: forwarded whole, in place,
 role unchanged, never turned into a user turn) have no equivalent on the other wire and change what
@@ -2356,7 +2359,8 @@ Prometheus on the default registry, exposed at `/metrics` on `metrics_listen`.
   candidate. **Responses** (`tests/translate.rs`): a stock `/v1/responses` body with `store: false`
   and a GPT catalog id is translated onto Chat Completions; the same body with `claude-*` lands on
   Messages. Managed `/v1/responses` + `gpt-4o` + `previous_response_id` hits OpenAI `/v1/responses`
-  with the field intact; Claude + `previous_response_id` is 400 naming the field, no upstream;
+  with the field intact; Claude + `previous_response_id` is 400 naming the field, no upstream
+  (`responses_session_field` classes a `conversation` the same way);
   `/{provider}/v1/responses` stays a relay. `ai.usage` still comes from the upstream parser. `GET /v1/models` lists the catalog, a candidate
   spelling is an alias, BYO on
   `/auto` → 400, BYO on `/v1` still forwarded, `/openai/…` ignoring the catalog, a stock SDK shape

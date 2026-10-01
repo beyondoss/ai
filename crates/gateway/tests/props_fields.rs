@@ -130,21 +130,6 @@ fn excused(body: &Value, field: &str) -> bool {
     }
 }
 
-/// Fields dropped today although they change the answer. Excluded while their defect is open;
-/// `props_regressions` reproduces each.
-fn open_defect(from: Endpoint, to: Endpoint, field: &str) -> bool {
-    matches!(
-        (from, to, field),
-        // D128: a Responses `conversation` is session state, but it is neither relayed nor
-        // refused: it is dropped, and the model answers without the conversation.
-        (Endpoint::Responses, _, "conversation")
-            // D129: Responses options that change the answer vanish off Responses: `top_logprobs`
-            // everywhere, the `prompt` template onto Messages (it is forwarded onto Chat).
-            | (Endpoint::Responses, _, "top_logprobs")
-            | (Endpoint::Responses, Endpoint::Messages, "prompt")
-    )
-}
-
 fn request_of(d: Endpoint) -> BoxedStrategy<Value> {
     match d {
         Endpoint::ChatCompletions => chat_request().prop_map(|r| r.body).boxed(),
@@ -185,7 +170,7 @@ fn prop_answer_changing_fields_are_never_silently_dropped() {
         case(),
         |(from, to, body, which)| {
             let (field, value) = answer_fields(from)[which].clone();
-            prop_assume!(!excused(&body, field) && !open_defect(from, to, field));
+            prop_assume!(!excused(&body, field));
             let mut without = body.clone();
             if let Some(m) = without.as_object_mut() {
                 m.remove(field);

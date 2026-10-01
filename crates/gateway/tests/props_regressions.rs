@@ -37,7 +37,6 @@ fn usage_with_boundary_counts_never_panics() {
 /// claim: S2
 /// defect: D124
 #[test]
-
 fn nothing_reaches_the_client_after_its_terminal_event() {
     // Chat upstream → Messages client: an error between the usage chunk and `[DONE]`.
     let chat = concat!(
@@ -205,7 +204,6 @@ fn tool_argument_numbers_keep_their_value() {
 /// claim: E3
 /// defect: D128
 #[test]
-#[ignore = "D128 reproduced: a Responses conversation is dropped, not relayed or refused"]
 fn a_responses_conversation_is_session_state() {
     let body = br#"{"model":"m","input":"What did I just say?","store":false,"conversation":"conv_abc123"}"#;
     for arm in [true, false] {
@@ -223,7 +221,6 @@ fn a_responses_conversation_is_session_state() {
 /// claim: TRN-21
 /// defect: D129
 #[test]
-#[ignore = "D129 reproduced: a Responses prompt template (onto Messages) and top_logprobs vanish"]
 fn responses_answer_options_are_never_dropped() {
     let cases = [
         (

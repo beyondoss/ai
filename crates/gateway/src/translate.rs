@@ -28,7 +28,7 @@
 //!   back and have no equivalent on the target (`input_audio`, a `file_id` or URL document or
 //!   image, a non-base64 data URI, `n` > 1, `logprobs`, audio output, `stop` onto Responses or a
 //!   model that rejects it, hosted / server / `custom` tools, `mcp_servers`, a Responses `prompt`
-//!   template, a Responses input item with no Chat Completions shape such as `item_reference` or
+//!   template and `top_logprobs`, a Responses input item with no Chat Completions shape such as `item_reference` or
 //!   `computer_call_output`; records of a hosted tool the provider ran are dropped). An explicit
 //!   `null` is "not set" and is never forwarded. Translation runs after the request headers went upstream, so the gateway cannot 400
 //!   here; passing the field through gets the provider's 400 naming it, instead of an answer about
@@ -689,7 +689,9 @@ fn openai_req_to_anthropic(v: &Value, claude: ClaudeModel) -> (Value, bool) {
     }
     // No Anthropic equivalent, and each changes what the client gets back. Forwarded verbatim so
     // the provider rejects them by name; dropping them would answer a different question.
-    for key in ["audio", "web_search_options", "top_logprobs"] {
+    // `prompt` is a Responses client's stored template, carried here by the intermediate Chat
+    // body of a Responses → Messages walk.
+    for key in ["audio", "web_search_options", "top_logprobs", "prompt"] {
         copy_if(&mut out, v, key);
     }
     if v.get("n").and_then(Value::as_u64).is_some_and(|n| n > 1) {
@@ -2438,7 +2440,10 @@ fn copy_if(out: &mut Map<String, Value>, v: &Value, key: &str) {
 
 /// Root-level Responses session field that cannot be honored off `/v1/responses`.
 ///
-/// `None` means the body is a one-shot: `store: false` and no `previous_response_id`. An omitted
+/// `None` means the body is a one-shot: `store: false`, no `previous_response_id` and no
+/// `conversation` (the Conversations API: the request continues a conversation whose items OpenAI
+/// holds, the same state `previous_response_id` points into, so it is relayed or refused the same
+/// way, never translated with the history dropped). An omitted
 /// (or `null`) `store` is OpenAI's default `true`, so it is session state only where the row has a
 /// Responses arm to keep it (`responses_arm`); elsewhere it is the stock `responses.create()` call,
 /// which translates rather than 400s. Unparseable JSON is `Some("store")` so a catalog walk
@@ -2450,10 +2455,22 @@ pub fn responses_session_field(body: &[u8], responses_arm: bool) -> Option<&'sta
     if previous_response_id_set(&v) {
         return Some("previous_response_id");
     }
+    if conversation_set(&v) {
+        return Some("conversation");
+    }
     match v.get("store") {
         Some(Value::Bool(false)) => None,
         Some(Value::Null) | None => responses_arm.then_some("store"),
         _ => Some("store"),
+    }
+}
+
+/// A `conversation` is an id string or `{"id": …}`; an empty id or `null` is not set.
+fn conversation_set(v: &Value) -> bool {
+    match v.get("conversation") {
+        Some(Value::String(s)) => !s.is_empty(),
+        Some(Value::Null) | None => false,
+        Some(_) => true,
     }
 }
 
@@ -3684,9 +3701,13 @@ fn responses_req_to_openai(v: &Value, up: Upstream, wrap_custom: bool) -> Value 
             out.insert("verbosity".into(), verbosity.clone());
         }
     }
-    // A stored prompt template decides what the model is asked. Chat Completions has no
-    // equivalent: forwarded for the provider to reject by name.
-    copy_if(&mut out, v, "prompt");
+    // A stored prompt template decides what the model is asked, and `top_logprobs` what the
+    // client gets back. Neither maps (Chat Completions' `top_logprobs` needs `logprobs`, whose
+    // answer a translated client is never shown): forwarded for the provider to reject by name,
+    // and onward by `openai_req_to_anthropic` when this body is bound for Messages.
+    for key in ["prompt", "top_logprobs"] {
+        copy_if(&mut out, v, key);
+    }
     // Responses nests the output format under `text.format` and flattens `json_schema`.
     if let Some(format) = v.pointer("/text/format") {
         let rf = match format.get("type").and_then(Value::as_str) {
