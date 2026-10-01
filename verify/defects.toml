@@ -2105,5 +2105,5 @@ evidence = "live 2026-10-01 final run (target/final-live5.log): CAT-6::raw::open
 claims = ["CAT-6"]
 state = "fixed"
 test = "a_tool_request_on_a_tool_less_row_is_refused_before_any_upstream"
-fix = "PENDING"
+fix = "dd28b44"
 note = "Fixed by dropping tools from the card (glm_5_3_flash_advertises_no_tools), and by the gateway refusing a request that offers tools on a row whose card lists none: a 400 \"z-ai/glm-5.3-flash does not accept tools\" before any upstream (route::refused_input, as for an image on a text-only row), since dropping the bit alone left both candidates serving tool calls (CAT-6 re-run: \"card omits tools, but the candidate called one\"). A refusal table that skips one candidate for tool requests (as REFUSES_STRUCTURED_OUTPUTS does for schemas, D155) would have left the other, equally unreliable one. Plain, reasoning and structured-output requests still use both candidates; an empty tools array is served. GLM 5.3, on the same two hosts, keeps tools. The other tool-less rows (Llama 4 Scout, grok-4.20-multi-agent) now get the gateway's 400 instead of their provider's own 4xx."
