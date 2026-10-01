@@ -788,6 +788,15 @@ fn openai_req_to_anthropic(v: &Value, claude: ClaudeModel) -> (Value, bool) {
     {
         out.remove("thinking");
     }
+    // The inverse: with thinking off, the final assistant turn may not hold thinking (a replay of
+    // the gateway's minted reasoning, D79). Earlier turns keep theirs; the API ignores them.
+    let thinking = out
+        .get("thinking")
+        .and_then(|t| t.get("type"))
+        .and_then(Value::as_str);
+    if thinking.map_or(claude.omitted_thinking_off, |t| t == "disabled") {
+        strip_final_assistant_thinking(&mut messages);
+    }
     if !system_parts.is_empty() {
         out.insert("system".into(), anthropic_system_value(system_parts));
     }
@@ -876,24 +885,41 @@ fn claude_chat_reasoning_guard(mut body: Value, up: Upstream) -> Value {
 /// block only from `reasoning_details`; a client that sends none back for that turn (pi, the stock
 /// OpenAI SDK, LangChain: a plain `reasoning` string at most) gets the request without reasoning,
 /// which Anthropic accepts. `true` when a key was removed.
+///
+/// With reasoning off (never asked for, or dropped here), the final assistant message's (see
+/// [`final_assistant`]) replayable thinking goes too: Anthropic rejects thinking in the final assistant message when thinking is
+/// disabled (D79), and OpenRouter replays `reasoning_details` as thinking whatever the request
+/// asked for.
 fn drop_unreplayable_chat_reasoning(out: &mut Map<String, Value>) -> bool {
-    if !CHAT_REASONING_KEYS
+    let on = CHAT_REASONING_KEYS
         .iter()
-        .any(|k| out.get(*k).is_some_and(reasoning_value_on))
+        .any(|k| out.get(*k).is_some_and(reasoning_value_on));
+    let lacks = on
+        && out
+            .get("messages")
+            .and_then(Value::as_array)
+            .is_some_and(|ms| chat_tool_turn_lacks_reasoning(ms));
+    if on && !lacks {
+        return false;
+    }
+    let mut changed = false;
+    if lacks {
+        for k in CHAT_REASONING_KEYS {
+            out.remove(k);
+        }
+        changed = true;
+    }
+    let is_tool = |m: &Value| m.get("role").and_then(Value::as_str) == Some("tool");
+    if let Some(m) = out
+        .get_mut("messages")
+        .and_then(Value::as_array_mut)
+        .and_then(|ms| final_assistant(ms, is_tool).and_then(|at| ms.get_mut(at)))
+        .and_then(Value::as_object_mut)
     {
-        return false;
+        changed |= m.remove("reasoning_details").is_some();
+        changed |= m.remove("thinking").is_some();
     }
-    let lacks = out
-        .get("messages")
-        .and_then(Value::as_array)
-        .is_some_and(|ms| chat_tool_turn_lacks_reasoning(ms));
-    if !lacks {
-        return false;
-    }
-    for k in CHAT_REASONING_KEYS {
-        out.remove(k);
-    }
-    true
+    changed
 }
 
 /// Whether a reasoning control's value asks for reasoning: not `null`, `false`, `"none"`,
@@ -957,6 +983,46 @@ pub fn claude_chat_relay_reasoning(body: Vec<u8>) -> Vec<u8> {
         encode(&v)
     } else {
         body
+    }
+}
+
+/// The index of the final assistant message: the last assistant message, when nothing but tool
+/// results follow it (the turn still in progress, a tool loop or a prefill). An assistant message
+/// a user has answered is history.
+fn final_assistant(messages: &[Value], is_tool_result: impl Fn(&Value) -> bool) -> Option<usize> {
+    let at = messages
+        .iter()
+        .rposition(|m| m.get("role").and_then(Value::as_str) == Some("assistant"))?;
+    messages[at + 1..].iter().all(is_tool_result).then_some(at)
+}
+
+/// Whether a Messages user message carries only `tool_result` blocks.
+fn is_tool_result_message(m: &Value) -> bool {
+    m.get("role").and_then(Value::as_str) == Some("user")
+        && m.get("content")
+            .and_then(Value::as_array)
+            .is_some_and(|bs| {
+                !bs.is_empty()
+                    && bs
+                        .iter()
+                        .all(|b| b.get("type").and_then(Value::as_str) == Some("tool_result"))
+            })
+}
+
+/// Remove `thinking` / `redacted_thinking` blocks from the final assistant message (see
+/// [`final_assistant`]), for a request with thinking off: Anthropic rejects one there ("When
+/// thinking is disabled, an assistant message in the final position cannot contain thinking").
+/// Earlier turns keep theirs, which the API ignores. A message that is nothing but thinking is left
+/// alone; emptied, it would be a different 400.
+fn strip_final_assistant_thinking(messages: &mut [Value]) {
+    let Some(blocks) = final_assistant(messages, is_tool_result_message)
+        .and_then(|at| messages[at].get_mut("content"))
+        .and_then(Value::as_array_mut)
+    else {
+        return;
+    };
+    if blocks.iter().any(|b| !is_thinking_block(b)) {
+        blocks.retain(|b| !is_thinking_block(b));
     }
 }
 
@@ -1460,6 +1526,10 @@ pub(crate) struct ClaudeModel {
     pub(crate) binding_controls: bool,
     /// Whether `thinking: {type: between_tools}` exists: Sonnet 5.5 and later Sonnets only.
     pub(crate) between_tools: bool,
+    /// Whether a request that omits `thinking` runs without it: Claude 4.x and older (4.6, 4.7
+    /// and 4.8 need `adaptive` set explicitly). Claude 5 and later, Fable and Mythos think when it
+    /// is omitted.
+    pub(crate) omitted_thinking_off: bool,
 }
 
 impl ClaudeModel {
@@ -1470,6 +1540,7 @@ impl ClaudeModel {
             mid_system: false,
             binding_controls: false,
             between_tools: false,
+            omitted_thinking_off: true,
         };
         let Some(at) = model.find("claude-") else {
             return NOT_CLAUDE;
@@ -1481,6 +1552,7 @@ impl ClaudeModel {
             mid_system: true,
             binding_controls: first_party,
             between_tools: false,
+            omitted_thinking_off: false,
         };
         let mut parts = model[at + "claude-".len()..].split(['-', '.']);
         let family = parts.next().unwrap_or("");
@@ -1511,6 +1583,7 @@ impl ClaudeModel {
                 },
                 binding_controls: first_party && version >= (5, 5),
                 between_tools: family == "sonnet" && version >= (5, 5),
+                omitted_thinking_off: version < (5, 0),
             },
             "fable" | "mythos" => ClaudeModel {
                 reasoning: ClaudeGen::Adaptive,
@@ -1518,6 +1591,7 @@ impl ClaudeModel {
                 mid_system: true,
                 binding_controls: first_party && family == "fable" && version >= (5, 1),
                 between_tools: false,
+                omitted_thinking_off: false,
             },
             _ => newest,
         }
@@ -7209,10 +7283,12 @@ mod tests {
         );
     }
 
-    /// Anthropic rejects `cache_control` on a thinking block.
+    /// Anthropic rejects `cache_control` on a thinking block. (Thinking on: with it off, the final
+    /// assistant turn sheds its thinking instead, D79.)
     #[test]
     fn the_conversation_marker_skips_trailing_thinking_blocks() {
         let mut req = oai_req();
+        req["reasoning_effort"] = json!("high");
         req["messages"] = json!([
             {"role": "user", "content": "hi"},
             {"role": "assistant", "content": [
@@ -7768,7 +7844,7 @@ mod tests {
                     {"type": "redacted_thinking", "data": "redacted"},
                     {"type": "text", "text": "hi"}
                 ]
-            }]
+            }, {"role": "user", "content": "and?"}]
         });
         let oai: Value = serde_json::from_slice(&request(
             Endpoint::Messages,

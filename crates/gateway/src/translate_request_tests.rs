@@ -2085,7 +2085,6 @@ fn openai_held_responses_items_are_dropped_only_when_translating() {
 /// claim: TRN-7, W4
 /// defect: D79
 #[test]
-#[ignore = "D79 reproduced: replayed thinking reaches the final assistant turn with thinking off"]
 fn replayed_thinking_leaves_the_final_assistant_turn_when_thinking_is_off() {
     let rs = |n: u32| {
         json!({"type": "reasoning", "id": format!("rs_gw_{n}"),
@@ -2127,10 +2126,16 @@ fn replayed_thinking_leaves_the_final_assistant_turn_when_thinking_is_off() {
     };
 
     // Onto Messages (Anthropic, Bedrock): Haiku 4.5 runs without thinking when it is omitted.
-    for model in ["claude-haiku-4-5", "global.anthropic.claude-haiku-4-5-20251001-v1:0"] {
+    for model in [
+        "claude-haiku-4-5",
+        "global.anthropic.claude-haiku-4-5-20251001-v1:0",
+    ] {
         let off = req(Endpoint::Responses, Endpoint::Messages, &body(None), model);
         let a = assistants(&off, "messages");
-        assert!(msg_thinks(&a[0]), "{model}: an earlier turn keeps its thinking: {off}");
+        assert!(
+            msg_thinks(&a[0]),
+            "{model}: an earlier turn keeps its thinking: {off}"
+        );
         assert!(!msg_thinks(a.last().unwrap()), "{model}: {off}");
         let on = req(
             Endpoint::Responses,
@@ -2138,18 +2143,28 @@ fn replayed_thinking_leaves_the_final_assistant_turn_when_thinking_is_off() {
             &body(Some(json!({"effort": "medium"}))),
             model,
         );
-        assert!(msg_thinks(assistants(&on, "messages").last().unwrap()), "{model}: {on}");
+        assert!(
+            msg_thinks(assistants(&on, "messages").last().unwrap()),
+            "{model}: {on}"
+        );
     }
 
     // Onto OpenRouter Chat: the replay rides `reasoning_details`.
     let model = "anthropic/claude-sonnet-4";
     let off = r2c(&body(None), model);
     let a = assistants(&off, "messages");
-    assert!(a.last().unwrap().get("reasoning_details").is_none(), "{off}");
+    assert!(
+        a.last().unwrap().get("reasoning_details").is_none(),
+        "{off}"
+    );
     assert!(a[0].get("reasoning_details").is_some(), "{off}");
     let on = r2c(&body(Some(json!({"effort": "medium"}))), model);
     assert!(
-        assistants(&on, "messages").last().unwrap().get("reasoning_details").is_some(),
+        assistants(&on, "messages")
+            .last()
+            .unwrap()
+            .get("reasoning_details")
+            .is_some(),
         "{on}"
     );
 
@@ -2164,5 +2179,8 @@ fn replayed_thinking_leaves_the_final_assistant_turn_when_thinking_is_off() {
     ]});
     let relayed = claude_chat_relay_reasoning(serde_json::to_vec(&chat_body).unwrap());
     let relayed: Value = serde_json::from_slice(&relayed).unwrap();
-    assert!(relayed["messages"][1].get("reasoning_details").is_none(), "{relayed}");
+    assert!(
+        relayed["messages"][1].get("reasoning_details").is_none(),
+        "{relayed}"
+    );
 }

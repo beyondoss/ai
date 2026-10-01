@@ -514,7 +514,18 @@ relay and a translated walk alike: when the request asks for reasoning (`reasoni
 `reasoning_details` OpenRouter can replay (a signed `reasoning.text` or an encrypted entry), those
 keys are dropped for that request — pi, the stock OpenAI SDK and LangChain echo at most a plain
 `reasoning` string. A relayed body that never says `reasoning` or `thinking` is not parsed (one
-`memmem` each). Structured output maps
+`memmem` each). The inverse holds too: with thinking off, Anthropic rejects thinking in the final
+assistant message ("When thinking is disabled, an assistant message in the final position cannot
+contain thinking"), which a client replaying the gateway's minted reasoning sends. The final
+assistant message is the last one when only tool results follow it (the turn in progress, or a
+prefill); one a user has answered is history and keeps its thinking, which the API ignores. On a
+walk onto Messages (Anthropic, Bedrock), thinking is off when the request sets `disabled` or omits
+`thinking` on a model that then runs without it (Claude 4.x and older; Claude 5, Fable and Mythos
+think when it is omitted), and that message loses its `thinking` / `redacted_thinking` blocks
+(unless it holds nothing else). Onto a Claude model behind Chat Completions, thinking is off when
+no reasoning key asks for it (or D77's rule dropped them), and that message loses
+`reasoning_details` and the gateway's `thinking` list, on a same-wire relay and a translated walk
+alike. A same-wire Messages relay is the client's body and is not touched. Structured output maps
 `response_format` `json_schema` ↔ `output_config.format` ↔ Responses `text.format`; OpenAI JSON mode
 (`json_object`) has no schema to give Anthropic and is dropped (OpenAI already requires the prompt to
 ask for JSON). Inline PDFs map Chat `file` ↔ Anthropic base64 `document` ↔ Responses `input_file`.
