@@ -33,6 +33,9 @@ A test may claim several claims. The tag lines go directly above the attributes 
 | `refuted`    | `test` passes and `note` records why the behavior was already correct.          |
 | `accepted`   | `note` records the decision, and `test` asserts the behavior as now documented. |
 
+A defect that only a real client can settle (`refuted` or `fixed` by a live cell) names the cell as
+`test = "live:<cell name>"`; the gate checks that cell's outcome in the last live run.
+
 When a reproduction starts passing, the gate stops and asks for the defect to be marked `fixed` or
 `refuted`. This keeps the ledger from saying "broken" after a fix, or "fixed" while the code is
 still broken. An `#[ignore]`d test that reproduces no open defect is also an error. That is the only

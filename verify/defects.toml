@@ -213,10 +213,10 @@ impact = "Claude Code always marks cache breakpoints. If OpenAI rejects the fiel
 confidence = "med-low"
 evidence = "translate.rs:2092, 2152, 2324, 2391"
 claims = ["TRN-10"]
-state = "suspected"
-test = ""
+state = "refuted"
+test = "live:W1::claude-code::gpt::claude-code"
 fix = ""
-note = "Live 2026-10-01 (gateway 4e36708, real OpenAI): Claude Code-shaped Messages requests with cache_control on system/tools/messages and a long JSON metadata.user_id were accepted by gpt-5-mini and gpt-4o-mini, with and without adaptive thinking. Likely refuted; becomes refuted once the live layer carries this as a cell (the gate requires a test)."
+note = "Refuted live: Claude Code (pinned 2.1.286) fixes the fixture repo on gpt-5-mini through the gateway (Messages translated onto native OpenAI Chat), with cache_control and metadata.user_id in its requests; OpenAI accepted every turn. Also checked by hand 2026-10-01 on gpt-5-mini and gpt-4o-mini with and without adaptive thinking."
 
 [[defect]]
 id = "D16"

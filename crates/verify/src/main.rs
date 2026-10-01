@@ -696,6 +696,37 @@ fn gate(ctx: &Ctx, args: &[String], root: &Path) -> bool {
         if d.state == "suspected" {
             continue;
         }
+        // A defect closed by a live cell names it as `live:<cell name>`; the cell's own outcome
+        // decides, and it must have run (live cells only exist under VERIFY_LIVE=1).
+        if let Some(cell) = d.test.strip_prefix("live:") {
+            if d.state == "reproduced" {
+                errors.push(format!(
+                    "{}: a reproduction must be a hermetic #[ignore]d test, not a live cell",
+                    d.id
+                ));
+            }
+            if d.note.trim().is_empty() {
+                errors.push(format!(
+                    "{}: {} by a live cell needs a `note` with the evidence",
+                    d.id, d.state
+                ));
+            }
+            if let Some(r) = results.as_ref() {
+                let outcome = r.get(&(LIVE_BINARY.to_owned(), cell.to_owned())).copied();
+                match outcome {
+                    Some(Outcome::Passed) => {}
+                    Some(Outcome::Failed) => errors.push(format!(
+                        "{}: live cell `{cell}` fails but the defect is {}",
+                        d.id, d.state
+                    )),
+                    _ if std::env::var("VERIFY_LIVE").as_deref() == Ok("1") => {
+                        errors.push(format!("{}: live cell `{cell}` did not run", d.id));
+                    }
+                    _ => {}
+                }
+            }
+            continue;
+        }
         let Some(t) = ctx
             .tagged
             .iter()
