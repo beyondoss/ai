@@ -324,19 +324,17 @@ fn responses_parallel_function_calls_become_one_assistant_message() {
 }
 
 /// Hosted and custom tools used to vanish: the model answered without a tool the client offered.
-/// (Hosted web search is the exception: no Chat Completions host runs it, and Codex always offers
-/// it, so it is dropped; see D78.)
+/// The hosted search is the documented exception (D78, see
+/// `hosted_web_search_is_dropped_leaving_responses_unless_chosen`).
 #[test]
 fn responses_hosted_tools_are_forwarded_and_custom_tools_mapped() {
     let body = json!({"model": "m", "store": false, "input": "x", "tools": [
-        {"type": "web_search"},
         {"type": "file_search", "vector_store_ids": ["vs_1"]},
         {"type": "custom", "name": "apply_patch", "description": "patch", "format": {"type": "text"}},
         {"type": "function", "name": "f", "parameters": {"type": "object", "properties": {}}, "strict": true}
     ]});
     let v = r2c(&body, "gpt-5-nano");
     let tools = v["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 3, "{v}");
     assert_eq!(tools[0]["type"], "file_search");
     assert_eq!(
         tools[1],
@@ -1226,7 +1224,8 @@ fn signed_thinking_crosses_from_every_chat_shape() {
         ]}),
     ] {
         let v = c2m(
-            &chat(json!({"messages": [
+            // Thinking on: a request that does not think drops replayed thinking (D79).
+            &chat(json!({"reasoning_effort": "medium", "messages": [
                 {"role": "user", "content": "2+2?"}, assistant.clone(), {"role": "user", "content": "3+3?"},
             ]})),
             "claude-sonnet-4-5",
@@ -2079,160 +2078,213 @@ fn openai_held_responses_items_are_dropped_only_when_translating() {
     assert_eq!(strip_gateway_reasoning(raw.clone()), raw);
 }
 
-/// A turn the gateway minted from Claude's thinking, replayed by a client whose request has
-/// thinking off: Anthropic rejects thinking in the final assistant message then ("When thinking is
-/// disabled, an assistant message in the final position cannot contain thinking"). Earlier
-/// assistant turns may keep theirs (the API ignores them), and a request with thinking on keeps
-/// everything.
+/// Responses client → a Messages row.
+fn r2m(body: &Value, model: &str) -> Value {
+    req(Endpoint::Responses, Endpoint::Messages, body, model)
+}
+
+/// `responses.create(instructions=None)` sends `instructions: null`: "not set", like every other
+/// null. Onto Chat Completions it became a system message with null content, which xAI (422) and
+/// Together (400) reject.
+/// claim: TRN-15
+/// defect: D102
+#[test]
+fn null_instructions_add_no_system_message() {
+    let body = json!({"model": "m", "store": false, "instructions": null, "input": "hi"});
+    for (what, v) in [
+        ("grok", r2c(&body, "grok-4.3")),
+        (
+            "together",
+            r2c(&body, "meta-llama/Llama-3.3-70B-Instruct-Turbo"),
+        ),
+        ("openai chat", r2c(&body, "gpt-4o-mini")),
+    ] {
+        assert_eq!(roles(&v), ["user"], "{what}: {v}");
+    }
+    let v = r2m(&body, "claude-haiku-4-5");
+    assert!(v.get("system").is_none(), "{v}");
+}
+
+/// A tool turn as a Responses client replays it: the reasoning item the gateway minted, the call it
+/// opened, then the result.
+fn replayed_tool_turn(reasoning: Option<Value>) -> Value {
+    let mut body = json!({"model": "m", "store": false, "input": [
+        {"role": "user", "content": "weather in Paris?"},
+        {"type": "reasoning", "id": "rs_gw18f2c3a4b5d60001", "encrypted_content": "rs_gw:EqQBsig==",
+         "summary": [{"type": "summary_text", "text": "Need weather."}]},
+        {"type": "function_call", "call_id": "toolu_01", "name": "get_weather", "arguments": "{}"},
+        {"type": "function_call_output", "call_id": "toolu_01", "output": "sunny"},
+    ], "tools": [{"type": "function", "name": "get_weather", "parameters": {"type": "object"}}]});
+    if let Some(r) = reasoning {
+        body["reasoning"] = r;
+    }
+    body
+}
+
+fn last_assistant(v: &Value) -> &Value {
+    v["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|m| m["role"] == "assistant")
+        .unwrap()
+}
+
+fn holds_thinking(m: &Value) -> bool {
+    m.get("reasoning_details").is_some()
+        || m.get("thinking").is_some()
+        || m["content"]
+            .as_array()
+            .is_some_and(|bs| bs.iter().any(is_thinking_block))
+}
+
+/// With thinking off, Anthropic on Bedrock (directly, and behind OpenRouter) rejects thinking in the
+/// final turn, every call of a tool loop included: "When thinking is disabled, an `assistant`
+/// message in the final position cannot contain `thinking`" (Anthropic's own API accepts it). A
+/// request that does not think has no use for any of it, so it leaves the assistant messages on
+/// every path to a Claude model. With thinking on it stays (a tool turn must open on it), and an
+/// adaptive-generation model with no reasoning asked still thinks adaptively, so it stays there too.
 /// claim: TRN-7, W4
 /// defect: D79
 #[test]
-fn replayed_thinking_leaves_the_final_assistant_turn_when_thinking_is_off() {
-    let rs = |n: u32| {
-        json!({"type": "reasoning", "id": format!("rs_gw_{n}"),
-            "summary": [{"type": "summary_text", "text": "Need weather."}],
-            "encrypted_content": format!("rs_gw:SIG{n}")})
-    };
-    let call = |id: &str| {
-        json!({"type": "function_call", "call_id": id, "name": "get_weather",
-            "arguments": "{\"city\":\"Paris\"}"})
-    };
-    let out = |id: &str| json!({"type": "function_call_output", "call_id": id, "output": "sunny"});
-    let input = json!([
-        {"role": "user", "content": "weather in Paris?"},
-        rs(1), call("call_1"), out("call_1"),
-        rs(2), call("call_2"), out("call_2"),
-    ]);
-    let tools = json!([{"type": "function", "name": "get_weather",
-        "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}}]);
-    let body = |reasoning: Option<Value>| {
-        let mut b = json!({"model": "m", "store": false, "tools": tools, "input": input});
-        if let Some(r) = reasoning {
-            b["reasoning"] = r;
+fn replayed_thinking_is_dropped_when_thinking_is_off() {
+    let off = replayed_tool_turn(None);
+    let mut bad = Vec::new();
+    for (what, v) in [
+        (
+            "Responses → OpenRouter Chat",
+            r2c(&off, "anthropic/claude-sonnet-4"),
+        ),
+        (
+            "Responses → Messages (budget)",
+            r2m(&off, "claude-haiku-4-5"),
+        ),
+        (
+            "Responses → Bedrock Messages",
+            r2m(&off, "global.anthropic.claude-haiku-4-5-20251001-v1:0"),
+        ),
+        (
+            "Responses → Messages (effort none)",
+            r2m(
+                &replayed_tool_turn(Some(json!({"effort": "none"}))),
+                "claude-sonnet-4-5",
+            ),
+        ),
+    ] {
+        if holds_thinking(last_assistant(&v)) {
+            bad.push(format!("{what}: {v}"));
         }
-        b
-    };
-    let assistants = |v: &Value, list: &str| -> Vec<Value> {
-        v[list]
+    }
+    // A Chat client replaying OpenRouter's reasoning_details with reasoning off, same wire.
+    let chat = json!({"model": "anthropic/claude-sonnet-4", "messages": [
+        {"role": "user", "content": "weather in Paris?"},
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "toolu_01", "type": "function",
+            "function": {"name": "get_weather", "arguments": "{}"}}],
+         "reasoning_details": [{"type": "reasoning.text", "text": "Need weather.",
+            "signature": "EqQBsig==", "format": "anthropic-claude-v1", "index": 0}]},
+        {"role": "tool", "tool_call_id": "toolu_01", "content": "sunny"},
+    ]});
+    let relayed: Value = serde_json::from_slice(&claude_chat_relay_reasoning(
+        serde_json::to_vec(&chat).unwrap(),
+        "anthropic/claude-sonnet-4",
+    ))
+    .unwrap();
+    if holds_thinking(last_assistant(&relayed)) {
+        bad.push(format!("Chat → OpenRouter Chat, same wire: {relayed}"));
+    }
+    // A tool loop is one assistant turn: its first call 400s on Bedrock too (pi's live session
+    // failed on `messages.1` with a second round after it).
+    let mut two_rounds = off.clone();
+    let input = two_rounds["input"].as_array_mut().unwrap();
+    input.push(
+        json!({"type": "function_call", "call_id": "toolu_02", "name": "get_weather",
+        "arguments": "{}"}),
+    );
+    input.push(json!({"type": "function_call_output", "call_id": "toolu_02", "output": "rain"}));
+    for (what, v) in [
+        (
+            "two rounds → OpenRouter Chat",
+            r2c(&two_rounds, "anthropic/claude-sonnet-4"),
+        ),
+        (
+            "two rounds → Messages",
+            r2m(&two_rounds, "claude-haiku-4-5"),
+        ),
+    ] {
+        let assistants = v["messages"]
             .as_array()
             .unwrap()
             .iter()
-            .filter(|m| m["role"] == "assistant")
-            .cloned()
-            .collect()
-    };
-    let msg_thinks = |m: &Value| {
-        m["content"]
-            .as_array()
-            .is_some_and(|bs| bs.iter().any(|b| b["type"] == "thinking"))
-    };
-
-    // Onto Messages (Anthropic, Bedrock): Haiku 4.5 runs without thinking when it is omitted.
-    for model in [
-        "claude-haiku-4-5",
-        "global.anthropic.claude-haiku-4-5-20251001-v1:0",
-    ] {
-        let off = req(Endpoint::Responses, Endpoint::Messages, &body(None), model);
-        let a = assistants(&off, "messages");
-        assert!(
-            msg_thinks(&a[0]),
-            "{model}: an earlier turn keeps its thinking: {off}"
-        );
-        assert!(!msg_thinks(a.last().unwrap()), "{model}: {off}");
-        let on = req(
-            Endpoint::Responses,
-            Endpoint::Messages,
-            &body(Some(json!({"effort": "medium"}))),
-            model,
-        );
-        assert!(
-            msg_thinks(assistants(&on, "messages").last().unwrap()),
-            "{model}: {on}"
-        );
+            .filter(|m| m["role"] == "assistant");
+        if assistants.clone().count() < 2 && what.contains("Chat") {
+            bad.push(format!("{what}: expected two assistant messages: {v}"));
+        }
+        if assistants.clone().any(holds_thinking) {
+            bad.push(format!("{what}: {v}"));
+        }
     }
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
 
-    // Onto OpenRouter Chat: the replay rides `reasoning_details`.
-    let model = "anthropic/claude-sonnet-4";
-    let off = r2c(&body(None), model);
-    let a = assistants(&off, "messages");
-    assert!(
-        a.last().unwrap().get("reasoning_details").is_none(),
-        "{off}"
-    );
-    assert!(a[0].get("reasoning_details").is_some(), "{off}");
-    let on = r2c(&body(Some(json!({"effort": "medium"}))), model);
-    assert!(
-        assistants(&on, "messages")
-            .last()
-            .unwrap()
-            .get("reasoning_details")
-            .is_some(),
-        "{on}"
-    );
-
-    // Same wire to OpenRouter: the client's own replay, thinking off.
-    let chat_body = json!({"model": model, "messages": [
-        {"role": "user", "content": "weather?"},
-        {"role": "assistant", "content": "", "tool_calls": [{"id": "toolu_1", "type": "function",
-            "function": {"name": "get_weather", "arguments": "{}"}}],
-         "reasoning_details": [{"type": "reasoning.text", "text": "t", "signature": "SIG",
-            "format": "anthropic-claude-v1", "index": 0}]},
-        {"role": "tool", "tool_call_id": "toolu_1", "content": "sunny"},
-    ]});
-    let relayed = claude_chat_relay_reasoning(serde_json::to_vec(&chat_body).unwrap());
-    let relayed: Value = serde_json::from_slice(&relayed).unwrap();
-    assert!(
-        relayed["messages"][1].get("reasoning_details").is_none(),
-        "{relayed}"
-    );
+    // Thinking on: the tool turn keeps (and must open on) its thinking.
+    let on = replayed_tool_turn(Some(json!({"effort": "medium"})));
+    let v = r2c(&on, "anthropic/claude-sonnet-4");
+    assert!(last_assistant(&v).get("reasoning_details").is_some(), "{v}");
+    let v = r2m(&on, "claude-haiku-4-5");
+    assert!(holds_thinking(last_assistant(&v)), "{v}");
+    // Adaptive generation, no reasoning asked: still adaptive thinking, so the block stays.
+    let v = r2m(&off, "claude-opus-4-8");
+    assert!(holds_thinking(last_assistant(&v)), "{v}");
 }
 
-/// Codex always offers its hosted `web_search`. Onto Anthropic's own API it becomes Anthropic's
-/// web search server tool (its domain filter and location carried over); where no search tool
-/// exists (Bedrock, a Chat Completions host) it is dropped, and Codex works without search,
-/// rather than the whole request failing on a tool type the provider does not know.
+/// Codex offers its hosted `web_search` on every turn (`external_web_access: false`, its default
+/// cached mode). No Chat Completions or Messages upstream runs OpenAI's search, and Anthropic 400ed
+/// the forwarded tool, so Codex could not run on a Claude row at all. A model-discretion hosted
+/// search is dropped leaving Responses; a `tool_choice` that names it is forwarded with it, for the
+/// provider to reject.
 /// claim: W2, TRN-21
 /// defect: D78
 #[test]
-fn codex_web_search_maps_onto_anthropic_or_is_dropped() {
-    let body = json!({"model": "m", "store": false, "input": "news?", "tool_choice": "auto",
-    "tools": [
-        {"type": "function", "name": "shell", "parameters": {"type": "object", "properties": {}}},
-        {"type": "web_search", "search_context_size": "medium",
-         "filters": {"allowed_domains": ["rust-lang.org"]},
-         "user_location": {"type": "approximate", "country": "US", "city": null}},
-    ]});
-    let tools = |v: &Value| v["tools"].as_array().cloned().unwrap_or_default();
-    let v = req(
-        Endpoint::Responses,
-        Endpoint::Messages,
-        &body,
-        "claude-haiku-4-5",
+fn hosted_web_search_is_dropped_leaving_responses_unless_chosen() {
+    let body = |choice: Value| {
+        json!({"model": "m", "store": false, "input": "hi", "tool_choice": choice, "tools": [
+            {"type": "function", "name": "shell", "parameters": {"type": "object"}},
+            {"type": "web_search", "external_web_access": false},
+            {"type": "web_search_preview"},
+        ]})
+    };
+    let searches = |v: &Value| -> usize {
+        v["tools"].as_array().map_or(0, |ts| {
+            ts.iter()
+                .filter(|t| {
+                    t["type"]
+                        .as_str()
+                        .is_some_and(|ty| ty.starts_with("web_search"))
+                })
+                .count()
+        })
+    };
+    for (what, v) in [
+        ("Messages", r2m(&body(json!("auto")), "claude-opus-4-8")),
+        (
+            "Chat",
+            r2c(&body(json!("auto")), "anthropic/claude-sonnet-4"),
+        ),
+    ] {
+        assert_eq!(searches(&v), 0, "{what}: {v}");
+        assert_eq!(v["tools"].as_array().map(Vec::len), Some(1), "{what}: {v}");
+    }
+    // Chosen by name: forwarded, so the provider names it.
+    let v = r2m(&body(json!({"type": "web_search"})), "claude-opus-4-8");
+    assert!(searches(&v) > 0, "{v}");
+    // Only the search offered: no tools, so no tool_choice either.
+    let v = r2c(
+        &json!({"model": "m", "store": false, "input": "hi", "tool_choice": "auto",
+            "tools": [{"type": "web_search"}]}),
+        "grok-4.3",
     );
-    let mut t = tools(&v);
-    assert_eq!(t.len(), 2, "{v}");
-    t[1].as_object_mut().unwrap().remove("cache_control");
-    assert_eq!(
-        t[1],
-        json!({"type": "web_search_20250305", "name": "web_search",
-            "allowed_domains": ["rust-lang.org"],
-            "user_location": {"type": "approximate", "country": "US"}}),
+    assert!(
+        v.get("tools").is_none() && v.get("tool_choice").is_none(),
         "{v}"
     );
-    for (what, v) in [
-        (
-            "Bedrock",
-            req(
-                Endpoint::Responses,
-                Endpoint::Messages,
-                &body,
-                "us.anthropic.claude-haiku-4-5-20251001-v1:0",
-            ),
-        ),
-        ("grok", r2c(&body, "grok-4.3")),
-    ] {
-        let t = tools(&v);
-        assert_eq!(t.len(), 1, "{what}: {v}");
-        assert!(!v.to_string().contains("web_search"), "{what}: {v}");
-    }
 }

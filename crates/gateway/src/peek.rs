@@ -848,6 +848,32 @@ pub fn remove_items(
 mod tests {
     use super::*;
 
+    /// Only a root member whose value is the literal `null` is removed (D101): not a string that
+    /// starts with `n`, not a nested `null`, not a role named user.
+    #[test]
+    fn remove_root_nulls_removes_only_root_nulls() {
+        fn strip(body: &[u8]) -> (bool, Vec<u8>) {
+            let mut b = body.to_vec();
+            let changed = remove_root_nulls(&mut b);
+            (changed, b)
+        }
+        let (changed, b) = strip(br#"{"model":"m","user" : null}"#);
+        assert!(changed);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&b).unwrap(),
+            serde_json::json!({"model": "m"})
+        );
+        assert!(!strip(br#"{"user":"nobody","model":"m"}"#).0);
+        let nested = br#"{"messages":[{"role":"user","user":null}],"metadata":{"user":null}}"#;
+        assert_eq!(strip(nested), (false, nested.to_vec()));
+        let (changed, b) = strip(br#"{"user":"u","x":null}"#);
+        assert!(changed);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&b).unwrap(),
+            serde_json::json!({"user": "u"})
+        );
+    }
+
     /// Only root-level, non-negative integer output limits are spanned: the digits exactly, the
     /// first of each key, never one nested in a message or tool schema.
     #[test]

@@ -4940,7 +4940,7 @@ impl ProxyHttp for AiProxy {
                             // A Claude model behind Chat Completions (OpenRouter): a tool turn
                             // with no thinking to replay goes without reasoning (D14's rule).
                             let len = buf.len();
-                            buf = translate::claude_chat_relay_reasoning(buf);
+                            buf = translate::claude_chat_relay_reasoning(buf, upstream_model);
                             changed |= buf.len() != len;
                         }
                         // Same-wire Chat to another host: an explicit null is "not set", as

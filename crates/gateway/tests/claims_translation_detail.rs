@@ -2,10 +2,10 @@
 //!
 //! Most of these drive the public translation functions directly (`translate::request`,
 //! `translate::response_json_status`, `translate::SseBridge`): the mapping tables are pure, so a
-//! gateway process adds nothing but time. The one end-to-end test needs the real binary, because
-//! what it pins is what leaves the gateway on a same-wire walk, where no translation runs at all.
+//! gateway process adds nothing but time. The end-to-end tests need the real binary, because
+//! what they pin is what leaves the gateway on a same-wire walk, where no translation runs at all.
 //!
-//! Run via `mise run test:integration:rs` (needs `nats-server` on PATH for the end-to-end test).
+//! Run via `mise run test:integration:rs` (needs `nats-server` on PATH for the end-to-end tests).
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -475,4 +475,75 @@ async fn max_tokens_reaches_a_reasoning_model_as_max_completion_tokens() {
         "OpenAI would 400 these:\n{}",
         wrong.join("\n")
     );
+}
+
+// --- TRN-15 --------------------------------------------------------------------------------------
+
+/// openai-python sends `user: null` for `user=None`. OpenAI and the translated Claude path take it
+/// as "not set"; OpenRouter 400s it ("user: Invalid input: expected string, received null"), so a
+/// same-wire relay to OpenRouter failed on claude-sonnet-4 and on every Claude row's failover. A
+/// root `user: null` leaves the relayed body (wherever it sits, however it is spaced); a real
+/// `user`, and a `user` key deeper in the body, are relayed untouched.
+/// claim: TRN-15
+/// defect: D101
+#[tokio::test]
+async fn a_null_user_is_not_relayed_to_openrouter() {
+    let (pubkey, sk) = test_keypair(1);
+    let mock = MockUpstream::start(Mode::Json).await;
+    let gw = Gateway::builder(unused_nats_port(), &mock.authority(), &b64(&pubkey))
+        .providers(&["anthropic", "openrouter"])
+        .start()
+        .await;
+    let msgs = r#""messages":[{"role":"user","content":"hi"}]"#;
+    let mut wrong = Vec::new();
+    for (body, user) in [
+        (
+            format!(r#"{{"model":"claude-sonnet-4","user":null,{msgs}}}"#),
+            None,
+        ),
+        (
+            format!(r#"{{"model":"claude-sonnet-4",{msgs}, "user" : null }}"#),
+            None,
+        ),
+        (
+            format!(
+                r#"{{"user":null,"model":"claude-sonnet-4",{msgs},"metadata":{{"user":null}}}}"#
+            ),
+            None,
+        ),
+        (
+            format!(r#"{{"model":"claude-sonnet-4","user":"u-1",{msgs}}}"#),
+            Some("u-1"),
+        ),
+    ] {
+        let resp = test_client()
+            .post(format!("{}/v1/chat/completions", gw.url()))
+            .header("authorization", format!("Bearer {}", vkey(&sk)))
+            .header("content-type", "application/json")
+            .body(body.clone())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "{body}");
+        let cap = mock.captured().unwrap();
+        assert_eq!(cap.path, "/api/v1/chat/completions", "a same-wire walk");
+        let sent: Value = match serde_json::from_slice(&cap.body) {
+            Ok(v) => v,
+            Err(e) => {
+                wrong.push(format!("{body}: invalid JSON relayed ({e})"));
+                continue;
+            }
+        };
+        let ok = match user {
+            None => sent.get("user").is_none(),
+            Some(u) => sent["user"] == u,
+        };
+        if !ok || sent["messages"][0]["content"] != "hi" {
+            wrong.push(format!("{body} -> {sent}"));
+        }
+        if body.contains("metadata") && sent["metadata"] != json!({"user": null}) {
+            wrong.push(format!("nested user changed: {sent}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }

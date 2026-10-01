@@ -152,7 +152,7 @@ async fn responses_client_parallel_tool_calls_reach_chat_as_one_turn() {
     assert_eq!(
         got["tools"][1],
         json!({"type": "file_search", "vector_store_ids": ["vs_1"]}),
-        "a hosted tool is forwarded for the provider to reject by name, not dropped"
+        "a hosted tool is forwarded for the provider to reject by name, not dropped (web_search aside: D78)"
     );
     assert_eq!(got["max_tokens"], 64);
 }

@@ -409,3 +409,123 @@ async fn explicit_nulls_are_omitted_on_a_same_wire_chat_relay_to_openrouter() {
         bad.join("\n")
     );
 }
+
+/// pi in Responses mode with thinking off replays a tool turn whose `reasoning` item the gateway
+/// minted from Claude's signed thinking. On claude-sonnet-4 (OpenRouter, served by Bedrock) the
+/// thinking rode `reasoning_details` on the tool loop of a request that does not think,
+/// and Bedrock 400s that: "When thinking is disabled, an `assistant` message in the final position
+/// cannot contain `thinking`", for every call of the loop. It goes without; a request that thinks
+/// keeps it.
+/// claim: TRN-7, W4
+/// defect: D79
+#[tokio::test]
+async fn a_replayed_thinking_turn_without_thinking_on_reaches_openrouter_without_it() {
+    let nats_port = unused_nats_port();
+    let (pubkey, sk) = test_keypair(1);
+    let mock = MockUpstream::start(Mode::Json).await;
+    let gw = Gateway::builder(nats_port, &GatewayBuilder::dead_authority(), &b64(&pubkey))
+        .providers(&["anthropic", "openrouter"])
+        .provider_authority("openrouter", &mock.authority())
+        .start()
+        .await;
+    let turn2 = |reasoning: Option<Value>| {
+        let mut body = json!({"model": "claude-sonnet-4", "store": false, "stream": false,
+        "tools": [{"type": "function", "name": "get_weather", "parameters": {"type": "object"}}],
+        "input": [
+            {"role": "user", "content": [{"type": "input_text", "text": "weather in Paris?"}]},
+            {"type": "reasoning", "id": "rs_gw18f2c3a4b5d60001", "encrypted_content": "rs_gw:EqQBsig==",
+             "summary": [{"type": "summary_text", "text": "Need weather."}]},
+            {"type": "function_call", "call_id": "toolu_01", "name": "get_weather", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "toolu_01", "output": "sunny"},
+            {"type": "function_call", "call_id": "toolu_02", "name": "get_weather", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "toolu_02", "output": "rain"},
+        ]});
+        if let Some(r) = reasoning {
+            body["reasoning"] = r;
+        }
+        body
+    };
+    // The loop's first call: Bedrock holds the whole tool loop to the rule, and pi's live session
+    // failed on it (`messages.1`) a round later.
+    let assistant = |got: &Value| {
+        got["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["role"] == "assistant")
+            .cloned()
+            .unwrap()
+    };
+
+    post(&gw, &sk, "/v1/responses", &turn2(None)).await;
+    let (cap, got) = captured(&mock);
+    assert_eq!(cap.path, "/api/v1/chat/completions");
+    let a = assistant(&got);
+    assert!(
+        a.get("reasoning_details").is_none() && a.get("thinking").is_none(),
+        "thinking on the final assistant turn of a request that does not think: {got}"
+    );
+    assert_eq!(a["tool_calls"][0]["id"], "toolu_01", "{got}");
+
+    // Control: one round with reasoning on keeps its signed thinking. (With the second round, whose
+    // call carries none, D77 drops the reasoning and the rule applies again.)
+    let mut on = turn2(Some(json!({"effort": "medium"})));
+    on["input"].as_array_mut().unwrap().truncate(4);
+    post(&gw, &sk, "/v1/responses", &on).await;
+    let (_, got) = captured(&mock);
+    assert_eq!(
+        assistant(&got)["reasoning_details"][0]["signature"],
+        "EqQBsig==",
+        "{got}"
+    );
+}
+
+/// Codex's hosted search, as it sends it on every turn (`web_search = "cached"`, its default).
+fn codex_web_search_body(model: &str) -> Value {
+    let mut body = codex_body(
+        model,
+        json!([{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "fix the test"}]}]),
+    );
+    body["tools"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"type": "web_search", "external_web_access": false}));
+    body
+}
+
+/// Codex offers its hosted `web_search` on every request. On a Claude row it reached Anthropic as
+/// an unknown tool type (400 on `tools.N`), so Codex could not run on Claude at all. No Messages or
+/// Chat Completions upstream runs OpenAI's search (Codex's default is OpenAI's cached index, which
+/// nothing else has), so the model-discretion search is dropped and Codex runs with the rest of its
+/// tools. Its calls still map back.
+/// claim: W2, TRN-21
+/// defect: D78
+#[tokio::test]
+async fn codex_runs_on_a_claude_row_without_its_hosted_web_search() {
+    for (raw, model, path) in [
+        (CLAUDE_CODEX_TOOL_JSON, "claude-opus-4-8", "/v1/messages"),
+        (
+            CHAT_CODEX_TOOL_JSON,
+            "claude-sonnet-4",
+            "/api/v1/chat/completions",
+        ),
+    ] {
+        let nats_port = unused_nats_port();
+        let (pubkey, sk) = test_keypair(1);
+        let mock = MockUpstream::start(Mode::Raw(200, "application/json", raw)).await;
+        let gw = Gateway::builder(nats_port, &mock.authority(), &b64(&pubkey))
+            .providers(&["anthropic", "openai", "openrouter"])
+            .start()
+            .await;
+        let resp = post(&gw, &sk, "/v1/responses", &codex_web_search_body(model)).await;
+        let (cap, got) = captured(&mock);
+        assert_eq!(cap.path, path);
+        let tools = got["tools"].as_array().unwrap();
+        assert!(
+            !got["tools"].to_string().contains("web_search"),
+            "{model}: the hosted search reached the upstream: {got}"
+        );
+        assert_eq!(tools.len(), 4, "{model}: every client tool kept: {got}");
+        assert_codex_calls(&resp);
+    }
+}

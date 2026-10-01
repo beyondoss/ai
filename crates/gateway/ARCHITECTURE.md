@@ -513,19 +513,18 @@ relay and a translated walk alike: when the request asks for reasoning (`reasoni
 `reasoning`, `include_reasoning`, `thinking`) and its last assistant tool-call turn carries no
 `reasoning_details` OpenRouter can replay (a signed `reasoning.text` or an encrypted entry), those
 keys are dropped for that request — pi, the stock OpenAI SDK and LangChain echo at most a plain
-`reasoning` string. A relayed body that never says `reasoning` or `thinking` is not parsed (one
-`memmem` each). The inverse holds too: with thinking off, Anthropic rejects thinking in the final
-assistant message ("When thinking is disabled, an assistant message in the final position cannot
-contain thinking"), which a client replaying the gateway's minted reasoning sends. The final
-assistant message is the last one when only tool results follow it (the turn in progress, or a
-prefill); one a user has answered is history and keeps its thinking, which the API ignores. On a
-walk onto Messages (Anthropic, Bedrock), thinking is off when the request sets `disabled` or omits
-`thinking` on a model that then runs without it (Claude 4.x and older; Claude 5, Fable and Mythos
-think when it is omitted), and that message loses its `thinking` / `redacted_thinking` blocks
-(unless it holds nothing else). Onto a Claude model behind Chat Completions, thinking is off when
-no reasoning key asks for it (or D77's rule dropped them), and that message loses
-`reasoning_details` and the gateway's `thinking` list, on a same-wire relay and a translated walk
-alike. A same-wire Messages relay is the client's body and is not touched. Structured output maps
+`reasoning` string. The inverse also holds: a request that does not think loses the thinking its
+assistant messages carry, since Anthropic on Bedrock, directly and behind OpenRouter, rejects it in
+the final turn ("When thinking is disabled, an `assistant` message in the final position cannot
+contain `thinking`"), and a tool loop is one turn: its first call 400s as much as its last
+(Anthropic's own API accepts both, and Bedrock accepts thinking in a turn a later user message
+answered; measured 2026-10-01). A request that does not think has no use for any of it and
+Anthropic ignores it, so it goes from every assistant message rather than from a turn boundary the
+gateway would have to guess (a message of only thinking keeps it: an empty one is a 400). "Does not think" is no reasoning key onto Chat Completions, and `thinking:
+disabled`, or no `thinking` before 4.7, onto Messages; an adaptive-generation model thinks without
+being asked, so its blocks stay. A Responses client with thinking off (pi) replays the gateway's
+`reasoning` items, so without this its tool turn 400ed on claude-sonnet-4 (D79). A relayed body
+that never says `reasoning` or `thinking` is not parsed (one `memmem` each). Structured output maps
 `response_format` `json_schema` ↔ `output_config.format` ↔ Responses `text.format`; OpenAI JSON mode
 (`json_object`) has no schema to give Anthropic and is dropped (OpenAI already requires the prompt to
 ask for JSON). Inline PDFs map Chat `file` ↔ Anthropic base64 `document` ↔ Responses `input_file`.
@@ -617,44 +616,34 @@ models today; one that does would 400 a turn after a forced one on an enforced a
 **Unmappable input is forwarded, not dropped.** `input_audio`, a `file_id` or URL document, a
 Files API image, a non-base64 data URI, `n` > 1, `logprobs`, audio output, Anthropic server and
 Anthropic-defined tools (`web_search_…`, `bash_…`, `text_editor_…`: as an empty-schema function the
-model would call one and nothing would run it), Responses hosted tools (`file_search`, `mcp`, …;
-`web_search` is mapped, below), a Chat Completions client's `custom` tools onto Messages, `mcp_servers`, a Responses `prompt`
+model would call one and nothing would run it), Responses hosted tools (`file_search`, `mcp`,
+…), a Chat Completions client's `custom` tools onto Messages, `mcp_servers`, a Responses `prompt`
 template, `stop` onto Responses, and Responses input items with no Chat Completions shape
-(`computer_call_output`, `local_shell_call`, …, forwarded whole in their place in `messages`), and a message whose role no dialect has (a typo, a framework's private
-role: forwarded whole, in place, role unchanged, never turned into a user turn) have no equivalent
-on the other wire and change what the client gets back. Only records of a hosted tool the provider ran itself (`web_search_call`, `mcp_call`, …) are
-dropped: the client wrote none of it, and the answer that used it follows as a message.
-
-**Hosted web search.** Codex offers Responses' hosted `web_search` on every request, so forwarding
-it whole failed Codex outright on every Claude row (D78). Onto Anthropic's own API (the bare
-`claude-…` spelling) it becomes Anthropic's web search server tool, `web_search_20250305` (the basic
-version every searching Claude model and Vertex accept), with `filters.allowed_domains` →
-`allowed_domains` and an approximate `user_location` carried over (`search_context_size` has no
-equivalent). Bedrock has no web search and no Chat Completions host runs it, so there it is dropped
-and Codex works without search (a body left with no tools loses `tool_choice` and
-`parallel_tool_calls`). Back to a Responses client, a `server_tool_use` web search and its
-`web_search_tool_result` become one `web_search_call` output item (`action: {type: "search",
-query}`, status `completed`, or `failed` when the result is Anthropic's error object), ahead of
-the message that used it: whole in a non-stream body, and on a stream as `output_item.added`, the
-`web_search_call.in_progress` / `.searching` / `.completed` events and `output_item.done`, once the
-result block arrives. The Chat Completions leg in between carries them as a `web_search_calls`
-list on the message or delta, which only a Responses client's bridge reads or emits. The search
-is billed from Anthropic's `usage.server_tool_use.web_search_requests` (`server_tool_calls`), as
-on any Messages walk. Codex's replayed `web_search_call` items are dropped like other hosted-tool
-records.
-
-So are
-`compaction` and `item_reference` items, which are OpenAI-held state (a summary only OpenAI can
-decrypt, a pointer into its store) that no translated upstream can resolve: a compacted Codex
-session that fails over onto a translated candidate runs on the history the client holds, a
-degraded answer rather than a 400. The distinction from forwarding: an item the gateway does not
-know is forwarded (the provider names it), and a known item that only OpenAI can read is dropped
-when translating. A same-wire Responses relay keeps both. An explicit
-`null` (how OpenAI SDKs send an unset option) is "not set" and is never forwarded; that includes
-`instructions: null`, which becomes no system message rather than one with null content. A
-same-wire Chat Completions relay to a host other than OpenAI (OpenRouter, xAI, Together, …) drops
-root-level nulls too, by span (`peek::remove_root_nulls`; every other byte is the client's):
-OpenRouter 400s `user: null`, which openai-python sends for `user=None`. Translation runs in `request_body_filter`, after the request headers went
+(`computer_call_output`, `local_shell_call`, …, forwarded whole in their place in `messages`), and
+a message whose role no dialect has (a typo, a framework's private role: forwarded whole, in place,
+role unchanged, never turned into a user turn) have no equivalent on the other wire and change what
+the client gets back. Only records of a hosted tool the provider ran itself (`web_search_call`,
+`mcp_call`, …) are dropped: the client wrote none of it, and the answer that used it follows as a
+message. So are `compaction` and `item_reference` items, which are OpenAI-held state (a summary
+only OpenAI can decrypt, a pointer into its store) that no translated upstream can resolve: a
+compacted Codex session that fails over onto a translated candidate runs on the history the client
+holds, a degraded answer rather than a 400. The distinction from forwarding: an item the gateway
+does not know is forwarded (the provider names it), and a known item that only OpenAI can read is
+dropped when translating. A same-wire Responses relay keeps both. OpenAI's hosted search
+(`web_search`, `web_search_preview` and dated spellings) is the one tool dropped leaving Responses,
+unless the `tool_choice` names it: Codex offers it on every turn, by default over OpenAI's cached
+index (`external_web_access: false`), which no other provider has; the model may use it or not and
+the client runs nothing for it, so Codex works on with its other tools (it searches only when it
+chooses to). Forwarded, it made Codex unusable on every Claude row (D78). Anthropic's server
+`web_search` is not substituted: it always fetches the live web (what Codex's default opts out of),
+bills per search, and a Claude row's OpenRouter and Bedrock candidates would each need their own
+spelling, so a failover would change what the tool does. An explicit `null` (how OpenAI SDKs send
+an unset option) is "not set" and is never forwarded; that includes Responses `instructions: null`,
+which becomes no system message rather than one with null content (D102). A same-wire Chat
+Completions relay to a host other than OpenAI (OpenRouter, xAI, Together, …) drops root-level nulls
+too, by span (`peek::remove_root_nulls`; every other byte is the client's): OpenRouter 400s
+`user: null`, which openai-python sends for `user=None`, so a Claude row's failover used to change
+the outcome (D101). Translation runs in `request_body_filter`, after the request headers went
 upstream, so the gateway cannot answer 400 itself; the field is passed through and the provider's
 400 names it (each verified live, 2026-09-30). A non-http(s) image or file URL (`file://`) is never
 forwarded in any shape, on any wire pair (Chat Completions ↔ Responses included); inline `data:`
