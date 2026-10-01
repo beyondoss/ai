@@ -817,7 +817,7 @@ group = "Billing integrity"
 text = "A cancel at any phase after the upstream accepts is billed (exact or estimate), stream or not"
 layer = "both"
 touches = ["crates/gateway/src/usage.rs", "crates/gateway/src/proxy.rs", "crates/gateway/src/peek.rs", "crates/gateway/src/main.rs"]
-defects = ["D07", "D123"]
+defects = ["D07", "D123", "D130"]
 
 [[claim]]
 id = "BIL-4"
@@ -916,7 +916,7 @@ group = "Billing integrity"
 text = "Retries never hide spend"
 layer = "hermetic"
 touches = ["crates/gateway/src/usage.rs", "crates/gateway/src/proxy.rs", "crates/gateway/src/peek.rs", "crates/gateway/src/main.rs"]
-defects = ["D09"]
+defects = ["D09", "D130"]
 
 [[claim]]
 id = "BIL-15"
@@ -970,7 +970,7 @@ group = "Billing integrity"
 text = "Estimates never exceed provider truth and are non-zero once the upstream accepts"
 layer = "live"
 touches = ["crates/gateway/src/usage.rs", "crates/gateway/src/proxy.rs", "crates/gateway/src/peek.rs", "crates/gateway/src/main.rs"]
-defects = ["D99", "D123"]
+defects = ["D99", "D123", "D130"]
 
 [[claim]]
 id = "BIL-21"

@@ -1390,9 +1390,9 @@ confidence = "high"
 evidence = "live 2026-10-01 B2+BIL-3+BIL-20::openai-py::gpt::stream_abort, three runs: the completed stream reports prompt_tokens 29; the identical request aborted after 25 content chunks bills an estimate of input_tokens 44 (outcome client_cancelled, usage_estimated true). usage.rs InputTally::feed counts all bytes outside base64 payloads; estimate_tokens divides by INPUT_BYTES_PER_TOKEN (5). On Claude the estimate keeps message_start's exact count, and on grok the prompt (with xAI's system preamble) outweighs the overhead, so those cells pass. Also live 2026-10-01 FLT-1 cells reset_mid_stream and stall_mid_stream on gpt-pooled and gpt-single, all four clients, four runs (16 cells each): the provider reported prompt_tokens 24 for the request (read from the drained upstream stream); the cut-short row estimates input_tokens 40 (Chat clients) or 32 (Messages clients translated onto Chat). Reproduced hermetically: usage::tests::input_estimate_counts_string_values_only: InputTally counts 105 bytes for a 55-byte prompt of string values (every key, brace and number), and more with stream_options and limits added."
 claims = ["BIL-20", "FLT-1"]
 state = "fixed"
-test = "input_estimate_counts_string_values_only"
-fix = "160dc5a"
-note = "Found by live cell B2+BIL-3+BIL-20::openai-py::gpt::stream_abort. Fixed: InputTally counts only the bytes of JSON string values (a string is a key when the next non-whitespace byte is ':'), still skipping data-URI and data-key payloads, any chunking, 12 bytes of state."
+test = "a_short_prompt_estimate_stays_under_the_provider_count"
+fix = "12981ee"
+note = "Found by live cell B2+BIL-3+BIL-20::openai-py::gpt::stream_abort. Fixed: InputTally no longer divides body bytes by a measured constant. It counts the pre-tokens of the prompt text: only the string values of prompt keys (content, text, role, system, instructions, input, output, arguments, name, description), split the way the GPT tokenizers' stated pre-tokenizer regex splits and every measured tokenizer honors (words at whitespace, one per letter run, one per three digits, one per punctuation run unless it is a single byte before letters; non-ASCII left out, a word of only non-ASCII counting one). A BPE tokenizer never merges across a pre-token split, so this is a lower bound by construction, on every wire, with no divisor. The fault prompt now estimates 16 (Chat and Messages bodies alike) for 24 real tokens. Measured on o200k_base, cl100k_base, grok-4.3's tokenize endpoint and Claude's count_tokens over prose, code, JSON, numbers, hex, base64-like text, French, Russian, CJK, emoji and punctuation: never above, ~0.8x on English and code for GPT/grok, ~0.65x for Claude (usage.rs input_estimate_never_exceeds_a_real_tokenizer pins those fixtures). Binary payloads drop out as values of non-text keys, so the base64 markers and aho-corasick are gone; text runs through a 9-state table four bytes per lookup in two lanes (1.3 GB/s on source, 3 GB/s on prose, 100 GB/s on an image body; benches/unit.rs input_tally). Also held by usage.rs input_estimate_counts_string_values_only (the bare and dressed stream-abort bodies estimate the same, under 29, at any split). Superseded (integration): a parallel fix counted all JSON string-value bytes / 5; the pre-token bound was kept."
 
 [[defect]]
 id = "D100"
@@ -1404,9 +1404,9 @@ confidence = "high"
 evidence = "live 2026-10-01 (corrupt base64 PNG, grok-4.3): T6::openai-py::xai::typed_error -> e.body a bare string; T6::anthropic-py::xai::typed_error -> a 400 typed api_error. Reproduced hermetically (translate_response.rs): xAI's {code, error: <string>} body reaches a Chat client on grok-4.20 untouched (no error object), and a Messages client typed api_error."
 claims = ["T6"]
 state = "fixed"
-test = "xai_errors_arrive_in_the_clients_envelope"
-fix = "42e96f5"
-note = "Found by live cells T6::openai-py::xai::typed_error and T6::anthropic-py::xai::typed_error. Fixed: an error body that names no type is typed by its HTTP status in the client's vocabulary (Messages 400 -> invalid_request_error, 404 -> not_found_error, ...; OpenAI wires: 4xx -> invalid_request_error, 429 -> rate_limit_exceeded), and a same-wire Chat relay from a non-OpenAI vendor withholds a non-2xx JSON body and rewrites it into OpenAI's envelope only when it is not already in it."
+test = "an_xai_error_arrives_in_the_clients_envelope"
+fix = "1c4cc2b"
+note = "Found by live cells T6::openai-py::xai::typed_error and T6::anthropic-py::xai::typed_error. Fixed both halves. A catalog walk now buffers a non-stream error from a same-endpoint candidate (catalog_error_relay, capped by MAX_TRANSLATE_BUFFER) and translate::response_json_tools re-encodes it unless it is already the client API's envelope, so OpenAI's and OpenRouter's own errors still relay byte for byte (an_error_already_in_the_clients_envelope_is_relayed_untouched). And map_error types an error whose body names none from its HTTP status (status_error_type: Anthropic's closed set on Messages, 400 -> invalid_request_error; the gateway's own words on the OpenAI endpoints) instead of api_error. translate_response_tests' 404 {detail} case moved from api_error to not_found_error. Also held by translate_response.rs xai_errors_arrive_in_the_clients_envelope (from a parallel, similar fix folded into this one)."
 
 [[defect]]
 id = "D101"
@@ -1725,7 +1725,21 @@ impact = "B2 and BIL-20 say a stream cut short is billed an estimate, non-zero o
 confidence = "high"
 evidence = "live 2026-10-01 FLT-1+REL-7+BIL-3+BIL-14+BIL-20::<client>::<route>::stall_after_head, all 16 cells (openai-py, anthropic-py, openai-node, anthropic-ts x claude-pooled, claude-single, gpt-pooled, gpt-single), four runs (two on 635acff, two on 4df371d): the fault proxy relays the provider's 200 head, then holds the body; the gateway cuts the stream at read_timeout_secs (20 in the trials; client sees a broken 200 stream, which is correct), and its row is {outcome: cut_short, input_tokens: 0, output_tokens: 0, usage_estimated: false} while the provider, drained by the proxy, reported in=25 out=43 (claude-haiku-4-5) / in=24 out=39 (gpt-4o-mini). Also seen once (before c7819c7, with a 5s stream idle bound) in a slow_drip cell when Anthropic took >5s to its first event: the client got a 504, the SDK retried, the provider processed two generations and the ledger billed one (the first row upstream_error 0/0). proxy.rs logging: `started` (parsed usage, output > 0, or a clean finish) gates the cut_short estimate, so a 2xx with no body bytes estimates nothing; `no_head` covers only a downstream abort before the head, not an upstream stall or reset after it."
 claims = ["FLT-1", "B2", "BIL-3", "BIL-20"]
-state = "suspected"
-test = ""
-fix = ""
-note = "Found by live cells FLT-1+REL-7+BIL-3+BIL-14+BIL-20::*::*::stall_after_head (crates/verify/tests/fault_live.rs). A 2xx head is the provider's proof it took the request; estimating input from InputTally there (as no_head already does for a client abort) would bill the prompt. Related open question, not filed: the gateway's own 502/504 after the body was delivered (reset or read timeout before the head) also bills 0, though proxy.rs's no_head comment says the provider bills that prompt either way."
+state = "fixed"
+test = "a_stream_accepted_then_silent_before_its_first_byte_is_billed_an_estimate"
+fix = "12981ee"
+note = "Found by live cells FLT-1+REL-7+BIL-3+BIL-14+BIL-20::*::*::stall_after_head (crates/verify/tests/fault_live.rs). Fixed: the 2xx head is the proof the provider took the request, so proxy.rs logging's `started` gate no longer needs message_start, a relayed delta or a clean finish; a cut-short 2xx stream is estimated unless it carried only an error event (an_error_only_stream_is_not_billed_an_estimate still passes). Both wires: the Anthropic one gets no message_start, so its input comes from the tally. The related open question (the gateway's own 504 before the head) is D130."
+
+[[defect]]
+id = "D130"
+severity = "med"
+area = "Billing"
+title = "The gateway's own read timeout before the head bills zero for a prompt the provider has"
+impact = "BIL-3 bills a client that gives up before the response head once the provider has the whole request (D07), because the provider bills that prompt either way. When the gateway gives up instead (read_timeout_secs on a live connection, its 504), the provider is in the same state and bills the same prompt, but the row was 0/0. The SDKs retry a 504, so the ledger held one generation where the provider billed two (BIL-14)."
+confidence = "high"
+evidence = "Open question raised with D123 by the fault-suite author (proxy.rs no_head comment: the provider bills that prompt either way). Hermetic: an upstream that reads the whole body and stays silent past read_timeout_secs = 2 -> client 504, row {outcome: upstream_error, input_tokens: 0, usage_estimated: false}, while a client giving up at the same moment is billed the estimate (billing_cancel::a_cancel_before_the_response_head_is_billed_an_estimate). no_head required ErrorSource::Downstream."
+claims = ["BIL-3", "BIL-14", "BIL-20"]
+state = "fixed"
+test = "a_read_timeout_before_the_head_bills_the_delivered_prompt"
+fix = "12981ee"
+note = "Fixed: no_head now covers any wait given up on (gave_up_waiting): the client going away, or the gateway's ReadTimedout from upstream. Both leave a provider holding the whole request on a live connection, and it cannot tell who hung up. A reset or close from the upstream before any head (the gateway's 502) stays 0 (a_close_before_the_head_bills_nothing): the peer declined to answer, the managed providers' edge (Cloudflare) answers a forwarded-then-lost request with a 52x status rather than a bare reset, and an estimate the customer cannot check errs low (BIL-20). A dead peer (keepalive or TCP_USER_TIMEOUT) stays 0 for the same reason. The fault suite now models stall_before_head as forwarded with the provider's answer held back (the realistic shape: a provider still working when the timeout fires) and owes an estimated row for it; reset_after_forward stays unbilled by design."
