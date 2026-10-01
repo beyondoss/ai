@@ -2486,7 +2486,6 @@ fn overflowing_chat_usage_saturates_when_translated() {
 /// claim: TRN-12
 /// defect: D96
 #[test]
-#[ignore = "D96 reproduced: an empty-args call holds the queue until the end of the stream"]
 fn an_empty_args_call_does_not_hold_parallel_calls_until_the_end() {
     let chunk = |calls: Value| {
         format!(
@@ -2495,8 +2494,12 @@ fn an_empty_args_call_does_not_hold_parallel_calls_until_the_end() {
         )
     };
     let chunks = [
-        chunk(json!([{"index": 0, "id": "call_a", "type": "function", "function": {"name": "now", "arguments": ""}}])),
-        chunk(json!([{"index": 1, "id": "call_b", "type": "function", "function": {"name": "weather", "arguments": ""}}])),
+        chunk(
+            json!([{"index": 0, "id": "call_a", "type": "function", "function": {"name": "now", "arguments": ""}}]),
+        ),
+        chunk(
+            json!([{"index": 1, "id": "call_b", "type": "function", "function": {"name": "weather", "arguments": ""}}]),
+        ),
         chunk(json!([{"index": 1, "function": {"arguments": "{\"city\":"}}])),
         chunk(json!([{"index": 1, "function": {"arguments": "\"Paris\"}"}}])),
     ];

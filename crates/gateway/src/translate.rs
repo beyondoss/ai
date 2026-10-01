@@ -5801,6 +5801,8 @@ struct OaiToAnt {
     /// complete JSON (nothing more can follow) or the stream ends: an upstream may interleave
     /// argument deltas across calls.
     queued: Vec<usize>,
+    /// How far the live call's arguments have been scanned for their end (see [`ArgsEnd`]).
+    live_end: ArgsEnd,
     /// Thinking held back until its signature arrives. See [`is_replayable_thinking`].
     thinking: Gather,
     stop: Option<&'static str>,
@@ -5808,6 +5810,59 @@ struct OaiToAnt {
     refused: bool,
     usage: Option<Usage>,
     finished: bool,
+}
+
+/// Where a streamed call's JSON arguments end, found incrementally: each step scans only the bytes
+/// that arrived since the last, so a live call with queued calls behind it costs O(len) overall,
+/// not a full re-parse per step (D96). The one full parse runs when the outer value closes, to
+/// confirm it is whole JSON.
+#[derive(Default)]
+struct ArgsEnd {
+    scanned: usize,
+    depth: u32,
+    in_string: bool,
+    escaped: bool,
+    /// The outer object or array has closed.
+    closed: bool,
+}
+
+impl ArgsEnd {
+    /// Whether `args` (the live call's whole argument text so far) is complete JSON.
+    fn whole(&mut self, args: &str) -> bool {
+        let b = args.as_bytes();
+        let first = b.iter().position(|c| !c.is_ascii_whitespace());
+        match first.map(|i| b[i]) {
+            None => return false,
+            // A scalar: short, so a parse each step is fine.
+            Some(c) if c != b'{' && c != b'[' => {
+                return serde_json::from_str::<serde::de::IgnoredAny>(args).is_ok();
+            }
+            Some(_) => {}
+        }
+        while !self.closed && self.scanned < b.len() {
+            let c = b[self.scanned];
+            self.scanned += 1;
+            if self.in_string {
+                match c {
+                    _ if self.escaped => self.escaped = false,
+                    b'\\' => self.escaped = true,
+                    b'"' => self.in_string = false,
+                    _ => {}
+                }
+                continue;
+            }
+            match c {
+                b'"' => self.in_string = true,
+                b'{' | b'[' => self.depth += 1,
+                b'}' | b']' => {
+                    self.depth = self.depth.saturating_sub(1);
+                    self.closed = self.depth == 0;
+                }
+                _ => {}
+            }
+        }
+        self.closed && serde_json::from_str::<serde::de::IgnoredAny>(args).is_ok()
+    }
 }
 
 fn ant_event(out: &mut Vec<u8>, typ: &str, body: &Value) {
@@ -5972,24 +6027,35 @@ impl OaiToAnt {
             );
         }
         self.live = Some(at);
+        self.live_end = ArgsEnd::default();
     }
 
     /// While calls wait, close the live block once its arguments are whole and show the next.
     fn advance_calls(&mut self, out: &mut Vec<u8>) {
         while !self.queued.is_empty() {
-            let whole = self.live.is_none_or(|at| {
-                self.calls
-                    .calls
-                    .get(at)
-                    .is_none_or(|c| serde_json::from_str::<serde::de::IgnoredAny>(&c.args).is_ok())
-            });
-            if !whole {
+            if !self.live_whole() {
                 return;
             }
             self.close_live(out);
             let at = self.queued.remove(0);
             self.show_call(at, out);
         }
+    }
+
+    /// Whether the live call can take no more arguments. Its JSON has closed; or it has none and
+    /// the upstream is already streaming a queued call's arguments, so it is a call that takes no
+    /// arguments, not one whose arguments are late (D96).
+    fn live_whole(&mut self) -> bool {
+        let Some(c) = self.live.and_then(|at| self.calls.calls.get(at)) else {
+            return true;
+        };
+        if c.args.trim_ascii().is_empty() {
+            return self
+                .queued
+                .iter()
+                .any(|&q| self.calls.calls.get(q).is_some_and(|q| !q.args.is_empty()));
+        }
+        self.live_end.whole(&c.args)
     }
 
     /// A whole thinking block, signed or redacted, emitted at once.

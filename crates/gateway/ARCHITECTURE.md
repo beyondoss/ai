@@ -776,8 +776,11 @@ Responses-only models the catalog routes to `/v1/responses`, and is held to the 
   non-stream body does. Onto Messages, parallel calls stream as sequential `tool_use` blocks
   (Anthropic never opens a block before closing the last): a call that appears while another's
   block is open waits, its arguments gathered, and opens once the open call's arguments are complete
-  JSON (no valid byte can follow) or the stream ends. A sequential upstream streams each call as it
-  comes; one that interleaves argument deltas has the later calls held back.
+  JSON (no valid byte can follow) or the stream ends. The end is found incrementally, scanning only
+  the argument bytes new since the last step, with one parse to confirm it when the outer value
+  closes. An open call with no argument bytes is done once a waiting call's arguments start
+  arriving (a zero-argument call; the upstream has moved on). A sequential upstream streams each
+  call as it comes; one that interleaves argument deltas has the later calls held back.
 - **Errors.** Any non-2xx JSON body is an error, whatever its shape (Bedrock's `{"message"}` has no
   `error` key); `message`, `type`, `code` and `param` survive, a string `error` is the message,
   OpenRouter's `metadata.raw` is quoted after its message with the provider's name, and a numeric
