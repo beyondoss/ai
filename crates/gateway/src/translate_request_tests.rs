@@ -1937,9 +1937,9 @@ fn null_instructions_are_absent_on_chat() {
 /// claim: TRN-20, TRN-4
 /// defect: D90
 #[test]
-#[ignore = "D90 reproduced: strip_gateway_reasoning re-serializes and reorders the body"]
 fn stripping_gateway_reasoning_changes_only_the_stripped_items() {
-    let ours = r#"{"type":"reasoning","id":"rs_gw_1","summary":[],"encrypted_content":"rs_gw:SIG"}"#;
+    let ours =
+        r#"{"type":"reasoning","id":"rs_gw_1","summary":[],"encrypted_content":"rs_gw:SIG"}"#;
     let theirs = r#"{"type": "reasoning", "id": "rs_abc", "encrypted_content": "gAAA"}"#;
     let user = r#"{ "role":"user", "content":"hi" }"#;
     let body = |items: &[&str]| {
@@ -1966,5 +1966,8 @@ fn stripping_gateway_reasoning_changes_only_the_stripped_items() {
     }
     // Nothing to strip, even with `rs_gw` in the text: identical bytes.
     let other = body(&[r#"{"role":"user","content":"what is rs_gw?"}"#]);
-    assert_eq!(strip_gateway_reasoning(other.clone().into_bytes()), other.into_bytes());
+    assert_eq!(
+        strip_gateway_reasoning(other.clone().into_bytes()),
+        other.into_bytes()
+    );
 }

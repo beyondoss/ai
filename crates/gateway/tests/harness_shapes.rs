@@ -399,7 +399,14 @@ async fn explicit_nulls_are_omitted_on_a_same_wire_chat_relay_to_openrouter() {
             bad.push(format!("{model}: {got}"));
         }
         assert_eq!(got["temperature"], 0.5, "{got}");
-        assert_eq!(got["messages"], body["messages"], "nested values are the client's: {got}");
+        assert_eq!(
+            got["messages"], body["messages"],
+            "nested values are the client's: {got}"
+        );
     }
-    assert!(bad.is_empty(), "explicit nulls reached OpenRouter:\n{}", bad.join("\n"));
+    assert!(
+        bad.is_empty(),
+        "explicit nulls reached OpenRouter:\n{}",
+        bad.join("\n")
+    );
 }

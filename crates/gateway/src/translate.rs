@@ -71,6 +71,7 @@
 //!
 //! Usage/billing parse the **upstream** body. This module only reshapes bytes the client sees.
 
+use crate::peek;
 use crate::route::Endpoint;
 use serde_json::{Map, Value, json};
 
@@ -4221,22 +4222,37 @@ fn is_gateway_reasoning(item: &Value) -> bool {
 /// Responses-first row, a GPT row's Responses arm, a mixed-row failover), where a foreign id and an
 /// Anthropic signature as `encrypted_content` mean nothing and are rejected. One `memmem` decides:
 /// a body without `rs_gw` is returned untouched, unparsed.
-pub fn strip_gateway_reasoning(body: Vec<u8>) -> Vec<u8> {
+///
+/// The items are cut out by span ([`peek::remove_items`]); every other byte stays as the client
+/// sent it. A `Value` round-trip would sort every object's keys (a strict structured output's
+/// schema property order, and with it the prompt-cache prefix) and respace the body (D90). Only an
+/// `input` element that mentions `rs_gw` is parsed, to check it is ours.
+pub fn strip_gateway_reasoning(mut body: Vec<u8>) -> Vec<u8> {
     if memchr::memmem::find(&body, b"rs_gw").is_none() {
         return body;
     }
-    let Ok(mut v) = serde_json::from_slice::<Value>(&body) else {
+    // The last `input` is the one a provider's parser keeps.
+    let Some(input) = peek::root_members(&body)
+        .and_then(|m| m.into_iter().rev().find(|m| m.key_is(&body, "input")))
+    else {
         return body;
     };
-    let Some(items) = v.get_mut("input").and_then(Value::as_array_mut) else {
-        return body;
-    };
-    let before = items.len();
-    items.retain(|i| !is_gateway_reasoning(i));
-    if items.len() == before {
+    if body.get(input.value.0) != Some(&b'[') {
         return body;
     }
-    encode(&v)
+    let Some(items) = peek::array_elements(&body, input.value.0) else {
+        return body;
+    };
+    let ours: Vec<bool> = items
+        .iter()
+        .map(|&(s, e)| {
+            let item = &body[s..e];
+            memchr::memmem::find(item, b"rs_gw").is_some()
+                && serde_json::from_slice::<Value>(item).is_ok_and(|v| is_gateway_reasoning(&v))
+        })
+        .collect();
+    peek::remove_items(&mut body, &items, |k| ours[k]);
+    body
 }
 
 /// The Anthropic thinking block behind a `reasoning` item this gateway minted for a Responses

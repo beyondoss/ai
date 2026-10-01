@@ -500,7 +500,9 @@ upstream they become that turn's signed thinking again, while OpenAI's own reaso
 dropped. The reverse holds on a same-wire Responses walk: a catalog walk that relays a Responses body
 to an OpenAI Responses upstream (a Responses-first row, a GPT row's Responses arm, a mixed-row
 failover) first strips the gateway's own reasoning items, whose id and Anthropic signature OpenAI
-rejects; one `memmem` for `rs_gw` keeps every other body a byte relay. Budget-thinking Claude (before 4.6) 400s a tool loop whose final assistant turn does not
+rejects; one `memmem` for `rs_gw` keeps every other body a byte relay. The items are cut out by
+span (`peek::remove_items`), so every other byte of a stripped body (key order, a strict schema's
+property order, spacing) is still the client's, and a prompt-cache prefix still matches. Budget-thinking Claude (before 4.6) 400s a tool loop whose final assistant turn does not
 open with its thinking block; when a client sent none back (Vercel, LangChain, a Responses client
 that drops reasoning items), that request goes without `thinking`, which Anthropic accepts. The
 same rule covers a Claude model behind Chat Completions (OpenRouter's `anthropic/…`: an

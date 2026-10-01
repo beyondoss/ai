@@ -617,6 +617,189 @@ fn escaped_key_is(quoted: &[u8], want: &str) -> bool {
     serde_json::from_slice::<String>(quoted).is_ok_and(|k| k == want)
 }
 
+// ---- Span edits ------------------------------------------------------------------------------------
+//
+// A few rewrites (dropping a root member, dropping items from an array) must leave every other byte
+// of the body as the client sent it: member order (strict structured outputs, schema property
+// order), spacing, and number spellings are all part of what the provider sees and what a prompt
+// cache keys on. A `serde_json::Value` round-trip loses all three. These helpers find spans with the
+// same string/escape-aware walk as the scanners above and splice them out; nothing is re-encoded.
+
+/// One member of a JSON object: the key's raw bytes (inside its quotes, escapes as sent) and the
+/// value's extent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Member {
+    pub key: (usize, usize),
+    pub value: (usize, usize),
+}
+
+impl Member {
+    /// The member's extent: the key's opening quote through the value's last byte.
+    pub fn span(&self) -> (usize, usize) {
+        (self.key.0 - 1, self.value.1)
+    }
+
+    /// Whether the key decodes to `want`. A raw compare, unless the key carries an escape
+    /// (`"stream_options"`), which a provider's parser decodes and so must we.
+    pub fn key_is(&self, body: &[u8], want: &str) -> bool {
+        let raw = &body[self.key.0..self.key.1];
+        if raw.contains(&b'\\') {
+            escaped_key_is(&body[self.key.0 - 1..=self.key.1], want)
+        } else {
+            raw == want.as_bytes()
+        }
+    }
+}
+
+fn skip_ws(b: &[u8], mut i: usize) -> usize {
+    while i < b.len() && b[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    i
+}
+
+/// The end (exclusive) of the string whose opening quote is at `open`.
+fn string_end(b: &[u8], open: usize) -> Option<usize> {
+    let mut i = open + 1;
+    loop {
+        let k = memchr::memchr2(b'"', b'\\', b.get(i..)?)?;
+        if b[i + k] == b'\\' {
+            i += k + 2;
+        } else {
+            return Some(i + k + 1);
+        }
+    }
+}
+
+/// The end (exclusive) of the JSON value starting at `i` (no leading whitespace).
+pub fn value_end(b: &[u8], i: usize) -> Option<usize> {
+    match *b.get(i)? {
+        b'"' => string_end(b, i),
+        b'{' | b'[' => {
+            let mut depth = 0u32;
+            let mut j = i;
+            while j < b.len() {
+                match b[j] {
+                    b'"' => {
+                        j = string_end(b, j)?;
+                        continue;
+                    }
+                    b'{' | b'[' => depth += 1,
+                    b'}' | b']' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return Some(j + 1);
+                        }
+                    }
+                    _ => {}
+                }
+                j += 1;
+            }
+            None
+        }
+        _ => {
+            let n = b[i..]
+                .iter()
+                .position(|c| matches!(c, b',' | b'}' | b']') || c.is_ascii_whitespace())
+                .map_or(b.len(), |k| i + k);
+            (n > i).then_some(n)
+        }
+    }
+}
+
+/// The members of the object whose `{` is at `open`, in order. `None` for malformed JSON.
+pub fn object_members(b: &[u8], open: usize) -> Option<Vec<Member>> {
+    let mut out = Vec::new();
+    let mut i = skip_ws(b, open + 1);
+    if b.get(i) == Some(&b'}') {
+        return Some(out);
+    }
+    loop {
+        if b.get(i) != Some(&b'"') {
+            return None;
+        }
+        let key_end = string_end(b, i)?;
+        let key = (i + 1, key_end - 1);
+        i = skip_ws(b, key_end);
+        if b.get(i) != Some(&b':') {
+            return None;
+        }
+        let start = skip_ws(b, i + 1);
+        let end = value_end(b, start)?;
+        out.push(Member {
+            key,
+            value: (start, end),
+        });
+        i = skip_ws(b, end);
+        match b.get(i)? {
+            b',' => i = skip_ws(b, i + 1),
+            b'}' => return Some(out),
+            _ => return None,
+        }
+    }
+}
+
+/// The members of the body's root object. `None` when the root is not a well-formed object.
+pub fn root_members(b: &[u8]) -> Option<Vec<Member>> {
+    let open = skip_ws(b, 0);
+    (b.get(open) == Some(&b'{')).then_some(())?;
+    object_members(b, open)
+}
+
+/// The elements of the array whose `[` is at `open`, as spans, in order.
+pub fn array_elements(b: &[u8], open: usize) -> Option<Vec<(usize, usize)>> {
+    let mut out = Vec::new();
+    let mut i = skip_ws(b, open + 1);
+    if b.get(i) == Some(&b']') {
+        return Some(out);
+    }
+    loop {
+        let end = value_end(b, i)?;
+        out.push((i, end));
+        i = skip_ws(b, end);
+        match b.get(i)? {
+            b',' => i = skip_ws(b, i + 1),
+            b']' => return Some(out),
+            _ => return None,
+        }
+    }
+}
+
+/// Remove the items `drop` selects from one container's item spans (members or elements, in
+/// order), with exactly the separators that keep it valid JSON. Every other byte is untouched.
+/// `true` when anything was removed.
+pub fn remove_items(
+    body: &mut Vec<u8>,
+    items: &[(usize, usize)],
+    drop: impl Fn(usize) -> bool,
+) -> bool {
+    let last_kept = (0..items.len()).rev().find(|&k| !drop(k));
+    let mut cuts: Vec<(usize, usize)> = Vec::new();
+    for k in 0..items.len() {
+        if !drop(k) {
+            continue;
+        }
+        match last_kept {
+            // Ahead of a kept item: the item and the separator after it, up to the next item.
+            Some(l) if k < l => cuts.push((items[k].0, items[k + 1].0)),
+            // The trailing run: from the last kept item's end, separators included.
+            Some(l) => {
+                cuts.push((items[l].1, items[items.len() - 1].1));
+                break;
+            }
+            // Nothing kept: the whole run, leaving an empty container.
+            None => {
+                cuts.push((items[k].0, items[items.len() - 1].1));
+                break;
+            }
+        }
+    }
+    for &(s, e) in cuts.iter().rev() {
+        body.drain(s..e);
+    }
+    !cuts.is_empty()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1135,5 +1318,61 @@ mod tests {
             scan(br#"{"model":"gpt-4\"o"}"#).as_deref(),
             Some("gpt-4\"o")
         );
+    }
+
+    /// Every subset of root members removed by span leaves valid JSON equal to the object without
+    /// them, and an empty subset leaves the bytes identical. Same for array elements.
+    #[test]
+    fn span_removal_matches_value_removal_for_every_subset() {
+        use serde_json::Value;
+        let corpus = [
+            r#"{"a":1,"b" : "x\"}y" ,"c":[1,{"d":null}], "e":{"f":[]},"g":true}"#,
+            "{\n  \"only\": null\n}",
+            r#" { "k\u0065y":"v", "z": -1.5e3 } "#,
+        ];
+        for body in corpus {
+            let b = body.as_bytes();
+            let members = root_members(b).expect(body);
+            let spans: Vec<_> = members.iter().map(Member::span).collect();
+            let want: Value = serde_json::from_str(body).unwrap();
+            let keys: Vec<String> = want.as_object().unwrap().keys().cloned().collect();
+            assert_eq!(members.len(), keys.len(), "{body}");
+            for mask in 0u32..(1 << spans.len()) {
+                let mut out = b.to_vec();
+                let changed = remove_items(&mut out, &spans, |k| mask & (1 << k) != 0);
+                assert_eq!(changed, mask != 0);
+                if mask == 0 {
+                    assert_eq!(out, b);
+                }
+                let got: Value = serde_json::from_slice(&out)
+                    .unwrap_or_else(|e| panic!("{e}: {}", String::from_utf8_lossy(&out)));
+                let mut expect = want.clone();
+                for (k, m) in members.iter().enumerate() {
+                    if mask & (1 << k) != 0 {
+                        let key: String =
+                            serde_json::from_slice(&b[m.key.0 - 1..=m.key.1]).unwrap();
+                        expect.as_object_mut().unwrap().remove(&key);
+                    }
+                }
+                assert_eq!(got, expect, "{body} mask {mask:b}");
+            }
+        }
+        let arr = br#"[ 1, "two" ,{"x":[3]},[],null ]"#;
+        let elems = array_elements(arr, 0).unwrap();
+        let all: Vec<Value> = serde_json::from_slice::<Vec<Value>>(arr).unwrap();
+        for mask in 0u32..(1 << elems.len()) {
+            let mut out = arr.to_vec();
+            remove_items(&mut out, &elems, |k| mask & (1 << k) != 0);
+            let got: Vec<Value> = serde_json::from_slice(&out).unwrap();
+            let expect: Vec<Value> = all
+                .iter()
+                .enumerate()
+                .filter(|(k, _)| mask & (1 << k) == 0)
+                .map(|(_, v)| v.clone())
+                .collect();
+            assert_eq!(got, expect, "mask {mask:b}");
+        }
+        let esc = br#"{"k\u0065y":1}"#;
+        assert!(root_members(esc).unwrap()[0].key_is(esc, "key"));
     }
 }
