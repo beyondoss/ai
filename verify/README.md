@@ -144,7 +144,9 @@ reports every HTTP call it made. The cell then holds each call to exactly one `a
 the tokens the client saw. A call whose row is not the ordinary one says so with `expect`: no row (a
 free token count, a BYO key), a refusal billed nothing, a cut-short estimate bounded by the same
 request completed, the provider it must land on, or a row field's minimum (cache reads, 1-hour
-writes, server tool calls). Image and PDF fixtures live in `verify/clients/fixtures/`.
+writes, server tool calls). Image and PDF fixtures live in `verify/clients/fixtures/`. A probe
+shared by routes that can and can't serve a feature reads the cell's claims (`VERIFY_CLAIMS`) and
+asserts the feature only where its cell claims it (`ai_sdk_responses`'s structured output, T4).
 
 A `raw` cell is the same with no SDK: httpx on the wire (`raw_*` probes in `probe.py`), streams
 read as SSE by hand. A coding agent's calls are invisible to a probe, so its `W*` and `E7` cells

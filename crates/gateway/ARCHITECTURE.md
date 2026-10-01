@@ -716,8 +716,11 @@ the client gets back. Only records of a hosted tool the provider ran itself (`we
 message. So are `compaction` and `item_reference` items, which are OpenAI-held state (a summary
 only OpenAI can decrypt, a pointer into its store) that no translated upstream can resolve: a
 compacted Codex session that fails over onto a translated candidate runs on the history the client
-holds, a degraded answer rather than a 400. The distinction from forwarding: an item the gateway
-does not know is forwarded (the provider names it), and a known item that only OpenAI can read is
+holds, a degraded answer rather than a 400. That rule is wrong for the Vercel AI SDK's default
+Responses model, which sends no `store` and passes every earlier assistant answer back as an
+`item_reference`: on a row with no Responses arm its conversation loses the assistant's turns
+(D175, open; `providerOptions.openai.store = false` avoids it). The distinction from forwarding:
+an item the gateway does not know is forwarded (the provider names it), and a known item that only OpenAI can read is
 dropped when translating. A same-wire Responses relay keeps both. OpenAI's hosted search
 (`web_search`, `web_search_preview` and dated spellings) is the one tool dropped leaving Responses,
 unless the `tool_choice` names it: Codex offers it on every turn, by default over OpenAI's cached

@@ -2,7 +2,8 @@
 // would. Same contract as ../py/probe.py: env VERIFY_BASE, VERIFY_KEY, VERIFY_MODEL; prints one
 // final line `VERIFY {json}` with ok, calls[{request_id, wire, usage{input_total, output,
 // cache_read}}, expect?], detail. VERIFY_PROVIDER and VERIFY_CLIENT name the route's first pool
-// and the cell's client, for probes shared across SDKs.
+// and the cell's client, for probes shared across SDKs; VERIFY_CLAIMS the cell's claims, for a
+// probe that asserts a feature only on the routes whose cells claim it.
 import { readFileSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import OpenAI from "openai";
@@ -10,21 +11,33 @@ import Anthropic from "@anthropic-ai/sdk";
 import { generateText, streamText, tool, jsonSchema, stepCountIs, Output, APICallError, embed, embedMany } from "ai";
 import { createOpenAI } from "@ai-sdk/openai";
 import { createAnthropic } from "@ai-sdk/anthropic";
+import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
 
 const BASE = process.env.VERIFY_BASE;
 const KEY = process.env.VERIFY_KEY;
 const MODEL = process.env.VERIFY_MODEL;
 const PROVIDER = process.env.VERIFY_PROVIDER ?? "";
 const CLIENT = process.env.VERIFY_CLIENT ?? "";
+const CLAIMS = (process.env.VERIFY_CLAIMS ?? "").split("+");
 
 const calls = [];
 const ids = [];
 // Every error answer, with what the cell's retry policy reads (see live.rs `retryable_failure`).
 const errors = [];
+// Every request the SDK sent: its path, JSON body and status, for probes that check the wire it
+// chose and what it sent.
+const sent = [];
 
 // A fetch that records each response's x-beyond-request-id, handed to every SDK.
 const recordingFetch = async (input, init) => {
+  let body = null;
+  try {
+    body = typeof init?.body === "string" ? JSON.parse(init.body) : null;
+  } catch {}
+  const req = { path: new URL(typeof input === "string" || input instanceof URL ? input : input.url).pathname, body };
+  sent.push(req);
   const resp = await fetch(input, init);
+  req.status = resp.status;
   ids.push(resp.headers.get("x-beyond-request-id"));
   if (resp.status >= 400) {
     const h = (n) => resp.headers.get(n);
@@ -117,7 +130,82 @@ const probes = {
     const provider = createAnthropic({ baseURL: `${BASE}/v1`, apiKey: KEY, fetch: recordingFetch });
     return aiSdk(provider(MODEL), "messages");
   },
+
+  // E3 / T1 / T4 via the Vercel AI SDK's DEFAULT OpenAI model, `openai(model)`: the Responses API
+  // (no `.chat`), as most application code calls it. Generate, a tool loop, and Output.object where
+  // the cell claims T4: not on a Bedrock-only gateway (the walk leaves Bedrock out of a json_schema
+  // request, so there its own refusal is the answer) nor on a row whose card lists no structured
+  // outputs (claude-sonnet-4, whose only candidate is OpenRouter's Bedrock-only endpoint).
+  async ai_sdk_responses() {
+    const model = createOpenAI({ baseURL: `${BASE}/v1`, apiKey: KEY, fetch: recordingFetch })(MODEL);
+    const [basic, detail] = await aiSdk(model, "responses");
+    let structured = true;
+    if (CLAIMS.includes("T4")) {
+      const g = await generateText({ model, maxRetries: 0, maxOutputTokens: 2048, output: Output.object({ schema: jsonSchema(SCHEMA) }), prompt: "Give the city, country and population (millions) of Paris." });
+      record("responses", aiUsage(g.usage));
+      structured = validates(g.output);
+      detail.obj = g.output;
+    }
+    const [wire, sentDetail] = sentOn("/v1/responses");
+    return [basic && structured && wire, { ...detail, sent: sentDetail }];
+  },
+
+  // E3 via the AI SDK's default OpenAI model: a conversation continued the documented way, turn 1's
+  // `response.messages` appended. The SDK sends no `store`, so it takes OpenAI to be keeping every
+  // response, and passes the assistant's turn-1 answer back as an `item_reference` to its id.
+  // Turn 2 must recall what the user said in turn 1 and what the model answered, or be refused
+  // with the item named (an `APICallError` 4xx that bills nothing): never answered without turn 1.
+  async ai_sdk_conversation() {
+    const model = createOpenAI({ baseURL: `${BASE}/v1`, apiKey: KEY, fetch: recordingFetch })(MODEL);
+    const codename = `KESTREL-${NONCE.slice(0, 4).toUpperCase()}`;
+    const messages = [{ role: "user", content: `The codename is ${codename}. Also pick one random four-digit number. Reply with only that number.` }];
+    const t1 = await generateText({ model, maxRetries: 0, maxOutputTokens: 1024, messages });
+    record("responses", aiUsage(t1.usage));
+    messages.push(...t1.response.messages);
+    // A model that never saw its own reply would re-pick the number, and the "random" number a model
+    // picks repeats often, so turn 2 also asks it to say so when it sees no reply of its own.
+    messages.push({ role: "user", content: "On one line, give the codename I told you and the exact number you replied with. If you see no earlier reply of yours in this conversation, say NO-REPLY instead of a number." });
+    const number = t1.text.match(/\d{4}/)?.[0];
+    const turns = { codename, turn1: t1.text.slice(0, 80) };
+    let ok;
+    try {
+      const t2 = await generateText({ model, maxRetries: 0, maxOutputTokens: 1024, messages });
+      record("responses", aiUsage(t2.usage));
+      turns.turn2 = t2.text.slice(0, 160);
+      ok = Boolean(number) && t2.text.includes(number) && t2.text.toUpperCase().includes(codename) && !/NO-REPLY/i.test(t2.text);
+    } catch (e) {
+      if (!APICallError.isInstance(e)) throw e;
+      // A provider's refusal has its row (billing nothing); the gateway's own has none.
+      record("responses", null, errors.at(-1)?.provider ? { error: true } : { rows: 0 });
+      turns.refused = { status: e.statusCode, message: e.message?.slice(0, 300) };
+      ok = e.statusCode >= 400 && e.statusCode < 500 && /item_reference/.test(e.message ?? "");
+    }
+    const [wire, sentDetail] = sentOn("/v1/responses");
+    return [ok && wire, { turns, sent: sentDetail }];
+  },
+
+  // E1 / T1 via `@ai-sdk/openai-compatible` (Chat Completions, include_usage): generate, then a
+  // tool loop, as an app wiring the gateway in as a generic OpenAI-compatible provider would.
+  async ai_sdk_compatible() {
+    const provider = createOpenAICompatible({ name: "beyond", baseURL: `${BASE}/v1`, apiKey: KEY, fetch: recordingFetch, includeUsage: true });
+    const [ok, detail] = await aiSdk(provider(MODEL), "chat");
+    const [wire, sentDetail] = sentOn("/v1/chat/completions");
+    return [ok && wire, { ...detail, sent: sentDetail }];
+  },
 };
+
+// Every request the SDK sent went to `path`, and what each body held (the fields the SDK chose to
+// send, `store` among them, and the types of its input items).
+function sentOn(path) {
+  const detail = sent.map(({ path: p, status, body }) => ({
+    path: p,
+    status,
+    keys: body ? Object.keys(body).sort() : null,
+    store: body && "store" in body ? body.store : "(omitted)",
+    input: Array.isArray(body?.input) ? body.input.map((i) => i.type ?? `role:${i.role}`) : undefined,
+  }));
+  return [sent.length === calls.length && sent.every((s) => s.path.endsWith(path)), detail];
+}
 
 // The AI SDK's usage, normalized. It derives totalTokens itself, so it can't say which convention
 // the provider used; it does report reasoning separately, so the billed output is one of exactly
@@ -360,6 +448,6 @@ let ok = false, detail;
 try {
   [ok, detail] = await probes[process.argv[2]]();
 } catch (e) {
-  detail = { exception: `${e?.name}: ${e?.message}`, stack: String(e?.stack ?? "").slice(0, 1500) };
+  detail = { exception: `${e?.name}: ${e?.message}`, stack: String(e?.stack ?? "").slice(0, 1500), ...(sent.length ? { sent: sentOn("")[1] } : {}) };
 }
 console.log("VERIFY " + JSON.stringify({ ok: Boolean(ok), calls, errors, detail }));

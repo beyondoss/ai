@@ -57,14 +57,21 @@ group = "Endpoints and SDK compatibility"
 text = "Responses: one-shot translates, session state relays on GPT, 400 on Claude"
 oracle = "item lifecycle intact; store / previous_response_id round-trip"
 layer = "both"
-clients = ["openai-py", "openai-node", "codex", "openai-agents", "raw"]
+clients = [
+  "openai-py",
+  "openai-node",
+  "ai-sdk",
+  "codex",
+  "openai-agents",
+  "raw",
+]
 failover_clients = ["openai-py", "codex"]
 touches = [
   "crates/gateway/src/route.rs",
   "crates/gateway/src/proxy.rs",
   "crates/gateway/src/translate.rs",
 ]
-defects = ["D74", "D128", "D145", "D147"]
+defects = ["D74", "D128", "D145", "D147", "D175"]
 
 [[claim]]
 id = "E4"
@@ -152,7 +159,7 @@ clients = [
 ]
 failover_clients = ["openai-py", "anthropic-py", "claude-code", "pi"]
 touches = ["crates/gateway/src/translate.rs", "crates/gateway/src/proxy.rs"]
-defects = ["D63", "D127", "D171", "D172"]
+defects = ["D63", "D127", "D171", "D172", "D175"]
 
 [[claim]]
 id = "T2"

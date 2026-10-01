@@ -274,6 +274,14 @@ const CELLS: &[Cell] = &[
     ("E4",                "anthropic-ts",  Runtime::Node,   "models_list",      ONE,      ""),
     ("E1+T1+B1+S2",       "ai-sdk",        Runtime::Node,   "ai_sdk_openai",    GEN,      "R1"),
     ("E2+T1+B1",          "ai-sdk",        Runtime::Node,   "ai_sdk_anthropic", GEN,      "R1"),
+    // The AI SDK's default OpenAI model is Responses (`openai(model)`, no `.chat`), most apps' call;
+    // `@ai-sdk/openai-compatible` is the generic provider apps wire a gateway in with. T4 only
+    // where the gateway serves a JSON schema: not Bedrock alone, not claude-sonnet-4 (its card
+    // lists no structured outputs).
+    ("E3+TRN-1+T1+T4+B1", "ai-sdk",        Runtime::Node,   "ai_sdk_responses", &[CLAUDE, GPT, FAILOVER, XAI, TOGETHER], "R1"),
+    ("E3+TRN-1+T1+B1",    "ai-sdk",        Runtime::Node,   "ai_sdk_responses", &[OPENROUTER, BEDROCK], ""),
+    ("E3+B1",             "ai-sdk",        Runtime::Node,   "ai_sdk_conversation", GEN,   ""),
+    ("E1+T1+B1+S2",       "ai-sdk",        Runtime::Node,   "ai_sdk_compatible", GEN,     "R1"),
     ("T2",                "anthropic-ts",  Runtime::Node,   "thinking_replay",  &[CLAUDE], ""),
     ("T3",                "ai-sdk",        Runtime::Node,   "ai_sdk_vision",    CLAUDE_GPT, ""),
     ("T4",                "openai-node",   Runtime::Node,   "structured_chat",  FAMILIES, ""),
@@ -451,10 +459,11 @@ fn main() {
                 let checks = Checks {
                     task: claims.split('+').any(|c| c != "E7"),
                     e7: claims.split('+').any(|c| c == "E7"),
+                    claims: claims.clone(),
                 };
                 let (route, keys) = (*route, keys.clone());
                 trials.push(Trial::test(name, move || {
-                    common::judge(|| run_cell(rt, client, probe, route, &keys, checks))
+                    common::judge(|| run_cell(rt, client, probe, route, &keys, &checks))
                 }));
             }
         }
@@ -465,13 +474,15 @@ fn main() {
 }
 
 /// What a cell asserts beyond the ledger, from the claims in its name.
-#[derive(Clone, Copy)]
 struct Checks {
     /// Any claim but E7: the client's verdict must hold (for a harness, the fixture test passes).
     task: bool,
     /// E7: the harness's model list and displayed session cost (see [`e7_problems`]). An E7-only
     /// cell doesn't need the task to succeed: a session that failed still has a cost to compare.
     e7: bool,
+    /// The cell's claims, `+`-joined, handed to the probe as `VERIFY_CLAIMS`: a probe shared by
+    /// routes that can and can't serve a feature asserts it only where its cell claims it.
+    claims: String,
 }
 
 /// Kills its process on drop, so a failing cell never leaks a gateway or nats-server.
@@ -525,7 +536,7 @@ fn run_cell(
     probe: &str,
     route: Route,
     keys: &BTreeMap<String, String>,
-    checks: Checks,
+    checks: &Checks,
 ) -> Result<(), Failed> {
     let mut retry = 0;
     loop {
@@ -600,7 +611,7 @@ fn attempt_cell(
     probe: &str,
     route: Route,
     keys: &BTreeMap<String, String>,
-    checks: Checks,
+    checks: &Checks,
     retryable: &mut Option<(Value, bool)>,
 ) -> Result<(), Failed> {
     let dir = std::env::temp_dir().join(format!(
@@ -672,6 +683,7 @@ fn attempt_cell(
         .env("VERIFY_MODEL", route.model)
         .env("VERIFY_PROVIDER", route.pools[0].0)
         .env("VERIFY_CLIENT", client)
+        .env("VERIFY_CLAIMS", &checks.claims)
         .env("VERIFY_GATEWAY_PID", gw.0.id().to_string());
     // A BYO probe sends the provider's own key through /{provider}/, the way a customer with
     // their own key would; a leak probe looks for the pool key in everything it was sent. Only

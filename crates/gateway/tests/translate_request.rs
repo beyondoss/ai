@@ -504,6 +504,82 @@ async fn stock_responses_create_without_store_works_on_a_claude_row() {
     assert!(got.get("store").is_none(), "{got}");
 }
 
+/// The Vercel AI SDK's default OpenAI model (`openai(model)`, the Responses API) sends no `store`,
+/// so it takes OpenAI to be keeping every response: a conversation passed back as
+/// `response.messages` sends the assistant's earlier answer as an `item_reference` to the id it
+/// was given. On a row with no Responses arm nothing holds that item, and the gateway drops it
+/// while translating: the model answers turn 2 without its own turn 1 (live: Claude, Together,
+/// OpenRouter, Bedrock). The referenced answer must reach the upstream, or the client must be
+/// told (a 4xx naming `item_reference`), never a confident answer to a conversation the model
+/// never saw.
+/// claim: E3
+/// defect: D175
+#[tokio::test]
+#[ignore = "D175 reproduced: an item_reference to a translated answer is dropped on a Claude row"]
+async fn an_item_reference_to_a_translated_answer_is_resolved_or_refused() {
+    let nats_port = unused_nats_port();
+    let (pubkey, sk) = test_keypair(1);
+    let mock = MockUpstream::start(Mode::AnthropicJson).await;
+    let gw = Gateway::builder(nats_port, &mock.authority(), &b64(&pubkey))
+        .providers(&["anthropic", "openai", "openrouter"])
+        .start()
+        .await;
+
+    // Turn 1, as the AI SDK sends it: no store. The mock answers "hi".
+    let user1 = json!({"role": "user", "content": "Pick a number."});
+    let text = post(
+        &gw,
+        &sk,
+        "/v1/responses",
+        &json!({"model": "claude-opus-4-8", "input": [user1]}),
+    )
+    .await;
+    let turn1: Value = serde_json::from_str(&text).unwrap();
+    let message = turn1["output"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["type"] == "message")
+        .unwrap_or_else(|| panic!("turn 1 has a message item: {turn1}"));
+    let id = message["id"].as_str().expect("the message item has an id");
+
+    // Turn 2: the AI SDK's `convertToOpenAIResponsesInput` with store unset (true) and the part's
+    // itemId set.
+    let body = json!({"model": "claude-opus-4-8", "input": [
+        user1,
+        {"type": "item_reference", "id": id},
+        {"role": "user", "content": "Which number did you pick?"},
+    ]});
+    let resp = test_client()
+        .post(format!("{}/v1/responses", gw.url()))
+        .header("authorization", format!("Bearer {}", vkey(&sk)))
+        .header("content-type", "application/json")
+        .body(serde_json::to_vec(&body).unwrap())
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status().as_u16();
+    let text = resp.text().await.unwrap();
+    if (400..500).contains(&status) {
+        assert!(
+            text.contains("item_reference"),
+            "a refusal names the item: {text}"
+        );
+        return;
+    }
+    assert_eq!(status, 200, "{text}");
+    let (_, got) = captured(&mock);
+    let assistant = got["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|m| m["role"] == "assistant" && m["content"].to_string().contains("hi"));
+    assert!(
+        assistant,
+        "turn 1's answer never reached the upstream, and the client was not told: {got}"
+    );
+}
+
 /// A Responses client's next turn after a Claude turn carries the `reasoning` item the gateway
 /// minted (`rs_gw…`, Claude's signature as `encrypted_content`). When that turn is served by a
 /// real OpenAI Responses upstream (a Responses-first row like Codex's, or a mixed-row failover), the item
