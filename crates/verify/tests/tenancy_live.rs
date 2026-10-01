@@ -562,10 +562,22 @@ fn run_cell(
     eprintln!("{scenario} detail: {}", verdict["detail"]);
 
     if verdict["ok"] != true {
-        // The scenario's clients run with retries off: a session that ended on its only
-        // provider's retryable answer is run again under the SDK policy (`common::retrying`).
-        if route.pools.len() == 1 {
-            common::note_if_ended_unavailable(&usage_rows(&log_path));
+        // The scenario's clients run with retries off: a session that ended on its only live
+        // provider's retryable answer is run again under the SDK policy (`common::retrying`). A
+        // provider holding only revoked keys (`REVOKED_*`, REL-14) refuses on purpose: its rows
+        // are the subject, never unavailability, and it is no provider to fail over to.
+        let live: std::collections::BTreeSet<&str> = route
+            .pools
+            .iter()
+            .filter(|(_, var)| !var.starts_with("REVOKED_"))
+            .map(|(provider, _)| *provider)
+            .collect();
+        if live.len() == 1 {
+            let rows: Vec<Value> = usage_rows(&log_path)
+                .into_iter()
+                .filter(|r| r["provider"].as_str().is_some_and(|p| live.contains(p)))
+                .collect();
+            common::note_if_ended_unavailable(&rows);
         }
         return Err(format!(
             "client verdict failed: {}\ncontrol: {transcript:?}\n--- gateway log ---\n{}",

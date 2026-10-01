@@ -101,14 +101,14 @@ apart and keeps their claims from `PROVEN` without turning them `RED`; the gate 
 whose closing live cell was inconclusive. The cell's other problems stay in the message. An answer
 the gateway made itself stays a failure, as does a relayed one where failover was possible.
 
-| Suite                                          | How a cell retries                                                                                                          |
-| ---------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
-| `live.rs`                                      | The probe's SDK runs with retries off (one HTTP call, one row); the whole cell runs again on a new gateway.                 |
-| `catalog_live.rs`                              | Each request is retried in place.                                                                                           |
-| `parity_live.rs`                               | Each request (direct or through the gateway) is retried in place.                                                           |
-| `tenancy_live.rs`, `reconcile_live.rs`, TOOL-1 | The whole cell runs again (no `Retry-After` to read: the backoff).                                                          |
-| LNG sessions, MCP cases                        | The harness already retried with its own defaults; a session that ended on its provider's retryable answer is INCONCLUSIVE. |
-| `fault_live.rs`, `session_live.rs`             | Not applied: their providers fail on purpose (injected faults, killed upstreams), so a relayed failure is the subject.      |
+| Suite                                                         | How a cell retries                                                                                                                                      |
+| ------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `live.rs` probes (SDK and raw HTTP)                           | The probe's client runs with retries off (one HTTP call, one row); the whole cell runs again on a new gateway.                                          |
+| `catalog_live.rs`                                             | Each request is retried in place.                                                                                                                       |
+| `parity_live.rs`                                              | Each request (direct or through the gateway) is retried in place.                                                                                       |
+| `tenancy_live.rs`, `reconcile_live.rs`, TOOL-1                | The whole cell runs again (no `Retry-After` to read: the backoff). A provider holding only revoked keys (REL-14) is not counted as one to fail over to. |
+| LNG sessions, MCP cases, `live.rs` harness and recorded cells | The harness already retried with its own defaults; a session that ended on its provider's retryable answer is INCONCLUSIVE.                             |
+| `fault_live.rs`, `session_live.rs`                            | Not applied: their providers fail on purpose (injected faults, killed upstreams), so a relayed failure is the subject.                                  |
 
 A cell that is INCONCLUSIVE on every run is worth a look: a provider 500 can be its deterministic
 answer to a request shape the gateway produced.

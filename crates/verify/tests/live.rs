@@ -454,7 +454,7 @@ fn main() {
                 };
                 let (route, keys) = (*route, keys.clone());
                 trials.push(Trial::test(name, move || {
-                    run_cell(rt, client, probe, route, &keys, checks)
+                    common::judge(|| run_cell(rt, client, probe, route, &keys, checks))
                 }));
             }
         }
@@ -693,7 +693,16 @@ fn attempt_cell(
 
     // Witness 1: the client's own verdict.
     if checks.task && verdict["ok"] != true {
-        *retryable = retryable_failure(&verdict, &usage_rows(&log_path), route);
+        let rows = usage_rows(&log_path);
+        *retryable = retryable_failure(&verdict, &rows, route);
+        // A coding agent (harness.py, or harness_long.py's recorded cells) has already retried
+        // with its own defaults and reports no `errors`: a session that ended on its only live
+        // provider's retryable answer is INCONCLUSIVE (`common::judge`), as LNG sessions are.
+        if matches!(rt, Runtime::Harness | Runtime::Recorded)
+            && route.pools.len() - route.dead.len() == 1
+        {
+            common::note_if_ended_unavailable(&rows);
+        }
         return Err(format!(
             "client verdict failed: {}\n--- gateway log ---\n{}",
             verdict["detail"],
