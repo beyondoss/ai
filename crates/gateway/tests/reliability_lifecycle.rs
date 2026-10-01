@@ -126,17 +126,29 @@ async fn a_header_stall_ends_at_the_configured_read_timeout() {
     );
 }
 
-/// With default config a streaming request whose upstream never sends a response head must still
-/// fail well under the 600s `read_timeout_secs`: a stall bound below it has to exist. A streaming
-/// provider sends its head at once, so 15s is a generous first-byte bound.
+/// A streaming request whose upstream never sends a response head must fail well under the 600s
+/// `read_timeout_secs`: a stall bound below it has to exist. That bound is
+/// `stream_idle_timeout_secs`, 120s by default (asserted below, against the default read timeout);
+/// the e2e half configures it to 2s, leaving `read_timeout_secs` at its default, so the stall is
+/// observed ending in a JSON 504 within seconds rather than after two minutes.
 /// claim: REL-7
 /// defect: D36
 #[tokio::test]
-#[ignore = "D36 reproduced: default config, streaming header stall still open at 15s (only read_timeout=600s bounds it)"]
 async fn a_streaming_header_stall_fails_well_under_read_timeout_by_default() {
+    let defaults = beyond_ai::config::AiConfig::default();
+    assert!(
+        defaults.stream_idle_timeout_secs > 0
+            && defaults.stream_idle_timeout_secs * 4 <= defaults.read_timeout_secs,
+        "a default stream stall bound well under read_timeout_secs: {} vs {}",
+        defaults.stream_idle_timeout_secs,
+        defaults.read_timeout_secs
+    );
     let (pubkey, _sk) = test_keypair(1);
     let mock = ReplyUpstream::start(|_, _| Reply::HeaderStall).await;
-    let gw = Gateway::start(unused_nats_port(), &mock.authority(), &b64(&pubkey)).await;
+    let gw = Gateway::builder(unused_nats_port(), &mock.authority(), &b64(&pubkey))
+        .config_line("stream_idle_timeout_secs = 2")
+        .start()
+        .await;
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(15))
         .build()
@@ -150,11 +162,40 @@ async fn a_streaming_header_stall_fails_well_under_read_timeout_by_default() {
         .send()
         .await;
     let took = start.elapsed();
+    let resp = result.unwrap_or_else(|e| panic!("no answer from the gateway after {took:?}: {e}"));
+    let status = resp.status().as_u16();
+    let text = resp.text().await.unwrap_or_default();
     assert!(
-        result.is_ok(),
-        "no answer from the gateway after {took:?}: {:?}",
-        result.err()
+        status == 504 && took < Duration::from_secs(6) && text.contains("\"error\""),
+        "status {status} after {took:?}: {text}"
     );
+}
+
+/// The stream bound is for streams only: a non-streaming request's time to its head is the whole
+/// generation, so it keeps `read_timeout_secs` and an answer slower than the stream bound arrives.
+/// claim: REL-7
+/// defect: D36
+#[tokio::test]
+async fn a_slow_non_streaming_answer_is_not_cut_at_the_stream_bound() {
+    let (pubkey, _sk) = test_keypair(1);
+    let mock = ReplyUpstream::start(|_, _| {
+        Reply::Delayed(Duration::from_millis(3500), Box::new(Reply::ok()))
+    })
+    .await;
+    let gw = Gateway::builder(unused_nats_port(), &mock.authority(), &b64(&pubkey))
+        .config_line("stream_idle_timeout_secs = 2")
+        .start()
+        .await;
+    let status = test_client()
+        .post(format!("{}/openai/v1/chat/completions", gw.url()))
+        .header("authorization", "Bearer sk-byo-test")
+        .header("content-type", "application/json")
+        .body(r#"{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}"#)
+        .send()
+        .await
+        .map(|r| r.status().as_u16())
+        .unwrap_or(0);
+    assert_eq!(status, 200);
 }
 
 /// A client that sends a request for a large stream and then never reads must be released (its

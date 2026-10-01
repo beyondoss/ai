@@ -219,6 +219,15 @@ pub struct AiConfig {
     /// blocked write. Per write: a slow but steady reader never trips it. `0` disables it.
     pub client_write_timeout_secs: u64,
 
+    /// The longest a provider may stay silent on a request that asked for a stream (root
+    /// `"stream": true`, read before connecting): before its response head, or between body
+    /// reads. A streaming provider answers its head at once and then keeps sending, so a longer
+    /// silence is a stall, ended with a JSON 504 rather than held for `read_timeout_secs` (600 s).
+    /// Pingora has one per-read upstream timeout, so this one bound covers the first byte and the
+    /// gaps alike. Requests that do not stream, or whose body is not read ahead (a large body on
+    /// `/{provider}` or BYO), keep `read_timeout_secs`. Capped by it; `0` disables.
+    pub stream_idle_timeout_secs: u64,
+
     /// Graceful-shutdown drain window (seconds): after SIGTERM, how long Pingora lets **in-flight
     /// requests finish** before tearing the runtimes down. Maps to Pingora's `grace_period_seconds`
     /// (left unset, Pingora silently defaults to 300s — this knob makes the window explicit).
@@ -383,6 +392,7 @@ impl Default for AiConfig {
             write_timeout_secs: 60,
             idle_timeout_secs: 90,
             client_write_timeout_secs: 60,
+            stream_idle_timeout_secs: 120,
             // Drain for the full request lifetime (= read_timeout_secs) so a deploy never truncates
             // an in-flight stream — we're a transparent proxy and must not mangle a paid-for
             // generation. Pingora stops accepting new connections at SIGTERM, so this only waits out
