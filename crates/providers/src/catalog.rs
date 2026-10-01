@@ -132,9 +132,12 @@ pub struct ModelRoute {
 ///   endpoint the catalog sends it to**. A bit the vendor's model page does not name (structured
 ///   outputs on `gpt-4`) is removed; so is one a candidate's endpoint refuses (function calling on
 ///   `grok-4.20-multi-agent`, which xAI gates behind beta access; tools on
-///   `meta-llama/llama-4-scout`, which no OpenRouter host serves). A bit one failover candidate
+///   `meta-llama/llama-4-scout`, which no OpenRouter host serves), and one no candidate enforces
+///   (structured outputs on Kimi K2.6, Kimi K2.7 Code and Qwen3.6 Plus, whose hosts accept a JSON
+///   schema and answer outside it). A bit one failover candidate
 ///   refuses but the gateway can steer around is kept, and a request using it skips that
-///   candidate: structured outputs on Bedrock ([`serves_structured_outputs`]), file input on
+///   candidate: structured outputs on Bedrock and OpenRouter's `z-ai/glm-5.2`
+///   ([`serves_structured_outputs`]), file input on
 ///   OpenRouter's `x-ai/grok-build-0.1` ([`serves_file_input`]). One the page omits but every
 ///   candidate serves is listed: function calling on `gpt-4`, the snapshot that introduced it.
 ///   The gateway refuses image input on a row whose card omits it, rather than let a candidate
@@ -316,15 +319,30 @@ const fn price(
     }
 }
 
+/// Candidates that accept a JSON-schema output constraint but do not enforce it, on a row whose
+/// card advertises [`STRUCTURED_OUTPUTS`] because another candidate does. OpenRouter's
+/// `z-ai/glm-5.2` spreads the request over hosts, and one that lists `structured_outputs` in its
+/// endpoint's `supported_parameters` (DigitalOcean) answers `{\n{\n  "answer": 391\n}`, which is
+/// not JSON (measured 2026-10-01; Together's `zai-org/GLM-5.2` holds the schema). A
+/// structured-output request leaves such a candidate out of its walk. A row where no candidate
+/// enforces the schema does not advertise it instead (`verify/catalog_truth.toml`
+/// `[[schema_unenforced]]` records each measurement).
+const REFUSES_STRUCTURED_OUTPUTS: &[(ProviderId, &str)] =
+    &[(ProviderId::OpenRouter, "z-ai/glm-5.2")];
+
 /// Whether a candidate honors a JSON-schema output constraint (`response_format` `json_schema`,
 /// Messages `output_config.format`, Responses `text.format`). Amazon Bedrock's Anthropic Messages
 /// surface does not: it answers `output_config.format` (and the beta `output_format`) with 400
 /// "Extra inputs are not permitted" on Opus 4.8 and a 404 "The model doesn't exist or doesn't
 /// support this API" on Haiku 4.5 (measured 2026-10-01), so a structured-output request on a row
-/// whose card advertises [`STRUCTURED_OUTPUTS`] must not be served there. The gateway drops such a
-/// candidate from that request's walk.
-pub const fn serves_structured_outputs(c: &Candidate) -> bool {
+/// whose card advertises [`STRUCTURED_OUTPUTS`] must not be served there. Nor may one listed in
+/// [`REFUSES_STRUCTURED_OUTPUTS`], which answers without holding the schema. The gateway drops
+/// such a candidate from that request's walk.
+pub fn serves_structured_outputs(c: &Candidate) -> bool {
     !matches!(c.provider, ProviderId::Bedrock)
+        && !REFUSES_STRUCTURED_OUTPUTS
+            .iter()
+            .any(|&(p, m)| p == c.provider && m == c.upstream_model)
 }
 
 /// Candidates that refuse file (PDF) input on a row whose card advertises it. OpenRouter routes
@@ -1933,7 +1951,7 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
             1776699402,
             262_144,
             IN_TEXT | IN_IMAGE,
-            TOOLS | REASONING | STRUCTURED_OUTPUTS,
+            TOOLS | REASONING, // structured outputs unenforced: D155
         ),
     },
     ModelRoute {
@@ -1948,7 +1966,7 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
             1781266361,
             262_144,
             IN_TEXT | IN_IMAGE,
-            TOOLS | REASONING | STRUCTURED_OUTPUTS,
+            TOOLS | REASONING, // structured outputs unenforced: D155
         ),
     },
     ModelRoute {
@@ -2158,7 +2176,7 @@ pub const MODEL_ROUTES: &[ModelRoute] = &[
             1_000_000,
             65_536,
             IN_TEXT | IN_IMAGE | IN_VIDEO,
-            TOOLS | REASONING | STRUCTURED_OUTPUTS,
+            TOOLS | REASONING, // structured outputs unenforced: D155
         ),
     },
     ModelRoute {
@@ -3951,21 +3969,110 @@ mod tests {
         assert!(checked >= 8, "only {checked} GPT-5.4+ OpenAI candidates");
     }
 
-    /// Amazon Bedrock's Messages surface refuses `output_config.format`: a structured-output request
-    /// must skip it. Every other candidate type honors the constraint.
+    /// Amazon Bedrock's Messages surface refuses `output_config.format`, and the candidates
+    /// `verify/catalog_truth.toml` records under `[[schema_unenforced]]` accept a JSON schema and
+    /// answer outside it. Each such candidate either sits on a row whose card does not advertise
+    /// structured outputs, or `serves_structured_outputs` refuses it so a schema request skips it.
+    /// Every refused candidate other than Bedrock has a measurement there, and every card that
+    /// advertises structured outputs keeps a candidate that enforces them.
     /// claim: CAT-6
+    /// defect: D107, D155
     #[test]
-    fn only_bedrock_refuses_structured_outputs() {
+    fn schema_unenforced_candidates_match_truth() {
+        let t = truth();
+        let mut recorded = std::collections::HashSet::new();
+        for e in truth_array(&t, "schema_unenforced") {
+            let field = |k: &str| e.get(k).and_then(toml::Value::as_str).unwrap_or_default();
+            let (model, provider, id) = (field("model"), field("provider"), field("id"));
+            for k in ["model", "provider", "id", "source", "date", "evidence"] {
+                assert!(!field(k).is_empty(), "{model} {provider}/{id}: {k}");
+            }
+            let row = exact_row(model);
+            assert!(row.is_some(), "{model}: not a catalog row");
+            let Some(row) = row else { continue };
+            let c = row
+                .candidates
+                .iter()
+                .chain(row.responses)
+                .find(|c| by_id(c.provider).name == provider && c.upstream_model == id);
+            assert!(c.is_some(), "{model}: no candidate {provider}/{id}");
+            let Some(c) = c else { continue };
+            assert!(
+                row.card.features & STRUCTURED_OUTPUTS == 0 || !serves_structured_outputs(c),
+                "{model}: {provider}/{id} answers outside the schema, yet the card advertises \
+                 structured outputs and a schema request may be sent there"
+            );
+            recorded.insert((c.provider, c.upstream_model));
+        }
+        assert!(
+            !recorded.is_empty(),
+            "the truth file records no schema_unenforced"
+        );
         for r in MODEL_ROUTES {
             for c in r.candidates.iter().chain(r.responses) {
-                assert_eq!(
-                    serves_structured_outputs(c),
-                    c.provider != ProviderId::Bedrock,
-                    "{}",
+                if c.provider != ProviderId::Bedrock && !serves_structured_outputs(c) {
+                    assert!(
+                        recorded.contains(&(c.provider, c.upstream_model)),
+                        "{}: {:?}/{} is refused without a [[schema_unenforced]] measurement",
+                        r.model,
+                        c.provider,
+                        c.upstream_model
+                    );
+                }
+                if c.provider == ProviderId::Bedrock {
+                    assert!(!serves_structured_outputs(c), "{}", r.model);
+                }
+            }
+            if r.card.features & STRUCTURED_OUTPUTS != 0 {
+                assert!(
+                    r.candidates.iter().any(serves_structured_outputs),
+                    "{}: advertises structured outputs, but no candidate enforces them",
                     r.model
                 );
             }
         }
+    }
+
+    /// The D155 rows: OpenRouter's GLM 5.2 is skipped by a schema request (Together holds the
+    /// schema), and Kimi K2.6, Kimi K2.7 Code and Qwen3.6 Plus, whose every candidate answers
+    /// outside it, no longer advertise structured outputs. Qwen3.8 Flash keeps them: both its
+    /// candidates held the schema in 48 calls (its sweep failure was OpenRouter's 429, D156).
+    /// claim: CAT-6
+    /// defect: D155
+    #[test]
+    fn structured_outputs_are_advertised_only_where_enforced() {
+        let glm = for_model("z-ai/glm-5.2");
+        assert!(glm.is_some(), "z-ai/glm-5.2");
+        if let Some(r) = glm {
+            assert_ne!(r.card.features & STRUCTURED_OUTPUTS, 0);
+            let serves: Vec<_> = r
+                .candidates
+                .iter()
+                .map(|c| (c.provider, serves_structured_outputs(c)))
+                .collect();
+            assert_eq!(
+                serves,
+                [
+                    (ProviderId::Together, true),
+                    (ProviderId::Fireworks, true),
+                    (ProviderId::OpenRouter, false),
+                ]
+            );
+        }
+        for m in [
+            "moonshotai/kimi-k2.6",
+            "moonshotai/kimi-k2.7-code",
+            "qwen/qwen3.6-plus",
+        ] {
+            let f = for_model(m).map(|r| r.card.features);
+            assert!(f.is_some_and(|f| f & STRUCTURED_OUTPUTS == 0), "{m}");
+            assert!(f.is_some_and(|f| f & TOOLS != 0), "{m} keeps tools");
+        }
+        let flash = for_model("qwen/qwen3.8-flash");
+        assert!(
+            flash.is_some_and(|r| r.card.features & STRUCTURED_OUTPUTS != 0
+                && r.candidates.iter().all(serves_structured_outputs))
+        );
     }
 
     /// Prices are the model maker's own published rate, never OpenRouter's listing (its cheapest

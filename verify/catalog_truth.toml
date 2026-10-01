@@ -34,6 +34,17 @@
 # `[[retired]]` and `[[not_serverless]]` are (provider, id) pairs the vendor no longer serves to a
 # standard key. No catalog candidate may name one (`no_candidate_is_retired_or_not_serverless`).
 #
+# `[[schema_unenforced]]` records a candidate that accepts a JSON-schema output request
+# (`response_format` `json_schema`, `strict: true`) and answers outside the schema, with the
+# OpenRouter endpoint listing that claimed otherwise and the measurement (D155). OpenRouter's
+# per-endpoint `supported_parameters` (`GET /api/v1/models/{id}/endpoints`) is not ground truth:
+# hosts that list `structured_outputs` answer fenced, renamed or broken JSON, and
+# `provider.require_parameters` does not avoid them. `schema_unenforced_candidates_match_truth`
+# asserts that each such candidate either sits on a row whose card does not advertise
+# `structured_outputs`, or is one `serves_structured_outputs` refuses (so a schema request skips
+# it), that every candidate it refuses (Bedrock aside) is recorded here, and that every
+# advertising card keeps a candidate that enforces the schema.
+#
 # Source audit: verify/catalog_truth_2026-10-01.md (raw pages fetched with curl and parsed locally).
 
 # Direct-vendor rows with no checked vendor facts, as { model = "...", reason = "..." }. Empty:
@@ -1076,6 +1087,7 @@ date = "2026-10-01"
 input = "0.50"
 output = "3.00"
 context_window = 1_000_000
+features_absent = ["structured_outputs"]
 
 [[row]]
 model = "qwen/qwen3.7-max"
@@ -1256,6 +1268,7 @@ output = "4.00"
 cache_read = "0.16"
 context_window = 262_144
 note = "OpenRouter-primary; Moonshot's own K2 table (cache hit $0.16, miss $0.95, output $4.00). No cache-write rate."
+features_absent = ["structured_outputs"]
 
 [[row]]
 model = "moonshotai/kimi-k2.7-code"
@@ -1266,6 +1279,7 @@ output = "4.00"
 cache_read = "0.19"
 context_window = 262_144
 note = "OpenRouter-primary; Moonshot's own K2 table (cache hit $0.19, miss $0.95, output $4.00). OpenRouter lists 0.6712 / 3.35, its cheapest host, not the maker's rate."
+features_absent = ["structured_outputs"]
 
 [[row]]
 model = "z-ai/glm-5.1"
@@ -1403,3 +1417,52 @@ output = "10.00"
 until = "2026-11-21"
 source = "https://developers.openai.com/api/docs/pricing.md"
 note = "OpenRouter lists $4 / $20 and charges half (CAT-7::raw::openrouter::gpt-5.6-sol-pro, 2026-10-01): the gpt-5.6-sol promotion."
+
+[[schema_unenforced]]
+model = "z-ai/glm-5.2"
+provider = "openrouter"
+id = "z-ai/glm-5.2"
+source = "https://openrouter.ai/api/v1/models/z-ai/glm-5.2/endpoints"
+date = "2026-10-01"
+supported_parameters = "28 of 33 endpoints list structured_outputs, DigitalOcean among them"
+evidence = 'CAT-6::raw::openrouter::z-ai/glm-5.2 answered "{\n{\n  "answer": 391\n}", which is not JSON (live 2026-10-01). Direct to OpenRouter with provider.only DigitalOcean: 3 of 6 answers are not JSON ("{\n{\n...", "{"{"answer": 391}"). Together zai-org/GLM-5.2, the row primary, held the schema 6 of 6 (streamed) and in the sweep (non-streamed).'
+note = "Steered: the card keeps structured_outputs, and a schema request skips this candidate."
+
+[[schema_unenforced]]
+model = "moonshotai/kimi-k2.6"
+provider = "openrouter"
+id = "moonshotai/kimi-k2.6"
+source = "https://openrouter.ai/api/v1/models/moonshotai/kimi-k2.6/endpoints"
+date = "2026-10-01"
+supported_parameters = "18 of 18 endpoints list structured_outputs"
+evidence = 'CAT-6::raw::openrouter::moonshotai/kimi-k2.6 answered a ```json-fenced {"expression", "result"} (live 2026-10-01). Direct to OpenRouter, 28 json_schema calls: Decart, Phala, Chutes (empty content), StreamLake and Moonshot AI itself answered outside the schema; Baidu, CoreWeave, Inceptron, Cloudflare, Crusoe, SiliconFlow and Venice held it. provider.require_parameters still routed to Chutes.'
+note = "The row's only candidate: the card drops structured_outputs."
+
+[[schema_unenforced]]
+model = "moonshotai/kimi-k2.7-code"
+provider = "openrouter"
+id = "moonshotai/kimi-k2.7-code"
+source = "https://openrouter.ai/api/v1/models/moonshotai/kimi-k2.7-code/endpoints"
+date = "2026-10-01"
+supported_parameters = "11 of 12 endpoints list structured_outputs, CoreWeave among them"
+evidence = 'CAT-6::raw::openrouter::moonshotai/kimi-k2.7-code answered its reasoning as prose followed by {"answer": 391} (live 2026-10-01). Direct to OpenRouter with provider.only CoreWeave: 0 of 12 answers are schema JSON (prose reasoning; once {"question", "answer"}). Other hosts held it 46 of 46.'
+note = "The row's only candidate: the card drops structured_outputs."
+
+[[schema_unenforced]]
+model = "qwen/qwen3.6-plus"
+provider = "together"
+id = "Qwen/Qwen3.6-Plus"
+source = "https://docs.together.ai/docs/serverless/models"
+date = "2026-10-01"
+evidence = 'Together answers a non-streamed request 400 streaming_required (D147). Streamed json_schema calls: 3 of 8 answered {"result": 391}.'
+note = "Neither candidate enforces the schema: the card drops structured_outputs."
+
+[[schema_unenforced]]
+model = "qwen/qwen3.6-plus"
+provider = "openrouter"
+id = "qwen/qwen3.6-plus"
+source = "https://openrouter.ai/api/v1/models/qwen/qwen3.6-plus/endpoints"
+date = "2026-10-01"
+supported_parameters = "1 of 1 endpoint (Alibaba) lists structured_outputs"
+evidence = 'CAT-6::raw::openrouter::qwen/qwen3.6-plus answered {"result": 391} (live 2026-10-01). Direct to OpenRouter (Alibaba): 2 of 24 answered {"result": 391}.'
+note = "Neither candidate enforces the schema: the card drops structured_outputs."

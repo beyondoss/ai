@@ -371,7 +371,10 @@ candidate serves on the endpoint it is reached on**: `grok-4.20-multi-agent` lis
 gates its client-side tools behind beta access), `gpt-4` lists the tools every candidate calls
 though its model page omits them. A bit that one failover candidate refuses but the walk can steer
 around stays on the card, and a request using it skips that candidate (below): structured outputs
-on Bedrock, file input on OpenRouter's `x-ai/grok-build-0.1`. Grok rows list file input because
+on Bedrock and on OpenRouter's `z-ai/glm-5.2`, file input on OpenRouter's `x-ai/grok-build-0.1`. A
+bit no candidate honors is dropped: Kimi K2.6, Kimi K2.7 Code and Qwen3.6 Plus list no structured
+outputs, because their hosts accept a JSON schema and answer outside it (OpenRouter's per-endpoint
+`supported_parameters` claims otherwise, so it is not taken as ground truth). Grok rows list file input because
 every grok row reaches xAI over `/v1/responses`, where xAI reads PDFs (its Chat Completions answers
 400 "File content is not supported on /v1/chat/completions"). Where the vendor publishes no max output, OpenRouter's 0.9x /
 0.8x-of-window filler is replaced by `UNPUBLISHED_MAX_OUTPUT` (32,768), a conservative figure and
@@ -398,8 +401,11 @@ body before choosing, as a headerless walk always does. Then:
 - A body asking for a JSON-schema output (`response_format` / `output_config.format` /
   `text.format`) leaves Amazon Bedrock out of the walk (`providers::catalog::serves_structured_outputs`):
   Bedrock's Messages surface answers `output_config.format` with a 400 (Opus 4.8) or a 404 (Haiku
-  4.5). It is left out of the order, failover and TTFT ranking alike, unless nothing else is usable
-  (an `x-beyond-only: bedrock`), when Bedrock's own answer is the client's.
+  4.5). So is a candidate that accepts the schema but does not hold its answer to it
+  (`REFUSES_STRUCTURED_OUTPUTS`: OpenRouter's `z-ai/glm-5.2`, whose hosts include one that answers
+  `{\n{\n  "answer": 391\n}`). It is left out of the order, failover and TTFT ranking alike, unless
+  nothing else is usable (an `x-beyond-only: bedrock`), when that provider's own answer is the
+  client's.
 - A body carrying a file part (Chat `file`, Messages `document`, Responses `input_file`) leaves a
   candidate that reads none out of the walk the same way (`providers::catalog::serves_file_input`):
   OpenRouter's `x-ai/grok-build-0.1` answers a PDF with 404 "No endpoints found that support file

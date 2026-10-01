@@ -99,7 +99,7 @@ layer = "live"
 clients = ["opencode", "pi", "claude-code"]
 failover_clients = []
 touches = ["crates/providers/src/catalog.rs", "crates/gateway/src/proxy.rs"]
-defects = ["D21", "D63", "D76"]
+defects = ["D21", "D63", "D76", "D157"]
 
 [[claim]]
 id = "E5"
@@ -1875,7 +1875,7 @@ touches = [
   "crates/gateway/src/route.rs",
   "crates/gateway/src/proxy.rs",
 ]
-defects = ["D61", "D105", "D108", "D147"]
+defects = ["D61", "D105", "D108", "D147", "D156"]
 
 [[claim]]
 id = "CAT-2"
@@ -1888,7 +1888,7 @@ touches = [
   "crates/gateway/src/route.rs",
   "crates/gateway/src/proxy.rs",
 ]
-defects = ["D18", "D61", "D147"]
+defects = ["D18", "D61", "D147", "D156"]
 
 [[claim]]
 id = "CAT-3"
@@ -1914,7 +1914,7 @@ touches = [
   "crates/gateway/src/route.rs",
   "crates/gateway/src/proxy.rs",
 ]
-defects = ["D54", "D62", "D85", "D111"]
+defects = ["D54", "D62", "D85", "D111", "D156"]
 
 [[claim]]
 id = "CAT-5"
@@ -1927,7 +1927,7 @@ touches = [
   "crates/gateway/src/route.rs",
   "crates/gateway/src/proxy.rs",
 ]
-defects = ["D106", "D112", "D145"]
+defects = ["D106", "D112", "D145", "D156"]
 
 [[claim]]
 id = "CAT-6"
@@ -1940,7 +1940,7 @@ touches = [
   "crates/gateway/src/route.rs",
   "crates/gateway/src/proxy.rs",
 ]
-defects = ["D54", "D62", "D105", "D107", "D113", "D114", "D115", "D170", "D171"]
+defects = ["D54", "D62", "D105", "D107", "D113", "D114", "D115", "D155", "D156", "D170", "D171"]
 
 [[claim]]
 id = "CAT-7"
@@ -1953,7 +1953,7 @@ touches = [
   "crates/gateway/src/route.rs",
   "crates/gateway/src/proxy.rs",
 ]
-defects = ["D19", "D60", "D116"]
+defects = ["D19", "D60", "D116", "D156"]
 
 [[claim]]
 id = "CAT-8"

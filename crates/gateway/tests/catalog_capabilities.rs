@@ -136,6 +136,84 @@ async fn a_structured_output_request_skips_a_bedrock_candidate() {
     assert_eq!(bedrock.hits(), 2);
 }
 
+/// OpenRouter's `z-ai/glm-5.2` accepts a JSON schema and some of its hosts answer outside it
+/// (`{\n{\n  "answer": 391\n}`), while Together's GLM 5.2 holds it. A structured-output request on
+/// the row is never sent to OpenRouter, even ordered first, from any client dialect; without the
+/// constraint the caller's order holds; pinned to OpenRouter alone it is still sent.
+/// claim: CAT-6
+/// defect: D155
+#[tokio::test]
+async fn a_structured_output_request_skips_a_candidate_that_does_not_enforce_it() {
+    let (pubkey, sk) = test_keypair(75);
+    let together = MockUpstream::start(Mode::Json).await;
+    let openrouter = MockUpstream::start(Mode::Json).await;
+    let gw = Gateway::builder(unused_nats_port(), &together.authority(), &b64(&pubkey))
+        .providers(&["together", "openrouter"])
+        .provider_authority("openrouter", &openrouter.authority())
+        .start()
+        .await;
+    let key = billing_vkey(&sk, 75);
+    let order = [("x-beyond-order", "openrouter")];
+    let cases: [Case<'_>; 3] = [
+        // Chat client, header-won row: the body is read before the walk.
+        (
+            "/v1/chat/completions",
+            &[("x-beyond-model", "z-ai/glm-5.2")],
+            json!({"model": "z-ai/glm-5.2", "max_tokens": 64,
+                   "messages": [{"role": "user", "content": "17*23?"}],
+                   "response_format": {"type": "json_schema",
+                       "json_schema": {"name": "answer", "strict": true, "schema": schema()}}}),
+        ),
+        // Messages client, headerless, translated onto Chat Completions.
+        (
+            "/v1/messages",
+            &[],
+            json!({"model": "z-ai/glm-5.2", "max_tokens": 64,
+                   "messages": [{"role": "user", "content": "17*23?"}],
+                   "output_config": {"format": {"type": "json_schema", "schema": schema()}}}),
+        ),
+        // Responses client.
+        (
+            "/v1/responses",
+            &[],
+            json!({"model": "z-ai/glm-5.2", "input": "17*23?",
+                   "text": {"format": {"type": "json_schema", "name": "answer",
+                                       "schema": schema()}}}),
+        ),
+    ];
+    for (path, extra, body) in &cases {
+        let mut headers = order.to_vec();
+        headers.extend_from_slice(extra);
+        let resp = post(&gw, &key, path, &headers, body).await;
+        assert_eq!(resp.status().as_u16(), 200, "{path}");
+        assert_eq!(provider_of(&resp).as_deref(), Some("together"), "{path}");
+    }
+    assert_eq!(
+        openrouter.hits(),
+        0,
+        "a structured-output request reached a candidate that does not enforce it"
+    );
+
+    // Without the constraint, the caller's order holds.
+    let plain = json!({"model": "z-ai/glm-5.2", "max_tokens": 64,
+                       "messages": [{"role": "user", "content": "hi"}]});
+    let resp = post(&gw, &key, "/v1/chat/completions", &order, &plain).await;
+    assert_eq!(resp.status().as_u16(), 200);
+    assert_eq!(provider_of(&resp).as_deref(), Some("openrouter"));
+
+    // OpenRouter alone: still sent, so the client gets the provider's answer rather than a 503.
+    let resp = post(
+        &gw,
+        &key,
+        "/v1/chat/completions",
+        &[("x-beyond-only", "openrouter")],
+        &cases[0].2,
+    )
+    .await;
+    assert_eq!(provider_of(&resp).as_deref(), Some("openrouter"));
+    assert_eq!(openrouter.hits(), 2);
+}
+
 /// A row whose card lists no image input refuses an image part with a 400 naming the row, on
 /// every client dialect and whether or not a header named the row, and no upstream is contacted:
 /// o3-mini would answer "I can't view images" and bill it, gpt-4 would answer 500. Text on the

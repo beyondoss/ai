@@ -904,7 +904,9 @@ const E7_TOLERANCE: f64 = 0.02;
 
 /// Claim E7 on a harness cell: the harness listed the catalog (`detail.listing`), and the session
 /// cost it displayed (`detail.cost.displayed`) equals the ledger rows priced at the model's card
-/// (`detail.cost.pricing`, USD per million tokens). A harness that displayed no cost fails: E7 is
+/// (`detail.cost.pricing`, USD per million tokens), with opencode's cache writes at the input
+/// rate, as opencode prices them on any OpenAI-compatible provider (D157). A harness that
+/// displayed no cost fails: E7 is
 /// claimed only on cells where one is shown.
 fn e7_problems(detail: &Value, rows: &[Value], model: &str) -> Vec<String> {
     let mut problems = Vec::new();
@@ -923,6 +925,21 @@ fn e7_problems(detail: &Value, rows: &[Value], model: &str) -> Vec<String> {
         return problems;
     };
     let price = |k: &str| cost["pricing"][k].as_f64().unwrap_or(f64::NAN) / 1e6;
+    // opencode reaches the gateway through `@ai-sdk/openai-compatible` (2.0.41, bundled in
+    // opencode-ai 1.18.34), whose usage converter reads only `prompt_tokens` and
+    // `prompt_tokens_details.cached_tokens` and sets `cacheWrite: undefined`: the gateway's (and
+    // OpenRouter's) `prompt_tokens_details.cache_write_tokens` is never read. opencode's step cost
+    // then takes `input = inputTokens - cacheRead - cacheWrite` with cacheWrite 0 (its fallbacks
+    // read only anthropic / vertex / bedrock / venice provider metadata), so every token it asked
+    // to have cache-written is priced at the input rate. The same happens calling OpenRouter
+    // directly with that provider: a client limitation, not a gateway gap (E7's oracle). The
+    // ledger still bills writes at the card's cache_write rate; only the harness's arithmetic is
+    // reproduced here.
+    let write_rate = if detail["harness"] == "opencode" {
+        price("input")
+    } else {
+        price("cache_write")
+    };
     let mut billed = 0.0;
     for row in rows {
         if row["requested_model"] != model {
@@ -954,7 +971,7 @@ fn e7_problems(detail: &Value, rows: &[Value], model: &str) -> Vec<String> {
         billed += fresh * price("input")
             + n("output_tokens") * price("output")
             + read * price("cache_read")
-            + write * price("cache_write");
+            + write * write_rate;
     }
     // Written so a NaN (a price missing from the detail) fails rather than passes.
     let within = billed > 0.0 && (displayed - billed).abs() <= billed * E7_TOLERANCE;

@@ -1939,3 +1939,45 @@ state = "suspected"
 test = ""
 fix = ""
 note = "Found by D147's live re-run. Likely fix: on a Chat relay to a host other than OpenAI, send developer as system. Not checked yet on Together's other model families."
+
+[[defect]]
+id = "D155"
+severity = "med"
+area = "Catalog"
+title = "OpenRouter candidates accept a JSON schema and answer outside it on rows that advertise structured outputs"
+impact = "z-ai/glm-5.2, moonshotai/kimi-k2.6, moonshotai/kimi-k2.7-code and qwen/qwen3.6-plus advertise structured_outputs. OpenRouter spreads a json_schema request over hosts, and several that list structured_outputs in their endpoint's supported_parameters ignore the schema: fenced JSON, renamed keys, prose reasoning before the object, or broken JSON. A client relying on the advertised capability gets output that fails its own parse; on Qwen3.6 Plus, Together's candidate does the same."
+confidence = "high"
+evidence = "live 2026-10-01 catalog sweep: CAT-6::raw::openrouter::z-ai/glm-5.2 -> \"{\\n{\\n  \\\"answer\\\": 391\\n}\"; moonshotai/kimi-k2.6 -> a ```json-fenced {\"expression\", \"result\"}; moonshotai/kimi-k2.7-code -> prose reasoning, then {\"answer\": 391}; qwen/qwen3.6-plus -> {\"result\": 391}. Direct to OpenRouter (same body, strict json_schema): glm-5.2 on DigitalOcean 3/6 not JSON; kimi-k2.6 broken by Decart, Phala, Chutes, StreamLake and Moonshot AI (28 calls); kimi-k2.7-code on CoreWeave 0/12 valid; qwen3.6-plus (Alibaba, its only host) 2/24 {\"result\"}; Together Qwen3.6-Plus (streamed) 3/8 {\"result\"}. OpenRouter's /endpoints lists structured_outputs on every host named. provider.require_parameters still routed kimi-k2.6 to Chutes (empty content). Not D155: minimax-m2.7 and qwen3.8-flash failed CAT-6 on OpenRouter's shared-pool 429 (D156); qwen3.8-flash held the schema 48/48 (Together and OpenRouter), minimax's schema requests land on Mara, which held it when it answered."
+claims = ["CAT-6"]
+state = "fixed"
+test = "a_structured_output_request_skips_a_candidate_that_does_not_enforce_it"
+fix = ""
+note = "Fixed as D107 was: capability-aware dispatch. providers::catalog::REFUSES_STRUCTURED_OUTPUTS lists OpenRouter's z-ai/glm-5.2, so serves_structured_outputs refuses it and route::unserved leaves it out of a json_schema request's walk (Together's GLM 5.2, which held the schema, serves; pinned to OpenRouter alone it is still sent). Where no candidate enforces the schema the card stops advertising it: kimi-k2.6, kimi-k2.7-code and qwen3.6-plus drop STRUCTURED_OUTPUTS. verify/catalog_truth.toml [[schema_unenforced]] records each candidate, OpenRouter's endpoint listing and the measurement, and features_absent on the three rows; schema_unenforced_candidates_match_truth and structured_outputs_are_advertised_only_where_enforced hold the catalog to it. OpenRouter's supported_parameters is not ground truth for enforcement."
+
+[[defect]]
+id = "D156"
+severity = "med"
+area = "Catalog"
+title = "Rows served only through OpenRouter's shared upstream pool are rate-limited by other OpenRouter customers' traffic"
+impact = "OpenRouter answers 429 \"temporarily rate-limited upstream ... add your own key\" (metadata.limit_source upstream_provider_shared_pool, is_byok false) when the upstream host's limit on OpenRouter's own key is spent. That limit is shared with every OpenRouter customer, so our traffic has no control over it, and a pool-key walk cannot help (every OpenRouter key draws on the same upstream pool). With the keys this deployment holds, every Mistral row (mistral-large/medium/small, ministral-3b/8b/14b, codestral: Mistral is the only host OpenRouter has for each), minimaxai/minimax-m2.7's structured-output requests (Mara is its only host listing structured_outputs) and, while Together's Qwen candidates are unusable non-streamed (D147), qwen/qwen3.6-plus, 3.7-max, 3.7-plus and 3.8-flash (Alibaba only) can fail on any request."
+confidence = "high"
+evidence = "live 2026-10-01 final run: 31 shared-pool 429s: mistralai/mistral-large-2512 (Mistral) 18, qwen/qwen3.8-flash (Alibaba) 7, minimax/minimax-m2.7 (Mara) 4, thinkingmachines/inkling (DeepInfra) 2; CAT-1/4/5/6/7::raw::openrouter::mistral-large-latest, CAT-6::raw::openrouter::{qwen/qwen3.8-flash,minimaxai/minimax-m2.7} and CAT-2::raw::all::qwen/qwen3.8-flash failed after the cell's two retries. Direct to OpenRouter, 2026-10-01 ~10:03 PT, 10 one-token calls 2 s apart: mistral-large-2512 8/10 429 shared pool; mistral-small-2603 6/10; mistral-medium-3-5 0/10; qwen3.8-flash 3/10; minimax-m2.7 0/10 (served by Minimax, Novita, AtlasCloud: plain requests avoid Mara). OpenRouter /api/v1/models/{id}/endpoints: every Mistral id has only Mistral endpoints; Qwen3.6/3.7/3.8 have only Alibaba."
+claims = ["CAT-1", "CAT-2", "CAT-4", "CAT-5", "CAT-6", "CAT-7"]
+state = "suspected"
+test = ""
+fix = ""
+note = "An account/procurement decision, not a code fix. Options: (A) a Mistral pool key (AI_POOL_KEY_MISTRAL): every Mistral row already lists Mistral's own API as its primary candidate (providers::catalog::mistral), so the key alone moves all seven rows off OpenRouter, with OpenRouter as failover; Mistral's own rate limits then apply to our account only. (B) OpenRouter BYOK: add a Mistral (or Alibaba, MiniMax) key under openrouter.ai/settings/integrations; OpenRouter tries BYOK endpoints first and by default falls back to shared capacity on failure, for a 5% fee on OpenRouter's price after a monthly free allowance (openrouter.ai/docs/use-cases/byok, 2026-10-01). Same upstream key as (A) but with OpenRouter still in the path, and nothing in the gateway changes. (C) Keep the rows and say they are best-effort: without (A) or (B) mistral-large-latest is not reliable (8 of 10 calls refused in a quiet minute). (D) Remove the affected rows. The Qwen rows recover when D147 makes Together usable (Together is their primary). No pure-code fix is clearly right: a shared-pool 429 is not our credential's limit, so treating it as a vendor failover (today a 429 never fails over) would be defensible, but no affected row has a second keyed vendor to fail over to, and it changes a documented rule. Also seen: the relayed 429 body carries OpenRouter's \"add your own key ... openrouter.ai/settings/integrations\" remedy, which a gateway client cannot act on."
+
+[[defect]]
+id = "D157"
+severity = "low"
+area = "Billing"
+title = "opencode displays less than the ledger on Claude rows: it prices cache writes at the input rate"
+impact = "E7::opencode::{claude,openrouter}::opencode failed: opencode displayed $0.013801 against the ledger's $0.015937 at the card (-13.4%), and $0.081599 against $0.089303 (-8.6%). The suspicion was that /v1/models publishes a price opencode misreads, or that the ledger misprices cache writes."
+confidence = "high"
+evidence = "opencode-ai 1.18.34 (verify/clients/node) bundles @ai-sdk/openai-compatible 2.0.41, whose usage converter reads prompt_tokens and prompt_tokens_details.cached_tokens and returns cacheWrite: undefined; cache_write_tokens appears nowhere in it. opencode's step cost computes input = inputTokens - cacheRead - cacheWrite, where cacheWrite falls back only to anthropic / vertex / bedrock / venice provider metadata, so written tokens stay in input and are priced at the input rate. opencode asks for the writes itself (providerOptions.openaiCompatible.cache_control on its system and last messages). The listing check passed (card_mismatch empty): all four prices reach opencode as published. Both gaps fit W x (cache_write - input): W = 8,542 for haiku (final prompt 8,550) and 10,273 for sonnet (final prompt 10,276); dropping the writes instead would need W of about 2k, below the 8.4k / 9.9k later read from cache."
+claims = ["E7"]
+state = "refuted"
+test = "live:E7::opencode::claude::opencode"
+fix = ""
+note = "Refuted: the gateway publishes the cache_write price opencode reads, reports writes in the standard prompt_tokens_details.cache_write_tokens (OpenRouter's own field, passed through on that route), and the ledger bills them at the card's cache_write rate correctly. opencode's OpenAI-compatible provider never reads that field, so it would price the same usage identically calling OpenRouter directly: a client limitation, which E7's oracle already excludes. The cell's oracle (crates/verify/tests/live.rs e7_problems) now prices opencode's cache writes at the input rate, as opencode does; the 2% tolerance is unchanged. Live 2026-10-01: E7::opencode::claude::opencode and E7::opencode::openrouter::opencode pass."
