@@ -816,10 +816,7 @@ mod tests {
     #[test]
     fn response_scanner_reads_a_responses_streams_nested_model() {
         let created = b"event: response.created\ndata: {\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"id\":\"resp_1\",\"status\":\"in_progress\",\"model\":\"gpt-5-2025-08-07\",\"output\":[]}}\n\n";
-        assert_eq!(
-            scan_response(created).as_deref(),
-            Some("gpt-5-2025-08-07")
-        );
+        assert_eq!(scan_response(created).as_deref(), Some("gpt-5-2025-08-07"));
         // Still exactly one level: a model inside the response's tools is not the response's.
         assert_eq!(
             scan_response(br#"{"response":{"tools":[{"model":"NESTED"}]}}"#),

@@ -87,7 +87,6 @@ const OPENROUTER_CACHED: &str = r#"{"id":"gen-1","object":"chat.completion","mod
 /// claim: BIL-7
 /// defect: D25
 #[tokio::test]
-#[ignore = "D25 reproduced: the OpenRouter-served row reports input_tokens=1000 (cache-inclusive) vs 100 from Anthropic"]
 async fn a_claude_row_normalizes_input_tokens_the_same_on_both_wires() {
     let (pubkey, sk) = test_keypair(53);
     let anthropic = MockUpstream::start(Mode::Raw(200, "application/json", ANTHROPIC_CACHED)).await;
@@ -122,11 +121,29 @@ async fn a_claude_row_normalizes_input_tokens_the_same_on_both_wires() {
     let o = usage_row_of(&via_openrouter).await;
     assert_eq!(a["provider"], "anthropic", "{a}");
     assert_eq!(o["provider"], "openrouter", "{o}");
+    // The rows keep each wire's own `input_tokens` (downstream consumers rely on it) and say which
+    // convention it follows in `usage_wire`. Normalized through it, the two must agree.
+    assert_eq!(a["usage_wire"], "anthropic", "{a}");
+    assert_eq!(o["usage_wire"], "openai", "{o}");
     assert_eq!(
-        (a["input_tokens"].as_u64(), a["cache_read_tokens"].as_u64()),
-        (o["input_tokens"].as_u64(), o["cache_read_tokens"].as_u64()),
+        (prompt_tokens(&a), a["cache_read_tokens"].as_u64()),
+        (prompt_tokens(&o), o["cache_read_tokens"].as_u64()),
         "same prompt, same catalog row, different input_tokens semantics:\nanthropic:  {a}\nopenrouter: {o}"
     );
+    assert_eq!(prompt_tokens(&a), Some(1000), "{a}");
+}
+
+/// The whole prompt a row reports, cache reads and writes included: `input_tokens` on the OpenAI
+/// convention, `input_tokens` plus both cache counts on the Anthropic one.
+fn prompt_tokens(row: &serde_json::Value) -> Option<u64> {
+    let input = row["input_tokens"].as_u64()?;
+    match row["usage_wire"].as_str()? {
+        "openai" => Some(input),
+        "anthropic" => {
+            Some(input + row["cache_read_tokens"].as_u64()? + row["cache_write_tokens"].as_u64()?)
+        }
+        _ => None,
+    }
 }
 
 /// OpenRouter reports Claude cache writes on the Chat Completions wire as

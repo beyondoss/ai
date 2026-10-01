@@ -168,7 +168,8 @@ Client (stock OpenAI/Anthropic SDK)
      Managed 2xx stream cut short before its usage block (client cancel / upstream death):
        estimate the missing side from the request tally + relayed events → usage_estimated
      Emit ai.usage fact: tenant, vpc, key_id, model, requested_model, routed_model, price_model,
-       token counts + reasoning breakout, + x-beyond-metadata tags (managed only) → blocking stdout, lossless
+       token counts + usage_wire + reasoning / 1h-cache-write / server-tool / service-tier
+       breakouts, + x-beyond-metadata tags (managed only) → blocking stdout, lossless
      Cache hit: same row with `cache_hit` and the stored tokens; no parse, no upstream latency
      Capturing: emit ai.payload (both bodies, truncation + completeness flags), correlated by
        request_id → bounded queue, DROPPED on overflow so a stalled sink can't backpressure
@@ -907,6 +908,27 @@ drain, the usage chunk is still present because SSE usage is always the final `d
 tail keeps the last 64KB. OpenAI's parser walks those lines backwards and stops at the first usage
 block; the split is `memrchr`, the same reason the forward Anthropic walk uses `memchr` — a tail
 with no usage block still has to scan all 64 KiB.
+
+**`input_tokens` follows its wire, and the row says which.** OpenAI's `prompt_tokens` (and the
+Responses API's `input_tokens`) include cached tokens; OpenRouter's also include its Claude cache
+writes. Anthropic's `input_tokens` excludes both cache reads and cache writes. So the same Claude
+prompt served by Anthropic and by OpenRouter Chat Completions reports `input_tokens` 100 and 1000
+for 900 cached. The rows keep each wire's own meaning (downstream consumers rely on it) and carry
+`usage_wire` (`openai` | `anthropic`) naming the convention: the whole prompt is `input_tokens` on
+`openai`, and `input_tokens + cache_read_tokens + cache_write_tokens` on `anthropic`. It is set by
+the extractor that read the usage, so a cache hit replays the convention its fill was parsed under;
+an estimate with nothing parsed takes the request's wire.
+
+**Priced variants and per-call fees** ride on the row next to the token counts:
+
+| Row field               | Source                                                                                                                                   |
+| ----------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| `cache_write_1h_tokens` | Anthropic `usage.cache_creation.ephemeral_1h_input_tokens` — a subset of `cache_write_tokens` (2×)                                       |
+| `server_tool_calls`     | Anthropic `usage.server_tool_use.web_search_requests` (cumulative, on `message_delta` when streamed)                                     |
+| `service_tier`          | `service_tier` as echoed: Chat Completions root, Responses `response`, Anthropic `usage`; absent if not echoed or not `[a-z0-9_-]{1,16}` |
+
+OpenAI reports no hosted-tool call count in `usage`, so `server_tool_calls` is 0 there. A
+malformed `service_tier` never fails the usage parse: it reads as absent.
 
 A final event can itself be bigger than the tail: a Responses `response.completed` echoes the
 request's instructions and tools ahead of `usage`, so a Codex-sized prompt puts it past 64 KiB and

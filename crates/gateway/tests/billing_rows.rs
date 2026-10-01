@@ -69,7 +69,6 @@ fn field_containing(row: &serde_json::Value, needle: &str) -> Option<u64> {
 /// claim: BIL-10, BIL-11
 /// defect: D24
 #[tokio::test]
-#[ignore = "D24 reproduced: the ai.usage row has no field for cache_creation.ephemeral_1h_input_tokens or server_tool_use.web_search_requests"]
 async fn priced_variants_and_server_tool_calls_reach_the_row() {
     let (pubkey, sk) = test_keypair(82);
     let mock = MockUpstream::start(Mode::Raw(
@@ -97,11 +96,15 @@ async fn priced_variants_and_server_tool_calls_reach_the_row() {
         Some(2000),
         "1-hour cache writes must be distinguishable from 5-minute ones: {row}"
     );
+    // The row names the count `server_tool_calls` (the decided schema; it is the billable server
+    // tool, web search, that Anthropic counts), so the needle is that name rather than the
+    // provider's `web_search` spelling. The value asserted is unchanged.
     assert_eq!(
-        field_containing(&row, "web_search"),
+        field_containing(&row, "server_tool_calls"),
         Some(3),
         "per-call web search fees need the call count: {row}"
     );
+    assert_eq!(row["usage_wire"], "anthropic", "{row}");
 }
 
 /// The upstream outcome carried by a row: any of the plausible field names.

@@ -5,7 +5,14 @@
 //! an SSE stream. For streaming we scan the relayed bytes for the usage event but never block the
 //! relay on it (see `proxy`).
 
+use crate::route::Dialect;
+use arrayvec::ArrayString;
 use serde::Deserialize;
+
+/// A provider-echoed service tier (`default`, `flex`, `priority`, `standard`, …). Inline and `Copy`
+/// so [`Usage`] stays `Copy`; a value longer than this, or outside `[a-z0-9_-]`, is dropped rather
+/// than written to a billing row.
+pub type ServiceTier = ArrayString<16>;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Usage {
@@ -19,6 +26,78 @@ pub struct Usage {
     /// that distinction is unrecoverable once the request completes, so absence must not collapse to
     /// zero.
     pub reasoning_tokens: Option<u64>,
+    /// Cache writes at the 1-hour TTL (Anthropic `cache_creation.ephemeral_1h_input_tokens`): a
+    /// subset of `cache_write_tokens`, priced at 2× input where the 5-minute ones are 1.25×.
+    pub cache_write_1h_tokens: u64,
+    /// Server-side tool calls the provider ran and prices per call (Anthropic
+    /// `server_tool_use.web_search_requests`). OpenAI reports no such count in `usage`.
+    pub server_tool_calls: u64,
+    /// The service tier the provider says it served at; `None` when it did not say.
+    pub service_tier: Option<ServiceTier>,
+    /// Which convention `input_tokens` follows: OpenAI's includes cached (and OpenRouter's
+    /// cache-written) tokens, Anthropic's excludes both cache reads and writes. Set by the extractor
+    /// that read it; `None` when nothing was read (an estimate), where the request's wire answers.
+    pub wire: Option<Dialect>,
+}
+
+/// Deserialize a `service_tier` string into a [`ServiceTier`], leniently: anything else — `null`,
+/// a number, an object, an over-long or oddly spelled string — reads as `None` rather than failing
+/// the parse, which would cost the whole usage block for a field nobody bills from directly.
+fn de_service_tier<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Option<ServiceTier>, D::Error> {
+    struct V;
+    impl<'de> serde::de::Visitor<'de> for V {
+        type Value = Option<ServiceTier>;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a service tier")
+        }
+        fn visit_str<E>(self, v: &str) -> Result<Self::Value, E> {
+            let ok = v
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-');
+            Ok(ok.then(|| ServiceTier::from(v).ok()).flatten())
+        }
+        fn visit_none<E>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+        fn visit_unit<E>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+        fn visit_some<D: serde::Deserializer<'de>>(self, d: D) -> Result<Self::Value, D::Error> {
+            d.deserialize_any(V)
+        }
+        fn visit_bool<E>(self, _: bool) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+        fn visit_i64<E>(self, _: i64) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+        fn visit_u64<E>(self, _: u64) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+        fn visit_f64<E>(self, _: f64) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(
+            self,
+            mut a: A,
+        ) -> Result<Self::Value, A::Error> {
+            while a.next_element::<serde::de::IgnoredAny>()?.is_some() {}
+            Ok(None)
+        }
+        fn visit_map<A: serde::de::MapAccess<'de>>(
+            self,
+            mut a: A,
+        ) -> Result<Self::Value, A::Error> {
+            while a
+                .next_entry::<serde::de::IgnoredAny, serde::de::IgnoredAny>()?
+                .is_some()
+            {}
+            Ok(None)
+        }
+    }
+    d.deserialize_any(V)
 }
 
 // Typed views of just the fields we meter. Deserializing into these (rather than a
@@ -131,6 +210,8 @@ impl From<OpenAiUsage> for Usage {
                 .unwrap_or(0),
             cache_write_tokens: u.prompt_tokens_details.cache_write_tokens,
             reasoning_tokens: u.completion_tokens_details.reasoning_tokens,
+            wire: Some(Dialect::OpenAi),
+            ..Usage::default()
         }
     }
 }
@@ -175,6 +256,8 @@ impl From<OpenAiResponsesUsage> for Usage {
             cache_read_tokens: u.input_tokens_details.cached_tokens,
             cache_write_tokens: u.input_tokens_details.cache_write_tokens,
             reasoning_tokens: u.output_tokens_details.reasoning_tokens,
+            wire: Some(Dialect::OpenAi),
+            ..Usage::default()
         }
     }
 }
@@ -194,6 +277,12 @@ struct AnthropicUsage {
     cache_creation_input_tokens: u64,
     #[serde(default)]
     output_tokens_details: AnthropicOutputDetails,
+    #[serde(default)]
+    cache_creation: AnthropicCacheCreation,
+    #[serde(default)]
+    server_tool_use: AnthropicServerToolUse,
+    #[serde(default, deserialize_with = "de_service_tier")]
+    service_tier: Option<ServiceTier>,
     /// OpenAI's characteristic field names — **never billed from**, only checked by
     /// [`Self::looks_openai_shaped`] (the symmetric case of `OpenAiUsage::looks_anthropic_shaped`): a
     /// real Anthropic `usage` object never carries these keys.
@@ -207,6 +296,20 @@ struct AnthropicUsage {
 struct AnthropicOutputDetails {
     #[serde(default)]
     thinking_tokens: Option<u64>,
+}
+
+/// The TTL split of `cache_creation_input_tokens`. Only the 1-hour share is priced differently.
+#[derive(Deserialize, Default)]
+struct AnthropicCacheCreation {
+    #[serde(default)]
+    ephemeral_1h_input_tokens: u64,
+}
+
+/// Server tools Anthropic ran during the turn. Web search is billed per request; web fetch is not.
+#[derive(Deserialize, Default)]
+struct AnthropicServerToolUse {
+    #[serde(default)]
+    web_search_requests: u64,
 }
 
 impl AnthropicUsage {
@@ -223,6 +326,10 @@ impl From<AnthropicUsage> for Usage {
             cache_read_tokens: u.cache_read_input_tokens,
             cache_write_tokens: u.cache_creation_input_tokens,
             reasoning_tokens: u.output_tokens_details.thinking_tokens,
+            cache_write_1h_tokens: u.cache_creation.ephemeral_1h_input_tokens,
+            server_tool_calls: u.server_tool_use.web_search_requests,
+            service_tier: u.service_tier,
+            wire: Some(Dialect::Anthropic),
         }
     }
 }
@@ -261,16 +368,22 @@ pub fn openai_body(body: &[u8]) -> Option<Usage> {
     #[derive(Deserialize)]
     struct Body {
         usage: Option<OpenAiUsage>,
+        // A root sibling of `usage` on Chat Completions and Responses bodies alike.
+        #[serde(default, deserialize_with = "de_service_tier")]
+        service_tier: Option<ServiceTier>,
     }
-    let usage = match serde_json::from_slice::<Body>(body) {
-        Ok(b) => b.usage?,
+    let (usage, service_tier) = match serde_json::from_slice::<Body>(body) {
+        Ok(b) => (b.usage?, b.service_tier),
         // Front-truncated tail of an oversized body — see `recover_trailing_usage`.
-        Err(_) => recover_trailing_usage::<OpenAiUsage>(body)?,
+        Err(_) => (recover_trailing_usage::<OpenAiUsage>(body)?, None),
     };
     if usage.looks_anthropic_shaped() {
         return None;
     }
-    Some(Usage::from(usage))
+    Some(Usage {
+        service_tier,
+        ..Usage::from(usage)
+    })
 }
 
 /// Anthropic non-streaming: top-level `usage.{input,output,cache_*}`. `None` on a dialect mismatch —
@@ -407,11 +520,16 @@ pub fn openai_stream(sse: &[u8]) -> Option<Usage> {
     #[derive(Deserialize)]
     struct ResponsesEnvelope {
         usage: Option<OpenAiResponsesUsage>,
+        #[serde(default, deserialize_with = "de_service_tier")]
+        service_tier: Option<ServiceTier>,
     }
     #[derive(Deserialize)]
     struct Chunk {
         usage: Option<OpenAiUsage>,
         response: Option<ResponsesEnvelope>,
+        // On every Chat Completions chunk, the usage chunk included.
+        #[serde(default, deserialize_with = "de_service_tier")]
+        service_tier: Option<ServiceTier>,
     }
     // Scanned in **reverse**, returning at the first accepted usage. "Last accepted in forward
     // order" and "first accepted in reverse order" select the same line by definition, so this is
@@ -432,10 +550,18 @@ pub fn openai_stream(sse: &[u8]) -> Option<Usage> {
         if let Ok(chunk) = serde_json::from_slice::<Chunk>(line) {
             if let Some(u) = chunk.usage {
                 if !u.looks_anthropic_shaped() {
-                    return Some(Usage::from(u));
+                    return Some(Usage {
+                        service_tier: chunk.service_tier,
+                        ..Usage::from(u)
+                    });
                 }
-            } else if let Some(u) = chunk.response.and_then(|r| r.usage) {
-                return Some(Usage::from(u));
+            } else if let Some(r) = chunk.response
+                && let Some(u) = r.usage
+            {
+                return Some(Usage {
+                    service_tier: r.service_tier,
+                    ..Usage::from(u)
+                });
             }
         }
     }
@@ -459,9 +585,10 @@ pub fn anthropic_stream(sse: &[u8]) -> Option<Usage> {
 
 /// Anthropic streaming: input + cache tokens arrive in `message_start.message.usage`; output (and
 /// reasoning/thinking tokens) accumulate in `message_delta.usage` (last delta is the cumulative
-/// total). A `message_delta` that also reports input or cache counts supersedes `message_start`'s. A `usage` block that looks OpenAI-shaped (dialect mismatch — see
-/// `AnthropicUsage::looks_openai_shaped`) is skipped entirely: if every line is mismatched, `saw_any`
-/// stays `false` and the function returns `None`.
+/// total). A `message_delta` that also reports input or cache counts supersedes `message_start`'s.
+/// A `usage` block that looks OpenAI-shaped (dialect mismatch — see
+/// `AnthropicUsage::looks_openai_shaped`) is skipped entirely: if every line is mismatched,
+/// `saw_any` stays `false` and the function returns `None`.
 ///
 /// Takes **parts** because those two facts sit at opposite ends of the stream and the proxy retains
 /// only a bounded head and a bounded tail (a whole stream can be megabytes). `message_start` is the
@@ -509,6 +636,8 @@ pub fn anthropic_stream_parts(parts: &[&[u8]]) -> Option<Usage> {
                 usage.input_tokens = u.input_tokens;
                 usage.cache_read_tokens = u.cache_read_input_tokens;
                 usage.cache_write_tokens = u.cache_creation_input_tokens;
+                usage.cache_write_1h_tokens = u.cache_creation.ephemeral_1h_input_tokens;
+                usage.service_tier = u.service_tier;
                 saw_any = true;
             }
             if let Some(u) = chunk.usage
@@ -530,6 +659,13 @@ pub fn anthropic_stream_parts(parts: &[&[u8]]) -> Option<Usage> {
                 if u.cache_creation_input_tokens > 0 {
                     usage.cache_write_tokens = u.cache_creation_input_tokens;
                 }
+                if u.cache_creation.ephemeral_1h_input_tokens > 0 {
+                    usage.cache_write_1h_tokens = u.cache_creation.ephemeral_1h_input_tokens;
+                }
+                // Cumulative, and only ever on the delta: the searches run mid-turn.
+                if u.server_tool_use.web_search_requests > 0 {
+                    usage.server_tool_calls = u.server_tool_use.web_search_requests;
+                }
                 if let Some(rt) = u.output_tokens_details.thinking_tokens {
                     usage.reasoning_tokens = Some(rt);
                 }
@@ -537,7 +673,10 @@ pub fn anthropic_stream_parts(parts: &[&[u8]]) -> Option<Usage> {
             }
         }
     }
-    saw_any.then_some(usage)
+    saw_any.then_some(Usage {
+        wire: Some(Dialect::Anthropic),
+        ..usage
+    })
 }
 
 // --- Estimates for a stream cut short -----------------------------------------------------------
@@ -920,6 +1059,8 @@ mod tests {
                 cache_read_tokens: 4,
                 cache_write_tokens: 0,
                 reasoning_tokens: None,
+                wire: Some(Dialect::OpenAi),
+                ..Usage::default()
             }
         );
     }
@@ -942,6 +1083,8 @@ mod tests {
                 cache_read_tokens: 64,
                 cache_write_tokens: 0,
                 reasoning_tokens: None,
+                wire: Some(Dialect::OpenAi),
+                ..Usage::default()
             }
         );
 
@@ -971,6 +1114,8 @@ mod tests {
                 cache_read_tokens: 10,
                 cache_write_tokens: 7,
                 reasoning_tokens: None,
+                wire: Some(Dialect::Anthropic),
+                ..Usage::default()
             }
         );
     }
@@ -1050,6 +1195,8 @@ mod tests {
             cache_read_tokens: 4000,
             cache_write_tokens: 100,
             reasoning_tokens: None,
+            wire: Some(Dialect::Anthropic),
+            ..Usage::default()
         };
 
         for deltas in [10, 500, 5000] {
@@ -1236,6 +1383,8 @@ mod tests {
                 cache_read_tokens: 0,
                 cache_write_tokens: 0,
                 reasoning_tokens: None,
+                wire: Some(Dialect::OpenAi),
+                ..Usage::default()
             }
         );
     }
@@ -1259,6 +1408,8 @@ mod tests {
                 cache_read_tokens: 10,
                 cache_write_tokens: 0,
                 reasoning_tokens: None,
+                wire: Some(Dialect::OpenAi),
+                ..Usage::default()
             }
         );
     }
@@ -1277,6 +1428,8 @@ mod tests {
                 cache_read_tokens: 0,
                 cache_write_tokens: 0,
                 reasoning_tokens: None,
+                wire: Some(Dialect::Anthropic),
+                ..Usage::default()
             }
         );
     }
@@ -1298,6 +1451,8 @@ mod tests {
                 cache_read_tokens: 12,
                 cache_write_tokens: 8,
                 reasoning_tokens: None,
+                wire: Some(Dialect::Anthropic),
+                ..Usage::default()
             }
         );
     }
@@ -1316,6 +1471,8 @@ mod tests {
                 cache_read_tokens: 0,
                 cache_write_tokens: 0,
                 reasoning_tokens: None,
+                wire: Some(Dialect::OpenAi),
+                ..Usage::default()
             }
         );
     }
@@ -1335,6 +1492,8 @@ mod tests {
                 cache_read_tokens: 0,
                 cache_write_tokens: 0,
                 reasoning_tokens: None,
+                wire: Some(Dialect::OpenAi),
+                ..Usage::default()
             }
         );
     }
@@ -1398,6 +1557,8 @@ mod tests {
                 cache_read_tokens: 64,
                 cache_write_tokens: 0,
                 reasoning_tokens: Some(12),
+                wire: Some(Dialect::OpenAi),
+                ..Usage::default()
             }
         );
     }
@@ -1463,6 +1624,49 @@ mod tests {
                     \"usage\":{\"input_tokens\":50,\"output_tokens\":20,\
                     \"output_tokens_details\":{\"reasoning_tokens\":15}}}}\n\n";
         assert_eq!(openai_stream(sse).unwrap().reasoning_tokens, Some(15));
+    }
+
+    #[test]
+    fn priced_variants_and_service_tier_are_read_on_every_wire() {
+        let body =
+            br#"{"usage":{"input_tokens":50,"output_tokens":10,"cache_creation_input_tokens":2000,
+            "cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":2000},
+            "server_tool_use":{"web_search_requests":3},"service_tier":"priority"}}"#;
+        let u = anthropic_body(body).unwrap();
+        assert_eq!((u.cache_write_1h_tokens, u.server_tool_calls), (2000, 3));
+        assert_eq!(u.service_tier.as_deref(), Some("priority"));
+        assert_eq!(u.wire, Some(Dialect::Anthropic));
+
+        // Streamed: the tier and 1h writes on `message_start`, the search count on the delta.
+        let sse = b"data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":5,\"cache_creation\":{\"ephemeral_1h_input_tokens\":7},\"service_tier\":\"standard\"}}}\n\n\
+data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":4,\"server_tool_use\":{\"web_search_requests\":2}}}\n\n";
+        let u = anthropic_stream(sse).unwrap();
+        assert_eq!((u.cache_write_1h_tokens, u.server_tool_calls), (7, 2));
+        assert_eq!(u.service_tier.as_deref(), Some("standard"));
+
+        let chat = br#"{"service_tier":"flex","usage":{"prompt_tokens":3,"completion_tokens":1}}"#;
+        let u = openai_body(chat).unwrap();
+        assert_eq!(u.service_tier.as_deref(), Some("flex"));
+        assert_eq!(u.wire, Some(Dialect::OpenAi));
+        let responses = b"data: {\"type\":\"response.completed\",\"response\":{\"service_tier\":\"default\",\"usage\":{\"input_tokens\":3,\"output_tokens\":1,\"total_tokens\":4}}}\n\n";
+        assert_eq!(
+            openai_stream(responses).unwrap().service_tier.as_deref(),
+            Some("default")
+        );
+
+        // A malformed tier never costs the usage block.
+        for tier in [
+            r#"7"#,
+            r#"{"a":[1]}"#,
+            r#""Has Caps""#,
+            r#""way-too-long-for-a-tier""#,
+        ] {
+            let body = format!(
+                r#"{{"service_tier":{tier},"usage":{{"prompt_tokens":3,"completion_tokens":1}}}}"#
+            );
+            let u = openai_body(body.as_bytes()).unwrap();
+            assert_eq!((u.input_tokens, u.service_tier), (3, None), "{tier}");
+        }
     }
 
     #[test]

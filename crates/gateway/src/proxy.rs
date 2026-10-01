@@ -4356,6 +4356,16 @@ impl ProxyHttp for AiProxy {
                 output_tokens = usage.output_tokens,
                 cache_read_tokens = usage.cache_read_tokens,
                 cache_write_tokens = usage.cache_write_tokens,
+                // Which convention `input_tokens` follows: `openai` includes cache reads (and
+                // OpenRouter's cache writes), `anthropic` excludes both. The same prompt for the same
+                // catalog row reports different `input_tokens` on the two wires; a consumer
+                // normalizes with this, and the existing fields keep their meaning.
+                usage_wire = usage.wire.unwrap_or(rc.dialect).as_str(),
+                // Priced variants and per-call fees (see `usage::Usage`). The 1-hour writes are a
+                // subset of `cache_write_tokens`, not additional to them.
+                cache_write_1h_tokens = usage.cache_write_1h_tokens,
+                server_tool_calls = usage.server_tool_calls,
+                service_tier = usage.service_tier.as_deref(),
                 // `Some(0)` (reported, none used) vs `None` (not reported at all — an unreasoning
                 // model, or a provider that doesn't surface it) matters and is unrecoverable once this
                 // line ships, so it's logged as `?` (Debug) rather than collapsed to a bare `0`.
