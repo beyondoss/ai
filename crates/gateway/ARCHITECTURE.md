@@ -1031,6 +1031,12 @@ reasoning_tokens`) and bills it at the output rate. When a body's arithmetic sho
 convention, `output_tokens` on the row is `completion_tokens + reasoning_tokens`. Before this, grok
 reasoning rows billed only the visible answer (a live grok-4.3 call: 7 of 174 output tokens).
 
+**Provider counts are untrusted numbers.** Every sum of provider-supplied counts (this arithmetic,
+the translated `usage` a client is shown, and the cut-short estimators' scaling) saturates at
+`u64::MAX` instead of overflowing. Release builds keep `overflow-checks` on, so an unchecked `+` on
+a garbage count would panic in logging and lose the billing row; a nonsense count now bills a
+saturated value instead.
+
 Missing or zero usage fields deserialize to zero (safe default) — **except** `reasoning_tokens`
 (`Usage::reasoning_tokens: Option<u64>`), which stays `None` when the provider didn't report it at
 all, distinct from `Some(0)` when it reported a real zero; that distinction is unrecoverable once the

@@ -3000,14 +3000,17 @@ impl Usage {
         // reasoning) and bills it as output, like `usage::openai_body` does; a translated client
         // must be shown the output it is billed.
         let r = reasoning.unwrap_or(0);
-        let outside = r > 0 && u64_at(u, "/total_tokens") == Some(prompt + completion + r);
+        // Saturating: provider numbers are untrusted and overflow-checks are on (D87).
+        let outside = r > 0
+            && u64_at(u, "/total_tokens")
+                == Some(prompt.saturating_add(completion).saturating_add(r));
         Self {
             uncached: prompt
                 .saturating_sub(cache_read)
                 .saturating_sub(cache_write),
             cache_read,
             cache_write,
-            output: completion + if outside { r } else { 0 },
+            output: completion.saturating_add(if outside { r } else { 0 }),
             reasoning,
         }
     }

@@ -2464,7 +2464,6 @@ fn translated_usage_counts_reasoning_reported_beside_completion_tokens() {
 /// claim: BIL-4, REL-17
 /// defect: D87
 #[test]
-#[ignore = "D87 reproduced: prompt + completion + reasoning overflows and panics"]
 fn overflowing_chat_usage_saturates_when_translated() {
     let max = u64::MAX;
     let chat = json!({
@@ -2474,7 +2473,8 @@ fn overflowing_chat_usage_saturates_when_translated() {
                   "completion_tokens_details": {"reasoning_tokens": max}},
     });
     for client in [Messages, Responses] {
-        let resp = std::panic::catch_unwind(|| json_resp(Chat, client, &chat)).expect("must not panic");
+        let resp =
+            std::panic::catch_unwind(|| json_resp(Chat, client, &chat)).expect("must not panic");
         let out = resp["usage"]["output_tokens"].as_u64();
         assert_eq!(out, Some(max), "{resp}");
     }

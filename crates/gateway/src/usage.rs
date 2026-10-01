@@ -241,10 +241,20 @@ impl From<OpenAiUsage> for Usage {
         // without a per-provider switch.
         let reasoning = u.completion_tokens_details.reasoning_tokens.unwrap_or(0);
         let reasoning_outside = reasoning > 0
-            && u.total_tokens == Some(u.prompt_tokens + u.completion_tokens + reasoning);
+            && u.total_tokens
+                == Some(
+                    u.prompt_tokens
+                        .saturating_add(u.completion_tokens)
+                        .saturating_add(reasoning),
+                );
         Usage {
             input_tokens: u.prompt_tokens,
-            output_tokens: u.completion_tokens + if reasoning_outside { reasoning } else { 0 },
+            // Provider numbers are untrusted: saturate rather than panic (overflow-checks are on).
+            output_tokens: u.completion_tokens.saturating_add(if reasoning_outside {
+                reasoning
+            } else {
+                0
+            }),
             // `prompt_tokens_details.cached_tokens` (real OpenAI, and OpenAI-compatible providers that
             // populate it) wins when present; DeepSeek's flat `prompt_cache_hit_tokens` is the fallback
             // for when it's entirely absent. Mirrors pi's
@@ -921,9 +931,11 @@ pub fn estimate_stream_output(tail: &[u8], total_bytes: u64) -> u64 {
     // Responses stream cut at 50% before this; the discount brings it under.
     let sampled = tail.len() as u64;
     let unseen = total_bytes.saturating_sub(sampled);
-    let scale = |n: u64| n + n * unseen * 9 / (sampled * 10);
+    let scale = |n: u64| {
+        n.saturating_add(n.saturating_mul(unseen).saturating_mul(9) / sampled.saturating_mul(10))
+    };
     let by_events = scale(deltas);
-    let by_text = scale(text) * 10 / OUTPUT_TEXT_BYTES_PER_TOKEN_X10;
+    let by_text = scale(text).saturating_mul(10) / OUTPUT_TEXT_BYTES_PER_TOKEN_X10;
     by_events.max(by_text)
 }
 
@@ -972,8 +984,9 @@ pub fn estimate_body_output(tail: &[u8], total_bytes: u64) -> u64 {
         return 0;
     }
     let sampled = n as u64;
-    let text = text + text * total_bytes.saturating_sub(sampled) / sampled;
-    text * 10 / OUTPUT_TEXT_BYTES_PER_TOKEN_X10
+    let text =
+        text.saturating_add(text.saturating_mul(total_bytes.saturating_sub(sampled)) / sampled);
+    text.saturating_mul(10) / OUTPUT_TEXT_BYTES_PER_TOKEN_X10
 }
 
 /// Generated text carried by one stream event, across the three wires: Chat Completions
@@ -1961,7 +1974,6 @@ data: {\"type\":\"message_delta\",\"usage\":{\"input_tokens\":2500,\"cache_read_
     /// claim: BIL-4, REL-17
     /// defect: D87
     #[test]
-    #[ignore = "D87 reproduced: prompt + completion + reasoning overflows and panics"]
     fn overflowing_provider_token_counts_saturate_instead_of_panicking() {
         let max = u64::MAX;
         let body = format!(
@@ -1973,7 +1985,9 @@ data: {\"type\":\"message_delta\",\"usage\":{\"input_tokens\":2500,\"cache_read_
             .unwrap();
         assert_eq!(u.input_tokens, max);
         assert_eq!(u.output_tokens, max, "saturated, not wrapped");
-        let sse = format!("data: {{\"choices\":[],\"usage\":{{\"prompt_tokens\":1,\"completion_tokens\":{max},\"total_tokens\":{max},\"completion_tokens_details\":{{\"reasoning_tokens\":5}}}}}}\n\ndata: [DONE]\n\n");
+        let sse = format!(
+            "data: {{\"choices\":[],\"usage\":{{\"prompt_tokens\":1,\"completion_tokens\":{max},\"total_tokens\":{max},\"completion_tokens_details\":{{\"reasoning_tokens\":5}}}}}}\n\ndata: [DONE]\n\n"
+        );
         let u = std::panic::catch_unwind(|| openai_stream(sse.as_bytes()))
             .expect("must not panic")
             .unwrap();
@@ -1983,6 +1997,8 @@ data: {\"type\":\"message_delta\",\"usage\":{\"input_tokens\":2500,\"cache_read_
 
 "#;
         assert!(std::panic::catch_unwind(|| estimate_stream_output(tail, max)).is_ok());
-        assert!(std::panic::catch_unwind(|| estimate_body_output(br#"{"a":"hello"}"#, max)).is_ok());
+        assert!(
+            std::panic::catch_unwind(|| estimate_body_output(br#"{"a":"hello"}"#, max)).is_ok()
+        );
     }
 }
