@@ -32,7 +32,7 @@ touches = [
   "crates/gateway/src/proxy.rs",
   "crates/gateway/src/translate.rs",
 ]
-defects = ["D63"]
+defects = ["D63", "D147"]
 
 [[claim]]
 id = "E2"
@@ -48,7 +48,7 @@ touches = [
   "crates/gateway/src/proxy.rs",
   "crates/gateway/src/translate.rs",
 ]
-defects = []
+defects = ["D147"]
 
 [[claim]]
 id = "E3"
@@ -64,7 +64,7 @@ touches = [
   "crates/gateway/src/proxy.rs",
   "crates/gateway/src/translate.rs",
 ]
-defects = ["D74", "D128", "D145"]
+defects = ["D74", "D128", "D145", "D147"]
 
 [[claim]]
 id = "E4"
@@ -1875,7 +1875,7 @@ touches = [
   "crates/gateway/src/route.rs",
   "crates/gateway/src/proxy.rs",
 ]
-defects = ["D61", "D105", "D108"]
+defects = ["D61", "D105", "D108", "D147"]
 
 [[claim]]
 id = "CAT-2"
@@ -1888,7 +1888,7 @@ touches = [
   "crates/gateway/src/route.rs",
   "crates/gateway/src/proxy.rs",
 ]
-defects = ["D18", "D61"]
+defects = ["D18", "D61", "D147"]
 
 [[claim]]
 id = "CAT-3"

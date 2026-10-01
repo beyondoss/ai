@@ -1869,3 +1869,17 @@ state = "fixed"
 test = "a_long_user_id_fits_openai_responses"
 fix = "54349d1"
 note = "Found by the D131 fix's live re-run. Fixed: onto OpenAI's own Responses a user over 64 characters becomes its FNV-1a hash (16 hex characters, stable per user, as anthropic_user_id does for an email address); xAI and a short id keep the client's value. Live 2026-10-01: TOOL-1::claude-code::gpt::mcp_150 passes."
+
+[[defect]]
+id = "D147"
+severity = "high"
+area = "Catalog"
+title = "A non-streaming call to a stream-only Together Qwen row is Together's 400"
+impact = "Together serves Qwen3.6 Plus, Qwen3.7 Plus, Qwen3.7 Max and Qwen3.8 Flash only as streams, and the four rows have Together as their primary. The gateway forwarded a non-streaming client body as it came, so every stock non-streaming SDK call (Chat, Messages or Responses with stream false or absent) on qwen/qwen3.6-plus, qwen/qwen3.7-plus, qwen/qwen3.7-max and qwen/qwen3.8-flash failed with Together's 400, which does not fail over."
+confidence = "high"
+evidence = "live catalog sweep 2026-10-01: CAT-1::raw::together::qwen/qwen3.6-plus, qwen/qwen3.7-plus, qwen/qwen3.7-max, qwen/qwen3.8-flash and CAT-2::raw::all::qwen/* (the same four) -> 400 {\"error\":{\"message\":\"This model only supports streaming. Set \\\"stream\\\": true.\",\"type\":\"invalid_request_error\",\"param\":\"stream\",\"code\":\"streaming_required\"}}. Direct to api.together.xyz /v1/chat/completions without stream: the same 400 on those four ids; Qwen3.5-9B, Qwen3.8-2.4T-A95B and every other Together id in the catalog answer 200 (openai/gpt-oss-120b was 503 service_unavailable both tries). With stream: true the four answer a normal Chat stream ending in a usage chunk. Reproduced hermetically: a_non_stream_call_on_a_stream_only_candidate_gets_a_whole_answer gets the 400."
+claims = ["CAT-1", "CAT-2", "E1", "E2", "E3"]
+state = "reproduced"
+test = "a_non_stream_call_on_a_stream_only_candidate_gets_a_whole_answer"
+fix = ""
+note = "Found by the live catalog sweep. Together publishes no stream-only flag in its model listing; the four ids were found by sending each Together id in the catalog a non-streaming request."

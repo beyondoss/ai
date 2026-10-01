@@ -1935,6 +1935,9 @@ impl Reply {
 pub struct ScriptReq {
     pub authorization: Option<String>,
     pub body_len: usize,
+    /// The forwarded path, query included.
+    pub path: String,
+    pub body: Bytes,
 }
 
 type ReplyScript = Arc<dyn Fn(usize, &ScriptReq) -> Reply + Send + Sync>;
@@ -2007,17 +2010,23 @@ impl ReplyUpstream {
                                 .get("authorization")
                                 .and_then(|v| v.to_str().ok())
                                 .map(String::from);
-                            let body_len = req
+                            let path = req
+                                .uri()
+                                .path_and_query()
+                                .map_or_else(|| req.uri().path().to_owned(), |pq| pq.to_string());
+                            let body = req
                                 .into_body()
                                 .collect()
                                 .await
-                                .map(|b| b.to_bytes().len())
+                                .map(|b| b.to_bytes())
                                 .unwrap_or_default();
                             let reply = script(
                                 n,
                                 &ScriptReq {
                                     authorization,
-                                    body_len,
+                                    body_len: body.len(),
+                                    path,
+                                    body,
                                 },
                             );
                             scripted_reply(reply).await
