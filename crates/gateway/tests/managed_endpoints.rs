@@ -234,3 +234,82 @@ async fn a_byo_key_still_reaches_any_provider_endpoint() {
         "BYO auth passes through untouched"
     );
 }
+
+/// What OpenAI answers a Responses `background: true` request: queued, no usage. It generates
+/// afterwards and bills the account, and nothing the gateway relays ever carries that usage.
+const QUEUED: &str = r#"{"id":"resp_bg","object":"response","created_at":1,"status":"queued","background":true,"model":"gpt-4.1","output":[],"usage":null}"#;
+
+/// A Responses `background: true` request is answered `200 {"status":"queued","usage":null}` and
+/// generated asynchronously, so a managed key would run it on the pool key unmetered (D195 would
+/// even bill an estimate of the envelope), and a managed key cannot poll for it (GET is refused).
+/// So a managed key gets a named 400 and no provider receives the request whole: on a catalog walk
+/// (small body, and a body past 64 KiB that goes through the full-body re-run) the refusal comes
+/// before any upstream; on the `/openai` provider route (small and large) the body is held and the
+/// request aborted before its last byte, as a duplicate `model` is (D34). `background: false` is
+/// served, and a BYO key is relayed as sent: the caller's own account can poll.
+/// claim: BIL-2, SEC-1
+/// defect: D202
+#[tokio::test]
+async fn background_responses_are_refused_on_managed_keys_only() {
+    let (pubkey, sk) = test_keypair(202);
+    // Counts only requests whose body arrived in full: what a provider would act on.
+    let mock = ScriptedUpstream::reply(200, "application/json", QUEUED.to_owned()).await;
+    let gw = Gateway::builder(unused_nats_port(), &mock.authority(), &b64(&pubkey))
+        .providers(&["openai"])
+        .start()
+        .await;
+    let key = managed_key(&sk);
+    let pad = "x".repeat(80 * 1024);
+    let small = r#"{"model":"gpt-4.1","input":"hi","background":true}"#.to_owned();
+    // `model` after `input`, past pingora's replay buffer: the catalog walk's full-body re-run.
+    let large = format!(r#"{{"input":"{pad}","background":true,"model":"gpt-4.1"}}"#);
+    let mut failures = Vec::new();
+    for path in ["/v1/responses", "/openai/v1/responses"] {
+        for body in [&small, &large] {
+            let before = mock.hits();
+            let (status, text, rid) = send(
+                &gw,
+                reqwest::Method::POST,
+                path,
+                ("authorization", format!("Bearer {key}")),
+                Some(body),
+            )
+            .await;
+            let v: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
+            let named = v["error"]["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("background"));
+            if status != 400 || !named || rid.is_none() || mock.hits() != before {
+                failures.push(format!(
+                    "{path} ({} bytes): {status}, {} upstream hits: {text}",
+                    body.len(),
+                    mock.hits() - before
+                ));
+            }
+        }
+    }
+    let (status, text, _) = send(
+        &gw,
+        reqwest::Method::POST,
+        "/v1/responses",
+        ("authorization", format!("Bearer {key}")),
+        Some(r#"{"model":"gpt-4.1","input":"hi","background":false}"#),
+    )
+    .await;
+    if status != 200 {
+        failures.push(format!("background: false: {status}: {text}"));
+    }
+    let before = mock.hits();
+    let (status, text, _) = send(
+        &gw,
+        reqwest::Method::POST,
+        "/openai/v1/responses",
+        ("authorization", "Bearer sk-caller-own-key".to_owned()),
+        Some(&small),
+    )
+    .await;
+    if status != 200 || mock.hits() != before + 1 || !text.contains("queued") {
+        failures.push(format!("BYO: {status}: {text}"));
+    }
+    assert!(failures.is_empty(), "{}\n{}", failures.join("\n"), gw.log());
+}

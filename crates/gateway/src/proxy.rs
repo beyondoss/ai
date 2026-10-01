@@ -428,6 +428,10 @@ pub struct RequestCtx {
     /// request body" — scoped to the managed OpenAI chat/completions path (see `is_streamable_path`)
     /// and bounded by `MAX_REQUEST_BODY`. BYO and every other request still stream straight through.
     inject_eligible: bool,
+    /// Managed `/{provider}/…/responses`: buffer the body (as `inject_eligible` does) so a
+    /// `background: true` request is refused before any byte of it goes upstream (D202). A catalog
+    /// walk reads its body in `request_filter` and refuses there.
+    background_check: bool,
     /// Accumulated request body — populated only when `inject_eligible`; otherwise stays empty and
     /// the body is never buffered.
     req_buf: Vec<u8>,
@@ -942,7 +946,7 @@ impl RequestCtx {
     ///
     /// Both can apply to the same request, in which case every edit is made to the one buffer.
     fn rewrites_body(&self) -> bool {
-        self.inject_eligible || self.auto.is_some()
+        self.inject_eligible || self.background_check || self.auto.is_some()
     }
 
     /// Point the forwarded path at the candidate about to be attempted.
@@ -1353,6 +1357,24 @@ impl AiProxy {
         Ok(true)
     }
 
+    /// A managed Responses `background: true` request (D202): the provider answers `queued` with
+    /// no usage and generates after the request ends, so nothing the gateway relays could meter
+    /// it, and a managed key cannot poll for the result (GET is refused).
+    async fn reject_background(&self, session: &mut Session, request_id: &str) -> Result<bool> {
+        self.state
+            .metrics
+            .rejection(Rejection::ManagedEndpoint)
+            .inc();
+        Self::reject_message_boxed(
+            session,
+            request_id,
+            400,
+            "invalid_request_error",
+            BACKGROUND_REFUSED.to_owned(),
+        )
+        .await
+    }
+
     async fn reject_message_boxed(
         session: &mut Session,
         request_id: &str,
@@ -1423,6 +1445,9 @@ impl AiProxy {
             return self
                 .reject_refused_input(session, &request_id, route, kind)
                 .await;
+        }
+        if route::is_responses_path(session.req_header().uri.path()) && requests_background(&body) {
+            return self.reject_background(session, &request_id).await;
         }
         let unserved = route::unserved(route.candidates, &body);
         let responses_tools = route::tools_need_responses_arm(
@@ -2610,6 +2635,23 @@ fn byo_credential_dialect(req: &pingora::http::RequestHeader) -> Result<Option<D
     Ok(vote)
 }
 
+/// What a managed Responses `background: true` request is told (D202).
+const BACKGROUND_REFUSED: &str = "background responses are not available with a managed key: the \
+     provider generates them after the request ends, where they cannot be metered; send the request \
+     without \"background\": true";
+
+/// Whether a Responses body asks for background mode: a root `background` member (escapes in its
+/// name decoded, any copy of it) whose value is `true`. `true` is a literal no escape can spell, so
+/// a body without those bytes is not parsed.
+fn requests_background(body: &[u8]) -> bool {
+    memchr::memmem::find(body, b"true").is_some()
+        && peek::root_members(body).is_some_and(|members| {
+            members
+                .iter()
+                .any(|m| m.key_is(body, "background") && &body[m.value.0..m.value.1] == b"true")
+        })
+}
+
 /// The `/{provider}/…` endpoints a managed key may reach: the metered generation calls and their
 /// token-count / compact sub-resources, matched by suffix so every provider's mount prefix
 /// (`/api/v1`, `/openai/v1`, `/inference/v1`, `/anthropic/v1`, `/backend-api/codex`) works.
@@ -3708,6 +3750,9 @@ impl ProxyHttp for AiProxy {
                         .reject_refused_input(session, &request_id, row, kind)
                         .await;
                 }
+                if inbound_responses && body_complete.as_deref().is_some_and(requests_background) {
+                    return self.reject_background(session, &request_id).await;
+                }
                 // A Responses request walks the row's Responses arm whenever the row has one,
                 // `store: false` one-shots included: there it is a byte relay, and translation onto
                 // Chat Completions would lose what only Responses has (Codex's `namespace` tools,
@@ -3994,10 +4039,18 @@ impl ProxyHttp for AiProxy {
         // passthrough), OpenAI dialect only, streaming-capable paths only — so everything else still
         // streams through untouched. Checked on the forwarded path (suffix), so it's prefix-agnostic.
         let inject_eligible = managed && dialect == Dialect::OpenAi && forward_streamable;
+        // A managed `/{provider}/…/responses` body is buffered too, so `background: true` (a
+        // generation the provider runs after the request ends, which no usage tap can meter) is
+        // refused before a byte of it goes upstream (D202). A catalog walk checked its body above.
+        let background_check = managed
+            && provider_route
+            && forward_path.as_deref().is_some_and(|p| {
+                route::forward_is_responses(p.split_once('?').map_or(p, |(p, _)| p))
+            });
         // That buffer counts against the body budget. A declared large body reserves up front,
         // before the tenant slot and the breaker permit, so a refusal holds neither; a chunked one
         // reserves as it grows (`request_body_filter`).
-        if inject_eligible
+        if (inject_eligible || background_check)
             && model_route.is_none()
             && let Some(n) = declared_len.filter(|n| *n > BODY_PEEK_LIMIT)
             && !ctx.held.reserve_body(n)
@@ -4086,6 +4139,7 @@ impl ProxyHttp for AiProxy {
                     // was never incremented. The stored `hit.streaming` is emitted on `ai.usage`.
                     streaming: false,
                     inject_eligible: false,
+                    background_check: false,
                     req_buf: Vec::new(),
                     resp_tail: UsageTail::default(),
                     resp_head: Vec::new(),
@@ -4230,6 +4284,7 @@ impl ProxyHttp for AiProxy {
             resp_model_scanner: peek::ModelScanner::for_response(),
             streaming: false,
             inject_eligible,
+            background_check,
             // Only the inject-eligible path ever buffers the request body (to splice
             // `stream_options` after the root `{`; the `stream` key can appear anywhere in the root
             // object, so the decision needs the whole body — buffering is inherent here, not
@@ -4241,7 +4296,10 @@ impl ProxyHttp for AiProxy {
             // The `+ STREAM_OPTIONS_FRAG.len()` is headroom for the splice, which
             // `apply_stream_usage_injection` performs *in place*: with it the injection never
             // reallocates, so a body arrives, is spliced, and goes upstream on one allocation.
-            req_buf: match (inject_eligible || model_route.is_some(), declared_len) {
+            req_buf: match (
+                inject_eligible || background_check || model_route.is_some(),
+                declared_len,
+            ) {
                 (true, Some(len)) => {
                     Vec::with_capacity(len.min(MAX_REQUEST_BODY) + STREAM_OPTIONS_FRAG.len())
                 }
@@ -5002,6 +5060,14 @@ impl ProxyHttp for AiProxy {
                         "duplicate root model key",
                     )
                     .into_down());
+                }
+                // Managed `/{provider}/…/responses` asking for `background: true` (D202).
+                if rc.background_check && requests_background(&buf) {
+                    self.state
+                        .metrics
+                        .rejection(Rejection::ManagedEndpoint)
+                        .inc();
+                    return Err(gateway_error(400, BACKGROUND_REFUSED).into_down());
                 }
                 // Wire mismatch on this *candidate*: map the inbound JSON onto this path's
                 // endpoint *before* the model splice. Keep the original client body in `req_buf`
@@ -6481,6 +6547,7 @@ mod tests {
             body_bytes_fed: 0,
             upstream_status: None,
             inject_eligible,
+            background_check: false,
             req_buf: Vec::new(),
             start: Instant::now(),
             attempt: 0,
@@ -7126,6 +7193,31 @@ mod tests {
         );
         assert!(all("a=1&b=2&keys=3&monkey=4").is_empty());
         assert!(all("").is_empty());
+    }
+
+    /// `background: true` is read as a provider's parser reads it: at the root, any copy, its name
+    /// escaped or not; never a nested member or a string that says so.
+    /// claim: BIL-2
+    #[test]
+    fn requests_background_reads_the_root_member() {
+        for body in [
+            r#"{"model":"m","background":true}"#,
+            r#"{ "background" : true , "input":"x"}"#,
+            r#"{"background":true}"#,
+            r#"{"background":false,"background":true}"#,
+        ] {
+            assert!(requests_background(body.as_bytes()), "{body}");
+        }
+        for body in [
+            r#"{"model":"m","background":false}"#,
+            r#"{"model":"m","background":null,"stream":true}"#,
+            r#"{"model":"m","background":"true"}"#,
+            r#"{"model":"m","metadata":{"background":true}}"#,
+            r#"{"model":"m","input":"background\":true"}"#,
+            "not json true",
+        ] {
+            assert!(!requests_background(body.as_bytes()), "{body}");
+        }
     }
 
     /// The pool key is scrubbed wherever it falls in a streamed body — inside one chunk, split

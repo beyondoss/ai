@@ -546,6 +546,16 @@ A managed request carrying `Upgrade` (a WebSocket: OpenAI Realtime, Codex) is a 
 checked first and counted under the same `managed_endpoint` reason. An upgraded connection is an
 opaque relay that no usage tap can meter, so it is refused by name rather than left to the path list.
 
+A managed Responses request with a root `background: true` is a 400 named after the field, counted
+under the same reason (D202). OpenAI answers it `200 {"status":"queued","usage":null}` and generates
+after the request ends, so no usage tap sees what it bills, and a managed key cannot poll for the
+result (GET is refused above). A catalog walk refuses it from the body it already read, before any
+upstream (the full-body re-run checks the body it holds). A managed `/{provider}/…/responses` body is
+buffered for this (as an OpenAI Chat body is for `stream_options`; the same body budget) and the
+request aborted before its last byte goes upstream, the way a duplicate `model` is, so no provider
+receives it whole. `background: false` is served; BYO keys relay it as sent (the caller's account
+can poll).
+
 **Which paths name an endpoint.** `route::implied_endpoint` is an exact table:
 `/v1/chat/completions`, `/v1/messages`, `/v1/responses`, `/v1/embeddings` (under `/auto` the `/v1`
 is optional; a trailing slash is ignored). Bare `/v1` and `/auto` name none and relay onto the row's

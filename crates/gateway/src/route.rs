@@ -277,6 +277,14 @@ pub fn is_responses_path(path: &str) -> bool {
     implied_endpoint(path) == Some(Endpoint::Responses)
 }
 
+/// Whether a forwarded (`/{provider}/…`, query stripped) path is the Responses generation
+/// endpoint itself, under any mount prefix: not a sub-resource or a stored response.
+pub fn forward_is_responses(path: &str) -> bool {
+    path.strip_suffix('/')
+        .unwrap_or(path)
+        .ends_with("/responses")
+}
+
 /// Whether a catalog candidate path is the Responses endpoint.
 pub fn candidate_path_is_responses(path: &str) -> bool {
     path.ends_with("/responses")

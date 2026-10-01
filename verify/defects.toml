@@ -2135,3 +2135,17 @@ state = "fixed"
 test = "split_weights_near_u32_max_never_overflow"
 fix = ""
 note = "Fixed in control.rs: a weight above MAX_SPLIT_WEIGHT = u32::MAX / MAX_CANDIDATES makes the header malformed (counted on ai_control_header_errors_total, the default walk serves), derived so the sum of the at most MAX_CANDIDATES weights a walk adds always fits a u32; the pick accumulates with saturating_add as well, so weights handed to permute directly cannot panic either. The test runs 512 seeds each of [1, u32::MAX], [2^31, 2^31] and [u32::MAX, u32::MAX] through permute, and checks the parse bound on both sides."
+
+[[defect]]
+id = "D202"
+severity = "high"
+area = "Billing"
+title = "A managed Responses request with background: true generated on the pool key unmetered"
+impact = "The gateway relayed a Responses body's background: true on GPT rows (the Responses arm) and on /openai/v1/responses. OpenAI answers 200 {\"status\":\"queued\",\"usage\":null} and generates afterwards, billing Beyond's account for a response no usage tap ever sees: a managed tenant could run any amount of generation free. D195 then billed an estimate of the queued envelope (a few tokens). A managed key cannot even poll for the result (the GET allowlist refuses it), so the only use of background on a managed key was the free generation."
+confidence = "high"
+evidence = "Hermetic: background_responses_are_refused_on_managed_keys_only. A mock answering the queued envelope received the whole request and the client got 200 queued on /v1/responses (gpt-4.1, small and an 80 KiB body through the full-body re-run) and on /openai/v1/responses (small and large). OpenAI documents background mode as returning status queued with the response polled at GET /v1/responses/{id} (https://platform.openai.com/docs/guides/background)."
+claims = ["BIL-2", "SEC-1"]
+state = "fixed"
+test = "background_responses_are_refused_on_managed_keys_only"
+fix = ""
+note = "Fixed in proxy.rs: a managed Responses body whose root background member (name escapes decoded, any copy) is true gets a named 400 (\"background responses are not available with a managed key ...\"), counted as ai_rejections_total{reason=managed_endpoint}, as an Upgrade is refused. A catalog walk refuses it from the body request_filter already read, before any upstream; relay_full_body refuses from the body it holds. On /{provider}/.../responses the managed body is now buffered (RequestCtx::background_check, the same body budget as the Chat stream_options buffer) and the request aborted in request_body_filter before its last byte goes upstream, as a duplicate model is (D34), so no provider receives it whole (the test counts whole bodies). background: false is served; BYO keys relay it (their account can poll). Unit: requests_background_reads_the_root_member. Cost: a managed provider-route Responses body is now held until its end before the provider sees it."
