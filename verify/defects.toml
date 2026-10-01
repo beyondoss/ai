@@ -1373,10 +1373,10 @@ area = "Docs"
 title = "Leftover misplaced doc comments and contradictions from the parallel merges"
 impact = "Fused/misplaced doc comments in proxy.rs (reset_request_body_phase/attempt_start, apply_* onto clamp_output_limits, is_streamable_path onto is_managed_provider_endpoint, 'Two reasons' lists three); ARCHITECTURE.md says BYO forwards every header untouched (contradicts D67) and BYO is pure passthrough (contradicts D36); config.rs says AI_POOL_KEY_OPENAI_CODEX reaches openai-codex while providers/lib.rs says it doesn't exist."
 confidence = "high"
-evidence = "proxy.rs ~780-827, ~2370-2480; ARCHITECTURE.md ~1400, ~1754, ~2114; config.rs ~594"
+evidence = "proxy.rs ~780-827, ~2370-2480; ARCHITECTURE.md ~1400, ~1754, ~2114; config.rs ~594. Reproduced (claims_contract.rs): every listed item fails: three doc blocks fused onto clamp_output_limits / is_managed_provider_endpoint / attempt_start with their own functions undocumented, 'Two reasons' listing three, ARCHITECTURE.md's BYO 'untouched' headers and 'pure passthrough', and config.rs's AI_POOL_KEY_OPENAI_CODEX example."
 claims = ["CAT-15"]
-state = "suspected"
-test = ""
+state = "reproduced"
+test = "doc_comments_sit_on_their_items_and_the_docs_agree"
 fix = ""
 note = "Found by the independent branch review (2026-10-01) of a54c22c."
 

@@ -1105,3 +1105,88 @@ fn architecture_tables_name_real_modules_metrics_and_fields() {
 
     assert!(wrong.is_empty(), "false statements:\n{}", wrong.join("\n"));
 }
+
+/// The `///` lines directly above `item` (e.g. `fn clamp_output_limits(`) in `src`, joined.
+fn doc_above(src: &str, item: &str) -> String {
+    let lines: Vec<&str> = src.lines().collect();
+    let at = lines
+        .iter()
+        .position(|l| l.trim_start().starts_with(item) || l.contains(&format!(" {item}")))
+        .unwrap_or_else(|| panic!("{item} not found"));
+    let mut doc: Vec<&str> = lines[..at]
+        .iter()
+        .rev()
+        .take_while(|l| l.trim_start().starts_with("///") || l.trim_start().starts_with("#["))
+        .copied()
+        .collect();
+    doc.reverse();
+    doc.join("\n")
+}
+
+/// Doc comments sit on the item they describe, and the docs do not contradict the code: the
+/// parallel merges left `proxy.rs` doc blocks fused onto the wrong functions, ARCHITECTURE.md
+/// saying BYO forwards every header untouched (D67 sweeps `x-beyond-*`) and is pure passthrough,
+/// and `config.rs` naming a Codex pool key that `providers` says cannot exist.
+/// claim: CAT-15
+/// defect: D98
+#[test]
+#[ignore = "D98 reproduced: misplaced doc comments and contradicting docs"]
+fn doc_comments_sit_on_their_items_and_the_docs_agree() {
+    let proxy = repo_file("crates/gateway/src/proxy.rs");
+    let arch = repo_file("crates/gateway/ARCHITECTURE.md");
+    let config = repo_file("crates/gateway/src/config.rs");
+    let mut wrong = Vec::new();
+    let mut check = |ok: bool, what: &str| {
+        if !ok {
+            wrong.push(what.to_owned());
+        }
+    };
+    let clamp = doc_above(&proxy, "fn clamp_output_limits(");
+    check(
+        !clamp.contains("stream_options") && !clamp.contains("Overwrite the `model`"),
+        "clamp_output_limits carries the injection / model-rewrite docs",
+    );
+    check(
+        doc_above(&proxy, "fn apply_stream_usage_injection(").contains("Splice `stream_options"),
+        "apply_stream_usage_injection has no doc",
+    );
+    check(
+        doc_above(&proxy, "fn apply_model_rewrite(").contains("Overwrite the `model`"),
+        "apply_model_rewrite has no doc",
+    );
+    check(
+        !doc_above(&proxy, "fn is_managed_provider_endpoint(")
+            .contains("Whether the **forwarded**"),
+        "is_managed_provider_endpoint carries is_streamable_path's doc",
+    );
+    check(
+        doc_above(&proxy, "fn is_streamable_path(").contains("Whether the **forwarded**"),
+        "is_streamable_path has no doc",
+    );
+    check(
+        !doc_above(&proxy, "fn attempt_start(").contains("Clear the state"),
+        "attempt_start carries reset_request_body_phase's doc",
+    );
+    check(
+        doc_above(&proxy, "fn reset_request_body_phase(").contains("Clear the state"),
+        "reset_request_body_phase has no doc",
+    );
+    check(
+        !proxy.contains("Two reasons a body gets rewritten"),
+        "rewrites_body says two reasons and lists three",
+    );
+    check(
+        !arch.contains("forward every client header untouched")
+            && !arch.contains("headers are forwarded untouched"),
+        "ARCHITECTURE.md: BYO headers untouched (D67 sweeps x-beyond-*)",
+    );
+    check(
+        !arch.contains("remain pure passthrough") && !arch.contains("(pure passthrough)"),
+        "ARCHITECTURE.md: BYO is pure passthrough",
+    );
+    check(
+        !config.contains("`AI_POOL_KEY_OPENAI_CODEX` reaches"),
+        "config.rs names a Codex pool key; providers says there is none",
+    );
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
