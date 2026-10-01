@@ -337,6 +337,10 @@ pub struct PoolAuth {
     pub header: Option<http::HeaderValue>,
     /// Where the bare key starts in `value` (after the scheme's `Bearer `), for [`Self::key`].
     key_at: usize,
+    /// A searcher for [`Self::key`], built once at boot: every managed error response is scanned
+    /// for an echo of the key (`proxy::Redact`), and building a searcher per response repeated the
+    /// key's preprocessing on each one (D92). Holds a copy of the key, like `header`.
+    finder: memchr::memmem::Finder<'static>,
     /// When this key's last auth failure (a 401, or a 403 naming the key) cools off, in ms since [`clock_ms`]'s epoch; 0
     /// when it has none. A cooling key is skipped as a request's *first* key, so traffic stops
     /// paying a round trip to a revoked key on every request. Shared across requests; relaxed
@@ -349,6 +353,11 @@ impl PoolAuth {
     /// and so what the gateway scrubs from responses (`proxy::Redact`).
     pub fn key(&self) -> &str {
         self.value.expose().get(self.key_at..).unwrap_or("")
+    }
+
+    /// The boot-built searcher for [`Self::key`].
+    pub fn finder(&self) -> &memchr::memmem::Finder<'static> {
+        &self.finder
     }
 
     fn cooling(&self, now_ms: u64) -> bool {
@@ -458,10 +467,16 @@ impl Provider {
                         h.set_sensitive(true);
                         h
                     });
+                let key_at = auth.value_prefix().map_or(0, str::len);
+                let finder = memchr::memmem::Finder::new(
+                    value.expose().get(key_at..).unwrap_or("").as_bytes(),
+                )
+                .into_owned();
                 PoolAuth {
                     value,
                     header,
-                    key_at: auth.value_prefix().map_or(0, str::len),
+                    key_at,
+                    finder,
                     bad_until_ms: AtomicU64::new(0),
                 }
             })

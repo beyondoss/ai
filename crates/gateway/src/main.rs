@@ -290,12 +290,8 @@ fn main() {
     // Client (app) traffic. Enable downstream HTTP/2 cleartext (h2c) when configured: Pingora peeks
     // the H2 connection preface and serves h2c, transparently falling back to HTTP/1.1 for h1
     // clients — so this is backward-compatible. Stays plaintext (no TLS); `add_tcp` is unchanged.
-    let mut proxy_builder = ProxyServiceBuilder::new(
-        &server.configuration,
-        AiProxy {
-            state: state.clone(),
-        },
-    );
+    let mut proxy_builder =
+        ProxyServiceBuilder::new(&server.configuration, AiProxy::new(state.clone()));
     if downstream_h2c {
         // `HttpServerOptions` is `#[non_exhaustive]`, so build via `Default` and set the field.
         let mut opts = HttpServerOptions::default();

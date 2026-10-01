@@ -71,7 +71,7 @@ use crate::route::{self, Dialect, Provider};
 use crate::state::{GatewayState, RequestId};
 use crate::terminal::TerminalTracker;
 use crate::{control, peek, smart, translate, usage};
-use arrayvec::ArrayString;
+use arrayvec::{ArrayString, ArrayVec};
 use async_trait::async_trait;
 use bytes::Bytes;
 use pingora::http::ResponseHeader;
@@ -214,13 +214,26 @@ const USAGE_HEAD_CAP: usize = 8 * 1024;
 const MAX_CONNECT_RETRIES: u8 = 2;
 
 pub struct AiProxy {
-    pub state: Arc<GatewayState>,
+    /// The gateway state, which lives as long as the process: a `&'static` borrow, so a request
+    /// context holds it without an `Arc` clone (a shared-cache-line RMW pair on every request,
+    /// fast rejects included; D92). Built with [`AiProxy::new`].
+    pub state: &'static GatewayState,
+}
+
+impl AiProxy {
+    /// A proxy over `state` for the rest of the process. Keeps one reference to it forever (the
+    /// gateway builds one proxy at boot, and its state is never torn down before exit).
+    pub fn new(state: Arc<GatewayState>) -> Self {
+        let state: &'static Arc<GatewayState> = Box::leak(Box::new(state));
+        Self { state }
+    }
 }
 
 /// Requests that exist right now: incremented when pingora builds a request's context
 /// (`new_ctx`, once the request header has been read) and decremented when that context drops,
 /// after `logging` has written its billing row. `main`'s shutdown drain exits once this reaches 0.
-/// Process-wide rather than on [`GatewayState`] so a request pays no `Arc` clone for it.
+/// One atomic add and one sub per request, the only shared write `new_ctx` and the context's drop
+/// make.
 pub static LIVE_REQUESTS: AtomicUsize = AtomicUsize::new(0);
 
 /// Pingora's per-request context: the admitted request's state, plus what it holds that must be
@@ -241,7 +254,7 @@ pub struct Ctx {
 /// The releasable state of one request. Kept beside, not inside, [`RequestCtx`]: none of it is
 /// touched per response chunk, and `RequestCtx`'s size is (see its size test).
 struct Held {
-    state: Arc<GatewayState>,
+    state: &'static GatewayState,
     /// Set at the top of `request_filter`, so an error answered before admission (a body read
     /// failure, say) still carries the request id.
     request_id: Option<RequestId>,
@@ -496,34 +509,41 @@ const REDACTED: &[u8] = b"[redacted]";
 
 impl Redact {
     /// Scrub `chunk` (with the bytes held back from the last one) and return what may be relayed
-    /// now: everything at `end_of_stream`, otherwise all but a key-sized tail.
-    fn feed(&mut self, key: &[u8], chunk: Option<Bytes>, end_of_stream: bool) -> Option<Bytes> {
-        if key.is_empty() {
+    /// now: everything at `end_of_stream`, otherwise all but a key-sized tail. `key` is the pool
+    /// key's boot-built searcher ([`route::PoolAuth::finder`]).
+    fn feed(
+        &mut self,
+        key: &memchr::memmem::Finder<'_>,
+        chunk: Option<Bytes>,
+        end_of_stream: bool,
+    ) -> Option<Bytes> {
+        let len = key.needle().len();
+        if len == 0 {
             return chunk;
         }
         let mut buf = std::mem::take(&mut self.carry);
         buf.extend_from_slice(chunk.as_deref().unwrap_or(&[]));
         mask_all(&mut buf, key);
         if !end_of_stream {
-            let keep = (key.len() - 1).min(buf.len());
+            let keep = (len - 1).min(buf.len());
             self.carry = buf.split_off(buf.len() - keep);
         }
         Some(Bytes::from(buf))
     }
 }
 
-/// Overwrite every occurrence of `key` in `buf` with [`REDACTED`], padded to `key`'s length.
+/// Overwrite every occurrence of `key`'s needle in `buf` with [`REDACTED`], padded to its length.
 /// Returns whether there was one.
-fn mask_all(buf: &mut [u8], key: &[u8]) -> bool {
-    let finder = memchr::memmem::Finder::new(key);
+fn mask_all(buf: &mut [u8], key: &memchr::memmem::Finder<'_>) -> bool {
+    let len = key.needle().len();
     let mut at = 0;
     let mut found = false;
-    while let Some(i) = finder.find(&buf[at..]) {
-        let hit = &mut buf[at + i..at + i + key.len()];
+    while let Some(i) = key.find(&buf[at..]) {
+        let hit = &mut buf[at + i..at + i + len];
         for (j, b) in hit.iter_mut().enumerate() {
             *b = REDACTED.get(j).copied().unwrap_or(b'*');
         }
-        at += i + key.len();
+        at += i + len;
         found = true;
     }
     found
@@ -1432,9 +1452,9 @@ impl AiProxy {
         };
         let us = pending.elapsed_us;
         a.health = None;
-        record_walk_ttft_us(&self.state, rc, us, !verdict);
+        record_walk_ttft_us(self.state, rc, us, !verdict);
         if !verdict {
-            pin_walk(&self.state, rc);
+            pin_walk(self.state, rc);
         }
     }
 
@@ -1545,18 +1565,11 @@ const MANAGED_ANTHROPIC_BETAS: [&str; 8] = [
 ];
 
 /// Drop every client header a managed request may not forward ([`MANAGED_FORWARD_HEADERS`]), and
-/// every `anthropic-beta` token not in [`MANAGED_ANTHROPIC_BETAS`]. Allocates only when there is
-/// something to drop.
+/// every `anthropic-beta` token not in [`MANAGED_ANTHROPIC_BETAS`]. The header sweep allocates
+/// nothing (D92: it collected the names into a `Vec` on nearly every managed request); only an
+/// `anthropic-beta` value with a token to drop is rebuilt.
 fn retain_managed_client_headers(req: &mut pingora::http::RequestHeader) -> Result<()> {
-    let unlisted: Vec<http::HeaderName> = req
-        .headers
-        .keys()
-        .filter(|k| !MANAGED_FORWARD_HEADERS.contains(&k.as_str()))
-        .cloned()
-        .collect();
-    for name in &unlisted {
-        req.remove_header(name);
-    }
+    remove_headers_where(req, |name| !MANAGED_FORWARD_HEADERS.contains(&name));
     let betas = req.headers.get_all("anthropic-beta");
     let mut values = betas.iter();
     let clean = match (values.next(), values.next()) {
@@ -1585,17 +1598,46 @@ fn retain_managed_client_headers(req: &mut pingora::http::RequestHeader) -> Resu
     Ok(())
 }
 
-/// Drop every `x-beyond-*` header from a request about to go upstream (D67). Allocates only when
-/// there is one to drop.
+/// Drop every `x-beyond-*` header from a request about to go upstream (D67). Allocates nothing.
 fn strip_beyond_headers(req: &mut pingora::http::RequestHeader) {
-    let ours: Vec<http::HeaderName> = req
-        .headers
-        .keys()
-        .filter(|k| k.as_str().starts_with("x-beyond-"))
-        .cloned()
-        .collect();
-    for name in &ours {
-        req.remove_header(name);
+    remove_headers_where(req, |name| name.starts_with("x-beyond-"));
+}
+
+/// Remove every header whose (lower-case) name `drop` matches, allocating nothing (D92): names are
+/// copied in batches onto the stack, since the map cannot be borrowed while it is edited. A name
+/// past the stack slot's length (no real header) is cloned instead.
+fn remove_headers_where(req: &mut pingora::http::RequestHeader, drop: impl Fn(&str) -> bool) {
+    const BATCH: usize = 16;
+    loop {
+        let mut names = ArrayVec::<ArrayString<64>, BATCH>::new();
+        let mut long = None;
+        let mut more = false;
+        for k in req.headers.keys().map(http::HeaderName::as_str) {
+            if !drop(k) {
+                continue;
+            }
+            if names.is_full() {
+                more = true;
+                break;
+            }
+            match ArrayString::from(k) {
+                Ok(name) => names.push(name),
+                Err(_) => {
+                    long = http::HeaderName::from_bytes(k.as_bytes()).ok();
+                    more = true;
+                    break;
+                }
+            }
+        }
+        for name in &names {
+            req.remove_header(name.as_str());
+        }
+        if let Some(name) = long {
+            req.remove_header(&name);
+        }
+        if !more {
+            return;
+        }
     }
 }
 
@@ -2784,7 +2826,7 @@ impl ProxyHttp for AiProxy {
         Ctx {
             rc: None,
             held: Held {
-                state: Arc::clone(&self.state),
+                state: self.state,
                 request_id: None,
                 in_flight: false,
                 active_stream: false,
@@ -4445,7 +4487,7 @@ impl ProxyHttp for AiProxy {
         // `response_filter` does not run for an abandoned attempt, so the ranker would never see
         // this failure unless we record it here. Penalty, not the raw elapsed — a 3ms 500 (or a
         // 1ms 401) must not beat a slower 2xx.
-        record_walk_ttft(&self.state, rc, false);
+        record_walk_ttft(self.state, rc, false);
         // The outgoing candidate's breaker failure is recorded by `upstream_peer`'s prologue, which
         // still sees `breaker_pending` set. A 5xx is a failure by the breaker's own definition, so
         // that is the right outcome — and recording it here as well would double-count. A key
@@ -4527,7 +4569,7 @@ impl ProxyHttp for AiProxy {
         // and a header the gateway adds later must not have leaked from old clients first. A sweep
         // by prefix rather than a list of names, so a new header cannot be forgotten here. Runs on
         // every attempt (pingora rebuilds the head from the downstream request each time), and
-        // before anything below adds a header of its own. Allocates only when one is present.
+        // before anything below adds a header of its own. Allocates nothing.
         strip_beyond_headers(upstream_request);
 
         // Point Host at the upstream. Same precomputed-value trick as the pool key above.
@@ -4896,7 +4938,7 @@ impl ProxyHttp for AiProxy {
                 }
             } else if !(rc.relay_abandoned && status == 429) {
                 let healthy = status < 500 && !(rc.managed && is_candidate_refusal(status));
-                record_walk_ttft(&self.state, rc, healthy);
+                record_walk_ttft(self.state, rc, healthy);
             }
             rc.provider.metrics.record_response(status);
             rc.upstream_status = Some(status);
@@ -4950,14 +4992,14 @@ impl ProxyHttp for AiProxy {
             // body is an answer and is not scanned; a streamed answer would pay for it per chunk.
             rc.redact = None;
             if rc.managed
-                && let Some(key) = rc
+                && let Some(finder) = rc
                     .provider
                     .pool_auth
                     .get(usize::from(rc.pool_key))
-                    .map(|a| a.key().as_bytes())
-                    .filter(|k| !k.is_empty())
+                    .map(route::PoolAuth::finder)
+                    .filter(|f| !f.needle().is_empty())
             {
-                let finder = memchr::memmem::Finder::new(key);
+                // Collects nothing (and so allocates nothing) unless a header echoes the key.
                 let echoed: Vec<http::HeaderName> = upstream_response
                     .headers
                     .iter()
@@ -5046,13 +5088,10 @@ impl ProxyHttp for AiProxy {
         self.state.fault_point("response_body_filter");
         // First, so nothing downstream — translation, capture, the cache, the usage tail — ever
         // holds the pool key (D66).
-        if let Some(r) = rc.redact.as_mut() {
-            let key = rc
-                .provider
-                .pool_auth
-                .get(usize::from(rc.pool_key))
-                .map_or(&[][..], |a| a.key().as_bytes());
-            *body = r.feed(key, body.take(), end_of_stream);
+        if let Some(r) = rc.redact.as_mut()
+            && let Some(auth) = rc.provider.pool_auth.get(usize::from(rc.pool_key))
+        {
+            *body = r.feed(auth.finder(), body.take(), end_of_stream);
         }
         let chunk = body.as_deref().unwrap_or(&[]);
         // A catalog walk's 2xx waits here for its health verdict (see `response_filter`): the
@@ -5314,7 +5353,7 @@ impl ProxyHttp for AiProxy {
             }
             Some((_, at, usable)) if first_usable(usable, at.saturating_add(1)).is_some() => {
                 self.state.metrics.candidate_failovers_total.inc();
-                record_walk_ttft(&self.state, rc, false);
+                record_walk_ttft(self.state, rc, false);
                 rc.advance_candidate(at);
                 e.set_retry(true);
             }
@@ -5478,7 +5517,7 @@ impl ProxyHttp for AiProxy {
                 // next candidate, since `logging` would then also resolve the still-pending permit —
                 // which would trip the breaker at half its configured threshold on the last
                 // candidate, exactly where everything lands once the primaries are sick.
-                record_walk_ttft(&self.state, rc, false);
+                record_walk_ttft(self.state, rc, false);
                 rc.provider.metrics.connect_retries_total.inc();
                 warn!(
                     request_id = %rc.request_id,
@@ -6230,16 +6269,13 @@ mod tests {
     /// claim: S1
     /// defect: D92
     #[test]
-    #[ignore = "D92 reproduced: new_ctx clones the gateway state's Arc for every request"]
     fn new_ctx_pays_no_arc_clone() {
         let state = GatewayState::new(
             crate::config::AiConfig::default(),
             crate::state::test_metrics(),
         )
         .unwrap();
-        let proxy = AiProxy {
-            state: state.clone(),
-        };
+        let proxy = AiProxy::new(state.clone());
         let before = Arc::strong_count(&state);
         let ctx = proxy.new_ctx();
         assert_eq!(
@@ -6248,6 +6284,46 @@ mod tests {
             "new_ctx cloned the state Arc"
         );
         drop(ctx);
+    }
+
+    /// The header sweep removes every match, past its stack batch and past its name slot, and keeps
+    /// everything else.
+    #[test]
+    fn remove_headers_where_removes_every_match_in_stack_batches() {
+        let mut req =
+            pingora::http::RequestHeader::build(http::Method::POST, b"/v1/x", None).unwrap();
+        let long = format!("x-{}", "l".repeat(80));
+        for i in 0..40 {
+            req.insert_header(format!("x-drop-{i}"), "v").unwrap();
+        }
+        req.insert_header(long.clone(), "v").unwrap();
+        req.insert_header("content-type", "application/json")
+            .unwrap();
+        req.insert_header("accept", "*/*").unwrap();
+        remove_headers_where(&mut req, |n| n.starts_with("x-"));
+        let left: Vec<&str> = req.headers.keys().map(http::HeaderName::as_str).collect();
+        assert_eq!(left.len(), 2, "{left:?}");
+        assert!(left.contains(&"content-type") && left.contains(&"accept"));
+    }
+
+    /// Each pool key's echo searcher is built once at boot, for exactly the bare key a provider
+    /// would echo (D92): `response_filter` and `Redact` borrow it rather than rebuild it per
+    /// response or per chunk.
+    #[test]
+    fn a_pool_key_carries_its_boot_built_searcher() {
+        let p = Provider::resolve(
+            "openai",
+            "api.openai.com:443".to_owned(),
+            Dialect::OpenAi,
+            AuthScheme::Bearer,
+            &["sk-pool-a", "sk-pool-b"],
+            ProviderMetrics::disconnected(),
+            None,
+        );
+        for (auth, key) in p.pool_auth.iter().zip(["sk-pool-a", "sk-pool-b"]) {
+            assert_eq!(auth.key(), key);
+            assert_eq!(auth.finder().needle(), key.as_bytes());
+        }
     }
 
     #[test]
@@ -6690,10 +6766,11 @@ mod tests {
     /// claim: SEC-7
     #[test]
     fn redact_scrubs_a_key_split_across_chunks_and_keeps_the_length() {
-        let key = b"sk-pool-secret-0123456789";
+        let raw = b"sk-pool-secret-0123456789";
+        let key = &memchr::memmem::Finder::new(raw);
         let body = format!(
             r#"{{"error":{{"message":"bad key {k} (again: {k})","note":"{k}"}}}}"#,
-            k = std::str::from_utf8(key).unwrap()
+            k = std::str::from_utf8(raw).unwrap()
         );
         for split in [1, 7, 20, 30, 47, body.len() - 1] {
             for step in [1, 3, 64] {
@@ -6715,7 +6792,7 @@ mod tests {
         }
         // A key shorter than the marker is masked with a truncated marker.
         let mut buf = *b"x=abc;";
-        assert!(mask_all(&mut buf, b"abc"));
+        assert!(mask_all(&mut buf, &memchr::memmem::Finder::new(b"abc")));
         assert_eq!(&buf, b"x=[re;");
     }
 

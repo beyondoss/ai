@@ -159,7 +159,8 @@ Client (stock OpenAI/Anthropic SDK)
   ▼  response_body_filter (proxy.rs)  — response relayed chunk-by-chunk; SSE is never fully buffered
   │  Managed >= 400, first: overwrite the pool key with `[redacted]***` (same length, so
   │    Content-Length holds), holding back a key-sized tail per chunk to catch a split key.
-  │    Everything below (translation, capture, cache, usage tail) sees the scrubbed bytes
+  │    Everything below (translation, capture, cache, usage tail) sees the scrubbed bytes.
+  │    The key searcher is built once per pool key at boot (`PoolAuth::finder`), not per response
   │  Translate path: convert SSE event-by-event into the inbound dialect (do not wait for `[DONE]`
   │    before forwarding deltas). Non-stream: map the JSON object, including error envelopes.
   │    Both held buffers (the non-stream body; one not-yet-terminated SSE event) are capped at
