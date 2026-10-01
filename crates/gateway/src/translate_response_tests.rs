@@ -2263,7 +2263,6 @@ fn parallel_tool_use_blocks_are_sequential_on_a_messages_stream() {
 /// claim: TRN-18
 /// defect: D46
 #[test]
-#[ignore = "D46 reproduced: translated context-overflow errors lack \"prompt is too long\" / code context_length_exceeded"]
 fn a_context_overflow_error_carries_what_each_harness_compacts_on() {
     let openai = json!({"error": {
         "message": "This model's maximum context length is 128000 tokens. However, your messages resulted in 130512 tokens. Please reduce the length of the messages.",
@@ -2293,7 +2292,6 @@ fn a_context_overflow_error_carries_what_each_harness_compacts_on() {
 /// claim: TRN-19
 /// defect: D46
 #[test]
-#[ignore = "D46 reproduced: response.failed error.code turns context_length_exceeded / insufficient_quota into server_error"]
 fn a_mid_stream_overflow_or_quota_code_survives_response_failed() {
     let mut bad = Vec::new();
     for (code, typ) in [

@@ -622,8 +622,9 @@ Responses-only models the catalog routes to `/v1/responses`, and is held to the 
   `output_item.done`, each with `sequence_number`, `output_index` and `item_id`, ending in
   `response.completed` carrying the whole `output` and usage. An upstream error is an `error` event
   (with the envelope under `error`, so an OpenAI SDK raises it) followed by `response.failed`, whose
-  `error.code` is one of the closed set the Responses schema allows (`server_error` when the
-  upstream's code is not; the `error` event keeps the upstream's own).
+  `error.code` is one of the closed set the Responses schema allows, plus the two real OpenAI also
+  sends there, `context_length_exceeded` and `insufficient_quota` (`server_error` when the
+  upstream's code is none of those; the `error` event keeps the upstream's own).
 - **Streams that fail or stop mid-way.** OpenRouter reports a provider that died mid-generation as
   a chunk carrying `choices` _and_ an `error` (with `finish_reason: "error"`); that is an error, not
   a finish, for a Messages or Responses client (a Chat client on the same wire gets the relay). A
@@ -647,7 +648,11 @@ Responses-only models the catalog routes to `/v1/responses`, and is held to the 
   `error` key); `message`, `type`, `code` and `param` survive, a string `error` is the message,
   OpenRouter's `metadata.raw` is quoted after its message with the provider's name, and a numeric
   `code` is a string on the OpenAI wire. OpenAI types with an Anthropic name get it
-  (`server_error` → `api_error`, rate limits → `rate_limit_error`).
+  (`server_error` → `api_error`, rate limits → `rate_limit_error`). A context overflow carries what
+  each client's harness compacts on: OpenAI's `context_length_exceeded` reaches a Messages client
+  with its message prefixed "prompt is too long: " (Claude Code's trigger), and Anthropic's "prompt
+  is too long" reaches a Chat Completions or Responses client with code `context_length_exceeded`
+  (Codex's and the Agents SDK's).
 - **Fields.** Every `chat.completion` and chunk has `created` and one `id`; Responses objects have
   `created_at`, items have `id`s (`msg_`, `fc_`, `rs_`) and function calls a `call_id`. An id the
   upstream did not give is minted (`…_gw…`), never a shared constant.

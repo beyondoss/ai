@@ -406,10 +406,21 @@ fn openai_error_field(v: Option<Value>) -> Value {
     }
 }
 
+/// Anthropic's words for a prompt past the context window; Claude Code compacts on them.
+const ANTHROPIC_OVERFLOW: &str = "prompt is too long";
+/// OpenAI's code for the same; Codex and the Agents SDK compact on it.
+const OPENAI_OVERFLOW: &str = "context_length_exceeded";
+
 fn map_error(v: &Value, client: Endpoint) -> Value {
-    let info = error_info(v);
+    let mut info = error_info(v);
+    // A context overflow says so in the words the client's harness acts on.
+    let says_overflow = info.message.contains(ANTHROPIC_OVERFLOW);
+    let coded_overflow = info.code.as_ref().and_then(Value::as_str) == Some(OPENAI_OVERFLOW);
     match client {
         Endpoint::Messages => {
+            if coded_overflow && !says_overflow {
+                info.message = format!("{ANTHROPIC_OVERFLOW}: {}", info.message);
+            }
             let mut err = Map::new();
             err.insert(
                 "type".into(),
@@ -426,6 +437,9 @@ fn map_error(v: &Value, client: Endpoint) -> Value {
             json!({ "type": "error", "error": err })
         }
         Endpoint::ChatCompletions | Endpoint::Responses | Endpoint::Embeddings => {
+            if says_overflow && info.code.is_none() {
+                info.code = Some(json!(OPENAI_OVERFLOW));
+            }
             let mut err = Map::new();
             err.insert("message".into(), json!(info.message));
             err.insert("type".into(), json!(info.typ));
@@ -6223,11 +6237,15 @@ impl OaiToResp {
 
 /// A failed Response's `error.code` is a closed set in the Responses schema (a typed client rejects
 /// any other value, and then reports that instead of the error). The upstream's own code still
-/// rides the `error` event, where any string is allowed.
+/// rides the `error` event, where any string is allowed. Two codes outside the published set pass
+/// too: real OpenAI fills `response.failed` with them, and Codex reads them there (it compacts on
+/// `context_length_exceeded` and stops retrying on `insufficient_quota`).
 fn responses_error_code(code: &str) -> &'static str {
-    const CODES: [&str; 21] = [
+    const CODES: [&str; 23] = [
         "server_error",
         "rate_limit_exceeded",
+        OPENAI_OVERFLOW,
+        "insufficient_quota",
         "invalid_prompt",
         "data_residency_mismatch",
         "bio_policy",
