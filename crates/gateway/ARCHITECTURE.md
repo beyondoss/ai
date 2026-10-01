@@ -609,7 +609,8 @@ template, `stop` onto Responses, and Responses input items with no Chat Completi
 their place in `messages`) have no equivalent on the other wire and change what the client gets
 back. Only records of a hosted tool the provider ran itself (`web_search_call`, `mcp_call`, …) are
 dropped: the client wrote none of it, and the answer that used it follows as a message. An explicit
-`null` (how OpenAI SDKs send an unset option) is "not set" and is never forwarded. Translation runs in `request_body_filter`, after the request headers went
+`null` (how OpenAI SDKs send an unset option) is "not set" and is never forwarded; that includes
+`instructions: null`, which becomes no system message rather than one with null content. Translation runs in `request_body_filter`, after the request headers went
 upstream, so the gateway cannot answer 400 itself; the field is passed through and the provider's
 400 names it (each verified live, 2026-09-30). A non-http(s) image or file URL (`file://`) is never
 forwarded in any shape, on any wire pair (Chat Completions ↔ Responses included); inline `data:`

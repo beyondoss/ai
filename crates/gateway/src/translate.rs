@@ -3581,7 +3581,9 @@ fn responses_req_to_openai(v: &Value, up: Upstream, wrap_custom: bool) -> Value 
     }
 
     let mut messages: Vec<Value> = Vec::new();
-    if let Some(instr) = v.get("instructions") {
+    // `instructions: null` (openai-python's `instructions=None`) is absent, as `copy_if` treats
+    // every other null: a system message with null content is a 422 on xAI, a 400 on Together.
+    if let Some(instr) = v.get("instructions").filter(|i| !i.is_null()) {
         messages.push(responses_instructions_to_system(instr));
     }
     messages.extend(responses_input_to_messages(v.get("input"), up));

@@ -1918,11 +1918,14 @@ fn request_reports_gateway_added_breakpoints() {
 /// claim: TRN-15
 /// defect: D102
 #[test]
-#[ignore = "D102 reproduced: instructions null becomes a system message with null content"]
 fn null_instructions_are_absent_on_chat() {
     let body = json!({"model": "m", "store": false, "instructions": null, "input": "hi"});
     for model in ["grok-4.3", "meta-llama/Llama-3.3-70B-Instruct-Turbo"] {
         let out = r2c(&body, model);
-        assert_eq!(out["messages"], json!([{"role": "user", "content": "hi"}]), "{out}");
+        assert_eq!(
+            out["messages"],
+            json!([{"role": "user", "content": "hi"}]),
+            "{out}"
+        );
     }
 }
