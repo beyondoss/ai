@@ -508,9 +508,9 @@ confidence = "high"
 evidence = "proxy.rs:618"
 claims = ["REL-7"]
 state = "fixed"
-test = "a_streaming_header_stall_fails_well_under_read_timeout_by_default"
-fix = "47aa861"
-note = "New stream_idle_timeout_secs (120, capped by read_timeout_secs) is the per-read upstream bound for a request that asks for a stream, so a header stall or silent gap ends in a JSON 504 (not resent). Pingora 0.9 has one per-read upstream timeout and no hook to change it after the head, so one bound covers first byte and gaps: no separate first_byte_timeout_secs. Streaming is known when the body is read before connecting (catalog walks, FullBody, any other small declared body); a large body on /{provider} or BYO keeps read_timeout_secs. Bound changed: the test asserts the 120s default sits well under read_timeout and observes the stall end at a configured 2s (waiting 120s in a test is not useful); a_slow_non_streaming_answer_is_not_cut_at_the_stream_bound pins the scope. Risk: a hidden-reasoning stream silent for over 120s is now cut."
+test = "a_dead_h2_upstream_is_detected_by_ping"
+fix = "6f8ac00"
+note = "Redesigned (6f8ac00); the first fix (47aa861) is superseded. 47aa861 added stream_idle_timeout_secs (120s), a per-read bound on streaming requests that cut any silence past it, which also cut a model thinking silently (hidden reasoning) and needed a read-ahead of every small body to learn stream:true (D80). The owner's rule: no arbitrary values tied to model thinking time; the gateway cannot tell silence-while-thinking from a stuck provider, so it must not cut silence below the client's own timeout, but it can detect a dead peer. Now: read_timeout_secs stays 600 (the OpenAI and Anthropic SDKs' default request timeout), the silence cut and the read-ahead are gone, and a dead upstream is detected by transport liveness: HTTP/2 PING every 15s (pingora's fixed 5s ACK deadline, so within 20s) and TCP keepalive 15s idle + 5s x 3 (30s) on upstream and client sockets, with TCP_USER_TIMEOUT 30s upstream. Tests: a_dead_h2_upstream_is_detected_by_ping (a peer that stops ACKing PINGs with its socket open ends within ~6s at a 1s interval; fails at the 40s client timeout with PING off), an_alive_but_silent_upstream_is_not_cut (8s of silence, several liveness bounds, arrives on H2 and H1), upstream_and_client_sockets_arm_tcp_keepalive (/proc/net/tcp timer 2 on both sockets; a vanished host needs packet loss to simulate)."
 
 [[defect]]
 id = "D37"
@@ -1067,10 +1067,10 @@ impact = "On a Claude row reached over Chat Completions or Responses, the gatewa
 confidence = "high"
 evidence = "live 2026-10-01 E7::opencode::claude (claude-haiku-4-5): opencode displayed $0.013819, the ledger priced at the card is $0.015957 (-13.4%), the whole gap being cache_write_tokens x 0.25 x $1/M. Per step, opencode's own tokens show cache.write 0 and the writes folded into input. @ai-sdk/openai-compatible 3.0.62 reads only prompt_tokens_details.cached_tokens. Breakpoints: translate.rs:961-1010 (auto_cache_breakpoints)."
 claims = ["E7"]
-state = "reproduced"
+state = "fixed"
 test = "gateway_added_breakpoints_bill_their_writes_as_input"
-fix = ""
-note = "Not the client's misreading of our usage: real OpenRouter reports the same shape (cached_tokens = reads only, cache_write_tokens separate; probed 2026-10-01 on anthropic/claude-haiku-4.5), so the gap exists only because the gateway turned caching on. pi's Responses provider also reads no cache writes; its Chat provider does."
+fix = "efbe794"
+note = "Not the client's misreading of our usage: real OpenRouter reports the same shape (cached_tokens = reads only, cache_write_tokens separate; probed 2026-10-01 on anthropic/claude-haiku-4.5), so the gap exists only because the gateway turned caching on. pi's Responses provider also reads no cache writes; its Chat provider does. Fixed by the rule that cache-write billing follows who chose to cache: when the gateway added the breakpoints (translate::request_with_tools reports it), the writes bill at the input rate (folded into input_tokens on the anthropic wire, cache_write_tokens 0) with gateway_cache_write_tokens recording them for reconciliation, and the translated client usage shows the same; a client that sent cache_control is billed true cache writes, as direct. Hermetic: billing_cache_writes.rs (Chat non-stream and stream, Responses, client-marked)."
 
 [[defect]]
 id = "D77"
@@ -1123,10 +1123,10 @@ impact = "Every POST <=64 KiB is read before connecting, so body_delivered is tr
 confidence = "high"
 evidence = "proxy.rs ~3287-3301 read-ahead; ~546-554 body_delivered; ~5059-5070 error_while_proxy (review of a54c22c)"
 claims = ["REL-1", "REL-21"]
-state = "suspected"
-test = ""
-fix = ""
-note = "Found by the independent branch review (2026-10-01) of a54c22c."
+state = "fixed"
+test = "a_reused_connection_reset_before_reading_is_resent"
+fix = "6f8ac00"
+note = "Found by the independent branch review (2026-10-01) of a54c22c. Fixed in 6f8ac00: the read-ahead is removed with the silence cut it served (D36), so a small body streams straight through to the upstream again, BYO zero-copy. Removing it alone did not restore the retry: body_delivered is also true for a body pingora forwarded itself before the head read failed. So error_while_proxy now treats a reused HTTP/1.1 connection reset before any response byte (pingora's ReusedOnly ReadError with ECONNRESET/ECONNABORTED: the socket was closed with our request unread) as unprocessed and resends it on a fresh connection (reset_before_reading, beside D72's upstream_refused_stream). A clean EOF after the body stays unretried, since a server that read the request and hung up looks the same (D09's a_reused_connection_failure_after_the_body_is_not_resent still passes); a timeout is never resent."
 
 [[defect]]
 id = "D81"
