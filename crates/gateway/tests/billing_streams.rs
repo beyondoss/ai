@@ -197,3 +197,42 @@ async fn anthropic_cumulative_message_delta_usage_supersedes_message_start() {
         "{row}"
     );
 }
+
+/// A Chat Completions stream that finishes cleanly (`[DONE]`) with no generated text and a usage
+/// block whose shape the extractor cannot read (`prompt_tokens` as a string): the provider still
+/// billed the turn.
+const UNPARSEABLE_USAGE_SSE: &str = "data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4o-2024-08-06\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"}}]}\n\n\
+data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4o-2024-08-06\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
+data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4o-2024-08-06\",\"choices\":[],\"usage\":{\"prompt_tokens\":\"5\",\"completion_tokens\":9}}\n\n\
+data: [DONE]\n\n";
+
+/// A completed managed 2xx stream whose usage cannot be parsed is billed an estimate, flagged,
+/// and counted as a parse error — never a silent zero-token row.
+/// claim: BIL-6, BIL-12, BIL-15
+/// defect: D56
+#[tokio::test]
+#[ignore = "D56 reproduced: a clean [DONE] stream with unparseable usage and no text bills 0/0, usage_estimated=false"]
+async fn a_finished_stream_with_unparseable_usage_bills_a_flagged_estimate() {
+    let (pubkey, sk) = test_keypair(64);
+    let mock =
+        MockUpstream::start(Mode::Raw(200, "text/event-stream", UNPARSEABLE_USAGE_SSE)).await;
+    let gw = Gateway::builder(unused_nats_port(), &mock.authority(), &b64(&pubkey))
+        .providers(&["openai"])
+        .start()
+        .await;
+    let (status, text) = post(
+        format!("{}/openai/v1/chat/completions", gw.url()),
+        &billing_vkey(&sk, 64),
+        r#"{"model":"gpt-4o","stream":true,"messages":[{"role":"user","content":"Summarize the history of TCP congestion control."}]}"#,
+        &[],
+    )
+    .await;
+    assert_eq!(status, 200, "{text}");
+    let row = usage_row_of(&gw).await;
+    assert_eq!(row["usage_estimated"], true, "{row}");
+    assert!(
+        row["input_tokens"].as_u64().unwrap_or(0) > 0,
+        "the provider took the prompt; input must be estimated: {row}"
+    );
+    wait_for_metric(&gw, "ai_usage_parse_errors_total", "", 1.0).await;
+}
