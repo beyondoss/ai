@@ -2712,14 +2712,21 @@ impl Usage {
             .or_else(|| u64_at(u, "/cache_creation_input_tokens"))
             .unwrap_or(0);
         let prompt = u64_at(u, "/prompt_tokens").unwrap_or(0);
+        let completion = u64_at(u, "/completion_tokens").unwrap_or(0);
+        let reasoning = u64_at(u, "/completion_tokens_details/reasoning_tokens");
+        // xAI reports reasoning beside `completion_tokens` (total = prompt + completion +
+        // reasoning) and bills it as output, like `usage::openai_body` does; a translated client
+        // must be shown the output it is billed.
+        let r = reasoning.unwrap_or(0);
+        let outside = r > 0 && u64_at(u, "/total_tokens") == Some(prompt + completion + r);
         Self {
             uncached: prompt
                 .saturating_sub(cache_read)
                 .saturating_sub(cache_write),
             cache_read,
             cache_write,
-            output: u64_at(u, "/completion_tokens").unwrap_or(0),
-            reasoning: u64_at(u, "/completion_tokens_details/reasoning_tokens"),
+            output: completion + if outside { r } else { 0 },
+            reasoning,
         }
     }
 

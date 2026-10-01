@@ -2354,3 +2354,26 @@ fn a_tool_input_sent_in_the_start_block_reaches_the_client() {
     }
     assert!(bad.is_empty(), "{}", bad.join("\n"));
 }
+
+/// xAI puts reasoning beside `completion_tokens`; a Messages or Responses client is shown the output
+/// it is billed (visible + reasoning), the same count `usage::openai_body` bills.
+///
+/// claim: BIL-6, BIL-9
+/// defect: D64
+#[test]
+fn translated_usage_counts_reasoning_reported_beside_completion_tokens() {
+    let xai = json!({
+        "id": "x", "object": "chat.completion", "created": 1, "model": "grok-4.3",
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": "391"}, "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 202, "completion_tokens": 7, "total_tokens": 376,
+                  "completion_tokens_details": {"reasoning_tokens": 167}},
+    });
+    let ant = json_resp(Chat, Messages, &xai);
+    assert_eq!(ant["usage"]["output_tokens"], 174, "{ant}");
+    let resp = json_resp(Chat, Responses, &xai);
+    assert_eq!(resp["usage"]["output_tokens"], 174, "{resp}");
+    assert_eq!(
+        resp["usage"]["output_tokens_details"]["reasoning_tokens"], 167,
+        "{resp}"
+    );
+}
