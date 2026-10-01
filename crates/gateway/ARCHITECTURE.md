@@ -314,6 +314,15 @@ naming the field, not a hollow Messages call. Usage/billing still parse the upst
 `ai.usage.model` is what the provider echoed. Same-wire Responses (`/{provider}/v1/responses`)
 stays a byte relay. `/{provider}/…` never translates.
 
+**Chat Completions streams from vendors other than OpenAI** are the one same-endpoint walk that
+is not a pure byte relay. A stock SDK accumulates every string in a delta except `index` and
+`type`. OpenRouter repeats `delta.role` on every chunk and `format` on every `reasoning_details`
+entry, so openai-python's `.stream()` built a role of `"assistantassistant…"` for the next turn to
+send back. These streams go through `SseBridge` in relay mode: an event is forwarded byte for byte
+unless it repeats an identity field, which `translate::ChatIdentity` drops. The identity fields are
+`role`, a reasoning entry's `id`/`format`, and a tool call's `id`/name, each tracked per choice and
+per entry. OpenAI's own streams stay a zero-copy relay.
+
 **Embeddings rows.** `text-embedding-3-small` and `-large` are catalog rows whose candidates are
 embeddings paths (OpenAI `/v1/embeddings`, then OpenRouter `/api/v1/embeddings`), so a stock
 `client.embeddings.create` on managed `/v1` walks, fails over, and bills input tokens like any other

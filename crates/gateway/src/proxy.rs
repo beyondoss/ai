@@ -1550,6 +1550,18 @@ fn catalog_translating(auto: &ModelRouting) -> bool {
     catalog_serving_endpoint(auto).is_some_and(|up| t.client != up)
 }
 
+/// A Chat Completions client served by a Chat Completions candidate of a vendor other than OpenAI,
+/// whose stream may repeat what OpenAI's sends once (see `translate::ChatIdentity`).
+fn catalog_chat_relay(auto: &ModelRouting) -> bool {
+    auto.translate
+        .as_ref()
+        .is_some_and(|t| t.client == route::Endpoint::ChatCompletions)
+        && auto.candidate_at(auto.candidate).is_some_and(|c| {
+            c.provider != providers::ProviderId::OpenAi
+                && route::Endpoint::of_upstream_path(c.path) == route::Endpoint::ChatCompletions
+        })
+}
+
 /// The fragment spliced into a streaming OpenAI chat body. Always followed by a comma, since the
 /// splice point is just inside a root object that is non-empty by construction (a root `"stream"`
 /// key is what made it eligible).
@@ -3427,8 +3439,14 @@ impl ProxyHttp for AiProxy {
 
             // Translate changes the body length (and SSE event count). Drop the upstream
             // Content-Length so the client is not truncated; H1 needs chunked framing.
-            // Same-endpoint candidates stay a byte relay — do not wrap them in SseBridge.
-            if rc.auto.as_ref().is_some_and(|a| catalog_translating(a)) {
+            // Same-endpoint candidates stay a byte relay, except a Chat Completions stream from a
+            // vendor other than OpenAI: it relays through `SseBridge`, which drops the identity
+            // fields OpenRouter repeats on every chunk (see `translate::ChatIdentity`).
+            if rc
+                .auto
+                .as_ref()
+                .is_some_and(|a| catalog_translating(a) || (rc.streaming && catalog_chat_relay(a)))
+            {
                 let streaming = rc.streaming;
                 let upstream = rc
                     .auto
@@ -3504,7 +3522,10 @@ impl ProxyHttp for AiProxy {
             }
         }
 
-        let translating = rc.auto.as_ref().is_some_and(|a| catalog_translating(a));
+        // A translation, or a Chat Completions relay that `response_filter` gave a bridge.
+        let translating = rc.auto.as_ref().is_some_and(|a| {
+            catalog_translating(a) || a.translate.as_ref().is_some_and(|t| t.sse.is_some())
+        });
         if translating {
             let streaming = rc.streaming;
             let dialect = rc.dialect;

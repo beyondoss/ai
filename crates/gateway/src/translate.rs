@@ -4114,9 +4114,13 @@ fn created_of(v: Option<&Value>) -> u64 {
 /// Every pairing meets in Chat Completions chunks: a Messages or Responses upstream is read into
 /// [`ChatItem`]s, and a Messages or Responses client is written from them. The middle is values,
 /// not bytes, so a composed pairing (Messages → Responses) parses each event once.
+///
+/// With `client == upstream` it is a relay: events pass through as they came, except a Chat
+/// Completions chunk that repeats an identity field (see [`ChatIdentity`]).
 pub struct SseBridge {
     client: Endpoint,
     upstream: Endpoint,
+    identity: ChatIdentity,
     buf: Vec<u8>,
     /// Bytes of `buf` already searched for an event end, so a long unterminated event is scanned
     /// once rather than from the start on every chunk.
@@ -4158,6 +4162,98 @@ impl ChatItem {
     }
 }
 
+/// The identity fields of a Chat Completions stream: `delta.role`, a `reasoning_details` entry's
+/// `id` and `format`, a tool call's `id` and name. OpenAI sends each once, in the first chunk that
+/// carries its choice or entry, and stock SDKs accumulate every other string as a delta
+/// (openai-python's `accumulate_delta` concatenates all but `index` and `type`). OpenRouter
+/// repeats `role` on every chunk and `format` on every reasoning entry, so a relayed stream left
+/// the client a message whose role was "assistantassistant…" for its next turn to send back. This
+/// drops a repeat.
+#[derive(Default)]
+struct ChatIdentity {
+    /// One packed key per field already sent: choice, list, entry index, field.
+    sent: Vec<u64>,
+}
+
+impl ChatIdentity {
+    const ROLE: u64 = 0;
+    const REASONING_ID: u64 = 1;
+    const REASONING_FORMAT: u64 = 2;
+    const CALL_ID: u64 = 3;
+    const CALL_NAME: u64 = 4;
+
+    /// Drop the identity fields this stream already sent. `true` when anything was dropped.
+    fn strip(&mut self, chunk: &mut Value) -> bool {
+        let Some(choices) = chunk.get_mut("choices").and_then(Value::as_array_mut) else {
+            return false;
+        };
+        let mut dropped = false;
+        for (pos, choice) in choices.iter_mut().enumerate() {
+            let c = index_of(choice, pos);
+            let Some(delta) = choice.get_mut("delta").and_then(Value::as_object_mut) else {
+                continue;
+            };
+            dropped |= self.once(delta, "role", c, 0, Self::ROLE);
+            if let Some(entries) = delta
+                .get_mut("reasoning_details")
+                .and_then(Value::as_array_mut)
+            {
+                for (pos, entry) in entries.iter_mut().enumerate() {
+                    let i = index_of(entry, pos);
+                    if let Some(entry) = entry.as_object_mut() {
+                        dropped |= self.once(entry, "id", c, i, Self::REASONING_ID);
+                        dropped |= self.once(entry, "format", c, i, Self::REASONING_FORMAT);
+                    }
+                }
+            }
+            if let Some(calls) = delta.get_mut("tool_calls").and_then(Value::as_array_mut) {
+                for (pos, call) in calls.iter_mut().enumerate() {
+                    let i = index_of(call, pos);
+                    let Some(call) = call.as_object_mut() else {
+                        continue;
+                    };
+                    dropped |= self.once(call, "id", c, i, Self::CALL_ID);
+                    // A custom tool's name rides `custom`, the way a function's rides `function`.
+                    for body in ["function", "custom"] {
+                        if let Some(body) = call.get_mut(body).and_then(Value::as_object_mut) {
+                            dropped |= self.once(body, "name", c, i, Self::CALL_NAME);
+                        }
+                    }
+                }
+            }
+        }
+        dropped
+    }
+
+    /// Keep `obj[field]` the first time this stream carries it for (choice, entry); drop it after.
+    fn once(
+        &mut self,
+        obj: &mut Map<String, Value>,
+        field: &str,
+        choice: u64,
+        entry: u64,
+        kind: u64,
+    ) -> bool {
+        if !obj.get(field).is_some_and(Value::is_string) {
+            return false;
+        }
+        let key = (choice & 0xff_ffff) << 40 | (entry & 0xffff_ffff) << 8 | kind;
+        if self.sent.contains(&key) {
+            obj.remove(field);
+            return true;
+        }
+        self.sent.push(key);
+        false
+    }
+}
+
+/// An item's own `index`, else its position in the list.
+fn index_of(item: &Value, pos: usize) -> u64 {
+    item.get("index")
+        .and_then(Value::as_u64)
+        .unwrap_or(pos as u64)
+}
+
 /// What a client is told when the upstream stream ended without saying how.
 fn truncated_stream_error() -> Value {
     json!({ "error": {
@@ -4172,6 +4268,7 @@ impl SseBridge {
         Self {
             client,
             upstream,
+            identity: ChatIdentity::default(),
             buf: Vec::new(),
             scanned: 0,
             ant_to_oai: AntToOai::default(),
@@ -4209,7 +4306,7 @@ impl SseBridge {
 
     fn map_event(&mut self, raw: &[u8]) -> Vec<u8> {
         if self.upstream == self.client {
-            return raw.to_vec();
+            return self.relay(raw);
         }
         let (event, data) = parse_sse(raw);
         if data.is_empty() && event.is_empty() {
@@ -4228,6 +4325,18 @@ impl SseBridge {
             self.deliver(item, &mut out);
         }
         out
+    }
+
+    /// A relayed event, as it came unless it is a chunk that repeats an identity field.
+    fn relay(&mut self, raw: &[u8]) -> Vec<u8> {
+        let (event, data) = parse_sse(raw);
+        if event.is_empty()
+            && let Ok(mut v) = serde_json::from_str::<Value>(&data)
+            && self.identity.strip(&mut v)
+        {
+            return sse_data(&value_string(&v));
+        }
+        raw.to_vec()
     }
 
     fn deliver(&mut self, item: ChatItem, out: &mut Vec<u8>) {
