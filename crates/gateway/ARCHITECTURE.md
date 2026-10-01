@@ -106,7 +106,10 @@ Client (stock OpenAI/Anthropic SDK)
   │    x-goog-api-key) UNCONDITIONALLY → inject the next unused pool key in the
   │    provider's own scheme (never provider A's key on provider B); a `key=` query
   │    param is dropped from the forwarded path (other params kept)
-  │  BYO: leave auth header unchanged
+  │  Managed: forward only allowlisted client headers (content-type, content-length,
+  │    transfer-encoding, expect, accept, user-agent, anthropic-version, anthropic-beta
+  │    filtered to known-safe tokens); everything else the client sent is dropped
+  │  BYO: leave auth header unchanged (and every other client header)
   │  Managed: accept-encoding: identity (the gateway parses the body; gzip billed 0 tokens)
   │  Strip x-beyond-* control headers (ours; meaningless upstream)
   │  Set Host; path: verbatim for /{provider} (prefix stripped), or the candidate's
@@ -1427,6 +1430,37 @@ to serve.
   Messages ↔ Responses is translated so the client sees the inbound dialect. Usage taps stay on
   the upstream body.
 - BYO token validity — forwarded as-is; the provider rejects it if invalid
+
+**Which client headers ride on the pool key.** A managed request is sent with Beyond's credentials,
+so it forwards only the client headers the gateway can vouch for, and drops the rest before adding
+its own (pool key, `Host`, `accept-encoding`, OpenRouter attribution, a translated walk's
+`anthropic-version` and `anthropic-beta`):
+
+| Forwarded           | Why                                                                                        |
+| ------------------- | ------------------------------------------------------------------------------------------ |
+| `content-type`      | the body's media type                                                                      |
+| `content-length`    | framing (re-framed by the gateway when it rewrites the body)                               |
+| `transfer-encoding` | framing                                                                                    |
+| `expect`            | a client waiting on `100 Continue` is answered by the provider, not by its own timeout     |
+| `accept`            | SSE vs JSON negotiation                                                                    |
+| `user-agent`        | provider-side diagnostics                                                                  |
+| `anthropic-version` | Anthropic's required API version                                                           |
+| `anthropic-beta`    | only the tokens below; a header left with none is removed, and repeated header lines merge |
+
+`anthropic-beta` is an allowlist of tokens that change how a request is parsed or streamed and
+nothing about price or server-side execution: `claude-code-20250219`, `prompt-caching-2024-07-31`,
+`interleaved-thinking-2025-05-14`, `fine-grained-tool-streaming-2025-05-14`,
+`context-management-2025-06-27`, `token-efficient-tools-2025-02-19`, `output-128k-2025-02-19`, and
+the gateway's own `thinking-binding-controls-2026-08-01`. Everything else is dropped: `context-1m-*`
+turns on premium long-context pricing, `mcp-client-*`, `code-execution-*` and `files-api-*` reach
+servers, sandboxes and storage on Beyond's account, and `oauth-*` means nothing beside a pool API
+key. The gateway's own beta for a translated walk is merged in after the filter, so it is never
+dropped. Adding a token is a one-line change to `MANAGED_ANTHROPIC_BETAS` in `proxy.rs`.
+
+Dropped, among others: `openai-organization` and `openai-project` (they switch the org or project the
+pool key bills to, and an SDK user with `OPENAI_ORG_ID` set got a 401), `cookie`,
+`x-goog-user-project`, SDK telemetry (`x-stainless-*`). `proxy-authorization` is hop-by-hop and never
+crosses the proxy for anyone. BYO requests forward every client header untouched.
 
 **Where a credential may travel:**
 

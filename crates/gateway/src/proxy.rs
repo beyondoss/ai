@@ -966,6 +966,88 @@ impl AiProxy {
 /// (OpenAI and everyone else) is checked separately below since it needs prefix-stripping.
 const STATIC_KEY_HEADERS: [&str; 3] = ["x-api-key", "api-key", "x-goog-api-key"];
 
+/// The client headers a managed request forwards to the provider. Every other client header is
+/// dropped in `upstream_request_filter` before the gateway adds its own (pool key, `Host`,
+/// `accept-encoding`, OpenRouter attribution, a translated walk's `anthropic-version` /
+/// `anthropic-beta`).
+///
+/// An allowlist rather than a blocklist because the request rides on Beyond's pool key: a header
+/// the gateway has never heard of is one it cannot vouch for. `openai-organization` and
+/// `openai-project` would switch the org or project the pool key bills to (and 401 for an SDK user
+/// with `OPENAI_ORG_ID` set), `cookie` / `proxy-authorization` / `x-goog-user-project` are someone
+/// else's credentials or billing selectors, and SDK telemetry (`x-stainless-*`) is noise. Framing
+/// headers stay so the body arrives intact, and `expect` stays so a client waiting on
+/// `100 Continue` is answered by the provider rather than by its own timeout.
+const MANAGED_FORWARD_HEADERS: [&str; 8] = [
+    "content-type",
+    "content-length",
+    "transfer-encoding",
+    "expect",
+    "accept",
+    "user-agent",
+    "anthropic-version",
+    "anthropic-beta",
+];
+
+/// `anthropic-beta` tokens a managed request may send on the pool key. Each changes how a request
+/// is parsed or streamed, and none changes what Anthropic charges per token or runs server-side
+/// tools the gateway does not meter. Anything else is dropped: `context-1m-*` switches on premium
+/// long-context pricing, `mcp-client-*` / `code-execution-*` / `files-api-*` reach servers, sandboxes
+/// and storage on Beyond's account, and `oauth-*` is meaningless beside a pool API key. The gateway's
+/// own [`translate::THINKING_BINDING_BETA`] is listed too, so a Messages client on a binding model
+/// may send it itself.
+const MANAGED_ANTHROPIC_BETAS: [&str; 8] = [
+    "claude-code-20250219",
+    "prompt-caching-2024-07-31",
+    "interleaved-thinking-2025-05-14",
+    "fine-grained-tool-streaming-2025-05-14",
+    "context-management-2025-06-27",
+    "token-efficient-tools-2025-02-19",
+    "output-128k-2025-02-19",
+    translate::THINKING_BINDING_BETA,
+];
+
+/// Drop every client header a managed request may not forward ([`MANAGED_FORWARD_HEADERS`]), and
+/// every `anthropic-beta` token not in [`MANAGED_ANTHROPIC_BETAS`]. Allocates only when there is
+/// something to drop.
+fn retain_managed_client_headers(req: &mut pingora::http::RequestHeader) -> Result<()> {
+    let unlisted: Vec<http::HeaderName> = req
+        .headers
+        .keys()
+        .filter(|k| !MANAGED_FORWARD_HEADERS.contains(&k.as_str()))
+        .cloned()
+        .collect();
+    for name in &unlisted {
+        req.remove_header(name);
+    }
+    let betas = req.headers.get_all("anthropic-beta");
+    let mut values = betas.iter();
+    let clean = match (values.next(), values.next()) {
+        (None, _) => true,
+        (Some(v), None) => v.to_str().is_ok_and(|v| {
+            v.split(',')
+                .map(str::trim)
+                .all(|t| MANAGED_ANTHROPIC_BETAS.contains(&t))
+        }),
+        _ => false,
+    };
+    if !clean {
+        let kept = betas
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .flat_map(|v| v.split(','))
+            .map(str::trim)
+            .filter(|t| MANAGED_ANTHROPIC_BETAS.contains(t))
+            .collect::<Vec<_>>()
+            .join(",");
+        req.remove_header("anthropic-beta");
+        if !kept.is_empty() {
+            req.insert_header("anthropic-beta", kept)?;
+        }
+    }
+    Ok(())
+}
+
 /// Extract query-param `name`'s value from a raw query string (`k=v&k2=v2`). Used only for Google
 /// Gemini's `?key=` convention — the sole query-param credential shape among recognized providers.
 /// No percent-decoding: a real API key is alphanumeric, so a plain split is exact, and decoding would
@@ -3219,6 +3301,10 @@ impl ProxyHttp for AiProxy {
             // degraded request but a *credential disclosure*: nothing removed, nothing inserted, and
             // the caller's Ed25519 virtual key forwarded verbatim to a third-party provider. Now the
             // worst case is an unauthenticated request the provider rejects with a 401.
+            //
+            // The allowlist would drop these too; they are removed by name so this invariant does
+            // not hang on the list's contents.
+            retain_managed_client_headers(upstream_request)?;
             upstream_request.remove_header("authorization");
             for header in STATIC_KEY_HEADERS {
                 upstream_request.remove_header(header);
@@ -4627,6 +4713,63 @@ mod tests {
     fn extract_virtual_key_returns_none_when_absent() {
         let req = req_with_headers("/v1/chat/completions", &[]);
         assert_eq!(extract_virtual_key(&req), None);
+    }
+
+    #[test]
+    fn managed_client_headers_keep_only_the_allowlist_and_safe_betas() {
+        let mut req = req_with_headers(
+            "/v1/messages",
+            &[
+                ("content-type", "application/json"),
+                ("user-agent", "claude-cli/2.0"),
+                ("anthropic-version", "2023-06-01"),
+                ("openai-organization", "org-evil"),
+                ("cookie", "session=1"),
+                ("x-stainless-lang", "js"),
+                (
+                    "anthropic-beta",
+                    "prompt-caching-2024-07-31, context-1m-2025-08-07,interleaved-thinking-2025-05-14",
+                ),
+            ],
+        );
+        retain_managed_client_headers(&mut req).unwrap();
+        let mut names: Vec<&str> = req.headers.keys().map(|k| k.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            [
+                "anthropic-beta",
+                "anthropic-version",
+                "content-type",
+                "user-agent"
+            ]
+        );
+        assert_eq!(
+            req.headers.get("anthropic-beta").unwrap(),
+            "prompt-caching-2024-07-31,interleaved-thinking-2025-05-14"
+        );
+
+        // A value made only of unlisted tokens leaves no header at all; two header lines are
+        // filtered as one list rather than letting the second through unread.
+        let mut req = req_with_headers(
+            "/v1/messages",
+            &[("anthropic-beta", "mcp-client-2025-04-04")],
+        );
+        retain_managed_client_headers(&mut req).unwrap();
+        assert!(req.headers.get("anthropic-beta").is_none());
+        let mut req = req_with_headers("/v1/messages", &[]);
+        req.append_header("anthropic-beta", "prompt-caching-2024-07-31")
+            .unwrap();
+        req.append_header("anthropic-beta", "code-execution-2025-05-22")
+            .unwrap();
+        retain_managed_client_headers(&mut req).unwrap();
+        assert_eq!(
+            req.headers
+                .get_all("anthropic-beta")
+                .iter()
+                .collect::<Vec<_>>(),
+            ["prompt-caching-2024-07-31"]
+        );
     }
 
     #[test]
