@@ -775,7 +775,7 @@ evidence = "README.md; ARCHITECTURE.md; config.example.toml"
 claims = ["CAT-15"]
 state = "fixed"
 test = "architecture_tables_name_real_modules_metrics_and_fields"
-fix = "5a4caf1"
+fix = "0fd7054"
 note = "ARCHITECTURE.md (config field names and missing keys, env override scope, Claude lineup, /v1/models and the catalog-walk 413 after identity, ai_requests_total, metrics_listen reachability, live smoke) and config.example.toml (env scope, openai-codex, fireworks-anthropic /inference path, AWS_BEARER_TOKEN_BEDROCK) corrected; README was fixed earlier."
 
 [[defect]]
@@ -887,7 +887,7 @@ evidence = "live cell E1::openai-py::gpt::chat_basic 2026-10-01: 400 unsupported
 claims = ["E1", "T1", "TRN-5"]
 state = "fixed"
 test = "a_stock_max_tokens_reaches_native_openai_as_max_completion_tokens"
-fix = "cbb2c92"
+fix = "8f9a9cb"
 note = "A catalog walk served by native OpenAI Chat Completions renames a root max_tokens to max_completion_tokens in place (peek limit_keys); with both present max_tokens is dropped. Other OpenAI-wire hosts keep max_tokens."
 
 [[defect]]
@@ -957,7 +957,7 @@ evidence = "translate.rs Chat Completions <-> Responses image part mapping passe
 claims = ["TRN-21"]
 state = "fixed"
 test = "a_file_image_url_never_reaches_a_responses_upstream"
-fix = "5225bc3"
+fix = "2781c66"
 note = "Chat Completions <-> Responses drops a non-http(s), non-data image URL and a file:// input_file file_url, as the Messages mapping already did."
 
 [[defect]]
@@ -971,7 +971,7 @@ evidence = "proxy.rs logging(): `free` is derived from rc.auto.sub, which is Non
 claims = ["BIL-18"]
 state = "fixed"
 test = "token_counts_write_no_row_on_a_provider_route"
-fix = "ebd61fe"
+fix = "f9ed3ff"
 note = "logging derives the free sub-resource from the forwarded path too (route::SubResource::of_forward_path), so /{provider} token counts write no row and no parse error."
 
 [[defect]]
@@ -985,7 +985,7 @@ evidence = "usage.rs anthropic_stream_finished: memmem::find(tail, b\"message_de
 claims = ["BIL-22"]
 state = "fixed"
 test = "generated_message_delta_text_does_not_hide_a_cut_short_anthropic_stream"
-fix = "dc2a7d0"
+fix = "c63c89e"
 note = "anthropic_stream_finished matches an `\\nevent: message_delta` line or a `\"type\":\"message_delta\"` member, which JSON-escaped generated text cannot forge."
 
 [[defect]]
