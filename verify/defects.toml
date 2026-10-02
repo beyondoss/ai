@@ -2469,5 +2469,5 @@ evidence = "proxy.rs served providers::catalog::models_list_json() for every GET
 claims = ["E4", "CAT-9"]
 state = "fixed"
 test = "v1_models_lists_only_rows_an_openai_pool_key_serves"
-fix = "6a4e403"
+fix = "85cea3f"
 note = "Fixed: GatewayState::new renders the list once at boot (state::models_list_body) from the rows with at least one candidate on a pool-keyed provider; a row whose primary is unkeyed but whose fallback is keyed stays listed. A BYO-only deployment (no pool keys) lists the whole catalog so callers with their own keys can discover names. Same shape; one body per deployment, independent of the caller's key type. Also tested: v1_models_lists_claude_but_not_together_only_rows_on_anthropic_and_openrouter (no catalog row is Together-only today; it checks the rows with no anthropic or openrouter candidate, e.g. openai/gpt-oss-120b), v1_models_on_a_byo_only_deployment_lists_the_whole_catalog, models_list_json_where_keeps_shape_and_order. The E4 live probes' VERIFY_CATALOG_ROWS is now the keyed row count for the cell's pools."
