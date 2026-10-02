@@ -93,8 +93,12 @@ use serde_json::Value;
 const DEV_PUBKEY_B64: &str = "6kpsY+KcUgq+9VB7Ey7F+ZVHdq6+vnuSQh7qaRRG0iw=";
 const DEV_TOKEN: &str = "bai_v1.1.AQAAAAAAAAABAAAAAAAAAA.WrWcPbklu91PS-4WuR6GnBNF3h4nROpH0EQQlfJf06f7_lEnlQOCSBimhH2JMwXFJgw40BniTB7-yIdFnpldDw";
 
-/// LNG-1: the fewest billed model calls a session may make.
-const MIN_TURNS: usize = 25;
+/// The fixture's ordered steps (`STEPS` in harness_long.py).
+const FIXTURE_STEPS: usize = 8;
+/// LNG-1: the fewest billed model calls a completed session can make. Each step's instruction is to
+/// read its test file, write the code, then run its tests, and each needs the previous one's result
+/// (a model call per tool round), so finishing all the steps takes at least three calls a step.
+const MIN_TURNS: usize = 3 * FIXTURE_STEPS;
 /// LNG-1: a session with more than one compaction request per this many billed calls is looping
 /// (Claude Code's measured rate is one per 10-14 calls at its knob here; pi sends two per
 /// compaction; a loop compacts every 2-3 turns).
