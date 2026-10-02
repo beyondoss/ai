@@ -172,6 +172,71 @@ jobs:
           echo "--- memory ---"; free -m | head -2
           echo "--- surviving beyond-ai processes (leaked daemons) ---"
           ps -eo pid,etime,rss,args | grep -E "beyond-ai|nats-server" | grep -v grep || echo "  none"
+  # The gateway's concurrency-sensitive hermetic tests (reliability, billing, streaming,
+  # cancellation, capture), run repeatedly with every core saturated by a CPU hog. Two real races
+  # (D248's GOAWAY resend, D208's capture drain) passed on a fast dev box and failed only on CI's
+  # slower runners; this makes "slow" the normal condition instead of luck.
+  #
+  # One hog per core, not `taskset -c 0`: pinning everything to one CPU serialises the burst, so no
+  # two H2 streams share a connection and D248's test passes as "inconclusive" every time (measured:
+  # reverted fix, 20/20 green pinned to one CPU; 17/20 red on four CPUs with four hogs; every
+  # iteration of this job's command red). Concurrency needs parallelism to race at all.
+  #
+  # Repeated runs, not `--stress-count`: nextest 0.9.140 exits 0 from a stress run whose last
+  # iteration passed even when earlier ones failed (measured). `rss_plateaus…` is excluded: a
+  # memory-growth bound, not a race, and ~2 minutes alone under contention, it would set the pace.
+  # The ci profile's one retry stays: it absorbs a one-off timeout from a starved poll, while a real
+  # race like D248 (red in most single runs) still fails both tries in at least one iteration.
+  gateway-stress:
+    name: gateway stress (contended CPUs)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      STRESS_FILTER: >-
+        package(beyond-ai) and (binary(=claims_reliability) or binary(reliability_*) or binary(billing_*) or binary(=claims_billing) or binary(=claims_billing_integrity) or binary(=cancellation) or binary(=cut_short) or binary(=claims_streaming) or binary(=capture) or binary(=tenant_concurrency) or (kind(lib) and test(capture_sink::))) and not test(=rss_plateaus_under_sustained_load_and_large_bodies)
+      # ~2 minutes an iteration on a 4-vCPU hosted runner under the hogs (measured ~1 minute on a
+      # 16-core dev box restricted to 4 CPUs with 4 hogs), so ~10 minutes in all.
+      STRESS_RUNS: "5"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v4
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+      - name: compile tests
+        run: cargo nextest run --profile ci -p beyond-ai -E "$STRESS_FILTER" --no-run
+        timeout-minutes: 20
+      # Same pipe rules as `test`: nextest writes to a file, and the hogs get /dev/null for all
+      # three streams, so no grandchild holds GitHub's stdout pipe open past the step.
+      - name: stress
+        run: |
+          set +e
+          LOG="$RUNNER_TEMP/nextest.log"
+          : > "$LOG"
+          echo "nextest output -> $LOG"
+          HOGS=""
+          for _ in $(seq "$(nproc)"); do
+            yes </dev/null >/dev/null 2>&1 &
+            HOGS="$HOGS $!"
+          done
+          status=0
+          for i in $(seq "$STRESS_RUNS"); do
+            echo "=== run $i/$STRESS_RUNS ===" >> "$LOG"
+            start=$SECONDS
+            cargo nextest run --profile ci -p beyond-ai -E "$STRESS_FILTER" >> "$LOG" 2>&1 </dev/null
+            rc=$?
+            echo "run $i/$STRESS_RUNS: exit $rc in $((SECONDS - start))s"
+            [ "$rc" -ne 0 ] && status=$rc
+          done
+          kill $HOGS 2>/dev/null
+          pkill -9 -f 'nats-server' 2>/dev/null
+          echo "--- failures and retries ---"
+          grep -E '^\s+(TRY [0-9]+ )?(FAIL|TIMEOUT|SIGKILL)|^=== run' "$LOG" || echo "  none"
+          echo "--- last 100 lines of the log file ---"
+          tail -100 "$LOG"
+          exit $status
+        timeout-minutes: 15
   # The release build is the long pole; running it alongside the others (not after them) is most of
   # the wall-clock win.
   build:
@@ -220,14 +285,15 @@ jobs:
   Check:
     name: Check
     runs-on: ubuntu-latest
-    needs: [fmt, clippy, test, build, mutants-diff]
+    needs: [fmt, clippy, test, gateway-stress, build, mutants-diff]
     if: always()
     steps:
       - name: Gate on all checks
         run: |
-          echo "fmt=${{ needs.fmt.result }} clippy=${{ needs.clippy.result }} test=${{ needs.test.result }} build=${{ needs.build.result }} mutants-diff=${{ needs.mutants-diff.result }}"
+          echo "fmt=${{ needs.fmt.result }} clippy=${{ needs.clippy.result }} test=${{ needs.test.result }} gateway-stress=${{ needs.gateway-stress.result }} build=${{ needs.build.result }} mutants-diff=${{ needs.mutants-diff.result }}"
           [ "${{ needs.fmt.result }}" = "success" ] \
             && [ "${{ needs.clippy.result }}" = "success" ] \
             && [ "${{ needs.test.result }}" = "success" ] \
+            && [ "${{ needs.gateway-stress.result }}" = "success" ] \
             && [ "${{ needs.build.result }}" = "success" ] \
             && [ "${{ needs.mutants-diff.result }}" = "success" ]
