@@ -144,7 +144,11 @@ def main(scenario):
             detail["code_txt"] = (work / "code.txt").read_text().strip()
         except OSError:
             detail["code_txt"] = None
-        ok = fixture_ok(work) and CODE in (detail["code_txt"] or "")
+        # The claim is recall across `resume`: the codename exists only in the first message, so it
+        # appearing in code.txt or in the resumed turn's own reply proves the chain was carried.
+        # (gpt-5.3-codex sometimes answers "I'll write it now" and ends the turn without the write.)
+        resumed = steps[-1].get("stdout_tail", "") if steps else ""
+        ok = fixture_ok(work) and (CODE in (detail["code_txt"] or "") or CODE in resumed)
     else:
         return False, {"why": f"unknown scenario {scenario}"}
     detail["steps"] = steps
