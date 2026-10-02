@@ -184,7 +184,7 @@ Client (stock OpenAI/Anthropic SDK)
   │    arguments for `response.completed`; tool calls queued onto Messages) is: past
   │    MAX_STREAM_OUTPUT, the largest catalog `max_output_tokens` × 128 bytes (the longest
   │    o200k/cl100k token), 46.9 MiB, the response is aborted the same way (D218). Each event is
-  │    mapped in place and the buffer compacted once per chunk; a delta finds its tool call in O(1)
+  │    mapped in place and the buffer compacted once per chunk; a delta finds its tool call in O(1).
   │  Managed only: feed *upstream* chunks → ModelScanner::for_response → billed model
   │    (accepts Anthropic's nested message.model, so it stops in the first chunk for both dialects)
   │  Append *upstream* bytes to bounded 64KB tail (copy_within compaction once tail > 128KB)
