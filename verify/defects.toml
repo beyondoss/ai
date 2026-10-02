@@ -2539,5 +2539,5 @@ evidence = "circuit_breaker.rs: the reclaim reset permits to half_open_permits -
 claims = ["REL-6"]
 state = "fixed"
 test = "a_reclaimed_probe_releasing_late_does_not_mint_a_second_probe"
-fix = "this commit"
+fix = "4c9fa18"
 note = "Fixed lock-free in the same packed AtomicU64: while OPEN or HALF_OPEN the 14-bit failure field holds a probe generation, bumped on OPEN -> HALF_OPEN and on every reclaim (an opening breaker seeds it from the clock). allow() returns a Permit carrying it (a CLOSED permit carries none); release(permit), record_success_for and record_failure_for are no-ops in HALF_OPEN for any other generation, and release still saturates at half_open_permits. proxy.rs's ledger RequestCtx::breaker_pending is now Option<Permit>. Unpermitted record_success/record_failure (the error-in-200 settle) are unchanged. Also tested: a_permit_from_another_generation_neither_releases_nor_decides, concurrent_stale_releases_never_mint_permits, test_a_stalled_probe_permit_is_reclaimed_after_the_reset_timeout (stale outcomes no longer decide)."
