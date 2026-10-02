@@ -98,6 +98,12 @@ async fn order_and_only_steer_every_call_to_the_named_provider() {
 /// A provider that 500s opens its breaker: further calls are 503 without reaching it. Once the
 /// reset window passes and the provider is healthy again, the half-open probe closes the breaker
 /// and traffic flows.
+///
+/// No step leans on wall-clock timing. The breaker stamps whole seconds, so an open breaker with a
+/// 1 s reset half-opens at the *next* second boundary, which can be a millisecond after it opened:
+/// a second "still open" request could legitimately be the probe (CI saw exactly that, a 500 where
+/// a 503 was expected). So the shed is proved on the very request that found the breaker open (it
+/// 503'd and the provider saw no hit), and recovery is polled for rather than slept for.
 /// claim: R6
 #[tokio::test]
 async fn the_breaker_opens_on_a_broken_provider_and_recovers() {
@@ -120,29 +126,36 @@ async fn the_breaker_opens_on_a_broken_provider_and_recovers() {
         .await;
 
     let byo = || post(&gw, "sk-byo-breaker", &[]);
-    let mut opened = false;
+    let mut shed = None;
     for _ in 0..20 {
-        if byo().await.status().as_u16() == 503 {
-            opened = true;
+        let hits = upstream.hits();
+        let status = byo().await.status().as_u16();
+        if status == 503 {
+            shed = Some(upstream.hits() - hits);
             break;
         }
+        assert_eq!(status, 500, "a closed breaker relays the provider's 500");
     }
-    assert!(opened, "the breaker never opened on a run of 500s");
-    let hits = upstream.hits();
-    assert_eq!(byo().await.status().as_u16(), 503, "open sheds load");
     assert_eq!(
-        upstream.hits(),
-        hits,
-        "an open breaker does not reach the provider"
+        shed,
+        Some(0),
+        "the breaker opens on a run of 500s, and an open breaker sheds without reaching the provider"
     );
 
     broken.store(false, Ordering::SeqCst);
-    tokio::time::sleep(Duration::from_millis(1200)).await;
-    assert_eq!(
-        byo().await.status().as_u16(),
-        200,
-        "the half-open probe reaches the recovered provider"
-    );
+    let deadline = std::time::Instant::now() + CONDITION_BUDGET;
+    loop {
+        match byo().await.status().as_u16() {
+            200 => break,
+            503 => {}
+            other => panic!("only an open breaker (503) or the recovered probe (200): {other}"),
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the half-open probe never reached the recovered provider"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
     for i in 0..3 {
         assert_eq!(byo().await.status().as_u16(), 200, "closed again, #{i}");
     }

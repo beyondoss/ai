@@ -6347,6 +6347,10 @@ impl ProxyHttp for AiProxy {
             && let Some(permit) = rc.breaker_pending.take()
         {
             match rc.upstream_status {
+                // Defensive only, so its mutants are equivalent (excluded in .cargo/mutants.toml):
+                // `response_filter` sets `upstream_status` and takes the permit in the same step,
+                // and nothing else sets it on a request that holds a permit (a cache hit never
+                // claims one), so a pending permit here always comes with `None`.
                 Some(s) if s >= 500 => breaker.record_failure_for(permit),
                 Some(_) => breaker.record_success_for(permit),
                 // No response head arrived. Blame the provider only when the failure actually came

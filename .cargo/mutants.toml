@@ -13,3 +13,9 @@ examine_globs = [
   "crates/gateway/src/circuit_breaker.rs",
   "crates/gateway/src/peek.rs",
 ]
+# Equivalent mutants, each with the reason at its source.
+exclude_re = [
+  # `logging`'s breaker ledger never sees a pending permit with a status: `response_filter` takes
+  # the permit when it sets `upstream_status`, so the `Some(s)` arms are defensive only.
+  'replace match guard s >= 500 with (true|false) in <impl ProxyHttp for AiProxy>::logging',
+]

@@ -1173,6 +1173,44 @@ mod tests {
         );
     }
 
+    /// D256: a reclaim moves the generation *forward*, past every generation already handed out.
+    /// The reclaimed probe's permit must stay stale through the live probe failing, the breaker
+    /// reopening and half-opening again: if the reclaim stepped the generation back, the next
+    /// half-open's bump would land on the stalled permit's generation, and its late success would
+    /// close a breaker whose current probe has not answered.
+    /// claim: REL-6
+    /// defect: D256
+    #[test]
+    fn a_reclaimed_probe_stays_stale_through_a_reopen() {
+        static NOW: AtomicU64 = AtomicU64::new(100);
+        fn clock() -> u64 {
+            NOW.load(Ordering::Relaxed)
+        }
+        let cb = CircuitBreaker::with_clock(
+            CircuitBreakerConfig::windowed(1, Duration::from_secs(60))
+                .reset_timeout(Duration::from_secs(5))
+                .half_open_permits(1),
+            clock,
+        );
+        cb.record_failure();
+        NOW.store(105, Ordering::Relaxed);
+        let stalled = cb.allow().expect("the probe");
+        NOW.store(110, Ordering::Relaxed);
+        let live = cb.allow().expect("the stalled probe's permit is reclaimed");
+        cb.record_failure_for(live);
+        assert_eq!(cb.state(), CircuitState::Open, "the live probe failed");
+        NOW.store(115, Ordering::Relaxed);
+        let _next = cb.allow().expect("half-open again");
+        cb.record_success_for(stalled);
+        assert_eq!(
+            cb.state(),
+            CircuitState::HalfOpen {
+                permits_remaining: 0
+            },
+            "the stalled probe's late success decides nothing"
+        );
+    }
+
     #[test]
     fn test_retry_after_counts_down_the_reset_timeout() {
         static NOW: AtomicU64 = AtomicU64::new(100);

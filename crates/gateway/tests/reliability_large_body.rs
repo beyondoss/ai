@@ -227,20 +227,17 @@ async fn a_reset_after_the_whole_body_is_not_resent_for_any_body_size() {
     }
 }
 
-/// An upstream that resets before it has read the whole body cannot hold the request, so the walk
-/// fails over to the next candidate and the client never sees the reset. The gateway holds the body
-/// before connecting (a catalog walk reads it ahead), so the reset surfaces as the write of a body
-/// too large for the socket buffers failing.
-/// claim: REL-1, REL-21
-/// defect: D51
-#[tokio::test]
-async fn a_reset_during_the_upload_fails_over() {
+/// A provider that reads the request head and the first 256 KiB of the body, so the gateway is
+/// mid-write, then resets the connection (no FIN: SO_LINGER 0). Returns its address, how many
+/// connections it has reset, and the accept task to abort.
+async fn mid_upload_resetter() -> (
+    std::net::SocketAddr,
+    std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    tokio::task::JoinHandle<()>,
+) {
     use tokio::io::AsyncReadExt;
-    let (pubkey, sk) = test_keypair(1);
-    // Read the request head and the first 256 KiB of the body, so the gateway is mid-write, then
-    // reset the connection (no FIN: SO_LINGER 0).
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let primary = listener.local_addr().unwrap();
+    let addr = listener.local_addr().unwrap();
     let resets = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let counter = resets.clone();
     let task = tokio::spawn(async move {
@@ -258,23 +255,42 @@ async fn a_reset_during_the_upload_fails_over() {
             drop(s);
         }
     });
-    let fallback = MockUpstream::start(Mode::Json).await;
-    let gw = Gateway::builder(unused_nats_port(), &primary.to_string(), &b64(&pubkey))
-        .providers(&["openai", "openrouter"])
-        .provider_authority("openrouter", &fallback.authority())
-        .start()
-        .await;
-    let resp = test_client()
+    (addr, resets, task)
+}
+
+/// An 8 MiB `/auto` walk, openai first, then openrouter.
+async fn send_large_walk(gw: &Gateway, key: &str) -> u16 {
+    test_client()
         .post(format!("{}/auto/chat/completions", gw.url()))
-        .header("authorization", format!("Bearer {}", vkey(&sk)))
+        .header("authorization", format!("Bearer {key}"))
         .header("content-type", "application/json")
         .header("x-beyond-model", MODEL)
         .header("x-beyond-order", "openai,openrouter")
         .body(body(8 << 20))
         .send()
         .await
-        .unwrap();
-    let status = resp.status().as_u16();
+        .unwrap()
+        .status()
+        .as_u16()
+}
+
+/// An upstream that resets before it has read the whole body cannot hold the request, so the walk
+/// fails over to the next candidate and the client never sees the reset. The gateway holds the body
+/// before connecting (a catalog walk reads it ahead), so the reset surfaces as the write of a body
+/// too large for the socket buffers failing.
+/// claim: REL-1, REL-21
+/// defect: D51
+#[tokio::test]
+async fn a_reset_during_the_upload_fails_over() {
+    let (pubkey, sk) = test_keypair(1);
+    let (primary, resets, task) = mid_upload_resetter().await;
+    let fallback = MockUpstream::start(Mode::Json).await;
+    let gw = Gateway::builder(unused_nats_port(), &primary.to_string(), &b64(&pubkey))
+        .providers(&["openai", "openrouter"])
+        .provider_authority("openrouter", &fallback.authority())
+        .start()
+        .await;
+    let status = send_large_walk(&gw, &vkey(&sk)).await;
     task.abort();
     assert_eq!(
         (
@@ -284,6 +300,43 @@ async fn a_reset_during_the_upload_fails_over() {
         ),
         (200, 1, 1),
         "log:\n{}",
+        gw.log()
+    );
+}
+
+/// A large body's failover to the next candidate still charges the candidate it left: the reset
+/// is that provider failing, so its breaker hears of it. Only a same-candidate retry (a reused
+/// connection the provider had closed) gives the permit back without an outcome; a failover that
+/// did the same would leave a provider resetting every large upload forever closed. With a
+/// threshold of 1 the first reset opens the breaker, so the second request skips the primary.
+/// claim: REL-21
+#[tokio::test]
+async fn a_large_body_failover_charges_the_breaker_it_left() {
+    let (pubkey, sk) = test_keypair(1);
+    let (primary, resets, task) = mid_upload_resetter().await;
+    let fallback = MockUpstream::start(Mode::Json).await;
+    // A reset far longer than the test: the breaker must still be open for request 2.
+    let gw = Gateway::builder(unused_nats_port(), &primary.to_string(), &b64(&pubkey))
+        .providers(&["openai", "openrouter"])
+        .provider_authority("openrouter", &fallback.authority())
+        .config_line("circuit_breaker_threshold = 1")
+        .config_line("circuit_breaker_window_secs = 60")
+        .config_line("circuit_breaker_reset_secs = 600")
+        .start()
+        .await;
+    let key = vkey(&sk);
+    let first = send_large_walk(&gw, &key).await;
+    let second = send_large_walk(&gw, &key).await;
+    task.abort();
+    assert_eq!(
+        (
+            first,
+            second,
+            resets.load(std::sync::atomic::Ordering::SeqCst),
+            fallback.hits()
+        ),
+        (200, 200, 1, 2),
+        "(first, second, primary resets, fallback hits); log:\n{}",
         gw.log()
     );
 }
