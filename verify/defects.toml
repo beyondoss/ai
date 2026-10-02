@@ -2413,7 +2413,7 @@ evidence = "Final live run on 101d023: the cell's SDK got 200 and the forced cal
 claims = ["TOOL-1"]
 state = "fixed"
 test = "live:TOOL-1::openai-py::gpt::chat_128"
-fix = "TBD"
+fix = "ff09001"
 note = "Not a gateway defect: one client call, one row. Fixed in the harness: the Recorder counts running handlers, and stop() waits (up to 10 s) for them to finish recording before it takes the list. Every Recorder user (long sessions, MCP, TOOL-1) gets the fix. Live: the cell re-run twice, PASS."
 
 [[defect]]
@@ -2427,7 +2427,7 @@ evidence = "Final live run on 101d023, kept gateway log target/catalog-live/gw-3
 claims = ["CAT-4"]
 state = "fixed"
 test = "live:CAT-4::raw::openrouter::qwen/qwen3.8-27b"
-fix = "TBD"
+fix = "ff09001"
 note = "The gateway relayed what came; the provider stalled. Fixed in catalog_live: a body that times out after the provider's head (x-beyond-provider) marks the cell provider-unavailable (INCONCLUSIVE) and the message says the read timed out."
 
 [[defect]]
@@ -2441,5 +2441,5 @@ evidence = "Final live run on 101d023: in 2433 (1510 cached) out 30, card 4 / 20
 claims = ["CAT-7"]
 state = "fixed"
 test = "live:CAT-7::raw::openrouter::gpt-5.6-sol-pro"
-fix = "TBD"
+fix = "ff09001"
 note = "The card is right and keeps the standard rate. Fixed: a [[promo]] may name its cached-input rate (cache_read; both gpt-5.6-sol promotions now say 0.20, until 2026-11-21), and CAT-7 prices cached input at it (the card's cached rate when none is named). catalog_matches_vendor_truth holds a promo cache_read below the card's. Live: the cell re-run twice, PASS, once with 1510 cached input tokens at exactly the failing run's figures."
