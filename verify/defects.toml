@@ -2341,10 +2341,10 @@ impact = "A completed call billed usage_estimated bills the provider's exact inp
 confidence = "low"
 evidence = "Final live run on 7eca5e5 (target/final-live6.log, concurrent phase, 3,137 cells): LNG-1+LNG-2::claude-code::claude::long_task flagged 534ea41d4f95638a-26 and -27 (POST /v1/messages -> 200) as estimates, 2 of 60 calls, every prompt size monotonic (no client retry). The cell's gateway log tail was empty: long_live read it after cleanup() had removed the directory, so no row or warn line survived. Re-run alone on 7eca5e5 with VERIFY_LONG_KEEP=1 (2026-10-01): PASS, 60 calls, 0 usage_estimated rows. git diff f97ccbf..7eca5e5 leaves the estimate decision (cut_short, body_cut, body_unmetered, no_head, anthropic_stream_finished, the usage tail and head) unchanged; the lazy InputTally (D215-D218) changes only the input count of a row already being estimated. So the range holds no commit that decides to estimate, and the bisect has nothing to bisect."
 claims = ["BIL-3", "LNG-1"]
-state = "suspected"
+state = "accepted"
 test = "live:LNG-1+LNG-2::claude-code::claude::long_task"
 fix = ""
-note = "Not reproduced. Under the stream rules, an Anthropic 2xx stream is estimated only when message_delta is missing from the usage tail (the upstream or the client ended the stream before it), or the parent recorded no upstream head with a downstream error. long_live now keeps the log tail on failure and prints the row, client_gone, bytes, deltas and the usage the client saw beside the problem, so the next occurrence names which rule fired."
+note = "ACCEPTED 2026-10-01 by the owner: not reproduced in three runs after the one occurrence (alone, a full verify:live on 30de2b7, and alongside a full catalog sweep for load); no estimate logic changed between the last good run and 7eca5e5; two consecutive mid-session calls under peak load fit a provider-interrupted stream, for which an estimate is the correct bill. The cell now prints which estimate rule fired and keeps the gateway log, so a recurrence re-opens this with the cause. Not reproduced. Under the stream rules, an Anthropic 2xx stream is estimated only when message_delta is missing from the usage tail (the upstream or the client ended the stream before it), or the parent recorded no upstream head with a downstream error. long_live now keeps the log tail on failure and prints the row, client_gone, bytes, deltas and the usage the client saw beside the problem, so the next occurrence names which rule fired."
 
 [[defect]]
 id = "D241"
