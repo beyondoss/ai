@@ -1273,8 +1273,10 @@ JSON-schema request for it to hosts that answer 410 Gone, so no candidate could 
 `verify/catalog_truth.toml` `[[retired]]` records each retirement with the vendor's notice: a
 `retired` date keeps the row and its candidates from coming back
 (`no_candidate_is_retired_or_not_serverless`, `no_catalog_row_outlives_its_retirement`), and a
-scheduled `retires` date keeps the row until that day, when the same test fails until it is
-removed (Claude Sonnet 4.5 on 2026-11-30; gpt-5, -mini, -nano, -pro, o3 and o3-pro on
+scheduled `retires` date keeps the row until that day. From 14 days before it the same test
+prints a warning naming the row and date; it fails only under `CATALOG_RETIREMENT_STRICT=1`,
+which the weekly `deep.yml` job sets, so the calendar never fails an unrelated PR and the row is
+still removed before the date (Claude Sonnet 4.5 on 2026-11-30; gpt-5, -mini, -nano, -pro, o3 and o3-pro on
 2026-12-11). `GET /v1/models`
 does not carry the date: neither the OpenAI list shape nor Anthropic's `/v1/models` has a
 deprecation field. The live cells `CAT-16::raw::{provider}::{row}` (`crates/verify/tests/catalog_live.rs`,
