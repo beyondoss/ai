@@ -611,8 +611,72 @@ def key_rotation():
     return ok and not leaks, detail
 
 
+def responses_usage(u):
+    d = getattr(u, "input_tokens_details", None)
+    return {"input_total": u.input_tokens, "output": u.output_tokens,
+            "cache_read": (getattr(d, "cached_tokens", None) or 0) if d else 0}
+
+
+def responses_call(key, **kw):
+    """One non-streaming Responses call. Returns (status, request_id, response or None, error)."""
+    c = client(key)
+    try:
+        raw = c.responses.with_raw_response.create(model=MODEL, max_output_tokens=32, **kw)
+        r = raw.parse()
+        record(key, raw.headers.get("x-beyond-request-id"), responses_usage(r.usage))
+        return 200, r, None
+    except Exception as e:  # noqa: BLE001 - the SDK's typed error is the evidence
+        resp = getattr(e, "response", None)
+        if resp is None:
+            raise
+        record(key, resp.headers.get("x-beyond-request-id"), None, refused=True)
+        return resp.status_code, None, {"sdk_error": type(e).__name__, "body": getattr(e, "body", None)}
+
+
+def responses_id_isolation():
+    """SEC-25. Every managed tenant shares Beyond's OpenAI organization, where OpenAI stores each
+    response. Tenant A stores a turn holding a codename; tenant B, holding A's real response and
+    message ids, sends them as previous_response_id and as an item_reference: each is a 400 naming
+    the field, billing nothing. B's full assistant item carrying A's message id is served from the
+    content B sent, so the answer never holds A's codename. A continues its own chain and recalls it."""
+    code = f"KESTREL-{os.getpid() % 10000:04d}"
+    status, r1, err = responses_call("a1", input=f"The codename is {code}. Reply with just OK.")
+    if status != 200:
+        return False, {"a1_turn1": status, "error": err}
+    msg_id = next((o.id for o in r1.output if o.type == "message"), None)
+    detail = {"code": code, "resp_id": r1.id, "msg_id": msg_id}
+    refusals = {}
+    for field, kw in (
+        ("previous_response_id", {"input": "What is the codename?", "previous_response_id": r1.id}),
+        ("input[0].id", {"input": [{"type": "item_reference", "id": msg_id},
+                                  {"role": "user", "content": "What is the codename?"}]}),
+    ):
+        s, _, e = responses_call("b1", **kw)
+        inner = ((e or {}).get("body") or {})
+        inner = inner.get("error", inner) if isinstance(inner, dict) else {}
+        message = inner.get("message", "") if isinstance(inner, dict) else ""
+        refusals[field] = {"status": s, "message": message[:160]}
+        refusals[field]["ok"] = (s == 400 and field in message and "does not belong to this tenant" in message
+                                 and clear_refusal(s, e, 400, "invalid_request_error"))
+    # A's message id on B's own full item: the gateway cuts it, OpenAI reads B's content.
+    s, rb, e = responses_call("b1", input=[
+        {"type": "message", "role": "assistant", "id": msg_id, "status": "completed",
+         "content": [{"type": "output_text", "text": "Hello there.", "annotations": []}]},
+        {"role": "user", "content": "Quote your previous message exactly."}])
+    b_text = rb.output_text if rb else ""
+    detail["b_full_item"] = {"status": s, "text": b_text[:160], "error": e}
+    s2, r2, e2 = responses_call("a1", input="What is the codename? Reply with just the codename.",
+                                previous_response_id=r1.id)
+    a_text = r2.output_text if r2 else ""
+    detail.update(refusals=refusals, a_chain={"status": s2, "text": a_text[:160], "error": e2})
+    ok = (all(v["ok"] for v in refusals.values()) and s == 200 and code not in b_text
+          and s2 == 200 and code in a_text)
+    return ok, detail
+
+
 SCENARIOS = {f.__name__: f for f in (revoke_tenant, revoke_key, exhaust_allowance, claude_code_revoked,
-                                     cache_isolation, pin_isolation, tenant_limit, rate_limit, key_rotation)}
+                                     cache_isolation, pin_isolation, tenant_limit, rate_limit, key_rotation,
+                                     responses_id_isolation)}
 
 if __name__ == "__main__":
     try:

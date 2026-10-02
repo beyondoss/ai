@@ -14,8 +14,10 @@
 //! a **signed id** bound to the calling tenant ([`Relay`]), and every id the client sends back
 //! (`previous_response_id`, `conversation`, each `input` item's `id`) must verify for that same
 //! tenant and is stripped back to the provider's id before the body leaves
-//! ([`Signer::unsign_request`]). An unsigned, foreign or altered id is a 400 before any upstream is
-//! contacted. BYO keys are the caller's own organization and are never touched.
+//! ([`Signer::unsign_request`]). An unsigned, foreign or altered reference is a 400 before any
+//! upstream is contacted; on a full input item, which carries its own content, such an id is cut
+//! instead, so the provider reads the content (Codex mints its own `msg_<uuid>` ids for the
+//! messages it writes). BYO keys are the caller's own organization and are never touched.
 //!
 //! **Format.** A signed id keeps the provider id's prefix (everything up to and including its
 //! first `_`), so SDK schemas and prefix checks still pass. When the rest is lowercase hex (every
@@ -315,9 +317,11 @@ impl Signer {
 
     /// Check every id in a managed Responses request body and strip each back to its provider id:
     /// root `previous_response_id`, root `conversation` (a string, or an object's `id`), and the
-    /// `id` of every `input` item (an `item_reference`, or a full item: OpenAI answers a full item
-    /// carrying a stored item's id from the store, D231). Every occurrence of each key is checked,
-    /// whatever its spelling (escapes included), since the provider's parser decodes them all.
+    /// `id` of every `input` item. A reference that does not verify is refused; a full item's id
+    /// that does not verify is cut, since OpenAI answers a full item carrying a stored item's id
+    /// from the store (D231) and reads one with no id from its own content ([`Self::unsign_item`]).
+    /// Every occurrence of each key is checked, whatever its spelling (escapes included), since the
+    /// provider's parser decodes them all.
     ///
     /// `catalog`: the body is a catalog walk's, whose relay cuts the reasoning items the gateway
     /// minted from Claude's thinking (`translate::strip_gateway_reasoning`, D50): they are cut here
@@ -392,19 +396,8 @@ impl Signer {
                 let ok = each_element(body, v.0, |(s, _)| {
                     let i = n;
                     n += 1;
-                    if body[s] != b'{' {
-                        return;
-                    }
-                    let ok = each_member(body, s, |c| {
-                        if c.key_is(body, "id")
-                            && body[c.value.0] == b'"'
-                            && !self.unsign_at(tenant, body, c.value, &mut edits)
-                        {
-                            fail.get_or_insert_with(|| format!("input[{i}].id"));
-                        }
-                    });
-                    if !ok {
-                        fail.get_or_insert_with(|| format!("input[{i}]"));
+                    if body[s] == b'{' && !self.unsign_item(tenant, body, s, &mut edits) {
+                        fail.get_or_insert_with(|| format!("input[{i}].id"));
                     }
                 });
                 if !ok {
@@ -419,6 +412,67 @@ impl Signer {
             return Err(unreadable());
         }
         Ok(edits.apply(body))
+    }
+
+    /// One `input` item, the object at `open`. Its every `id` that verifies for `tenant` becomes
+    /// the provider id. One that does not (a client's own: Codex mints `msg_<uuid>` for its
+    /// messages; one from a translated row; another tenant's) is **cut** from a full item, which
+    /// the provider then reads from the content it carries, as it does an item with no id (live,
+    /// 2026-10-01, a message and a reasoning item with `encrypted_content`). An item reference
+    /// (`type` `item_reference`, or neither `type` nor `role`) has nothing else to read: `false`,
+    /// and the request is refused. So is an item the walk cannot read.
+    fn unsign_item(&self, tenant: u64, body: &[u8], open: usize, edits: &mut Edits) -> bool {
+        // Each member, and whether it is a string `id`.
+        let mut members: Vec<(Member, bool)> = Vec::new();
+        let (mut typ, mut role) = (None, false);
+        let ok = each_member(body, open, |m| {
+            let id = m.key_is(body, "id") && body[m.value.0] == b'"';
+            if m.key_is(body, "type") {
+                // The last one is the provider's.
+                typ = json_str(body, m.value).map(Cow::into_owned);
+            } else if m.key_is(body, "role") {
+                role = true;
+            }
+            members.push((m, id));
+        });
+        if !ok {
+            return false;
+        }
+        if !members.iter().any(|m| m.1) {
+            return true;
+        }
+        let reference = match typ.as_deref() {
+            Some(t) => t == "item_reference",
+            None => !role,
+        };
+        let mut drop = vec![false; members.len()];
+        let mut raws: Vec<Option<String>> = vec![None; members.len()];
+        for (k, m) in members.iter().enumerate().filter(|(_, m)| m.1) {
+            match json_str(body, m.0.value).and_then(|s| self.verify(tenant, &s)) {
+                Some(raw) => raws[k] = Some(raw),
+                None if reference => return false,
+                None => drop[k] = true,
+            }
+        }
+        // Replacements and cuts, in source order, as `peek::remove_items` cuts members.
+        let last_kept = (0..members.len()).rev().find(|&k| !drop[k]);
+        for k in 0..members.len() {
+            if let Some(raw) = &raws[k] {
+                edits.push_str(members[k].0.value, raw);
+            } else if drop[k] {
+                let cut = match last_kept {
+                    Some(l) if k < l => (members[k].0.span().0, members[k + 1].0.span().0),
+                    Some(l) => (members[l].0.span().1, members[members.len() - 1].0.span().1),
+                    None => (members[k].0.span().0, members[members.len() - 1].0.span().1),
+                };
+                edits.push_cut(cut);
+                if last_kept.is_none_or(|l| k > l) {
+                    // A trailing run is one cut, from the last kept member to the end.
+                    break;
+                }
+            }
+        }
+        true
     }
 
     /// Verify the JSON string at `span` for `tenant` and queue its provider id in its place.
@@ -782,6 +836,12 @@ impl Edits {
         self.spans.push((span.0, span.1, start, self.arena.len()));
     }
 
+    /// Remove `span`.
+    fn push_cut(&mut self, span: (usize, usize)) {
+        let at = self.arena.len();
+        self.spans.push((span.0, span.1, at, at));
+    }
+
     /// `src` with every edit applied, appended to `out`.
     fn write(&self, src: &[u8], out: &mut Vec<u8>) {
         let mut last = 0;
@@ -1011,15 +1071,42 @@ mod tests {
         );
         let err = s.unsign_request(B, body.as_bytes(), false).unwrap_err();
         assert_eq!(err.field, "previous_response_id");
-        let raw = format!(
-            r#"{{"input":[{{"role":"user","content":"x"}},{{"type":"message","role":"assistant","id":"{MSG}","content":[]}}]}}"#
-        );
-        assert_eq!(
-            s.unsign_request(A, raw.as_bytes(), false)
-                .unwrap_err()
-                .field,
-            "input[1].id"
-        );
+        // A full item whose id does not verify (a raw one, a client's own) loses the id and keeps
+        // its content; a reference has no content, so it is refused.
+        let full = |id: &str| {
+            format!(
+                r#"{{"input":[{{"role":"user","content":"x"}},{{"type":"message","id":"{id}","role":"assistant","content":[]}},{{"role":"user","id":"{id}","content":"y"}},{{"id":"{id}","type":"reasoning","encrypted_content":"e","id":"{id}"}}]}}"#
+            )
+        };
+        for id in [
+            MSG,
+            "msg_01a0f9e5-01e6-7083-a088-785980d6aeab",
+            &s.sign(B, MSG),
+        ] {
+            let out = s
+                .unsign_request(A, full(id).as_bytes(), false)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                String::from_utf8(out).unwrap(),
+                r#"{"input":[{"role":"user","content":"x"},{"type":"message","role":"assistant","content":[]},{"role":"user","content":"y"},{"type":"reasoning","encrypted_content":"e"}]}"#,
+                "{id}"
+            );
+        }
+        let out = s
+            .unsign_request(A, full(&m).as_bytes(), false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), full(MSG));
+        for reference in [
+            format!(r#"{{"input":[{{"type":"item_reference","id":"{MSG}"}}]}}"#),
+            format!(r#"{{"input":[{{"id":"{MSG}"}}]}}"#),
+        ] {
+            let err = s
+                .unsign_request(A, reference.as_bytes(), false)
+                .unwrap_err();
+            assert_eq!(err.field, "input[0].id");
+        }
         // An escaped key is the same key to the provider.
         let esc = format!(r#"{{"previous\u005fresponse_id":"{RESP}"}}"#);
         assert!(s.unsign_request(A, esc.as_bytes(), false).is_err());

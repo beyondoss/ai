@@ -1345,13 +1345,22 @@ capture, the cache (keyed by tenant, so a hit replays the tenant's own ids) and 
 tracker.
 
 **In.** Root `previous_response_id`, root `conversation` (a string, or an object's `id`) and the
-`id` of **every** `input` item (references and full items) must verify for the calling tenant.
-Every occurrence of each key is checked, whatever its spelling: a duplicate key, or one written with
-escapes (`"previous\u005fresponse_id"`), is what a provider's parser decodes. Each is replaced by
-OpenAI's own id before the body leaves; nothing else changes. An unsigned id (a raw `resp_…`),
-another tenant's, an altered one or one signed under a key since removed is a **400**
-`invalid_request_error` naming the field ("previous_response_id does not belong to this tenant…",
-`ai_rejections_total{reason="foreign_id"}`). On a catalog walk the body is in hand before
+`id` of **every** `input` item are checked against the calling tenant. Every occurrence of each key
+is checked, whatever its spelling: a duplicate key, or one written with escapes
+(`"previous\u005fresponse_id"`), is what a provider's parser decodes. An id that verifies is
+replaced by OpenAI's own id before the body leaves; nothing else changes. One that does not (a raw
+`resp_…`, another tenant's, an altered one, one signed under a key since removed, a client's own):
+
+- as `previous_response_id`, `conversation` or an item reference (`type: "item_reference"`, or an
+  item with neither `type` nor `role`), which have nothing else to read, is a **400**
+  `invalid_request_error` naming the field ("previous_response_id does not belong to this
+  tenant…", `ai_rejections_total{reason="foreign_id"}`);
+- on a full item, which carries its own content, is **cut**: OpenAI reads an item with no id from
+  its content (live, 2026-10-01: a message, and a reasoning item with `encrypted_content`). Codex
+  mints its own ids for the messages it writes (`msg_<uuidv7>`), and a translated row's answer
+  carries the gateway's or another vendor's; neither is OpenAI's, and neither is refused.
+
+On a catalog walk the body is in hand before
 connecting, so the upstream never sees the request (a large body is checked in `relay_full_body`
 before its first attempt). A `/{provider}` body streams through, so it is checked as it is
 rewritten in `request_body_filter`: its request headers have already left, but not one byte of its
@@ -2441,8 +2450,9 @@ to serve.
   but its headers have already left, so the 400 is pingora's bare status.
 - Per-credential request rate within ceiling; aggregate BYO rate within ceiling
 - Every id sent back on a managed Responses relay to a store (`previous_response_id`,
-  `conversation`, each `input` item's `id`) is one the gateway issued to the same tenant (400
-  otherwise, before any upstream; see [Tenant-bound Responses ids](#tenant-bound-responses-ids-signed_idrs))
+  `conversation`, each `input` item's `id`) reaches the provider only if the gateway issued it to
+  the same tenant: otherwise a reference is a 400 before any upstream and a full item's id is cut
+  (see [Tenant-bound Responses ids](#tenant-bound-responses-ids-signed_idrs))
 
 **What passes through unchecked:**
 
@@ -2799,7 +2809,8 @@ Prometheus on the default registry, exposed at `/metrics` on `metrics_listen`.
   naming the defect, until it is fixed.
 - **Tenant-bound Responses ids end to end (`tests/signed_ids.rs`):** tenant A's response, item and
   conversation ids, used by tenant B in each position (signed, or stripped to OpenAI's id), are a
-  400 naming the field with zero upstream hits, and so is a full item carrying A's id (D230, D231);
+  400 naming the field with zero upstream hits, and a full item carrying A's id reaches OpenAI
+  without it (D230, D231);
   A's own ids round-trip and the upstream gets OpenAI's; JSON bodies and every SSE event are signed
   consistently; BYO is relayed byte for byte; an id from before a rotation verifies and one from a
   removed key does not; a tampered id is refused; no key is a 503 before any upstream; the

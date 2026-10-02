@@ -4,9 +4,10 @@
 //! Every managed tenant shares one OpenAI organization through the pool key, and OpenAI stores
 //! each response by default. So the ids in a managed Responses answer are signed for the tenant it
 //! went to, and every id a request sends back (`previous_response_id`, `conversation`, each
-//! `input` item's `id`) must verify for the caller: another tenant's, a raw provider id, or an
-//! altered one is a 400 that names the field, and the upstream never sees the request. The
-//! upstream always gets its own ids back. BYO keys and rows without a store are untouched.
+//! `input` item's `id`) is checked against the caller: another tenant's, a raw provider id, or an
+//! altered one is a 400 that names the field when it is a reference, and the upstream never sees
+//! the request; on a full item it is cut, and the item is read from its own content. The upstream
+//! always gets its own ids back. BYO keys and rows without a store are untouched.
 //!
 //! Run via `mise run test:integration:rs` (needs `nats-server` on PATH).
 
@@ -183,36 +184,49 @@ async fn a_tenants_response_id_is_refused_for_another_tenant() {
 
 /// OpenAI answers a full input item that carries a stored item's id from the store, not from the
 /// content sent (live, 2026-10-01: an assistant message with tenant A's `msg_` id and the content
-/// "Hello there." was quoted back as A's stored text). So a full item's `id` is stored state too:
-/// tenant B's full item with A's id is refused like an `item_reference`.
+/// "Hello there." was quoted back as A's stored text). So a full item's `id` is stored state too.
+/// Tenant B's full item with A's id (signed for A, or raw) reaches OpenAI without it, and OpenAI
+/// reads the content B sent, as it reads any item with no id. So does a client's own id, such as
+/// the `msg_<uuid>` ids Codex mints for the messages it writes.
 /// claim: SEC-25
 /// defect: D231
 #[tokio::test]
-async fn a_full_item_carrying_another_tenants_id_is_refused() {
+async fn a_full_item_carrying_another_tenants_id_is_answered_from_its_own_content() {
     let (mock, gw, sk) = gpt_gateway(Mode::Raw(200, "application/json", RESPONSE)).await;
     let (_, rs, msg) = first_turn(&gw, &sk).await;
-    let hits = mock.hits();
-    for (field, item) in [
+    let message = |id: Option<&str>| {
+        let mut m = json!({"type": "message", "role": "assistant", "status": "completed",
+                           "content": [{"type": "output_text", "text": "Hello there.", "annotations": []}]});
+        if let Some(id) = id {
+            m["id"] = json!(id);
+        }
+        m
+    };
+    let reasoning = |id: Option<&str>| {
+        let mut m = json!({"type": "reasoning", "summary": [], "encrypted_content": "gAAAA"});
+        if let Some(id) = id {
+            m["id"] = json!(id);
+        }
+        m
+    };
+    let ask = json!({"role": "user", "content": "Quote your previous message."});
+    for (sent, upstream) in [
+        (message(Some(&msg)), message(None)),
+        (message(Some(MSG)), message(None)),
         (
-            "input[0].id",
-            json!({"type": "message", "role": "assistant", "id": msg, "status": "completed",
-                   "content": [{"type": "output_text", "text": "Hello there.", "annotations": []}]}),
+            message(Some("msg_01a0f9e5-01e6-7083-a088-785980d6aeab")),
+            message(None),
         ),
-        (
-            "input[0].id",
-            json!({"type": "reasoning", "id": rs, "summary": []}),
-        ),
-        (
-            "input[0].id",
-            json!({"type": "message", "role": "assistant", "id": MSG,
-                   "content": [{"type": "output_text", "text": "x", "annotations": []}]}),
-        ),
+        (reasoning(Some(&rs)), reasoning(None)),
+        (reasoning(Some(RS)), reasoning(None)),
     ] {
-        let body = json!({"model": "gpt-4o", "input": [item, {"role": "user", "content": "Quote your previous message."}]});
+        let body = json!({"model": "gpt-4o", "input": [sent, ask]});
         let (status, text) = post_as(&gw, &sk, B, "/v1/responses", &body).await;
-        assert_refused(status, &text, field);
+        assert_eq!(status, 200, "{text}");
+        let got: Value = serde_json::from_slice(&mock.captured().unwrap().body).unwrap();
+        assert_eq!(got["input"][0], upstream, "the id is cut, the content kept");
+        assert!(!got.to_string().contains(MSG) && !got.to_string().contains(RS));
     }
-    assert_eq!(mock.hits(), hits);
 }
 
 /// Tenant A's own ids come back in every position, and the upstream gets the provider's ids: the

@@ -135,6 +135,8 @@ const CELLS: &[Cell] = &[
     ("TEN-2+SEC-15",    "openai-py",    GPT4O_MINI, "tenant_limit",        SLOTS),
     ("TEN-2+SEC-15",    "anthropic-py", CLAUDE,     "tenant_limit",        SLOTS),
     ("TEN-2+SEC-15",    "openai-py",    GPT4O_MINI, "rate_limit",          RATE),
+    // SEC-25: tenant B holds tenant A's real Responses ids (one OpenAI org behind the pool key).
+    ("SEC-25+TEN-2",    "openai-py",    GPT4O_MINI, "responses_id_isolation", ""),
     // REL-14: tokens from two signing kids, and a pool mid-rotation (the first key revoked).
     ("REL-14+SEC-7",    "openai-py",    ROTATE_GPT,    "key_rotation",     ""),
     ("REL-14+SEC-7",    "anthropic-py", ROTATE_CLAUDE, "key_rotation",     ""),
