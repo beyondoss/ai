@@ -46,7 +46,8 @@ fn agent_through_real_gateway_to_mock_upstream() {
          upstream_tls = false\n\
          \n[provider_authorities]\nanthropic = \"{mock_authority}\"\n\
          \n[pool_keys]\nanthropic = \"sk-pool-secret\"\n\
-         \n[signing_keys]\n1 = \"{DEV_PUBKEY_B64}\"\n"
+         \n[signing_keys]\n1 = \"{DEV_PUBKEY_B64}\"\n\
+         \n[id_signing_keys]\n1 = \"BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=\"\n"
     );
     let config_path = dir.path().join("gateway.toml");
     std::fs::write(&config_path, config).unwrap();

@@ -458,17 +458,18 @@ impl GatewayState {
     pub fn new(config: AiConfig, metrics: Arc<Metrics>) -> Result<Arc<Self>> {
         let keyring = config.build_keyring()?;
         let id_signer = config.build_id_signer()?;
-        // Without it every managed Responses turn on a GPT row (and every managed
-        // `/{provider}/…/responses`) is a 503: the ids it would relay sit in one provider org
-        // that every tenant shares (`signed_id.rs`). Other traffic is unaffected, so this warns
-        // rather than refusing to boot.
+        // A deployment that verifies `bai_` keys serves managed traffic, and managed Responses ids
+        // sit in one provider org every tenant shares (`signed_id.rs`): without an id signing key
+        // they can't be tenant-bound, so this is a hard boot failure, not a warning. A BYO-only
+        // deployment (no `signing_keys`) stores nothing on Beyond's accounts and needs none.
         if id_signer.is_none() && !config.signing_keys.is_empty() {
-            warn!(
-                "no id_signing_keys configured — managed /v1/responses on GPT rows and managed \
-                 /{{provider}}/…/responses will 503 (fail-closed: their response ids would be \
-                 resolvable by every tenant). Set AI_ID_SIGNING_KEY_<kid> to the base64 of 32 \
-                 random bytes."
-            );
+            return Err(GatewayError::Config(
+                "signing_keys are configured (managed traffic) but no id_signing_keys are — refusing \
+                 to boot: managed Responses ids would be resolvable by every tenant. Set \
+                 AI_ID_SIGNING_KEY_1 to the base64 of 32 random bytes (e.g. `openssl rand -base64 \
+                 32`)."
+                    .to_string(),
+            ));
         }
         // No signing keys ⇒ every `bai_v1…` fails verify and 401s (fail-closed). BYO still works.
         // That's a *valid* mode (a BYO-only deployment), but a far more common cause is a

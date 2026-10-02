@@ -182,7 +182,8 @@ fn check_signing_keys(config: &AiConfig) -> CheckResult {
 }
 
 /// The id signing keys bind the Responses ids OpenAI stores to a tenant (`signed_id.rs`). Without
-/// one, managed Responses on a GPT row fails closed (503); a BYO-only deployment needs none.
+/// one, a deployment with `signing_keys` (managed traffic) refuses to boot; a BYO-only deployment
+/// needs none.
 fn check_id_signing_keys(config: &AiConfig) -> CheckResult {
     match config.build_id_signer() {
         Ok(Some(_)) => pass(
@@ -195,7 +196,7 @@ fn check_id_signing_keys(config: &AiConfig) -> CheckResult {
         ),
         Ok(None) => fail(
             "id_signing_keys",
-            "no id signing keys configured — managed /v1/responses on GPT rows will 503",
+            "no id signing keys configured — the gateway refuses to boot with signing_keys set",
             "set AI_ID_SIGNING_KEY_<kid> to the base64 of 32 random bytes (openssl rand -base64 32)",
         ),
         Err(e) => fail(

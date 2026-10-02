@@ -1000,7 +1000,10 @@ impl RequestCtx {
     ///
     /// Both can apply to the same request, in which case every edit is made to the one buffer.
     fn rewrites_body(&self) -> bool {
-        self.inject_eligible || self.background_check || self.auto.is_some() || self.signed.is_some()
+        self.inject_eligible
+            || self.background_check
+            || self.auto.is_some()
+            || self.signed.is_some()
     }
 
     /// Point the forwarded path at the candidate about to be attempted.

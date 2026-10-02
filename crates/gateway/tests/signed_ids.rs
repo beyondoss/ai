@@ -17,6 +17,7 @@ mod common;
 
 use common::*;
 use serde_json::{Value, json};
+use std::time::Duration;
 
 const A: u64 = 501;
 const B: u64 = 502;
@@ -495,49 +496,24 @@ async fn a_tampered_id_is_refused() {
     assert_eq!(mock.hits(), hits);
 }
 
-/// No id signing key: a managed Responses relay to a store fails closed with a 503 that says why,
-/// before any upstream, rather than handing out ids every tenant could resolve. Nothing else is
-/// affected: Chat Completions on the same row, and Responses on a row with no store.
+/// No id signing key on a deployment that serves managed traffic (it has `signing_keys`): the
+/// gateway refuses to boot, naming the missing key, rather than handing out Responses ids every
+/// tenant could resolve. A BYO-only deployment (no `signing_keys`) stores nothing on Beyond's
+/// accounts and boots without one.
 /// claim: SEC-25
 #[tokio::test]
-async fn a_missing_id_signing_key_fails_closed() {
-    let (mock, gw, sk) =
-        gpt_gateway_with(Mode::Json, GatewayBuilder::without_id_signing_keys).await;
-    for path in [
-        "/v1/responses",
-        "/openai/v1/responses",
-        "/v1/responses/compact",
-    ] {
-        let (status, text) = post_as(
-            &gw,
-            &sk,
-            A,
-            path,
-            &json!({"model": "gpt-4o", "input": "hi"}),
-        )
-        .await;
-        assert_eq!(status, 503, "{path}: {text}");
-        assert!(text.contains("id signing key"), "{text}");
-    }
-    assert_eq!(mock.hits(), 0);
-    let (status, text) = post_as(
-        &gw,
-        &sk,
-        A,
-        "/v1/chat/completions",
-        &json!({"model": "gpt-4o", "messages": [{"role": "user", "content": "hi"}]}),
-    )
-    .await;
-    assert_eq!(status, 200, "{text}");
-    let metrics = gw.metrics().await;
-    assert_eq!(
-        parse_metric(&metrics, "ai_rejections_total", "id_signing_unset"),
-        3.0
+async fn a_missing_id_signing_key_refuses_to_boot() {
+    let (pubkey, _sk) = test_keypair(1);
+    let managed = format!("[signing_keys]\n1 = \"{}\"", b64(&pubkey));
+    let err = boot_refuses(&managed, Duration::from_secs(10))
+        .expect("a managed deployment without id_signing_keys must not boot");
+    assert!(
+        err.contains("id_signing_keys"),
+        "names the missing key: {err}"
     );
     assert!(
-        gw.log().contains("no id_signing_keys configured"),
-        "boot warns: {}",
-        gw.log()
+        boot_refuses("", Duration::from_secs(3)).is_none(),
+        "a BYO-only deployment boots without an id signing key"
     );
 }
 

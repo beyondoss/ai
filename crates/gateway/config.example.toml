@@ -254,9 +254,9 @@ capture_queue_depth = 1024
 
 # Secrets that bind the ids OpenAI stores (response, conversation and item ids) to the tenant they
 # were issued to (kid -> base64 of >= 32 random bytes; `openssl rand -base64 32`). Inject via
-# AI_ID_SIGNING_KEY_<KID>. Every managed tenant shares Beyond's OpenAI organization, so without a
-# key a managed Responses request on a GPT row (or managed /{provider}/…/responses) is a 503
-# (fail-closed); everything else is served. Keep a rotated-out key listed for 30 days so the ids it
+# AI_ID_SIGNING_KEY_<KID>. Every managed tenant shares Beyond's OpenAI organization, so REQUIRED
+# whenever [signing_keys] is set: the gateway refuses to boot without one. A BYO-only deployment
+# needs none. Keep a rotated-out key listed for 30 days so the ids it
 # signed still verify. See ARCHITECTURE.md "Tenant-bound Responses ids".
 [id_signing_keys]
 # 1 = "<base64-32-random-bytes>"

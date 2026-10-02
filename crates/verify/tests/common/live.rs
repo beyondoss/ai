@@ -19,7 +19,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 /// The dev gateway's `[id_signing_keys]` table (kid `1`: 32 bytes of 7), appended after
-/// `[signing_keys]`. Without one a managed Responses turn on a GPT row is a 503 (`signed_id.rs`).
+/// `[signing_keys]`. A gateway with `signing_keys` and no id signing key refuses to boot (`signed_id.rs`).
 pub const DEV_ID_SIGNING_TOML: &str =
     "\n[id_signing_keys]\n1 = \"BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=\"\n";
 
