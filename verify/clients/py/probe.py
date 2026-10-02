@@ -1637,6 +1637,133 @@ def h2_burst():
     return ok, {"served": served, "peak_in_flight": peak_flight[0], "peak_upstream_connections": peak_conns}
 
 
+# Long outputs: ~32k output tokens through a translated path, where only short generations had
+# been exercised. The task is deterministic (the integers 1..LONG_N, one per line), so the client
+# can check every line arrived. Measured on claude-haiku-4-5 (2026-10-02): 1..6000 is 17,004
+# output tokens in 72s, ~2.85 tokens per 4-digit line, so 1..11000 is ~32k tokens and ~135s.
+# LONG_MAX fits that with ~25% headroom, under Haiku 4.5's 64k output cap. Cost per call: ~60
+# input tokens plus ~32k output at $5/MTok, about $0.16; the three cells about $0.50 per run.
+LONG_N = 11000
+LONG_MAX = 40000
+LONG_ASK = [{"role": "user", "content": (
+    f"Write every integer from 1 to {LONG_N} in order, one per line, digits only. Output nothing "
+    "else: no introduction, no commentary, no ellipses, never skip or abbreviate. The last line "
+    f"must be {LONG_N}.")}]
+
+
+class _Tail(httpx.SyncByteStream):
+    """A response body stream that keeps the last bytes the client read, so a probe can see the
+    raw terminal event (`data: [DONE]`) that the SDK swallows."""
+
+    def __init__(self, inner, sink):
+        self.inner, self.sink = inner, sink
+
+    def __iter__(self):
+        for chunk in self.inner:
+            self.sink[0] = (self.sink[0] + chunk)[-256:]
+            yield chunk
+
+    def close(self):
+        self.inner.close()
+
+
+def long_client():
+    """openai-py on a transport that records each body's tail, with a read timeout past a ~135s
+    non-streamed generation (the SDK's own default is 600s; `http()`'s is 120s)."""
+    import openai
+    tail = [b""]
+
+    class Transport(httpx.HTTPTransport):
+        def handle_request(self, request):
+            resp = super().handle_request(request)
+            tail[0] = b""
+            resp.stream = _Tail(resp.stream, tail)
+            return resp
+
+    hc = httpx.Client(transport=Transport(), event_hooks={"response": [_hook]}, timeout=600)
+    return openai.OpenAI(base_url=f"{BASE}/v1", api_key=KEY, http_client=hc, max_retries=0), tail
+
+
+def long_text_problems(text):
+    """Every line 1..LONG_N, in order, nothing missing at the end (a truncation) or in between."""
+    lines = (text or "").strip().splitlines()
+    want = [str(i) for i in range(1, LONG_N + 1)]
+    if lines == want:
+        return None
+    first = next((i for i, (a, b) in enumerate(zip(lines, want)) if a != b), min(len(lines), len(want)))
+    return {"lines": len(lines), "want": LONG_N, "first_divergence": first,
+            "around": lines[max(0, first - 2):first + 2], "last": lines[-3:]}
+
+
+def long_output():
+    """S1 / B1 / BIL-6 on a long generation: openai-py Chat, streamed, translated to Messages on
+    the Claude row. Every line arrives, in many chunks (incremental, not buffered); the stream
+    ends with finish_reason "stop" (Messages end_turn), a usage chunk and the raw `data: [DONE]`
+    terminator, not a cut; and the row's output tokens equal the usage shown, exactly."""
+    c, tail = long_client()
+    t0 = time.monotonic()
+    s = c.chat.completions.create(model=MODEL, max_tokens=LONG_MAX, stream=True, messages=LONG_ASK,
+                                  stream_options={"include_usage": True})
+    parts, usage, finish, chunks, ttft = [], None, None, 0, None
+    for chunk in s:
+        usage = chunk.usage or usage
+        for ch in chunk.choices:
+            if ch.delta.content:
+                ttft = ttft if ttft is not None else time.monotonic() - t0
+                chunks += 1
+                parts.append(ch.delta.content)
+            finish = ch.finish_reason or finish
+    u = chat_usage(usage)
+    record("chat", u)
+    text_bad = long_text_problems("".join(parts))
+    done = tail[0].rstrip().endswith(b"data: [DONE]")
+    ok = text_bad is None and finish == "stop" and done and u is not None and chunks > 100
+    return ok, {"finish_reason": finish, "usage": u, "content_chunks": chunks, "done_terminator": done,
+                "ttft_s": ttft, "elapsed_s": round(time.monotonic() - t0, 1), "text": text_bad,
+                "tail": tail[0][-120:].decode(errors="replace")}
+
+
+def long_output_responses():
+    """TRN-1 / S1 / B1 / BIL-6 on a long generation: openai-py Responses, streamed, translated to
+    Messages on the Claude row. Every line arrives; the last event is response.completed with
+    status "completed" and no incomplete_details (Messages end_turn), the text the deltas built
+    equals the final response's; the row's output tokens equal the usage shown, exactly."""
+    c, _ = long_client()
+    t0 = time.monotonic()
+    deltas, last, n = [], None, 0
+    with c.responses.stream(model=MODEL, input=LONG_ASK, max_output_tokens=LONG_MAX) as s:
+        for ev in s:
+            last = ev.type
+            if ev.type == "response.output_text.delta":
+                n += 1
+                deltas.append(ev.delta)
+        final = s.get_final_response()
+    u = responses_usage(final.usage) if final.usage else None
+    record("responses", u)
+    streamed = "".join(deltas)
+    text_bad = long_text_problems(streamed)
+    ok = (text_bad is None and last == "response.completed" and final.status == "completed"
+          and final.incomplete_details is None and final.output_text == streamed and u is not None and n > 100)
+    return ok, {"last_event": last, "status": final.status, "incomplete": final.incomplete_details,
+                "usage": u, "delta_events": n, "final_matches_deltas": final.output_text == streamed,
+                "elapsed_s": round(time.monotonic() - t0, 1), "text": text_bad}
+
+
+def long_output_nonstream():
+    """B1 / BIL-6 on a long generation, non-streamed: openai-py Chat on the Claude row, one ~135s
+    response held open. Every line arrives, finish_reason is "stop" (Messages end_turn), and the
+    row's output tokens equal the usage shown, exactly."""
+    c, _ = long_client()
+    t0 = time.monotonic()
+    r = c.chat.completions.create(model=MODEL, max_tokens=LONG_MAX, messages=LONG_ASK)
+    u = chat_usage(r.usage)
+    record("chat", u)
+    text_bad = long_text_problems(r.choices[0].message.content)
+    finish = r.choices[0].finish_reason
+    ok = text_bad is None and finish == "stop" and u is not None
+    return ok, {"finish_reason": finish, "usage": u, "elapsed_s": round(time.monotonic() - t0, 1), "text": text_bad}
+
+
 PROBES = {f.__name__: f for f in [
     chat_basic, messages_basic, responses_basic, models_list, tools_chat, tools_messages, embeddings,
     langchain_chat, agents_sdk, agents_chat, responses_count_compact, count_tokens, thinking_replay, reasoning_replay,
@@ -1646,7 +1773,8 @@ PROBES = {f.__name__: f for f in [
     reasoning_metered, web_search, mid_system, developer_role, cache_control_turns, cache_control_parts,
     max_tokens_clamp, strict_tools, explicit_nulls, context_overflow, agents_handoff, langchain_agent,
     langchain_embeddings, agents_structured, thinking_no_echo, raw_models, raw_count_compact, raw_failover, raw_steer,
-    raw_session_pin, raw_big_body, raw_stream_abort, byo_raw, raw_auto_cache, raw_embeddings, leak_scan, h2_burst]}
+    raw_session_pin, raw_big_body, raw_stream_abort, byo_raw, raw_auto_cache, raw_embeddings, leak_scan, h2_burst,
+    long_output, long_output_responses, long_output_nonstream]}
 
 if __name__ == "__main__":
     name = sys.argv[1]

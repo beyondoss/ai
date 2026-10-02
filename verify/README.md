@@ -127,8 +127,10 @@ Three more answers count as the provider's:
 
 **Retries fit the test's time budget.** nextest terminates a test at its profile's `slow-timeout`
 period × `terminate-after` (180s under `verify`; the reconciliation and long-session binaries have
-their own). The retry loop (`common::sdk_retry`, `sdk_backoff`) reads that budget from
-`.config/nextest.toml` for `NEXTEST_PROFILE` and `NEXTEST_BINARY_ID`, and gives up a retry whose
+their own, as do live.rs's `long_output*` cells, matched by test name: 6 minutes for a ~32k-token
+generation measured at 135-177s). The retry loop (`common::sdk_retry`, `sdk_backoff`) reads that
+budget from `.config/nextest.toml` for `NEXTEST_PROFILE`, `NEXTEST_BINARY_ID` and
+`NEXTEST_TEST_NAME`, and gives up a retry whose
 wait plus one more attempt as long as the last would not finish inside it, keeping five seconds to
 read the billing row and report. The catalog sweep also caps each request's timeout at the time
 left. So a cell reports its last answer (INCONCLUSIVE, where it is the provider's) instead of being

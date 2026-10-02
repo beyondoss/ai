@@ -60,6 +60,12 @@ slow-timeout = { period = "60s", terminate-after = 18 }
 filter = "binary_id(beyond-ai-verify::long_live)"
 slow-timeout = { period = "60s", terminate-after = 35 }
 
+# A long-output live cell (`long_output*` in crates/verify/tests/live.rs) streams ~32k tokens,
+# ~135s on Claude Haiku 4.5, past the 180s default once the gateway boots and speed varies.
+[[profile.verify.overrides]]
+filter = "binary_id(beyond-ai-verify::live) & test(/long_output/)"
+slow-timeout = { period = "60s", terminate-after = 6 }
+
 [profile.verify.junit]
 path = "junit.xml"
 

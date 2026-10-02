@@ -271,6 +271,13 @@ const CELLS: &[Cell] = &[
     ("TRN-18",            "anthropic-py",  Runtime::Python, "context_overflow", &[GPT4O_MINI], ""),
     ("W5+TRN-24",         "openai-agents", Runtime::Python, "agents_handoff",   CLAUDE_GPT, ""),
     ("W6",                "langchain",     Runtime::Python, "langchain_agent",  CLAUDE_GPT, ""),
+    // Long outputs (~32k tokens, the integers 1..11000) on translated paths, where only short
+    // generations ran before: every line arrives, the stream ends on its terminal event, the stop
+    // reason maps, and the row bills exactly the usage shown. Haiku-class, ~$0.16 a cell. Their
+    // nextest budget is raised in .config/nextest.toml (a ~135s generation plus the gateway boot).
+    ("S1+B1+BIL-6",       "openai-py",     Runtime::Python, "long_output",      &[CLAUDE], ""),
+    ("TRN-1+S1+B1+BIL-6", "openai-py",     Runtime::Python, "long_output_responses", &[CLAUDE], ""),
+    ("B1+BIL-6",          "openai-py",     Runtime::Python, "long_output_nonstream", &[CLAUDE], ""),
     // Node SDKs.
     ("E1+B1+S1+S2",       "openai-node",   Runtime::Node,   "chat_basic",       GEN,      "R1"),
     ("E2+B1+S1",          "anthropic-ts",  Runtime::Node,   "messages_basic",   GEN,      "R1"),
